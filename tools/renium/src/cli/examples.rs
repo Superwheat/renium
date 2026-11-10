@@ -138,10 +138,13 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("js", "Examples:\n  rbx js job-id --wait-seconds 30"),
     ("iu", "Examples:\n  rbx iu icon.png --user 123456"),
     ("ss", "Examples:\n  rbx ss DataStore UpdateAsync"),
-    ("sg", "Examples:\n  rbx sg \"DailyReward\""),
+    (
+        "sg",
+        "Examples:\n  rbx sg \"DailyReward\"\n  rbx sg DailyReward --fn",
+    ),
     (
         "sr",
-        "Examples:\n  rbx sr src/ServerScriptService/Main.server.luau",
+        "Examples:\n  rbx sr src/ServerScriptService/Main.server.luau\n  rbx sr src/ServerScriptService/Main.server.luau --outline\n  rbx sr src/ServerScriptService/Main.server.luau --fn onPlayerAdded",
     ),
     (
         "play",

@@ -1804,7 +1804,7 @@ fn reflected_property_names(class_name: &str) -> Vec<&'static str> {
 /// Up to five names close to `wanted`: case-insensitive substring matches
 /// first, then the smallest edit distance, ties by name. A name that shares
 /// a long prefix (AssetType for AssetId) counts as well.
-fn closest_property_names<'a>(
+pub(crate) fn closest_property_names<'a>(
     wanted: &str,
     names: impl IntoIterator<Item = &'a str>,
 ) -> Vec<String> {

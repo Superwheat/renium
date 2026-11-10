@@ -1676,12 +1676,17 @@ pub(super) struct ScriptGrepArgs {
     )]
     pub(super) count: bool,
     #[arg(
-        help = "Maximum matching lines, or scripts with --count",
-        short,
-        long,
-        default_value_t = 50
+        help = "Print each function that holds a match once, whole, instead of its matching lines",
+        long = "fn",
+        conflicts_with = "count"
     )]
-    pub(super) limit: usize,
+    pub(super) functions: bool,
+    #[arg(
+        help = "Maximum matching lines (default 50), scripts with --count, or source lines with --fn (default 200)",
+        short,
+        long
+    )]
+    pub(super) limit: Option<usize>,
 }
 
 #[derive(Parser)]
@@ -1692,6 +1697,19 @@ pub(super) struct ScriptReadArgs {
     pub(super) start_line: usize,
     #[arg(help = "Last line to read", long)]
     pub(super) end_line: Option<usize>,
+    #[arg(
+        help = "List the functions instead of the source: one `FIRST-LAST name(params)` line each, nested ones indented",
+        long,
+        conflicts_with_all = ["start_line", "end_line", "functions"]
+    )]
+    pub(super) outline: bool,
+    #[arg(
+        help = "Print only this function, by its outline name or the last segment of it; repeatable",
+        long = "fn",
+        value_name = "NAME",
+        conflicts_with_all = ["start_line", "end_line"]
+    )]
+    pub(super) functions: Vec<String>,
 }
 
 #[derive(Parser)]

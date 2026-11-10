@@ -331,17 +331,22 @@ pub(crate) fn cooperative_luau(code: &str) -> Result<String> {
     {
         return Ok(code.to_string());
     }
-    // full_moon's recursive parser can exhaust an ordinary daemon request
-    // thread even with a few nested loops in a debug build. Keep parsing,
-    // traversal and AST destruction on one joined worker with its own stack.
+    on_luau_parser_stack(|| instrument_luau(code))?
+}
+
+/// Runs `work` on one joined worker with its own 64 MiB stack. full_moon's
+/// recursive parser can exhaust an ordinary daemon request thread even with a
+/// few nested loops in a debug build, so parsing, traversal and AST
+/// destruction all belong inside `work`.
+pub(crate) fn on_luau_parser_stack<T: Send>(work: impl FnOnce() -> T + Send) -> Result<T> {
     thread::scope(|scope| {
         thread::Builder::new()
-            .name("renium-luau-instrument".into())
+            .name("renium-luau-parser".into())
             .stack_size(64 * 1024 * 1024)
-            .spawn_scoped(scope, || instrument_luau(code))
-            .context("Could not start Luau instrumentation")?
+            .spawn_scoped(scope, work)
+            .context("Could not start the Luau parser")?
             .join()
-            .map_err(|_| anyhow::anyhow!("Luau instrumentation failed"))?
+            .map_err(|_| anyhow::anyhow!("The Luau parser failed"))
     })
 }
 

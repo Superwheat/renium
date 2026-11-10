@@ -15,6 +15,7 @@ pub(crate) mod commands;
 pub(crate) mod context;
 pub(crate) mod live;
 pub(crate) mod local;
+pub(crate) mod luau_outline;
 pub(crate) mod places;
 pub(crate) mod property_access;
 pub(crate) mod reconcile;

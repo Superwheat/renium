@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use walkdir::WalkDir;
 
 use crate::app::output::print_json_output;
+use crate::automation::luau_outline::{LuauFunction, luau_functions};
 use crate::automation::{BoundContext, Failure, op};
 use crate::cli::{
     AssetInsertArgs, AssetSearchArgs, BridgeConnectionArgs, GenerateModelArgs, JobStatusArgs,
@@ -36,6 +37,10 @@ struct ScriptRead {
     end_line: Option<usize>,
     #[serde(alias = "should_read_entire_file")]
     _entire: Option<bool>,
+    #[serde(default)]
+    outline: bool,
+    #[serde(default, rename = "fn")]
+    functions: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -50,6 +55,8 @@ struct ScriptGrep {
     count: bool,
     scope: Option<String>,
     limit: Option<usize>,
+    #[serde(default, rename = "fn")]
+    functions: bool,
 }
 
 pub(crate) fn asset_search_command(args: AssetSearchArgs) -> anyhow::Result<()> {
@@ -196,13 +203,83 @@ fn print_script_hits(result: Result<Value, Failure>) -> anyhow::Result<()> {
 
 const HIT_TEXT_LIMIT: usize = 240;
 
+fn items<'a>(value: &'a Value, key: &str) -> &'a [Value] {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+}
+
+/// One hit as a `LINE: text` line, without the indentation and with a long
+/// line cut short.
+fn push_hit_line(text: &mut String, hit: &Value) {
+    let line = hit["text"].as_str().unwrap_or_default().trim();
+    text.push_str(&format!("{}: ", hit["line"]));
+    match line.char_indices().nth(HIT_TEXT_LIMIT) {
+        Some((cut, _)) => {
+            text.push_str(&line[..cut]);
+            text.push('\u{2026}');
+        }
+        None => text.push_str(line),
+    }
+    text.push('\n');
+}
+
+/// One function of a `--fn` grep: a `FIRST-LAST name` line, then its source,
+/// or its hit lines when the limit had no room for the source; returns the
+/// number of lines after the first.
+fn push_function(text: &mut String, function: &Value) -> u64 {
+    text.push_str(&format!(
+        "{}-{} {}\n",
+        function["startLine"],
+        function["endLine"],
+        function["name"].as_str().unwrap_or_default()
+    ));
+    if let Some(source) = function.get("source").and_then(Value::as_str) {
+        text.push_str(source);
+        text.push('\n');
+        return source.split('\n').count() as u64;
+    }
+    let hits = items(function, "hits");
+    for hit in hits {
+        push_hit_line(text, hit);
+    }
+    hits.len() as u64
+}
+
+/// The lines under one script's path: the parse error of a script whose
+/// functions could not be read, then its functions and hits in line order;
+/// returns the number of source and hit lines.
+fn push_script_lines(text: &mut String, result: &Value) -> u64 {
+    if let Some(error) = result.get("parseError").and_then(Value::as_str) {
+        text.push_str(&format!("does not parse ({error}); matching lines:\n"));
+    }
+    let mut lines = 0;
+    let mut functions = items(result, "functions").iter().peekable();
+    for hit in items(result, "hits") {
+        let line = hit["line"].as_u64();
+        while let Some(function) = functions.next_if(|next| next["startLine"].as_u64() < line) {
+            lines += push_function(text, function);
+        }
+        push_hit_line(text, hit);
+        lines += 1;
+    }
+    for function in functions {
+        lines += push_function(text, function);
+    }
+    lines
+}
+
 /// Search hits as text: each script's path on its own line, for a grep
 /// followed by its hits as `LINE: text` without the indentation and with a
 /// long line cut short, and a last line when the limit left hits out. A
-/// script search names the scripts only; `rbx sg` shows the lines, and with
-/// `--count` each script's path and its number of matching lines.
+/// script search names the scripts only; `rbx sg` shows the lines, with
+/// `--count` each script's path and its number of matching lines, and with
+/// `--fn` each function that holds a hit as a `FIRST-LAST name` line and its
+/// source (its hit lines when the limit has no room for the source), in line
+/// order with the hits outside every function.
 fn script_hits_text(value: &Value) -> String {
-    let results = value["results"].as_array().map_or(&[][..], Vec::as_slice);
+    let results = items(value, "results");
     if results.is_empty() {
         return "no matches".to_string();
     }
@@ -214,28 +291,13 @@ fn script_hits_text(value: &Value) -> String {
             text.push_str(&format!(" {count}"));
         }
         text.push('\n');
-        for hit in result
-            .get("hits")
-            .and_then(Value::as_array)
-            .map_or(&[][..], Vec::as_slice)
-        {
-            lines += 1;
-            let line = hit["text"].as_str().unwrap_or_default().trim();
-            text.push_str(&format!("{}: ", hit["line"]));
-            match line.char_indices().nth(HIT_TEXT_LIMIT) {
-                Some((cut, _)) => {
-                    text.push_str(&line[..cut]);
-                    text.push('\u{2026}');
-                }
-                None => text.push_str(line),
-            }
-            text.push('\n');
-        }
+        lines += push_script_lines(&mut text, result);
     }
     if value["truncated"] == json!(true) {
+        let total_lines = value.get("totalLines").unwrap_or(&value["totalMatches"]);
         let (shown, total, unit) = match value.get("totalFiles") {
             Some(total) => (results.len() as u64, total.as_u64().unwrap_or(0), "scripts"),
-            None => (lines, value["totalMatches"].as_u64().unwrap_or(0), "lines"),
+            None => (lines, total_lines.as_u64().unwrap_or(0), "lines"),
         };
         text.push_str(&format!(
             "{shown} of {total} {unit} shown; -l N shows more\n"
@@ -272,8 +334,52 @@ pub(crate) fn script_grep_command(
             "count": args.count,
             "scope": args.scope,
             "limit": args.limit,
+            "fn": args.functions,
         }),
     ))
+}
+
+/// A script read as text: a line range as `FIRST-LAST/TOTAL` and its source,
+/// an outline as `TOTAL lines` and one `FIRST-LAST name(params)` line per
+/// function, indented one space per enclosing function, and functions read by
+/// name each as `FIRST-LAST/TOTAL name` and its source.
+fn script_read_text(value: &Value) -> String {
+    let total = &value["totalLines"];
+    if let Some(source) = value.get("source").and_then(Value::as_str) {
+        return format!(
+            "{}-{}/{total}\n{source}",
+            value["startLine"], value["endLine"]
+        );
+    }
+    let functions = items(value, "functions");
+    let mut text = String::new();
+    if functions
+        .iter()
+        .all(|function| function.get("source").is_none())
+    {
+        text.push_str(&format!("{total} lines\n"));
+    }
+    for function in functions {
+        let range = format!("{}-{}", function["startLine"], function["endLine"]);
+        let name = function["name"].as_str().unwrap_or_default();
+        match function.get("source").and_then(Value::as_str) {
+            Some(source) => text.push_str(&format!("{range}/{total} {name}\n{source}\n")),
+            None => {
+                let depth = function["depth"].as_u64().unwrap_or(0) as usize;
+                let parameters = items(function, "parameters")
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                text.push_str(&format!(
+                    "{}{range} {name}({parameters})\n",
+                    " ".repeat(depth)
+                ));
+            }
+        }
+    }
+    text.truncate(text.trim_end_matches('\n').len());
+    text
 }
 
 pub(crate) fn script_read_command(
@@ -281,23 +387,18 @@ pub(crate) fn script_read_command(
     project: Option<&Path>,
 ) -> anyhow::Result<()> {
     let (root, _) = script_roots(project)?;
-    let value = script_read_at(
-        &root,
-        &json!({
+    let parameters = if args.outline || !args.functions.is_empty() {
+        json!({ "path": args.path, "outline": args.outline, "fn": args.functions })
+    } else {
+        json!({
             "path": args.path,
             "startLine": args.start_line,
             "endLine": args.end_line,
-        }),
-    )
-    .map_err(|failure| anyhow::anyhow!(failure.0.m))?;
-    let text = format!(
-        "{}-{}/{}\n{}",
-        value["startLine"],
-        value["endLine"],
-        value["totalLines"],
-        value["source"].as_str().unwrap_or_default()
-    );
-    crate::app::output::emit_global_output(&value, &text)
+        })
+    };
+    let value =
+        script_read_at(&root, &parameters).map_err(|failure| anyhow::anyhow!(failure.0.m))?;
+    crate::app::output::emit_global_output(&value, &script_read_text(&value))
 }
 
 fn failure(message: impl Into<String>, next: &str) -> Failure {
@@ -460,6 +561,9 @@ fn script_read_at(root: &Path, parameters: &Value) -> Result<Value, Failure> {
     let path = resolve_script(root, &request.path, "script-read")?;
     let source = read_script(&path, "script-read")?;
     let lines = source.lines().collect::<Vec<_>>();
+    if request.outline || !request.functions.is_empty() {
+        return script_read_functions(&relative(root, &path), &source, &lines, &request);
+    }
     let start = request.start_line.unwrap_or(1);
     let requested_end = request.end_line.unwrap_or(lines.len());
     if start == 0 || requested_end < start || start > lines.len() {
@@ -481,6 +585,101 @@ fn script_read_at(root: &Path, parameters: &Value) -> Result<Value, Failure> {
     }))
 }
 
+/// One function as a result entry: its name and lines, and under `key` its
+/// `source` or the `hits` returned in place of it.
+fn function_entry(function: &LuauFunction, key: &str, value: Value) -> Value {
+    let mut entry = json!({
+        "name": function.name,
+        "startLine": function.first_line,
+        "endLine": function.last_line,
+    });
+    entry[key] = value;
+    entry
+}
+
+/// A function's source: the script's lines from its first through its last.
+fn function_source(function: &LuauFunction, lines: &[&str]) -> Value {
+    json!(lines[function.first_line - 1..function.last_line].join("\n"))
+}
+
+/// The functions `names` ask for, each once and in source order. A name
+/// matches a function's printed name or its last segment; a name that matches
+/// none is an error that lists the nearest names.
+fn named_functions<'a>(
+    path: &str,
+    functions: &'a [LuauFunction],
+    names: &[String],
+) -> Result<Vec<&'a LuauFunction>, Failure> {
+    let unmatched = names
+        .iter()
+        .find(|name| !functions.iter().any(|function| function.is_named(name)));
+    if let Some(name) = unmatched {
+        let qualified = name.contains(['.', ':']);
+        let nearest = crate::bytecode::closest_property_names(
+            name,
+            functions.iter().map(|function| match qualified {
+                true => function.name.as_str(),
+                false => function.last_segment(),
+            }),
+        );
+        let mut message = format!("No function {name} in {path}");
+        if !nearest.is_empty() {
+            message.push_str(&format!("; nearest: {}", nearest.join(", ")));
+        }
+        message.push_str("; --outline lists them all");
+        return Err(failure(message, "script-read"));
+    }
+    Ok(functions
+        .iter()
+        .filter(|function| names.iter().any(|name| function.is_named(name)))
+        .collect())
+}
+
+/// A script read by function: with `outline` the name, parameters, lines and
+/// depth of every function, with `fn` names the source of each function they
+/// match. A script that does not parse is an error with the parser's first
+/// error and its line.
+fn script_read_functions(
+    path: &str,
+    source: &str,
+    lines: &[&str],
+    request: &ScriptRead,
+) -> Result<Value, Failure> {
+    let ranged = request.start_line.is_some() || request.end_line.is_some();
+    if ranged || (request.outline && !request.functions.is_empty()) {
+        return Err(failure(
+            "script-read takes one of a line range, outline and fn",
+            "script-read",
+        ));
+    }
+    let functions = luau_functions(source).map_err(|error| {
+        failure(
+            format!("{path} does not parse ({error}); read it by line range"),
+            "script-read",
+        )
+    })?;
+    let listed = if request.outline {
+        functions
+            .iter()
+            .map(|function| {
+                json!({
+                    "name": function.name,
+                    "parameters": function.parameters,
+                    "startLine": function.first_line,
+                    "endLine": function.last_line,
+                    "depth": function.depth,
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        named_functions(path, &functions, &request.functions)?
+            .into_iter()
+            .map(|function| function_entry(function, "source", function_source(function, lines)))
+            .collect()
+    };
+    Ok(json!({ "path": path, "totalLines": lines.len(), "functions": listed }))
+}
+
 pub(crate) fn script_read(context: &BoundContext, parameters: &Value) -> Result<Value, Failure> {
     script_read_at(Path::new(&context.root), parameters)
 }
@@ -500,18 +699,28 @@ fn script_grep_at(root: &Path, source: &Path, parameters: &Value) -> Result<Valu
     }
     let matches = line_matcher(&request)?;
     let scope = request.scope.as_deref().map(scope_prefix);
+    let files = script_files(source).into_iter().filter(|path| {
+        scope
+            .as_deref()
+            .is_none_or(|scope| in_scope(&relative(root, path), scope))
+    });
+    if request.functions {
+        if request.count {
+            return Err(failure(
+                "script-grep takes one of count and fn",
+                "script-grep",
+            ));
+        }
+        let limit = request.limit.unwrap_or(200).clamp(1, 1000);
+        return script_grep_functions(root, files, &matches, limit);
+    }
     let limit = request.limit.unwrap_or(50).clamp(1, 1000);
     // Matches are grouped by file: one path per script instead of one per line.
     let mut results: Vec<Value> = Vec::new();
     let mut returned = 0;
     let mut total_matches = 0;
     let mut matching_files = 0;
-    for path in script_files(source) {
-        if let Some(scope) = scope.as_deref()
-            && !in_scope(&relative(root, &path), scope)
-        {
-            continue;
-        }
+    for path in files {
         let source = read_script(&path, "script-grep")?;
         if request.count {
             let count = source.lines().filter(|line| matches(line)).count();
@@ -546,6 +755,142 @@ fn script_grep_at(root: &Path, source: &Path, parameters: &Value) -> Result<Valu
             result["totalFiles"] = json!(matching_files);
         }
     } else if returned < total_matches {
+        result["truncated"] = json!(true);
+    }
+    Ok(result)
+}
+
+type FunctionHits<'a> = (Option<&'a LuauFunction>, Vec<usize>);
+
+/// The hit lines of one script grouped for a function grep, in line order: a
+/// function that holds hits comes once with all of them, and a hit outside
+/// every function on its own. The function is the innermost one around a hit,
+/// or the one around that where it holds hits of its own as well.
+fn hits_by_function<'a>(functions: &'a [LuauFunction], hits: &[usize]) -> Vec<FunctionHits<'a>> {
+    let mut holding = std::collections::BTreeSet::new();
+    for &line in hits {
+        let innermost = functions
+            .iter()
+            .enumerate()
+            .filter(|(_, function)| function.holds(line))
+            .max_by_key(|(_, function)| function.depth);
+        holding.extend(innermost.map(|(index, _)| index));
+    }
+    let mut kept: Vec<&LuauFunction> = Vec::new();
+    for function in holding.into_iter().map(|index| &functions[index]) {
+        let nested = kept
+            .last()
+            .is_some_and(|outer| outer.depth < function.depth && outer.holds(function.first_line));
+        if !nested {
+            kept.push(function);
+        }
+    }
+    let mut groups: Vec<FunctionHits> = Vec::new();
+    for &line in hits {
+        let function = kept.iter().copied().find(|function| function.holds(line));
+        match groups.last_mut() {
+            Some((Some(last), group))
+                if function.is_some_and(|function| std::ptr::eq(function, *last)) =>
+            {
+                group.push(line);
+            }
+            _ => groups.push((function, vec![line])),
+        }
+    }
+    groups
+}
+
+/// Spends what is `left` of a function grep's line limit on one script's
+/// grouped hits and returns the `functions` and `hits` to show and the lines
+/// they take without a limit. A function comes with its source while that
+/// fits in what is left; one that does not comes with its hit lines instead,
+/// one line of the limit each like a hit outside the functions.
+fn spend_lines(
+    groups: Vec<FunctionHits>,
+    lines: &[&str],
+    left: &mut usize,
+) -> (Vec<Value>, Vec<Value>, usize) {
+    let mut functions = Vec::new();
+    let mut outside = Vec::new();
+    let mut total = 0;
+    for (function, hits) in groups {
+        let length = function.map_or(1, LuauFunction::line_count);
+        total += length;
+        if let Some(function) = function.filter(|_| length <= *left) {
+            *left -= length;
+            let source = function_source(function, lines);
+            functions.push(function_entry(function, "source", source));
+            continue;
+        }
+        let shown = hits.len().min(*left);
+        *left -= shown;
+        let hits = hits[..shown]
+            .iter()
+            .map(|&line| json!({ "line": line, "text": lines[line - 1] }))
+            .collect::<Vec<_>>();
+        match function {
+            _ if shown == 0 => {}
+            Some(function) => functions.push(function_entry(function, "hits", json!(hits))),
+            None => outside.extend(hits),
+        }
+    }
+    (functions, outside, total)
+}
+
+/// A grep that returns whole functions: per script the `functions` that hold
+/// a hit, each once with its `source`, and the `hits` outside every function.
+/// A script that does not parse returns its hits and a `parseError`. `limit`
+/// caps the source and hit lines returned across all scripts, a function too
+/// long for what is left of it returns its `hits` instead of its `source`,
+/// and `totalLines` counts the lines without the limit.
+fn script_grep_functions(
+    root: &Path,
+    files: impl Iterator<Item = PathBuf>,
+    matches: &LineMatcher,
+    limit: usize,
+) -> Result<Value, Failure> {
+    let mut results: Vec<Value> = Vec::new();
+    let mut left = limit;
+    let mut total_matches = 0;
+    let mut total_lines = 0;
+    for path in files {
+        let source = read_script(&path, "script-grep")?;
+        let lines = source.lines().collect::<Vec<_>>();
+        let hits = (1..=lines.len())
+            .filter(|line| matches(lines[line - 1]))
+            .collect::<Vec<_>>();
+        if hits.is_empty() {
+            continue;
+        }
+        total_matches += hits.len();
+        let (functions, parse_error) = match luau_functions(&source) {
+            Ok(functions) => (functions, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        let groups = hits_by_function(&functions, &hits);
+        let (shown_functions, shown_hits, script_lines) = spend_lines(groups, &lines, &mut left);
+        total_lines += script_lines;
+        if shown_functions.is_empty() && shown_hits.is_empty() {
+            continue;
+        }
+        let mut result = json!({ "path": relative(root, &path) });
+        if let Some(error) = parse_error {
+            result["parseError"] = json!(error);
+        }
+        if !shown_functions.is_empty() {
+            result["functions"] = json!(shown_functions);
+        }
+        if !shown_hits.is_empty() {
+            result["hits"] = json!(shown_hits);
+        }
+        results.push(result);
+    }
+    let mut result = json!({
+        "results": results,
+        "totalMatches": total_matches,
+        "totalLines": total_lines,
+    });
+    if limit - left < total_lines {
         result["truncated"] = json!(true);
     }
     Ok(result)
@@ -607,7 +952,179 @@ pub(crate) fn script_grep(context: &BoundContext, parameters: &Value) -> Result<
 mod tests {
     use serde_json::json;
 
-    use super::{HIT_TEXT_LIMIT, script_grep_at, script_hits_text};
+    use super::{
+        HIT_TEXT_LIMIT, script_grep_at, script_hits_text, script_read_at, script_read_text,
+    };
+
+    /// Runs `check` on the root and source folder of a project that holds
+    /// `files`, given as paths under `src` and their text.
+    fn with_scripts(
+        files: &[(&str, &str)],
+        check: impl FnOnce(&std::path::Path, &std::path::Path),
+    ) {
+        let root = crate::system::files::create_unique_directory(
+            &std::env::temp_dir(),
+            "renium-script-fn-",
+        )
+        .unwrap();
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            let _ = std::fs::remove_dir_all(&root);
+        });
+        let root = crate::system::files::canonical_path(&root).unwrap();
+        let source = root.join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        for (path, text) in files {
+            std::fs::write(source.join(path), text).unwrap();
+        }
+        check(&root, &source);
+    }
+
+    const SHOP: &str = "\
+local Shop = {}
+function Shop.buy(player, id)
+\tlocal function price()
+\t\treturn 5
+\tend
+\treturn price()
+end
+Shop.sell = function(player)
+end
+return Shop
+";
+
+    #[test]
+    fn a_script_reads_as_an_outline_and_by_function_name() {
+        with_scripts(&[("Shop.luau", SHOP)], |root, _| {
+            let read = |mut parameters: serde_json::Value| {
+                parameters["path"] = json!("src/Shop.luau");
+                script_read_at(root, &parameters)
+                    .map(|value| script_read_text(&value))
+                    .map_err(|failure| failure.0.m)
+            };
+            assert_eq!(
+                read(json!({ "outline": true })).unwrap(),
+                "10 lines\n2-7 Shop.buy(player, id)\n 3-5 price()\n8-9 Shop.sell(player)"
+            );
+            assert_eq!(
+                read(json!({ "fn": ["sell"] })).unwrap(),
+                "8-9/10 Shop.sell\nShop.sell = function(player)\nend"
+            );
+            assert_eq!(
+                read(json!({ "fn": ["price", "Shop.buy", "buy"] })).unwrap(),
+                "2-7/10 Shop.buy\nfunction Shop.buy(player, id)\n\tlocal function price()\n\t\treturn 5\n\tend\n\treturn price()\nend\n3-5/10 price\n\tlocal function price()\n\t\treturn 5\n\tend"
+            );
+            assert_eq!(
+                read(json!({ "fn": ["sell", "bye"] })).unwrap_err(),
+                "No function bye in src/Shop.luau; nearest: buy; --outline lists them all"
+            );
+            assert_eq!(
+                read(json!({ "fn": ["Shop.sel"] })).unwrap_err(),
+                "No function Shop.sel in src/Shop.luau; nearest: Shop.sell, Shop.buy; --outline lists them all"
+            );
+            assert_eq!(
+                read(json!({ "startLine": 8, "endLine": 9 })).unwrap(),
+                "8-9/10\nShop.sell = function(player)\nend"
+            );
+            assert!(read(json!({ "outline": true, "endLine": 9 })).is_err());
+            assert!(read(json!({ "outline": true, "fn": ["sell"] })).is_err());
+        });
+    }
+
+    #[test]
+    fn a_script_that_does_not_parse_says_so_and_greps_as_plain_lines() {
+        let files = [
+            (
+                "Broken.luau",
+                "local function grant()\n\treturn 1\nend\nlocal x = )\n",
+            ),
+            ("Fine.luau", "local function grant()\n\treturn 2\nend\n"),
+        ];
+        with_scripts(&files, |root, source| {
+            let error =
+                script_read_at(root, &json!({ "path": "src/Broken.luau", "outline": true }))
+                    .map_err(|failure| failure.0.m)
+                    .unwrap_err();
+            assert!(
+                error.starts_with("src/Broken.luau does not parse (line 4: "),
+                "{error}"
+            );
+            assert!(!error.contains('\n'), "{error}");
+            let value = script_grep_at(root, source, &json!({ "query": "return", "fn": true }))
+                .map_err(|failure| failure.0.m)
+                .unwrap();
+            let error = value["results"][0]["parseError"].as_str().unwrap();
+            assert!(error.starts_with("line 4: "), "{error}");
+            assert_eq!(
+                script_hits_text(&value),
+                format!(
+                    "src/Broken.luau\ndoes not parse ({error}); matching lines:\n2: return 1\nsrc/Fine.luau\n1-3 grant\nlocal function grant()\n\treturn 2\nend"
+                )
+            );
+        });
+    }
+
+    const ROUNDS: &str = "\
+local total = 0
+local function add(value)
+\ttotal += value
+\treturn total
+end
+local function outer()
+\tlocal function inner()
+\t\treturn total
+\tend
+\treturn inner()
+end
+local function both()
+\tlocal seen = total
+\tlocal function nested()
+\t\treturn total
+\tend
+\treturn nested() + seen
+end
+local function unrelated()
+end
+";
+
+    #[test]
+    fn a_function_grep_prints_each_function_once_and_the_limit_caps_source_lines() {
+        with_scripts(&[("Rounds.luau", ROUNDS)], |root, source| {
+            let grep = |mut parameters: serde_json::Value| {
+                parameters["query"] = json!("total");
+                parameters["fn"] = json!(true);
+                script_grep_at(root, source, &parameters).map_err(|failure| failure.0.m)
+            };
+            let add = "2-5 add\nlocal function add(value)\n\ttotal += value\n\treturn total\nend";
+            let all = grep(json!({})).unwrap();
+            assert_eq!(all["totalMatches"], json!(6));
+            assert_eq!(all["totalLines"], json!(15));
+            assert_eq!(
+                script_hits_text(&all),
+                format!(
+                    "src/Rounds.luau\n1: local total = 0\n{add}\n7-9 inner\n\tlocal function inner()\n\t\treturn total\n\tend\n12-18 both\nlocal function both()\n\tlocal seen = total\n\tlocal function nested()\n\t\treturn total\n\tend\n\treturn nested() + seen\nend"
+                )
+            );
+            assert_eq!(
+                script_hits_text(&grep(json!({ "limit": 9 })).unwrap()),
+                format!(
+                    "src/Rounds.luau\n1: local total = 0\n{add}\n7-9 inner\n\tlocal function inner()\n\t\treturn total\n\tend\n12-18 both\n13: local seen = total\n9 of 15 lines shown; -l N shows more"
+                )
+            );
+            assert_eq!(
+                script_hits_text(&grep(json!({ "limit": 6 })).unwrap()),
+                format!(
+                    "src/Rounds.luau\n1: local total = 0\n{add}\n7-9 inner\n8: return total\n6 of 15 lines shown; -l N shows more"
+                )
+            );
+            assert_eq!(
+                script_hits_text(&grep(json!({ "limit": 5 })).unwrap()),
+                format!(
+                    "src/Rounds.luau\n1: local total = 0\n{add}\n5 of 15 lines shown; -l N shows more"
+                )
+            );
+            assert!(grep(json!({ "count": true })).is_err());
+        });
+    }
 
     #[test]
     fn a_grep_takes_a_regular_expression_and_a_path_scope() {
