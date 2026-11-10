@@ -466,7 +466,11 @@ def no_matching_studio(ctx: Context):
         verdict = str(status.pointer("/diagnosis/verdict") or "")
         ctx.expect(status.get("clients") in (None, []), f"no clients: {status.json}")
         ctx.expect("B.rbxl" in verdict and "no connected Studio matches this project" in verdict, f"verdict: {verdict}")
-        luau = ctx.rbx("l", "return 1", "-w", "3", ok=False, timeout=60)
+        while True:
+            luau = ctx.rbx("l", "return 1", "-w", "3", ok=False, timeout=60)
+            if "has not connected yet" not in luau.error or time.monotonic() > deadline:
+                break
+            time.sleep(3)
         ctx.expect_in("No Studio runtime connected to this project within", luau.error, "l without a match")
         ctx.expect_in("no connected Studio matches this project", luau.error, "l carries the verdict")
     finally:
