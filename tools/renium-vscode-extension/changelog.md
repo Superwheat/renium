@@ -124,7 +124,8 @@
 - Aligning a store's ids in a pull, merge, first pairing, model JSON adapter or service projection no longer rewrites the id of a reference into another service that shares it, and a reference retargeted from an instance of its own store to one of another service with the same id is seen as a change.
 - A merge no longer lets a reference bind to an instance the other side put at its removed target's path: it is a conflict without a preference, and restored or cleared with one; when a merge restores an instance for a reference, it also restores what that instance refers to, with script sources.
 - A pull keeps an instance's store id on the instance Studio reports it for after a rename, instead of giving it to a new instance that took the old name.
-- Studio now reports that store id for an instance a push created at a service root (such as `rbx ba ReplicatedStorage -n Name --push`), so after Studio renames or moves it a reference from another service still names it. An instance Studio moved into another service is no longer reported under its old store's id.
+- A pull keeps the store id of every instance a push created, after Studio renames or moves it: the import now carries the ids of a pushed subtree's descendants as well as its roots, and Studio reports those instances under them. A new instance that takes the old name gets its own id, so a reference from another service still names the renamed instance. An instance Studio moved into another service is no longer reported under its old store's id.
+- The native Windows paths work on Studio 0.747 again. The binary reader's wrapper, the attribute signal's new argument order and the ObjectValue relay are found by their structure, so a push imports natively and keeps its native verification instead of falling back to the plugin transport; Studio 0.746 still matches.
 
 ## 0.5.9 - 2026-11-06
 
