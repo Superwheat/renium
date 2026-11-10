@@ -3201,6 +3201,13 @@ fn gui_input_bounds(
              by a non-scrolling container or positioned outside the viewport)"
         );
     }
+    if let Some(reason) = bounds.get("notVisible").and_then(Value::as_str) {
+        let path = bounds.get("ordinalPath").and_then(Value::as_str);
+        bail!(
+            "GUI element {} is not visible: {reason}",
+            path.unwrap_or(subject)
+        );
+    }
     if bounds.get("visible").and_then(Value::as_bool) == Some(false) {
         bail!("GUI element {subject} is not visible");
     }

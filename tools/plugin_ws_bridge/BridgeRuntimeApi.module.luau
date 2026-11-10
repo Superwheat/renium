@@ -993,21 +993,26 @@ end
 		return matches
 	end
 
+	-- Whether a player sees `instance`, and what decides it: the nearest of it
+	-- and its ancestors with Visible=false, else its ScreenGui. An instance
+	-- outside every ScreenGui is not seen and has no second result.
 	local function isEffectivelyVisible(instance)
 		local current = instance
 		while current ~= nil do
 			if current:IsA("GuiObject") then
 				if not current.Visible then
-					return false
+					return false, current
 				end
 			elseif current:IsA("ScreenGui") then
-				return current.Enabled
+				return current.Enabled, current
 			end
 			current = current.Parent
 		end
-		return false
+		return false, nil
 	end
 
+	-- Whether the center of `instance` is inside the screen and every ancestor
+	-- that clips it; the second result is the ancestor that clips it away.
 	local function guiCenterOnScreen(instance, insetX, insetY)
 		local absPos = instance.AbsolutePosition
 		local absSize = instance.AbsoluteSize
@@ -1019,7 +1024,7 @@ end
 			local viewportX = centerX + insetX
 			local viewportY = centerY + insetY
 			if viewportX < 0 or viewportY < 0 or viewportX > viewport.X or viewportY > viewport.Y then
-				return false
+				return false, nil
 			end
 		end
 		local current = instance.Parent
@@ -1033,12 +1038,12 @@ end
 					or centerY < clipPos.Y
 					or centerY > clipPos.Y + clipSize.Y
 				then
-					return false
+					return false, current
 				end
 			end
 			current = current.Parent
 		end
-		return true
+		return true, nil
 	end
 
 	local function scrollGuiIntoView(instance)
@@ -1101,6 +1106,42 @@ end
 		return table.concat(parts, ".")
 	end
 
+	-- Why a player cannot see `instance`, as the end of a "is not visible: "
+	-- message with paths under `root`, or nil when it is shown: the nearest of
+	-- it and its ancestors with Visible=false, its ScreenGui with
+	-- Enabled=false, no ScreenGui around it, an AbsoluteSize without area, or
+	-- a center outside the screen or outside an ancestor that clips it.
+	local function guiNotVisibleReason(instance, root, insetX, insetY): string?
+		local visible, decider = isEffectivelyVisible(instance)
+		if not visible then
+			if decider == nil then
+				return "it is not inside a ScreenGui"
+			elseif decider == instance then
+				return "it has Visible=false"
+			end
+			local property = if decider:IsA("ScreenGui") then "Enabled" else "Visible"
+			return `{guiOrdinalPath(root, decider)} has {property}=false`
+		end
+		local size = instance.AbsoluteSize
+		if size.X <= 0 or size.Y <= 0 then
+			return ("it has AbsoluteSize %gx%g"):format(size.X, size.Y)
+		end
+		local onScreen, clippedBy = guiCenterOnScreen(instance, insetX, insetY)
+		if onScreen then
+			return nil
+		elseif clippedBy ~= nil then
+			return `its center is outside {guiOrdinalPath(root, clippedBy)}, which clips its descendants`
+		end
+		local position = instance.AbsolutePosition
+		local viewport = game:GetService("Workspace").CurrentCamera.ViewportSize
+		return ("its center %d,%d is outside the %dx%d screen"):format(
+			math.round(position.X + size.X / 2 + insetX),
+			math.round(position.Y + size.Y / 2 + insetY),
+			viewport.X,
+			viewport.Y
+		)
+	end
+
 	local function guiBoundsResult(current, root, matchedCount)
 		local absPos = current.AbsolutePosition
 		local absSize = current.AbsoluteSize
@@ -1140,6 +1181,7 @@ end
 			height = absSize.Y,
 			visible = isEffectivelyVisible(current),
 			onScreen = guiCenterOnScreen(current, insetX, insetY),
+			notVisible = guiNotVisibleReason(current, root, insetX, insetY),
 			viewportWidth = viewport.X,
 			viewportHeight = viewport.Y,
 			className = current.ClassName,
@@ -1850,11 +1892,8 @@ updateMouse()
 			if bounds.ok ~= true then
 				error(tostring(bounds.error or "GUI target could not be resolved"), 0)
 			end
-			if bounds.visible ~= true then
-				error(`GUI element {tostring(bounds.fullName)} is not visible`, 0)
-			end
-			if bounds.onScreen ~= true then
-				error(`GUI element {tostring(bounds.fullName)} is outside the viewport`, 0)
+			if bounds.notVisible ~= nil then
+				error(`GUI element {bounds.ordinalPath} is not visible: {bounds.notVisible}`, 0)
 			end
 			if bounds.hitTest ~= true then
 				local blocker = tostring(bounds.blockedBy or "another GUI element")

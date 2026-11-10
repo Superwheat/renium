@@ -1045,7 +1045,7 @@ def press_ambiguity_and_refusals(ctx: Context):
         by_id = ctx.rbx("pr", "--id", str(dup_id), "-p", "1", timeout=60)
         ctx.expect(by_id.get("action") == "press", f"pr --id: {by_id.json}")
         ctx.expect_in("matched nothing", ctx.rbx("pr", "NoSuchGui", "-p", "1", ok=False, timeout=60).error, "pr NoSuchGui")
-        ctx.expect_in("is not visible", ctx.rbx("pr", "Shop.Hidden", "-p", "1", ok=False, timeout=60).error, "pr Shop.Hidden")
+        ctx.expect_in("Shop.Hidden is not visible: it has Visible=false", ctx.rbx("pr", "Shop.Hidden", "-p", "1", ok=False, timeout=60).error, "pr Shop.Hidden")
         ctx.expect_in("is covered by", ctx.rbx("pr", "Shop.Covered", "-p", "1", ok=False, timeout=60).error, "pr Shop.Covered")
     finally:
         _stop(ctx)

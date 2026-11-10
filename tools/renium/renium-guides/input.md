@@ -14,7 +14,7 @@ rbx go --pos "745,40,510" -p 1
 rbx wait "workspace:GetAttribute('Ready') ~= nil" -c -t 20
 ```
 
-Reuse paths from `ui`'s `p` field. Paths are relative to `PlayerGui`; its prefix is optional. `Name[n]` selects duplicates in the client's own child order, which for replicated world parts can differ from Edit's; name a part uniquely when several share a name.
+Reuse paths from `ui`'s `p` field. Paths are relative to `PlayerGui`; its prefix is optional. A click or press on an element the player cannot see fails and says why: `Main.HUD has Visible=false` (the nearest hidden ancestor), a ScreenGui with `Enabled=false`, a zero `AbsoluteSize`, or a center outside the screen or a clipping ancestor. `Name[n]` selects duplicates in the client's own child order, which for replicated world parts can differ from Edit's; name a part uniquely when several share a name.
 
 `pr --world` needs an on-screen target; use `go` first. `go PATH` walks to the nearest point of the part's or model's bounding box and stops within eight studs; `--pos` targets an exact point. Both return the remaining distance. `inp move X,Y` moves the game's mouse: hover events fire, `Mouse.Target` follows it, and a following click reaches `ClickDetector`s. A point under Roblox's own UI (chat, player list, top bar icons) is still delivered, with that element hidden for the moment; the result then carries `throughSystemUi`, meaning a player could not have clicked there. The Roblox menu button's corner is reserved by the engine and stays refused.
 

@@ -587,4 +587,64 @@ reset()
 result = send({ { type = "text", text = "free" } })
 assert(result.textObserved == nil and delivered() == "text free", "text without a focus action is sent once, unchecked")
 
+-- A click on an element a player cannot see names what hides it, with paths
+-- as the command takes them, and sends nothing.
+local function configMenu()
+	reset()
+	local main = new("ScreenGui", playerGui, { Name = "Main", DisplayOrder = 10 })
+	local hudPosition, hudSize = at(100, 100, 400, 300)
+	local hud = new("Frame", main, { Name = "HUD", AbsolutePosition = hudPosition, AbsoluteSize = hudSize })
+	local buttons = new("Frame", hud, { Name = "Buttons", AbsolutePosition = hudPosition, AbsoluteSize = hudSize })
+	local configPosition, configSize = at(200, 200, 100, 40)
+	local config = new("TextButton", buttons, { Name = "Config", AbsolutePosition = configPosition, AbsoluteSize = configSize })
+	return { main = main, hud = hud, buttons = buttons, config = config }
+end
+local CONFIG = "Main.HUD.Buttons.Config"
+local function refusal(hide, expected)
+	local menu = configMenu()
+	hide(menu)
+	local text = failure({ { type = "click", path = CONFIG } })
+	assert(text == `GUI element {CONFIG} is not visible: {expected}`, text)
+	assert(delivered() == "", "a refused click sends nothing: " .. delivered())
+end
+configMenu()
+result = send({ { type = "click", path = CONFIG } })
+assert(result.verifiedClicks == 1 and delivered() == "MouseButton1 down,MouseButton1 up", "a visible element is clicked")
+refusal(function(menu)
+	menu.hud.Visible = false
+end, "Main.HUD has Visible=false")
+refusal(function(menu)
+	menu.hud.Visible = false
+	menu.buttons.Visible = false
+end, "Main.HUD.Buttons has Visible=false")
+refusal(function(menu)
+	menu.hud.Visible = false
+	menu.config.Visible = false
+end, "it has Visible=false")
+refusal(function(menu)
+	menu.main.Enabled = false
+end, "Main has Enabled=false")
+refusal(function(menu)
+	menu.config.AbsoluteSize = Vector2.new(0, 40)
+end, "it has AbsoluteSize 0x40")
+refusal(function(menu)
+	menu.config.AbsolutePosition = Vector2.new(1400, 200)
+end, "its center 1450,278 is outside the 1280x720 screen")
+refusal(function(menu)
+	menu.buttons.ClipsDescendants = true
+	menu.config.AbsolutePosition = Vector2.new(600, 200)
+end, "its center is outside Main.HUD.Buttons, which clips its descendants")
+local twins = configMenu()
+twins.config.Visible = false
+new("TextButton", twins.buttons, { Name = "Config", Visible = false })
+for _, action in { { type = "click", path = CONFIG .. "[1]" }, { type = "click", id = twins.config:GetDebugId() } } do
+	message = failure({ action })
+	assert(message == `GUI element {CONFIG}[1] is not visible: it has Visible=false`, message)
+end
+reset()
+local loosePosition, looseSize = at(200, 200, 100, 40)
+new("TextButton", new("Folder", playerGui, { Name = "Loose" }), { Name = "Button", AbsolutePosition = loosePosition, AbsoluteSize = looseSize })
+message = failure({ { type = "click", path = "Loose.Button" } })
+assert(message == "GUI element Loose.Button is not visible: it is not inside a ScreenGui", message)
+
 print("Renium CoreGui dismiss tests passed")
