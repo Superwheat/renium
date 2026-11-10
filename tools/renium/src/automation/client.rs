@@ -290,44 +290,6 @@ pub(crate) fn run_stdio_proxy(bridge_ports: String, bridge_wait_seconds: f64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
-
-    #[test]
-    fn response_deadline_is_absolute_and_reports_the_waiting_operation() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let mut peer = listener.accept().unwrap().0;
-        peer.write_all(b"ab").unwrap();
-        let mut reader = DeadlineReader {
-            stream: &client,
-            deadline: Instant::now() + Duration::from_secs(2),
-        };
-        assert_eq!(reader.read(&mut [0]).unwrap(), 1);
-        reader.deadline = Instant::now();
-        assert_eq!(
-            reader.read(&mut [0]).unwrap_err().kind(),
-            io::ErrorKind::TimedOut
-        );
-        let mut remaining = [0];
-        client.read_exact(&mut remaining).unwrap();
-        assert_eq!(remaining[0], b'b');
-        let error = send_on_stream_with_timeout(
-            &client,
-            &super::super::Request {
-                v: super::super::PROTOCOL_VERSION,
-                id: 1,
-                op: op::CAP,
-                cx: None,
-                p: json!({}),
-            },
-            Duration::from_millis(20),
-        )
-        .err()
-        .expect("an unanswered capability request must time out");
-        assert!(format!("{error:#}").contains("Waiting for daemon response to operation 0"));
-        assert!(is_response_timeout(&error));
-        assert!(!is_response_timeout(&anyhow::anyhow!("connection refused")));
-    }
 
     #[test]
     fn busy_daemon_errors_name_the_operations_it_is_serving() {

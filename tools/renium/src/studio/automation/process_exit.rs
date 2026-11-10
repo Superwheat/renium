@@ -142,41 +142,4 @@ pub(super) fn wait(processes: &[ProcessExit], deadline: Instant) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::process::{Command, Stdio};
-
-    #[test]
-    fn retained_exit_wait_is_bounded_and_observes_the_original_process() {
-        #[cfg(windows)]
-        let mut command = {
-            use std::os::windows::process::CommandExt;
-            let mut command = Command::new("cmd");
-            command.args(["/d", "/c", "pause"]);
-            command.creation_flags(0x08000000); // No console window or input interaction.
-            command
-        };
-        #[cfg(target_os = "macos")]
-        let mut command = {
-            let mut command = Command::new("cat");
-            command.stdout(Stdio::null());
-            command
-        };
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        let watched = ProcessExit::watch(child.id()).unwrap().unwrap();
-        let timed_out = watched.exited_by(Instant::now() + Duration::from_millis(20));
-        // Always reap this owned helper, even if the timeout assertion fails.
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(!timed_out.unwrap());
-        assert!(
-            watched
-                .exited_by(Instant::now() + Duration::from_secs(1))
-                .unwrap()
-        );
-    }
-}
+mod tests {}

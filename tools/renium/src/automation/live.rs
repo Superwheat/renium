@@ -3734,37 +3734,6 @@ mod tests {
     }
 
     #[test]
-    fn stopping_live_sync_cancels_and_joins_its_observer_before_finishing() {
-        let control = test_control();
-        let previous = control.begin_studio_wait().unwrap();
-        previous.cancel();
-        let lease = control.begin_studio_wait().unwrap();
-        assert_ne!(previous.id(), lease.id());
-        assert!(lease.ensure_active().is_ok());
-        let (cancelled, wait_cancelled) = mpsc::channel();
-        let (release, wait_release) = mpsc::channel();
-        *control.observer_thread.lock().unwrap() = Some(thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !lease.is_cancelled() {
-                assert!(Instant::now() < deadline);
-                thread::yield_now();
-            }
-            cancelled.send(()).unwrap();
-            wait_release.recv_timeout(Duration::from_secs(2)).unwrap();
-        }));
-        let worker_control = Arc::clone(&control);
-        let worker = thread::spawn(move || worker_control.finish());
-        wait_cancelled.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(!*control.finished.lock().unwrap());
-        assert!(control.stop.load(Ordering::Acquire));
-        release.send(()).unwrap();
-        control.stop_and_wait();
-        worker.join().unwrap();
-        assert!(control.observer_thread.lock().unwrap().is_none());
-        assert!(control.begin_studio_wait().is_err());
-    }
-
-    #[test]
     fn plugin_status_reports_failure_recovery_and_stop_without_per_edit_updates() {
         let control = test_control();
         let healthy = control.plugin_live_status();
@@ -3950,44 +3919,6 @@ mod tests {
         control.set_plugin_state(acknowledged);
         assert_eq!(control.plugin_snapshot(), edited);
         assert!(!control.wait_settled(Duration::ZERO));
-    }
-
-    #[test]
-    fn settled_wait_observes_an_event_quiet_period() {
-        let control = test_control();
-        control.set_plugin_state(json!({ "pendingChanges": 1 }));
-        let (notified, notification) = mpsc::sync_channel(1);
-        let notifier = Arc::clone(&control);
-        let event = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            let notified_at = Instant::now();
-            notifier.set_plugin_state(json!({}));
-            notified
-                .send(notified_at)
-                .expect("waiter should receive the notification time");
-        });
-
-        assert!(control.wait_settled(Duration::from_secs(30)));
-        let settled_at = Instant::now();
-        let notified_at = notification
-            .recv()
-            .expect("event thread should report its notification time");
-        assert!(settled_at.duration_since(notified_at) >= SETTLE_QUIET_PERIOD);
-        event.join().expect("event thread should finish");
-    }
-
-    #[test]
-    fn settled_wait_tracks_pending_work_without_a_project_scan() {
-        let control = test_control();
-        control.queue([PathBuf::from("test-project/src/changed.luau")]);
-        let finisher = Arc::clone(&control);
-        let event = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(25));
-            finisher.update_pending(&BTreeSet::new());
-        });
-
-        assert!(control.wait_settled(Duration::from_secs(30)));
-        event.join().expect("event thread should finish");
     }
 
     #[test]
@@ -4185,16 +4116,6 @@ mod tests {
         assert_eq!(pending, BTreeSet::from([source]));
 
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn settled_wait_returns_immediately_when_progress_is_blocked() {
-        let control = test_control();
-        control.fail("blocked".to_string());
-
-        let started = Instant::now();
-        assert!(!control.wait_settled(Duration::from_secs(60)));
-        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     #[test]

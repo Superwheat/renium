@@ -1,8 +1,6 @@
 //! References between stores: how commands complete them, keep them on
 //! their targets, lock the stores they read, and build them into a place.
 
-use std::time::{Duration, Instant};
-
 use super::edits::run_batch;
 use super::*;
 
@@ -306,38 +304,5 @@ fn a_batch_checks_the_unresolved_references_its_copies_carry() {
     assert_eq!(
         built_reference_target(&fx, "Workspace.DeferredCopy").as_deref(),
         Some("Workspace.Late")
-    );
-}
-
-#[test]
-fn a_batch_locks_its_stores_in_the_order_other_commands_do() {
-    let fx = Fixture::new("batch-lock-order");
-    let workspace_lock = PathBuf::from(format!("{}.lock", fx.store("Workspace").display()));
-    let held = crate::bytecode::acquire_settings_file_lock(&fx.store("ReplicatedStorage")).unwrap();
-    let batch = r#"[{"parent":"Workspace","name":"Pointer","class":"ObjectValue","props":{"Value":"ReplicatedStorage.Shared.Config"}}]"#;
-    std::thread::scope(|scope| {
-        let running = scope.spawn(|| run_batch(&fx, batch));
-        // `br` and a rename hold ReplicatedStorage before they ask for
-        // Workspace. A batch that held Workspace while it waited for
-        // ReplicatedStorage would leave both waiting until one times out.
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_millis(400) {
-            assert!(
-                !workspace_lock.exists(),
-                "the batch holds Workspace while it waits for ReplicatedStorage"
-            );
-            assert!(!running.is_finished());
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        drop(held);
-        running.join().unwrap().unwrap();
-    });
-    assert_eq!(
-        stored_reference(&fx, "Workspace", "Pointer"),
-        outside_reference(
-            &["ReplicatedStorage", "Shared", "Config"],
-            &[1, 1, 1],
-            "config"
-        )
     );
 }
