@@ -674,6 +674,9 @@ local function prepareImportedIdentities(group: any)
 		end
 		if instance == nil or instance.Name ~= name or instance.ClassName ~= class or seen[instance]
 			or (parent ~= 0 and instance.Parent ~= instances[parent]) then
+			if #name > 100 then
+				error(`Instance name has {#name} bytes and Studio keeps 100: {string.sub(name, 1, 40)}...`)
+			end
 			error("Imported instance identity does not match the payload")
 		end
 		seen[instance] = true

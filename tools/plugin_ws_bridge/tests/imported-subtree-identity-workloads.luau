@@ -203,7 +203,9 @@ do
 	prepared.instanceIdentities = identity.validate(metadata(oversized), 1)
 	-- Lune does not enforce Studio's Name limit; model the engine's result.
 	leaf.Name = string.rep("x", 100)
-	assert(not pcall(identity.prepare, prepared), "Truncated names must not be accepted as the requested identity")
+	local accepted, refusal = pcall(identity.prepare, prepared)
+	assert(not accepted, "Truncated names must not be accepted as the requested identity")
+	assert(string.find(tostring(refusal), "129 bytes and Studio keeps 100", 1, true), tostring(refusal))
 	root:Destroy()
 end
 

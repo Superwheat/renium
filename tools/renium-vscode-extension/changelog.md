@@ -32,6 +32,7 @@
 ### Improvements
 
 - A Play start in one Studio no longer holds up the other Studios on the same daemon. The start kept a daemon-wide gate for the 5 to 7 s Studio takes to launch a test, so a push, a stop or another start in a second Studio waited that long (a 150 ms push took 6 s); it now gives the gate back while it waits, and two Studios start Play at the same time. Requests to the starting Studio itself still wait for its start.
+- A push that would create an instance whose name is longer than the 100 bytes Studio keeps is refused, rolled back and says so with the name's length. Studio used to cut such a name silently, which left the open place and the files with different names.
 - A click or press on a GUI element the player cannot see says why: the nearest ancestor with `Visible=false` (`Main.HUD has Visible=false`), a ScreenGui with `Enabled=false`, a zero `AbsoluteSize`, or a center outside the screen or outside an ancestor that clips it. The error used to say only "is not visible".
 - The agent guide tells agents to call the `rbx` MCP tool when they have one, a deferred one included, to read scripts by range or by function with several parts in one call, and to search scripts with `rbx sg`; it carries one-call recipes for a Play restart and for UI input in Play.
 - A command on a service that has no store yet (`rbx bs Lighting`, `rbx tr Teams`, `rbx in`, a batch op) pulls that service from Studio first, when a daemon is running, instead of stopping at "pull from Studio".
