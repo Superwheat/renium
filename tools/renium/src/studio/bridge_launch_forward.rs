@@ -6,6 +6,17 @@ use crate::project::workflows::{launch_ticket_pending, take_launch_ticket};
 
 const YIELD_REQUEST: &[u8] = b"RENIUM-YIELD\n";
 
+/// How often the stand-in looks at the launch tickets and tries the ports it
+/// does not hold.
+const TICKET_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long the stand-in leaves the ports alone after it was asked for them.
+const YIELD_PAUSE: Duration = Duration::from_millis(1500);
+
+/// The connections taken from one port before the yield request and the
+/// launch tickets are looked at again.
+const ACCEPT_BATCH: usize = 16;
+
 struct Forwarder {
     awaited: Vec<u32>,
     running: bool,
@@ -32,13 +43,7 @@ pub(crate) fn forward_launched_studio(pid: u32, saved_ports: &[u16]) {
     forwarder.running = true;
     drop(forwarder);
     let ports = saved_ports.to_vec();
-    thread::spawn(move || {
-        if stand_in(&ports, still_awaited) {
-            let mut forwarder = FORWARDER.lock_recover();
-            forwarder.awaited.clear();
-            forwarder.running = false;
-        }
-    });
+    thread::spawn(move || stand_in(&ports, still_awaited));
 }
 
 fn still_awaited() -> bool {
@@ -48,45 +53,80 @@ fn still_awaited() -> bool {
     forwarder.running
 }
 
-/// Listens on whichever of `ports` are free while `awaited` holds, and
-/// returns true when a starting daemon asked for the ports instead. A port
-/// another process holds is tried again: that process may be a daemon that
-/// takes the tickets itself, or a stand-in about to finish.
-fn stand_in(ports: &[u16], awaited: impl Fn() -> bool) -> bool {
+/// Listens on whichever of `ports` are free and returns once `awaited` no
+/// longer holds. A port another process holds is tried again: that process
+/// may be a daemon that takes the tickets itself, or a stand-in about to
+/// finish. A request to yield only pauses the stand-in: it lets go of its
+/// ports for `YIELD_PAUSE` and then tries them again, so a daemon that took
+/// them keeps them and a request no daemon followed up on costs a short gap.
+fn stand_in(ports: &[u16], awaited: impl Fn() -> bool) {
     let yielded = Arc::new(AtomicBool::new(false));
+    let connections = Arc::new(AtomicUsize::new(0));
     let session_id = format!("launch-forward-{:x}", std::process::id());
     let mut listeners: Vec<(u16, TcpListener)> = Vec::new();
     let mut checked: Option<Instant> = None;
-    while !yielded.load(Ordering::Relaxed) {
-        if checked.is_none_or(|at| at.elapsed() >= Duration::from_millis(500)) {
+    let mut paused: Option<Instant> = None;
+    loop {
+        if yielded.swap(false, Ordering::Relaxed) && paused.is_none() {
+            listeners.clear();
+            paused = Some(Instant::now());
+        }
+        let resumes = paused.is_some_and(|at| at.elapsed() >= YIELD_PAUSE);
+        if resumes {
+            paused = None;
+        }
+        if resumes || checked.is_none_or(|at| at.elapsed() >= TICKET_CHECK_INTERVAL) {
             checked = Some(Instant::now());
             if !awaited() {
-                return false;
+                return;
             }
-            for port in ports {
-                if listeners.iter().any(|(bound, _)| bound == port) {
-                    continue;
-                }
-                if let Ok(listener) = TcpListener::bind(("127.0.0.1", *port))
-                    && listener.set_nonblocking(true).is_ok()
-                {
-                    listeners.push((*port, listener));
-                }
+            if paused.is_none() {
+                bind_free_ports(ports, &mut listeners);
             }
         }
         for (port, listener) in &listeners {
-            while let Ok((stream, addr)) = listener.accept() {
-                let port = *port;
-                let session_id = session_id.clone();
-                let yielded = Arc::clone(&yielded);
-                thread::spawn(move || {
-                    forward_connection(stream, addr, port, &session_id, &yielded)
-                });
-            }
+            accept_batch(*port, listener, &session_id, &yielded, &connections);
         }
         thread::sleep(Duration::from_millis(25));
     }
-    true
+}
+
+fn bind_free_ports(ports: &[u16], listeners: &mut Vec<(u16, TcpListener)>) {
+    for port in ports {
+        if listeners.iter().any(|(bound, _)| bound == port) {
+            continue;
+        }
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", *port))
+            && listener.set_nonblocking(true).is_ok()
+        {
+            listeners.push((*port, listener));
+        }
+    }
+}
+
+/// Takes at most `ACCEPT_BATCH` waiting connections. Each is handled on its
+/// own thread while a handshake permit is free and dropped otherwise.
+fn accept_batch(
+    port: u16,
+    listener: &TcpListener,
+    session_id: &str,
+    yielded: &Arc<AtomicBool>,
+    connections: &Arc<AtomicUsize>,
+) {
+    for _ in 0..ACCEPT_BATCH {
+        let Ok((stream, addr)) = listener.accept() else {
+            return;
+        };
+        let Some(permit) = HandshakePermit::acquire(connections) else {
+            continue;
+        };
+        let session_id = session_id.to_string();
+        let yielded = Arc::clone(yielded);
+        thread::spawn(move || {
+            let _permit = permit;
+            forward_connection(stream, addr, port, &session_id, &yielded)
+        });
+    }
 }
 
 fn forward_connection(
@@ -202,39 +242,125 @@ pub(super) fn bind_bridge_port(host: &str, port: u16) -> io::Result<TcpListener>
 mod tests {
     use super::*;
 
+    struct StandIn {
+        port: u16,
+        address: SocketAddr,
+        awaited: Arc<AtomicBool>,
+        serving: thread::JoinHandle<()>,
+    }
+
+    impl StandIn {
+        fn start() -> Self {
+            let port = TcpListener::bind(("127.0.0.1", 0))
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let awaited = Arc::new(AtomicBool::new(true));
+            let serving = thread::spawn({
+                let awaited = Arc::clone(&awaited);
+                move || stand_in(&[port], || awaited.load(Ordering::Relaxed))
+            });
+            Self {
+                port,
+                address: SocketAddr::from(([127, 0, 0, 1], port)),
+                awaited,
+                serving,
+            }
+        }
+
+        fn connect(&self) -> TcpStream {
+            let started = Instant::now();
+            loop {
+                match TcpStream::connect_timeout(&self.address, Duration::from_millis(250)) {
+                    Ok(stream) => break stream,
+                    Err(error) if started.elapsed() > Duration::from_secs(10) => panic!("{error}"),
+                    Err(_) => thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        }
+
+        fn turns_away(&self, mut stranger: TcpStream) -> bool {
+            stranger
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut answer = Vec::new();
+            let _ = stranger.read_to_end(&mut answer);
+            answer.is_empty()
+        }
+
+        fn finish_when_the_tickets_are_taken(self) {
+            assert!(
+                !self.serving.is_finished(),
+                "the stand-in lasts while a launch is awaited"
+            );
+            self.awaited.store(false, Ordering::Relaxed);
+            self.serving.join().unwrap();
+        }
+    }
+
     #[test]
     fn a_stand_in_turns_strangers_away_and_gives_its_port_to_a_starting_daemon() {
-        let port = TcpListener::bind(("127.0.0.1", 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let serving = thread::spawn(move || stand_in(&[port], || true));
-        let address = SocketAddr::from(([127, 0, 0, 1], port));
-        let started = Instant::now();
-        let mut stranger = loop {
-            match TcpStream::connect(address) {
-                Ok(stream) => break stream,
-                Err(error) if started.elapsed() > Duration::from_secs(5) => panic!("{error}"),
-                Err(_) => thread::sleep(Duration::from_millis(10)),
-            }
-        };
+        let stand_in = StandIn::start();
+        let mut stranger = stand_in.connect();
         stranger
             .write_all(b"GET / HTTP/1.1\r\nUpgrade: websocket\r\n\r\n")
             .unwrap();
-        stranger
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut answer = Vec::new();
-        let _ = stranger.read_to_end(&mut answer);
-        assert!(answer.is_empty(), "a stranger gets no handshake");
         assert!(
-            TcpListener::bind(address).is_err(),
+            stand_in.turns_away(stranger),
+            "a stranger gets no handshake"
+        );
+        assert!(
+            TcpListener::bind(stand_in.address).is_err(),
             "the stand-in keeps the port"
         );
 
-        let listener = bind_bridge_port("127.0.0.1", port).expect("the stand-in yields");
-        assert!(serving.join().unwrap(), "the stand-in reports the yield");
+        let listener = bind_bridge_port("127.0.0.1", stand_in.port).expect("the stand-in yields");
+        stand_in.finish_when_the_tickets_are_taken();
+        drop(listener);
+    }
+
+    #[test]
+    fn a_stand_in_serves_again_when_no_daemon_takes_the_port_it_yielded() {
+        let stand_in = StandIn::start();
+        drop(stand_in.connect());
+
+        let asked = Instant::now();
+        assert!(ask_to_yield("127.0.0.1", stand_in.port));
+        loop {
+            match TcpListener::bind(stand_in.address) {
+                Ok(_) => break,
+                Err(error) if asked.elapsed() > Duration::from_secs(5) => panic!("{error}"),
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+
+        let stranger = stand_in.connect();
+        assert!(
+            asked.elapsed() >= YIELD_PAUSE,
+            "the stand-in leaves the port alone for the pause"
+        );
+        assert!(
+            stand_in.turns_away(stranger),
+            "a stranger gets no handshake"
+        );
+        stand_in.finish_when_the_tickets_are_taken();
+    }
+
+    #[test]
+    fn more_connections_than_the_bound_do_not_stop_a_later_yield() {
+        let stand_in = StandIn::start();
+        drop(stand_in.connect());
+
+        let flood = (0..MAX_PENDING_HANDSHAKES * 3)
+            .map(|_| stand_in.connect())
+            .collect::<Vec<_>>();
+        for idle in flood {
+            assert!(stand_in.turns_away(idle), "an idle connection is dropped");
+        }
+
+        let listener = bind_bridge_port("127.0.0.1", stand_in.port).expect("the stand-in yields");
+        stand_in.finish_when_the_tickets_are_taken();
         drop(listener);
     }
 }

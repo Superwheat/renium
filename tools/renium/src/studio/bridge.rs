@@ -110,13 +110,17 @@ fn origin_is_studio(origin: &str) -> bool {
     host == "roblox.com" || host.ends_with(".roblox.com")
 }
 
+/// The connections one listener loop handles at a time; a connection past
+/// this bound is dropped.
+const MAX_PENDING_HANDSHAKES: usize = 8;
+
 struct HandshakePermit(Arc<AtomicUsize>);
 
 impl HandshakePermit {
     fn acquire(pending: &Arc<AtomicUsize>) -> Option<Self> {
         pending
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < 8).then_some(count + 1)
+                (count < MAX_PENDING_HANDSHAKES).then_some(count + 1)
             })
             .ok()
             .map(|_| Self(Arc::clone(pending)))

@@ -1358,6 +1358,7 @@ pub fn launch_published_studio(game_id: i64, place_id: i64) -> Result<Value> {
     ];
     set_aside_recovery_files(&place_id.to_string());
     let pid = spawn_studio(&executable, &arguments.map(OsStr::new))?;
+    expect_launched_studio(pid);
     Ok(json!({
         "ok": true,
         "pid": pid,
