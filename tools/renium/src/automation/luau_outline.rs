@@ -39,7 +39,7 @@ impl LuauFunction {
 
 struct Outline<'a> {
     source: &'a str,
-    assigned: HashMap<usize, (String, usize)>,
+    assigned: HashMap<usize, (String, usize, usize)>,
     found: Vec<(usize, usize, LuauFunction)>,
 }
 
@@ -106,10 +106,25 @@ impl Outline<'_> {
     /// visit of the function itself lists it under `name`, from `first_line`
     /// or else from the line of that keyword.
     fn name_function(&mut self, value: &ast::Expression, name: String, first_line: Option<usize>) {
+        // A function in parentheses or under a type assertion is still the
+        // assigned function, and its lines run to the end of that expression.
+        let last_line = value
+            .tokens()
+            .map(|token| token.token().end_position().line())
+            .max()
+            .unwrap_or(0);
+        let mut value = value;
+        while let ast::Expression::Parentheses { expression, .. }
+        | ast::Expression::TypeAssertion { expression, .. } = value
+        {
+            value = expression;
+        }
         if let ast::Expression::Function(function) = value {
             let start = function.function_token().token().start_position();
-            self.assigned
-                .insert(start.bytes(), (name, first_line.unwrap_or(start.line())));
+            self.assigned.insert(
+                start.bytes(),
+                (name, first_line.unwrap_or(start.line()), last_line),
+            );
         }
     }
 
@@ -222,8 +237,11 @@ impl Visitor for Outline<'_> {
 
     fn visit_anonymous_function(&mut self, node: &ast::AnonymousFunction) {
         let start = node.function_token().token().start_position().bytes();
-        if let Some((name, first_line)) = self.assigned.remove(&start) {
+        if let Some((name, first_line, last_line)) = self.assigned.remove(&start) {
             self.add(name, first_line, node.function_token(), node.body());
+            if let Some((_, _, function)) = self.found.last_mut() {
+                function.last_line = function.last_line.max(last_line);
+            }
         }
     }
 }
@@ -326,6 +344,16 @@ end
 Shop.Sell = function(player)
 end
 Shop.handlers[\"open\"] = function() end
+local wrapped = (
+\tfunction(value)
+\t\treturn value
+\tend
+)
+local asserted = function()
+\treturn \"\"
+end :: (
+\t() -> string
+)
 return Shop
 ";
         assert_eq!(
@@ -337,6 +365,8 @@ return Shop
                 "10-12 clamp(value, low, high)",
                 "13-14 Shop.Sell(player)",
                 "15-15 Shop.handlers[\"open\"]()",
+                "16-20 wrapped(value)",
+                "21-25 asserted()",
             ]
         );
     }
