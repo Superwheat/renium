@@ -67,12 +67,20 @@ impl RefreshReservation {
     }
 }
 
+/// The lock is released here and not by the close: a child forked by another
+/// thread keeps the open file, and its lock, until that child execs.
+impl Drop for RefreshReservation {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 fn reserve_refresh_at(path: PathBuf, now: u128) -> Result<Option<RefreshReservation>> {
     let root = path
         .parent()
         .context("Refresh reservation has no directory")?;
     fs::create_dir_all(root)?;
-    let mut file = fs::File::options()
+    let file = fs::File::options()
         .read(true)
         .write(true)
         .create(true)
@@ -83,8 +91,9 @@ fn reserve_refresh_at(path: PathBuf, now: u128) -> Result<Option<RefreshReservat
         Err(fs::TryLockError::WouldBlock) => return Ok(None),
         Err(fs::TryLockError::Error(error)) => return Err(error.into()),
     }
+    let mut reservation = RefreshReservation { file };
     let mut previous = String::new();
-    Read::by_ref(&mut file)
+    Read::by_ref(&mut reservation.file)
         .take(64)
         .read_to_string(&mut previous)?;
     if previous
@@ -94,10 +103,10 @@ fn reserve_refresh_at(path: PathBuf, now: u128) -> Result<Option<RefreshReservat
     {
         return Ok(None);
     }
-    file.rewind()?;
-    file.set_len(0)?;
-    write!(file, "{now}")?;
-    Ok(Some(RefreshReservation { file }))
+    reservation.file.rewind()?;
+    reservation.file.set_len(0)?;
+    write!(reservation.file, "{now}")?;
+    Ok(Some(reservation))
 }
 
 impl Drop for Lock {
@@ -328,6 +337,7 @@ mod reservation_tests {
         });
         let path = root.join("pending");
         let first = reserve_refresh_at(path.clone(), 100).unwrap().unwrap();
+        let _inherited = first.file.try_clone().unwrap();
         assert!(reserve_refresh_at(path.clone(), 100).unwrap().is_none());
         drop(first);
         assert!(reserve_refresh_at(path.clone(), 200).unwrap().is_none());

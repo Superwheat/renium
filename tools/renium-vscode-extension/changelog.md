@@ -117,6 +117,7 @@
 - A reference whose stored path is out of date is found by its id: the place build and a push reach the renamed instance, a push sends its current path, and a pull of one service updates the paths other stores hold.
 - In Live Sync, a reference in one service to an instance the other side removed from another service is a conflict; a preference restores the instance or clears the reference.
 - `rbx ba` accepts a reference to the instance being added, and one `rbx ba --batch` accepts a reference to an instance a later op adds; a path that names nothing says to create the target first or add both in one batch.
+- On macOS and Linux the reservation of an update check could outlive the check while another thread was starting a child process, so the next check skipped its refresh; the reservation is now released when the check ends.
 
 ## 0.5.9 - 2026-11-06
 
