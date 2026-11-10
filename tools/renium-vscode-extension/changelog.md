@@ -126,6 +126,7 @@
 - A pull keeps an instance's store id on the instance Studio reports it for after a rename, instead of giving it to a new instance that took the old name.
 - A pull keeps the store id of every instance a push created, after Studio renames or moves it: the import now carries the ids of a pushed subtree's descendants as well as its roots, and Studio reports those instances under them. A new instance that takes the old name gets its own id, so a reference from another service still names the renamed instance. An instance Studio moved into another service is no longer reported under its old store's id.
 - The native Windows paths work on Studio 0.747 again. The binary reader's wrapper, the attribute signal's new argument order and the ObjectValue relay are found by their structure, so a push imports natively and keeps its native verification instead of falling back to the plugin transport; Studio 0.746 still matches.
+- macOS: native snapshots and captures work on Studio 0.746 again; the local-save serializer is found by its function boundaries, callers and ownership instead of an exact prologue and allocation size. `rbx native-probe` now reports Studio actions as native, accepts the `RobloxStudio.bin` layout for viewport capture and names a missing Screen Recording permission without opening a prompt, and says which operations macOS has no native implementation for (service import, attribute observation, package actions, PID-scoped input).
 
 ## 0.5.9 - 2026-11-06
 
