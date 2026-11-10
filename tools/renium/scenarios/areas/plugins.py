@@ -189,10 +189,10 @@ def scaffold_check_and_refusals(ctx: Context):
     folder = _scaffold(ctx)
     for relative in ("renium-plugin.json", "Cargo.toml", "src/main.rs", "AGENTS.md", "sdk/src/lib.rs", "sdk/src/process.rs", "sdk/src/lease.rs"):
         ctx.expect((folder / relative).is_file(), f"starter lacks {relative}")
-    sdk = (folder / "sdk/src/lib.rs").read_bytes()
+    lines = lambda path: path.read_bytes().replace(b"\r\n", b"\n")
     canonical = (ctx.root.parent.parent / "projest" / "tools" / "renium-plugin-sdk" / "src" / "lib.rs")
     if canonical.is_file():
-        ctx.expect(sdk == canonical.read_bytes(), "starter SDK matches the repository SDK")
+        ctx.expect(lines(folder / "sdk/src/lib.rs") == lines(canonical), "starter SDK matches the repository SDK")
     checked = ctx.rbx("plugin", "check", "demo", timeout=60)
     ctx.expect(checked.get("valid") is True and checked.get("compiled") is False and "hello" in (checked.get("commands") or {}), f"check: {checked.json}")
     early = ctx.rbx("plugin", "install", "demo", ok=False, timeout=60)
@@ -532,7 +532,8 @@ def collab_local_host_and_guest(ctx: Context):
         _, joined = _join(ctx, started["invite"], "guest")
         ctx.expect(joined.get("role") == "guest" and joined.get("connected") is True, f"guest: {joined.json}")
         ctx.expect(_project_files(guest) == _project_files(ctx.root), "guest files equal the host's")
-        ctx.expect(sorted(p.name for p in (guest / ".renium").iterdir()) in (["collab.json"], [".gitignore", "collab.json"]), f"guest .renium: {sorted(p.name for p in (guest / '.renium').iterdir())}")
+        state = {p.name for p in (guest / ".renium").iterdir()}
+        ctx.expect("collab.json" in state and state <= {".gitignore", "collab.json", "map-cache.json"}, f"guest .renium: {sorted(state)}")
         users = lambda root: sorted(p.get("user") for p in _collab(ctx, root, "status").get("participants") or [])
         _until(ctx, lambda: users(ctx.root) == ["guest", "host"] and users(guest) == ["guest", "host"], 30, lambda: f"participants: host {users(ctx.root)} guest {users(guest)}")
         printed = _collab(ctx, ctx.root, "invite", json_mode=False)

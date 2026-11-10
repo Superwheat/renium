@@ -722,17 +722,21 @@ def luau_errors(ctx: Context):
 
 
 def luau_timeouts(ctx: Context):
-    """PLAY-052: l times out at 10 s by default and at -t; a busy loop is stopped at its timeout and the
-    next run answers at once; a Play run past 120 s hits the runner limit."""
+    """PLAY-052: l times out at 10 s by default; the default limit grows to cover the literal sleeps
+    written into the code and the result reports it as timeoutSeconds; -t stays as given, also below a
+    literal sleep; a busy loop is stopped at its timeout and the next run answers at once; a Play run past
+    120 s hits the runner limit."""
     ctx.open_studio()
-    default = ctx.rbx("l", "task.wait(12)", ok=False, timeout=60)
+    default = ctx.rbx("l", "local n = 12 task.wait(n)", ok=False, timeout=60)
     ctx.expect("timed out after 10.0s" in default.error and 9 <= default.seconds <= 14, f"default timeout ({default.seconds:.1f}s): {default.error[:300]}")
+    grown = ctx.rbx("l", "task.wait(12) return 1", timeout=60)
+    ctx.expect(grown.get("results") == [1] and grown.get("timeoutSeconds") == 22 and 11 <= grown.seconds <= 20, f"limit grown over a literal sleep ({grown.seconds:.1f}s): {grown.json}")
     short = ctx.rbx("l", "-t", "2", "task.wait(5)", ok=False, timeout=60)
     ctx.expect("2.0s" in short.error and short.seconds < 5, f"-t 2 ({short.seconds:.1f}s): {short.error[:300]}")
     loop = ctx.rbx("l", "-t", "2", "while true do end", ok=False, timeout=60)
     ctx.expect(loop.seconds < 6, f"busy loop stopped after {loop.seconds:.1f}s: {loop.error[:300]}")
     after = ctx.rbx("l", "return 1", timeout=60)
-    ctx.expect(after.get("results") == [1] and after.seconds < 3, f"run after the loop ({after.seconds:.1f}s): {after.json}")
+    ctx.expect(after.get("results") == [1] and after.get("timeoutSeconds") is None and after.seconds < 3, f"run after the loop ({after.seconds:.1f}s): {after.json}")
     _play(ctx)
     try:
         long = ctx.rbx("l", "--server", "-t", "300", "task.wait(125)", ok=False, timeout=400)
@@ -805,18 +809,18 @@ def file_relative_to_the_cwd(ctx: Context):
 
 
 def play_gates_follow_the_requests_client(ctx: Context):
-    """PLAY-132: a client request submitted before its client connects runs behind that client's gate once
-    it is there, so the next request to the same client waits for it; a bare client request shares the gate
-    of the client it runs on with the explicit request to that client, and the Edit window answers at once."""
+    """PLAY-132: a client that joined a running session has its own gate, so a request to it waits for the
+    request already running there; a bare client request shares the gate of the client it runs on with the
+    explicit request to that client, and the Edit window answers at once."""
     _play(ctx, "-p", "2")
     try:
-        added = _bg(ctx, "play", "--add-players", "1", timeout=300)
-        time.sleep(0.5)
-        early = _bg(ctx, "lc", "task.wait(6) return 1", "3", timeout=120)
-        ctx.expect(added.result(timeout=300).get("added") == ["Player3"], "a third client joined")
+        added = ctx.rbx("play", "--add-players", "1", timeout=300)
+        ctx.expect(added.get("added") == ["Player3"], f"a third client joined: {added.json}")
+        holder = _bg(ctx, "lc", "task.wait(6) return 1", "3", timeout=120)
+        time.sleep(1)
         later = ctx.rbx("lc", "return 2", "3", timeout=120)
-        ctx.expect(later.get("results") == [2] and later.seconds >= 3, f"client 3 after the request that waited for it ({later.seconds:.1f}s): {later.json}")
-        ctx.expect(early.result(timeout=120).get("results") == [1], "the early request ran on client 3")
+        ctx.expect(later.get("results") == [2] and later.seconds >= 3, f"client 3 after its holder ({later.seconds:.1f}s): {later.json}")
+        ctx.expect(holder.result(timeout=120).get("results") == [1], "client 3 holder result")
     finally:
         _stop(ctx)
     _play(ctx)

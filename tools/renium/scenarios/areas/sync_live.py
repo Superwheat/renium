@@ -51,13 +51,18 @@ def _wait_file(ctx: Context, relative: str, needle: str, seconds: int = 60):
     ctx.expect_in(needle, ctx.read(relative), f"{relative} after the Studio edit")
 
 
-BAD_MATERIAL = '{"_type":"EnumItem","enumType":"Enum.Material","name":"NotAMaterial"}'
+BAD_CLASS = "NoSuchStudioClass"
+BAD = "Props.Bad"
 
 
 def _blocked_push(ctx: Context):
-    """H4: a stored enum value Studio does not know makes the push of that store fail for good
-    (a non-creatable class such as Player is refused at ba since D11)."""
-    ctx.rbx("bs", "Workspace", "-i", "editor:2", "-p", "Material", "-j", BAD_MATERIAL)
+    """H4: a stored instance of a class Studio does not have makes the push of that store fail for good.
+    ba takes a class name its reflection database does not know, because the database can lag behind
+    Studio (a non-creatable class such as Player is refused at ba since D11, an unknown enum item at bs),
+    and the plugin refuses an upsert whose class Instance.new cannot create before it applies anything.
+    The instance sits under Props: a new instance directly under the service root would travel as a
+    binary import instead of an upsert."""
+    ctx.rbx("ba", "Workspace", "-n", "Bad", "-c", BAD_CLASS, "-I", "Props")
     deadline = time.monotonic() + 40
     status = None
     while time.monotonic() < deadline:
@@ -65,7 +70,7 @@ def _blocked_push(ctx: Context):
         if _error_of(status):
             return status
         time.sleep(1)
-    raise AssertionError(f"the bad enum push never failed: {status.json if status else None}")
+    raise AssertionError(f"the push of the unknown class never failed: {status.json if status else None}")
 
 
 def _error_of(status) -> str:
@@ -173,9 +178,9 @@ def pull_keeps_a_blocked_store_pending(ctx: Context):
     _studio_edit(ctx, "workspace.Props.Crate.Anchored = true")
     time.sleep(8)
     status = ctx.rbx("lst", ok=None, timeout=60)
-    ctx.expect("NotAMaterial" in ctx.rbx("bg", "Workspace", "-i", "editor:2", "Material").stdout, "the blocked store edit was overwritten by the pull")
+    ctx.expect(ctx.rbx("bg", "Workspace", BAD, "ClassName", ok=None).json == BAD_CLASS, "the blocked store edit was overwritten by the pull")
     ctx.expect(_error_of(status), f"blocked push error vanished: {status.json}")
-    ctx.rbx("bs", "Workspace", "-i", "editor:2", "-p", "Material", "--null")
+    ctx.rbx("br", "Workspace", BAD)
     _settled(ctx, 90)
     ctx.expect(ctx.rbx("bg", "Workspace", "-i", "editor:2", "Anchored").json is True, "Studio's anchor reached the store")
     ctx.expect(ctx.luau("return workspace.Props.Crate.Anchored") is True, "Studio keeps its anchor")
@@ -403,7 +408,7 @@ def blocked_path_keeps_other_pushes_flowing(ctx: Context):
     """SYNC-103: a non-retryable failure blocks its path and reports it while other files still push."""
     _live(ctx)
     status = _blocked_push(ctx)
-    ctx.expect_in("NotAMaterial", _error_of(status), "error names the rejected value")
+    ctx.expect_in(BAD_CLASS, _error_of(status), "error names the rejected class")
     ctx.write(MAIN, 'print("main")\nreturn 103\n')
     deadline = time.monotonic() + 40
     while time.monotonic() < deadline and "return 103" not in _source(ctx, "game.ServerScriptService.Main"):
@@ -417,7 +422,7 @@ def retry_after_the_fix_clears_the_block(ctx: Context):
     """SYNC-104: rp after removing the bad instance clears the error and empties the queue."""
     _live(ctx)
     _blocked_push(ctx)
-    ctx.rbx("bs", "Workspace", "-i", "editor:2", "-p", "Material", "--null")
+    ctx.rbx("br", "Workspace", BAD)
     ctx.rbx("rp", timeout=60)
     status = _settled(ctx, 90)
     ctx.expect(not status.pointer("/daemon/error"), f"error not cleared: {status.json}")
@@ -432,7 +437,7 @@ def discard_pending_keeps_studio_edits_pullable(ctx: Context):
     ctx.rbx("dp", timeout=60)
     status = ctx.rbx("lst", ok=None, timeout=60)
     ctx.expect(status.pointer("/daemon/pendingCount", 0) == 0 and not status.pointer("/daemon/error"), f"after dp: {status.json}")
-    ctx.expect(ctx.luau("return workspace.Props.Crate.Material.Name") != "NotAMaterial", "the rejected value never reached Studio")
+    ctx.expect(ctx.luau('return workspace.Props:FindFirstChild("Bad") == nil') is True, "the rejected instance never reached Studio")
     _settled(ctx, 30)
     ctx.expect(ctx.rbx("bg", "Workspace", "Props.Sign", "Value").json == "before dp", "the Studio edit made before dp was pulled (D4)")
 
@@ -782,41 +787,18 @@ def full_push_rewrites_script_and_recreates_instance(ctx: Context):
     ctx.expect(ctx.luau("return workspace.Props:FindFirstChild('Sign') ~= nil") is True, "Sign recreated")
 
 
-def _held_push(ctx: Context, args: tuple[str, ...], decision: str, seconds: float) -> tuple[bool, dict, str]:
-    """H14: runs a push detached, decides its Studio review from this process, and returns
-    (decided, last JSON answer, stderr)."""
-    env = dict(os.environ, RENIUM_PLACE=str(ctx.root / ctx.place))
-    held = subprocess.Popen([RBX, "--output-mode", "json", *args], cwd=ctx.root, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
-    decided = False
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline and held.poll() is None:
-        time.sleep(1)
-        if ctx.rbx("rv", decision, ok=None, timeout=30).ok:
-            decided = True
-            break
-    out, err = held.communicate(timeout=600)
-    ctx.log.append(f"$ (detached) {' '.join(args)}  [exit {held.returncode}]\n{out.strip()[:1200]}\n{err.strip()[:600]}")
-    result = {}
-    for line in reversed((out + "\n" + err).strip().splitlines()):
-        if line.strip().startswith("{"):
-            result = json.loads(line.strip())
-            break
-    return decided, result, err
-
-
 def staged_push_reviews_against_the_project_threshold(ctx: Context):
     """SYNC-258: a full push without --yes stages the project in a private copy; the review threshold comes from
-    the project's place configuration, not from that copy, so threshold 0 holds a one-change push while the
-    plugin keeps its default threshold of 5."""
+    the project's place configuration, not from that copy, so threshold 0 holds a one-change push (it applies
+    nothing and answers heldForReview with its change list) while the plugin keeps its default threshold of 5."""
     ctx.open_studio()
     ctx.rbx("cfg", "set", "liveSync.changesThreshold", "0", timeout=60)
     try:
         ctx.write(MAIN, ctx.read(MAIN).rstrip() + "\n-- staged review\n")
-        decided, result, err = _held_push(ctx, ("ps",), "skip", 60)
-        ctx.expect(decided, f"a one-change staged push with the project threshold at 0 was never held: {result} err={err[-300:]!r}")
-        ctx.expect_in("held for review in Studio", err, "the hold notice on the caller's stderr")
-        ctx.expect(result.get("skippedByReview") is True or "skipped" in str(result.get("error")), f"skipped push result: {result}")
-        ctx.expect("-- staged review" not in _source(ctx, "game.ServerScriptService.Main"), "Studio Main unchanged after rv skip")
+        held = ctx.rbx("ps", ok=None, timeout=120)
+        ctx.expect(held.get("heldForReview") is True and held.get("effectiveChanges") == 1, f"a one-change staged push with the project threshold at 0 was not held: {held.json} stderr={held.stderr[-300:]!r}")
+        ctx.expect("Main" in json.dumps(held.get("review")), f"the change list names Main: {held.json}")
+        ctx.expect("-- staged review" not in _source(ctx, "game.ServerScriptService.Main"), "Studio Main unchanged while the push is held")
     finally:
         ctx.rbx("cfg", "set", "liveSync.changesThreshold", "5", ok=None, timeout=60)
 
@@ -824,7 +806,7 @@ def staged_push_reviews_against_the_project_threshold(ctx: Context):
 def chunked_review_honors_the_project_threshold(ctx: Context):
     """SYNC-259: a review payload over 1 MiB reaches the plugin in chunks and still applies the project's
     liveSync.changesThreshold: with the project at 100000 and the plugin's own threshold at 0 (H4) the push
-    applies without a hold; with the project at 0 it is held and rv skip leaves Studio unchanged."""
+    applies without a hold; with the project at 0 it applies nothing and answers heldForReview."""
     from areas.data_live import _review_threshold_zero
 
     count = 6000
@@ -836,7 +818,7 @@ def chunked_review_honors_the_project_threshold(ctx: Context):
         ctx.rbx("cfg", "set", "liveSync.changesThreshold", "100000", timeout=60)
         started = time.monotonic()
         pushed = ctx.rbx("ps", WORKSPACE, "-u", ok=None, timeout=600)
-        ctx.expect(pushed.ok and pushed.get("skippedByReview") is not True and "held for review" not in pushed.stderr and time.monotonic() - started < 85, f"a chunked review with the project threshold above the change count was held or skipped: {pushed.json} stderr={pushed.stderr[-300:]!r}")
+        ctx.expect(pushed.ok and pushed.get("heldForReview") is not True and pushed.get("skippedByReview") is not True and "held for review" not in pushed.stderr and time.monotonic() - started < 85, f"a chunked review with the project threshold above the change count was held or skipped: {pushed.json} stderr={pushed.stderr[-300:]!r}")
         # The daemon may still be verifying the 6000-instance push; a request
         # that finds it busy is answered "5s limit", so the count is polled.
         deadline = time.monotonic() + 90
@@ -848,25 +830,35 @@ def chunked_review_honors_the_project_threshold(ctx: Context):
         ctx.expect(counted.ok and (counted.get("results") or [None])[0] == count, f"every Part reached Studio: {counted.json or counted.error[:200]}")
         ctx.rbx("l", "workspace.Bulk:Destroy() return true", "-t", "60", timeout=120)
         ctx.rbx("cfg", "set", "liveSync.changesThreshold", "0", timeout=60)
-        decided, result, err = _held_push(ctx, ("ps", WORKSPACE, "-u"), "skip", 120)
-        ctx.expect(decided, f"a chunked review with the project threshold at 0 was never held: {result} err={err[-300:]!r}")
-        ctx.expect(result.get("skippedByReview") is True or "skipped" in str(result.get("error")), f"skipped push result: {result}")
-        ctx.expect(ctx.luau("return workspace:FindFirstChild('Bulk') == nil") is True, "Studio unchanged after rv skip")
+        held = ctx.rbx("ps", WORKSPACE, "-u", ok=None, timeout=600)
+        ctx.expect(held.get("heldForReview") is True, f"a chunked review with the project threshold at 0 was not held: {held.json} stderr={held.stderr[-300:]!r}")
+        ctx.expect(ctx.luau("return workspace:FindFirstChild('Bulk') == nil") is True, "Studio unchanged while the push is held")
+
+
+def _names_viewport_camera(ctx: Context) -> bool:
+    """Whether the Workspace store's root holds a CurrentCamera reference to an instance; a store without
+    the field answers the class default, an empty reference."""
+    value = ctx.rbx("bg", "Workspace", "-p", "CurrentCamera", ok=None).json
+    return isinstance(value, dict) and value.get("ok") is not False and bool(set(value) - {"_type"})
+
+
 def legacy_store_keeps_the_viewport_camera_on_a_pull(ctx: Context):
-    """SYNC-260: a store written before Workspace.CurrentCamera was saved still keeps its viewport camera
-    row on a Live Sync pull: a Studio edit of the camera's FieldOfView is not pulled while an unrelated
-    Studio edit is, and the pulled store then names the camera."""
+    """SYNC-260: a store that names no Workspace.CurrentCamera still keeps its viewport camera row on a
+    Live Sync pull: a Studio edit of the camera's FieldOfView is not pulled while an unrelated Studio edit
+    is, and the pulled store then names the camera. bs refuses every edit of CurrentCamera, so the store
+    comes from an import of the saved place, which leaves the engine-managed reference out and keeps the
+    identities of the store it replaces."""
     ctx.open_studio()
-    if ctx.rbx("bg", "Workspace", "-p", "CurrentCamera", ok=None).json is not None:
-        ctx.rbx("bs", "Workspace", "-p", "CurrentCamera", "-j", "null", ok=None, timeout=60)
-        ctx.expect(ctx.rbx("bg", "Workspace", "-p", "CurrentCamera", ok=None).json is None, "precondition: the store names no CurrentCamera (bs did not drop it; write the legacy store by hand)")
+    if _names_viewport_camera(ctx):
+        ctx.rbx("pi", ctx.place, "-s", "Workspace", timeout=120)
+        ctx.expect(not _names_viewport_camera(ctx), f"precondition: the store names no CurrentCamera (the place import kept it: {ctx.rbx('bg', 'Workspace', '-p', 'CurrentCamera', ok=None).json})")
     before = ctx.rbx("bg", "Workspace", "Camera", "FieldOfView").json
     ctx.rbx("lon", "--wait", "60", timeout=200)
     _studio_edit(ctx, "workspace.CurrentCamera.FieldOfView = 60 workspace.Props.Crate.Anchored = false")
     _settled(ctx)
     ctx.expect(ctx.rbx("bg", "Workspace", "Camera", "FieldOfView").json == before, "the viewport camera keeps the store's FieldOfView")
     ctx.expect(ctx.rbx("bg", "Workspace", "-i", "editor:2", "Anchored").json is False, "the unrelated Studio edit is pulled")
-    ctx.expect(ctx.rbx("bg", "Workspace", "-p", "CurrentCamera", ok=None).json is not None, "the pulled store names the viewport camera")
+    ctx.expect(_names_viewport_camera(ctx), "the pulled store names the viewport camera")
 
 
 SCENARIOS = [
