@@ -210,8 +210,8 @@ fn layout(path: &Path) -> Result<Layout> {
     {
         return Ok(cached.layout.clone());
     }
-    let bytes = fs::read(path)?;
-    let layout = discover(&PeImage::parse(&bytes)?)?;
+    let mapped = ImageView::open(path)?;
+    let layout = discover(&PeImage::parse(mapped.bytes())?)?;
     cache.lock_recover().insert(
         path.to_owned(),
         CachedLayout {
@@ -274,28 +274,22 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "reads whichever Studio is installed; run it by hand against a new Studio build"]
-    fn installed_studio_resolves_two_restore_selection_calls() {
-        let Some(path) = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .map(|root| root.join("Roblox").join("Versions"))
-            .and_then(|versions| fs::read_dir(versions).ok())
-            .and_then(|entries| {
-                entries
-                    .flatten()
-                    .map(|entry| entry.path().join("RobloxStudioBeta.exe"))
-                    .find(|candidate| candidate.is_file())
-            })
-        else {
-            return;
-        };
-        let bytes = fs::read(&path).unwrap();
-        let image = PeImage::parse(&bytes).unwrap();
-        let layout = discover(&image).unwrap();
-        assert_eq!(layout.sites.len(), 2);
-        for (rva, original) in &layout.sites {
-            assert_eq!(original[0], 0xe8, "{rva:#x}");
-            image.require_executable_rva(*rva).unwrap();
+    #[ignore = "set RENIUM_STUDIO_EXES to the executable fixtures to inspect"]
+    fn installed_studio_resolves_two_restore_selection_calls() -> Result<()> {
+        for path in std::env::var("RENIUM_STUDIO_EXES")?.split(';') {
+            let bytes = fs::read(path)?;
+            let image = PeImage::parse(&bytes)?;
+            let owned = discover(&image)?;
+            let layout = layout(Path::new(path))?;
+            assert_eq!(layout.sites, owned.sites);
+            assert_eq!(layout.image_stamp, owned.image_stamp);
+            assert_eq!(layout.sites.len(), 2);
+            for (rva, original) in &layout.sites {
+                assert_eq!(original[0], 0xe8, "{rva:#x}");
+                image.require_executable_rva(*rva)?;
+            }
+            println!("{path}: {:?}", layout.sites);
         }
+        Ok(())
     }
 }

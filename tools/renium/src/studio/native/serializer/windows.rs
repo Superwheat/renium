@@ -24,10 +24,13 @@ use anyhow::{Context, Result, bail};
 use memchr::memmem;
 #[path = "windows_audio.rs"]
 mod audio;
+#[path = "windows_image.rs"]
+mod image;
 #[path = "windows_import.rs"]
 mod import;
 #[path = "windows_loader.rs"]
 mod loader;
+use image::ImageView;
 #[path = "windows_observation.rs"]
 mod observation;
 #[path = "windows_package_notice.rs"]
@@ -1018,11 +1021,12 @@ fn studio_layout(path: &Path) -> Result<(PeSection, SerializerTrace, [u32; 3])> 
     if let Some(layout) = cached {
         return Ok(layout);
     }
-    let executable =
-        fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
-    let image = PeImage::parse(&executable)?;
+    let mapped =
+        ImageView::open(path).with_context(|| format!("Could not read {}", path.display()))?;
+    let executable = mapped.bytes();
+    let image = PeImage::parse(executable)?;
     let data = image.section(b".data")?;
-    let trace = trace_serializer(path, &executable)?;
+    let trace = trace_serializer(path, executable)?;
     cache.lock_recover().insert(
         path.to_path_buf(),
         CachedLayout {
@@ -1145,13 +1149,15 @@ fn package_layout(path: &Path) -> Result<PackageLayout> {
     {
         return Ok(layout);
     }
-    let bytes = fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
-    let image = PeImage::parse(&bytes)?;
+    let mapped =
+        ImageView::open(path).with_context(|| format!("Could not read {}", path.display()))?;
+    let bytes = mapped.bytes();
+    let image = PeImage::parse(bytes)?;
     let layout = PackageLayout {
         data: image.section(b".data")?,
         rdata: image.section(b".rdata").ok(),
         text: image.section(b".text")?,
-        submit_task: renderer_submit_task_rva(&bytes, &image)?,
+        submit_task: renderer_submit_task_rva(bytes, &image)?,
         image_stamp: image.image_stamp,
         function_ranges: {
             let table = image.section(b".pdata")?;
@@ -1159,8 +1165,8 @@ fn package_layout(path: &Path) -> Result<PackageLayout> {
                 .step_by(12)
                 .map(|offset| {
                     Ok((
-                        read_u32(&bytes, offset)? as usize,
-                        read_u32(&bytes, offset + 4)? as usize,
+                        read_u32(bytes, offset)? as usize,
+                        read_u32(bytes, offset + 4)? as usize,
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?

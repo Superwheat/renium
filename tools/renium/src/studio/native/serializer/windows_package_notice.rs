@@ -113,8 +113,8 @@ fn layout(path: &Path) -> Result<Layout> {
     {
         return Ok(cached.layout.clone());
     }
-    let bytes = fs::read(path)?;
-    let layout = discover(&PeImage::parse(&bytes)?)?;
+    let mapped = ImageView::open(path)?;
+    let layout = discover(&PeImage::parse(mapped.bytes())?)?;
     cache.lock_recover().insert(
         path.to_owned(),
         CachedNoticeLayout {
@@ -279,7 +279,12 @@ mod tests {
     fn installed_studio_builds_expose_the_package_popup_flag() -> Result<()> {
         for path in std::env::var("RENIUM_STUDIO_EXES")?.split(';') {
             let bytes = fs::read(path)?;
-            let layout = discover(&PeImage::parse(&bytes)?)?;
+            let owned = discover(&PeImage::parse(&bytes)?)?;
+            let layout = layout(Path::new(path))?;
+            assert_eq!(layout.flag, owned.flag);
+            assert_eq!(layout.registration, owned.registration);
+            assert_eq!(layout.registration_bytes, owned.registration_bytes);
+            assert_eq!(layout.image_stamp, owned.image_stamp);
             println!(
                 "{path}: flag {:#x} registration {:#x}",
                 layout.flag, layout.registration

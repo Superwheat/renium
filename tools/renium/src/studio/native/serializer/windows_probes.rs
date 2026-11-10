@@ -160,7 +160,7 @@ fn snapshot_probe(
 fn audio_probe(memory: &ProcessMemory, loaded: &[ModuleEntry]) -> Result<Value> {
     let audio = loaded.iter().find(|module| module.name.eq_ignore_ascii_case("audioses.dll"))
         .context("Windows audio client is not initialized; the render gate will probe when a stream exists")?;
-    let mapped = observation::ImageView::open(&audio.path)?;
+    let mapped = ImageView::open(&audio.path)?;
     let image = PeImage::parse(mapped.bytes())?;
     verify_loaded_image(memory, audio, image.image_stamp)?;
     let factory = exported_rva(&image, "DllGetClassObject")?;
@@ -206,7 +206,7 @@ fn action_probe(
             .iter()
             .find(|m| m.name.eq_ignore_ascii_case(module))
             .with_context(|| format!("Studio action dependency {module} is not loaded"))?;
-        let mapped = observation::ImageView::open(&module.path)?;
+        let mapped = ImageView::open(&module.path)?;
         let image = PeImage::parse(mapped.bytes())?;
         verify_loaded_image(memory, module, image.image_stamp)?;
         for name in names {
@@ -399,7 +399,7 @@ fn allocator_probe(
     studio: &ModuleEntry,
     loaded: &[ModuleEntry],
 ) -> Result<Value> {
-    let mapped = observation::ImageView::open(&studio.path)?;
+    let mapped = ImageView::open(&studio.path)?;
     let image = PeImage::parse(mapped.bytes())?;
     let imports = allocator_imports(&image)?;
     let mimalloc = imports.iter().any(|(name, _)| name == "mi_free");
@@ -419,7 +419,7 @@ fn allocator_probe(
         .iter()
         .find(|m| m.name.eq_ignore_ascii_case(module_name))
         .context("Engine allocator module is not loaded")?;
-    let allocator = observation::ImageView::open(&module.path)?;
+    let allocator = ImageView::open(&module.path)?;
     let allocator = PeImage::parse(allocator.bytes())?;
     verify_loaded_image(memory, module, allocator.image_stamp)?;
     let mut bindings = Vec::new();

@@ -4,76 +4,13 @@ use super::*;
 const OBSERVATION_HEADER_SIZE: usize = 320;
 use crate::system::LockRecover;
 use std::io::{self, Seek, SeekFrom};
-use std::os::windows::io::AsRawHandle;
 use std::sync::Arc;
 use windows_sys::Win32::Foundation::{
     DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle,
 };
-use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READONLY,
-    UnmapViewOfFile,
-};
 use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, SetEvent};
 #[path = "windows_observation_signal.rs"]
 pub(super) mod signal;
-
-pub(super) struct ImageView {
-    view: MEMORY_MAPPED_VIEW_ADDRESS,
-    _mapping: Handle,
-    _file: fs::File,
-    len: usize,
-}
-impl ImageView {
-    pub(super) fn open(path: &Path) -> Result<Self> {
-        // Deny writes/deletion while slices exist. Only the PE headers, unwind
-        // table and selected functions are touched, instead of copying 226 MB.
-        let file = fs::OpenOptions::new().read(true).share_mode(1).open(path)?;
-        let len = usize::try_from(file.metadata()?.len())?;
-        anyhow::ensure!(
-            len > 0 && len <= isize::MAX as usize,
-            "Invalid Studio image size"
-        );
-        let mapping = unsafe {
-            CreateFileMappingW(
-                file.as_raw_handle() as HANDLE,
-                null(),
-                PAGE_READONLY,
-                0,
-                0,
-                null(),
-            )
-        };
-        anyhow::ensure!(
-            !mapping.is_null(),
-            "Cannot map Studio image: {}",
-            io::Error::last_os_error()
-        );
-        let mapping = Handle(mapping);
-        let view = unsafe { MapViewOfFile(mapping.0, FILE_MAP_READ, 0, 0, len) };
-        anyhow::ensure!(
-            !view.Value.is_null(),
-            "Cannot read Studio image mapping: {}",
-            io::Error::last_os_error()
-        );
-        Ok(Self {
-            view,
-            _mapping: mapping,
-            _file: file,
-            len,
-        })
-    }
-    pub(super) fn bytes(&self) -> &[u8] {
-        // The read-only mapping and write-denying file handle outlive this slice.
-        unsafe { std::slice::from_raw_parts(self.view.Value.cast(), self.len) }
-    }
-}
-impl Drop for ImageView {
-    fn drop(&mut self) {
-        unsafe {
-            UnmapViewOfFile(self.view);
-        }
-    }
-}
 
 #[derive(Clone)]
 struct Prepared {

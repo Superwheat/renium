@@ -211,8 +211,8 @@ pub(super) fn probe_binding(
         kind == ".?AV?$BoundFuncDesc@VChangeHistoryService@RBX@@$$A6AXV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@W4FinishRecordingOperation@Enums@2@V?$optional@V?$shared_ptr@$$CBVValueTable@Reflection@RBX@@@std@@@4@@Z$0A@$02@Reflection@RBX@@",
         "Unsupported FinishRecording calling convention"
     );
-    let bytes = fs::read(&studio.path)?;
-    let image = PeImage::parse(&bytes)?;
+    let mapped = ImageView::open(&studio.path)?;
+    let image = PeImage::parse(mapped.bytes())?;
     let table = memory.read_u64(descriptor)? as usize;
     let offset = functions::member_field(memory, studio, layout, descriptor, table)?;
     anyhow::ensure!(
@@ -306,18 +306,19 @@ fn installed_binding(
         .iter()
         .find(|module| (module.base..module.base + module.size).contains(&hook))
         .context("History slot points outside a loaded helper")?;
-    let bytes = fs::read(&helper.path)?;
+    let mapped = ImageView::open(&helper.path)?;
+    let bytes = mapped.bytes();
     anyhow::ensure!(
         helper
             .name
-            .eq_ignore_ascii_case(&format!("renium-studio-helper-{:016x}.dll", fnv1a(&bytes))),
+            .eq_ignore_ascii_case(&format!("renium-studio-helper-{:016x}.dll", fnv1a(bytes))),
         "History hook does not belong to a content-addressed helper"
     );
-    let image = PeImage::parse(&bytes)?;
+    let image = PeImage::parse(bytes)?;
     verify_loaded_image(memory, helper, image.image_stamp)?;
     let version = export(&image, b"ReniumHistoryAbiVersion")?;
     anyhow::ensure!(
-        read_u32(&bytes, image.rva_to_offset(version)?)? == 2
+        read_u32(bytes, image.rva_to_offset(version)?)? == 2
             && memory.read_u32(helper.base + version)? == 2,
         "History helper generation has an incompatible ownership ABI; restart this Studio window"
     );

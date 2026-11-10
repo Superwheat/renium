@@ -84,50 +84,51 @@ fn prepared(path: &Path) -> Result<PreparedLoader> {
     {
         return cached.result.clone().map_err(anyhow::Error::msg);
     }
-    let result = fs::read(path)
-        .context("Cannot read Studio binary-loader image")
-        .and_then(|bytes| {
-            let trace = trace_loader(&bytes)?;
-            let image = PeImage::parse(&bytes)?;
-            let (history, history_code) = history::discover(&image)?;
-            let table = image.rva_to_offset(history.table - 8)?;
-            let history_table = (0..=history.slots)
-                .map(|index| {
-                    (read_u64(&bytes, table + index * 8)? as usize)
-                        .checked_sub(image.image_base)
-                        .context("Studio history table points outside its image")
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let mut code = Vec::new();
-            for rva in [
-                trace.loader,
-                trace.reader,
-                trace.factory.lookup,
-                trace.factory.intern_name,
-                trace.factory.instance_reader,
-            ]
-            .into_iter()
-            .chain(history_code)
-            {
-                if code.iter().any(|(address, _)| *address == rva) {
-                    continue;
-                }
-                let offset = image.rva_to_offset(rva)?;
-                let (begin, end) = image.function_bounds(offset)?;
-                anyhow::ensure!(
-                    begin == offset,
-                    "Native reader contract is not a complete function"
-                );
-                code.push((rva, bytes[begin..end].to_vec()));
-            }
-            Ok(PreparedLoader {
-                trace,
-                history,
-                history_table: std::sync::Arc::new(history_table),
-                code: std::sync::Arc::new(code),
+    // Sharing/mapping failures are transient, not an unsupported reader ABI.
+    let mapped = ImageView::open(path).context("Cannot read Studio binary-loader image")?;
+    let result = (|| -> Result<PreparedLoader> {
+        let bytes = mapped.bytes();
+        let trace = trace_loader(bytes)?;
+        let image = PeImage::parse(bytes)?;
+        let (history, history_code) = history::discover(&image)?;
+        let table = image.rva_to_offset(history.table - 8)?;
+        let history_table = (0..=history.slots)
+            .map(|index| {
+                (read_u64(bytes, table + index * 8)? as usize)
+                    .checked_sub(image.image_base)
+                    .context("Studio history table points outside its image")
             })
+            .collect::<Result<Vec<_>>>()?;
+        let mut code = Vec::new();
+        for rva in [
+            trace.loader,
+            trace.reader,
+            trace.factory.lookup,
+            trace.factory.intern_name,
+            trace.factory.instance_reader,
+        ]
+        .into_iter()
+        .chain(history_code)
+        {
+            if code.iter().any(|(address, _)| *address == rva) {
+                continue;
+            }
+            let offset = image.rva_to_offset(rva)?;
+            let (begin, end) = image.function_bounds(offset)?;
+            anyhow::ensure!(
+                begin == offset,
+                "Native reader contract is not a complete function"
+            );
+            code.push((rva, bytes[begin..end].to_vec()));
+        }
+        Ok(PreparedLoader {
+            trace,
+            history,
+            history_table: std::sync::Arc::new(history_table),
+            code: std::sync::Arc::new(code),
         })
-        .map_err(|error| format!("{error:#}"));
+    })()
+    .map_err(|error| format!("{error:#}"));
     cache.lock_recover().insert(
         path.to_owned(),
         CachedLoader {
@@ -450,6 +451,16 @@ fn reader_stack_write(
     }
 }
 
+// Search for the LEA opcode before checking its REX prefix. Those prefixes
+// occur throughout .text; only RIP-relative LEAs can name the loader anchor.
+fn rip_relative_leas(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    memchr::memchr_iter(0x8d, bytes).filter_map(|opcode| {
+        let at = opcode.checked_sub(1)?;
+        let code = bytes.get(at..at + 7)?;
+        (matches!(code[0], 0x48 | 0x4c) && code[2] & 0xc7 == 5).then_some(at)
+    })
+}
+
 pub(super) fn trace_loader(bytes: &[u8]) -> Result<LoaderTrace> {
     let image = PeImage::parse(bytes)?;
     let text = image.section(b".text")?;
@@ -467,13 +478,8 @@ pub(super) fn trace_loader(bytes: &[u8]) -> Result<LoaderTrace> {
     );
     let mut anchors = HashSet::new();
     let text_bytes = &bytes[text.raw_offset..text.raw_offset + text.raw_size];
-    for at in memchr::memchr2_iter(0x48, 0x4c, text_bytes) {
-        let Some(code) = text_bytes.get(at..at + 7) else {
-            continue;
-        };
-        if code[1] != 0x8d || code[2] & 0xc7 != 5 {
-            continue;
-        }
+    for at in rip_relative_leas(text_bytes) {
+        let code = &text_bytes[at..at + 7];
         let i = Decoder::with_ip(
             64,
             code,
@@ -561,6 +567,16 @@ pub(super) fn trace_loader(bytes: &[u8]) -> Result<LoaderTrace> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loader_anchor_candidates_keep_both_rex_prefixes_and_reject_truncation() -> Result<()> {
+        let bytes = hex(
+            "8D90488D05000000004C8D3D00000000408D0500000000488B0500000000488D0400000000488D05",
+        )?;
+        assert_eq!(rip_relative_leas(&bytes).collect::<Vec<_>>(), [2, 9]);
+        assert_eq!(rip_relative_leas(&[]).count(), 0);
+        Ok(())
+    }
 
     #[test]
     fn reader_tracks_saved_registers_and_vector_zero_initialization() -> Result<()> {

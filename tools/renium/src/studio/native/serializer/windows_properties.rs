@@ -1786,8 +1786,8 @@ pub(crate) fn history_diagnostic(pid: u32, title: &str) -> Result<serde_json::Va
     let descriptor =
         find_class_member_descriptor(&prepared.memory, instance, model.layout, "FinishRecording")?;
     let kind = read_rtti_type(&prepared.memory, descriptor, studio.base, studio.size);
-    let bytes = fs::read(&studio.path)?;
-    let image = PeImage::parse(&bytes)?;
+    let mapped = ImageView::open(&studio.path)?;
+    let image = PeImage::parse(mapped.bytes())?;
     let fields = prepared.memory.read_vec(descriptor, 512)?;
     let mut slots = Vec::new();
     for offset in (0..512).step_by(8) {

@@ -60,6 +60,91 @@ impl PathFixture {
     }
 }
 
+/// Run in a fresh test process for each image/build, with
+/// RENIUM_TEST_STUDIO_IMAGE pointing to a retained Studio executable.
+#[test]
+#[ignore]
+fn measure_cold_image_probes() -> Result<()> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    fn counters() -> Result<PROCESS_MEMORY_COUNTERS_EX> {
+        let mut value: PROCESS_MEMORY_COUNTERS_EX = unsafe { zeroed() };
+        value.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        anyhow::ensure!(
+            unsafe {
+                GetProcessMemoryInfo(
+                    GetCurrentProcess(),
+                    (&mut value as *mut PROCESS_MEMORY_COUNTERS_EX)
+                        .cast::<PROCESS_MEMORY_COUNTERS>(),
+                    value.cb,
+                )
+            } != 0,
+            "Cannot measure process memory"
+        );
+        Ok(value)
+    }
+    let path = PathBuf::from(
+        std::env::var_os("RENIUM_TEST_STUDIO_IMAGE").context("Set RENIUM_TEST_STUDIO_IMAGE")?,
+    );
+    let length = fs::metadata(&path)?.len();
+    let before = counters()?;
+    let started = Instant::now();
+    let (_, serializer, stamp) = studio_layout(&path)?;
+    let package = package_layout(&path)?;
+    let loader = loader::prepare(&path)?;
+    let after = counters()?;
+    let cold_millis = started.elapsed().as_millis();
+    let warm = Instant::now();
+    studio_layout(&path)?;
+    package_layout(&path)?;
+    loader::prepare(&path)?;
+    let warm_micros = warm.elapsed().as_micros();
+    println!(
+        "{}",
+        serde_json::json!({
+            "image": path, "fileBytes": length,
+            "privateBefore": before.PrivateUsage, "privateAfter": after.PrivateUsage,
+            "peakCommitBefore": before.PeakPagefileUsage, "peakCommitAfter": after.PeakPagefileUsage,
+            "workingSetBefore": before.WorkingSetSize, "workingSetAfter": after.WorkingSetSize,
+            "peakWorkingSet": after.PeakWorkingSetSize,
+            "coldMillis": cold_millis, "warmMicros": warm_micros,
+            "imageStamp": stamp,
+            "serializer": [serializer.serializer, serializer.context_builder, serializer.context_destroy, serializer.root_collector, serializer.deallocator],
+            "submitTask": package.submit_task, "functionRanges": package.function_ranges.len(),
+            "loader": format!("{loader:?}"),
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn loader_retries_discovery_after_an_image_mapping_failure() -> Result<()> {
+    let directory = crate::tests::support::temp_dir("native-image-retry");
+    let path = directory.join("image.exe");
+    fs::write(&path, b"not a PE image")?;
+    let writer = fs::OpenOptions::new().write(true).open(&path)?;
+    let blocked = loader::prepare(&path).unwrap_err();
+    assert!(
+        blocked
+            .to_string()
+            .contains("Cannot read Studio binary-loader image")
+    );
+    drop(writer);
+    // No bytes or timestamps changed: retry must reach PE discovery instead
+    // of retaining the temporary sharing violation as an unsupported image.
+    let retried = loader::prepare(&path).unwrap_err();
+    assert!(
+        retried
+            .to_string()
+            .contains("Studio executable is too small"),
+        "{retried:#}"
+    );
+    fs::remove_dir_all(directory)?;
+    Ok(())
+}
+
 #[test]
 fn property_paths_use_service_class_before_display_name() -> Result<()> {
     let memory = ProcessMemory::open_read_only(std::process::id())?;
