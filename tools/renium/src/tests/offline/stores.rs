@@ -284,6 +284,19 @@ fn tree_prints_nodes_in_text_and_json_mode() {
     let fx = Fixture::new("tree-golden");
     let root = fx.path("");
     assert_eq!(fx.both(&["tr", "Workspace", "-r", &root]), workspace_tree());
+    assert_eq!(
+        fx.both(&[
+            "tr",
+            "Workspace",
+            "--depth",
+            "0",
+            "-F",
+            "n,Gravity",
+            "-r",
+            &root
+        ]),
+        json!([{"n": "Workspace", "props": {"Gravity": 120.0}}])
+    );
     let full = fx.both(&["tr", "Workspace", "-o", "full", "-r", &root]);
     assert_eq!(
         full,

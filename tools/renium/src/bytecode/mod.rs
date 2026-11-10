@@ -17,6 +17,7 @@ pub(crate) mod explorer;
 pub(crate) mod query;
 pub(crate) mod references;
 mod tree_text;
+mod value_text;
 
 use crate::app::output::{OutputMode, ReportedFailure, print_json_output};
 use crate::app::timing::current_millis;
@@ -24,7 +25,7 @@ use crate::bytecode::edit::{
     bytecode_service_name, collect_settings_subtree_preorder, reject_package_link_instance_mutation,
 };
 use crate::bytecode::explorer::{
-    BytecodeNodeProjection, explorer_search_groups, explorer_search_instance_matches,
+    BytecodeNodeProjection, TextForm, explorer_search_groups, explorer_search_instance_matches,
     insert_top_field, parse_requested_fields,
 };
 use crate::bytecode::query::{
@@ -1430,21 +1431,24 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
         }
     }
 
-    if mode.uses_short_keys()
-        && args.fields == FIND_DEFAULT_FIELDS
-        && crate::app::output::prints_text()
-        && let Some(text) = tree_text::match_lines(
-            &ctx.document,
-            &ctx.path_segments_by_index,
-            &ctx.path_ordinals_by_index,
-            &match_indices,
-            limit,
-        )
-    {
+    let projection = ctx.projection(mode, fields.as_ref());
+    if let Some(row_fields) = tree_text::row_fields(
+        &projection,
+        &args.fields,
+        FIND_DEFAULT_FIELDS,
+        TextForm::Paths,
+        &match_indices,
+    ) && let Some(text) = tree_text::match_lines(
+        &ctx.document,
+        &ctx.path_segments_by_index,
+        &ctx.path_ordinals_by_index,
+        &match_indices,
+        limit,
+        &row_fields,
+    ) {
         println!("{text}");
         return Ok(());
     }
-    let projection = ctx.projection(mode, fields.as_ref());
     let matches = match_indices
         .into_iter()
         .map(|index| projection.node(index, false))
@@ -1489,22 +1493,26 @@ pub(super) fn tree_command(args: TreeArgs) -> Result<()> {
         .take(args.limit.unwrap_or(usize::MAX))
         .collect::<Vec<_>>();
     let visible_indices = node_indices.iter().copied().collect::<HashSet<_>>();
-    if mode.uses_short_keys()
-        && args.fields == TREE_DEFAULT_FIELDS
-        && crate::app::output::prints_text()
-    {
+    let projection = ctx.projection(mode, fields.as_ref());
+    if let Some(row_fields) = tree_text::row_fields(
+        &projection,
+        &args.fields,
+        TREE_DEFAULT_FIELDS,
+        TextForm::Tree,
+        &node_indices,
+    ) {
         println!(
             "{}",
             tree_text::text_tree(
                 &ctx.document,
                 &ctx.children_by_parent,
                 root_index,
-                &visible_indices
+                &visible_indices,
+                &row_fields,
             )
         );
         return Ok(());
     }
-    let projection = ctx.projection(mode, fields.as_ref());
     let nodes = node_indices
         .into_iter()
         .map(|index| projection.search_node(index, &visible_indices))
@@ -1544,7 +1552,7 @@ pub(crate) fn inspect_command(args: InspectArgs) -> Result<()> {
     let projection = ctx.projection(mode, fields.as_ref());
     // The first target may carry flag selectors; the extra positionals are
     // names or dotted paths in the same store, resolved on the same decode.
-    let mut nodes = Vec::new();
+    let mut inspected = Vec::new();
     let mut targets = vec![high_level_target(&args.target, positional.as_deref())];
     targets.extend(args.more_targets.iter().map(|target| HighLevelTarget {
         index: None,
@@ -1556,14 +1564,21 @@ pub(crate) fn inspect_command(args: InspectArgs) -> Result<()> {
         positional: Some(target.as_str()),
     }));
     for target in targets {
-        let index = match high_level_target_resolution(&ctx, target)? {
-            HighLevelTargetResolution::Found(index) => index,
+        match high_level_target_resolution(&ctx, target)? {
+            HighLevelTargetResolution::Found(index) => inspected.push(index),
             HighLevelTargetResolution::Ambiguous(indices) => {
                 return high_level_print_ambiguity(&ctx, mode, &indices, args.pretty);
             }
-        };
-        nodes.push(projection.node(index, true));
+        }
     }
+    if let Some(text) = tree_text::inspect_text(&projection, &args.fields, &inspected) {
+        println!("{text}");
+        return Ok(());
+    }
+    let mut nodes = inspected
+        .into_iter()
+        .map(|index| projection.node(index, true))
+        .collect::<Vec<_>>();
     if args.more_targets.is_empty() {
         return print_json_output(&nodes.remove(0), args.pretty);
     }

@@ -1669,7 +1669,18 @@ pub(super) struct ScriptGrepArgs {
         value_name = "PATH"
     )]
     pub(super) scope: Option<String>,
-    #[arg(help = "Maximum matching lines", short, long, default_value_t = 50)]
+    #[arg(
+        help = "Print each script's number of matching lines instead of the lines",
+        short = 'c',
+        long
+    )]
+    pub(super) count: bool,
+    #[arg(
+        help = "Maximum matching lines, or scripts with --count",
+        short,
+        long,
+        default_value_t = 50
+    )]
     pub(super) limit: usize,
 }
 

@@ -209,6 +209,19 @@ pub(crate) fn rotation_rows_from_orientation([rx, ry, rz]: [f64; 3]) -> [[f64; 3
     rows
 }
 
+/// Studio's Orientation of a rotation matrix given by its rows, in degrees
+/// (`CFrame:ToOrientation`): the inverse of `rotation_rows_from_orientation`.
+/// Looking straight up or down leaves Y and Z one shared turn, reported as Y.
+pub(crate) fn orientation_from_rotation_rows(rows: [[f64; 3]; 3]) -> [f64; 3] {
+    let rx = (-rows[1][2]).clamp(-1.0, 1.0).asin();
+    let (ry, rz) = if rows[1][2].abs() > 0.999_999 {
+        ((-rows[2][0]).atan2(rows[0][0]), 0.0)
+    } else {
+        (rows[0][2].atan2(rows[2][2]), rows[1][0].atan2(rows[1][1]))
+    };
+    [rx.to_degrees(), ry.to_degrees(), rz.to_degrees()]
+}
+
 /// What a new store instance needs; the CLI and script imports both build it.
 pub(crate) struct StoreInstanceRequest {
     pub(crate) settings_file: PathBuf,

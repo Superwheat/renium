@@ -46,6 +46,8 @@ struct ScriptGrep {
     case_insensitive: bool,
     #[serde(default)]
     regex: bool,
+    #[serde(default)]
+    count: bool,
     scope: Option<String>,
     limit: Option<usize>,
 }
@@ -197,7 +199,8 @@ const HIT_TEXT_LIMIT: usize = 240;
 /// Search hits as text: each script's path on its own line, for a grep
 /// followed by its hits as `LINE: text` without the indentation and with a
 /// long line cut short, and a last line when the limit left hits out. A
-/// script search names the scripts only; `rbx sg` shows the lines.
+/// script search names the scripts only; `rbx sg` shows the lines, and with
+/// `--count` each script's path and its number of matching lines.
 fn script_hits_text(value: &Value) -> String {
     let results = value["results"].as_array().map_or(&[][..], Vec::as_slice);
     if results.is_empty() {
@@ -207,6 +210,9 @@ fn script_hits_text(value: &Value) -> String {
     let mut lines = 0u64;
     for result in results {
         text.push_str(result["path"].as_str().unwrap_or_default());
+        if let Some(count) = result.get("count") {
+            text.push_str(&format!(" {count}"));
+        }
         text.push('\n');
         for hit in result
             .get("hits")
@@ -263,6 +269,7 @@ pub(crate) fn script_grep_command(
             "query": args.query,
             "caseInsensitive": args.case_insensitive,
             "regex": args.regex,
+            "count": args.count,
             "scope": args.scope,
             "limit": args.limit,
         }),
@@ -498,6 +505,7 @@ fn script_grep_at(root: &Path, source: &Path, parameters: &Value) -> Result<Valu
     let mut results: Vec<Value> = Vec::new();
     let mut returned = 0;
     let mut total_matches = 0;
+    let mut matching_files = 0;
     for path in script_files(source) {
         if let Some(scope) = scope.as_deref()
             && !in_scope(&relative(root, &path), scope)
@@ -505,6 +513,17 @@ fn script_grep_at(root: &Path, source: &Path, parameters: &Value) -> Result<Valu
             continue;
         }
         let source = read_script(&path, "script-grep")?;
+        if request.count {
+            let count = source.lines().filter(|line| matches(line)).count();
+            if count > 0 {
+                total_matches += count;
+                matching_files += 1;
+                if results.len() < limit {
+                    results.push(json!({ "path": relative(root, &path), "count": count }));
+                }
+            }
+            continue;
+        }
         let mut hits = Vec::new();
         for (index, line) in source.lines().enumerate() {
             if matches(line) {
@@ -519,9 +538,14 @@ fn script_grep_at(root: &Path, source: &Path, parameters: &Value) -> Result<Valu
             results.push(json!({ "path": relative(root, &path), "hits": hits }));
         }
     }
-    let truncated = returned < total_matches;
+    let listed = results.len();
     let mut result = json!({ "results": results, "totalMatches": total_matches });
-    if truncated {
+    if request.count {
+        if listed < matching_files {
+            result["truncated"] = json!(true);
+            result["totalFiles"] = json!(matching_files);
+        }
+    } else if returned < total_matches {
         result["truncated"] = json!(true);
     }
     Ok(result)
@@ -653,6 +677,18 @@ mod tests {
         );
         let broken = grep(json!({ "query": "(", "regex": true })).err().unwrap();
         assert!(broken.contains("Invalid regular expression"));
+        let counted =
+            grep(json!({ "query": "grant", "caseInsensitive": true, "count": true })).unwrap();
+        assert_eq!(
+            script_hits_text(&counted),
+            "src/Server/Shop.server.luau 2\nsrc/ServerOther/Wheel.luau 1"
+        );
+        let first = grep(json!({ "query": "grant", "caseInsensitive": true, "count": true, "limit": 1 }))
+            .unwrap();
+        assert_eq!(
+            script_hits_text(&first),
+            "src/Server/Shop.server.luau 2\n1 of 2 scripts shown; -l N shows more"
+        );
     }
 
     #[test]

@@ -81,6 +81,97 @@ pub(crate) fn parse_requested_fields(raw: Option<&str>) -> Option<HashSet<String
     (!fields.is_empty()).then_some(fields)
 }
 
+/// A text form of instance records and what its lines state by themselves.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum TextForm {
+    /// `rbx tr`: name, class, nesting and child counts.
+    Tree,
+    /// `rbx f` and `rbx in`: path and class.
+    Paths,
+}
+
+/// The long key of every field a record can carry.
+const RECORD_FIELD_KEYS: [&str; 16] = [
+    "settingsId",
+    "index",
+    "name",
+    "className",
+    "parentId",
+    "parentIndex",
+    "childCount",
+    "hasPackageLink",
+    "children",
+    "pathSegments",
+    "pathOrdinals",
+    "sourcePath",
+    "settingsFile",
+    "canonicalSettingsId",
+    "properties",
+    "attributes",
+];
+
+/// Where a text form has a requested field.
+enum TextField {
+    /// Its lines state it already.
+    Line,
+    /// A property, attribute or tag printed after the line.
+    Value,
+    /// Only the JSON records carry it.
+    RecordOnly,
+}
+
+/// Whether a text form prints everything a field request asks for: fields
+/// its lines state already, plus at least one property, attribute or tag to
+/// print after them. A preset counts as the form's own line; a record field
+/// named by itself that the lines do not state (an id, an index, a source
+/// path, a script's Source) is only in the JSON records.
+pub(crate) fn text_form_prints_fields(raw: &str, form: TextForm) -> bool {
+    let mut values = false;
+    for field in raw
+        .split(',')
+        .map(|field| field.trim().to_ascii_lowercase())
+        .filter(|field| !field.is_empty())
+    {
+        match text_field(&field, form) {
+            TextField::Line => {}
+            TextField::Value => values = true,
+            TextField::RecordOnly => return false,
+        }
+    }
+    values
+}
+
+fn text_field(field: &str, form: TextForm) -> TextField {
+    let tree_line = || {
+        if form == TextForm::Tree {
+            TextField::Line
+        } else {
+            TextField::RecordOnly
+        }
+    };
+    match field {
+        "lookup" | "select" | "sel" => return TextField::Line,
+        "tree" | "expand" | "kids" | "brief" | "node" => return tree_line(),
+        _ => {}
+    }
+    let key = RECORD_FIELD_KEYS
+        .into_iter()
+        .find(|key| field.eq_ignore_ascii_case(key) || node_field_aliases(key).contains(&field));
+    match key {
+        Some("name" | "className" | "pathSegments" | "pathOrdinals") => TextField::Line,
+        Some("childCount" | "children") => tree_line(),
+        Some("properties" | "attributes") => TextField::Value,
+        Some(_) => TextField::RecordOnly,
+        None if ["p:", "prop:", "property:"]
+            .iter()
+            .any(|prefix| field.strip_prefix(prefix) == Some("source")) =>
+        {
+            TextField::RecordOnly
+        }
+        None => TextField::Value,
+    }
+}
+
 struct BytecodeExplorerBatchContext<'a> {
     document: &'a SettingsBytecode,
     service: &'a str,
@@ -1236,6 +1327,26 @@ impl BytecodeNodeProjection<'_> {
                 Value::String(source_path.to_string_lossy().into_owned()),
             );
         }
+        if let Some(properties) = self.properties(index) {
+            node.insert(
+                node_output_key(self.mode, "properties").to_string(),
+                properties,
+            );
+        }
+        if let Some(attributes) = self.attributes(index) {
+            node.insert(
+                node_output_key(self.mode, "attributes").to_string(),
+                attributes,
+            );
+        }
+
+        Value::Object(node)
+    }
+
+    /// The properties of one instance that the mode and the requested fields
+    /// show, with references resolved to paths; `None` when none are shown.
+    pub fn properties(&self, index: usize) -> Option<Value> {
+        let instance = &self.document.instances[index];
         let mut properties = filtered_record(
             &instance.properties,
             self.fields,
@@ -1269,14 +1380,14 @@ impl BytecodeNodeProjection<'_> {
                 properties.retain(|name, _| !is_engine_state_property(name));
             }
         }
-        if let Some(properties) = properties {
-            node.insert(
-                node_output_key(self.mode, "properties").to_string(),
-                properties,
-            );
-        }
+        properties
+    }
+
+    /// The attributes of one instance that the mode and the requested fields
+    /// show, with references resolved to paths; `None` when none are shown.
+    pub fn attributes(&self, index: usize) -> Option<Value> {
         let mut attributes = filtered_record(
-            &instance.attributes,
+            &self.document.instances[index].attributes,
             self.fields,
             matches!(self.mode, OutputMode::Full),
             true,
@@ -1291,14 +1402,7 @@ impl BytecodeNodeProjection<'_> {
                 attributes,
             );
         }
-        if let Some(attributes) = attributes {
-            node.insert(
-                node_output_key(self.mode, "attributes").to_string(),
-                attributes,
-            );
-        }
-
-        Value::Object(node)
+        attributes
     }
 }
 
