@@ -3539,13 +3539,10 @@ pub(crate) fn rbx_dom_service_root_property_values(
         let Some(instance) = dom.get_by_ref(referent) else {
             continue;
         };
-        let service = if service_names.contains(instance.class.as_str()) {
-            instance.class.to_string()
-        } else if service_names.contains(&instance.name) {
-            instance.name.clone()
-        } else {
+        let service = instance.class.as_str();
+        if !service_names.contains(service) {
             continue;
-        };
+        }
         let mut values = Map::new();
         for (name, value) in &instance.properties {
             if matches!(name.as_str(), "Attributes" | "Tags") {
@@ -3557,7 +3554,7 @@ pub(crate) fn rbx_dom_service_root_property_values(
                 values.insert(name.to_string(), value);
             }
         }
-        result.insert(service, values);
+        result.insert(service.to_string(), values);
     }
     result
 }

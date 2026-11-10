@@ -44,6 +44,35 @@ pub(crate) fn temp_dir(tag: &str) -> PathBuf {
         .unwrap_or(path)
 }
 
+/// Raw saved names, including both a service-name collision and a same-Name
+/// root before the service. The Workspace reference selects the second Part.
+pub(crate) fn renamed_service_place() -> rbx_dom_weak::WeakDom {
+    rbx_xml::from_reader_default(
+        br#"<roblox version="4">
+          <Item class="Folder" referent="alias"><Properties><string name="Name">Vault</string></Properties></Item>
+          <Item class="ServerStorage" referent="service">
+            <Properties><string name="Name">Vault</string><int64 name="SourceAssetId">42</int64></Properties>
+            <Item class="Folder" referent="parent"><Properties><string name="Name">InService</string></Properties>
+              <Item class="Part" referent="first"><Properties><string name="Name">Renamed</string><bool name="Anchored">false</bool></Properties></Item>
+              <Item class="Part" referent="target"><Properties><string name="Name">Renamed</string><bool name="Anchored">true</bool></Properties></Item>
+            </Item>
+          </Item>
+          <Item class="Folder" referent="namesake">
+            <Properties><string name="Name">ServerStorage</string><int64 name="SourceAssetId">99</int64></Properties>
+            <Item class="Folder" referent="decoy-parent"><Properties><string name="Name">InService</string></Properties>
+              <Item class="Part" referent="decoy-first"><Properties><string name="Name">Renamed</string><bool name="Anchored">false</bool></Properties></Item>
+              <Item class="Part" referent="decoy-second"><Properties><string name="Name">Renamed</string><bool name="Anchored">false</bool></Properties></Item>
+            </Item>
+          </Item>
+          <Item class="Workspace" referent="workspace"><Properties><string name="Name">Workspace</string></Properties>
+            <Item class="ObjectValue" referent="reference"><Properties><string name="Name">External</string><Ref name="Value">target</Ref></Properties></Item>
+          </Item>
+        </roblox>"#
+            .as_slice(),
+    )
+    .expect("raw renamed-service place")
+}
+
 /// A project whose ReplicatedStorage.Shared is a packed read-only link, as
 /// `rbx lkp` leaves it: the store carries Util's text inline, the package
 /// under links/ holds the same subtree, and Util has no source file. Returns

@@ -94,6 +94,16 @@ impl RbxModelFormat {
     }
 }
 
+/// Service roots are addressed by class, even when their saved Name differs.
+pub(crate) fn is_service_class(class_name: &str) -> bool {
+    rbx_reflection_database::get().is_ok_and(|database| {
+        database
+            .classes
+            .get(class_name)
+            .is_some_and(|class| class.tags.contains(&rbx_reflection::ClassTag::Service))
+    })
+}
+
 pub(crate) fn rbx_dom_instance_by_path_unique(
     dom: &RbxWeakDom,
     path_segments: &[String],
@@ -107,6 +117,8 @@ pub(crate) fn rbx_dom_instance_by_path_unique(
     }
     let mut current = vec![dom.root_ref()];
     for (depth, segment) in path_segments.iter().enumerate() {
+        let service_root =
+            depth == 0 && dom.root().class.as_str() == "DataModel" && is_service_class(segment);
         let ordinal = path_ordinals.get(depth).copied().unwrap_or(1);
         let mut next = Vec::new();
         for parent_ref in &current {
@@ -118,7 +130,13 @@ pub(crate) fn rbx_dom_instance_by_path_unique(
                 .iter()
                 .filter_map(|child_ref| {
                     dom.get_by_ref(*child_ref)
-                        .filter(|child| child.name == *segment)
+                        .filter(|child| {
+                            if service_root {
+                                child.class.as_str() == segment
+                            } else {
+                                child.name == *segment
+                            }
+                        })
                         .map(|_| *child_ref)
                 })
                 .nth(ordinal.saturating_sub(1));
@@ -167,19 +185,30 @@ pub(crate) fn rbx_dom_instance_path_parts(
     while let Some(instance) = dom.get_by_ref(current) {
         let parent = instance.parent();
         if current != dom.root_ref() || instance.class.as_str() != "DataModel" {
-            segments.push(instance.name.clone());
-            let ordinal = dom.get_by_ref(parent).map_or(1, |parent| {
-                parent
-                    .children()
-                    .iter()
-                    .take_while(|sibling_ref| **sibling_ref != current)
-                    .filter(|sibling_ref| {
-                        dom.get_by_ref(**sibling_ref)
-                            .is_some_and(|sibling| sibling.name == instance.name)
-                    })
-                    .count()
-                    + 1
+            let service_root = (current == dom.root_ref()
+                || (parent == dom.root_ref() && dom.root().class.as_str() == "DataModel"))
+                && is_service_class(instance.class.as_str());
+            segments.push(if service_root {
+                instance.class.to_string()
+            } else {
+                instance.name.clone()
             });
+            let ordinal = if service_root {
+                1
+            } else {
+                dom.get_by_ref(parent).map_or(1, |parent| {
+                    parent
+                        .children()
+                        .iter()
+                        .take_while(|sibling_ref| **sibling_ref != current)
+                        .filter(|sibling_ref| {
+                            dom.get_by_ref(**sibling_ref)
+                                .is_some_and(|sibling| sibling.name == instance.name)
+                        })
+                        .count()
+                        + 1
+                })
+            };
             ordinals.push(ordinal);
         }
         if parent.is_none() {
@@ -372,12 +401,19 @@ fn collect_rbx_dom_path_import_refs(
         };
         let ordinal = counts.entry(child.name.as_str()).or_default();
         *ordinal += 1;
+        let service_root = parent == dom.root_ref()
+            && parent_instance.class.as_str() == "DataModel"
+            && is_service_class(child.class.as_str());
         let mut segments = Vec::with_capacity(parent_segments.len() + 1);
         segments.extend_from_slice(parent_segments);
-        segments.push(child.name.clone());
+        segments.push(if service_root {
+            child.class.to_string()
+        } else {
+            child.name.clone()
+        });
         let mut ordinals = Vec::with_capacity(parent_ordinals.len() + 1);
         ordinals.extend_from_slice(parent_ordinals);
-        ordinals.push(*ordinal);
+        ordinals.push(if service_root { 1 } else { *ordinal });
         refs_preorder.push(child_ref);
         path_segments_by_ref.insert(child_ref, segments.clone());
         path_ordinals_by_ref.insert(child_ref, ordinals.clone());
@@ -412,7 +448,11 @@ pub(crate) fn rbx_dom_path_import_refs(
         );
     } else {
         let root_ref = dom.root_ref();
-        let segments = vec![dom.root().name.clone()];
+        let segments = vec![if is_service_class(dom.root().class.as_str()) {
+            dom.root().class.to_string()
+        } else {
+            dom.root().name.clone()
+        }];
         let ordinals = vec![1];
         refs_preorder.push(root_ref);
         path_segments_by_ref.insert(root_ref, segments.clone());

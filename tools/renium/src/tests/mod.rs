@@ -3693,6 +3693,27 @@ fn unknown_property_types_survive_settings_and_binary_round_trips() {
 }
 
 #[test]
+fn renamed_service_root_properties_do_not_come_from_a_namesake_folder() {
+    let mut dom = support::renamed_service_place();
+    let service_names = HashSet::from(["Workspace".to_string(), "ServerStorage".to_string()]);
+    let database = rbx_reflection_database::get().unwrap();
+    let values = rbx_dom_service_root_property_values(&dom, &service_names, database);
+    assert_eq!(values["ServerStorage"]["SourceAssetId"], json!(42));
+    assert_eq!(values.len(), 2);
+    let service = dom
+        .descendants()
+        .find(|node| node.class == "ServerStorage")
+        .unwrap()
+        .referent();
+    dom.destroy(service);
+    let values = rbx_dom_service_root_property_values(&dom, &service_names, database);
+    assert!(
+        !values.contains_key("ServerStorage"),
+        "a namesake cannot supply an absent service's fields"
+    );
+}
+
+#[test]
 fn live_snapshot_preserves_unrelated_service_root_properties() {
     let database = rbx_reflection_database::get().unwrap();
     let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));

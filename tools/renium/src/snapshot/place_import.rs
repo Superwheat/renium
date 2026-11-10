@@ -18,7 +18,7 @@ use crate::project::layout::apply_configured_project_layout;
 use crate::rbx::decode::{
     NativePropertyFilter, native_property_filter, rbx_properties_to_native_settings_records,
 };
-use crate::rbx::model::{BytecodeModelImportRefs, RbxPlaceFormat};
+use crate::rbx::model::{BytecodeModelImportRefs, RbxPlaceFormat, is_service_class};
 use crate::snapshot::export::{
     ExportExecutionSetup, finish_export_import, finish_export_publication, prepare_export_execution,
 };
@@ -188,7 +188,13 @@ impl PlacePaths {
         while let Some((index, parent_segments, parent_ordinals, ordinal)) = stack.pop() {
             let instance = &flat.instances[index];
             let mut path = parent_segments;
-            path.push(instance.name.clone());
+            path.push(
+                if instance.parent_index.is_none() && is_service_class(instance.class.as_str()) {
+                    instance.class.to_string()
+                } else {
+                    instance.name.clone()
+                },
+            );
             let mut ords = parent_ordinals;
             ords.push(ordinal);
             let mut counts = HashMap::<&str, usize>::new();
@@ -470,6 +476,74 @@ mod tests {
     }
 
     #[test]
+    fn renamed_service_place_import_keeps_cross_service_references() {
+        for format in [RbxPlaceFormat::Binary, RbxPlaceFormat::Xml] {
+            let root = crate::tests::support::temp_dir("renamed-service-import");
+            let _cleanup = crate::system::files::OnDrop::new(|| {
+                let _ = std::fs::remove_dir_all(&root);
+            });
+            let dom = crate::tests::support::renamed_service_place();
+            format
+                .write(&root.join("place.rbxl"), &dom, dom.root().children())
+                .unwrap();
+            std::fs::write(root.join("renium.project.jsonc"), r#"{"schemaVersion":1}"#).unwrap();
+            assert_eq!(run(&root)["ok"], true);
+            let workspace =
+                SettingsBytecode::read_file(&root.join("instances/Workspace.renium")).unwrap();
+            let reference = &workspace
+                .instances
+                .iter()
+                .find(|node| node.name == "External")
+                .unwrap()
+                .properties["Value"];
+            assert_eq!(
+                reference["pathSegments"],
+                json!(["ServerStorage", "InService", "Renamed"]),
+                "{format:?}"
+            );
+            assert_eq!(reference["pathOrdinals"], json!([1, 1, 2]));
+            let service =
+                SettingsBytecode::read_file(&root.join("instances/ServerStorage.renium")).unwrap();
+            assert_eq!(service.instances[0].name, "ServerStorage");
+            // Rebuild without the original place: only the imported reference
+            // can identify the target, including its duplicate-name ordinal.
+            std::fs::remove_file(root.join(".renium/import-base.json")).unwrap();
+            let output = root.join("rebuilt.rbxl");
+            crate::rbx::model::bytecode_export_place(crate::cli::BytecodeExportPlaceArgs {
+                project: crate::cli::ProjectSourceArgs {
+                    project_root: root.clone(),
+                    src_root: "src".into(),
+                },
+                services: "Workspace,ServerStorage".into(),
+                output: output.clone(),
+                format: None,
+                base: None,
+                pretty: false,
+            })
+            .unwrap();
+            let rebuilt = RbxPlaceFormat::Binary.read(&output).unwrap();
+            let reference = rebuilt
+                .descendants()
+                .find(|node| node.name == "External")
+                .unwrap();
+            let rbx_dom_weak::types::Variant::Ref(target) = reference.properties[&"Value".into()]
+            else {
+                panic!("ObjectValue.Value is not a reference");
+            };
+            let target = rebuilt
+                .get_by_ref(target)
+                .expect("rebuilt reference target");
+            assert_eq!(target.name, "Renamed");
+            assert_eq!(target.properties[&"Anchored".into()], true.into());
+            let parent = rebuilt.get_by_ref(target.parent()).unwrap();
+            assert_eq!(
+                rebuilt.get_by_ref(parent.parent()).unwrap().class,
+                "ServerStorage"
+            );
+        }
+    }
+
+    #[test]
     fn binary_and_misnamed_xml_imports_rebuild_binary_rig_data_and_saved_lighting() {
         use rbx_dom_weak::types::{BinaryString, SharedString, Variant};
         let binary = BinaryString::from(vec![0, 255, 1, 128, 0, 7]);
@@ -617,23 +691,28 @@ mod tests {
     fn xml_import_preserves_partial_hulls_without_inventing_boxes() {
         let root = crate::tests::support::temp_dir("xml-partial-hulls");
         let path = root.join("place.rbxlx");
-        let dom = WeakDom::new(
-            InstanceBuilder::new("DataModel").with_child(
-                InstanceBuilder::new("Workspace")
-                    .with_child(
-                        InstanceBuilder::new("MeshPart")
-                            .with_name("Computed")
-                            .with_property(
-                                "PhysicalConfigData",
-                                rbx_dom_weak::types::SharedString::new(b"CSGPHS-hull".to_vec()),
-                            ),
-                    )
-                    .with_child(InstanceBuilder::new("MeshPart").with_name("Missing")),
-            ),
+        let mut dom = crate::tests::support::renamed_service_place();
+        let service = dom
+            .descendants()
+            .find(|node| node.class == "ServerStorage")
+            .unwrap()
+            .referent();
+        dom.insert(
+            service,
+            InstanceBuilder::new("MeshPart")
+                .with_name("Computed")
+                .with_property(
+                    "PhysicalConfigData",
+                    rbx_dom_weak::types::SharedString::new(b"CSGPHS-hull".to_vec()),
+                ),
+        );
+        dom.insert(
+            service,
+            InstanceBuilder::new("MeshPart").with_name("Missing"),
         );
         rbx_xml::to_writer_default(File::create(&path).unwrap(), &dom, dom.root().children())
             .unwrap();
-        let flat = read_place(&path, &["Workspace".into()]).unwrap();
+        let flat = read_place(&path, &["Workspace".into(), "ServerStorage".into()]).unwrap();
         for name in ["Computed", "Missing"] {
             let instance = flat
                 .instances
