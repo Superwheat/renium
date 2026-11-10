@@ -505,6 +505,44 @@ mod tests {
         let (_, direct, _) = native_overlay_property_schemas(database, &schemas, &filters);
         assert_eq!(direct["Model"][0].name, "WorldPivot");
     }
+
+    #[test]
+    fn native_records_keep_the_engine_type_of_content_the_database_does_not_know() {
+        let database = rbx_reflection_database::get().unwrap();
+        let refs = BytecodeModelImportRefs::default();
+        let properties = [
+            (
+                rbx_dom_weak::Ustr::from("FutureContent"),
+                RbxVariant::Content(RbxContent::none()),
+            ),
+            (
+                rbx_dom_weak::Ustr::from("FutureContentId"),
+                RbxVariant::ContentId("rbxassetid://7".into()),
+            ),
+        ];
+        let (native, json, _, _) = rbx_properties_to_native_settings_records(
+            "Folder",
+            properties.iter().map(|(name, value)| (name, value)),
+            database,
+            &refs,
+            None,
+        );
+        assert!(native.is_empty());
+        let export_refs = crate::rbx::model::BytecodeModelExportRefs::default();
+        for (name, variant) in &properties {
+            assert_eq!(
+                crate::rbx::encode::json_to_rbx_property_variant(
+                    &json[name.as_str()],
+                    None,
+                    database,
+                    &export_refs,
+                )
+                .as_ref(),
+                Some(variant),
+                "{name}"
+            );
+        }
+    }
 }
 
 pub(crate) fn overlay_property_names_value(
@@ -988,9 +1026,10 @@ pub(crate) fn rbx_properties_to_native_settings_records<'a>(
                 filter.reconstruct_decal_color_map && output_name == "TextureContent"
                     || filter.reconstruct_weld_enabled && output_name == "State"
             });
-        // A number for a member the reflection database does not know keeps
-        // its engine type in the store, so a later build writes it as the
-        // engine declared it instead of leaving it out.
+        // A number or a content value for a member the reflection database
+        // does not know keeps its engine type in the store, so a later build
+        // writes it as the engine declared it: a number is not left out and a
+        // content value is not written as a string, which Studio refuses.
         if descriptor.is_none()
             && matches!(
                 variant,
@@ -998,6 +1037,8 @@ pub(crate) fn rbx_properties_to_native_settings_records<'a>(
                     | RbxVariant::Int64(_)
                     | RbxVariant::Float32(_)
                     | RbxVariant::Float64(_)
+                    | RbxVariant::Content(_)
+                    | RbxVariant::ContentId(_)
             )
             && rbx_property_descriptor(database, class_name, property_name).is_none()
             && let Some(value) =
