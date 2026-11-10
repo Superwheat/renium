@@ -118,7 +118,14 @@ try {
     $summary | Set-Content -LiteralPath (Join-Path $runRoot 'summary.md') -Encoding utf8
     $summary | Write-Output
     if ($env:GITHUB_STEP_SUMMARY) { $summary | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY }
-    if ($code -ne 0 -or -not $report.ok) { throw "Native canary failed; see the per-operation table and $reportPath" }
+    # Voxel playback is an optional acceleration that Studio has offered no
+    # hook for since 0.739; explicit Terrain rollback is its supported path.
+    $broken = @($report.operations | Where-Object { $_.verdict -ne 'native' -and $_.operation -ne 'voxelHistory' } |
+        ForEach-Object { $_.operation })
+    if ($code -ne 0 -or $broken.Count -gt 0) {
+        $what = if ($broken.Count -gt 0) { $broken -join ', ' } else { "exit code $code" }
+        throw "Native canary failed ($what); see the per-operation table and $reportPath"
+    }
 } finally {
     # Only the exact process launched with this run's unique place may be stopped.
     $owned = @(Get-Process RobloxStudioBeta -ErrorAction SilentlyContinue | Where-Object {
