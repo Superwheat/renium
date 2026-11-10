@@ -246,6 +246,10 @@ fn bridge_request_allowed_after_cancel(method: &str, params: &Value) -> bool {
         )
 }
 
+#[path = "bridge_launch_forward.rs"]
+mod launch_forward;
+pub(crate) use launch_forward::forward_launched_studio;
+
 #[cfg(test)]
 #[path = "bridge_routing_tests.rs"]
 pub(crate) mod routing_tests;
@@ -1550,7 +1554,7 @@ impl BridgeServer {
         };
 
         for port in ports {
-            let listener = TcpListener::bind((bind_host.as_str(), *port)).with_context(|| {
+            let listener = launch_forward::bind_bridge_port(&bind_host, *port).with_context(|| {
                 format!(
                     "Failed to bind bridge server on {bind_host}:{port}; close the Renium process using that port or run `rbx daemon list` and `rbx daemon stop --all`"
                 )

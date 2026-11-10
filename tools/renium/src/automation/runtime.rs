@@ -3386,6 +3386,14 @@ fn automation_execute_request_inner(
             kill_orphans_result(bridge, request.p.get("place").and_then(Value::as_str)),
         ),
         op::STUDIOS => {
+            if let Some(pid) = request
+                .p
+                .get("launched")
+                .and_then(Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok())
+            {
+                workflows::expect_launched_studio(pid);
+            }
             let wait_seconds = request
                 .p
                 .get("waitSeconds")

@@ -81,6 +81,7 @@
 
 ### Bug fixes
 
+- `rbx --daemon NAME so FILE` (or `RENIUM_DAEMON_NAME`) no longer starts the default daemon. The Studio's plugin still connects to the default ports first; when no daemon listens there, the named daemon answers on them until that Studio has moved over, turns every other Studio away, and gives the ports to a default daemon that starts meanwhile. A running default daemon passes the window on as before.
 - `rbx bs --push` pushes the edited instance alone. It used to push the instance's whole subtree again, so one attribute set on a large folder or model took many seconds and could make Studio ask whether to stop the plugin.
 - A store-file push the review held (`rbx ps instances/SERVICE.renium` with more than the threshold's changes) returns the hold and its `--yes` hint again; it used to go on to read Studio back and report "did not retain pushed project changes" for instances nothing had created yet.
 - `rbx dev set` no longer reports a 1.5 s timeout for a device Studio did switch to: when the setters outlive the plugin's reply window, the status read afterwards stands in for the result and carries `settledAfterTimeout`.

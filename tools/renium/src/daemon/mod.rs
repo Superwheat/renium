@@ -522,23 +522,6 @@ fn write_daemon_discovery_file(
     Ok(())
 }
 
-/// The bridge ports a named daemon published in its discovery file, for the
-/// launch ticket of a Studio the CLI opens on that daemon's behalf.
-pub(crate) fn named_daemon_bridge_ports(name: &str) -> Option<Vec<u16>> {
-    daemon_discovery_write_paths(name)
-        .into_iter()
-        .find_map(|path| {
-            let value: Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
-            let ports = value
-                .get("bridgePorts")?
-                .as_array()?
-                .iter()
-                .filter_map(|port| u16::try_from(port.as_u64()?).ok())
-                .collect::<Vec<_>>();
-            (ports.len() == 2).then_some(ports)
-        })
-}
-
 /// The control port a named daemon published in its discovery file.
 pub(crate) fn named_daemon_control_port(name: &str) -> Option<u16> {
     daemon_discovery_write_paths(name)

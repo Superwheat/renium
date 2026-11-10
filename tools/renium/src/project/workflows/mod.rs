@@ -972,23 +972,36 @@ fn daemon_status_text(values: &[Value]) -> String {
 pub fn run_studio(args: StudioArgs, global_project: Option<&Path>) -> Result<()> {
     let project = args.project.as_deref().or(global_project);
     if !args.check {
-        // A Studio opened for a named daemon connects to the default ports
-        // first, so both daemons run before the launch: the named one so its
-        // ports are known for the launch ticket, the default one to pass the
-        // window on.
-        let named_daemon_ports = named_daemon_launch_ports();
+        // A Studio opened for a daemon other than the default one connects to
+        // the default ports first. That daemon runs before the launch and is
+        // told the Studio's pid after it, so it can bring the window over;
+        // the default daemon is neither started nor asked.
+        let other_daemon = !crate::daemon::is_default_daemon();
+        if other_daemon {
+            let _ = crate::daemon::daemon_control_request(
+                crate::automation::op::CAP,
+                None,
+                json!({}),
+                false,
+            );
+        }
         let mut result = launch_studio(args.file.as_deref(), project)?;
         let already_open = result.get("alreadyOpen").and_then(Value::as_bool) == Some(true);
         remember_launched_place(project, &result);
-        if !already_open
+        if other_daemon
+            && !already_open
             && let Some(pid) = result.get("pid").and_then(Value::as_u64)
-            && let Some(ports) = named_daemon_ports
-            && let Err(error) = record_launch_ticket(pid as u32, &ports)
+            && let Err(error) = crate::daemon::daemon_control_request(
+                crate::automation::op::STUDIOS,
+                None,
+                json!({ "launched": pid }),
+                false,
+            )
         {
             crate::log_global(
                 2,
                 format_args!(
-                    "[renium] could not record the launch ticket for Studio {pid}: {error:#}"
+                    "[renium] the daemon could not be told about launched Studio {pid}: {error:#}"
                 ),
             );
         }
@@ -1071,15 +1084,7 @@ fn launch_studio_inner(
         Vec::new()
     };
     let pid = spawn_studio(&executable, &[file.as_os_str()])?;
-    if let Some(ports) = crate::studio::bridge::daemon_bridge_ports()
-        && ports != DEFAULT_BRIDGE_PORTS
-        && let Err(error) = record_launch_ticket(pid, &ports)
-    {
-        crate::log_global(
-            2,
-            format_args!("[renium] could not record the launch ticket for Studio {pid}: {error:#}"),
-        );
-    }
+    expect_launched_studio(pid);
     #[allow(unused_mut)]
     let mut result = json!({
         "ok": true,
@@ -1151,30 +1156,26 @@ pub(crate) fn wait_for_studio_processes_to_exit(pids: &[u32]) {
 /// says otherwise.
 const DEFAULT_BRIDGE_PORTS: [u16; 2] = [8781, 8782];
 
-/// When `--daemon NAME` names a daemon other than the default, the bridge
-/// ports a Studio launched now should end up on. Both that daemon and the
-/// default daemon are started first, since the plugin connects to the
-/// default ports and the default daemon forwards the window.
-fn named_daemon_launch_ports() -> Option<Vec<u16>> {
-    let name = std::env::var("RENIUM_DAEMON_NAME").ok()?;
-    let name = name.trim().to_string();
-    if name.is_empty() || name == "default" {
-        return None;
-    }
-    let wake = |daemon: &str| {
-        unsafe { std::env::set_var("RENIUM_DAEMON_NAME", daemon) };
-        let _ = crate::daemon::daemon_control_request(
-            crate::automation::op::CAP,
-            None,
-            json!({}),
-            false,
-        );
+/// In a daemon on other bridge ports than the plugin's default: notes a
+/// Studio launched for this daemon and brings it over. The Studio connects to
+/// the default ports first; a daemon listening there reads the launch ticket
+/// and sends the Studio on, and while none listens this daemon stands in on
+/// those ports itself. A no-op in the default daemon and in a CLI process.
+pub(crate) fn expect_launched_studio(pid: u32) {
+    let Some(ports) = crate::studio::bridge::daemon_bridge_ports() else {
+        return;
     };
-    wake(&name);
-    wake("default");
-    unsafe { std::env::set_var("RENIUM_DAEMON_NAME", &name) };
-    let ports = crate::daemon::named_daemon_bridge_ports(&name)?;
-    (ports != DEFAULT_BRIDGE_PORTS).then_some(ports)
+    if ports == DEFAULT_BRIDGE_PORTS {
+        return;
+    }
+    if let Err(error) = record_launch_ticket(pid, &ports) {
+        crate::log_global(
+            2,
+            format_args!("[renium] could not record the launch ticket for Studio {pid}: {error:#}"),
+        );
+        return;
+    }
+    crate::studio::bridge::forward_launched_studio(pid, &DEFAULT_BRIDGE_PORTS);
 }
 
 fn launch_ticket_dir() -> Result<PathBuf> {
@@ -1193,9 +1194,9 @@ fn unix_ms_now() -> u64 {
 }
 
 /// A Studio launched by a daemon on other bridge ports than the plugin's
-/// default is noted by pid; the daemon on the default ports reads the note
-/// when that Studio's plugin connects there and sends it on.
-pub(crate) fn record_launch_ticket(pid: u32, ports: &[u16]) -> Result<()> {
+/// default is noted by pid; whichever daemon listens on the default ports
+/// reads the note when that Studio's plugin connects there and sends it on.
+fn record_launch_ticket(pid: u32, ports: &[u16]) -> Result<()> {
     let dir = launch_ticket_dir()?;
     fs::create_dir_all(&dir)?;
     sweep_stale_launch_tickets(&dir);
@@ -1248,19 +1249,41 @@ pub(crate) fn take_launch_ticket(pid: u32) -> Option<Vec<u16>> {
     Some(ports)
 }
 
+/// Whether a fresh launch ticket for Studio `pid` still waits to be taken.
+pub(crate) fn launch_ticket_pending(pid: u32) -> bool {
+    launch_ticket_dir().is_ok_and(|dir| launch_ticket_pending_in(&dir, pid, unix_ms_now()))
+}
+
+fn launch_ticket_pending_in(dir: &Path, pid: u32, now_ms: u64) -> bool {
+    let path = dir.join(format!("{pid}.json"));
+    fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|value| launch_ticket_fresh(&path, &value, now_ms))
+}
+
+/// A ticket without a creation time (written by an older Renium) is dated by
+/// its file.
+fn launch_ticket_fresh(path: &Path, value: &Value, now_ms: u64) -> bool {
+    match value.get("createdUnixMs").and_then(Value::as_u64) {
+        Some(created) => now_ms.saturating_sub(created) <= LAUNCH_TICKET_TTL.as_millis() as u64,
+        None => fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age <= LAUNCH_TICKET_TTL),
+    }
+}
+
 fn take_launch_ticket_in(dir: &Path, pid: u32, now_ms: u64) -> Option<Vec<u16>> {
     let path = dir.join(format!("{pid}.json"));
-    let age = fs::metadata(&path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok());
     let bytes = fs::read(&path).ok()?;
+    let value = serde_json::from_slice::<Value>(&bytes).ok();
+    let fresh = value
+        .as_ref()
+        .is_some_and(|value| launch_ticket_fresh(&path, value, now_ms));
     let _ = fs::remove_file(&path);
-    let value: Value = serde_json::from_slice(&bytes).ok()?;
-    let fresh = match value.get("createdUnixMs").and_then(Value::as_u64) {
-        Some(created) => now_ms.saturating_sub(created) <= LAUNCH_TICKET_TTL.as_millis() as u64,
-        None => age.is_some_and(|age| age <= LAUNCH_TICKET_TTL),
-    };
+    let value = value?;
     if !fresh {
         crate::log_global(
             3,
@@ -3066,6 +3089,24 @@ fn replace_file(source: &Path, target: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::tests::support::temp_dir;
+
+    #[test]
+    fn a_launch_ticket_is_pending_until_it_is_taken_or_stale() -> Result<()> {
+        let dir = temp_dir("launch-ticket-pending");
+        fs::create_dir_all(&dir)?;
+        let ttl = LAUNCH_TICKET_TTL.as_millis() as u64;
+        write_launch_ticket(&dir, 41, &[8791, 8792], 1_000)?;
+        assert!(launch_ticket_pending_in(&dir, 41, 1_000 + ttl));
+        assert!(!launch_ticket_pending_in(&dir, 41, 1_001 + ttl));
+        assert!(!launch_ticket_pending_in(&dir, 42, 1_000));
+        assert_eq!(
+            take_launch_ticket_in(&dir, 41, 1_000),
+            Some(vec![8791, 8792])
+        );
+        assert!(!launch_ticket_pending_in(&dir, 41, 1_000));
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
 
     #[test]
     fn init_converts_a_rojo_project_in_place() -> Result<()> {
