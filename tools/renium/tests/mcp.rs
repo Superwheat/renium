@@ -275,7 +275,12 @@ fn a_running_command_ends_when_the_server_is_killed() {
         "method": "tools/call",
         "params": {"name": "rbx", "arguments": arguments},
     }));
-    wait_until("the command serves its port", || listening(port));
+    wait_until("the command serves its port", || {
+        if let Ok(answer) = server.lines.try_recv() {
+            panic!("the command ended instead of serving port {port}: {answer}");
+        }
+        listening(port)
+    });
     server.child.kill().unwrap();
     server.child.wait().unwrap();
     wait_until("the command ended with the server", || !listening(port));
