@@ -607,15 +607,21 @@ local function validatedImportIdentities(raw: any, rootCount: number): any
 		error("Invalid imported instance identities")
 	end
 	local isArray, stringCount = denseArrayLength(raw.strings)
-	if not isArray then error("Imported identity strings must be an array") end
+	if not isArray then
+		error("Imported identity strings must be an array")
+	end
 	local budget = BridgeParallel.newWorkBudget()
 	for _, value in ipairs(raw.strings) do
 		budget()
-		if type(value) ~= "string" then error("Imported identity strings must be strings") end
+		if type(value) ~= "string" then
+			error("Imported identity strings must be strings")
+		end
 	end
 	local nodes = EncodingService:Base64Decode(buffer.fromstring(raw.nodes))
 	local bytes = buffer.len(nodes)
-	if bytes == 0 or bytes % 20 ~= 0 then error("Imported identity tree is truncated") end
+	if bytes == 0 or bytes % 20 ~= 0 then
+		error("Imported identity tree is truncated")
+	end
 	local ids = {}
 	for offset = 0, bytes - 20, 20 do
 		budget()
@@ -630,7 +636,9 @@ local function validatedImportIdentities(raw: any, rootCount: number): any
 		end
 		local id = raw.strings[buffer.readu32(nodes, offset + 16) + 1]
 		if id ~= "" then
-			if ids[id] then error("Duplicate imported settings id") end
+			if ids[id] then
+				error("Duplicate imported settings id")
+			end
 			ids[id] = true
 		end
 	end
