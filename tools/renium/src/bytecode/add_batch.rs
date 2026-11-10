@@ -1689,29 +1689,6 @@ impl StudioPrep {
         Ok(())
     }
 
-    /// Applies to the open place what turned the store at `settings_file`
-    /// from `before` into what it holds now, so the scoped push that follows
-    /// pairs each instance where the store has it; a push alone would create
-    /// a copy and leave the original. `None` when nothing was renamed, moved
-    /// or removed.
-    pub(crate) fn apply_store_edit(
-        settings_file: &Path,
-        before: &SettingsBytecode,
-    ) -> Result<Option<Value>> {
-        let after = SettingsBytecode::read_file(settings_file)?;
-        let service = crate::bytecode::edit::bytecode_service_name(&after, settings_file, "");
-        let mut prep = Self::default();
-        if prep.add_store(before, &after, &service).is_err() {
-            bail!(
-                "An instance moved under one this edit created, which Studio does not have yet; push the store with `rbx ps`"
-            );
-        }
-        if prep.is_empty() {
-            return Ok(None);
-        }
-        prep.apply_in_studio().map(Some)
-    }
-
     /// One Luau chunk for the Edit window: every instance is found before
     /// anything changes, and moved instances are detached first so a swap of
     /// parent and child never forms a cycle.
@@ -1749,7 +1726,9 @@ impl StudioPrep {
         )
     }
 
-    fn apply_in_studio(&self) -> Result<Value> {
+    /// Runs the chunk in the open place and returns its counts with the
+    /// paths it did not find.
+    pub(crate) fn apply_in_studio(&self) -> Result<Value> {
         let result = crate::daemon::daemon_control_request(
             crate::automation::op::LUAU,
             None,

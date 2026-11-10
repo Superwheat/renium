@@ -3551,3 +3551,83 @@ fn pushed_moves_take_the_same_named_sibling_the_store_names() {
         "Border:first,Border:second,Border:third"
     );
 }
+
+#[test]
+fn pushed_edits_report_a_store_the_project_does_not_have() {
+    let fx = Fixture::new("cold-store-push");
+    fs::remove_file(fx.store("Workspace")).unwrap();
+    let store = fx.store_arg("Workspace");
+    let edits: [&[&str]; 3] = [
+        &["Lobby", "-p", "Parent", "--str", "ws", "--push"],
+        &["Lobby", "-p", "Name", "--str", "Hall", "--push"],
+        &["--where", "Border", "-p", "Parent", "--str", "ws", "--push"],
+    ];
+    for edit in edits {
+        let error = fx.text(&[&["bs", "-f", &store], edit].concat()).err();
+        assert!(
+            error.contains("No synced Renium store for service 'Workspace'"),
+            "{edit:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_store_edit_prepares_studio_for_its_own_renames_and_moves_only() {
+    use crate::bytecode::set_property_outcome;
+    use crate::cli::BytecodeSetPropertyArgs;
+
+    let fx = Fixture::new("edit-studio-prep");
+    let mut instances = vec![
+        settings_instance("ws", "Workspace", "Workspace", None),
+        settings_instance("borders", "Borders", "Folder", Some(0)),
+    ];
+    for id in ["first", "second", "third"] {
+        instances.push(settings_instance(id, "Border", "Folder", Some(1)));
+    }
+    instances.push(settings_instance("spare", "Spare", "Folder", Some(0)));
+    fx.write_store("Workspace", &settings_document(instances));
+    let store = fx.store_arg("Workspace");
+    let prep = |edit: &[&str]| {
+        let args = [&["bs", "-f", &store], edit].concat();
+        set_property_outcome(BytecodeSetPropertyArgs::try_parse_from(args).unwrap())
+            .unwrap()
+            .1
+    };
+    let paths = |prep: &crate::bytecode::add_batch::StudioPrep| {
+        prep.paths
+            .iter()
+            .map(|path| (path.path_segments.join("."), path.path_ordinals.clone()))
+            .collect::<Vec<_>>()
+    };
+    let place = mock_place();
+
+    let moved = prep(&["-i", "second", "-p", "Parent", "--str", "spare"]);
+    assert_eq!(
+        paths(&moved),
+        [
+            ("Workspace.Borders.Border".to_string(), vec![1, 1, 2]),
+            ("Workspace.Spare".to_string(), vec![1, 1]),
+        ]
+    );
+    assert_eq!(moved.moves, [(0, 1)]);
+    assert!(moved.renames.is_empty() && moved.destroys.is_empty());
+    let outcome = run_in(&place, &moved.luau());
+    assert_eq!(outcome["moved"].as_f64(), Some(1.0), "{outcome}");
+
+    let renamed = prep(&["-i", "third", "-p", "Name", "--str", "Last"]);
+    assert_eq!(
+        paths(&renamed),
+        [("Workspace.Borders.Border".to_string(), vec![1, 1, 2])]
+    );
+    assert_eq!(renamed.renames, [(0, "Last".to_string())]);
+    assert!(renamed.moves.is_empty() && renamed.destroys.is_empty());
+    let outcome = run_in(&place, &renamed.luau());
+    assert_eq!(outcome["renamed"].as_f64(), Some(1.0), "{outcome}");
+    assert_eq!(
+        children_in(&place, "Workspace.Borders"),
+        "Border:first,Last:third"
+    );
+    assert_eq!(children_in(&place, "Workspace.Spare"), "Border:second");
+
+    assert!(prep(&["-i", "first", "-p", "Archivable", "-j", "false"]).is_empty());
+}

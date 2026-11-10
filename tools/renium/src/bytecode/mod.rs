@@ -2114,37 +2114,11 @@ pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result
     if let Some(query) = args.where_query.take() {
         return bytecode_set_property_where(args, &query);
     }
-    // A push pairs the store with Studio by path, so a renamed or moved
-    // instance is renamed or moved in the place first; otherwise the push
-    // would create a copy at the new path and leave the original.
-    let before = if args.push && sets_name_or_parent(&args.property) {
-        let mut selected = args.clone();
-        adopt_single_positional_target(&mut selected.input, None, &mut selected.selector)?;
-        let (settings_file, _) = resolve_bytecode_cli_settings_file(
-            selected.input.settings_file.as_deref(),
-            selected.input.service_or_file.as_deref(),
-            None,
-        )?;
-        let document = SettingsBytecode::read_file(&settings_file)?;
-        Some((settings_file, document))
-    } else {
-        None
-    };
-    let mut result = bytecode_set_property_result(args.clone())?;
-    if let Some((settings_file, before)) = &before
-        && let Some(applied) = add_batch::StudioPrep::apply_store_edit(settings_file, before)?
-    {
-        result["studioApplied"] = applied;
+    let (mut result, studio) = set_property_outcome(args.clone())?;
+    if args.push && !studio.is_empty() {
+        result["studioApplied"] = studio.apply_in_studio()?;
     }
     finish_set_property(args, result)
-}
-
-/// Whether `-p` names Name or Parent, alone or as `NAME=JSON`.
-fn sets_name_or_parent(properties: &[String]) -> bool {
-    properties.iter().any(|property| {
-        let name = property.split('=').next().unwrap_or(property);
-        name.eq_ignore_ascii_case("name") || name.eq_ignore_ascii_case("parent")
-    })
 }
 
 /// The assignments of a `bs` call, each a property name and its value: one
@@ -2287,7 +2261,7 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
         args.input.service_or_file.as_deref(),
         None,
     )?;
-    let document = SettingsBytecode::read_file(&settings_file)?;
+    let document = read_existing_service_store(&settings_file)?;
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let scope = resolve_bytecode_selector_or_service_root(
         &document,
@@ -2322,18 +2296,20 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
         .map(|&index| document.instances[index].settings_id.clone())
         .collect::<Vec<_>>();
     let push = args.push;
-    let selectors = ids
-        .iter()
-        .map(|id| BytecodeInstanceSelectorArgs::by_settings_id(Some(id.clone())))
-        .collect::<Vec<_>>();
     let (assignments, inline_values) = parse_set_assignments(&args)?;
+    let edits = ids
+        .iter()
+        .map(|id| {
+            (
+                BytecodeInstanceSelectorArgs::by_settings_id(Some(id.clone())),
+                assignments.as_slice(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let (mut outcomes, studio) = set_store_properties(&args, &edits)?;
     // One write covers every match, so the first match's outcome names the
     // properties set and every changed path.
-    let outcome = assignments_result(
-        set_store_properties(&args, &selectors, assignments)?.swap_remove(0),
-        &args.property,
-        inline_values,
-    );
+    let outcome = assignments_result(outcomes.swap_remove(0), &args.property, inline_values);
     let set_names = outcome
         .get("set")
         .and_then(Value::as_array)
@@ -2363,11 +2339,8 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
         "settingsFile": settings_file,
     });
     if push {
-        if sets_name_or_parent(&args.property)
-            && let Some(applied) =
-                add_batch::StudioPrep::apply_store_edit(&settings_file, &document)?
-        {
-            result["studioApplied"] = applied;
+        if !studio.is_empty() {
+            result["studioApplied"] = studio.apply_in_studio()?;
         }
         result["push"] = crate::bytecode::edit::push_stored_instances(
             settings_file.clone(),
@@ -2449,7 +2422,7 @@ pub(crate) fn bytecode_rename_where(
     if from.is_empty() {
         bail!("--replace FROM must not be empty");
     }
-    let document = SettingsBytecode::read_file(&settings_file)?;
+    let document = read_existing_service_store(&settings_file)?;
     let service = bytecode_service_name(&document, &settings_file, "");
     let selector = BytecodeInstanceSelectorArgs::by_settings_id(scope_settings_id);
     let scope = resolve_bytecode_selector_or_service_root(
@@ -2490,15 +2463,28 @@ pub(crate) fn bytecode_rename_where(
             path_of(scope.index)
         );
     }
-    let mut changed_paths = BTreeSet::new();
-    for (settings_id, _, name) in &renames {
-        let result = bytecode_set_property_result(BytecodeSetPropertyArgs {
+    let names = renames
+        .iter()
+        .map(|(_, _, name)| [("Name".to_string(), json!(name))])
+        .collect::<Vec<_>>();
+    let edits = renames
+        .iter()
+        .zip(&names)
+        .map(|((settings_id, _, _), name)| {
+            (
+                BytecodeInstanceSelectorArgs::by_settings_id(Some(settings_id.clone())),
+                name.as_slice(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let (outcomes, studio) = set_store_properties(
+        &BytecodeSetPropertyArgs {
             where_query: None,
             input: BytecodeFileArgs::settings_file(settings_file.clone()),
-            selector: BytecodeInstanceSelectorArgs::by_settings_id(Some(settings_id.clone())),
+            selector: BytecodeInstanceSelectorArgs::by_settings_id(None),
             property: vec!["Name".to_string()],
             value_json: None,
-            value_str: Some(name.clone()),
+            value_str: None,
             value_num: None,
             value_bool: None,
             value_null: false,
@@ -2507,11 +2493,16 @@ pub(crate) fn bytecode_rename_where(
             override_packages: true,
             push: false,
             pretty: false,
-        })?;
-        if let Some(paths) = result.get("changedPaths").and_then(Value::as_array) {
-            changed_paths.extend(paths.iter().filter_map(Value::as_str).map(str::to_string));
-        }
-    }
+        },
+        &edits,
+    )?;
+    // One write covers every rename, so each outcome lists every changed path.
+    let changed_paths = outcomes
+        .first()
+        .and_then(|outcome| outcome.first())
+        .and_then(|outcome| outcome.get("changedPaths"))
+        .cloned()
+        .unwrap_or_default();
     let ids = renames
         .iter()
         .map(|(id, _, _)| id.clone())
@@ -2527,8 +2518,8 @@ pub(crate) fn bytecode_rename_where(
         "settingsFile": settings_file,
     });
     if push {
-        if let Some(applied) = add_batch::StudioPrep::apply_store_edit(&settings_file, &document)? {
-            result["studioApplied"] = applied;
+        if !studio.is_empty() {
+            result["studioApplied"] = studio.apply_in_studio()?;
         }
         result["push"] = crate::bytecode::edit::push_stored_instances(
             settings_file.clone(),
@@ -2656,12 +2647,21 @@ pub(crate) fn where_matches(
 
 /// A `bs` edit as its result: one `-p NAME` with a value flag, or several
 /// `-p NAME=JSON`, applied to the selected instance.
-pub(crate) fn bytecode_set_property_result(mut args: BytecodeSetPropertyArgs) -> Result<Value> {
+pub(crate) fn bytecode_set_property_result(args: BytecodeSetPropertyArgs) -> Result<Value> {
+    set_property_outcome(args).map(|(result, _)| result)
+}
+
+/// `bytecode_set_property_result` with what a push has to rename and move
+/// in the open place first.
+pub(crate) fn set_property_outcome(
+    mut args: BytecodeSetPropertyArgs,
+) -> Result<(Value, add_batch::StudioPrep)> {
     adopt_single_positional_target(&mut args.input, None, &mut args.selector)?;
     let (assignments, inline_values) = parse_set_assignments(&args)?;
-    let outcomes = set_store_properties(&args, std::slice::from_ref(&args.selector), assignments)?
-        .swap_remove(0);
-    Ok(assignments_result(outcomes, &args.property, inline_values))
+    let (mut outcomes, studio) =
+        set_store_properties(&args, &[(args.selector.clone(), assignments.as_slice())])?;
+    let result = assignments_result(outcomes.swap_remove(0), &args.property, inline_values);
+    Ok((result, studio))
 }
 
 /// A rename or a move: references to the instance and its descendants carry
@@ -2708,19 +2708,21 @@ fn read_locked_stores(
     Ok(documents)
 }
 
-/// Applies every assignment to every selected instance of one store and
+/// Applies to each selected instance of one store its assignments and
 /// returns one result per instance and assignment. The instances are
 /// resolved before anything changes and the files are written once, after
 /// the last assignment was accepted, so a failing one leaves them untouched.
+///
+/// The second value is what the edit renamed and moved, taken from the store
+/// as it was under the edit's lock. A push pairs the store with Studio by
+/// path, so it applies that to the open place first; otherwise it would
+/// create a copy at the new path and leave the original.
 fn set_store_properties(
     args: &BytecodeSetPropertyArgs,
-    selectors: &[BytecodeInstanceSelectorArgs],
-    assignments: Vec<(String, Value)>,
-) -> Result<Vec<Vec<Value>>> {
-    if assignments
-        .iter()
-        .any(|(property, _)| property.eq_ignore_ascii_case("classname"))
-    {
+    edits: &[(BytecodeInstanceSelectorArgs, &[(String, Value)])],
+) -> Result<(Vec<Vec<Value>>, add_batch::StudioPrep)> {
+    let assigned = || edits.iter().flat_map(|(_, assignments)| assignments.iter());
+    if assigned().any(|(property, _)| property.eq_ignore_ascii_case("classname")) {
         bail!("ClassName is read-only");
     }
     let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
@@ -2729,9 +2731,7 @@ fn set_store_properties(
         None,
     )?;
     let scope = parse_property_scope(&args.scope)?;
-    let structural = assignments
-        .iter()
-        .any(|(property, _)| is_structural_property(property, scope));
+    let structural = assigned().any(|(property, _)| is_structural_property(property, scope));
     let locked_stores = if structural {
         project_store_files(&settings_file)?
     } else {
@@ -2740,9 +2740,9 @@ fn set_store_properties(
     let _locks = lock_existing_service_stores(locked_stores.iter().map(PathBuf::as_path))?;
     let document = SettingsBytecode::read_file(&settings_file)?;
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
-    let indices = selectors
+    let indices = edits
         .iter()
-        .map(|selector| {
+        .map(|(selector, _)| {
             resolve_bytecode_selector_or_service_root(
                 &document,
                 &service,
@@ -2767,7 +2767,7 @@ fn set_store_properties(
         store_edited: false,
     };
     let mut applied = Vec::with_capacity(indices.len());
-    for index in indices {
+    for (index, (_, assignments)) in indices.into_iter().zip(edits) {
         reject_owned_instance_edit(&edit.document, &service, index, &links)?;
         let outcomes = assignments
             .iter()
@@ -2888,7 +2888,7 @@ impl StorePropertyEdit<'_> {
         mut self,
         locked_stores: &BTreeSet<PathBuf>,
         mut applied: Vec<Vec<AppliedAssignment>>,
-    ) -> Result<Vec<Vec<Value>>> {
+    ) -> Result<(Vec<Vec<Value>>, add_batch::StudioPrep)> {
         if let Some((before_document, _)) = &self.before
             && let Some(moved_to) =
                 instance_api::order_reparented_instances_last(&mut self.document, before_document)
@@ -2965,6 +2965,14 @@ impl StorePropertyEdit<'_> {
                 );
             }
         }
+        let mut studio = add_batch::StudioPrep::default();
+        if let Some((before_document, _)) = &self.before
+            && studio
+                .add_store(before_document, &self.document, self.service)
+                .is_err()
+        {
+            bail!("A moved instance's new parent is not in the store");
+        }
         let changed_paths = file_mutation_paths(&writes, &removals);
         apply_file_mutations(&writes, &removals)?;
         let path_parts = applied
@@ -2972,7 +2980,7 @@ impl StorePropertyEdit<'_> {
             .flatten()
             .any(|assignment| assignment.structural)
             .then(|| build_editor_instance_path_parts(&self.document, self.service));
-        Ok(applied
+        let results = applied
             .iter()
             .map(|outcomes| {
                 outcomes
@@ -3007,7 +3015,8 @@ impl StorePropertyEdit<'_> {
                     })
                     .collect()
             })
-            .collect())
+            .collect();
+        Ok((results, studio))
     }
 }
 
@@ -4282,6 +4291,15 @@ pub(super) fn ensure_service_store_exists(settings_file: &Path, service_hint: &s
     document
         .write_file(settings_file)
         .with_context(|| format!("Failed to create {}", settings_file.display()))
+}
+
+/// Reads a store, pulling it first when the project does not have it yet.
+fn read_existing_service_store(settings_file: &Path) -> Result<SettingsBytecode> {
+    pull_missing_service_store(settings_file);
+    if !settings_file.exists() {
+        return Err(missing_service_store_error(settings_file));
+    }
+    SettingsBytecode::read_file(settings_file)
 }
 
 pub(super) fn lock_existing_service_store(settings_file: &Path) -> Result<SettingsFileLock> {
