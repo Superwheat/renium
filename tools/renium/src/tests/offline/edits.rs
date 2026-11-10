@@ -472,7 +472,7 @@ fn batch_outcome(
     run().map_err(|error| normalize_text(&format!("{error:#}"), &fx.root))
 }
 
-fn run_batch(fx: &Fixture, input: &str) -> Result<Value, String> {
+pub(super) fn run_batch(fx: &Fixture, input: &str) -> Result<Value, String> {
     batch_outcome(fx, input, false).map(|outcome| super::normalize(outcome.result, &fx.root))
 }
 
@@ -829,7 +829,7 @@ fn batch_ops_resolve_and_carry_references_into_other_services() {
     .unwrap_err();
     assert!(
         missing.ends_with(
-            "Batch op 2 (set): Reference target was not found: ServerScriptService.Kit.Newer is not in the ServerScriptService store; `rbx f ServerScriptService NAME` finds a path and `rbx pl` refreshes the store from Studio"
+            "Batch op 2 (set): Reference target was not found: ServerScriptService.Kit.Newer is not in the ServerScriptService store when the batch ends; add it in this batch or before it (`rbx f ServerScriptService NAME` finds a path, `rbx pl` refreshes the store from Studio)"
         ),
         "{missing}"
     );

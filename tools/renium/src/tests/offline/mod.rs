@@ -18,6 +18,7 @@ use crate::tests::support::{settings_document, settings_instance, temp_dir};
 mod edits;
 mod files;
 mod project;
+mod references;
 mod stores;
 
 /// What one captured command run produced.

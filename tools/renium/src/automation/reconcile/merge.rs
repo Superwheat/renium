@@ -77,6 +77,13 @@ pub(crate) fn merge_snapshots_with_changes(
             merged.insert(path, value);
         }
     }
+    reference_settlement::settle_references_between_stores(
+        &sides,
+        preference,
+        &mut merged,
+        &mut conflicts,
+        &mut changes,
+    )?;
     keep_directories_implied_by_files(&mut merged, &sides, &mut changes);
     settle_script_paths(&sides, &mut merged, &mut changes)?;
     conflicts.sort();

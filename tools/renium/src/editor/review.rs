@@ -4,6 +4,7 @@ use std::fs;
 #[cfg(any(windows, target_os = "macos"))]
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 #[cfg(any(windows, target_os = "macos"))]
 #[cfg(any(windows, target_os = "macos"))]
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ use serde_json::{Map, Value, json};
 use crate::app::output::global_log_enabled;
 use crate::app::timing::current_millis;
 use crate::cli::PushEditorChangesArgs;
+use crate::editor::paths::{build_editor_instance_paths, build_editor_instance_paths_for_indices};
 use crate::editor::types::{EditorChangeSet, EditorInstancePath};
 use crate::rbx::decode::rbx_variant_to_settings_json;
 #[cfg(any(windows, target_os = "macos", test))]
@@ -37,6 +39,7 @@ use crate::roblox::schema::{
     MATERIAL_SERVICE_CLASS, PropertySchemaEntry, PropertySchemaMap, TEXTURE_PACK_PROPERTY,
     USE_2022_MATERIALS_PROPERTY, has_protected_texture_pack,
 };
+use crate::settings::bytecode::SettingsBytecode;
 use crate::studio::bridge::BridgeServer;
 use crate::studio::bridge::BridgeTarget;
 #[cfg(any(windows, target_os = "macos"))]
@@ -287,11 +290,88 @@ pub(crate) fn property_schema_entry<'a>(
         .find(|entry| entry.name.eq_ignore_ascii_case(property_name))
 }
 
+/// How many targets of one store are looked up one by one before the
+/// paths of the whole store are built at once.
+const OUTSIDE_PATHS_ONE_BY_ONE: usize = 64;
+
+/// One store a pushed reference leads into, with the paths found so far.
+struct OutsideStore {
+    document: Arc<SettingsBytecode>,
+    index_by_id: HashMap<String, usize>,
+    paths: HashMap<usize, Option<EditorInstancePath>>,
+    complete: bool,
+}
+
+/// Where the instances of a project's other stores are now, by service and
+/// settings id. A push sends a reference into another service with its
+/// target's current path: the stored path is the one a pull or a command
+/// last wrote, and an edit of the target's store that did not reach this
+/// store leaves it behind. A store is read when a reference first names its
+/// service.
+pub(crate) struct OutsideReferencePaths<'a> {
+    load: Box<OutsideStoreLoader<'a>>,
+    stores: Mutex<HashMap<String, Option<OutsideStore>>>,
+}
+
+/// Gives the store of a service, or None when the project has none.
+type OutsideStoreLoader<'a> = dyn Fn(&str) -> Option<Arc<SettingsBytecode>> + Send + Sync + 'a;
+
+impl<'a> OutsideReferencePaths<'a> {
+    /// `load` gives the store of a service, or None when it has none.
+    pub(crate) fn new(
+        load: impl Fn(&str) -> Option<Arc<SettingsBytecode>> + Send + Sync + 'a,
+    ) -> Self {
+        Self {
+            load: Box::new(load),
+            stores: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn path(&self, service: &str, settings_id: &str) -> Option<EditorInstancePath> {
+        let mut stores = self
+            .stores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !stores.contains_key(service) {
+            let store = (self.load)(service).map(|document| OutsideStore {
+                index_by_id: document
+                    .instances
+                    .iter()
+                    .enumerate()
+                    .map(|(index, instance)| (instance.settings_id.clone(), index))
+                    .collect(),
+                document,
+                paths: HashMap::new(),
+                complete: false,
+            });
+            stores.insert(service.to_string(), store);
+        }
+        let store = stores.get_mut(service)?.as_mut()?;
+        let index = *store.index_by_id.get(settings_id)?;
+        if !store.complete && !store.paths.contains_key(&index) {
+            if store.paths.len() < OUTSIDE_PATHS_ONE_BY_ONE {
+                let path =
+                    build_editor_instance_paths_for_indices(&store.document, service, &[index])
+                        .remove(&index);
+                store.paths.insert(index, path);
+            } else {
+                store.paths = build_editor_instance_paths(&store.document, service)
+                    .into_iter()
+                    .enumerate()
+                    .collect();
+                store.complete = true;
+            }
+        }
+        store.paths.get(&index).cloned().flatten()
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct EditorReferenceIds<'a> {
     service: Option<&'a str>,
     by_index: Vec<&'a str>,
     by_id: HashMap<&'a str, usize>,
+    outside: Option<&'a OutsideReferencePaths<'a>>,
 }
 
 impl<'a> EditorReferenceIds<'a> {
@@ -306,6 +386,7 @@ impl<'a> EditorReferenceIds<'a> {
             service: None,
             by_index,
             by_id,
+            outside: None,
         }
     }
 
@@ -315,6 +396,30 @@ impl<'a> EditorReferenceIds<'a> {
     pub(crate) fn in_service(mut self, service: &'a str) -> Self {
         self.service = Some(service);
         self
+    }
+
+    /// Gives the other stores of the project, so that a reference into
+    /// another service is sent with its target's current path.
+    pub(crate) fn with_outside(mut self, outside: Option<&'a OutsideReferencePaths<'a>>) -> Self {
+        self.outside = outside;
+        self
+    }
+
+    /// The current path of the instance a reference into another service
+    /// names by the id it has in that service's store.
+    fn outside_path(&self, object: &Map<String, Value>) -> Option<EditorInstancePath> {
+        let own = self.service?;
+        let service = object
+            .get("pathSegments")
+            .and_then(Value::as_array)
+            .and_then(|segments| segments.first())
+            .and_then(Value::as_str)
+            .filter(|service| *service != own)?;
+        let settings_id = object
+            .get("settingsId")
+            .or_else(|| object.get("instanceId"))
+            .and_then(Value::as_str)?;
+        self.outside?.path(service, settings_id)
     }
 
     pub(crate) fn resolve(&self, object: &Map<String, Value>) -> Option<usize> {
@@ -446,27 +551,33 @@ fn normalize_editor_ref_value(
             );
         }
         if let Some(Some(path)) = paths_by_index.get(zero_index) {
-            out.insert(
-                "pathSegments".to_string(),
-                Value::Array(
-                    path.path_segments
-                        .iter()
-                        .map(|segment| Value::String(segment.clone()))
-                        .collect(),
-                ),
-            );
-            out.insert(
-                "pathOrdinals".to_string(),
-                Value::Array(
-                    path.path_ordinals
-                        .iter()
-                        .map(|ordinal| json!(*ordinal as u64))
-                        .collect(),
-                ),
-            );
+            insert_reference_path(&mut out, path);
         }
+    } else if let Some(path) = settings_ids_by_index.outside_path(object) {
+        insert_reference_path(&mut out, &path);
     }
     Value::Object(out)
+}
+
+fn insert_reference_path(reference: &mut Map<String, Value>, path: &EditorInstancePath) {
+    reference.insert(
+        "pathSegments".to_string(),
+        Value::Array(
+            path.path_segments
+                .iter()
+                .map(|segment| Value::String(segment.clone()))
+                .collect(),
+        ),
+    );
+    reference.insert(
+        "pathOrdinals".to_string(),
+        Value::Array(
+            path.path_ordinals
+                .iter()
+                .map(|ordinal| json!(*ordinal as u64))
+                .collect(),
+        ),
+    );
 }
 
 pub(crate) fn normalize_editor_sequence_value(value: &Value, type_name: &str) -> Value {

@@ -1102,6 +1102,12 @@ local function isProtectedWorkspaceCameraInstance(instance: Instance?): boolean
 	return instance ~= nil and instance == Workspace.CurrentCamera
 end
 
+-- A reference names its target by the settings id the target has in the store
+-- of the path's service, or of the holder's service when it has no path. That
+-- identity comes before the stored path, as it does in a place build: another
+-- instance can sit at a path the target has left. An instance the same push
+-- stages at the path is the target, and an id the service only knows by
+-- position never precedes the path.
 local function decodeRefValue(raw: { [string]: any }, ctx: { [string]: any }?, serviceName: string?): any
 	local targetServiceName = if type(raw.pathSegments) == "table" and #raw.pathSegments > 0
 		then tostring(raw.pathSegments[1])
@@ -1112,15 +1118,11 @@ local function decodeRefValue(raw: { [string]: any }, ctx: { [string]: any }?, s
 			return staged
 		end
 	end
-	if type(raw.pathSegments) == "table" then
-		local instance = resolvePathSegments(raw.pathSegments, nil, raw.pathOrdinals)
-		if instance ~= nil then
-			return instance
-		end
-	end
 	local settingsInstance: Instance? = nil
-	if ctx ~= nil and type(targetServiceName) == "string" and targetServiceName ~= "" then
-		local settingsId = raw.settingsId
+	local settingsId = nil
+	local serviceScoped = ctx ~= nil and type(targetServiceName) == "string" and targetServiceName ~= ""
+	if serviceScoped then
+		settingsId = raw.settingsId
 			or raw.instanceId
 			or (if type(raw.debugId) == "string" and raw.debugId ~= "" then "debug:" .. raw.debugId else nil)
 		local persistent = matchedSettingsInstance(targetServiceName, settingsId, ctx)
@@ -1131,16 +1133,26 @@ local function decodeRefValue(raw: { [string]: any }, ctx: { [string]: any }?, s
 		if settingsInstance ~= nil and strongSettingsId(settingsId) then
 			return settingsInstance
 		end
-		if settingsInstance == nil and type(ctx.allowedServices) == "table" then
-			for candidateServiceName, allowed in pairs(ctx.allowedServices) do
-				if allowed and candidateServiceName ~= targetServiceName then
-					local candidate = resolveInstanceBySettingsId(candidateServiceName, settingsId, ctx)
-					if candidate ~= nil then
-						if settingsInstance ~= nil and settingsInstance ~= candidate then
-							return nil
-						end
-						settingsInstance = candidate
+	end
+	if type(raw.pathSegments) == "table" then
+		local instance = resolvePathSegments(raw.pathSegments, nil, raw.pathOrdinals)
+		if instance ~= nil then
+			return instance
+		end
+	end
+	-- A path says which service's store the id is of, so another service's
+	-- instance with the same id is not the target. Only an id that is unique
+	-- in the place still finds an instance Studio moved to another service.
+	local anyService = type(raw.pathSegments) ~= "table" or strongSettingsId(settingsId)
+	if ctx ~= nil and serviceScoped and anyService and settingsInstance == nil and type(ctx.allowedServices) == "table" then
+		for candidateServiceName, allowed in pairs(ctx.allowedServices) do
+			if allowed and candidateServiceName ~= targetServiceName then
+				local candidate = resolveInstanceBySettingsId(candidateServiceName, settingsId, ctx)
+				if candidate ~= nil then
+					if settingsInstance ~= nil and settingsInstance ~= candidate then
+						return nil
 					end
+					settingsInstance = candidate
 				end
 			end
 		end

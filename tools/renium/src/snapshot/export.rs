@@ -45,7 +45,7 @@ use crate::studio::bridge::{
 use crate::studio::native::editor::{EditorBinaryExportFinishGuard, editor_binary_export_parts};
 use crate::system::LockRecover;
 use crate::system::files::{
-    OnDrop, create_unique_directory, fnv1a, is_service_settings_file_name,
+    OnDrop, create_unique_directory, exact_path_key, fnv1a, is_service_settings_file_name,
     resolve_existing_project_root, sanitize_name, sha256_hex, write_bytes_if_changed,
 };
 
@@ -589,27 +589,31 @@ impl ExportProjectStage {
         settings_candidates: &[PathBuf],
     ) -> Result<Vec<PathBuf>> {
         let mut updated = BTreeSet::new();
+        let changed_stores = settings_candidates
+            .iter()
+            .map(|relative| exact_path_key(relative))
+            .collect::<HashSet<_>>();
         for current_source_root in self.source_roots(project_root)? {
-            let Ok(relative_source_root) = current_source_root.strip_prefix(project_root) else {
-                continue;
-            };
+            // The stores of a source root are where its layout keeps them,
+            // which need not be under the root itself.
+            let stores = service_store_paths(&current_source_root)?;
             let mut before = BTreeMap::new();
             let mut after = BTreeMap::new();
-            let document_pairs = settings_candidates
+            let document_pairs = stores
                 .par_iter()
-                .filter(|relative| relative.starts_with(relative_source_root))
-                .map(|relative| -> Result<Option<_>> {
-                    let current_path = project_root.join(relative);
-                    let staged_path = self.project_root.join(relative);
-                    let Some(service) = crate::project::storage::store_service_name(relative)
-                    else {
+                .map(|(service, current_path)| -> Result<Option<_>> {
+                    let Ok(relative) = current_path.strip_prefix(project_root) else {
                         return Ok(None);
                     };
+                    if !changed_stores.contains(&exact_path_key(relative)) {
+                        return Ok(None);
+                    }
+                    let staged_path = self.project_root.join(relative);
                     let (current, staged) = rayon::join(
-                        || SettingsBytecode::read_structure_file(&current_path),
+                        || SettingsBytecode::read_structure_file(current_path),
                         || SettingsBytecode::read_structure_file(&staged_path),
                     );
-                    Ok(Some((service, current?, staged?)))
+                    Ok(Some((service.clone(), current?, staged?)))
                 })
                 .collect::<Result<Vec<_>>>()?;
             for (service, current, staged) in document_pairs.into_iter().flatten() {
@@ -625,7 +629,7 @@ impl ExportProjectStage {
                 .filter_map(|key| key.split_once('\u{1}').map(|(path, _)| path))
                 .map(|path| path.split('\0').map(ToString::to_string).collect())
                 .collect::<Vec<Vec<String>>>();
-            for (_, current_path) in service_store_paths(&current_source_root)? {
+            for current_path in stores.values() {
                 let relative = current_path.strip_prefix(project_root)?.to_path_buf();
                 let staged_path = self.project_root.join(&relative);
                 let baseline = (!self.publish_baseline.contains_key(&relative))
@@ -634,7 +638,7 @@ impl ExportProjectStage {
                 let source_path = if staged_path.is_file() {
                     &staged_path
                 } else {
-                    &current_path
+                    current_path
                 };
                 let Some(mut document) = SettingsBytecode::read_file_if_contains_any_string_set(
                     source_path,
@@ -3327,5 +3331,65 @@ mod publication_tests {
             "return 'unrelated'\n"
         );
         drop(stage);
+    }
+
+    #[test]
+    fn export_publication_carries_a_renamed_target_into_a_store_the_pull_left_out() {
+        use crate::tests::support::{settings_document, settings_instance};
+        let mut fixture = Fixture::new();
+        drop(fixture.stage.take());
+        let store = |service: &str| PathBuf::from("instances").join(format!("{service}.renium"));
+        let replicated = || settings_instance("rs", "ReplicatedStorage", "ReplicatedStorage", None);
+        // Studio's own id of an instance pairs a capture with the files.
+        let folder = |settings_id: &str, name: &str, unique_id: u8| {
+            let mut instance = settings_instance(settings_id, name, "Folder", Some(0));
+            instance.properties.insert(
+                "UniqueId".to_string(),
+                json!({"_type": "UniqueId", "value": format!("{unique_id:032x}")}),
+            );
+            instance
+        };
+        settings_document(vec![replicated(), folder("a", "A", 1)])
+            .write_file(&fixture.root.join(store("ReplicatedStorage")))
+            .unwrap();
+        let reference = |name: &str| {
+            json!({
+                "_type": "Ref",
+                "settingsId": "a",
+                "pathSegments": ["ReplicatedStorage", name],
+                "pathOrdinals": [1, 1],
+            })
+        };
+        let mut holder = settings_instance("holder", "Holder", "ObjectValue", Some(0));
+        holder
+            .properties
+            .insert("Value".to_string(), reference("A"));
+        settings_document(vec![
+            settings_instance("ws", "Workspace", "Workspace", None),
+            holder,
+        ])
+        .write_file(&fixture.root.join(store("Workspace")))
+        .unwrap();
+        let stage = ExportProjectStage::create(
+            &fixture.root,
+            Path::new("src"),
+            &["ReplicatedStorage".into()],
+        )
+        .unwrap();
+        // Studio renamed A and put another instance under its old name.
+        settings_document(vec![
+            replicated(),
+            folder("a", "Renamed", 1),
+            folder("b", "A", 2),
+        ])
+        .write_file(&stage.project_root.join(store("ReplicatedStorage")))
+        .unwrap();
+        stage.publish(&fixture.root, true).unwrap();
+        let workspace =
+            SettingsBytecode::read_file(&fixture.root.join(store("Workspace"))).unwrap();
+        assert_eq!(
+            workspace.instances[1].properties["Value"],
+            reference("Renamed")
+        );
     }
 }

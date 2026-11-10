@@ -1581,6 +1581,11 @@ fn positional_values_equivalent(
         .enumerate()
         .map(|(index, instance)| (instance.settings_id.as_str(), index))
         .collect::<AHashMap<_, _>>();
+    let ids = PairedStoreIds {
+        service: store_service(reference),
+        left: &reference_ids,
+        right: &observed_ids,
+    };
     let equivalent = |(index, (reference_instance, observed_instance)): (
         usize,
         (&SettingsBytecodeInstance, &SettingsBytecodeInstance),
@@ -1610,13 +1615,11 @@ fn positional_values_equivalent(
                 &reference_instance.class_name,
                 &reference_instance.properties,
                 &observed_instance.properties,
-                &reference_ids,
-                &observed_ids,
+                ids,
             ) && reconciliation_values_map_equal_with_ids(
                 &reference_instance.attributes,
                 &observed_instance.attributes,
-                &reference_ids,
-                &observed_ids,
+                ids,
             )
     };
     if reference.instances.len() >= 2_048 && rayon::current_num_threads() > 1 {
@@ -1870,6 +1873,11 @@ fn align_settings_ids_for_contiguous_structural_change(
             )
         })
         .collect::<AHashMap<_, _>>();
+    let ids = PairedStoreIds {
+        service: store_service(reference),
+        left: &reference_ids,
+        right: &observed_ids,
+    };
     let equivalent = |position: usize| {
         let (reference_index, observed_index) = index_map.pair_at(position);
         let reference = &reference.instances[reference_index];
@@ -1879,13 +1887,11 @@ fn align_settings_ids_for_contiguous_structural_change(
                 &reference.class_name,
                 &reference.properties,
                 &observed.properties,
-                &reference_ids,
-                &observed_ids,
+                ids,
             ) && reconciliation_values_map_equal_with_ids(
                 &reference.attributes,
                 &observed.attributes,
-                &reference_ids,
-                &observed_ids,
+                ids,
             )
     };
     let common_matches = if common_len >= 2_048 && rayon::current_num_threads() > 1 {
@@ -2267,20 +2273,65 @@ pub(crate) fn inherit_workspace_viewport_reference(
     }
 }
 
+/// The settings ids of two copies of one store, by position, with the
+/// service the store is of. A reference into the store is the same in both
+/// copies when it names the same position, whatever id each copy gives it.
+#[derive(Clone, Copy)]
+struct PairedStoreIds<'a> {
+    service: Option<&'a str>,
+    left: &'a AHashMap<&'a str, usize>,
+    right: &'a AHashMap<&'a str, usize>,
+}
+
+impl PairedStoreIds<'_> {
+    /// Whether a reference with this path names an instance of the store.
+    /// Settings ids are unique within one store only, so an id of the store
+    /// says nothing about a reference whose path leads into another service.
+    fn hold(&self, path_service: Option<&str>) -> bool {
+        match (path_service, self.service) {
+            (Some(target), Some(own)) => target == own,
+            _ => true,
+        }
+    }
+}
+
+/// The service a store is of: the name of its root.
+fn store_service(document: &SettingsBytecode) -> Option<&str> {
+    document
+        .instances
+        .iter()
+        .find(|instance| instance.parent_index.is_none())
+        .map(|instance| instance.name.as_str())
+}
+
+/// The service a reference's path leads into, when it has a path.
+fn reference_path_service(reference: &Map<String, Value>) -> Option<&str> {
+    reference
+        .get("pathSegments")
+        .and_then(Value::as_array)
+        .and_then(|segments| segments.first())
+        .and_then(Value::as_str)
+}
+
 pub(crate) fn reconciliation_maps_equal(
     class_name: &str,
     left: &Map<String, Value>,
     right: &Map<String, Value>,
 ) -> bool {
-    reconciliation_maps_equal_with_ids(class_name, left, right, &AHashMap::new(), &AHashMap::new())
+    let no_ids = AHashMap::new();
+    let ids = PairedStoreIds {
+        service: None,
+        left: &no_ids,
+        right: &no_ids,
+    };
+    reconciliation_maps_equal_with_ids(class_name, left, right, ids)
 }
 
-pub(crate) fn reconciliation_maps_equal_with_ids(
+fn reconciliation_maps_equal_with_ids(
     class_name: &str,
     left: &Map<String, Value>,
     right: &Map<String, Value>,
-    left_ids: &AHashMap<&str, usize>,
-    right_ids: &AHashMap<&str, usize>,
+    ids: PairedStoreIds<'_>,
 ) -> bool {
     let database = rbx_reflection_database::get().ok();
     let stable = |name: &str, value: &Value| {
@@ -2311,8 +2362,7 @@ pub(crate) fn reconciliation_maps_equal_with_ids(
                     value,
                     other,
                     reconciliation_property_uses_f32(class_name, name, value, other),
-                    Some(left_ids),
-                    Some(right_ids),
+                    Some(ids),
                 ) => {}
             Some(other)
                 if studio_recomputed_values_match(class_name, name, value, other)
@@ -2736,7 +2786,13 @@ pub(crate) fn reconciliation_values_map_equal(
     left: &Map<String, Value>,
     right: &Map<String, Value>,
 ) -> bool {
-    reconciliation_values_map_equal_with_ids(left, right, &AHashMap::new(), &AHashMap::new())
+    let no_ids = AHashMap::new();
+    let ids = PairedStoreIds {
+        service: None,
+        left: &no_ids,
+        right: &no_ids,
+    };
+    reconciliation_values_map_equal_with_ids(left, right, ids)
 }
 
 // Studio writes RBX_ attributes for itself (reimport ids, migration markers)
@@ -2745,23 +2801,16 @@ pub(crate) fn is_engine_managed_attribute(name: &str) -> bool {
     name.starts_with("RBX_")
 }
 
-pub(crate) fn reconciliation_values_map_equal_with_ids(
+fn reconciliation_values_map_equal_with_ids(
     left: &Map<String, Value>,
     right: &Map<String, Value>,
-    left_ids: &AHashMap<&str, usize>,
-    right_ids: &AHashMap<&str, usize>,
+    ids: PairedStoreIds<'_>,
 ) -> bool {
     let authored = |(name, _): &(&String, &Value)| !is_engine_managed_attribute(name);
     left.iter().filter(authored).count() == right.iter().filter(authored).count()
         && left.iter().filter(authored).all(|(name, value)| {
             right.get(name).is_some_and(|other| {
-                reconciliation_values_equal_with_ids(
-                    value,
-                    other,
-                    false,
-                    Some(left_ids),
-                    Some(right_ids),
-                )
+                reconciliation_values_equal_with_ids(value, other, false, Some(ids))
             })
         })
 }
@@ -2811,7 +2860,7 @@ fn reconciliation_value_contains_reference(value: &Value) -> bool {
 }
 
 pub(crate) fn reconciliation_values_equal(left: &Value, right: &Value, approximate: bool) -> bool {
-    reconciliation_values_equal_with_ids(left, right, approximate, None, None)
+    reconciliation_values_equal_with_ids(left, right, approximate, None)
 }
 
 /// Stores written by older model imports keep scalars typed, as
@@ -2869,8 +2918,7 @@ fn reconciliation_values_equal_with_ids(
     left: &Value,
     right: &Value,
     approximate: bool,
-    left_ids: Option<&AHashMap<&str, usize>>,
-    right_ids: Option<&AHashMap<&str, usize>>,
+    ids: Option<PairedStoreIds<'_>>,
 ) -> bool {
     let (left, right) = (typed_scalar(left), typed_scalar(right));
     let canonical = (
@@ -2898,13 +2946,7 @@ fn reconciliation_values_equal_with_ids(
         (Value::Array(left), Value::Array(right)) => {
             left.len() == right.len()
                 && left.iter().zip(right).all(|(left, right)| {
-                    reconciliation_values_equal_with_ids(
-                        left,
-                        right,
-                        approximate,
-                        left_ids,
-                        right_ids,
-                    )
+                    reconciliation_values_equal_with_ids(left, right, approximate, ids)
                 })
         }
         (Value::Object(left), Value::Object(right)) => {
@@ -2919,12 +2961,22 @@ fn reconciliation_values_equal_with_ids(
                     .or_else(|| right.get("instanceId"))
                     .and_then(Value::as_str);
                 if let (Some(left_id), Some(right_id)) = (left_id, right_id) {
-                    return match (
-                        left_ids.and_then(|ids| ids.get(left_id)),
-                        right_ids.and_then(|ids| ids.get(right_id)),
-                    ) {
-                        (Some(left), Some(right)) => left == right,
-                        _ => left_id == right_id,
+                    // Settings ids are unique within one store only, and the
+                    // path's service says which store an id is of: the same
+                    // id under two services names two instances.
+                    let left_service = reference_path_service(left);
+                    let right_service = reference_path_service(right);
+                    if let (Some(left_service), Some(right_service)) = (left_service, right_service)
+                        && left_service != right_service
+                    {
+                        return false;
+                    }
+                    let positions = ids
+                        .filter(|ids| ids.hold(left_service) && ids.hold(right_service))
+                        .and_then(|ids| ids.left.get(left_id).zip(ids.right.get(right_id)));
+                    return match positions {
+                        Some((left, right)) => left == right,
+                        None => left_id == right_id,
                     };
                 }
                 let left_path = (left.get("pathSegments"), left.get("pathOrdinals"));
@@ -2970,13 +3022,7 @@ fn reconciliation_values_equal_with_ids(
                 return authored_font_fields(left).count() == authored_font_fields(right).count()
                     && authored_font_fields(left).all(|(name, value)| {
                         right.get(name).is_some_and(|other| {
-                            reconciliation_values_equal_with_ids(
-                                value,
-                                other,
-                                approximate,
-                                left_ids,
-                                right_ids,
-                            )
+                            reconciliation_values_equal_with_ids(value, other, approximate, ids)
                         })
                     });
             }
@@ -3022,8 +3068,8 @@ fn reconciliation_values_equal_with_ids(
                             return value == other;
                         };
                         return match (
-                            left_ids.and_then(|ids| ids.get(left)),
-                            right_ids.and_then(|ids| ids.get(right)),
+                            ids.and_then(|ids| ids.left.get(left)),
+                            ids.and_then(|ids| ids.right.get(right)),
                         ) {
                             (Some(left), Some(right)) => left == right,
                             (None, None) => left == right,
@@ -3035,13 +3081,7 @@ fn reconciliation_values_equal_with_ids(
                             (type_name, name.as_str()),
                             (Some("UDim"), "offset") | (Some("UDim2"), "xOffset" | "yOffset")
                         );
-                    reconciliation_values_equal_with_ids(
-                        value,
-                        other,
-                        approximate,
-                        left_ids,
-                        right_ids,
-                    )
+                    reconciliation_values_equal_with_ids(value, other, approximate, ids)
                 })
         }
         _ => left == right,
@@ -3738,6 +3778,61 @@ mod tests {
             database,
             "LocalScript",
             "Enabled"
+        ));
+    }
+
+    #[test]
+    fn references_into_different_services_differ_when_their_ids_match() {
+        let reference = |service: &str, name: &str, id: &str| {
+            json!({
+                "_type": "Ref",
+                "settingsId": id,
+                "pathSegments": [service, name],
+                "pathOrdinals": [1, 1],
+            })
+        };
+        let document = |target_id: &str, value: &Value| {
+            let instance = |id: &str, name: &str, class_name: &str, parent| {
+                SettingsBytecodeInstance::new(
+                    id.to_string(),
+                    name.to_string(),
+                    class_name.to_string(),
+                    parent,
+                )
+            };
+            let mut holder = instance("holder", "Holder", "ObjectValue", Some(0));
+            holder.properties.insert("Value".to_string(), value.clone());
+            SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances: vec![
+                    instance("ws", "Workspace", "Workspace", None),
+                    instance(target_id, "A", "Folder", Some(0)),
+                    holder,
+                ],
+            }
+        };
+        // Stores number their instances alike, so ReplicatedStorage.A and
+        // ServerStorage.B can both be `editor:1`.
+        let baseline = reference("ReplicatedStorage", "A", "editor:1");
+        let edited = reference("ServerStorage", "B", "editor:1");
+        assert!(!reconciliation_values_equal(&baseline, &edited, false));
+        assert!(reconciliation_values_equal(&baseline, &baseline, false));
+        let mut observed = document("editor:1", &edited);
+        align_equivalent_values(&document("editor:1", &baseline), &mut observed);
+        assert_eq!(observed.instances[2].properties["Value"], edited);
+
+        // Two copies of one store pair their own instances by position, and
+        // a reference into the store with them. An id of another store is
+        // not one of theirs, also when the store has an instance with it.
+        let outside = |id: &str| reference("ReplicatedStorage", "A", id);
+        assert!(!settings_documents_positionally_equivalent(
+            &document("first", &outside("first")),
+            &document("second", &outside("second")),
+        ));
+        let inside = |id: &str| reference("Workspace", "A", id);
+        assert!(settings_documents_positionally_equivalent(
+            &document("first", &inside("first")),
+            &document("second", &inside("second")),
         ));
     }
 

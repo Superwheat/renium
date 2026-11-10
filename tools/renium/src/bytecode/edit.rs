@@ -8,6 +8,7 @@ use serde_json::{Map, Value, json};
 
 use crate::app::output::print_json_output;
 use crate::bytecode::query::{bytecode_parent_index, parse_property_assignments};
+use crate::bytecode::references::{MissingTarget, ReferencedStores};
 use crate::bytecode::{
     acquire_settings_file_lock, adopt_single_positional_target, apply_file_mutations,
     collect_source_path_updates, ensure_service_store_exists, file_mutation_paths,
@@ -762,9 +763,15 @@ pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value>
         parse_property_assignments(&raw_properties)?,
         parse_property_assignments(&raw_attributes)?,
     )?;
-    let mut referenced = super::references::ReferencedStores::default();
-    for value in properties.values_mut().chain(attributes.values_mut()) {
-        referenced.qualify(value, &settings_file, &document)?;
+    let mut referenced = ReferencedStores::default();
+    let mut to_itself = Vec::new();
+    for (name, value) in properties.iter_mut() {
+        if referenced.qualify(value, &settings_file, &document, MissingTarget::Defer)? {
+            to_itself.push(name.clone());
+        }
+    }
+    for value in attributes.values_mut() {
+        referenced.qualify(value, &settings_file, &document, MissingTarget::Refuse)?;
     }
     let added = instance_api::add_instance(
         &mut document,
@@ -777,6 +784,20 @@ pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value>
             attributes,
         },
     )?;
+    // A path that named nothing may name the new instance itself.
+    for name in to_itself {
+        let Some(mut value) = document.instances[added.index]
+            .properties
+            .get(&name)
+            .cloned()
+        else {
+            continue;
+        };
+        referenced.qualify(&mut value, &settings_file, &document, MissingTarget::Refuse)?;
+        document.instances[added.index]
+            .properties
+            .insert(name, value);
+    }
     let mut writes = BTreeMap::new();
     let mut removals = Vec::new();
     let source_paths = collect_source_path_updates(
@@ -1629,10 +1650,7 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
         None,
     )?;
     let store_files = super::project_store_files(&settings_file)?;
-    let locks = store_files
-        .iter()
-        .map(|path| lock_existing_service_store(path))
-        .collect::<Result<Vec<_>>>()?;
+    let locks = super::lock_existing_service_stores(store_files.iter().map(PathBuf::as_path))?;
     let mut document = SettingsBytecode::read_file(&settings_file)?;
     let before_document = document.clone();
     let service = bytecode_service_name(&document, &settings_file, &service_hint);

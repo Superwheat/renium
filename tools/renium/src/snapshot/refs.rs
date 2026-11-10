@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
-use crate::settings::bytecode::{SettingsBytecode, visit_reference_objects_mut};
+use crate::settings::bytecode::{
+    SettingsBytecode, reference_leads_out_of, visit_reference_objects_mut,
+};
 
 pub(crate) fn settings_instance_path(document: &SettingsBytecode, index: usize) -> String {
     let mut parts = Vec::new();
@@ -22,14 +24,26 @@ pub(crate) fn settings_instance_path(document: &SettingsBytecode, index: usize) 
 }
 
 pub(crate) fn stabilize_record_references(record: &mut Map<String, Value>, ids: &[String]) {
-    rewrite_record_reference_ids(record, Some(ids), None, false);
+    rewrite_record_reference_ids(record, Some(ids), None, false, None);
 }
 
 pub(crate) fn remap_record_reference_ids(
     record: &mut Map<String, Value>,
     ids: &HashMap<String, String>,
 ) {
-    rewrite_record_reference_ids(record, None, Some(ids), false);
+    rewrite_record_reference_ids(record, None, Some(ids), false, None);
+}
+
+/// Renames the settings ids of one store, the store of `service`, in the
+/// references of a record of that store. Settings ids are unique within one
+/// store only: a reference whose path leads into another service names an
+/// instance of that service's store and keeps its id.
+pub(crate) fn remap_store_reference_ids(
+    record: &mut Map<String, Value>,
+    ids: &HashMap<String, String>,
+    service: &str,
+) {
+    rewrite_record_reference_ids(record, None, Some(ids), false, Some(service));
 }
 
 pub(crate) fn remap_and_stabilize_record_references(
@@ -38,7 +52,7 @@ pub(crate) fn remap_and_stabilize_record_references(
     remap: &HashMap<String, String>,
     keep_instance_indices: bool,
 ) {
-    rewrite_record_reference_ids(record, Some(ids), Some(remap), keep_instance_indices);
+    rewrite_record_reference_ids(record, Some(ids), Some(remap), keep_instance_indices, None);
 }
 
 fn rewrite_record_reference_ids(
@@ -46,8 +60,12 @@ fn rewrite_record_reference_ids(
     indices: Option<&[String]>,
     remap: Option<&HashMap<String, String>>,
     keep_instance_indices: bool,
+    store_service: Option<&str>,
 ) {
     visit_reference_objects_mut(record, |object| {
+        if store_service.is_some_and(|service| reference_leads_out_of(object, service)) {
+            return;
+        }
         let has_text_id = ["settingsId", "instanceId"]
             .into_iter()
             .any(|key| object.get(key).and_then(Value::as_str).is_some());

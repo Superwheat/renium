@@ -2658,8 +2658,8 @@ fn is_structural_property(property: &str, scope: PropertyScope) -> bool {
 }
 
 /// The store at `settings_file` and the project's other stores. An edit
-/// that renames, moves or removes instances locks them all, in this order,
-/// since any of them may hold a reference it has to update.
+/// that renames, moves or removes instances locks them all, since any of
+/// them may hold a reference it has to update.
 pub(crate) fn project_store_files(settings_file: &Path) -> Result<BTreeSet<PathBuf>> {
     let mut files = BTreeSet::from([settings_file.to_path_buf()]);
     if let Some(src_root) = crate::project::storage::source_directory(settings_file).parent() {
@@ -2723,10 +2723,7 @@ fn set_store_properties(
     } else {
         BTreeSet::from([settings_file.clone()])
     };
-    let _locks = locked_stores
-        .iter()
-        .map(|path| lock_existing_service_store(path))
-        .collect::<Result<Vec<_>>>()?;
+    let _locks = lock_existing_service_stores(locked_stores.iter().map(PathBuf::as_path))?;
     let document = SettingsBytecode::read_file(&settings_file)?;
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let indices = selectors
@@ -2810,8 +2807,12 @@ impl StorePropertyEdit<'_> {
         fold_derived_property(&mut self.document, index, &mut property, &mut value)?;
         let (stored, requested_differs) =
             stored_property_edit(&mut self.document, index, &property, &mut value, self.scope)?;
-        self.references
-            .qualify(&mut value, self.settings_file, &self.document)?;
+        self.references.qualify(
+            &mut value,
+            self.settings_file,
+            &self.document,
+            references::MissingTarget::Refuse,
+        )?;
         if matches!(self.scope, PropertyScope::Auto | PropertyScope::Metadata)
             && matches!(property.as_str(), "Name" | "ClassName" | "Parent")
             && is_protected_engine_container(&self.document, index)
@@ -3596,10 +3597,7 @@ fn apply_property_batch_to_root(
         .iter()
         .map(|service| (service.clone(), service_settings_path(&root.join(service))))
         .collect::<BTreeMap<_, _>>();
-    let _locks = settings_files
-        .values()
-        .map(|settings_file| lock_existing_service_store(settings_file))
-        .collect::<Result<Vec<_>>>()?;
+    let _locks = lock_existing_service_stores(settings_files.values().map(PathBuf::as_path))?;
     let mut documents = BTreeMap::new();
     for (service, settings_file) in &settings_files {
         let document = SettingsBytecode::read_file(settings_file)?;
@@ -4296,6 +4294,45 @@ pub(super) fn lock_existing_service_store(settings_file: &Path) -> Result<Settin
         return Err(missing_service_store_error(settings_file));
     }
     acquire_settings_file_lock(settings_file)
+}
+
+/// `lock_existing_service_store` for several stores at once, locked in the
+/// order `acquire_settings_file_locks` gives them.
+pub(super) fn lock_existing_service_stores<'a>(
+    settings_files: impl IntoIterator<Item = &'a Path>,
+) -> Result<Vec<SettingsFileLock>> {
+    let settings_files = settings_files.into_iter().collect::<Vec<_>>();
+    for settings_file in &settings_files {
+        pull_missing_service_store(settings_file);
+        if !settings_file.exists() {
+            return Err(missing_service_store_error(settings_file));
+        }
+    }
+    acquire_settings_file_locks(settings_files)
+}
+
+/// Where a store's lock stands in the order every command takes store locks
+/// in: by its absolute path, whichever way the command spelled it.
+pub(super) fn settings_lock_order_key(settings_file: &Path) -> String {
+    crate::system::files::path_key(&crate::system::files::absolutize_for_daemon(settings_file))
+}
+
+/// Locks several stores, each once, in one order for every command. Two
+/// commands that need the same stores then never hold one each while they
+/// wait for the other's, which would stop both until a lock times out.
+pub(super) fn acquire_settings_file_locks<'a>(
+    settings_files: impl IntoIterator<Item = &'a Path>,
+) -> Result<Vec<SettingsFileLock>> {
+    let mut ordered = settings_files
+        .into_iter()
+        .map(|settings_file| (settings_lock_order_key(settings_file), settings_file))
+        .collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.0.cmp(&right.0));
+    ordered.dedup_by(|later, earlier| later.0 == earlier.0);
+    ordered
+        .into_iter()
+        .map(|(_, settings_file)| acquire_settings_file_lock(settings_file))
+        .collect()
 }
 
 pub(super) fn acquire_settings_file_lock(settings_file: &Path) -> Result<SettingsFileLock> {

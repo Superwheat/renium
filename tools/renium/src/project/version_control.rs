@@ -18,11 +18,12 @@ use crate::rbx::model::read_settings_model_document;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode,
-    SettingsBytecodeInstance, is_reference_object, reindex_reference_indices,
+    SettingsBytecodeInstance, is_reference_object, reference_leads_out_of,
+    reindex_store_reference_indices,
 };
 use crate::settings::tree::settings_children_by_parent;
 use crate::snapshot::refs::{
-    remap_record_reference_ids, settings_instance_path, stabilize_record_references,
+    remap_store_reference_ids, settings_instance_path, stabilize_record_references,
 };
 use crate::system::files::{fnv1a_hex, resolve_link_project_root, strip_extended_prefix};
 use crate::system::tools::run_git_checked;
@@ -704,6 +705,19 @@ struct PreparedSettingsMerge {
     ours: SettingsBytecode,
     theirs: SettingsBytecode,
     theirs_id_remap: HashMap<String, String>,
+    /// The service the merged store is of.
+    service: String,
+}
+
+/// The service a merge's store is of: the name of the root on the first
+/// side that has one.
+fn merged_store_service(documents: [&SettingsBytecode; 3]) -> String {
+    documents
+        .into_iter()
+        .flat_map(|document| &document.instances)
+        .find(|instance| instance.parent_index.is_none())
+        .map(|instance| instance.name.clone())
+        .unwrap_or_default()
 }
 
 fn prepare_settings_merge(
@@ -752,15 +766,20 @@ fn prepare_settings_merge(
             theirs_id_remap.insert(id.clone(), fresh);
         }
     }
+    // The remap renames instances of this store. A reference into another
+    // service can carry one of the renamed ids, as the id its target has in
+    // its own store, and keeps it.
+    let service = merged_store_service([&ours, &theirs, &base]);
     for instance in &mut theirs.instances {
-        remap_record_reference_ids(&mut instance.properties, &theirs_id_remap);
-        remap_record_reference_ids(&mut instance.attributes, &theirs_id_remap);
+        remap_store_reference_ids(&mut instance.properties, &theirs_id_remap, &service);
+        remap_store_reference_ids(&mut instance.attributes, &theirs_id_remap, &service);
     }
     PreparedSettingsMerge {
         base,
         ours,
         theirs,
         theirs_id_remap,
+        service,
     }
 }
 
@@ -785,6 +804,7 @@ fn reattach_orphans(
     merged: &mut Vec<VcMergedInstance>,
     preferred: &SettingsBytecode,
     id_remap: &HashMap<String, String>,
+    service: &str,
 ) {
     let preferred_ids = settings_ids_by_index(preferred);
     let mut present = merged
@@ -805,7 +825,12 @@ fn reattach_orphans(
         };
         if let Some(&parent_index) = preferred_ids.get(&parent) {
             present.insert(parent);
-            merged.push(preferred_instance(preferred, parent_index, id_remap));
+            merged.push(preferred_instance(
+                preferred,
+                parent_index,
+                id_remap,
+                service,
+            ));
             index += 1;
         } else if let Some(&own_index) = preferred_ids.get(&merged[index].settings_id) {
             // The preferred side's parent of its own instance exists on that
@@ -823,26 +848,21 @@ fn preferred_instance(
     preferred: &SettingsBytecode,
     index: usize,
     id_remap: &HashMap<String, String>,
+    service: &str,
 ) -> VcMergedInstance {
     let mut record = merged_instance_from(preferred, index);
     record.parent_id = record
         .parent_id
         .map(|id| id_remap.get(&id).cloned().unwrap_or(id));
-    remap_record_reference_ids(&mut record.properties, id_remap);
-    remap_record_reference_ids(&mut record.attributes, id_remap);
+    remap_store_reference_ids(&mut record.properties, id_remap, service);
+    remap_store_reference_ids(&mut record.attributes, id_remap, service);
     record
 }
 
 /// The id a reference object names when it points into the store being
 /// merged. A reference with a path into another service is that store's.
 fn same_store_reference_id<'a>(object: &'a Map<String, Value>, service: &str) -> Option<&'a str> {
-    let into_another_service = object
-        .get("pathSegments")
-        .and_then(Value::as_array)
-        .and_then(|segments| segments.first())
-        .and_then(Value::as_str)
-        .is_some_and(|first| first != service);
-    if into_another_service {
+    if reference_leads_out_of(object, service) {
         return None;
     }
     object
@@ -987,13 +1007,13 @@ fn settle_references_to_removed_instances(
                     && let Some(&index) = preferred_ids.get(target)
                     && present.insert(target.clone())
                 {
-                    merged.push(preferred_instance(preferred, index, id_remap));
+                    merged.push(preferred_instance(preferred, index, id_remap, &service));
                 }
             }
             if merged.len() == before {
                 break;
             }
-            reattach_orphans(merged, preferred, id_remap);
+            reattach_orphans(merged, preferred, id_remap, &service);
             dangling = dangling_references(merged, &service);
         }
     }
@@ -1030,6 +1050,44 @@ fn settle_references_to_removed_instances(
             });
         }
     }
+}
+
+/// Puts instances a merge removed from a store back into it, with the
+/// ancestors the merged store lacks. `source` is the store as the merge's
+/// base had it, so the instances return under the ids the merged stores use
+/// for them.
+pub(crate) fn restore_removed_instances(
+    merged: &SettingsBytecode,
+    source: &SettingsBytecode,
+    settings_ids: &HashSet<String>,
+) -> SettingsBytecode {
+    let service = merged_store_service([merged, source, source]);
+    let no_remap = HashMap::new();
+    let mut records = (0..merged.instances.len())
+        .map(|index| merged_instance_from(merged, index))
+        .collect::<Vec<_>>();
+    let mut present = merged
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.as_str())
+        .collect::<HashSet<_>>();
+    for (index, instance) in source.instances.iter().enumerate() {
+        if settings_ids.contains(&instance.settings_id)
+            && present.insert(instance.settings_id.as_str())
+        {
+            records.push(preferred_instance(source, index, &no_remap, &service));
+        }
+    }
+    reattach_orphans(&mut records, source, &no_remap, &service);
+    for record in &mut records {
+        if is_lua_source_class(&record.class_name) {
+            record
+                .properties
+                .entry("Source".to_string())
+                .or_insert_with(|| Value::String(EXTERNAL_SOURCE_MARKER.to_string()));
+        }
+    }
+    finish_settings_merge(records, Some(true), merged.version, Vec::new()).0
 }
 
 fn parent_cycles(instances: &[VcMergedInstance]) -> Vec<Vec<usize>> {
@@ -1194,9 +1252,14 @@ fn finish_settings_merge(
         .enumerate()
         .map(|(index, instance)| (instance.settings_id.clone(), index))
         .collect::<HashMap<_, _>>();
+    let service = instances
+        .iter()
+        .find(|instance| instance.parent_index.is_none())
+        .map(|instance| instance.name.clone())
+        .unwrap_or_default();
     for instance in &mut instances {
-        reindex_reference_indices(&mut instance.properties, &indices_by_id);
-        reindex_reference_indices(&mut instance.attributes, &indices_by_id);
+        reindex_store_reference_indices(&mut instance.properties, &indices_by_id, &service);
+        reindex_store_reference_indices(&mut instance.attributes, &indices_by_id, &service);
     }
     (SettingsBytecode { version, instances }, conflicts)
 }
@@ -1278,6 +1341,7 @@ fn merge_prepared_settings_documents(
         ours,
         theirs,
         theirs_id_remap,
+        service,
     } = prepared;
     let version = ours.version.max(theirs.version);
     let base = &base;
@@ -1397,8 +1461,8 @@ fn merge_prepared_settings_documents(
             if let Some(fresh) = theirs_id_remap.get(id).cloned() {
                 let mut properties = instance.properties.clone();
                 let mut attributes = instance.attributes.clone();
-                remap_record_reference_ids(&mut properties, &theirs_id_remap);
-                remap_record_reference_ids(&mut attributes, &theirs_id_remap);
+                remap_store_reference_ids(&mut properties, &theirs_id_remap, &service);
+                remap_store_reference_ids(&mut attributes, &theirs_id_remap, &service);
                 merged.push(VcMergedInstance {
                     settings_id: fresh.clone(),
                     name: instance.name.clone(),
@@ -1422,8 +1486,8 @@ fn merge_prepared_settings_documents(
                 Some(false) => {
                     let mut properties = instance.properties.clone();
                     let mut attributes = instance.attributes.clone();
-                    remap_record_reference_ids(&mut properties, &theirs_id_remap);
-                    remap_record_reference_ids(&mut attributes, &theirs_id_remap);
+                    remap_store_reference_ids(&mut properties, &theirs_id_remap, &service);
+                    remap_store_reference_ids(&mut attributes, &theirs_id_remap, &service);
                     merged.push(VcMergedInstance {
                         settings_id: id.clone(),
                         name: instance.name.clone(),
@@ -1445,8 +1509,8 @@ fn merge_prepared_settings_documents(
         }
         let mut properties = instance.properties.clone();
         let mut attributes = instance.attributes.clone();
-        remap_record_reference_ids(&mut properties, &theirs_id_remap);
-        remap_record_reference_ids(&mut attributes, &theirs_id_remap);
+        remap_store_reference_ids(&mut properties, &theirs_id_remap, &service);
+        remap_store_reference_ids(&mut attributes, &theirs_id_remap, &service);
         merged.push(VcMergedInstance {
             settings_id: theirs_id_remap
                 .get(id)
@@ -1475,7 +1539,7 @@ fn merge_prepared_settings_documents(
     };
     match preferred {
         Some(preferred) => {
-            reattach_orphans(&mut merged, preferred, preferred_remap);
+            reattach_orphans(&mut merged, preferred, preferred_remap, &service);
             // Breaking a cycle moves an instance to the preferred side's
             // parent, which the merge may have removed, and restoring a
             // removed parent can close a cycle; the two steps repeat until
@@ -1486,7 +1550,7 @@ fn merge_prepared_settings_documents(
                     break;
                 }
                 resolve_parent_cycles(&mut merged, Some(preferred), &mut conflicts);
-                reattach_orphans(&mut merged, preferred, preferred_remap);
+                reattach_orphans(&mut merged, preferred, preferred_remap, &service);
             }
         }
         None => resolve_parent_cycles(&mut merged, None, &mut conflicts),

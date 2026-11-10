@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -16,7 +16,7 @@ use crate::bytecode::edit::{
 };
 use crate::bytecode::{
     apply_file_mutations, collect_source_path_updates, file_mutation_paths,
-    lock_existing_service_store, preserve_source_path_extension,
+    lock_existing_service_stores, preserve_source_path_extension,
 };
 use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
@@ -309,11 +309,7 @@ pub(crate) fn move_instance_between_service_stores(
     let move_started = Instant::now();
     let src_root = source_root_for_stores(source_file, target_file)?;
     let files = service_store_paths(&src_root)?;
-    let lock_paths = files.values().cloned().collect::<BTreeSet<_>>();
-    let _locks = lock_paths
-        .iter()
-        .map(|path| lock_existing_service_store(path))
-        .collect::<Result<Vec<_>>>()?;
+    let _locks = lock_existing_service_stores(files.values().map(PathBuf::as_path))?;
     let load_started = Instant::now();
     let (source_before, target_before) = rayon::join(
         || SettingsBytecode::read_file(source_file),

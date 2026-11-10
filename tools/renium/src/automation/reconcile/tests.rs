@@ -2978,6 +2978,98 @@ fn a_store_new_to_the_baseline_reports_class_mismatches() {
 }
 
 #[test]
+fn a_merge_settles_a_reference_to_an_instance_the_other_side_removed_from_another_store() {
+    let instance = |id: &str, name: &str, class_name: &str, parent| {
+        SettingsBytecodeInstance::new(
+            id.to_string(),
+            name.to_string(),
+            class_name.to_string(),
+            parent,
+        )
+    };
+    let reference = json!({
+        "_type": "Ref",
+        "settingsId": "target",
+        "pathSegments": ["Workspace", "Kit", "Target"],
+        "pathOrdinals": [1, 1, 1],
+    });
+    let workspace_path = PathBuf::from("instances/Workspace.renium");
+    let replicated_path = PathBuf::from("instances/ReplicatedStorage.renium");
+    let snapshot = |with_target: bool, value: Option<&Value>| {
+        let mut workspace = vec![instance("ws", "Workspace", "Workspace", None)];
+        if with_target {
+            workspace.push(instance("kit", "Kit", "Folder", Some(0)));
+            workspace.push(instance("target", "Target", "Folder", Some(1)));
+        }
+        let mut pointer = instance("pointer", "Pointer", "ObjectValue", Some(0));
+        if let Some(value) = value {
+            pointer
+                .properties
+                .insert("Value".to_string(), value.clone());
+        }
+        let encode = |instances| {
+            encode_settings_bytecode(&SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances,
+            })
+            .unwrap()
+        };
+        file_snapshot(&[
+            ("instances/Workspace.renium", &encode(workspace)),
+            (
+                "instances/ReplicatedStorage.renium",
+                &encode(vec![
+                    instance("rs", "ReplicatedStorage", "ReplicatedStorage", None),
+                    pointer,
+                ]),
+            ),
+        ])
+    };
+    // The files point ReplicatedStorage.Pointer at Workspace.Kit.Target
+    // while Studio removes Kit: each store changed on one side only.
+    let baseline = snapshot(true, None);
+    let editor = snapshot(true, Some(&reference));
+    let studio = snapshot(false, None);
+    let merge = |preference| {
+        let (merged, conflicts, changes) =
+            merge_snapshots_with_changes(Some(&baseline), &editor, &studio, preference, None)
+                .unwrap();
+        let names = settings_document(merged.entries.get(&workspace_path))
+            .unwrap()
+            .instances
+            .iter()
+            .map(|instance| instance.name.clone())
+            .collect::<Vec<_>>();
+        let value = settings_document(merged.entries.get(&replicated_path))
+            .unwrap()
+            .instances[1]
+            .properties
+            .get("Value")
+            .cloned();
+        (names, value, conflicts, changes)
+    };
+    let (_, _, conflicts, _) = merge(ConflictPreference::None);
+    assert_eq!(
+        conflicts,
+        [format!(
+            "{}: Pointer: Value: refers to Workspace.Kit.Target (id=target), which the other side removed",
+            replicated_path.display()
+        )]
+    );
+    let (names, value, conflicts, changes) = merge(ConflictPreference::Editor);
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(names, ["Workspace", "Kit", "Target"]);
+    assert_eq!(value, Some(reference.clone()));
+    assert!(changes.studio.contains(&workspace_path));
+    assert!(!changes.editor.contains(&workspace_path));
+    let (names, value, conflicts, changes) = merge(ConflictPreference::Studio);
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(names, ["Workspace"]);
+    assert_eq!(value, Some(json!({"_type": "Ref"})));
+    assert!(changes.editor.contains(&replicated_path));
+}
+
+#[test]
 fn a_scope_removed_from_publication_is_not_republished() {
     let baseline = file_snapshot(&[
         ("old/Workspace/Removed.luau", b"return 1"),

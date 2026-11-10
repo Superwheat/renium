@@ -1771,6 +1771,148 @@ fn package_target_settings_ids_include_existing_subtree() {
 }
 
 #[test]
+fn package_replacement_keeps_a_reference_into_another_service_with_a_replaced_id() {
+    let root = temp_dir("package-outside-reference");
+    let package_path = root.join("kit.renium");
+    let mut leaf = settings_instance("pkg:1", "Leaf", "Folder", Some(0));
+    leaf.attributes.insert("Revision".to_string(), json!(1));
+    settings_document(vec![settings_instance("pkg:0", "A", "Folder", None), leaf])
+        .write_file(&package_path)
+        .unwrap();
+    // ReplicatedStorage.Target has the id that Workspace.P.A.Leaf has in
+    // its own store.
+    let outside = json!({
+        "_type": "Ref",
+        "settingsId": "4",
+        "pathSegments": ["ReplicatedStorage", "Target"],
+        "pathOrdinals": [1, 1],
+    });
+    let mut pointer = settings_instance("5", "Pointer", "ObjectValue", Some(0));
+    pointer
+        .properties
+        .insert("Value".to_string(), outside.clone());
+    let mut document = settings_document(vec![
+        settings_instance("1", "Workspace", "Workspace", None),
+        settings_instance("2", "P", "Folder", Some(0)),
+        settings_instance("3", "A", "Folder", Some(1)),
+        settings_instance("4", "Leaf", "Folder", Some(2)),
+        pointer,
+        settings_instance("6", "After", "Folder", Some(1)),
+    ]);
+    materialize_package_target(
+        &mut document,
+        PackageMaterialization {
+            service_dir: &root.join("src").join("Workspace"),
+            service: "Workspace",
+            target_segments: &["P".to_string(), "A".to_string()],
+            target_ordinals: &[],
+            package_path: &package_path,
+            filesystem_target: false,
+            external_references: &HashSet::new(),
+            displace_into: None,
+        },
+    )
+    .unwrap();
+    let by_name = |name: &str| {
+        document
+            .instances
+            .iter()
+            .find(|instance| instance.name == name)
+            .unwrap()
+    };
+    assert_eq!(by_name("Leaf").settings_id, "4");
+    assert_eq!(by_name("Leaf").attributes["Revision"], json!(1));
+    assert_eq!(by_name("Pointer").properties["Value"], outside);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_reference_into_a_third_service_does_not_hold_a_replaced_instance() {
+    // ServerStorage.Pointer names ReplicatedStorage.Target, which has the id
+    // that Workspace.Leaf has in its own store.
+    let mut pointer = settings_instance("pointer", "Pointer", "ObjectValue", Some(0));
+    pointer.properties.insert(
+        "Value".to_string(),
+        json!({
+            "_type": "Ref",
+            "settingsId": "4",
+            "pathSegments": ["ReplicatedStorage", "Target"],
+            "pathOrdinals": [1, 1],
+        }),
+    );
+    let mut into_workspace = settings_instance("direct", "Direct", "ObjectValue", Some(0));
+    into_workspace.properties.insert(
+        "Value".to_string(),
+        json!({
+            "_type": "Ref",
+            "settingsId": "5",
+            "pathSegments": ["Workspace", "Kept"],
+            "pathOrdinals": [1, 1],
+        }),
+    );
+    let workspace_store = PathBuf::from("instances/Workspace.renium");
+    let documents = HashMap::from([
+        (
+            workspace_store.clone(),
+            settings_document(vec![
+                settings_instance("1", "Workspace", "Workspace", None),
+                settings_instance("4", "Leaf", "Folder", Some(0)),
+                settings_instance("5", "Kept", "Folder", Some(0)),
+            ]),
+        ),
+        (
+            PathBuf::from("instances/ServerStorage.renium"),
+            settings_document(vec![
+                settings_instance("ss", "ServerStorage", "ServerStorage", None),
+                pointer,
+                into_workspace,
+            ]),
+        ),
+    ]);
+    assert_eq!(
+        referenced_settings_ids_outside(&documents, &workspace_store),
+        HashSet::from(["5".to_string()])
+    );
+}
+
+#[test]
+fn preserved_subtree_identity_leaves_a_reference_into_another_service() {
+    let outside = json!({
+        "_type": "Ref",
+        "settingsId": "editor:2",
+        "pathSegments": ["ReplicatedStorage", "Other"],
+        "pathOrdinals": [1, 1],
+    });
+    let mut holder = settings_instance("holder", "Holder", "ObjectValue", Some(0));
+    holder
+        .properties
+        .insert("Value".to_string(), outside.clone());
+    let mut inside = settings_instance("inside", "Inside", "ObjectValue", Some(0));
+    inside.properties.insert(
+        "Value".to_string(),
+        json!({"_type": "Ref", "settingsId": "editor:2"}),
+    );
+    let mut document = settings_document(vec![
+        settings_instance("root", "ServerStorage", "ServerStorage", None),
+        settings_instance("editor:1", "Packages", "Folder", Some(0)),
+        settings_instance("editor:2", "Child", "Folder", Some(1)),
+        holder,
+        inside,
+    ]);
+    let preserved = HashMap::from([(
+        instance_path_parts_key(&["Child".to_string()], &[1]),
+        "kept".to_string(),
+    )]);
+    apply_preserved_subtree_identity(&mut document, 1, &preserved).unwrap();
+    assert_eq!(document.instances[2].settings_id, "kept");
+    assert_eq!(document.instances[3].properties["Value"], outside);
+    assert_eq!(
+        document.instances[4].properties["Value"],
+        json!({"_type": "Ref", "settingsId": "kept", "instanceIndex": 3})
+    );
+}
+
+#[test]
 fn link_apply_replaces_locked_package_target_with_added_child_drift() {
     let dir = temp_dir("package-added-child-drift");
     let src_root = dir.join("src");

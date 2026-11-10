@@ -16,7 +16,7 @@ use crate::app::output::{
 };
 use crate::app::timing::{current_millis, elapsed_ms, log_timing};
 use crate::automation::op;
-use crate::bytecode::{SettingsFileLock, acquire_settings_file_lock};
+use crate::bytecode::{SettingsFileLock, acquire_settings_file_locks};
 use crate::cli::{
     ApplyEditorDeleteArgs, ApplyEditorPropertyArgs, EditorMutationArgs, PushEditorChangesArgs,
 };
@@ -36,9 +36,9 @@ use crate::editor::paths::{
     infer_source_script, service_from_changed_path,
 };
 use crate::editor::review::{
-    EditorReviewOutcome, apply_protected_writes_offline, is_externally_managed_editor_property,
-    is_externally_managed_protected_write, is_user_facing_protected_write,
-    local_place_path_for_bridge, normalize_editor_bridge_value,
+    EditorReviewOutcome, OutsideReferencePaths, apply_protected_writes_offline,
+    is_externally_managed_editor_property, is_externally_managed_protected_write,
+    is_user_facing_protected_write, local_place_path_for_bridge, normalize_editor_bridge_value,
     protected_root_write_rows_with_live_values, protected_write_matches_previous,
     protected_write_rows_with_previous_values, request_editor_push_review,
     request_protected_write_review, studio_pid_for_bridge,
@@ -73,7 +73,7 @@ use crate::studio::native::editor::{
 use crate::studio::native::import::build_editor_binary_import;
 use crate::system::files::{
     absolutize_under, canonical_path, fnv1a_hex, is_service_settings_file_name, path_key,
-    service_settings_path, strip_extended_prefix,
+    service_settings_path, strip_extended_prefix, validate_filesystem_instance_name,
 };
 use crate::system::text::normalized_source_bytes;
 
@@ -3251,10 +3251,15 @@ fn push_editor_changes_with_collected(
     } else {
         build_editor_binary_import(&args, &changes, bridge)?
     };
+    let stores_root = match projection.filter(|stage| stage.is_temporary()) {
+        Some(projection) => projection.root().to_path_buf(),
+        None => absolutize_under(&args.project.project_root, &args.project.src_root),
+    };
     materialize_native_property_changes(
         &mut changes,
         binary_import.as_ref(),
         &args.project.project_root,
+        &stores_root,
     )?;
     defer_imported_native_root_rows(&mut changes, binary_import.as_ref());
     if global_log_enabled(5) {
@@ -4566,15 +4571,12 @@ impl EditorSettingsTransaction {
             active: true,
         };
         let result = (|| -> Result<()> {
-            let mut lock_paths = changes
-                .settings_writes
-                .iter()
-                .map(|write| (path_key(&write.path), &write.path))
-                .collect::<Vec<_>>();
-            lock_paths.sort_by(|left, right| left.0.cmp(&right.0));
-            for (_, path) in lock_paths {
-                transaction._locks.push(acquire_settings_file_lock(path)?);
-            }
+            transaction._locks = acquire_settings_file_locks(
+                changes
+                    .settings_writes
+                    .iter()
+                    .map(|write| write.path.as_path()),
+            )?;
             for write in &changes.settings_writes {
                 if settings_file_hash(&write.path)? != write.expected_hash {
                     bail!(
@@ -5146,6 +5148,7 @@ fn finish_editor_change_collection(
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     log_editor_collection_timing("property schema", phase_started);
     let phase_started = Instant::now();
+    let outside_references = outside_reference_paths(src_root, Some(documents));
     for service in changed_services {
         if let Some(document) = documents.get(&service).and_then(Option::as_ref) {
             let deferred = changes.native_property_documents.contains_key(&service);
@@ -5169,6 +5172,7 @@ fn finish_editor_change_collection(
                     },
                     property_schema_by_class: &property_schema_by_class,
                     database,
+                    outside_references: Some(&outside_references),
                 },
             );
         }
@@ -5177,10 +5181,36 @@ fn finish_editor_change_collection(
     Ok(changes)
 }
 
+/// The stores of the project as a push reads them for the references it
+/// sends into another service: the document the push already holds, or else
+/// the instances of the store on disk.
+fn outside_reference_paths<'a>(
+    src_root: &'a Path,
+    documents: Option<&'a HashMap<String, Option<Arc<SettingsBytecode>>>>,
+) -> OutsideReferencePaths<'a> {
+    OutsideReferencePaths::new(move |service| {
+        if let Some(document) = documents
+            .and_then(|documents| documents.get(service))
+            .and_then(Option::as_ref)
+        {
+            return Some(Arc::clone(document));
+        }
+        if validate_filesystem_instance_name(service, "service").is_err() {
+            return None;
+        }
+        let path = service_settings_path(&src_root.join(service));
+        path.is_file()
+            .then(|| SettingsBytecode::read_structure_file(&path).ok())
+            .flatten()
+            .map(Arc::new)
+    })
+}
+
 fn materialize_native_property_changes(
     changes: &mut EditorChangeSet,
     import: Option<&EditorBinaryImport>,
     project_root: &Path,
+    src_root: &Path,
 ) -> Result<()> {
     if changes.native_property_documents.is_empty() {
         return Ok(());
@@ -5189,6 +5219,7 @@ fn materialize_native_property_changes(
     let schema = load_rbx_dom_property_schema(project_root)?.unwrap_or_default();
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let filter = EditorPropertyFilter::default();
+    let outside_references = outside_reference_paths(src_root, None);
     for (service, document) in std::mem::take(&mut changes.native_property_documents) {
         append_editor_target_changes(
             changes,
@@ -5201,6 +5232,7 @@ fn materialize_native_property_changes(
                 property_scope: EditorPropertyScope::Imported(import),
                 property_schema_by_class: &schema,
                 database,
+                outside_references: Some(&outside_references),
             },
         );
     }

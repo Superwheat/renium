@@ -2265,32 +2265,54 @@ fn json_to_rbx_content(value: &Value, refs: &BytecodeModelExportRefs) -> Option<
     Some(RbxContent::from_referent(json_to_rbx_ref(value, refs)))
 }
 
+/// The service a reference's path leads into, when it has a path.
+fn reference_path_service(object: &Map<String, Value>) -> Option<&str> {
+    object
+        .get("pathSegments")
+        .and_then(Value::as_array)
+        .and_then(|segments| segments.first())
+        .and_then(Value::as_str)
+}
+
 /// Whether a reference's path leads into another service than the one being
 /// encoded. Settings ids are unique within a store only, so an id or index
 /// of this store that happens to match says nothing about such a target.
 fn names_another_service(object: &Map<String, Value>, refs: &BytecodeModelExportRefs) -> bool {
-    refs.service.is_some_and(|own| {
-        object
-            .get("pathSegments")
-            .and_then(Value::as_array)
-            .and_then(|segments| segments.first())
-            .and_then(Value::as_str)
-            .is_some_and(|service| service != own)
-    })
+    refs.service
+        .is_some_and(|own| reference_path_service(object).is_some_and(|service| service != own))
 }
 
+/// The exported instance a reference's settings id names. The id belongs
+/// to the store of the service the reference's path leads into, so it is
+/// looked up there and nowhere else: an instance of another service with
+/// the same id is not the target, and a reference whose service is not
+/// exported resolves by nothing. A reference without a path is one of the
+/// encoded store, or else of the one store of the build that has the id.
 fn model_export_ref_by_settings_id(
     refs: &BytecodeModelExportRefs,
     settings_id: &str,
-    another_service: bool,
+    path_service: Option<&str>,
 ) -> Option<RbxRef> {
+    let of_service = |service: &str| {
+        refs.settings_ids_by_service
+            .as_ref()
+            .and_then(|by_service| by_service.get(service))
+            .and_then(|ids| ids.get(settings_id))
+            .copied()
+    };
+    if let Some(service) = path_service
+        && refs.service.is_some_and(|own| own != service)
+    {
+        return of_service(service);
+    }
     refs.by_settings_id
         .get(settings_id)
         .copied()
-        .filter(|_| !another_service)
+        .or_else(|| refs.service.and_then(of_service))
         .or_else(|| {
             refs.global_by_settings_id
                 .as_ref()
+                .filter(|_| path_service.is_none())
                 .and_then(|global| global.get(settings_id).copied())
         })
 }
@@ -2334,7 +2356,9 @@ fn strict_model_export_ref(
             .as_str()
             .filter(|value| !value.is_empty())
             .with_context(|| format!("Ref {selector} must be a non-empty string"))?;
-        if let Some(referent) = model_export_ref_by_settings_id(refs, id, another_service) {
+        if let Some(referent) =
+            model_export_ref_by_settings_id(refs, id, reference_path_service(object))
+        {
             return Ok(Some(referent));
         }
     }
@@ -2509,7 +2533,9 @@ fn json_to_rbx_ref(value: &Value, refs: &BytecodeModelExportRefs) -> RbxRef {
         .get("settingsId")
         .or_else(|| object.get("instanceId"))
         .and_then(Value::as_str)
-        .and_then(|settings_id| model_export_ref_by_settings_id(refs, settings_id, another_service))
+        .and_then(|settings_id| {
+            model_export_ref_by_settings_id(refs, settings_id, reference_path_service(object))
+        })
         .or_else(|| {
             let segments = object
                 .get("pathSegments")

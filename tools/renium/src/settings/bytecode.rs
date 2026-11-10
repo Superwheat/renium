@@ -109,6 +109,20 @@ impl SettingsBytecode {
         read_settings_file(path, decode_settings_bytecode_structure)
     }
 
+    /// Decodes a store's instances without their properties and attributes.
+    pub(crate) fn decode_structure(bytes: &[u8]) -> Result<Self> {
+        decode_settings_bytecode_structure(bytes)
+    }
+
+    /// Decodes a store when it holds every string of one of the sets in
+    /// `required`.
+    pub(crate) fn decode_if_contains_any_string_set(
+        bytes: &[u8],
+        required: &[Vec<String>],
+    ) -> Result<Option<Self>> {
+        decode_settings_bytecode_if_contains_any_string_set(bytes, required)
+    }
+
     pub(crate) fn read_file_if_contains_any_string_set(
         path: &Path,
         required: &[Vec<String>],
@@ -4052,19 +4066,51 @@ pub(crate) fn reindex_reference_indices(
     record: &mut Map<String, Value>,
     indices: &HashMap<String, usize>,
 ) {
+    visit_reference_objects_mut(record, |object| reindex_reference(object, indices));
+}
+
+/// `reindex_reference_indices` for a record of the store of `service`, whose
+/// instances `indices` holds. A reference whose path leads into another
+/// service names no instance of this store, also when its id is one of the
+/// store's, and carries no index.
+pub(crate) fn reindex_store_reference_indices(
+    record: &mut Map<String, Value>,
+    indices: &HashMap<String, usize>,
+    service: &str,
+) {
     visit_reference_objects_mut(record, |object| {
-        let index = object
-            .get("settingsId")
-            .or_else(|| object.get("instanceId"))
-            .and_then(Value::as_str)
-            .and_then(|id| indices.get(id))
-            .copied();
-        if let Some(index) = index {
-            object.insert("instanceIndex".to_string(), Value::from(index + 1));
-        } else {
+        if reference_leads_out_of(object, service) {
             object.remove("instanceIndex");
+        } else {
+            reindex_reference(object, indices);
         }
     });
+}
+
+fn reindex_reference(object: &mut Map<String, Value>, indices: &HashMap<String, usize>) {
+    let index = object
+        .get("settingsId")
+        .or_else(|| object.get("instanceId"))
+        .and_then(Value::as_str)
+        .and_then(|id| indices.get(id))
+        .copied();
+    if let Some(index) = index {
+        object.insert("instanceIndex".to_string(), Value::from(index + 1));
+    } else {
+        object.remove("instanceIndex");
+    }
+}
+
+/// Whether a reference has a path into another service than `service`. Such
+/// a reference names an instance of that service's store: settings ids are
+/// unique within one store only, and the path says which store an id is of.
+pub(crate) fn reference_leads_out_of(reference: &Map<String, Value>, service: &str) -> bool {
+    reference
+        .get("pathSegments")
+        .and_then(Value::as_array)
+        .and_then(|segments| segments.first())
+        .and_then(Value::as_str)
+        .is_some_and(|target| target != service)
 }
 
 pub(crate) fn visit_reference_objects_mut(

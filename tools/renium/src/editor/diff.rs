@@ -5,8 +5,8 @@ use serde_json::{Map, Value};
 
 use crate::editor::paths::{build_editor_instance_paths, build_editor_instance_paths_for_indices};
 use crate::editor::review::{
-    EditorReferenceIds, is_engine_managed_editor_property, is_externally_managed_editor_property,
-    normalize_editor_bridge_value, property_schema_entry,
+    EditorReferenceIds, OutsideReferencePaths, is_engine_managed_editor_property,
+    is_externally_managed_editor_property, normalize_editor_bridge_value, property_schema_entry,
 };
 use crate::editor::sync::is_lua_source_class;
 use crate::editor::types::{
@@ -546,7 +546,7 @@ pub(crate) fn append_editor_property_changes(
     database: &ReflectionDatabase<'_>,
 ) {
     let paths_by_index = build_editor_instance_paths(document, service);
-    let settings_ids_by_index = editor_settings_ids(document, service);
+    let settings_ids_by_index = editor_settings_ids(document, service, None);
     append_editor_property_changes_with_paths(
         changes,
         document,
@@ -725,6 +725,8 @@ pub(crate) struct EditorTargetChangeOptions<'a, 'db> {
     pub(crate) property_scope: EditorPropertyScope<'a>,
     pub(crate) property_schema_by_class: &'a PropertySchemaMap,
     pub(crate) database: &'db ReflectionDatabase<'db>,
+    /// The project's other stores, for the paths of references into them.
+    pub(crate) outside_references: Option<&'a OutsideReferencePaths<'a>>,
 }
 
 // A full native import needs paths only for retained fields, inline sources and
@@ -840,7 +842,7 @@ pub(crate) fn append_editor_target_changes(
     filter: &EditorPropertyFilter,
     options: EditorTargetChangeOptions<'_, '_>,
 ) {
-    let settings_ids_by_index = editor_settings_ids(document, service);
+    let settings_ids_by_index = editor_settings_ids(document, service, options.outside_references);
     let native_indices =
         native_target_path_indices(document, service, filter, &options, &settings_ids_by_index);
     if filter.has_target_ids() && native_indices.is_none() {
@@ -975,6 +977,7 @@ pub(crate) fn append_editor_target_changes(
 fn editor_settings_ids<'a>(
     document: &'a SettingsBytecode,
     service: &'a str,
+    outside: Option<&'a OutsideReferencePaths<'a>>,
 ) -> EditorReferenceIds<'a> {
     EditorReferenceIds::new(
         document
@@ -983,6 +986,7 @@ fn editor_settings_ids<'a>(
             .map(|instance| instance.settings_id.as_str()),
     )
     .in_service(service)
+    .with_outside(outside)
 }
 
 fn normalized_editor_attributes(
@@ -1083,7 +1087,7 @@ mod native_property_tests {
                 options.database,
                 EditorPropertyPaths {
                     paths_by_index: &paths,
-                    settings_ids_by_index: &editor_settings_ids(document, service),
+                    settings_ids_by_index: &editor_settings_ids(document, service, None),
                     scope: options.property_scope,
                 },
             );
@@ -1298,6 +1302,7 @@ mod native_property_tests {
                             property_scope: scope,
                             property_schema_by_class: &schema,
                             database: rbx_reflection_database::get().unwrap(),
+                            outside_references: None,
                         };
                         let expected =
                             full_path_collection(&document, "Workspace", &filter, &options);
@@ -1342,13 +1347,14 @@ mod native_property_tests {
                     property_scope: scope,
                     property_schema_by_class: &schema,
                     database: rbx_reflection_database::get().unwrap(),
+                    outside_references: None,
                 };
                 let indices = native_target_path_indices(
                     &document,
                     "Workspace",
                     &filter,
                     &options,
-                    &editor_settings_ids(&document, "Workspace"),
+                    &editor_settings_ids(&document, "Workspace", None),
                 )
                 .unwrap();
                 assert!(
@@ -1427,6 +1433,7 @@ mod native_property_tests {
                     property_scope: scope,
                     property_schema_by_class: &schema,
                     database: rbx_reflection_database::get().unwrap(),
+                    outside_references: None,
                 };
                 let expected = full_path_collection(&document, "Workspace", &filter, &options);
                 let mut actual = EditorChangeSet::default();
@@ -1502,6 +1509,7 @@ mod native_property_tests {
                     property_scope: scope,
                     property_schema_by_class: &HashMap::new(),
                     database: rbx_reflection_database::get().unwrap(),
+                    outside_references: None,
                 },
             );
             changes

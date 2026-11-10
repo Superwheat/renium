@@ -10,7 +10,7 @@ use crate::app::output::print_json_output;
 use crate::bytecode::edit::{
     collect_settings_subtree_preorder, instance_path_parts_key, prune_removed_source_dirs,
 };
-use crate::bytecode::{acquire_settings_file_lock, apply_file_mutations};
+use crate::bytecode::{acquire_settings_file_locks, apply_file_mutations};
 use crate::cli::SyncWallyPackagesArgs;
 use crate::editor::document::ensure_editor_source_target_in_bytecode;
 use crate::editor::paths::{build_editor_instance_paths, infer_editor_source_path_spec_in_service};
@@ -780,10 +780,7 @@ pub(crate) fn sync_wally_packages_result(mut args: SyncWallyPackagesArgs) -> Res
             .values()
             .filter_map(|storage| storage.settings_file.clone()),
     )?;
-    let mut guards = Vec::with_capacity(settings_files.len());
-    for settings_file in &settings_files {
-        guards.push(acquire_settings_file_lock(settings_file)?);
-    }
+    let guards = acquire_settings_file_locks(settings_files.iter().map(PathBuf::as_path))?;
     let existing_settings_files = settings_files
         .iter()
         .filter(|path| path.is_file())

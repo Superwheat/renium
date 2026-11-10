@@ -12,7 +12,8 @@ use crate::bytecode::edit::{
     strict_ref_old_index,
 };
 use crate::bytecode::{
-    acquire_settings_file_lock, apply_file_mutations, apply_file_mutations_with_permissions,
+    acquire_settings_file_lock, acquire_settings_file_locks, apply_file_mutations,
+    apply_file_mutations_with_permissions,
 };
 use crate::cli::{
     LinkAddArgs, LinkApplyArgs, LinkBreakArgs, LinkDeletePackageArgs, LinkMoveTargetArgs,
@@ -982,13 +983,12 @@ pub(super) fn apply_project_links_inner(
             .filter(|target| target.resolved && !target.broken)
             .filter_map(|target| target.storage.as_ref()?.settings_file.clone()),
     )?;
-    let mut settings_guards = Vec::with_capacity(settings_files.len());
-    for settings_file in settings_files
-        .iter()
-        .filter(|path| path.is_file() || !args.check)
-    {
-        settings_guards.push(acquire_settings_file_lock(settings_file)?);
-    }
+    let settings_guards = acquire_settings_file_locks(
+        settings_files
+            .iter()
+            .filter(|path| path.is_file() || !args.check)
+            .map(PathBuf::as_path),
+    )?;
 
     let existing_settings_files = settings_files
         .iter()
@@ -1336,18 +1336,19 @@ pub(crate) fn link_break(mut args: LinkBreakArgs) -> Result<()> {
         .filter(|target| package_target_keys.contains(&link_target_ref_key(target)))
         .cloned()
         .collect::<Vec<_>>();
-    let mut settings_guards = Vec::new();
+    let settings_files = if package_targets.is_empty() {
+        Vec::new()
+    } else {
+        collect_project_settings_files(&src_root, package_settings_files)?
+    };
+    let _settings_guards =
+        acquire_settings_file_locks(settings_files.iter().map(PathBuf::as_path))?;
     let mut documents = HashMap::new();
     let mut settings_outputs = HashMap::new();
     let mut writes = BTreeMap::new();
     let mut removals = Vec::new();
     let mut externalized_source_paths = Vec::new();
     if !package_targets.is_empty() {
-        let settings_files = collect_project_settings_files(&src_root, package_settings_files)?;
-        settings_guards.reserve(settings_files.len());
-        for settings_file in &settings_files {
-            settings_guards.push(acquire_settings_file_lock(settings_file)?);
-        }
         for target in &package_targets {
             let (_, paths) = plan_unlink_link_target_instance(
                 &project_root,
@@ -2855,10 +2856,8 @@ pub(crate) fn link_delete_package(mut args: LinkDeletePackageArgs) -> Result<()>
         }
     }
     let settings_files = collect_project_settings_files(&src_root, target_settings_files)?;
-    let mut _settings_guards = Vec::with_capacity(settings_files.len());
-    for settings_file in &settings_files {
-        _settings_guards.push(acquire_settings_file_lock(settings_file)?);
-    }
+    let _settings_guards =
+        acquire_settings_file_locks(settings_files.iter().map(PathBuf::as_path))?;
     let link = manifest.links.remove(link_index);
 
     let mut touched_services = HashSet::new();

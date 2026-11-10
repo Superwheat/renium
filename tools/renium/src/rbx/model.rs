@@ -299,6 +299,9 @@ impl RbxPlaceFormat {
     }
 }
 
+/// The exported instances of each service by settings id.
+pub(crate) type ServiceSettingsRefs<'a> = AHashMap<&'a str, AHashMap<&'a str, RbxRef>>;
+
 #[derive(Default)]
 pub(crate) struct BytecodeModelExportRefs<'a> {
     /// The service whose store is being encoded, when it is one store of a
@@ -306,6 +309,13 @@ pub(crate) struct BytecodeModelExportRefs<'a> {
     pub(crate) service: Option<&'a str>,
     pub(crate) by_index: AHashMap<usize, RbxRef>,
     pub(crate) by_settings_id: AHashMap<&'a str, RbxRef>,
+    /// The settings ids of every service of a place build, by service; a
+    /// place build keeps the encoded service's own ids here too. Ids are
+    /// unique within one store only, so a reference with a path is looked
+    /// up under the path's service.
+    pub(crate) settings_ids_by_service: Option<Arc<ServiceSettingsRefs<'a>>>,
+    /// The ids that one instance of the whole build has, for a reference
+    /// that names no service.
     pub(crate) global_by_settings_id: Option<Arc<AHashMap<&'a str, RbxRef>>>,
     pub(crate) by_path_key: HashMap<String, RbxRef>,
     pub(crate) global_by_path_key: Option<Arc<HashMap<String, RbxRef>>>,
@@ -580,10 +590,14 @@ fn canonicalize_settings_reference_documents_scoped(
         {
             return Some(*target);
         }
-        if let Some(target) = persistent_id
-            .and_then(|id| context.global_ids.get(id))
-            .copied()
-            .flatten()
+        // An id the path's service does not have is not looked up in the
+        // other stores: the one instance that happens to carry it there is
+        // not the target. Only a reference that names no service is.
+        if path_service.is_none()
+            && let Some(target) = persistent_id
+                .and_then(|id| context.global_ids.get(id))
+                .copied()
+                .flatten()
         {
             return Some(target);
         }
@@ -1226,14 +1240,14 @@ pub(crate) fn encode_settings_model(document: &SettingsBytecode, binary: bool) -
 fn export_value_needs_path_refs(
     value: &Value,
     service: &str,
-    local_ids: &AHashMap<&str, RbxRef>,
+    ids_by_service: &ServiceSettingsRefs<'_>,
     global_ids: &AHashMap<&str, RbxRef>,
 ) -> bool {
     match value {
         Value::Array(values) => values
             .iter()
             .filter(|value| matches!(value, Value::Array(_) | Value::Object(_)))
-            .any(|value| export_value_needs_path_refs(value, service, local_ids, global_ids)),
+            .any(|value| export_value_needs_path_refs(value, service, ids_by_service, global_ids)),
         Value::Object(object) => {
             let typed = object.get("_type").and_then(Value::as_str) == Some("Ref");
             let reference = if typed {
@@ -1242,21 +1256,26 @@ fn export_value_needs_path_refs(
                 object.get("Ref").and_then(Value::as_object)
             };
             if let Some(reference) = reference {
-                // A path into another service is not resolved by this
-                // store's ids, which are unique within the store only.
-                let another_service = reference
+                // Ids are unique within one store only: a reference with a
+                // path resolves by the ids of the path's service, and one
+                // without by this store's or the one store that has the id.
+                let path_service = reference
                     .get("pathSegments")
                     .and_then(Value::as_array)
                     .and_then(|segments| segments.first())
-                    .and_then(Value::as_str)
-                    .is_some_and(|target| target != service);
+                    .and_then(Value::as_str);
+                let service_has = |service: &str, id: &str| {
+                    ids_by_service
+                        .get(service)
+                        .is_some_and(|ids| ids.contains_key(id))
+                };
                 let resolved_id = reference
                     .get("settingsId")
                     .or_else(|| reference.get("instanceId"))
                     .and_then(Value::as_str)
-                    .is_some_and(|id| {
-                        (!another_service && local_ids.contains_key(id))
-                            || global_ids.contains_key(id)
+                    .is_some_and(|id| match path_service {
+                        Some(target) => service_has(target, id),
+                        None => service_has(service, id) || global_ids.contains_key(id),
                     });
                 if !resolved_id && reference.contains_key("pathSegments") {
                     return true;
@@ -1268,7 +1287,9 @@ fn export_value_needs_path_refs(
             object
                 .values()
                 .filter(|value| matches!(value, Value::Array(_) | Value::Object(_)))
-                .any(|value| export_value_needs_path_refs(value, service, local_ids, global_ids))
+                .any(|value| {
+                    export_value_needs_path_refs(value, service, ids_by_service, global_ids)
+                })
         }
         _ => false,
     }
@@ -1389,8 +1410,15 @@ pub(crate) fn build_rbx_place(
             (by_index, by_settings_id)
         })
         .collect::<Vec<_>>();
+    let (per_service_refs, per_service_ids): (Vec<_>, Vec<_>) =
+        per_service_refs.into_iter().unzip();
+    let settings_ids_by_service = export_inputs
+        .iter()
+        .map(|(service, ..)| service.as_str())
+        .zip(per_service_ids)
+        .collect::<ServiceSettingsRefs<'_>>();
     let mut global_settings_refs = AHashMap::with_capacity(total_instances);
-    for ((_, _, _, document, _, _, _, subtree, _), (by_index, _)) in
+    for ((_, _, _, document, _, _, _, subtree, _), by_index) in
         export_inputs.iter().zip(&per_service_refs)
     {
         for &index in subtree {
@@ -1408,22 +1436,23 @@ pub(crate) fn build_rbx_place(
     // Stable IDs are the normal reference route. Build the more expensive full
     // path indexes only when a value can actually fall through to that route.
     // Unknown IDs still need paths before their instance-index fallback.
-    let needs_paths = export_inputs.par_iter().enumerate().any(
-        |(service_index, (service, _, _, document, _, _, _, subtree, _))| {
-            subtree.par_chunks(4096).any(|chunk| {
-                chunk.iter().any(|&index| {
-                    document.instances[index].properties.values().any(|value| {
-                        export_value_needs_path_refs(
-                            value,
-                            service,
-                            &per_service_refs[service_index].1,
-                            &global_unique_settings_refs,
-                        )
+    let needs_paths =
+        export_inputs
+            .par_iter()
+            .any(|(service, _, _, document, _, _, _, subtree, _)| {
+                subtree.par_chunks(4096).any(|chunk| {
+                    chunk.iter().any(|&index| {
+                        document.instances[index].properties.values().any(|value| {
+                            export_value_needs_path_refs(
+                                value,
+                                service,
+                                &settings_ids_by_service,
+                                &global_unique_settings_refs,
+                            )
+                        })
                     })
                 })
-            })
-        },
-    );
+            });
     let mut global_path_refs = HashMap::new();
     let mut global_path_segment_refs = HashMap::new();
     if needs_paths {
@@ -1433,7 +1462,7 @@ pub(crate) fn build_rbx_place(
             export_inputs.iter().enumerate()
         {
             let paths = build_editor_instance_paths_with_children(document, service, children);
-            let by_index = &per_service_refs[service_index].0;
+            let by_index = &per_service_refs[service_index];
             for &index in subtree {
                 let referent = by_index[&index];
                 if let Some(Some(path)) = paths.get(index) {
@@ -1451,6 +1480,7 @@ pub(crate) fn build_rbx_place(
         }
     }
 
+    let settings_ids_by_service = Arc::new(settings_ids_by_service);
     let global_unique_settings_refs = Arc::new(global_unique_settings_refs);
     let global_path_refs = Arc::new(global_path_refs);
     let global_path_segment_refs = Arc::new(global_path_segment_refs);
@@ -1469,12 +1499,12 @@ pub(crate) fn build_rbx_place(
         .map(
             |(
                 (service, _, _, document, source_paths, children, root_index, subtree, _),
-                (by_index, by_settings_id),
+                by_index,
             )| {
                 let refs = BytecodeModelExportRefs {
                     service: Some(service.as_str()),
                     by_index,
-                    by_settings_id,
+                    settings_ids_by_service: Some(Arc::clone(&settings_ids_by_service)),
                     global_by_settings_id: Some(Arc::clone(&global_unique_settings_refs)),
                     global_by_path_key: Some(Arc::clone(&global_path_refs)),
                     global_by_path_segments_key: Some(Arc::clone(&global_path_segment_refs)),

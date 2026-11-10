@@ -1543,7 +1543,7 @@ fn set_property_resolves_a_path_reference_against_the_project_stores() {
     let value = || fx.both(&["bg", "-f", &store, "Target", "Value"]);
     assert_eq!(
         set("ServerScriptService.Tools.Nope").err(),
-        "Reference target was not found: ServerScriptService.Tools.Nope is not in the ServerScriptService store; `rbx f ServerScriptService NAME` finds a path and `rbx pl` refreshes the store from Studio"
+        "Reference target was not found: ServerScriptService.Tools.Nope is not in the ServerScriptService store; create the target first or add both in one `rbx ba --batch` (`rbx f ServerScriptService NAME` finds a path, `rbx pl` refreshes the store from Studio)"
     );
     assert_eq!(
         set("Workspace.Lobby.Border").err(),
@@ -1589,7 +1589,7 @@ fn set_property_resolves_a_path_reference_against_the_project_stores() {
     };
     assert_eq!(
         add("Broken", "ReplicatedStorage.Shared.Nope").err(),
-        "Reference target was not found: ReplicatedStorage.Shared.Nope is not in the ReplicatedStorage store; `rbx f ReplicatedStorage NAME` finds a path and `rbx pl` refreshes the store from Studio"
+        "Reference target was not found: ReplicatedStorage.Shared.Nope is not in the ReplicatedStorage store; create the target first or add both in one `rbx ba --batch` (`rbx f ReplicatedStorage NAME` finds a path, `rbx pl` refreshes the store from Studio)"
     );
     add("Pointer", "ReplicatedStorage.Shared.Config").ok();
     assert_eq!(

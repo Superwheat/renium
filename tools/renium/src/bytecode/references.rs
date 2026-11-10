@@ -3,7 +3,7 @@
 //! edit renames, moves or removes instances.
 
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -108,18 +108,33 @@ struct ReferenceTargetPath {
     path: EditorInstancePath,
 }
 
+/// What becomes of a path reference that names no instance of its store.
+#[derive(Clone, Copy)]
+pub(crate) enum MissingTarget {
+    /// It stays as written, for a second look once the command has added
+    /// its instances: an instance may refer to itself, and a batch to an
+    /// instance one of its later ops adds.
+    Defer,
+    /// It is refused as the write of one command.
+    Refuse,
+    /// It is refused as what a batch leaves when its last op has run.
+    RefuseAfterBatch,
+}
+
 /// Completes the hand-written references in `value` against the stores in
 /// `documents`, by service name. A reference by settings id gains its
 /// target's path, as a pull stores it, so both sides compare equal. A
 /// reference by path gains its target's id and ordinals, so it stays on the
-/// target through later renames and moves; a path that names no instance of
-/// its store is refused, and one into a service without a store cannot be
-/// checked and stays as written.
+/// target through later renames and moves. A path that names no instance of
+/// its store is refused or left for later, as `missing` says, and one into a
+/// service without a store cannot be checked and stays as written. Returns
+/// whether a reference was left for later.
 pub(crate) fn qualify_reference_targets(
     value: &mut Value,
     documents: &BTreeMap<&str, &SettingsBytecode>,
     written: &WrittenReferences,
-) -> Result<()> {
+    missing: MissingTarget,
+) -> Result<bool> {
     let mut targets_by_settings_id = HashMap::<&str, Vec<ReferenceTargetPath>>::new();
     for (service, document) in documents {
         if written.settings_ids.is_empty() {
@@ -145,43 +160,56 @@ pub(crate) fn qualify_reference_targets(
             }
         }
     }
-    qualify(value, documents, &targets_by_settings_id)
+    let targets = QualifyTargets {
+        documents,
+        by_settings_id: &targets_by_settings_id,
+        missing,
+    };
+    qualify(value, &targets)
 }
 
-fn qualify(
-    value: &mut Value,
-    documents: &BTreeMap<&str, &SettingsBytecode>,
-    targets_by_settings_id: &HashMap<&str, Vec<ReferenceTargetPath>>,
-) -> Result<()> {
+struct QualifyTargets<'a> {
+    documents: &'a BTreeMap<&'a str, &'a SettingsBytecode>,
+    by_settings_id: &'a HashMap<&'a str, Vec<ReferenceTargetPath>>,
+    missing: MissingTarget,
+}
+
+fn qualify(value: &mut Value, targets: &QualifyTargets<'_>) -> Result<bool> {
+    let mut deferred = false;
     match value {
         Value::Array(values) => {
             for value in values {
-                qualify(value, documents, targets_by_settings_id)?;
+                deferred |= qualify(value, targets)?;
             }
         }
         Value::Object(object) => {
             match written_reference(object) {
                 Some(WrittenReference::SettingsId(id)) => {
-                    let targets = targets_by_settings_id
+                    let found = targets
+                        .by_settings_id
                         .get(id.as_str())
                         .map(Vec::as_slice)
                         .unwrap_or_default();
-                    qualify_settings_id(object, &id, targets)?;
+                    qualify_settings_id(object, &id, found)?;
                 }
                 Some(WrittenReference::Path(service)) => {
-                    if let Some(document) = documents.get(service.as_str()) {
-                        qualify_path(object, document)?;
+                    match targets.documents.get(service.as_str()) {
+                        Some(document) => {
+                            deferred |= qualify_path(object, document, targets.missing)?;
+                        }
+                        // A later op of the batch may create the store.
+                        None => deferred |= matches!(targets.missing, MissingTarget::Defer),
                     }
                 }
                 None => {}
             }
             for nested in object.values_mut() {
-                qualify(nested, documents, targets_by_settings_id)?;
+                deferred |= qualify(nested, targets)?;
             }
         }
         _ => {}
     }
-    Ok(())
+    Ok(deferred)
 }
 
 fn qualify_settings_id(
@@ -209,7 +237,12 @@ fn qualify_settings_id(
     Ok(())
 }
 
-fn qualify_path(reference: &mut Map<String, Value>, document: &SettingsBytecode) -> Result<()> {
+/// Completes one path reference; returns whether it was left for later.
+fn qualify_path(
+    reference: &mut Map<String, Value>,
+    document: &SettingsBytecode,
+    missing: MissingTarget,
+) -> Result<bool> {
     let (segments, ordinals) =
         strict_reference_path(reference)?.context("Reference has no pathSegments")?;
     let service = segments[0].as_str();
@@ -217,21 +250,30 @@ fn qualify_path(reference: &mut Map<String, Value>, document: &SettingsBytecode)
     let [index] = matches[..] else {
         let path = compact_path_string(&segments, ordinals.as_deref())
             .unwrap_or_else(|| segments.join("."));
-        if matches.is_empty() {
+        if !matches.is_empty() {
             bail!(
-                "Reference target was not found: {path} is not in the {service} store; `rbx f {service} NAME` finds a path and `rbx pl` refreshes the store from Studio"
+                "Reference target is ambiguous: {} instances are at {path}; give the ordinal, as in {path}[2]",
+                matches.len()
             );
         }
-        bail!(
-            "Reference target is ambiguous: {} instances are at {path}; give the ordinal, as in {path}[2]",
-            matches.len()
+        let lookup = format!(
+            "`rbx f {service} NAME` finds a path, `rbx pl` refreshes the store from Studio"
         );
+        match missing {
+            MissingTarget::Defer => return Ok(true),
+            MissingTarget::Refuse => bail!(
+                "Reference target was not found: {path} is not in the {service} store; create the target first or add both in one `rbx ba --batch` ({lookup})"
+            ),
+            MissingTarget::RefuseAfterBatch => bail!(
+                "Reference target was not found: {path} is not in the {service} store when the batch ends; add it in this batch or before it ({lookup})"
+            ),
+        }
     };
     let target = build_editor_instance_paths_for_indices(document, service, &[index])
         .remove(&index)
         .context("Reference target has no path")?;
     set_reference_target(reference, &document.instances[index].settings_id, &target);
-    Ok(())
+    Ok(false)
 }
 
 /// The instances `segments` names from the service root down, in store
@@ -293,21 +335,23 @@ pub(crate) struct ReferencedStores {
 
 impl ReferencedStores {
     /// Completes the references in `value`, which is written to the store at
-    /// `settings_file` whose content is `own_document`.
+    /// `settings_file` whose content is `own_document`. Returns whether a
+    /// path that names nothing was left for later, as `missing` allows.
     pub(crate) fn qualify(
         &mut self,
         value: &mut Value,
         settings_file: &Path,
         own_document: &SettingsBytecode,
-    ) -> Result<()> {
+        missing: MissingTarget,
+    ) -> Result<bool> {
         let written = WrittenReferences::of(value);
         if written.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let as_written = value.to_string();
         if let Some(completed) = self.completed.get(&as_written) {
             *value = completed.clone();
-            return Ok(());
+            return Ok(false);
         }
         let own_service = crate::project::storage::store_service_name(settings_file)
             .context("Service settings path has no service name")?;
@@ -318,9 +362,11 @@ impl ReferencedStores {
             .map(|(service, document)| (service.as_str(), document))
             .collect::<BTreeMap<_, _>>();
         documents.insert(&own_service, own_document);
-        qualify_reference_targets(value, &documents, &written)?;
-        self.completed.insert(as_written, value.clone());
-        Ok(())
+        let deferred = qualify_reference_targets(value, &documents, &written, missing)?;
+        if !deferred {
+            self.completed.insert(as_written, value.clone());
+        }
+        Ok(deferred)
     }
 
     fn read(
@@ -369,6 +415,8 @@ struct EditedStore<'a> {
     before: &'a SettingsBytecode,
     /// Where every instance of the store is now, by settings id.
     current: HashMap<String, EditorInstancePath>,
+    /// The ids of the instances the edit added and removed again.
+    short_lived: Option<&'a HashSet<String>>,
     earlier: OnceCell<EarlierTargets<'a>>,
 }
 
@@ -390,6 +438,7 @@ impl<'a> EditedStore<'a> {
         service: &'a str,
         before: &'a SettingsBytecode,
         after: Option<&SettingsBytecode>,
+        short_lived: Option<&'a HashSet<String>>,
     ) -> Self {
         let current = after
             .map(|after| {
@@ -405,6 +454,7 @@ impl<'a> EditedStore<'a> {
             service,
             before,
             current,
+            short_lived,
             earlier: OnceCell::new(),
         }
     }
@@ -442,7 +492,9 @@ impl<'a> EditedStore<'a> {
     /// the one with the reference's settings id when the store knows that
     /// id, now or before the edit, and otherwise the one that was at the
     /// reference's path before the edit. A reference whose target the edit
-    /// left in place stays as it is, also when it stores another path.
+    /// left in place stays as it is, also when it stores another path. An
+    /// instance the edit added and removed again is in neither document; a
+    /// reference written to it in between is one to a removed instance.
     fn follow(
         &self,
         settings_id: Option<&str>,
@@ -450,6 +502,12 @@ impl<'a> EditedStore<'a> {
         ordinals: Option<&[usize]>,
     ) -> Followed<'_> {
         let known_now = settings_id.and_then(|id| self.current.get_key_value(id));
+        if known_now.is_none()
+            && let Some(id) = settings_id
+            && self.short_lived.is_some_and(|ids| ids.contains(id))
+        {
+            return Followed::Removed;
+        }
         if known_now.is_some_and(|(_, now)| same_path(now, segments, ordinals)) {
             return Followed::Unchanged;
         }
@@ -567,6 +625,18 @@ pub(crate) fn follow_edited_references(
     edited: &BTreeMap<String, &SettingsBytecode>,
     documents: &mut BTreeMap<String, SettingsBytecode>,
 ) -> BTreeSet<String> {
+    follow_edited_references_with_short_lived(edited, &BTreeMap::new(), documents)
+}
+
+/// `follow_edited_references` for an edit of several steps. `short_lived`
+/// holds, by service, the ids of the instances the edit added and removed
+/// again: they are in no store before or after, and a reference a step wrote
+/// to one of them is cleared like one to any removed instance.
+pub(crate) fn follow_edited_references_with_short_lived(
+    edited: &BTreeMap<String, &SettingsBytecode>,
+    short_lived: &BTreeMap<String, &HashSet<String>>,
+    documents: &mut BTreeMap<String, SettingsBytecode>,
+) -> BTreeSet<String> {
     let mut holders = Vec::new();
     for (service, document) in documents.iter() {
         for (index, instance) in document.instances.iter().enumerate() {
@@ -589,7 +659,12 @@ pub(crate) fn follow_edited_references(
         .map(|(service, before)| {
             (
                 service.as_str(),
-                EditedStore::new(service, before, documents.get(service)),
+                EditedStore::new(
+                    service,
+                    before,
+                    documents.get(service),
+                    short_lived.get(service).copied(),
+                ),
             )
         })
         .collect::<HashMap<_, _>>();

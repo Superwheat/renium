@@ -10,7 +10,7 @@ use std::sync::{OnceLock, RwLock};
 
 use anyhow::{Context, Result, bail};
 
-use crate::bytecode::acquire_settings_file_lock;
+use crate::bytecode::acquire_settings_file_locks;
 use crate::system::files::{
     SERVICE_SETTINGS_FILE_NAME, absolutize_for_daemon, create_unique_directory, path_key,
 };
@@ -356,16 +356,11 @@ fn migrate_legacy_stores(layout: &StoreLayout) -> Result<()> {
         return Ok(());
     }
     // Lock both layouts so two CLI/daemon loads can resume the same migration.
-    let mut locks = moves
-        .iter()
-        .flat_map(|(old, new)| [old, new])
-        .collect::<Vec<_>>();
-    locks.sort();
-    locks.dedup();
-    let _locks = locks
-        .into_iter()
-        .map(|path| acquire_settings_file_lock(path))
-        .collect::<Result<Vec<_>>>()?;
+    let _locks = acquire_settings_file_locks(
+        moves
+            .iter()
+            .flat_map(|(old, new)| [old.as_path(), new.as_path()]),
+    )?;
     let mut copies = Vec::new();
     for (old, new) in moves {
         if fs::symlink_metadata(&old).is_ok_and(|metadata| metadata.file_type().is_symlink()) {

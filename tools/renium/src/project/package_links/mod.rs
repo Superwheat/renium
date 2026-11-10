@@ -27,11 +27,11 @@ use crate::rbx::model::canonicalize_settings_reference_documents;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode,
-    SettingsBytecodeInstance, encode_settings_bytecode, reindex_reference_indices,
+    SettingsBytecodeInstance, encode_settings_bytecode, reindex_store_reference_indices,
 };
 use crate::settings::instance::{self as instance_api, AddInstanceSpec, InstanceSelector};
 use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
-use crate::snapshot::refs::remap_record_reference_ids;
+use crate::snapshot::refs::remap_store_reference_ids;
 use crate::system::files::{
     absolutize_under, canonical_path, ensure_existing_ancestor_inside, exact_path_key, fnv1a_hex,
     is_service_settings_file_name, path_extension_is, path_key, service_settings_path,
@@ -1641,8 +1641,11 @@ fn prepare_external_package_references(
         .copied()
         .map(|index| (index, index))
         .collect::<HashMap<_, _>>();
-    let (segments, ordinals) = build_editor_instance_path_parts(document, "");
-    let refs = build_clone_ref_map(
+    let service = document_service_name(document)
+        .unwrap_or_default()
+        .to_string();
+    let (segments, ordinals) = build_editor_instance_path_parts(document, &service);
+    let mut refs = build_clone_ref_map(
         document,
         CloneRefMapInput {
             source_subtree: &all_indices,
@@ -1651,6 +1654,9 @@ fn prepare_external_package_references(
             path_ordinals_before: &ordinals,
         },
     );
+    // A reference whose path leads into another service names an instance
+    // of that store, also when its id is the id of a replaced instance.
+    refs.store_service = Some(service);
     for (index, instance) in document.instances.iter_mut().enumerate() {
         if removed.contains(&index) {
             continue;
@@ -1736,6 +1742,7 @@ pub(crate) fn external_reference_sources(
     id: &str,
 ) -> Vec<String> {
     let excluded = exact_path_key(excluded);
+    let excluded_service = loaded_store_service(documents, &excluded);
     let mut sources = Vec::new();
     for (path, document) in documents {
         if exact_path_key(path) == excluded {
@@ -1756,7 +1763,9 @@ pub(crate) fn external_reference_sources(
                 collect_reference_targets(value, &mut targets);
             }
             if targets.iter().any(|(target, target_service)| {
-                target == id && reference_leaves_store(defined_locally, service, target_service)
+                target == id
+                    && reference_leaves_store(defined_locally, service, target_service)
+                    && reference_may_enter(target_service, excluded_service.as_deref())
             }) {
                 sources.push(format!(
                     "{}: {}",
@@ -1863,6 +1872,28 @@ fn reference_leaves_store(
             .is_some_and(|target| service != Some(target))
 }
 
+/// The service of the store at `path` among the loaded stores.
+fn loaded_store_service(
+    documents: &HashMap<PathBuf, SettingsBytecode>,
+    path: &str,
+) -> Option<String> {
+    documents
+        .iter()
+        .find(|(candidate, _)| exact_path_key(candidate) == path)
+        .and_then(|(_, document)| document_service_name(document))
+        .map(str::to_string)
+}
+
+/// Whether a reference that leaves its store can lead into the store of
+/// `service`: it names that service, or none. A path into a third service
+/// names an instance there, whatever id it carries.
+fn reference_may_enter(target_service: &Option<String>, service: Option<&str>) -> bool {
+    match (target_service.as_deref(), service) {
+        (Some(target), Some(service)) => target == service,
+        _ => true,
+    }
+}
+
 fn referenced_settings_ids(document: &SettingsBytecode) -> HashSet<String> {
     fn collect(value: &Value, output: &mut HashSet<String>) {
         match value {
@@ -1911,12 +1942,15 @@ fn referenced_settings_ids(document: &SettingsBytecode) -> HashSet<String> {
 
 /// Settings IDs that other stores reference and do not define themselves:
 /// observation IDs such as `reconcile:24` repeat across stores, so a Ref that
-/// resolves inside its own store is not a reference into this one.
+/// resolves inside its own store is not a reference into this one, and
+/// neither is one whose path leads into a third service.
 fn referenced_settings_ids_outside(
     documents: &HashMap<PathBuf, SettingsBytecode>,
     excluded: &Path,
 ) -> HashSet<String> {
     let excluded = exact_path_key(excluded);
+    let excluded_service = loaded_store_service(documents, &excluded);
+    let excluded_service = excluded_service.as_deref();
     documents
         .iter()
         .filter(|(path, _)| exact_path_key(path) != excluded)
@@ -1941,6 +1975,7 @@ fn referenced_settings_ids_outside(
                 .into_iter()
                 .filter(move |(id, target_service)| {
                     reference_leaves_store(local.contains(id), service.as_deref(), target_service)
+                        && reference_may_enter(target_service, excluded_service)
                 })
                 .map(|(id, _)| id)
         })
@@ -2114,10 +2149,15 @@ fn apply_preserved_subtree_identity(
             document.instances[index].settings_id = next;
         }
     }
+    // The ids are those of this store's instances; a reference into another
+    // service keeps the id its target has in that service's store.
+    let service = document_service_name(document)
+        .unwrap_or_default()
+        .to_string();
     if !remapped.is_empty() {
         for instance in &mut document.instances {
-            remap_record_reference_ids(&mut instance.properties, &remapped);
-            remap_record_reference_ids(&mut instance.attributes, &remapped);
+            remap_store_reference_ids(&mut instance.properties, &remapped, &service);
+            remap_store_reference_ids(&mut instance.attributes, &remapped, &service);
         }
     }
     let indices = document
@@ -2127,8 +2167,8 @@ fn apply_preserved_subtree_identity(
         .map(|(index, instance)| (instance.settings_id.clone(), index))
         .collect::<HashMap<_, _>>();
     for instance in &mut document.instances {
-        reindex_reference_indices(&mut instance.properties, &indices);
-        reindex_reference_indices(&mut instance.attributes, &indices);
+        reindex_store_reference_indices(&mut instance.properties, &indices, &service);
+        reindex_store_reference_indices(&mut instance.attributes, &indices, &service);
     }
     Ok(())
 }
@@ -2496,10 +2536,17 @@ fn materialize_package_target(
             .enumerate()
             .map(|(index, (instance, _))| (instance.settings_id.clone(), index))
             .collect::<HashMap<_, _>>();
+        // The indices are those of this store's instances; a reference into
+        // another service has none, also when its id is one of the store's.
+        let store_service = remaining
+            .iter()
+            .find(|(_, parent_id)| parent_id.is_none())
+            .map(|(instance, _)| instance.name.clone())
+            .unwrap_or_default();
         for (mut instance, parent_id) in remaining {
             instance.parent_index = parent_id.and_then(|id| indices.get(&id).copied());
-            reindex_reference_indices(&mut instance.properties, &indices);
-            reindex_reference_indices(&mut instance.attributes, &indices);
+            reindex_store_reference_indices(&mut instance.properties, &indices, &store_service);
+            reindex_store_reference_indices(&mut instance.attributes, &indices, &store_service);
             document.instances.push(instance);
         }
     }

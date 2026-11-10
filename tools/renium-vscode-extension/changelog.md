@@ -110,6 +110,11 @@
 - A reference path that names no instance in the stores is refused, `Pad[2]` picks the second of two same-named instances, and a build that cannot resolve a reference names the instance, the property and the path.
 - A Live Sync merge that keeps or brings back a script one side removed (for a reference or a child the preferred side added, or for its changed properties) also brings back its source file from the side that still has the script.
 - The extension's property panel refuses renaming or moving an instance that holds a read-only link, as `rbx rn` and `rbx mv` do, unless packages are overridden, and stores a value in the form of its property, as `rbx bs` does (a numeric string becomes a number, an enum name its item); a value the property cannot take is refused instead of written to a store that fails the place build.
+- A reference into another service whose id also exists in another store could be treated as unchanged by Live Sync, renumbered by `rbx vcm`, or pointed at the local copy by a link or Wally update; each now reads the id as one of the path's service.
+- `rbx bep -s SERVICE` pointed a reference into a service it left out at a same-numbered instance of an exported service; it now refuses and names the instance, the property and the path.
+- A reference whose stored path is out of date is found by its id: the place build and a push reach the renamed instance, a push sends its current path, and a pull of one service updates the paths other stores hold.
+- In Live Sync, a reference in one service to an instance the other side removed from another service is a conflict; a preference restores the instance or clears the reference.
+- `rbx ba` accepts a reference to the instance being added, and one `rbx ba --batch` accepts a reference to an instance a later op adds; a path that names nothing says to create the target first or add both in one batch.
 
 ## 0.5.9 - 2026-11-06
 

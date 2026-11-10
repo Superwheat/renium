@@ -74,6 +74,7 @@ mod merge;
 mod pairing;
 mod push_flow;
 mod push_plan;
+mod reference_settlement;
 mod replacement;
 mod staging;
 #[cfg(test)]

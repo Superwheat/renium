@@ -17,15 +17,16 @@ use crate::bytecode::edit::{
 use crate::bytecode::explorer::compact_path_string;
 use crate::bytecode::query::resolve_document_id_or_target;
 use crate::bytecode::references::{
-    WrittenReferences, follow_edited_references, qualify_reference_targets,
+    MissingTarget, WrittenReferences, follow_edited_references_with_short_lived,
+    qualify_reference_targets,
 };
 use crate::bytecode::{
-    SettingsFileLock, acquire_settings_file_lock, apply_file_mutations, check_new_source_file,
+    SettingsFileLock, acquire_settings_file_locks, apply_file_mutations, check_new_source_file,
     collect_source_path_updates, ensure_settable_attribute_name, file_mutation_paths,
     fold_derived_property, high_level_split_path, missing_service_store_error,
     preserve_source_path_extension, reject_owned_instance_edit, reject_read_only_link_edit,
-    reject_read_only_link_subtree_edit, resolve_bytecode_cli_settings_file, store_link_enforcement,
-    stored_property_edit,
+    reject_read_only_link_subtree_edit, resolve_bytecode_cli_settings_file,
+    settings_lock_order_key, store_link_enforcement, stored_property_edit,
 };
 use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
@@ -42,6 +43,9 @@ use crate::settings::bytecode::{
 use crate::settings::instance::{self as instance_api, AddInstanceSpec, PropertyScope};
 use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
 use crate::system::files::{path_key, service_settings_path, validate_filesystem_instance_name};
+
+/// The longest first name of a dotted string that is looked up as a service.
+const MAX_SERVICE_NAME_LEN: usize = 100;
 
 /// An add op of a `ba --batch` request; an op without `op` adds.
 #[derive(Deserialize)]
@@ -158,6 +162,40 @@ impl BatchOp {
             "remove" => Self::Remove(serde_json::from_value(fields)?),
             other => bail!("unknown op {other:?}; use add, set, clone, rename, move or remove"),
         })
+    }
+
+    /// The paths and parents the op names, each with the op's `service`.
+    fn store_targets(&self) -> Vec<(&str, Option<&str>)> {
+        match self {
+            Self::Add(item) => vec![(item.parent.as_str(), item.service.as_deref())],
+            Self::Set(op) => vec![(op.path.as_str(), op.service.as_deref())],
+            Self::Clone(op) => std::iter::once(op.path.as_str())
+                .chain(op.parent.as_deref())
+                .map(|raw| (raw, op.service.as_deref()))
+                .collect(),
+            Self::Rename(op) => vec![(op.path.as_str(), op.service.as_deref())],
+            Self::Move(op) => vec![
+                (op.path.as_str(), op.service.as_deref()),
+                (op.parent.as_str(), op.service.as_deref()),
+            ],
+            Self::Remove(op) => vec![(op.path.as_str(), op.service.as_deref())],
+        }
+    }
+
+    /// The property and attribute values the op writes.
+    fn written_values(&self) -> Box<dyn Iterator<Item = &Value> + '_> {
+        match self {
+            Self::Add(item) => Box::new(item.props.values().chain(item.attrs.values())),
+            Self::Set(op) => Box::new(op.props.values().chain(op.attrs.values())),
+            Self::Clone(op) => Box::new(op.props.values().chain(op.attrs.values())),
+            Self::Rename(_) | Self::Move(_) | Self::Remove(_) => Box::new(std::iter::empty()),
+        }
+    }
+
+    /// Whether the op changes paths, so that references in any store of the
+    /// project may have to follow.
+    fn restructures(&self) -> bool {
+        matches!(self, Self::Rename(_) | Self::Move(_) | Self::Remove(_))
     }
 
     fn label(&self) -> String {
@@ -304,15 +342,19 @@ pub(crate) fn apply_store_batch(
     let mut batch = BatchState {
         resolve_store,
         override_packages,
+        locks: BatchLocks::acquire(&ops, resolve_store)?,
         stores: Vec::new(),
         positions: HashMap::new(),
         refs: HashMap::new(),
         receipts: Vec::new(),
         labels: Vec::new(),
         last_moves: HashMap::new(),
+        running: 0,
+        pending: Vec::new(),
     };
     for (position, op) in ops.into_iter().enumerate() {
         let label = op.label();
+        batch.running = position;
         batch
             .apply(position, op)
             .with_context(|| format!("Batch op {position} ({label})"))?;
@@ -321,11 +363,119 @@ pub(crate) fn apply_store_batch(
     batch.finish(push)
 }
 
+/// The service whose store an op's path or parent is in: the op's
+/// `service`, or the first name of a dotted path. A `#ref` names the store
+/// of an earlier op, and a settings id alone names none.
+fn named_service(raw: &str, service: Option<&str>) -> Option<String> {
+    let raw = raw.trim();
+    if raw.starts_with('#') {
+        return None;
+    }
+    match service.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(service) => Some(service.to_string()),
+        None if raw.contains(':') => None,
+        None => high_level_split_path(raw).into_iter().next(),
+    }
+}
+
+/// Adds the services the strings in a written value may lead into: a
+/// reference property takes a dotted path, with or without a leading `game`.
+fn collect_dotted_path_services(value: &Value, services: &mut BTreeSet<String>) {
+    match value {
+        Value::String(text) => {
+            let mut names = text
+                .split('.')
+                .filter(|name| !name.is_empty())
+                .skip_while(|name| *name == "game");
+            if let (Some(service), Some(_)) = (names.next(), names.next())
+                && service.len() <= MAX_SERVICE_NAME_LEN
+            {
+                services.insert(service.to_string());
+            }
+        }
+        Value::Array(values) => values
+            .iter()
+            .for_each(|value| collect_dotted_path_services(value, services)),
+        Value::Object(object) => object
+            .values()
+            .for_each(|value| collect_dotted_path_services(value, services)),
+        _ => {}
+    }
+}
+
+/// The store locks a batch holds from before its first op until its files
+/// are written.
+struct BatchLocks {
+    keys: HashSet<String>,
+    _held: Vec<SettingsFileLock>,
+}
+
+impl BatchLocks {
+    /// Locks every store the batch can read or write, in the order all
+    /// commands take store locks in. Taking them one by one as the ops reach
+    /// them would hold one store while waiting for another that a rename or
+    /// a removal locked first. An op names its stores, a written value may
+    /// lead into any service that has a store, and an op that changes paths
+    /// or a reference by settings id alone reaches every store of the
+    /// project.
+    fn acquire(ops: &[BatchOp], resolve_store: &StoreResolver<'_>) -> Result<Self> {
+        let mut files = Vec::new();
+        let mut seen = HashSet::new();
+        for (raw, service) in ops.iter().flat_map(BatchOp::store_targets) {
+            if let Some(service) = named_service(raw, service)
+                && let Ok((file, _)) = resolve_store(&service)
+                && seen.insert(settings_lock_order_key(&file))
+            {
+                files.push(file);
+            }
+        }
+        let mut source_roots = BTreeSet::new();
+        for file in &files {
+            // A pull writes the store under its own lock, so it comes first.
+            crate::bytecode::pull_missing_service_store(file);
+            if let Some(root) = crate::project::storage::source_directory(file).parent() {
+                source_roots.insert(root.to_path_buf());
+            }
+        }
+        let mut services = BTreeSet::new();
+        let mut every_store = ops.iter().any(BatchOp::restructures);
+        for value in ops.iter().flat_map(BatchOp::written_values) {
+            let written = WrittenReferences::of(value);
+            every_store |= written.needs_every_store();
+            services.extend(written.path_services().map(str::to_string));
+            collect_dotted_path_services(value, &mut services);
+        }
+        for source_root in &source_roots {
+            let service_dirs = if every_store {
+                crate::project::storage::service_directories(source_root)?
+            } else {
+                services
+                    .iter()
+                    .filter(|service| validate_filesystem_instance_name(service, "service").is_ok())
+                    .map(|service| source_root.join(service))
+                    .collect()
+            };
+            files.extend(
+                service_dirs
+                    .iter()
+                    .map(|service_dir| service_settings_path(service_dir))
+                    .filter(|path| path.is_file()),
+            );
+        }
+        Ok(Self {
+            keys: files
+                .iter()
+                .map(|file| settings_lock_order_key(file))
+                .collect(),
+            _held: acquire_settings_file_locks(files.iter().map(PathBuf::as_path))?,
+        })
+    }
+}
+
 struct StoreState {
     settings_file: PathBuf,
     service: String,
     service_dir: PathBuf,
-    _lock: SettingsFileLock,
     override_packages: bool,
     links: std::cell::OnceCell<LinkEnforcement>,
     before: SettingsBytecode,
@@ -342,6 +492,8 @@ struct StoreState {
     moved: HashSet<String>,
     /// An op renamed, moved or removed an instance of the store.
     restructured: bool,
+    /// The ids of the instances the batch added and removed again.
+    short_lived: HashSet<String>,
     touched: bool,
 }
 
@@ -360,15 +512,28 @@ struct RefTarget {
     index: usize,
 }
 
+/// A reference property an op wrote by a path that named nothing when the
+/// op ran. It is looked up again when the last op has run.
+struct PendingReference {
+    store: usize,
+    settings_id: String,
+    property: String,
+    op: usize,
+}
+
 struct BatchState<'a> {
     resolve_store: &'a StoreResolver<'a>,
     override_packages: bool,
+    locks: BatchLocks,
     stores: Vec<StoreState>,
     positions: HashMap<String, usize>,
     refs: HashMap<String, RefTarget>,
     receipts: Vec<Receipt>,
     labels: Vec<String>,
     last_moves: HashMap<(usize, String), usize>,
+    /// The position of the op that is being applied.
+    running: usize,
+    pending: Vec<PendingReference>,
 }
 
 impl BatchState<'_> {
@@ -403,8 +568,14 @@ impl BatchState<'_> {
             mut attributes,
             given_source,
         } = prepare_new_instance_values(&item.class, properties, item.attrs)?;
-        for value in properties.values_mut().chain(attributes.values_mut()) {
-            self.qualify(store, value)?;
+        let mut deferred = Vec::new();
+        for (name, value) in properties.iter_mut() {
+            if self.qualify(store, value, MissingTarget::Defer)? {
+                deferred.push(name.clone());
+            }
+        }
+        for value in attributes.values_mut() {
+            self.qualify(store, value, MissingTarget::Refuse)?;
         }
         let state = &mut self.stores[store];
         let settings_id = match item.id.filter(|id| !id.is_empty()) {
@@ -438,6 +609,9 @@ impl BatchState<'_> {
             state.created_by.insert(added.settings_id.clone(), position);
         }
         state.touch(added.index);
+        for property in deferred {
+            self.defer_reference(store, added.index, property);
+        }
         let fields = Map::from_iter([("id".to_string(), json!(added.settings_id))]);
         self.record("add", store, added.index, item.reference, fields, script);
         Ok(())
@@ -594,6 +768,11 @@ impl BatchState<'_> {
             .iter()
             .map(|&index| (state.id(index), index))
             .collect::<HashMap<_, _>>();
+        let short_lived = removed
+            .keys()
+            .filter(|settings_id| !state.before_ids.contains(*settings_id))
+            .cloned()
+            .collect::<Vec<_>>();
         let mut indices = vec![index];
         indices.extend(self.receipts.iter().filter_map(|receipt| {
             let settings_id = receipt.settings_id.as_ref()?;
@@ -622,6 +801,7 @@ impl BatchState<'_> {
         let path = path_at(index);
         let state = &mut self.stores[store];
         instance_api::remove_instances_at_indices(&mut state.document, &[index], true)?;
+        state.short_lived.extend(short_lived);
         state.restructured = true;
         state.touched = true;
         self.receipts.push(Receipt {
@@ -717,15 +897,12 @@ impl BatchState<'_> {
             }
             return Ok((target.store, target.index));
         }
-        let service = match service {
-            Some(service) => service.to_string(),
+        let service = match named_service(raw, service) {
+            Some(service) => service,
             None if raw.contains(':') => {
                 bail!("{role} {raw} is a settings id; add \"service\" to say which store it is in")
             }
-            None => high_level_split_path(raw)
-                .into_iter()
-                .next()
-                .with_context(|| format!("{role} {raw:?} names no service"))?,
+            None => bail!("{role} {raw:?} names no service"),
         };
         let (settings_file, service_hint) = (self.resolve_store)(&service)?;
         let store = self.load(settings_file, &service_hint, create)?;
@@ -742,15 +919,19 @@ impl BatchState<'_> {
     }
 
     fn load(&mut self, settings_file: PathBuf, service_hint: &str, create: bool) -> Result<usize> {
-        let key = path_key(&settings_file);
+        let key = settings_lock_order_key(&settings_file);
         if let Some(position) = self.positions.get(&key) {
             return Ok(*position);
         }
-        crate::bytecode::pull_missing_service_store(&settings_file);
         if !create && !settings_file.exists() {
             return Err(missing_service_store_error(&settings_file));
         }
-        let lock = acquire_settings_file_lock(&settings_file)?;
+        if !self.locks.keys.contains(&key) {
+            bail!(
+                "{} was not locked before the batch ran",
+                settings_file.display()
+            );
+        }
         let document = if settings_file.exists() {
             SettingsBytecode::read_file(&settings_file)?
         } else {
@@ -769,7 +950,6 @@ impl BatchState<'_> {
             settings_file,
             service,
             service_dir,
-            _lock: lock,
             override_packages: self.override_packages,
             links: std::cell::OnceCell::new(),
             before: document.clone(),
@@ -784,6 +964,7 @@ impl BatchState<'_> {
             push_ids: Vec::new(),
             moved: HashSet::new(),
             restructured: false,
+            short_lived: HashSet::new(),
             touched: false,
         });
         self.positions.insert(key, self.stores.len() - 1);
@@ -804,7 +985,7 @@ impl BatchState<'_> {
                 continue;
             }
             if let Some(paths) = holding
-                && !self.positions.contains_key(&path_key(&path))
+                && !self.positions.contains_key(&settings_lock_order_key(&path))
                 && (paths.is_empty()
                     || SettingsBytecode::read_file_if_contains_any_string_set(&path, paths)?
                         .is_none())
@@ -849,11 +1030,13 @@ impl BatchState<'_> {
 
     /// Completes the references in a value an op writes to `store`, against
     /// the stores as the batch has them so far: a path may name an instance
-    /// an earlier op created, and not one an earlier op removed.
-    fn qualify(&mut self, store: usize, value: &mut Value) -> Result<()> {
+    /// an earlier op created, and not one an earlier op removed. Returns
+    /// whether a path that names nothing yet was left for the end of the
+    /// batch, as `missing` allows.
+    fn qualify(&mut self, store: usize, value: &mut Value, missing: MissingTarget) -> Result<bool> {
         let written = WrittenReferences::of(value);
         if written.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         if let Some(source_root) = self.stores[store]
             .service_dir
@@ -875,7 +1058,41 @@ impl BatchState<'_> {
             .iter()
             .map(|store| (store.service.as_str(), &store.document))
             .collect::<BTreeMap<_, _>>();
-        qualify_reference_targets(value, &documents, &written)
+        qualify_reference_targets(value, &documents, &written, missing)
+    }
+
+    /// Notes that the value the running op gave a property of the instance
+    /// holds a path that names nothing yet.
+    fn defer_reference(&mut self, store: usize, index: usize, property: String) {
+        self.pending.push(PendingReference {
+            store,
+            settings_id: self.stores[store].id(index),
+            property,
+            op: self.running,
+        });
+    }
+
+    /// Completes the references that named nothing when their op ran,
+    /// against the stores as the batch leaves them. One that still names
+    /// nothing fails the batch under the op that wrote it.
+    fn resolve_pending_references(&mut self) -> Result<()> {
+        for pending in std::mem::take(&mut self.pending) {
+            let Some(index) = self.stores[pending.store].index_of(&pending.settings_id) else {
+                continue;
+            };
+            let properties = &self.stores[pending.store].document.instances[index].properties;
+            let Some(mut value) = properties.get(&pending.property).cloned() else {
+                continue;
+            };
+            self.qualify(pending.store, &mut value, MissingTarget::RefuseAfterBatch)
+                .with_context(|| {
+                    format!("Batch op {} ({})", pending.op, self.labels[pending.op])
+                })?;
+            self.stores[pending.store].document.instances[index]
+                .properties
+                .insert(pending.property, value);
+        }
+        Ok(())
     }
 
     /// Sets `props` as `rbx bs` does (Position and Orientation fold into the
@@ -905,7 +1122,7 @@ impl BatchState<'_> {
             fold_derived_property(document, index, &mut name, &mut value)?;
             let (property, _) =
                 stored_property_edit(document, index, &name, &mut value, PropertyScope::Auto)?;
-            self.qualify(store, &mut value)?;
+            let deferred = self.qualify(store, &mut value, MissingTarget::Defer)?;
             instance_api::set_instance_property(
                 &mut self.stores[store].document,
                 index,
@@ -913,6 +1130,9 @@ impl BatchState<'_> {
                 value,
                 PropertyScope::Auto,
             )?;
+            if deferred {
+                self.defer_reference(store, index, property.clone());
+            }
             properties.push(property);
         }
         let mut attributes = Vec::with_capacity(attrs.len());
@@ -920,7 +1140,7 @@ impl BatchState<'_> {
             if !value.is_null() {
                 ensure_settable_attribute_name(&name)?;
             }
-            self.qualify(store, &mut value)?;
+            self.qualify(store, &mut value, MissingTarget::Refuse)?;
             instance_api::set_instance_property(
                 &mut self.stores[store].document,
                 index,
@@ -983,7 +1203,14 @@ impl BatchState<'_> {
             .filter(|store| store.restructured)
             .map(|store| (store.service.clone(), &store.before))
             .collect::<BTreeMap<_, _>>();
-        let mut changed = follow_edited_references(&edited, &mut documents);
+        let short_lived = self
+            .stores
+            .iter()
+            .filter(|store| !store.short_lived.is_empty())
+            .map(|store| (store.service.clone(), &store.short_lived))
+            .collect::<BTreeMap<_, _>>();
+        let mut changed =
+            follow_edited_references_with_short_lived(&edited, &short_lived, &mut documents);
         changed.extend(canonicalize_settings_references_for_moves(
             &mut documents,
             &moved,
@@ -998,6 +1225,7 @@ impl BatchState<'_> {
     }
 
     fn finish(mut self, push: bool) -> Result<BatchOutcome> {
+        self.resolve_pending_references()?;
         if self.stores.iter().any(|store| store.restructured) {
             self.update_references()?;
         }

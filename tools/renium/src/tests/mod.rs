@@ -189,6 +189,67 @@ fn changed_directory_collects_every_external_script() {
 }
 
 #[test]
+fn a_pushed_reference_into_another_service_carries_its_targets_current_path() {
+    let project_root = temp_dir("push-outside-reference");
+    let workspace_dir = project_root.join("src/Workspace");
+    let replicated_dir = project_root.join("src/ReplicatedStorage");
+    fs::create_dir_all(&workspace_dir).unwrap();
+    fs::create_dir_all(&replicated_dir).unwrap();
+    // As a pull of ReplicatedStorage alone leaves the project: the target
+    // was renamed, another instance has its old name, and the Workspace
+    // store still carries the old path.
+    settings_document(vec![
+        settings_instance("rs", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("a", "Renamed", "Folder", Some(0)),
+        settings_instance("b", "A", "Folder", Some(0)),
+    ])
+    .write_file(&service_settings_path(&replicated_dir))
+    .unwrap();
+    let mut holder = settings_instance("holder", "Holder", "ObjectValue", Some(0));
+    holder.properties.insert(
+        "Value".to_string(),
+        json!({
+            "_type": "Ref",
+            "settingsId": "a",
+            "pathSegments": ["ReplicatedStorage", "A"],
+            "pathOrdinals": [1, 1],
+        }),
+    );
+    settings_document(vec![
+        settings_instance("ws", "Workspace", "Workspace", None),
+        holder,
+    ])
+    .write_file(&service_settings_path(&workspace_dir))
+    .unwrap();
+    let changes = collect_editor_changes(&PushEditorChangesArgs {
+        changed_paths: vec![service_settings_path(&workspace_dir)],
+        ..PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: project_root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            BridgeConnectionArgs::local(0.0),
+        )
+    })
+    .unwrap();
+    let sent = changes
+        .property_changes
+        .iter()
+        .find(|change| change.settings_id.as_deref() == Some("holder"))
+        .map(|change| change.properties["Value"].clone());
+    assert_eq!(
+        sent,
+        Some(json!({
+            "_type": "Ref",
+            "settingsId": "a",
+            "pathSegments": ["ReplicatedStorage", "Renamed"],
+            "pathOrdinals": [1, 1],
+        }))
+    );
+    let _ = fs::remove_dir_all(project_root);
+}
+
+#[test]
 fn get_property_accepts_the_properties_after_the_target() {
     let names = |arguments: &[&str]| {
         let mut args = BytecodeGetPropertyArgs::try_parse_from(
@@ -4280,6 +4341,79 @@ fn vc_merge_keeps_parallel_additions_with_colliding_ids() {
 }
 
 #[test]
+fn vc_merge_leaves_a_reference_into_another_service_out_of_an_id_collision() {
+    let outside = json!({
+        "_type": "Ref",
+        "settingsId": "fresh",
+        "pathSegments": ["ReplicatedStorage", "External"],
+        "pathOrdinals": [1, 1],
+    });
+    let inside = json!({
+        "_type": "Ref",
+        "settingsId": "fresh",
+        "pathSegments": ["Workspace", "Theirs"],
+        "pathOrdinals": [1, 1],
+    });
+    let document = |added: &str, outside: &Value, inside: &Value| {
+        let mut instances = vec![
+            vc_test_instance("ws", "Workspace", "Workspace", None, &[]),
+            vc_test_instance(
+                "outside",
+                "Outside",
+                "ObjectValue",
+                Some(0),
+                &[("Value", outside.clone())],
+            ),
+            vc_test_instance(
+                "inside",
+                "Inside",
+                "ObjectValue",
+                Some(0),
+                &[("Value", inside.clone())],
+            ),
+        ];
+        if !added.is_empty() {
+            instances.push(vc_test_instance("fresh", added, "Folder", Some(0), &[]));
+        }
+        settings_document(instances)
+    };
+    let empty = json!({"_type": "Ref"});
+    // Both sides add a Workspace instance under the id `fresh`, which is
+    // also the id of ReplicatedStorage.External in its own store.
+    let (merged, conflicts) = merge_settings_documents(
+        &document("", &empty, &empty),
+        &document("Ours", &empty, &empty),
+        &document("Theirs", &outside, &inside),
+        None,
+    );
+    assert!(conflicts.is_empty());
+    let merged = crate::settings::bytecode::decode_settings_bytecode(
+        &crate::settings::bytecode::encode_settings_bytecode(&merged).unwrap(),
+    )
+    .unwrap();
+    let by_name = |name: &str| {
+        merged
+            .instances
+            .iter()
+            .find(|instance| instance.name == name)
+            .unwrap()
+    };
+    assert_eq!(by_name("Ours").settings_id, "fresh");
+    let theirs = by_name("Theirs").settings_id.clone();
+    assert_ne!(theirs, "fresh");
+    assert_eq!(by_name("Outside").properties["Value"], outside);
+    let theirs_index = merged
+        .instances
+        .iter()
+        .position(|instance| instance.settings_id == theirs)
+        .unwrap();
+    assert_eq!(
+        by_name("Inside").properties["Value"],
+        json!({"_type": "Ref", "instanceIndex": theirs_index + 1})
+    );
+}
+
+#[test]
 fn vc_merge_applies_clean_deletions_and_flags_delete_modify() {
     let base = settings_document(vec![
         vc_test_instance("root", "S", "Folder", None, &[]),
@@ -4467,6 +4601,7 @@ fn targeted_service_root_properties_survive_descendant_only_upsert_selection() {
             property_scope: crate::editor::diff::EditorPropertyScope::All,
             property_schema_by_class: &HashMap::new(),
             database: rbx_reflection_database::get().unwrap(),
+            outside_references: None,
         },
     );
     assert!(
