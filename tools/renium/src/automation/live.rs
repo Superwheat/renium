@@ -418,6 +418,16 @@ impl Control {
         self.status.lock_recover().mode = mode.name().to_string();
     }
 
+    /// Whether the session sends file edits to Studio by itself: it runs,
+    /// writes, has not stopped on an error and waits for no decision.
+    fn delivers_file_edits(&self) -> bool {
+        let status = self.status.lock_recover();
+        status.running
+            && !status.resolution_required
+            && status.error.is_none()
+            && self.writes_enabled.load(Ordering::Acquire)
+    }
+
     fn set_resolution_required(&self, required: bool) {
         let mut status = self.status.lock_recover();
         if status.resolution_required != required {
@@ -1514,6 +1524,12 @@ impl Manager {
                 && control.writes_enabled.load(Ordering::Acquire)
                 && control.pull_changes.load(Ordering::Acquire)
         })
+    }
+
+    /// Whether Live Sync sends this context's file edits to Studio by itself.
+    pub(crate) fn delivers_file_edits(&self, context_id: u64) -> bool {
+        self.control(context_id)
+            .is_some_and(|control| control.delivers_file_edits())
     }
 
     /// Project-relative files with edits Live Sync has not pushed yet; a pull
@@ -4066,6 +4082,30 @@ mod tests {
                 ])
             );
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_session_delivers_file_edits_only_while_it_runs_and_writes() {
+        let root = crate::tests::support::temp_dir("live-delivers");
+        let session = |mode, resolution_required| {
+            Control::new(root.clone(), true, false, mode, resolution_required)
+        };
+        let writing = session(PairMode::Reconcile, false);
+        assert!(writing.delivers_file_edits());
+        writing.pause();
+        assert!(writing.delivers_file_edits());
+        writing.fail("Studio rejected the push".to_string());
+        assert!(!writing.delivers_file_edits());
+        writing.clear_error();
+        assert!(writing.delivers_file_edits());
+        writing.set_mode(PairMode::Verify);
+        assert!(!writing.delivers_file_edits());
+        assert!(!session(PairMode::Verify, false).delivers_file_edits());
+        assert!(!session(PairMode::Reconcile, true).delivers_file_edits());
+        let stopped = session(PairMode::Reconcile, false);
+        stopped.status.lock_recover().running = false;
+        assert!(!stopped.delivers_file_edits());
         fs::remove_dir_all(root).unwrap();
     }
 

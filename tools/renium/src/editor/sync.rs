@@ -1536,6 +1536,9 @@ fn add_editor_commit_status(summary: &mut Map<String, Value>, status: EditorComm
 }
 
 pub(crate) fn push_editor_changes(args: PushEditorChangesArgs) -> Result<()> {
+    if !args.verify {
+        crate::cli::syntax::ensure_script_files_parse(&args.paths)?;
+    }
     let result = push_editor_changes_result(args)?;
     print_json_output(&result, global_pretty_output(false))
 }
@@ -1595,6 +1598,7 @@ pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Res
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
         "destructive": !incremental,
+        "deferToLiveSync": args.defer_to_live_sync,
     });
     // Every push the user has not opted out of with --no-review goes through
     // the daemon's review so protected writes stay allowed; `yes` alone

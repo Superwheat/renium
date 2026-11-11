@@ -572,6 +572,21 @@ pub(crate) fn push_stored_instances(
     settings_ids: Vec<String>,
     scope: PushedScope,
 ) -> Result<Value> {
+    crate::editor::sync::push_editor_changes_result(stored_instances_push(
+        settings_file,
+        settings_ids,
+        scope,
+    ))
+    .context("The store was written but the push failed; push it with `rbx ps`")
+}
+
+/// The push `push_stored_instances` sends, for the project in the working
+/// directory.
+pub(crate) fn stored_instances_push(
+    settings_file: PathBuf,
+    settings_ids: Vec<String>,
+    scope: PushedScope,
+) -> crate::cli::PushEditorChangesArgs {
     let mut args = crate::cli::PushEditorChangesArgs::new(
         crate::cli::ProjectSourceArgs::current(),
         crate::cli::BridgeConnectionArgs::default_connection(),
@@ -601,8 +616,7 @@ pub(crate) fn push_stored_instances(
     args.exact_target_ids = scope == PushedScope::Instance;
     args.yes = true;
     args.verify_sources = true;
-    crate::editor::sync::push_editor_changes_result(args)
-        .context("The store was written but the push failed; push it with `rbx ps`")
+    args
 }
 
 /// A script file imported with `--path-json` into a project whose service is
@@ -614,6 +628,44 @@ pub(crate) fn register_imported_script(
 ) -> Result<Option<Value>> {
     let segments: Vec<String> =
         serde_json::from_str(path_json).context("--path-json must be a JSON string array")?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Import destination has no file name")?;
+    register_script_file(
+        loaded,
+        ScriptFileEntry {
+            segments: &segments,
+            file_name,
+            source: None,
+        },
+    )
+}
+
+/// A script file and the store instance it stands for.
+pub(crate) struct ScriptFileEntry<'a> {
+    /// The service, the parents below it and the script's name.
+    pub(crate) segments: &'a [String],
+    /// Names the class, as the project's script suffixes read it.
+    pub(crate) file_name: &'a str,
+    /// The text of a script whose file is written with its store instance,
+    /// into a store that is created when the service has none; without it
+    /// the file is there already and a service without a store is left alone.
+    pub(crate) source: Option<&'a str>,
+}
+
+/// Adds the store instance of a script file through `add_store_instance`, as
+/// `rbx ba` adds one; None when nothing was added (a service without a store,
+/// or a script that is in the store already).
+pub(crate) fn register_script_file(
+    loaded: &crate::project::config::LoadedProject,
+    entry: ScriptFileEntry,
+) -> Result<Option<Value>> {
+    let ScriptFileEntry {
+        segments,
+        file_name,
+        source,
+    } = entry;
     if segments.len() < 2 {
         return Ok(None);
     }
@@ -625,15 +677,13 @@ pub(crate) fn register_imported_script(
         &loaded.root,
         &src_root,
     )?;
-    if !settings_file.is_file() {
+    if source.is_some() {
+        ensure_service_store_exists(&settings_file, &service_hint)?;
+    } else if !settings_file.is_file() {
         return Ok(None);
     }
     crate::project::config::cache_script_naming(&loaded.root, &loaded.project);
     let naming = crate::project::config::project_script_naming(&loaded.project);
-    let file_name = destination
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("Import destination has no file name")?;
     let Some((class_name, stem, run_context)) =
         crate::editor::paths::infer_source_script(file_name, &naming)
     else {
@@ -661,7 +711,9 @@ pub(crate) fn register_imported_script(
         .collect::<Vec<_>>();
     match existing.as_slice() {
         [] => {}
-        [instance] if is_lua_source_class(&instance.class_name) => return Ok(None),
+        [instance] if is_lua_source_class(&instance.class_name) && source.is_none() => {
+            return Ok(None);
+        }
         [instance] => bail!(
             "{} already exists in the store as a {}; remove it with `rbx br` or choose another name",
             segments.join("."),
@@ -675,6 +727,9 @@ pub(crate) fn register_imported_script(
         && context != "Legacy"
     {
         properties.push(format!("RunContext=\"{context}\""));
+    }
+    if let Some(source) = source {
+        properties.push(format!("Source={}", serde_json::to_string(source)?));
     }
     add_store_instance(StoreInstanceRequest {
         settings_file,

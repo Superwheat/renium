@@ -1924,6 +1924,14 @@ fn automation_dispatch_managed(
             reviewed,
         );
     }
+    // A push that defers to Live Sync leaves the files to a session that is
+    // writing: it sends them itself, and a push beside it would pause it.
+    if operation == op::PUSH
+        && parameters.get("deferToLiveSync").and_then(Value::as_bool) == Some(true)
+        && state.live_sync().delivers_file_edits(context.id)
+    {
+        return Ok(json!({ "ok": true, "pushed": false, "liveSync": true }));
+    }
     let writes_project = matches!(
         operation,
         op::PULL

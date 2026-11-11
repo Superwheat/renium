@@ -124,6 +124,9 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::ScriptSearch(args) => script_search_command(args, project),
         Commands::ScriptGrep(args) => script_grep_command(args, project),
         Commands::ScriptRead(args) => script_read_command(args, project),
+        Commands::ScriptEdit(args) => {
+            crate::automation::script_edit::script_edit_command(args, project)
+        }
         Commands::StartStopPlay(args) => start_stop_play_command(args),
         Commands::ListClients(args) => list_clients_command(args),
         Commands::EditorReviewDecision(args) => editor_review_decision_command(args),

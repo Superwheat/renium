@@ -82,7 +82,7 @@ fn tool() -> Value {
                 },
                 "stdin": {
                     "type": "string",
-                    "description": "Text fed to each command's stdin, for --batch - and -j -",
+                    "description": "Text fed to each command's stdin, for --batch -, -j - and se --new",
                 },
                 "cwd": {
                     "type": "string",

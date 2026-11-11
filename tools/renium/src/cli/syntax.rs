@@ -133,6 +133,62 @@ fn changed_luau_paths(listing: &[u8], top: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// What the offline check finds wrong with a script.
+pub(crate) struct SyntaxFailure {
+    /// The message `rbx ck` prints.
+    pub(crate) message: String,
+    /// The line the compiler names, when it names one.
+    pub(crate) line: Option<usize>,
+    /// The compiler's text after that line, or the whole message without one.
+    pub(crate) reason: String,
+}
+
+/// The syntax error of Luau source as `rbx ck` reports it, or None when the
+/// source parses.
+pub(crate) fn syntax_failure(source: &str) -> Option<SyntaxFailure> {
+    let error = validate_luau_syntax(source).err()?;
+    let message = format!("{error:#}");
+    let located = error.chain().find_map(|cause| {
+        let mlua::Error::SyntaxError { message, .. } = cause.downcast_ref::<mlua::Error>()? else {
+            return None;
+        };
+        let (line, reason) = message.split_once(':')?;
+        Some((line.trim().parse().ok()?, reason.trim().to_string()))
+    });
+    Some(match located {
+        Some((line, reason)) => SyntaxFailure {
+            message,
+            line: Some(line),
+            reason,
+        },
+        None => SyntaxFailure {
+            reason: message.clone(),
+            message,
+            line: None,
+        },
+    })
+}
+
+/// The script files a push names are checked as `rbx ck` checks them, so a
+/// script that does not parse stops the push before Studio is asked.
+pub(crate) fn ensure_script_files_parse(paths: &[PathBuf]) -> Result<()> {
+    for path in paths {
+        if !is_luau_source(path) || !path.is_file() {
+            continue;
+        }
+        let source = fs::read_to_string(path)
+            .with_context(|| format!("Cannot read {} as UTF-8 text", path.display()))?;
+        if let Some(failure) = syntax_failure(&source) {
+            bail!(
+                "{}: {}; nothing was pushed",
+                path.display(),
+                failure.message
+            );
+        }
+    }
+    Ok(())
+}
+
 fn check(files: &[PathBuf], stdin: &mut impl Read) -> Result<Value> {
     if files
         .iter()

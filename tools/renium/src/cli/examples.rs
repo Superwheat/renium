@@ -197,6 +197,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ),
     ("rp", "Examples:\n  rbx rp"),
     ("dp", "Examples:\n  rbx dp"),
+    (
+        "se",
+        "Examples:\n  rbx se src/ServerScriptService/Main.server.luau 'local speed = 16' 'local speed = 24'\n  rbx se ServerScriptService.Main 'oldCall()' 'newCall()' 'legacy = true' '' -f src/ReplicatedStorage/Config.luau 'Rounds = 3' 'Rounds = 5'\n  rbx se src/ReplicatedStorage/Config.luau oldName newName --all --no-push\n  Get-Content -Raw draft.luau | rbx se src/ServerScriptService/Rounds.server.luau --new",
+    ),
     ("ps", "Examples:\n  rbx ps src/StarterGui/Menu.client.luau"),
     (
         "prop",

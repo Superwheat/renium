@@ -20,6 +20,7 @@ pub(crate) mod places;
 pub(crate) mod property_access;
 pub(crate) mod reconcile;
 pub(crate) mod runtime;
+pub(crate) mod script_edit;
 mod stdio_proxy;
 pub(crate) mod studio_args;
 pub(crate) mod tools;

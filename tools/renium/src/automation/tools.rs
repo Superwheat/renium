@@ -506,7 +506,7 @@ fn failure(message: impl Into<String>, next: &str) -> Failure {
     Failure::new("bad_req", message.into(), false, next)
 }
 
-fn has_script_extension(path: &Path) -> bool {
+pub(super) fn has_script_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| matches!(extension, "lua" | "luau"))
@@ -525,7 +525,7 @@ fn script_files(source: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn read_script(path: &Path, next: &str) -> Result<String, Failure> {
+pub(super) fn read_script(path: &Path, next: &str) -> Result<String, Failure> {
     let metadata = fs::metadata(path).map_err(|error| {
         failure(
             format!("Failed to inspect {}: {error}", path.display()),
@@ -542,7 +542,7 @@ fn read_script(path: &Path, next: &str) -> Result<String, Failure> {
         .map_err(|error| failure(format!("Failed to read {}: {error}", path.display()), next))
 }
 
-fn relative(root: &Path, path: &Path) -> String {
+pub(super) fn relative(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
@@ -696,7 +696,7 @@ fn mapped_script<'a>(sourcemap: &'a SourcemapNode, requested: &str) -> Result<&'
 /// The project's script mapping for one command: the sourcemap on disk, and
 /// the one built from the stores and source files, which answers when the one
 /// on disk is missing or does not lead to a script file.
-struct ScriptMapping<'a> {
+pub(super) struct ScriptMapping<'a> {
     root: &'a Path,
     saved: OnceCell<Option<SourcemapNode>>,
     built: OnceCell<SourcemapNode>,
@@ -719,7 +719,7 @@ fn loaded_once<T>(
 }
 
 impl<'a> ScriptMapping<'a> {
-    fn new(root: &'a Path) -> Self {
+    pub(super) fn new(root: &'a Path) -> Self {
         Self {
             root,
             saved: OnceCell::new(),
@@ -748,7 +748,10 @@ impl<'a> ScriptMapping<'a> {
 /// The script file a read names: a file path, or an instance path
 /// (`ServerScriptService.Main`) that the project's script mapping leads to a
 /// file.
-fn resolve_read_target(mapping: &ScriptMapping, requested: &str) -> Result<PathBuf, Failure> {
+pub(super) fn resolve_read_target(
+    mapping: &ScriptMapping,
+    requested: &str,
+) -> Result<PathBuf, Failure> {
     let root = mapping.root;
     let names_file = requested.contains(['/', '\\']) || has_script_extension(Path::new(requested));
     if names_file || root.join(requested).is_file() {

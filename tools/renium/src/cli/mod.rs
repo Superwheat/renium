@@ -17,6 +17,7 @@ use crate::automation::commands::{
     ImageUploadArgs, InputArgs, MultiEditArgs, PlaceAddArgs, PlaceRenameArgs, PlaceReorderArgs,
     StudioCloseArgs, StudioReopenArgs, StudioStatusArgs,
 };
+use crate::automation::script_edit::ScriptEditArgs;
 use crate::cli::args::{
     CursorPollArgs, GenerateSourcemapArgs, VcInitArgs, VcMergeArgs, VcTextconvArgs, ViewArgs,
 };
@@ -538,6 +539,12 @@ pub(super) enum Commands {
     ScriptGrep(ScriptGrepArgs),
     #[command(name = "sr", alias = "script-read", about = "Read a script")]
     ScriptRead(ScriptReadArgs),
+    #[command(
+        name = "se",
+        alias = "script-edit",
+        about = "Replace text in script files, check their syntax and push them, in one call"
+    )]
+    ScriptEdit(ScriptEditArgs),
     #[command(
         name = "play",
         alias = "playtest",
@@ -2764,6 +2771,10 @@ pub(super) struct PushEditorChangesArgs {
     /// review policy is the authored project's.
     #[arg(skip)]
     pub(crate) link_project_root: Option<PathBuf>,
+    /// `rbx se` pushes nothing while Live Sync writes for the project: the
+    /// session delivers the files, and the result says so.
+    #[arg(skip)]
+    pub(crate) defer_to_live_sync: bool,
     #[arg(
         help = "Only push these properties",
         short,
@@ -2825,6 +2836,7 @@ impl PushEditorChangesArgs {
             exact_target_ids: false,
             targets_extend_paths: false,
             link_project_root: None,
+            defer_to_live_sync: false,
             target_properties: Vec::new(),
             upsert_instances_only: false,
             verify_sources: false,

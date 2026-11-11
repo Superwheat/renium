@@ -1606,3 +1606,290 @@ fn every_project_a_command_loads_is_known_to_the_map_refresh() {
     }
     let _ = fs::remove_dir_all(other);
 }
+
+/// What a stand-in push was asked to send: a new script by its store and
+/// instance, or script files by name.
+#[derive(Debug, PartialEq)]
+enum Pushed {
+    Stored(String, String),
+    Files(Vec<String>),
+}
+
+/// Runs `rbx se` in text mode with `stdin`, and lists what it pushed.
+fn script_edit(fx: &Fixture, args: &[&str], stdin: &str) -> (Outcome, Vec<Pushed>) {
+    use crate::automation::script_edit::PushTarget;
+    let name = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
+    let pushed = std::cell::RefCell::new(Vec::new());
+    let push = |_: &Path, target: &PushTarget| {
+        pushed.borrow_mut().push(match target {
+            PushTarget::Stored {
+                settings_file,
+                settings_id,
+            } => Pushed::Stored(name(settings_file), settings_id.to_string()),
+            PushTarget::Files(paths) => {
+                Pushed::Files(paths.iter().map(|path| name(path)).collect())
+            }
+        });
+        Ok(json!({"ok": true, "sourceVerified": 1, "verified": true}))
+    };
+    let outcome = run_script_edit(&fx.root, CaptureMode::Text, args, stdin, &push);
+    (outcome, pushed.into_inner())
+}
+
+/// The name, class and parent index of the last instance of a store.
+fn last_added(fx: &Fixture, service: &str) -> (String, String, Option<usize>, String) {
+    let store = fx.read_store(service);
+    let added = store.instances.last().unwrap();
+    assert_eq!(
+        added.properties.get("Source"),
+        Some(&json!(EXTERNAL_SOURCE_MARKER))
+    );
+    (
+        added.name.clone(),
+        added.class_name.clone(),
+        added.parent_index,
+        added.settings_id.clone(),
+    )
+}
+
+#[test]
+fn a_new_script_gets_its_file_and_store_entry_from_stdin_and_is_pushed() {
+    let fx = Fixture::new("script-new");
+    let project = fx.path("renium.project.jsonc");
+    let rounds = "src/ServerScriptService/Rounds.server.luau";
+    let source = "local Rounds = {}\nreturn Rounds\n";
+    let (created, pushed) = script_edit(&fx, &[rounds, "--new", "--project", &project], source);
+    assert_eq!(created.error, None);
+    assert_eq!(
+        created.stdout,
+        format!("{rounds}: new Script, 2 lines\npushed, verified\n")
+    );
+    assert_eq!(fs::read_to_string(fx.path(rounds)).unwrap(), source);
+    let (name, class, parent, id) = last_added(&fx, "ServerScriptService");
+    assert_eq!(
+        (name.as_str(), class.as_str(), parent),
+        ("Rounds", "Script", Some(0))
+    );
+    assert_eq!(
+        pushed,
+        [Pushed::Stored("ServerScriptService.renium".to_string(), id)]
+    );
+
+    let gate = "src/Workspace/Lobby/Gate.client.luau";
+    let (created, pushed) = script_edit(
+        &fx,
+        &["--no-push", &fx.path(gate), "--new", "--project", &project],
+        "\u{feff}print('gate')",
+    );
+    assert_eq!(
+        created.stdout,
+        format!("{gate}: new LocalScript, 1 line\nnot pushed (--no-push)\n")
+    );
+    assert_eq!(fs::read_to_string(fx.path(gate)).unwrap(), "print('gate')");
+    let (name, class, parent, _) = last_added(&fx, "Workspace");
+    assert_eq!(
+        (name.as_str(), class.as_str(), parent),
+        ("Gate", "LocalScript", Some(1))
+    );
+    assert_eq!(pushed, []);
+
+    let prices = "src/ReplicatedStorage/Shared/Prices.luau";
+    let json = run_script_edit(
+        &fx.root,
+        CaptureMode::Json,
+        &[prices, "--new", "--project", &project],
+        "return { sword = 5 }\n",
+        &|_, _| Ok(json!({"ok": true, "pushed": false, "liveSync": true})),
+    );
+    assert_eq!(
+        json.ok(),
+        json!({
+            "ok": true,
+            "files": [{"file": prices, "created": true, "class": "ModuleScript", "lineCount": 1}],
+            "push": {"pushed": false, "reason": "liveSync"},
+        })
+    );
+    let (name, class, parent, _) = last_added(&fx, "ReplicatedStorage");
+    assert_eq!(
+        (name.as_str(), class.as_str(), parent),
+        ("Prices", "ModuleScript", Some(1))
+    );
+
+    let hud = "src/StarterGui/Hud.client.luau";
+    let (created, _) = script_edit(
+        &fx,
+        &[hud, "--new", "--no-push", "--project", &project],
+        "print('hud')\n",
+    );
+    assert_eq!(created.error, None);
+    assert_eq!(fx.names("StarterGui"), ["StarterGui", "Hud"]);
+    assert!(fx.exists(hud));
+}
+
+#[test]
+fn a_new_script_that_is_refused_leaves_no_file_and_no_store_entry() {
+    let fx = Fixture::new("script-new-refused");
+    let project = fx.path("renium.project.jsonc");
+    let refused = |file: &str, source: &str| {
+        let (outcome, pushed) = script_edit(&fx, &[file, "--new", "--project", &project], source);
+        assert_eq!(pushed, [], "{file}");
+        outcome
+    };
+    let workspace = fx.names("Workspace");
+    let server = fx.names("ServerScriptService");
+
+    assert_eq!(
+        refused("src/Workspace/Spawner.server.luau", "return 1\n").err(),
+        "src/Workspace/Spawner.server.luau already exists; `rbx se FILE OLD NEW` edits it"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.path("src/Workspace/Spawner.server.luau")).unwrap(),
+        SPAWNER_SOURCE
+    );
+
+    let bad = "src/ServerScriptService/Bad.server.luau";
+    let syntax = refused(bad, "local ok = 1\nlocal x = )\n");
+    assert_eq!(syntax.error.as_deref(), Some(STRUCTURED_FAILURE));
+    assert_eq!(
+        syntax.stdout,
+        format!(
+            "{bad}: syntax error, line 2: Expected identifier when parsing expression, got ')'\n2:\nlocal x = )\nnothing written\n"
+        )
+    );
+    assert!(!fx.exists(bad));
+
+    let deep = "src/ServerScriptService/Systems/Queue.luau";
+    assert_eq!(
+        refused(deep, "return {}\n").err(),
+        "Systems is not in the ServerScriptService store"
+    );
+    assert!(!fx.exists(deep) && !fx.exists("src/ServerScriptService/Systems"));
+
+    assert_eq!(
+        refused("src/Workspace/Lobby.luau", "return {}\n").err(),
+        "Workspace.Lobby already exists in the store as a Folder; remove it with `rbx br` or choose another name"
+    );
+    assert_eq!(
+        refused("src/Workspace/Spawner.luau", "return {}\n").err(),
+        "Workspace.Spawner already exists in the store as a Script; remove it with `rbx br` or choose another name"
+    );
+    assert!(!fx.exists("src/Workspace/Lobby.luau") && !fx.exists("src/Workspace/Spawner.luau"));
+
+    assert_eq!(
+        refused("src/ServerScriptService/Empty.luau", " \n").err(),
+        "--new reads the new script's source from stdin, and stdin was empty"
+    );
+    assert_eq!(
+        refused("ServerScriptService.Rounds", "return 1\n").err(),
+        "--new takes a script file path such as src/ServerScriptService/Name.server.luau, not ServerScriptService.Rounds"
+    );
+    assert_eq!(
+        refused("src/Loose.luau", "return 1\n").err(),
+        "src/Loose.luau is not inside a service folder (src/ServerScriptService/Name.luau)"
+    );
+    assert_eq!(
+        refused("notes/Loose.luau", "return 1\n").err(),
+        "notes/Loose.luau is not under a source folder of the project"
+    );
+    let (paired, _) = script_edit(
+        &fx,
+        &[
+            "--project",
+            &project,
+            "src/ServerScriptService/Pairs.luau",
+            "--new",
+            "a",
+            "b",
+        ],
+        "return 1\n",
+    );
+    assert!(paired.err().contains("no OLD NEW pairs"));
+
+    assert_eq!(fx.names("Workspace"), workspace);
+    assert_eq!(fx.names("ServerScriptService"), server);
+}
+
+#[test]
+fn a_new_script_under_a_mapped_folder_is_its_file_alone() {
+    let fx = Fixture::new("script-new-mapped");
+    let mapped = mapped_project(&fx);
+    let (created, pushed) = script_edit(
+        &fx,
+        &[
+            "src/server/Extra.server.luau",
+            "--new",
+            "--project",
+            &mapped,
+        ],
+        "print('extra')\n",
+    );
+    assert_eq!(created.error, None);
+    assert_eq!(
+        created.stdout,
+        "src/server/Extra.server.luau: new Script, 1 line\npushed, verified\n"
+    );
+    assert_eq!(
+        pushed,
+        [Pushed::Files(vec!["Extra.server.luau".to_string()])]
+    );
+    assert_eq!(
+        fs::read_to_string(fx.path("mapped/src/server/Extra.server.luau")).unwrap(),
+        "print('extra')\n"
+    );
+    assert!(!fx.exists("mapped/instances"));
+}
+
+#[test]
+fn script_edit_takes_an_instance_path_or_a_file_and_keeps_crlf() {
+    let fx = Fixture::new("script-edit-targets");
+    let project = fx.path("renium.project.jsonc");
+    let helper = "src/Workspace/Lobby/Helper.client.luau";
+    let (edited, pushed) = script_edit(
+        &fx,
+        &[
+            "--project",
+            &project,
+            "ReplicatedStorage.Shared.Config",
+            "rounds = 3",
+            "rounds = 5",
+            "-f",
+            &fx.path(helper),
+            "local a = 1\nreturn a",
+            "local a = 2\nreturn a",
+        ],
+        "",
+    );
+    assert_eq!(edited.error, None);
+    assert_eq!(
+        edited.stdout,
+        format!(
+            "src/ReplicatedStorage/Shared/Config.luau: 1 edit, line 1\n{helper}: 1 edit, lines 1-2\npushed, verified\n"
+        )
+    );
+    assert_eq!(
+        pushed,
+        [Pushed::Files(vec![
+            "Config.luau".to_string(),
+            "Helper.client.luau".to_string()
+        ])]
+    );
+    assert_eq!(
+        fs::read_to_string(fx.path("src/ReplicatedStorage/Shared/Config.luau")).unwrap(),
+        "return { rounds = 5 }\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.path(helper)).unwrap(),
+        "local a = 2\r\nreturn a\r\n"
+    );
+}
+
+#[test]
+fn a_push_checks_the_syntax_of_the_script_files_it_names_first() {
+    let fx = Fixture::new("push-syntax");
+    let spawner = fx.path("src/Workspace/Spawner.server.luau");
+    fs::write(&spawner, "print('spawn')\nlocal x = )\n").unwrap();
+    assert_eq!(
+        fx.text(&["ps", &fx.path("src/Workspace"), &spawner]).err(),
+        "<root>/src/Workspace/Spawner.server.luau: Invalid Luau syntax: syntax error: 2: Expected identifier when parsing expression, got ')'; nothing was pushed"
+    );
+}

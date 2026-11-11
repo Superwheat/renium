@@ -357,9 +357,16 @@ pub(super) fn run_at(root: &Path, mode: CaptureMode, args: &[&str]) -> Outcome {
             };
         }
     };
-    let (result, value, stdout) = capture_output(mode, || {
-        crate::cli::dispatch::dispatch(cli.command, cli.project.as_deref())
-    });
+    captured(
+        root,
+        capture_output(mode, || {
+            crate::cli::dispatch::dispatch(cli.command, cli.project.as_deref())
+        }),
+    )
+}
+
+fn captured(root: &Path, run: (anyhow::Result<()>, Option<Value>, String)) -> Outcome {
+    let (result, value, stdout) = run;
     Outcome {
         value: normalize(value.unwrap_or(Value::Null), root),
         stdout: normalize_text(&stdout, root),
@@ -367,6 +374,33 @@ pub(super) fn run_at(root: &Path, mode: CaptureMode, args: &[&str]) -> Outcome {
             .err()
             .map(|error| normalize_text(&format!("{error:#}"), root)),
     }
+}
+
+/// Runs `rbx se` (`args` without the program and command names) with `stdin`
+/// as its input and `push` in place of the push to Studio.
+pub(super) fn run_script_edit(
+    root: &Path,
+    mode: CaptureMode,
+    args: &[&str],
+    stdin: &str,
+    push: crate::automation::script_edit::Push,
+) -> Outcome {
+    let cli = Cli::try_parse_from(["rbx", "se"].into_iter().chain(args.iter().copied()))
+        .expect("the se command line parses");
+    let crate::cli::Commands::ScriptEdit(parsed) = cli.command else {
+        unreachable!("se is the script edit command");
+    };
+    captured(
+        root,
+        capture_output(mode, || {
+            crate::automation::script_edit::run(
+                parsed,
+                cli.project.as_deref(),
+                &mut stdin.as_bytes(),
+                push,
+            )
+        }),
+    )
 }
 
 fn root_forms(root: &Path) -> Vec<String> {

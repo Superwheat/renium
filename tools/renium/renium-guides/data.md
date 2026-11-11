@@ -41,6 +41,9 @@ rbx ba Workspace -I Lobby.Props -n NewPart -c Part -p 'Anchored=true' --push
 rbx bs Workspace Lobby.Door -p 'Transparency=0.5' -p 'CanCollide=false' --push
 rbx bs Workspace Lobby --where 'is:Part Transparency>0.5' -p 'CanCollide=false' --push   # every match under Lobby
 rbx bss Workspace -i editor:script --str "return 1"
+rbx se src/ServerScriptService/Main.server.luau 'local speed = 16' 'local speed = 24'   # replace, check, push
+rbx se ServerScriptService.Main 'oldCall()' 'newCall()' -f src/ReplicatedStorage/Config.luau 'Rounds = 3' 'Rounds = 5'
+Get-Content -Raw draft.luau | rbx se src/ServerScriptService/Rounds.server.luau --new   # new script from stdin
 rbx mv Workspace -i editor:id -I editor:parent --push
 rbx mv StarterGui -i editor:id --to-service ReplicatedStorage -I editor:parent
 rbx cp Workspace -i Lobby.Pad -I Props -n Pad2 --push           # copy, name the copy, push it
@@ -61,9 +64,10 @@ Unknown properties are rejected. `--scope property` explicitly selects a real pr
 
 References use `-j '{"_type":"Ref","settingsId":"editor:target"}'`; clear with `--null`. Without an ID, use `pathSegments` and `pathOrdinals`.
 
-Edit existing script files directly. For a new script, write the file and create its entry with `ba` (it adopts the file); `bss --str` or `--source-file` writes source through the store.
+Scripts: `rbx se FILE OLD NEW [OLD NEW ...] [-f FILE OLD NEW ...]` changes script text, checks it and pushes it in one call. FILE is a script file or its instance path (`ServerScriptService.Main`), as `sr` takes it. Each OLD is replaced by its NEW in order and must occur exactly once in the file as the earlier pairs left it (`--all`: every occurrence, at least one); an empty NEW deletes; `-f FILE` goes on in another file. CRLF and LF match each other, and the file keeps its own line endings. Nothing is written unless every pair of every file applies and every changed file passes the `ck` check. A refusal says what to fix, so no second read: an OLD that is not there names its pair and prints the closest place with its line numbers and the file's exact text (`closest is lines 120-122 (only indentation or trailing space differs). The file has:`), one that occurs several times lists the line numbers, a syntax error names the file and line. The changed files are then pushed as `rbx ps FILES` pushes them. Text output is one line per file with its edits and new lines, then one for the push: `src/A.luau: 2 edits, lines 120-134, 201`, then `pushed, verified` (Studio holds the new source), `not pushed: Live Sync delivers it`, or `not pushed: no Studio is connected` (the files are written; `rbx ps FILE` pushes them later). `--no-push` only writes. `--output-mode json` returns `files` (`file`, `edits`, `lines`) and `push` (`pushed` with `verified`, or `reason`). Options other than `-f`, `--all` and `--no-push` go before FILE; put `--` before a first OLD that starts with `-f`.
+A new script: its source on stdin (the MCP tool's `stdin`) to `rbx se src/ServerScriptService/Name.server.luau --new` writes the file with its store entry as `ba` creates one, checks it and pushes it. The class comes from the file name (`.server.luau` Script, `.client.luau` LocalScript, `.luau` ModuleScript) and the folders above it must be in the store; a file that exists is refused. `bss --str` or `--source-file` writes source through the store.
 
-Check changed scripts together with `rbx ck`, which takes the `.luau`/`.lua` files git reports as changed in the project; name files or folders (`rbx ck src/ServerScriptService`) otherwise. It parses Luau offline without executing it; use `rbx ck -` for UTF-8 source on stdin. Errors include the file and syntax location, and return a failing exit code. This is not type checking, lint, or a behavior test.
+Check changed scripts together with `rbx ck`, which takes the `.luau`/`.lua` files git reports as changed in the project; name files or folders (`rbx ck src/ServerScriptService`) otherwise. It parses Luau offline without executing it; use `rbx ck -` for UTF-8 source on stdin. Errors include the file and syntax location, and return a failing exit code. This is not type checking, lint, or a behavior test. `se` and `ps` run this check themselves on the script files they are given and stop on its error, so no `ck` step goes before them.
 
 `changedPaths` lists actual file changes; empty means no-op. Live Sync sends them automatically; without it, push returned paths with their settings IDs, not an entire service.
 
