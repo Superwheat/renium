@@ -1535,7 +1535,8 @@ fn add_editor_commit_status(summary: &mut Map<String, Value>, status: EditorComm
     }
 }
 
-pub(crate) fn push_editor_changes(args: PushEditorChangesArgs) -> Result<()> {
+pub(crate) fn push_editor_changes(mut args: PushEditorChangesArgs) -> Result<()> {
+    name_script_paths(&mut args, &std::env::current_dir()?)?;
     if !args.verify {
         crate::cli::syntax::ensure_script_files_parse(&args.paths)?;
     }
@@ -6565,6 +6566,33 @@ mod named_script_tests {
         assert!(
             shared.starts_with("Util names 2 scripts: src/A/Util.luau, src/B/Util.luau"),
             "{shared}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_script_pushed_by_name_is_syntax_checked_before_studio_is_asked() {
+        let root = crate::tests::support::temp_dir("push-name-syntax");
+        let script = root.join("src").join("Server").join("Honk.server.luau");
+        fs::create_dir_all(script.parent().unwrap()).unwrap();
+        fs::write(
+            &script,
+            "print('honk'
+",
+        )
+        .unwrap();
+        let project = ProjectSourceArgs {
+            project_root: root.clone(),
+            src_root: PathBuf::from("src"),
+        };
+        let mut args =
+            PushEditorChangesArgs::new(project, BridgeConnectionArgs::default_connection());
+        args.paths = vec![PathBuf::from("Honk")];
+        let error = push_editor_changes(args).unwrap_err().to_string();
+        assert!(
+            error.starts_with(&script.display().to_string())
+                && error.ends_with("nothing was pushed"),
+            "{error}"
         );
         fs::remove_dir_all(root).unwrap();
     }
