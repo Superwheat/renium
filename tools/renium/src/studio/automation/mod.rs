@@ -4087,7 +4087,9 @@ pub(crate) fn wait_timed_out_result(
         "elapsedSeconds": elapsed,
         "error": format!(
             "Timed out after {timeout}s waiting for condition (last value: {detail}); \
-             raise -t; rbx wait 30s waits a fixed time, rbx l --detach runs a sampler"
+             read the state it depends on before waiting again, and raise -t only when \
+             the event is still on its way; rbx wait 30s waits a fixed time, \
+             rbx l --detach runs a sampler"
         ),
     })
 }

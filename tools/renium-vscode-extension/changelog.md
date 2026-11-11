@@ -29,6 +29,7 @@
 - `rbx ps` checks the syntax of the script files named on its command line, by path or by name, before pushing, so no `rbx ck` step is needed first; `--no-check` pushes a script that holds text other than Luau.
 - The `rbx` MCP tool marks itself to load with the session in clients that defer MCP tools behind a search, so an agent's first command needs no lookup turn; its folder argument is described as only for another project.
 - The agent guide is ordered by the usual path of a script task: find, read the part, edit with `rbx se`, check in Play in one call.
+- A wait that times out says to read the state its condition depends on before waiting again, instead of only to raise `-t`, and the agent guide says what `-t` to give a Play wait.
 
 ## 0.6.0 - 2026-11-10
 
