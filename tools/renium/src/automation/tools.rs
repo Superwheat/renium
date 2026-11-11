@@ -959,6 +959,22 @@ impl<'a> ScriptMapping<'a> {
         }
     }
 
+    /// Whether the project places files in the tree itself (tree nodes with
+    /// a path, or mounts), which can put a script at the top of the place
+    /// under a name its file does not have.
+    fn maps_its_own_tree(&self) -> bool {
+        config::try_load_project(None, Some(self.root))
+            .ok()
+            .flatten()
+            .filter(|loaded| loaded.root == self.root)
+            .is_some_and(|loaded| {
+                !loaded.project.mounts.is_empty()
+                    || config::project_tree_nodes(&loaded.project.tree)
+                        .iter()
+                        .any(|(_, node)| node.path.is_some())
+            })
+    }
+
     /// The file of the script at an instance path.
     fn file(&self, requested: &str) -> Result<&str, Failure> {
         let saved = loaded_once(&self.saved, || load_existing_sourcemap_root(self.root))?;
@@ -980,9 +996,10 @@ impl<'a> ScriptMapping<'a> {
 /// The script file a read names, tried in this order: a file path, an
 /// instance path (`ServerScriptService.Main`) that the project's script
 /// mapping leads to a file, and the name one script alone goes by (`Main`).
-/// A request without a dot could only be an instance at the top of the place,
-/// where no script is, so its name is looked up first and the script mapping
-/// is not loaded for it.
+/// A request without a dot could only be an instance at the top of the place.
+/// No script is there unless the project maps its tree itself, so without
+/// such a mapping the name is looked up first and the script mapping is not
+/// loaded for it.
 pub(super) fn resolve_read_target(
     mapping: &ScriptMapping,
     requested: &str,
@@ -996,15 +1013,15 @@ pub(super) fn resolve_read_target(
         script_by_name(root, mapping.source, requested)
             .map_err(|shared| failure(shared, "script-read"))
     };
-    let top_level = !requested.contains('.');
-    if top_level && let Some(path) = named()? {
+    let name_only = !requested.contains('.') && !mapping.maps_its_own_tree();
+    if name_only && let Some(path) = named()? {
         return resolve_script(root, &path.to_string_lossy(), "script-read");
     }
     let unmapped = match mapping.file(requested) {
         Ok(file) => return resolve_script(root, file, "script-read"),
         Err(unmapped) => unmapped,
     };
-    if top_level {
+    if name_only {
         return Err(unmapped);
     }
     match named()? {
@@ -1645,7 +1662,9 @@ fn scope_prefix(scope: &str) -> String {
 
 /// The `--in` scopes as path prefixes: a file or folder under the project as
 /// it is given, anything else as the file of the one script that goes by that
-/// name. A scope that is neither is an error.
+/// name. A path that is not there matches nothing, as a folder that may be
+/// absent always did; a bare word that is neither a path nor a script's name
+/// is an error, since it was meant as one of the two.
 fn scope_prefixes(root: &Path, source: &Path, scopes: &[String]) -> Result<Vec<String>, Failure> {
     scopes
         .iter()
@@ -1656,6 +1675,11 @@ fn scope_prefixes(root: &Path, source: &Path, scopes: &[String]) -> Result<Vec<S
             }
             match script_by_name(root, source, &prefix) {
                 Ok(Some(path)) => Ok(relative(root, &path)),
+                Ok(None)
+                    if prefix.contains('/') || has_script_extension(Path::new(&prefix)) =>
+                {
+                    Ok(prefix)
+                }
                 Ok(None) => Err(failure(
                     format!(
                         "--in {scope}: the project has no file or folder at that path and no script by that name"
@@ -2306,6 +2330,12 @@ end
             assert_eq!(
                 grep(json!("Nope")).unwrap_err(),
                 "--in Nope: the project has no file or folder at that path and no script by that name"
+            );
+            assert_eq!(
+                grep(json!(["src/Missing", "src/A"])).unwrap(),
+                "src/A/Util.luau
+1: return 1",
+                "a folder that is not there matches nothing and the other scope still answers"
             );
         });
     }
