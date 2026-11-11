@@ -1,6 +1,5 @@
 ---
 source: rbx_xml/src/tests/mod.rs
-assertion_line: 38
 expression: encoded_text
 ---
 <roblox version="4">
@@ -41,7 +40,7 @@ expression: encoded_text
         <B>1</B>
       </Color3>
       <Content name="ImageContent">
-        <url>rbxasset://textures/ui/GuiImagePlaceholder.png</url>
+        <uri>rbxasset://textures/ui/GuiImagePlaceholder.png</uri>
       </Content>
       <Vector2 name="ImageRectOffset">
         <X>0</X>
@@ -142,7 +141,7 @@ expression: encoded_text
         <B>1</B>
       </Color3>
       <Content name="ImageContent">
-        <url>rbxasset://textures/ui/GuiImagePlaceholder.png</url>
+        <uri>rbxasset://textures/ui/GuiImagePlaceholder.png</uri>
       </Content>
       <Vector2 name="ImageRectOffset">
         <X>0</X>

@@ -1,6 +1,5 @@
 ---
 source: rbx_xml/src/tests/mod.rs
-assertion_line: 38
 expression: encoded_text
 ---
 <roblox version="4">
@@ -42,7 +41,7 @@ expression: encoded_text
         <BinaryString name="AttributesSerialize"></BinaryString>
         <bool name="AutoUpdate">false</bool>
         <Content name="PackageContentSerialize">
-          <url>rbxassetid://9111823334</url>
+          <uri>rbxassetid://9111823334</uri>
         </Content>
         <int64 name="SourceAssetId">-1</int64>
         <BinaryString name="Tags"></BinaryString>

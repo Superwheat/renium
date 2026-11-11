@@ -36,6 +36,29 @@ pub fn write_content<W: Write>(
     Ok(())
 }
 
+/// Writes a `ContentId` value that was migrated to `Content` under its
+/// legacy property name (`MeshId`, `TextureID`, `ColorMap`). Studio reads a
+/// legacy name with the legacy `<url>` child.
+pub fn write_legacy_content<W: Write>(
+    writer: &mut XmlEventWriter<W>,
+    xml_property_name: &str,
+    value: &Content,
+) -> Result<(), EncodeError> {
+    writer.write(XmlWriteEvent::start_element(XML_TAG_NAME).attr("name", xml_property_name))?;
+    match value.value() {
+        ContentType::Uri(uri) => {
+            writer.write(XmlWriteEvent::start_element("url"))?;
+            writer.write_string(uri)?;
+        }
+        _ => {
+            writer.write(XmlWriteEvent::start_element("null"))?;
+        }
+    }
+    writer.write(XmlWriteEvent::end_element())?;
+    writer.write(XmlWriteEvent::end_element())?;
+    Ok(())
+}
+
 pub fn read_content<R: Read>(
     reader: &mut XmlEventReader<R>,
     instance_id: rbx_dom_weak::types::Ref,
@@ -82,9 +105,11 @@ pub fn read_content<R: Read>(
     Ok(value)
 }
 
-// A ContentId type is serialized as either:
+// A Content value is serialized as either:
 // <null></null>, which indicates an empty content value
-// <url>something</url>, where 'something' is a URL to use for content.
+// <uri>something</uri>, where 'something' is a URI to use for content.
+// Studio reads a `<url>` child of a Content property such as MeshContent as
+// an empty value, so the URI is never written with the legacy tag here.
 impl XmlType for Content {
     const XML_TAG_NAME: &'static str = XML_TAG_NAME;
 
@@ -94,7 +119,7 @@ impl XmlType for Content {
                 writer.write(XmlWriteEvent::start_element("null"))?;
             }
             ContentType::Uri(uri) => {
-                writer.write(XmlWriteEvent::start_element("url"))?;
+                writer.write(XmlWriteEvent::start_element("uri"))?;
                 writer.write_string(uri)?;
             }
             _ => {
@@ -262,7 +287,7 @@ mod test {
         test_util::test_xml_serialize(
             r#"
                 <Content name="foo">
-                    <url>Some URL</url>
+                    <uri>Some URL</uri>
                 </Content>
             "#,
             &Content::from_uri("Some URL"),

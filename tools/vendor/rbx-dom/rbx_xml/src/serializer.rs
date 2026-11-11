@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, io::Write};
 
 use ahash::{HashMap, HashMapExt};
 use rbx_dom_weak::{
-    types::{Ref, SharedString, SharedStringHash, Variant},
+    types::{ContentType, Ref, SharedString, SharedStringHash, Variant},
     WeakDom,
 };
 use rbx_reflection::{PropertyKind, PropertySerialization, ReflectionDatabase};
@@ -11,7 +11,7 @@ use crate::{
     conversion::ConvertVariant,
     core::find_serialized_property_descriptor,
     error::{EncodeError as NewEncodeError, EncodeErrorKind},
-    types::write_value_xml,
+    types::{write_legacy_content, write_value_xml},
 };
 
 use crate::serializer_core::{XmlEventWriter, XmlWriteEvent};
@@ -239,11 +239,10 @@ fn serialize_instance<'dom, W: Write>(
                 // If the migration fails, there's no harm in us doing nothing
                 // since old values will still load in Studio.
                 if let Ok(new_value) = migration.perform(&converted_value) {
-                    if should_write_migrated_content_with_legacy_xml_name(
-                        &converted_value,
-                        &new_value,
-                    ) {
-                        write_value_xml(writer, state, serialized_name, &new_value)?;
+                    if let (Variant::ContentId(_), Variant::Content(content)) =
+                        (&*converted_value, &new_value)
+                    {
+                        write_legacy_content(writer, serialized_name, content)?;
                     } else {
                         for &new_property_name in migration.new_property_names() {
                             write_value_xml(writer, state, new_property_name, &new_value)?;
@@ -276,9 +275,18 @@ fn serialize_instance<'dom, W: Write>(
                 }
                 EncodePropertyBehavior::WriteUnknown | EncodePropertyBehavior::NoReflection => {
                     // We'll take this value as-is with no conversions on
-                    // either the name or value.
-
-                    write_value_xml(writer, state, property_name, value)?;
+                    // either the name or value. Without reflection the name
+                    // is all that tells a legacy content property (`Image`,
+                    // read from `<url>`) from a Content one (`ImageContent`).
+                    match value {
+                        Variant::Content(content)
+                            if !names_content_property(property_name)
+                                && !matches!(content.value(), ContentType::Object(_)) =>
+                        {
+                            write_legacy_content(writer, property_name, content)?;
+                        }
+                        _ => write_value_xml(writer, state, property_name, value)?,
+                    }
                 }
                 EncodePropertyBehavior::ErrorOnUnknown => {
                     return Err(writer.error(EncodeErrorKind::UnknownProperty {
@@ -301,11 +309,8 @@ fn serialize_instance<'dom, W: Write>(
     Ok(())
 }
 
-fn should_write_migrated_content_with_legacy_xml_name(
-    old_value: &Variant,
-    new_value: &Variant,
-) -> bool {
-    matches!(old_value, Variant::ContentId(_)) && matches!(new_value, Variant::Content(_))
+fn names_content_property(property_name: &str) -> bool {
+    property_name.ends_with("Content") || property_name.ends_with("ContentSerialize")
 }
 
 fn serialize_shared_strings<W: Write>(

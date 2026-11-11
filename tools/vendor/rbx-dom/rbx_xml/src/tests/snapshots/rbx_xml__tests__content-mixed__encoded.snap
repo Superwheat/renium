@@ -1,6 +1,5 @@
 ---
 source: rbx_xml/src/tests/mod.rs
-assertion_line: 38
 expression: encoded_text
 ---
 <roblox version="4">
@@ -41,7 +40,7 @@ expression: encoded_text
       <int64 name="SourceAssetId">-1</int64>
       <BinaryString name="Tags"></BinaryString>
       <Content name="TextureContent">
-        <url>rbxasset://textures/SpawnLocation.png</url>
+        <uri>rbxasset://textures/SpawnLocation.png</uri>
       </Content>
       <float name="Transparency">0</float>
       <int name="ZIndex">1</int>
@@ -180,7 +179,7 @@ expression: encoded_text
         <B>1</B>
       </Color3>
       <Content name="ImageContent">
-        <url>rbxasset://textures/SpawnLocation.png</url>
+        <uri>rbxasset://textures/SpawnLocation.png</uri>
       </Content>
       <Vector2 name="ImageRectOffset">
         <X>0</X>

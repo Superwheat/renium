@@ -2,7 +2,7 @@
 
 use rbx_dom_weak::types::{
     Attributes, BinaryString, BrickColor, Color3, Color3uint8, ColorSequence,
-    ColorSequenceKeypoint, ContentId, Enum, EnumItem, Font, MaterialColors, NumberRange,
+    ColorSequenceKeypoint, Content, ContentId, Enum, EnumItem, Font, MaterialColors, NumberRange,
     NumberSequence, NumberSequenceKeypoint, Rect, Tags, TerrainMaterials, UDim, UDim2, UniqueId,
     Variant, VariantType, Vector2, Vector3,
 };
@@ -287,11 +287,92 @@ fn serialize_contentid_migrations_with_legacy_xml_property_names() {
         "{encoded}"
     );
 
+    assert!(
+        encoded.contains("<url>rbxassetid://93436871821239</url>"),
+        "{encoded}"
+    );
+    assert!(!encoded.contains("<uri>"), "{encoded}");
     assert!(!encoded.contains("MeshContent"), "{encoded}");
     assert!(!encoded.contains("ColorMapContent"), "{encoded}");
     assert!(!encoded.contains("MetalnessMapContent"), "{encoded}");
     assert!(!encoded.contains("NormalMapContent"), "{encoded}");
     assert!(!encoded.contains("RoughnessMapContent"), "{encoded}");
+}
+
+/// Studio reads `<url>` under a Content property such as MeshContent as an
+/// empty value, which opens a place with every mesh and texture missing.
+#[test]
+fn serialize_content_properties_with_the_uri_tag() {
+    let _ = env_logger::try_init();
+
+    let mesh_part = InstanceBuilder::new("MeshPart")
+        .with_property(
+            "MeshContent",
+            Content::from_uri("rbxassetid://93436871821239"),
+        )
+        .with_property("TextureContent", Content::none());
+    let dom = WeakDom::new(mesh_part);
+
+    let mut encoded = Vec::new();
+    crate::to_writer_default(&mut encoded, &dom, &[dom.root_ref()]).unwrap();
+    let encoded = String::from_utf8(encoded).unwrap();
+
+    assert!(
+        encoded.contains(r#"<Content name="MeshContent">"#),
+        "{encoded}"
+    );
+    assert!(
+        encoded.contains("<uri>rbxassetid://93436871821239</uri>"),
+        "{encoded}"
+    );
+    assert!(
+        encoded.contains(r#"<Content name="TextureContent">"#) && encoded.contains("<null>"),
+        "{encoded}"
+    );
+    assert!(!encoded.contains("<url>"), "{encoded}");
+
+    let decoded = crate::from_str_default(&encoded).unwrap();
+    let part = decoded.get_by_ref(decoded.root().children()[0]).unwrap();
+    assert_eq!(
+        part.properties.get(&"MeshContent".into()),
+        Some(&Variant::Content(Content::from_uri(
+            "rbxassetid://93436871821239"
+        )))
+    );
+}
+
+#[test]
+fn unreflected_content_keeps_the_tag_its_property_name_takes() {
+    let _ = env_logger::try_init();
+
+    let document = r#"
+        <roblox version="4">
+            <Item class="ImageButton" referent="RBX1">
+                <Properties>
+                    <Content name="Image"><url>rbxassetid://1</url></Content>
+                    <Content name="HoverImageContent"><uri>rbxassetid://2</uri></Content>
+                </Properties>
+            </Item>
+        </roblox>
+    "#;
+    let dom = crate::from_str(
+        document,
+        crate::DecodeOptions::new().property_behavior(crate::DecodePropertyBehavior::NoReflection),
+    )
+    .unwrap();
+
+    let mut encoded = Vec::new();
+    crate::to_writer(
+        &mut encoded,
+        &dom,
+        dom.root().children(),
+        crate::EncodeOptions::new().property_behavior(crate::EncodePropertyBehavior::NoReflection),
+    )
+    .unwrap();
+    let encoded = String::from_utf8(encoded).unwrap();
+
+    assert!(encoded.contains("<url>rbxassetid://1</url>"), "{encoded}");
+    assert!(encoded.contains("<uri>rbxassetid://2</uri>"), "{encoded}");
 }
 
 #[test]

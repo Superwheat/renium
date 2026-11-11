@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- A place or model written as `.rbxlx` or `.rbxmx` (`rbx bep --format rbxlx`, `rbx bem -o model.rbxmx`) opens in Studio with its meshes, textures, images and sounds. Their asset ids were written under `<url>`, which Studio reads as empty for properties such as `MeshContent`, so every MeshPart showed as a block and every image was blank; they are written under `<uri>` now. Files in the binary formats (`.rbxl`, `.rbxm`) were not affected, and Renium reads the files it wrote before.
+
 ## 0.6.1 - 2026-11-11
 
 ### New

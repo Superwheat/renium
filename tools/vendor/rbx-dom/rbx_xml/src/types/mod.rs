@@ -15,6 +15,7 @@ mod cframe;
 mod color_sequence;
 mod colors;
 mod content;
+pub use self::content::write_legacy_content;
 mod enumeration;
 mod faces;
 mod font;

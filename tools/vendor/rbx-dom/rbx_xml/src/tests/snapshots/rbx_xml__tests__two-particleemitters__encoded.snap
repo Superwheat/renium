@@ -1,6 +1,5 @@
 ---
 source: rbx_xml/src/tests/mod.rs
-assertion_line: 38
 expression: encoded_text
 ---
 <roblox version="4">
@@ -33,7 +32,7 @@ expression: encoded_text
       </Vector2>
       <BinaryString name="Tags"></BinaryString>
       <Content name="TextureContent">
-        <url>rbxasset://textures/particles/sparkles_main.dds</url>
+        <uri>rbxasset://textures/particles/sparkles_main.dds</uri>
       </Content>
       <NumberSequence name="Transparency">0 0 0 1 0 0 </NumberSequence>
       <float name="VelocityInheritance">0</float>
@@ -69,7 +68,7 @@ expression: encoded_text
       </Vector2>
       <BinaryString name="Tags"></BinaryString>
       <Content name="TextureContent">
-        <url>rbxasset://textures/particles/sparkles_main.dds</url>
+        <uri>rbxasset://textures/particles/sparkles_main.dds</uri>
       </Content>
       <NumberSequence name="Transparency">0 0 0 1 0 0 </NumberSequence>
       <float name="VelocityInheritance">0</float>

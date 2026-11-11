@@ -288,7 +288,7 @@ expression: encoded_text
           <float name="StudsPerTileV">8</float>
           <BinaryString name="Tags"></BinaryString>
           <Content name="TextureContent">
-            <url>rbxassetid://6372755229</url>
+            <uri>rbxassetid://6372755229</uri>
           </Content>
           <ContentId name="TexturePack">
             <null>
@@ -560,7 +560,7 @@ expression: encoded_text
           <int64 name="SourceAssetId">-1</int64>
           <BinaryString name="Tags"></BinaryString>
           <Content name="TextureContent">
-            <url>rbxasset://textures/SpawnLocation.png</url>
+            <uri>rbxasset://textures/SpawnLocation.png</uri>
           </Content>
           <ContentId name="TexturePack">
             <null>
@@ -715,7 +715,7 @@ expression: encoded_text
           <float name="StudsPerTileV">8</float>
           <BinaryString name="Tags"></BinaryString>
           <Content name="TextureContent">
-            <url>rbxassetid://6372755229</url>
+            <uri>rbxassetid://6372755229</uri>
           </Content>
           <ContentId name="TexturePack">
             <null>
@@ -2082,20 +2082,20 @@ expression: encoded_text
         <UniqueId name="HistoryId">00000000000000000000000000000000</UniqueId>
         <float name="MoonAngularSize">11</float>
         <Content name="MoonTextureContent">
-          <url>rbxassetid://6444320592</url>
+          <uri>rbxassetid://6444320592</uri>
         </Content>
         <bool name="DefinesCapabilities">false</bool>
         <Content name="SkyboxBackContent">
-          <url>rbxassetid://6444884337</url>
+          <uri>rbxassetid://6444884337</uri>
         </Content>
         <Content name="SkyboxDownContent">
-          <url>rbxassetid://6444884785</url>
+          <uri>rbxassetid://6444884785</uri>
         </Content>
         <Content name="SkyboxFrontContent">
-          <url>rbxassetid://6444884337</url>
+          <uri>rbxassetid://6444884337</uri>
         </Content>
         <Content name="SkyboxLeftContent">
-          <url>rbxassetid://6444884337</url>
+          <uri>rbxassetid://6444884337</uri>
         </Content>
         <Vector3 name="SkyboxOrientation">
           <X>0</X>
@@ -2103,16 +2103,16 @@ expression: encoded_text
           <Z>0</Z>
         </Vector3>
         <Content name="SkyboxRightContent">
-          <url>rbxassetid://6444884337</url>
+          <uri>rbxassetid://6444884337</uri>
         </Content>
         <Content name="SkyboxUpContent">
-          <url>rbxassetid://6412503613</url>
+          <uri>rbxassetid://6412503613</uri>
         </Content>
         <int64 name="SourceAssetId">332039975</int64>
         <int name="StarCount">3000</int>
         <float name="SunAngularSize">11</float>
         <Content name="SunTextureContent">
-          <url>rbxassetid://6196665106</url>
+          <uri>rbxassetid://6196665106</uri>
         </Content>
         <BinaryString name="Tags"></BinaryString>
         <UniqueId name="UniqueId">7ae0e5570bbb7d4c0a5586bb000003c2</UniqueId>

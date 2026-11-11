@@ -775,6 +775,51 @@ fn compare_place_matches_a_project_that_sets_properties_a_place_file_renames() {
     );
 }
 
+/// Studio reads `<url>` under a Content property such as MeshContent as an
+/// empty value and opens the place with every mesh, image and sound missing,
+/// so each asset id sits under the child tag that goes with its property name.
+#[test]
+fn export_place_writes_asset_ids_in_the_form_studio_reads() {
+    let fx = Fixture::new("export-place-assets");
+    let root = fx.path("");
+    let project = fx.path("renium.project.jsonc");
+    let store = fx.store_arg("Workspace");
+    for (name, class, property) in [
+        ("Snd", "Sound", r#"SoundId="rbxassetid://11""#),
+        ("Label", "ImageLabel", r#"Image="rbxassetid://12""#),
+        ("Sticker", "Decal", r#"Texture="rbxassetid://13""#),
+    ] {
+        fx.text(&["ba", "-f", &store, "-n", name, "-c", class, "-p", property])
+            .ok();
+    }
+    let place = fx.path("build.rbxlx");
+    fx.text(&["bep", "-r", &root, "-o", &place]).ok();
+    let text = std::fs::read_to_string(&place).unwrap();
+    let mut asset_ids = 0;
+    let mut lines = text.lines().map(str::trim).peekable();
+    while let Some(line) = lines.next() {
+        let Some(name) = line
+            .strip_prefix("<Content name=\"")
+            .and_then(|rest| rest.split('"').next())
+        else {
+            continue;
+        };
+        let child = lines.peek().copied().unwrap_or_default();
+        if child.starts_with("<null>") {
+            continue;
+        }
+        let modern = name.ends_with("Content") || name.ends_with("ContentSerialize");
+        let tag = if modern { "<uri>" } else { "<url>" };
+        assert!(child.starts_with(tag), "{name}: {child}");
+        asset_ids += usize::from(child.contains("rbxassetid://1"));
+    }
+    assert_eq!(asset_ids, 3, "{text}");
+    let compared = fx
+        .text(&["cmp", &place, "--full", "--all", "--project", &project])
+        .ok();
+    assert_eq!(compared["differences"], json!([]));
+}
+
 #[test]
 fn compare_place_compares_two_files_in_either_format() {
     let fx = Fixture::new("compare-files");
