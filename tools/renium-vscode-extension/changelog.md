@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- `rbx se FILE OLD NEW [OLD NEW ...] [-f FILE OLD NEW ...]` replaces text in script files, checks their syntax and pushes them in one call. Nothing is written unless every replacement applies and every file parses; `--all` replaces every occurrence, `--no-push` only writes. A replacement that does not apply says which pair and file and prints the closest place with its line numbers and the file's exact text; one that matches several places lists their lines. With Live Sync running `se` leaves delivery to it and says so; with no Studio connected it writes the files and reports that they were not pushed.
+- `rbx se FILE --new` creates a script from source on stdin with its store entry, checks it and pushes it.
+- `rbx play --client-until 'LUAU'` waits until an expression is true on client 1 (after `--until` when both are given), bounded by `-t`, and reports `clientUntil` and `clientUntilSeconds`. `--result` and `--client-result` accept it as their wait.
+- A script goes by its name alone where one script has it: `rbx sr DataHandler:690-760`, `rbx sg X --in DataHandler`, `rbx se HonkHandler OLD NEW`, `rbx ck HonkHandler`, `rbx ps HonkHandler` (an `init` file by its folder's name). A name several scripts share is refused with their paths.
+
+### Improvements
+
+- During Play, what an `rbx l` or `rbx lc` chunk connects or schedules (`:Connect`, `task.delay`, `task.spawn`) stays alive for 120 s after the chunk returns, so one call can arm a listener and a later call read what it counted. Edit runs and failed runs still end with the chunk; `--detach` remains for samplers. Needs the updated Studio plugin.
+- `rbx inp` verifies every click on a GUI path, also in a list with `text`, `key`, scroll or coordinates: the element is scrolled into view when its turn comes, a hidden or covered one is refused, a button must fire `Activated` once and a text box must take focus. Before, one other action in the list sent every click as a coordinate resolved up front, so a scrolled-out target was missed and the call still reported ok with `verifiedClicks: 0`.
+- An `rbx inp` list stops at the first click that fails and says where: `Action 3 of 5 (click Main.Shop.Redeem) failed; actions 1-2 ran, actions 4-5 did not: ...`.
+- A click or press on a hidden or covered element lists what takes a click now, nearest first: `... Main.HUD has Visible=false. Clickable now: Main.DailyRewards.Header.Exit, ...` (up to 12 paths), so the retry needs no `rbx ui` call.
+- `rbx inp click` on a text box or a plain GUI element works on its own; it used to fail with "The expected GuiButton is no longer available". `textObserved: false` reports text typed after a click on a text box that did not arrive.
+- A move, press, release or scroll in an `rbx inp` list that names a GUI path reads its point when its turn comes, so a target that an earlier click of the list opened is found.
+- `rbx play --result` and `--client-result`, and `rbx wait --result`, may run for what the waits left of `-t` (at least 10 s, at most 120) instead of stopping at 10 s; a timeout names `-t` on the play command.
+- `rbx play -s` while a session is running says so: `alreadyRunning: true` and a `startNote` that earlier state remains and `rbx play -r` starts fresh.
+- Two Luau hints: an Edit `rbx l` that requires a `:Clone()` of a module and then indexes nil is told the clone has no Parent; a failed `--result` or `--client-result` chunk says the session is still running and which command reruns it.
+- `rbx ss` prints each script as `path N lines` and `rbx sg -c` as `path COUNT/N lines`, so deciding whether a script is short enough to read whole needs no `wc -l`.
+- `rbx sg` prints the hits inside a function under a `FIRST-LAST name` line (a hit on the function's own first line as `FIRST-LAST: text`), so the next read is `rbx sr FILE --fn NAME` or exactly that range.
+- `rbx sr FILE` without lines prints a script of 120 lines or more as its outline, with a first line that says how to read a part; `--all` prints it whole. Shorter scripts and explicit ranges print as before, and each target of a call is decided on its own. `rbx sr FILE:A-B --outline` prints the outline and then the lines.
+- `rbx sg TEXT --fn` prints a function longer than 60 lines as its matching lines with 3 lines around each, unless the function's own first line matches.
+- `rbx sg` takes paths after the text (`rbx sg TEXT src/Folder`), `--not TEXT` (repeatable) to leave out matching lines and scripts whose path holds the text, and `--offset N` to read on after a limit. An `--in` that names nothing is an error, not `no matches`. A literal query that holds `|` and matches nothing runs again as a regular expression, and the first line says so.
+- `rbx bg SERVICE TARGET` without a property prints the instance's stored properties as `rbx in SERVICE TARGET -F props` does, and `rbx in ... --depth N` answers that `rbx tr` takes `--depth`.
+- `rbx ps` checks the syntax of the script files named on its command line, by path or by name, before pushing, so no `rbx ck` step is needed first.
+- The `rbx` MCP tool marks itself to load with the session in clients that defer MCP tools behind a search, so an agent's first command needs no lookup turn; its folder argument is described as only for another project.
+- The agent guide is ordered by the usual path of a script task: find, read the part, edit with `rbx se`, check in Play in one call.
+
 ## 0.6.0 - 2026-11-10
 
 ### New
