@@ -589,7 +589,15 @@ def order_within_shard(rows: list, seed: int) -> list:
 ABORT_STREAK = 3
 ABORT_MARKERS = ("has not connected within", "No Studio runtime connected to this project")
 # One row is enough for these: no later row can pass until the user acts.
-ABORT_AT_ONCE_MARKERS = ("is signed out and shows the Roblox sign-in dialog",)
+ABORT_AT_ONCE = (
+    ("is signed out and shows the Roblox sign-in dialog", "Studio is signed out (seen in {row}); sign in to Studio, then start the run again"),
+    ("macOS is asking on this Mac's screen", "macOS is asking for a permission on this Mac's screen (seen in {row}); answer the prompt, then start the run again"),
+)
+
+
+def abort_at_once_reason(reason: str, row: str) -> str | None:
+    """Why a run stops after this row's failure, or None when later rows can still pass."""
+    return next((text.format(row=row) for marker, text in ABORT_AT_ONCE if marker in reason), None)
 
 
 def infrastructure_failure(outcome: dict) -> bool:
@@ -1007,6 +1015,8 @@ def run_session(scenarios: list[Scenario], size: str, label: str, keep: bool, or
                     outcome["reset"] = session.reset(ctx)
                 except Exception as error:
                     outcome["resetError"] = f"{type(error).__name__}: {str(error)[:400]}"
+                    if abort_at_once_reason(str(error), scenario.id):
+                        raise
                     session.close_studio(ctx)
                     session.open_studio(ctx)
                     outcome["reset"] = "reopen after a failed reset"
@@ -1050,8 +1060,9 @@ def run_session(scenarios: list[Scenario], size: str, label: str, keep: bool, or
             status = outcome["status"].upper()
             print(f"[{scenario.id}] {status} in {outcome['seconds']}s" + (f": {outcome.get('reason','')[:300]}" if status != "PASS" else ""), flush=True)
             streak = streak + 1 if infrastructure_failure(outcome) else 0
-            if any(marker in outcome.get("reason", "") for marker in ABORT_AT_ONCE_MARKERS) and not abort_requested():
-                request_abort(f"Studio is signed out (seen in {scenario.id}); sign in to Studio, then start the run again")
+            needs_user = abort_at_once_reason(outcome.get("reason", ""), scenario.id) if outcome["status"] != "pass" else None
+            if needs_user and not abort_requested():
+                request_abort(needs_user)
             if streak >= ABORT_STREAK and not abort_requested():
                 request_abort(f"{ABORT_STREAK} rows in a row never reached a connected Studio (last: {scenario.id}); check that Studio is logged in and the plugin is installed")
             if progress is not None:

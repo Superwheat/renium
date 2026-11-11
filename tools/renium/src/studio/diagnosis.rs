@@ -306,6 +306,103 @@ fn startup_hang_in_log(text: &str) -> Option<StartupHang> {
     hang
 }
 
+/// The macOS permission prompts on screen that concern Studio.
+#[derive(Default)]
+struct PermissionPrompts {
+    /// The question of each prompt that names Studio.
+    named: Vec<String>,
+    /// Prompts whose text could not be read.
+    unread: usize,
+    /// Whether they stayed unread because Accessibility is off for the app
+    /// that started Renium.
+    accessibility_off: bool,
+}
+
+/// macOS asks before Studio may read the Documents folder, where its plugins
+/// and settings live, and asks again when Studio's signature changes: after
+/// every Studio update, once Renium has prepared the new version. A Studio
+/// that needs the answer opens no place until someone gives it.
+#[cfg(target_os = "macos")]
+fn studio_permission_prompts() -> PermissionPrompts {
+    let mut prompts = sort_system_prompts(crate::studio::input::system_prompts());
+    prompts.accessibility_off =
+        prompts.unread > 0 && !crate::studio::input::accessibility_granted();
+    prompts
+}
+
+#[cfg(not(target_os = "macos"))]
+fn studio_permission_prompts() -> PermissionPrompts {
+    PermissionPrompts::default()
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn sort_system_prompts(prompts: Vec<Option<String>>) -> PermissionPrompts {
+    let mut sorted = PermissionPrompts::default();
+    for prompt in prompts {
+        let Some(text) = prompt else {
+            sorted.unread += 1;
+            continue;
+        };
+        if let Some(question) = text.lines().next()
+            && asked_by_studio(question)
+        {
+            sorted.named.push(question.to_string());
+        }
+    }
+    sorted
+}
+
+/// Whether a prompt's question is asked on Studio's behalf: macOS opens the
+/// question with the name of the app that asks, in quotes.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn asked_by_studio(question: &str) -> bool {
+    let name = question
+        .trim_start_matches(|character: char| !character.is_alphanumeric())
+        .to_lowercase();
+    name.starts_with("robloxstudio") || name.starts_with("roblox studio")
+}
+
+/// How long a Studio's request to open its place must have stayed pending
+/// before a permission prompt on screen counts as what holds it. A launch
+/// that proceeds logs the start of the open within a second of asking.
+const PROMPT_HOLD_SECONDS: u64 = 20;
+
+/// The second of a Studio's life at which it asked to open its place, when
+/// the open never began after that: the state a macOS permission prompt
+/// holds it in, read from its log.
+fn studio_place_open_pending(pid: u32, started_unix: Option<u64>) -> Option<u64> {
+    place_open_pending_in_log(&studio_log_startup(pid, started_unix)?)
+}
+
+/// A Studio log line carries the seconds since Studio started as its second
+/// field.
+fn place_open_pending_in_log(text: &str) -> Option<u64> {
+    let mut requested = None;
+    for line in text.lines() {
+        if line.contains("[FLog::PlaceManager] Start to open place") {
+            requested = line
+                .split(',')
+                .nth(1)
+                .and_then(|seconds| seconds.split('.').next())
+                .and_then(|seconds| seconds.trim().parse::<u64>().ok());
+        } else if line.contains("[FLog::StudioKeyEvents] open place (")
+            || line.contains("[telemetryLog] State: OpenPlace")
+        {
+            requested = None;
+        }
+    }
+    requested
+}
+
+/// Whether a place open requested `requested` seconds into the life of a
+/// Studio that is now `age` seconds old has been pending for the hold period.
+fn pending_for_the_hold_period(age: Option<u64>, requested: Option<u64>) -> bool {
+    matches!(
+        (age, requested),
+        (Some(age), Some(requested)) if age.saturating_sub(requested) >= PROMPT_HOLD_SECONDS
+    )
+}
+
 fn open_failure_in_log(text: &str) -> Option<String> {
     let mut failure = None;
     let mut awaiting_message = false;
@@ -368,50 +465,99 @@ struct Observation<'a> {
     startup_hangs: &'a [(u32, StartupHang)],
     signed_out: &'a [u32],
     starting: &'a [(u32, u64)],
+    prompts: &'a PermissionPrompts,
+    prompt_held: &'a [u32],
+}
+
+/// The lead of every sentence that quotes a macOS prompt; the scenario
+/// runner stops a run on it.
+const PROMPT_LEAD: &str = "macOS is asking on this Mac's screen:";
+
+fn held_verdict(pid: u32, question: &str) -> String {
+    format!(
+        "Studio (pid {pid}) asked to open its place and has not begun, while {PROMPT_LEAD} {question} Only the user can answer that prompt: ask them to, then run the command again. macOS asks again after each Studio update."
+    )
+}
+
+/// What a prompt on screen may mean for a Studio that has not connected,
+/// appended to a verdict that names another cause.
+fn prompt_note(prompts: &PermissionPrompts) -> String {
+    match prompts.named.first() {
+        Some(question) => format!(
+            " {PROMPT_LEAD} {question} A Studio that needs that answer does not connect until the user gives it."
+        ),
+        None if prompts.unread > 0 => format!(
+            " macOS is showing a prompt on this Mac's screen that Renium could not read{}; if it asks on RobloxStudio's behalf, a Studio that needs the answer does not connect until the user gives it.",
+            if prompts.accessibility_off {
+                " (Accessibility is off for the app that started Renium)"
+            } else {
+                ""
+            }
+        ),
+        None => String::new(),
+    }
 }
 
 fn verdict_text(observation: &Observation<'_>) -> String {
+    let note = prompt_note(observation.prompts);
+    if let Some(failure) = failure_verdict(observation) {
+        return format!("{failure}{note}");
+    }
+    if let (Some(pid), Some(question)) = (
+        observation.prompt_held.first(),
+        observation.prompts.named.first(),
+    ) {
+        return held_verdict(*pid, question);
+    }
+    format!("{}{note}", connection_verdict(observation))
+}
+
+/// A Studio that is not running, or one that reported its own failure.
+fn failure_verdict(observation: &Observation<'_>) -> Option<String> {
+    if !observation.studio_running {
+        return Some(
+            "Studio is not running; open the place with `rbx so FILE` or `rbx ro`.".to_string(),
+        );
+    }
+    if let Some((pid, reason)) = observation.open_failures.first() {
+        return Some(format!(
+            "Studio (pid {pid}) could not open its place: {}. It is left at its start page; `rbx sx --terminate` closes it, then check that the signed-in Studio account can edit the place and run `rbx so FILE` or `rbx ro` again.",
+            reason.trim_end_matches('.')
+        ));
+    }
+    if let Some(pid) = observation.signed_out.first() {
+        return Some(format!(
+            "Studio (pid {pid}) is signed out and shows the Roblox sign-in dialog instead of its place; sign in to Studio, then run the command again."
+        ));
+    }
+    let (pid, hang) = observation.startup_hangs.first()?;
+    let stage = if hang.signed_in {
+        "after signing in at launch"
+    } else {
+        "while signing in at launch"
+    };
+    let advice = if hang.instances_at_launch > 1 {
+        "Studio 0.741 hangs windows opened while another Studio window is running; close this window and open the place again, and if it hangs again close every Studio window first or open the place from the running Studio with File > Open"
+    } else {
+        "close it and open the place again"
+    };
+    Some(format!(
+        "Studio (pid {pid}) hung {stage} (its own hang monitor reported it) and will not open its place or connect; {advice}."
+    ))
+}
+
+/// Why a running Studio that reported no failure serves no command of this
+/// project.
+fn connection_verdict(observation: &Observation<'_>) -> String {
     let Observation {
-        studio_running,
         plugin,
         earliest_start,
         clients_connected,
         open_places,
         bound,
-        open_failures,
-        startup_hangs,
-        signed_out,
         starting,
+        ..
     } = *observation;
-    if !studio_running {
-        return "Studio is not running; open the place with `rbx so FILE` or `rbx ro`.".to_string();
-    }
-    if let Some((pid, reason)) = open_failures.first() {
-        return format!(
-            "Studio (pid {pid}) could not open its place: {}. It is left at its start page; `rbx sx --terminate` closes it, then check that the signed-in Studio account can edit the place and run `rbx so FILE` or `rbx ro` again.",
-            reason.trim_end_matches('.')
-        );
-    }
-    if let Some(pid) = signed_out.first() {
-        return format!(
-            "Studio (pid {pid}) is signed out and shows the Roblox sign-in dialog instead of its place; sign in to Studio, then run the command again."
-        );
-    }
-    if let Some((pid, hang)) = startup_hangs.first() {
-        let stage = if hang.signed_in {
-            "after signing in at launch"
-        } else {
-            "while signing in at launch"
-        };
-        let advice = if hang.instances_at_launch > 1 {
-            "Studio 0.741 hangs windows opened while another Studio window is running; close this window and open the place again, and if it hangs again close every Studio window first or open the place from the running Studio with File > Open"
-        } else {
-            "close it and open the place again"
-        };
-        return format!(
-            "Studio (pid {pid}) hung {stage} (its own hang monitor reported it) and will not open its place or connect; {advice}."
-        );
-    }
     if let Some((path, None)) = plugin {
         return format!(
             "The Renium Studio plugin is missing from {path}; run `rbx setup` to install it, then restart Studio."
@@ -485,15 +631,40 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
         .filter(|process| studio_signed_out(process.pid, process.started_unix))
         .map(|process| process.pid)
         .collect::<Vec<_>>();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |value| value.as_secs());
-    let starting = processes
+    let unconnected = processes
         .iter()
         .filter(|process| !connected_pids.contains(&u64::from(process.pid)))
         .filter(|process| !open_failures.iter().any(|(pid, _)| *pid == process.pid))
         .filter(|process| !startup_hangs.iter().any(|(pid, _)| *pid == process.pid))
         .filter(|process| !signed_out.contains(&process.pid))
+        .collect::<Vec<_>>();
+    let prompts = if unconnected.is_empty() {
+        PermissionPrompts::default()
+    } else {
+        studio_permission_prompts()
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |value| value.as_secs());
+    let prompt_held = if prompts.named.is_empty() {
+        Vec::new()
+    } else {
+        unconnected
+            .iter()
+            .filter(|process| {
+                pending_for_the_hold_period(
+                    process
+                        .started_unix
+                        .map(|started| now.saturating_sub(started)),
+                    studio_place_open_pending(process.pid, process.started_unix),
+                )
+            })
+            .map(|process| process.pid)
+            .collect::<Vec<_>>()
+    };
+    let starting = unconnected
+        .iter()
+        .filter(|process| !prompt_held.contains(&process.pid))
         .filter_map(|process| {
             let elapsed = now.saturating_sub(process.started_unix?);
             (elapsed < STARTING_GRACE_SECONDS).then_some((process.pid, elapsed))
@@ -510,6 +681,8 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
         startup_hangs: &startup_hangs,
         signed_out: &signed_out,
         starting: &starting,
+        prompts: &prompts,
+        prompt_held: &prompt_held,
     });
     json!({
         "studioProcesses": processes.iter().map(|process| json!({
@@ -522,6 +695,8 @@ pub(crate) fn diagnose(clients: &[Value], project_root: Option<&Path>) -> Value 
         "openFailures": open_failures.iter().map(|(pid, reason)| json!({"pid": pid, "reason": reason})).collect::<Vec<_>>(),
         "startupHangs": startup_hangs.iter().map(|(pid, hang)| json!({"pid": pid, "instancesAtLaunch": hang.instances_at_launch, "signedIn": hang.signed_in})).collect::<Vec<_>>(),
         "signedOut": signed_out,
+        "permissionPrompts": prompts.named,
+        "heldByPrompt": prompt_held,
         "starting": starting.iter().map(|(pid, elapsed)| json!({"pid": pid, "elapsedSeconds": elapsed})).collect::<Vec<_>>(),
         "boundTarget": bound,
         "verdict": verdict,
@@ -543,6 +718,33 @@ pub(crate) fn is_signed_out(diagnosis: &Value) -> bool {
         .is_some_and(|pids| !pids.is_empty())
 }
 
+/// Whether a diagnosis reports this Studio as held by a macOS permission
+/// prompt: it asked to open its place and waits for the user's answer.
+pub(crate) fn is_held_by_prompt(diagnosis: &Value, pid: u32) -> bool {
+    diagnosis["heldByPrompt"].as_array().is_some_and(|pids| {
+        pids.iter()
+            .any(|held| held.as_u64() == Some(u64::from(pid)))
+    })
+}
+
+/// The verdict for this Studio when a diagnosis reports it as held by a
+/// macOS permission prompt.
+pub(crate) fn held_by_prompt_verdict(diagnosis: &Value, pid: u32) -> Option<String> {
+    let question = diagnosis["permissionPrompts"]
+        .as_array()?
+        .first()?
+        .as_str()?;
+    is_held_by_prompt(diagnosis, pid).then(|| held_verdict(pid, question))
+}
+
+/// Whether a `status` wait may still end with a connected Studio: none is at
+/// the sign-in dialog, and one is still opening its place or, for a project
+/// that has matched no runtime yet (`unmatched`), may still connect.
+pub(crate) fn worth_waiting(diagnosis: &Value, clients: &[Value], unmatched: bool) -> bool {
+    !is_signed_out(diagnosis)
+        && (is_starting(diagnosis) || unmatched && may_still_connect(diagnosis, clients))
+}
+
 /// Whether a diagnosis reports a Studio that is still opening its place.
 pub(crate) fn is_starting(diagnosis: &Value) -> bool {
     diagnosis["starting"]
@@ -551,8 +753,9 @@ pub(crate) fn is_starting(diagnosis: &Value) -> bool {
 }
 
 /// Whether a Studio process the project has not matched yet may still
-/// connect: one runs whose Edit session is not among `clients`, none failed
-/// to open its place or hung at launch. A `status -w` keeps waiting for it (a
+/// connect: one runs whose Edit session is not among `clients` and that no
+/// macOS permission prompt holds, and none failed to open its place or hung
+/// at launch. A `status -w` keeps waiting for it (a
 /// daemon restart or a fresh launch connects its plugin a few seconds later).
 /// When every running Studio has its Edit session connected, nothing is left
 /// to wait for. A Play client does not cover its process: it can share the
@@ -567,9 +770,15 @@ pub(crate) fn may_still_connect(diagnosis: &Value, clients: &[Value]) -> bool {
         .as_array()
         .is_some_and(|processes| {
             processes.iter().any(|process| {
-                !clients.iter().any(|client| {
-                    client["role"] == "edit" && client["pid"].as_u64() == process["pid"].as_u64()
-                })
+                let held = process["pid"]
+                    .as_u64()
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    .is_some_and(|pid| is_held_by_prompt(diagnosis, pid));
+                !held
+                    && !clients.iter().any(|client| {
+                        client["role"] == "edit"
+                            && client["pid"].as_u64() == process["pid"].as_u64()
+                    })
             })
         });
     unconnected
@@ -631,8 +840,14 @@ mod wait_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        Observation, StartupHang, elapsed_seconds, open_failure_in_log, startup_hang_in_log,
-        verdict_text,
+        Observation, PermissionPrompts, StartupHang, elapsed_seconds, open_failure_in_log,
+        startup_hang_in_log, verdict_text,
+    };
+
+    static NO_PROMPTS: PermissionPrompts = PermissionPrompts {
+        named: Vec::new(),
+        unread: 0,
+        accessibility_off: false,
     };
 
     #[test]
@@ -663,6 +878,8 @@ mod tests {
             startup_hangs: &[],
             signed_out: &[],
             starting: &[],
+            prompts: &NO_PROMPTS,
+            prompt_held: &[],
         }
     }
 
@@ -720,6 +937,8 @@ mod tests {
             startup_hangs: &[],
             signed_out: &[4711],
             starting: &[(4711, 3)],
+            prompts: &NO_PROMPTS,
+            prompt_held: &[],
         });
         assert!(
             verdict.contains("4711") && verdict.contains("signed out"),
@@ -729,6 +948,216 @@ mod tests {
             serde_json::json!({"signedOut": [4711], "studioProcesses": [{"pid": 4711}]});
         assert!(super::is_signed_out(&diagnosis));
         assert!(!super::may_still_connect(&diagnosis, &[]));
+    }
+
+    #[test]
+    fn a_prompt_counts_when_studio_asks_and_its_question_is_what_gets_quoted() {
+        let question =
+            "\u{201c}RobloxStudio\u{201d} would like to access files in your Documents folder.";
+        let prompts = super::sort_system_prompts(vec![
+            Some(format!(
+                "{question}\nRoblox Studio needs access to your Documents folder to store settings, plugins, and other data."
+            )),
+            Some(
+                "\u{201c}Terminal\u{201d} wants access to control \u{201c}RobloxStudio\u{201d}."
+                    .to_string(),
+            ),
+            None,
+        ]);
+        assert_eq!(prompts.named, [question.to_string()]);
+        assert_eq!(prompts.unread, 1);
+        assert!(super::asked_by_studio(
+            "\u{201e}Roblox Studio\u{201c} m\u{f6}chte auf Dateien zugreifen."
+        ));
+        assert!(!super::asked_by_studio(
+            "\u{201c}Terminal\u{201d} would like to access files in your Desktop folder."
+        ));
+    }
+
+    #[test]
+    fn a_studio_held_by_a_macos_permission_prompt_is_named_after_its_own_failures() {
+        let question =
+            "\u{201c}RobloxStudio\u{201d} would like to access files in your Documents folder.";
+        let prompts = super::sort_system_prompts(vec![Some(question.to_string())]);
+        let open = ["Other".to_string()];
+        let held = verdict_text(&Observation {
+            open_places: &open,
+            prompts: &prompts,
+            prompt_held: &[4711],
+            ..observation(Some(&plugin(None)), true)
+        });
+        assert!(
+            held.contains("4711") && held.contains(question) && !held.contains("rbx setup"),
+            "{held}"
+        );
+        assert!(!held.contains("Allow"), "{held}");
+        assert_eq!(held.matches(super::PROMPT_LEAD).count(), 1, "{held}");
+
+        let hang = [(
+            4712,
+            StartupHang {
+                instances_at_launch: 1,
+                signed_in: true,
+            },
+        )];
+        let hung = verdict_text(&Observation {
+            startup_hangs: &hang,
+            prompts: &prompts,
+            prompt_held: &[4711],
+            ..observation(Some(&plugin(Some(5))), false)
+        });
+        assert!(
+            hung.contains("Studio (pid 4712) hung") && hung.contains(question),
+            "{hung}"
+        );
+        let signed_out = verdict_text(&Observation {
+            signed_out: &[4713],
+            prompts: &prompts,
+            prompt_held: &[4711],
+            ..observation(Some(&plugin(Some(5))), false)
+        });
+        assert!(
+            signed_out.contains("4713") && signed_out.contains(question),
+            "{signed_out}"
+        );
+
+        let diagnosis = serde_json::json!({
+            "heldByPrompt": [4711],
+            "permissionPrompts": [question],
+        });
+        assert_eq!(
+            super::held_by_prompt_verdict(&diagnosis, 4711),
+            Some(super::held_verdict(4711, question))
+        );
+        assert_eq!(super::held_by_prompt_verdict(&diagnosis, 4712), None);
+    }
+
+    #[test]
+    fn a_prompt_that_holds_no_studio_is_a_note_on_every_other_verdict() {
+        let question =
+            "\u{201c}RobloxStudio\u{201d} would like to access files in your Documents folder.";
+        let prompts = super::sort_system_prompts(vec![Some(question.to_string())]);
+        let open = ["Other".to_string()];
+        let starting = verdict_text(&Observation {
+            starting: &[(4711, 5)],
+            prompts: &prompts,
+            ..observation(Some(&plugin(Some(5))), false)
+        });
+        assert!(
+            starting.contains("has not connected yet") && starting.contains(question),
+            "{starting}"
+        );
+        let elsewhere = verdict_text(&Observation {
+            open_places: &open,
+            prompts: &prompts,
+            ..observation(Some(&plugin(Some(5))), true)
+        });
+        assert!(
+            elsewhere.contains("Other") && elsewhere.contains(question),
+            "{elsewhere}"
+        );
+        let missing_plugin = verdict_text(&Observation {
+            prompts: &prompts,
+            ..observation(Some(&plugin(None)), false)
+        });
+        assert!(
+            missing_plugin.contains("rbx setup") && missing_plugin.contains(question),
+            "{missing_plugin}"
+        );
+
+        let unread = super::sort_system_prompts(vec![None]);
+        let unread_note = verdict_text(&Observation {
+            open_places: &open,
+            prompts: &unread,
+            ..observation(Some(&plugin(Some(5))), true)
+        });
+        assert!(
+            unread_note.contains("could not read") && !unread_note.contains("Accessibility"),
+            "{unread_note}"
+        );
+        let no_access = PermissionPrompts {
+            accessibility_off: true,
+            ..super::sort_system_prompts(vec![None])
+        };
+        let no_access_note = verdict_text(&Observation {
+            prompts: &no_access,
+            ..observation(Some(&plugin(Some(5))), false)
+        });
+        assert!(
+            no_access_note.contains("Accessibility is off"),
+            "{no_access_note}"
+        );
+        let quiet = verdict_text(&observation(Some(&plugin(Some(5))), false));
+        assert!(!quiet.contains("macOS"), "{quiet}");
+    }
+
+    #[test]
+    fn a_held_studio_ends_the_wait_and_another_starting_studio_keeps_it() {
+        let held_only = serde_json::json!({
+            "studioProcesses": [{"pid": 4711}],
+            "heldByPrompt": [4711],
+            "starting": [],
+        });
+        assert!(super::is_held_by_prompt(&held_only, 4711));
+        assert!(!super::is_held_by_prompt(&held_only, 4712));
+        assert!(!super::may_still_connect(&held_only, &[]));
+        assert!(!super::worth_waiting(&held_only, &[], true));
+
+        let with_another = serde_json::json!({
+            "studioProcesses": [{"pid": 4711}, {"pid": 4712}],
+            "heldByPrompt": [4711],
+            "starting": [{"pid": 4712, "elapsedSeconds": 3}],
+        });
+        assert!(super::worth_waiting(&with_another, &[], false));
+        let aged = serde_json::json!({
+            "studioProcesses": [{"pid": 4711}, {"pid": 4712}],
+            "heldByPrompt": [4711],
+            "starting": [],
+        });
+        assert!(super::worth_waiting(&aged, &[], true));
+        assert!(!super::worth_waiting(&aged, &[], false));
+        let connected = serde_json::json!({ "pid": 4712, "role": "edit" });
+        assert!(!super::worth_waiting(&aged, &[connected], true));
+        let signed_out = serde_json::json!({
+            "studioProcesses": [{"pid": 4712}],
+            "signedOut": [4712],
+            "starting": [{"pid": 4713, "elapsedSeconds": 3}],
+        });
+        assert!(!super::worth_waiting(&signed_out, &[], true));
+    }
+
+    #[test]
+    fn a_place_open_that_was_asked_for_and_never_began_is_read_from_the_log() {
+        let asked = "2026-11-11T20:48:57.160Z,2.160966,f70bdd80,6,Info [FLog::StudioKeyEvents] enter LifecycleManager UserSession scope\n\
+            2026-11-11T20:48:57.162Z,2.162519,f70bdd80,6,Info [FLog::PlaceManager] Start to open place with traceId: e86f2f5f\n\
+            2026-11-11T20:53:07.535Z,252.535339,6c39b000,6 [DFLog::NamedMutex] NamedMutex(0x1, name:InstallerInfo.log)\n";
+        assert_eq!(super::place_open_pending_in_log(asked), Some(2));
+        assert_eq!(
+            super::place_open_pending_in_log(
+                "2026-11-11T20:48:56.972Z,1.972898,f70bdd80,6,Info [FLog::StudioKeyEvents] login [end][success]\n"
+            ),
+            None
+        );
+        let began = format!(
+            "{asked}2026-11-11T20:27:20.398Z,3.398547,f70bdd80,6,Info [FLog::StudioKeyEvents] open place (identifier = /p/a.rbxl) [start]\n"
+        );
+        assert_eq!(super::place_open_pending_in_log(&began), None);
+        let state = format!(
+            "{asked}2026-11-11T20:27:20.526Z,3.526665,6b903000,6 [telemetryLog] State: OpenPlaceInitialization\n"
+        );
+        assert_eq!(super::place_open_pending_in_log(&state), None);
+    }
+
+    #[test]
+    fn only_a_request_that_stayed_pending_for_the_hold_period_counts_as_held() {
+        assert!(super::pending_for_the_hold_period(Some(27), Some(2)));
+        assert!(!super::pending_for_the_hold_period(Some(15), Some(2)));
+        assert!(!super::pending_for_the_hold_period(
+            Some(3_600),
+            Some(3_595)
+        ));
+        assert!(!super::pending_for_the_hold_period(Some(3_600), None));
+        assert!(!super::pending_for_the_hold_period(None, Some(2)));
     }
 
     #[test]

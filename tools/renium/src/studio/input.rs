@@ -256,6 +256,21 @@ pub fn frontmost_studio_pid() -> Option<u32> {
     platform::frontmost_studio_pid()
 }
 
+/// The text of each macOS system prompt on screen, such as the one that asks
+/// whether RobloxStudio may access the Documents folder; None stands for a
+/// prompt that could not be read (no Accessibility permission, or it did not
+/// answer in time).
+#[cfg(target_os = "macos")]
+pub fn system_prompts() -> Vec<Option<String>> {
+    platform::system_prompts()
+}
+
+/// Whether macOS lets this process read other apps' windows (Accessibility).
+#[cfg(target_os = "macos")]
+pub fn accessibility_granted() -> bool {
+    platform::accessibility_granted()
+}
+
 #[cfg(windows)]
 pub fn post_mouse_move(window: &StudioWindow, x: i32, y: i32) -> Result<()> {
     platform::post_mouse_move(&window.handle, x, y)
@@ -2902,6 +2917,193 @@ mod platform {
             CFRelease(layer_key);
             CFRelease(number_key);
             Ok(records)
+        }
+    }
+
+    /// What one reading of the system prompts may spend on accessibility
+    /// messages: the deadline is checked before each message, and a message
+    /// waits at most PROMPT_MESSAGE_TIMEOUT_SECONDS for its element.
+    const PROMPT_READING_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+    const PROMPT_MESSAGE_TIMEOUT_SECONDS: f32 = 0.5;
+    const PROMPT_ELEMENT_BUDGET: usize = 48;
+    /// Polls a few hundred milliseconds apart share one reading.
+    const PROMPT_READING_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// macOS shows its permission prompts as windows of UserNotificationCenter.
+    /// One entry per prompt on screen: its lines in reading order, or None
+    /// when they could not be read.
+    pub fn system_prompts() -> Vec<Option<String>> {
+        type Reading = (std::time::Instant, Vec<Option<String>>);
+        static RECENT: std::sync::Mutex<Option<Reading>> = std::sync::Mutex::new(None);
+        let mut recent = RECENT.lock_recover();
+        if let Some((read, prompts)) = recent.as_ref()
+            && read.elapsed() < PROMPT_READING_AGE
+        {
+            return prompts.clone();
+        }
+        let prompts = read_system_prompts();
+        *recent = Some((std::time::Instant::now(), prompts.clone()));
+        prompts
+    }
+
+    pub fn accessibility_granted() -> bool {
+        // SAFETY: this read-only system query has no preconditions.
+        unsafe { AXIsProcessTrusted() }
+    }
+
+    fn read_system_prompts() -> Vec<Option<String>> {
+        let mut owners: Vec<(i32, usize)> = Vec::new();
+        // SAFETY: the window list and both keys are owned here and released
+        // below; the dictionaries stay valid while the list is retained.
+        unsafe {
+            let list = CGWindowListCopyWindowInfo(K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY, 0);
+            if list.is_null() {
+                return Vec::new();
+            }
+            let owner_name_key = cf_string("kCGWindowOwnerName");
+            let owner_pid_key = cf_string("kCGWindowOwnerPID");
+            for index in 0..CFArrayGetCount(list) {
+                let dict = CFArrayGetValueAtIndex(list, index);
+                if dict.is_null()
+                    || cf_string_value(CFDictionaryGetValue(dict, owner_name_key)).as_deref()
+                        != Some("UserNotificationCenter")
+                {
+                    continue;
+                }
+                let Some(pid) = cf_number_i32(CFDictionaryGetValue(dict, owner_pid_key)) else {
+                    continue;
+                };
+                match owners.iter_mut().find(|(owner, _)| *owner == pid) {
+                    Some((_, windows)) => *windows += 1,
+                    None => owners.push((pid, 1)),
+                }
+            }
+            CFRelease(list);
+            CFRelease(owner_name_key);
+            CFRelease(owner_pid_key);
+        }
+        let deadline = std::time::Instant::now() + PROMPT_READING_BUDGET;
+        let mut prompts = Vec::new();
+        for (pid, windows) in owners {
+            let mut texts = system_prompt_texts(pid, deadline);
+            if texts.len() < windows {
+                texts.resize(windows, None);
+            }
+            prompts.extend(texts);
+        }
+        prompts
+    }
+
+    /// One entry per prompt window of the process; none when its windows
+    /// could not be listed.
+    fn system_prompt_texts(pid: i32, deadline: std::time::Instant) -> Vec<Option<String>> {
+        let Ok(application) = ax_application(pid) else {
+            return Vec::new();
+        };
+        let mut reading = PromptReading {
+            deadline,
+            elements: PROMPT_ELEMENT_BUDGET,
+            complete: true,
+            lines: Vec::new(),
+        };
+        let windows = reading.attribute(application, "AXWindows");
+        // SAFETY: ax_application returned an owned accessibility element.
+        unsafe { CFRelease(application) };
+        let Some(windows) = windows else {
+            return Vec::new();
+        };
+        let mut texts = Vec::new();
+        // SAFETY: AXWindows is an owned CFArray whose entries stay valid while it is retained.
+        let count = unsafe { CFArrayGetCount(windows) };
+        for index in 0..count {
+            // SAFETY: index is within the CFArray count read above.
+            let window = unsafe { CFArrayGetValueAtIndex(windows, index) };
+            reading.complete = true;
+            reading.lines.clear();
+            reading.collect(window);
+            texts.push(
+                (reading.complete && !reading.lines.is_empty()).then(|| reading.lines.join("\n")),
+            );
+        }
+        // SAFETY: AXUIElementCopyAttributeValue returned an owned CFArray.
+        unsafe { CFRelease(windows) };
+        texts
+    }
+
+    /// A bounded walk over the static texts of a prompt window.
+    struct PromptReading {
+        deadline: std::time::Instant,
+        elements: usize,
+        complete: bool,
+        lines: Vec<String>,
+    }
+
+    impl PromptReading {
+        /// An attribute's value, or None when the element has none; a read
+        /// that fails, or that would start after the deadline, leaves the
+        /// walk incomplete.
+        fn attribute(&mut self, element: AXUIElementRef, name: &str) -> Option<CFTypeRef> {
+            const K_AX_ERROR_ATTRIBUTE_UNSUPPORTED: i32 = -25205;
+            const K_AX_ERROR_NO_VALUE: i32 = -25212;
+            if std::time::Instant::now() >= self.deadline {
+                self.complete = false;
+                return None;
+            }
+            let attribute = cf_string(name);
+            let mut value = std::ptr::null();
+            // SAFETY: element is a valid accessibility element and attribute a
+            // valid CFString; a messaging timeout applies to its element only.
+            let result = unsafe {
+                AXUIElementSetMessagingTimeout(element, PROMPT_MESSAGE_TIMEOUT_SECONDS);
+                AXUIElementCopyAttributeValue(element, attribute, &raw mut value)
+            };
+            // SAFETY: cf_string returned an owned Core Foundation object.
+            unsafe { CFRelease(attribute) };
+            match result {
+                0 if !value.is_null() => Some(value),
+                0 | K_AX_ERROR_ATTRIBUTE_UNSUPPORTED | K_AX_ERROR_NO_VALUE => None,
+                _ => {
+                    self.complete = false;
+                    None
+                }
+            }
+        }
+
+        fn text(&mut self, element: AXUIElementRef, name: &str) -> Option<String> {
+            let value = self.attribute(element, name)?;
+            let text = cf_string_value(value);
+            // SAFETY: AXUIElementCopyAttributeValue returned an owned Core Foundation object.
+            unsafe { CFRelease(value) };
+            text
+        }
+
+        fn collect(&mut self, element: AXUIElementRef) {
+            if self.elements == 0 {
+                self.complete = false;
+                return;
+            }
+            self.elements -= 1;
+            if self.text(element, "AXRole").as_deref() == Some("AXStaticText")
+                && let Some(text) = self.text(element, "AXValue")
+                && !text.trim().is_empty()
+            {
+                self.lines.push(text.trim().to_string());
+            }
+            if !self.complete {
+                return;
+            }
+            let Some(children) = self.attribute(element, "AXChildren") else {
+                return;
+            };
+            // SAFETY: AXChildren is an owned CFArray whose entries stay valid while it is retained.
+            let count = unsafe { CFArrayGetCount(children) };
+            for index in 0..count {
+                // SAFETY: index is within the CFArray count read above.
+                let child = unsafe { CFArrayGetValueAtIndex(children, index) };
+                self.collect(child);
+            }
+            // SAFETY: AXUIElementCopyAttributeValue returned an owned CFArray.
+            unsafe { CFRelease(children) };
         }
     }
 

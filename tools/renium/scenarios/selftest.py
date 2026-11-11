@@ -16,6 +16,7 @@ import os
 import shutil
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -82,6 +83,72 @@ def status_of(report: list[dict]) -> dict:
     return {row["id"]: row["status"] for row in report}
 
 
+HELD = "Studio (pid 7) asked to open its place and has not begun, while macOS is asking on this Mac's screen: RobloxStudio would like to access files in your Documents folder."
+
+
+def session_rows(reset_errors=(), fail_first=None) -> tuple[list[str], int]:
+    """Runs the real row loop over two rows with a stand-in session. `reset_errors`
+    are raised in turn by a row's reset and by the reopen that follows a failed
+    reset; `fail_first` fails the first row itself. Returns the two outcomes and
+    how often Studio was reopened."""
+    errors = list(reset_errors)
+    reopened = []
+
+    class StubContext:
+        def __init__(self):
+            self.log, self.studio_open, self.row_started = [], True, 0.0
+
+    class StubSession:
+        resets = reopens = 0
+        root = WORK / "stub-session"
+        slot = types.SimpleNamespace(acquire=lambda: None)
+
+        def __init__(self, size, label):
+            pass
+
+        def context(self, scenario):
+            return StubContext()
+
+        def reset(self, ctx):
+            if errors:
+                raise RuntimeError(errors.pop(0))
+            return "push"
+
+        def close_studio(self, ctx):
+            pass
+
+        def open_studio(self, ctx):
+            reopened.append(1)
+            if errors:
+                raise RuntimeError(errors.pop(0))
+
+        def finish(self, ctx, keep):
+            pass
+
+    class StubLock:
+        def __init__(self, *args):
+            pass
+
+        def __getattr__(self, name):
+            return lambda *args: None
+
+    def first(ctx):
+        if fail_first:
+            raise run.ScenarioFailure(fail_first)
+
+    rows = [run.Scenario(id="A", title="", size="small", run=first), run.Scenario(id="B", title="", size="small", run=lambda ctx: None)]
+    real = run.Session, run.RowLock, run.RowGate
+    run.Session, run.RowLock, run.RowGate = StubSession, StubLock, StubLock
+    run.ABORT_FILE.unlink(missing_ok=True)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            outcomes = run.run_session(rows, "small", "stub", False, 1)
+    finally:
+        run.Session, run.RowLock, run.RowGate = real
+        run.ABORT_FILE.unlink(missing_ok=True)
+    return [row["status"] for row in outcomes], len(reopened)
+
+
 def main() -> int:
     child_dir = WORK / "child"
     child_dir.mkdir(parents=True)
@@ -137,6 +204,18 @@ def main() -> int:
     # More shards than rows: the empty ones are not started.
     code, printed, report = drive({}, shards=6)
     assert code == 0 and len(report) == 4, (printed, report)
+
+    # A failure only the user can clear stops the run after one row, and a
+    # reset that fails with it is not answered by reopening Studio.
+    assert "macOS" in (run.abort_at_once_reason(HELD, "LIFE-003") or "") and "LIFE-003" in run.abort_at_once_reason(HELD, "LIFE-003")
+    assert "signed out" in (run.abort_at_once_reason("Studio (pid 7) is signed out and shows the Roblox sign-in dialog instead of its place", "A") or "")
+    assert run.abort_at_once_reason("Studio (pid 7) has not connected within 120s.", "A") is None
+    assert not run.infrastructure_failure({"status": "fail", "reason": HELD})
+    assert session_rows(fail_first=HELD) == (["fail", "abort"], 0)
+    assert session_rows(reset_errors=[HELD]) == (["error", "abort"], 0)
+    assert session_rows(reset_errors=["push failed", HELD]) == (["error", "abort"], 1)
+    assert session_rows(reset_errors=["push failed"]) == (["pass", "pass"], 1)
+    assert session_rows(fail_first="Sign is missing") == (["fail", "pass"], 0)
 
     shutil.rmtree(WORK, ignore_errors=True)
     print("scenario runner self-test passed")

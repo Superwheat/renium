@@ -1274,10 +1274,11 @@ fn studio_status_result(
             // An undecided match says nothing about the connected Studios, so
             // none of them counts as belonging elsewhere.
             let elsewhere: &[Value] = if decided { &connected } else { &[] };
-            let waiting = !crate::studio::diagnosis::is_signed_out(&current)
-                && (crate::studio::diagnosis::is_starting(&current)
-                    || context.runtime_id.is_none()
-                        && crate::studio::diagnosis::may_still_connect(&current, elsewhere));
+            let waiting = crate::studio::diagnosis::worth_waiting(
+                &current,
+                elsewhere,
+                context.runtime_id.is_none(),
+            );
             if waiting && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(500));
                 continue;

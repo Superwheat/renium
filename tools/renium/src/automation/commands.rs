@@ -81,6 +81,9 @@ pub(crate) fn wait_for_launched_studio(
         if listed("openFailures") || listed("startupHangs") {
             bail!("Studio (pid {pid}) could not open the place. {verdict}");
         }
+        if let Some(held) = crate::studio::diagnosis::held_by_prompt_verdict(&diagnosis, pid) {
+            bail!("{held}");
+        }
         if Instant::now() >= deadline {
             bail!("Studio (pid {pid}) has not connected within {wait:.0}s. {verdict}");
         }

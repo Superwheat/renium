@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Improvements
+
+- On macOS, `rbx so`, `rbx ro`, `rbx status` and every command that finds no Studio name the system prompt that keeps Studio from opening its place: macOS asks whether RobloxStudio may access the Documents folder, and asks again after each Studio update. `rbx so` stops waiting about 20 seconds after Studio asked for its place and says that only the user can answer the prompt, where it used to wait two minutes and report a Studio that "has not connected yet"; `rbx status` says so at once.
+
 ### Bug fixes
 
 - A place or model written as `.rbxlx` or `.rbxmx` (`rbx bep --format rbxlx`, `rbx bem -o model.rbxmx`) opens in Studio with its meshes, textures, images and sounds. Their asset ids were written under `<url>`, which Studio reads as empty for properties such as `MeshContent`, so every MeshPart showed as a block and every image was blank; they are written under `<uri>` now. Files in the binary formats (`.rbxl`, `.rbxm`) were not affected, and Renium reads the files it wrote before.
