@@ -3263,13 +3263,79 @@ fn send_virtual_input(
         }
         let result =
             bridge.call_for_selector("sendVirtualInput", params, BridgeTarget::Client, player)?;
-        ensure_plugin_api_ok(&result)?;
+        if let Some(failure) = virtual_input_failure(&result) {
+            return Err(failure.into());
+        }
         merged = Some(match merged {
             None => result,
             Some(previous) => merge_virtual_input_results(previous, result),
         });
     }
     merged.context("Virtual input needs at least one action")
+}
+
+/// Virtual input the client refused: why, with what can be clicked instead
+/// when a click target was hidden or covered, and the `step` that click's
+/// command carried.
+#[derive(Debug)]
+pub(super) struct VirtualInputFailure {
+    pub(super) message: String,
+    pub(super) step: Option<usize>,
+}
+
+impl std::fmt::Display for VirtualInputFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for VirtualInputFailure {}
+
+fn virtual_input_failure(result: &Value) -> Option<VirtualInputFailure> {
+    if result.get("ok").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let message = result
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("Plugin API returned ok=false");
+    Some(VirtualInputFailure {
+        message: with_clickable_now(message, result),
+        step: result
+            .get("failedStep")
+            .and_then(Value::as_u64)
+            .map(|step| step as usize),
+    })
+}
+
+const CLICKABLE_NOW_PATHS: usize = 12;
+const CLICKABLE_NOW_CHARS: usize = 600;
+
+/// `message` followed by the GUI paths the client says take a click now
+/// (`source.clickable`, nearest to the refused target first), so a retry
+/// needs no `ui` call: at most twelve paths and about 600 characters. The
+/// message is returned as it is when nothing is clickable.
+fn with_clickable_now(message: &str, source: &Value) -> String {
+    let mut listed = String::new();
+    let paths = source
+        .get("clickable")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(CLICKABLE_NOW_PATHS);
+    for path in paths {
+        let separator = if listed.is_empty() { "" } else { ", " };
+        if listed.len() + separator.len() + path.len() > CLICKABLE_NOW_CHARS {
+            break;
+        }
+        listed.push_str(separator);
+        listed.push_str(path);
+    }
+    if listed.is_empty() {
+        return message.to_string();
+    }
+    format!("{message}. Clickable now: {listed}")
 }
 
 /// One bridge call answers within thirty seconds, so a batch whose waits
@@ -3307,6 +3373,9 @@ fn merge_virtual_input_results(previous: Value, last: Value) -> Value {
         json!(count(&previous, "actions").unwrap_or(0) + count(&merged, "actions").unwrap_or(0));
     if let Some(clicks) = count(&previous, "verifiedClicks") {
         merged["verifiedClicks"] = json!(clicks + count(&merged, "verifiedClicks").unwrap_or(0));
+    }
+    if previous.get("textObserved") == Some(&Value::Bool(false)) {
+        merged["textObserved"] = json!(false);
     }
     if let Some(observed) = previous.get("keysObserved").and_then(Value::as_object) {
         let current = merged["keysObserved"]
@@ -3422,6 +3491,41 @@ fn resolve_edit_window(
     bail!("Studio screenshots are only supported on Windows and macOS")
 }
 
+/// Why the element `bounds` describes cannot take a click, or None when it
+/// can: off screen, not visible (with the plugin's reason), or covered.
+fn gui_click_refusal(bounds: &Value, requested: &str) -> Option<String> {
+    let flag = |key: &str| bounds.get(key).and_then(Value::as_bool);
+    let subject = bounds
+        .get("fullName")
+        .and_then(Value::as_str)
+        .unwrap_or(requested);
+    if flag("onScreen") == Some(false) {
+        return Some(format!(
+            "{subject} could not be brought on screen (auto-scroll was attempted; it is clipped \
+             by a non-scrolling container or positioned outside the viewport)"
+        ));
+    }
+    if let Some(reason) = bounds.get("notVisible").and_then(Value::as_str) {
+        let path = bounds.get("ordinalPath").and_then(Value::as_str);
+        return Some(format!(
+            "GUI element {} is not visible: {reason}",
+            path.unwrap_or(subject)
+        ));
+    }
+    if flag("visible") == Some(false) {
+        return Some(format!("GUI element {subject} is not visible"));
+    }
+    if flag("hitTest") == Some(false) {
+        return Some(match bounds.get("blockedBy").and_then(Value::as_str) {
+            Some(blocker) => format!("GUI element {subject} is covered by {blocker}"),
+            None => {
+                format!("GUI element {subject} is not receiving pointer input at its center")
+            }
+        });
+    }
+    None
+}
+
 fn gui_input_bounds(
     bridge: &BridgeServer,
     player: Option<&str>,
@@ -3450,31 +3554,8 @@ fn gui_input_bounds(
         } else {
             bounds
         };
-    let subject = bounds
-        .get("fullName")
-        .and_then(Value::as_str)
-        .unwrap_or(requested);
-    if bounds.get("onScreen").and_then(Value::as_bool) == Some(false) {
-        bail!(
-            "{subject} could not be brought on screen (auto-scroll was attempted; it is clipped \
-             by a non-scrolling container or positioned outside the viewport)"
-        );
-    }
-    if let Some(reason) = bounds.get("notVisible").and_then(Value::as_str) {
-        let path = bounds.get("ordinalPath").and_then(Value::as_str);
-        bail!(
-            "GUI element {} is not visible: {reason}",
-            path.unwrap_or(subject)
-        );
-    }
-    if bounds.get("visible").and_then(Value::as_bool) == Some(false) {
-        bail!("GUI element {subject} is not visible");
-    }
-    if bounds.get("hitTest").and_then(Value::as_bool) == Some(false) {
-        if let Some(blocker) = bounds.get("blockedBy").and_then(Value::as_str) {
-            bail!("GUI element {subject} is covered by {blocker}");
-        }
-        bail!("GUI element {subject} is not receiving pointer input at its center");
+    if let Some(refusal) = gui_click_refusal(&bounds, requested) {
+        bail!("{}", with_clickable_now(&refusal, &bounds));
     }
     let x = bounds
         .get("x")
@@ -6726,5 +6807,98 @@ mod virtual_input_tests {
             "the last call reports what is still held"
         );
         assert_eq!(merged["coreGui"]["pressed"], true);
+    }
+
+    #[test]
+    fn a_refused_click_lists_what_is_clickable_now() {
+        let hidden = "GUI element Main.HUD.Config is not visible: Main.HUD has Visible=false";
+        let listed = with_clickable_now(
+            hidden,
+            &json!({ "clickable": ["Main.DailyRewards.Header.Exit", "Main.DailyRewards.Claim"] }),
+        );
+        assert_eq!(
+            listed,
+            format!(
+                "{hidden}. Clickable now: Main.DailyRewards.Header.Exit, Main.DailyRewards.Claim"
+            )
+        );
+        for nothing in [
+            json!({}),
+            json!({ "clickable": [] }),
+            json!({ "clickable": null }),
+        ] {
+            assert_eq!(with_clickable_now(hidden, &nothing), hidden);
+        }
+
+        let many: Vec<String> = (1..=20).map(|n| format!("Shop.Item{n}")).collect();
+        let capped = with_clickable_now(hidden, &json!({ "clickable": many }));
+        let list = capped.split_once("Clickable now: ").unwrap().1;
+        assert_eq!(list.split(", ").count(), 12);
+        assert!(list.ends_with("Shop.Item12"));
+
+        let long: Vec<String> = (1..=12)
+            .map(|n| format!("{}.B{n}", "Deep".repeat(30)))
+            .collect();
+        let budgeted = with_clickable_now(hidden, &json!({ "clickable": long }));
+        let list = budgeted.split_once("Clickable now: ").unwrap().1;
+        assert!(list.len() <= 600, "{}", list.len());
+        assert_eq!(list.split(", ").count(), 4, "whole paths only");
+    }
+
+    #[test]
+    fn a_failed_virtual_input_call_keeps_its_step_and_list() {
+        assert!(virtual_input_failure(&json!({ "ok": true, "actions": 2 })).is_none());
+        let failure = virtual_input_failure(&json!({
+            "ok": false,
+            "error": "GUI element Players.A.PlayerGui.Shop.Buy is covered by Players.A.PlayerGui.Popup.Frame",
+            "failedStep": 3,
+            "clickable": ["Popup.Close"],
+        }))
+        .unwrap();
+        assert_eq!(failure.step, Some(3));
+        assert_eq!(
+            failure.to_string(),
+            "GUI element Players.A.PlayerGui.Shop.Buy is covered by Players.A.PlayerGui.Popup.Frame. Clickable now: Popup.Close"
+        );
+        let plain = virtual_input_failure(
+            &json!({ "ok": false, "error": "Virtual input requires a Play client" }),
+        )
+        .unwrap();
+        assert_eq!(plain.step, None);
+        assert_eq!(plain.to_string(), "Virtual input requires a Play client");
+    }
+
+    #[test]
+    fn a_press_target_is_refused_with_its_reason() {
+        let refusal = |bounds: Value| gui_click_refusal(&bounds, "Shop.Buy");
+        assert_eq!(
+            refusal(json!({ "onScreen": true, "visible": true, "hitTest": true })),
+            None
+        );
+        assert_eq!(
+            refusal(json!({
+                "fullName": "Players.A.PlayerGui.Main.HUD.Config", "ordinalPath": "Main.HUD.Config",
+                "onScreen": true, "visible": false, "notVisible": "Main.HUD has Visible=false",
+            }))
+            .unwrap(),
+            "GUI element Main.HUD.Config is not visible: Main.HUD has Visible=false"
+        );
+        assert_eq!(
+            refusal(json!({
+                "fullName": "Players.A.PlayerGui.Shop.Buy", "onScreen": true, "visible": true,
+                "hitTest": false, "blockedBy": "Players.A.PlayerGui.Popup.Frame",
+            }))
+            .unwrap(),
+            "GUI element Players.A.PlayerGui.Shop.Buy is covered by Players.A.PlayerGui.Popup.Frame"
+        );
+        assert_eq!(
+            refusal(json!({ "onScreen": true, "visible": true, "hitTest": false })).unwrap(),
+            "GUI element Shop.Buy is not receiving pointer input at its center"
+        );
+        assert!(
+            refusal(json!({ "onScreen": false }))
+                .unwrap()
+                .starts_with("Shop.Buy could not be brought on screen")
+        );
     }
 }

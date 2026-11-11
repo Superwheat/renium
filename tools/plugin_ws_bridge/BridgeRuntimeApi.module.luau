@@ -27,6 +27,8 @@ local CORE_GUI_DISMISS_LABELS = {
 	"okay",
 	"got it",
 }
+-- How many clickable paths a refused click names.
+local CLICKABLE_PATH_LIMIT = 12
 local PLAY_RESTART_SETTLE_SECONDS = 2
 local runnerSequence = 0
 
@@ -1142,28 +1144,77 @@ end
 		)
 	end
 
+	-- Whether a click at the center of `current` reaches it, and otherwise the
+	-- full name of the button, text box or Active element that takes it.
+	local function guiHitTest(current)
+		local absPos = current.AbsolutePosition
+		local absSize = current.AbsoluteSize
+		local playerGui = current:FindFirstAncestorOfClass("PlayerGui")
+		if playerGui then
+			local hits = playerGui:GetGuiObjectsAtPosition(absPos.X + absSize.X / 2, absPos.Y + absSize.Y / 2)
+			for _, hit in ipairs(hits) do
+				if hit == current or hit:IsDescendantOf(current) then
+					return true, nil
+				elseif
+					not current:IsDescendantOf(hit)
+					and (hit:IsA("GuiButton") or hit:IsA("TextBox") or hit.Active)
+				then
+					return false, hit:GetFullName()
+				end
+			end
+		end
+		return false, nil
+	end
+
+	local guiInventory
+
+	-- What a click can reach while `target` cannot take one: the paths of the
+	-- `ui` listing that nothing covers, those under the nearest ancestor of
+	-- `target` first, or nil when there is none.
+	local function clickableGuiPaths(target)
+		local inventory, instances = guiInventory({ limit = 500 })
+		if inventory.ok ~= true then
+			return nil
+		end
+		local distance = {}
+		local ancestor, steps = target, 0
+		while ancestor ~= nil do
+			distance[ancestor] = steps
+			ancestor = ancestor.Parent
+			steps += 1
+		end
+		local candidates = {}
+		for index, instance in ipairs(instances) do
+			local shared = instance.Parent
+			while shared ~= nil and distance[shared] == nil do
+				shared = shared.Parent
+			end
+			candidates[index] = { index = index, distance = if shared ~= nil then distance[shared] else math.huge }
+		end
+		table.sort(candidates, function(a, b)
+			if a.distance ~= b.distance then
+				return a.distance < b.distance
+			end
+			return a.index < b.index
+		end)
+		local paths = {}
+		for _, candidate in ipairs(candidates) do
+			if guiHitTest(instances[candidate.index]) then
+				paths[#paths + 1] = inventory.items[candidate.index].p
+				if #paths >= CLICKABLE_PATH_LIMIT then
+					break
+				end
+			end
+		end
+		return if #paths > 0 then paths else nil
+	end
+
 	local function guiBoundsResult(current, root, matchedCount)
 		local absPos = current.AbsolutePosition
 		local absSize = current.AbsoluteSize
 		local centerX = absPos.X + absSize.X / 2
 		local centerY = absPos.Y + absSize.Y / 2
-		local hitTest = false
-		local blockedBy
-		local playerGui = current:FindFirstAncestorOfClass("PlayerGui")
-		if playerGui then
-			for _, hit in ipairs(playerGui:GetGuiObjectsAtPosition(centerX, centerY)) do
-				if hit == current or hit:IsDescendantOf(current) then
-					hitTest = true
-					break
-				elseif
-					not current:IsDescendantOf(hit)
-					and (hit:IsA("GuiButton") or hit:IsA("TextBox") or hit.Active)
-				then
-					blockedBy = hit:GetFullName()
-					break
-				end
-			end
-		end
+		local hitTest, blockedBy = guiHitTest(current)
 		local insetX, insetY = 0, 0
 		local topLeft = (game:GetService("GuiService") :: any):GetGuiInset()
 		if typeof(topLeft) == "Vector2" then
@@ -1171,6 +1222,7 @@ end
 		end
 		local camera = game:GetService("Workspace").CurrentCamera
 		local viewport = if camera ~= nil then camera.ViewportSize else Vector2.new(0, 0)
+		local notVisible = guiNotVisibleReason(current, root, insetX, insetY)
 		return {
 			ok = true,
 			x = centerX + insetX,
@@ -1181,7 +1233,8 @@ end
 			height = absSize.Y,
 			visible = isEffectivelyVisible(current),
 			onScreen = guiCenterOnScreen(current, insetX, insetY),
-			notVisible = guiNotVisibleReason(current, root, insetX, insetY),
+			notVisible = notVisible,
+			clickable = if notVisible ~= nil or not hitTest then clickableGuiPaths(current) else nil,
 			viewportWidth = viewport.X,
 			viewportHeight = viewport.Y,
 			className = current.ClassName,
@@ -1352,7 +1405,8 @@ end
 		return guiBoundsResult(current, root, matchedCount)
 	end
 
-	function api.getGuiInventory(params)
+	-- The `ui` listing and, as a second result, the instance behind each item.
+	function guiInventory(params)
 		local limit = math.clamp(tonumber(params.limit) or 200, 1, 500)
 		local localPlayer = game:GetService("Players").LocalPlayer
 		if localPlayer == nil then
@@ -1486,6 +1540,7 @@ end
 		end
 
 		local items = {}
+		local instances = {}
 		local truncated = false
 		local includeOffscreen = params.includeOffscreen == true or params.includeOffScreen == true
 		for _, descendant in ipairs(playerGui:GetDescendants()) do
@@ -1510,6 +1565,7 @@ end
 				local text = if descendant:IsA("TextButton") or descendant:IsA("TextBox")
 					then string.sub(descendant.Text, 1, 60)
 					else nil
+				instances[#items + 1] = descendant
 				items[#items + 1] = {
 					p = inventoryPath(descendant),
 					c = descendant.ClassName,
@@ -1522,7 +1578,11 @@ end
 				}
 			end
 		end
-		return { ok = true, items = items, count = #items, truncated = truncated }
+		return { ok = true, items = items, count = #items, truncated = truncated }, instances
+	end
+
+	function api.getGuiInventory(params)
+		return (guiInventory(params))
 	end
 
 	function api.getWorldPoint(params)
@@ -1886,23 +1946,18 @@ updateMouse()
 				pcall(virtualInput.SendMouseButton, virtualInput, position, button, false, 0)
 			end
 		end
-		local function sendVerifiedClick(action)
-			assertOperationOwnership(operationGeneration)
-			local bounds = api.getGuiBounds({ path = action.path, id = action.id, scroll = true })
-			if bounds.ok ~= true then
-				error(tostring(bounds.error or "GUI target could not be resolved"), 0)
+		local function clickAt(position, holdMs)
+			sendMouseButton(position, Enum.UserInputType.MouseButton1, true, 0)
+			local okHold, holdError = pcall(function()
+				task.wait(math.clamp((tonumber(holdMs) or 30) / 1000, 0, 10))
+				assertOperationOwnership(operationGeneration)
+			end)
+			sendMouseButton(position, Enum.UserInputType.MouseButton1, false, 0)
+			if not okHold then
+				error(holdError, 0)
 			end
-			if bounds.notVisible ~= nil then
-				error(`GUI element {bounds.ordinalPath} is not visible: {bounds.notVisible}`, 0)
-			end
-			if bounds.hitTest ~= true then
-				local blocker = tostring(bounds.blockedBy or "another GUI element")
-				error(`GUI element {tostring(bounds.fullName)} is covered by {blocker}`, 0)
-			end
-			local target = findGuiButtonById(tostring(bounds.id or ""))
-			if target == nil then
-				error("The expected GuiButton is no longer available", 0)
-			end
+		end
+		local function clickButton(target, position, holdMs)
 			local activated = 0
 			local clicked = 0
 			local activatedConnection = target.Activated:Connect(function()
@@ -1911,27 +1966,74 @@ updateMouse()
 			local clickedConnection = target.MouseButton1Click:Connect(function()
 				clicked += 1
 			end)
-			local position = Vector2.new(tonumber(bounds.x) or 0, tonumber(bounds.y) or 0)
-			sendMouseButton(position, Enum.UserInputType.MouseButton1, true, 0)
-			local okHold, holdError = pcall(function()
-				task.wait(math.clamp((tonumber(action.holdMs) or 30) / 1000, 0, 10))
-				assertOperationOwnership(operationGeneration)
+			local okClick, clickError = pcall(function()
+				clickAt(position, holdMs)
+				local deadline = os.clock() + 1
+				while (activated == 0 or clicked == 0) and os.clock() < deadline do
+					RunService.Heartbeat:Wait()
+					assertOperationOwnership(operationGeneration)
+				end
 			end)
-			sendMouseButton(position, Enum.UserInputType.MouseButton1, false, 0)
-			if not okHold then
-				activatedConnection:Disconnect()
-				clickedConnection:Disconnect()
-				error(holdError, 0)
+			activatedConnection:Disconnect()
+			clickedConnection:Disconnect()
+			if not okClick then
+				error(clickError, 0)
 			end
+			if activated ~= 1 or clicked ~= 1 then
+				error(`Expected one Activated and MouseButton1Click event, got {activated} and {clicked}`, 0)
+			end
+		end
+		-- Text reaches a box from the frame after its focus landed; the text
+		-- action then checks that it arrived in this box.
+		local function awaitTextBoxFocus(target, refusal)
 			local deadline = os.clock() + 1
-			while (activated == 0 or clicked == 0) and os.clock() < deadline do
+			while UserInputService:GetFocusedTextBox() ~= target and os.clock() < deadline do
 				RunService.Heartbeat:Wait()
 				assertOperationOwnership(operationGeneration)
 			end
-			activatedConnection:Disconnect()
-			clickedConnection:Disconnect()
-			if activated ~= 1 or clicked ~= 1 then
-				error(`Expected one Activated and MouseButton1Click event, got {activated} and {clicked}`, 0)
+			if UserInputService:GetFocusedTextBox() ~= target then
+				error(refusal, 0)
+			end
+			RunService.Heartbeat:Wait()
+			assertOperationOwnership(operationGeneration)
+			focusedTextBox = target
+			focusedTextBefore = target.Text
+		end
+		local refusedClickable = nil
+		-- Clicks a GUI element a player can see and reach, after scrolling it
+		-- into view. A button counts as verified once it fired Activated and
+		-- MouseButton1Click exactly once, a text box once it took focus; any
+		-- other element is clicked after the same visibility and cover checks
+		-- and not counted.
+		local function sendVerifiedClick(action)
+			assertOperationOwnership(operationGeneration)
+			refusedClickable = nil
+			local bounds = api.getGuiBounds({ path = action.path, id = action.id, scroll = true })
+			if bounds.ok ~= true then
+				error(tostring(bounds.error or "GUI target could not be resolved"), 0)
+			end
+			if bounds.notVisible ~= nil then
+				refusedClickable = bounds.clickable
+				error(`GUI element {bounds.ordinalPath} is not visible: {bounds.notVisible}`, 0)
+			end
+			if bounds.hitTest ~= true then
+				refusedClickable = bounds.clickable
+				local blocker = tostring(bounds.blockedBy or "another GUI element")
+				error(`GUI element {tostring(bounds.fullName)} is covered by {blocker}`, 0)
+			end
+			local target = findGuiObjectById(tostring(bounds.id or ""), "GuiObject")
+			if target == nil then
+				error("The GUI element is no longer available", 0)
+			end
+			local position = Vector2.new(tonumber(bounds.x) or 0, tonumber(bounds.y) or 0)
+			if target:IsA("GuiButton") then
+				clickButton(target, position, action.holdMs)
+			elseif target:IsA("TextBox") then
+				clickAt(position, action.holdMs)
+				awaitTextBoxFocus(target, `TextBox {bounds.ordinalPath} did not take focus after the click`)
+			else
+				clickAt(position, action.holdMs)
+				return
 			end
 			verifiedClicks += 1
 		end
@@ -2208,6 +2310,11 @@ updateMouse()
 					sendKey(action.down == true, keyCode, action.repeated == true)
 				elseif actionType == "text" then
 					local text = tostring(action.text or "")
+					-- A box that lost focus since (a click elsewhere, Return)
+					-- no longer takes the text, so it is not the one to check.
+					if focusedTextBox ~= nil and UserInputService:GetFocusedTextBox() ~= focusedTextBox then
+						focusedTextBox = nil
+					end
 					local function sendText()
 						local okSend, sendError = pcall(virtualInput.SendTextInput, virtualInput, text)
 						if not okSend then
@@ -2254,21 +2361,20 @@ updateMouse()
 						error("The requested TextBox is no longer available", 0)
 					end
 					target:CaptureFocus()
-					local deadline = os.clock() + 1
-					while UserInputService:GetFocusedTextBox() ~= target and os.clock() < deadline do
-						RunService.Heartbeat:Wait()
-						assertOperationOwnership(operationGeneration)
-					end
-					if UserInputService:GetFocusedTextBox() ~= target then
-						error("The requested TextBox did not receive focus", 0)
-					end
-					-- The focus lands this frame; text input reaches the box from the next.
-					RunService.Heartbeat:Wait()
-					assertOperationOwnership(operationGeneration)
-					focusedTextBox = target
-					focusedTextBefore = target.Text
+					awaitTextBoxFocus(target, "The requested TextBox did not receive focus")
 				elseif actionType == "click" then
-					sendVerifiedClick(action)
+					-- A click that cannot be verified ends the batch with the
+					-- sender's `step` for it and what can be clicked instead.
+					local okClick, clickError = pcall(sendVerifiedClick, action)
+					if not okClick then
+						assertOperationOwnership(operationGeneration)
+						return {
+							ok = false,
+							error = tostring(clickError),
+							failedStep = tonumber(action.step),
+							clickable = refusedClickable,
+						}
+					end
 				else
 					local position = Vector2.new(tonumber(action.x) or 0, tonumber(action.y) or 0)
 					if actionType == "move" then

@@ -23,8 +23,9 @@ local SUPERCLASS = {
 -- What the engine does, as read from Studio's VirtualInput: pointer events
 -- refuse a point over a CoreGui GuiButton or Active element, keys refuse while
 -- a menu is open, a CoreGui TextBox is focused or a rendered CoreGui object is
--- selected. That a hidden selection stops counting is an assumption the
--- maintainer verifies live.
+-- selected. That a hidden selection stops counting, that a left click on a
+-- game TextBox focuses it and that a press elsewhere releases that focus are
+-- assumptions the maintainer verifies live.
 local engine = { frame = 0 }
 local coreGui
 local playerGui
@@ -230,6 +231,7 @@ local function new(className, parent, props)
 		raw.Active = false
 		raw.ClipsDescendants = false
 		raw.ContentText = ""
+		raw.Text = ""
 		raw.AbsolutePosition = Vector2.new(0, 0)
 		raw.AbsoluteSize = Vector2.new(0, 0)
 	end
@@ -280,16 +282,26 @@ function virtualInput:SendMouseButton(position, button, down)
 	if button == Enum.UserInputType.MouseButton1 then
 		local target = nil
 		for _, object in playerGui:GetGuiObjectsAtPosition(position.X - INSET.X, position.Y - INSET.Y) do
-			if object:IsA("GuiButton") then
+			if object:IsA("GuiButton") or object:IsA("TextBox") then
 				target = object
 				break
 			end
 		end
 		if down then
 			engine.pressTarget = target
+			local focused = engine.focusedTextBox
+			if focused ~= nil and focused ~= target and focused:IsDescendantOf(playerGui) then
+				engine.focusedTextBox = nil
+			end
 		elseif target ~= nil and target == engine.pressTarget then
-			target.MouseButton1Click:Fire()
-			target.Activated:Fire()
+			if target:IsA("TextBox") then
+				if not engine.refuseFocus then
+					target:CaptureFocus()
+				end
+			else
+				target.MouseButton1Click:Fire()
+				target.Activated:Fire()
+			end
 		end
 	end
 end
@@ -388,6 +400,7 @@ local codec = {}
 local RuntimeApi = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeRuntimeApi.module.luau"), {
 	environment = {
 		game = runtimeGame,
+		workspace = services.Workspace,
 		Enum = Enum,
 		Vector2 = Vector2,
 		task = scheduler,
@@ -420,6 +433,7 @@ local function reset(options)
 	engine.focusedTextBox = nil
 	engine.focusFrame = nil
 	engine.dropTextSends = 0
+	engine.refuseFocus = false
 	engine.refuseCoreMoves = options and options.refuseCoreMoves or false
 	engine.delivered = {}
 	engine.buttons = {}
@@ -453,10 +467,14 @@ end
 local function send(actions)
 	return api.sendVirtualInput({ actions = actions })
 end
+-- The message of a batch that fails: raised, or returned by a refused click.
 local function failure(actions)
-	local ok, message = pcall(send, actions)
-	assert(not ok, "the input batch should fail")
-	return tostring(message)
+	local ok, outcome = pcall(send, actions)
+	if not ok then
+		return tostring(outcome)
+	end
+	assert(outcome.ok == false, "the input batch should fail")
+	return tostring(outcome.error)
 end
 local function delivered()
 	return table.concat(engine.delivered, ",")
@@ -646,5 +664,94 @@ local loosePosition, looseSize = at(200, 200, 100, 40)
 new("TextButton", new("Folder", playerGui, { Name = "Loose" }), { Name = "Button", AbsolutePosition = loosePosition, AbsoluteSize = looseSize })
 message = failure({ { type = "click", path = "Loose.Button" } })
 assert(message == "GUI element Loose.Button is not visible: it is not inside a ScreenGui", message)
+
+-- A click on a GUI path is verified wherever it stands in a batch: a text
+-- box takes focus, a button fires once, and the first click a player could
+-- not make ends the batch with its step and what can be clicked instead.
+local function shop()
+	reset()
+	local topbar = new("ScreenGui", playerGui, { Name = "Topbar", DisplayOrder = 20 })
+	local menuPosition, menuSize = at(10, 0, 40, 40)
+	new("TextButton", topbar, { Name = "Menu", AbsolutePosition = menuPosition, AbsoluteSize = menuSize })
+	local main = new("ScreenGui", playerGui, { Name = "Main", DisplayOrder = 10 })
+	local panelPosition, panelSize = at(100, 100, 600, 400)
+	local panel = new("Frame", main, { Name = "Shop", AbsolutePosition = panelPosition, AbsoluteSize = panelSize })
+	local codesPosition, codesSize = at(120, 120, 200, 40)
+	local codes = new("TextBox", panel, { Name = "Codes", AbsolutePosition = codesPosition, AbsoluteSize = codesSize })
+	local redeemPosition, redeemSize = at(120, 180, 100, 40)
+	local redeem = new("TextButton", panel, { Name = "Redeem", AbsolutePosition = redeemPosition, AbsoluteSize = redeemSize })
+	local closePosition, closeSize = at(640, 110, 40, 40)
+	new("TextButton", panel, { Name = "Close", AbsolutePosition = closePosition, AbsoluteSize = closeSize })
+	local hudPosition, hudSize = at(100, 520, 600, 60)
+	local hud = new("Frame", main, { Name = "HUD", AbsolutePosition = hudPosition, AbsoluteSize = hudSize })
+	local cashPosition, cashSize = at(120, 530, 100, 40)
+	new("TextButton", hud, { Name = "Cash", AbsolutePosition = cashPosition, AbsoluteSize = cashSize })
+	local fixture = { main = main, panel = panel, codes = codes, hud = hud, redeemed = {} }
+	redeem.Activated:Connect(function()
+		table.insert(fixture.redeemed, codes.Text)
+		codes.Text = ""
+	end)
+	return fixture
+end
+local CLICK = "MouseButton1 down,MouseButton1 up"
+
+local store = shop()
+result = send({
+	{ type = "click", path = "Main.Shop.Codes", step = 1 },
+	{ type = "text", text = "ABC" },
+	{ type = "wait", ms = 0 },
+	{ type = "click", path = "Main.Shop.Redeem", step = 3 },
+	{ type = "text", text = "late" },
+})
+assert(result.ok and result.verifiedClicks == 2, "the box and the button are both verified")
+assert(store.redeemed[1] == "ABC" and #store.redeemed == 1 and result.textObserved == true, "typed, then redeemed")
+assert(delivered() == `{CLICK},text ABC,{CLICK},text late`, "actions keep their order: " .. delivered())
+assert(store.codes.Text == "", "text after the box lost focus is sent once and not retyped into it")
+
+store = shop()
+result = send({ { type = "click", path = "Main.Shop" } })
+assert(result.ok and result.verifiedClicks == 0 and delivered() == CLICK, "a plain element is clicked, not counted")
+
+store = shop()
+engine.refuseFocus = true
+message = failure({ { type = "click", path = "Main.Shop.Codes" } })
+assert(message == "TextBox Main.Shop.Codes did not take focus after the click", message)
+
+store = shop()
+local popupPosition, popupSize = at(0, -58, 1280, 720)
+local popup = new("Frame", store.main, { Name = "DailyRewards", Active = true, AbsolutePosition = popupPosition, AbsoluteSize = popupSize })
+local exitPosition, exitSize = at(900, 100, 40, 40)
+new("TextButton", popup, { Name = "Exit", AbsolutePosition = exitPosition, AbsoluteSize = exitSize })
+result = send({
+	{ type = "move", x = 5, y = 500 },
+	{ type = "wait", ms = 0 },
+	{ type = "click", path = "Main.Shop.Redeem", step = 3 },
+	{ type = "text", text = "never" },
+})
+assert(result.ok == false and result.failedStep == 3, "the covered click ends the batch at its step")
+assert(
+	result.error == "GUI element Players.Player1.PlayerGui.Main.Shop.Redeem is covered by Players.Player1.PlayerGui.Main.DailyRewards",
+	result.error
+)
+local uncovered = table.concat(result.clickable, ",")
+assert(uncovered == "Main.DailyRewards.Exit,Topbar.Menu", "the buttons under the popup are not offered: " .. uncovered)
+assert(delivered() == "move", "what stood before the click ran, the rest did not: " .. delivered())
+
+store = shop()
+store.hud.Visible = false
+result = send({ { type = "click", path = "Main.HUD.Cash" } })
+assert(result.ok == false and result.failedStep == nil, "a click without a step fails without one")
+assert(result.error == "GUI element Main.HUD.Cash is not visible: Main.HUD has Visible=false", result.error)
+local nearestFirst = "Main.Shop.Codes,Main.Shop.Redeem,Main.Shop.Close,Topbar.Menu"
+assert(table.concat(result.clickable, ",") == nearestFirst, table.concat(result.clickable, ","))
+local bounds = api.getGuiBounds({ path = "Main.HUD.Cash", scroll = true })
+assert(table.concat(bounds.clickable, ",") == nearestFirst, "a press reads the same list")
+assert(api.getGuiBounds({ path = "Main.Shop.Redeem" }).clickable == nil, "a reachable element carries no list")
+for index = 1, 20 do
+	local position, size = at(120 + (index - 1) % 10 * 45, 250 + (index - 1) // 10 * 45, 40, 40)
+	new("TextButton", store.panel, { Name = `Item{index}`, AbsolutePosition = position, AbsoluteSize = size })
+end
+result = send({ { type = "click", path = "Main.HUD.Cash" } })
+assert(#result.clickable == 12 and result.clickable[12] == "Main.Shop.Item9", "twelve paths at most")
 
 print("Renium CoreGui dismiss tests passed")
