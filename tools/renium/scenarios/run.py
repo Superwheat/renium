@@ -607,6 +607,13 @@ def infrastructure_failure(outcome: dict) -> bool:
     return outcome.get("status") in ("fail", "error") and any(marker in outcome.get("reason", "") for marker in ABORT_MARKERS)
 
 
+def raise_if_needs_user(error: str) -> None:
+    """A recovery step (reopening Studio, pushing again) must not hide a failure
+    only the user can clear: it is raised for the row loop to stop the run on."""
+    if abort_at_once_reason(error, ""):
+        raise ScenarioFailure(error)
+
+
 def abort_requested() -> str | None:
     try:
         return ABORT_FILE.read_text(encoding="utf-8").strip() or "aborted"
@@ -941,7 +948,8 @@ class Session:
             ctx.studio_open = True
             try:
                 ctx.guard_binding()
-            except ScenarioFailure:
+            except ScenarioFailure as error:
+                raise_if_needs_user(str(error))
                 self.close_studio(ctx)
         if self.studio_open:
             ctx.rbx("play", "-x", ok=None, timeout=60)
@@ -957,8 +965,11 @@ class Session:
         if pushed.ok:
             try:
                 counts = ctx.luau(SERVICE_COUNTS)
-            except ScenarioFailure:
+            except ScenarioFailure as error:
+                raise_if_needs_user(str(error))
                 counts = None
+        else:
+            raise_if_needs_user(pushed.error)
         if pushed.ok and counts == self.counts:
             self.resets += 1
             return "push"
@@ -1336,23 +1347,38 @@ def main() -> int:
         skipped = sum(1 for o in outcomes if o["status"] == "skip")
         print(f"\n{passed}/{len(outcomes) - skipped} passed; {skipped} skipped; seed {seed}; report {report}")
         return 0 if passed + skipped == len(outcomes) else 1
-    for scenario in scenarios:
-        print(f"[{scenario.id}] {scenario.title} ...", flush=True)
-        if os.name not in scenario.platforms:
-            outcome = {"id": scenario.id, "title": scenario.title, "size": scenario.size, "status": "skip", "reason": f"not run on {os.name}", "seconds": 0, "log": []}
-            outcomes.append(outcome)
-            print(f"[{scenario.id}] SKIP (not run on this platform)", flush=True)
-            continue
-        outcome = run_scenario(scenario, args.keep)
-        outcomes.append(outcome)
-        status = outcome["status"].upper()
-        print(f"[{scenario.id}] {status} in {outcome['seconds']}s" + (f": {outcome.get('reason','')[:300]}" if status != "PASS" else ""), flush=True)
+    outcomes.extend(run_isolated(scenarios, args.keep))
     report = REPORTS / f"{stamp}.json"
     report.write_text(json.dumps(outcomes, indent=1), encoding="utf-8")
     passed = sum(1 for o in outcomes if o["status"] == "pass")
     skipped = sum(1 for o in outcomes if o["status"] == "skip")
     print(f"\n{passed}/{len(outcomes) - skipped} passed; {skipped} skipped; report {report}")
     return 0 if passed + skipped == len(outcomes) else 1
+
+
+def run_isolated(scenarios: list[Scenario], keep: bool) -> list[dict]:
+    """Every row in a fixture and Studio of its own."""
+    outcomes = []
+    for scenario in scenarios:
+        aborted = abort_requested()
+        if aborted:
+            outcomes.append({"id": scenario.id, "title": scenario.title, "size": scenario.size, "status": "abort", "reason": aborted, "seconds": 0, "log": []})
+            print(f"[{scenario.id}] ABORT: {aborted}", flush=True)
+            continue
+        print(f"[{scenario.id}] {scenario.title} ...", flush=True)
+        if os.name not in scenario.platforms:
+            outcome = {"id": scenario.id, "title": scenario.title, "size": scenario.size, "status": "skip", "reason": f"not run on {os.name}", "seconds": 0, "log": []}
+            outcomes.append(outcome)
+            print(f"[{scenario.id}] SKIP (not run on this platform)", flush=True)
+            continue
+        outcome = run_scenario(scenario, keep)
+        outcomes.append(outcome)
+        status = outcome["status"].upper()
+        print(f"[{scenario.id}] {status} in {outcome['seconds']}s" + (f": {outcome.get('reason','')[:300]}" if status != "PASS" else ""), flush=True)
+        needs_user = abort_at_once_reason(outcome.get("reason", ""), scenario.id) if outcome["status"] != "pass" else None
+        if needs_user and not abort_requested():
+            request_abort(needs_user)
+    return outcomes
 
 
 if __name__ == "__main__":

@@ -149,6 +149,41 @@ def session_rows(reset_errors=(), fail_first=None) -> tuple[list[str], int]:
     return [row["status"] for row in outcomes], len(reopened)
 
 
+def reset_after_a_failed_push(error: str) -> str:
+    """The real Session.reset when its push fails with `error`: how it recovered,
+    or what it raised."""
+    session = object.__new__(run.Session)
+    session.environment, session.studio_open, session.counts, session.resets, session.reopens = dict(os.environ), True, {}, 0, 0
+    session.restore_files = lambda: None
+    session.close_studio = session.open_studio = lambda ctx: None
+    ctx = types.SimpleNamespace(log=[], studio_open=True, guard_binding=lambda: None, luau=lambda source: {},
+                                rbx=lambda *args, **options: types.SimpleNamespace(ok=args[0] != "ps", error=error))
+    real = run.terminate_pids, run.orphan_play_server_pids
+    run.terminate_pids, run.orphan_play_server_pids = (lambda pids: None), (lambda: [])
+    cwd = os.getcwd()
+    try:
+        return session.reset(ctx)
+    except run.ScenarioFailure as failure:
+        return f"raised: {failure}"
+    finally:
+        run.terminate_pids, run.orphan_play_server_pids = real
+        os.chdir(cwd)
+
+
+def isolated_rows(first_reason: str) -> list[str]:
+    """The real isolated loop over two rows whose first fails with `first_reason`."""
+    rows = [run.Scenario(id=name, title="", size="small", run=lambda ctx: None) for name in "AB"]
+    real = run.run_scenario
+    run.run_scenario = lambda scenario, keep: {"id": scenario.id, "status": "fail" if scenario.id == "A" else "pass", "reason": first_reason if scenario.id == "A" else "", "seconds": 0, "log": []}
+    run.ABORT_FILE.unlink(missing_ok=True)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return [row["status"] for row in run.run_isolated(rows, False)]
+    finally:
+        run.run_scenario = real
+        run.ABORT_FILE.unlink(missing_ok=True)
+
+
 def main() -> int:
     child_dir = WORK / "child"
     child_dir.mkdir(parents=True)
@@ -216,6 +251,10 @@ def main() -> int:
     assert session_rows(reset_errors=["push failed", HELD]) == (["error", "abort"], 1)
     assert session_rows(reset_errors=["push failed"]) == (["pass", "pass"], 1)
     assert session_rows(fail_first="Sign is missing") == (["fail", "pass"], 0)
+    assert reset_after_a_failed_push(HELD) == f"raised: {HELD}"
+    assert reset_after_a_failed_push("push failed") == "reopen"
+    assert isolated_rows(HELD) == ["fail", "abort"]
+    assert isolated_rows("Sign is missing") == ["fail", "pass"]
 
     shutil.rmtree(WORK, ignore_errors=True)
     print("scenario runner self-test passed")
