@@ -931,6 +931,32 @@ fn plan(
     })
 }
 
+/// Writes every changed file or none: when a write fails, the files written
+/// before it get their text back, and the error says so.
+fn write_changes(changes: &[Change]) -> Result<Vec<PathBuf>> {
+    let mut written: Vec<&Change> = Vec::new();
+    for change in changes.iter().filter(|change| change.changed()) {
+        if let Err(error) = write_utf8_file(&change.path, &change.edited.text) {
+            let kept = written
+                .iter()
+                .filter(|done| write_utf8_file(&done.path, &done.original).is_err())
+                .map(|done| done.file.as_str())
+                .collect::<Vec<_>>();
+            let restored = if kept.is_empty() {
+                "nothing stays changed".to_string()
+            } else {
+                format!("these keep their edits: {}", kept.join(", "))
+            };
+            return Err(error.context(format!("{} could not be written; {restored}", change.file)));
+        }
+        written.push(change);
+    }
+    Ok(written
+        .into_iter()
+        .map(|change| change.path.clone())
+        .collect())
+}
+
 /// What a push carries: script files by path, or a new script by its store
 /// instance.
 pub(crate) enum PushTarget<'a> {
@@ -968,8 +994,29 @@ fn push_to_studio(root: &Path, target: &PushTarget) -> Result<Value> {
         ),
     };
     args.project.project_root = root.to_path_buf();
-    args.defer_to_live_sync = true;
+    args.defer_to_live_sync = live_sync_watches(root, target);
     crate::editor::sync::push_editor_changes_result(args)
+}
+
+/// Whether Live Sync watches every file of the push, so a running session
+/// can be left to deliver it; a file outside the watched folders would wait
+/// for a session that never sees it.
+fn live_sync_watches(root: &Path, target: &PushTarget) -> bool {
+    let PushTarget::Files(paths) = target else {
+        return true;
+    };
+    let Ok(inputs) = config::load_project(Some(root), None)
+        .and_then(|loaded| config::project_watch_inputs(&loaded))
+    else {
+        return false;
+    };
+    paths.iter().all(|path| {
+        inputs.files.contains(path)
+            || inputs
+                .directories
+                .iter()
+                .any(|directory| path.starts_with(directory))
+    })
 }
 
 fn no_studio(error: &anyhow::Error) -> bool {
@@ -1062,6 +1109,7 @@ fn new_script_path(root: &Path, requested: &str) -> Result<PathBuf> {
     if path.exists() {
         bail!("{requested} already exists; `rbx se FILE OLD NEW` edits it");
     }
+    crate::system::files::ensure_existing_ancestor_inside(root, &path, "A new script")?;
     Ok(path)
 }
 
@@ -1210,11 +1258,7 @@ pub(crate) fn run(
         Ok(changes) => changes,
         Err(refusals) => return refuse(&refusals),
     };
-    let mut written = Vec::new();
-    for change in changes.iter().filter(|change| change.changed()) {
-        write_utf8_file(&change.path, &change.edited.text)?;
-        written.push(change.path.clone());
-    }
+    let written = write_changes(&changes)?;
     let outcome = if written.is_empty() {
         json!({ "pushed": false, "reason": "noChange" })
     } else if request.no_push {
@@ -1835,6 +1879,44 @@ mod tests {
             missing.error
         );
         assert_eq!(project.read("A.luau"), A);
+    }
+
+    #[test]
+    fn a_failed_write_gives_the_earlier_files_their_text_back() {
+        let root = crate::tests::support::temp_dir("se-rollback");
+        let first = root.join("A.luau");
+        fs::write(
+            &first,
+            "return 1
+",
+        )
+        .unwrap();
+        let blocked = root.join("B.luau");
+        fs::create_dir_all(&blocked).unwrap();
+        let change = |path: &Path, file: &str| Change {
+            path: path.to_path_buf(),
+            file: file.to_string(),
+            original: "return 1
+"
+            .to_string(),
+            edited: Edited {
+                text: "return 2
+"
+                .to_string(),
+                edits: 1,
+                lines: vec![(1, 1)],
+            },
+        };
+        let error = write_changes(&[change(&first, "A.luau"), change(&blocked, "B.luau")])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "B.luau could not be written; nothing stays changed");
+        assert_eq!(
+            fs::read_to_string(&first).unwrap(),
+            "return 1
+"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

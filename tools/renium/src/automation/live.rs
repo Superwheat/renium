@@ -419,12 +419,15 @@ impl Control {
     }
 
     /// Whether the session sends file edits to Studio by itself: it runs,
-    /// writes, has not stopped on an error and waits for no decision.
+    /// writes, is not paused or stopping, has not stopped on an error and
+    /// waits for no decision.
     fn delivers_file_edits(&self) -> bool {
         let status = self.status.lock_recover();
         status.running
+            && !status.paused
             && !status.resolution_required
             && status.error.is_none()
+            && !self.stop.load(Ordering::Acquire)
             && self.writes_enabled.load(Ordering::Acquire)
     }
 
@@ -4094,6 +4097,8 @@ mod tests {
         let writing = session(PairMode::Reconcile, false);
         assert!(writing.delivers_file_edits());
         writing.pause();
+        assert!(!writing.delivers_file_edits());
+        writing.resume(Vec::new());
         assert!(writing.delivers_file_edits());
         writing.fail("Studio rejected the push".to_string());
         assert!(!writing.delivers_file_edits());
@@ -4106,6 +4111,9 @@ mod tests {
         let stopped = session(PairMode::Reconcile, false);
         stopped.status.lock_recover().running = false;
         assert!(!stopped.delivers_file_edits());
+        let stopping = session(PairMode::Reconcile, false);
+        stopping.request_stop();
+        assert!(!stopping.delivers_file_edits());
         fs::remove_dir_all(root).unwrap();
     }
 

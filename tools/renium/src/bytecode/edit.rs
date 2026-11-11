@@ -743,9 +743,10 @@ pub(crate) fn register_script_file(
         },
         properties,
         attributes: Vec::new(),
-        // The import has written the script file by now; read-only links do
-        // not guard `ip`.
-        override_packages: true,
+        // An import has written the script file by now, so read-only links
+        // do not guard `ip`; a script created here is refused inside one as
+        // any added instance is.
+        override_packages: source.is_none(),
     })
     .map(Some)
 }
