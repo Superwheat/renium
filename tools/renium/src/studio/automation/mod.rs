@@ -456,13 +456,24 @@ fn user_luau_request(
     Ok(request)
 }
 
+/// What a Play run says when its Studio's plugin predates kept runners.
+const LISTENERS_ENDED: &str = "ended with the chunk: this Studio runs an older Renium plugin; restart Studio to load the installed one";
+
 /// Drops what the plugin says about a kept runner (`background`, its
 /// `executionId`): the caller has nothing to do with either, and a text
-/// result would print them as a note on every Play run.
+/// result would print them as a note on every Play run. A Play runner that
+/// was asked to stay and did not says so as `listeners`, since whatever the
+/// chunk connected is gone.
 fn strip_kept_runner_fields(result: &mut Value) {
-    if let Some(map) = result.as_object_mut() {
-        map.remove("background");
-        map.remove("executionId");
+    let Some(map) = result.as_object_mut() else {
+        return;
+    };
+    let kept = map.remove("background") == Some(Value::Bool(true));
+    map.remove("executionId");
+    let ran_in_play =
+        map.get("runner") == Some(&Value::Bool(true)) && map.get("ok") == Some(&Value::Bool(true));
+    if ran_in_play && !kept {
+        map.insert("listeners".to_string(), json!(LISTENERS_ENDED));
     }
 }
 
@@ -921,16 +932,15 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     let named_players = args.players.is_some();
     let waits_began = Instant::now();
     if started {
-        match await_play_conditions(&mut result, &args) {
-            Ok(true) => {}
-            Ok(false) => {
-                print_play_result(result, named_players)?;
-                return Err(ReportedFailure.into());
+        let held = await_play_conditions(&mut result, &args);
+        if !matches!(held, Ok(true)) {
+            // A wait that failed leaves the session up for a look at it, so
+            // a requested stop is reported as not done.
+            if args.stop_after {
+                result["stopped"] = json!(false);
             }
-            Err(error) => {
-                print_play_result(result, named_players)?;
-                return Err(error);
-            }
+            print_play_result(result, named_players)?;
+            return Err(held.err().unwrap_or_else(|| ReportedFailure.into()));
         }
     }
     // Ordinary Play has one client; its console answers the client-side
@@ -950,9 +960,10 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     }
     if waits_hold {
         let limit = || result_run_seconds(args.until_timeout, waits_began.elapsed().as_secs_f64());
-        // With --until the server result was read in the wait's own runner,
-        // at the moment the condition held.
-        if args.until.is_none()
+        // With --until alone the server result was read in the wait's own
+        // runner, at the moment the condition held; a client condition after
+        // it moves the reading behind that one.
+        if (args.until.is_none() || args.client_until.is_some())
             && let Some(code) = args.result.as_deref()
         {
             result["result"] = evaluate_after_wait(code, "server", limit(), &args);
@@ -1022,12 +1033,16 @@ fn await_play_conditions(result: &mut Value, args: &StartStopPlayArgs) -> Result
         daemon_control_request(op::WAIT, None, parameters, false)
     };
     if let Some(condition) = args.until.as_deref() {
+        let result_in_wait = args
+            .result
+            .as_deref()
+            .filter(|_| args.client_until.is_none());
         let mut wait = wait(json!({
             "condition": condition,
-            "result": args.result,
+            "result": result_in_wait,
             "server": true,
         }))
-        .map_err(|error| result_chunk_timeout(error, args.result.is_some()))?;
+        .map_err(|error| result_chunk_timeout(error, result_in_wait.is_some()))?;
         name_failed_result_chunk(&mut wait);
         if !attach_awaited_result(result, wait) {
             return Ok(false);
@@ -1480,7 +1495,6 @@ fn compact_play_result(result: &mut Value, named_players: bool) {
     // controller status; `alreadyRunning` and `startNote` say what it means.
     if map.get("alreadyRunning") == Some(&Value::Bool(true)) {
         for key in [
-            "running",
             "starting",
             "readyForStart",
             "engineRunning",
@@ -6401,9 +6415,13 @@ mod play_check_tests {
         );
         kept.as_object_mut().unwrap().remove("runner");
         assert_eq!(luau_text(&kept), "3");
-        let mut older_plugin = json!({"ok": true, "results": [], "background": false});
+        let mut edit_window = json!({"ok": true, "results": [], "background": false});
+        strip_kept_runner_fields(&mut edit_window);
+        assert_eq!(luau_text(&edit_window), "ok");
+        let mut older_plugin =
+            json!({"ok": true, "results": [], "background": false, "runner": true});
         strip_kept_runner_fields(&mut older_plugin);
-        assert_eq!(luau_text(&older_plugin), "ok");
+        assert_eq!(older_plugin["listeners"], LISTENERS_ENDED);
     }
 
     #[test]
@@ -6608,7 +6626,7 @@ mod play_check_tests {
         assert_eq!(
             serde_json::to_string(&result).unwrap(),
             format!(
-                r#"{{"alreadyRunning":true,"clients":1,"ok":true,"result":"0/10","serverReady":true,"startNote":"{ALREADY_RUNNING_NOTE}","until":"true","untilSeconds":0.0}}"#
+                r#"{{"alreadyRunning":true,"clients":1,"ok":true,"result":"0/10","running":true,"serverReady":true,"startNote":"{ALREADY_RUNNING_NOTE}","until":"true","untilSeconds":0.0}}"#
             )
         );
 
