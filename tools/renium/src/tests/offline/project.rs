@@ -1964,6 +1964,6 @@ fn a_push_checks_the_syntax_of_the_script_files_it_names_first() {
     fs::write(&spawner, "print('spawn')\nlocal x = )\n").unwrap();
     assert_eq!(
         fx.text(&["ps", &fx.path("src/Workspace"), &spawner]).err(),
-        "<root>/src/Workspace/Spawner.server.luau: Invalid Luau syntax: syntax error: 2: Expected identifier when parsing expression, got ')'; nothing was pushed"
+        "<root>/src/Workspace/Spawner.server.luau: Invalid Luau syntax: syntax error: 2: Expected identifier when parsing expression, got ')'; nothing was pushed (--no-check pushes a script that holds other text)"
     );
 }

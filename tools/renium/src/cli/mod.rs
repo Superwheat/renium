@@ -2892,6 +2892,11 @@ pub(super) struct PushEditorChangesArgs {
     )]
     pub(super) verify: bool,
     #[arg(
+        help = "Push the named script files without the syntax check, for a script that holds text other than Luau",
+        long
+    )]
+    pub(crate) no_check: bool,
+    #[arg(
         help = "Skip the Studio review and protected property writes (prefer --yes)",
         long
     )]
@@ -2936,6 +2941,7 @@ impl PushEditorChangesArgs {
             upsert_instances_only: false,
             verify_sources: false,
             verify: false,
+            no_check: false,
             no_review: false,
             yes: false,
             review_report: false,

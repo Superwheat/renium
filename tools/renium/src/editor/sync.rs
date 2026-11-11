@@ -1537,7 +1537,7 @@ fn add_editor_commit_status(summary: &mut Map<String, Value>, status: EditorComm
 
 pub(crate) fn push_editor_changes(mut args: PushEditorChangesArgs) -> Result<()> {
     name_script_paths(&mut args, &std::env::current_dir()?)?;
-    if !args.verify {
+    if !args.verify && !args.no_check {
         crate::cli::syntax::ensure_script_files_parse(&args.paths)?;
     }
     let result = push_editor_changes_result(args)?;
@@ -6591,9 +6591,12 @@ mod named_script_tests {
         let error = push_editor_changes(args).unwrap_err().to_string();
         assert!(
             error.starts_with(&script.display().to_string())
-                && error.ends_with("nothing was pushed"),
+                && error.contains("nothing was pushed"),
             "{error}"
         );
+        let marked = root.join("src").join("Server").join("Marked.server.luau");
+        fs::write(&marked, "\u{feff}return 1\n").unwrap();
+        assert!(crate::cli::syntax::ensure_script_files_parse(&[marked]).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 }

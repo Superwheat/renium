@@ -187,7 +187,9 @@ pub(crate) fn syntax_failure(source: &str) -> Option<SyntaxFailure> {
 }
 
 /// The script files a push names are checked as `rbx ck` checks them, so a
-/// script that does not parse stops the push before Studio is asked.
+/// script that does not parse stops the push before Studio is asked. A
+/// leading byte order mark is not part of the text that is checked; the file
+/// keeps it.
 pub(crate) fn ensure_script_files_parse(paths: &[PathBuf]) -> Result<()> {
     for path in paths {
         if !is_luau_source(path) || !path.is_file() {
@@ -195,9 +197,9 @@ pub(crate) fn ensure_script_files_parse(paths: &[PathBuf]) -> Result<()> {
         }
         let source = fs::read_to_string(path)
             .with_context(|| format!("Cannot read {} as UTF-8 text", path.display()))?;
-        if let Some(failure) = syntax_failure(&source) {
+        if let Some(failure) = syntax_failure(source.trim_start_matches('\u{feff}')) {
             bail!(
-                "{}: {}; nothing was pushed",
+                "{}: {}; nothing was pushed (--no-check pushes a script that holds other text)",
                 path.display(),
                 failure.message
             );
