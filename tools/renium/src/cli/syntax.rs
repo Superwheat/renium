@@ -13,7 +13,7 @@ use crate::studio::automation::validate_luau_syntax;
 
 #[derive(Args)]
 pub(crate) struct CheckArgs {
-    /// Script files or folders to parse (- reads stdin); with no paths, the Luau files git reports as changed in the project
+    /// Script files, folders or scripts' unique names (HonkHandler) to parse (- reads stdin); with no paths, the Luau files git reports as changed in the project
     #[arg(value_name = "PATH")]
     files: Vec<PathBuf>,
 }
@@ -33,7 +33,7 @@ pub(crate) fn run(args: CheckArgs, project: Option<&Path>) -> Result<()> {
         }
         files
     } else {
-        expand_folders(args.files)?
+        expand_folders(named_scripts(args.files, project)?)?
     };
     let result = check(&files, &mut io::stdin().lock())?;
     let mut printed = result.clone();
@@ -45,6 +45,23 @@ pub(crate) fn run(args: CheckArgs, project: Option<&Path>) -> Result<()> {
         return Err(ReportedFailure.into());
     }
     Ok(())
+}
+
+/// A path that is no file or folder becomes the file of the one script that
+/// goes by that name in the project (`HonkHandler` for
+/// `src/ServerScriptService/HonkHandler.server.luau`). `-` and a name no
+/// script goes by stay as they are.
+fn named_scripts(files: Vec<PathBuf>, project: Option<&Path>) -> Result<Vec<PathBuf>> {
+    files
+        .into_iter()
+        .map(|file| {
+            if file == Path::new("-") || file.exists() {
+                return Ok(file);
+            }
+            let named = crate::automation::tools::project_script_by_name(project, &file)?;
+            Ok(named.unwrap_or(file))
+        })
+        .collect()
 }
 
 fn is_luau_source(path: &Path) -> bool {
@@ -241,6 +258,37 @@ fn compact_check_result(result: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_script_is_checked_by_the_name_it_alone_goes_by() {
+        let root = crate::tests::support::temp_dir("syntax-names");
+        let project = root.join("renium.project.jsonc");
+        fs::write(&project, "{\n  \"schemaVersion\": 1\n}\n").unwrap();
+        for path in [
+            "src/Server/Honk.server.luau",
+            "src/A/Util.luau",
+            "src/B/Util.luau",
+        ] {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "return 1").unwrap();
+        }
+        let honk = root.join("src").join("Server").join("Honk.server.luau");
+        let named = |name: &str| named_scripts(vec![name.into()], Some(&project));
+        let honk_alone = std::slice::from_ref(&honk);
+        assert_eq!(named("Honk").unwrap(), honk_alone);
+        assert_eq!(named(&honk.to_string_lossy()).unwrap(), honk_alone);
+        assert_eq!(named("-").unwrap(), [PathBuf::from("-")]);
+        assert_eq!(named("Nope").unwrap(), [PathBuf::from("Nope")]);
+        let shared = named("Util").unwrap_err().to_string();
+        assert!(
+            shared.starts_with("Util names 2 scripts: src/A/Util.luau, src/B/Util.luau"),
+            "{shared}"
+        );
+        let result = check(&named("Honk").unwrap(), &mut io::empty()).unwrap();
+        assert_eq!(result["ok"], true);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn checks_folders_recursively_and_git_changes_without_paths() {

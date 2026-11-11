@@ -768,6 +768,41 @@ fn get_property_takes_every_selector_form() {
 }
 
 #[test]
+fn get_property_without_a_property_prints_what_inspect_props_prints() {
+    let fx = Fixture::new("get-stored");
+    let root = fx.path("");
+    let stored = |arguments: &[&str]| {
+        let args = crate::cli::BytecodeGetPropertyArgs::try_parse_from(
+            std::iter::once("bg").chain(arguments.iter().copied()),
+        )
+        .unwrap();
+        let mut inspect = crate::bytecode::stored_properties_request(&args).unwrap();
+        inspect.project.project_root = fx.root.clone();
+        let (result, value, _) = capture_output(CaptureMode::Text, || {
+            crate::bytecode::print_stored_properties(inspect)
+        });
+        result.map(|()| value.unwrap())
+    };
+    assert_eq!(
+        stored(&["Workspace", "Lobby.Door"]).unwrap(),
+        fx.both(&["in", "Workspace", "Lobby.Door", "-F", "props", "-r", &root])
+    );
+    assert_eq!(
+        stored(&["Workspace", "-i", "door"]).unwrap(),
+        json!({"props": door_props()})
+    );
+    let missing = stored(&["Workspace", "Gravity"]).unwrap_err().to_string();
+    assert!(
+        missing.starts_with("No matching instance: Gravity; "),
+        "{missing}"
+    );
+    assert!(
+        missing.ends_with("; rbx bg Workspace -p PROPERTY reads a property of the service itself"),
+        "{missing}"
+    );
+}
+
+#[test]
 fn get_property_reports_missing_names_targets_stores_and_bad_arguments() {
     let fx = Fixture::new("get-errors");
     let store = fx.store_arg("Workspace");

@@ -50,7 +50,7 @@ use crate::editor::types::{
     take_pre_routed_protected_writes,
 };
 use crate::project::config;
-use crate::project::layout::apply_configured_project_layout;
+use crate::project::layout::{apply_configured_project_layout, configured_project_layout};
 use crate::project::package_links::LinkEnforcement;
 use crate::project::package_links::{
     apply_link_enforcement_to_changed_paths, build_link_enforcement,
@@ -1568,10 +1568,39 @@ fn only_named_scripts(args: &PushEditorChangesArgs) -> bool {
         && args.target_settings_id_files.is_empty()
 }
 
+/// A positional path that is no file or folder becomes the file of the one
+/// script that goes by that name in the project (`HonkHandler` for
+/// `src/ServerScriptService/HonkHandler.server.luau`); a name no script goes
+/// by stays as it is.
+fn name_script_paths(args: &mut PushEditorChangesArgs, invocation_root: &Path) -> Result<()> {
+    let missing = |path: &Path| !absolutize_under(invocation_root, path).exists();
+    if !args.paths.iter().any(|path| missing(path)) {
+        return Ok(());
+    }
+    let (root, source) =
+        configured_project_layout(&args.project.project_root, &args.project.src_root)?;
+    let root = absolutize_under(invocation_root, &root);
+    let source = absolutize_under(&root, &source);
+    for path in args.paths.iter_mut().filter(|path| missing(path)) {
+        let named = path
+            .to_str()
+            .map(|name| crate::automation::tools::script_by_name(&root, &source, name))
+            .transpose()
+            .map_err(anyhow::Error::msg)?
+            .flatten();
+        if let Some(file) = named {
+            *path = file;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Result<Value> {
+    let invocation_root = std::env::current_dir()?;
+    name_script_paths(&mut args, &invocation_root)?;
     let named_scripts = only_named_scripts(&args);
     args.changed_paths.append(&mut args.paths);
-    resolve_cli_push_paths(&mut args, &std::env::current_dir()?)?;
+    resolve_cli_push_paths(&mut args, &invocation_root)?;
     apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
     add_service_store_paths(&mut args)?;
     let incremental = !args.changed_paths.is_empty()
@@ -6491,6 +6520,52 @@ mod saved_field_review_tests {
             drop(bridge);
             plugin.join().unwrap();
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod named_script_tests {
+    use super::*;
+    use crate::cli::{BridgeConnectionArgs, ProjectSourceArgs};
+
+    #[test]
+    fn a_push_takes_a_script_by_the_name_it_alone_goes_by() {
+        let root = crate::tests::support::temp_dir("push-names");
+        for path in [
+            "src/Server/Honk.server.luau",
+            "src/A/Util.luau",
+            "src/B/Util.luau",
+        ] {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "return 1").unwrap();
+        }
+        let named = |paths: &[&str]| {
+            let project = ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: PathBuf::from("src"),
+            };
+            let mut args =
+                PushEditorChangesArgs::new(project, BridgeConnectionArgs::default_connection());
+            args.paths = paths.iter().map(PathBuf::from).collect();
+            name_script_paths(&mut args, &root).map(|()| (only_named_scripts(&args), args.paths))
+        };
+        let honk = root.join("src").join("Server").join("Honk.server.luau");
+        let util = PathBuf::from("src/A/Util.luau");
+        assert_eq!(
+            named(&["Honk", "src/A/Util.luau"]).unwrap(),
+            (true, vec![honk, util])
+        );
+        assert_eq!(
+            named(&["Nope"]).unwrap(),
+            (false, vec![PathBuf::from("Nope")])
+        );
+        let shared = named(&["Util"]).unwrap_err().to_string();
+        assert!(
+            shared.starts_with("Util names 2 scripts: src/A/Util.luau, src/B/Util.luau"),
+            "{shared}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

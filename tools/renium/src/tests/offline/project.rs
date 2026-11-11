@@ -983,7 +983,13 @@ fn script_read_takes_line_ranges_on_the_target_and_several_targets() {
         )
     );
     assert_eq!(
-        read(&[&format!("{SHOP_FILE}:2-4"), "--outline"]).err(),
+        read(&[&format!("{SHOP_FILE}:2-4"), "--outline"]).stdout,
+        format!(
+            "== {SHOP_FILE}\n7 lines\n2-4 Shop.buy(player, id)\n5-6 Shop.sell(player)\n== {SHOP_FILE} 2-4\n{buy}"
+        )
+    );
+    assert_eq!(
+        read(&[&format!("{SHOP_FILE}:2-4"), "--fn", "buy"]).err(),
         "script-read takes one of a line range, outline and fn"
     );
     assert!(
@@ -1024,7 +1030,17 @@ fn script_read_resolves_an_instance_path_through_the_script_mapping() {
     );
     assert_eq!(
         read(&["Workspace.Lobby.Halper"]).err(),
-        "No script at Workspace.Lobby.Halper: it is not a file, and the project has no instance at that path; rbx ss NAME finds scripts"
+        "No script at Workspace.Lobby.Halper: it is not a file or a script's name, and the project has no instance at that path; rbx ss NAME finds scripts"
+    );
+    assert_eq!(
+        read(&["Halper"]).err(),
+        "No script at Halper: it is not a file or a script's name, and the project has no instance at that path; rbx ss NAME finds scripts"
+    );
+    assert_eq!(
+        read(&["Helper:2", "Config:1"]).stdout,
+        format!(
+            "== src/Workspace/Lobby/Helper.client.luau 2-2\nreturn a\n== {SHOP_FILE} 1-1\nlocal Shop = {{}}\n"
+        )
     );
 
     fx.write_store(
@@ -1068,6 +1084,64 @@ fn script_read_resolves_an_instance_path_through_the_script_mapping() {
         format!(
             "== src/Workspace/Spawner.server.luau 1-1\n{SPAWNER_SOURCE}== src/Workspace/Lobby/Helper.client.luau 1-1\nlocal a = 1\n"
         )
+    );
+}
+
+#[test]
+fn script_commands_print_for_agents_in_text_mode_and_keep_their_json() {
+    let (fx, project) = shop_fixture("script-text-forms");
+    let long = format!(
+        "local function first()\n{}end\nreturn first\n",
+        "\tprint(1)\n".repeat(118)
+    );
+    let long_file = "src/ReplicatedStorage/Shared/Long.luau";
+    fs::write(fx.path(long_file), &long).unwrap();
+    let text = |args: &[&str]| {
+        let run = fx.text(&[args, &["--project", &project]].concat());
+        assert!(run.error.is_none(), "{:?}", run.error);
+        run.stdout
+    };
+    let json = |args: &[&str]| fx.json(&[args, &["--project", &project]].concat()).ok();
+    let outline = "121 lines, outline only: FILE:A-B or --fn NAME reads a part, --all everything\n1-120 first()\n";
+
+    assert_eq!(text(&["sr", "Long"]), outline);
+    assert_eq!(text(&["sr", "Long", "--all"]), format!("1-121/121\n{long}"));
+    assert_eq!(
+        text(&["sr", "Config", long_file]),
+        format!("== {SHOP_FILE} 1-7\n{SHOP_SOURCE}== {long_file}\n{outline}")
+    );
+    let whole = json(&["sr", "Long"]);
+    assert_eq!(whole["source"], json!(long.trim_end()));
+    assert_eq!(whole.get("outlineOnly"), None);
+
+    assert_eq!(text(&["ss", "Shop"]), format!("{SHOP_FILE} 7 lines\n"));
+    assert_eq!(
+        json(&["ss", "Shop"])["results"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["matches", "path"]
+    );
+
+    assert_eq!(
+        text(&["sg", "return", "Config"]),
+        format!("{SHOP_FILE}\n2-4 buy\n3: return id\n7: return Shop\n")
+    );
+    assert_eq!(
+        json(&["sg", "return", "Config"]),
+        json!({"results": [{"path": SHOP_FILE, "hits": [
+            {"line": 3, "text": "\treturn id"},
+            {"line": 7, "text": "return Shop"},
+        ]}], "totalMatches": 2})
+    );
+    assert_eq!(
+        text(&["sg", "buy|sell", "-c"]),
+        format!("no literal match; as a pattern (-E):\n{SHOP_FILE} 2/7 lines\n")
+    );
+    assert_eq!(
+        json(&["sg", "buy|sell", "-c"]),
+        json!({"results": [], "totalMatches": 0})
     );
 }
 

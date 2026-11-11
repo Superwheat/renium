@@ -35,7 +35,8 @@ use crate::bytecode::query::{
 use crate::cli::{
     BytecodeApplyPropertyBatchArgs, BytecodeFileArgs, BytecodeGetPropertyArgs,
     BytecodeInstanceSelectorArgs, BytecodeSetPropertyArgs, BytecodeSetSourceArgs,
-    FIND_DEFAULT_FIELDS, FindArgs, HighLevelTargetArgs, InspectArgs, TREE_DEFAULT_FIELDS, TreeArgs,
+    FIND_DEFAULT_FIELDS, FindArgs, HighLevelTargetArgs, InspectArgs, ProjectSourceArgs,
+    TREE_DEFAULT_FIELDS, TreeArgs,
 };
 use crate::daemon::is_process_alive;
 use crate::editor::document::is_protected_engine_container;
@@ -1535,6 +1536,11 @@ pub(super) fn tree_command(args: TreeArgs) -> Result<()> {
 }
 
 pub(crate) fn inspect_command(args: InspectArgs) -> Result<()> {
+    if args.depth.is_some() {
+        bail!(
+            "rbx in shows the instances it is given and takes no --depth; rbx tr SERVICE TARGET --depth N shows the levels below one"
+        );
+    }
     let HighLevelSelection {
         service,
         value: positional,
@@ -1586,6 +1592,9 @@ pub(crate) fn inspect_command(args: InspectArgs) -> Result<()> {
 }
 
 pub(super) fn bytecode_get_property(mut args: BytecodeGetPropertyArgs) -> Result<()> {
+    if let Some(inspect) = stored_properties_request(&args) {
+        return print_stored_properties(inspect);
+    }
     if let Some(property) = adopt_positional_target(&mut args.input, None, &mut args.selector) {
         // The store file took the first positional; the word that was parsed
         // as the target is really the first property name.
@@ -1855,6 +1864,66 @@ fn edit_distance(left: &str, right: &str) -> usize {
     previous[right.len()]
 }
 
+fn selects_by_option(selector: &BytecodeInstanceSelectorArgs) -> bool {
+    selector.settings_id.is_some()
+        || selector.index.is_some()
+        || selector.name.is_some()
+        || selector.class_name.is_some()
+        || selector.path_segments_json.is_some()
+}
+
+/// A `bg SERVICE TARGET` call that names an instance of a service and no
+/// property, as the `in SERVICE TARGET -F props` call that lists the stored
+/// ones. A store file (`-f`) and the service itself still need a property.
+pub(crate) fn stored_properties_request(args: &BytecodeGetPropertyArgs) -> Option<InspectArgs> {
+    let selector = &args.selector;
+    let names_property = !args.property.is_empty() || !args.property_after_target.is_empty();
+    let service = args.input.service_or_file.as_deref()?;
+    if names_property
+        || args.input.settings_file.is_some()
+        || bytecode_input_looks_like_settings_file(service)
+        || selects_by_option(selector) == selector.target.is_some()
+    {
+        return None;
+    }
+    Some(InspectArgs {
+        target: HighLevelTargetArgs {
+            service_or_target: Some(service.to_string()),
+            target: selector.target.clone(),
+            service: None,
+            settings_id: selector.settings_id.clone(),
+            index: selector.index,
+            name: selector.name.clone(),
+            class_name: selector.class_name.clone(),
+            path: selector.path_segments_json.clone(),
+            ords: (selector.path_ordinals_json != "[]")
+                .then(|| selector.path_ordinals_json.clone()),
+        },
+        more_targets: Vec::new(),
+        project: ProjectSourceArgs::current(),
+        output: "compact".to_string(),
+        fields: "props".to_string(),
+        depth: None,
+        pretty: args.pretty,
+    })
+}
+
+/// Prints the stored properties of the instance a `bg` call names without a
+/// property. The word after the service may have been meant as a property of
+/// the service, so a target that is not found says how to read one.
+pub(crate) fn print_stored_properties(inspect: InspectArgs) -> Result<()> {
+    let service = inspect.target.service_or_target.clone().unwrap_or_default();
+    let positional = inspect.target.target.is_some();
+    inspect_command(inspect).map_err(|error| {
+        if !positional || error.is::<ReportedFailure>() {
+            return error;
+        }
+        anyhow::anyhow!(
+            "{error:#}; rbx bg {service} -p PROPERTY reads a property of the service itself"
+        )
+    })
+}
+
 /// The property names a `bg` call asks for, from `-p` flags and the words
 /// after the target, in the order given and without repeats.
 pub(crate) fn get_property_names(args: &mut BytecodeGetPropertyArgs) -> Result<Vec<String>> {
@@ -1870,12 +1939,8 @@ pub(crate) fn get_property_names(args: &mut BytecodeGetPropertyArgs) -> Result<V
     }
     // With a flag selector (-i, -x, -n, -c, --path) the first positional word
     // is a property name, not a target.
+    let flagged = selects_by_option(&args.selector);
     let selector = &mut args.selector;
-    let flagged = selector.settings_id.is_some()
-        || selector.index.is_some()
-        || selector.name.is_some()
-        || selector.class_name.is_some()
-        || selector.path_segments_json.is_some();
     if flagged
         && let Some(property) = selector.target.take()
         && !properties.contains(&property)

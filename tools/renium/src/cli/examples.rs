@@ -140,11 +140,11 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("ss", "Examples:\n  rbx ss DataStore UpdateAsync"),
     (
         "sg",
-        "Examples:\n  rbx sg \"DailyReward\"\n  rbx sg DailyReward --fn",
+        "Examples:\n  rbx sg \"DailyReward\"\n  rbx sg DailyReward --fn\n  rbx sg -E 'Fire(Server|AllClients)' --in DataHandler --not Admin",
     ),
     (
         "sr",
-        "Examples:\n  rbx sr src/ServerScriptService/Main.server.luau\n  rbx sr src/ServerScriptService/Main.server.luau --outline\n  rbx sr src/ServerScriptService/Main.server.luau --fn onPlayerAdded\n  rbx sr ServerScriptService.Main:1-40 src/ReplicatedStorage/Config.luau:120-",
+        "Examples:\n  rbx sr src/ServerScriptService/Main.server.luau\n  rbx sr src/ServerScriptService/Main.server.luau --outline\n  rbx sr src/ServerScriptService/Main.server.luau --fn onPlayerAdded\n  rbx sr ServerScriptService.Main:1-40 src/ReplicatedStorage/Config.luau:120-\n  rbx sr Main:1-40 Config --all",
     ),
     (
         "play",
@@ -226,7 +226,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("in", "Examples:\n  rbx in Workspace -i editor:item"),
     (
         "bg",
-        "Examples:\n  rbx bg Workspace Lobby.Door Anchored\n  rbx bg Workspace -i editor:item Name\n  rbx bg Workspace -p Gravity",
+        "Examples:\n  rbx bg Workspace Lobby.Door Anchored\n  rbx bg Workspace -i editor:item Name\n  rbx bg Workspace -p Gravity\n  rbx bg Workspace Lobby.Door",
     ),
     (
         "bs",

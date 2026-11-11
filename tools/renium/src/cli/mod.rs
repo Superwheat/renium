@@ -1017,6 +1017,62 @@ mod tests {
     }
 
     #[test]
+    fn script_commands_take_the_forms_agents_type() {
+        match parse(&["sg", "Grant", "src/Server", "DataHandler", "-E"]).unwrap() {
+            Commands::ScriptGrep(args) => {
+                assert_eq!(args.query, "Grant");
+                assert_eq!(args.paths, ["src/Server", "DataHandler"]);
+                assert!(args.regex);
+            }
+            _ => unreachable!(),
+        }
+        let paged = [
+            "sg", "-E", "a|b", "--in", "x", "--not", "HD Admin", "--not", "y", "--offset", "50",
+            "-l", "200",
+        ];
+        match parse(&paged).unwrap() {
+            Commands::ScriptGrep(args) => {
+                assert_eq!(args.query, "a|b");
+                assert!(args.paths.is_empty());
+                assert_eq!(args.scope, ["x"]);
+                assert_eq!(args.not, ["HD Admin", "y"]);
+                assert_eq!((args.offset, args.limit), (Some(50), Some(200)));
+            }
+            _ => unreachable!(),
+        }
+        assert!(parse(&["sg", "x", "--offset", "5", "-c"]).is_err());
+        assert!(parse(&["sg", "x", "--offset", "5", "--fn"]).is_err());
+        match parse(&["sr", "DataHandler:690-960", "--outline"]).unwrap() {
+            Commands::ScriptRead(args) => assert!(args.outline && !args.all),
+            _ => unreachable!(),
+        }
+        assert!(parse(&["sr", "DataHandler", "--all", "--fn", "x"]).is_err());
+        match parse(&[
+            "in",
+            "Workspace",
+            "Lobby.Obby",
+            "-F",
+            "props",
+            "--depth",
+            "2",
+        ])
+        .unwrap()
+        {
+            Commands::Inspect(args) => {
+                assert_eq!(args.depth, Some(2));
+                let refused = crate::bytecode::inspect_command(args).unwrap_err();
+                assert!(
+                    refused
+                        .to_string()
+                        .contains("rbx tr SERVICE TARGET --depth N"),
+                    "{refused}"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
     fn every_visible_command_has_a_short_example() {
         command().debug_assert();
         for subcommand in command()
@@ -1307,6 +1363,13 @@ pub(crate) struct InspectArgs {
         default_value = "brief,ords"
     )]
     pub(super) fields: String,
+    #[arg(
+        help = "Not taken here: `rbx tr SERVICE TARGET --depth N` shows the levels below an instance",
+        long,
+        value_name = "N",
+        hide = true
+    )]
+    pub(super) depth: Option<usize>,
     #[arg(help = "Pretty-print the JSON result", long)]
     pub(super) pretty: bool,
 }
@@ -1656,18 +1719,41 @@ impl ScriptSearchArgs {
 pub(super) struct ScriptGrepArgs {
     #[arg(help = "Text to find", allow_hyphen_values = true)]
     pub(super) query: String,
+    #[arg(
+        help = "Script files or folders to search, the same as --in",
+        value_name = "PATH"
+    )]
+    pub(super) paths: Vec<String>,
     #[arg(help = "Ignore case", short = 'i', long)]
     pub(super) case_insensitive: bool,
-    #[arg(help = "Read the query as a regular expression", short = 'E', long)]
+    #[arg(
+        help = "Read the query as a regular expression (a literal query that holds | and matches nothing is read as one)",
+        short = 'E',
+        long
+    )]
     pub(super) regex: bool,
     #[arg(
-        help = "Search only this script file or folder, a path under the project; repeat for several",
+        help = "Search only this script file or folder, a path under the project or a script's unique name (DataHandler); repeat for several",
         long = "in",
         value_name = "PATH"
     )]
     pub(super) scope: Vec<String>,
     #[arg(
-        help = "Print each script's number of matching lines instead of the lines",
+        help = "Leave out matching lines that hold TEXT and scripts whose path holds it; repeatable",
+        long,
+        value_name = "TEXT",
+        allow_hyphen_values = true
+    )]
+    pub(super) not: Vec<String>,
+    #[arg(
+        help = "Skip the first N matching lines, to read on after a limit",
+        long,
+        value_name = "N",
+        conflicts_with_all = ["count", "functions"]
+    )]
+    pub(super) offset: Option<usize>,
+    #[arg(
+        help = "Print each script's number of matching lines and its length instead of the lines",
         short = 'c',
         long
     )]
@@ -1681,7 +1767,7 @@ pub(super) struct ScriptGrepArgs {
     )]
     pub(super) context: Option<usize>,
     #[arg(
-        help = "Print each function that holds a match once, whole, instead of its matching lines",
+        help = "Print each function that holds a match once, whole, instead of its matching lines; one longer than 60 lines prints its matching lines with 3 lines around each unless its first line matches",
         long = "fn",
         conflicts_with = "count"
     )]
@@ -1697,7 +1783,7 @@ pub(super) struct ScriptGrepArgs {
 #[derive(Parser)]
 pub(super) struct ScriptReadArgs {
     #[arg(
-        help = "Script file or instance path (ServerScriptService.Main), with lines as FILE:A-B, FILE:A- or FILE:A; several are read in one call",
+        help = "Script file, instance path (ServerScriptService.Main) or a script's unique name (Main), with lines as FILE:A-B, FILE:A- or FILE:A; several are read in one call. Without lines a script of 120 lines or more prints as its outline",
         value_name = "TARGET",
         required = true
     )]
@@ -1707,11 +1793,17 @@ pub(super) struct ScriptReadArgs {
     #[arg(help = "Last line to read of a target without lines", long)]
     pub(super) end_line: Option<usize>,
     #[arg(
-        help = "List the functions instead of the source: one `FIRST-LAST name(params)` line each, nested ones indented",
+        help = "List the functions instead of the source: one `FIRST-LAST name(params)` line each, nested ones indented; a target with lines prints its outline, then those lines",
         long,
         conflicts_with_all = ["start_line", "end_line", "functions"]
     )]
     pub(super) outline: bool,
+    #[arg(
+        help = "Print a script of 120 lines or more whole instead of as its outline",
+        long,
+        conflicts_with_all = ["outline", "functions"]
+    )]
+    pub(super) all: bool,
     #[arg(
         help = "Print only this function, by its outline name or the last segment of it; repeatable",
         long = "fn",
@@ -2716,7 +2808,10 @@ pub(super) struct PushEditorChangesArgs {
     pub(super) project: ProjectSourceArgs,
     #[command(flatten)]
     pub(super) bridge: BridgeConnectionArgs,
-    #[arg(help = "Files or directories to push", value_name = "PATH")]
+    #[arg(
+        help = "Files or directories to push; a script also by its unique name (HonkHandler)",
+        value_name = "PATH"
+    )]
     pub(super) paths: Vec<PathBuf>,
     #[arg(
         help = "Push a service's store file (instances/NAME.renium), repeatable",

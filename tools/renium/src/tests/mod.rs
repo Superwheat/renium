@@ -226,6 +226,48 @@ fn get_property_accepts_the_properties_after_the_target() {
 }
 
 #[test]
+fn get_property_without_a_property_asks_for_the_stored_ones() {
+    let request = |arguments: &[&str]| {
+        let args = BytecodeGetPropertyArgs::try_parse_from(
+            std::iter::once("bg").chain(arguments.iter().copied()),
+        )
+        .unwrap();
+        crate::bytecode::stored_properties_request(&args).map(|inspect| {
+            let target = inspect.target;
+            assert_eq!((inspect.fields.as_str(), inspect.depth), ("props", None));
+            (
+                target.service_or_target,
+                target.target,
+                target.settings_id,
+                target.ords,
+            )
+        })
+    };
+    let workspace = Some("Workspace".to_string());
+    assert_eq!(
+        request(&["Workspace", "Lobby.Door"]),
+        Some((workspace.clone(), Some("Lobby.Door".into()), None, None))
+    );
+    assert_eq!(
+        request(&["Workspace", "-i", "editor:door"]),
+        Some((workspace.clone(), None, Some("editor:door".into()), None))
+    );
+    assert_eq!(
+        request(&["Workspace", "--path", "Lobby.Border", "--ords", "[1,2]"]),
+        Some((workspace, None, None, Some("[1,2]".into())))
+    );
+    assert_eq!(request(&["Workspace"]), None);
+    assert_eq!(request(&["Workspace", "Lobby.Door", "Anchored"]), None);
+    assert_eq!(
+        request(&["Workspace", "Lobby.Door", "-p", "Anchored"]),
+        None
+    );
+    assert_eq!(request(&["Workspace", "-i", "editor:door", "Name"]), None);
+    assert_eq!(request(&["-f", "instances/Workspace.renium", "Door"]), None);
+    assert_eq!(request(&["instances/Workspace.renium", "Door"]), None);
+}
+
+#[test]
 fn inspect_prints_one_array_for_several_targets_and_get_one_object_for_several_properties() {
     use clap::Parser;
     let dir = temp_dir("inspect-several-targets");

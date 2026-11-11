@@ -896,8 +896,12 @@ fn failed(failure: crate::automation::Failure) -> anyhow::Error {
 
 /// Every file of the request with its pairs applied, or every reason one of
 /// them cannot be. A file named twice gets its pairs in the order given.
-fn plan(root: &Path, request: &Request) -> Result<Result<Vec<Change>, Vec<Refusal>>> {
-    let mapping = ScriptMapping::new(root);
+fn plan(
+    root: &Path,
+    source: &Path,
+    request: &Request,
+) -> Result<Result<Vec<Change>, Vec<Refusal>>> {
+    let mapping = ScriptMapping::new(root, source);
     let mut files: Vec<(PathBuf, Vec<&Pair>)> = Vec::new();
     for target in &request.targets {
         let path = resolve_read_target(&mapping, &target.file).map_err(failed)?;
@@ -1201,7 +1205,8 @@ pub(crate) fn run(
         return create(&loaded, args, stdin, push);
     }
     let request = edit_request(args)?;
-    let changes = match plan(&loaded.root, &request)? {
+    let source = loaded.root.join(&loaded.project.source_root);
+    let changes = match plan(&loaded.root, &source, &request)? {
         Ok(changes) => changes,
         Err(refusals) => return refuse(&refusals),
     };
