@@ -551,16 +551,28 @@ pub(crate) fn is_starting(diagnosis: &Value) -> bool {
 }
 
 /// Whether a Studio process the project has not matched yet may still
-/// connect: one runs, none failed to open its place or hung at launch. A
-/// `status -w` keeps waiting for it (a daemon restart or a fresh launch
-/// connects its plugin a few seconds later).
-pub(crate) fn may_still_connect(diagnosis: &Value) -> bool {
+/// connect: one runs whose Edit session is not among `clients`, none failed
+/// to open its place or hung at launch. A `status -w` keeps waiting for it (a
+/// daemon restart or a fresh launch connects its plugin a few seconds later).
+/// When every running Studio has its Edit session connected, nothing is left
+/// to wait for. A Play client does not cover its process: it can share the
+/// process of an Edit session that has not reconnected yet.
+pub(crate) fn may_still_connect(diagnosis: &Value, clients: &[Value]) -> bool {
     let non_empty = |key: &str| {
         diagnosis[key]
             .as_array()
             .is_some_and(|values| !values.is_empty())
     };
-    non_empty("studioProcesses")
+    let unconnected = diagnosis["studioProcesses"]
+        .as_array()
+        .is_some_and(|processes| {
+            processes.iter().any(|process| {
+                !clients.iter().any(|client| {
+                    client["role"] == "edit" && client["pid"].as_u64() == process["pid"].as_u64()
+                })
+            })
+        });
+    unconnected
         && !non_empty("openFailures")
         && !non_empty("startupHangs")
         && !non_empty("signedOut")
@@ -574,21 +586,45 @@ mod wait_tests {
 
     #[test]
     fn a_running_studio_without_a_failure_may_still_connect() {
-        assert!(may_still_connect(&json!({
-            "studioProcesses": [{ "pid": 1 }],
+        assert!(may_still_connect(
+            &json!({
+                "studioProcesses": [{ "pid": 1 }],
+                "openFailures": [],
+                "startupHangs": [],
+            }),
+            &[]
+        ));
+        assert!(!may_still_connect(
+            &json!({
+                "studioProcesses": [],
+                "openFailures": [],
+                "startupHangs": [],
+            }),
+            &[]
+        ));
+        assert!(!may_still_connect(
+            &json!({
+                "studioProcesses": [{ "pid": 1 }],
+                "openFailures": [{ "pid": 1, "reason": "no access" }],
+                "startupHangs": [],
+            }),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn studios_that_are_all_connected_leave_nothing_to_wait_for() {
+        let diagnosis = json!({
+            "studioProcesses": [{ "pid": 1 }, { "pid": 2 }],
             "openFailures": [],
             "startupHangs": [],
-        })));
-        assert!(!may_still_connect(&json!({
-            "studioProcesses": [],
-            "openFailures": [],
-            "startupHangs": [],
-        })));
-        assert!(!may_still_connect(&json!({
-            "studioProcesses": [{ "pid": 1 }],
-            "openFailures": [{ "pid": 1, "reason": "no access" }],
-            "startupHangs": [],
-        })));
+        });
+        let client = |pid: u32| json!({ "pid": pid, "role": "edit" });
+        assert!(!may_still_connect(&diagnosis, &[client(1), client(2)]));
+        assert!(may_still_connect(&diagnosis, &[client(1)]));
+        assert!(may_still_connect(&diagnosis, &[json!({ "role": "edit" })]));
+        let play = json!({ "pid": 2, "role": "play-server" });
+        assert!(may_still_connect(&diagnosis, &[client(1), play]));
     }
 }
 
@@ -692,7 +728,7 @@ mod tests {
         let diagnosis =
             serde_json::json!({"signedOut": [4711], "studioProcesses": [{"pid": 4711}]});
         assert!(super::is_signed_out(&diagnosis));
-        assert!(!super::may_still_connect(&diagnosis));
+        assert!(!super::may_still_connect(&diagnosis, &[]));
     }
 
     #[test]

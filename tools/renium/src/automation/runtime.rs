@@ -1162,6 +1162,60 @@ fn live_sync_summary(status: &Value) -> Option<Value> {
     Some(summary)
 }
 
+/// The context was bound before its Studio connected; a Studio that matches
+/// the project now is attached, as the next command's bind would attach it.
+/// False when the match could not be decided: a window name that could not be
+/// read, or several Studios that fit.
+fn attach_matching_studio(
+    context: &mut automation::BoundContext,
+    state: Option<&automation::State>,
+    bridge: &BridgeServer,
+) -> bool {
+    if context.runtime_id.is_some() {
+        return true;
+    }
+    let Some(state) = state else {
+        return true;
+    };
+    match bound_context::resolve(state, bridge, context.id) {
+        Ok(resolved) => {
+            *context = resolved;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// A status answers within one poll of its wait; a slower one writes the part
+/// that held it to the daemon log. `polling` is the number of polls and the
+/// slowest bind with selection and inventory with diagnosis among them.
+fn log_status_overrun(
+    entered: Instant,
+    wait: Duration,
+    before_wait: Duration,
+    waited: Duration,
+    polling: (u32, Duration, Duration),
+) {
+    let total = entered.elapsed();
+    if total <= wait + Duration::from_secs(2) {
+        return;
+    }
+    let (polls, slowest_bind, slowest_diagnosis) = polling;
+    log_global(
+        3,
+        format_args!(
+            "[renium] status took {} ms with a {} ms wait for a Studio: {} ms before the wait, {} ms in {polls} polls (slowest bind and selection {} ms, slowest inventory and diagnosis {} ms), {} ms after it",
+            total.as_millis(),
+            wait.as_millis(),
+            before_wait.as_millis(),
+            waited.as_millis(),
+            slowest_bind.as_millis(),
+            slowest_diagnosis.as_millis(),
+            total.saturating_sub(before_wait + waited).as_millis(),
+        ),
+    );
+}
+
 fn studio_status_result(
     context: &automation::BoundContext,
     parameters: &Value,
@@ -1169,8 +1223,15 @@ fn studio_status_result(
     bridge: &BridgeServer,
     bridge_wait_seconds: f64,
 ) -> Value {
+    let entered = Instant::now();
+    let wait = Duration::from_secs_f64(bridge_wait_seconds.max(0.0));
+    let (mut before_wait, mut waited) = (Duration::ZERO, Duration::ZERO);
+    let (mut polls, mut slowest_bind, mut slowest_diagnosis) =
+        (0u32, Duration::ZERO, Duration::ZERO);
     let all = parameters.get("all").and_then(Value::as_bool) == Some(true);
     let mut context = context.clone();
+    let attach =
+        |context: &mut automation::BoundContext| attach_matching_studio(context, state, bridge);
     let select_clients = |context: &automation::BoundContext| {
         let clients = bridge.list_bridge_clients();
         if all {
@@ -1194,35 +1255,43 @@ fn studio_status_result(
                 BridgeTarget::Edit,
             );
         }
-        let deadline = Instant::now() + Duration::from_secs_f64(bridge_wait_seconds.max(0.0));
+        before_wait = entered.elapsed();
+        let deadline = Instant::now() + wait;
         loop {
-            // The context was bound before its Studio connected; a Studio
-            // that matches the project now is attached here, as the next
-            // command's bind would attach it.
-            if context.runtime_id.is_none()
-                && let Some(state) = state
-                && let Ok(resolved) = bound_context::resolve(state, bridge, context.id)
-            {
-                context = resolved;
-            }
+            polls += 1;
+            let poll_started = Instant::now();
+            let decided = attach(&mut context);
             clients = select_clients(&context);
+            slowest_bind = slowest_bind.max(poll_started.elapsed());
             if has_edit_client(&clients) {
                 break;
             }
-            let current = crate::studio::diagnosis::diagnose(
-                &bridge.list_bridge_clients(),
-                Some(Path::new(&context.root)),
-            );
+            let diagnosis_started = Instant::now();
+            let connected = bridge.list_bridge_clients();
+            let current =
+                crate::studio::diagnosis::diagnose(&connected, Some(Path::new(&context.root)));
+            slowest_diagnosis = slowest_diagnosis.max(diagnosis_started.elapsed());
+            // An undecided match says nothing about the connected Studios, so
+            // none of them counts as belonging elsewhere.
+            let elsewhere: &[Value] = if decided { &connected } else { &[] };
             let waiting = !crate::studio::diagnosis::is_signed_out(&current)
                 && (crate::studio::diagnosis::is_starting(&current)
                     || context.runtime_id.is_none()
-                        && crate::studio::diagnosis::may_still_connect(&current));
-            if !waiting || Instant::now() >= deadline {
-                diagnosis = Some(current);
-                break;
+                        && crate::studio::diagnosis::may_still_connect(&current, elsewhere));
+            if waiting && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
             }
-            std::thread::sleep(Duration::from_millis(500));
+            // A Studio that connected after this poll's bind is in the
+            // inventory the answer was decided on; it is matched first.
+            attach(&mut context);
+            clients = select_clients(&context);
+            if !has_edit_client(&clients) {
+                diagnosis = Some(current);
+            }
+            break;
         }
+        waited = entered.elapsed().saturating_sub(before_wait);
     }
     let context = &context;
     let mut result = json!({
@@ -1334,6 +1403,13 @@ fn studio_status_result(
     if !orphans.is_empty() {
         result["orphans"] = json!(orphans);
     }
+    log_status_overrun(
+        entered,
+        wait,
+        before_wait,
+        waited,
+        (polls, slowest_bind, slowest_diagnosis),
+    );
     result
 }
 
