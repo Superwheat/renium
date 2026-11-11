@@ -64,6 +64,9 @@ fn tool() -> Value {
     json!({
         "name": "rbx",
         "description": "Renium's `rbx` command for Roblox Studio. Pass the arguments as a list; read RENIUM.md in the project for the commands.",
+        // One small tool: clients that defer MCP tools behind a search load
+        // it with the session, so the first command needs no lookup turn.
+        "_meta": {"anthropic/alwaysLoad": true},
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -83,7 +86,7 @@ fn tool() -> Value {
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Project folder; default: the server's working directory",
+                    "description": "Only for a project in another folder; leave out for this one",
                 },
             },
         },

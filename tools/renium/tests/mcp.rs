@@ -141,6 +141,7 @@ fn a_client_initializes_lists_the_tool_and_runs_rbx() {
     let tools = listed["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["name"], "rbx");
+    assert_eq!(tools[0]["_meta"]["anthropic/alwaysLoad"], true);
     assert_eq!(
         server.call(json!({"args": ["--version"]})),
         json!({"content": [{"type": "text", "text": format!("renium {VERSION}")}], "isError": false})
