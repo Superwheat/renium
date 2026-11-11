@@ -298,7 +298,7 @@ function virtualInput:SendMouseButton(position, button, down)
 				if not engine.refuseFocus then
 					target:CaptureFocus()
 				end
-			else
+			elseif not engine.swallowClicks then
 				target.MouseButton1Click:Fire()
 				target.Activated:Fire()
 			end
@@ -434,6 +434,7 @@ local function reset(options)
 	engine.focusFrame = nil
 	engine.dropTextSends = 0
 	engine.refuseFocus = false
+	engine.swallowClicks = false
 	engine.refuseCoreMoves = options and options.refuseCoreMoves or false
 	engine.delivered = {}
 	engine.buttons = {}
@@ -775,5 +776,24 @@ result = send({
 })
 assert(result.ok == false and result.failedStep == 2, "a hidden scroll target ends the batch at its step")
 assert(result.error == "GUI element Main.Shop.Redeem is not visible: Main.Shop has Visible=false", result.error)
+
+-- A button that answers its press without firing its events (it opens a
+-- prompt or replaces itself) fails a strict click and is left unconfirmed
+-- by a lenient one, which lets the rest of the batch run.
+store = shop()
+engine.swallowClicks = true
+result = send({
+	{ type = "click", path = "Main.Shop.Redeem", step = 1, lenient = true },
+	{ type = "move", x = 5, y = 500 },
+})
+assert(result.ok and result.verifiedClicks == 0 and result.unconfirmedClicks == 1, "an unconfirmed click does not end the batch")
+assert(delivered() == `{CLICK},move`, "the batch went on: " .. delivered())
+store = shop()
+engine.swallowClicks = true
+message = failure({ { type = "click", path = "Main.Shop.Redeem" } })
+assert(message == "Expected one Activated and MouseButton1Click event, got 0 and 0", message)
+store = shop()
+result = send({ { type = "click", path = "Main.Shop.Redeem", lenient = true } })
+assert(result.ok and result.verifiedClicks == 1 and result.unconfirmedClicks == nil, "a button that fires is verified either way")
 
 print("Renium CoreGui dismiss tests passed")

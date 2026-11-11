@@ -1788,6 +1788,7 @@ updateMouse()
 		end
 		local virtualInput = sharedVirtualInput
 		local verifiedClicks = 0
+		local unconfirmedClicks = 0
 		local heldKeys = sharedHeldKeys
 		local keysObserved = {}
 		local heldButtons = {}
@@ -1957,7 +1958,10 @@ updateMouse()
 				error(holdError, 0)
 			end
 		end
-		local function clickButton(target, position, holdMs)
+		-- Returns whether the button fired Activated and MouseButton1Click
+		-- once. `lenient` leaves a button that fired neither (one that opens
+		-- a prompt or replaces itself on the press) unconfirmed, not failed.
+		local function clickButton(target, position, holdMs, lenient)
 			local activated = 0
 			local clicked = 0
 			local activatedConnection = target.Activated:Connect(function()
@@ -1980,8 +1984,12 @@ updateMouse()
 				error(clickError, 0)
 			end
 			if activated ~= 1 or clicked ~= 1 then
+				if lenient then
+					return false
+				end
 				error(`Expected one Activated and MouseButton1Click event, got {activated} and {clicked}`, 0)
 			end
+			return true
 		end
 		-- Text reaches a box from the frame after its focus landed; the text
 		-- action then checks that it arrived in this box.
@@ -2027,7 +2035,10 @@ updateMouse()
 			end
 			local position = Vector2.new(tonumber(bounds.x) or 0, tonumber(bounds.y) or 0)
 			if target:IsA("GuiButton") then
-				clickButton(target, position, action.holdMs)
+				if not clickButton(target, position, action.holdMs, action.lenient == true) then
+					unconfirmedClicks += 1
+					return
+				end
 			elseif target:IsA("TextBox") then
 				clickAt(position, action.holdMs)
 				awaitTextBoxFocus(target, `TextBox {bounds.ordinalPath} did not take focus after the click`)
@@ -2315,9 +2326,24 @@ updateMouse()
 					if focusedTextBox ~= nil and UserInputService:GetFocusedTextBox() ~= focusedTextBox then
 						focusedTextBox = nil
 					end
+					-- A box whose handler takes the text and puts its old value
+					-- back still changed; the signal sees that, the value does not.
+					local textChanged = false
+					local textConnection = nil
+					if focusedTextBox ~= nil then
+						local okSignal, signal = pcall(focusedTextBox.GetPropertyChangedSignal, focusedTextBox, "Text")
+						if okSignal and signal ~= nil then
+							textConnection = signal:Connect(function()
+								textChanged = true
+							end)
+						end
+					end
 					local function sendText()
 						local okSend, sendError = pcall(virtualInput.SendTextInput, virtualInput, text)
 						if not okSend then
+							if textConnection ~= nil then
+								textConnection:Disconnect()
+							end
 							error(keyboardRefusal(sendError), 0)
 						end
 					end
@@ -2327,7 +2353,7 @@ updateMouse()
 					-- is sent once more after refocusing when it did not arrive.
 					if focusedTextBox ~= nil and text ~= "" then
 						local function textArrived()
-							return focusedTextBox.Text ~= focusedTextBefore
+							return textChanged or focusedTextBox.Text ~= focusedTextBefore
 						end
 						local function awaitText()
 							local deadline = os.clock() + 0.5
@@ -2345,6 +2371,9 @@ updateMouse()
 							sendText()
 							textObserved = awaitText()
 						end
+					end
+					if textConnection ~= nil then
+						textConnection:Disconnect()
 					end
 				elseif actionType == "dismiss" or actionType == "press" then
 					local position = if action.x ~= nil and action.y ~= nil
@@ -2442,6 +2471,7 @@ updateMouse()
 				ok = true,
 				actions = #actions,
 				verifiedClicks = verifiedClicks,
+				unconfirmedClicks = if unconfirmedClicks > 0 then unconfirmedClicks else nil,
 				textObserved = textObserved,
 				activated = if activationId ~= "" then activationCount == 1 else nil,
 				clicked = if activationId ~= "" then clickCount == 1 else nil,

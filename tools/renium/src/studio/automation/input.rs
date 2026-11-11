@@ -300,6 +300,22 @@ fn virtual_input_commands(actions: &[InputAction], locate: &mut Locate) -> Resul
             }
         }
     }
+    // Clicks and waits alone keep the strict check of each button's events.
+    // Beside other actions a button that answers its press another way (a
+    // prompt, a panel that replaces it) is counted as unconfirmed instead.
+    let strict = actions.iter().all(|action| {
+        matches!(
+            action.action,
+            InputActionKind::Click | InputActionKind::Wait
+        )
+    });
+    if !strict {
+        for command in &mut commands {
+            if command["type"] == "click" {
+                command["lenient"] = json!(true);
+            }
+        }
+    }
     Ok(commands)
 }
 
@@ -563,7 +579,33 @@ fn os_input_result(request: &InputRequest, bridge: &BridgeServer) -> Result<Valu
     Ok(result)
 }
 
+/// The plugin build from which a GUI path in an input list is resolved,
+/// checked and clicked by the client when its turn comes. An older plugin
+/// reads such an action as the point 0,0 or as a button it does not find.
+const GUI_PATH_INPUT_BUILD_UNIX: i64 = 1_794_366_810;
+
+fn names_gui_path(actions: &[InputAction]) -> bool {
+    actions.iter().any(|action| {
+        action
+            .path
+            .as_deref()
+            .is_some_and(|path| !is_world_path(path))
+    })
+}
+
+fn predates_gui_path_input(clients: &[Value]) -> bool {
+    clients
+        .iter()
+        .filter_map(|client| client.get("bridgeBuildUnix").and_then(Value::as_i64))
+        .any(|build| build < GUI_PATH_INPUT_BUILD_UNIX)
+}
+
 fn virtual_input_result(request: &InputRequest, bridge: &BridgeServer) -> Result<Value> {
+    if names_gui_path(&request.actions) && predates_gui_path_input(&bridge.list_bridge_clients()) {
+        bail!(
+            "A connected Studio runs an older Renium plugin than input on GUI paths needs; restart Studio to load the installed one"
+        );
+    }
     let player = request.player.as_deref();
     let commands = virtual_input_commands(&request.actions, &mut |action, previous| {
         action_position(action, bridge, player, previous)
@@ -576,7 +618,13 @@ fn virtual_input_result(request: &InputRequest, bridge: &BridgeServer) -> Result
         "inputMethod": "virtual",
     });
     note_system_ui(&mut result, &response);
-    for key in ["heldKeys", "keysObserved", "verifiedClicks", "coreGui"] {
+    for key in [
+        "heldKeys",
+        "keysObserved",
+        "verifiedClicks",
+        "unconfirmedClicks",
+        "coreGui",
+    ] {
         if let Some(value) = response.get(key).filter(|value| !value.is_null()) {
             result[key] = value.clone();
         }
@@ -645,7 +693,7 @@ mod tests {
         );
         assert_eq!(
             commands[0],
-            json!({ "type": "click", "path": "Main.Shop.Codes", "holdMs": 30, "step": 1 })
+            json!({ "type": "click", "path": "Main.Shop.Codes", "holdMs": 30, "step": 1, "lenient": true })
         );
         assert_eq!(commands[1]["text"], "ABC");
         assert_eq!(
@@ -664,12 +712,33 @@ mod tests {
         assert_eq!(commands[11]["x"], 450);
         assert_eq!(
             commands[15],
-            json!({ "type": "click", "path": "Main.Shop.Redeem", "holdMs": 80, "step": 7 })
+            json!({ "type": "click", "path": "Main.Shop.Redeem", "holdMs": 80, "step": 7, "lenient": true })
         );
         assert!(
             located.is_empty(),
             "no GUI path is resolved ahead of its turn: {located:?}"
         );
+    }
+
+    #[test]
+    fn gui_paths_wait_for_a_plugin_that_resolves_them_at_their_turn() {
+        let request = |actions: Value| request(actions).actions;
+        assert!(names_gui_path(&request(
+            json!([{ "action": "scroll-down", "path": "Main.Shop.Slots" }])
+        )));
+        assert!(!names_gui_path(&request(json!([
+            { "action": "click", "path": "Workspace.Door" },
+            { "action": "click", "x": 4, "y": 5 },
+            { "action": "key-press", "key": "E" },
+        ]))));
+        let older =
+            json!({ "role": "play-client", "bridgeBuildUnix": GUI_PATH_INPUT_BUILD_UNIX - 1 });
+        let current = json!({ "role": "edit", "bridgeBuildUnix": GUI_PATH_INPUT_BUILD_UNIX });
+        assert!(predates_gui_path_input(&[current.clone(), older]));
+        assert!(!predates_gui_path_input(&[
+            current,
+            json!({ "role": "edit" })
+        ]));
     }
 
     #[test]
@@ -697,6 +766,20 @@ mod tests {
     }
 
     #[test]
+    fn clicks_and_waits_alone_keep_the_strict_button_check() {
+        let (commands, _) = plan(json!([
+            { "action": "click", "path": "Main.Open" },
+            { "action": "wait", "ms": 0 },
+            { "action": "click", "path": "Main.Close" },
+        ]));
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.get("lenient").is_none())
+        );
+    }
+
+    #[test]
     fn a_key_or_text_path_is_focused_with_a_verified_click() {
         let (typed, located) = plan(json!([
             { "action": "wait", "ms": 0 },
@@ -705,7 +788,7 @@ mod tests {
         ]));
         assert_eq!(
             typed[1],
-            json!({ "type": "click", "path": "Chat.Box", "holdMs": 30, "step": 2 })
+            json!({ "type": "click", "path": "Chat.Box", "holdMs": 30, "step": 2, "lenient": true })
         );
         assert_eq!(
             types(&typed),
