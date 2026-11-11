@@ -372,6 +372,9 @@ pub(crate) fn ensure_plugin_api_ok(result: &Value) -> Result<()> {
     Ok(())
 }
 
+const RUNNER_TIMEOUT_HINT: &str =
+    "pass -t SECONDS, or use --detach NAME for samplers and read them with --collect NAME";
+
 const LUAU_ERROR_HINTS: [(&str, &str); 4] = [
     (
         "cannot read 'Source'",
@@ -381,10 +384,7 @@ const LUAU_ERROR_HINTS: [(&str, &str); 4] = [
         "lacking capability Plugin",
         "profiling inside runners is blocked; use `rbx perf start --player N` or `rbx perf micro-start`",
     ),
-    (
-        "Luau runner timed out after",
-        "pass -t SECONDS, or use --detach NAME for samplers and read them with --collect NAME",
-    ),
+    ("Luau runner timed out after", RUNNER_TIMEOUT_HINT),
     (
         "is not a valid member of",
         "`rbx tr SERVICE.PATH` lists an instance's children and `rbx l \"return X.ClassName\"` its class",
@@ -398,6 +398,50 @@ fn luau_error_hint(text: &str) -> Option<&'static str> {
         .map(|(_, hint)| *hint)
 }
 
+const CLONED_MODULE_HINT: &str = "a cloned ModuleScript has no Parent, so `script.Parent` inside it is nil; require the module itself: `rbx l` already loads modules fresh in Edit";
+
+/// The hint for a failure the error text alone does not explain: an Edit run
+/// that requires a `:Clone()` of a module and then indexes nil.
+pub(crate) fn luau_code_hint(code: &str, result: &Value) -> Option<&'static str> {
+    let in_edit = matches!(
+        result.get("context").and_then(Value::as_str),
+        Some("edit" | "plugin")
+    );
+    let indexes_nil = result
+        .get("error")
+        .and_then(Value::as_str)
+        .is_some_and(|error| error.contains("attempt to index nil with"));
+    (in_edit && indexes_nil && code.contains(":Clone()") && code.contains("require"))
+        .then_some(CLONED_MODULE_HINT)
+}
+
+/// The error of a failed `rbx play --result` or `--client-result` chunk with
+/// its next step: the session it ran in is still up, so the chunk is rerun
+/// there instead of in a new session. A chunk that ran out of time is told
+/// what raises the limit on `play`.
+pub(crate) fn failed_play_result_error(error: &str, client: bool) -> String {
+    let rerun = if client {
+        "`rbx lc 'LUAU'`"
+    } else {
+        "`rbx l --server 'LUAU'`"
+    };
+    if error.contains(RUNNER_TIMEOUT_HINT) {
+        return error.replacen(
+            RUNNER_TIMEOUT_HINT,
+            &format!(
+                "raise this command's -t SECONDS, or rerun the chunk with {rerun} -t SECONDS; the session is still running"
+            ),
+            1,
+        );
+    }
+    let separator = if error.contains("\nHint: ") {
+        "; "
+    } else {
+        "\nHint: "
+    };
+    format!("{error}{separator}the session is still running; {rerun} reruns the chunk")
+}
+
 /// A failed Luau run as the plugin reported it: the folded message, plus the
 /// console lines Studio logged during the run on their own.
 #[derive(Debug)]
@@ -407,6 +451,17 @@ pub(crate) struct LuauRunFailure {
 }
 
 impl LuauRunFailure {
+    /// The same failure with a hint line, unless it already carries one.
+    pub(crate) fn with_hint(mut self, hint: Option<&str>) -> Self {
+        if let Some(hint) = hint
+            && !self.message.contains("\nHint: ")
+        {
+            self.message.push_str("\nHint: ");
+            self.message.push_str(hint);
+        }
+        self
+    }
+
     /// The same failure named after the runtime it came from, keeping the
     /// console lines a JSON caller reads as `consoleErrors`.
     pub(crate) fn in_context(mut self, label: &str) -> Self {
@@ -789,7 +844,7 @@ mod tests {
 
 #[cfg(test)]
 mod luau_hint_tests {
-    use super::ensure_luau_api_ok;
+    use super::{LuauRunFailure, ensure_luau_api_ok, failed_play_result_error, luau_code_hint};
     use serde_json::json;
 
     #[test]
@@ -822,6 +877,77 @@ mod luau_hint_tests {
         );
         assert!(!edit.contains("Hint:"));
         assert!(ensure_luau_api_ok(&json!({"ok": true})).is_ok());
+    }
+
+    #[test]
+    fn requiring_a_cloned_module_in_edit_names_the_missing_parent() {
+        let clone =
+            "local N = require(game.ReplicatedStorage.Misc.NumberFormat:Clone()) return N.Cash(5)";
+        let failed = json!({
+            "ok": false, "context": "edit",
+            "error": "UIEffects:11: attempt to index nil with 'NumberFormat'\n[string \"Renium\"]:1",
+        });
+        let hint = luau_code_hint(clone, &failed).expect("a hint");
+        assert!(hint.contains("no Parent") && hint.contains("loads modules fresh"));
+        let shown = ensure_luau_api_ok(&failed)
+            .unwrap_err()
+            .downcast::<LuauRunFailure>()
+            .unwrap()
+            .with_hint(Some(hint))
+            .in_context("Edit window")
+            .to_string();
+        assert!(shown.starts_with("[Edit window] UIEffects:11:"), "{shown}");
+        assert!(
+            shown.ends_with(&format!("[string \"Renium\"]:1\nHint: {hint}")),
+            "{shown}"
+        );
+
+        let plain = "return require(game.ReplicatedStorage.Misc.NumberFormat).Cash(5)";
+        assert_eq!(luau_code_hint(plain, &failed), None);
+        let copy = "local part = workspace.Pad:Clone() return part.Missing.Name";
+        assert_eq!(luau_code_hint(copy, &failed), None);
+        let mut server = failed.clone();
+        server["context"] = json!("server");
+        assert_eq!(luau_code_hint(clone, &server), None);
+        let mut other = failed.clone();
+        other["error"] = json!("Misc is not a valid member of ReplicatedStorage");
+        assert_eq!(luau_code_hint(clone, &other), None);
+        let hinted = ensure_luau_api_ok(&other)
+            .unwrap_err()
+            .downcast::<LuauRunFailure>()
+            .unwrap()
+            .with_hint(Some("second"))
+            .to_string();
+        assert_eq!(hinted.matches("Hint: ").count(), 1, "{hinted}");
+    }
+
+    #[test]
+    fn a_failed_play_result_chunk_says_the_session_still_runs() {
+        assert_eq!(
+            failed_play_result_error(
+                "The condition was met, but the result expression failed: attempt to call missing method 'GetSpawnZone' of table",
+                false
+            ),
+            "The condition was met, but the result expression failed: attempt to call missing method 'GetSpawnZone' of table\nHint: the session is still running; `rbx l --server 'LUAU'` reruns the chunk"
+        );
+        assert_eq!(
+            failed_play_result_error(
+                "[client 1] Shop is not a valid member of PlayerGui\nHint: `rbx tr SERVICE.PATH` lists an instance's children and `rbx l \"return X.ClassName\"` its class",
+                true
+            ),
+            "[client 1] Shop is not a valid member of PlayerGui\nHint: `rbx tr SERVICE.PATH` lists an instance's children and `rbx l \"return X.ClassName\"` its class; the session is still running; `rbx lc 'LUAU'` reruns the chunk"
+        );
+        let timeout = format!(
+            "{:#}",
+            ensure_luau_api_ok(
+                &json!({"ok": false, "error": "Luau runner timed out after 118.0s and was stopped"})
+            )
+            .unwrap_err()
+        );
+        assert_eq!(
+            failed_play_result_error(&timeout, false),
+            "Luau runner timed out after 118.0s and was stopped\nHint: raise this command's -t SECONDS, or rerun the chunk with `rbx l --server 'LUAU'` -t SECONDS; the session is still running"
+        );
     }
 }
 

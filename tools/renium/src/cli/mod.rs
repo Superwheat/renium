@@ -1503,6 +1503,10 @@ pub(super) struct LuauRunnerArgs {
         help = "Seconds a detached runner stays alive"
     )]
     pub(super) lifetime: f64,
+    /// Set for a run the user issued: during Play its connections and
+    /// scheduled threads stay alive for a while after the chunk returns.
+    #[arg(skip)]
+    pub(super) keep_alive: bool,
 }
 
 #[derive(Parser)]
@@ -1759,7 +1763,15 @@ pub(super) struct StartStopPlayArgs {
     )]
     pub(super) until: Option<String>,
     #[arg(
-        help = "After starting (and --until), wait until a server or client console line contains this text; the result's `untilConsole` names the side and the seconds it took",
+        help = "After starting (and --until), wait until this Luau expression is true on the first client; the result carries `clientUntil` and `clientUntilSeconds`",
+        long,
+        value_name = "LUAU",
+        allow_hyphen_values = true,
+        conflicts_with_all = ["stop", "add_players", "leave", "kill_orphans"]
+    )]
+    pub(super) client_until: Option<String>,
+    #[arg(
+        help = "After starting (and --until, --client-until), wait until a server or client console line contains this text; the result's `untilConsole` names the side and the seconds it took",
         long,
         value_name = "TEXT",
         allow_hyphen_values = true,
@@ -1767,14 +1779,14 @@ pub(super) struct StartStopPlayArgs {
     )]
     pub(super) until_console: Option<String>,
     #[arg(
-        help = "Seconds to wait for --until and --until-console",
+        help = "Seconds to wait for --until, --client-until and --until-console; --result and --client-result may run for what is left of it (10 at least)",
         short = 't',
         long,
         default_value_t = 120.0
     )]
     pub(super) until_timeout: f64,
     #[arg(
-        help = "Once --until or --until-console holds, evaluate this Luau expression (or chunk) once on the server and return it as `result`, tables included",
+        help = "Once the waits hold, evaluate this Luau expression (or chunk) once on the server and return it as `result`, tables included",
         long,
         value_name = "LUAU",
         allow_hyphen_values = true,
@@ -1782,7 +1794,7 @@ pub(super) struct StartStopPlayArgs {
     )]
     pub(super) result: Option<String>,
     #[arg(
-        help = "Once --until or --until-console holds, evaluate this Luau expression (or chunk) once on the first client and return it as `clientResult`",
+        help = "Once the waits hold, evaluate this Luau expression (or chunk) once on the first client and return it as `clientResult`",
         long,
         value_name = "LUAU",
         allow_hyphen_values = true,

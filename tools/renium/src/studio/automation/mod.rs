@@ -78,21 +78,7 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
         });
         default_luau_run_timeout(code.as_deref().unwrap_or(""))
     });
-    let parameters = json!({
-        "code": args.code,
-        "file": args.file.map(absolute_from_cwd),
-        "client": args.client,
-        "player": args.player,
-        "server": args.server,
-        "edit": args.edit,
-        "timeout": timeout,
-        "detach": args.runner.detach,
-        "collect": args.runner.collect,
-        "stop": args.runner.stop,
-        "lifetime": args.runner.lifetime,
-        "bridgeWaitSeconds": args.bridge.wait_seconds,
-        "bridgePorts": args.bridge.ports,
-    });
+    let parameters = luau_command_parameters(&args, timeout);
     let text = args.runner.detach.is_none()
         && args.runner.collect.is_none()
         && crate::app::output::compact_text_output();
@@ -135,6 +121,27 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
         return Ok(());
     }
     print_json_output(&result, false)
+}
+
+/// The daemon request of `rbx l` and `rbx lc`. `keepAlive` marks the run as
+/// the user's own, which no chunk Renium composes itself carries.
+fn luau_command_parameters(args: &ExecuteLuauArgs, timeout: f64) -> Value {
+    json!({
+        "code": args.code,
+        "file": args.file.clone().map(absolute_from_cwd),
+        "client": args.client,
+        "player": args.player,
+        "server": args.server,
+        "edit": args.edit,
+        "timeout": timeout,
+        "detach": args.runner.detach,
+        "collect": args.runner.collect,
+        "stop": args.runner.stop,
+        "lifetime": args.runner.lifetime,
+        "keepAlive": true,
+        "bridgeWaitSeconds": args.bridge.wait_seconds,
+        "bridgePorts": args.bridge.ports,
+    })
 }
 
 /// What a plain `rbx l` or `rbx lc` run prints in text mode: the lines the
@@ -404,14 +411,59 @@ fn luau_context_label(result: &Value, player: Option<&str>) -> String {
     }
 }
 
-fn ensure_luau_ok_in_context(result: &Value, player: Option<&str>) -> Result<()> {
+/// Fails for a run the plugin reported as failed, named after the runtime it
+/// ran in. `code` is the chunk the user wrote, when its text can explain the
+/// failure.
+fn ensure_luau_ok_in_context(
+    result: &Value,
+    player: Option<&str>,
+    code: Option<&str>,
+) -> Result<()> {
     ensure_luau_api_ok(result).map_err(|error| {
         let label = luau_context_label(result, player);
         match error.downcast::<crate::app::output::LuauRunFailure>() {
-            Ok(run) => run.in_context(&label).into(),
+            Ok(run) => run
+                .with_hint(code.and_then(|code| crate::app::output::luau_code_hint(code, result)))
+                .in_context(&label)
+                .into(),
             Err(error) => anyhow::anyhow!("[{label}] {error:#}"),
         }
     })
+}
+
+/// How long a Play runner of a user-issued chunk stays after the chunk
+/// returns, so a connection or `task.delay` made in one call is still there
+/// for the next.
+const LUAU_KEEP_ALIVE_SECONDS: f64 = 120.0;
+
+/// The `executeLuau` request of a user's chunk. A detached runner carries its
+/// own lifetime; any other run that may land in a Play runtime asks the
+/// plugin to keep its runner under `keepAliveSeconds`, a parameter the Edit
+/// window's path and older plugins do not read.
+fn user_luau_request(
+    code: &str,
+    target: BridgeTarget,
+    timeout: f64,
+    runner: &crate::cli::LuauRunnerArgs,
+) -> Result<Value> {
+    let mut request = luau_request(code, "Renium", target, timeout)?;
+    if let Some(name) = runner.detach.as_deref() {
+        request["detach"] = json!(runner_name(name)?);
+        request["lifetimeSeconds"] = json!(runner.lifetime.clamp(1.0, 3600.0));
+    } else if runner.keep_alive && target != BridgeTarget::Edit {
+        request["keepAliveSeconds"] = json!(LUAU_KEEP_ALIVE_SECONDS);
+    }
+    Ok(request)
+}
+
+/// Drops what the plugin says about a kept runner (`background`, its
+/// `executionId`): the caller has nothing to do with either, and a text
+/// result would print them as a note on every Play run.
+fn strip_kept_runner_fields(result: &mut Value) {
+    if let Some(map) = result.as_object_mut() {
+        map.remove("background");
+        map.remove("executionId");
+    }
 }
 
 /// The run limit `rbx l` and `rbx lc` use when `-t` is not given.
@@ -517,7 +569,7 @@ pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) 
             player,
             Some(Duration::from_secs(30)),
         )?;
-        ensure_luau_ok_in_context(&result, player)?;
+        ensure_luau_ok_in_context(&result, player, None)?;
         return Ok(result);
     }
     let code = if let Some(code) = args.code.or(args.inline_code) {
@@ -531,22 +583,21 @@ pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) 
         .timeout
         .unwrap_or(DEFAULT_LUAU_TIMEOUT_SECONDS)
         .clamp(0.1, 120.0);
-    let mut request = luau_request(&code, "Renium", target, timeout)?;
-    let detached = args.runner.detach.as_deref().map(runner_name).transpose()?;
-    if let Some(name) = detached {
-        request["detach"] = json!(name);
-        request["lifetimeSeconds"] = json!(args.runner.lifetime.clamp(1.0, 3600.0));
-    }
-    let result = bridge.call_for_selector_with_timeout(
+    let request = user_luau_request(&code, target, timeout, &args.runner)?;
+    let kept = request.get("keepAliveSeconds").is_some();
+    let mut result = bridge.call_for_selector_with_timeout(
         "executeLuau",
         request,
         target,
         player,
         Some(Duration::from_secs_f64(timeout + 10.0)),
     )?;
-    ensure_luau_ok_in_context(&result, player)?;
-    if detached.is_some() && result.get("detached").is_none() {
+    ensure_luau_ok_in_context(&result, player, Some(&code))?;
+    if args.runner.detach.is_some() && result.get("detached").is_none() {
         bail!("The Studio plugin predates detached runners; run rbx setup and restart Studio");
+    }
+    if kept {
+        strip_kept_runner_fields(&mut result);
     }
     Ok(result)
 }
@@ -822,21 +873,7 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
-    if let Some(condition) = args.until.as_deref() {
-        wait_condition_body(condition)?;
-    }
-    for result in [args.result.as_deref(), args.client_result.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        wait_result_body(result)?;
-    }
-    if (args.result.is_some() || args.client_result.is_some())
-        && args.until.is_none()
-        && args.until_console.is_none()
-    {
-        bail!("--result and --client-result need --until or --until-console");
-    }
+    validate_play_waits(&args)?;
     // A stop names no players, so a session started with -p N stops too.
     let stop_parameters = json!({
         "mode": args.mode,
@@ -880,32 +917,18 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
     {
         result["at"] = stand_player_at(target, &result, &args);
     }
-    if let Some(condition) = args.until.as_deref()
-        && result.get("ok").and_then(Value::as_bool) != Some(false)
-    {
-        let wait = daemon_control_request(
-            op::WAIT,
-            None,
-            json!({
-                "condition": condition,
-                "result": args.result,
-                "server": true,
-                "timeout": args.until_timeout,
-                "editRuntimeId": result.get("editRuntimeId"),
-                "bridgeWaitSeconds": args.bridge.wait_seconds,
-                "bridgePorts": args.bridge.ports,
-            }),
-            false,
-        );
-        match wait {
-            Ok(wait) => {
-                if !attach_awaited_result(&mut result, wait) {
-                    print_play_result(result, args.players.is_some())?;
-                    return Err(ReportedFailure.into());
-                }
+    let started = result.get("ok").and_then(Value::as_bool) != Some(false);
+    let named_players = args.players.is_some();
+    let waits_began = Instant::now();
+    if started {
+        match await_play_conditions(&mut result, &args) {
+            Ok(true) => {}
+            Ok(false) => {
+                print_play_result(result, named_players)?;
+                return Err(ReportedFailure.into());
             }
             Err(error) => {
-                print_play_result(result, args.players.is_some())?;
+                print_play_result(result, named_players)?;
                 return Err(error);
             }
         }
@@ -917,109 +940,218 @@ pub(crate) fn start_stop_play_command(args: StartStopPlayArgs) -> Result<()> {
         .and_then(Value::as_array)
         .is_some_and(|clients| !clients.is_empty())
         && args.mode.as_deref().is_none_or(|mode| mode == "play");
-    let fetch = |side: &str, limit: u64| {
-        let console = daemon_control_request(
-            op::CONSOLE,
-            None,
-            json!({
-                "limit": limit,
-                "sinceSeq": 0,
-                "fromOldest": false,
-                "clear": false,
-                side: true,
-                "bridgeWaitSeconds": args.bridge.wait_seconds,
-                "bridgePorts": args.bridge.ports,
-            }),
-            false,
-        );
-        match console {
-            Ok(mut console) => {
-                console::compact_console_entries(&mut console);
-                let mut entries = console
-                    .get("entries")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                console::fold_play_console(&mut entries);
-                Value::Array(entries)
-            }
-            Err(error) => json!({ "error": format!("{error:#}") }),
-        }
-    };
+    let mut waits_hold = started;
     if let Some(text) = args.until_console.as_deref()
-        && result.get("ok").and_then(Value::as_bool) != Some(false)
+        && started
     {
-        let started = std::time::Instant::now();
-        let deadline = started + std::time::Duration::from_secs_f64(args.until_timeout);
-        let mut matched = None;
-        loop {
-            for side in ["server", "client"] {
-                if side == "client" && !has_client {
-                    continue;
-                }
-                if let Some(entries) = fetch(side, 200).as_array()
-                    && let Some(entry) = entries.iter().find(|entry| {
-                        entry
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .is_some_and(|message| message.contains(text))
-                    })
-                {
-                    matched = Some((side, entry.clone()));
-                    break;
-                }
-            }
-            if matched.is_some() || std::time::Instant::now() >= deadline {
-                break;
-            }
-            thread::sleep(std::time::Duration::from_millis(400));
-        }
-        let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
-        let hit = matched.is_some();
-        result["untilConsole"] = match matched {
-            Some((side, entry)) => json!({
-                "text": text,
-                "matched": true,
-                "side": side,
-                "seconds": seconds,
-                "entry": entry,
-            }),
-            None => json!({ "text": text, "matched": false, "timedOut": true, "seconds": seconds }),
-        };
-        if hit
-            && args.until.is_none()
+        let record = await_console_text(text, has_client, &args);
+        waits_hold = record.get("matched") == Some(&Value::Bool(true));
+        result["untilConsole"] = record;
+    }
+    if waits_hold {
+        let limit = || result_run_seconds(args.until_timeout, waits_began.elapsed().as_secs_f64());
+        // With --until the server result was read in the wait's own runner,
+        // at the moment the condition held.
+        if args.until.is_none()
             && let Some(code) = args.result.as_deref()
         {
-            result["result"] = evaluate_after_wait(code, "server", &args);
+            result["result"] = evaluate_after_wait(code, "server", limit(), &args);
         }
-    }
-    if let Some(code) = args.client_result.as_deref()
-        && result.get("ok").and_then(Value::as_bool) != Some(false)
-        && result
-            .get("untilConsole")
-            .is_none_or(|until| until.get("matched") == Some(&Value::Bool(true)))
-        && result
-            .get("until")
-            .is_none_or(|until| until.get("ok") != Some(&Value::Bool(false)))
-    {
-        result["clientResult"] = evaluate_after_wait(code, "client", &args);
+        if let Some(code) = args.client_result.as_deref() {
+            result["clientResult"] = evaluate_after_wait(code, "client", limit(), &args);
+        }
     }
     if let Some(limit) = args.console
-        && result.get("ok").and_then(Value::as_bool) != Some(false)
+        && started
     {
-        result["console"] = fetch("server", limit);
+        result["console"] = play_console_entries("server", limit, &args);
         if has_client {
-            result["clientConsole"] = fetch("client", limit);
+            result["clientConsole"] = play_console_entries("client", limit, &args);
         }
     }
-    if args.stop_after && result.get("ok").and_then(Value::as_bool) != Some(false) {
+    if args.stop_after && started {
         result["stopped"] =
             match daemon_control_request(op::PLAY_STOP, None, stop_parameters, false) {
                 Ok(stop) => json!(stop.get("ok") == Some(&Value::Bool(true))),
                 Err(error) => json!({ "error": format!("{error:#}") }),
             };
     }
-    print_play_result(result, args.players.is_some())
+    print_play_result(result, named_players)
+}
+
+/// Checks the wait and result options of a play start before anything runs:
+/// each is a Luau expression or chunk, a result has a wait to follow, and a
+/// client condition has a client to run on.
+fn validate_play_waits(args: &StartStopPlayArgs) -> Result<()> {
+    for condition in [args.until.as_deref(), args.client_until.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        wait_condition_body(condition)?;
+    }
+    for result in [args.result.as_deref(), args.client_result.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        wait_result_body(result)?;
+    }
+    if (args.result.is_some() || args.client_result.is_some())
+        && args.until.is_none()
+        && args.client_until.is_none()
+        && args.until_console.is_none()
+    {
+        bail!("--result and --client-result need --until, --client-until or --until-console");
+    }
+    if args.client_until.is_some() && matches!(args.mode.as_deref(), Some("run" | "server")) {
+        bail!("--client-until waits on a client, and --mode run and server have none");
+    }
+    Ok(())
+}
+
+/// Runs the `--until` wait on the server, then the `--client-until` wait on
+/// the first client, each for up to `-t` seconds, and records them on the
+/// start result as `until` and `clientUntil`. `Ok(false)` means a wait did
+/// not hold; its record says why.
+fn await_play_conditions(result: &mut Value, args: &StartStopPlayArgs) -> Result<bool> {
+    let edit_runtime_id = result.get("editRuntimeId").cloned().unwrap_or(Value::Null);
+    let wait = |mut parameters: Value| {
+        parameters["timeout"] = json!(args.until_timeout);
+        parameters["editRuntimeId"] = edit_runtime_id.clone();
+        parameters["bridgeWaitSeconds"] = json!(args.bridge.wait_seconds);
+        parameters["bridgePorts"] = json!(args.bridge.ports);
+        daemon_control_request(op::WAIT, None, parameters, false)
+    };
+    if let Some(condition) = args.until.as_deref() {
+        let mut wait = wait(json!({
+            "condition": condition,
+            "result": args.result,
+            "server": true,
+        }))
+        .map_err(|error| result_chunk_timeout(error, args.result.is_some()))?;
+        name_failed_result_chunk(&mut wait);
+        if !attach_awaited_result(result, wait) {
+            return Ok(false);
+        }
+    }
+    if let Some(condition) = args.client_until.as_deref() {
+        let wait = wait(json!({
+            "condition": condition,
+            "client": true,
+            "player": 1,
+        }))?;
+        let held = wait.get("ok") == Some(&Value::Bool(true));
+        result["clientUntil"] = wait;
+        return Ok(held);
+    }
+    Ok(true)
+}
+
+/// A wait whose condition was met and whose `--result` chunk then failed
+/// says what to do about the chunk: the session it ran in is still up.
+fn name_failed_result_chunk(wait: &mut Value) {
+    if wait.get("conditionMet") != Some(&Value::Bool(true)) {
+        return;
+    }
+    if let Some(error) = wait.get("error").and_then(Value::as_str) {
+        wait["error"] = json!(crate::app::output::failed_play_result_error(error, false));
+    }
+}
+
+/// A wait with a `--result` chunk runs that chunk in the wait's runner, so a
+/// runner that ran out of time there is the chunk's failure and gets the
+/// chunk's hint. Any other error passes through.
+fn result_chunk_timeout(error: anyhow::Error, has_result: bool) -> anyhow::Error {
+    let text = format!("{error:#}");
+    if !has_result || !text.contains("Luau runner timed out after") {
+        return error;
+    }
+    let message = crate::app::output::failed_play_result_error(&text, false);
+    match error.downcast::<crate::automation::DaemonFailure>() {
+        Ok(mut failure) => {
+            failure.message = message;
+            failure.into()
+        }
+        Err(_) => anyhow::anyhow!(message),
+    }
+}
+
+/// Seconds a `--result` or `--client-result` chunk may run: what the waits
+/// left of `-t`, never less than a plain Luau run gets and at most the 120 s
+/// Studio gives a runner.
+fn result_run_seconds(budget: f64, waited: f64) -> f64 {
+    (budget - waited).clamp(DEFAULT_LUAU_TIMEOUT_SECONDS, 120.0)
+}
+
+/// The last `limit` entries of the play server's or the first client's
+/// console, folded; `{ "error" }` when the console could not be read.
+fn play_console_entries(side: &str, limit: u64, args: &StartStopPlayArgs) -> Value {
+    let console = daemon_control_request(
+        op::CONSOLE,
+        None,
+        json!({
+            "limit": limit,
+            "sinceSeq": 0,
+            "fromOldest": false,
+            "clear": false,
+            side: true,
+            "bridgeWaitSeconds": args.bridge.wait_seconds,
+            "bridgePorts": args.bridge.ports,
+        }),
+        false,
+    );
+    match console {
+        Ok(mut console) => {
+            console::compact_console_entries(&mut console);
+            let mut entries = console
+                .get("entries")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            console::fold_play_console(&mut entries);
+            Value::Array(entries)
+        }
+        Err(error) => json!({ "error": format!("{error:#}") }),
+    }
+}
+
+/// Polls the server console, and the client's when the session has one,
+/// until a line contains `text` or `-t` seconds pass; the `untilConsole`
+/// record of the start result.
+fn await_console_text(text: &str, has_client: bool, args: &StartStopPlayArgs) -> Value {
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs_f64(args.until_timeout);
+    let sides: &[&str] = if has_client {
+        &["server", "client"]
+    } else {
+        &["server"]
+    };
+    let matched = loop {
+        let found = sides.iter().find_map(|side| {
+            let entries = play_console_entries(side, 200, args);
+            let entry = entries.as_array()?.iter().find(|entry| {
+                entry
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| message.contains(text))
+            })?;
+            Some((*side, entry.clone()))
+        });
+        if found.is_some() || Instant::now() >= deadline {
+            break found;
+        }
+        thread::sleep(Duration::from_millis(400));
+    };
+    let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
+    match matched {
+        Some((side, entry)) => json!({
+            "text": text,
+            "matched": true,
+            "side": side,
+            "seconds": seconds,
+            "entry": entry,
+        }),
+        None => json!({ "text": text, "matched": false, "timedOut": true, "seconds": seconds }),
+    }
 }
 
 /// Prints a Play result. Text mode keeps the decision fields on one JSON line
@@ -1066,16 +1198,42 @@ fn take_play_consoles(result: &mut Value) -> Vec<String> {
     lines
 }
 
-/// Evaluates `--result` or `--client-result` once the wait holds, on the
-/// server or on the first client; the value, or `{ "error" }`.
-fn evaluate_after_wait(code: &str, side: &str, args: &StartStopPlayArgs) -> Value {
+/// Evaluates `--result` or `--client-result` once the waits hold, on the
+/// server or on the first client, for up to `timeout` seconds; the value, or
+/// `{ "error" }` with what to do about the failed chunk.
+fn evaluate_after_wait(code: &str, side: &str, timeout: f64, args: &StartStopPlayArgs) -> Value {
     let code = match wait_result_body(code) {
         Ok(code) => code,
         Err(error) => return json!({ "error": format!("{error:#}") }),
     };
+    let parameters = result_chunk_parameters(&code, side, timeout, args);
+    match daemon_control_request(op::LUAU, None, parameters, false) {
+        Ok(run) => run
+            .get("results")
+            .and_then(Value::as_array)
+            .and_then(|results| results.first())
+            .cloned()
+            .unwrap_or(Value::Null),
+        Err(error) => json!({
+            "error": crate::app::output::failed_play_result_error(
+                &format!("{error:#}"),
+                side == "client",
+            )
+        }),
+    }
+}
+
+/// The Luau request of a `--result` or `--client-result` chunk. It is not a
+/// user-issued run: its runner ends with the chunk.
+fn result_chunk_parameters(
+    code: &str,
+    side: &str,
+    timeout: f64,
+    args: &StartStopPlayArgs,
+) -> Value {
     let mut parameters = json!({
         "code": code,
-        "timeout": 30.0,
+        "timeout": timeout,
         "bridgeWaitSeconds": args.bridge.wait_seconds,
         "bridgePorts": args.bridge.ports,
     });
@@ -1085,15 +1243,7 @@ fn evaluate_after_wait(code: &str, side: &str, args: &StartStopPlayArgs) -> Valu
     } else {
         parameters["server"] = json!(true);
     }
-    match daemon_control_request(op::LUAU, None, parameters, false) {
-        Ok(run) => run
-            .get("results")
-            .and_then(Value::as_array)
-            .and_then(|results| results.first())
-            .cloned()
-            .unwrap_or(Value::Null),
-        Err(error) => json!({ "error": format!("{error:#}") }),
-    }
+    parameters
 }
 
 /// Runs `--at` on the play server: the first player's character is stood on
@@ -1326,24 +1476,53 @@ fn compact_play_result(result: &mut Value, named_players: bool) {
     ] {
         map.remove(key);
     }
-    if let Some(until) = map.get("until")
-        && until.get("ok") == Some(&Value::Bool(true))
-        && let Some(value) = until.get("value").cloned()
-    {
-        let elapsed = until.get("elapsedSeconds").and_then(Value::as_f64);
-        map.insert("until".to_string(), value);
-        if let Some(elapsed) = elapsed {
-            map.insert(
-                "untilSeconds".to_string(),
-                json!((elapsed * 10.0).round() / 10.0),
-            );
+    // A start that found a session running answers with the Edit window's
+    // controller status; `alreadyRunning` and `startNote` say what it means.
+    if map.get("alreadyRunning") == Some(&Value::Bool(true)) {
+        for key in [
+            "running",
+            "starting",
+            "readyForStart",
+            "engineRunning",
+            "engineStarted",
+            "executing",
+            "runState",
+            "studioTest",
+            "lastResult",
+        ] {
+            map.remove(key);
         }
-    } else if let Some(until) = map.get_mut("until").and_then(Value::as_object_mut) {
-        compact_wait_record(until);
+    }
+    for (key, seconds_key) in [
+        ("until", "untilSeconds"),
+        ("clientUntil", "clientUntilSeconds"),
+    ] {
+        compact_play_wait(map, key, seconds_key);
     }
     if let Some(status) = map.get_mut("status").and_then(Value::as_object_mut) {
         status.remove("lastResult");
         status.remove("studioTest");
+    }
+}
+
+/// A wait of a play start in text mode: one that held becomes its value
+/// under `key` and its seconds under `seconds_key`; one that failed keeps its
+/// record without the echoed condition.
+fn compact_play_wait(map: &mut Map<String, Value>, key: &str, seconds_key: &str) {
+    if let Some(wait) = map.get(key)
+        && wait.get("ok") == Some(&Value::Bool(true))
+        && let Some(value) = wait.get("value").cloned()
+    {
+        let elapsed = wait.get("elapsedSeconds").and_then(Value::as_f64);
+        map.insert(key.to_string(), value);
+        if let Some(elapsed) = elapsed {
+            map.insert(
+                seconds_key.to_string(),
+                json!((elapsed * 10.0).round() / 10.0),
+            );
+        }
+    } else if let Some(wait) = map.get_mut(key).and_then(Value::as_object_mut) {
+        compact_wait_record(wait);
     }
 }
 
@@ -2514,7 +2693,7 @@ fn start_play_with_retries(
             .and_then(|launch| start_attempt(bridge, &launch, plan, wait))
             .map_err(|error| with_orphan_hint(bridge, error))?;
         let mut result = match outcome {
-            AttemptOutcome::AlreadyRunning(existing) => existing,
+            AttemptOutcome::AlreadyRunning(existing) => already_running_result(existing),
             AttemptOutcome::Started {
                 mut result,
                 requested,
@@ -2553,6 +2732,18 @@ fn start_play_with_retries(
             plan.session_kind(),
         ),
     ))
+}
+
+const ALREADY_RUNNING_NOTE: &str =
+    "nothing was started: state from earlier calls remains; rbx play -r starts fresh";
+
+/// The answer of a start that found a session running: the controller's
+/// status, marked so the caller does not take what follows for a fresh
+/// session.
+fn already_running_result(mut status: Value) -> Value {
+    status["alreadyRunning"] = json!(true);
+    status["startNote"] = json!(ALREADY_RUNNING_NOTE);
+    status
 }
 
 fn with_orphan_hint(bridge: &BridgeServer, error: anyhow::Error) -> anyhow::Error {
@@ -3759,7 +3950,8 @@ pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> 
         }
         let slice = remaining.min(WAIT_PROBE_SLICE_SECONDS);
         let code = wait_probe_code(&body, result_body.as_deref(), slice, interval);
-        let outcome = run_luau_task(bridge, target, player, &code, slice + 5.0)?;
+        let limit = wait_probe_run_limit(slice, remaining, result_body.is_some());
+        let outcome = run_luau_task(bridge, target, player, &code, limit)?;
         if outcome.success {
             return Ok(met_condition_result(
                 args,
@@ -3768,6 +3960,19 @@ pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> 
             ));
         }
         detail = outcome.detail;
+    }
+}
+
+/// The run limit of one probe slice. The condition is polled for `slice`
+/// seconds and gets a margin on top. A result body runs in the same runner
+/// once the condition holds, so with one the runner may use what is left of
+/// the wait's timeout (`remaining`), up to the 120 s Studio gives a runner.
+fn wait_probe_run_limit(slice: f64, remaining: f64, has_result: bool) -> f64 {
+    let polled = slice + 5.0;
+    if has_result {
+        remaining.clamp(polled, 120.0)
+    } else {
+        polled
     }
 }
 
@@ -5159,6 +5364,7 @@ mod play_state_tests {
                 "consoleErrors": ["ReplicatedStorage.Bad:1: bad module"],
             }),
             None,
+            Some("return require(game.ReplicatedStorage.Bad)"),
         )
         .unwrap_err();
         let run = error
@@ -5174,6 +5380,29 @@ mod play_state_tests {
                 .starts_with("[play server] Requested module")
         );
         assert!(error.to_string().contains("Studio logged during the run:"));
+    }
+
+    #[test]
+    fn an_edit_run_that_requires_a_clone_is_told_why_it_indexed_nil() {
+        let failed = json!({
+            "ok": false,
+            "context": "edit",
+            "error": "UIEffects:11: attempt to index nil with 'NumberFormat'",
+        });
+        let code =
+            "local U = require(game.ReplicatedStorage.Misc.UIEffects:Clone()) return U.Cash(1)";
+        let error = ensure_luau_ok_in_context(&failed, None, Some(code))
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("[Edit window] UIEffects:11:"), "{error}");
+        assert!(
+            error.contains("\nHint: a cloned ModuleScript has no Parent"),
+            "{error}"
+        );
+        let unexplained = ensure_luau_ok_in_context(&failed, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(!unexplained.contains("Hint:"), "{unexplained}");
     }
 
     #[test]
@@ -5971,6 +6200,340 @@ mod compact_result_tests {
                 "until": {"ok": false, "timedOut": true, "value": "false", "elapsedSeconds": 120.3, "error": error}
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod play_check_tests {
+    use super::*;
+
+    fn play_args(parts: &[&str]) -> std::result::Result<StartStopPlayArgs, clap::Error> {
+        use clap::Parser;
+        match crate::cli::Cli::try_parse_from(parts)?.command {
+            crate::cli::Commands::StartStopPlay(args) => Ok(args),
+            _ => panic!("expected play"),
+        }
+    }
+
+    fn luau_args(parts: &[&str]) -> ExecuteLuauArgs {
+        use clap::Parser;
+        match crate::cli::Cli::try_parse_from(parts).unwrap().command {
+            crate::cli::Commands::ExecuteLuau(args) => args,
+            crate::cli::Commands::ExecuteClientLuau(args) => args.into_luau_args().unwrap(),
+            _ => panic!("expected l or lc"),
+        }
+    }
+
+    fn runner(keep_alive: bool, detach: Option<&str>) -> crate::cli::LuauRunnerArgs {
+        crate::cli::LuauRunnerArgs {
+            detach: detach.map(str::to_string),
+            lifetime: 600.0,
+            keep_alive,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_users_play_chunk_asks_the_plugin_to_keep_its_runner() {
+        for target in [
+            BridgeTarget::Main,
+            BridgeTarget::Server,
+            BridgeTarget::Client,
+        ] {
+            let request = user_luau_request("return 1", target, 10.0, &runner(true, None)).unwrap();
+            assert_eq!(request["keepAliveSeconds"], 120.0, "{target:?}");
+            assert!(request.get("backgroundLifetimeSeconds").is_none());
+            assert!(request.get("detach").is_none());
+        }
+        let edit =
+            user_luau_request("return 1", BridgeTarget::Edit, 10.0, &runner(true, None)).unwrap();
+        assert!(edit.get("keepAliveSeconds").is_none());
+        let internal =
+            user_luau_request("return 1", BridgeTarget::Server, 10.0, &runner(false, None))
+                .unwrap();
+        assert_eq!(
+            internal,
+            luau_request("return 1", "Renium", BridgeTarget::Server, 10.0).unwrap()
+        );
+        let detached = user_luau_request(
+            "return 1",
+            BridgeTarget::Server,
+            10.0,
+            &runner(true, Some("sampler")),
+        )
+        .unwrap();
+        assert_eq!(detached["detach"], "sampler");
+        assert_eq!(detached["lifetimeSeconds"], 600.0);
+        assert!(detached.get("keepAliveSeconds").is_none());
+        assert!(
+            user_luau_request(
+                "return 1",
+                BridgeTarget::Server,
+                10.0,
+                &runner(true, Some("no good"))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn only_the_l_and_lc_commands_mark_a_run_as_the_users() {
+        for parts in [
+            &["rbx", "l", "--server", "return 1"][..],
+            &["rbx", "l", "return 1"],
+            &["rbx", "lc", "return 1", "2"],
+        ] {
+            let args = luau_args(parts);
+            assert!(
+                !args.runner.keep_alive,
+                "the flag is no command-line option"
+            );
+            assert_eq!(
+                luau_command_parameters(&args, 10.0)["keepAlive"],
+                true,
+                "{parts:?}"
+            );
+        }
+        let play = play_args(&["rbx", "play", "-s", "--until-console", "x"]).unwrap();
+        for side in ["server", "client"] {
+            let chunk = result_chunk_parameters("return 1", side, 42.0, &play);
+            assert!(chunk.get("keepAlive").is_none(), "{chunk}");
+            assert_eq!(chunk["timeout"], 42.0);
+            assert_eq!(chunk[side], true);
+        }
+        assert_eq!(
+            result_chunk_parameters("return 1", "client", 42.0, &play)["player"],
+            1
+        );
+    }
+
+    #[test]
+    fn a_kept_run_prints_what_a_plain_run_prints() {
+        let mut kept = json!({
+            "ok": true, "context": "server", "results": [3], "output": [],
+            "background": true, "executionId": "runtime:7", "runner": true
+        });
+        strip_kept_runner_fields(&mut kept);
+        assert_eq!(
+            kept,
+            json!({"ok": true, "context": "server", "results": [3], "output": [], "runner": true})
+        );
+        kept.as_object_mut().unwrap().remove("runner");
+        assert_eq!(luau_text(&kept), "3");
+        let mut older_plugin = json!({"ok": true, "results": [], "background": false});
+        strip_kept_runner_fields(&mut older_plugin);
+        assert_eq!(luau_text(&older_plugin), "ok");
+    }
+
+    #[test]
+    fn result_chunks_get_what_the_waits_left_of_the_play_timeout() {
+        assert_eq!(result_run_seconds(120.0, 0.0), 120.0);
+        assert_eq!(result_run_seconds(120.0, 7.5), 112.5);
+        assert_eq!(result_run_seconds(60.0, 20.0), 40.0);
+        assert_eq!(result_run_seconds(60.0, 58.0), 10.0);
+        assert_eq!(result_run_seconds(5.0, 0.0), 10.0);
+        assert_eq!(result_run_seconds(600.0, 1.0), 120.0);
+
+        assert_eq!(wait_probe_run_limit(5.0, 120.0, false), 10.0);
+        assert_eq!(wait_probe_run_limit(5.0, 120.0, true), 120.0);
+        assert_eq!(wait_probe_run_limit(5.0, 47.0, true), 47.0);
+        assert_eq!(wait_probe_run_limit(5.0, 8.0, true), 10.0);
+        assert_eq!(wait_probe_run_limit(1.5, 1.5, true), 6.5);
+        assert_eq!(wait_probe_run_limit(5.0, 3000.0, true), 120.0);
+    }
+
+    #[test]
+    fn a_failed_result_chunk_of_a_wait_names_the_running_session() {
+        let mut failed = json!({
+            "ok": false, "conditionMet": true, "value": "true",
+            "error": "The condition was met, but the result expression failed: attempt to index nil with 'Floor'"
+        });
+        name_failed_result_chunk(&mut failed);
+        assert_eq!(
+            failed["error"],
+            "The condition was met, but the result expression failed: attempt to index nil with 'Floor'\nHint: the session is still running; `rbx l --server 'LUAU'` reruns the chunk"
+        );
+        let mut timed_out = wait_timed_out_result("shared.Ready", 30.0, &json!("false"), 30.1);
+        let unchanged = timed_out.clone();
+        name_failed_result_chunk(&mut timed_out);
+        assert_eq!(timed_out, unchanged);
+
+        let runner = || {
+            anyhow::Error::from(crate::automation::DaemonFailure {
+                message: "Luau runner timed out after 118.0s and was stopped\nHint: pass -t SECONDS, or use --detach NAME for samplers and read them with --collect NAME".to_string(),
+                detail: Some(json!({"consoleErrors": ["late"]})),
+            })
+        };
+        let named = result_chunk_timeout(runner(), true);
+        assert_eq!(
+            named.to_string(),
+            "Luau runner timed out after 118.0s and was stopped\nHint: raise this command's -t SECONDS, or rerun the chunk with `rbx l --server 'LUAU'` -t SECONDS; the session is still running"
+        );
+        let detail = named
+            .downcast_ref::<crate::automation::DaemonFailure>()
+            .and_then(|failure| failure.detail.clone());
+        assert_eq!(detail, Some(json!({"consoleErrors": ["late"]})));
+        assert!(
+            result_chunk_timeout(runner(), false)
+                .to_string()
+                .contains("--detach NAME")
+        );
+        let other = result_chunk_timeout(anyhow::anyhow!("The bound Studio changed"), true);
+        assert_eq!(other.to_string(), "The bound Studio changed");
+    }
+
+    #[test]
+    fn client_until_is_a_wait_of_its_own_on_the_first_client() {
+        let args = play_args(&[
+            "rbx",
+            "play",
+            "-s",
+            "--client-until",
+            "game.Players.LocalPlayer.PlayerGui.Main.Shop.Visible",
+            "--client-result",
+            "#game.Players.LocalPlayer.PlayerGui:GetChildren()",
+            "--result",
+            "workspace.DistributedGameTime",
+            "-t",
+            "30",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.client_until.as_deref(),
+            Some("game.Players.LocalPlayer.PlayerGui.Main.Shop.Visible")
+        );
+        assert_eq!(args.until_timeout, 30.0);
+        assert!(args.until.is_none());
+        validate_play_waits(&args).unwrap();
+
+        let both = play_args(&[
+            "rbx",
+            "play",
+            "-r",
+            "--until",
+            "shared.Ready",
+            "--client-until",
+            "-1 < 0",
+        ])
+        .unwrap();
+        assert_eq!(both.until.as_deref(), Some("shared.Ready"));
+        assert_eq!(both.client_until.as_deref(), Some("-1 < 0"));
+        validate_play_waits(&both).unwrap();
+
+        let unparsable =
+            play_args(&["rbx", "play", "-s", "--client-until", "workspace.("]).unwrap();
+        let error = format!("{:#}", validate_play_waits(&unparsable).unwrap_err());
+        assert!(
+            error.starts_with("The condition is neither a Luau expression nor a chunk"),
+            "{error}"
+        );
+        for mode in ["run", "server"] {
+            let headless = play_args(&[
+                "rbx",
+                "play",
+                "-s",
+                "--mode",
+                mode,
+                "--client-until",
+                "true",
+            ])
+            .unwrap();
+            let error = validate_play_waits(&headless).unwrap_err().to_string();
+            assert!(error.contains("have none"), "{error}");
+        }
+        let lone = play_args(&["rbx", "play", "-s", "--client-result", "1"]).unwrap();
+        let error = validate_play_waits(&lone).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "--result and --client-result need --until, --client-until or --until-console"
+        );
+        for parts in [
+            &["rbx", "play", "-x", "--client-until", "true"][..],
+            &[
+                "rbx",
+                "play",
+                "--add-players",
+                "1",
+                "--client-until",
+                "true",
+            ],
+            &[
+                "rbx",
+                "play",
+                "--leave",
+                "-p",
+                "1",
+                "--client-until",
+                "true",
+            ],
+            &["rbx", "play", "--kill-orphans", "--client-until", "true"],
+        ] {
+            assert!(play_args(parts).is_err(), "{parts:?}");
+        }
+    }
+
+    #[test]
+    fn a_play_start_reports_the_client_wait_beside_the_server_wait() {
+        let mut result = json!({
+            "ok": true, "action": "start", "mode": "play", "serverReady": true,
+            "clients": [{"playerName": "A", "role": "client"}],
+            "until": {"action": "wait", "condition": "a", "ok": true, "value": "true", "elapsedSeconds": 2.04},
+            "clientUntil": {"action": "wait", "condition": "b", "ok": true, "value": "true", "elapsedSeconds": 0.26}
+        });
+        compact_play_result(&mut result, false);
+        assert_eq!(
+            result,
+            json!({
+                "ok": true, "serverReady": true, "clients": 1,
+                "until": "true", "untilSeconds": 2.0,
+                "clientUntil": "true", "clientUntilSeconds": 0.3
+            })
+        );
+
+        let mut failed = json!({"ok": true, "action": "start", "clients": []});
+        let wait = wait_timed_out_result("panel.Visible", 30.0, &json!("false"), 30.26);
+        let error = wait["error"].clone();
+        failed["clientUntil"] = wait;
+        compact_play_result(&mut failed, false);
+        assert_eq!(
+            failed,
+            json!({
+                "ok": true, "clients": 0,
+                "clientUntil": {"ok": false, "timedOut": true, "value": "false", "elapsedSeconds": 30.3, "error": error}
+            })
+        );
+    }
+
+    #[test]
+    fn a_start_into_a_running_session_says_nothing_was_started() {
+        let status = json!({
+            "ok": true, "running": true, "starting": false, "readyForStart": false,
+            "engineRunning": true, "engineStarted": true, "executing": true, "mode": "play",
+            "launchNonce": "play-1", "runState": "Enum.RunState.Stopped",
+            "studioTest": {"editModeActive": false},
+            "clients": [{"role": "server"}, {"role": "client", "playerName": "A"}]
+        });
+        let mut result = already_running_result(status.clone());
+        assert_eq!(result["alreadyRunning"], true);
+        assert_eq!(result["startNote"], ALREADY_RUNNING_NOTE);
+        assert!(ALREADY_RUNNING_NOTE.contains("rbx play -r"));
+        assert_eq!(result["running"], true, "json mode keeps the status");
+        assert_eq!(result["launchNonce"], "play-1");
+
+        result["serverReady"] = json!(true);
+        result["until"] = json!({"ok": true, "value": "true", "elapsedSeconds": 0.0});
+        result["result"] = json!("0/10");
+        compact_play_result(&mut result, false);
+        assert_eq!(
+            serde_json::to_string(&result).unwrap(),
+            format!(
+                r#"{{"alreadyRunning":true,"clients":1,"ok":true,"result":"0/10","serverReady":true,"startNote":"{ALREADY_RUNNING_NOTE}","until":"true","untilSeconds":0.0}}"#
+            )
+        );
+
+        let mut fresh = json!({"ok": true, "action": "start", "running": true, "clients": []});
+        compact_play_result(&mut fresh, false);
+        assert_eq!(fresh["running"], true);
     }
 }
 

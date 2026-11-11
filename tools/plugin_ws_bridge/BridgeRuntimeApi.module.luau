@@ -3021,6 +3021,11 @@ updateMouse()
 		backgroundLifetimeSeconds = if backgroundLifetimeSeconds
 			then math.clamp(backgroundLifetimeSeconds, 0.1, 610)
 			else nil
+		-- Play runners only: the Edit path below never reads this, so a chunk
+		-- run in the Edit window still ends with its threads.
+		local keepAliveSeconds = BridgeValueCodec.decodeNumber(params.keepAliveSeconds)
+		local runnerLifetimeSeconds = backgroundLifetimeSeconds
+			or (if keepAliveSeconds then math.clamp(keepAliveSeconds, 0.1, 610) else nil)
 		local detach = nil
 		if params.detach ~= nil then
 			detach = {
@@ -3050,7 +3055,7 @@ updateMouse()
 				code,
 				timeoutSeconds,
 				"client",
-				backgroundLifetimeSeconds,
+				runnerLifetimeSeconds,
 				operationGeneration,
 				detach
 			)
@@ -3065,7 +3070,7 @@ updateMouse()
 				code,
 				timeoutSeconds,
 				"server",
-				backgroundLifetimeSeconds,
+				runnerLifetimeSeconds,
 				operationGeneration,
 				detach
 			)

@@ -146,6 +146,7 @@ pub(super) fn luau(root: &Path, parameters: &Value) -> Result<ExecuteLuauArgs> {
             collect: string(object, "collect"),
             stop: boolean(object, "stop")?,
             lifetime: number(object, "lifetime", 600.0)?,
+            keep_alive: boolean(object, "keepAlive")?,
         },
     })
 }
@@ -183,6 +184,7 @@ pub(super) fn play(operation: u16, parameters: &Value) -> Result<StartStopPlayAr
         leave,
         mode: string(object, "mode"),
         until: None,
+        client_until: None,
         until_console: None,
         until_timeout: 120.0,
         result: None,

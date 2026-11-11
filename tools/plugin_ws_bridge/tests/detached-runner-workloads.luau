@@ -187,6 +187,25 @@ scheduler.wait(0.1)
 local failure = api.collectLuauRunner({ name = "failing" })
 assert(failure.ok and failure.done and failure.status == "error" and string.find(failure.results[1], "boom", 1, true), "collect reports the body's error")
 
+local beforeKept = runnerCount()
+local keptFailure = api.executeLuau({ code = "error('boom')", context = "server", keepAliveSeconds = 0.15 })
+assert(not keptFailure.ok and runnerCount() == beforeKept, "a failed runner is removed even when asked to stay")
+local kept = api.executeLuau({ code = "return 'armed'", context = "server", keepAliveSeconds = 0.15 })
+assert(kept.ok and kept.results[1] == "armed" and kept.background == true and kept.executionId ~= nil,
+	"a kept runner reports its result and that it stays")
+assert(runnerCount() == beforeKept + 1, "a kept runner outlives its return")
+local keptDetached = api.executeLuau({
+	code = "return 'both'",
+	context = "server",
+	detach = "kept",
+	lifetimeSeconds = 5,
+	keepAliveSeconds = 0.15,
+})
+assert(keptDetached.ok and runnerCount() == beforeKept + 2, "a detached runner keeps its own lifetime")
+scheduler.wait(0.3)
+assert(runnerCount() == beforeKept + 1, "a kept runner is removed once its time is up")
+assert(api.collectLuauRunner({ name = "kept", stop = true }).ok, "the detached runner outlives the kept one")
+
 services.RunService.IsRunning = function() return false end
 local stopped = api.executeLuau({ code = "error('must not execute')", context = "plugin" })
 assert(not stopped.ok and stopped.context == "server" and string.find(stopped.error, "restarting", 1, true),
@@ -196,4 +215,31 @@ assert(not edit.ok and string.find(edit.error, "Play", 1, true), "detaching need
 
 api.requestCancellation()
 assert(runnerCount() == 0, "cancellation removes detached runners")
+
+local editEnvironment = {
+	game = runtimeGame,
+	Enum = { RunState = { Stopped = "stopped" }, RunContext = { Server = "Server" } },
+	Instance = { new = newInstance },
+	task = scheduler,
+	script = { Parent = { BridgeValueCodec = codec } },
+	require = function(module)
+		assert(module == codec)
+		return module
+	end,
+	loadstring = function(code)
+		return luau.load(code)
+	end,
+}
+local editApi = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeRuntimeApi.module.luau"), {
+	environment = editEnvironment,
+})().create({}, {
+	runtimeId = "edit-runtime",
+	bridgeRole = "edit",
+	assertRequestLeaseActive = function() end,
+	assertSessionOwnership = function() end,
+})
+local editKept = editApi.executeLuau({ code = "return 2", context = "plugin", keepAliveSeconds = 120 })
+assert(editKept.ok and editKept.results[1] == 2 and editKept.context == "edit", "the Edit window runs the chunk")
+assert(editKept.background == false, "the Edit window does not keep a chunk's threads for keepAliveSeconds")
+editApi.requestCancellation()
 print("Renium detached runner tests passed")
