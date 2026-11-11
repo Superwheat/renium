@@ -180,6 +180,34 @@ fn pointer_commands(action: &InputAction, x: i32, y: i32) -> Vec<Value> {
     }
 }
 
+/// The GUI path of a move, press, release or scroll that names one. The
+/// client reads its point when the action's turn comes, so a target that an
+/// earlier action of the list opens is found.
+fn deferred_pointer_path(action: &InputAction) -> Option<&str> {
+    let path = action.path.as_deref()?;
+    let deferred = !matches!(action.action, InputActionKind::Click)
+        && !is_world_path(path)
+        && action.x.is_none()
+        && action.y.is_none();
+    deferred.then_some(path)
+}
+
+fn path_pointer_commands(action: &InputAction, path: &str, step: usize) -> Vec<Value> {
+    let right = matches!(action.button, Some(MouseButton::Right));
+    let button = if right { "right" } else { "left" };
+    let moved = json!({ "type": "move", "path": path, "step": step });
+    let pressed = |down: bool| json!({ "type": "button", "path": path, "step": step, "button": button, "down": down });
+    let scrolled =
+        |delta: i32| json!({ "type": "scroll", "path": path, "step": step, "delta": delta });
+    match action.action {
+        InputActionKind::MouseDown => vec![moved, pressed(true)],
+        InputActionKind::MouseUp => vec![moved, pressed(false)],
+        InputActionKind::ScrollUp => vec![moved, scrolled(1)],
+        InputActionKind::ScrollDown => vec![moved, scrolled(-1)],
+        _ => vec![moved],
+    }
+}
+
 /// The click that focuses a key or text action's own path before it: the
 /// verified click for a GUI path, a click at its point for a world part.
 fn focus_commands<'a>(
@@ -254,9 +282,14 @@ fn virtual_input_commands(actions: &[InputAction], locate: &mut Locate) -> Resul
             | InputActionKind::Click
             | InputActionKind::ScrollUp
             | InputActionKind::ScrollDown => {
-                let (x, y) = pointer_target(action, &pointer, locate)?;
-                commands.extend(pointer_commands(action, x, y));
-                pointer = Pointer::At(x, y);
+                if let Some(path) = deferred_pointer_path(action) {
+                    commands.extend(path_pointer_commands(action, path, step));
+                    pointer = Pointer::Element(action);
+                } else {
+                    let (x, y) = pointer_target(action, &pointer, locate)?;
+                    commands.extend(pointer_commands(action, x, y));
+                    pointer = Pointer::At(x, y);
+                }
             }
             InputActionKind::Wait => match action.ms.unwrap_or(0) {
                 0 => commands.push(json!({ "type": "wait", "ms": 0 })),
@@ -621,18 +654,21 @@ mod tests {
         );
         assert_eq!(commands[6]["ms"], 300);
         assert_eq!(
+            commands[7],
+            json!({ "type": "move", "path": "Main.Shop.Slots", "step": 5 })
+        );
+        assert_eq!(
             commands[8],
-            json!({ "type": "scroll", "x": 100, "y": 200, "delta": -1 })
+            json!({ "type": "scroll", "path": "Main.Shop.Slots", "step": 5, "delta": -1 })
         );
         assert_eq!(commands[11]["x"], 450);
         assert_eq!(
             commands[15],
             json!({ "type": "click", "path": "Main.Shop.Redeem", "holdMs": 80, "step": 7 })
         );
-        assert_eq!(
-            located,
-            ["Main.Shop.Slots"],
-            "no click path is resolved ahead of its turn"
+        assert!(
+            located.is_empty(),
+            "no GUI path is resolved ahead of its turn: {located:?}"
         );
     }
 

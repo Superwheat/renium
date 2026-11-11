@@ -2377,6 +2377,27 @@ updateMouse()
 					end
 				else
 					local position = Vector2.new(tonumber(action.x) or 0, tonumber(action.y) or 0)
+					-- A GUI path is read when its turn comes, so a target an
+					-- earlier action of the batch opened is found.
+					if action.path ~= nil then
+						local bounds = api.getGuiBounds({ path = action.path })
+						local refusal = nil
+						if bounds.ok ~= true then
+							refusal = tostring(bounds.error or "GUI target could not be resolved")
+						elseif bounds.notVisible ~= nil then
+							refusal = `GUI element {bounds.ordinalPath} is not visible: {bounds.notVisible}`
+						end
+						if refusal ~= nil then
+							assertOperationOwnership(operationGeneration)
+							return {
+								ok = false,
+								error = refusal,
+								failedStep = tonumber(action.step),
+								clickable = bounds.clickable,
+							}
+						end
+						position = Vector2.new(tonumber(bounds.x) or 0, tonumber(bounds.y) or 0)
+					end
 					if actionType == "move" then
 						sendMousePosition(position)
 					elseif actionType == "button" then

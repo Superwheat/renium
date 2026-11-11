@@ -754,4 +754,26 @@ end
 result = send({ { type = "click", path = "Main.HUD.Cash" } })
 assert(#result.clickable == 12 and result.clickable[12] == "Main.Shop.Item9", "twelve paths at most")
 
+store = shop()
+store.panel.Visible = false
+local openPosition, openSize = at(300, 530, 100, 40)
+local open = new("TextButton", store.hud, { Name = "Open", AbsolutePosition = openPosition, AbsoluteSize = openSize })
+open.Activated:Connect(function()
+	store.panel.Visible = true
+end)
+result = send({
+	{ type = "click", path = "Main.HUD.Open", step = 1 },
+	{ type = "move", path = "Main.Shop.Redeem", step = 2 },
+})
+assert(result.ok, "a path the first click opened is found at its turn: " .. tostring(result.error))
+assert(delivered() == `{CLICK},move`, "the move follows the click: " .. delivered())
+store = shop()
+store.panel.Visible = false
+result = send({
+	{ type = "move", x = 5, y = 500 },
+	{ type = "scroll", path = "Main.Shop.Redeem", step = 2, delta = -1 },
+})
+assert(result.ok == false and result.failedStep == 2, "a hidden scroll target ends the batch at its step")
+assert(result.error == "GUI element Main.Shop.Redeem is not visible: Main.Shop has Visible=false", result.error)
+
 print("Renium CoreGui dismiss tests passed")
