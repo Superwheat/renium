@@ -1,4 +1,4 @@
-<!-- renium-version: 0.6.1 -->
+<!-- renium-version: 0.6.2 -->
 # Renium for agents
 
 Call the `rbx` tool: the arguments as a list, or `steps` (several lists) to run commands in one call; put every read or check you already know you need into one call. Load the tool first when it is deferred; `rbx` in a shell only without it. Act directly: commands report a missing Studio or a sync problem themselves, so skip `status`, `cs` and `lst`.
