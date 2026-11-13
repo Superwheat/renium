@@ -245,6 +245,7 @@ pub(super) fn automation_pull_args(
         export_all_properties: automation_bool(object, "exportAllProperties", false)?,
         quiet_timings: std::env::var_os("RENIUM_PROFILE_PULL").is_none(),
         preserve_paths: Vec::new(),
+        keep_local_only_scripts: automation_bool(object, "keepLocalOnlyScripts", false)?,
         layout_src_root: None,
     })
 }
@@ -721,6 +722,9 @@ fn automation_pull_operation(
     });
     if let Some(id) = published.history_id.as_deref() {
         result["historyId"] = json!(id);
+    }
+    if !published.preserved.is_empty() {
+        result["keptFiles"] = json!(published.preserved);
     }
     if !published.read_only_links_restored.is_empty() {
         result["readOnlyLinksRestored"] = json!(published.read_only_links_restored);

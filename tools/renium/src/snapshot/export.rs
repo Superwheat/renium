@@ -184,6 +184,7 @@ pub(crate) struct ExportProjectStage {
     restored_links: Vec<Value>,
     studio_overrides: StudioOverrides,
     preserve_paths: Vec<PathBuf>,
+    keep_local_only_scripts: bool,
     holds_project_files: bool,
     active: bool,
 }
@@ -194,6 +195,13 @@ impl ExportProjectStage {
     /// Studio copy they are waiting to overwrite.
     pub(crate) fn preserve_project_paths(&mut self, paths: Vec<PathBuf>) {
         self.preserve_paths = paths;
+    }
+
+    /// The publish leaves in place every script file it would delete that
+    /// Studio holds no instance for. A pull that only fetches a missing store
+    /// was not asked to remove a script written ahead of its instance.
+    pub(crate) fn keep_local_only_scripts(&mut self, keep: bool) {
+        self.keep_local_only_scripts = keep;
     }
 
     pub(crate) fn create(project_root: &Path, src_dir: &Path, services: &[String]) -> Result<Self> {
@@ -372,6 +380,7 @@ impl ExportProjectStage {
             restored_links: Vec::new(),
             studio_overrides: BTreeMap::new(),
             preserve_paths: Vec::new(),
+            keep_local_only_scripts: false,
             holds_project_files: clone_project_data,
             active: true,
         };
@@ -750,6 +759,15 @@ impl ExportProjectStage {
         let mut refreshed = settings_candidates;
         refreshed.extend(repaired);
         refresh_publish_hashes(&self.project_root, &mut staged, &refreshed)?;
+        if self.keep_local_only_scripts {
+            let naming = self
+                .loaded
+                .as_ref()
+                .map(|loaded| config::project_script_naming(&loaded.project))
+                .unwrap_or_default();
+            self.preserve_paths
+                .extend(local_only_scripts(&current, &staged, &naming));
+        }
         let (operation_paths, preserved) = split_preserved_paths(
             publish_operation_paths(&current, &staged),
             &self.preserve_paths,
@@ -903,6 +921,76 @@ impl ExportProjectStage {
             }),
         })
     }
+}
+
+/// The folder a script file's instance sits in and the name it goes by, both
+/// lowercased: the file name without role suffix and extension, and for an
+/// `init` file the folder above its own with that folder's name.
+fn script_instance(path: &Path, naming: &config::ProjectScriptNaming) -> Option<(String, String)> {
+    let file_name = path.file_name()?.to_str()?;
+    let (_, name, _) = crate::editor::paths::infer_source_script(file_name, naming)?;
+    let folder = path.parent()?;
+    match name {
+        Some(name) => Some(instance_key(folder, &name)),
+        None => Some(instance_key(
+            folder.parent()?,
+            folder.file_name()?.to_str()?,
+        )),
+    }
+}
+
+fn instance_key(folder: &Path, name: &str) -> (String, String) {
+    (folder.to_string_lossy().to_lowercase(), name.to_lowercase())
+}
+
+/// Script files the publish would delete although Studio holds no instance for
+/// them: nothing staged in the script's folder, script or directory, goes by
+/// its name, and the same holds for every folder above it that Studio lacks.
+/// A script Studio has in another form (as a folder with an `init` file, under
+/// another class, in another letter case) stays the publish's to replace.
+fn local_only_scripts(
+    current: &BTreeMap<PathBuf, PublishEntryState>,
+    staged: &BTreeMap<PathBuf, PublishEntryState>,
+    naming: &config::ProjectScriptNaming,
+) -> Vec<PathBuf> {
+    let studio_instances = staged
+        .iter()
+        .filter_map(|(path, state)| match state {
+            PublishEntryState::Directory => {
+                Some(instance_key(path.parent()?, path.file_name()?.to_str()?))
+            }
+            _ => script_instance(path, naming),
+        })
+        .collect::<HashSet<_>>();
+    let studio_lacks = |path: &Path| {
+        let Some(instance) = script_instance(path, naming) else {
+            return false;
+        };
+        if studio_instances.contains(&instance) {
+            return false;
+        }
+        path.ancestors()
+            .skip(1)
+            .take_while(|folder| !staged.contains_key(*folder))
+            .all(|folder| {
+                let (Some(parent), Some(name)) = (
+                    folder.parent(),
+                    folder.file_name().and_then(|name| name.to_str()),
+                ) else {
+                    return true;
+                };
+                !studio_instances.contains(&instance_key(parent, name))
+            })
+    };
+    current
+        .iter()
+        .filter(|(path, state)| {
+            !matches!(state, PublishEntryState::Directory)
+                && !staged.contains_key(*path)
+                && studio_lacks(path)
+        })
+        .map(|(path, _)| path.clone())
+        .collect()
 }
 
 /// Operations on a preserved path stay out of the publish. An operation that
@@ -1862,6 +1950,7 @@ fn export_snapshots_core(
     if matches!(purpose, ExportPurpose::Pull) {
         project_stage.prepare_read_only_links(&project_root, &args.src_dir, &services)?;
         project_stage.preserve_project_paths(args.preserve_paths.clone());
+        project_stage.keep_local_only_scripts(args.keep_local_only_scripts);
     }
     let ServiceExportRun {
         spans: service_export_spans,
@@ -2821,6 +2910,62 @@ mod publication_tests {
             fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
             "return 'captured'\n"
         );
+    }
+
+    #[test]
+    fn export_publication_keeps_the_scripts_studio_has_no_instance_for() {
+        let mut fixture = Fixture::new();
+        drop(fixture.stage.take());
+        let service = PathBuf::from("src/ReplicatedStorage");
+        let unpushed = service.join("Unpushed.client.luau");
+        let nested = service.join("NewFolder/Child.luau");
+        let reshaped = service.join("Reshaped.luau");
+        let under_script = service.join("Flat/Child.luau");
+        let notes = service.join("Notes.txt");
+        let local = [&unpushed, &nested, &reshaped, &under_script, &notes];
+        for path in local {
+            fs::create_dir_all(fixture.root.join(path).parent().unwrap()).unwrap();
+            fs::write(fixture.root.join(path), "return 'local'\n").unwrap();
+        }
+        let mut stage = ExportProjectStage::create(
+            &fixture.root,
+            Path::new("src"),
+            &["ReplicatedStorage".into()],
+        )
+        .unwrap();
+        for path in local {
+            fs::remove_file(stage.project_root.join(path)).unwrap();
+        }
+        for folder in ["NewFolder", "Flat"] {
+            fs::remove_dir(stage.project_root.join(service.join(folder))).unwrap();
+        }
+        let studio = [
+            PathBuf::from(SOURCE),
+            service.join("Reshaped/init.luau"),
+            service.join("Flat.luau"),
+        ];
+        for path in &studio {
+            fs::create_dir_all(stage.project_root.join(path).parent().unwrap()).unwrap();
+            fs::write(stage.project_root.join(path), "return 'studio'\n").unwrap();
+        }
+        stage.keep_local_only_scripts(true);
+        let published = stage.publish(&fixture.root, false).unwrap();
+        assert_eq!(published.preserved, [nested.clone(), unpushed.clone()]);
+        for path in [&nested, &unpushed] {
+            assert_eq!(
+                fs::read_to_string(fixture.root.join(path)).unwrap(),
+                "return 'local'\n"
+            );
+        }
+        for path in [&reshaped, &under_script, &notes] {
+            assert!(!fixture.root.join(path).exists(), "{}", path.display());
+        }
+        for path in &studio {
+            assert_eq!(
+                fs::read_to_string(fixture.root.join(path)).unwrap(),
+                "return 'studio'\n"
+            );
+        }
     }
 
     #[test]

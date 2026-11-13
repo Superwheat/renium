@@ -4276,6 +4276,8 @@ impl Drop for SettingsFileLock {
 /// it, so the first `bs`, `tr`, `in` or batch op on a service goes on instead
 /// of stopping at "pull from Studio". Only a daemon that is already running is
 /// asked; any failure leaves the usual missing-store error to the caller.
+/// A script file under the service that Studio holds no instance for stays, so
+/// a script written before its `ba` keeps its text.
 pub(crate) fn pull_missing_service_store(settings_file: &Path) {
     if settings_file.exists() || !crate::automation::client::shared_daemon_available() {
         return;
@@ -4298,6 +4300,7 @@ pub(crate) fn pull_missing_service_store(settings_file: &Path) {
         "services": service,
         "bridgeWaitSeconds": 1.0,
         "exportAllProperties": false,
+        "keepLocalOnlyScripts": true,
     });
     match crate::daemon::daemon_control_request(
         crate::automation::op::PULL,
@@ -4305,8 +4308,15 @@ pub(crate) fn pull_missing_service_store(settings_file: &Path) {
         parameters,
         false,
     ) {
-        Ok(_) if settings_file.exists() => {
-            eprintln!("[renium] {service} had no store; pulled it from Studio first");
+        Ok(result) if settings_file.exists() => {
+            let kept = result["keptFiles"].as_array().map_or(0, Vec::len);
+            if kept == 0 {
+                eprintln!("[renium] {service} had no store; pulled it from Studio first");
+            } else {
+                eprintln!(
+                    "[renium] {service} had no store; pulled it from Studio first and kept {kept} script file(s) Studio has no script for"
+                );
+            }
         }
         Ok(_) => {}
         Err(error) => {

@@ -2796,6 +2796,10 @@ pub(super) struct PullArgs {
     /// Project paths whose unsynced edits the publish leaves in place.
     #[arg(skip)]
     pub(crate) preserve_paths: Vec<PathBuf>,
+    /// Leaves in place the script files the publish would delete that Studio
+    /// holds no instance for: the pull that fetches a missing store.
+    #[arg(skip)]
+    pub(crate) keep_local_only_scripts: bool,
     /// The source root whose existing script files decide the names and forms
     /// of the imported scripts, when the import writes somewhere else.
     #[arg(skip)]
