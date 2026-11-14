@@ -706,16 +706,40 @@ pub(crate) fn absolutize_under(root: &Path, path: &Path) -> PathBuf {
     }
 }
 
+/// A place file's path as Studio is launched with it and reports it: absolute,
+/// without `.` or `..`, with Windows 8.3 names written out.
+pub(crate) fn place_file_path(path: &Path) -> PathBuf {
+    expand_short_names(absolutize_for_daemon(path))
+}
+
+/// The absolute form of a path that the daemon or Studio compares as text. A
+/// relative path starts at the working directory, and `.` and `..` are resolved
+/// by name, as the shell that typed them reads them.
 pub(crate) fn absolutize_for_daemon(path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
     };
-    absolute
-        .components()
-        .filter(|component| !matches!(component, std::path::Component::CurDir))
-        .collect()
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let below_a_name = matches!(
+                    resolved.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                );
+                if below_a_name {
+                    resolved.pop();
+                } else if !absolute.has_root() {
+                    resolved.push("..");
+                }
+            }
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+    resolved
 }
 
 /// Windows 8.3 names (`SUPERW~1`) name the same folder as the long form that

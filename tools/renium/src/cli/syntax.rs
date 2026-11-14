@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
@@ -13,24 +14,24 @@ use crate::studio::automation::validate_luau_syntax;
 
 #[derive(Args)]
 pub(crate) struct CheckArgs {
-    /// Script files, folders or scripts' unique names (HonkHandler) to parse (- reads stdin); with no paths, the Luau files git reports as changed in the project
+    /// Script files, folders or scripts' unique names (HonkHandler) to parse (- reads stdin); with no paths, the Luau files git reports as changed in the project, or every Luau file of a project that is not in git
     #[arg(value_name = "PATH")]
     files: Vec<PathBuf>,
 }
 
 pub(crate) fn run(args: CheckArgs, project: Option<&Path>) -> Result<()> {
+    let mut whole_project = false;
     let files = if args.files.is_empty() {
-        let files = changed_luau_files(project)?;
+        let (files, in_git) = default_luau_files(project)?;
         if files.is_empty() {
-            return print_json_output(
-                &json!({
-                    "ok": true,
-                    "checked": 0,
-                    "note": "git reports no changed .luau or .lua files; pass files or folders to check specific ones",
-                }),
-                false,
-            );
+            let note = if in_git {
+                "git reports no changed .luau or .lua files; pass files or folders to check specific ones"
+            } else {
+                "the project has no .luau or .lua files"
+            };
+            return print_json_output(&json!({"ok": true, "checked": 0, "note": note}), false);
         }
+        whole_project = !in_git;
         files
     } else {
         expand_folders(named_scripts(args.files, project)?)?
@@ -39,6 +40,9 @@ pub(crate) fn run(args: CheckArgs, project: Option<&Path>) -> Result<()> {
     let mut printed = result.clone();
     if crate::app::output::compact_text_output() {
         compact_check_result(&mut printed);
+    }
+    if whole_project {
+        printed["note"] = json!("no git repository here: checked every script of the project");
     }
     print_json_output(&printed, false)?;
     if result["ok"] == false {
@@ -97,7 +101,10 @@ fn expand_folders(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn changed_luau_files(project: Option<&Path>) -> Result<Vec<PathBuf>> {
+/// The files `rbx ck` checks when it is given none, and whether git chose
+/// them: the changed Luau files in a git repository, every script of the
+/// project where git has nothing to say.
+fn default_luau_files(project: Option<&Path>) -> Result<(Vec<PathBuf>, bool)> {
     let scope = match crate::project::config::try_resolve_project_path(project, None)? {
         Some(project) => project
             .parent()
@@ -114,10 +121,7 @@ fn changed_luau_files(project: Option<&Path>) -> Result<Vec<PathBuf>> {
             .map(|output| output.stdout)
     };
     let Some(top) = git(&["rev-parse", "--show-toplevel"]) else {
-        bail!(
-            "{} is not in a git repository; pass the files or folders to check",
-            scope.display()
-        );
+        return Ok((project_luau_files(project, &scope)?, false));
     };
     let top = PathBuf::from(String::from_utf8_lossy(&top).trim());
     let listing = git(&[
@@ -129,7 +133,51 @@ fn changed_luau_files(project: Option<&Path>) -> Result<Vec<PathBuf>> {
         ".",
     ])
     .context("git status failed; pass the files or folders to check")?;
-    Ok(changed_luau_paths(&listing, &top))
+    Ok((changed_luau_paths(&listing, &top), true))
+}
+
+/// Without git nothing says which files changed, so the whole project is
+/// checked: every Luau file under its source folder, the paths its tree
+/// names and its mounts.
+fn project_luau_files(project: Option<&Path>, scope: &Path) -> Result<Vec<PathBuf>> {
+    use crate::project::config;
+    let Some(loaded) = config::try_load_project(project, None)? else {
+        bail!(
+            "{} is not in a git repository and has no Renium project file; pass the files or folders to check",
+            scope.display()
+        );
+    };
+    let mut roots = vec![loaded.root.join(&loaded.project.source_root)];
+    roots.extend(
+        config::project_tree_nodes(&loaded.project.tree)
+            .into_iter()
+            .filter_map(|(_, node)| node.path.map(|path| loaded.root.join(path))),
+    );
+    roots.extend(
+        loaded
+            .project
+            .mounts
+            .iter()
+            .map(|mount| loaded.root.join(&mount.source)),
+    );
+    let mut files = BTreeSet::new();
+    for root in roots {
+        if root.is_dir() {
+            files.extend(
+                walkdir::WalkDir::new(&root)
+                    .into_iter()
+                    .filter_entry(|entry| {
+                        entry.depth() == 0 || !entry.file_name().to_string_lossy().starts_with('.')
+                    })
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_type().is_file() && is_luau_source(entry.path()))
+                    .map(walkdir::DirEntry::into_path),
+            );
+        } else if root.is_file() && is_luau_source(&root) {
+            files.insert(root);
+        }
+    }
+    Ok(files.into_iter().collect())
 }
 
 fn changed_luau_paths(listing: &[u8], top: &Path) -> Vec<PathBuf> {

@@ -83,8 +83,8 @@ fn check_luau_parses_files_folders_and_reports_failures_in_both_modes() {
     );
     assert_eq!(
         fx.text(&["ck", "--project", &fx.path("renium.project.jsonc")])
-            .err(),
-        "<root> is not in a git repository; pass the files or folders to check"
+            .ok(),
+        json!({"checked": 3, "note": "no git repository here: checked every script of the project", "ok": true})
     );
     assert_eq!(
         fx.text(&["ck", "-", "-"]).err(),

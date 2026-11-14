@@ -13,6 +13,7 @@ use crate::cli::BridgeConnectionArgs;
 use crate::cloud;
 use crate::daemon::{daemon_control_request, daemon_project_root};
 use crate::project::config;
+use crate::system::files::place_file_path;
 
 const STATUS_DEADLINE: Duration = Duration::from_secs(10);
 const STUDIO_CONNECT_WAIT_SECONDS: f64 = 120.0;
@@ -410,7 +411,7 @@ pub(crate) fn studio_reopen(args: StudioReopenArgs, project: Option<&Path>) -> R
     let mut result = daemon_result(
         op::STUDIO_OPEN,
         project,
-        json!({ "file": args.file }),
+        json!({ "file": args.file.as_deref().map(place_file_path) }),
         true,
         Some(&args.bridge),
     )?;

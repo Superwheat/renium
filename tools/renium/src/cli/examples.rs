@@ -125,7 +125,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("l", "Examples:\n  rbx l \"return game.PlaceId\""),
     (
         "lc",
-        "Examples:\n  rbx lc \"return game.PlaceId\" 1\n  rbx lc -t 30 --detach probe \"state.n = 0 while true do state.n += 1 task.wait(1) end\" 1\n  rbx lc --collect probe 1 --stop",
+        "Examples:\n  rbx lc \"return game.PlaceId\" 1\n  rbx lc -f probe.luau 1\n  rbx lc -t 30 --detach probe \"state.n = 0 while true do state.n += 1 task.wait(1) end\" 1\n  rbx lc --collect probe 1 --stop",
     ),
     ("dev", "Examples:\n  rbx dev set \"iPhone 16 Pro\""),
     (

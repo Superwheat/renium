@@ -2068,6 +2068,14 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
             } else {
                 serde_json::from_str(&args.value).unwrap_or(Value::String(args.value))
             };
+            // A stored place applies in every folder of the project, so a path
+            // to a place file is kept in full instead of relative to this one.
+            let parsed = match (args.key.as_str(), parsed) {
+                ("place", Value::String(place)) => {
+                    Value::String(crate::studio::target::resolved_place_selector(&place))
+                }
+                (_, parsed) => parsed,
+            };
             set_dotted(&mut value, &args.key, parsed.clone())?;
             validate_config_scope_change(args.scope, &args.root, &path, &value)?;
             write_json(&path, &value)?;

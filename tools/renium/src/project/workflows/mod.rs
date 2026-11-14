@@ -20,7 +20,7 @@ use crate::project::config::{self, LoadedProject, PROJECT_FILE_NAME};
 use crate::project::experience::{find_experience_root, load_experience, resolve_experience_place};
 use crate::system::files::{
     absolutize_for_daemon as absolute_path, atomic_write_file, ends_with_ignore_ascii_case,
-    exact_path_key as path_text, write_bytes_if_changed,
+    exact_path_key as path_text, place_file_path, write_bytes_if_changed,
 };
 
 mod build_watch;
@@ -2960,8 +2960,12 @@ fn resolve_studio_file(
     project: Option<&Path>,
     allow_build: bool,
 ) -> Result<Option<PathBuf>> {
-    if let Some(file) = file {
-        let file = absolute_path(file);
+    let pinned = file
+        .is_none()
+        .then(crate::studio::target::pinned_place_file)
+        .flatten();
+    if let Some(file) = file.or(pinned.as_deref()) {
+        let file = place_file_path(file);
         if !file.is_file() {
             bail!("Studio file does not exist: {}", file.display());
         }

@@ -240,7 +240,8 @@ fn run_cli() -> Result<()> {
         cli.place
             .clone()
             .or_else(|| std::env::var("RENIUM_PLACE").ok())
-            .filter(|value| !value.trim().is_empty()),
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| studio::target::resolved_place_selector(&value)),
     );
     if let Some(name) = cli.daemon.as_deref() {
         unsafe {

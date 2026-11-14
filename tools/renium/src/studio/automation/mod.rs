@@ -6321,6 +6321,30 @@ mod play_check_tests {
         }
     }
 
+    #[test]
+    fn lc_runs_a_file_on_the_named_player_or_the_first_client() {
+        let named = luau_args(&["rbx", "lc", "-f", "probe.luau", "2"]);
+        assert_eq!(named.file.as_deref(), Some(Path::new("probe.luau")));
+        assert_eq!(named.player.as_deref(), Some("2"));
+        assert!(named.code.is_none() && !named.client);
+        let first = luau_args(&["rbx", "lc", "--file", "probe.luau"]);
+        assert!(first.client && first.player.is_none());
+        for parts in [
+            &["rbx", "lc", "-f", "probe.luau", "return 1", "1"][..],
+            &["rbx", "lc", "return 1", "-f", "probe.luau"][..],
+            &["rbx", "lc", "-f", "probe.luau", "-"][..],
+        ] {
+            use clap::Parser;
+            let crate::cli::Commands::ExecuteClientLuau(args) =
+                crate::cli::Cli::try_parse_from(parts).unwrap().command
+            else {
+                panic!("expected lc");
+            };
+            let error = args.into_luau_args().err().unwrap().to_string();
+            assert!(error.starts_with("-f takes the file"), "{error}");
+        }
+    }
+
     fn runner(keep_alive: bool, detach: Option<&str>) -> crate::cli::LuauRunnerArgs {
         crate::cli::LuauRunnerArgs {
             detach: detach.map(str::to_string),

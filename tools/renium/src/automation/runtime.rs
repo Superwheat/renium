@@ -1025,7 +1025,7 @@ fn open_studio(
     #[cfg(any(windows, target_os = "macos"))]
     let connected = connected_edit_studios(bridge);
     let target = if let Some(file) = requested_file {
-        let file = bound_context::path(context, file);
+        let file = crate::system::files::place_file_path(&bound_context::path(context, file));
         Some(automation::StudioReopenTarget {
             file: Some(file),
             game_id: None,

@@ -36,7 +36,7 @@ pub(crate) fn command() -> clap::Command {
     command.term_width(0).before_help(
         "New here? In a Roblox project folder run `rbx init` once, then read the RENIUM.md it creates.",
     ).after_help(
-        "Global options (any command):\n  --place <NAME|ID|GAME:PLACE>  Pin to one Studio place (env: RENIUM_PLACE)\n  --project <PATH>              Use this renium.project.jsonc\n  --output-mode text|json|pretty  --fields KEY,KEY  --log-level off|error|warn|info|debug|trace  -v\n  --color auto|always|never  --yes  --backtrace  --daemon <NAME>\n\nExamples:\n  rbx f Workspace -n Door\n  rbx pl\n  rbx ps src/StarterGui/Menu.client.luau\n  rbx l \"return game.PlaceId\"\n  rbx sc --studio -o studio.png",
+        "Global options (any command):\n  --place <NAME|FILE|ID|GAME:PLACE>  Pin to one Studio place (env: RENIUM_PLACE)\n  --project <PATH>              Use this renium.project.jsonc\n  --output-mode text|json|pretty  --fields KEY,KEY  --log-level off|error|warn|info|debug|trace  -v\n  --color auto|always|never  --yes  --backtrace  --daemon <NAME>\n\nExamples:\n  rbx f Workspace -n Door\n  rbx pl\n  rbx ps src/StarterGui/Menu.client.luau\n  rbx l \"return game.PlaceId\"\n  rbx sc --studio -o studio.png",
     )
 }
 
@@ -44,7 +44,7 @@ pub(crate) fn command() -> clap::Command {
 #[command(author, version, disable_help_subcommand = true)]
 pub(super) struct Cli {
     #[arg(
-        help = "Pin bridge commands to one Studio place by name, placeId, or gameId:placeId (env: RENIUM_PLACE)",
+        help = "Pin bridge commands to one Studio place by name, place file, placeId, or gameId:placeId (env: RENIUM_PLACE)",
         long,
         global = true,
         hide = true,
@@ -1476,7 +1476,7 @@ pub(super) struct ExecuteClientLuauArgs {
     pub(super) bridge: BridgeConnectionArgs,
     #[arg(
         help = "Luau code (- for stdin)",
-        required_unless_present = "collect",
+        required_unless_present_any = ["collect", "file"],
         allow_hyphen_values = true
     )]
     pub(super) code: Option<String>,
@@ -1484,6 +1484,14 @@ pub(super) struct ExecuteClientLuauArgs {
     pub(super) player: Option<String>,
     #[arg(hide = true)]
     pub(super) unexpected: Vec<String>,
+    #[arg(
+        help = "Luau file to run instead of CODE",
+        short,
+        long,
+        value_name = "PATH",
+        conflicts_with = "collect"
+    )]
+    pub(super) file: Option<PathBuf>,
     #[arg(
         help = "Seconds before the run is cancelled [default: 10, more for code that sleeps or waits in a loop]",
         short,
@@ -1496,15 +1504,29 @@ pub(super) struct ExecuteClientLuauArgs {
 
 impl ExecuteClientLuauArgs {
     /// `lc` positionals are CODE then PLAYER, or PLAYER alone after
-    /// `--collect NAME`. Misplaced values are rejected with a corrected
-    /// command instead of running a player index as code.
+    /// `--collect NAME` or `-f PATH`. Misplaced values are rejected with a
+    /// corrected command instead of running a player index as code.
     pub(super) fn into_luau_args(mut self) -> anyhow::Result<ExecuteLuauArgs> {
         let player_hint = [self.player.as_deref(), self.code.as_deref()]
             .into_iter()
             .flatten()
             .find(|value| is_player_index(value))
             .unwrap_or("1");
-        if let Some(name) = self.runner.collect.as_deref() {
+        if let Some(file) = self.file.as_deref() {
+            let looks_like_code = |value: &str| {
+                value == "-" || value.contains(|c: char| c.is_whitespace() || "()=".contains(c))
+            };
+            if self.player.is_some()
+                || !self.unexpected.is_empty()
+                || self.code.as_deref().is_some_and(looks_like_code)
+            {
+                anyhow::bail!(
+                    "-f takes the file and an optional PLAYER, no code: rbx lc -f {} {player_hint}",
+                    file.display()
+                );
+            }
+            self.player = self.code.take();
+        } else if let Some(name) = self.runner.collect.as_deref() {
             if self.player.is_some() || !self.unexpected.is_empty() {
                 anyhow::bail!(
                     "--collect takes no code, only NAME and an optional PLAYER: rbx lc --collect {name} {player_hint}"
@@ -1529,7 +1551,7 @@ impl ExecuteClientLuauArgs {
             bridge: self.bridge,
             code: self.code,
             inline_code: None,
-            file: None,
+            file: self.file,
             client: self.player.is_none(),
             player: self.player,
             server: false,
