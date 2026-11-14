@@ -12,6 +12,7 @@
 
 - `--place` (and `RENIUM_PLACE`) given as a relative path to a place file, such as `--place ..\Place.rbxl`, selects the Studio that has that file open. Only a full path or a bare file name matched before, so `rbx so ..\Place.rbxl --place ..\Place.rbxl` opened the place and the next command answered "no connected Studio matches this project". `rbx cfg set place` stores such a path in full, so it means the same file in every folder.
 - `rbx so FILE` and `rbx ro FILE` open, report and remember the place by its full path without `.`, `..` or Windows short names (`SUPERW~1`). `rbx ro .\Place.rbxl` read the file from the project folder instead of the current one and remembered a path that later commands could not match.
+- `rbx docs --serve` keeps serving when a visitor drops its connection or sends nothing; one reset connection used to end the server.
 - The first command on a service without a store (`rbx ba`, `bs`, `tr`, `in`, a batch) pulls that service from Studio. That pull now keeps the script files under the service that Studio has no script for. It used to delete them, so a script file written before its `rbx ba ... --push` was lost and the new script arrived in Studio with an empty Source while the command reported `verified: true`. The command says how many files it kept. A file Studio does have a script for is replaced by Studio's copy as before, and so is every file in an explicit `rbx pl`.
 
 ## 0.6.2 - 2026-11-12

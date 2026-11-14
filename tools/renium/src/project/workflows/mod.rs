@@ -869,16 +869,23 @@ pub fn run_docs(args: DocsArgs) -> Result<()> {
         "<!doctype html><meta charset=utf-8><title>Renium docs</title><style>body{{font:15px/1.55 system-ui;max-width:1000px;margin:3rem auto;padding:0 1rem;color:#ddd;background:#181818}}pre{{white-space:pre-wrap}}</style><pre>{}</pre>",
         html_escape(&text)
     );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        html.len(),
+        html
+    );
+    // The server outlives its visitors: one that resets its connection, sends
+    // nothing or stops reading costs only its own answer.
     for stream in listener.incoming() {
-        let mut stream = stream?;
+        let Ok(mut stream) = stream else {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
         let mut request = [0u8; 4096];
         let _ = stream.read(&mut request);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            html.len(),
-            html
-        );
-        stream.write_all(response.as_bytes())?;
+        let _ = stream.write_all(response.as_bytes());
     }
     Ok(())
 }
