@@ -282,12 +282,15 @@ def so_refuses_missing_and_non_place_files(ctx: Context):
 
 
 def so_without_a_file(ctx: Context):
-    """LIFE-005: so without FILE refuses two top-level places, and in a project without a place file builds
-    .renium/build/studio.rbxl and opens it."""
+    """LIFE-005: so without FILE refuses two top-level places unless the place pin names one of them, which it
+    then opens; in a project without a place file it builds .renium/build/studio.rbxl and opens it."""
     ctx.close_studio()
     shutil.copy(ctx.root / ctx.place, ctx.root / "B.rbxl")
-    two = ctx.rbx("so", ok=False, timeout=60)
+    two = _run(ctx, "so", env=_env(ctx, unset=("RENIUM_PLACE",)), cwd=ctx.root, ok=False, timeout=60)
     ctx.expect_in(f"More than one Studio file exists under {ctx.root}", two.error, "two places")
+    pinned = ctx.rbx("so", timeout=240)
+    ctx.expect(pinned.get("connected") is True and str(Path(pinned.get("file") or "").resolve()) == str((ctx.root / ctx.place).resolve()), f"so opens the pinned place: {pinned.json}")
+    ctx.close_studio()
     (ctx.root / "B.rbxl").unlink()
     bare = ctx.root.parent / f"{ctx.root.name}-noplace"
     shutil.copytree(ctx.root, bare, ignore=shutil.ignore_patterns(".renium", "*.lock", "*.rbxl", "*.rbxl.lock"))
