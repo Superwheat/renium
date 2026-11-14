@@ -777,6 +777,25 @@ def no_review_during_play(ctx: Context):
         ctx.expect(ctx.luau("return workspace.Props:FindFirstChild('Sign') == nil") is True, "Sign gone in Edit")
 
 
+def first_store_keeps_a_new_script(ctx: Context):
+    """DATA-054: a service without a store is pulled by the first command that needs it, and that pull keeps a
+    script file Studio has no script for: `ba --push` adopts it and Studio gets its text. A file Studio does
+    have a script for takes Studio's copy. `rbx ck` without git checks the whole project."""
+    ctx.open_studio()
+    ctx.luau("local s = Instance.new('LocalScript') s.Name = 'Known' s.Source = '-- studio' s.Parent = game.StarterGui return true")
+    (ctx.root / "instances" / "StarterGui.renium").unlink()
+    ctx.write("src/StarterGui/Fresh.client.luau", "print('fresh')\n")
+    ctx.write("src/StarterGui/Known.client.luau", "print('local')\n")
+    added = ctx.rbx("ba", "StarterGui", "-n", "Fresh", "-c", "LocalScript", "--push", timeout=120)
+    ctx.expect(added.get("adoptedSource") == "src/StarterGui/Fresh.client.luau", f"ba adopts the kept file: {added.json}")
+    ctx.expect_in("kept 1 script file", added.stderr, "the pull says what it kept")
+    ctx.expect(ctx.read("src/StarterGui/Fresh.client.luau") == "print('fresh')\n", "the new script file keeps its text")
+    ctx.expect(ctx.luau("return game.StarterGui.Fresh.Source") == "print('fresh')\n", "Studio has the new script's text")
+    ctx.expect(ctx.read("src/StarterGui/Known.client.luau").strip() == "-- studio", "a script Studio has takes Studio's copy")
+    checked = ctx.rbx("ck", timeout=60)
+    ctx.expect(checked.ok and "checked every script" in str(checked.get("note")), f"ck without git: {checked.json}")
+
+
 SCENARIOS = [
     Scenario("DATA-001", "prop --yes edits Studio only", "small", slotted(prop_yes_edits_studio_only)),
     Scenario("DATA-002", "prop without --yes applies one change", "small", slotted(prop_without_yes_applies_one_change)),
@@ -828,4 +847,5 @@ SCENARIOS = [
     Scenario("DATA-051", "saved field held at threshold 0", "small", slotted(saved_field_review_at_threshold_zero)),
     Scenario("DATA-052", "saved field on a same-named sibling", "small", slotted(saved_field_on_duplicate_sibling)),
     Scenario("DATA-053", "held prop result reaches the caller", "small", slotted(prop_hold_notice_reaches_the_caller)),
+    Scenario("DATA-054", "a first store keeps a new script", "small", slotted(first_store_keeps_a_new_script)),
 ]

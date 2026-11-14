@@ -601,7 +601,7 @@ def luau_contexts(ctx: Context):
 
 def clients_via_l_and_lc(ctx: Context):
     """PLAY-042: l -c and l -p N reach play clients; lc without a player picks one client without an
-    ambiguity error."""
+    ambiguity error; lc -f FILE PLAYER runs a file there and refuses code beside it."""
     _play(ctx, "-p", "2")
     try:
         client = ctx.rbx("l", "-c", "return game.Players.LocalPlayer ~= nil", timeout=60)
@@ -610,6 +610,10 @@ def clients_via_l_and_lc(ctx: Context):
         ctx.expect(second.get("results") == ["Player2"], f"l -p 2: {second.json}")
         any_client = ctx.rbx("lc", "return game.Players.LocalPlayer.Name", timeout=60)
         ctx.expect(any_client.get("results") in (["Player1"], ["Player2"]), f"lc without a player: {any_client.json}")
+        ctx.write("who.luau", "return game.Players.LocalPlayer.Name\n")
+        from_file = ctx.rbx("lc", "-f", "who.luau", "2", timeout=60)
+        ctx.expect(from_file.get("results") == ["Player2"], f"lc -f FILE 2: {from_file.json}")
+        ctx.expect_in("-f takes the file", ctx.rbx("lc", "-f", "who.luau", "return 1", "2", ok=False, timeout=60).error, "lc -f with code")
     finally:
         _stop(ctx)
 

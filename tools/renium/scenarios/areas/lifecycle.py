@@ -511,8 +511,8 @@ def place_flag_selects_another_studio(ctx: Context):
 
 def two_places_need_a_pin(ctx: Context):
     """LIFE-021: with two Studios on same-named places, an unpinned command from a third project and a bare
-    --place name are refused as ambiguous; the project's own Studio and an absolute --place path answer;
-    status --all lists both."""
+    --place name are refused as ambiguous; the project's own Studio, an absolute --place path and a relative one
+    answer; status --all lists both."""
     ctx.open_studio()
     other = ctx.root.parent / f"{ctx.root.name}-other"
     shutil.rmtree(other, ignore_errors=True)
@@ -540,6 +540,8 @@ def two_places_need_a_pin(ctx: Context):
         ctx.expect(pinned.get("results") == [1], f"pinned call: {pinned.json}")
         absolute = _run(ctx, "--place", str(ctx.root / ctx.place), "l", "return 1", env=unpinned_env, timeout=60)
         ctx.expect(absolute.get("results") == [1], f"absolute --place: {absolute.json}")
+        relative = _run(ctx, "--place", os.path.join("..", ctx.place), "l", "return 1", env=unpinned_env, cwd=ctx.root / "src", timeout=60)
+        ctx.expect(relative.get("results") == [1], f"relative --place from a subfolder: {relative.json}")
         everything = ctx.rbx("status", "--all", timeout=60)
         listed = {str(Path(c.get("localFile")).resolve()) for c in everything.get("clients") or [] if c.get("role") == "edit" and c.get("localFile")}
         ctx.expect({str((ctx.root / ctx.place).resolve()), str((other / ctx.place).resolve())} <= listed, f"status --all: {everything.json}")
