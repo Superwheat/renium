@@ -498,6 +498,11 @@ pub(crate) fn set_instance_property(
             set_metadata_value(instance, property_name, value, resolved_parent_index)
         }
         PropertyScope::Property => {
+            if matches!(property_name, "Name" | "ClassName" | "Parent") {
+                bail!(
+                    "{property_name} is part of the instance record, not a stored property; set it without --scope property"
+                );
+            }
             set_map_value(&mut instance.properties, property_name, value);
             Ok(())
         }

@@ -1,6 +1,7 @@
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
@@ -277,6 +278,61 @@ pub(crate) fn log_global(level: u8, message: std::fmt::Arguments<'_>) {
     }
 }
 
+/// Characters that act on a terminal or reorder what it shows instead of
+/// being shown: the control characters and the bidirectional overrides.
+fn acts_on_a_terminal(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+fn escaped(text: &str, kept: impl Fn(char) -> bool) -> Cow<'_, str> {
+    if !text.chars().any(|ch| acts_on_a_terminal(ch) && !kept(ch)) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if acts_on_a_terminal(ch) && !kept(ch) {
+            out.extend(ch.escape_unicode());
+        } else {
+            out.push(ch);
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Text from a store or a place (a name, a class, an id, a key) as one piece
+/// of a printed line: an escape sequence, a line break or a direction
+/// override in it is written out (`\u{1b}`) instead of taking effect.
+pub(crate) fn visible(text: &str) -> Cow<'_, str> {
+    escaped(text, |_| false)
+}
+
+/// What a terminal is sent: line breaks and tabs lay the output out, and
+/// every other control character in it came from project data. Output that
+/// goes to a pipe or a file keeps its bytes.
+fn terminal_text(text: String, terminal: bool) -> String {
+    if !terminal {
+        return text;
+    }
+    match escaped(&text, |ch| matches!(ch, '\n' | '\r' | '\t')) {
+        Cow::Borrowed(_) => text,
+        Cow::Owned(escaped) => escaped,
+    }
+}
+
+fn stdout_is_terminal() -> bool {
+    static TERMINAL: OnceLock<bool> = OnceLock::new();
+    *TERMINAL.get_or_init(|| io::stdout().is_terminal())
+}
+
+fn stderr_is_terminal() -> bool {
+    static TERMINAL: OnceLock<bool> = OnceLock::new();
+    *TERMINAL.get_or_init(|| io::stderr().is_terminal())
+}
+
 pub(crate) fn write_stdout(message: fmt::Arguments<'_>) {
     if CAPTURED_STDOUT.with_borrow_mut(|captured| {
         captured.as_mut().is_some_and(|buffer| {
@@ -287,7 +343,7 @@ pub(crate) fn write_stdout(message: fmt::Arguments<'_>) {
     }) {
         return;
     }
-    let _ = write_output_line(io::stdout().lock(), message);
+    let _ = write_output_line(io::stdout().lock(), message, stdout_is_terminal());
 }
 
 /// Text written to stdout without a trailing newline (a rendered store, a
@@ -302,18 +358,23 @@ pub(crate) fn write_stdout_text(message: fmt::Arguments<'_>) {
         return;
     }
     let mut stdout = io::stdout().lock();
-    let _ = stdout.write_fmt(message);
+    let text = terminal_text(fmt::format(message), stdout_is_terminal());
+    let _ = stdout.write_all(text.as_bytes());
     let _ = stdout.flush();
 }
 
 pub(crate) fn write_stderr(message: fmt::Arguments<'_>) {
-    let _ = write_output_line(io::stderr().lock(), message);
+    let _ = write_output_line(io::stderr().lock(), message, stderr_is_terminal());
 }
 
-fn write_output_line(mut writer: impl Write, message: fmt::Arguments<'_>) -> io::Result<()> {
+fn write_output_line(
+    mut writer: impl Write,
+    message: fmt::Arguments<'_>,
+    terminal: bool,
+) -> io::Result<()> {
     // Display implementations such as serde_json::Value emit many fragments.
     // Buffer the complete line so unbuffered stderr does not write each one.
-    let mut line = fmt::format(message);
+    let mut line = terminal_text(fmt::format(message), terminal);
     line.push('\n');
     writer.write_all(line.as_bytes())
 }
@@ -833,12 +894,25 @@ mod tests {
             serde_json::json!({"name": format!("service {index}"), "ms": 0.25})
         }).collect::<Vec<_>>()});
         let mut writer = Writer::default();
-        write_output_line(&mut writer, format_args!("[renium] profile {value}")).unwrap();
+        write_output_line(&mut writer, format_args!("[renium] profile {value}"), false).unwrap();
         assert_eq!(writer.writes, 1);
         assert_eq!(
             writer.bytes,
             format!("[renium] profile {value}\n").as_bytes()
         );
+    }
+
+    #[test]
+    fn a_terminal_is_sent_no_control_characters_from_project_data() {
+        let name = "Door\u{1b}]0;title\u{7}\u{9b}2J\u{202e}txt";
+        let line = format!("Workspace\n\t{name} Part\r\n");
+        assert_eq!(
+            terminal_text(line.clone(), true),
+            "Workspace\n\tDoor\\u{1b}]0;title\\u{7}\\u{9b}2J\\u{202e}txt Part\r\n"
+        );
+        assert_eq!(terminal_text(line.clone(), false), line);
+        assert_eq!(visible("a\nb"), "a\\u{a}b");
+        assert!(matches!(visible("plain ☕"), Cow::Borrowed(_)));
     }
 }
 

@@ -115,13 +115,27 @@ pub(crate) fn store_files(project: &Path) -> Result<Vec<PathBuf>> {
             let path = entry.path();
             if entry.file_type()?.is_dir() {
                 pending.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "renium") {
+            } else if is_store_file(&path) {
                 stores.push(path);
             }
         }
     }
     stores.sort();
     Ok(stores)
+}
+
+/// A store is named after the instance it holds: `Workspace.renium`. A file
+/// whose stem is no instance name (`...renium` has the stem `..`) is no store,
+/// so its name never becomes a folder of the source tree.
+fn is_store_file(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "renium") && store_stem(path).is_some()
+}
+
+/// The instance name a store file is named after.
+fn store_stem(path: &Path) -> Option<&str> {
+    path.file_stem()?.to_str().filter(|stem| {
+        crate::system::files::validate_filesystem_instance_name(stem, "store").is_ok()
+    })
 }
 
 pub(crate) fn instances_root(source: &Path) -> Option<PathBuf> {
@@ -155,7 +169,7 @@ pub(crate) fn service_for_store(source: &Path, path: &Path) -> Option<String> {
     }
     let relative = path.strip_prefix(root).ok()?;
     if relative.components().count() == 1 {
-        path.file_stem()?.to_str().map(str::to_owned)
+        store_stem(&path).map(str::to_owned)
     } else {
         relative
             .components()
@@ -173,7 +187,7 @@ pub(crate) fn store_service_name(path: &Path) -> Option<String> {
     {
         path.parent()?.file_name()?.to_str().map(str::to_owned)
     } else {
-        path.file_stem()?.to_str().map(str::to_owned)
+        store_stem(path).map(str::to_owned)
     }
 }
 
@@ -276,8 +290,9 @@ pub(crate) fn source_directory(settings: &Path) -> PathBuf {
         if let Some(layout) = layouts
             .values()
             .find(|layout| settings.parent() == Some(layout.project.join("instances").as_path()))
+            && let Some(service) = store_stem(&settings)
         {
-            return layout.source.join(settings.file_stem().unwrap_or_default());
+            return layout.source.join(service);
         }
     }
     settings.parent().unwrap_or(Path::new(".")).to_path_buf()
@@ -334,7 +349,7 @@ pub(crate) fn service_directories(source: &Path) -> Result<Vec<PathBuf>> {
         for entry in fs::read_dir(instances)? {
             let entry = entry?;
             let path = entry.path();
-            if entry.file_type()?.is_file() && path.extension().is_some_and(|ext| ext == "renium") {
+            if entry.file_type()?.is_file() && is_store_file(&path) {
                 let name = path
                     .file_stem()
                     .context("Store has no service name")?

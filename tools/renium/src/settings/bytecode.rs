@@ -3,6 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -39,6 +40,23 @@ const MAX_SETTINGS_BYTECODE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_SETTINGS_COLLECTION_ITEMS: usize = 500_000;
 const MAX_SETTINGS_STRING_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SETTINGS_VALUE_DEPTH: usize = 128;
+/// The memory a decoded store may take: this much for any file, and more for
+/// a larger one. A decoded value takes far more memory than its bytes in the
+/// file, and a payload of one repeated value compresses to almost nothing, so
+/// the byte limits alone leave a file of a few kilobytes room for gigabytes.
+/// Real stores decode to a few hundred megabytes at most and compress less
+/// than tenfold.
+const SETTINGS_DECODE_BASE_BYTES: usize = 1 << 30;
+const SETTINGS_DECODE_BYTES_PER_FILE_BYTE: usize = 256;
+/// What the decoder charges, rounded up from what the types take: a value
+/// slot (in a group, an array or a map), a map's first node, and the fixed
+/// part of each value kind.
+const VALUE_SLOT_BYTES: usize = 64;
+const MAP_BYTES: usize = 640;
+const INSTANCE_BYTES: usize = 256;
+/// Properties a store never holds: the record's own name, class and parent say
+/// what the instance is and where it sits.
+const SETTINGS_RECORD_FIELDS: [&str; 3] = ["Name", "ClassName", "Parent"];
 const MAX_SETTINGS_HIERARCHY_DEPTH: usize = 512;
 // One document per service store; memory is bounded by the instance and byte
 // limits below, so a project's whole set of small stores stays cached.
@@ -403,7 +421,7 @@ pub(crate) fn is_null_reference_value(value: &Value) -> bool {
 
 pub(crate) fn decode_settings_bytecode(bytes: &[u8]) -> Result<SettingsBytecode> {
     let (version, decoded) = decode_settings_bytecode_container(bytes)?;
-    decode_settings_bytecode_document(version, &decoded)
+    decode_settings_bytecode_document(version, &decoded, &DecodeBudget::for_file(bytes.len()))
 }
 
 fn decode_settings_bytecode_if_contains_any_string_set(
@@ -420,7 +438,11 @@ fn decode_settings_bytecode_if_contains_any_string_set(
     {
         return Ok(None);
     }
-    Ok(Some(decode_settings_bytecode_document(version, &decoded)?))
+    Ok(Some(decode_settings_bytecode_document(
+        version,
+        &decoded,
+        &DecodeBudget::for_file(bytes.len()),
+    )?))
 }
 
 fn decode_settings_bytecode_container(bytes: &[u8]) -> Result<(u8, Vec<u8>)> {
@@ -454,24 +476,21 @@ fn decode_settings_bytecode_container(bytes: &[u8]) -> Result<(u8, Vec<u8>)> {
     Ok((version, decoded))
 }
 
-fn decode_settings_bytecode_document(version: u8, decoded: &[u8]) -> Result<SettingsBytecode> {
+fn decode_settings_bytecode_document(
+    version: u8,
+    decoded: &[u8],
+    budget: &DecodeBudget,
+) -> Result<SettingsBytecode> {
     let mut payload_reader = BytecodeReader::new(decoded);
-    let document = decode_settings_bytecode_payload(version, &mut payload_reader)?;
+    let document = decode_settings_bytecode_payload(version, &mut payload_reader, budget)?;
     payload_reader.finish()?;
     Ok(document)
 }
 
 fn decode_settings_bytecode_structure(bytes: &[u8]) -> Result<SettingsBytecode> {
     let (version, decoded) = decode_settings_bytecode_container(bytes)?;
-    decode_settings_bytecode_structure_document(version, &decoded)
-}
-
-fn decode_settings_bytecode_structure_document(
-    version: u8,
-    decoded: &[u8],
-) -> Result<SettingsBytecode> {
-    let mut reader = BytecodeReader::new(decoded);
-    let header = decode_settings_payload_header(&mut reader)?;
+    let mut reader = BytecodeReader::new(&decoded);
+    let header = decode_settings_payload_header(&mut reader, &DecodeBudget::for_file(bytes.len()))?;
     Ok(SettingsBytecode {
         version,
         instances: header.instances,
@@ -487,9 +506,10 @@ struct SettingsPayloadHeader {
 
 fn decode_settings_payload_header(
     reader: &mut BytecodeReader<'_>,
+    budget: &DecodeBudget,
 ) -> Result<SettingsPayloadHeader> {
     let string_count = reader.read_collection_len("string count")?;
-    let mut strings = Vec::with_capacity(string_count);
+    let mut strings = Vec::with_capacity(reader.capacity(string_count, 1));
     for _ in 0..string_count {
         let len = reader.read_len("string byte length")?;
         if len > MAX_SETTINGS_STRING_BYTES {
@@ -500,23 +520,19 @@ fn decode_settings_payload_header(
     }
 
     let class_count = reader.read_collection_len("class count")?;
-    let mut classes = Vec::with_capacity(class_count);
+    let mut classes = Vec::with_capacity(reader.capacity(class_count, 1));
     for _ in 0..class_count {
-        classes.push(reader.read_string(&strings, "class string id")?.to_string());
+        classes.push(budget.copied(reader.read_string(&strings, "class string id")?)?);
     }
 
     let property_count = reader.read_collection_len("property count")?;
-    let mut properties = Vec::with_capacity(property_count);
+    let mut properties = Vec::with_capacity(reader.capacity(property_count, 1));
     for _ in 0..property_count {
-        properties.push(
-            reader
-                .read_string(&strings, "property string id")?
-                .to_string(),
-        );
+        properties.push(budget.copied(reader.read_string(&strings, "property string id")?)?);
     }
 
     let instance_count = reader.read_collection_len("instance count")?;
-    let instances = decode_settings_instances(reader, &strings, &classes, instance_count)?;
+    let instances = decode_settings_instances(reader, &strings, &classes, instance_count, budget)?;
     validate_settings_hierarchy(&instances)?;
 
     Ok(SettingsPayloadHeader {
@@ -530,16 +546,17 @@ fn decode_settings_payload_header(
 fn decode_settings_bytecode_payload(
     version: u8,
     reader: &mut BytecodeReader<'_>,
+    budget: &DecodeBudget,
 ) -> Result<SettingsBytecode> {
     let SettingsPayloadHeader {
         strings,
         properties,
         mut instances,
         instance_count,
-    } = decode_settings_payload_header(reader)?;
+    } = decode_settings_payload_header(reader, budget)?;
 
     let group_count = reader.read_collection_len("property group count")?;
-    let mut specs = Vec::with_capacity(group_count);
+    let mut specs = Vec::with_capacity(reader.capacity(group_count, 4));
     for _ in 0..group_count {
         let property_id = reader.read_len("property id")?;
         let property_name = properties
@@ -549,19 +566,20 @@ fn decode_settings_bytecode_payload(
         let value_count = reader.read_collection_len("property value count")?;
         let body_len = reader.read_len("property group byte length")?;
         let body = reader.read_bytes(body_len)?;
+        if SETTINGS_RECORD_FIELDS.contains(&property_name.as_str()) {
+            continue;
+        }
         specs.push((property_name, kind, value_count, body));
     }
+    let scope = ValueScope {
+        strings: &strings,
+        instance_count,
+        budget,
+    };
     let decoded_groups = specs
         .par_iter()
         .map(|(property_name, kind, value_count, body)| {
-            decode_property_group_body(
-                body,
-                property_name.as_str(),
-                *kind,
-                *value_count,
-                &strings,
-                instance_count,
-            )
+            decode_property_group_body(body, property_name.as_str(), *kind, *value_count, scope)
         })
         .collect::<Result<Vec<_>>>()?;
     apply_decoded_property_groups(&mut instances, &specs, decoded_groups);
@@ -576,18 +594,22 @@ fn decode_settings_instance_range(
     first_index: usize,
     instance_count: usize,
     count: usize,
+    budget: &DecodeBudget,
 ) -> Result<Vec<SettingsBytecodeInstance>> {
     let mut reader = BytecodeReader::new(bytes);
+    budget.take(count.saturating_mul(INSTANCE_BYTES))?;
     let mut instances = Vec::with_capacity(count);
     for offset in 0..count {
         let instance_index = first_index + offset;
         let settings_id = read_compact_settings_id(&mut reader, strings)?;
-        let name = reader.read_string(strings, "instance name")?.to_string();
+        budget.take(settings_id.len())?;
+        let name = budget.copied(reader.read_string(strings, "instance name")?)?;
         let class_id = reader.read_len("instance class id")?;
-        let class_name = classes
-            .get(class_id)
-            .with_context(|| format!("Invalid class id {class_id}"))?
-            .clone();
+        let class_name = budget.copied(
+            classes
+                .get(class_id)
+                .with_context(|| format!("Invalid class id {class_id}"))?,
+        )?;
         let parent_raw = reader.read_len("parent index")?;
         let parent_index = decode_parent_index(parent_raw, instance_index, instance_count)?;
         instances.push(SettingsBytecodeInstance::new(
@@ -606,6 +628,7 @@ fn decode_settings_instances(
     strings: &[String],
     classes: &[String],
     instance_count: usize,
+    budget: &DecodeBudget,
 ) -> Result<Vec<SettingsBytecodeInstance>> {
     if instance_count < SETTINGS_BINARY_PARALLEL_MIN_INSTANCES || rayon::current_num_threads() <= 1
     {
@@ -624,6 +647,7 @@ fn decode_settings_instances(
             0,
             instance_count,
             instance_count,
+            budget,
         );
     }
 
@@ -657,6 +681,7 @@ fn decode_settings_instances(
                 first_index,
                 instance_count,
                 count,
+                budget,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -741,14 +766,85 @@ fn apply_decoded_property_groups(
         });
 }
 
+/// What a value needs from its document: the string table, the instance
+/// count its indices must stay under, and the document's memory budget.
+#[derive(Clone, Copy)]
+struct ValueScope<'a> {
+    strings: &'a [String],
+    instance_count: usize,
+    budget: &'a DecodeBudget,
+}
+
+impl ValueScope<'_> {
+    /// A copy of the string the next id names, charged to the budget: the
+    /// table holds a string once, and every use of it is a copy.
+    fn string(&self, reader: &mut BytecodeReader<'_>, label: &str) -> Result<String> {
+        self.budget.copied(reader.read_string(self.strings, label)?)
+    }
+}
+
+/// The memory a document may still decode into, shared by the parts that
+/// decode in parallel.
+struct DecodeBudget {
+    remaining: AtomicUsize,
+}
+
+impl DecodeBudget {
+    fn new(bytes: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(bytes),
+        }
+    }
+
+    fn for_file(file_bytes: usize) -> Self {
+        Self::new(
+            SETTINGS_DECODE_BASE_BYTES
+                .saturating_add(file_bytes.saturating_mul(SETTINGS_DECODE_BYTES_PER_FILE_BYTE)),
+        )
+    }
+
+    fn take(&self, bytes: usize) -> Result<()> {
+        self.remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(bytes)
+            })
+            .map(drop)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Settings bytecode decodes to more memory than a file of its size may take"
+                )
+            })
+    }
+
+    fn copied(&self, text: &str) -> Result<String> {
+        self.take(text.len())?;
+        Ok(text.to_string())
+    }
+}
+
+/// The fixed memory of one value of a kind, beyond its slot: the map a typed
+/// value is, with its fields, or the header of an array.
+fn value_kind_bytes(kind: u8) -> usize {
+    match kind {
+        0..=6 | 20 => 0,
+        7 | 9 | 21 => VALUE_SLOT_BYTES,
+        8 => MAP_BYTES,
+        16 => MAP_BYTES + 16 * VALUE_SLOT_BYTES,
+        _ => MAP_BYTES + 8 * VALUE_SLOT_BYTES,
+    }
+}
+
 fn decode_property_group_body(
     body: &[u8],
     property_name: &str,
     kind: u8,
     value_count: usize,
-    strings: &[String],
-    instance_count: usize,
+    scope: ValueScope<'_>,
 ) -> Result<Vec<DecodedGroupEntry>> {
+    let ValueScope { instance_count, .. } = scope;
+    scope.budget.take(
+        value_count.saturating_mul(VALUE_SLOT_BYTES + property_name.len() + value_kind_bytes(kind)),
+    )?;
     let mut reader = BytecodeReader::new(body);
     let cframe_group_decoder = decode_cframe_group_header(kind, &mut reader)?;
     // Large numeric columns otherwise occupy one Rayon worker while the other
@@ -768,12 +864,14 @@ fn decode_property_group_body(
         && value_count >= SETTINGS_BINARY_PARALLEL_CHUNK_SIZE
         && rayon::current_num_threads() > 1
     {
-        let mut values = Vec::with_capacity(value_count);
+        let mut values = Vec::with_capacity(reader.capacity(value_count, numeric_bytes + 1));
         let mut instance_index = 0_usize;
-        for _ in 0..value_count {
-            instance_index = instance_index
-                .checked_add(reader.read_len("property instance index")?)
-                .context("Property instance index delta overflow")?;
+        for position in 0..value_count {
+            instance_index = next_group_instance(
+                instance_index,
+                reader.read_len("property instance index")?,
+                position,
+            )?;
             if instance_index >= instance_count {
                 bail!("Invalid property instance index {instance_index}");
             }
@@ -792,7 +890,7 @@ fn decode_property_group_body(
                 let mut reader = BytecodeReader::new(bytes);
                 let value = match &cframe_group_decoder {
                     CFrameGroupDecoder::Inline => {
-                        decode_raw_value_payload(&mut reader, kind, strings, instance_count, 0)?
+                        decode_raw_value_payload(&mut reader, kind, scope, 0)?
                     }
                     CFrameGroupDecoder::RotationTable(rotations) => {
                         decode_cframe_rotation_table_payload(&mut reader, rotations)?
@@ -804,12 +902,13 @@ fn decode_property_group_body(
     }
     let mut previous_instance_index = 0_usize;
     let mut previous_ref_target_index = 0_usize;
-    let mut entries = Vec::with_capacity(value_count);
-    for _ in 0..value_count {
-        let encoded_index = reader.read_len("property instance index")?;
-        let instance_index = previous_instance_index
-            .checked_add(encoded_index)
-            .context("Property instance index delta overflow")?;
+    let mut entries = Vec::with_capacity(reader.capacity(value_count, 1));
+    for position in 0..value_count {
+        let instance_index = next_group_instance(
+            previous_instance_index,
+            reader.read_len("property instance index")?,
+            position,
+        )?;
         previous_instance_index = instance_index;
         if instance_index >= instance_count {
             bail!("Invalid property instance index {instance_index}");
@@ -817,7 +916,7 @@ fn decode_property_group_body(
         if property_name == "Attributes" && kind == 8 {
             entries.push(DecodedGroupEntry::Attributes(
                 instance_index,
-                decode_attributes_payload(&mut reader, strings, instance_count)?,
+                decode_attributes_payload(&mut reader, scope)?,
             ));
         } else {
             let value = if kind == 17 {
@@ -829,7 +928,7 @@ fn decode_property_group_body(
             } else {
                 match &cframe_group_decoder {
                     CFrameGroupDecoder::Inline => {
-                        decode_raw_value_payload(&mut reader, kind, strings, instance_count, 0)?
+                        decode_raw_value_payload(&mut reader, kind, scope, 0)?
                     }
                     CFrameGroupDecoder::RotationTable(rotations) => {
                         decode_cframe_rotation_table_payload(&mut reader, rotations)?
@@ -841,6 +940,17 @@ fn decode_property_group_body(
     }
     reader.finish()?;
     Ok(entries)
+}
+
+/// The instance of a group's next value. A group holds one value per
+/// instance in rising order, so after the first every step moves on.
+fn next_group_instance(previous: usize, step: usize, position: usize) -> Result<usize> {
+    if position > 0 && step == 0 {
+        bail!("Settings bytecode gives one instance two values of a property");
+    }
+    previous
+        .checked_add(step)
+        .context("Property instance index delta overflow")
 }
 
 pub(crate) fn encode_settings_bytecode(document: &SettingsBytecode) -> Result<Vec<u8>> {
@@ -1330,6 +1440,14 @@ impl<'a> BytecodeReader<'a> {
         usize::try_from(raw).with_context(|| format!("{label} does not fit in usize"))
     }
 
+    /// The room to reserve for `count` items that each take at least
+    /// `item_bytes` of the remaining input: a count the input cannot hold
+    /// reserves nothing beyond what it can.
+    fn capacity(&self, count: usize, item_bytes: usize) -> usize {
+        let remaining = self.cursor.get_ref().len() - self.position();
+        count.min(remaining / item_bytes.max(1))
+    }
+
     fn read_collection_len(&mut self, label: &str) -> Result<usize> {
         let len = self.read_len(label)?;
         if len > MAX_SETTINGS_COLLECTION_ITEMS {
@@ -1356,34 +1474,34 @@ impl<'a> BytecodeReader<'a> {
     }
 }
 
-fn decode_raw_value(
-    reader: &mut BytecodeReader<'_>,
-    strings: &[String],
-    instance_count: usize,
-) -> Result<Value> {
-    decode_raw_value_at_depth(reader, strings, instance_count, 0)
+fn decode_raw_value(reader: &mut BytecodeReader<'_>, scope: ValueScope<'_>) -> Result<Value> {
+    decode_raw_value_at_depth(reader, scope, 0)
 }
 
 fn decode_raw_value_at_depth(
     reader: &mut BytecodeReader<'_>,
-    strings: &[String],
-    instance_count: usize,
+    scope: ValueScope<'_>,
     depth: usize,
 ) -> Result<Value> {
     if depth > MAX_SETTINGS_VALUE_DEPTH {
         bail!("Settings bytecode value nesting exceeds safe depth of {MAX_SETTINGS_VALUE_DEPTH}");
     }
     let kind = reader.read_u8().context("Missing value kind")?;
-    decode_raw_value_payload(reader, kind, strings, instance_count, depth)
+    scope.budget.take(value_kind_bytes(kind))?;
+    decode_raw_value_payload(reader, kind, scope, depth)
 }
 
 fn decode_raw_value_payload(
     reader: &mut BytecodeReader<'_>,
     kind: u8,
-    strings: &[String],
-    instance_count: usize,
+    scope: ValueScope<'_>,
     depth: usize,
 ) -> Result<Value> {
+    let ValueScope {
+        instance_count,
+        budget,
+        ..
+    } = scope;
     match kind {
         0 => Ok(Value::Null),
         1 => Ok(Value::Bool(false)),
@@ -1391,26 +1509,21 @@ fn decode_raw_value_payload(
         3 => Ok(json!(unzigzag_i64(reader.read_var_u64()?,))),
         4 => Ok(json!(reader.read_var_u64()?)),
         5 => Ok(json_number_f64(read_f64(reader)?)),
-        6 => Ok(Value::String(
-            reader.read_string(strings, "value string id")?.to_string(),
-        )),
+        6 => Ok(Value::String(scope.string(reader, "value string id")?)),
         7 => {
             let len = reader.read_collection_len("array length")?;
-            let mut items = Vec::with_capacity(len);
+            budget.take(len.saturating_mul(VALUE_SLOT_BYTES))?;
+            let mut items = Vec::with_capacity(reader.capacity(len, 1));
             for _ in 0..len {
-                items.push(decode_raw_value_at_depth(
-                    reader,
-                    strings,
-                    instance_count,
-                    depth + 1,
-                )?);
+                items.push(decode_raw_value_at_depth(reader, scope, depth + 1)?);
             }
             Ok(Value::Array(items))
         }
-        8 => decode_object_payload(reader, strings, instance_count, depth),
+        8 => decode_object_payload(reader, scope, depth),
         9 => {
             let len = reader.read_collection_len("numeric array length")?;
-            let mut items = Vec::with_capacity(len);
+            budget.take(len.saturating_mul(VALUE_SLOT_BYTES))?;
+            let mut items = Vec::with_capacity(reader.capacity(len, 8));
             for _ in 0..len {
                 items.push(json_number_f64(read_f64(reader)?));
             }
@@ -1419,13 +1532,14 @@ fn decode_raw_value_payload(
         20 => Ok(json_number_f64(read_f32(reader)? as f64)),
         21 => {
             let len = reader.read_collection_len("f32 numeric array length")?;
-            let mut items = Vec::with_capacity(len);
+            budget.take(len.saturating_mul(VALUE_SLOT_BYTES))?;
+            let mut items = Vec::with_capacity(reader.capacity(len, 4));
             for _ in 0..len {
                 items.push(json_number_f64(read_f32(reader)? as f64));
             }
             Ok(Value::Array(items))
         }
-        10 => decode_ref_fallback_payload(reader, strings),
+        10 => decode_ref_fallback_payload(reader, scope),
         11 => decode_fixed_numeric_payload(reader, "Vector2", &["x", "y"]),
         12 => decode_fixed_numeric_payload(reader, "Vector3", &["x", "y", "z"]),
         13 => decode_fixed_numeric_payload(reader, "UDim", &["scale", "offset"]),
@@ -1451,20 +1565,12 @@ fn decode_raw_value_payload(
             "EnumItem",
             [(
                 "name",
-                Value::String(
-                    reader
-                        .read_string(strings, "enum item string id")?
-                        .to_string(),
-                ),
+                Value::String(scope.string(reader, "enum item string id")?),
             )],
         )),
         NESTED_ENUM_ITEM_KIND => {
-            let enum_type = reader
-                .read_string(strings, "nested enum type string id")?
-                .to_string();
-            let name = reader
-                .read_string(strings, "nested enum item string id")?
-                .to_string();
+            let enum_type = scope.string(reader, "nested enum type string id")?;
+            let name = scope.string(reader, "nested enum item string id")?;
             Ok(typed_object(
                 "EnumItem",
                 [
@@ -1479,17 +1585,17 @@ fn decode_raw_value_payload(
 
 fn decode_object_payload(
     reader: &mut BytecodeReader<'_>,
-    strings: &[String],
-    instance_count: usize,
+    scope: ValueScope<'_>,
     depth: usize,
 ) -> Result<Value> {
     let field_count = reader.read_collection_len("object field count")?;
-    let mut out = Map::with_capacity(field_count);
+    scope
+        .budget
+        .take(field_count.saturating_mul(VALUE_SLOT_BYTES))?;
+    let mut out = Map::new();
     for _ in 0..field_count {
-        let key = reader
-            .read_string(strings, "object key string id")?
-            .to_string();
-        let value = decode_raw_value_at_depth(reader, strings, instance_count, depth + 1)?;
+        let key = scope.string(reader, "object key string id")?;
+        let value = decode_raw_value_at_depth(reader, scope, depth + 1)?;
         out.insert(key, value);
     }
     Ok(Value::Object(out))
@@ -1497,16 +1603,16 @@ fn decode_object_payload(
 
 fn decode_attributes_payload(
     reader: &mut BytecodeReader<'_>,
-    strings: &[String],
-    instance_count: usize,
+    scope: ValueScope<'_>,
 ) -> Result<Map<String, Value>> {
     let field_count = reader.read_collection_len("attribute count")?;
-    let mut out = Map::with_capacity(field_count);
+    scope
+        .budget
+        .take(field_count.saturating_mul(VALUE_SLOT_BYTES))?;
+    let mut out = Map::new();
     for _ in 0..field_count {
-        let key = reader
-            .read_string(strings, "attribute key string id")?
-            .to_string();
-        let value = decode_raw_value(reader, strings, instance_count)?;
+        let key = scope.string(reader, "attribute key string id")?;
+        let value = decode_raw_value(reader, scope)?;
         out.insert(key, unwrap_attribute_value(value));
     }
     Ok(out)
@@ -1556,48 +1662,49 @@ fn unwrap_attribute_value(value: Value) -> Value {
 
 fn decode_ref_fallback_payload(
     reader: &mut BytecodeReader<'_>,
-    strings: &[String],
+    scope: ValueScope<'_>,
 ) -> Result<Value> {
+    let budget = scope.budget;
     let flags = reader.read_var_u64().context("Missing ref flags")?;
     let mut out = Map::new();
     out.insert("_type".to_string(), Value::String("Ref".to_string()));
     if flags & 1 != 0 {
         out.insert(
             "instanceId".to_string(),
-            Value::String(reader.read_string(strings, "ref instance id")?.to_string()),
+            Value::String(scope.string(reader, "ref instance id")?),
         );
     }
     if flags & 2 != 0 {
         out.insert(
             "debugId".to_string(),
-            Value::String(reader.read_string(strings, "ref debug id")?.to_string()),
+            Value::String(scope.string(reader, "ref debug id")?),
         );
     }
     if flags & 4 != 0 {
         let len = reader.read_collection_len("ref path segment count")?;
-        let mut segments = Vec::with_capacity(len);
+        budget.take(len.saturating_mul(VALUE_SLOT_BYTES))?;
+        let mut segments = Vec::with_capacity(reader.capacity(len, 1));
         for _ in 0..len {
-            segments.push(Value::String(
-                reader.read_string(strings, "ref path segment")?.to_string(),
-            ));
+            segments.push(Value::String(scope.string(reader, "ref path segment")?));
         }
         out.insert("pathSegments".to_string(), Value::Array(segments));
     }
     if flags & 8 != 0 {
         out.insert(
             "path".to_string(),
-            Value::String(reader.read_string(strings, "ref path")?.to_string()),
+            Value::String(scope.string(reader, "ref path")?),
         );
     }
     if flags & 16 != 0 {
         out.insert(
             "settingsId".to_string(),
-            Value::String(reader.read_string(strings, "ref settings id")?.to_string()),
+            Value::String(scope.string(reader, "ref settings id")?),
         );
     }
     if flags & 32 != 0 {
         let len = reader.read_collection_len("ref path ordinal count")?;
-        let mut ordinals = Vec::with_capacity(len);
+        budget.take(len.saturating_mul(VALUE_SLOT_BYTES))?;
+        let mut ordinals = Vec::with_capacity(reader.capacity(len, 1));
         for _ in 0..len {
             ordinals.push(json!(
                 reader.read_var_u64().context("Missing ref path ordinal")?
@@ -1653,7 +1760,7 @@ fn decode_cframe_group_header(
         0 => Ok(CFrameGroupDecoder::Inline),
         1 => {
             let rotation_count = reader.read_collection_len("CFrame rotation table count")?;
-            let mut rotations = Vec::with_capacity(rotation_count);
+            let mut rotations = Vec::with_capacity(reader.capacity(rotation_count, 36));
             for _ in 0..rotation_count {
                 let mut rotation = [0.0_f64; 9];
                 for component in &mut rotation {
@@ -4253,8 +4360,8 @@ mod tests {
                 }
             }
             for index in 0..count {
-                // Include duplicate and non-unit index deltas at chunk boundaries.
-                write_var_u64(&mut body, (index % 3) as u64).unwrap();
+                // Include non-unit index deltas at chunk boundaries.
+                write_var_u64(&mut body, (1 + index % 3) as u64).unwrap();
                 for field in 0..fields {
                     body.extend(((index as f32 - field as f32) / 4.).to_le_bytes());
                 }
@@ -4264,7 +4371,13 @@ mod tests {
             }
             let decode = |bytes: &[u8], pool: &rayon::ThreadPool| {
                 pool.install(|| {
-                    decode_property_group_body(bytes, "Numeric", kind, count, &[], count * 2)
+                    let budget = DecodeBudget::new(usize::MAX);
+                    let scope = ValueScope {
+                        strings: &[],
+                        instance_count: count * 4,
+                        budget: &budget,
+                    };
+                    decode_property_group_body(bytes, "Numeric", kind, count, scope)
                 })
             };
             let expected = decode(&body, &serial).unwrap();
@@ -4539,5 +4652,141 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("hierarchy exceeds safe depth"));
+    }
+
+    /// A payload with one root instance and one property group whose body
+    /// is `body`, wrapped as a store file.
+    fn store_with_group(kind: u8, value_count: usize, body: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for text in ["editor:0", "Workspace", "Value"] {
+            if payload.is_empty() {
+                write_var_u64(&mut payload, 3).unwrap();
+            }
+            write_var_u64(&mut payload, text.len() as u64).unwrap();
+            payload.extend_from_slice(text.as_bytes());
+        }
+        // One class and one property, both by string id; one root instance.
+        for id in [1, 1, 1, 2, 1, 0, 1, 0, 0] {
+            write_var_u64(&mut payload, id).unwrap();
+        }
+        // One group: property 0, its kind, value count and body.
+        write_var_u64(&mut payload, 1).unwrap();
+        write_var_u64(&mut payload, 0).unwrap();
+        payload.push(kind);
+        write_var_u64(&mut payload, value_count as u64).unwrap();
+        write_var_u64(&mut payload, body.len() as u64).unwrap();
+        payload.extend_from_slice(body);
+        wrap_settings_bytecode_payload(&payload).unwrap()
+    }
+
+    fn group_body(body: &[u8], kind: u8, values: usize, budget: usize) -> Result<usize> {
+        let budget = DecodeBudget::new(budget);
+        let scope = ValueScope {
+            strings: &[],
+            instance_count: 4,
+            budget: &budget,
+        };
+        decode_property_group_body(body, "Value", kind, values, scope).map(|entries| entries.len())
+    }
+
+    #[test]
+    fn a_count_the_input_cannot_hold_reserves_no_room_for_it() {
+        let reader = BytecodeReader::new(&[0; 10]);
+        assert_eq!(reader.capacity(500_000, 1), 10);
+        assert_eq!(reader.capacity(500_000, 4), 2);
+        assert_eq!(reader.capacity(3, 1), 3);
+
+        // Arrays that each claim the largest length and hold one more such
+        // array reserved 16 MB a level before; the body is a few hundred bytes.
+        let mut body = Vec::new();
+        write_var_u64(&mut body, 0).unwrap();
+        for _ in 0..=MAX_SETTINGS_VALUE_DEPTH {
+            write_var_u64(&mut body, MAX_SETTINGS_COLLECTION_ITEMS as u64).unwrap();
+            body.push(7);
+        }
+        let error = group_body(&body, 7, 1, usize::MAX).unwrap_err().to_string();
+        assert!(error.contains("nesting exceeds safe depth"), "{error}");
+        // A file this small may not decode into that much either.
+        let error = decode_settings_bytecode(&store_with_group(7, 1, &body))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("more memory than a file"), "{error}");
+    }
+
+    #[test]
+    fn a_store_decodes_into_no_more_memory_than_its_budget() {
+        let mut body = Vec::new();
+        write_var_u64(&mut body, 0).unwrap();
+        write_var_u64(&mut body, 8).unwrap();
+        body.extend_from_slice(&[0; 8]);
+        // The value in its group, the array it is and its eight items.
+        let cost = VALUE_SLOT_BYTES + "Value".len() + value_kind_bytes(7) + 8 * VALUE_SLOT_BYTES;
+        assert_eq!(group_body(&body, 7, 1, cost).unwrap(), 1);
+        let error = group_body(&body, 7, 1, cost - 1).unwrap_err().to_string();
+        assert!(error.contains("more memory than a file"), "{error}");
+        assert!(decode_settings_bytecode(&store_with_group(7, 1, &body)).is_ok());
+
+        // One long string named by many instances is a copy for each.
+        let name = "n".repeat(4096);
+        let instances = (0..64)
+            .map(|index| {
+                SettingsBytecodeInstance::new(
+                    format!("i{index}"),
+                    name.clone(),
+                    "Folder".to_string(),
+                    (index > 0).then_some(0),
+                )
+            })
+            .collect();
+        let payload = encode_settings_bytecode_payload(&SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances,
+        })
+        .unwrap();
+        let decode = |budget: usize| {
+            decode_settings_bytecode_document(
+                SETTINGS_BINARY_VERSION,
+                &payload,
+                &DecodeBudget::new(budget),
+            )
+        };
+        assert!(decode(64 * (4096 + INSTANCE_BYTES) + 4096).is_ok());
+        let error = decode(32 * 4096).unwrap_err().to_string();
+        assert!(error.contains("more memory than a file"), "{error}");
+    }
+
+    #[test]
+    fn a_group_holds_one_value_for_an_instance() {
+        // Two booleans: the second for the next instance, or for the same one.
+        assert_eq!(group_body(&[0, 1], 2, 2, usize::MAX).unwrap(), 2);
+        let error = group_body(&[0, 0], 2, 2, usize::MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("two values of a property"), "{error}");
+        assert_eq!(group_body(&[0], 2, 1, usize::MAX).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_store_cannot_carry_an_instances_name_class_or_parent_as_properties() {
+        let mut root = SettingsBytecodeInstance::new(
+            "editor:0".to_string(),
+            "Workspace".to_string(),
+            "Workspace".to_string(),
+            None,
+        );
+        for name in ["Name", "ClassName", "Parent", "Anchored"] {
+            root.properties.insert(name.to_string(), json!("x"));
+        }
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root],
+        };
+        let payload = encode_settings_bytecode_payload(&document).unwrap();
+        let decoded =
+            decode_settings_bytecode(&wrap_settings_bytecode_payload(&payload).unwrap()).unwrap();
+        assert_eq!(
+            decoded.instances[0].properties.keys().collect::<Vec<_>>(),
+            ["Anchored"]
+        );
     }
 }

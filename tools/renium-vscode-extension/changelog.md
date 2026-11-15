@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- A crafted `.renium` file of a few kilobytes could make any command that reads it (`rbx tr`, a push, `git diff` through the text view, the extension) reserve tens of gigabytes of memory, or decode into gigabytes of values and string copies. A count in a store now reserves only what the file can hold, a property group holds one value per instance, and a store may decode into about 1 GB of memory plus 256 bytes per byte of its file; real stores of 8 MB decode to a few hundred megabytes.
+- A store that carried `Parent` as a property could move an instance out of the synced services when that property was pushed, into CoreGui for example, where it draws over Studio and no pull sees it. A store's `Name`, `ClassName` and `Parent` properties are ignored (the instance record holds its name, class and parent), `rbx bs --scope property` refuses those three names, and the plugin refuses a pushed `Parent` value.
+- Control characters and text-direction overrides in project data no longer reach the terminal: `rbx v` and `rbx vct` (the text view Git uses for `.renium` diffs) always print them escaped (`\u{1b}`, `\u{a}`), and every other command escapes them when its output goes to a terminal; output to a pipe or a file keeps its bytes. They were printed raw, so an instance name could send escape sequences to the terminal or forge lines of a diff.
+- A file in `instances` whose name is no instance name, such as `...renium`, is not read as a store. Its stem `..` was taken as a service, which pointed that service's scripts at the folder above the sources and crashed `rbx xp`.
+- Package tooltips in the extension show package and instance names as text; Markdown in a name was rendered.
+
 ## 0.6.3 - 2026-11-14
 
 ### Improvements

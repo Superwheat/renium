@@ -1005,6 +1005,68 @@ fn view_and_textconv_render_stores_models_places_and_empty_files() {
 }
 
 #[test]
+fn a_store_from_elsewhere_cannot_write_to_the_terminal_or_name_a_folder_outside_the_sources() {
+    let fx = Fixture::new("hostile-store");
+    let mut document = fx.read_store("Workspace");
+    let mut hostile = SettingsBytecodeInstance::new(
+        "id\u{1b}[0m".to_string(),
+        "a\u{1b}]0;title\u{7}\nb".to_string(),
+        "Folder\r".to_string(),
+        Some(0),
+    );
+    hostile
+        .properties
+        .insert("Key\u{8}".to_string(), json!("\u{1b}\u{9b}2J\u{202e}"));
+    hostile.attributes.insert("At\ttr".to_string(), json!(true));
+    document.instances.push(hostile);
+    fx.write_store("Workspace", &document);
+    for command in ["v", "vct"] {
+        let text = fx.text(&[command, &fx.store_arg("Workspace")]);
+        assert_eq!(text.error, None);
+        assert!(
+            !text
+                .stdout
+                .chars()
+                .any(|ch| ch != '\n' && (ch.is_control() || ch == '\u{202e}')),
+            "{command} printed a control character: {:?}",
+            text.stdout
+        );
+        assert!(
+            text.stdout.contains(concat!(
+                "= Workspace/a\\u{1b}]0;title\\u{7}\\u{a}b [Folder\\u{d}] id=id\\u{1b}[0m\n",
+                "  Key\\u{8} = \"\\u001b\\u{9b}2J\\u{202e}\"\n",
+                "  @At\\u{9}tr = true\n",
+            )),
+            "{}",
+            text.stdout
+        );
+    }
+
+    // `...renium` has the stem `..`, which as a service would be the folder
+    // above the sources.
+    let fx = Fixture::new("store-name");
+    fs::copy(
+        fx.store("Workspace"),
+        fx.store("Workspace").with_file_name("...renium"),
+    )
+    .unwrap();
+    let built = fx
+        .json(&["bep", "-r", &fx.path(""), "-o", &fx.path("built.rbxl")])
+        .ok();
+    assert_eq!(
+        built["services"],
+        json!(["Workspace", "ReplicatedStorage", "ServerScriptService"])
+    );
+    let explained = fx.json(&[
+        "xp",
+        "src/Workspace",
+        "--project",
+        &fx.path("renium.project.jsonc"),
+    ]);
+    assert_eq!(explained.error, None);
+}
+
+#[test]
 fn view_and_textconv_render_places_models_empty_and_foreign_files() {
     let fx = Fixture::new("view-files");
     let saved = fx.root.join("saved.rbxl");

@@ -143,6 +143,16 @@ export class LinkDecorationProvider implements vscode.FileDecorationProvider {
   }
 }
 
+/** Text from a package (a name, a class) as it reads in a Markdown tooltip: its characters, not its markup. */
+function markdownText(value: string): string {
+  return new vscode.MarkdownString(undefined, true).appendText(value).value;
+}
+
+/** The same text as an inline code span; a backtick or a line break in it would end the span. */
+function markdownCode(value: string): string {
+  return `\`${value.replace(/`/g, "'").replace(/\s+/g, " ")}\``;
+}
+
 function relativeTimeLabel(unixMs?: number | null): string {
   if (!unixMs || unixMs <= 0) {
     return "unknown";
@@ -485,8 +495,8 @@ export class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTree
     }
 
     const tooltip = new vscode.MarkdownString(undefined, true);
-    tooltip.appendMarkdown(`**${name}**${rootClass ? `  \`${rootClass}\`` : ""}\n\n`);
-    tooltip.appendMarkdown(`- Source: \`${link.source ?? "?"}\`\n`);
+    tooltip.appendMarkdown(`**${markdownText(name)}**${rootClass ? `  ${markdownCode(rootClass)}` : ""}\n\n`);
+    tooltip.appendMarkdown(`- Source: ${markdownCode(String(link.source ?? "?"))}\n`);
     if (typeof link.instances === "number" && link.instances > 0) {
       tooltip.appendMarkdown(`- Instances: ${link.instances}\n`);
     }
@@ -515,7 +525,7 @@ export class PackagesTreeProvider implements vscode.TreeDataProvider<PackageTree
     const className = String(node.className ?? "");
     item.description = className && className !== label ? className : undefined;
     item.tooltip = new vscode.MarkdownString(
-      `**${label}**${className ? `  \`${className}\`` : ""}\n\nPackage: \`${element.preview.name}\`\n\nPath: \`${packageDisplayPath(node)}\``,
+      `**${markdownText(label)}**${className ? `  ${markdownCode(className)}` : ""}\n\nPackage: ${markdownCode(String(element.preview.name))}\n\nPath: ${markdownCode(packageDisplayPath(node))}`,
       true,
     );
     const iconUri = vscode.Uri.joinPath(this.extensionUri, "assets", `${iconAssetNameForClass(className || "Folder", this.iconNames)}.png`);

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use crate::app::output::print_json_output;
+use crate::app::output::{print_json_output, visible};
 use crate::bytecode::edit::next_editor_settings_id_fast;
 use crate::bytecode::stabilize_reference_output;
 use crate::cli::args::{VcInitArgs, VcMergeArgs, VcTextconvArgs, ViewArgs};
@@ -288,14 +288,15 @@ pub(crate) fn settings_doc_to_text(document: &SettingsBytecode) -> String {
     while let Some((index, parent_path)) = stack.pop() {
         let instance = &document.instances[index];
         let path = if parent_path.is_empty() {
-            instance.name.clone()
+            visible(&instance.name).into_owned()
         } else {
-            format!("{parent_path}/{}", instance.name)
+            format!("{parent_path}/{}", visible(&instance.name))
         };
         let _ = writeln!(
             out,
             "= {path} [{}] id={}",
-            instance.class_name, instance.settings_id
+            visible(&instance.class_name),
+            visible(&instance.settings_id)
         );
         let mut property_record = instance.properties.clone();
         stabilize_reference_output(
@@ -320,7 +321,7 @@ pub(crate) fn settings_doc_to_text(document: &SettingsBytecode) -> String {
                 );
                 continue;
             }
-            let _ = writeln!(out, "  {key} = {value}");
+            let _ = writeln!(out, "  {} = {}", visible(key), visible(&value.to_string()));
         }
         let mut attribute_record = instance.attributes.clone();
         stabilize_reference_output(
@@ -333,7 +334,7 @@ pub(crate) fn settings_doc_to_text(document: &SettingsBytecode) -> String {
         let mut attributes: Vec<(&String, &Value)> = attribute_record.iter().collect();
         attributes.sort_by(|a, b| a.0.cmp(b.0));
         for (key, value) in attributes {
-            let _ = writeln!(out, "  @{key} = {value}");
+            let _ = writeln!(out, "  @{} = {}", visible(key), visible(&value.to_string()));
         }
         if let Some(kids) = children.get(&Some(index)) {
             for kid in kids.iter().rev() {

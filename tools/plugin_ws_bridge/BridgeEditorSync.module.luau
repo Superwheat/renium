@@ -3021,6 +3021,11 @@ local function applyChangedProperty(instance, propertyName, rawValue, change, ct
 		stats.noops += 1
 		return
 	end
+	if propertyName == "Parent" then
+		-- An instance's place in the tree is its path. A Parent value would
+		-- move it wherever a reference resolves, outside the synced services too.
+		error("Parent is not a property a push sets; " .. instance:GetFullName() .. " moves by its path")
+	end
 	if propertyName == "ClassName" then
 		if tostring(rawValue) == instance.ClassName then
 			stats.noops += 1
@@ -3122,6 +3127,9 @@ local function applyChangedProperty(instance, propertyName, rawValue, change, ct
 end
 
 local function resetProperty(instance, propertyName, change, ctx, stats, unreadableNames)
+	if propertyName == "Parent" then
+		error("Parent is not a property a push resets; " .. instance:GetFullName() .. " is removed by its path")
+	end
 	if propertyName == "Tags" then
 		applyTags(instance, {}, stats, ctx)
 		return

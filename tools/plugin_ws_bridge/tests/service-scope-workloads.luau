@@ -193,3 +193,15 @@ do
 	assert(seen.pruned == renamed)
 end
 print("Renamed service: upsert, delete and reconcile address the service by class name")
+
+local applyProperty = extract("local function applyChangedProperty(", "local function resetProperty(",
+	{ Workspace = {}, error = error }, "applyChangedProperty")
+local moved = { GetFullName = function() return "StarterGui.Overlay" end }
+local reparented, reparentError = pcall(applyProperty, moved, "Parent", { _type = "Ref", pathSegments = { "CoreGui" } }, {}, {}, { noops = 0 })
+assert(not reparented and tostring(reparentError):find("Parent is not a property a push sets", 1, true),
+	"a pushed Parent value must not move an instance")
+local resetProperty = extract("local function resetProperty(", "local function deleteAttribute(",
+	{ error = error }, "resetProperty")
+local detached, detachError = pcall(resetProperty, moved, "Parent", {}, {}, { noops = 0 })
+assert(not detached and tostring(detachError):find("Parent is not a property a push resets", 1, true),
+	"a pushed Parent reset must not detach an instance")
