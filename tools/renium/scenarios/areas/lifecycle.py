@@ -1154,7 +1154,7 @@ def docs_serve(ctx: Context):
 
 
 def _plugin_file(ctx: Context) -> Path:
-    """A copy of the installed Studio plugin (the Renium.rbxm beside rbx can be an older build)."""
+    """A copy of the installed Studio plugin."""
     installed = (Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "Plugins" / "Renium.rbxm") if os.name == "nt" else (Path.home() / "Documents" / "Roblox" / "Plugins" / "Renium.rbxm")
     ctx.expect(installed.is_file(), f"no installed plugin at {installed}")
     copy = ctx.root / "Renium-installed.rbxm"

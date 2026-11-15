@@ -107,6 +107,63 @@ pub(crate) fn validate_rbxm_version(bytes: &[u8], expected: &str) -> Result<()> 
     Ok(())
 }
 
+struct PluginSource {
+    bytes: Vec<u8>,
+    label: String,
+    /// The copy beside the executable that these downloaded bytes can replace.
+    replaces: Option<PathBuf>,
+}
+
+/// The plugin to install: `--file`, else the copy beside the executable when it is the plugin of `version`
+/// (an installer writes that copy, and it can be from another release than the executable), else a download.
+fn plugin_source(
+    file: Option<&str>,
+    bundled: Option<&Path>,
+    version: &str,
+    download: impl FnOnce(&Path) -> Result<String>,
+) -> Result<PluginSource> {
+    if let Some(file) = file {
+        let path = Path::new(file);
+        if !path.is_file() {
+            bail!("--file {} does not exist", path.display());
+        }
+        return Ok(PluginSource {
+            bytes: fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?,
+            label: format!("file {file}"),
+            replaces: None,
+        });
+    }
+    if let Some(path) = bundled
+        && let Ok(bytes) = fs::read(path)
+        && validate_rbxm_version(&bytes, version).is_ok()
+    {
+        return Ok(PluginSource {
+            bytes,
+            label: format!("bundled {}", path.display()),
+            replaces: None,
+        });
+    }
+    let staging = std::env::temp_dir().join(format!("renium-plugin-{}.rbxm", std::process::id()));
+    let fetched = download(&staging).and_then(|label| {
+        let bytes =
+            fs::read(&staging).with_context(|| format!("Failed to read {}", staging.display()))?;
+        Ok((bytes, label))
+    });
+    let _ = fs::remove_file(&staging);
+    match (fetched, bundled) {
+        (Ok((bytes, label)), _) => Ok(PluginSource {
+            bytes,
+            label,
+            replaces: bundled.map(Path::to_path_buf),
+        }),
+        (Err(error), Some(path)) => Err(error.context(format!(
+            "{} is not the plugin of Renium {version}",
+            path.display()
+        ))),
+        (Err(error), None) => Err(error),
+    }
+}
+
 fn download_compatible_plugin(destination: &Path) -> Result<String> {
     let url = format!(
         "https://github.com/{GITHUB_REPO}/releases/download/v{BUILD_VERSION}/{PLUGIN_ASSET_NAME}"
@@ -282,25 +339,16 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
         }
         return emit_global_output(&response, &text);
     }
-    let staging_download =
-        std::env::temp_dir().join(format!("renium-plugin-{}.rbxm", std::process::id()));
-
-    let (source_path, source_label) = if let Some(file) = args.file.as_ref() {
-        let path = PathBuf::from(file);
-        if !path.is_file() {
-            bail!("--file {} does not exist", path.display());
-        }
-        (path, format!("file {file}"))
-    } else if let Some(sibling) = exe_sibling {
-        let label = format!("bundled {}", sibling.display());
-        (sibling, label)
-    } else {
-        let url = download_compatible_plugin(&staging_download)?;
-        (staging_download.clone(), url)
-    };
-
-    let bytes = std::fs::read(&source_path)
-        .with_context(|| format!("Failed to read {}", source_path.display()))?;
+    let PluginSource {
+        bytes,
+        label: source_label,
+        replaces,
+    } = plugin_source(
+        args.file.as_deref(),
+        exe_sibling.as_deref(),
+        BUILD_VERSION,
+        download_compatible_plugin,
+    )?;
     validate_rbxm(&bytes)?;
 
     if args.dry_run {
@@ -310,7 +358,6 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
             .is_none()
             .then(|| serializer::setup_studio_patch(true))
             .transpose()?;
-        let _ = std::fs::remove_file(&staging_download);
         let response = json!({
             "ok": true,
             "action": "setup",
@@ -344,7 +391,11 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
     #[cfg(target_os = "macos")]
     let previous_plugin = fs::read(&target).ok();
     update::install_bytes(&target, &bytes)?;
-    let _ = std::fs::remove_file(&staging_download);
+    if args.dir.is_none()
+        && let Some(outdated) = replaces.as_deref()
+    {
+        let _ = update::install_bytes(outdated, &bytes);
+    }
 
     #[cfg(target_os = "macos")]
     // An explicit plugin destination is a scoped plugin installation, including
@@ -407,4 +458,77 @@ pub(crate) fn setup_command(args: SetupArgs) -> Result<()> {
         text = format!("{text}; {note}");
     }
     emit_global_output(&response, &text)
+}
+
+#[cfg(test)]
+mod tests {
+    use rbx_dom_weak::{InstanceBuilder, WeakDom};
+
+    use super::*;
+
+    fn plugin_model(version: &str) -> Vec<u8> {
+        let runtime = InstanceBuilder::new("ModuleScript")
+            .with_name("BridgePluginRuntime")
+            .with_property(
+                "Source",
+                format!("local BRIDGE_VERSION = \"{version}\"\nreturn {{}}\n"),
+            );
+        let dom = WeakDom::new(InstanceBuilder::new("Folder").with_child(runtime));
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, &[dom.root_ref()]).unwrap();
+        bytes
+    }
+
+    fn released(staging: &Path) -> Result<String> {
+        fs::write(staging, plugin_model("0.6.4"))?;
+        Ok("release".to_string())
+    }
+
+    fn unreachable(_: &Path) -> Result<String> {
+        bail!("no network")
+    }
+
+    #[test]
+    fn a_bundled_plugin_of_another_release_is_replaced_by_a_download() {
+        let folder = std::env::temp_dir().join(format!("renium-setup-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        let bundled = folder.join(PLUGIN_ASSET_NAME);
+        let given = folder.join("given.rbxm");
+        fs::write(&given, plugin_model("0.6.3")).unwrap();
+
+        fs::write(&bundled, plugin_model("0.6.4")).unwrap();
+        let current = plugin_source(None, Some(&bundled), "0.6.4", unreachable).unwrap();
+        assert_eq!(current.bytes, plugin_model("0.6.4"));
+        assert_eq!(current.label, format!("bundled {}", bundled.display()));
+        assert_eq!(current.replaces, None);
+
+        for outdated in [plugin_model("0.5.8"), b"not a model".to_vec()] {
+            fs::write(&bundled, outdated).unwrap();
+            let downloaded = plugin_source(None, Some(&bundled), "0.6.4", released).unwrap();
+            assert_eq!(downloaded.bytes, plugin_model("0.6.4"));
+            assert_eq!(downloaded.label, "release");
+            assert_eq!(downloaded.replaces.as_deref(), Some(bundled.as_path()));
+        }
+
+        let chosen = plugin_source(given.to_str(), Some(&bundled), "0.6.4", unreachable).unwrap();
+        assert_eq!(chosen.bytes, plugin_model("0.6.3"));
+        assert_eq!(chosen.replaces, None);
+
+        let offline = plugin_source(None, Some(&bundled), "0.6.4", unreachable)
+            .err()
+            .map(|error| format!("{error:#}"));
+        assert_eq!(
+            offline,
+            Some(format!(
+                "{} is not the plugin of Renium 0.6.4: no network",
+                bundled.display()
+            ))
+        );
+
+        let alone = plugin_source(None, None, "0.6.4", released).unwrap();
+        assert_eq!(alone.bytes, plugin_model("0.6.4"));
+        assert_eq!(alone.replaces, None);
+
+        fs::remove_dir_all(&folder).unwrap();
+    }
 }

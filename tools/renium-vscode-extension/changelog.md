@@ -10,6 +10,10 @@
 - The Play recipe in the agent guide waits on the state the check reads instead of on elapsed game time. In measured agent runs a copied `workspace.DistributedGameTime > 10` added 3 to 25 seconds to a Play start that was ready after 5.
 - A `hint:` line now and then tells a caller what costs it tokens: a chunk sent whole for the third time with only its strings and numbers changed (keep it in a file, send the values), and runs whose own text is full of unrounded numbers (return the values). In measured agent sessions half of all Luau tokens were such resent chunks.
 
+### Bug fixes
+
+- `rbx setup` and `rbx setup --repair` no longer fail with "The Studio plugin version X does not match Renium Y" when the `Renium.rbxm` beside the executable is from another release. That file is skipped and the plugin of the running release is downloaded; a setup into the default Plugins folder also replaces the file beside the executable with the download.
+
 ## 0.6.4 - 2026-11-15
 
 ### Bug fixes
