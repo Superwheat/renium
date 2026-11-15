@@ -3,6 +3,8 @@
 
 Call the `rbx` tool: the arguments as a list, or `steps` (several lists) to run commands in one call; put every read or check you already know you need into one call. Load the tool first when it is deferred; `rbx` in a shell only without it. Act directly: commands report a missing Studio or a sync problem themselves, so skip `status`, `cs` and `lst`.
 
+When the user says sync or start sync they mean Live Sync, not a scoped `pl` or `ps`: `rbx lon --wait 120`, then make the requested change in the files. Live Sync mirrors the whole place both ways: Studio's changes come into the files (a new folder pulls every service), and files that differ from the last sync go to Studio. When the folder may hold files you cannot account for, or the user limited what may go in, start a just-opened place with `rbx lon --initial-sync-priority verify --wait 120` instead: it writes nothing while the sides differ and names the differences; `RENIUM/sync.md` says how to choose.
+
 ## Scripts: find, read the part, edit, check
 
 - Find: the prompt and `RENIUM/map.md` (in context) give the names. `rbx sg TEXT` (`-E` regex, `--in NAME` or `src/Folder`, `--not TEXT`, `-c` counts) prints the matching lines, those in a function under its `FIRST-LAST name` line; `rbx ss WORD` lists the scripts containing a word. Both show each script's line count.

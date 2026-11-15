@@ -739,6 +739,54 @@ def first_pairing_same_file_difference_is_a_conflict(ctx: Context):
     started = ctx.rbx("lon", ok=False, timeout=200)
     ctx.expect_in("both sides", started.error, "first pairing reports the conflict")
     ctx.expect("return 81" in ctx.read(MAIN) and _source(ctx, "game.ServerScriptService.Main") == "return 82", "neither side written")
+def first_lon_pulls_what_a_folder_lacks(ctx: Context):
+    """SYNC-261: `lon` in a new project folder, and in one that holds a single pulled service, pulls the
+    services the folder lacks and changes nothing in Studio; when Studio changed the pulled service after
+    the pull, the difference waits as a conflict and nothing is written."""
+    ctx.open_studio()
+    _studio_edit(ctx, 'local part = Instance.new("Part") part.Name = "OnlyInStudio" part.Parent = workspace')
+    state = (
+        "local n = 0 for _, name in {'Workspace', 'ReplicatedStorage', 'ServerScriptService', 'Lighting', 'StarterGui', 'ServerStorage'} do "
+        "n += #game:GetService(name):GetDescendants() end "
+        "return n .. '|' .. game.ServerScriptService.Main.Source .. '|' .. game.ReplicatedStorage.Shared.Util.Source"
+    )
+    before = ctx.luau(state)
+
+    def folder(name: str) -> Path:
+        other = ctx.root.parent / f"{ctx.root.name}-{name}"
+        shutil.rmtree(other, ignore_errors=True)
+        other.mkdir()
+        ctx.rbx("init", timeout=60, cwd=other)
+        return other
+
+    for name, pulled_first in (("new", ()), ("partial", ("ReplicatedStorage",))):
+        other = folder(name)
+        try:
+            for service in pulled_first:
+                ctx.rbx("pl", "-s", service, timeout=120, cwd=other)
+            ctx.rbx("lon", "--wait", "60", timeout=200, cwd=other)
+            for service in ("Workspace", "Lighting", "ServerScriptService"):
+                ctx.expect((other / "instances" / f"{service}.renium").is_file(), f"{name}: no {service} store")
+            ctx.expect((other / MAIN).is_file(), f"{name}: Main was not pulled")
+            tree = ctx.rbx("tr", "Workspace", "--depth", "1", json_mode=False, timeout=60, cwd=other)
+            ctx.expect_in("OnlyInStudio", tree.stdout, f"{name}: the Studio-only part in the files")
+            ctx.expect(ctx.luau(state) == before, f"{name}: Studio changed")
+        finally:
+            ctx.rbx("lof", ok=None, timeout=60, cwd=other)
+            shutil.rmtree(other, ignore_errors=True)
+
+    other = folder("moved-on")
+    try:
+        ctx.rbx("pl", "-s", "ReplicatedStorage", timeout=120, cwd=other)
+        _studio_edit(ctx, 'game.ReplicatedStorage.Shared.Util.Source = "return 261"')
+        refused = ctx.rbx("lon", "--wait", "60", ok=False, timeout=200, cwd=other)
+        ctx.expect_in("Util", refused.error, "the conflict names the script")
+        ctx.expect(not (other / "instances" / "Workspace.renium").exists(), "a store was written beside a conflict")
+        ctx.expect("261" not in (other / UTIL).read_text(encoding="utf-8"), "the pulled file was overwritten")
+        ctx.expect_in("return 261", _source(ctx, "game.ReplicatedStorage.Shared.Util"), "Studio kept its edit")
+    finally:
+        ctx.rbx("lof", ok=None, timeout=60, cwd=other)
+        shutil.rmtree(other, ignore_errors=True)
 
 
 def first_pairing_preference_resolves(ctx: Context):
@@ -926,6 +974,7 @@ SCENARIOS = [
     Scenario("SYNC-138", "offline file edits push after reopen", "small", offline_file_edits_push_after_reopen),
     Scenario("SYNC-081", "first pairing same-file difference is a conflict", "small", first_pairing_same_file_difference_is_a_conflict),
     Scenario("SYNC-082", "first pairing preference resolves", "small", first_pairing_preference_resolves),
+    Scenario("SYNC-261", "first lon pulls what a folder lacks", "small", first_lon_pulls_what_a_folder_lacks),
     Scenario("SYNC-112", "large batch under Live Sync", "small", large_batch_under_live_sync),
     Scenario("SYNC-139", "full push rewrites a script and recreates an instance", "small", full_push_rewrites_script_and_recreates_instance),
     Scenario("SYNC-258", "staged push reads the project's threshold", "small", staged_push_reviews_against_the_project_threshold),

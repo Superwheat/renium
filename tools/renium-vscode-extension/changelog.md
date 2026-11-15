@@ -8,6 +8,7 @@
 - `rbx l -a VALUE` and `rbx lc -a VALUE` pass values to the code as `...` (JSON, or any other text as a string; repeat for more), so a probe kept in a file runs with new values without being sent again: `rbx l -f probe.luau -a "Car 2" -a 5`.
 - A Luau result longer than 12,000 characters is cut on a line end and kept whole in a file under `.renium/cache/` that the cut line names (the newest eight are kept); notes and hints follow the cut. The limit was 100,000 characters with nothing kept. `-o FILE` writes a result to a file and prints one line about it. A collected runner past the limit prints its state in lines.
 - The Play recipe in the agent guide waits on the state the check reads instead of on elapsed game time. In measured agent runs a copied `workspace.DistributedGameTime > 10` added 3 to 25 seconds to a Play start that was ready after 5.
+- The agent guide says that a user who asks to sync or start sync means Live Sync (`rbx lon`), what Live Sync moves in each direction, and to start in verify mode on a just-opened place whose files the agent cannot account for. The sync guide says what `rbx lon` does in a new or partly pulled folder and that a preference does not hold back a file-side difference.
 - A `hint:` line now and then tells a caller what costs it tokens: a chunk sent whole for the third time with only its strings and numbers changed (keep it in a file, send the values), and runs whose own text is full of unrounded numbers (return the values). In measured agent sessions half of all Luau tokens were such resent chunks.
 
 ### Bug fixes

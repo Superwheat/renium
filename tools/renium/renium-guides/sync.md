@@ -1,6 +1,6 @@
 # Sync
 
-`pl`: Studio → files (replaces the pulled files). `ps`: files → Studio. Live Sync handles both directions. First connection: a new or `pi`-imported project pulls once after Studio opens the place; an existing project runs only `rbx lon`.
+`pl`: Studio → files (replaces the pulled files). `ps`: files → Studio. Live Sync handles both directions, and it is what a user who says sync or start sync asks for. First connection: `rbx lon` in a new project pulls every service; in a partly pulled one it pulls the services the folder lacks once the files it holds match Studio (a difference there waits as a conflict and nothing is written); a `pi`-imported project pulls once after Studio opens the place; an existing project runs only `rbx lon`.
 
 ```powershell
 rbx pl
@@ -33,7 +33,7 @@ Live Sync compares each side with their last common Renium state: one-sided chan
 
 A place closed without saving can reopen older than the files: set `rbx cfg set liveSync.initialSyncPriority verify` before `rbx ro` and read `rbx lst --details`.
 
-`rbx lst --details` shows both values and verify paths as `push:` (files differ) or `pull:` (Studio differs); `rbx lon --prefer studio|editor` overrides verify for that run. Keep the side you can account for: `studio` after merely opening the place, `editor` when the files carry your work; ask only when both sides hold edits you did not make.
+`rbx lst --details` shows both values and verify paths as `push:` (files differ) or `pull:` (Studio differs); `rbx lon --prefer studio|editor` overrides verify for that run. Keep the side you can account for: `studio` after merely opening the place, `editor` when the files carry your work; ask only when both sides hold edits you did not make. A preference settles only what both sides changed: a file that differs from the last sync, or a script only the files hold, goes to Studio as your edit under either preference. When the differences include files you cannot account for (older copies, a folder brought in from elsewhere), do not resolve over them: ask, or take Studio's version of a service with `rbx lof`, `rbx pl -s SERVICE` and `rbx lon`. That pull replaces the service's files and removes scripts Studio lacks; `rbx rev --sync ID` with the `historyId` it returned restores them.
 
 ```powershell
 rbx cfg get liveSync.initialSyncPriority
