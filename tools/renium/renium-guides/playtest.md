@@ -18,7 +18,7 @@ rbx play -s                         # ordinary Play: one window
 rbx play -s --players 2             # local server and two clients
 rbx play -s --players 2 --until 'shared.RoundHandler.GameState == "InRound"'
 rbx play -s --no-ready                 # return before the players have joined
-rbx play -s --until 'workspace.DistributedGameTime > 10' --console 40 --stop-after   # return the server console, then stop
+rbx play -s --until 'shared.RoundHandler ~= nil' --console 40 --stop-after   # return the server console, then stop
 rbx play -s --at Workspace.Lobby.Pad --until 'game.Players:GetPlayers()[1]:GetAttribute("Checkpoint") == 1' --console 20 --stop-after   # stand the player on a part first
 rbx play -s --client-until 'game.Players.LocalPlayer.PlayerGui.Main.Shop.Visible' --client-result 'LUAU'   # wait on client 1, then read it
 rbx play -r                         # restart after a code change (stops, then starts the same way)
