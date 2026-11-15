@@ -1466,6 +1466,23 @@ pub(super) struct ExecuteLuauArgs {
         long
     )]
     pub(super) timeout: Option<f64>,
+    #[arg(
+        help = "A value the code reads from `...`: JSON, or any other text as a string (repeat for more)",
+        short,
+        long,
+        value_name = "VALUE",
+        allow_hyphen_values = true,
+        conflicts_with = "collect"
+    )]
+    pub(super) arg: Vec<String>,
+    #[arg(
+        help = "Write the result to this file and print one line about it",
+        short,
+        long,
+        value_name = "FILE",
+        conflicts_with = "detach"
+    )]
+    pub(super) out: Option<PathBuf>,
     #[command(flatten)]
     pub(super) runner: LuauRunnerArgs,
 }
@@ -1498,6 +1515,23 @@ pub(super) struct ExecuteClientLuauArgs {
         long
     )]
     pub(super) timeout: Option<f64>,
+    #[arg(
+        help = "A value the code reads from `...`: JSON, or any other text as a string (repeat for more)",
+        short,
+        long,
+        value_name = "VALUE",
+        allow_hyphen_values = true,
+        conflicts_with = "collect"
+    )]
+    pub(super) arg: Vec<String>,
+    #[arg(
+        help = "Write the result to this file and print one line about it",
+        short,
+        long,
+        value_name = "FILE",
+        conflicts_with = "detach"
+    )]
+    pub(super) out: Option<PathBuf>,
     #[command(flatten)]
     pub(super) runner: LuauRunnerArgs,
 }
@@ -1557,6 +1591,8 @@ impl ExecuteClientLuauArgs {
             server: false,
             edit: false,
             timeout: self.timeout,
+            arg: self.arg,
+            out: self.out,
             runner: self.runner,
         })
     }

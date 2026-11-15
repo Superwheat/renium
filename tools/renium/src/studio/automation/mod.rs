@@ -41,6 +41,7 @@ pub(crate) mod property_access;
 mod recording;
 mod recording_review;
 pub(crate) mod render_quality;
+pub(crate) mod result_text;
 pub(crate) mod test_processes;
 
 pub(crate) use console::{get_console_output_command, get_console_output_result};
@@ -79,9 +80,11 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
         default_luau_run_timeout(code.as_deref().unwrap_or(""))
     });
     let parameters = luau_command_parameters(&args, timeout);
-    let text = args.runner.detach.is_none()
-        && args.runner.collect.is_none()
-        && crate::app::output::compact_text_output();
+    let compact = crate::app::output::compact_text_output();
+    if args.out.is_some() && !compact {
+        bail!("--out writes the text form of a result and does not combine with --output-mode");
+    }
+    let text = args.runner.detach.is_none() && args.runner.collect.is_none() && compact;
     let mut result = match daemon_result(op::LUAU, None, parameters, false, Some(&args.bridge)) {
         Err(error) if text => {
             crate::app::output::write_stderr(format_args!("error: {error:#}"));
@@ -117,8 +120,20 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
         }
     }
     if text {
-        crate::app::output::write_stdout(format_args!("{}", luau_text(&result)));
-        return Ok(());
+        return print_luau_text(
+            &luau_body(&result),
+            &luau_trailer(&result),
+            args.out.as_deref(),
+        );
+    }
+    if compact && args.runner.collect.is_some() {
+        let short = result_text::compact_value(&result);
+        // A runner's state is the caller's own data, often a long log: one
+        // that passes the limit prints as lines, so the cut falls between two.
+        if args.out.is_some() || short.to_string().chars().count() > LUAU_TEXT_LIMIT {
+            return print_luau_text(&collected_text(&result), &[], args.out.as_deref());
+        }
+        return print_json_output(&short, false);
     }
     print_json_output(&result, false)
 }
@@ -134,6 +149,7 @@ fn luau_command_parameters(args: &ExecuteLuauArgs, timeout: f64) -> Value {
         "server": args.server,
         "edit": args.edit,
         "timeout": timeout,
+        "args": args.arg,
         "detach": args.runner.detach,
         "collect": args.runner.collect,
         "stop": args.runner.stop,
@@ -144,13 +160,11 @@ fn luau_command_parameters(args: &ExecuteLuauArgs, timeout: f64) -> Value {
     })
 }
 
-/// What a plain `rbx l` or `rbx lc` run prints in text mode: the lines the
-/// code printed as `[level] message`, then each returned value on a line of
-/// its own (a string as it is, `nil`, anything else as compact JSON), or `ok`
-/// when it returned nothing. Whatever else the result carries for the reader
-/// to act on (`timeoutSeconds`, `syncReview`) follows as one `note:` line;
-/// where the run landed and how it persists stay in json mode.
-fn luau_text(result: &Value) -> String {
+/// What a plain `rbx l` or `rbx lc` run prints in text mode before its
+/// closing lines: the lines the code printed as `[level] message`, then each
+/// returned value (`result_text::value_text`), or `ok` when it returned
+/// nothing. Where the run landed and how it persists stay in json mode.
+fn luau_body(result: &Value) -> String {
     let mut lines = result
         .get("output")
         .and_then(Value::as_array)
@@ -163,10 +177,23 @@ fn luau_text(result: &Value) -> String {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    lines.extend(values.iter().map(luau_value_text));
+    let alone = values.len() == 1;
+    lines.extend(
+        values
+            .iter()
+            .map(|value| result_text::value_text(value, alone)),
+    );
     if values.is_empty() {
         lines.push("ok".to_string());
     }
+    lines.join("\n")
+}
+
+/// The closing lines of a plain run: whatever else the result carries for
+/// the reader to act on (`syncReview`, `listeners`) as one `note:` line, and
+/// the daemon's advice on spending fewer tokens as a `hint:` line. They are
+/// printed after a cut, so a long result does not lose them.
+fn luau_trailer(result: &Value) -> Vec<String> {
     let notes = result
         .as_object()
         .into_iter()
@@ -174,68 +201,166 @@ fn luau_text(result: &Value) -> String {
         .filter(|(key, _)| {
             !matches!(
                 key.as_str(),
-                "ok" | "context" | "persistence" | "results" | "output" | "timeoutSeconds"
+                "ok" | "context" | "persistence" | "results" | "output" | "timeoutSeconds" | "hint"
             )
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<Map<String, Value>>();
+    let mut lines = Vec::new();
     if !notes.is_empty() {
         lines.push(format!("note: {}", Value::Object(notes)));
     }
-    cap_luau_text(lines.join("\n"))
-}
-
-/// The most characters a plain Luau run prints in text mode.
-const LUAU_TEXT_LIMIT: usize = 100_000;
-
-/// A run's text, cut at the limit with a last line that says how much was
-/// left out, so one oversized return does not fill a reader's context.
-fn cap_luau_text(text: String) -> String {
-    let Some((cut, _)) = text.char_indices().nth(LUAU_TEXT_LIMIT) else {
-        return text;
-    };
-    let total = text.chars().count();
-    format!(
-        "{}\n... (cut: {LUAU_TEXT_LIMIT} of {total} characters shown; return less, or read it with --output-mode json)",
-        &text[..cut]
-    )
-}
-
-/// Whether a returned string, printed as it is, would read as something
-/// else: another value (`nil`, `true`, a number, a JSON value), the `ok` of a
-/// run that returned nothing, or one of the lines a run prints around its
-/// values.
-fn reads_as_another_value(text: &str) -> bool {
-    text.is_empty()
-        || matches!(text, "nil" | "ok")
-        || serde_json::from_str::<Value>(text).is_ok()
-        || [
-            "[print] ",
-            "[warn] ",
-            "[error] ",
-            "[info] ",
-            "note: ",
-            "error: ",
-            "... (cut: ",
-        ]
-        .iter()
-        .any(|prefix| text.starts_with(prefix))
-}
-
-fn luau_value_text(value: &Value) -> String {
-    match value {
-        Value::String(text) if reads_as_another_value(text) => value.to_string(),
-        Value::String(text) => text.clone(),
-        Value::Null => "nil".to_string(),
-        Value::Object(map) if map.len() == 1 && map.get("_type") == Some(&json!("Nil")) => {
-            "nil".to_string()
-        }
-        other => {
-            let mut shortened = other.clone();
-            crate::app::output::shorten_single_precision_floats(&mut shortened);
-            shortened.to_string()
-        }
+    if let Some(hint) = result.get("hint").and_then(Value::as_str) {
+        lines.push(format!("hint: {hint}"));
     }
+    lines
+}
+
+/// A plain run's whole text when nothing is cut.
+#[cfg(test)]
+fn luau_text(result: &Value) -> String {
+    shown_luau_text(&luau_body(result), &luau_trailer(result), |_| None)
+}
+
+/// A collected runner in lines: its status as one JSON line, what it printed,
+/// then `state:` and `results:` with their values in the text form.
+fn collected_text(result: &Value) -> String {
+    let status = result
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| !matches!(key.as_str(), "state" | "results" | "output"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Map<String, Value>>();
+    let mut lines = vec![Value::Object(status).to_string()];
+    lines.extend(
+        result
+            .get("output")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(console::console_entry_line),
+    );
+    if let Some(state) = result.get("state") {
+        lines.push(format!("state:\n{}", result_text::value_text(state, true)));
+    }
+    if let Some(values) = result.get("results").and_then(Value::as_array) {
+        lines.push("results:".to_string());
+        lines.extend(
+            values
+                .iter()
+                .map(|value| result_text::value_text(value, values.len() == 1)),
+        );
+    }
+    lines.join("\n")
+}
+
+/// The most characters a Luau run prints in text mode. Results past it are
+/// rare (2 of 735 measured agent calls) and cost a reader thousands of
+/// tokens each.
+const LUAU_TEXT_LIMIT: usize = 12_000;
+
+/// The text cut at the limit, on a line end when one is near, and how many
+/// characters it holds in all; None for text within the limit.
+fn cut_luau_text(text: &str) -> Option<(&str, usize)> {
+    let (limit, _) = text.char_indices().nth(LUAU_TEXT_LIMIT)?;
+    let shown = &text[..limit];
+    let shown = match shown.rfind('\n') {
+        Some(line_end) if line_end >= limit - limit / 4 => &shown[..line_end],
+        _ => shown,
+    };
+    Some((shown, text.chars().count()))
+}
+
+/// What a run's text prints as: the body, cut past the limit with a line
+/// that says how much was left out and where `saved` put all of it, then the
+/// closing lines.
+fn shown_luau_text(
+    body: &str,
+    trailer: &[String],
+    saved: impl FnOnce(&str) -> Option<String>,
+) -> String {
+    let mut lines = match cut_luau_text(body) {
+        None => vec![body.to_string()],
+        Some((shown, total)) => {
+            let rest = match saved(body) {
+                Some(file) => format!("all of it is in {file}"),
+                None => "return less, or write all of it with --out FILE".to_string(),
+            };
+            vec![
+                shown.to_string(),
+                format!(
+                    "... (cut: {} of {total} characters shown; {rest})",
+                    shown.chars().count()
+                ),
+            ]
+        }
+    };
+    lines.extend(trailer.iter().cloned());
+    lines.join("\n")
+}
+
+/// The files of cut results a project keeps; older ones are removed.
+const LUAU_OVERFLOW_FILES: usize = 8;
+
+/// Saves a cut result in the cache of the project the command runs in (the
+/// nearest folder up from the current one that holds a project) and names the
+/// file as the caller can open it; None outside a project. Each run gets a
+/// file of its own, so runs side by side do not point at each other's text.
+fn save_luau_overflow(text: &str) -> Option<String> {
+    let current = std::env::current_dir().ok()?;
+    let project = current.ancestors().find(|folder| {
+        folder.join(".renium").is_dir()
+            || folder
+                .join(crate::project::config::PROJECT_FILE_NAME)
+                .is_file()
+    })?;
+    let cache = project.join(".renium").join("cache");
+    fs::create_dir_all(&cache).ok()?;
+    let file = cache.join(format!(
+        "luau-output-{}-{}.txt",
+        current_millis(),
+        std::process::id()
+    ));
+    fs::write(&file, format!("{text}\n")).ok()?;
+    let mut kept = fs::read_dir(&cache)
+        .ok()?
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("luau-output-") && name.ends_with(".txt"))
+        })
+        .collect::<Vec<_>>();
+    kept.sort();
+    for old in kept.iter().rev().skip(LUAU_OVERFLOW_FILES) {
+        let _ = fs::remove_file(old);
+    }
+    let shown = file.strip_prefix(&current).unwrap_or(&file);
+    Some(shown.to_string_lossy().replace('\\', "/"))
+}
+
+/// Prints a run's text. With `--out FILE` the body goes to the file and one
+/// line says so; otherwise a body past the limit is cut and kept whole in the
+/// project's cache, so one oversized return does not fill a reader's context.
+fn print_luau_text(body: &str, trailer: &[String], out: Option<&Path>) -> Result<()> {
+    let text = match out {
+        Some(out) => {
+            fs::write(out, format!("{body}\n"))
+                .with_context(|| format!("Failed to write {}", out.display()))?;
+            let mut lines = vec![format!(
+                "{} lines ({} characters) written to {}",
+                body.lines().count(),
+                body.chars().count(),
+                out.display()
+            )];
+            lines.extend(trailer.iter().cloned());
+            lines.join("\n")
+        }
+        None => shown_luau_text(body, trailer, save_luau_overflow),
+    };
+    crate::app::output::write_stdout(format_args!("{text}"));
+    Ok(())
 }
 
 pub(crate) fn validate_luau_syntax(code: &str) -> Result<()> {
@@ -583,12 +708,19 @@ pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) 
         ensure_luau_ok_in_context(&result, player, None)?;
         return Ok(result);
     }
-    let code = if let Some(code) = args.code.or(args.inline_code) {
-        code
+    let (written, sent_whole) = if let Some(code) = args.code.or(args.inline_code) {
+        (code, true)
     } else if let Some(path) = args.file {
-        read_luau_file(&path)?
+        (read_luau_file(&path)?, false)
     } else {
         bail!("Missing Luau code. Use -e <code> or -f <file>.");
+    };
+    let code = if args.arg.is_empty() {
+        written.clone()
+    } else {
+        // Checked as written, so a syntax error names the caller's own lines.
+        validate_luau_syntax(&written)?;
+        luau_with_arguments(&written, &args.arg)?
     };
     let timeout = args
         .timeout
@@ -610,7 +742,213 @@ pub(crate) fn execute_luau_result(args: ExecuteLuauArgs, bridge: &BridgeServer) 
     if kept {
         strip_kept_runner_fields(&mut result);
     }
+    // Advice goes to the runs a caller wrote, not to chunks Renium composes.
+    if args.runner.keep_alive && args.runner.detach.is_none() {
+        let resent = sent_whole
+            .then(|| lock_token_advice().resent(&written))
+            .flatten()
+            .map(|runs| resent_chunk_hint(runs, client));
+        let hint = resent.or_else(|| {
+            lock_token_advice()
+                .long_floats(&result)
+                .then(|| LONG_FLOATS_HINT.to_string())
+        });
+        if let Some(hint) = hint {
+            result["hint"] = json!(hint);
+        }
+    }
     Ok(result)
+}
+
+/// A `-a` value: JSON when it is JSON, any other text as a string. Text that
+/// opens like a JSON table or string and is neither is an error, since a
+/// shell that ate the quotes would otherwise hand the chunk a string where it
+/// expects a table.
+fn luau_argument(value: &str) -> Result<Value> {
+    match serde_json::from_str(value) {
+        Ok(parsed) => Ok(parsed),
+        Err(error) if value.starts_with(['{', '[', '"']) => bail!(
+            "-a {value}: not valid JSON ({error}); a table is written as {{\"key\":1}} or [1,2], and text that starts with {{, [ or a quote as a JSON string"
+        ),
+        Err(_) => Ok(Value::String(value.to_string())),
+    }
+}
+
+/// The chunk with `values` as its `...`. The wrapper opens on the chunk's
+/// first line and closes on a line of its own, so error lines keep their
+/// numbers and a comment on the last line ends before `end`.
+fn luau_with_arguments(code: &str, values: &[String]) -> Result<String> {
+    let literals = values
+        .iter()
+        .map(|value| Ok(luau_literal(&luau_argument(value)?)))
+        .collect::<Result<Vec<_>>>()?
+        .join(",");
+    Ok(format!("return (function(...) {code}\nend)({literals})"))
+}
+
+/// A JSON value written as Luau.
+fn luau_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "nil".to_string(),
+        Value::Bool(_) | Value::Number(_) => value.to_string(),
+        Value::String(text) => {
+            let mut literal = String::with_capacity(text.len() + 2);
+            literal.push('"');
+            for character in text.chars() {
+                match character {
+                    '"' | '\\' => {
+                        literal.push('\\');
+                        literal.push(character);
+                    }
+                    '\n' => literal.push_str("\\n"),
+                    '\r' => literal.push_str("\\r"),
+                    control if control.is_control() => {
+                        literal.push_str(&format!("\\u{{{:X}}}", control as u32));
+                    }
+                    other => literal.push(other),
+                }
+            }
+            literal.push('"');
+            literal
+        }
+        Value::Array(items) => format!(
+            "{{{}}}",
+            items.iter().map(luau_literal).collect::<Vec<_>>().join(",")
+        ),
+        Value::Object(fields) => format!(
+            "{{{}}}",
+            fields
+                .iter()
+                .map(|(key, item)| format!(
+                    "[{}]={}",
+                    luau_literal(&Value::String(key.clone())),
+                    luau_literal(item)
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
+}
+
+/// The chunk with every string, number, comment and space taken out: what
+/// two runs share when only their values differ.
+fn luau_skeleton(code: &str) -> String {
+    use full_moon::tokenizer::{Lexer, LexerResult, TokenType};
+    let tokens = match Lexer::new(code, full_moon::LuaVersion::luau()).collect() {
+        LexerResult::Ok(tokens) | LexerResult::Recovered(tokens, _) => tokens,
+        LexerResult::Fatal(_) => return code.to_string(),
+    };
+    let mut skeleton = String::with_capacity(code.len());
+    for token in &tokens {
+        match token.token_type() {
+            TokenType::StringLiteral { .. }
+            | TokenType::InterpolatedString { .. }
+            | TokenType::Number { .. } => skeleton.push('0'),
+            TokenType::SingleLineComment { .. }
+            | TokenType::MultiLineComment { .. }
+            | TokenType::Whitespace { .. } => {}
+            _ => {
+                skeleton.push_str(&token.to_string());
+                skeleton.push(' ');
+            }
+        }
+    }
+    skeleton
+}
+
+/// A chunk shorter than this costs about as much as the call that would
+/// replace it.
+const RESENT_CHUNK_MIN_LENGTH: usize = 200;
+
+/// How many chunk shapes the daemon remembers before it starts over.
+const RESENT_CHUNK_SHAPES: usize = 1024;
+
+/// Unrounded numbers in the text a run built before the run counts as one
+/// that spends tokens on digits.
+const LONG_FLOATS_PER_RUN: usize = 4;
+
+const LONG_FLOATS_HINT: &str = "the text this code builds carries every digit of its numbers; return the values themselves (a table for several) and they print to 3 decimals";
+
+/// What the daemon has seen callers spend tokens on, for the `hint:` line of
+/// a Luau run. Agents resend one probe a dozen times with other values and
+/// format numbers into text digit by digit; a hint now and then costs less
+/// than either habit.
+#[derive(Default)]
+struct TokenAdvice {
+    chunk_runs: std::collections::HashMap<u64, u32>,
+    long_float_runs: u32,
+}
+
+impl TokenAdvice {
+    /// How often this chunk has been sent whole with only its values
+    /// changed, when that is worth saying: the third time, and again each
+    /// time the count doubles.
+    fn resent(&mut self, code: &str) -> Option<u32> {
+        use std::hash::{Hash, Hasher};
+        let skeleton = luau_skeleton(code);
+        if skeleton.len() < RESENT_CHUNK_MIN_LENGTH {
+            return None;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        skeleton.hash(&mut hasher);
+        if self.chunk_runs.len() >= RESENT_CHUNK_SHAPES {
+            self.chunk_runs.clear();
+        }
+        let runs = self.chunk_runs.entry(hasher.finish()).or_insert(0);
+        *runs += 1;
+        (runs.is_multiple_of(3) && (*runs / 3).is_power_of_two()).then_some(*runs)
+    }
+
+    /// Whether to say that this run's own text is full of unrounded numbers:
+    /// the second run that is, and again each time their count doubles.
+    fn long_floats(&mut self, result: &Value) -> bool {
+        static LONG: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"\d\.\d{6,}").expect("valid float pattern")
+        });
+        let texts = result
+            .get("results")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            // A JSON table in a string prints as the table, rounded.
+            .filter(|text| !text.starts_with(['{', '[']))
+            .chain(
+                result
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.get("message").and_then(Value::as_str)),
+            );
+        let found = texts
+            .map(|text| LONG.find_iter(text).count())
+            .sum::<usize>();
+        if found < LONG_FLOATS_PER_RUN {
+            return false;
+        }
+        self.long_float_runs += 1;
+        self.long_float_runs >= 2 && self.long_float_runs.is_power_of_two()
+    }
+}
+
+fn lock_token_advice() -> std::sync::MutexGuard<'static, TokenAdvice> {
+    static ADVICE: std::sync::LazyLock<std::sync::Mutex<TokenAdvice>> =
+        std::sync::LazyLock::new(Default::default);
+    ADVICE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn resent_chunk_hint(runs: u32, client: bool) -> String {
+    let command = if client {
+        "rbx lc -f FILE PLAYER -a VALUE"
+    } else {
+        "rbx l -f FILE -a VALUE"
+    };
+    format!(
+        "this chunk has now been sent {runs} times with only its values changed; put it in a file once and send the values: `{command}`"
+    )
 }
 
 pub(crate) fn studio_device_command(args: StudioDeviceArgs) -> Result<()> {
@@ -1512,6 +1850,11 @@ fn compact_play_result(result: &mut Value, named_players: bool) {
         ("clientUntil", "clientUntilSeconds"),
     ] {
         compact_play_wait(map, key, seconds_key);
+    }
+    for key in ["result", "clientResult"] {
+        if let Some(value) = map.get_mut(key) {
+            *value = result_text::compact_value(value);
+        }
     }
     if let Some(status) = map.get_mut("status").and_then(Value::as_object_mut) {
         status.remove("lastResult");
@@ -4588,10 +4931,14 @@ fn run_input_command(
 }
 
 /// A wait's record without the echo of its request, its seconds rounded to
-/// one decimal; a timed-out wait keeps its last value and error.
+/// one decimal and its `--result` value in the short form of a Luau result; a
+/// timed-out wait keeps its last value and error.
 fn compact_wait_record(record: &mut Map<String, Value>) {
     record.remove("action");
     record.remove("condition");
+    if let Some(value) = record.get_mut("result") {
+        *value = result_text::compact_value(value);
+    }
     for key in ["elapsedSeconds", "waitedSeconds"] {
         if let Some(seconds) = record.get(key).and_then(Value::as_f64) {
             record.insert(key.to_string(), json!((seconds * 10.0).round() / 10.0));
@@ -6204,7 +6551,7 @@ mod compact_result_tests {
                 "results": ["say \"hi\"\nthen leave", 3, true, {"_type": "Nil"}, null,
                     {"abs": 228.31427001953125, "list": [1, "a"]}, []]
             })),
-            "say \"hi\"\nthen leave\n3\ntrue\nnil\nnil\n{\"abs\":228.31427,\"list\":[1,\"a\"]}\n[]"
+            "say \"hi\"\nthen leave\n3\ntrue\nnil\nnil\n{\"abs\":228.314,\"list\":[1,\"a\"]}\n[]"
         );
         assert_eq!(luau_text(&json!({"ok": true, "context": "server"})), "ok");
         assert_eq!(
@@ -6230,17 +6577,6 @@ mod compact_result_tests {
             })),
             "[print] step 1\n  step 2\n[warn] [Renium stopped capturing command output at its size limit.]\n{\"_truncated\":{\"kept\":128,\"total\":300},\"a\":1}\nnote: {\"syncReview\":\"Live Sync is waiting\"}"
         );
-        let long =
-            luau_text(&json!({"ok": true, "results": ["\u{e9}".repeat(LUAU_TEXT_LIMIT + 7)]}));
-        let (shown, note) = long.split_once('\n').unwrap();
-        assert_eq!(shown.chars().count(), LUAU_TEXT_LIMIT);
-        assert_eq!(
-            note,
-            format!(
-                "... (cut: {LUAU_TEXT_LIMIT} of {} characters shown; return less, or read it with --output-mode json)",
-                LUAU_TEXT_LIMIT + 7
-            )
-        );
         assert_eq!(
             luau_text(&json!({"ok": true, "output": [{"type": "print", "message": "done"}]})),
             "[print] done\nok"
@@ -6248,35 +6584,263 @@ mod compact_result_tests {
     }
 
     #[test]
-    fn a_play_result_hands_its_consoles_over_as_text() {
-        let mut result = json!({
-            "ok": true, "mode": "play", "clients": 1, "until": "true", "untilSeconds": 7.1,
-            "console": [
-                {"message": "Workspace.Pack:1: Expected identifier", "time": 62.5, "type": "error"},
-                {"message": "event fired.", "repeat": 3, "time": 62.5, "type": "info"},
-                {"message": "ContentId: rbxassetid://128044540936968 failed", "time": 62.5, "type": "warn"},
-                {"message": "event fired.", "repeat": 2, "time": 62.6, "type": "info"},
-                {"message": "ContentId: rbxassetid://977129176443663 failed", "time": 63.1, "type": "warn"}
-            ],
-            "clientConsole": []
-        });
+    fn a_long_luau_result_is_cut_at_the_limit_or_the_line_before_it() {
+        assert_eq!(cut_luau_text(&"a".repeat(LUAU_TEXT_LIMIT)), None);
+        let unbroken = "\u{e9}".repeat(LUAU_TEXT_LIMIT + 7);
+        let (shown, total) = cut_luau_text(&unbroken).unwrap();
+        assert_eq!(shown.chars().count(), LUAU_TEXT_LIMIT);
+        assert_eq!(total, LUAU_TEXT_LIMIT + 7);
+        let lines = "0123456789\n".repeat(LUAU_TEXT_LIMIT / 10);
+        let (shown, total) = cut_luau_text(&lines).unwrap();
+        assert!(shown.ends_with("\n0123456789"));
+        assert!(shown.len() >= LUAU_TEXT_LIMIT - 11);
+        assert_eq!(total, lines.len());
+        // A line end far before the limit is not worth the text after it.
+        let late = format!("first\n{}", "b".repeat(LUAU_TEXT_LIMIT * 2));
         assert_eq!(
-            take_play_consoles(&mut result),
-            vec![
-                "server console:",
-                "[error] Workspace.Pack:1: Expected identifier",
-                "[info] event fired. (x5)",
-                "[warn] ContentId: rbxassetid://128044540936968 failed (+1 similar)",
-                "client console: empty",
+            cut_luau_text(&late).unwrap().0.chars().count(),
+            LUAU_TEXT_LIMIT
+        );
+    }
+
+    #[test]
+    fn a_lone_value_spreads_over_lines_and_several_values_stay_one_line_each() {
+        let list = json!([{"x": 1.23456}, {"x": 2}]);
+        assert_eq!(
+            luau_text(&json!({"ok": true, "results": [list]})),
+            "x\n1.235\n2"
+        );
+        assert_eq!(
+            luau_text(&json!({"ok": true, "results": [list, 5, ["a b", "c d"]]})),
+            "[{\"x\":1.235},{\"x\":2}]\n5\n[\"a b\",\"c d\"]"
+        );
+        // Text the code built keeps its digits; returned numbers are rounded.
+        assert_eq!(
+            luau_text(&json!({
+                "ok": true,
+                "output": [{"type": "print", "message": "dt 0.016666668"}],
+                "results": ["at 846.5567626953125", 846.5567626953125],
+            })),
+            "[print] dt 0.016666668\nat 846.5567626953125\n846.557"
+        );
+    }
+
+    #[test]
+    fn a_cut_result_keeps_its_note_and_hint_and_names_the_saved_file() {
+        let result = json!({
+            "ok": true,
+            "results": [(1..=2000).map(|n| format!("line {n} of a listing")).collect::<Vec<_>>()],
+            "hint": "store it", "syncReview": "waiting"
+        });
+        let body = luau_body(&result);
+        let trailer = luau_trailer(&result);
+        assert_eq!(
+            trailer,
+            ["note: {\"syncReview\":\"waiting\"}", "hint: store it"]
+        );
+        let mut saved = None;
+        let shown = shown_luau_text(&body, &trailer, |whole| {
+            saved = Some(whole.to_string());
+            Some(".renium/cache/luau-output-1.txt".to_string())
+        });
+        assert_eq!(saved.as_deref(), Some(body.as_str()));
+        let lines = shown.lines().collect::<Vec<_>>();
+        let (cut, closing) = lines.split_at(lines.len() - 3);
+        assert!(cut.len() < 2000 && cut.last().unwrap().starts_with("line "));
+        let shown_characters = cut.join("\n").chars().count();
+        assert!(shown_characters <= LUAU_TEXT_LIMIT && shown_characters > LUAU_TEXT_LIMIT - 40);
+        assert_eq!(
+            closing,
+            [
+                format!(
+                    "... (cut: {shown_characters} of {} characters shown; all of it is in .renium/cache/luau-output-1.txt)",
+                    body.chars().count()
+                )
+                .as_str(),
+                "note: {\"syncReview\":\"waiting\"}",
+                "hint: store it",
+            ]
+        );
+        let unsaved = shown_luau_text(&body, &[], |_| None);
+        assert!(
+            unsaved.ends_with("characters shown; return less, or write all of it with --out FILE)")
+        );
+        assert_eq!(
+            shown_luau_text("short", &trailer, |_| panic!("nothing to save")),
+            "short\nnote: {\"syncReview\":\"waiting\"}\nhint: store it"
+        );
+    }
+
+    #[test]
+    fn a_collected_runner_prints_its_state_in_lines() {
+        assert_eq!(
+            collected_text(&json!({
+                "ok": true, "context": "server", "name": "probe", "done": true, "elapsedSeconds": 1.062,
+                "output": [{"type": "print", "message": "armed"}],
+                "state": {"phase": "done", "log": ["0.4 track", "0.8 drift"], "at": {"_type": "Vector3", "x": 1.23456, "y": 2, "z": 3}},
+                "results": [true]
+            })),
+            "{\"context\":\"server\",\"done\":true,\"elapsedSeconds\":1.062,\"name\":\"probe\",\"ok\":true}\n[print] armed\nstate:\n{\"at\":\"Vector3(1.235, 2, 3)\",\"phase\":\"done\"}\nlog:\n0.4 track\n0.8 drift\nresults:\ntrue"
+        );
+    }
+
+    /// What the chunk returns when it runs with these `-a` values.
+    fn run_with_arguments(code: &str, values: &[&str]) -> Value {
+        use mlua::LuaSerdeExt;
+        let values = values
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        let wrapped = luau_with_arguments(code, &values).unwrap();
+        let lua = mlua::Lua::new();
+        let returned: mlua::MultiValue = lua.load(wrapped).eval().unwrap();
+        Value::Array(
+            returned
+                .into_iter()
+                .map(|value| lua.from_value(value).unwrap())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn arguments_reach_a_chunk_as_its_varargs() {
+        assert_eq!(
+            run_with_arguments(
+                "local name, n, text, none, table, odd = ...\nreturn name, n * 2, text, none == nil, table.at[2], table.on, odd, select(\"#\", ...) -- done",
+                &[
+                    "Door",
+                    "5",
+                    "\"5\"",
+                    "null",
+                    "{\"at\":[1,2.5],\"on\":true}",
+                    "say \"hi\"\\\n\t\u{7}"
+                ]
+            ),
+            json!(["Door", 10, "5", true, 2.5, true, "say \"hi\"\\\n\t\u{7}", 6])
+        );
+        // A chunk that returns nothing, one that ends in a comment, and a
+        // value that is not JSON and is taken as text.
+        assert_eq!(run_with_arguments("local a = ...", &["1"]), json!([]));
+        assert_eq!(
+            run_with_arguments("return ... -- all", &["-7", "a b"]),
+            json!([-7, "a b"])
+        );
+        assert_eq!(
+            run_with_arguments("return ...", &["1e400", "nil", "Car 2"]),
+            json!(["1e400", "nil", "Car 2"])
+        );
+        // An error keeps the line of the chunk as it was written.
+        let wrapped =
+            luau_with_arguments("local a = ...\nerror(\"boom \" .. a)", &["x".to_string()])
+                .unwrap();
+        let error = mlua::Lua::new()
+            .load(wrapped)
+            .set_name("Renium")
+            .exec()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(":2: boom x"), "{error}");
+        // Text that opens like a table or a string must be one.
+        for broken in ["{y:2.5}", "{\"y\":2.5", "[1,", "\"open"] {
+            let error = luau_with_arguments("return ...", &[broken.to_string()])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with(&format!("-a {broken}: not valid JSON")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chunk_resent_with_other_values_is_told_to_keep_the_code() {
+        let chunk = |name: &str, n: u32| {
+            format!(
+                "local car = workspace.Vehicles:FindFirstChild(\"{name}\") -- probe {n}\nlocal seat = car and car:FindFirstChild(\"DriverSeat\")\nif not seat then return \"none\" end\nlocal velocity = seat.AssemblyLinearVelocity\nreturn {{speed = velocity.Magnitude, at = seat.Position, limit = {n}.5, throttle = seat.ThrottleFloat}}"
+            )
+        };
+        assert_eq!(
+            luau_skeleton(&chunk("A", 1)),
+            luau_skeleton(&chunk("Other Car", 22))
+        );
+        assert_ne!(
+            luau_skeleton(&chunk("A", 1)),
+            luau_skeleton(&chunk("A", 1).replace("Position", "CFrame"))
+        );
+        let mut advice = TokenAdvice::default();
+        let runs = (1..=12)
+            .map(|n| advice.resent(&chunk("Car", n)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            runs,
+            [
+                None,
+                None,
+                Some(3),
+                None,
+                None,
+                Some(6),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(12)
             ]
         );
         assert_eq!(
-            result,
-            json!({"ok": true, "mode": "play", "clients": 1, "until": "true", "untilSeconds": 7.1})
+            advice.resent(&chunk("Car", 13).replace("Position", "Orientation")),
+            None
         );
-        let mut unread = json!({"ok": true, "console": {"error": "no play server"}});
-        assert!(take_play_consoles(&mut unread).is_empty());
-        assert_eq!(unread["console"]["error"], "no play server");
+        // A short chunk is not worth a file.
+        assert!((0..6).all(|n| {
+            advice
+                .resent(&format!("return workspace.Part{n}.Position"))
+                .is_none()
+        }));
+        assert_eq!(
+            resent_chunk_hint(3, false),
+            "this chunk has now been sent 3 times with only its values changed; put it in a file once and send the values: `rbx l -f FILE -a VALUE`"
+        );
+        assert!(resent_chunk_hint(6, true).ends_with("`rbx lc -f FILE PLAYER -a VALUE`"));
+    }
+
+    #[test]
+    fn runs_that_build_text_from_unrounded_numbers_are_told_now_and_then() {
+        let digits = json!({"ok": true, "results": ["at 846.5567626953125, 119.03035736083984 size 2.970987319946289, 3.362443208694458"]});
+        let printed = json!({"ok": true, "output": [
+            {"type": "print", "message": "846.5567626953125 119.03035736083984"},
+            {"type": "print", "message": "2.970987319946289 3.362443208694458"}
+        ]});
+        let mut advice = TokenAdvice::default();
+        let told = [
+            &digits, &printed, &digits, &digits, &digits, &digits, &digits, &printed,
+        ]
+        .map(|result| advice.long_floats(result));
+        assert_eq!(told, [false, true, false, true, false, false, false, true]);
+        // Returned numbers, a few digits and JSON in a string are not counted.
+        for quiet in [
+            json!({"ok": true, "results": [[846.5567626953125, 119.03035736083984, 2.970987319946289, 3.362443208694458]]}),
+            json!({"ok": true, "results": ["at 846.5567626953125, 119.03035736083984"]}),
+            json!({"ok": true, "results": ["[846.5567626953125,119.03035736083984,2.970987319946289,3.362443208694458]"]}),
+        ] {
+            assert!(!advice.long_floats(&quiet));
+        }
+        assert_eq!(advice.long_float_runs, 8);
+    }
+
+    #[test]
+    fn a_play_or_wait_result_prints_its_values_in_the_short_form() {
+        let value =
+            json!({"at": {"_type": "Vector3", "x": 1.23456789, "y": 2, "z": 3}, "t": 0.123456789});
+        let short = json!({"at": "Vector3(1.235, 2, 3)", "t": 0.123});
+        let mut play = json!({"ok": true, "clients": [], "result": value, "clientResult": value});
+        compact_play_result(&mut play, false);
+        assert_eq!(play["result"], short);
+        assert_eq!(play["clientResult"], short);
+        let mut wait = json!({"ok": true, "action": "wait", "condition": "x", "value": "true", "result": value});
+        compact_wait_record(wait.as_object_mut().unwrap());
+        assert_eq!(wait, json!({"ok": true, "value": "true", "result": short}));
     }
 
     #[test]
@@ -6319,6 +6883,27 @@ mod play_check_tests {
             crate::cli::Commands::ExecuteClientLuau(args) => args.into_luau_args().unwrap(),
             _ => panic!("expected l or lc"),
         }
+    }
+
+    #[test]
+    fn l_and_lc_take_arguments_and_an_output_file() {
+        let args = luau_args(&[
+            "rbx",
+            "l",
+            "-f",
+            "probe.luau",
+            "-a",
+            "Door",
+            "-a",
+            "-5",
+            "-o",
+            "out.txt",
+        ]);
+        assert_eq!(args.arg, ["Door", "-5"]);
+        assert_eq!(args.out.as_deref(), Some(Path::new("out.txt")));
+        let client = luau_args(&["rbx", "lc", "return ...", "2", "-a", "x"]);
+        assert_eq!(client.arg, ["x"]);
+        assert_eq!(client.player.as_deref(), Some("2"));
     }
 
     #[test]

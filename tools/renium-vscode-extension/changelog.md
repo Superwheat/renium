@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Improvements
+
+- `rbx l` and `rbx lc` print returned values in fewer tokens in text mode: numbers to 3 decimals (3 significant digits below 1; a value just off a whole number keeps the difference, so `5.0001` does not print as `5`), `Vector3(1.235, 2, 3.5)`, `CFrame(x, y, z, rot rx, ry, rz)`, `RGB(163, 162, 165)`, `Enum.Material.Wood` and `Workspace.Lobby.Door (Part)` in place of `_type` objects. A run that returns one value prints a list of records as one header line and a row per record, a list of strings as lines, and a JSON table returned inside a string as the table. A 40-part listing that took 3,300 tokens takes 1,000, less than text formatted by hand. Text the code builds prints as it is. `play --result`, `wait --result` and `--collect` print the same short values; `--output-mode json` keeps exact values.
+- `rbx l -a VALUE` and `rbx lc -a VALUE` pass values to the code as `...` (JSON, or any other text as a string; repeat for more), so a probe kept in a file runs with new values without being sent again: `rbx l -f probe.luau -a "Car 2" -a 5`.
+- A Luau result longer than 12,000 characters is cut on a line end and kept whole in a file under `.renium/cache/` that the cut line names (the newest eight are kept); notes and hints follow the cut. The limit was 100,000 characters with nothing kept. `-o FILE` writes a result to a file and prints one line about it. A collected runner past the limit prints its state in lines.
+- A `hint:` line now and then tells a caller what costs it tokens: a chunk sent whole for the third time with only its strings and numbers changed (keep it in a file, send the values), and runs whose own text is full of unrounded numbers (return the values). In measured agent sessions half of all Luau tokens were such resent chunks.
+
 ## 0.6.4 - 2026-11-15
 
 ### Bug fixes

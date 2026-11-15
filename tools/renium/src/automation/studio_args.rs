@@ -141,6 +141,11 @@ pub(super) fn luau(root: &Path, parameters: &Value) -> Result<ExecuteLuauArgs> {
             "timeout",
             crate::studio::automation::DEFAULT_LUAU_TIMEOUT_SECONDS,
         )?),
+        arg: match object.get("args") {
+            None | Some(Value::Array(_)) => strings(object, "args")?,
+            Some(_) => bail!("p.args must be an array of strings"),
+        },
+        out: None,
         runner: crate::cli::LuauRunnerArgs {
             detach: string(object, "detach"),
             collect: string(object, "collect"),

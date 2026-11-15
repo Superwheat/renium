@@ -647,6 +647,54 @@ def value_shapes(ctx: Context):
     ctx.expect(len(keys) == 128 and table.get("_truncated") == {"kept": 128, "total": 200}, f"truncated map: {len(keys)} keys, {table.get('_truncated')}")
 
 
+def text_results_are_short(ctx: Context):
+    """PLAY-047: text mode prints typed values short and a lone list of records as rows, and leaves text
+    the code built alone; -a passes values as `...` to code and to a file; a long result is cut with the
+    whole text kept in the project and its hint after the cut; -o writes a result to a file; a chunk
+    resent with other values gets a hint."""
+    ctx.open_studio()
+
+    def text(*args: str) -> str:
+        return ctx.rbx("l", "--edit", *args, json_mode=False, timeout=60).stdout.strip()
+
+    typed = text("return Vector3.new(1.23456789,2,3.5), CFrame.new(1,2,3)*CFrame.Angles(0,math.rad(90),0), CFrame.fromOrientation(math.rad(-90),math.rad(30),0), Color3.fromRGB(163,162,165), Enum.Material.Wood, workspace, game, 1/3, 5.0001, math.huge")
+    ctx.expect(typed.splitlines() == ["Vector3(1.235, 2, 3.5)", "CFrame(1, 2, 3, rot 0, 90, 0)", "CFrame(0, 0, 0, rot -90, 30, 0)", "RGB(163, 162, 165)", "Enum.Material.Wood", "Workspace (Workspace)", "game (DataModel)", "0.333", "5.0001", "inf"], f"typed values: {typed!r}")
+    records = text("return {total = 2, parts = {{name = 'A', at = Vector3.new(1/3, 2, 3)}, {name = 'B C', at = Vector3.new(4, 5, 6)}}}")
+    ctx.expect(records.splitlines() == ['{"total":2}', "parts:", "at:Vector3 name", "0.333,2,3 A", '4,5,6 "B C"'], f"records: {records!r}")
+    several = text("return {{x = 1}, {x = 2}}, 5, 'at 846.5567626953125'")
+    ctx.expect(several.splitlines() == ['[{"x":1},{"x":2}]', "5", "at 846.5567626953125"], f"several values, and text as it is: {several!r}")
+    exact = ctx.rbx("l", "--edit", "return 1/3", timeout=60).get("results")
+    ctx.expect(exact == [1 / 3], f"json mode keeps the digits: {exact}")
+
+    passed = text("local name, n, at = ... return name, n * 2, at.y", "-a", "Car 2", "-a", "5", "-a", '{"y":2.5}')
+    ctx.expect(passed.splitlines() == ["Car 2", "10", "2.5"], f"-a: {passed!r}")
+    ctx.write("probe.luau", "local name, n = ...\nreturn name .. '!', n -- last\n")
+    from_file = text("-f", "probe.luau", "-a", "x", "-a", "-7")
+    ctx.expect(from_file.splitlines() == ["x!", "-7"], f"-f with -a: {from_file!r}")
+    failed = ctx.rbx("l", "--edit", "local a = ...\nerror('boom ' .. a)", "-a", "x", ok=False, timeout=60)
+    ctx.expect_in('[string "Renium"]:2: boom x', failed.error, "-a keeps error lines")
+    ctx.expect_in("not valid JSON", ctx.rbx("l", "--edit", "return ...", "-a", "{y:2.5}", ok=False, timeout=60).error, "-a with a broken table")
+    ctx.expect_in("--collect", ctx.rbx("l", "--collect", "none", "-a", "1", ok=False, timeout=60).error, "-a with --collect")
+
+    long = text("local t = {} for i = 1, 900 do t[i] = ('line %d of a long listing'):format(i) end return t").splitlines()
+    named = re.search(r"all of it is in (\.renium/cache/luau-output-\d+-\d+\.txt)\)$", long[-1])
+    ctx.expect(long[-1].startswith("... (cut: ") and named is not None, f"cut line: {long[-1]!r}")
+    ctx.expect(sum(len(line) + 1 for line in long) < 12200 and long[-2].startswith("line "), "cut on a line end")
+    ctx.expect((ctx.root / named.group(1)).read_text(encoding="utf-8").splitlines()[-1] == "line 900 of a long listing", "the whole result is kept")
+    written = text("local t = {} for i = 1, 900 do t[i] = {i = i, third = i / 3} end return t", "-o", "big.txt")
+    ctx.expect(written == "901 lines (%d characters) written to big.txt" % len((ctx.root / "big.txt").read_text(encoding="utf-8").rstrip("\n")), f"-o: {written!r}")
+    ctx.expect((ctx.root / "big.txt").read_text(encoding="utf-8").splitlines()[:2] == ["i third", "1 0.333"], "-o holds the text form")
+    ctx.expect_in("--out writes the text form", ctx.rbx("l", "--edit", "return 1", "-o", "x.txt", ok=False, timeout=60).error, "-o in json mode")
+
+    # The daemon counts a chunk's shape for as long as it runs, so each run of this row sends its own.
+    counter = f"n{os.getpid()}x{int(time.time())}"
+    chunk = f"local {counter} = 0\nfor _, child in workspace:GetChildren() do\n    if child:IsA('BasePart') and child.Position.Y > %d and child.Name ~= '%s' then\n        {counter} += 1\n    end\nend\nlocal lines = {{}}\nfor i = 1, %d do lines[i] = ('line %%d of a long listing'):format(i) end\nreturn {{count = {counter}, total = #workspace:GetChildren(), gravity = workspace.Gravity, lines = lines}}"
+    runs = [text(chunk % (index, f"N{index}", 900 if index == 3 else 2)).splitlines() for index in range(1, 5)]
+    hints = [any(line.startswith("hint: this chunk has now been sent") for line in run) for run in runs]
+    ctx.expect(hints == [False, False, True, False], f"resent chunk hints: {hints}")
+    ctx.expect(runs[2][-2].startswith("... (cut: ") and runs[2][-1].endswith("`rbx l -f FILE -a VALUE`"), f"the hint follows the cut: {runs[2][-2:]}")
+
+
 def captured_output(ctx: Context):
     """PLAY-045: a runner's print and warn come back in output and stay out of the console; a flood is cut
     at 257 entries with a closing note; Play runner prints stay out of the server console too."""
@@ -1871,6 +1919,7 @@ SCENARIOS = [
     Scenario("PLAY-044", "value shapes", "small", value_shapes),
     Scenario("PLAY-045", "captured output", "small", captured_output),
     Scenario("PLAY-046", "Edit and Play lifetimes", "small", edit_and_play_lifetimes),
+    Scenario("PLAY-047", "text results are short", "small", text_results_are_short),
     Scenario("PLAY-050", "luau from file and stdin", "small", luau_from_file_and_stdin),
     Scenario("PLAY-051", "luau errors name the runtime", "small", luau_errors),
     Scenario("PLAY-052", "luau timeouts", "small", luau_timeouts),
