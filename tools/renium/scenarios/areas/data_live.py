@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import shutil
 import subprocess
 import time
 from contextlib import contextmanager
@@ -797,6 +798,29 @@ def first_store_keeps_a_new_script(ctx: Context):
     ctx.expect(checked.ok and "checked every script" in str(checked.get("note")), f"ck without git: {checked.json}")
 
 
+def store_text_and_names_stay_contained(ctx: Context):
+    """DATA-055: a store's Name, ClassName and Parent are no stored properties; a control character in an
+    instance name is printed escaped by the store text view; a file in instances that is no instance name is no
+    store; a name that would leave the service folder as a path stays inside it."""
+    for name, reason in (("Parent", "part of the instance record"), ("Name", "part of the instance record"), ("ClassName", "read-only")):
+        refused = ctx.rbx("bs", "Workspace", "Props.Sign", "-p", name, "--scope", "property", "--str", "x", ok=False, timeout=60)
+        ctx.expect_in(reason, refused.error, f"bs --scope property -p {name}")
+    added = ctx.rbx("ba", "Workspace", "-n", "Esc\x1b]0;t\x07Name", "-c", "Folder", timeout=60)
+    ctx.expect(added.ok, f"ba with a control character in the name: {added.json}")
+    for command in ("v", "vct"):
+        text = ctx.rbx(command, "instances/Workspace.renium", json_mode=False, timeout=60)
+        ctx.expect("\x1b" not in text.stdout and "\x07" not in text.stdout, f"{command} prints no control character")
+        ctx.expect_in("Esc\\u{1b}]0;t\\u{7}Name", text.stdout, f"{command} shows the name escaped")
+    shutil.copy(ctx.root / "instances" / "ReplicatedStorage.renium", ctx.root / "instances" / "...renium")
+    ctx.rbx("ba", "Workspace", "-n", "..", "-c", "Script", timeout=60)
+    ctx.rbx("ba", "Workspace", "-n", "..\\..\\escaped", "-c", "Script", timeout=60)
+    built = ctx.rbx("bep", "-o", "contained.rbxl", timeout=120)
+    ctx.expect(".." not in (built.get("services") or [".."]), f"bep services: {built.json}")
+    outside = [path.name for path in ctx.root.parent.iterdir() if path.name.startswith("escaped")] + [path.name for path in ctx.root.iterdir() if path.suffix in (".luau", ".lua")]
+    ctx.expect(not outside, f"script files outside the sources: {outside}")
+    ctx.expect((ctx.root / "src" / "Workspace" / "_.server.luau").is_file(), "the script named .. is a file inside its service folder")
+
+
 SCENARIOS = [
     Scenario("DATA-001", "prop --yes edits Studio only", "small", slotted(prop_yes_edits_studio_only)),
     Scenario("DATA-002", "prop without --yes applies one change", "small", slotted(prop_without_yes_applies_one_change)),
@@ -849,4 +873,5 @@ SCENARIOS = [
     Scenario("DATA-052", "saved field on a same-named sibling", "small", slotted(saved_field_on_duplicate_sibling)),
     Scenario("DATA-053", "held prop result reaches the caller", "small", slotted(prop_hold_notice_reaches_the_caller)),
     Scenario("DATA-054", "a first store keeps a new script", "small", slotted(first_store_keeps_a_new_script)),
+    Scenario("DATA-055", "store text and names stay contained", "small", slotted(store_text_and_names_stay_contained)),
 ]
