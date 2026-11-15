@@ -14,6 +14,8 @@
 ### Bug fixes
 
 - `rbx setup` and `rbx setup --repair` no longer fail with "The Studio plugin version X does not match Renium Y" when the `Renium.rbxm` beside the executable is from another release. That file is skipped and the plugin of the running release is downloaded; a setup into the default Plugins folder also replaces the file beside the executable with the download.
+- `rbx pi` into a project that already holds the place keeps the id of every instance that is still there, also one that was only renamed. When the place had changed in more than one spot, the import numbered the store anew, and whatever stored an id (a link's lock, a reference by id) then named another instance. An instance that is new in the place file gets a number above every number the store holds.
+- `rbx lk` no longer writes a package over the wrong instance when the id its lock holds for a target stands on another instance. Before, such a lock made `rbx lk` replace an unrelated instance without an error, or fail with "targets ... overlap". It now follows the id to a renamed or moved target only when that instance is of the package's root class, has one of the package root's children and is not part of another target; while something still stands at the manifest path, the target is whichever of the two holds the package's content, and when neither does `rbx lk` warns and writes nothing for that target. `rbx lk --force-target` applies to the instance at the named path whatever the lock's id says. A target detached with `rbx lkb` is no longer attached again when its instance is renamed, a deleted target's id is dropped from the lock, and `rbx lkb --remove` removes the target's lock state also when its link keeps other targets.
 
 ## 0.6.4 - 2026-11-15
 

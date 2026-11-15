@@ -1333,10 +1333,10 @@ fn import_place_into_an_existing_project_keeps_matching_identities() {
         fx.both(&["tr", "Workspace", "--depth", "2", "-r", &root]),
         json!([
             {"c": "Workspace", "cc": 3, "ch": ["lobby", "spawner", "target"], "id": "ws", "n": "Workspace", "ords": [1]},
-            {"c": "Folder", "cc": 3, "ch": ["door", "4", "5"], "id": "lobby", "n": "Lobby", "ords": [1, 1]},
+            {"c": "Folder", "cc": 3, "ch": ["door", "caff", "cb00"], "id": "lobby", "n": "Lobby", "ords": [1, 1]},
             {"c": "Part", "cc": 0, "id": "door", "n": "Door", "ords": [1, 1, 1]},
-            {"c": "Part", "cc": 0, "id": "4", "n": "Pad", "ords": [1, 1, 1]},
-            {"c": "Part", "cc": 0, "id": "5", "n": "Pad", "ords": [1, 1, 2]},
+            {"c": "Part", "cc": 0, "id": "caff", "n": "Pad", "ords": [1, 1, 1]},
+            {"c": "Part", "cc": 0, "id": "cb00", "n": "Pad", "ords": [1, 1, 2]},
             {"c": "Script", "cc": 0, "id": "spawner", "n": "Spawner", "ords": [1, 1]},
             {"c": "ObjectValue", "cc": 0, "id": "target", "n": "Target", "ords": [1, 1]},
         ])

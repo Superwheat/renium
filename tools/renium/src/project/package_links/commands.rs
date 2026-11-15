@@ -99,17 +99,148 @@ fn migrate_link_target_lock(
     changed
 }
 
+/// Where a target is when the id its lock holds stands on an instance other
+/// than the one at the manifest path.
+enum LockedId {
+    /// The manifest path names the target; the id is on some other instance.
+    Stays,
+    /// The id's instance is the target under a new name or parent, with its
+    /// storage when that was resolved.
+    Moved(Option<Box<LinkTargetStorage>>),
+    /// Something stands at both places and neither holds the package.
+    Unclear,
+}
+
+/// Whether the instance a selector names holds the package's content or the
+/// content the last apply left there.
+fn target_holds_package(
+    document: &SettingsBytecode,
+    selector: &(String, Vec<String>, Vec<usize>),
+    service_dir: &Path,
+    (package, baseline): (&SettingsBytecode, Option<&str>),
+) -> Result<bool> {
+    let (fingerprint, matches_package, _) = compare_package_target(
+        document,
+        selector,
+        service_dir,
+        (package, &package_document_fingerprint(package)?),
+        false,
+    )?;
+    Ok(matches_package
+        || match baseline {
+            None => false,
+            Some(baseline) if super::fingerprint_is_current(baseline) => {
+                fingerprint.as_deref() == Some(baseline)
+            }
+            Some(baseline) => {
+                legacy_target_fingerprint(document, selector, service_dir)?.as_deref()
+                    == Some(baseline)
+            }
+        })
+}
+
+/// Decides whether a locked id that stands away from the manifest path is the
+/// target under a new name or parent. An id can come to stand on another
+/// instance (a store rebuilt from a place file was numbered anew, a removed
+/// instance's id is given out again), and following it there would write the
+/// package over that instance. The id's instance must be of the package's
+/// root class and stand clear of every other target (`taken`). With nothing
+/// at the manifest path it must also have a child of the package's root, by
+/// name and class, when that root has children. While something still stands
+/// at the manifest path, the target is whichever of the two holds the
+/// package, the id's instance when both do; a target the caller named to
+/// force (`pinned`) is the one at its path.
+fn locked_id_target(
+    (project_root, src_root): (&Path, &Path),
+    target: &ResolvedLinkTarget,
+    document: &SettingsBytecode,
+    (settings_id, moved): (&str, &LinkTargetRef),
+    (taken, pinned): (bool, bool),
+    baseline: Option<&str>,
+) -> Result<LockedId> {
+    let package_path = target
+        .package_source
+        .as_ref()
+        .context("Package link target has no package source")?;
+    let package = SettingsBytecode::read_file(package_path)?;
+    let root_class = settings_root_indices(&package)
+        .first()
+        .map(|index| package.instances[*index].class_name.as_str());
+    let Some(index) = document
+        .instances
+        .iter()
+        .position(|instance| instance.settings_id == settings_id)
+        .filter(|index| Some(document.instances[*index].class_name.as_str()) == root_class)
+        .filter(|_| !taken)
+    else {
+        return Ok(LockedId::Stays);
+    };
+    let at_path = link_target_document_selector(target, document)?;
+    if resolve_editor_instance_by_path_ordinals(document, &at_path.0, &at_path.1, &at_path.2)
+        .is_none()
+    {
+        let children = |document: &SettingsBytecode, parent: usize| {
+            let children = document.instances.iter();
+            children
+                .filter(|instance| instance.parent_index == Some(parent))
+                .map(|instance| (instance.name.clone(), instance.class_name.clone()))
+                .collect::<HashSet<_>>()
+        };
+        let packaged = children(&package, settings_root_indices(&package)[0]);
+        return Ok(
+            if packaged.is_empty() || !packaged.is_disjoint(&children(document, index)) {
+                LockedId::Moved(None)
+            } else {
+                LockedId::Stays
+            },
+        );
+    }
+    if pinned {
+        return Ok(LockedId::Stays);
+    }
+    let storage = target
+        .storage
+        .as_ref()
+        .context("Resolved link target has no ownership information")?;
+    let path_holds = target_holds_package(
+        document,
+        &at_path,
+        &storage.source_root,
+        (&package, baseline),
+    )?;
+    let storage = match resolve_link_target_storage(project_root, src_root, moved, true, true) {
+        Ok(storage) => storage,
+        Err(_) if path_holds => return Ok(LockedId::Stays),
+        Err(error) => return Err(error),
+    };
+    let at_id = link_target_document_selector_parts(
+        &target.service,
+        &link_target_segments(moved),
+        &link_target_ordinals(moved),
+        &storage,
+        document,
+    )?;
+    let id_holds =
+        target_holds_package(document, &at_id, &storage.source_root, (&package, baseline))?;
+    Ok(match (id_holds, path_holds) {
+        (true, _) => LockedId::Moved(Some(Box::new(storage))),
+        (false, true) => LockedId::Stays,
+        (false, false) => LockedId::Unclear,
+    })
+}
+
 fn reconcile_package_target_names(
     project_root: &Path,
     src_root: &Path,
     targets: &mut [ResolvedLinkTarget],
     documents: &HashMap<PathBuf, SettingsBytecode>,
     manifest: &mut LinkManifest,
-    lock: &mut super::LinkLock,
+    (lock, named): (&mut super::LinkLock, &dyn Fn(&ResolvedLinkTarget) -> bool),
 ) -> Result<bool> {
     let mut changed = false;
     for target in targets {
-        if target.package_source.is_none() || !target.resolved {
+        // A detached target stays detached wherever its instance goes.
+        if target.package_source.is_none() || !target.resolved || target.broken {
             continue;
         }
         let Some(storage) = target.storage.as_ref() else {
@@ -121,10 +252,12 @@ fn reconcile_package_target_names(
         let old_segments = target.target_segments.clone();
         let old_ordinals = target.target_ordinals.clone();
         let old_key = link_target_key(&target.service, &old_segments, &old_ordinals);
-        let Some(settings_id) = lock
-            .entries
-            .get(&target.link_id)
-            .and_then(|entry| entry.targets.get(&old_key))
+        let Some(entry) = lock.entries.get(&target.link_id) else {
+            continue;
+        };
+        let Some(settings_id) = entry
+            .targets
+            .get(&old_key)
             .and_then(|target| target.settings_id.as_deref())
         else {
             continue;
@@ -140,20 +273,64 @@ fn reconcile_package_target_names(
         if old_segments == new_segments && old_ordinals == new_ordinals {
             continue;
         }
+        let baseline = entry.files.get(&package_lock_key(
+            "package-target",
+            &target.service,
+            &old_segments,
+            &old_ordinals,
+        ));
         let new_ref_key = link_target_ref_key(&actual);
-        if manifest.links.iter().any(|link| {
-            link.targets
-                .iter()
-                .any(|candidate| link_target_ref_key(candidate) == new_ref_key)
-        }) {
-            bail!(
-                "Renamed link target {}.{} conflicts with another link target",
-                target.service,
-                new_segments.join(".")
-            );
-        }
-        let new_storage = resolve_link_target_storage(project_root, src_root, &actual, true, true)?;
         let old_ref_key = link_target_key(&target.service, &old_segments, &old_ordinals);
+        let detached = manifest
+            .broken
+            .iter()
+            .map(link_target_ref_key)
+            .collect::<HashSet<_>>();
+        let taken = manifest
+            .links
+            .iter()
+            .flat_map(|link| &link.targets)
+            .filter(|other| other.service == target.service)
+            .map(|other| (link_target_ref_key(other), other))
+            .filter(|(key, _)| *key != old_ref_key && !detached.contains(key))
+            .any(|(_, other)| {
+                let (segments, ordinals) =
+                    (link_target_segments(other), link_target_ordinals(other));
+                selector_starts_with(&new_segments, &new_ordinals, &segments, &ordinals)
+                    || selector_starts_with(&segments, &ordinals, &new_segments, &new_ordinals)
+            });
+        let new_storage = match locked_id_target(
+            (project_root, src_root),
+            target,
+            document,
+            (settings_id, &actual),
+            (taken, named(target)),
+            baseline.map(String::as_str),
+        )? {
+            LockedId::Stays => continue,
+            LockedId::Unclear => {
+                target.resolved = false;
+                let place = |segments: &[String], ordinals: &[usize]| {
+                    let ordinals = link_target_output_ordinals(ordinals.to_vec());
+                    let mut place = format!("{}.{}", target.service, segments.join("."));
+                    if !ordinals.is_empty() {
+                        place.push_str(&format!(" (ords {ordinals:?})"));
+                    }
+                    place
+                };
+                target.unresolved_reason = Some(format!(
+                    "the lock's id for target {} is on {} and neither holds the package; `rbx lk --force-target` with the target's selector writes the package at its path, `rbx lkm` moves the target",
+                    place(&old_segments, &old_ordinals),
+                    place(&new_segments, &new_ordinals)
+                ));
+                continue;
+            }
+            LockedId::Moved(storage) => storage,
+        };
+        let new_storage = match new_storage {
+            Some(storage) => *storage,
+            None => resolve_link_target_storage(project_root, src_root, &actual, true, true)?,
+        };
         let manifest_target = manifest
             .links
             .iter_mut()
@@ -183,7 +360,6 @@ fn reconcile_package_target_names(
         target.target_segments = new_segments;
         target.target_ordinals = new_ordinals;
         target.storage = Some(new_storage);
-        target.broken = false;
         changed = true;
     }
     Ok(changed)
@@ -534,6 +710,16 @@ impl PackageLinkApply<'_> {
         )?;
         if !target_exists && lock_entry.files.contains_key(&lock_key) && !target_forced {
             changes.mark_deleted_target(manifest, target, args.check, true);
+            // The id named the deleted instance; one given out again later is another instance's.
+            if !args.check
+                && let Some(locked) = lock_entry.targets.get_mut(&link_target_key(
+                    &target.service,
+                    &target.target_segments,
+                    &target.target_ordinals,
+                ))
+            {
+                locked.settings_id = None;
+            }
             return Ok(());
         }
         let previous_package_hash = lock_entry.files.get(&lock_key).cloned();
@@ -1010,21 +1196,6 @@ pub(super) fn apply_project_links_inner(
             &target.service,
         );
     }
-    let mut lock = read_link_lock(&project_root)?;
-    let manifest_changed = restoring.is_none()
-        && reconcile_package_target_names(
-            &project_root,
-            &src_root,
-            &mut targets,
-            &documents,
-            &mut manifest,
-            &mut lock,
-        )?;
-    let mut changes = LinkApplyChanges {
-        manifest_changed,
-        ..Default::default()
-    };
-
     let forced_targets: Vec<LinkTargetRef> = args
         .force_target
         .iter()
@@ -1035,17 +1206,34 @@ pub(super) fn apply_project_links_inner(
             Ok(target)
         })
         .collect::<Result<_>>()?;
+    let named = |target: &ResolvedLinkTarget| {
+        forced_targets.iter().any(|forced| {
+            forced.service == target.service
+                && link_target_segments(forced) == target.target_segments
+                && link_target_ordinals(forced) == target.target_ordinals
+        })
+    };
+    let forced = |target: &ResolvedLinkTarget| args.force_targets || named(target);
+    let mut lock = read_link_lock(&project_root)?;
+    let manifest_changed = restoring.is_none()
+        && reconcile_package_target_names(
+            &project_root,
+            &src_root,
+            &mut targets,
+            &documents,
+            &mut manifest,
+            (&mut lock, &named),
+        )?;
+    let mut changes = LinkApplyChanges {
+        manifest_changed,
+        ..Default::default()
+    };
 
     for target in &targets {
         if target.broken {
             continue;
         }
-        let target_forced = args.force_targets
-            || forced_targets.iter().any(|forced| {
-                forced.service == target.service
-                    && link_target_segments(forced) == target.target_segments
-                    && link_target_ordinals(forced) == target.target_ordinals
-            });
+        let target_forced = forced(target);
         if !target.resolved {
             if target.storage.is_none() {
                 bail!(
@@ -1374,10 +1562,10 @@ pub(crate) fn link_break(mut args: LinkBreakArgs) -> Result<()> {
         manifest.links.retain(|link| !link.targets.is_empty());
     } else {
         let existing: HashSet<String> = manifest.broken.iter().map(link_target_ref_key).collect();
-        for target in to_break {
-            let key = link_target_ref_key(&target);
+        for target in &to_break {
+            let key = link_target_ref_key(target);
             if !existing.contains(&key) {
-                manifest.broken.push(target);
+                manifest.broken.push(target.clone());
             }
         }
     }
@@ -1411,6 +1599,18 @@ pub(crate) fn link_break(mut args: LinkBreakArgs) -> Result<()> {
         let mut lock = read_link_lock(&project_root)?;
         lock.entries
             .retain(|link_id, _| active_links.contains(link_id.as_str()));
+        for target in &to_break {
+            let (segments, ordinals) = (link_target_segments(target), link_target_ordinals(target));
+            for entry in lock.entries.values_mut() {
+                entry
+                    .targets
+                    .remove(&link_target_key(&target.service, &segments, &ordinals));
+                for kind in ["package", "package-target"] {
+                    let key = package_lock_key(kind, &target.service, &segments, &ordinals);
+                    entry.files.remove(&key);
+                }
+            }
+        }
         let lock_path = link_lock_path(&project_root);
         let removed = lock.entries.is_empty();
         lock_removed = Some(removed);

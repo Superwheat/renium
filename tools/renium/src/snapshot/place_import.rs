@@ -18,7 +18,10 @@ use crate::project::layout::apply_configured_project_layout;
 use crate::rbx::decode::{
     NativePropertyFilter, native_property_filter, rbx_properties_to_native_settings_records,
 };
+use crate::rbx::encode::settings_root_indices;
 use crate::rbx::model::{BytecodeModelImportRefs, RbxPlaceFormat, is_service_class};
+use crate::settings::bytecode::SettingsBytecode;
+use crate::settings::tree::settings_children_by_parent;
 use crate::snapshot::export::{
     ExportExecutionSetup, finish_export_import, finish_export_publication, prepare_export_execution,
 };
@@ -26,7 +29,7 @@ use crate::snapshot::import::parse_services;
 use crate::snapshot::types::{
     ExportedSnapshotParts, NativeSettingsProperty, NativeSettingsValue, SnapshotInstance,
 };
-use crate::system::files::resolve_existing_project_root;
+use crate::system::files::{resolve_existing_project_root, service_settings_path};
 
 /// Imports a saved place file into the project the same way a pull imports
 /// Studio's binary export, without a Studio session.
@@ -48,6 +51,11 @@ pub(crate) fn import_place_file(mut args: ImportPlaceArgs) -> Result<()> {
         direct_import_dispatcher,
         export_services,
     } = prepare_export_execution(&args.src_dir, &project_root, None, &services, total_started)?;
+    // The stores the import is aligned with: the stage's copy of the project's.
+    let stored_root = project_stage
+        .import_project_root
+        .join(&project_stage.import_src_dir);
+    let copied = project_stage.copy_gate();
     let mut filters = HashMap::new();
     let mut imported = 0usize;
     for service in &export_services {
@@ -58,7 +66,10 @@ pub(crate) fn import_place_file(mut args: ImportPlaceArgs) -> Result<()> {
                 convert_service(
                     service,
                     &flat.instances,
-                    indices,
+                    (
+                        indices,
+                        stored_service(&stored_root, service, copied.as_ref())?.as_ref(),
+                    ),
                     &paths,
                     database,
                     &mut filters,
@@ -294,10 +305,113 @@ fn external_targets<T: Clone>(
         .collect()
 }
 
+/// The store the project has of a service, when it has one with a root,
+/// read once the stage holds its copy of the project.
+fn stored_service(
+    stored_root: &Path,
+    service: &str,
+    copied: Option<&crate::snapshot::import::ImportReadyGate>,
+) -> Result<Option<SettingsBytecode>> {
+    let path = service_settings_path(&stored_root.join(service));
+    if let Some(copied) = copied {
+        copied()?;
+    }
+    Ok(SettingsBytecode::read_file(&path)
+        .ok()
+        .filter(|store| settings_root_indices(store).len() == 1))
+}
+
+/// The ids an import gives a service's instances, by position, so that the
+/// alignment that follows pairs them with the store as the place does. A
+/// place file says where an instance stands, not which stored instance it
+/// is, while that alignment takes an id both sides carry for one instance.
+/// Going down from the root, an instance takes the id of the stored child of
+/// the same parent that alone has its name and class, or of the one stored
+/// child of its class that is gone when it is the one new child of that
+/// class and has the same children: a rename. Every other instance, same-named
+/// siblings among them, takes a number above all the store's, and the
+/// alignment pairs it by what it is. `imported` is name, class and parent.
+fn stored_ids(
+    store: &SettingsBytecode,
+    imported: &[(&str, &str, Option<usize>)],
+) -> Vec<Option<String>> {
+    let stored_children = settings_children_by_parent(store);
+    let mut imported_children = vec![Vec::new(); imported.len()];
+    for (index, (_, _, parent)) in imported.iter().enumerate() {
+        if let Some(parent) = parent {
+            imported_children[*parent].push(index);
+        }
+    }
+    let stored_key = |index: usize| {
+        let instance = &store.instances[index];
+        (instance.name.as_str(), instance.class_name.as_str())
+    };
+    let imported_key = |index: usize| (imported[index].0, imported[index].1);
+    let same_children = |new: usize, old: usize| {
+        let mut new = imported_children[new]
+            .iter()
+            .map(|child| imported_key(*child))
+            .collect::<Vec<_>>();
+        let mut old = stored_children[old]
+            .iter()
+            .map(|child| stored_key(*child))
+            .collect::<Vec<_>>();
+        new.sort_unstable();
+        old.sort_unstable();
+        new == old
+    };
+    let mut paired = vec![None; imported.len()];
+    let mut pending = vec![(0, settings_root_indices(store)[0])];
+    while let Some((new_parent, old_parent)) = pending.pop() {
+        paired[new_parent] = Some(old_parent);
+        let mut groups = HashMap::<(&str, &str), (Vec<usize>, Vec<usize>)>::new();
+        for &child in &imported_children[new_parent] {
+            groups.entry(imported_key(child)).or_default().0.push(child);
+        }
+        for &child in &stored_children[old_parent] {
+            groups.entry(stored_key(child)).or_default().1.push(child);
+        }
+        let mut renamed = HashMap::<&str, (Vec<usize>, Vec<usize>)>::new();
+        for ((_, class), (new, old)) in groups {
+            match (new.as_slice(), old.as_slice()) {
+                ([new], [old]) => pending.push((*new, *old)),
+                (_, []) => renamed.entry(class).or_default().0.extend(new),
+                ([], _) => renamed.entry(class).or_default().1.extend(old),
+                _ => {}
+            }
+        }
+        for pair in renamed.into_values() {
+            if let ([new], [old]) = (pair.0.as_slice(), pair.1.as_slice())
+                && same_children(*new, *old)
+            {
+                pending.push((*new, *old));
+            }
+        }
+    }
+    let mut number = store
+        .instances
+        .iter()
+        .filter_map(|instance| u32::from_str_radix(&instance.settings_id, 16).ok())
+        .max()
+        .map_or(1, |highest| u64::from(highest).max(1));
+    paired
+        .into_iter()
+        .enumerate()
+        .map(|(position, paired)| match paired {
+            _ if position == 0 => None,
+            Some(index) => Some(store.instances[index].settings_id.clone()),
+            None => {
+                number += 1;
+                Some(format!("{number:x}"))
+            }
+        })
+        .collect()
+}
+
 fn convert_service(
     service: &str,
     instances: &[FlatInstance],
-    indices: &[usize],
+    (indices, stored): (&[usize], Option<&SettingsBytecode>),
     paths: &PlacePaths,
     database: &ReflectionDatabase<'_>,
     filters: &mut HashMap<String, NativePropertyFilter>,
@@ -318,6 +432,22 @@ fn convert_service(
         new_index_by_ref,
         ..Default::default()
     };
+    let mut ids = stored.map(|store| {
+        let imported = indices
+            .iter()
+            .enumerate()
+            .map(|(local, &global)| {
+                let instance = &instances[global];
+                let parent = instance.parent_index;
+                (
+                    if local == 0 { service } else { &instance.name },
+                    instance.class.as_str(),
+                    parent.and_then(|parent| local_by_global.get(&parent).copied()),
+                )
+            })
+            .collect::<Vec<_>>();
+        stored_ids(store, &imported)
+    });
     let mut converted = Vec::with_capacity(indices.len());
     let mut native_by_instance = Vec::with_capacity(indices.len());
     for (local, &global) in indices.iter().enumerate() {
@@ -406,6 +536,7 @@ fn convert_service(
             attributes,
             instance_index: Some(local + 1),
             parent_index,
+            transported_settings_id: ids.as_mut().and_then(|ids| ids[local].take()),
             ..Default::default()
         });
         native_by_instance.push(native_properties);
@@ -460,7 +591,6 @@ mod tests {
 
     use super::*;
     use crate::app::output::capture_json_output;
-    use crate::settings::bytecode::SettingsBytecode;
     use crate::system::files::create_unique_directory;
 
     fn run(root: &Path) -> Value {
@@ -1023,5 +1153,81 @@ mod tests {
         let second = run(&root);
         assert_eq!(second["changedPaths"].as_array().map(Vec::len), Some(0));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A second import of a place that changed in two separate spots keeps
+    /// the id of every instance that is still there: the number an instance
+    /// has in the file is not the stored instance of that number. A renamed
+    /// instance keeps its id and so do its descendants; an instance that
+    /// stands where another one was, with other children, does not take its id.
+    #[test]
+    fn a_second_import_keeps_ids_when_instances_shift() {
+        let root = crate::tests::support::temp_dir("reimport-ids");
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            let _ = std::fs::remove_dir_all(&root);
+        });
+        std::fs::write(root.join("renium.project.jsonc"), r#"{"schemaVersion":1}"#).unwrap();
+        let write_place = |pads: usize, pallets: usize, cases: &str, shelf: &str| {
+            let folder = |name: &str, class: &str, count: usize| {
+                (0..count).fold(
+                    InstanceBuilder::new("Folder").with_name(name),
+                    |folder, _| folder.with_child(InstanceBuilder::new(class).with_name("Item")),
+                )
+            };
+            let cases = InstanceBuilder::new("Folder")
+                .with_name(cases)
+                .with_child(folder("Misc", "MeshPart", pallets))
+                .with_child(InstanceBuilder::new("Part").with_name(shelf));
+            let dom = WeakDom::new(
+                InstanceBuilder::new("DataModel").with_child(
+                    InstanceBuilder::new("Workspace")
+                        .with_name("Workspace")
+                        .with_child(folder("Front", "Part", pads))
+                        .with_child(cases),
+                ),
+            );
+            RbxPlaceFormat::Binary
+                .write(&root.join("place.rbxl"), &dom, dom.root().children())
+                .unwrap();
+        };
+        let ids = || {
+            let store =
+                SettingsBytecode::read_file(&root.join("instances/Workspace.renium")).unwrap();
+            let all = store
+                .instances
+                .iter()
+                .map(|instance| instance.settings_id.clone())
+                .collect::<Vec<_>>();
+            let named = [0, 1, 2, 3].map(|rank| {
+                let node = |name: &str| store.instances.iter().find(|node| node.name == name);
+                let found = match rank {
+                    0 => node("Front"),
+                    1 => node("Cases")
+                        .or_else(|| node("Crates"))
+                        .or_else(|| node("Decor")),
+                    2 => node("Misc"),
+                    _ => node("Shelf").or_else(|| node("Lamp")),
+                };
+                found.unwrap().settings_id.clone()
+            });
+            (named, all)
+        };
+        write_place(6, 4, "Cases", "Shelf");
+        assert_eq!(run(&root)["ok"], true);
+        let (before, _) = ids();
+        for (pads, pallets, cases) in [(3, 9, "Cases"), (3, 9, "Crates"), (5, 2, "Cases")] {
+            write_place(pads, pallets, cases, "Shelf");
+            assert_eq!(run(&root)["ok"], true);
+            let (after, all) = ids();
+            assert_eq!(after, before, "{pads} {pallets} {cases}");
+            assert_eq!(all.iter().collect::<HashSet<_>>().len(), all.len());
+        }
+        write_place(5, 2, "Decor", "Lamp");
+        assert_eq!(run(&root)["ok"], true);
+        let (after, all) = ids();
+        assert_eq!(after[0], before[0]);
+        for old in &before[1..] {
+            assert!(!all.contains(old), "{old} was handed to another instance");
+        }
     }
 }

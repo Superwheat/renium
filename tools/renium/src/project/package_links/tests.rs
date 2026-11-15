@@ -2345,3 +2345,273 @@ fn replacing_a_target_keeps_package_internal_references() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+/// The id a lock holds for a target can come to stand on another instance (a
+/// store rebuilt from a place file is numbered anew, a removed instance's id
+/// is given out again). Apply follows the id to a renamed target, also when a
+/// new instance took the old name, never to an instance that is not the
+/// target, and writes nothing when it cannot tell which of two it is.
+#[test]
+fn link_apply_follows_a_locked_id_only_to_its_target() {
+    let dir = temp_dir("link-locked-id");
+    let service_dir = dir.join("src").join("ReplicatedStorage");
+    fs::create_dir_all(&service_dir).unwrap();
+    let settings_path = service_settings_path(&service_dir);
+    let package_path = dir.join("links").join("pkg.renium");
+    fs::create_dir_all(package_path.parent().unwrap()).unwrap();
+    settings_document(vec![
+        settings_instance("pkg", "Pkg", "Folder", None),
+        settings_instance("part", "Part", "Part", Some(0)),
+    ])
+    .write_file(&package_path)
+    .unwrap();
+    let store = settings_document(vec![
+        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("pkg", "Pkg", "Folder", Some(0)),
+        settings_instance("part", "Part", "Part", Some(1)),
+        settings_instance("other", "Other", "Folder", Some(0)),
+        settings_instance("mine", "Mine", "Part", Some(3)),
+    ]);
+    store.write_file(&settings_path).unwrap();
+    write_package_link_manifest(&dir, "ReplicatedStorage", true, &["Pkg"]);
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    let target = || {
+        let manifest = read_link_manifest(&dir.join("renium-link.json")).unwrap();
+        link_target_segments(&manifest.links[0].targets[0])
+    };
+    let names = || {
+        let document = SettingsBytecode::read_file(&settings_path).unwrap();
+        let name = |index: usize| document.instances[index].name.clone();
+        let mut names = document
+            .instances
+            .iter()
+            .map(|node| {
+                (
+                    node.parent_index.map(name).unwrap_or_default(),
+                    node.name.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let untouched = names();
+
+    for elsewhere in ["part", "other", "mine"] {
+        let mut lock = read_link_lock(&dir).unwrap();
+        for locked in lock.entries.get_mut("pkg").unwrap().targets.values_mut() {
+            locked.settings_id = Some(elsewhere.into());
+        }
+        write_link_lock(&dir, &lock).unwrap();
+        link_apply(test_link_apply_args(&dir)).unwrap();
+        assert_eq!(target(), ["Pkg"], "{elsewhere}");
+        assert_eq!(names(), untouched, "{elsewhere}");
+        let lock = read_link_lock(&dir).unwrap();
+        let locked = lock.entries["pkg"].targets.values().next().unwrap();
+        assert_eq!(locked.settings_id.as_deref(), Some("pkg"), "{elsewhere}");
+    }
+
+    let mut document = SettingsBytecode::read_file(&settings_path).unwrap();
+    document.instances[1].name = "Renamed".into();
+    document
+        .instances
+        .push(settings_instance("new", "Pkg", "Folder", Some(0)));
+    let new = document.instances.len() - 1;
+    document
+        .instances
+        .push(settings_instance("keep", "Keep", "Part", Some(new)));
+    document.write_file(&settings_path).unwrap();
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    assert_eq!(target(), ["Renamed"]);
+    assert!(names().contains(&("Pkg".to_string(), "Keep".to_string())));
+    assert!(names().contains(&("Renamed".to_string(), "Part".to_string())));
+
+    // Renamed again with a change of its own, and another instance under the name it had.
+    let mut document = SettingsBytecode::read_file(&settings_path).unwrap();
+    document.instances[1].name = "Edited".into();
+    document
+        .instances
+        .push(settings_instance("extra", "Extra", "Part", Some(1)));
+    document
+        .instances
+        .push(settings_instance("squatter", "Renamed", "Folder", Some(0)));
+    document.write_file(&settings_path).unwrap();
+    let unclear = names();
+    let (result, warnings) = commands::apply_project_links(
+        &test_link_apply_args(&dir),
+        &dir,
+        &dir.join("src"),
+        &dir.join("renium-link.json"),
+        read_link_manifest(&dir.join("renium-link.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(warnings, 1, "{result}");
+    assert!(result["warnings"][0].as_str().unwrap().contains("rbx lkm"));
+    assert_eq!(target(), ["Renamed"]);
+    assert_eq!(names(), unclear);
+
+    // Forcing the target says the instance at its path is the target.
+    let mut forced = test_link_apply_args(&dir);
+    forced.force_target =
+        vec![r#"{"service":"ReplicatedStorage","path":["ReplicatedStorage","Renamed"]}"#.into()];
+    link_apply(forced).unwrap();
+    assert_eq!(target(), ["Renamed"]);
+    assert!(names().contains(&("Renamed".to_string(), "Part".to_string())));
+    assert!(names().contains(&("Edited".to_string(), "Extra".to_string())));
+
+    // The target is deleted and its id stands on an instance with none of the package's children.
+    store.write_file(&settings_path).unwrap();
+    write_package_link_manifest(&dir, "ReplicatedStorage", true, &["Pkg"]);
+    fs::remove_file(link_lock_path(&dir)).unwrap();
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    let mut gone = vec![
+        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("pkg", "Unrelated", "Folder", Some(0)),
+    ];
+    settings_document(gone.clone())
+        .write_file(&settings_path)
+        .unwrap();
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    let manifest = read_link_manifest(&dir.join("renium-link.json")).unwrap();
+    assert_eq!(manifest.broken.len(), 1);
+    assert_eq!(names().len(), 2);
+
+    // Its id went with it: an instance that carries it later is not the target either.
+    gone.push(settings_instance("part", "Part", "Part", Some(1)));
+    gone.push(settings_instance("own", "Own", "Part", Some(1)));
+    settings_document(gone).write_file(&settings_path).unwrap();
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    assert_eq!(target(), ["Pkg"]);
+    assert!(names().contains(&("Unrelated".to_string(), "Own".to_string())));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A detached target stays detached when its instance is renamed, and a
+/// deleted target whose id stands inside another target is marked deleted
+/// without stopping the apply.
+#[test]
+fn link_apply_leaves_detached_targets_and_ids_inside_other_targets() {
+    let dir = temp_dir("link-detached-id");
+    let service_dir = dir.join("src").join("ReplicatedStorage");
+    fs::create_dir_all(&service_dir).unwrap();
+    let settings_path = service_settings_path(&service_dir);
+    let package_path = dir.join("links").join("pkg.renium");
+    fs::create_dir_all(package_path.parent().unwrap()).unwrap();
+    settings_document(vec![
+        settings_instance("pkg", "Pkg", "Folder", None),
+        settings_instance("inner", "Inner", "Folder", Some(0)),
+        settings_instance("leaf", "Inner", "Folder", Some(1)),
+    ])
+    .write_file(&package_path)
+    .unwrap();
+    let store = |first: &str| {
+        settings_document(vec![
+            settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
+            settings_instance("a", first, "Folder", Some(0)),
+            settings_instance("a-inner", "Inner", "Folder", Some(1)),
+            settings_instance("a-leaf", "Inner", "Folder", Some(2)),
+            settings_instance("b", "Second", "Folder", Some(0)),
+            settings_instance("b-inner", "Inner", "Folder", Some(4)),
+            settings_instance("b-leaf", "Inner", "Folder", Some(5)),
+        ])
+    };
+    store("Pkg").write_file(&settings_path).unwrap();
+    write_package_link_manifest(&dir, "ReplicatedStorage", true, &["Pkg", "Second"]);
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    let manifest = || read_link_manifest(&dir.join("renium-link.json")).unwrap();
+    let paths = || {
+        let targets = manifest().links[0].targets.clone();
+        targets.iter().map(link_target_segments).collect::<Vec<_>>()
+    };
+
+    link_break(LinkBreakArgs {
+        project: ProjectSourceArgs {
+            project_root: dir.clone(),
+            src_root: PathBuf::from("src"),
+        },
+        manifest: PathBuf::from("renium-link.json"),
+        link: None,
+        service: Some("ReplicatedStorage".into()),
+        path_segments_json: Some(r#"["ReplicatedStorage","Pkg"]"#.into()),
+        path_ordinals_json: "[]".into(),
+        remove: false,
+        cache_dir: None,
+        pretty: false,
+    })
+    .unwrap();
+    let mut renamed = store("Mine");
+    renamed.instances[3].name = "Changed".into();
+    renamed.write_file(&settings_path).unwrap();
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    assert_eq!(paths(), [["Pkg"], ["Second"]]);
+    assert_eq!(manifest().broken.len(), 1);
+    let document = SettingsBytecode::read_file(&settings_path).unwrap();
+    assert!(document.instances.iter().any(|node| node.name == "Changed"));
+
+    // Pkg is gone and its lock's id stands on the Folder inside Second.
+    store("Pkg").write_file(&settings_path).unwrap();
+    write_package_link_manifest(&dir, "ReplicatedStorage", true, &["Pkg", "Second"]);
+    fs::remove_file(link_lock_path(&dir)).unwrap();
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    let mut lock = read_link_lock(&dir).unwrap();
+    let pkg_key = link_target_key("ReplicatedStorage", &["Pkg".to_string()], &[1]);
+    let locked = lock.entries.get_mut("pkg").unwrap();
+    locked.targets.get_mut(&pkg_key).unwrap().settings_id = Some("b-inner".into());
+    write_link_lock(&dir, &lock).unwrap();
+    let mut gone = store("Pkg");
+    gone.instances.drain(1..4);
+    for instance in &mut gone.instances[1..] {
+        instance.parent_index = instance.parent_index.map(|parent| parent.saturating_sub(3));
+    }
+    gone.write_file(&settings_path).unwrap();
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    assert_eq!(paths(), [["Pkg"], ["Second"]]);
+    assert_eq!(manifest().broken.len(), 1);
+    assert_eq!(
+        SettingsBytecode::read_file(&settings_path)
+            .unwrap()
+            .instances
+            .len(),
+        4
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn link_break_remove_forgets_the_target_in_the_lock() {
+    let dir = temp_dir("link-remove-lock");
+    let service_dir = dir.join("src").join("ReplicatedStorage");
+    write_link_test_service(&service_dir);
+    let package_path = dir.join("links").join("pkg.renium");
+    fs::create_dir_all(package_path.parent().unwrap()).unwrap();
+    settings_document(vec![settings_instance("pkg", "Pkg", "Folder", None)])
+        .write_file(&package_path)
+        .unwrap();
+    write_package_link_manifest(&dir, "ReplicatedStorage", true, &["Pkg", "Second"]);
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    assert_eq!(
+        read_link_lock(&dir).unwrap().entries["pkg"].targets.len(),
+        2
+    );
+    link_break(LinkBreakArgs {
+        project: ProjectSourceArgs {
+            project_root: dir.clone(),
+            src_root: PathBuf::from("src"),
+        },
+        manifest: PathBuf::from("renium-link.json"),
+        link: None,
+        service: Some("ReplicatedStorage".into()),
+        path_segments_json: Some(r#"["ReplicatedStorage","Second"]"#.into()),
+        path_ordinals_json: "[]".into(),
+        remove: true,
+        cache_dir: None,
+        pretty: false,
+    })
+    .unwrap();
+    let lock = read_link_lock(&dir).unwrap();
+    let entry = &lock.entries["pkg"];
+    assert_eq!(entry.targets.len(), 1);
+    assert!(entry.files.keys().all(|key| !key.contains("Second")));
+    assert!(entry.files.keys().any(|key| key.contains("Pkg")));
+    fs::remove_dir_all(dir).unwrap();
+}
