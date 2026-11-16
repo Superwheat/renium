@@ -2027,7 +2027,12 @@ fn canonicalize_content_uri_alias(instance: &mut SettingsBytecodeInstance) -> Re
     };
     // Studio now serializes these URIs through Content, while older files
     // and protected setters use ContentId. Object-backed Content stays typed.
-    // A default legacy mirror is harmless; conflicting authored URIs are not.
+    // An empty mirror under either name is harmless; conflicting authored
+    // URIs are not.
+    if value.as_str() == Some("") && instance.properties.contains_key(legacy) {
+        instance.properties.remove(modern);
+        return Ok(());
+    }
     if let Some(existing) = instance.properties.get(legacy)
         && typed_scalar(existing).as_str() != Some("")
         && !reconciliation_values_equal(existing, value, false)
@@ -4938,6 +4943,18 @@ mod tests {
                         old.instances[0].properties
                     );
                 }
+            }
+            for empty in [json!(""), json!({"_type": "Content", "value": ""})] {
+                let mut mirrored = document(Map::from_iter([
+                    (modern.into(), empty),
+                    (legacy.into(), json!("rbxassetid://7")),
+                ]));
+                canonicalize_settings_property_names(&mut mirrored).unwrap();
+                assert_eq!(
+                    mirrored.instances[0].properties,
+                    Map::from_iter([(legacy.to_string(), json!("rbxassetid://7"))]),
+                    "{class}"
+                );
             }
             let mut object = document(Map::from_iter([(
                 modern.into(),
