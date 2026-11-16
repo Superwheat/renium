@@ -3835,6 +3835,85 @@ fn game_settings_properties_are_not_sent_or_patched() {
 }
 
 #[test]
+fn a_protected_write_is_already_in_place_only_when_the_place_holds_its_value() {
+    let item = |fields: Value| {
+        let mut item = json!({"_type": "EnumItem"});
+        item.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        item
+    };
+    // (the place's value, the requested value, the same)
+    let cases = [
+        (json!(1), json!(1), true),
+        (json!(1), json!(2), false),
+        (
+            item(json!({"enumType": "Material", "name": "Plastic", "value": 256})),
+            item(json!({"name": "Plastic"})),
+            true,
+        ),
+        (
+            item(json!({"enumType": "Material", "name": "Plastic", "value": 256})),
+            item(json!({"enumType": "Material", "name": "Plastic"})),
+            true,
+        ),
+        (
+            item(json!({"enumType": "Material", "name": "Plastic"})),
+            item(json!({"enumType": "Material", "name": "Wood"})),
+            false,
+        ),
+        (
+            item(json!({"enumType": "Material", "name": "Plastic"})),
+            item(json!({"enumType": "SurfaceType", "name": "Plastic", "value": 1})),
+            false,
+        ),
+        (
+            item(json!({"value": 2})),
+            item(json!({"enumType": "Material", "value": 2})),
+            true,
+        ),
+        (
+            item(json!({"value": 2})),
+            item(json!({"enumType": "Material", "value": 3})),
+            false,
+        ),
+        (
+            item(json!({"name": "Plastic"})),
+            item(json!({"enumType": "Material"})),
+            false,
+        ),
+        (
+            item(json!({"name": "Plastic"})),
+            json!({"name": "Plastic", "value": 256}),
+            false,
+        ),
+        (
+            json!({"name": "Plastic", "value": 256}),
+            item(json!({"name": "Plastic"})),
+            false,
+        ),
+        (item(json!({"name": "Plastic"})), json!("Plastic"), false),
+    ];
+    for (index, (previous, requested, same)) in cases.into_iter().enumerate() {
+        let row = json!({"oldValueKnown": true, "oldValue": previous, "value": requested});
+        assert_eq!(protected_write_matches_previous(&row), same, "case {index}");
+        let mut unknown = row.clone();
+        unknown["oldValueKnown"] = json!(false);
+        assert!(!protected_write_matches_previous(&unknown), "case {index}");
+    }
+    // A removal is in place when the place holds no value.
+    for (missing, same) in [(true, true), (false, false)] {
+        let row = json!({
+            "oldValueKnown": true,
+            "oldValueMissing": missing,
+            "oldValue": 1,
+            "deleted": true,
+        });
+        assert_eq!(protected_write_matches_previous(&row), same);
+    }
+}
+
+#[test]
 fn protected_review_only_keeps_user_facing_properties() {
     let database = rbx_reflection_database::get().unwrap();
     assert!(!is_engine_managed_editor_property(
