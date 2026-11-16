@@ -6,8 +6,8 @@ and compares the averages with the runs before it.
     python -I tools/renium/scenarios/speed.py --record         # add a passing run to the history
     python -I tools/renium/scenarios/speed.py --cleanup        # close what a cut-short run left open
 
-The optional push phase fills an empty place from the whole project, verifies
-that a second push is unchanged, and checks that pulling changes no project file.
+The push phase fills an empty place from the whole project, verifies that a
+second push is unchanged, and checks that pulling changes no project file.
 
 The place is a private file on the machine that runs this. Its path comes from
 RENIUM_SPEED_PLACE or from the one-line file ~/.renium/speed-place.txt. The
@@ -368,7 +368,7 @@ def push(run: Run, source: Path, root: Path) -> None:
 
 
 PHASES = {"offline": offline, "studio": studio, "push": push}
-DEFAULT_PHASES = ["offline", "studio"]
+DEFAULT_PHASES = ["offline", "studio", "push"]
 
 
 def history() -> list[dict]:
