@@ -505,25 +505,6 @@ local function compareReviewNodes(a, b)
 	return an < bn
 end
 
-local function findOrdinalChild(parent, name, ordinal)
-	if not parent then
-		return nil
-	end
-	if ordinal <= 1 then
-		return parent:FindFirstChild(name)
-	end
-	local seen = 0
-	for _, child in ipairs(parent:GetChildren()) do
-		if child.Name == name then
-			seen = seen + 1
-			if seen == ordinal then
-				return child
-			end
-		end
-	end
-	return nil
-end
-
 local function newReviewNode(name, className, instance, ordinal)
 	return {
 		name = name,
@@ -533,6 +514,8 @@ local function newReviewNode(name, className, instance, ordinal)
 		instance = instance,
 		children = {},
 		childByKey = {},
+		childrenByName = {},
+		numberedNames = {},
 		props = {},
 		expanded = false,
 		changeTotal = 0,
@@ -578,6 +561,30 @@ local function buildReviewTree(summaryRows, groups, helpers)
 		table.insert(roots, node)
 	end
 
+	-- Each parent's live children by name, listed once. A model with
+	-- hundreds of same-named children is walked once for the whole review
+	-- and not once per row, which took Studio half a minute.
+	local liveChildrenByParent = {}
+	local function liveNamed(parent, name)
+		if not parent then
+			return nil
+		end
+		local byName = liveChildrenByParent[parent]
+		if byName == nil then
+			byName = {}
+			for _, child in ipairs(parent:GetChildren()) do
+				local named = byName[child.Name]
+				if named == nil then
+					named = {}
+					byName[child.Name] = named
+				end
+				named[#named + 1] = child
+			end
+			liveChildrenByParent[parent] = byName
+		end
+		return byName[name]
+	end
+
 	local function serviceNode(serviceName)
 		local node = rootByName[serviceName]
 		if not node then
@@ -589,10 +596,13 @@ local function buildReviewTree(summaryRows, groups, helpers)
 	end
 
 	for _, group in ipairs(groups) do
+		if helpers.yieldForBudget then
+			helpers.yieldForBudget()
+		end
 		local segments = group.pathSegments
 		local node = serviceNode(tostring(segments[1]))
 		local resolvedInstance = nil
-		local resolved = helpers.resolveInstance(group)
+		local resolved = helpers.resolveInstance(group, liveChildrenByParent)
 		if typeof(resolved) == "Instance" then
 			resolvedInstance = resolved
 		end
@@ -603,7 +613,10 @@ local function buildReviewTree(summaryRows, groups, helpers)
 			local key = name .. "\1" .. tostring(ordinal)
 			local child = node.childByKey[key]
 			if not child then
-				local liveChild = i == #segments and resolvedInstance or findOrdinalChild(node.instance, name, ordinal)
+				local liveSameName = liveNamed(node.instance, name)
+				local liveChild = i == #segments and resolvedInstance
+					or liveSameName and liveSameName[math.max(ordinal, 1)]
+					or nil
 				local className = if liveChild
 					then liveChild.ClassName
 					elseif i == #segments then tostring(group.className or "Folder")
@@ -611,23 +624,19 @@ local function buildReviewTree(summaryRows, groups, helpers)
 				child = newReviewNode(name, className, liveChild, ordinal)
 				node.childByKey[key] = child
 				table.insert(node.children, child)
-				local duplicateCount = 0
-				for _, existing in ipairs(node.children) do
-					if existing.name == name then
-						duplicateCount += 1
-					end
+				local sameName = node.childrenByName[name]
+				if sameName == nil then
+					sameName = {}
+					node.childrenByName[name] = sameName
 				end
-				local liveDuplicateCount = 0
-				if node.instance then
-					for _, sibling in ipairs(node.instance:GetChildren()) do
-						if sibling.Name == name then
-							liveDuplicateCount += 1
-						end
-					end
-				end
-				if duplicateCount > 1 or liveDuplicateCount > 1 or ordinal > 1 then
-					for _, existing in ipairs(node.children) do
-						if existing.name == name then
+				sameName[#sameName + 1] = child
+				-- A name several siblings share shows its ordinal on each.
+				if #sameName > 1 or (liveSameName ~= nil and #liveSameName > 1) or ordinal > 1 then
+					if node.numberedNames[name] then
+						child.displayName = string.format("%s[%d]", name, child.ordinal)
+					else
+						node.numberedNames[name] = true
+						for _, existing in ipairs(sameName) do
 							existing.displayName = string.format("%s[%d]", name, existing.ordinal)
 						end
 					end

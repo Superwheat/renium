@@ -4221,6 +4221,7 @@ function BridgePluginRuntime.start(context)
 				readProperty = editorSync.readReviewProperty,
 				valuesEqual = EditorSyncModule.valuesEqual,
 				resolveInstance = editorSync.resolveReviewInstance,
+				yieldForBudget = ParallelModule.newWorkBudget(),
 			}
 		)
 	end
@@ -4238,6 +4239,7 @@ function BridgePluginRuntime.start(context)
 			readProperty = editorSync.readReviewProperty,
 			valuesEqual = EditorSyncModule.valuesEqual,
 			resolveInstance = editorSync.resolveReviewInstance,
+			yieldForBudget = ParallelModule.newWorkBudget(),
 		})
 	end
 
@@ -4247,6 +4249,7 @@ function BridgePluginRuntime.start(context)
 			readProperty = editorSync.readReviewProperty,
 			valuesEqual = EditorSyncModule.valuesEqual,
 			resolveInstance = editorSync.resolveReviewInstance,
+			yieldForBudget = ParallelModule.newWorkBudget(),
 		})
 	end
 

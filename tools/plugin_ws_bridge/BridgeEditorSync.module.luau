@@ -6685,8 +6685,19 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		invalidateEditorService(serviceName)
 	end
 
-	function api.resolveReviewInstance(change: { [string]: any }): Instance?
-		return resolveInstance(change, ctx)
+	-- `childIndex` lists parents' children by name for the review that is
+	-- being built, so its ordinal paths cost one child scan per parent.
+	function api.resolveReviewInstance(change: { [string]: any }, childIndex: any?): Instance?
+		local previous = ctx.resolveChildIndex
+		if previous == nil then
+			ctx.resolveChildIndex = childIndex
+		end
+		local resolved, instance = pcall(resolveInstance, change, ctx)
+		ctx.resolveChildIndex = previous
+		if not resolved then
+			error(instance, 0)
+		end
+		return instance
 	end
 
 	function api.decodeReviewValue(raw: any, enumHint: string?, serviceName: string?): (boolean, any)
