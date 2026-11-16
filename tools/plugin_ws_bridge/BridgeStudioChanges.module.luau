@@ -920,6 +920,27 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			token.cameraFovValue = value
 			return token
 		end
+		local linkedTime = if instance.ClassName ~= "Lighting" then nil
+			elseif string.lower(propertyName) == "timeofday" then "ClockTime"
+			elseif string.lower(propertyName) == "clocktime" then "TimeOfDay"
+			else nil
+		if linkedTime then
+			-- Lighting keeps the time of day as one value under two names: a
+			-- write to either changes the other, with the value Studio derives.
+			primeExpectedProperty(instance, propertyName)
+			primeExpectedProperty(instance, linkedTime)
+			return { tokens = {
+				expectInstanceEvent(
+					state.expectedInstanceProperties,
+					instance,
+					string.lower(propertyName),
+					expectedPropertyFingerprint(instance, propertyName, value),
+					false,
+					nil
+				),
+				expectInstanceEvent(state.expectedInstanceProperties, instance, string.lower(linkedTime), nil, false, nil),
+			} }
+		end
 		if instance.ClassName == "UICorner" and propertyName == "CornerRadius" then
 			local tokens = {}
 			for _, name in { "TopLeftRadius", "TopRightRadius", "BottomLeftRadius", "BottomRightRadius" } do

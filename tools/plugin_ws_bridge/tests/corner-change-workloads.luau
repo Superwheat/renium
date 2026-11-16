@@ -101,6 +101,7 @@ local texture = instance("Texture", "Texture", storage)
 local gui = instance("ScreenGui", "Gui", storage)
 gui.ScreenInsets = roblox.Enum.ScreenInsets.CoreUISafeInsets
 local localScript = instance("LocalScript", "LocalScript", storage)
+local lighting = instance("Lighting", "Lighting", storage)
 localScript.Disabled = false
 local terrain = setmetatable(instance("Terrain", "Terrain", storage), { __index = function(_, key)
 	if key == "Decoration" then error("Decoration is not a readable member") end
@@ -292,6 +293,24 @@ assert(tracker.serviceGeneration("ReplicatedStorage") == generation, `expected {
 local insetJournal = tracker.drainChangeJournal("corner")
 assert(#insetJournal == 1 and insetJournal[1].properties.ScreenInsets.value == gui.ScreenInsets
 	and insetJournal[1].properties.IgnoreGuiInset == nil, "outside insets must replay the exact enum, not its boolean alias")
+for _, written in { "TimeOfDay", "ClockTime" } do
+	lighting.TimeOfDay, lighting.ClockTime = "14:00:00", 14
+	lighting.Changed:Fire("TimeOfDay")
+	lighting.Changed:Fire("ClockTime")
+	generation = tracker.serviceGeneration("ReplicatedStorage")
+	tracker.drainChangeJournal("corner")
+	local token = tracker.expectPropertyEvent(lighting, written, if written == "TimeOfDay" then "13:24:40" else 13.5)
+	lighting.TimeOfDay, lighting.ClockTime = "13:24:40", 13.5
+	lighting.Changed:Fire(written)
+	lighting.Changed:Fire(if written == "TimeOfDay" then "ClockTime" else "TimeOfDay")
+	tracker.cancelExpectedEvent(token)
+	assert(tracker.serviceGeneration("ReplicatedStorage") == generation, `a write of Lighting.{written} made its other name an outside edit`)
+end
+lighting.TimeOfDay, lighting.ClockTime = "09:00:00", 9
+lighting.Changed:Fire("ClockTime")
+generation += 1
+assert(tracker.serviceGeneration("ReplicatedStorage") == generation, "an outside change of Lighting's time must still count")
+tracker.drainChangeJournal("corner")
 for _, test in { { beam, "Texture", "TextureContent" }, { mesh, "MeshId", "MeshContent" } } do
 	local target, alias, canonical = table.unpack(test)
 	for index = 1, 100 do
