@@ -168,26 +168,39 @@ fn the_tool_definition_stays_under_a_thousand_characters() {
 }
 
 #[test]
-fn steps_stop_at_the_first_failure() {
+fn a_failed_step_stops_the_queue() {
     let scratch = Scratch::new("steps");
     let mut server = Server::start(&scratch);
     let result = server.call(json!({
-        "steps": [["ck", "-"], ["no-such-command"], ["init"]],
+        "steps": [["ck", "-"], ["no-such-command"], ["init"], ["ck", "-"]],
         "stdin": "return 1\n",
     }));
     assert_eq!(result["isError"], true, "{result}");
     let content = result["content"].as_array().unwrap();
-    assert_eq!(content.len(), 2, "{result}");
+    let text = |index: usize| content[index]["text"].as_str().unwrap();
+    assert_eq!(content.len(), 3, "{result}");
     assert!(
-        content[1]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Unknown command 'no-such-command'"),
+        text(1).contains("Unknown command 'no-such-command'"),
+        "{result}"
+    );
+    assert_eq!(
+        text(2),
+        "step 2 failed; the 2 after it did not run",
         "{result}"
     );
     assert!(!scratch.0.join("RENIUM.md").exists());
     let broken = server.call(json!({"args": ["ck", "-"], "stdin": "local = 1\n"}));
     assert_eq!(broken["isError"], true, "{broken}");
+}
+
+#[test]
+fn a_failed_read_does_not_stop_the_queue() {
+    let scratch = Scratch::new("steps-read");
+    let mut server = Server::start(&scratch);
+    let result = server.call(json!({"steps": [["sr", "NoSuchScript"], ["init"]]}));
+    assert_eq!(result["isError"], true, "{result}");
+    assert_eq!(result["content"].as_array().unwrap().len(), 2, "{result}");
+    assert!(scratch.0.join("RENIUM.md").exists(), "{result}");
 }
 
 #[test]

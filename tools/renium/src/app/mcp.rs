@@ -15,6 +15,7 @@ use clap::Args;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::cli::queue::is_lookup;
 use crate::system::LockRecover;
 
 pub(crate) mod register;
@@ -78,7 +79,7 @@ fn tool() -> Value {
                 "steps": {
                     "type": "array",
                     "items": arguments,
-                    "description": "Instead of args: argument lists run in order, stopping at the first failure",
+                    "description": "Instead of args: argument lists run in order as one queue. A failed step stops the queue; a failed search or read does not",
                 },
                 "stdin": {
                     "type": "string",
@@ -215,6 +216,7 @@ struct CallArguments {
 struct Step {
     text: String,
     failed: bool,
+    cancelled: bool,
 }
 
 enum Ending {
@@ -369,15 +371,30 @@ impl Server {
                 true,
             ));
         }
+        // A step the rest may build on stops the queue when it fails. A
+        // search or a read leaves nothing behind, so the steps after a failed
+        // one still run instead of being sent again.
         let mut texts = Vec::new();
-        for args in &steps {
+        let mut failed = false;
+        for (index, args) in steps.iter().enumerate() {
             let step = self.run_step(args, arguments.stdin.as_deref(), &cwd, cancelled);
             texts.push(step.text);
-            if step.failed {
-                return Ok(tool_result(texts, true));
+            if !step.failed {
+                continue;
+            }
+            failed = true;
+            if step.cancelled || !is_lookup(args) {
+                let unrun = steps.len() - index - 1;
+                if unrun > 0 && !step.cancelled {
+                    texts.push(format!(
+                        "step {} failed; the {unrun} after it did not run",
+                        index + 1
+                    ));
+                }
+                break;
             }
         }
-        Ok(tool_result(texts, false))
+        Ok(tool_result(texts, failed))
     }
 
     fn run_step(
@@ -411,6 +428,7 @@ impl Server {
                 return Step {
                     text: format!("Could not start {}: {error}", self.program.display()),
                     failed: true,
+                    cancelled: false,
                 };
             }
         };
@@ -433,11 +451,13 @@ impl Server {
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
+        let cancelled = matches!(ending, Ending::Cancelled);
         let note = match ending {
             Ending::Exited(status) if status.success() => {
                 return Step {
                     text,
                     failed: false,
+                    cancelled: false,
                 };
             }
             Ending::Exited(_) if !text.is_empty() => None,
@@ -458,7 +478,11 @@ impl Server {
             }
             text.push_str(&note);
         }
-        Step { text, failed: true }
+        Step {
+            text,
+            failed: true,
+            cancelled,
+        }
     }
 }
 

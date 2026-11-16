@@ -10,6 +10,7 @@ pub(crate) mod config;
 pub(crate) mod dispatch;
 mod examples;
 pub(crate) mod performance;
+pub(crate) mod queue;
 pub(crate) mod syntax;
 
 use crate::app::update;
@@ -1058,14 +1059,17 @@ mod tests {
         ])
         .unwrap()
         {
+            Commands::Inspect(args) => assert_eq!(args.depth, Some(2)),
+            _ => unreachable!(),
+        }
+        match parse(&["in", "Workspace", "A", "B", "--depth", "2"]).unwrap() {
             Commands::Inspect(args) => {
-                assert_eq!(args.depth, Some(2));
                 let refused = crate::bytecode::inspect_command(args).unwrap_err();
                 assert!(
                     refused
                         .to_string()
                         .contains("rbx tr SERVICE TARGET --depth N"),
-                    "{refused}"
+                    "several targets with --depth are refused: {refused}"
                 );
             }
             _ => unreachable!(),
