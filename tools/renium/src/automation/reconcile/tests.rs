@@ -5889,3 +5889,156 @@ fn a_comparison_reports_a_link_package_it_cannot_enforce_instead_of_packing_noth
         "no manifest is no packed script"
     );
 }
+
+/// One service with these `(identity, name, class)` instances under its
+/// root, and these script files.
+fn scripts_snapshot(instances: &[(&str, &str, &str)], files: &[(&str, &str)]) -> ProjectSnapshot {
+    let mut document = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![SettingsBytecodeInstance::new(
+            "root".into(),
+            "ReplicatedStorage".into(),
+            "ReplicatedStorage".into(),
+            None,
+        )],
+    };
+    for (id, name, class) in instances {
+        document.instances.push(SettingsBytecodeInstance::new(
+            (*id).into(),
+            (*name).into(),
+            (*class).into(),
+            Some(0),
+        ));
+    }
+    let mut snapshot = ProjectSnapshot::default();
+    snapshot.entries.insert(
+        PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium"),
+        SnapshotEntry::File(encode_settings_bytecode(&document).unwrap()),
+    );
+    for (name, source) in files {
+        snapshot.entries.insert(
+            PathBuf::from("src/ReplicatedStorage").join(name),
+            SnapshotEntry::File(source.as_bytes().to_vec()),
+        );
+    }
+    snapshot
+}
+
+fn script_text(snapshot: &ProjectSnapshot, name: &str) -> Option<String> {
+    match snapshot
+        .entries
+        .get(&PathBuf::from("src/ReplicatedStorage").join(name))
+    {
+        Some(SnapshotEntry::File(bytes)) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        _ => None,
+    }
+}
+
+#[test]
+fn an_edited_script_follows_the_rename_and_a_new_script_keeps_its_old_name() {
+    let baseline = scripts_snapshot(
+        &[("a", "A", "ModuleScript")],
+        &[("A.luau", "return 'base'")],
+    );
+    let editor = scripts_snapshot(
+        &[("a", "A", "ModuleScript")],
+        &[("A.luau", "return 'edit'")],
+    );
+    let studio = scripts_snapshot(
+        &[("a", "B", "ModuleScript"), ("n", "A", "ModuleScript")],
+        &[("B.luau", "return 'base'"), ("A.luau", "return 'new'")],
+    );
+    for preference in [
+        ConflictPreference::None,
+        ConflictPreference::Editor,
+        ConflictPreference::Studio,
+    ] {
+        let (merged, conflicts) =
+            merge_snapshots(Some(&baseline), &editor, &studio, preference).unwrap();
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert_eq!(
+            script_text(&merged, "B.luau").as_deref(),
+            Some("return 'edit'")
+        );
+        assert_eq!(
+            script_text(&merged, "A.luau").as_deref(),
+            Some("return 'new'")
+        );
+    }
+}
+
+#[test]
+fn both_sides_editing_a_script_one_side_renamed_is_a_conflict_at_the_files_path() {
+    let baseline = scripts_snapshot(
+        &[("a", "A", "ModuleScript")],
+        &[("A.luau", "return 'base'")],
+    );
+    let editor = scripts_snapshot(
+        &[("a", "A", "ModuleScript")],
+        &[("A.luau", "return 'edit'")],
+    );
+    let studio = scripts_snapshot(
+        &[("a", "B", "ModuleScript")],
+        &[("B.luau", "return 'studio'")],
+    );
+    let (_, conflicts) =
+        merge_snapshots(Some(&baseline), &editor, &studio, ConflictPreference::None).unwrap();
+    assert_eq!(
+        conflicts,
+        [format!(
+            "{} changed on both sides",
+            Path::new("src/ReplicatedStorage").join("A.luau").display()
+        )]
+    );
+    for (preference, text) in [
+        (ConflictPreference::Editor, "return 'edit'"),
+        (ConflictPreference::Studio, "return 'studio'"),
+    ] {
+        let (merged, conflicts) =
+            merge_snapshots(Some(&baseline), &editor, &studio, preference).unwrap();
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert_eq!(script_text(&merged, "B.luau").as_deref(), Some(text));
+        assert_eq!(script_text(&merged, "A.luau"), None);
+    }
+}
+
+#[test]
+fn a_script_kept_against_its_removal_does_not_take_the_text_of_the_one_that_reused_its_identity() {
+    let baseline = scripts_snapshot(
+        &[("editor:9", "Old", "ModuleScript")],
+        &[("Old.luau", "return 'old'")],
+    );
+    let editor = scripts_snapshot(
+        &[("editor:9", "New", "Script")],
+        &[("New.server.luau", "print('new')")],
+    );
+    let mut studio = scripts_snapshot(
+        &[("editor:9", "Old", "ModuleScript")],
+        &[("Old.luau", "return 'old'")],
+    );
+    let store = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
+    let mut document = settings_document(studio.entries.get(&store)).unwrap();
+    document.instances[1]
+        .attributes
+        .insert("Mark".into(), json!(1));
+    studio.entries.insert(
+        store,
+        SnapshotEntry::File(encode_settings_bytecode(&document).unwrap()),
+    );
+    let (merged, conflicts) = merge_snapshots(
+        Some(&baseline),
+        &editor,
+        &studio,
+        ConflictPreference::Studio,
+    )
+    .unwrap();
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert_eq!(
+        script_text(&merged, "Old.luau").as_deref(),
+        Some("return 'old'")
+    );
+    assert_eq!(
+        script_text(&merged, "New.server.luau").as_deref(),
+        Some("print('new')")
+    );
+}

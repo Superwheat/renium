@@ -503,6 +503,7 @@ impl Coordinator {
                     editor: HashSet::new(),
                     studio: side_differences.clone(),
                     aligned_studio: HashMap::new(),
+                    editor_script_paths: HashMap::new(),
                 },
             )
         } else {

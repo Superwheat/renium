@@ -271,6 +271,10 @@ pub(crate) struct MergeChanges {
     /// to, for every path whose Studio side changed. The push plan compares
     /// against these so its previous locations follow the merge's pairing.
     pub(crate) aligned_studio: HashMap<PathBuf, SettingsBytecode>,
+    /// Where each script of the files' side stands, by store and by the
+    /// identity the merge gave it: a store may name another instance by an
+    /// identity the merge had to give away.
+    pub(crate) editor_script_paths: HashMap<PathBuf, HashMap<String, PathBuf>>,
 }
 
 pub(crate) struct MergedEntry {
@@ -278,6 +282,7 @@ pub(crate) struct MergedEntry {
     pub(crate) editor_changed: bool,
     pub(crate) studio_changed: bool,
     pub(crate) aligned_studio: Option<SettingsBytecode>,
+    pub(crate) editor_script_paths: Option<HashMap<String, PathBuf>>,
 }
 
 pub(crate) struct SnapshotSides<'a> {

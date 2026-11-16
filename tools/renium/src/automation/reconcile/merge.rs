@@ -46,6 +46,7 @@ pub(crate) fn merge_snapshots_with_changes(
                 editor_changed: false,
                 studio_changed: false,
                 aligned_studio: None,
+                editor_script_paths: None,
             }
         } else if path
             .file_name()
@@ -73,6 +74,9 @@ pub(crate) fn merge_snapshots_with_changes(
                 changes.aligned_studio.insert(path.clone(), document);
             }
         }
+        if let Some(paths) = result.editor_script_paths {
+            changes.editor_script_paths.insert(path.clone(), paths);
+        }
         if let Some(value) = result.value {
             merged.insert(path, value);
         }
@@ -85,7 +89,13 @@ pub(crate) fn merge_snapshots_with_changes(
         &mut changes,
     )?;
     keep_directories_implied_by_files(&mut merged, &sides, &mut changes);
-    settle_script_paths(&sides, &mut merged, &mut changes)?;
+    settle_script_paths(
+        &sides,
+        preference,
+        &mut merged,
+        &mut conflicts,
+        &mut changes,
+    )?;
     conflicts.sort();
     conflicts.dedup();
     Ok((ProjectSnapshot { entries: merged }, conflicts, changes))
@@ -153,12 +163,17 @@ pub(crate) fn script_paths_by_settings_id(
     let Some(entry) = entries.get(settings_path) else {
         return Ok(HashMap::new());
     };
-    let document = settings_document(Some(entry))?;
-    let source_paths = source_paths_by_settings_index(&document, settings_path)?;
+    script_paths_of(&settings_document(Some(entry))?, settings_path)
+}
+
+fn script_paths_of(
+    document: &SettingsBytecode,
+    settings_path: &Path,
+) -> Result<HashMap<String, PathBuf>> {
     Ok(document
         .instances
         .iter()
-        .zip(source_paths)
+        .zip(source_paths_by_settings_index(document, settings_path)?)
         .filter_map(|(instance, path)| path.map(|path| (instance.settings_id.clone(), path)))
         .collect())
 }
@@ -248,58 +263,150 @@ pub(crate) fn changed_script_source_ids(
         .collect())
 }
 
-/// The source files of the scripts the merged store holds although one side
-/// no longer has them: a preference brought the script back for a reference
-/// or a child that side knows nothing of, or kept its changed record. The
-/// files merge on their own and follow that side's removal, so each comes
-/// back with the content of the side that has the script, at the path the
-/// merged store gives it.
-fn sources_of_scripts_one_side_removed(
-    merged: &BTreeMap<PathBuf, SnapshotEntry>,
-    merged_paths: &HashMap<String, PathBuf>,
-    editor: (&ProjectSnapshot, &HashMap<String, PathBuf>),
-    studio: (&ProjectSnapshot, &HashMap<String, PathBuf>),
-) -> Vec<(PathBuf, SnapshotEntry)> {
-    let mut sources = Vec::new();
-    for (id, path) in merged_paths {
-        if matches!(merged.get(path), Some(SnapshotEntry::File(_))) {
-            continue;
+/// The source a script ends with when its file does not stand at one path on
+/// every side: one side renamed or moved the script, or something above it,
+/// or gave it its first child or took its last, while the other side may have
+/// edited the text. The files merged path by path know nothing of that, so
+/// the text is merged by the script's identity instead. A conflict names the
+/// path the files hold the script at.
+fn source_merged_by_identity(
+    paths: (&Path, &Path),
+    baseline: Option<&SnapshotEntry>,
+    editor: Option<&SnapshotEntry>,
+    studio: Option<&SnapshotEntry>,
+    preference: ConflictPreference,
+    conflicts: &mut Vec<String>,
+) -> Option<SnapshotEntry> {
+    let (desired, editor_path) = paths;
+    let (Some(editor @ SnapshotEntry::File(_)), Some(studio @ SnapshotEntry::File(_))) =
+        (editor, studio)
+    else {
+        return None;
+    };
+    let same = |left: &SnapshotEntry, right: Option<&SnapshotEntry>| {
+        entries_equivalent(desired, Some(left), right)
+    };
+    let source = if same(editor, Some(studio)) || same(studio, baseline) {
+        editor
+    } else if same(editor, baseline) {
+        studio
+    } else {
+        match preference {
+            ConflictPreference::Editor => editor,
+            ConflictPreference::Studio => studio,
+            ConflictPreference::None => {
+                conflicts.push(format!("{} changed on both sides", editor_path.display()));
+                editor
+            }
         }
-        let source = match (editor.1.get(id), studio.1.get(id)) {
-            (Some(kept), None) => editor.0.entries.get(kept),
-            (None, Some(kept)) => studio.0.entries.get(kept),
-            _ => None,
+    };
+    Some(source.clone())
+}
+
+/// Adds the folders a placed script file needs that no side has yet, up to
+/// the nearest folder some side knows.
+fn place_directories_above(
+    file: &Path,
+    merged: &mut BTreeMap<PathBuf, SnapshotEntry>,
+    sides: &SnapshotSides<'_>,
+    touched: &mut BTreeSet<PathBuf>,
+) {
+    let known = |path: &Path| {
+        let is_directory = |snapshot: &ProjectSnapshot| {
+            matches!(snapshot.entries.get(path), Some(SnapshotEntry::Directory))
         };
-        if let Some(source @ SnapshotEntry::File(_)) = source {
-            sources.push((path.clone(), source.clone()));
+        is_directory(sides.editor)
+            || is_directory(sides.studio)
+            || sides.baseline.is_some_and(is_directory)
+    };
+    let mut missing = Vec::new();
+    for ancestor in file.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            return;
+        }
+        if matches!(merged.get(ancestor), Some(SnapshotEntry::Directory)) || known(ancestor) {
+            break;
+        }
+        missing.push(ancestor.to_path_buf());
+    }
+    for directory in missing {
+        merged.insert(directory.clone(), SnapshotEntry::Directory);
+        touched.insert(directory);
+    }
+}
+
+/// Removes the folders above a script file that left its place, as far up as
+/// they hold nothing any more.
+fn drop_directories_emptied_above(
+    file: &Path,
+    merged: &mut BTreeMap<PathBuf, SnapshotEntry>,
+    touched: &mut BTreeSet<PathBuf>,
+) {
+    for ancestor in file.ancestors().skip(1) {
+        // What a folder holds sorts right behind it.
+        let holds_something = merged
+            .range::<Path, _>((
+                std::ops::Bound::Excluded(ancestor),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .is_some_and(|(path, _)| path.starts_with(ancestor));
+        if ancestor.as_os_str().is_empty() || holds_something {
+            return;
+        }
+        if matches!(merged.get(ancestor), Some(SnapshotEntry::Directory)) {
+            merged.remove(ancestor);
+            touched.insert(ancestor.to_path_buf());
         }
     }
-    sources
 }
 
 /// Brings the script files of every store the merge changed in line with
-/// the merged store: a script that came back against one side's removal
-/// gets its source file back, and a file at a path no script of the merged
-/// store has is removed.
+/// the merged store. A script whose file stands at different paths on the
+/// two sides gets its source, merged by its identity, at the path the merged
+/// store gives it. A script only one side has gets that side's source there.
+/// A file at a path no script of the merged store has is removed, with the
+/// folders that leaves empty.
 pub(crate) fn settle_script_paths(
     sides: &SnapshotSides<'_>,
+    preference: ConflictPreference,
     merged: &mut BTreeMap<PathBuf, SnapshotEntry>,
+    conflicts: &mut Vec<String>,
     changes: &mut MergeChanges,
 ) -> Result<()> {
     let (baseline, editor, studio) = (sides.baseline, sides.editor, sides.studio);
+    let is_store = |path: &&PathBuf| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_service_settings_file_name)
+    };
+    // A store both sides changed from the shared state moved its scripts on
+    // both sides too, even where they now hold it alike: a sync that stopped
+    // halfway leaves one side holding the result of the other's rename.
+    let changed_on_both_sides = baseline.into_iter().flat_map(|baseline| {
+        baseline
+            .entries
+            .iter()
+            .filter(|(path, _)| is_store(path))
+            .filter_map(|(path, entry)| {
+                (editor.entries.get(path) != Some(entry) && studio.entries.get(path) != Some(entry))
+                    .then_some(path)
+            })
+    });
     let settings_paths = changes
         .editor
         .iter()
         .chain(changes.studio.iter())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(is_service_settings_file_name)
-        })
+        .filter(is_store)
+        .chain(changed_on_both_sides)
+        .filter(|path| merged.contains_key(*path))
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut touched = BTreeSet::new();
-    let mut restored = Vec::new();
+    let mut placed = Vec::new();
+    let mut vacated = Vec::new();
+    let mut settled_by_identity = HashSet::new();
+    let mut identity_conflicts = Vec::new();
     for settings_path in settings_paths {
         let baseline_paths = baseline
             .map(|snapshot| script_paths_by_settings_id(&snapshot.entries, &settings_path))
@@ -308,40 +415,110 @@ pub(crate) fn settle_script_paths(
         let editor_paths = script_paths_by_settings_id(&editor.entries, &settings_path)?;
         let studio_paths = script_paths_by_settings_id(&studio.entries, &settings_path)?;
         let merged_paths = script_paths_by_settings_id(merged, &settings_path)?;
-        for (path, source) in sources_of_scripts_one_side_removed(
-            merged,
-            &merged_paths,
-            (editor, &editor_paths),
-            (studio, &studio_paths),
-        ) {
-            merged.insert(path.clone(), source);
-            touched.insert(path.clone());
-            restored.push(path);
+        // Each side by the identities the merged store uses. Where the merge
+        // left a side's store as it was, that store is the merged one.
+        let editor_by_merged_id = match changes.editor_script_paths.get(&settings_path) {
+            Some(paths) => paths.clone(),
+            None if !changes.editor.contains(&settings_path) => merged_paths.clone(),
+            None => editor_paths.clone(),
+        };
+        let studio_by_merged_id = match changes.aligned_studio.get(&settings_path) {
+            Some(aligned) => script_paths_of(aligned, &settings_path)?,
+            None if !changes.studio.contains(&settings_path) => merged_paths.clone(),
+            None => studio_paths.clone(),
+        };
+        let mut one_sided = Vec::new();
+        for (id, desired) in &merged_paths {
+            let (editor_path, studio_path) =
+                match (editor_by_merged_id.get(id), studio_by_merged_id.get(id)) {
+                    (Some(editor_path), Some(studio_path)) => (editor_path, studio_path),
+                    (Some(path), None) => {
+                        one_sided.push((desired, editor.entries.get(path)));
+                        continue;
+                    }
+                    (None, Some(path)) => {
+                        one_sided.push((desired, studio.entries.get(path)));
+                        continue;
+                    }
+                    (None, None) => continue,
+                };
+            let baseline_path = baseline_paths.get(id);
+            if editor_path == desired
+                && studio_path == desired
+                && baseline_path.is_none_or(|path| path == desired)
+            {
+                continue;
+            }
+            let Some(source) = source_merged_by_identity(
+                (desired, editor_path),
+                baseline_path
+                    .and_then(|path| baseline.and_then(|snapshot| snapshot.entries.get(path))),
+                editor.entries.get(editor_path),
+                studio.entries.get(studio_path),
+                preference,
+                &mut identity_conflicts,
+            ) else {
+                continue;
+            };
+            settled_by_identity.extend(
+                [
+                    Some(desired),
+                    Some(editor_path),
+                    Some(studio_path),
+                    baseline_path,
+                ]
+                .into_iter()
+                .flatten()
+                .cloned(),
+            );
+            merged.insert(desired.clone(), source);
+            touched.insert(desired.clone());
+            placed.push(desired.clone());
+        }
+        // A script only one side has takes its text from that side: where a
+        // preference brought it back against the other side's removal, and
+        // where its path is one a script settled above stood at, so the file
+        // found there is that other script's.
+        for (desired, source) in one_sided {
+            let Some(source @ SnapshotEntry::File(_)) = source else {
+                continue;
+            };
+            if matches!(merged.get(desired), Some(SnapshotEntry::File(_)))
+                && !settled_by_identity.contains(desired)
+            {
+                continue;
+            }
+            merged.insert(desired.clone(), source.clone());
+            touched.insert(desired.clone());
+            placed.push(desired.clone());
         }
         let desired_paths = merged_paths.values().collect::<HashSet<_>>();
-        let ids = baseline_paths
-            .keys()
-            .chain(editor_paths.keys())
-            .chain(studio_paths.keys())
+        let stale = baseline_paths
+            .values()
+            .chain(editor_paths.values())
+            .chain(studio_paths.values())
+            .filter(|path| !desired_paths.contains(path))
             .cloned()
-            .collect::<HashSet<_>>();
-        for id in ids {
-            let desired = merged_paths.get(&id);
-            for path in [
-                baseline_paths.get(&id),
-                editor_paths.get(&id),
-                studio_paths.get(&id),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if desired == Some(path) || desired_paths.contains(path) {
-                    continue;
-                }
-                merged.remove(path);
-                touched.insert(path.clone());
-            }
+            .collect::<BTreeSet<_>>();
+        for path in stale {
+            merged.remove(&path);
+            touched.insert(path.clone());
+            vacated.push(path);
         }
+    }
+    // What the path by path merge said about those files is void: a file one
+    // side moved away and the other edited is no conflict of its own.
+    conflicts.retain(|conflict| {
+        !settled_by_identity
+            .iter()
+            .any(|path| *conflict == format!("{} changed on both sides", path.display()))
+    });
+    conflicts.append(&mut identity_conflicts);
+    for path in &placed {
+        place_directories_above(path, merged, sides, &mut touched);
+    }
+    for path in &vacated {
+        drop_directories_emptied_above(path, merged, &mut touched);
     }
     for path in touched {
         let merged_entry = merged.get(&path);
@@ -356,7 +533,7 @@ pub(crate) fn settle_script_paths(
             changes.studio.insert(path);
         }
     }
-    for path in restored {
+    for path in placed {
         keep_directories_implied_by_file(&path, merged, sides, changes);
     }
     Ok(())
@@ -400,6 +577,7 @@ pub(crate) fn merge_entry(
         studio_changed: !entries_equivalent(path, studio, value.as_ref()),
         value,
         aligned_studio: None,
+        editor_script_paths: None,
     }
 }
 
@@ -636,6 +814,7 @@ pub(crate) fn merge_settings_entry(
             editor_changed: false,
             studio_changed: false,
             aligned_studio: None,
+            editor_script_paths: None,
         });
     }
     if !first_pairing && editor.is_none() && studio.is_some() {
@@ -647,6 +826,7 @@ pub(crate) fn merge_settings_entry(
             editor_changed: true,
             studio_changed: false,
             aligned_studio: None,
+            editor_script_paths: None,
         });
     }
     let mut editor_doc = settings_document(editor)
@@ -659,10 +839,12 @@ pub(crate) fn merge_settings_entry(
             editor_changed: false,
             studio_changed: false,
             aligned_studio: None,
+            editor_script_paths: None,
         });
     }
     remove_reconciliation_derived_properties(&mut editor_doc);
     remove_reconciliation_derived_properties(&mut studio_doc);
+    let editor_script_paths;
     let (merged, editor_equivalent, studio_equivalent, aligned_studio) = if first_pairing {
         let previous_conflicts = conflicts.len();
         let alignment = align_first_pairing(
@@ -672,6 +854,7 @@ pub(crate) fn merge_settings_entry(
             preference,
             conflicts,
         );
+        editor_script_paths = script_paths_of(&editor_doc, path)?;
         crate::settings::equivalence::inherit_workspace_viewport_reference(
             &mut editor_doc,
             &studio_doc,
@@ -738,6 +921,7 @@ pub(crate) fn merge_settings_entry(
             conflicts,
         );
         align_transient_script_guids(&mut base_doc, &mut editor_doc, &mut studio_doc);
+        editor_script_paths = script_paths_of(&editor_doc, path)?;
         if global_log_enabled(5) {
             log_global(
                 5,
@@ -823,6 +1007,7 @@ pub(crate) fn merge_settings_entry(
         editor_changed,
         studio_changed,
         aligned_studio,
+        editor_script_paths: Some(editor_script_paths),
     })
 }
 
