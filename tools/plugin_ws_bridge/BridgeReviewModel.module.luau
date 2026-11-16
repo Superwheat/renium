@@ -739,7 +739,7 @@ local function buildReviewTree(summaryRows, groups, helpers)
 						haveOld = true
 					else
 						local okCall, okDecode, decoded =
-							pcall(helpers.decodeValue, entry.oldValue, name, group.service)
+							pcall(helpers.decodeValue, entry.oldValue, name, group.service, liveChildrenByParent)
 						if okCall and okDecode then
 							haveOld = true
 							oldValue = decoded
@@ -767,7 +767,8 @@ local function buildReviewTree(summaryRows, groups, helpers)
 				if deleting then
 					haveNew = true
 				elseif not truncated then
-					local okCall, okDecode, decoded = pcall(helpers.decodeValue, entry.value, name, group.service)
+					local okCall, okDecode, decoded =
+						pcall(helpers.decodeValue, entry.value, name, group.service, liveChildrenByParent)
 					if okCall and okDecode then
 						haveNew = true
 						newValue = decoded

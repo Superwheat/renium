@@ -21,7 +21,7 @@
 
 ### Bug fixes
 
-- Studio no longer shows "user_Renium.rbxm is not responding" while a push is prepared for review. Building the review listed a parent's children twice for every row, so a model with hundreds of same-named children (a rig's 850 welds) kept the plugin busy for half a minute. Each parent's children are now listed once per review, and the review pauses regularly while it is built.
+- Studio no longer shows "user_Renium.rbxm is not responding" while a push is prepared for review. Building the review listed a parent's children twice for every row, so a model with hundreds of same-named children (a rig's 850 welds) kept the plugin busy for half a minute. Each parent's children are now listed once per review, and the review pauses regularly while it is built. A store pulled in an earlier Studio session also no longer costs a pass over the whole service for every id Studio does not know. Measured on a 20,000-instance Workspace with 852 welds under one model: 29 seconds before, 0.7 after.
 - A push that sent only values Studio already held answers `unchanged` in place of `verified: false` with nothing to explain it.
 - The rows of a held push no longer print the service twice (`Workspace.Workspace.Lobby`), and an instance sent whole reads `upsert PATH Class` in place of `+ PATH Class`, which looked like an instance Studio did not have.
 - A push no longer fails with "Studio did not retain pushed project changes ... (WeldConstraint.State was not retained (expected 1, Studio has <absent>))" after it applied in full. The check after a push now leaves out the values the engine owns, such as a weld's `State` and a collision group's numeric id, which a store can carry (a link package, an imported place) and no read-back from Studio returns.

@@ -847,13 +847,25 @@ local function resolveInstanceBySettingsId(serviceName: string, rawSettingsId: a
 	if strongSettingsId(settingsId) then
 		local state = getStateForService(serviceName, ctx)
 		if state ~= nil and type(state.instances) == "table" then
-			for _, candidate in ipairs(state.instances) do
-				local live = liveInstance(candidate)
-				if live ~= nil and "debug:" .. tostring(live:GetDebugId(32)) == settingsId then
-					lookup[settingsId] = live
-					return live
+			-- One pass lists every instance of this state by its live id. An
+			-- id that is still missing belongs to none of them, so the misses
+			-- after it cost nothing until the state changes: a store pulled in
+			-- an earlier Studio session misses on every id it holds.
+			local cached = ctx.settingsIdLookupByService[serviceName]
+			if
+				type(cached) == "table"
+				and (cached.listedState ~= state or cached.listedCount ~= #state.instances)
+			then
+				cached.listedState = state
+				cached.listedCount = #state.instances
+				for _, candidate in ipairs(state.instances) do
+					local live = liveInstance(candidate)
+					if live ~= nil then
+						lookup["debug:" .. tostring(live:GetDebugId(32))] = live
+					end
 				end
 			end
+			return liveInstance(lookup[settingsId])
 		end
 		return nil
 	end
@@ -1266,7 +1278,12 @@ local function decodeRefValue(raw: { [string]: any }, ctx: { [string]: any }?, s
 		end
 	end
 	if type(raw.pathSegments) == "table" then
-		local instance = resolvePathSegments(raw.pathSegments, nil, raw.pathOrdinals)
+		local instance = resolvePathSegments(
+			raw.pathSegments,
+			nil,
+			raw.pathOrdinals,
+			if ctx ~= nil then ctx.resolveChildIndex else nil
+		)
 		if instance ~= nil then
 			return instance
 		end
@@ -6700,8 +6717,17 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		return instance
 	end
 
-	function api.decodeReviewValue(raw: any, enumHint: string?, serviceName: string?): (boolean, any)
-		return decodeValue(raw, enumHint, ctx, serviceName)
+	function api.decodeReviewValue(raw: any, enumHint: string?, serviceName: string?, childIndex: any?): (boolean, any)
+		local previous = ctx.resolveChildIndex
+		if previous == nil then
+			ctx.resolveChildIndex = childIndex
+		end
+		local decoded = table.pack(pcall(decodeValue, raw, enumHint, ctx, serviceName))
+		ctx.resolveChildIndex = previous
+		if not decoded[1] then
+			error(decoded[2], 0)
+		end
+		return decoded[2], decoded[3]
 	end
 
 	function api.readReviewProperty(instance: Instance, propertyName: string): (boolean, any)
