@@ -968,6 +968,7 @@ fn encode_settings_bytecode_with_reference_lookup(
     build_reference_lookup: bool,
 ) -> Result<Vec<u8>> {
     validate_settings_hierarchy(&document.instances)?;
+    validate_settings_record_properties(&document.instances)?;
     let canonical = canonical_attribute_document(document);
     let document = canonical.as_ref().unwrap_or(document);
     let settled = forced_properties_settled_document(document);
@@ -976,6 +977,42 @@ fn encode_settings_bytecode_with_reference_lookup(
         encode_settings_bytecode_payload_with_reference_lookup(document, build_reference_lookup)?;
     let encoded = wrap_settings_bytecode_payload(&payload)?;
     Ok(encoded)
+}
+
+/// Refuses a property a store cannot give back: one named for a field of the
+/// instance record, which a store keeps only in the record, and an object
+/// named Attributes, which a store reads back as the instance's attributes.
+fn validate_settings_record_properties(instances: &[SettingsBytecodeInstance]) -> Result<()> {
+    let lookup = SettingsBinaryInstanceLookup::default();
+    for instance in instances {
+        let held = |name: &str| {
+            instance
+                .properties
+                .get(name)
+                .filter(|value| !value.is_null())
+        };
+        if let Some(field) = SETTINGS_RECORD_FIELDS
+            .into_iter()
+            .find(|field| held(field).is_some())
+        {
+            bail!(
+                "Instance {} ({}) holds a {field} property; a store keeps the instance's {field} in its record",
+                instance.settings_id,
+                instance.name
+            );
+        }
+        if held("Attributes").is_some_and(|value| {
+            ref_payload_object(value).is_none()
+                && matches!(binary_raw_value_kind(value, &lookup), Ok(8))
+        }) {
+            bail!(
+                "Instance {} ({}) holds an object property named Attributes, which a store reads back as its attributes; set them as attributes",
+                instance.settings_id,
+                instance.name
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_settings_hierarchy(instances: &[SettingsBytecodeInstance]) -> Result<()> {
@@ -4873,5 +4910,35 @@ mod tests {
             json!({"_type": "Ref", "instanceId": "a", "pathSegments": ["Lighting", "Sun"]})
         );
         assert_eq!(encode_settings_bytecode(&decoded).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_property_a_store_cannot_give_back_is_refused() {
+        let document = |name: &str, value: Value| {
+            let mut part = hierarchy_instance("editor:1", Some(0));
+            part.properties.insert(name.to_string(), value);
+            SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances: vec![hierarchy_instance("editor:0", None), part],
+            }
+        };
+        for (name, value) in [
+            ("Name", json!("Door")),
+            ("ClassName", json!("Model")),
+            ("Parent", json!("editor:0")),
+            ("Attributes", json!({"Health": 5})),
+        ] {
+            let error = encode_settings_bytecode(&document(name, value.clone()))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(name), "{error}");
+            assert!(
+                encode_settings_bytecode_with_dense_references(&document(name, value)).is_err()
+            );
+        }
+        assert!(encode_settings_bytecode(&document("Name", Value::Null)).is_ok());
+        let kept = document("Attributes", json!("text"));
+        let decoded = decode_settings_bytecode(&encode_settings_bytecode(&kept).unwrap()).unwrap();
+        assert_eq!(decoded.instances[1].properties["Attributes"], json!("text"));
     }
 }

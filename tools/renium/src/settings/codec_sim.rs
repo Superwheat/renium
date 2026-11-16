@@ -10,7 +10,10 @@
 //!    string-set decode gives d1 for sets of strings one of which the store
 //!    holds whole, and nothing for a set it does not.
 //! 2. Every value of d1 is the stated canonical form of d0's value, exactly:
-//!    the same keys, number kinds and float bits.
+//!    the same keys, number kinds and float bits. A document with a property
+//!    named for a record field (Name, ClassName, Parent) or an object named
+//!    Attributes is refused instead, by both encoders: a store cannot give
+//!    such a property back.
 //! 3. encode(d1) == encode(d0) byte for byte, and decode(encode(d1)) == d1.
 //! 4. The dense-references encoder finds a reference's target by its
 //!    instanceIndex alone, checking a settingsId beside it against that
@@ -168,10 +171,10 @@ const NONFINITE: [&str; 3] = ["nan", "inf", "-inf"];
 const SHRINK_INSTANCES: usize = 200_000;
 /// A string no generated document holds.
 const ABSENT: &str = "\u{1}no store holds this\u{2}";
-/// Properties the decoder drops: the record's own fields say these.
+/// Properties a store keeps only in the instance record.
 const RECORD_FIELDS: [&str; 3] = ["Name", "ClassName", "Parent"];
 /// The cases the codec gets wrong, by the names `RENIUM_SIM_DEFECTS` takes.
-const DEFECTS: [&str; 3] = ["typed-property", "record-field", "attributes-property"];
+const DEFECTS: [&str; 1] = ["typed-property"];
 
 /// A generated value and the form each encoder's decode must give back.
 #[derive(Clone)]
@@ -1153,20 +1156,29 @@ impl Gen<'_> {
         )
     }
 
-    // Excluded (`record-field`): a Name, ClassName or Parent property, which
-    // the encoder writes and the decoder drops, so law 3 fails (codec defect).
-    // Excluded (`attributes-property`): an Attributes property that holds an
-    // object, which decodes as the instance's attributes, or fails to decode
-    // beside them (codec defect).
-    fn named_property(&mut self) -> (String, Stated) {
-        if self.defect("record-field") && self.chance(8) {
-            let name = self.pick(&RECORD_FIELDS).to_string();
-            return (name, Stated::kept(json!(self.text())));
-        }
-        if self.defect("attributes-property") && self.chance(8) {
+    /// A property the encoder refuses: one named for a record field, or an
+    /// object named Attributes.
+    fn refused_property(&mut self) -> (String, Stated) {
+        if self.chance(2) {
             return ("Attributes".into(), self.object(0));
         }
-        let (name, value) = match self.rng.below(15) {
+        let name = self.pick(&RECORD_FIELDS).to_string();
+        (name, Stated::kept(json!(self.text())))
+    }
+
+    /// The properties next to the refused ones that a store keeps: a record
+    /// field that is null, dropped as any null property is, and an
+    /// Attributes property that is no object.
+    fn near_refused_property(&mut self) -> (&'static str, Stated) {
+        if self.chance(2) {
+            return (self.pick(&RECORD_FIELDS), Stated::kept(Value::Null));
+        }
+        ("Attributes", Stated::kept(json!(self.text())))
+    }
+
+    fn named_property(&mut self) -> (String, Stated) {
+        let (name, value) = match self.rng.below(16) {
+            13 => self.near_refused_property(),
             0 | 1 => ("Value", self.property()),
             2 => ("Size", self.fixed(VECTOR3)),
             3 => ("CFrame", self.cframe(true)),
@@ -1361,6 +1373,8 @@ enum Kind {
     Deepest,
     /// Every instance holds the same values.
     Copies,
+    /// An ordinary document with one property the encoders refuse.
+    Refused,
     Empty,
 }
 
@@ -1370,11 +1384,12 @@ fn generate(seed: u64) -> Doc {
         3 => Kind::Large,
         7 => Kind::Copies,
         11 => Kind::Deepest,
+        15 => Kind::Refused,
         19 => Kind::Empty,
         _ => Kind::Ordinary,
     };
     let count = match kind {
-        Kind::Ordinary => 1 + rng.below(40),
+        Kind::Ordinary | Kind::Refused => 1 + rng.below(40),
         Kind::Large => {
             SETTINGS_BINARY_PARALLEL_CHUNK_SIZE.max(SETTINGS_BINARY_PARALLEL_MIN_INSTANCES)
                 + 1
@@ -1394,7 +1409,7 @@ fn generate(seed: u64) -> Doc {
         long_source: kind == Kind::Large,
         defects: defects(),
     };
-    let entries = if kind == Kind::Copies {
+    let mut entries: Vec<Vec<Entry>> = if kind == Kind::Copies {
         let copy = generator.columns();
         let entries = copy
             .into_iter()
@@ -1411,6 +1426,16 @@ fn generate(seed: u64) -> Doc {
             .map(|node| generator.entries(&node.class, kind == Kind::Large))
             .collect()
     };
+    if kind == Kind::Refused {
+        let (name, value) = generator.refused_property();
+        let held = &mut entries[generator.rng.below(nodes.len())];
+        held.retain(|entry| entry.attribute || entry.name != name);
+        held.push(Entry {
+            attribute: false,
+            name,
+            value,
+        });
+    }
     let version = [SETTINGS_BINARY_VERSION, SETTINGS_BINARY_VERSION - 1, 0][rng.below(3)];
     Doc {
         version,
@@ -1453,6 +1478,17 @@ impl Doc {
         }
     }
 
+    /// Whether both encoders must refuse the document: it holds a property
+    /// named for a record field, or an object named Attributes.
+    fn refused(&self) -> bool {
+        self.entries.iter().flatten().any(|entry| {
+            !entry.attribute
+                && !entry.value.input.is_null()
+                && (RECORD_FIELDS.contains(&entry.name.as_str())
+                    || (entry.name == "Attributes" && entry.value.input.is_object()))
+        })
+    }
+
     /// What decoding an encoder's bytes must give; None where the dense
     /// encoder must refuse the document.
     fn stated(&self, dense: bool) -> Option<SettingsBytecode> {
@@ -1470,9 +1506,7 @@ impl Doc {
                     };
                     if entry.attribute {
                         instance.attributes.insert(entry.name.clone(), value);
-                    } else if !entry.value.input.is_null()
-                        && !RECORD_FIELDS.contains(&entry.name.as_str())
-                    {
+                    } else if !entry.value.input.is_null() {
                         instance.properties.insert(entry.name.clone(), value);
                     }
                 }
@@ -1765,8 +1799,22 @@ fn dense_kept(
     Ok(())
 }
 
+/// Law 2 for a document with a property no store can give back.
+fn refused(d0: &SettingsBytecode) -> Result<(), String> {
+    if encode_settings_bytecode(d0).is_ok() {
+        return Err("law 2: the encoder took a property named for a record field or an object named Attributes".into());
+    }
+    if encode_settings_bytecode_with_dense_references(d0).is_ok() {
+        return Err("law 4: the dense encoder took a property named for a record field or an object named Attributes".into());
+    }
+    Ok(())
+}
+
 fn laws(doc: &Doc) -> Result<(), String> {
     let d0 = doc.input();
+    if doc.refused() {
+        return refused(&d0);
+    }
     let bytes = encode_settings_bytecode(&d0)
         .map_err(|error| format!("law 2: the encoder refused the document: {error:#}"))?;
     let d1 = decode_settings_bytecode(&bytes)
