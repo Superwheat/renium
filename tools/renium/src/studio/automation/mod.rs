@@ -87,7 +87,12 @@ pub(crate) fn execute_luau_command(mut args: ExecuteLuauArgs) -> Result<()> {
     let text = args.runner.detach.is_none() && args.runner.collect.is_none() && compact;
     let mut result = match daemon_result(op::LUAU, None, parameters, false, Some(&args.bridge)) {
         Err(error) if text => {
-            crate::app::output::write_stderr(format_args!("error: {error:#}"));
+            let error = format!("{error:#}");
+            crate::app::output::write_stderr(format_args!("error: {error}"));
+            // The read that would follow a missing member comes with it.
+            if let Some(holds) = crate::bytecode::saved_children_line(&error) {
+                crate::app::output::write_stderr(format_args!("{holds}"));
+            }
             return Err(ReportedFailure.into());
         }
         result => result?,
@@ -548,6 +553,7 @@ fn ensure_luau_ok_in_context(
         let label = luau_context_label(result, player);
         match error.downcast::<crate::app::output::LuauRunFailure>() {
             Ok(run) => run
+                .with_event_wait_hint(code)
                 .with_hint(code.and_then(|code| crate::app::output::luau_code_hint(code, result)))
                 .in_context(&label)
                 .into(),
@@ -605,9 +611,10 @@ fn strip_kept_runner_fields(result: &mut Value) {
 /// The run limit `rbx l` and `rbx lc` use when `-t` is not given.
 pub(crate) const DEFAULT_LUAU_TIMEOUT_SECONDS: f64 = 10.0;
 
-/// The run limit when `-t` is not given: it grows to cover the sleeps written
-/// into the code, so a probe with `task.wait(25)` in it is not stopped at
-/// 10 s. Studio stops a runner at 120 s regardless.
+/// The run limit when `-t` is not given: it grows to cover the waits written
+/// into the code, so a probe with `task.wait(25)`, `WaitForChild(name, 15)`
+/// or a loop bounded by `os.clock() - started < 40` is not stopped at 10 s.
+/// Studio stops a runner at 120 s regardless.
 fn default_luau_run_timeout(code: &str) -> f64 {
     let code = luau_without_strings_and_comments(code);
     let code = code.as_str();
@@ -662,15 +669,25 @@ fn waits_in_a_loop(code: &str) -> bool {
 /// grows; shorter sleeps fit the limit as it is.
 const LUAU_SLEEP_MARGIN_SECONDS: f64 = 5.0;
 
-/// Seconds the code sleeps in `wait(N)` and `task.wait(N)` calls whose N is
-/// a number literal.
+/// Seconds the code may wait by its own number literals: `wait(N)` and
+/// `task.wait(N)`, the timeout of `WaitForChild(name, N)` (the name is a
+/// blanked string here), and a deadline against a clock, `os.clock() - t < N`
+/// or `os.clock() + N`.
 fn literal_sleep_seconds(code: &str) -> f64 {
-    static SLEEP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"\bwait\s*\(\s*((?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*\)")
-            .expect("valid sleep pattern")
+    const NUMBER: &str = r"((?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)";
+    const CLOCK: &str = r"\b(?:os\.clock|os\.time|tick|time)\s*\(\s*\)";
+    static WAITS: std::sync::LazyLock<[regex::Regex; 4]> = std::sync::LazyLock::new(|| {
+        [
+            format!(r"\bwait\s*\(\s*{NUMBER}\s*\)"),
+            format!(r"\bWaitForChild\s*\([^(),]*,\s*{NUMBER}\s*\)"),
+            format!(r"{CLOCK}\s*-\s*[\w.]+\s*<=?\s*{NUMBER}"),
+            format!(r"{CLOCK}\s*\+\s*{NUMBER}"),
+        ]
+        .map(|pattern| regex::Regex::new(&pattern).expect("valid wait pattern"))
     });
-    SLEEP
-        .captures_iter(code)
+    WAITS
+        .iter()
+        .flat_map(|pattern| pattern.captures_iter(code))
         .filter_map(|capture| capture[1].parse::<f64>().ok())
         .sum()
 }
@@ -3613,16 +3630,51 @@ fn send_virtual_input(
         split_virtual_input(actions)
     };
     let mut merged = None;
+    let mut held = HashSet::new();
     for batch in batches {
+        // A click that follows another action is asked again until its
+        // target is up: a panel the earlier action opened needs no wait
+        // written before it. The first action has nothing to wait for, and
+        // a refusal lets go of every held key, so nothing may be held: not by
+        // this request, nor by an earlier one, which the answers so far name.
+        let keys_held = merged
+            .as_ref()
+            .and_then(|answer: &Value| answer.get("heldKeys"))
+            .and_then(Value::as_array)
+            .is_some_and(|keys| !keys.is_empty());
+        let awaited = (expect_activated_id.is_none() && held.is_empty() && !keys_held)
+            .then(|| batch.first().filter(|action| action["type"] == "click"))
+            .flatten()
+            .map(|click| click["step"].as_u64())
+            .filter(|step| step.is_some_and(|step| step > 1))
+            .map(|step| (step, Instant::now() + CLICK_TARGET_WAIT));
+        batch
+            .iter()
+            .for_each(|action| note_held_input(&mut held, action));
         let mut params = json!({ "actions": batch });
         if let Some(id) = expect_activated_id {
             params["expectActivatedId"] = Value::String(id.to_string());
         }
-        let result =
-            bridge.call_for_selector("sendVirtualInput", params, BridgeTarget::Client, player)?;
-        if let Some(failure) = virtual_input_failure(&result) {
-            return Err(failure.into());
-        }
+        let result = loop {
+            let result = bridge.call_for_selector(
+                "sendVirtualInput",
+                params.clone(),
+                BridgeTarget::Client,
+                player,
+            )?;
+            let Some(failure) = virtual_input_failure(&result) else {
+                break result;
+            };
+            let waits = awaited.is_some_and(|(step, deadline)| {
+                result.get("failedStep").and_then(Value::as_u64) == step
+                    && click_target_may_appear(&failure.message)
+                    && Instant::now() < deadline
+            });
+            if !waits {
+                return Err(failure.into());
+            }
+            thread::sleep(CLICK_TARGET_POLL);
+        };
         merged = Some(match merged {
             None => result,
             Some(previous) => merge_virtual_input_results(previous, result),
@@ -3695,24 +3747,63 @@ fn with_clickable_now(message: &str, source: &Value) -> String {
     format!("{message}. Clickable now: {listed}")
 }
 
+/// How long a click waits for its GUI target to exist, show and be reachable.
+const CLICK_TARGET_WAIT: Duration = Duration::from_secs(2);
+const CLICK_TARGET_POLL: Duration = Duration::from_millis(150);
+
+/// Whether a click was refused before it was sent for a reason that time can
+/// mend: the element is not there yet, not shown yet or still covered.
+fn click_target_may_appear(message: &str) -> bool {
+    [
+        " is not visible: ",
+        " is covered by ",
+        " not found under ",
+        "PlayerGui is not available",
+        "LocalPlayer is not available",
+    ]
+    .iter()
+    .any(|reason| message.contains(reason))
+}
+
+/// Keeps `held` as the keys and buttons a batch leaves down.
+fn note_held_input(held: &mut HashSet<String>, action: &Value) {
+    let name = match action["type"].as_str() {
+        Some("key") => format!("key {}", action["key"]),
+        Some("button") => format!("button {}", action["button"]),
+        _ => return,
+    };
+    if action["down"] == true {
+        held.insert(name);
+    } else {
+        held.remove(&name);
+    }
+}
+
 /// One bridge call answers within thirty seconds, so a batch whose waits
 /// add up to more than this goes to the client as consecutive calls; keys
-/// and buttons held at the end of a call stay held into the next one.
+/// and buttons held at the end of a call stay held into the next one. A
+/// verified click starts a call of its own while nothing is held, so a click
+/// that has to wait for its target is asked again with nothing run twice.
 const MAX_VIRTUAL_CALL_WAIT_MS: u64 = 25_000;
 
 fn split_virtual_input(actions: Vec<Value>) -> Vec<Vec<Value>> {
     let mut batches: Vec<Vec<Value>> = vec![Vec::new()];
     let mut waited = 0;
+    let mut held = HashSet::new();
     for action in actions {
         let wait = if action["type"] == "wait" {
             action["ms"].as_u64().unwrap_or(0)
         } else {
             action["holdMs"].as_u64().unwrap_or(0)
         };
-        if waited + wait > MAX_VIRTUAL_CALL_WAIT_MS && !batches.last().is_some_and(Vec::is_empty) {
+        let awaited_click = action["type"] == "click" && held.is_empty();
+        if (awaited_click || waited + wait > MAX_VIRTUAL_CALL_WAIT_MS)
+            && !batches.last().is_some_and(Vec::is_empty)
+        {
             batches.push(Vec::new());
             waited = 0;
         }
+        note_held_input(&mut held, &action);
         waited += wait;
         if let Some(batch) = batches.last_mut() {
             batch.push(action);
@@ -3728,8 +3819,15 @@ fn merge_virtual_input_results(previous: Value, last: Value) -> Value {
     let count = |value: &Value, key: &str| value.get(key).and_then(Value::as_u64);
     merged["actions"] =
         json!(count(&previous, "actions").unwrap_or(0) + count(&merged, "actions").unwrap_or(0));
-    if let Some(clicks) = count(&previous, "verifiedClicks") {
-        merged["verifiedClicks"] = json!(clicks + count(&merged, "verifiedClicks").unwrap_or(0));
+    for key in ["verifiedClicks", "unconfirmedClicks"] {
+        if let Some(clicks) = count(&previous, key) {
+            merged[key] = json!(clicks + count(&merged, key).unwrap_or(0));
+        }
+    }
+    if merged.get("coreGui").is_none_or(Value::is_null)
+        && let Some(report) = previous.get("coreGui").filter(|report| !report.is_null())
+    {
+        merged["coreGui"] = report.clone();
     }
     if previous.get("textObserved") == Some(&Value::Bool(false)) {
         merged["textObserved"] = json!(false);
@@ -6352,6 +6450,36 @@ mod compact_result_tests {
     }
 
     #[test]
+    fn the_default_run_limit_covers_bounded_waits() {
+        assert_eq!(
+            default_luau_run_timeout(
+                "local a = workspace.Lobby:WaitForChild('Ads', 10) return a ~= nil"
+            ),
+            20.0
+        );
+        assert_eq!(
+            default_luau_run_timeout("return workspace:WaitForChild('A', 3)"),
+            10.0
+        );
+        assert_eq!(
+            default_luau_run_timeout("return workspace:WaitForChild('A')"),
+            10.0
+        );
+        assert_eq!(
+            default_luau_run_timeout(
+                "local t = os.clock() while os.clock() - t < 40 and not done do task.wait(0.5) end return 1"
+            ),
+            50.5
+        );
+        assert_eq!(
+            default_luau_run_timeout(
+                "local deadline = os.clock() + 25 repeat task.wait() until os.clock() > deadline"
+            ),
+            35.0
+        );
+    }
+
+    #[test]
     fn sleeps_named_in_strings_and_comments_do_not_grow_the_run_limit() {
         assert_eq!(
             default_luau_run_timeout("return \"please wait(90) here\""),
@@ -7413,7 +7541,46 @@ mod virtual_input_tests {
             json!({ "type": "click", "path": "B", "holdMs": 10_000 }),
             json!({ "type": "click", "path": "C", "holdMs": 10_000 }),
         ]);
-        assert_eq!(clicks.len(), 2);
+        assert_eq!(clicks.len(), 3);
+    }
+
+    #[test]
+    fn a_click_starts_its_own_call_unless_something_is_held() {
+        let click = |path: &str, step: u64| json!({ "type": "click", "path": path, "step": step });
+        let wait = json!({ "type": "wait", "ms": 300 });
+        let text = json!({ "type": "text", "text": "abc" });
+        let batches = split_virtual_input(vec![
+            wait.clone(),
+            click("Open", 2),
+            wait.clone(),
+            click("Box", 4),
+            text.clone(),
+            click("Redeem", 6),
+        ]);
+        let shape = |batches: &[Vec<Value>]| batches.iter().map(Vec::len).collect::<Vec<_>>();
+        assert_eq!(shape(&batches), [1, 2, 2, 1]);
+        assert!(batches[1..].iter().all(|batch| batch[0]["type"] == "click"));
+
+        let key = |down: bool| json!({ "type": "key", "key": "W", "down": down });
+        let held = split_virtual_input(vec![key(true), click("A", 2), key(false), click("B", 4)]);
+        assert_eq!(
+            shape(&held),
+            [3, 1],
+            "a click under a held key stays in its call"
+        );
+
+        assert!(click_target_may_appear(
+            "GUI element Main.Shop.Redeem is not visible: Main.Shop has Visible=false"
+        ));
+        assert!(click_target_may_appear(
+            "GUI element A.B is covered by A.Popup"
+        ));
+        assert!(click_target_may_appear(
+            "Path segment 'Shop' not found under Players.A.PlayerGui.Main"
+        ));
+        assert!(!click_target_may_appear(
+            "Expected one Activated and MouseButton1Click event, got 0 and 0"
+        ));
     }
 
     #[test]
@@ -7428,6 +7595,17 @@ mod virtual_input_tests {
         });
         let merged = merge_virtual_input_results(first, last);
         assert_eq!(merged["actions"], 7);
+        let counted = merge_virtual_input_results(
+            json!({ "ok": true, "actions": 1, "verifiedClicks": 0, "unconfirmedClicks": 1 }),
+            json!({ "ok": true, "actions": 1, "verifiedClicks": 1 }),
+        );
+        assert_eq!(counted["unconfirmedClicks"], 1);
+        assert_eq!(counted["verifiedClicks"], 1);
+        let dismissed = merge_virtual_input_results(
+            json!({ "ok": true, "actions": 1, "coreGui": { "pressed": true } }),
+            json!({ "ok": true, "actions": 1, "verifiedClicks": 1 }),
+        );
+        assert_eq!(dismissed["coreGui"]["pressed"], true);
         assert_eq!(merged["verifiedClicks"], 1);
         assert_eq!(merged["keysObserved"], json!({ "W": true, "E": false }));
         assert_eq!(merged["throughSystemUi"], json!(["chat"]));

@@ -638,6 +638,57 @@ fn inspect_reports_ambiguous_and_missing_targets() {
 }
 
 #[test]
+fn a_sibling_that_shares_its_name_is_read_by_its_number() {
+    let fx = Fixture::new("inspect-siblings");
+    let root = fx.path("");
+    let second = fx.text(&["tr", "Workspace", "Lobby.Border2", "-r", &root]);
+    assert_eq!(second.ok()[0]["id"], "border2");
+    assert!(
+        fx.text(&["tr", "Workspace", "Lobby.Border3", "-r", &root])
+            .err()
+            .contains("No matching instance path: Workspace.Lobby.Border3")
+    );
+    assert!(
+        fx.text(&["tr", "Workspace", "Lobby.Door1", "-r", &root])
+            .err()
+            .contains("No matching instance path"),
+        "one Door is not a numbered group"
+    );
+}
+
+#[test]
+fn a_missing_member_error_gets_what_the_saved_place_holds_there() {
+    let fx = Fixture::new("missing-member");
+    let root = PathBuf::from(fx.path(""));
+    let line =
+        |error: &str| crate::bytecode::saved_children_line_in(&root, Path::new("src"), error);
+    assert_eq!(
+        line(r#"[Edit window] Dor is not a valid member of Folder "Workspace.Lobby""#).as_deref(),
+        Some("Workspace.Lobby holds in the saved place: Door, Border, Helper")
+    );
+    let there = line(r#"Door is not a valid member of Folder "Workspace.Lobby""#).unwrap();
+    assert!(
+        there.starts_with(
+            "the saved place has Door in Workspace.Lobby; it is not there in this session"
+        ),
+        "{there}"
+    );
+    assert_eq!(
+        line(r#"X is not a valid member of Part "Workspace.Lobby.Door""#).as_deref(),
+        Some("Workspace.Lobby.Door has no children in the saved place")
+    );
+    assert_eq!(
+        line(r#"X is not a valid member of Folder "Workspace.Nowhere""#),
+        None
+    );
+    assert_eq!(
+        line(r#"X is not a valid member of PlayerGui "Players.A.PlayerGui""#),
+        None
+    );
+    assert_eq!(line("attempt to index nil with 'Font'"), None);
+}
+
+#[test]
 fn get_property_reads_every_stored_value_kind() {
     let fx = Fixture::new("get-kinds");
     let store = fx.store_arg("Workspace");

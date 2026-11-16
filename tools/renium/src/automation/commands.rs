@@ -169,7 +169,11 @@ pub(crate) struct InputArgs {
         value_name = "PATH"
     )]
     shot: Option<PathBuf>,
-    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(
+        required_unless_present_any = ["result", "shot"],
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
     actions: Vec<String>,
     #[command(flatten)]
     bridge: BridgeConnectionArgs,
@@ -717,14 +721,18 @@ pub(crate) fn input(mut args: InputArgs, project: Option<&Path>) -> Result<()> {
     args.player = lifted.player.or(args.player);
     args.result = lifted.result.or(args.result);
     args.shot = lifted.shot.or(args.shot);
-    let actions = input_actions(&lifted.actions)?;
-    let mut result = daemon_result(
-        op::INPUT,
-        project,
-        json!({ "player": args.player, "actions": actions }),
-        false,
-        Some(&args.bridge),
-    )?;
+    // Without actions the call only looks: `inp -p 1 --shot out.png`.
+    let mut result = if lifted.actions.is_empty() {
+        json!({ "ok": true, "actions": 0 })
+    } else {
+        daemon_result(
+            op::INPUT,
+            project,
+            json!({ "player": args.player, "actions": input_actions(&lifted.actions)? }),
+            false,
+            Some(&args.bridge),
+        )?
+    };
     let mut requested_shot = None;
     // The follow-ups run on the same client once the actions are in, so one
     // call covers "act, then look": a typed observation and a screenshot.

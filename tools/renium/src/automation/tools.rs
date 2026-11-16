@@ -511,7 +511,9 @@ fn script_read_text(value: &Value) -> String {
     }
     let functions = items(value, "functions");
     let mut text = String::new();
-    if value["outlineOnly"] == json!(true) {
+    if let Some(instead) = value.get("instead").and_then(Value::as_str) {
+        text.push_str(&format!("{instead}\n"));
+    } else if value["outlineOnly"] == json!(true) {
         text.push_str(&outline_only_line(value));
     } else if functions
         .iter()
@@ -993,6 +995,36 @@ impl<'a> ScriptMapping<'a> {
     }
 }
 
+/// The one script file whose project path ends with `requested`, for a file
+/// named without its folders (`DataHandler.server.luau`, `Touch/init.luau`).
+/// Several such files are an error that lists them.
+fn script_by_path_end(
+    root: &Path,
+    source: &Path,
+    requested: &str,
+) -> Result<Option<String>, Failure> {
+    let wanted = scope_prefix(requested);
+    let mut ending = script_files(source)
+        .iter()
+        .map(|path| relative(root, path))
+        .filter(|path| {
+            path.strip_suffix(wanted.as_str())
+                .is_some_and(|folders| folders.is_empty() || folders.ends_with('/'))
+        })
+        .collect::<Vec<_>>();
+    if ending.len() < 2 {
+        return Ok(ending.pop());
+    }
+    Err(failure(
+        format!(
+            "{requested} ends {} script paths: {}; pass one of them",
+            ending.len(),
+            ending.join(", ")
+        ),
+        "script-read",
+    ))
+}
+
 /// The script file a read names, tried in this order: a file path, an
 /// instance path (`ServerScriptService.Main`) that the project's script
 /// mapping leads to a file, and the name one script alone goes by (`Main`).
@@ -1007,6 +1039,12 @@ pub(super) fn resolve_read_target(
     let root = mapping.root;
     let names_file = requested.contains(['/', '\\']) || has_script_extension(Path::new(requested));
     if names_file || root.join(requested).is_file() {
+        if !Path::new(requested).is_absolute()
+            && !root.join(requested).exists()
+            && let Some(path) = script_by_path_end(root, mapping.source, requested)?
+        {
+            return resolve_script(root, &path, "script-read");
+        }
         return resolve_script(root, requested, "script-read");
     }
     let named = || {
@@ -1190,10 +1228,29 @@ fn script_read_functions(
     let listed = if request.outline {
         outline_entries(&functions)
     } else {
-        named_functions(path, &functions, &request.functions)?
-            .into_iter()
-            .map(|function| function_entry(function, "source", function_source(function, lines)))
-            .collect()
+        match named_functions(path, &functions, &request.functions) {
+            Ok(named) => named
+                .into_iter()
+                .map(|function| {
+                    function_entry(function, "source", function_source(function, lines))
+                })
+                .collect(),
+            // A name no function has gets the outline, which is the read that
+            // would follow, under a line saying what was not found.
+            Err(missing) if !functions.is_empty() => {
+                let instead = missing
+                    .0
+                    .m
+                    .replace("; --outline lists them all", "; its outline instead");
+                return Ok(json!({
+                    "path": path,
+                    "totalLines": lines.len(),
+                    "instead": instead,
+                    "functions": outline_entries(&functions),
+                }));
+            }
+            Err(missing) => return Err(missing),
+        }
     };
     Ok(json!({ "path": path, "totalLines": lines.len(), "functions": listed }))
 }
@@ -1662,34 +1719,45 @@ fn scope_prefix(scope: &str) -> String {
 
 /// The `--in` scopes as path prefixes: a file or folder under the project as
 /// it is given, anything else as the file of the one script that goes by that
-/// name. A path that is not there matches nothing, as a folder that may be
-/// absent always did; a bare word that is neither a path nor a script's name
-/// is an error, since it was meant as one of the two.
+/// name, or else every script whose path holds the word (`--in Honk` for
+/// HonkHandler and HonkClient). A path that is not there matches nothing, as
+/// a folder that may be absent always did; a bare word that no script path
+/// holds is an error, since it was meant to name something.
 fn scope_prefixes(root: &Path, source: &Path, scopes: &[String]) -> Result<Vec<String>, Failure> {
-    scopes
-        .iter()
-        .map(|scope| {
-            let prefix = scope_prefix(scope);
-            if root.join(&prefix).exists() {
-                return Ok(prefix);
+    let mut prefixes = Vec::new();
+    for scope in scopes {
+        let prefix = scope_prefix(scope);
+        if root.join(&prefix).exists() {
+            prefixes.push(prefix);
+            continue;
+        }
+        match script_by_name(root, source, &prefix) {
+            Ok(Some(path)) => prefixes.push(relative(root, &path)),
+            Ok(None) if prefix.contains('/') || has_script_extension(Path::new(&prefix)) => {
+                prefixes.push(prefix);
             }
-            match script_by_name(root, source, &prefix) {
-                Ok(Some(path)) => Ok(relative(root, &path)),
-                Ok(None)
-                    if prefix.contains('/') || has_script_extension(Path::new(&prefix)) =>
-                {
-                    Ok(prefix)
+            Ok(None) => {
+                let word = prefix.to_lowercase();
+                let before = prefixes.len();
+                prefixes.extend(
+                    script_files(source)
+                        .iter()
+                        .map(|path| relative(root, path))
+                        .filter(|path| path.to_lowercase().contains(&word)),
+                );
+                if prefixes.len() == before {
+                    return Err(failure(
+                        format!(
+                            "--in {scope}: the project has no file or folder at that path, no script by that name and no script path with that word"
+                        ),
+                        "script-grep",
+                    ));
                 }
-                Ok(None) => Err(failure(
-                    format!(
-                        "--in {scope}: the project has no file or folder at that path and no script by that name"
-                    ),
-                    "script-grep",
-                )),
-                Err(shared) => Err(failure(shared, "script-grep")),
             }
-        })
-        .collect()
+            Err(shared) => return Err(failure(shared, "script-grep")),
+        }
+    }
+    Ok(prefixes)
 }
 
 fn in_scope(relative: &str, scope: &str) -> bool {
@@ -1781,12 +1849,14 @@ return Shop
                 "2-7/10 Shop.buy\nfunction Shop.buy(player, id)\n\tlocal function price()\n\t\treturn 5\n\tend\n\treturn price()\nend\n3-5/10 price\n\tlocal function price()\n\t\treturn 5\n\tend"
             );
             assert_eq!(
-                read(json!({ "fn": ["sell", "bye"] })).unwrap_err(),
-                "No function bye in src/Shop.luau; nearest: buy; --outline lists them all"
+                read(json!({ "fn": ["sell", "bye"] })).unwrap(),
+                "No function bye in src/Shop.luau; nearest: buy; its outline instead\n2-7 Shop.buy(player, id)\n 3-5 price()\n8-9 Shop.sell(player)",
+                "a name no function has gets the outline"
             );
-            assert_eq!(
-                read(json!({ "fn": ["Shop.sel"] })).unwrap_err(),
-                "No function Shop.sel in src/Shop.luau; nearest: Shop.sell, Shop.buy; --outline lists them all"
+            assert!(
+                read(json!({ "fn": ["Shop.sel"] })).unwrap().starts_with(
+                    "No function Shop.sel in src/Shop.luau; nearest: Shop.sell, Shop.buy; its outline instead\n"
+                )
             );
             assert_eq!(
                 read(json!({ "startLine": 8, "endLine": 9 })).unwrap(),
@@ -2314,6 +2384,19 @@ end
                 "{unknown}"
             );
             assert_eq!(script_by_name(root, source, "A/Util"), Ok(None));
+            assert_eq!(
+                read("DataHandler.server.luau").unwrap(),
+                "src/Server/DataHandler.server.luau"
+            );
+            assert_eq!(
+                read("Shop/init.client.luau").unwrap(),
+                "src/Client/Shop/init.client.luau"
+            );
+            assert_eq!(
+                read("Util.luau").unwrap_err(),
+                "Util.luau ends 2 script paths: src/A/Util.luau, src/B/Util.luau; pass one of them"
+            );
+            assert!(read("Handler.server.luau").is_err());
 
             let grep = |scope: Value| {
                 grep_text(root, source, json!({ "query": "return", "scope": scope }))
@@ -2329,7 +2412,12 @@ end
             assert_eq!(grep(json!("Util")).unwrap_err(), shared);
             assert_eq!(
                 grep(json!("Nope")).unwrap_err(),
-                "--in Nope: the project has no file or folder at that path and no script by that name"
+                "--in Nope: the project has no file or folder at that path, no script by that name and no script path with that word"
+            );
+            assert_eq!(
+                grep(json!("handler")).unwrap(),
+                "src/Server/DataHandler.server.luau\n2: return a",
+                "a word that names nothing takes the scripts whose path holds it"
             );
             assert_eq!(
                 grep(json!(["src/Missing", "src/A"])).unwrap(),

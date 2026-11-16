@@ -511,7 +511,24 @@ pub(crate) struct LuauRunFailure {
     pub(crate) console_errors: Vec<String>,
 }
 
+/// What a chunk that ran out of time inside an event's `:Wait()` is told in
+/// place of "pass -t": more time does not bring back an event that fired
+/// before the chunk listened.
+const EVENT_WAIT_HINT: &str = "the chunk was still waiting in `:Wait()` on an event; one fired before the chunk ran is missed, so connect in one `rbx l`/`rbx lc` (its connections live 120 s), fire it, then read; pass -t SECONDS only for an event still to come";
+
 impl LuauRunFailure {
+    /// A timeout of code that waits on an event with `:Wait()` says so.
+    pub(crate) fn with_event_wait_hint(mut self, code: Option<&str>) -> Self {
+        if code.is_some_and(|code| code.contains(":Wait()"))
+            && self.message.contains(RUNNER_TIMEOUT_HINT)
+        {
+            self.message = self
+                .message
+                .replacen(RUNNER_TIMEOUT_HINT, EVENT_WAIT_HINT, 1);
+        }
+        self
+    }
+
     /// The same failure with a hint line, unless it already carries one.
     pub(crate) fn with_hint(mut self, hint: Option<&str>) -> Self {
         if let Some(hint) = hint

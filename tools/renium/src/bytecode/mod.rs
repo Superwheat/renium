@@ -930,6 +930,70 @@ pub(super) fn ensure_bytecode_service_path_segments(
     }
 }
 
+/// For a Luau error "X is not a valid member of Class "Service.Path"": what
+/// the saved place holds at that path, as a line to print under the error.
+/// Nothing when the project has no store of that service or no one instance
+/// at the path.
+pub(crate) fn saved_children_line(error: &str) -> Option<String> {
+    saved_children_line_in(Path::new("."), Path::new("src"), error)
+}
+
+pub(crate) fn saved_children_line_in(root: &Path, src: &Path, error: &str) -> Option<String> {
+    static MEMBER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(\S+) is not a valid member of \w+ "([^"]+)""#)
+            .expect("valid member pattern")
+    });
+    let captures = MEMBER.captures(error)?;
+    let (missing, path) = (&captures[1], &captures[2]);
+    let segments = path.split('.').map(str::to_string).collect::<Vec<_>>();
+    let service = segments.first()?;
+    let (project_root, src_root) = configured_project_layout(root, src).ok()?;
+    if validate_filesystem_instance_name(service, "service").is_err()
+        || !service_settings_path(&absolutize_under(&project_root, &src_root).join(service))
+            .is_file()
+    {
+        return None;
+    }
+    let ctx = high_level_context(root, src, service).ok()?;
+    let [index] = high_level_match_path_candidates(&ctx, &segments)[..] else {
+        return None;
+    };
+    let mut names = Vec::new();
+    for child in ctx.children_by_parent.get(index)? {
+        let name = ctx.document.instances[*child].name.as_str();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if names.contains(&missing) {
+        return Some(format!(
+            "the saved place has {missing} in {path}; it is not there in this session (not replicated or streamed in yet, or removed by a script)"
+        ));
+    }
+    if names.is_empty() {
+        return Some(format!("{path} has no children in the saved place"));
+    }
+    const LISTED: usize = 12;
+    let mut listed = closest_property_names(missing, names.iter().copied());
+    for name in &names {
+        if listed.len() >= LISTED {
+            break;
+        }
+        if !listed.iter().any(|shown| shown == name) {
+            listed.push(name.to_string());
+        }
+    }
+    listed.truncate(LISTED);
+    let more = match names.len().saturating_sub(listed.len()) {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    Some(format!(
+        "{path} holds in the saved place: {}{more}",
+        listed.join(", ")
+    ))
+}
+
 fn high_level_match_path_candidates(
     ctx: &HighLevelBytecodeContext,
     segments: &[String],
@@ -1100,6 +1164,34 @@ fn high_level_print_ambiguity(
     Err(ReportedFailure.into())
 }
 
+/// The instance a path ending in `Spawn3` means when nothing has that name
+/// but several siblings are named `Spawn`: the third of them, which the tree
+/// prints inside `Spawn[1-10]`. Says on stderr how the path was read.
+fn numbered_sibling(ctx: &HighLevelBytecodeContext, segments: &[String]) -> Option<usize> {
+    let last = segments.last()?;
+    let name = last.trim_end_matches(|character: char| character.is_ascii_digit());
+    if name.is_empty() || name.len() == last.len() {
+        return None;
+    }
+    let number = last[name.len()..].parse::<usize>().ok()?;
+    let mut siblings = segments.to_vec();
+    *siblings.last_mut()? = name.to_string();
+    let named = high_level_match_path_candidates(ctx, &siblings);
+    let count = named.len();
+    let mut numbered = named.into_iter().filter(|index| {
+        ctx.path_ordinals_by_index
+            .get(*index)
+            .and_then(|ordinals| ordinals.as_ref())
+            .and_then(|ordinals| ordinals.last().copied())
+            == Some(number)
+    });
+    let found = numbered
+        .next()
+        .filter(|_| count > 1 && numbered.next().is_none())?;
+    eprintln!("nothing is named {last}; read as {name}[{number}], one of {count} named {name}");
+    Some(found)
+}
+
 fn high_level_resolve_path_candidates(
     ctx: &HighLevelBytecodeContext,
     segments: &[String],
@@ -1107,6 +1199,12 @@ fn high_level_resolve_path_candidates(
 ) -> Result<HighLevelTargetResolution> {
     let path_label = segments.join(".");
     let candidates = high_level_match_path_candidates(ctx, segments);
+    if candidates.is_empty()
+        && ordinals.is_empty()
+        && let Some(index) = numbered_sibling(ctx, segments)
+    {
+        return Ok(HighLevelTargetResolution::Found(index));
+    }
     if !ordinals.is_empty() {
         let matched = candidates
             .into_iter()
@@ -1536,10 +1634,23 @@ pub(super) fn tree_command(args: TreeArgs) -> Result<()> {
 }
 
 pub(crate) fn inspect_command(args: InspectArgs) -> Result<()> {
-    if args.depth.is_some() {
-        bail!(
-            "rbx in shows the instances it is given and takes no --depth; rbx tr SERVICE TARGET --depth N shows the levels below one"
-        );
+    if let Some(depth) = args.depth {
+        if !args.more_targets.is_empty() {
+            bail!(
+                "rbx in shows the instances it is given and takes no --depth; rbx tr SERVICE TARGET --depth N shows the levels below one"
+            );
+        }
+        // The levels below an instance are what `tr` shows, so that is run.
+        eprintln!("rbx in takes no --depth; this is rbx tr with --depth {depth} instead");
+        return tree_command(TreeArgs {
+            target: args.target,
+            project: args.project,
+            depth,
+            limit: None,
+            output: args.output,
+            fields: crate::cli::TREE_DEFAULT_FIELDS.to_string(),
+            pretty: args.pretty,
+        });
     }
     let HighLevelSelection {
         service,
@@ -1569,17 +1680,41 @@ pub(crate) fn inspect_command(args: InspectArgs) -> Result<()> {
         ordinals: None,
         positional: Some(target.as_str()),
     }));
+    // Siblings that share a name are shown by their first, with a line
+    // saying how to pick another: asking for one of them is no failure.
+    let mut same_named = Vec::new();
     for target in targets {
         match high_level_target_resolution(&ctx, target)? {
             HighLevelTargetResolution::Found(index) => inspected.push(index),
             HighLevelTargetResolution::Ambiguous(indices) => {
-                return high_level_print_ambiguity(&ctx, mode, &indices, args.pretty);
+                if !mode.uses_short_keys()
+                    || high_level_shared_ambiguity(&ctx, &indices).is_none()
+                    || indices.len() > HIGH_LEVEL_AMBIGUITY_LIMIT
+                {
+                    return high_level_print_ambiguity(&ctx, mode, &indices, args.pretty);
+                }
+                inspected.push(indices[0]);
+                same_named.push(indices);
             }
         }
     }
     if let Some(text) = tree_text::inspect_text(&projection, &args.fields, &inspected) {
         println!("{text}");
+        for indices in &same_named {
+            let name = &ctx.document.instances[indices[0]].name;
+            let others = match indices.len() {
+                2 => format!("{name}[2] is the other"),
+                count => format!("{name}[2] to {name}[{count}] are the others"),
+            };
+            println!(
+                "{name}: the first of {} with this name is shown; {others}",
+                indices.len()
+            );
+        }
         return Ok(());
+    }
+    if let Some(indices) = same_named.first() {
+        return high_level_print_ambiguity(&ctx, mode, indices, args.pretty);
     }
     let mut nodes = inspected
         .into_iter()
