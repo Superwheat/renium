@@ -55,11 +55,14 @@ first.
 
 ## The native helper
 
-A Studio plugin cannot set some saved data, such as Terrain voxels, `MeshPart.MeshId`
-and the engine properties scripts are blocked from. Renium uses a native helper for
-those: it syncs Terrain, reads and writes protected properties, publishes packages
-without dialogs, and captures or sends input to play windows that are not in front.
-Each protected read or write through the helper waits for your approval by default.
+A Studio plugin cannot set some saved data, such as the voxel grid Terrain is saved
+as, `MeshPart.MeshId` and the engine properties scripts are blocked from. Renium uses
+a native helper for those: it writes Terrain from the files into Studio, reads and
+writes protected properties, publishes packages without dialogs, and captures or
+sends input to play windows that are not in front. Each protected read or write
+through the helper waits for your approval by default. Editing voxels needs no
+helper: a script, or `rbx l --edit`, changes them through the Terrain API
+(`FillBlock`, `WriteVoxels`) as in any plugin.
 
 On Windows, Renium loads the helper into the running Studio. On macOS it patches
 the installed Studio app instead. `rbx setup`, which the installer runs, and
