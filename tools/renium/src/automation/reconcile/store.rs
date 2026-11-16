@@ -432,4 +432,177 @@ mod tests {
         assert!(!pack_directory(&root, key).exists());
         fs::remove_dir_all(root).unwrap();
     }
+
+    fn snapshot(entries: &[(&str, SnapshotEntry)]) -> ProjectSnapshot {
+        ProjectSnapshot {
+            entries: entries
+                .iter()
+                .map(|(path, entry)| (PathBuf::from(path), entry.clone()))
+                .collect(),
+        }
+    }
+
+    fn file(bytes: &[u8]) -> SnapshotEntry {
+        SnapshotEntry::File(bytes.to_vec())
+    }
+
+    fn link(target: &str, directory: bool) -> SnapshotEntry {
+        SnapshotEntry::Symlink {
+            target: PathBuf::from(target),
+            directory,
+        }
+    }
+
+    #[test]
+    fn a_stored_snapshot_matches_only_the_snapshot_it_holds() {
+        let root = temp_dir("reconcile-store-matches");
+        let held = [
+            ("src", SnapshotEntry::Directory),
+            ("src/A.luau", file(b"return 'a'")),
+            ("src/Shared", link("../shared", true)),
+        ];
+        let stored = StoredSnapshot::write(&root, "pair", &snapshot(&held)).unwrap();
+        assert!(stored.matches(&snapshot(&held)));
+        assert!(stored.contains(Path::new("src/A.luau")));
+        assert!(!stored.contains(Path::new("src/B.luau")));
+        let with = |index: usize, path: &'static str, entry: SnapshotEntry| {
+            let mut other = held.clone();
+            other[index] = (path, entry);
+            snapshot(&other)
+        };
+        for (what, other) in [
+            (
+                "other bytes of the same length",
+                with(1, "src/A.luau", file(b"return 'b'")),
+            ),
+            (
+                "the same file under another name",
+                with(1, "src/B.luau", file(b"return 'a'")),
+            ),
+            (
+                "a folder for the file",
+                with(1, "src/A.luau", SnapshotEntry::Directory),
+            ),
+            ("a file for the folder", with(0, "src", file(b""))),
+            (
+                "another link target",
+                with(2, "src/Shared", link("../other", true)),
+            ),
+            (
+                "a file link for the folder link",
+                with(2, "src/Shared", link("../shared", false)),
+            ),
+            ("one entry fewer", snapshot(&held[..2])),
+            (
+                "one entry more",
+                snapshot(&[held.as_slice(), &[("src/B.luau", file(b""))]].concat()),
+            ),
+        ] {
+            assert!(!stored.matches(&other), "{what}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pruning_removes_the_packs_no_entry_uses_and_nothing_else() {
+        let root = temp_dir("reconcile-store-prune");
+        let key = "pair";
+        let mut stored =
+            StoredSnapshot::write(&root, key, &snapshot(&[("src/A.luau", file(b"first"))]))
+                .unwrap();
+        // Nothing was written for this pair yet.
+        stored.prune(&root, "other").unwrap();
+        StoredSnapshot::clear(&root, "other").unwrap();
+        let current = snapshot(&[("src/A.luau", file(b"second"))]);
+        stored
+            .replace_scopes(&root, key, &[PathBuf::from("src")], &current)
+            .unwrap();
+        assert_eq!(fs::read_dir(pack_directory(&root, key)).unwrap().count(), 2);
+        stored.prune(&root, key).unwrap();
+        assert_eq!(fs::read_dir(pack_directory(&root, key)).unwrap().count(), 1);
+        assert!(stored.load(&root, key).unwrap() == current);
+        // A pack folder that cannot be listed is an error, not an empty one.
+        let blocked = pack_directory(&root, "blocked");
+        fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        fs::write(&blocked, b"").unwrap();
+        assert!(stored.prune(&root, "blocked").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_pack_cut_short_on_disk_is_written_again() {
+        let root = temp_dir("reconcile-store-rewrite");
+        let held = snapshot(&[("src/A.luau", file(b"return 'a'"))]);
+        StoredSnapshot::write(&root, "pair", &held).unwrap();
+        let pack = fs::read_dir(pack_directory(&root, "pair"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::write(&pack, b"return").unwrap();
+        let stored = StoredSnapshot::write(&root, "pair", &held).unwrap();
+        assert!(stored.load(&root, "pair").unwrap() == held);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_pack_name_that_is_no_digest_is_never_opened() {
+        let root = temp_dir("reconcile-store-pack-name");
+        for pack in ["ab".to_string(), "z".repeat(64), "../".repeat(21) + "x"] {
+            let stored = StoredSnapshot {
+                entries: BTreeMap::from([(
+                    PathBuf::from("src/A.luau"),
+                    StoredEntry::File(StoredFile {
+                        pack,
+                        offset: 0,
+                        length: 0,
+                        digest: [0; 32],
+                    }),
+                )]),
+            };
+            let error = stored.load(&root, "pair").err().unwrap().to_string();
+            assert_eq!(error, "Invalid snapshot pack name");
+        }
+    }
+
+    #[test]
+    fn a_migration_onto_an_existing_store_needs_both_to_hold_the_same() -> Result<()> {
+        let root = temp_dir("baseline-store-migration-conflict");
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            crate::project::storage::forget(&root);
+            let _ = fs::remove_dir_all(&root);
+        });
+        fs::write(
+            root.join("renium.project.jsonc"),
+            br#"{"schemaVersion":1,"sourceRoot":"code/scripts"}"#,
+        )?;
+        crate::project::config::load_project(Some(&root.join("renium.project.jsonc")), None)?;
+        let old = "code/scripts/Workspace/__roblox_sync_settings.renium";
+        let new = "instances/Workspace.renium";
+        let migrate = |old_entry: SnapshotEntry, new_entry: SnapshotEntry| {
+            let both = snapshot(&[
+                ("pad.txt", file(b"pad")),
+                (old, old_entry),
+                (new, new_entry),
+            ]);
+            let mut stored = StoredSnapshot::write(&root, "pair", &both)?;
+            stored.migrate_store_paths(&root)?;
+            stored.load(&root, "pair")
+        };
+        let merged = migrate(file(b"baseline"), file(b"baseline"))?;
+        assert!(!merged.entries.contains_key(Path::new(old)));
+        assert!(merged.entries.get(Path::new(new)) == Some(&file(b"baseline")));
+        for (old_entry, new_entry) in [
+            (file(b"baseline"), file(b"baselinE")),
+            (file(b"baseline"), file(b"longer baseline")),
+            (file(b"baseline"), SnapshotEntry::Directory),
+            (link("a", false), link("b", false)),
+        ] {
+            let error = migrate(old_entry, new_entry).err().unwrap().to_string();
+            assert!(error.contains("conflicting old and new stores"), "{error}");
+        }
+        assert!(migrate(link("a", false), link("a", false)).is_ok());
+        Ok(())
+    }
 }
