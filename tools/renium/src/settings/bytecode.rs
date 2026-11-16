@@ -3384,14 +3384,13 @@ fn collect_font_strings<'a>(obj: &'a Map<String, Value>, out: &mut SettingsStrin
 }
 
 fn collect_ref_strings<'a>(ref_value: &'a Map<String, Value>, out: &mut SettingsStringCounts<'a>) {
-    if let Some(instance_index) = ref_value.get("instanceIndex").and_then(Value::as_u64) {
-        let instance_id = format!("{instance_index:x}");
-        add_count_key(out, Cow::Owned(instance_id), 1);
+    if let Some(instance_id) = fallback_instance_id(ref_value) {
+        add_count_key(out, instance_id, 1);
     }
     if let Some(settings_id) = fallback_settings_id(ref_value) {
         add_count(out, settings_id);
     }
-    for key in ["instanceId", "debugId", "path"] {
+    for key in ["debugId", "path"] {
         if let Some(text) = ref_value.get(key).and_then(Value::as_str) {
             add_count(out, text);
         }
@@ -3748,6 +3747,21 @@ fn write_font_payload<W: Write + ?Sized>(
     Ok(())
 }
 
+/// The instance id an unresolved reference is written with: its instanceId,
+/// or else its instanceIndex in hex. The string table counts this one.
+fn fallback_instance_id(ref_value: &Map<String, Value>) -> Option<Cow<'_, str>> {
+    ref_value
+        .get("instanceId")
+        .and_then(Value::as_str)
+        .map(Cow::Borrowed)
+        .or_else(|| {
+            ref_value
+                .get("instanceIndex")
+                .and_then(Value::as_u64)
+                .map(|instance_index| Cow::Owned(format!("{instance_index:x}")))
+        })
+}
+
 /// The settings id an unresolved reference is written with: its settingsId,
 /// or else its referent or ref alias. The string table counts this one.
 fn fallback_settings_id(ref_value: &Map<String, Value>) -> Option<&str> {
@@ -3761,14 +3775,7 @@ fn write_ref_fallback_payload<W: Write + ?Sized>(
     string_ids: &SettingsStringIdMap<'_>,
     writer: &mut W,
 ) -> Result<()> {
-    let instance_id_owned = ref_value
-        .get("instanceIndex")
-        .and_then(Value::as_u64)
-        .map(|instance_index| format!("{instance_index:x}"));
-    let instance_id = ref_value
-        .get("instanceId")
-        .and_then(Value::as_str)
-        .or(instance_id_owned.as_deref());
+    let instance_id = fallback_instance_id(ref_value);
     let debug_id = ref_value.get("debugId").and_then(Value::as_str);
     let path_segments = ref_value.get("pathSegments").and_then(Value::as_array);
     let path = ref_value.get("path").and_then(Value::as_str);
@@ -3794,7 +3801,7 @@ fn write_ref_fallback_payload<W: Write + ?Sized>(
         flags |= 32;
     }
     write_var_u64(writer, flags)?;
-    if let Some(instance_id) = instance_id {
+    if let Some(instance_id) = &instance_id {
         write_binary_string_id(writer, string_ids, instance_id)?;
     }
     if let Some(debug_id) = debug_id {
@@ -4840,5 +4847,31 @@ mod tests {
             decode_settings_bytecode(&dense).unwrap().instances[2].properties["Local"],
             json!({"_type": "Ref", "settingsId": "debug:0_7"})
         );
+    }
+
+    #[test]
+    fn an_outside_reference_with_an_id_and_an_index_reencodes_to_its_bytes() {
+        let mut root = hierarchy_instance("editor:0", None);
+        root.name = "Workspace".to_string();
+        root.properties.insert(
+            "Target".to_string(),
+            json!({
+                "_type": "Ref",
+                "pathSegments": ["Lighting", "Sun"],
+                "instanceId": "a",
+                "instanceIndex": 24,
+            }),
+        );
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root],
+        };
+        let bytes = encode_settings_bytecode(&document).unwrap();
+        let decoded = decode_settings_bytecode(&bytes).unwrap();
+        assert_eq!(
+            decoded.instances[0].properties["Target"],
+            json!({"_type": "Ref", "instanceId": "a", "pathSegments": ["Lighting", "Sun"]})
+        );
+        assert_eq!(encode_settings_bytecode(&decoded).unwrap(), bytes);
     }
 }

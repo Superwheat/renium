@@ -171,12 +171,7 @@ const ABSENT: &str = "\u{1}no store holds this\u{2}";
 /// Properties the decoder drops: the record's own fields say these.
 const RECORD_FIELDS: [&str; 3] = ["Name", "ClassName", "Parent"];
 /// The cases the codec gets wrong, by the names `RENIUM_SIM_DEFECTS` takes.
-const DEFECTS: [&str; 4] = [
-    "typed-property",
-    "record-field",
-    "attributes-property",
-    "index-beside-id",
-];
+const DEFECTS: [&str; 3] = ["typed-property", "record-field", "attributes-property"];
 
 /// A generated value and the form each encoder's decode must give back.
 #[derive(Clone)]
@@ -918,17 +913,13 @@ impl Gen<'_> {
 
     /// Selectors whose path leads into another service: none of them can
     /// name an instance of this store, whatever ids they carry.
-    // Excluded (`index-beside-id`): an instanceId beside an instanceIndex; the
-    // encoder counts the index's hex form into the string table but writes the
-    // id, so law 3 fails (codec defect).
     fn leading_out(&mut self) -> (Vec<(&'static str, Value)>, Value) {
         let mut segments = vec![OUTSIDE_SERVICE.to_string()];
         segments.extend((0..self.rng.below(3)).map(|_| self.pick(&NAMES).to_string()));
         let mut given = vec![("pathSegments", json!(segments))];
         let mut kept = Vec::new();
         let index = (!self.chance(3)).then(|| 1 + self.rng.below(self.shape.ids.len() + 5));
-        let instance_id = ((index.is_none() || self.defect("index-beside-id")) && self.chance(2))
-            .then(|| format!("{:x}", self.fresh() + 4096));
+        let instance_id = self.chance(2).then(|| format!("{:x}", self.fresh() + 4096));
         if let Some(index) = index {
             given.push(("instanceIndex", json!(index)));
         }
