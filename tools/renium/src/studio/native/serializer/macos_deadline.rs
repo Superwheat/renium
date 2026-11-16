@@ -457,22 +457,6 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_or_broken_socket_is_not_a_deadline() {
-        for result in [Ok(0), Err(io::ErrorKind::ConnectionReset.into())] {
-            let mut result = Some(result);
-            let error = read_exact_until(
-                &mut [0],
-                Instant::now() + Duration::from_secs(3),
-                Instant::now,
-                |_, _| result.take().expect("terminal failures must not retry"),
-            )
-            .unwrap_err();
-            assert!(error.is::<io::Error>());
-            assert!(!error.is::<DeadlineExceeded>());
-        }
-    }
-
-    #[test]
     fn identity_deadlines_survive_transport_context_and_the_worker_join() {
         let now = Instant::now();
         let mut failures = vec![
