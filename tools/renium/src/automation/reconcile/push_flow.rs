@@ -610,14 +610,15 @@ pub(crate) fn push_project(
     }
     let mut expected_after_push = project;
     expected_after_push.entries.extend(pushed.generated.entries);
-    let files_unchanged = expected_after_push == current;
-    if settle_native_import && files_unchanged {
-        current = publish_native_import_readback(readback_stage, &root, &source_paths)?;
-        pushed.summary.insert(
-            "historyId".into(),
-            Value::String(history.commit(&current, &ProjectSnapshot::default())?),
-        );
-    }
+    let files_unchanged = expected_after_push == current
+        && (!settle_native_import
+            || settle_native_import_files(
+                readback_stage,
+                (&root, &source_paths),
+                &mut history,
+                &mut current,
+                &mut pushed.summary,
+            )?);
     if files_unchanged && !requires_stage && replacement.is_none() {
         // Readback verified the remaining fields. The commit proof predates
         // that readback, so retaining it still requires Studio to have remained
@@ -668,6 +669,34 @@ fn capture_push_readback(
         Ok((stage, snapshot))
     } else {
         capture_studio_services_with_stage(context, bridge, services, settle_import, stage)
+    }
+}
+
+/// Writes a verified import's state to the files and refreshes its undo
+/// entry; false when the files were left as they are. Studio holds the
+/// import by now, so a file saved while it was read back is newer work and
+/// stays: the next pull brings the import's identities into the files.
+fn settle_native_import_files(
+    stage: ExportProjectStage,
+    (root, paths): (&Path, &[PathBuf]),
+    history: &mut history::SyncHistory,
+    current: &mut ProjectSnapshot,
+    summary: &mut Map<String, Value>,
+) -> Result<bool> {
+    match publish_native_import_readback(stage, root, paths) {
+        Ok(published) => {
+            *current = published;
+            let id = history.commit(current, &ProjectSnapshot::default())?;
+            summary.insert("historyId".into(), Value::String(id));
+            Ok(true)
+        }
+        Err(error) => {
+            log_global(
+                3,
+                format_args!("[renium] the import's state was not written to the files: {error:#}"),
+            );
+            Ok(false)
+        }
     }
 }
 
