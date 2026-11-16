@@ -115,12 +115,6 @@ fn registration_and_resource_names_cannot_escape_the_registry() {
 }
 
 #[test]
-#[ignore = "subprocess timeout fixture; invoked only by its parent test"]
-fn subprocess_sleep_fixture() {
-    std::thread::sleep(Duration::from_secs(5));
-}
-
-#[test]
 fn concurrent_claims_have_one_winner_and_corrupt_records_stay_quarantined() {
     let root = crate::tests::support::temp_dir("plugin-claim-race");
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
