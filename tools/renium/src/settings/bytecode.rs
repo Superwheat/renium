@@ -1944,8 +1944,8 @@ struct SettingsBinaryInstanceLookup<'a> {
     by_path_parts: AHashMap<String, Option<usize>>,
 }
 
-const SETTINGS_BINARY_PARALLEL_MIN_INSTANCES: usize = 2_048;
-const SETTINGS_BINARY_PARALLEL_CHUNK_SIZE: usize = 4096;
+pub(crate) const SETTINGS_BINARY_PARALLEL_MIN_INSTANCES: usize = 2_048;
+pub(crate) const SETTINGS_BINARY_PARALLEL_CHUNK_SIZE: usize = 4096;
 
 #[derive(Clone, Copy)]
 enum FixedNumericKind {

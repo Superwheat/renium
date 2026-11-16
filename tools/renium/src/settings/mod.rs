@@ -1,4 +1,6 @@
 pub(crate) mod bytecode;
+#[cfg(test)]
+mod codec_sim;
 pub(crate) mod equivalence;
 pub(crate) mod instance;
 pub(crate) mod tree;
