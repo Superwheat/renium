@@ -90,6 +90,19 @@ pub(crate) fn drop_projection_cache() -> usize {
     entries
 }
 
+/// Drops one project's kept staged copy, so its next staging starts from
+/// nothing.
+#[cfg(test)]
+pub(crate) fn forget_projection(project: &Path) {
+    let key = fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+    let entry = PROJECTION_CACHE
+        .get()
+        .and_then(|cache| cache.lock_recover().remove(&key));
+    if let Some(kept) = entry.and_then(|entry| entry.lock_recover().take()) {
+        let _ = fs::remove_dir_all(kept.root);
+    }
+}
+
 thread_local! {
     static NESTED_STAGE_STACK: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
     static PROJECTION_TRANSFORM_STACK: RefCell<Vec<Vec<ProjectionTransform>>> = const { RefCell::new(Vec::new()) };

@@ -1943,7 +1943,7 @@ pub(crate) fn native_editor_full_push_eligible(args: &PushEditorChangesArgs) -> 
     Ok(true)
 }
 
-fn collect_project_editor_changes(
+pub(super) fn collect_project_editor_changes(
     args: &PushEditorChangesArgs,
 ) -> Result<(EditorChangeSet, Option<config::ProjectionStage>)> {
     collect_project_editor_changes_with_documents(args, PreparedEditorDocuments::default())
