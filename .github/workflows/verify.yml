@@ -98,6 +98,17 @@ jobs:
       - name: Run CLI tests
         run: cargo test --locked --manifest-path tools/renium/Cargo.toml
 
+      # Every run above takes the simulations through the same few seeds. The
+      # nightly run takes seeds no run before it had, so the search goes on
+      # between changes; a failure prints the seed that replays it.
+      - name: Run the simulations on new seeds
+        if: github.event_name == 'schedule' && matrix.os == 'ubuntu-latest'
+        env:
+          RENIUM_SIM_FIRST: ${{ github.run_number }}000000
+        run: |
+          RENIUM_SIM_SEEDS=4000 cargo test --locked --manifest-path tools/renium/Cargo.toml -- reconcile::sim
+          RENIUM_SIM_SEEDS=150 cargo test --locked --manifest-path tools/renium/Cargo.toml -- editor::stage_sim
+
       - name: Run plugin SDK tests
         run: cargo test --locked --manifest-path tools/renium-plugin-sdk/Cargo.toml
 
