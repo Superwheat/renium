@@ -2396,6 +2396,9 @@ pub(super) struct WaitUntilArgs {
         allow_hyphen_values = true
     )]
     pub(super) result: Option<String>,
+    /// One slice of a longer wait, which answers for the whole wait itself.
+    #[arg(skip)]
+    pub(super) slice: bool,
 }
 
 #[derive(Parser)]

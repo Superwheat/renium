@@ -4060,6 +4060,7 @@ fn edit_wait_in_slices(
         }
         let mut parameters = request.p.clone();
         parameters["timeout"] = json!(remaining.min(EDIT_WAIT_SLICE_SECONDS));
+        parameters["slice"] = json!(true);
         let slice = automation::Request {
             v: request.v,
             id: request.id,

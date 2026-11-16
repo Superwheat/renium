@@ -930,10 +930,11 @@ pub(super) fn ensure_bytecode_service_path_segments(
     }
 }
 
-/// For a Luau error "X is not a valid member of Class "Service.Path"": what
-/// the saved place holds at that path, as a line to print under the error.
-/// Nothing when the project has no store of that service or no one instance
-/// at the path.
+/// For a Luau error "X is not a valid member of Class "Service.Path"": the
+/// names nearest to X that the saved place has at that path, or that X is
+/// there in the saved place, as a line to print under the error. Nothing
+/// when the project has no store of that service, no one instance at the
+/// path, or no name like X there.
 pub(crate) fn saved_children_line(error: &str) -> Option<String> {
     saved_children_line_in(Path::new("."), Path::new("src"), error)
 }
@@ -970,27 +971,15 @@ pub(crate) fn saved_children_line_in(root: &Path, src: &Path, error: &str) -> Op
             "the saved place has {missing} in {path}; it is not there in this session (not replicated or streamed in yet, or removed by a script)"
         ));
     }
-    if names.is_empty() {
-        return Some(format!("{path} has no children in the saved place"));
+    // A name with nothing like it there is a method or property that was
+    // misspelled, which the children would not explain.
+    let nearest = closest_property_names(missing, names.iter().copied());
+    if nearest.is_empty() {
+        return None;
     }
-    const LISTED: usize = 12;
-    let mut listed = closest_property_names(missing, names.iter().copied());
-    for name in &names {
-        if listed.len() >= LISTED {
-            break;
-        }
-        if !listed.iter().any(|shown| shown == name) {
-            listed.push(name.to_string());
-        }
-    }
-    listed.truncate(LISTED);
-    let more = match names.len().saturating_sub(listed.len()) {
-        0 => String::new(),
-        more => format!(" and {more} more"),
-    };
     Some(format!(
-        "{path} holds in the saved place: {}{more}",
-        listed.join(", ")
+        "{path} has no {missing} in the saved place; nearest: {}",
+        nearest.join(", ")
     ))
 }
 

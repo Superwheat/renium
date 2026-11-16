@@ -43,6 +43,7 @@ mod recording_review;
 pub(crate) mod render_quality;
 pub(crate) mod result_text;
 pub(crate) mod test_processes;
+mod wait_parts;
 
 pub(crate) use console::{get_console_output_command, get_console_output_result};
 pub(crate) use input::input_result;
@@ -4477,12 +4478,30 @@ pub(crate) fn wait_until_result(args: &WaitUntilArgs, bridge: &BridgeServer) -> 
     loop {
         let remaining = timeout - started.elapsed().as_secs_f64();
         if remaining <= 0.0 {
-            return Ok(wait_timed_out_result(
+            let mut timed_out = wait_timed_out_result(
                 &args.condition,
                 timeout,
                 &detail,
                 started.elapsed().as_secs_f64(),
-            ));
+            );
+            // The look that would follow a wait that ran out comes with it:
+            // which part of the condition does not hold, and on what value.
+            let stopped = (!args.slice)
+                .then(|| wait_parts::ConditionParts::of(&body))
+                .flatten()
+                .and_then(|parts| {
+                    let looked = run_luau_task(bridge, target, player, &parts.probe(), 3.0).ok()?;
+                    parts.stopped_at(&looked.results)
+                });
+            if let Some(stopped) = stopped {
+                let error = timed_out["error"].as_str().unwrap_or_default().replacen(
+                    "; read the state it depends on before waiting again, and raise",
+                    &format!("; {stopped}; raise"),
+                    1,
+                );
+                timed_out["error"] = json!(error);
+            }
+            return Ok(timed_out);
         }
         let slice = remaining.min(WAIT_PROBE_SLICE_SECONDS);
         let code = wait_probe_code(&body, result_body.as_deref(), slice, interval);
@@ -7381,6 +7400,7 @@ mod wait_condition_tests {
 
     fn wait_args(condition: &str, result: Option<&str>) -> WaitUntilArgs {
         WaitUntilArgs {
+            slice: false,
             bridge: BridgeConnectionArgs::local(3.0),
             condition: condition.to_string(),
             player: None,

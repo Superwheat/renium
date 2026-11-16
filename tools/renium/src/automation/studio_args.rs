@@ -317,6 +317,7 @@ pub(super) fn wait(parameters: &Value) -> Result<WaitUntilArgs> {
         timeout: number(object, "timeout", 60.0)?,
         interval: number(object, "interval", 0.25)?,
         result: string(object, "result"),
+        slice: boolean(object, "slice")?,
     })
 }
 

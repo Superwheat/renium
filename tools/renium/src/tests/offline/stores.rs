@@ -662,9 +662,16 @@ fn a_missing_member_error_gets_what_the_saved_place_holds_there() {
     let root = PathBuf::from(fx.path(""));
     let line =
         |error: &str| crate::bytecode::saved_children_line_in(&root, Path::new("src"), error);
+    let near =
+        line(r#"[Edit window] Dor is not a valid member of Folder "Workspace.Lobby""#).unwrap();
+    assert!(
+        near.starts_with("Workspace.Lobby has no Dor in the saved place; nearest: Door"),
+        "{near}"
+    );
     assert_eq!(
-        line(r#"[Edit window] Dor is not a valid member of Folder "Workspace.Lobby""#).as_deref(),
-        Some("Workspace.Lobby holds in the saved place: Door, Border, Helper")
+        line(r#"GetBoundingBox is not a valid member of Folder "Workspace.Lobby""#),
+        None,
+        "a method that does not exist is not explained by the children"
     );
     let there = line(r#"Door is not a valid member of Folder "Workspace.Lobby""#).unwrap();
     assert!(
@@ -674,8 +681,8 @@ fn a_missing_member_error_gets_what_the_saved_place_holds_there() {
         "{there}"
     );
     assert_eq!(
-        line(r#"X is not a valid member of Part "Workspace.Lobby.Door""#).as_deref(),
-        Some("Workspace.Lobby.Door has no children in the saved place")
+        line(r#"X is not a valid member of Part "Workspace.Lobby.Door""#),
+        None
     );
     assert_eq!(
         line(r#"X is not a valid member of Folder "Workspace.Nowhere""#),
