@@ -171,12 +171,10 @@ const ABSENT: &str = "\u{1}no store holds this\u{2}";
 /// Properties the decoder drops: the record's own fields say these.
 const RECORD_FIELDS: [&str; 3] = ["Name", "ClassName", "Parent"];
 /// The cases the codec gets wrong, by the names `RENIUM_SIM_DEFECTS` takes.
-const DEFECTS: [&str; 6] = [
+const DEFECTS: [&str; 4] = [
     "typed-property",
     "record-field",
     "attributes-property",
-    "unresolved-alias",
-    "dense-alias",
     "index-beside-id",
 ];
 
@@ -342,16 +340,6 @@ fn stored_f32(number: f64) -> f32 {
     } else {
         value
     }
-}
-
-/// Whether a store writes an id as a number instead of a string: `debug:0_`
-/// and a decimal below 2^63 without a leading zero.
-fn compact_id(id: &str) -> bool {
-    id.strip_prefix("debug:0_").is_some_and(|digits| {
-        digits.bytes().all(|byte| byte.is_ascii_digit())
-            && (digits == "0" || !digits.starts_with('0'))
-            && digits.parse::<u64>().is_ok_and(|value| value < 1 << 63)
-    })
 }
 
 fn last_part(text: &str) -> &str {
@@ -962,7 +950,8 @@ impl Gen<'_> {
         if self.chance(2) {
             let target = self.rng.below(self.shape.ids.len());
             let id = json!(self.shape.ids[target]);
-            given.push(("settingsId", id.clone()));
+            let key = self.pick(&["settingsId", "referent", "ref"]);
+            given.push((key, id.clone()));
             kept.push(("settingsId", id));
         }
         if self.chance(3) {
@@ -973,22 +962,12 @@ impl Gen<'_> {
         (given, outside(&kept))
     }
 
-    // Excluded (`unresolved-alias`, `dense-alias`): a referent or ref alias
-    // that names no instance, and one the dense encoder keeps whose target's
-    // id is compact; the encoder never adds an alias's id to the string table
-    // and refuses the store (codec defect).
     fn reference(&mut self) -> Stated {
         let target = self.rng.below(self.shape.ids.len());
         let index = json!(target + 1);
         let id = json!(self.shape.ids[target]);
         let resolved = json!({"_type": "Ref", "instanceIndex": target + 1});
-        let alias = self.defect("dense-alias") || !compact_id(&self.shape.ids[target]);
-        let kinds = if self.defect("unresolved-alias") {
-            12
-        } else {
-            11
-        };
-        let (selectors, plain, dense) = match self.rng.below(kinds) {
+        let (selectors, plain, dense) = match self.rng.below(11) {
             0 => (
                 vec![("instanceIndex", index)],
                 resolved.clone(),
@@ -999,7 +978,7 @@ impl Gen<'_> {
                 resolved,
                 Some(outside(&[("settingsId", id)])),
             ),
-            2 if alias => {
+            2 => {
                 let alias = self.pick(&["referent", "ref"]);
                 (
                     vec![(alias, id.clone())],
@@ -1030,8 +1009,9 @@ impl Gen<'_> {
             }
             7 => {
                 let missing = json!(format!("gone:{}", self.fresh()));
+                let key = self.pick(&["settingsId", "referent", "ref"]);
                 let kept = outside(&[("settingsId", missing.clone())]);
-                (vec![("settingsId", missing)], kept.clone(), Some(kept))
+                (vec![(key, missing)], kept.clone(), Some(kept))
             }
             8 => {
                 let mut selectors = Vec::new();
@@ -1051,12 +1031,6 @@ impl Gen<'_> {
                 let selectors = self.missing_path();
                 let kept = outside(&selectors);
                 (selectors, kept.clone(), Some(kept))
-            }
-            11 => {
-                let missing = json!(format!("gone:{}", self.fresh()));
-                let alias = self.pick(&["referent", "ref"]);
-                let kept = outside(&[("settingsId", missing.clone())]);
-                (vec![(alias, missing)], kept.clone(), Some(kept))
             }
             _ => {
                 let (selectors, kept) = self.leading_out();

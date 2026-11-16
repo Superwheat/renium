@@ -3388,7 +3388,10 @@ fn collect_ref_strings<'a>(ref_value: &'a Map<String, Value>, out: &mut Settings
         let instance_id = format!("{instance_index:x}");
         add_count_key(out, Cow::Owned(instance_id), 1);
     }
-    for key in ["settingsId", "instanceId", "debugId", "path"] {
+    if let Some(settings_id) = fallback_settings_id(ref_value) {
+        add_count(out, settings_id);
+    }
+    for key in ["instanceId", "debugId", "path"] {
         if let Some(text) = ref_value.get(key).and_then(Value::as_str) {
             add_count(out, text);
         }
@@ -3745,6 +3748,14 @@ fn write_font_payload<W: Write + ?Sized>(
     Ok(())
 }
 
+/// The settings id an unresolved reference is written with: its settingsId,
+/// or else its referent or ref alias. The string table counts this one.
+fn fallback_settings_id(ref_value: &Map<String, Value>) -> Option<&str> {
+    ["settingsId", "referent", "ref"]
+        .into_iter()
+        .find_map(|key| ref_value.get(key).and_then(Value::as_str))
+}
+
 fn write_ref_fallback_payload<W: Write + ?Sized>(
     ref_value: &Map<String, Value>,
     string_ids: &SettingsStringIdMap<'_>,
@@ -3761,10 +3772,7 @@ fn write_ref_fallback_payload<W: Write + ?Sized>(
     let debug_id = ref_value.get("debugId").and_then(Value::as_str);
     let path_segments = ref_value.get("pathSegments").and_then(Value::as_array);
     let path = ref_value.get("path").and_then(Value::as_str);
-    let settings_id = ref_value.get("settingsId").and_then(Value::as_str);
-    let settings_id = settings_id
-        .or_else(|| ref_value.get("referent").and_then(Value::as_str))
-        .or_else(|| ref_value.get("ref").and_then(Value::as_str));
+    let settings_id = fallback_settings_id(ref_value);
     let path_ordinals = ref_value.get("pathOrdinals").and_then(Value::as_array);
     let mut flags = 0_u64;
     if instance_id.is_some() {
@@ -4787,6 +4795,50 @@ mod tests {
         assert_eq!(
             decoded.instances[0].properties.keys().collect::<Vec<_>>(),
             ["Anchored"]
+        );
+    }
+
+    #[test]
+    fn an_unresolved_reference_alias_is_written_as_its_settings_id() {
+        // The target's id is compact, so the string table holds it only
+        // through the alias.
+        let mut holder = SettingsBytecodeInstance::new(
+            "editor:2".to_string(),
+            "Holder".to_string(),
+            "ObjectValue".to_string(),
+            Some(0),
+        );
+        holder.properties.insert(
+            "Gone".to_string(),
+            json!({"_type": "Ref", "referent": "gone"}),
+        );
+        holder.properties.insert(
+            "Local".to_string(),
+            json!({"_type": "Ref", "ref": "debug:0_7"}),
+        );
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                hierarchy_instance("editor:0", None),
+                hierarchy_instance("debug:0_7", Some(0)),
+                holder,
+            ],
+        };
+        let bytes = encode_settings_bytecode(&document).unwrap();
+        let decoded = decode_settings_bytecode(&bytes).unwrap();
+        assert_eq!(
+            decoded.instances[2].properties["Gone"],
+            json!({"_type": "Ref", "settingsId": "gone"})
+        );
+        assert_eq!(
+            decoded.instances[2].properties["Local"],
+            json!({"_type": "Ref", "instanceIndex": 2})
+        );
+        assert_eq!(encode_settings_bytecode(&decoded).unwrap(), bytes);
+        let dense = encode_settings_bytecode_with_dense_references(&document).unwrap();
+        assert_eq!(
+            decode_settings_bytecode(&dense).unwrap().instances[2].properties["Local"],
+            json!({"_type": "Ref", "settingsId": "debug:0_7"})
         );
     }
 }
