@@ -131,7 +131,7 @@ fn keep_directories_implied_by_file(
         matches!(snapshot.entries.get(path), Some(SnapshotEntry::Directory))
     };
     for ancestor in file.ancestors().skip(1) {
-        if ancestor.as_os_str().is_empty() || merged.contains_key(ancestor) {
+        if merged.contains_key(ancestor) {
             continue;
         }
         let known = is_directory(sides.editor, ancestor)
@@ -417,11 +417,10 @@ pub(crate) fn settle_script_paths(
         let merged_paths = script_paths_by_settings_id(merged, &settings_path)?;
         // Each side by the identities the merged store uses. Where the merge
         // left a side's store as it was, that store is the merged one.
-        let editor_by_merged_id = match changes.editor_script_paths.get(&settings_path) {
-            Some(paths) => paths.clone(),
-            None if !changes.editor.contains(&settings_path) => merged_paths.clone(),
-            None => editor_paths.clone(),
-        };
+        let editor_by_merged_id = changes
+            .editor_script_paths
+            .get(&settings_path)
+            .unwrap_or(&editor_paths);
         let studio_by_merged_id = match changes.aligned_studio.get(&settings_path) {
             Some(aligned) => script_paths_of(aligned, &settings_path)?,
             None if !changes.studio.contains(&settings_path) => merged_paths.clone(),
@@ -619,7 +618,6 @@ pub(crate) fn entries_equivalent(
     right: Option<&SnapshotEntry>,
 ) -> bool {
     match (left, right) {
-        (None, None) | (Some(SnapshotEntry::Directory), Some(SnapshotEntry::Directory)) => true,
         (Some(SnapshotEntry::File(left)), Some(SnapshotEntry::File(right)))
             if is_source_path(path) =>
         {
@@ -720,11 +718,9 @@ pub(crate) fn first_record_difference(
         }
         let left = observed.1.get(name);
         let right = expected.1.get(name);
-        let equal = match (left, right) {
-            (Some(left), Some(right)) => reconciliation_values_equal(left, right, false),
-            (None, None) => true,
-            _ => false,
-        };
+        let equal = left
+            .zip(right)
+            .is_some_and(|(left, right)| reconciliation_values_equal(left, right, false));
         if !equal {
             return Some(format!(
                 "Studio attribute {name} is {}; the files have {}",
@@ -983,30 +979,15 @@ pub(crate) fn merge_settings_entry(
             )
         }
     };
-    let value = if merged.instances.is_empty() && editor.is_none() && studio.is_none() {
-        None
-    } else {
-        Some(SnapshotEntry::File(
-            encode_settings_bytecode(&merged)
-                .with_context(|| format!("Failed to merge {}", path.display()))?,
-        ))
-    };
-    let editor_changed = match editor {
-        Some(_) => !editor_equivalent,
-        None => value.is_some(),
-    };
-    let studio_changed = match studio {
-        Some(_) => !studio_equivalent,
-        None => value.is_some(),
-    };
-    let aligned_studio = (studio_changed && studio.is_some())
-        .then_some(aligned_studio)
-        .flatten();
+    let value = SnapshotEntry::File(
+        encode_settings_bytecode(&merged)
+            .with_context(|| format!("Failed to merge {}", path.display()))?,
+    );
     Ok(MergedEntry {
-        value,
-        editor_changed,
-        studio_changed,
-        aligned_studio,
+        value: Some(value),
+        editor_changed: editor.is_none() || !editor_equivalent,
+        studio_changed: studio.is_none() || !studio_equivalent,
+        aligned_studio: aligned_studio.filter(|_| studio.is_some()),
         editor_script_paths: Some(editor_script_paths),
     })
 }
