@@ -44,6 +44,103 @@ pub(crate) fn temp_dir(tag: &str) -> PathBuf {
         .unwrap_or(path)
 }
 
+/// The generator the simulations draw from: one seed gives the same run on
+/// every machine.
+pub(crate) struct SimRng(pub(crate) u64);
+
+impl SimRng {
+    pub(crate) fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut value = self.0;
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^ (value >> 31)
+    }
+
+    pub(crate) fn below(&mut self, bound: usize) -> usize {
+        (self.next() % bound as u64) as usize
+    }
+
+    pub(crate) fn pick<T: Clone>(&mut self, items: &[T]) -> Option<T> {
+        (!items.is_empty()).then(|| items[self.below(items.len())].clone())
+    }
+
+    pub(crate) fn shuffle<T>(&mut self, items: &mut [T]) {
+        for index in (1..items.len()).rev() {
+            items.swap(index, self.below(index + 1));
+        }
+    }
+}
+
+/// Runs a simulation once per seed and fails with every seed that did not
+/// hold. `RENIUM_SIM_SEEDS=N` runs N seeds instead of `default_seeds`,
+/// `RENIUM_SIM_FIRST=S` starts at seed S, and `RENIUM_SIM_SEED=S` replays one
+/// seed and prints its steps.
+pub(crate) fn run_seeds(
+    default_seeds: u64,
+    run: impl Fn(u64, &mut Vec<String>) -> Result<(), String> + Sync,
+) {
+    let number = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+    };
+    let replay = number("RENIUM_SIM_SEED");
+    let first = replay.or(number("RENIUM_SIM_FIRST")).unwrap_or(0);
+    let count = match replay {
+        Some(_) => 1,
+        None => number("RENIUM_SIM_SEEDS").unwrap_or(default_seeds),
+    };
+    // The code under simulation runs its own work on the shared thread pool,
+    // so the seeds are spread over a few plain threads instead of that pool.
+    let next = AtomicU64::new(first);
+    let failures = std::sync::Mutex::new(Vec::new());
+    let workers = number("RENIUM_SIM_THREADS").map_or_else(
+        || std::thread::available_parallelism().map_or(2, |cores| cores.get().div_ceil(4)),
+        |threads| threads as usize,
+    );
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let seed = next.fetch_add(1, Ordering::Relaxed);
+                    if seed >= first + count {
+                        break;
+                    }
+                    let mut log = Vec::new();
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run(seed, &mut log)
+                    }))
+                    .unwrap_or_else(|_| Err("it panicked".to_string()));
+                    if let Err(failure) = outcome {
+                        let steps = match replay {
+                            Some(_) => format!("{}\n", log.join("\n")),
+                            None => String::new(),
+                        };
+                        failures
+                            .lock()
+                            .unwrap()
+                            .push((seed, format!("{steps}seed {seed}: {failure}")));
+                    }
+                }
+            });
+        }
+    });
+    let mut failures = failures.into_inner().unwrap();
+    failures.sort();
+    assert!(
+        failures.is_empty(),
+        "{} of {count} seeds failed (replay one with RENIUM_SIM_SEED):\n{}",
+        failures.len(),
+        failures
+            .iter()
+            .take(12)
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 /// Raw saved names, including both a service-name collision and a same-Name
 /// root before the service. The Workspace reference selects the second Part.
 pub(crate) fn renamed_service_place() -> rbx_dom_weak::WeakDom {

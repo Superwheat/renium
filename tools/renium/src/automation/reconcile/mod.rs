@@ -77,6 +77,8 @@ mod push_flow;
 mod push_plan;
 mod reference_settlement;
 mod replacement;
+#[cfg(test)]
+mod sim;
 mod staging;
 #[cfg(test)]
 mod tests;
