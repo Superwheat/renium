@@ -477,6 +477,21 @@ fn saved_field_without_plugin_api(class_name: &str, name: &str) -> bool {
     })
 }
 
+// A push leaves the engine-managed fields of a service root out (a deprecated
+// Lighting.Outlines, a hidden Workspace.Wind), and Studio's record of a root,
+// the plugin's reading plus the native unscriptable fields, leaves them out
+// too, so a root record without one says nothing about the files' value.
+fn root_field_push_never_sends(instance: &SettingsBytecodeInstance, name: &str) -> bool {
+    instance.parent_index.is_none()
+        && rbx_reflection_database::get().is_ok_and(|database| {
+            crate::editor::review::is_engine_managed_editor_property(
+                &instance.class_name,
+                name,
+                database,
+            )
+        })
+}
+
 pub(crate) fn expected_map_mismatch(
     expected: &Map<String, Value>,
     actual: &Map<String, Value>,
@@ -497,7 +512,8 @@ pub(crate) fn expected_map_mismatch(
         let actual = verification_value(actual, name, properties);
         if properties
             && actual.is_none()
-            && crate::settings::equivalence::capture_may_omit(class_name, name)
+            && (crate::settings::equivalence::capture_may_omit(class_name, name)
+                || root_field_push_never_sends(instance, name))
         {
             return None;
         }
@@ -559,7 +575,8 @@ pub(crate) fn changed_map_mismatch(
         let actual = verification_value(observed, name, properties);
         if properties
             && actual.is_none()
-            && crate::settings::equivalence::capture_may_omit(class_name, name)
+            && (crate::settings::equivalence::capture_may_omit(class_name, name)
+                || root_field_push_never_sends(instance, name))
         {
             return None;
         }

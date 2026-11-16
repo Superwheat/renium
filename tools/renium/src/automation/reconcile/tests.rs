@@ -1714,6 +1714,80 @@ fn a_field_the_files_never_carry_is_not_checked_for_retention() {
 }
 
 #[test]
+fn a_service_field_the_push_never_sends_is_not_demanded_from_studio() {
+    for (service, name, files) in [
+        ("Lighting", "Outlines", json!(false)),
+        ("StarterGui", "ResetPlayerGuiOnSpawn", json!(false)),
+        ("Workspace", "Wind", json!(3.0)),
+    ] {
+        let root =
+            SettingsBytecodeInstance::new("root".into(), service.into(), service.into(), None);
+        let desired = Map::from_iter([(name.to_string(), files)]);
+        assert_eq!(
+            expected_map_mismatch(&desired, &Map::new(), true, &root),
+            None,
+            "{service}.{name}"
+        );
+        assert_eq!(
+            changed_map_mismatch(&Map::new(), &desired, &Map::new(), true, &root),
+            None,
+            "{service}.{name}"
+        );
+    }
+    let lighting =
+        SettingsBytecodeInstance::new("root".into(), "Lighting".into(), "Lighting".into(), None);
+    let outlines = |value: bool| Map::from_iter([("Outlines".to_string(), json!(value))]);
+    assert!(
+        changed_map_mismatch(
+            &Map::new(),
+            &outlines(false),
+            &outlines(true),
+            true,
+            &lighting
+        )
+        .is_some(),
+        "a value Studio reports still has to match"
+    );
+    let brightness = Map::from_iter([("Brightness".to_string(), json!(3.0))]);
+    assert!(
+        changed_map_mismatch(&Map::new(), &brightness, &Map::new(), true, &lighting).is_some(),
+        "a root field the push writes is still demanded"
+    );
+    let frame =
+        SettingsBytecodeInstance::new("frame".into(), "Frame".into(), "Frame".into(), Some(0));
+    let draggable = Map::from_iter([("Draggable".to_string(), json!(true))]);
+    assert!(
+        expected_map_mismatch(&draggable, &Map::new(), true, &frame).is_some(),
+        "an import writes a descendant's deprecated field and the capture reports it"
+    );
+
+    let path = PathBuf::from("instances/Lighting.renium");
+    let entry = |properties: Value| {
+        let mut root = lighting.clone();
+        root.properties = properties.as_object().unwrap().clone();
+        SnapshotEntry::File(
+            encode_settings_bytecode(&SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances: vec![root],
+            })
+            .unwrap(),
+        )
+    };
+    let before = entry(json!({"Brightness": 2.0}));
+    let desired = entry(json!({"Brightness": 3.0, "Outlines": false}));
+    let pushed = entry(json!({"Brightness": 3.0}));
+    assert_eq!(
+        settings_delta_mismatch(&path, Some(&before), Some(&desired), Some(&pushed), None).unwrap(),
+        None
+    );
+    assert!(
+        settings_delta_mismatch(&path, Some(&before), Some(&desired), Some(&before), None)
+            .unwrap()
+            .is_some_and(|detail| detail.contains("Brightness"))
+    );
+}
+
+#[test]
 fn retention_checks_distinguish_editor_state_and_authored_attributes() {
     for (class, name) in [
         ("Workspace", "InsertPoint"),
