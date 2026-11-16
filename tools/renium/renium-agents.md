@@ -1,4 +1,4 @@
-<!-- renium-version: 0.6.4 -->
+<!-- renium-version: 0.6.5 -->
 # Renium for agents
 
 Call the `rbx` tool: the arguments as a list, or `steps` (several lists) to queue commands in one call. Queue everything you can already write, not one command per call: all the reads you need, or an edit with its whole test (`se`, `play -r` with its wait, each `l --server` and `lc` check, `co --server --level error`, `play -x`). Every step answers on its own. A failed step stops the queue, since the rest builds on it, and Play is left as it is; a failed search or read does not, the steps after it still run. Load the tool first when it is deferred; `rbx` in a shell only without it. Act directly: commands report a missing Studio or a sync problem themselves, so skip `status`, `cs` and `lst`.
