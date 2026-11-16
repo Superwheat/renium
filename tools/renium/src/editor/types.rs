@@ -373,6 +373,9 @@ pub(crate) struct PreparedEditorDocuments {
     /// pushed as that instance and what it holds, as a folder is; no folder
     /// needs to stand there.
     pub(crate) instance_paths: HashSet<String>,
+    /// Of those, the instances a file defines in full: what Studio holds
+    /// below one and the file does not make is removed with the push.
+    pub(crate) whole_instance_paths: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -390,6 +393,10 @@ pub(crate) struct EditorChangeSet {
     /// Engine-set fields of imported instances, written in a follow-up
     /// transaction of the same push once the import has joined its service.
     pub(crate) deferred_native_rows: Vec<EditorPropertyChange>,
+    /// Pushed instances, each with its service, that a file defines in full.
+    /// The push creates and updates what the file makes; what Studio holds
+    /// below such an instance beyond that is found and removed before it runs.
+    pub(crate) whole_instances: Vec<(String, EditorInstancePath)>,
 }
 
 impl EditorChangeSet {

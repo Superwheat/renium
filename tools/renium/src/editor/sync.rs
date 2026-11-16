@@ -45,9 +45,9 @@ use crate::editor::review::{
 };
 use crate::editor::types::{
     EditorBinaryImport, EditorChangeSet, EditorHistoryEntry, EditorInstanceChange,
-    EditorInstanceDescriptor, EditorPreserveDescriptor, EditorPropertyChange, EditorPropertyFilter,
-    EditorSettingsWrite, EditorSourceChange, EditorSourceTarget, PreparedEditorDocuments,
-    take_pre_routed_protected_writes,
+    EditorInstanceDescriptor, EditorInstancePath, EditorPreserveDescriptor, EditorPropertyChange,
+    EditorPropertyFilter, EditorSettingsWrite, EditorSourceChange, EditorSourceTarget,
+    PreparedEditorDocuments, take_pre_routed_protected_writes,
 };
 use crate::project::config;
 use crate::project::layout::{apply_configured_project_layout, configured_project_layout};
@@ -2003,6 +2003,7 @@ fn collect_project_editor_changes_with_documents(
         return Ok((changes, Some(projection)));
     }
     let mut projected_instance_paths = Vec::new();
+    let mut projected_whole_instance_paths = Vec::new();
     let mut projected_paths = if full_selection {
         collect_editor_full_paths(projection.root())?
     } else {
@@ -2025,6 +2026,7 @@ fn collect_project_editor_changes_with_documents(
             named_push_folders(&loaded, &changed_paths, projection.root(), &whole_services)?;
         paths.extend(folders.staged.iter().cloned());
         let mut instance_paths = Vec::new();
+        let mut whole_instance_paths = Vec::new();
         for changed_path in changed_paths {
             let absolute = absolutize_under(&loaded.root, &changed_path);
             let source_file = !absolute.is_dir()
@@ -2036,7 +2038,7 @@ fn collect_project_editor_changes_with_documents(
             let mut mapped =
                 config::project_source_to_staged_paths(&loaded, &absolute, projection.root())?;
             let produced = if source_file || folders.cover(&absolute) {
-                Some(Vec::new())
+                Some(NamedFileInstances::default())
             } else if args.link_project_root.is_some() {
                 // A planned push names exactly what it compared.
                 None
@@ -2050,12 +2052,16 @@ fn collect_project_editor_changes_with_documents(
                         .and_then(|name| name.to_str())
                         .is_some_and(is_service_settings_file_name)
                 });
-                instance_paths.extend(produced);
+                if produced.whole {
+                    whole_instance_paths.extend(produced.staged.iter().cloned());
+                }
+                instance_paths.extend(produced.staged);
             }
             paths.extend(mapped);
         }
         paths.extend(instance_paths.iter().cloned());
         projected_instance_paths = instance_paths;
+        projected_whole_instance_paths = whole_instance_paths;
         paths
     };
     projected_paths.sort();
@@ -2077,6 +2083,10 @@ fn collect_project_editor_changes_with_documents(
         &link_enforcement,
         &mut PreparedEditorDocuments {
             instance_paths: projected_instance_paths
+                .iter()
+                .map(|path| path_key(&canonical_editor_changed_path(&project_root, path)))
+                .collect(),
+            whole_instance_paths: projected_whole_instance_paths
                 .iter()
                 .map(|path| path_key(&canonical_editor_changed_path(&project_root, path)))
                 .collect(),
@@ -2179,18 +2189,26 @@ fn staged_service(relative: &Path) -> Option<String> {
     }
 }
 
-/// What a named file that is no script pushes, as staged paths that name
-/// instances. A metadata file pushes the instance it describes; a file that
-/// makes no instance pushes nothing. `None` leaves the file to its whole
-/// service: a store or a nested project, a file of a service whose store is
-/// pushed with it, metadata of a service itself, and the source of a sync
-/// rule, because the instances it no longer makes have to go as well.
+/// What a named file that is no script pushes: staged paths that name
+/// instances, and whether the file defines those instances in full.
+#[derive(Default)]
+struct NamedFileInstances {
+    staged: Vec<PathBuf>,
+    whole: bool,
+}
+
+/// A metadata file pushes the instance it describes. The source of a sync
+/// rule pushes the instance it makes, in full: what Studio holds below it and
+/// the file no longer makes is removed. A file that makes no instance pushes
+/// nothing. `None` leaves the file to its whole service: a store or a nested
+/// project, a file of a service whose store is pushed with it, and a file
+/// that describes a service itself.
 fn named_file_instances(
     loaded: &config::LoadedProject,
     projection: &config::ProjectionStage,
     source: &Path,
     whole_services: &HashSet<String>,
-) -> Result<Option<Vec<PathBuf>>> {
+) -> Result<Option<NamedFileInstances>> {
     let name = source
         .file_name()
         .and_then(|name| name.to_str())
@@ -2200,7 +2218,6 @@ fn named_file_instances(
         || name.ends_with(".renium")
         || name.ends_with(".project.json")
         || name.ends_with(".project.jsonc")
-        || !projection.transformed_targets_for_source(source).is_empty()
     {
         return Ok(None);
     }
@@ -2213,17 +2230,22 @@ fn named_file_instances(
     {
         return Ok(None);
     }
-    let mut staged = Vec::new();
+    let mut instances = projection.transformed_targets_for_source(source);
+    let whole = !instances.is_empty();
     for relative in &relatives {
-        let Some(instance) = config::metadata_sidecar_instance(loaded, relative)? else {
-            continue;
-        };
+        instances.extend(config::metadata_sidecar_instance(loaded, relative)?);
+    }
+    let mut staged = Vec::new();
+    for instance in instances {
         let Some((service, below)) = instance
             .split_first()
             .filter(|(_, below)| !below.is_empty())
         else {
             return Ok(None);
         };
+        if whole_services.contains(service) {
+            return Ok(None);
+        }
         staged.push(
             below
                 .iter()
@@ -2232,7 +2254,7 @@ fn named_file_instances(
                 }),
         );
     }
-    Ok(Some(staged))
+    Ok(Some(NamedFileInstances { staged, whole }))
 }
 
 /// The staged folders a named source folder becomes, when each lies below a
@@ -2328,6 +2350,9 @@ struct EditorFilterCandidatePage {
     items: Vec<EditorFilterCandidateRow>,
     next_index: Option<usize>,
     snapshot_id: Option<String>,
+    /// Studio's own setting that keeps instances the files do not know.
+    #[serde(default)]
+    keep_unknowns: bool,
 }
 
 #[derive(Deserialize)]
@@ -2485,6 +2510,189 @@ fn attach_ignore_unknown_preserves(
         sort_editor_preserves(&mut preserves);
         change.preserve_instances = preserves;
     }
+    Ok(())
+}
+
+/// Whether one instance path lies below another, sibling ordinals included;
+/// an ordinal that is not written is the first sibling.
+fn instance_path_is_below(
+    segments: &[String],
+    ordinals: &[usize],
+    root_segments: &[String],
+    root_ordinals: &[usize],
+) -> bool {
+    segments.len() > root_segments.len()
+        && segments.starts_with(root_segments)
+        && (0..root_segments.len()).all(|index| {
+            ordinals.get(index).copied().unwrap_or(1)
+                == root_ordinals.get(index).copied().unwrap_or(1)
+        })
+}
+
+/// Every instance Studio holds in a service, and whether Studio is set to
+/// keep the ones the files do not know.
+fn studio_service_instances(
+    bridge: &BridgeServer,
+    service: &str,
+) -> Result<(Vec<EditorFilterCandidateRow>, bool)> {
+    let mut rows = Vec::new();
+    let mut keep_unknowns = false;
+    let mut start_index = 1usize;
+    let mut snapshot_id = None;
+    loop {
+        let page: EditorFilterCandidatePage = serde_json::from_value(bridge.call(
+            "getEditorFilterCandidates",
+            json!({
+                "service": service,
+                "startIndex": start_index,
+                "maxCount": 500,
+                "snapshotId": snapshot_id,
+                "includeSettingsIds": true,
+            }),
+        )?)
+        .context("Studio returned invalid instance candidates")?;
+        if snapshot_id.is_none() {
+            snapshot_id.clone_from(&page.snapshot_id);
+        }
+        keep_unknowns |= page.keep_unknowns;
+        rows.extend(page.items);
+        let Some(next_index) = page.next_index else {
+            return Ok((rows, keep_unknowns));
+        };
+        if next_index <= start_index {
+            bail!("Studio instance candidate cursor did not advance");
+        }
+        start_index = next_index;
+    }
+}
+
+/// Finds what Studio holds below each instance a file defines in full and
+/// the files do not make, and removes it ahead of the push. The push itself
+/// only creates and updates, so the rest of the service is left alone.
+///
+/// A removal has to be certain. An instance stays when the files hold any
+/// instance by its path of names, since same-named siblings are told apart
+/// by position alone; when its whole instance cannot be told apart in Studio
+/// by name and class; and wherever the project or Studio keeps unknown
+/// instances.
+fn attach_whole_instance_removals(
+    args: &PushEditorChangesArgs,
+    bridge: &BridgeServer,
+    changes: &mut EditorChangeSet,
+    projection: Option<&config::ProjectionStage>,
+) -> Result<()> {
+    let whole_instances = std::mem::take(&mut changes.whole_instances);
+    if whole_instances.is_empty() || args.upsert_instances_only {
+        return Ok(());
+    }
+    let desired = build_editor_filter_candidates(args, changes, projection)?;
+    let mut desired_names = HashSet::new();
+    for key in desired.by_path.keys() {
+        if let Ok((segments, _)) = serde_json::from_str::<(Vec<String>, Vec<usize>)>(key) {
+            desired_names.insert(segments);
+        }
+    }
+    let mut roots_by_service: BTreeMap<String, Vec<EditorInstancePath>> = BTreeMap::new();
+    for (service, root) in whole_instances {
+        roots_by_service.entry(service).or_default().push(root);
+    }
+    let kept_targets = files_to_studio_ignore_unknown_targets(
+        &args.project.project_root,
+        &roots_by_service.keys().cloned().collect(),
+    )?;
+    let mut removals = Vec::new();
+    for (service, roots) in roots_by_service {
+        let (rows, keep_unknowns) = studio_service_instances(bridge, &service)?;
+        if keep_unknowns {
+            continue;
+        }
+        let kept = kept_targets.get(&service).map_or(&[][..], Vec::as_slice);
+        // A whole instance is looked for where the files place it. It counts
+        // only when Studio holds one instance by that path of names and that
+        // one has the class the file gives it.
+        let roots = roots
+            .into_iter()
+            .filter(|root| {
+                let mut named = rows
+                    .iter()
+                    .filter(|row| row.path_segments == root.path_segments);
+                let class = desired
+                    .by_path
+                    .get(&editor_filter_path_key(
+                        &root.path_segments,
+                        &root.path_ordinals,
+                    ))
+                    .map(|index| desired.candidates[*index].class_name.as_str());
+                matches!(
+                    (named.next(), named.next()),
+                    (Some(only), None) if class == Some(only.class_name.as_str())
+                )
+            })
+            .collect::<Vec<_>>();
+        let unknown = rows
+            .iter()
+            .filter(|row| {
+                row.class_name != "PackageLink"
+                    && roots.iter().any(|root| {
+                        instance_path_is_below(
+                            &row.path_segments,
+                            &row.path_ordinals,
+                            &root.path_segments,
+                            &root.path_ordinals,
+                        )
+                    })
+                    && !kept
+                        .iter()
+                        .any(|target| row.path_segments.starts_with(target))
+                    && !desired_names.contains(&row.path_segments)
+                    && !desired.by_id.contains_key(&(
+                        service.clone(),
+                        canonical_filter_settings_id(projection, &row.settings_id),
+                    ))
+            })
+            .collect::<Vec<_>>();
+        // An instance below one that is removed goes with it.
+        let instances = unknown
+            .iter()
+            .filter(|row| {
+                !unknown.iter().any(|above| {
+                    instance_path_is_below(
+                        &row.path_segments,
+                        &row.path_ordinals,
+                        &above.path_segments,
+                        &above.path_ordinals,
+                    )
+                })
+            })
+            .map(|row| EditorInstanceDescriptor {
+                // Studio's own identity for the instance outranks its path;
+                // one Studio gave no identity is named by its path.
+                settings_id: if row.settings_id.is_empty() {
+                    format!(
+                        "studio:{}",
+                        editor_filter_path_key(&row.path_segments, &row.path_ordinals)
+                    )
+                } else {
+                    row.settings_id.clone()
+                },
+                path_segments: row.path_segments.clone(),
+                path_ordinals: row.path_ordinals.clone(),
+                previous_settings_id: (!row.settings_id.is_empty())
+                    .then(|| row.settings_id.clone()),
+                ..EditorInstanceDescriptor::default()
+            })
+            .collect::<Vec<_>>();
+        if !instances.is_empty() {
+            removals.push(EditorInstanceChange {
+                mode: "deleteInstances".to_string(),
+                service,
+                allow_deletes: false,
+                instances,
+                preserve_instances: Vec::new(),
+            });
+        }
+    }
+    changes.instance_changes.splice(0..0, removals);
     Ok(())
 }
 
@@ -2776,6 +2984,7 @@ fn apply_files_to_studio_filters(
     projection: Option<&config::ProjectionStage>,
 ) -> Result<()> {
     attach_ignore_unknown_preserves(args, bridge, changes, projection)?;
+    attach_whole_instance_removals(args, bridge, changes, projection)?;
     let Some(rules) = files_to_studio_filter_rules(&args.project.project_root)? else {
         return Ok(());
     };
@@ -3279,7 +3488,6 @@ fn push_editor_changes_with_collected(
     mut changes: EditorChangeSet,
     options: CollectedPushOptions<'_>,
 ) -> Result<serde_json::Map<String, Value>> {
-    announce_unreviewed_deletions(&args, &changes);
     let CollectedPushOptions {
         started,
         projection,
@@ -3291,6 +3499,7 @@ fn push_editor_changes_with_collected(
     super::native_roots::normalize_resets(&mut changes)?;
     let phase_started = Instant::now();
     apply_files_to_studio_filters(&args, bridge, &mut changes, projection)?;
+    announce_unreviewed_deletions(&args, &changes);
     log_timing("native editor push filters", phase_started);
     let phase_started = Instant::now();
     let unchanged_sources = if prepared_binary_import.is_none() {
@@ -5525,6 +5734,18 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                 &service,
                 Some((&target.path_segments, &target.path_ordinals)),
             );
+            if prepared_documents
+                .whole_instance_paths
+                .contains(&path_key(&absolute_path))
+            {
+                changes.whole_instances.push((
+                    service.clone(),
+                    EditorInstancePath {
+                        path_segments: target.path_segments.clone(),
+                        path_ordinals: target.path_ordinals.clone(),
+                    },
+                ));
+            }
             property_filter.add_service_ids(&service, target.settings_ids);
             changed_services.settings.insert(service.clone());
             changed_services.target_upsert.insert(service);
@@ -6407,6 +6628,86 @@ mod sync_tests {
         assert!(
             carried.instance_changes.is_empty() && carried.source_changes.is_empty(),
             "a file that makes no instance pushes nothing"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_named_sync_rule_source_is_pushed_as_the_whole_instance_it_makes() {
+        use crate::cli::ProjectSourceArgs;
+
+        let root = crate::tests::support::temp_dir("named-model-file");
+        fs::create_dir_all(root.join("src/shared")).unwrap();
+        fs::create_dir_all(root.join("empty")).unwrap();
+        fs::write(root.join("src/shared/Balance.luau"), "return 1\n").unwrap();
+        let model = root.join("src/shared/Map.model.json");
+        fs::write(
+            &model,
+            r#"{"className": "Folder", "children": [{"name": "Pad", "className": "Part"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,
+                "syncRules":[{"pattern":"**/*.model.json","use":"model-json","suffix":".model.json"}],
+                "tree":{"ReplicatedStorage":{"Shared":{"$path":"src/shared"}}}}"#,
+        )
+        .unwrap();
+        let mut store = crate::rbx::model::source_only_settings_document(
+            &root.join("empty"),
+            "ReplicatedStorage",
+        )
+        .unwrap();
+        store
+            .instances
+            .push(crate::settings::bytecode::SettingsBytecodeInstance::new(
+                "outside-folder".to_string(),
+                "Finds".to_string(),
+                "Folder".to_string(),
+                Some(0),
+            ));
+        store
+            .write_file(&root.join("instances/ReplicatedStorage.renium"))
+            .unwrap();
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.changed_paths.push(model);
+        let (changes, _) = collect_project_editor_changes(&args).unwrap();
+        assert!(
+            changes
+                .instance_changes
+                .iter()
+                .all(|change| change.mode == "upsertInstances" && !change.allow_deletes),
+            "the file does not reconcile its service"
+        );
+        let paths = changes
+            .instance_changes
+            .iter()
+            .flat_map(|change| &change.instances)
+            .map(|instance| instance.path_segments.join("."))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [
+                "ReplicatedStorage.Shared",
+                "ReplicatedStorage.Shared.Map",
+                "ReplicatedStorage.Shared.Map.Pad"
+            ]
+        );
+        let whole = changes
+            .whole_instances
+            .iter()
+            .map(|(service, path)| format!("{service}: {}", path.path_segments.join(".")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            whole,
+            ["ReplicatedStorage: ReplicatedStorage.Shared.Map"],
+            "what Studio holds below Map beyond the file is looked up and removed"
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -9772,6 +9772,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			items = items,
 			nextIndex = nextIndex,
 			snapshotId = snapshot.id,
+			keepUnknowns = keepUnknownsEnabled(ctx),
 		}
 	end
 
