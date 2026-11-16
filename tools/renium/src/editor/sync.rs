@@ -1994,6 +1994,8 @@ fn collect_project_editor_changes_with_documents(
     } else {
         let mut paths = Vec::new();
         let naming = config::project_script_naming(&loaded.project);
+        let folders = named_push_folders(&loaded, &changed_paths, projection.root())?;
+        paths.extend(folders.staged.iter().cloned());
         for changed_path in changed_paths {
             let absolute = absolutize_under(&loaded.root, &changed_path);
             let source_file = !absolute.is_dir()
@@ -2004,7 +2006,7 @@ fn collect_project_editor_changes_with_documents(
                     .is_some();
             let mut mapped =
                 config::project_source_to_staged_paths(&loaded, &absolute, projection.root())?;
-            if source_file {
+            if source_file || folders.cover(&absolute) {
                 mapped.retain(|path| {
                     !path
                         .file_name()
@@ -2049,6 +2051,87 @@ fn collect_project_editor_changes_with_documents(
         });
     }
     Ok((changes, Some(projection)))
+}
+
+/// The folders a push names, and the mapped sources inside them, sorted by
+/// how each is pushed: as the subtree it maps to (`staged` holds those staged
+/// folders), or as a whole service because it maps to one.
+#[derive(Default)]
+struct NamedPushFolders {
+    subtrees: Vec<PathBuf>,
+    services: Vec<PathBuf>,
+    staged: Vec<PathBuf>,
+}
+
+impl NamedPushFolders {
+    /// Whether the nearest such folder around a path is pushed as a subtree,
+    /// which then carries the path's instance data.
+    fn cover(&self, path: &Path) -> bool {
+        let nearest = |folders: &[PathBuf]| {
+            folders
+                .iter()
+                .filter(|folder| path.starts_with(folder))
+                .map(|folder| folder.components().count())
+                .max()
+        };
+        nearest(&self.subtrees) > nearest(&self.services)
+    }
+}
+
+fn named_push_folders(
+    loaded: &config::LoadedProject,
+    changed_paths: &[PathBuf],
+    stage_root: &Path,
+) -> Result<NamedPushFolders> {
+    let mut folders = NamedPushFolders::default();
+    let mut mapped_sources = None;
+    for changed_path in changed_paths {
+        let named = absolutize_under(&loaded.root, changed_path);
+        if !named.is_dir() {
+            continue;
+        }
+        if mapped_sources.is_none() {
+            mapped_sources = Some(config::project_source_roots(loaded)?);
+        }
+        // A mapped source inside the named folder may land in another service.
+        let inner = mapped_sources
+            .iter()
+            .flatten()
+            .filter(|source| source.is_dir() && **source != named && source.starts_with(&named))
+            .cloned()
+            .collect::<Vec<_>>();
+        for folder in std::iter::once(named).chain(inner) {
+            match staged_folders_below_service(loaded, &folder, stage_root)? {
+                Some(staged) => {
+                    folders.staged.extend(staged);
+                    folders.subtrees.push(folder);
+                }
+                None => folders.services.push(folder),
+            }
+        }
+    }
+    Ok(folders)
+}
+
+/// The staged folders a named source folder becomes, when each lies below a
+/// service. Such a folder is pushed as the instance it maps to and what that
+/// holds; a folder that maps to a service is the whole service.
+fn staged_folders_below_service(
+    loaded: &config::LoadedProject,
+    source: &Path,
+    stage_root: &Path,
+) -> Result<Option<Vec<PathBuf>>> {
+    if !source.is_dir() {
+        return Ok(None);
+    }
+    let relatives = config::project_source_to_staged_relatives(loaded, source)?;
+    let folders = relatives
+        .iter()
+        .filter(|relative| relative.components().count() > 1)
+        .map(|relative| stage_root.join(relative))
+        .filter(|staged| staged.is_dir())
+        .collect::<Vec<_>>();
+    Ok((!folders.is_empty() && folders.len() == relatives.len()).then_some(folders))
 }
 
 fn log_editor_collection_timing(label: &str, started: Instant) {
@@ -6000,6 +6083,129 @@ mod sync_tests {
                 .collect::<Vec<_>>(),
             ["ReplicatedStorage.Keep"],
             "the planner's listed script file is pushed beside its targeted instances"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_named_script_push_keeps_what_a_pull_wrote_to_the_store() {
+        use crate::cli::ProjectSourceArgs;
+
+        let root = crate::tests::support::temp_dir("named-push-after-pull");
+        fs::create_dir_all(root.join("src/shared")).unwrap();
+        fs::create_dir_all(root.join("empty")).unwrap();
+        let script = root.join("src/shared/Balance.luau");
+        fs::write(&script, "return 1\n").unwrap();
+        fs::write(
+            root.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"tree":{"ReplicatedStorage":{"Shared":{"$path":"src/shared"}}}}"#,
+        )
+        .unwrap();
+        let store = root.join("instances/ReplicatedStorage.renium");
+        crate::rbx::model::source_only_settings_document(&root.join("empty"), "ReplicatedStorage")
+            .unwrap()
+            .write_file(&store)
+            .unwrap();
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.changed_paths.push(script);
+        let write_back = |args: &PushEditorChangesArgs| {
+            let (changes, _) = collect_project_editor_changes(args).unwrap();
+            for write in changes.settings_writes {
+                write.document.write_file(&write.path).unwrap();
+            }
+        };
+        write_back(&args);
+
+        // A file beside the service folders changes too; it belongs to no service.
+        fs::write(
+            root.join("src/README.md"),
+            "notes
+",
+        )
+        .unwrap();
+        let mut pulled = SettingsBytecode::read_file(&store).unwrap();
+        pulled
+            .instances
+            .push(crate::settings::bytecode::SettingsBytecodeInstance::new(
+                "pulled-folder".to_string(),
+                "Finds".to_string(),
+                "Folder".to_string(),
+                Some(0),
+            ));
+        pulled.write_file(&store).unwrap();
+        write_back(&args);
+        assert!(
+            SettingsBytecode::read_file(&store)
+                .unwrap()
+                .instances
+                .iter()
+                .any(|instance| instance.name == "Finds"),
+            "the folder a pull added to the store survives a push of one script"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_named_mapped_folder_is_pushed_as_its_own_subtree() {
+        use crate::cli::ProjectSourceArgs;
+
+        let root = crate::tests::support::temp_dir("named-mapped-folder");
+        fs::create_dir_all(root.join("src/shared")).unwrap();
+        fs::create_dir_all(root.join("empty")).unwrap();
+        fs::write(root.join("src/shared/Balance.luau"), "return 1\n").unwrap();
+        fs::write(
+            root.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"tree":{"ReplicatedStorage":{"Shared":{"$path":"src/shared"}}}}"#,
+        )
+        .unwrap();
+        let mut store = crate::rbx::model::source_only_settings_document(
+            &root.join("empty"),
+            "ReplicatedStorage",
+        )
+        .unwrap();
+        store
+            .instances
+            .push(crate::settings::bytecode::SettingsBytecodeInstance::new(
+                "outside-folder".to_string(),
+                "Finds".to_string(),
+                "Folder".to_string(),
+                Some(0),
+            ));
+        store
+            .write_file(&root.join("instances/ReplicatedStorage.renium"))
+            .unwrap();
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.changed_paths.push(root.join("src/shared"));
+        let (changes, _) = collect_project_editor_changes(&args).unwrap();
+        assert_eq!(
+            changes
+                .source_changes
+                .iter()
+                .map(|change| change.path_segments.join("."))
+                .collect::<Vec<_>>(),
+            ["ReplicatedStorage.Shared.Balance"]
+        );
+        assert!(
+            changes.instance_changes.iter().all(|change| {
+                !change.allow_deletes
+                    && change
+                        .instances
+                        .iter()
+                        .all(|instance| instance.settings_id != "outside-folder")
+            }),
+            "a named folder leaves the rest of its service alone"
         );
         fs::remove_dir_all(root).unwrap();
     }

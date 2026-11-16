@@ -472,9 +472,17 @@ fn append_editor_target_inline_source_changes_with_paths(
     filter: &EditorPropertyFilter,
     paths_by_index: &[Option<EditorInstancePath>],
 ) {
+    // A script whose file is already in the push is sent once, from the file.
+    let from_files = changes
+        .source_changes
+        .iter()
+        .filter(|change| change.service == service)
+        .filter_map(|change| change.settings_id.clone())
+        .collect::<HashSet<_>>();
     for (index, instance) in document.instances.iter().enumerate() {
         if !filter.includes_instance_in(service, &instance.settings_id)
             || !is_lua_source_class(&instance.class_name)
+            || from_files.contains(&instance.settings_id)
         {
             continue;
         }

@@ -22,6 +22,8 @@
 
 ### Bug fixes
 
+- In a project whose `tree` maps folders (`"$path": "src/shared"`), `rbx ps FILE` no longer takes instances out of a store that a pull had just written. The push reused a copy of the project made before the pull and wrote that copy's store back over `instances/SERVICE.renium`, so a folder built in Studio and pulled was gone from the files after a push of one unchanged script, with no message. The copy now notices every source that changed on disk since it was made.
+- In such a project, `rbx ps FOLDER` pushes the instance the folder maps to and what it holds. It pushed the whole service around it, which removed instances that existed only in Studio anywhere in that service.
 - Studio no longer shows "user_Renium.rbxm is not responding" while a push is prepared for review. Building the review listed a parent's children twice for every row, so a model with hundreds of same-named children (a rig's 850 welds) kept the plugin busy for half a minute. Each parent's children are now listed once per review, and the review pauses regularly while it is built. A store pulled in an earlier Studio session also no longer costs a pass over the whole service for every id Studio does not know. Measured on a 20,000-instance Workspace with 852 welds under one model: 29 seconds before, 0.7 after.
 - A push that sent only values Studio already held answers `unchanged` in place of `verified: false` with nothing to explain it.
 - The rows of a held push no longer print the service twice (`Workspace.Workspace.Lobby`), and an instance sent whole reads `upsert PATH Class` in place of `+ PATH Class`, which looked like an instance Studio did not have.

@@ -64,6 +64,20 @@ static SCRIPT_NAMING_CACHE: OnceLock<Mutex<HashMap<PathBuf, ProjectScriptNaming>
     OnceLock::new();
 static GLOB_MATCHER_CACHE: OnceLock<Mutex<HashMap<String, GlobMatcher>>> = OnceLock::new();
 type ProjectionCacheEntry = Arc<Mutex<Option<CachedProjection>>>;
+/// Every file and folder a staged copy was built from, as it was on disk
+/// then. An entry is named by its source root and its path below that root,
+/// so two spellings of the project folder name the same entries.
+#[derive(Default)]
+struct ProjectionInputs {
+    roots: HashMap<String, PathBuf>,
+    stamps: HashMap<(String, PathBuf), ProjectionInputStamp>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProjectionInputStamp {
+    Directory,
+    File(u64, Option<std::time::SystemTime>),
+}
 static PROJECTION_CACHE: OnceLock<Mutex<HashMap<PathBuf, ProjectionCacheEntry>>> = OnceLock::new();
 
 pub(crate) fn drop_projection_cache() -> usize {
@@ -726,6 +740,7 @@ struct CachedProjection {
     root: PathBuf,
     project_hash: String,
     source_shape: HashMap<String, u8>,
+    inputs: ProjectionInputs,
     transforms: Arc<Vec<ProjectionTransform>>,
     identities: Arc<HashMap<String, ProjectionIdentity>>,
 }

@@ -37,14 +37,15 @@ use super::{
     FilterRule, FilterScope, LoadedProject, MetadataSidecar, MountOwnership, NESTED_STAGE_STACK,
     OwnedFilterCandidate, PROJECT_SCHEMA_VERSION, PROJECTION_CACHE, PROJECTION_IDENTITY_STACK,
     PROJECTION_TRANSFORM_STACK, ProjectMount, ProjectNode, ProjectTarget, ProjectionEntry,
-    ProjectionFieldOwner, ProjectionIdentity, ProjectionStage, ProjectionTransform,
-    ScriptExtensionPolicy, SyncRule, absolute_path, active_target_ordinals, cache_script_naming,
-    compile_glob, filter_allows_scope, filter_path_segments, load_nested_project,
-    parse_jsonc_value, path_slash, project_script_naming, project_source_roots,
-    project_source_to_staged_relative, project_source_to_staged_relatives, project_tree_nodes,
-    projection_path_key, record_projection_identity, relocate_cached_script_naming,
-    remove_cached_script_naming, remove_empty_stage_parents, resolve_project_write_path,
-    validate_instance_target, with_project_target,
+    ProjectionFieldOwner, ProjectionIdentity, ProjectionInputStamp, ProjectionInputs,
+    ProjectionStage, ProjectionTransform, ScriptExtensionPolicy, SyncRule, absolute_path,
+    active_target_ordinals, cache_script_naming, compile_glob, filter_allows_scope,
+    filter_path_segments, load_nested_project, parse_jsonc_value, path_slash,
+    project_script_naming, project_source_roots, project_source_to_staged_relative,
+    project_source_to_staged_relatives, project_tree_nodes, projection_path_key,
+    record_projection_identity, relocate_cached_script_naming, remove_cached_script_naming,
+    remove_empty_stage_parents, resolve_project_write_path, validate_instance_target,
+    with_project_target,
 };
 use crate::system::LockRecover;
 
@@ -271,6 +272,19 @@ pub fn stage_project_cached(
     let reusable = cache
         .as_ref()
         .is_some_and(|entry| entry.project_hash == project_hash && entry.root.is_dir());
+    // The caller names what it is about to use, not everything that changed:
+    // a pull or an editor may have rewritten other files since the copy was
+    // staged. Those are refreshed with the named ones.
+    let mut inputs = None;
+    let mut changed = changed_sources.to_vec();
+    if let Some(entry) = cache.as_ref().filter(|_| reusable) {
+        let current = projection_inputs(loaded)?;
+        changed.extend(stale_projection_inputs(loaded, &entry.inputs, &current));
+        changed.sort();
+        changed.dedup();
+        inputs = Some(current);
+    }
+    let changed_sources = changed.as_slice();
     let source_shape_changed = reusable
         && cache.as_ref().is_some_and(|entry| {
             changed_sources.iter().any(|source| {
@@ -312,6 +326,7 @@ pub fn stage_project_cached(
     }
     let mut services = BTreeSet::new();
     let mut rebuild_all = false;
+    let staged_root = entry.root.clone();
     for source in changed_sources {
         if absolute_path(source) == absolute_path(&loaded.path) {
             rebuild_all = true;
@@ -323,10 +338,18 @@ pub fn stage_project_cached(
             break;
         }
         for relative in relatives {
-            let Some(Component::Normal(service)) = relative.components().next() else {
+            let mut components = relative.components();
+            let Some(Component::Normal(service)) = components.next() else {
                 rebuild_all = true;
                 break;
             };
+            // A file beside the service folders belongs to no service.
+            if components.next().is_none()
+                && (source.is_file() || staged_root.join(&relative).is_file())
+            {
+                rebuild_all = true;
+                break;
+            }
             let Some(service) = service.to_str() else {
                 rebuild_all = true;
                 break;
@@ -350,9 +373,15 @@ pub fn stage_project_cached(
     let entry = cache
         .as_mut()
         .context("Projection cache entry disappeared")?;
+    if rebuild_all {
+        inputs = None;
+    }
     if !changed_sources.is_empty()
         && patch_cached_projection_scripts(loaded, &entry.root, changed_sources)?
     {
+        if let Some(inputs) = inputs {
+            entry.inputs = inputs;
+        }
         if source_shape_changed {
             entry.source_shape = projection_source_shape(loaded)?;
         }
@@ -387,6 +416,9 @@ pub fn stage_project_cached(
                 return Err(error);
             }
         }
+    }
+    if let Some(inputs) = inputs {
+        entry.inputs = inputs;
     }
     Ok(ProjectionStage {
         root: entry.root.clone(),
@@ -432,6 +464,10 @@ fn create_cached_projection(
     key: &Path,
     project_hash: String,
 ) -> Result<Option<CachedProjection>> {
+    if !project_requires_temporary_stage(loaded)? {
+        return Ok(None);
+    }
+    let inputs = projection_inputs(loaded)?;
     let staged = stage_project(loaded)?;
     if !staged.is_temporary() {
         return Ok(None);
@@ -456,9 +492,129 @@ fn create_cached_projection(
         root: cache_root,
         project_hash,
         source_shape: projection_source_shape(loaded)?,
+        inputs,
         transforms: staged.transforms.clone(),
         identities: staged.identities.clone(),
     }))
+}
+
+/// The files and folders a staged copy reads. A source that is one file
+/// counts as that file alone, not as the folder it sits in.
+fn projection_input_roots(
+    loaded: &LoadedProject,
+    roots: &mut BTreeSet<PathBuf>,
+    store_roots: &mut BTreeSet<PathBuf>,
+    visited: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    if !visited.insert(absolute_path(&loaded.path)) {
+        return Ok(());
+    }
+    roots.insert(loaded.root.join(&loaded.project.source_root));
+    roots.insert(loaded.root.join("instances"));
+    store_roots.insert(loaded.root.join("instances"));
+    let tree_sources = project_tree_nodes(&loaded.project.tree)
+        .into_iter()
+        .filter_map(|(_, node)| node.path);
+    let mount_sources = loaded
+        .project
+        .mounts
+        .iter()
+        .map(|mount| mount.source.clone());
+    let adapter_sources = loaded
+        .project
+        .adapters
+        .iter()
+        .filter(|adapter| adapter.direction != AdapterDirection::FromProject)
+        .map(|adapter| adapter.source.clone());
+    for source in tree_sources.chain(mount_sources).chain(adapter_sources) {
+        let path = loaded.root.join(source);
+        if path.is_file() && is_nested_project_path(&path) {
+            projection_input_roots(&load_nested_project(&path)?, roots, store_roots, visited)?;
+        }
+        roots.insert(path);
+    }
+    Ok(())
+}
+
+fn projection_inputs(loaded: &LoadedProject) -> Result<ProjectionInputs> {
+    let mut roots = BTreeSet::new();
+    let mut store_roots = BTreeSet::new();
+    projection_input_roots(loaded, &mut roots, &mut store_roots, &mut BTreeSet::new())?;
+    let mut inputs = ProjectionInputs::default();
+    for root in &roots {
+        if roots
+            .iter()
+            .any(|other| other != root && root.starts_with(other))
+        {
+            continue;
+        }
+        // A root is named by its place in the project, which stays the same
+        // when the root is deleted or the project folder is spelled another way.
+        let root_key = root
+            .strip_prefix(&loaded.root)
+            .map_or_else(|_| projection_path_key(root), path_slash);
+        inputs.roots.insert(root_key.clone(), root.clone());
+        // The store folder also holds lock and temporary files while a push
+        // or a pull writes; only the stores are read.
+        let stores_only = store_roots.contains(root);
+        let entries = walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.depth() == 0
+                    || !entry.file_type().is_dir()
+                    || (entry.file_name() != ".git" && entry.file_name() != ".renium")
+            });
+        // An entry that cannot be read is left to the staging pass to report.
+        for entry in entries.filter_map(Result::ok) {
+            let stamp = if entry.file_type().is_dir() {
+                ProjectionInputStamp::Directory
+            } else {
+                if stores_only && !path_extension_is(entry.path(), &["renium"]) {
+                    continue;
+                }
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                ProjectionInputStamp::File(metadata.len(), metadata.modified().ok())
+            };
+            let relative = entry.path().strip_prefix(root).unwrap_or(entry.path());
+            inputs
+                .stamps
+                .insert((root_key.clone(), relative.to_path_buf()), stamp);
+        }
+    }
+    Ok(inputs)
+}
+
+/// Inputs that are not on disk as the staged copy read them: rewritten,
+/// added or removed since.
+fn stale_projection_inputs(
+    loaded: &LoadedProject,
+    staged: &ProjectionInputs,
+    current: &ProjectionInputs,
+) -> Vec<PathBuf> {
+    current
+        .stamps
+        .iter()
+        .filter(|(entry, stamp)| staged.stamps.get(*entry) != Some(stamp))
+        .map(|(entry, _)| entry)
+        .chain(
+            staged
+                .stamps
+                .keys()
+                .filter(|entry| !current.stamps.contains_key(*entry)),
+        )
+        .filter_map(|(root, relative)| {
+            let root = current.roots.get(root)?;
+            Some(if relative.as_os_str().is_empty() {
+                root.clone()
+            } else {
+                root.join(relative)
+            })
+        })
+        .filter(|path| !path_is_ignored(loaded, path).unwrap_or(false))
+        .collect()
 }
 
 fn projection_source_kind(path: &Path) -> Option<u8> {
