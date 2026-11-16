@@ -125,11 +125,19 @@ def fresh(folder: Path) -> Path:
     return folder
 
 
-def differences(data) -> int:
+def differences(data, studio_saved: bool = False) -> int:
+    """How many instances differ. A place Studio saved may differ in the
+    collision data of meshes alone: Studio writes a placeholder for a mesh it
+    had not cooked yet at that moment, so two saves of one place differ there."""
     found = (data or {}).get("differences")
-    if isinstance(found, list):
-        return len(found)
-    return int(found) if isinstance(found, (int, float)) else -1
+    if not isinstance(found, list):
+        return int(found) if isinstance(found, (int, float)) else -1
+
+    def cook_state_only(entry) -> bool:
+        names = {item.get("name") for item in entry.get("properties") or []}
+        return entry.get("kind") == "changed" and not entry.get("attributes") and names == {"PhysicalConfigData"}
+
+    return sum(1 for entry in found if not (studio_saved and cook_state_only(entry)))
 
 
 def offline(run: Run, source: Path, root: Path) -> None:
@@ -319,7 +327,7 @@ def studio(run: Run, source: Path, root: Path) -> None:
         if index < run.rounds:
             open_studio(run, folder, place, "open the place in Studio")
     data, _ = run.timed("compare the saved place with the project", ["cmp", "place.rbxl", "--full", "--all"], folder, timeout=1800)
-    expect(differences(data) == 0, "the saved place differs from the project after the run")
+    expect(differences(data, studio_saved=True) == 0, "the saved place differs from the project after the run")
 
 
 def push(run: Run, source: Path, root: Path) -> None:
