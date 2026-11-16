@@ -326,6 +326,12 @@ fn checks_agent_update(command: &Commands) -> bool {
 }
 
 fn refresh_agent_instructions(project: Option<&Path>) {
+    if let Err(error) = app::agent_hints::refresh(app::build::VERSION) {
+        log_global(
+            4,
+            format_args!("[renium] the agent note was not refreshed: {error:#}"),
+        );
+    }
     match project::workflows::refresh_outdated_agent_instructions(project) {
         Ok(changed) if !changed.is_empty() => eprintln!(
             "[renium] updated {}; reread before the next Renium step",

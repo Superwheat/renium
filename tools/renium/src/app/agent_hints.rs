@@ -131,6 +131,59 @@ pub(crate) fn install(version: &str) -> Result<Vec<PathBuf>> {
     }
 }
 
+/// The version a written note names.
+fn noted_version(text: &str) -> Option<semver::Version> {
+    let start = text.find(START)?;
+    let block = &text[start..start + text[start..].find(END)?];
+    let named = block
+        .split_once("Renium ")?
+        .1
+        .split_once(" is installed")?
+        .0;
+    semver::Version::parse(named).ok()
+}
+
+/// Brings a note that names an older version up to this one, where it
+/// stands in its file. An update replaces the executable without running
+/// setup, and an agent quotes the version it reads in the note.
+pub(crate) fn refresh_in(home: &Path, version: &str) -> Result<Vec<PathBuf>> {
+    let Ok(running) = semver::Version::parse(version) else {
+        return Ok(Vec::new());
+    };
+    let mut changed = Vec::new();
+    for target in targets_in(home) {
+        let Ok(current) = fs::read_to_string(&target.path) else {
+            continue;
+        };
+        let current = current.replace("\r\n", "\n");
+        if noted_version(&current).is_none_or(|noted| noted >= running) {
+            continue;
+        }
+        let Some(start) = current.find(START) else {
+            continue;
+        };
+        let Some(end) = current[start..].find(END) else {
+            continue;
+        };
+        let wanted = format!(
+            "{}{}{}",
+            &current[..start],
+            hint_block(version).trim_end(),
+            &current[start + end + END.len()..]
+        );
+        write_text(&target.path, &wanted)?;
+        changed.push(target.path);
+    }
+    Ok(changed)
+}
+
+pub(crate) fn refresh(version: &str) -> Result<Vec<PathBuf>> {
+    match home_directory() {
+        Some(home) => refresh_in(&home, version),
+        None => Ok(Vec::new()),
+    }
+}
+
 /// Removes the note; a file that held nothing else is deleted.
 pub(crate) fn remove_in(home: &Path) -> Result<Vec<PathBuf>> {
     let mut changed = Vec::new();
@@ -250,6 +303,38 @@ mod tests {
         );
         assert!(!home.path().join(".claude/CLAUDE.md").exists());
         assert!(remove_in(home.path())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_note_from_an_older_version_is_brought_up_where_it_stands() -> Result<()> {
+        let home = ScratchHome::new()?;
+        fs::create_dir_all(home.path().join(".claude"))?;
+        fs::create_dir_all(home.path().join(".codex"))?;
+        let file = home.path().join(".claude/CLAUDE.md");
+        fs::write(
+            &file,
+            format!("top\n\n{}\n\nbottom\n", hint_block("0.6.2").trim_end()),
+        )?;
+        fs::write(home.path().join(".codex/AGENTS.md"), "Be brief.\n")?;
+
+        assert_eq!(
+            refresh_in(home.path(), "0.6.4")?,
+            std::slice::from_ref(&file)
+        );
+        let text = fs::read_to_string(&file)?;
+        assert!(text.starts_with("top\n\n<!-- renium:start -->\nRenium 0.6.4 is installed."));
+        assert!(text.ends_with("<!-- renium:end -->\n\nbottom\n"));
+        assert_eq!(
+            fs::read_to_string(home.path().join(".codex/AGENTS.md"))?,
+            "Be brief.\n",
+            "a file without the note gets none"
+        );
+        assert!(refresh_in(home.path(), "0.6.4")?.is_empty());
+        assert!(
+            refresh_in(home.path(), "0.6.3")?.is_empty(),
+            "an older build leaves a newer note alone"
+        );
         Ok(())
     }
 
