@@ -3359,13 +3359,11 @@ fn prepare_protected_writes(
         );
     }
     let reported_count = reported.len();
-    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let applicable = reported
         .into_iter()
         .enumerate()
         .filter(|(_, row)| {
-            !is_externally_managed_protected_write(row)
-                && is_user_facing_protected_write(row, database)
+            !is_externally_managed_protected_write(row) && is_user_facing_protected_write(row)
         })
         .map(|(index, row)| ((studio_pending[index], live_checked[index]), row))
         .collect::<Vec<_>>();

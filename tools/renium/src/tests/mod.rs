@@ -3926,62 +3926,41 @@ fn protected_review_only_keeps_user_facing_properties() {
         "TexturePack",
         database
     ));
-    assert!(!is_user_facing_protected_write(
-        &json!({
-            "kind": "attribute",
-            "className": "Lighting",
-            "name": "RBX_OriginalTechnologyOnFileLoad",
-        }),
-        database
-    ));
-    assert!(!is_user_facing_protected_write(
-        &json!({
-            "kind": "property",
-            "className": "Lighting",
-            "name": "ExtendLightRangeTo120",
-        }),
-        database
-    ));
-    assert!(!is_user_facing_protected_write(
-        &json!({
-            "kind": "property",
-            "className": "Workspace",
-            "name": "CollisionGroupData",
-        }),
-        database
-    ));
-    assert!(!is_user_facing_protected_write(
-        &json!({
-            "kind": "property",
-            "className": "Lighting",
-            "name": "Technology",
-        }),
-        database
-    ));
-    assert!(is_user_facing_protected_write(
-        &json!({
-            "kind": "property",
-            "className": "MeshPart",
-            "name": "MeshId",
-        }),
-        database
-    ));
-    assert!(is_user_facing_protected_write(
-        &json!({
-            "kind": "property",
-            "className": "MaterialVariant",
-            "name": "TexturePack",
-        }),
-        database
-    ));
-    assert!(is_user_facing_protected_write(
-        &json!({
-            "kind": "attribute",
-            "className": "Part",
-            "name": "CreatorNote",
-        }),
-        database
-    ));
+    assert!(!is_user_facing_protected_write(&json!({
+        "kind": "attribute",
+        "className": "Lighting",
+        "name": "RBX_OriginalTechnologyOnFileLoad",
+    })));
+    assert!(!is_user_facing_protected_write(&json!({
+        "kind": "property",
+        "className": "Lighting",
+        "name": "ExtendLightRangeTo120",
+    })));
+    assert!(!is_user_facing_protected_write(&json!({
+        "kind": "property",
+        "className": "Workspace",
+        "name": "CollisionGroupData",
+    })));
+    assert!(!is_user_facing_protected_write(&json!({
+        "kind": "property",
+        "className": "Lighting",
+        "name": "Technology",
+    })));
+    assert!(is_user_facing_protected_write(&json!({
+        "kind": "property",
+        "className": "MeshPart",
+        "name": "MeshId",
+    })));
+    assert!(is_user_facing_protected_write(&json!({
+        "kind": "property",
+        "className": "MaterialVariant",
+        "name": "TexturePack",
+    })));
+    assert!(is_user_facing_protected_write(&json!({
+        "kind": "attribute",
+        "className": "Part",
+        "name": "CreatorNote",
+    })));
     for (class, property) in [
         ("Workspace", "ModelStreamingBehavior"),
         ("Lighting", "LightingStyle"),
@@ -3990,10 +3969,34 @@ fn protected_review_only_keeps_user_facing_properties() {
         ("Model", "Scale"),
     ] {
         assert!(is_user_facing_protected_write(
-            &json!({"className": class, "name": property}),
-            database
+            &json!({"className": class, "name": property})
         ));
     }
+}
+
+#[test]
+fn the_material_service_switch_is_user_facing_only_on_the_service_itself() {
+    let row = |class: &str, service: &str, path: Value| json!({"className": class, "name": "Use2022Materials", "service": service, "pathSegments": path});
+    let service = "MaterialService";
+    assert!(is_user_facing_protected_write(&row(
+        service,
+        service,
+        json!([service])
+    )));
+    for other in [
+        row(service, "Workspace", json!([service])),
+        row(service, service, json!([service, "Copy"])),
+        row(service, service, json!(["Workspace"])),
+        row(service, service, json!([])),
+        row("Part", service, json!([service])),
+        json!({"className": service, "service": service, "pathSegments": [service]}),
+        json!({"name": "TexturePack"}),
+    ] {
+        assert!(!is_user_facing_protected_write(&other), "{other}");
+    }
+    assert!(!is_user_facing_protected_write(
+        &json!({"className": "MaterialService", "name": "AsphaltName"})
+    ));
 }
 
 #[test]

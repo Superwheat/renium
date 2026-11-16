@@ -229,10 +229,7 @@ pub(crate) fn plugin_cannot_write_property(
     })
 }
 
-pub(crate) fn is_user_facing_protected_write(
-    row: &Value,
-    database: &ReflectionDatabase<'_>,
-) -> bool {
+pub(crate) fn is_user_facing_protected_write(row: &Value) -> bool {
     let Some(name) = row.get("name").and_then(Value::as_str) else {
         return false;
     };
@@ -254,29 +251,9 @@ pub(crate) fn is_user_facing_protected_write(
                     segments.len() == 1 && segments[0].as_str() == Some(MATERIAL_SERVICE_CLASS)
                 });
     }
-    if has_protected_texture_pack(class_name) && name == TEXTURE_PACK_PROPERTY {
-        return true;
-    }
-    if super::native_roots::is_property(class_name, name)
+    has_protected_texture_pack(class_name) && name == TEXTURE_PACK_PROPERTY
+        || super::native_roots::is_property(class_name, name)
         || super::native_geometry::is_mesh_geometry_property(class_name, name)
-    {
-        return true;
-    }
-    let Some(descriptor) = rbx_property_descriptor(database, class_name, name) else {
-        return false;
-    };
-    if is_engine_managed_editor_property(class_name, name, database) {
-        return false;
-    }
-    if matches!(&descriptor.data_type, RbxDataType::Enum(name) if *name == "RolloutState") {
-        return false;
-    }
-    if !matches!(descriptor.scriptability, RbxScriptability::Read) {
-        return false;
-    }
-    class_name == "MeshPart"
-        && name == "MeshId"
-        && rbx_model_property_descriptor(database, class_name, name).is_some()
 }
 
 pub(crate) fn property_schema_entry<'a>(
