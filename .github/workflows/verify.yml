@@ -108,6 +108,7 @@ jobs:
         run: |
           RENIUM_SIM_SEEDS=4000 cargo test --locked --manifest-path tools/renium/Cargo.toml -- reconcile::sim
           RENIUM_SIM_SEEDS=150 cargo test --locked --manifest-path tools/renium/Cargo.toml -- editor::stage_sim
+          RENIUM_SIM_SEEDS=2000 cargo test --locked --manifest-path tools/renium/Cargo.toml -- settings::codec_sim
 
       - name: Run plugin SDK tests
         run: cargo test --locked --manifest-path tools/renium-plugin-sdk/Cargo.toml
