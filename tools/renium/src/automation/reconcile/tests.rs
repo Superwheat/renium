@@ -1717,6 +1717,7 @@ fn a_field_the_files_never_carry_is_not_checked_for_retention() {
 fn retention_checks_distinguish_editor_state_and_authored_attributes() {
     for (class, name) in [
         ("Workspace", "InsertPoint"),
+        ("WeldConstraint", "State"),
         ("GuiObject", "AbsoluteSize"),
         ("Sound", "TimeLength"),
         ("ScrollingFrame", "CanvasPosition"),

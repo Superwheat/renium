@@ -417,6 +417,14 @@ pub(crate) fn verification_skips_property(
                 name,
             ))
         || reconciliation_property_is_derived(name)
+        // A value the engine owns (a weld's State, a collision group's
+        // numeric id) is not read back the way a store may carry it.
+        || crate::settings::equivalence::reconciliation_property_is_engine_state(
+            rbx_reflection_database::get().ok(),
+            class_name,
+            name,
+            forced.get(name).unwrap_or(&Value::Null),
+        )
         || crate::settings::equivalence::reconciliation_property_is_forced(name, forced)
         || rbx_reflection_database::get().is_ok_and(|database| {
             crate::editor::review::is_editor_state_property(class_name, name, database)
