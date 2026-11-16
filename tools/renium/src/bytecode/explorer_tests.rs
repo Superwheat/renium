@@ -297,3 +297,38 @@ fn lazy_indexes_preserve_source_references_and_metadata_aliases() {
     assert_eq!(node["canonicalSettingsId"], "script-0");
     assert_eq!(node["settingsFile"], json!(file));
 }
+
+#[test]
+fn a_read_leaves_out_what_the_engine_computes_and_binary_payloads() {
+    use serde_json::json;
+    let hidden = |name: &str, value: serde_json::Value| super::hidden_by_default(name, &value);
+    for name in [
+        "MeshSize",
+        "VertexCount",
+        "UnscaledVolume",
+        "UnscaledCofm",
+        "UniqueId",
+        "HistoryId",
+    ] {
+        assert!(hidden(name, json!(1)), "{name}");
+    }
+    assert!(hidden(
+        "AeroMeshData",
+        json!({"_type": "SharedString", "base64": "QUJD"})
+    ));
+    assert!(hidden(
+        "PhysicalConfigData",
+        json!({"_type": "BinaryString", "base64": ""})
+    ));
+    for (name, value) in [
+        ("Size", json!({"_type": "Vector3", "x": 1, "y": 2, "z": 3})),
+        ("MeshContent", json!("rbxassetid://1")),
+        ("Anchored", json!(true)),
+        (
+            "RenderFidelity",
+            json!({"_type": "EnumItem", "name": "Performance"}),
+        ),
+    ] {
+        assert!(!hidden(name, value), "{name}");
+    }
+}

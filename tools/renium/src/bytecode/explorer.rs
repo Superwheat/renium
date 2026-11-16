@@ -380,9 +380,14 @@ fn bytecode_batch_instance_index(
     instance_api::find_unique_instance_index(document, selector)
 }
 
-fn is_engine_state_property(name: &str) -> bool {
+/// Saved fields a reader does not ask for: what the engine recomputes on
+/// load or owns (cached mesh and physics numbers, file-local ids) and values
+/// that are only a binary payload. A read leaves them out unless they are
+/// named or everything is asked for.
+fn hidden_by_default(name: &str, value: &Value) -> bool {
     crate::settings::equivalence::reconciliation_property_is_derived(name)
-        || matches!(name, "UniqueId" | "HistoryId")
+        || matches!(name, "UniqueId" | "HistoryId" | "MeshSize")
+        || value.get("base64").is_some_and(Value::is_string)
 }
 
 /// Compact output prints a path as one dotted string with `[n]` after any
@@ -1372,12 +1377,15 @@ impl BytecodeNodeProjection<'_> {
                 self.canonical_settings_ids_by_index,
                 properties,
             );
-            // Values the engine recomputes on load are not authored data; a
-            // default full view leaves them out, and any field request shows them.
-            if !requested_field(self.fields, "properties", node_field_aliases("properties"))
-                && !crate::app::output::global_json_output()
-            {
-                properties.retain(|name, _| !is_engine_state_property(name));
+            // Text output leaves out what nobody reads by default. `-o full`
+            // with the properties asked for shows every stored field, and so
+            // does naming one.
+            let everything = matches!(self.mode, OutputMode::Full)
+                && requested_field(self.fields, "properties", node_field_aliases("properties"));
+            if !everything && !crate::app::output::global_json_output() {
+                properties.retain(|name, value| {
+                    !hidden_by_default(name, value) || requested_property_field(self.fields, name)
+                });
             }
         }
         properties
