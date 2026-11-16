@@ -530,6 +530,37 @@ mod tests {
     }
 
     #[test]
+    fn a_scope_loads_what_lies_under_it_and_needs_its_pack_on_disk() {
+        let root = temp_dir("reconcile-store-scopes");
+        let held = snapshot(&[
+            ("src", SnapshotEntry::Directory),
+            ("src/A.luau", file(b"return 'a'")),
+            ("src/B.luau", file(b"return 'b'")),
+            ("notes.txt", file(b"notes")),
+        ]);
+        let stored = StoredSnapshot::write(&root, "pair", &held).unwrap();
+        let scoped = |scope: &str| {
+            stored
+                .load_scopes(&root, "pair", &[PathBuf::from(scope)])
+                .unwrap()
+        };
+        assert!(scoped("src/A.luau") == snapshot(&[("src/A.luau", file(b"return 'a'"))]));
+        let mut under_src = held.clone();
+        under_src.entries.remove(Path::new("notes.txt"));
+        assert!(scoped("src") == under_src);
+        assert!(stored.packs_present(&root, "pair"));
+        assert!(!stored.packs_present(&root, "other"));
+        let folders = snapshot(&[("src", SnapshotEntry::Directory)]);
+        let folders = StoredSnapshot::write(&root, "folders", &folders).unwrap();
+        assert!(folders.packs_present(&root, "folders"));
+        for pack in fs::read_dir(pack_directory(&root, "pair")).unwrap() {
+            fs::remove_file(pack.unwrap().path()).unwrap();
+        }
+        assert!(!stored.packs_present(&root, "pair"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_pack_cut_short_on_disk_is_written_again() {
         let root = temp_dir("reconcile-store-rewrite");
         let held = snapshot(&[("src/A.luau", file(b"return 'a'"))]);
