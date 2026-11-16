@@ -721,7 +721,7 @@ impl Coordinator {
         overlay_snapshot_paths(&mut merged, &readback, &changes.editor);
         let (baseline, unsynced) = synchronized_baseline(context, &publish_paths, &merged)?;
         setup.unsynced_paths = unsynced;
-        if let Some(history) = sync_history {
+        if let Some(mut history) = sync_history {
             // Readback publication can normalize generated settings. Guard undo
             // against those accepted file bytes, not the earlier staged bytes.
             history.commit(&baseline, &ProjectSnapshot::default())?;
@@ -1090,7 +1090,7 @@ impl Coordinator {
         apply_snapshot_paths(&stage.project_root, &changed, &current)?;
         log_reconcile_timing("incremental staged write", phase);
         let phase = Instant::now();
-        let history = history::SyncHistory::begin(root, &source, &previous, &changed)?;
+        let mut history = history::SyncHistory::begin(root, &source, &previous, &changed)?;
         let StagedPushResult {
             generated,
             mut summary,

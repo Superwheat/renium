@@ -179,6 +179,10 @@ extern "C" RENIUM_HISTORY_EXPORT void ReniumHistoryFinish(void* history, std::st
         if (found != registrations.end() && found->second.history == history && found->second.modelOwner->Alive())
             registration = found->second;
     }
+    // A rejected commit has not reached the engine. Retain the restoration
+    // until the caller cancels the still-open recording.
+    if (registration && operation != 0 && registration->terrainWritten && registration->checkTerrain)
+        registration->checkTerrain();
     struct Erase {
         std::string token;
         bool armed;
@@ -188,8 +192,6 @@ extern "C" RENIUM_HISTORY_EXPORT void ReniumHistoryFinish(void* history, std::st
             registrations.erase(token);
         }
     } erase{token, registration.has_value()};
-    if (registration && operation != 0 && registration->terrainWritten && registration->checkTerrain)
-        registration->checkTerrain();
     {
         // Skipping the engine's voxel playback is only an optimization; the
         // explicit restoration below is the final voxel state either way.

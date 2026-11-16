@@ -6,8 +6,8 @@ and compares the averages with the runs before it.
     python -I tools/renium/scenarios/speed.py --record         # add a passing run to the history
     python -I tools/renium/scenarios/speed.py --cleanup        # close what a cut-short run left open
 
-The push phase fills an empty place from the project. It runs only when it is
-named: that path does not pass on every place yet.
+The optional push phase fills an empty place from the whole project, verifies
+that a second push is unchanged, and checks that pulling changes no project file.
 
 The place is a private file on the machine that runs this. Its path comes from
 RENIUM_SPEED_PLACE or from the one-line file ~/.renium/speed-place.txt. The
@@ -22,6 +22,7 @@ and one second slower than the median of the last five recorded runs.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -330,6 +331,13 @@ def studio(run: Run, source: Path, root: Path) -> None:
     expect(differences(data, studio_saved=True) == 0, "the saved place differs from the project after the run")
 
 
+def project_files(folder: Path) -> dict:
+    files = (path for path in folder.rglob("*")
+             if path.is_file() and ".renium" not in path.relative_to(folder).parts)
+    return {str(path.relative_to(folder)): (path.stat().st_mtime_ns, hashlib.sha256(path.read_bytes()).digest())
+            for path in files}
+
+
 def push(run: Run, source: Path, root: Path) -> None:
     empty_project = fresh(root / "empty")
     run.rbx(["init", "."], empty_project)
@@ -348,12 +356,12 @@ def push(run: Run, source: Path, root: Path) -> None:
         place = folder / "place.rbxl"
         shutil.copy2(empty, place)
         open_studio(run, folder, place, "open an empty place in Studio")
-        services = sorted(store.stem for store in (folder / "instances").glob("*.renium") if store.stem != "Workspace")
-        named = [argument for service in services for argument in ("-s", service)]
-        run.timed("push, every service but Workspace into an empty place", ["ps", "--yes", *named], folder, place=place, timeout=3600)
-        data, _ = run.timed("push again, nothing changed", ["ps", "--yes", *named], folder, place=place, timeout=1800)
+        run.timed("push, whole project into an empty place", ["ps", "--yes"], folder, place=place, timeout=3600)
+        data, _ = run.timed("push again, nothing changed", ["ps", "--yes"], folder, place=place, timeout=1800)
         expect((data or {}).get("unchanged") is True, "a second push into the filled place still changed it")
-        run.timed("pull after the push into an empty place", ["pl", "-s", ",".join(services)], folder, place=place, timeout=1800)
+        before_pull = project_files(folder)
+        run.timed("pull after the push into an empty place", ["pl"], folder, place=place, timeout=1800)
+        expect(project_files(folder) == before_pull, "pulling the filled place changed project files")
         run.rbx(["sx", "--terminate"], folder, place=place, ok=False, timeout=300)
         wait_closed(run, folder, place)
         shutil.rmtree(folder, ignore_errors=True)

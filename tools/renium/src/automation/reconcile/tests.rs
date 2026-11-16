@@ -1905,6 +1905,41 @@ fn push_verification_accepts_the_texture_pack_studio_issues_for_an_appearance() 
 }
 
 #[test]
+fn terrain_readback_accepts_rebuilt_cache_only_after_verified_voxel_replacement() {
+    let instance = SettingsBytecodeInstance::new(
+        "terrain".into(),
+        "Terrain".into(),
+        "Terrain".into(),
+        Some(0),
+    );
+    let grid = |bytes: &str| json!({"_type": "BinaryString", "base64": base64::encode(bytes)});
+    let properties = |voxels: &str, cache: &str| {
+        Map::from_iter([
+            ("SmoothGrid".into(), grid(voxels)),
+            ("PhysicsGrid".into(), grid(cache)),
+        ])
+    };
+    let before = properties("empty", "empty cache");
+    let desired = properties("voxels", "saved cache");
+    let observed = properties("voxels", "rebuilt cache");
+    assert!(expected_map_mismatch(&desired, &observed, true, &instance).is_none());
+    assert!(changed_map_mismatch(&before, &desired, &observed, true, &instance).is_none());
+    // Without a voxel replacement, a physics-only write still verifies exactly.
+    let physics_only = properties("voxels", "previous cache");
+    assert!(changed_map_mismatch(&physics_only, &desired, &observed, true, &instance).is_some());
+    for actual in [properties("outside painting", "rebuilt cache"), Map::new()] {
+        assert!(expected_map_mismatch(&desired, &actual, true, &instance).is_some());
+        assert!(changed_map_mismatch(&before, &desired, &actual, true, &instance).is_some());
+    }
+    let mut missing_cache = observed.clone();
+    missing_cache.remove("PhysicsGrid");
+    assert!(expected_map_mismatch(&desired, &missing_cache, true, &instance).is_some());
+    // Same-named attributes remain authored values.
+    assert!(expected_map_mismatch(&desired, &observed, false, &instance).is_some());
+    assert!(changed_map_mismatch(&before, &desired, &observed, false, &instance).is_some());
+}
+
+#[test]
 fn push_verification_follows_game_settings_policy_without_hiding_saved_values() {
     let path = PathBuf::from("src/Players/__roblox_sync_settings.renium");
     let document = |name: &str, capacity: Option<i64>, auto_loads: bool| SettingsBytecode {

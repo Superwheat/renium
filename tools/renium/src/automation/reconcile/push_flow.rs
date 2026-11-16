@@ -415,7 +415,8 @@ pub(crate) fn push_project(
     }
     let mutation_paths = differences.clone();
     let phase = Instant::now();
-    let history = history::SyncHistory::begin(&root, &src_dir, &studio, &mutation_paths)?;
+    let mut history = history::SyncHistory::begin(&root, &src_dir, &studio, &mutation_paths)?;
+    let settle_native_import = replace && !plan.initial_native_services.is_empty();
     if !replace {
         apply_snapshot_paths(&stage.project_root, &mutation_paths, &project)?;
     }
@@ -475,7 +476,17 @@ pub(crate) fn push_project(
             .clone_from(&guard.tracking_guard_id);
     }
 
-    let current = capture_snapshot(&root, stage.publish_paths())?;
+    // A full import allocates new native identities and settles service state.
+    // Reuse its verification capture to publish that accepted representation,
+    // with a file baseline taken before readback so newer editor work is safe.
+    let import_readback = settle_native_import
+        .then(|| -> Result<_> {
+            let mut stage = ExportProjectStage::create(&root, &src_dir, services)?;
+            stage.prepare_read_only_links(&root, &src_dir, services)?;
+            Ok(stage)
+        })
+        .transpose()?;
+    let mut current = capture_snapshot(&root, stage.publish_paths())?;
     let mut verification_paths = differences;
     verification_paths.extend(mutation_paths);
     verification_paths.extend(pushed.generated.entries.keys().cloned());
@@ -488,7 +499,8 @@ pub(crate) fn push_project(
     // Native replacement validates the loader receipt, retained settings,
     // supplemental writes and script buffers before committing. Re-export only
     // services outside that contract, transformed outputs or newer file edits.
-    if !requires_stage
+    if !settle_native_import
+        && !requires_stage
         && replacement.is_none()
         && stage
             .loaded
@@ -551,30 +563,20 @@ pub(crate) fn push_project(
         );
         return Ok(pushed.summary);
     }
-    let verification_services = services_for_snapshot_paths(context, &verification_paths);
+    let verification_services = if settle_native_import {
+        services.to_vec()
+    } else {
+        services_for_snapshot_paths(context, &verification_paths)
+    };
     let phase = Instant::now();
-    let readback_stage = if requires_stage {
-        ExportProjectStage::create(&root, &src_dir, &verification_services)?
-    } else {
-        ExportProjectStage::create_for_comparison(&root, &src_dir, &verification_services)?
-    };
-    let mut readback = if !requires_stage
-        && readback_stage
-            .loaded
-            .as_ref()
-            .is_none_or(|loaded| loaded.project.adapters.is_empty())
-    {
-        capture_studio_services_in_memory(context, bridge, &verification_services, &readback_stage)?
-    } else {
-        capture_studio_services_with_stage(
-            context,
-            bridge,
-            &verification_services,
-            false,
-            readback_stage,
-        )?
-        .1
-    };
+    let (readback_stage, mut readback) = capture_push_readback(
+        context,
+        bridge,
+        &verification_services,
+        &src_dir,
+        requires_stage,
+        import_readback,
+    )?;
     if let Some(enforcement) = &link_enforcement {
         super::staging::pack_read_only_link_scripts_with(
             enforcement,
@@ -608,7 +610,15 @@ pub(crate) fn push_project(
     }
     let mut expected_after_push = project;
     expected_after_push.entries.extend(pushed.generated.entries);
-    if expected_after_push == current && !requires_stage && replacement.is_none() {
+    let files_unchanged = expected_after_push == current;
+    if settle_native_import && files_unchanged {
+        current = publish_native_import_readback(readback_stage, &root, &source_paths)?;
+        pushed.summary.insert(
+            "historyId".into(),
+            Value::String(history.commit(&current, &ProjectSnapshot::default())?),
+        );
+    }
+    if files_unchanged && !requires_stage && replacement.is_none() {
         // Readback verified the remaining fields. The commit proof predates
         // that readback, so retaining it still requires Studio to have remained
         // unchanged throughout verification (including its asynchronous reads).
@@ -628,6 +638,102 @@ pub(crate) fn push_project(
         &mut _native_attributes,
     );
     Ok(pushed.summary)
+}
+
+fn capture_push_readback(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    services: &[String],
+    src_dir: &Path,
+    requires_stage: bool,
+    import_readback: Option<ExportProjectStage>,
+) -> Result<(ExportProjectStage, ProjectSnapshot)> {
+    let settle_import = import_readback.is_some();
+    let root = Path::new(&context.root);
+    let stage = if let Some(stage) = import_readback {
+        stage
+    } else if requires_stage {
+        ExportProjectStage::create(root, src_dir, services)?
+    } else {
+        ExportProjectStage::create_for_comparison(root, src_dir, services)?
+    };
+    if !settle_import
+        && !requires_stage
+        && stage
+            .loaded
+            .as_ref()
+            .is_none_or(|loaded| loaded.project.adapters.is_empty())
+    {
+        let snapshot = capture_studio_services_in_memory(context, bridge, services, &stage)?;
+        Ok((stage, snapshot))
+    } else {
+        capture_studio_services_with_stage(context, bridge, services, settle_import, stage)
+    }
+}
+
+fn publish_native_import_readback(
+    stage: ExportProjectStage,
+    root: &Path,
+    paths: &[PathBuf],
+) -> Result<ProjectSnapshot> {
+    let (published, _) = crate::snapshot::export::finish_export_publication(
+        Some(stage),
+        root,
+        false,
+        None,
+        || Ok(()),
+        || Ok(()),
+    )?;
+    let current = capture_snapshot(root, paths)?;
+    history::ensure_published_state(&published, &current)?;
+    Ok(current)
+}
+
+#[test]
+fn native_import_readback_publishes_once_and_protects_newer_files() -> Result<()> {
+    let root = crate::tests::support::temp_dir("native-import-readback");
+    let _cleanup = OnDrop::new(|| {
+        let _ = fs::remove_dir_all(&root);
+    });
+    let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+    let document = |identity: &str| {
+        let mut instance = SettingsBytecodeInstance::new(
+            "root".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        );
+        instance.properties.insert(
+            "UniqueId".into(),
+            json!({"_type": "UniqueId", "value": identity}),
+        );
+        encode_settings_bytecode(&SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![instance],
+        })
+        .unwrap()
+    };
+    let original = document("00000000000000000000000000000001");
+    let accepted = document("00000000000000000000000000000002");
+    fs::create_dir_all(root.join(path.parent().unwrap()))?;
+    fs::write(root.join(&path), &original)?;
+    let prepare = || -> Result<ExportProjectStage> {
+        let stage = ExportProjectStage::create(&root, Path::new("src"), &["Workspace".into()])?;
+        fs::write(stage.project_root.join(&path), &accepted)?;
+        Ok(stage)
+    };
+    let stage = prepare()?;
+    let paths = stage.publish_paths().to_vec();
+    let after = publish_native_import_readback(stage, &root, &paths)?;
+    assert!(after.entries[&path] == SnapshotEntry::File(accepted.clone()));
+    let modified = fs::metadata(root.join(&path))?.modified()?;
+    assert!(publish_native_import_readback(prepare()?, &root, &paths)? == after);
+    assert_eq!(fs::metadata(root.join(&path))?.modified()?, modified);
+    let stage = prepare()?;
+    fs::write(root.join(&path), &original)?;
+    assert!(publish_native_import_readback(stage, &root, &paths).is_err());
+    assert_eq!(fs::read(root.join(path))?, original);
+    Ok(())
 }
 
 pub(crate) fn reopened_push_context(

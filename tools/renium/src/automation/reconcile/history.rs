@@ -34,14 +34,14 @@ pub(crate) fn record_published_files(
     let before = capture_snapshot(backups.root(), &roots)?;
     let after = capture_snapshot(root, &roots)?;
     ensure_published_state(published, &after)?;
-    let history = SyncHistory::begin(root, source, &before, &scopes)?;
+    let mut history = SyncHistory::begin(root, source, &before, &scopes)?;
     Ok(Some(history.commit(&after, &ProjectSnapshot::default())?))
 }
 
 /// The after-state the entry blesses must be what the publish wrote. A save
 /// that landed in between is the editor's newer work; an entry built on it
 /// would let the undo replace that work with the backup.
-fn ensure_published_state(
+pub(crate) fn ensure_published_state(
     published: &crate::snapshot::export::PublishedProjectChanges,
     after: &ProjectSnapshot,
 ) -> Result<()> {
@@ -134,10 +134,12 @@ impl SyncHistory {
     }
 
     pub(crate) fn commit(
-        mut self,
+        &mut self,
         after: &ProjectSnapshot,
         generated: &ProjectSnapshot,
     ) -> Result<String> {
+        // A verified native import can settle generated file state after the
+        // Studio commit. Refresh its expected state without adding another undo.
         self.record.expected = Some(snapshot_digest(after, generated, &self.record.scopes));
         self.record.committed_at = u64::try_from(
             std::time::SystemTime::now()
@@ -692,6 +694,31 @@ mod tests {
     }
 
     #[test]
+    fn native_import_readback_refreshes_the_same_undo_entry() {
+        let root = temp_dir("native-import-history");
+        let path = "src/Workspace/Script.luau";
+        let before = snapshot(&[(path, b"return 1")]);
+        let pushed = snapshot(&[(path, b"return 2")]);
+        let accepted = snapshot(&[(path, b"return 3")]);
+        let paths = HashSet::from([PathBuf::from(path)]);
+        let mut history = SyncHistory::begin(&root, Path::new("src"), &before, &paths).unwrap();
+        let id = history
+            .commit(&pushed, &ProjectSnapshot::default())
+            .unwrap();
+        assert_eq!(
+            id,
+            history
+                .commit(&accepted, &ProjectSnapshot::default())
+                .unwrap()
+        );
+        assert_eq!(committed_sync_entries(&root).unwrap().len(), 1);
+        apply_snapshot_paths(&root, &paths, &accepted).unwrap();
+        revert_sync(&root, Path::new("src"), &id).unwrap();
+        assert_eq!(fs::read(root.join(path)).unwrap(), b"return 1");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn sync_history_restores_created_deleted_and_changed_files_without_touching_other_work() {
         let root = temp_dir("sync-history");
         let before = snapshot(&[
@@ -708,7 +735,7 @@ mod tests {
             .chain(after.entries.keys())
             .cloned()
             .collect();
-        let history = SyncHistory::begin(&root, Path::new("src"), &before, &paths).unwrap();
+        let mut history = SyncHistory::begin(&root, Path::new("src"), &before, &paths).unwrap();
         let pending: SyncHistoryRecord =
             rmp_serde::from_slice(&fs::read(history.directory.join("sync.rmp")).unwrap()).unwrap();
         assert!(pending.expected.is_none());
@@ -808,7 +835,7 @@ mod tests {
         }
         let paths = HashSet::from([PathBuf::from("src/Workspace/A.luau")]);
         let before = snapshot(&[("src/Workspace/A.luau", b"return 1")]);
-        let history = SyncHistory::begin(&root, Path::new("src"), &before, &paths).unwrap();
+        let mut history = SyncHistory::begin(&root, Path::new("src"), &before, &paths).unwrap();
         let id = history.directory.file_name().unwrap().to_str().unwrap();
         assert!(
             revert_sync(&root, Path::new("src"), id)

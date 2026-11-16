@@ -3013,19 +3013,6 @@ fn build_editor_binary_import_for_services(
         &build.unresolved_reference_properties_by_ref,
         viewport_ref,
     );
-    build
-        .omitted_properties_by_class
-        .entry("Model".to_string())
-        .or_default()
-        .insert("WorldPivot".to_string());
-    // Studio's reader does not take a texture pack from the payload (the
-    // property is RobloxSecurity); the native setter applies it afterwards,
-    // in the same transaction, like a pivot.
-    build
-        .omitted_properties_by_class
-        .entry("SurfaceAppearance".to_string())
-        .or_default()
-        .insert(crate::roblox::schema::TEXTURE_PACK_PROPERTY.to_string());
     log_timing("native editor import group preparation", phase_started);
     let replacement_groups = pending_groups
         .iter()
@@ -3182,7 +3169,10 @@ fn build_editor_binary_import_for_services(
             groups,
             native_replacement: Some(native_replacement),
             instance_count,
-            post_apply_properties_by_class: build.omitted_properties_by_class,
+            post_apply_properties_by_class: import_property_omissions(
+                build.omitted_properties_by_class,
+                true,
+            ),
             post_apply_properties_by_path,
             external_references_post_applied: true,
             viewport_references_post_applied,
@@ -3288,12 +3278,54 @@ fn build_editor_binary_import_for_services(
         groups,
         native_replacement: None,
         instance_count,
-        post_apply_properties_by_class: build.omitted_properties_by_class,
+        post_apply_properties_by_class: import_property_omissions(
+            build.omitted_properties_by_class,
+            false,
+        ),
         post_apply_properties_by_path,
         external_references_post_applied: true,
         viewport_references_post_applied,
     }))
 }
+
+fn import_property_omissions(
+    mut omitted: HashMap<String, HashSet<String>>,
+    native_reader: bool,
+) -> HashMap<String, HashSet<String>> {
+    omitted
+        .entry("Model".into())
+        .or_default()
+        .insert("WorldPivot".into());
+    // Plugin deserialization omits RobloxSecurity texture packs. The native
+    // full-place reader carries them in its payload, without per-instance
+    // protected setters after the bulk import. Keep genuine encoder omissions.
+    if !native_reader {
+        omitted
+            .entry("SurfaceAppearance".into())
+            .or_default()
+            .insert(crate::roblox::schema::TEXTURE_PACK_PROPERTY.into());
+    }
+    omitted
+}
+
+#[test]
+fn native_reader_carries_texture_packs_but_keeps_genuine_encoder_omissions() {
+    let encoded = HashMap::from([("Part".into(), HashSet::from(["UnsupportedField".into()]))]);
+    let native = import_property_omissions(encoded.clone(), true);
+    assert!(!native.contains_key("SurfaceAppearance"));
+    assert!(native["Model"].contains("WorldPivot"));
+    assert!(native["Part"].contains("UnsupportedField"));
+    let plugin = import_property_omissions(encoded, false);
+    assert!(plugin["SurfaceAppearance"].contains("TexturePack"));
+    let unencoded = HashMap::from([(
+        "SurfaceAppearance".into(),
+        HashSet::from(["TexturePack".into()]),
+    )]);
+    assert!(
+        import_property_omissions(unencoded, true)["SurfaceAppearance"].contains("TexturePack")
+    );
+}
+
 #[test]
 fn independent_additions_keep_complete_subtrees_and_reference_additions_keep_the_full_index() {
     let mut document = SettingsBytecode {

@@ -4981,6 +4981,11 @@ fn container_setting_rows(
             let mut row = change.clone();
             row.reset_properties.clear();
             row.deleted_attributes.clear();
+            // Studio derives the service pivot from its imported contents, and
+            // captures omit it. Model pivots still require exact verification.
+            if row.class_name == "Workspace" {
+                row.properties.remove("WorldPivot");
+            }
             row
         })
         .collect()
@@ -5238,6 +5243,70 @@ fn merge_editor_summary_checked(summary: &mut Map<String, Value>, result: &Value
 #[cfg(test)]
 mod source_change_tests {
     use super::*;
+
+    #[test]
+    fn imported_containers_keep_model_pivots_but_not_workspace_pivot() {
+        use crate::editor::types::{
+            EditorBinaryImportGroup, EditorNativePlan, EditorNativeReplacement,
+        };
+
+        let mut changes = EditorChangeSet::default();
+        let mut groups = Vec::new();
+        for class_name in ["Workspace", "Model"] {
+            let path = vec![class_name.to_string()];
+            changes.property_changes.push(EditorPropertyChange {
+                service: class_name.into(),
+                class_name: class_name.into(),
+                path_segments: path.clone(),
+                properties: serde_json::from_value(json!({"WorldPivot": "pivot", "Name": "root"}))
+                    .unwrap(),
+                ..Default::default()
+            });
+            groups.push(EditorBinaryImportGroup {
+                service: class_name.into(),
+                additive: false,
+                target_path: path,
+                count: 0,
+                payload_root_name: String::new(),
+                expected_structure: None,
+                root_paths: vec![],
+                root_settings_ids: vec![],
+                instance_identities: None,
+                viewport_camera: None,
+                retained_roots: vec![],
+                package_roots: vec![],
+                mutation_package_roots: vec![],
+                change_generation: None,
+            });
+        }
+        let import = EditorBinaryImport {
+            bytes: vec![],
+            groups,
+            native_replacement: Some(EditorNativeReplacement {
+                plan: EditorNativePlan {
+                    bindings: vec![],
+                    classes: vec![],
+                    aliases: vec![],
+                },
+                batches: vec![],
+            }),
+            instance_count: 0,
+            post_apply_properties_by_class: Default::default(),
+            post_apply_properties_by_path: Default::default(),
+            external_references_post_applied: false,
+            viewport_references_post_applied: false,
+        };
+        let rows = container_setting_rows(&changes, &import);
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].properties.contains_key("WorldPivot"));
+        assert_eq!(rows[0].properties["Name"], "root");
+        assert_eq!(rows[1].properties["WorldPivot"], "pivot");
+        assert!(
+            changes.property_changes[0]
+                .properties
+                .contains_key("WorldPivot")
+        );
+    }
 
     #[test]
     fn structural_receipts_accumulate_per_service_across_batches() {

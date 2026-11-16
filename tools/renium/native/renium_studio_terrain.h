@@ -88,10 +88,14 @@ struct Write {
         }
         RestoreAcquisition(method);
     }
-    void Check(bool written) const {
-        if (Get(smooth, terrain) != (written ? writtenSmooth : beforeSmooth) ||
-            Get(physics, terrain) != (written ? writtenPhysics : beforePhysics))
-            throw std::runtime_error("Terrain changed outside this sync transaction");
+    void Check() const {
+        if (Get(smooth, terrain) != writtenSmooth)
+            throw std::runtime_error("Terrain SmoothGrid changed outside this sync transaction");
+        // Replacing voxels schedules a physics rebuild after the setter returns.
+        // Its derived cache is not an outside edit; a physics-only write still
+        // requires exact readback through commit.
+        if (beforeSmooth == writtenSmooth && Get(physics, terrain) != writtenPhysics)
+            throw std::runtime_error("Terrain PhysicsGrid changed outside this sync transaction");
     }
     void Rollback() const {
         renium_terrain_observation::OwnWrite own(terrain);
@@ -102,7 +106,8 @@ struct Write {
         }
         // Exact cancellation preserves the engine's original empty-chunk layout
         // too. With outside painting, the SmoothGrid setter updates its geometry.
-        if (currentSmooth == writtenSmooth && currentPhysics == writtenPhysics && currentPhysics != beforePhysics)
+        if (currentSmooth == writtenSmooth && (beforeSmooth != writtenSmooth || currentPhysics == writtenPhysics)
+            && currentPhysics != beforePhysics)
             Set(physics, terrain, beforePhysics);
         if (Get(smooth, terrain) != restored)
             throw std::runtime_error("Studio did not restore the Terrain voxel grid");
@@ -189,7 +194,7 @@ static Result Apply(void* terrain, std::shared_ptr<void> owner, std::uintptr_t m
     {
         std::lock_guard lock(renium_history::registrationsMutex);
         auto& registration = renium_history::registrations.at(token);
-        registration.checkTerrain = [write] { write->Check(true); };
+        registration.checkTerrain = [write] { write->Check(); };
         registration.terrainWritten = true;
     }
     return {true, Hash(write->writtenSmooth, write->writtenPhysics)};

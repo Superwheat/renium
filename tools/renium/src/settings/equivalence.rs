@@ -2005,6 +2005,44 @@ fn serialized_only_logical_name(
     }
 }
 
+fn canonicalize_content_uri_alias(instance: &mut SettingsBytecodeInstance) -> Result<()> {
+    let (modern, legacy) = match instance.class_name.as_str() {
+        class if crate::roblox::schema::has_protected_texture_pack(class) => {
+            ("TexturePackContent", "TexturePack")
+        }
+        "PartOperation" | "UnionOperation" | "NegateOperation" | "IntersectOperation" => {
+            ("Content", "AssetId")
+        }
+        "Shirt" => ("ShirtTemplateContent", "ShirtTemplate"),
+        "Pants" => ("PantsTemplateContent", "PantsTemplate"),
+        _ => return Ok(()),
+    };
+    let Some(value) = instance
+        .properties
+        .get(modern)
+        .map(typed_scalar)
+        .filter(|value| value.is_string())
+    else {
+        return Ok(());
+    };
+    // Studio now serializes these URIs through Content, while older files
+    // and protected setters use ContentId. Object-backed Content stays typed.
+    // A default legacy mirror is harmless; conflicting authored URIs are not.
+    if let Some(existing) = instance.properties.get(legacy)
+        && typed_scalar(existing).as_str() != Some("")
+        && !reconciliation_values_equal(existing, value, false)
+    {
+        bail!(
+            "{} contains conflicting values for properties {legacy} and {modern}",
+            instance.name
+        );
+    }
+    let value = value.clone();
+    instance.properties.remove(modern);
+    instance.properties.insert(legacy.to_string(), value);
+    Ok(())
+}
+
 pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsBytecode) -> Result<()> {
     let database = rbx_reflection_database::get()?;
     // A dominant service must not serialize canonicalization after decoding.
@@ -2016,6 +2054,7 @@ pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsByteco
             let mut names_by_class = AHashMap::<&str, AHashMap<String, Option<&str>>>::new();
             let mut migrations_by_class = AHashMap::<&str, AHashMap<String, bool>>::new();
             for instance in instances {
+                canonicalize_content_uri_alias(instance)?;
                 let names = names_by_class.entry(&instance.class_name).or_default();
                 let mut renamed_property = |name: &str| {
                     if let Some(renamed) = names.get(name) {
@@ -2424,6 +2463,9 @@ fn reconciliation_maps_equal_with_ids(
             Some(other)
                 if hulls_match(name, value, other)
                     && geometry_sources_equal(class_name, left, right) => {}
+            Some(_)
+                if name == "PhysicsGrid"
+                    && terrain_physics_caches_match(class_name, left, right) => {}
             Some(other)
                 if is_asset_reference_property(class_name, name)
                     && asset_texts_equal(value, other) => {}
@@ -2447,6 +2489,26 @@ fn reconciliation_maps_equal_with_ids(
             || left.contains_key(name)
             || reconciliation_property_value_is_default(class_name, name, value)
     })
+}
+
+/// Studio rebuilds Terrain's collision cache after loading voxels. Preserve
+/// the stored cache only when both records carry exactly the same voxel grid;
+/// absent grids and property-only comparisons provide no such proof.
+pub(crate) fn terrain_physics_caches_match(
+    class_name: &str,
+    left: &Map<String, Value>,
+    right: &Map<String, Value>,
+) -> bool {
+    let binary = |value: &Value| {
+        value.get("_type").and_then(Value::as_str) == Some("BinaryString")
+            && value.get("base64").is_some_and(Value::is_string)
+    };
+    class_name == "Terrain"
+        && left
+            .get("SmoothGrid")
+            .is_some_and(|grid| binary(grid) && right.get("SmoothGrid") == Some(grid))
+        && left.get("PhysicsGrid").is_some_and(binary)
+        && right.get("PhysicsGrid").is_some_and(binary)
 }
 
 /// What a part's collision hull says about its authored fidelity: byte 10 of a
@@ -3752,6 +3814,7 @@ fn align_equivalent_property_map_values(
     observed: &mut Map<String, Value>,
 ) {
     let geometry_same = geometry_sources_equal(class_name, reference, observed);
+    let terrain_same = terrain_physics_caches_match(class_name, reference, observed);
     for (name, reference_value) in reference {
         let Some(observed_value) = observed.get_mut(name) else {
             continue;
@@ -3760,13 +3823,14 @@ fn align_equivalent_property_map_values(
             continue;
         }
         if reference_value != observed_value
-            && reconciliation_store_property_values_equal(
-                service,
-                class_name,
-                name,
-                Some(reference_value),
-                Some(observed_value),
-            )
+            && (name == "PhysicsGrid" && terrain_same
+                || reconciliation_store_property_values_equal(
+                    service,
+                    class_name,
+                    name,
+                    Some(reference_value),
+                    Some(observed_value),
+                ))
             && !reference_loses_enum_types(reference_value, observed_value)
         {
             observed_value.clone_from(reference_value);
@@ -4827,6 +4891,71 @@ mod tests {
             "TextWrapped",
             &Map::from_iter([("TextScaled".to_string(), json!(false))])
         ));
+    }
+
+    #[test]
+    fn content_uri_aliases_preserve_stores_in_both_directions_and_keep_object_content() {
+        for (class, modern, legacy) in [
+            ("SurfaceAppearance", "TexturePackContent", "TexturePack"),
+            ("MaterialVariant", "TexturePackContent", "TexturePack"),
+            ("TerrainDetail", "TexturePackContent", "TexturePack"),
+            ("Decal", "TexturePackContent", "TexturePack"),
+            ("UnionOperation", "Content", "AssetId"),
+            ("NegateOperation", "Content", "AssetId"),
+            ("IntersectOperation", "Content", "AssetId"),
+            ("Shirt", "ShirtTemplateContent", "ShirtTemplate"),
+            ("Pants", "PantsTemplateContent", "PantsTemplate"),
+        ] {
+            let document = |properties| {
+                let mut document = string_value_with_properties(properties);
+                document.instances[0].class_name = class.into();
+                document
+            };
+            for uri in ["", "rbxassetid://7"] {
+                let old = document(Map::from_iter([(legacy.into(), json!(uri))]));
+                for value in [json!(uri), json!({"_type": "Content", "value": uri})] {
+                    let new = document(Map::from_iter([
+                        (modern.into(), value),
+                        (legacy.into(), json!("")),
+                    ]));
+                    let old_bytes = encode_settings_bytecode(&old).unwrap();
+                    let new_bytes = encode_settings_bytecode(&new).unwrap();
+                    for (reference, observed) in
+                        [(&old_bytes, &new_bytes), (&new_bytes, &old_bytes)]
+                    {
+                        assert!(
+                            matches!(
+                                align_settings_bytes_to_reference(reference, observed).unwrap(),
+                                SettingsAlignment::Equivalent
+                            ),
+                            "{class}"
+                        );
+                    }
+                    let mut normalized = new;
+                    canonicalize_settings_property_names(&mut normalized).unwrap();
+                    assert_eq!(
+                        normalized.instances[0].properties,
+                        old.instances[0].properties
+                    );
+                }
+            }
+            let mut object = document(Map::from_iter([(
+                modern.into(),
+                json!({"_type": "Ref", "pathSegments": ["Workspace", "Mesh"]}),
+            )]));
+            let original = object.instances[0].properties.clone();
+            canonicalize_settings_property_names(&mut object).unwrap();
+            assert_eq!(object.instances[0].properties, original);
+            let mut conflicting = document(Map::from_iter([
+                (legacy.into(), json!("rbxassetid://1")),
+                (modern.into(), json!("rbxassetid://2")),
+            ]));
+            assert!(canonicalize_settings_property_names(&mut conflicting).is_err());
+        }
+        let mut unrelated =
+            string_value_with_properties(Map::from_iter([("Content".into(), json!("authored"))]));
+        canonicalize_settings_property_names(&mut unrelated).unwrap();
+        assert_eq!(unrelated.instances[0].properties["Content"], "authored");
     }
 
     #[test]
@@ -6057,6 +6186,66 @@ mod never_serialized_properties {
             &hull(6, b" old"),
             &serde_json::json!({"_type": "SharedString", "base64": base64::encode(b"not a hull")})
         ));
+    }
+
+    #[test]
+    fn terrain_physics_cache_alignment_requires_identical_voxels() {
+        let grid = |bytes: &str| serde_json::json!({"_type": "BinaryString", "base64": base64::encode(bytes)});
+        let properties = |voxels: &str, cache: &str| {
+            Map::from_iter([
+                ("SmoothGrid".into(), grid(voxels)),
+                ("PhysicsGrid".into(), grid(cache)),
+            ])
+        };
+        let saved = properties("voxels", "saved cache");
+        let rebuilt = properties("voxels", "rebuilt cache");
+        let edited = properties("painted voxels", "rebuilt cache");
+        assert!(reconciliation_maps_equal("Terrain", &saved, &rebuilt));
+        assert!(reconciliation_maps_equal("Terrain", &rebuilt, &saved));
+        assert!(!reconciliation_maps_equal("Terrain", &saved, &edited));
+        assert!(!terrain_physics_caches_match("Part", &saved, &rebuilt));
+        assert!(!terrain_physics_caches_match(
+            "Terrain",
+            &saved,
+            &Map::new()
+        ));
+        let mut missing_voxels = rebuilt.clone();
+        missing_voxels.remove("SmoothGrid");
+        assert!(!reconciliation_maps_equal(
+            "Terrain",
+            &saved,
+            &missing_voxels
+        ));
+        assert!(!reconciliation_property_values_equal(
+            "Terrain",
+            "PhysicsGrid",
+            saved.get("PhysicsGrid"),
+            rebuilt.get("PhysicsGrid")
+        ));
+
+        let document = |properties| {
+            let mut terrain = SettingsBytecodeInstance::new(
+                "terrain".into(),
+                "Terrain".into(),
+                "Terrain".into(),
+                None,
+            );
+            terrain.properties = properties;
+            SettingsBytecode {
+                version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+                instances: vec![terrain],
+            }
+        };
+        let saved_bytes = encode_settings_bytecode(&document(saved.clone())).unwrap();
+        let rebuilt_bytes = encode_settings_bytecode(&document(rebuilt.clone())).unwrap();
+        assert!(matches!(
+            align_settings_bytes_to_reference(&saved_bytes, &rebuilt_bytes).unwrap(),
+            SettingsAlignment::Equivalent
+        ));
+        for (mut observed, expected) in [(rebuilt, saved.clone()), (edited.clone(), edited)] {
+            align_equivalent_property_map_values(None, "Terrain", &saved, &mut observed);
+            assert_eq!(observed, expected);
+        }
     }
 
     #[test]

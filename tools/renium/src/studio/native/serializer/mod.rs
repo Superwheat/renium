@@ -120,6 +120,22 @@ fn terrain_observation_retains_one_subscription_and_validates_model_ownership() 
 }
 
 #[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn terrain_transactions_allow_physics_rebuilds_and_retain_rejected_commit_rollback() {
+    let name = if cfg!(windows) {
+        "renium-terrain-transaction-test.exe"
+    } else {
+        "renium-terrain-transaction-test"
+    };
+    assert!(
+        std::process::Command::new(std::path::Path::new(env!("OUT_DIR")).join(name))
+            .status()
+            .expect("run native Terrain transaction regression")
+            .success()
+    );
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn validate_function_arguments(
     class: &str,
     name: &str,

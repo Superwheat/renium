@@ -500,6 +500,14 @@ pub(crate) fn expected_map_mismatch(
 ) -> Option<String> {
     let class_name = &instance.class_name;
     expected.iter().find_map(|(name, value)| {
+        if properties
+            && name == "PhysicsGrid"
+            && crate::settings::equivalence::terrain_physics_caches_match(
+                class_name, expected, actual,
+            )
+        {
+            return None;
+        }
         if !properties && crate::settings::equivalence::is_engine_managed_attribute(name) {
             return None;
         }
@@ -561,6 +569,17 @@ pub(crate) fn changed_map_mismatch(
     names.dedup();
     let class_name = &instance.class_name;
     names.into_iter().find_map(|name| {
+        // Voxel replacement schedules a collision-cache rebuild. A physics-only
+        // write still needs exact readback; matching voxels alone cannot verify it.
+        if properties
+            && name == "PhysicsGrid"
+            && before.get("SmoothGrid") != desired.get("SmoothGrid")
+            && crate::settings::equivalence::terrain_physics_caches_match(
+                class_name, desired, observed,
+            )
+        {
+            return None;
+        }
         if !properties && crate::settings::equivalence::is_engine_managed_attribute(name) {
             return None;
         }

@@ -571,6 +571,8 @@ fn build_native_test(out_dir: &Path, name: &str, source: &Path) {
     run(&mut command, "Native regression build");
     println!("cargo:rerun-if-changed={}", source.display());
     println!("cargo:rerun-if-changed=native/renium_terrain_observation.h");
+    println!("cargo:rerun-if-changed=native/renium_studio_terrain.h");
+    println!("cargo:rerun-if-changed=native/renium_studio_history.h");
 }
 
 fn main() {
@@ -605,6 +607,13 @@ fn main() {
             "property-task",
             Path::new("native/tests/property_task.cpp"),
         );
+        if matches!(target_os.as_str(), "windows" | "macos") {
+            build_native_test(
+                &out_dir,
+                "terrain-transaction",
+                Path::new("native/tests/terrain_transaction.cpp"),
+            );
+        }
     }
     match target_os.as_str() {
         "windows" => {
