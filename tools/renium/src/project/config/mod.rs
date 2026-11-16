@@ -761,6 +761,16 @@ impl ProjectionStage {
             .map(|transform| transform.source.as_path())
     }
 
+    /// The instances a source file becomes through the project's sync rules.
+    pub fn transformed_targets_for_source(&self, source: &Path) -> Vec<Vec<String>> {
+        let source = absolute_path(source);
+        self.transforms
+            .iter()
+            .filter(|transform| absolute_path(&transform.source) == source)
+            .map(|transform| transform.target.clone())
+            .collect()
+    }
+
     pub fn transformed_scripts(&self) -> impl Iterator<Item = (&[String], &Path, &'static str)> {
         self.transforms.iter().filter_map(|transform| {
             transform.script_class_name.map(|class_name| {
@@ -1463,6 +1473,17 @@ fn project_source_to_staged_relative(
     Ok(project_source_to_staged_relatives(loaded, source)?
         .into_iter()
         .next())
+}
+
+/// The instance a metadata sidecar describes, for the sidecar's staged path.
+pub(crate) fn metadata_sidecar_instance(
+    loaded: &LoadedProject,
+    staged_relative: &Path,
+) -> Result<Option<Vec<String>>> {
+    if !projection::is_metadata_sidecar(staged_relative) {
+        return Ok(None);
+    }
+    projection::metadata_sidecar_target(loaded, staged_relative).map(Some)
 }
 
 pub fn project_source_to_staged_relatives(

@@ -1591,6 +1591,19 @@ fn name_script_paths(args: &mut PushEditorChangesArgs, invocation_root: &Path) -
             .flatten();
         if let Some(file) = named {
             *path = file;
+        } else if !path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                ["lua", "luau", "renium"]
+                    .iter()
+                    .any(|kept| extension.eq_ignore_ascii_case(kept))
+            })
+        {
+            bail!(
+                "`{}` is not a file or a folder, and no script goes by that name; nothing was pushed. A deleted script is pushed by its file name (`rbx ps src/Folder/Old.luau`); `rbx ps` without paths pushes every difference",
+                path.display()
+            );
         }
     }
     Ok(())
@@ -1989,13 +2002,29 @@ fn collect_project_editor_changes_with_documents(
         log_editor_collection_timing("changes", phase_started);
         return Ok((changes, Some(projection)));
     }
+    let mut projected_instance_paths = Vec::new();
     let mut projected_paths = if full_selection {
         collect_editor_full_paths(projection.root())?
     } else {
         let mut paths = Vec::new();
         let naming = config::project_script_naming(&loaded.project);
-        let folders = named_push_folders(&loaded, &changed_paths, projection.root())?;
+        // A store named in the push carries its whole service, and with it
+        // every folder and file of that service named beside it.
+        let mut whole_services = HashSet::new();
+        for changed_path in &changed_paths {
+            if changed_path.extension().is_some_and(|ext| ext == "renium") {
+                let absolute = absolutize_under(&loaded.root, changed_path);
+                whole_services.extend(
+                    config::project_source_to_staged_relatives(&loaded, &absolute)?
+                        .iter()
+                        .filter_map(|relative| staged_service(relative)),
+                );
+            }
+        }
+        let folders =
+            named_push_folders(&loaded, &changed_paths, projection.root(), &whole_services)?;
         paths.extend(folders.staged.iter().cloned());
+        let mut instance_paths = Vec::new();
         for changed_path in changed_paths {
             let absolute = absolutize_under(&loaded.root, &changed_path);
             let source_file = !absolute.is_dir()
@@ -2006,16 +2035,27 @@ fn collect_project_editor_changes_with_documents(
                     .is_some();
             let mut mapped =
                 config::project_source_to_staged_paths(&loaded, &absolute, projection.root())?;
-            if source_file || folders.cover(&absolute) {
+            let produced = if source_file || folders.cover(&absolute) {
+                Some(Vec::new())
+            } else if args.link_project_root.is_some() {
+                // A planned push names exactly what it compared.
+                None
+            } else {
+                named_file_instances(&loaded, &projection, &absolute, &whole_services)?
+            };
+            if let Some(produced) = produced {
                 mapped.retain(|path| {
                     !path
                         .file_name()
                         .and_then(|name| name.to_str())
                         .is_some_and(is_service_settings_file_name)
                 });
+                instance_paths.extend(produced);
             }
             paths.extend(mapped);
         }
+        paths.extend(instance_paths.iter().cloned());
+        projected_instance_paths = instance_paths;
         paths
     };
     projected_paths.sort();
@@ -2030,11 +2070,18 @@ fn collect_project_editor_changes_with_documents(
     projected_args.changed_paths_files.clear();
     projected_args.link_cache_dir = None;
     let (project_root, src_root) = editor_project_roots(&projected_args)?;
-    let mut changes = collect_editor_changes_with_link_enforcement(
+    let mut changes = collect_editor_changes_with_link_enforcement_and_documents(
         &projected_args,
         &project_root,
         &src_root,
         &link_enforcement,
+        &mut PreparedEditorDocuments {
+            instance_paths: projected_instance_paths
+                .iter()
+                .map(|path| path_key(&canonical_editor_changed_path(&project_root, path)))
+                .collect(),
+            ..PreparedEditorDocuments::default()
+        },
     )?;
     // Projection also creates identities for new source files. Publish their
     // metadata through the ordinary guarded settings transaction, so later
@@ -2082,6 +2129,7 @@ fn named_push_folders(
     loaded: &config::LoadedProject,
     changed_paths: &[PathBuf],
     stage_root: &Path,
+    whole_services: &HashSet<String>,
 ) -> Result<NamedPushFolders> {
     let mut folders = NamedPushFolders::default();
     let mut mapped_sources = None;
@@ -2101,7 +2149,17 @@ fn named_push_folders(
             .cloned()
             .collect::<Vec<_>>();
         for folder in std::iter::once(named).chain(inner) {
-            match staged_folders_below_service(loaded, &folder, stage_root)? {
+            let staged =
+                staged_folders_below_service(loaded, &folder, stage_root)?.filter(|staged| {
+                    !staged.iter().any(|staged| {
+                        staged
+                            .strip_prefix(stage_root)
+                            .ok()
+                            .and_then(staged_service)
+                            .is_some_and(|service| whole_services.contains(&service))
+                    })
+                });
+            match staged {
                 Some(staged) => {
                     folders.staged.extend(staged);
                     folders.subtrees.push(folder);
@@ -2111,6 +2169,70 @@ fn named_push_folders(
         }
     }
     Ok(folders)
+}
+
+/// The service a path of the staged copy lies in.
+fn staged_service(relative: &Path) -> Option<String> {
+    match relative.components().next()? {
+        std::path::Component::Normal(service) => service.to_str().map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// What a named file that is no script pushes, as staged paths that name
+/// instances. A metadata file pushes the instance it describes; a file that
+/// makes no instance pushes nothing. `None` leaves the file to its whole
+/// service: a store or a nested project, a file of a service whose store is
+/// pushed with it, metadata of a service itself, and the source of a sync
+/// rule, because the instances it no longer makes have to go as well.
+fn named_file_instances(
+    loaded: &config::LoadedProject,
+    projection: &config::ProjectionStage,
+    source: &Path,
+    whole_services: &HashSet<String>,
+) -> Result<Option<Vec<PathBuf>>> {
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !source.is_file()
+        || name.ends_with(".renium")
+        || name.ends_with(".project.json")
+        || name.ends_with(".project.jsonc")
+        || !projection.transformed_targets_for_source(source).is_empty()
+    {
+        return Ok(None);
+    }
+    let relatives = config::project_source_to_staged_relatives(loaded, source)?;
+    if relatives.is_empty()
+        || relatives.iter().any(|relative| {
+            relative.components().count() < 2
+                || staged_service(relative).is_none_or(|service| whole_services.contains(&service))
+        })
+    {
+        return Ok(None);
+    }
+    let mut staged = Vec::new();
+    for relative in &relatives {
+        let Some(instance) = config::metadata_sidecar_instance(loaded, relative)? else {
+            continue;
+        };
+        let Some((service, below)) = instance
+            .split_first()
+            .filter(|(_, below)| !below.is_empty())
+        else {
+            return Ok(None);
+        };
+        staged.push(
+            below
+                .iter()
+                .fold(projection.root().join(service), |path, name| {
+                    path.join(crate::system::files::sanitize_name(name))
+                }),
+        );
+    }
+    Ok(Some(staged))
 }
 
 /// The staged folders a named source folder becomes, when each lies below a
@@ -5377,7 +5499,10 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             continue;
         }
 
-        if metadata.as_ref().is_some_and(std::fs::Metadata::is_dir)
+        if (metadata.as_ref().is_some_and(std::fs::Metadata::is_dir)
+            || prepared_documents
+                .instance_paths
+                .contains(&path_key(&absolute_path)))
             && let Some(document) = documents.get(&service).and_then(Option::as_ref)
             && let Some(target) = editor_directory_target(
                 document,
@@ -6211,6 +6336,82 @@ mod sync_tests {
     }
 
     #[test]
+    fn a_named_file_that_is_no_script_pushes_only_the_instance_it_makes() {
+        use crate::cli::ProjectSourceArgs;
+
+        let root = crate::tests::support::temp_dir("named-mapped-file");
+        fs::create_dir_all(root.join("src/shared")).unwrap();
+        fs::create_dir_all(root.join("empty")).unwrap();
+        fs::write(root.join("src/shared/Balance.luau"), "return 1\n").unwrap();
+        fs::write(root.join("src/shared/notes.txt"), "to do\n").unwrap();
+        let sidecar = root.join("src/shared/Pad.meta.json");
+        fs::write(
+            &sidecar,
+            r#"{"className": "Part", "properties": {"Anchored": true}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"tree":{"ReplicatedStorage":{"Shared":{"$path":"src/shared"}}}}"#,
+        )
+        .unwrap();
+        let mut store = crate::rbx::model::source_only_settings_document(
+            &root.join("empty"),
+            "ReplicatedStorage",
+        )
+        .unwrap();
+        store
+            .instances
+            .push(crate::settings::bytecode::SettingsBytecodeInstance::new(
+                "outside-folder".to_string(),
+                "Finds".to_string(),
+                "Folder".to_string(),
+                Some(0),
+            ));
+        store
+            .write_file(&root.join("instances/ReplicatedStorage.renium"))
+            .unwrap();
+        let pushed = |path: PathBuf| {
+            let mut args = PushEditorChangesArgs::new(
+                ProjectSourceArgs {
+                    project_root: root.clone(),
+                    src_root: PathBuf::from("src"),
+                },
+                BridgeConnectionArgs::local(0.1),
+            );
+            args.changed_paths.push(path);
+            collect_project_editor_changes(&args).unwrap().0
+        };
+
+        let described = pushed(sidecar);
+        assert!(
+            described
+                .instance_changes
+                .iter()
+                .all(|change| change.mode == "upsertInstances" && !change.allow_deletes),
+            "a metadata file does not reconcile its service"
+        );
+        let paths = described
+            .instance_changes
+            .iter()
+            .flat_map(|change| &change.instances)
+            .map(|instance| instance.path_segments.join("."))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            ["ReplicatedStorage.Shared", "ReplicatedStorage.Shared.Pad"],
+            "the instance the file describes, below its parent"
+        );
+
+        let carried = pushed(root.join("src/shared/notes.txt"));
+        assert!(
+            carried.instance_changes.is_empty() && carried.source_changes.is_empty(),
+            "a file that makes no instance pushes nothing"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_case_only_renamed_script_file_maps_to_its_instance() {
         use crate::cli::ProjectSourceArgs;
 
@@ -6764,9 +6965,16 @@ mod named_script_tests {
             named(&["Honk", "src/A/Util.luau"]).unwrap(),
             (true, vec![honk, util])
         );
+        let nothing = named(&["Nope"]).unwrap_err().to_string();
+        assert!(
+            nothing
+                .starts_with("`Nope` is not a file or a folder, and no script goes by that name"),
+            "{nothing}"
+        );
         assert_eq!(
-            named(&["Nope"]).unwrap(),
-            (false, vec![PathBuf::from("Nope")])
+            named(&["src/A/Gone.luau"]).unwrap(),
+            (true, vec![PathBuf::from("src/A/Gone.luau")]),
+            "a deleted script is still named by its file"
         );
         let shared = named(&["Util"]).unwrap_err().to_string();
         assert!(

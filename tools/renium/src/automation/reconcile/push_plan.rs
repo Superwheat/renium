@@ -190,6 +190,7 @@ pub(crate) fn push_staged_project(
         PreparedEditorDocuments {
             documents: prepared_documents,
             native_services: plan.initial_native_services.clone(),
+            ..PreparedEditorDocuments::default()
         },
         |changes| {
             amend_reconciled_changes(changes, plan)?;

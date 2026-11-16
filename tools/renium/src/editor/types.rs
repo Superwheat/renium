@@ -369,6 +369,10 @@ pub(crate) struct EditorSourcePathSpec {
 pub(crate) struct PreparedEditorDocuments {
     pub(crate) documents: HashMap<String, Arc<SettingsBytecode>>,
     pub(crate) native_services: HashSet<String>,
+    /// Changed paths that name an instance by its place in a service and are
+    /// pushed as that instance and what it holds, as a folder is; no folder
+    /// needs to stand there.
+    pub(crate) instance_paths: HashSet<String>,
 }
 
 #[derive(Default)]
