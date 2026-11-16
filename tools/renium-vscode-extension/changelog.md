@@ -21,6 +21,9 @@
 
 ### Bug fixes
 
+- Studio no longer shows "user_Renium.rbxm is not responding" while a push is prepared for review. Building the review listed a parent's children twice for every row, so a model with hundreds of same-named children (a rig's 850 welds) kept the plugin busy for half a minute. Each parent's children are now listed once per review, and the review pauses regularly while it is built.
+- A push that sent only values Studio already held answers `unchanged` in place of `verified: false` with nothing to explain it.
+- The rows of a held push no longer print the service twice (`Workspace.Workspace.Lobby`), and an instance sent whole reads `upsert PATH Class` in place of `+ PATH Class`, which looked like an instance Studio did not have.
 - A push no longer fails with "Studio did not retain pushed project changes ... (WeldConstraint.State was not retained (expected 1, Studio has <absent>))" after it applied in full. The check after a push now leaves out the values the engine owns, such as a weld's `State` and a collision group's numeric id, which a store can carry (a link package, an imported place) and no read-back from Studio returns.
 - `rbx setup` and `rbx setup --repair` no longer fail with "The Studio plugin version X does not match Renium Y" when the `Renium.rbxm` beside the executable is from another release. That file is skipped and the plugin of the running release is downloaded; a setup into the default Plugins folder also replaces the file beside the executable with the download.
 - `rbx pi` into a project that already holds the place keeps the id of every instance that is still there, also one that was only renamed. When the place had changed in more than one spot, the import numbered the store anew, and whatever stored an id (a link's lock, a reference by id) then named another instance. An instance that is new in the place file gets a number above every number the store holds.

@@ -917,16 +917,20 @@ impl EditorReviewOutcome {
 pub(crate) fn editor_review_digest(rows: &[Value], limit: usize) -> (Vec<Value>, usize) {
     let mut digest = Vec::with_capacity(rows.len().min(limit));
     for row in rows.iter().take(limit) {
+        // A row's path starts at its service, which Studio's panel reads
+        // from it; a row that gives the path below the service gets it added.
         let service = row.get("service").and_then(Value::as_str).unwrap_or("");
-        let mut path = vec![service.to_string()];
-        path.extend(
-            row.get("pathSegments")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(str::to_string),
-        );
+        let mut path = row
+            .get("pathSegments")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if path.first().map(String::as_str) != Some(service) {
+            path.insert(0, service.to_string());
+        }
         let changes = row
             .get("entries")
             .and_then(Value::as_array)
@@ -936,7 +940,9 @@ pub(crate) fn editor_review_digest(rows: &[Value], limit: usize) -> (Vec<Value>,
                 let name = entry.get("name").and_then(Value::as_str).unwrap_or("");
                 let flag = |key: &str| entry.get(key).and_then(Value::as_bool) == Some(true);
                 match entry.get("kind").and_then(Value::as_str).unwrap_or("") {
-                    "instanceAdd" => "+instance (upsert: existing ancestors stay)".to_string(),
+                    "instanceAdd" => {
+                        "upsert instance (created only where Studio lacks it)".to_string()
+                    }
                     "instanceRemove" => "-instance".to_string(),
                     "instanceReplace" => "replace instance".to_string(),
                     "instanceReconcile" if flag("allowDeletes") => {
@@ -964,9 +970,10 @@ pub(crate) fn editor_review_digest(rows: &[Value], limit: usize) -> (Vec<Value>,
 /// How many review rows a text-mode result prints.
 const COMPACT_REVIEW_ROWS: usize = 20;
 
-/// A digest row as one line: `+ PATH Class` for an added instance,
+/// A digest row as one line: `upsert PATH Class` for an instance sent whole
+/// (Studio keeps the one it has and takes its values, or gets a new one),
 /// `- PATH Class` for a removed one, the kind before the path for a replaced
-/// or reconciled one, and `PATH: Name, Name` for changed values. An added
+/// or reconciled one, and `PATH: Name, Name` for changed values. An upserted
 /// instance brings everything it holds, so its value names are left out.
 fn review_row_text(row: &Value) -> String {
     let path = row.get("path").and_then(Value::as_str).unwrap_or("");
@@ -979,8 +986,8 @@ fn review_row_text(row: &Value) -> String {
         .filter_map(Value::as_str)
         .collect::<Vec<_>>();
     let whole = changes.iter().find_map(|change| {
-        if change.starts_with("+instance") {
-            Some("+")
+        if change.starts_with("upsert instance") {
+            Some("upsert")
         } else if *change == "-instance" {
             Some("-")
         } else if *change == "replace instance" {
@@ -2003,11 +2010,22 @@ mod review_threshold_tests {
         assert_eq!(more, 1);
         assert_eq!(digest.len(), 1);
         assert_eq!(digest[0]["path"], json!("Workspace.Lobby.CheckpointPad"));
+        let rooted = json!({
+            "service": "Workspace",
+            "pathSegments": ["Workspace", "Lobby"],
+            "className": "Folder",
+            "entries": [{"kind": "instanceAdd"}],
+        });
+        assert_eq!(
+            editor_review_digest(&[rooted], 1).0[0]["path"],
+            json!("Workspace.Lobby"),
+            "a path that starts at its service is not given the service twice"
+        );
         assert_eq!(digest[0]["class"], json!("Part"));
         assert_eq!(
             digest[0]["changes"],
             json!([
-                "+instance (upsert: existing ancestors stay)",
+                "upsert instance (created only where Studio lacks it)",
                 "Size",
                 "Reflectance (reset)",
                 "-@Owner"
@@ -2038,7 +2056,7 @@ mod review_threshold_tests {
                 "Workspace.Lobby.Pad",
                 "Part",
                 json!([
-                    "+instance (upsert: existing ancestors stay)",
+                    "upsert instance (created only where Studio lacks it)",
                     "Size",
                     "@Owner"
                 ]),
@@ -2061,7 +2079,7 @@ mod review_threshold_tests {
         assert_eq!(
             Value::Array(rows),
             json!([
-                "+ Workspace.Lobby.Pad Part",
+                "upsert Workspace.Lobby.Pad Part",
                 "- Workspace.Old Model",
                 "reconcile subtree (deletes allowed) Workspace.Map Folder",
                 "Workspace.Door: Size, Reflectance (reset), -@Owner",
@@ -2083,7 +2101,7 @@ mod review_threshold_tests {
             held["review"].as_array().unwrap().len(),
             COMPACT_REVIEW_ROWS
         );
-        assert_eq!(held["review"][0], json!("+ Workspace.Lobby.Pad Part"));
+        assert_eq!(held["review"][0], json!("upsert Workspace.Lobby.Pad Part"));
         assert_eq!(held["moreReviewRows"], json!(7 + 35 - COMPACT_REVIEW_ROWS));
         assert_eq!(held["push"]["review"], json!(["Workspace.Door: Size"]));
         let mut applied = json!({"ok": true, "review": [{"path": "Workspace.Door", "class": "Part", "changes": ["Size"]}]});

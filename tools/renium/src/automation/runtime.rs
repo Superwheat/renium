@@ -649,7 +649,14 @@ fn compact_push_summary(
         || ["instanceQueued", "sourceQueued", "propertyQueued"]
             .iter()
             .all(|key| summary.get(*key).and_then(Value::as_f64) == Some(0.0));
-    if !changed && nothing_sent {
+    // What was sent and changed nothing was in Studio already, when the
+    // read-back agreed with the files or Studio counted the values as held.
+    let already_held = read_back
+        || summary
+            .get("noops")
+            .and_then(Value::as_f64)
+            .is_some_and(|held| held > 0.0);
+    if !changed && (nothing_sent || already_held) {
         result.insert("unchanged".to_string(), Value::Bool(true));
         return result;
     }
@@ -5348,13 +5355,25 @@ mod tests {
             ),
             json!({ "ok": true, "scripts": {"updated": 1}, "verified": false })
         );
+        let sent =
+            json!({"ok": true, "instanceQueued": 3, "propertyQueued": 1, "propertyUpdated": 0});
+        assert_eq!(
+            compact(sent.clone(), true),
+            json!({ "ok": true, "unchanged": true }),
+            "a push whose read-back agrees and that changed nothing found it all in Studio"
+        );
+        assert_eq!(
+            compact(sent, false),
+            json!({ "ok": true, "verified": false }),
+            "a push that applied nothing and was not read back is not verified"
+        );
         assert_eq!(
             compact(
-                json!({"ok": true, "instanceQueued": 3, "propertyQueued": 1, "propertyUpdated": 0}),
-                true
+                json!({"ok": true, "instanceQueued": 1, "propertyQueued": 2, "noops": 2}),
+                false
             ),
-            json!({ "ok": true, "verified": false }),
-            "a push that applied nothing is not verified"
+            json!({ "ok": true, "unchanged": true }),
+            "values Studio counted as held already are no change"
         );
         assert_eq!(
             compact(
