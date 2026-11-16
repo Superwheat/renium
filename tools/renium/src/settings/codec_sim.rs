@@ -56,9 +56,6 @@
 //!   BrickColor and the sequences in the forms above.
 //! - The version becomes `SETTINGS_BINARY_VERSION`.
 //!
-//! The generator leaves out the cases the codec gets wrong, each where it
-//! would be generated, with the reason; `RENIUM_SIM_DEFECTS` names the ones to
-//! generate anyway, from `DEFECTS`, comma-separated, or `all`.
 //! `crate::tests::support::run_seeds` names the variables that run more seeds
 //! or replay one.
 
@@ -173,8 +170,6 @@ const SHRINK_INSTANCES: usize = 200_000;
 const ABSENT: &str = "\u{1}no store holds this\u{2}";
 /// Properties a store keeps only in the instance record.
 const RECORD_FIELDS: [&str; 3] = ["Name", "ClassName", "Parent"];
-/// The cases the codec gets wrong, by the names `RENIUM_SIM_DEFECTS` takes.
-const DEFECTS: [&str; 1] = ["typed-property"];
 
 /// A generated value and the form each encoder's decode must give back.
 #[derive(Clone)]
@@ -360,17 +355,11 @@ struct Gen<'a> {
     counter: usize,
     /// Whether the next script's source is the long one.
     long_source: bool,
-    /// The cases the codec gets wrong to generate anyway.
-    defects: Vec<&'static str>,
 }
 
 impl Gen<'_> {
     fn chance(&mut self, one_in: usize) -> bool {
         self.rng.below(one_in) == 0
-    }
-
-    fn defect(&self, name: &str) -> bool {
-        self.defects.contains(&name)
     }
 
     fn pick<T: Copy>(&mut self, items: &[T]) -> T {
@@ -527,10 +516,7 @@ impl Gen<'_> {
 
     /// Any value a property holds, in its top-level canonical form.
     fn property(&mut self) -> Stated {
-        if self.defect("typed-property") && self.chance(6) {
-            return self.typed_in_property();
-        }
-        match self.rng.below(19) {
+        match self.rng.below(20) {
             0 => Stated::kept(Value::Null),
             1..=6 => self.scalar(),
             7 => self.numeric_array(),
@@ -549,16 +535,14 @@ impl Gen<'_> {
             14 => self.enum_item(false),
             15 => self.brick_color(),
             16 | 17 => self.reference(),
+            18 => self.typed_value(),
             _ => self.shared(),
         }
     }
 
     /// Any value inside an array or object, in its nested canonical form.
     fn nested(&mut self, depth: usize) -> Stated {
-        if self.defect("typed-property") && self.chance(8) {
-            return self.typed_in_property();
-        }
-        let kinds = if depth < 2 { 17 } else { 10 };
+        let kinds = if depth < 2 { 18 } else { 11 };
         match self.rng.below(kinds) {
             0 => Stated::kept(Value::Null),
             1..=4 => self.scalar(),
@@ -570,20 +554,19 @@ impl Gen<'_> {
             }
             8 => self.cframe(false),
             9 => self.brick_color(),
-            10 => self.numeric_array(),
-            11 | 12 => self.mixed_array(depth + 1),
-            13 => self.object(depth + 1),
-            14 => self.typed_object(),
-            15 => Stated::kept(json!([])),
+            10 => self.typed_value(),
+            11 => self.numeric_array(),
+            12 | 13 => self.mixed_array(depth + 1),
+            14 => self.object(depth + 1),
+            15 => self.typed_object(),
+            16 => Stated::kept(json!([])),
             _ => Stated::kept(json!({})),
         }
     }
 
-    // Excluded (`typed-property`): a typed Font, ColorSequence or
-    // NumberSequence in a property or inside one. It decodes untyped, and the
-    // untyped form encodes with its fields in another order and other string
-    // counts, so law 3 fails (codec defect).
-    fn typed_in_property(&mut self) -> Stated {
+    /// A typed Font, ColorSequence or NumberSequence, which a property
+    /// stores in its decoded form.
+    fn typed_value(&mut self) -> Stated {
         match self.rng.below(3) {
             0 => {
                 let (mut input, canonical) = self.font_fields();
@@ -1352,18 +1335,6 @@ fn nodes(rng: &mut SimRng, count: usize, deepest: bool) -> Vec<Node> {
         .collect()
 }
 
-fn defects() -> Vec<&'static str> {
-    let named = std::env::var("RENIUM_SIM_DEFECTS").unwrap_or_default();
-    DEFECTS
-        .into_iter()
-        .filter(|defect| {
-            named
-                .split(',')
-                .any(|name| name == "all" || name == *defect)
-        })
-        .collect()
-}
-
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Ordinary,
@@ -1407,7 +1378,6 @@ fn generate(seed: u64) -> Doc {
         pool: Vec::new(),
         counter: 0,
         long_source: kind == Kind::Large,
-        defects: defects(),
     };
     let mut entries: Vec<Vec<Entry>> = if kind == Kind::Copies {
         let copy = generator.columns();

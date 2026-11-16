@@ -1094,7 +1094,8 @@ fn collect_settings_bytecode_chunk<'a>(
         add_count(&mut out.class_counts, instance.class_name.as_str());
 
         for (property_name, raw_value) in &instance.properties {
-            let kind = binary_raw_value_kind(raw_value, lookup)?;
+            let source = SettingsBinaryValueSource::of_property(raw_value);
+            let kind = binary_source_value_kind(&source, lookup)?;
             if kind == 0 {
                 continue;
             }
@@ -1105,7 +1106,7 @@ fn collect_settings_bytecode_chunk<'a>(
                 instance_index,
                 property_name,
                 kind,
-                SettingsBinaryValueSource::Property(raw_value),
+                source,
             )?;
         }
 
@@ -1961,8 +1962,16 @@ struct SettingsBinaryCollection<'a> {
 
 enum SettingsBinaryValueSource<'a> {
     Property(&'a Value),
+    /// A property value as `settled_property_value` gives it.
+    Settled(Value),
     Native(&'a NativeSettingsValue),
     Attributes(&'a Map<String, Value>),
+}
+
+impl<'a> SettingsBinaryValueSource<'a> {
+    fn of_property(value: &'a Value) -> Self {
+        settled_property_value(value).map_or(Self::Property(value), Self::Settled)
+    }
 }
 
 #[derive(Default)]
@@ -2063,7 +2072,7 @@ fn collect_settings_binary_chunk<'a>(
                 continue;
             }
             let property_name = property_name.as_str();
-            let source = SettingsBinaryValueSource::Property(raw_value);
+            let source = SettingsBinaryValueSource::of_property(raw_value);
             let kind = binary_source_value_kind(&source, lookup)?;
             if kind == 0 {
                 continue;
@@ -2643,6 +2652,7 @@ fn binary_source_value_kind(
 ) -> Result<u8> {
     Ok(match source {
         SettingsBinaryValueSource::Property(value) => binary_raw_value_kind(value, lookup)?,
+        SettingsBinaryValueSource::Settled(value) => binary_raw_value_kind(value, lookup)?,
         SettingsBinaryValueSource::Native(value) => native_value_kind(value),
         SettingsBinaryValueSource::Attributes(_) => 8,
     })
@@ -2655,6 +2665,14 @@ fn collect_binary_source_strings<'a>(
 ) -> Result<()> {
     match source {
         SettingsBinaryValueSource::Property(value) => collect_raw_value_strings(value, lookup, out),
+        SettingsBinaryValueSource::Settled(value) => {
+            let mut counts = SettingsStringCounts::default();
+            collect_raw_value_strings(value, lookup, &mut counts)?;
+            for (text, count) in counts {
+                add_count_key(out, Cow::Owned(text.into_owned()), count);
+            }
+            Ok(())
+        }
         SettingsBinaryValueSource::Native(value) => {
             collect_native_value_strings(value, out);
             Ok(())
@@ -2679,6 +2697,9 @@ fn write_binary_source_payload<W: Write + ?Sized>(
 ) -> Result<()> {
     match source {
         SettingsBinaryValueSource::Property(value) => {
+            write_raw_value_payload(value, kind, string_ids, lookup, writer)
+        }
+        SettingsBinaryValueSource::Settled(value) => {
             write_raw_value_payload(value, kind, string_ids, lookup, writer)
         }
         SettingsBinaryValueSource::Native(value) => {
@@ -2847,6 +2868,7 @@ fn write_resolved_ref_group_payload<W: Write + ?Sized>(
             bail!("Expected resolved Ref property group")
         }
         SettingsBinaryValueSource::Property(value) => *value,
+        SettingsBinaryValueSource::Settled(value) => value,
     };
     let ref_value = ref_payload_object(value).context("Expected Ref binary settings value")?;
     let target_index = resolve_ref_index(ref_value, lookup)?
@@ -2889,6 +2911,7 @@ fn build_cframe_rotation_table(
                 bail!("Expected CFrame property group")
             }
             SettingsBinaryValueSource::Property(value) => cframe_component_bits(value)?,
+            SettingsBinaryValueSource::Settled(value) => cframe_component_bits(value)?,
         };
         let position = [components[0], components[1], components[2]];
         let mut rotation = [0_u32; 9];
@@ -4010,6 +4033,116 @@ pub(crate) fn canonical_attribute_value(value: &Value) -> Option<Value> {
     None
 }
 
+/// A property value with each typed Font, ColorSequence and NumberSequence in
+/// it replaced by the form a store reads back for it, for the generic writer:
+/// the typed form and the decoded one encode to the same bytes. None when the
+/// value holds none. Attributes keep the typed payloads, which they restore.
+fn settled_property_value(value: &Value) -> Option<Value> {
+    holds_typed_value(value).then(|| settled_value(value))
+}
+
+fn settled_type(value: &Value) -> Option<&str> {
+    let object = value.as_object()?;
+    if ref_payload_object(value).is_some() {
+        return Some("Ref");
+    }
+    object.get("_type").and_then(Value::as_str)
+}
+
+/// Whether the generic writer reaches a typed Font, ColorSequence or
+/// NumberSequence in `value`: it writes the fields of plain objects and the
+/// items of arrays, and nothing inside the other typed values.
+fn holds_typed_value(value: &Value) -> bool {
+    match settled_type(value) {
+        Some("Font" | "ColorSequence" | "NumberSequence") => true,
+        Some(
+            "Ref" | "Vector2" | "Vector3" | "UDim" | "UDim2" | "Color3" | "CFrame" | "Rect"
+            | "EnumItem" | "BrickColor",
+        ) => false,
+        _ => match value {
+            Value::Array(items) => items.iter().any(holds_typed_value),
+            Value::Object(object) => object.values().any(holds_typed_value),
+            _ => false,
+        },
+    }
+}
+
+fn settled_value(value: &Value) -> Value {
+    match (settled_type(value), value) {
+        (Some("Font"), Value::Object(object)) => settled_font(object),
+        (Some("ColorSequence"), Value::Object(object)) => settled_color_sequence(object),
+        (Some("NumberSequence"), Value::Object(object)) => settled_number_sequence(object),
+        _ if !holds_typed_value(value) => value.clone(),
+        (_, Value::Array(items)) => Value::Array(items.iter().map(settled_value).collect()),
+        (_, Value::Object(object)) => Value::Object(
+            object
+                .iter()
+                .map(|(key, child)| (key.clone(), settled_value(child)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn settled_font(object: &Map<String, Value>) -> Value {
+    let mut out = Map::new();
+    for key in ["family", "weight", "style", "cachedFaceId"] {
+        if let Some(text) = object.get(key).and_then(Value::as_str) {
+            let text = match key {
+                "weight" | "style" => split_enum_tail(text),
+                _ => text,
+            };
+            out.insert(key.to_string(), Value::String(text.to_string()));
+        }
+    }
+    Value::Object(out)
+}
+
+/// A keypoint field as the sequence writers wrote it: as a property value,
+/// where an enum item keeps only its name.
+fn settled_keypoint_field(value: Option<&Value>) -> Value {
+    let Some(value) = value else {
+        return Value::Null;
+    };
+    if let Some((_, name)) = nested_enum_item(value) {
+        return typed_object("EnumItem", [("name", Value::String(name.to_string()))]);
+    }
+    settled_value(value)
+}
+
+fn settled_color_sequence(object: &Map<String, Value>) -> Value {
+    let keypoints = sequence_keypoint_values(object)
+        .iter()
+        .filter_map(Value::as_object)
+        .map(|keypoint| {
+            let color = keypoint
+                .get("value")
+                .and_then(color_components)
+                .unwrap_or([0.0; 3]);
+            json!({
+                "time": settled_keypoint_field(keypoint.get("time")),
+                "color": color.map(json_number_f64),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"ColorSequence": {"keypoints": keypoints}})
+}
+
+fn settled_number_sequence(object: &Map<String, Value>) -> Value {
+    let keypoints = sequence_keypoint_values(object)
+        .iter()
+        .filter_map(Value::as_object)
+        .map(|keypoint| {
+            json!({
+                "time": settled_keypoint_field(keypoint.get("time")),
+                "value": settled_keypoint_field(keypoint.get("value")),
+                "envelope": settled_keypoint_field(keypoint.get("envelope")),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"NumberSequence": {"keypoints": keypoints}})
+}
+
 /// Studio keeps TextWrapped on while TextScaled is on, so a store that says
 /// otherwise would differ from the place after every push and make the next
 /// push rewrite it; every encoded store carries the value Studio keeps. None
@@ -4940,5 +5073,74 @@ mod tests {
         let kept = document("Attributes", json!("text"));
         let decoded = decode_settings_bytecode(&encode_settings_bytecode(&kept).unwrap()).unwrap();
         assert_eq!(decoded.instances[1].properties["Attributes"], json!("text"));
+    }
+
+    #[test]
+    fn a_typed_font_or_sequence_encodes_as_its_decoded_form() {
+        // A store an earlier build wrote with these three in the typed layout.
+        const TYPED_LAYOUT: &[u8] = &[
+            82, 66, 83, 83, 69, 84, 0, 11, 165, 2, 243, 1, 40, 181, 47, 253, 96, 37, 0, 77, 7, 0,
+            242, 207, 52, 39, 16, 205, 54, 7, 128, 138, 24, 36, 240, 47, 230, 49, 160, 95, 194, 7,
+            32, 181, 2, 100, 205, 181, 10, 172, 31, 32, 136, 80, 28, 62, 230, 253, 39, 10, 178, 45,
+            137, 76, 1, 8, 157, 255, 17, 77, 255, 31, 14, 182, 186, 238, 27, 61, 235, 248, 234, 46,
+            244, 16, 117, 204, 53, 1, 214, 6, 2, 90, 99, 207, 80, 167, 83, 135, 173, 50, 247, 255,
+            211, 255, 169, 243, 111, 1, 227, 171, 204, 49, 197, 213, 61, 250, 136, 186, 239, 175,
+            48, 80, 128, 182, 11, 233, 108, 96, 120, 28, 209, 88, 3, 171, 13, 196, 144, 51, 37,
+            116, 181, 116, 56, 128, 213, 139, 9, 146, 228, 39, 201, 121, 53, 70, 146, 36, 147, 165,
+            172, 36, 42, 17, 194, 129, 207, 170, 48, 141, 51, 13, 121, 115, 177, 139, 72, 98, 207,
+            119, 97, 23, 27, 182, 5, 226, 137, 71, 121, 184, 98, 105, 38, 13, 88, 89, 177, 39, 77,
+            130, 98, 108, 169, 168, 121, 53, 229, 34, 95, 96, 83, 141, 45, 23, 107, 32, 152, 18,
+            197, 134, 189, 0, 93, 96, 43, 60, 108, 189, 249, 200, 121, 189, 206, 112, 248, 97, 65,
+            16, 6, 0, 24, 97, 76, 142, 76, 186, 121, 199, 118, 182, 13, 166, 84, 147, 182, 228, 1,
+        ];
+        let typed = [
+            (
+                "FontFace",
+                json!({"_type": "Font", "family": "rbxasset://fonts/families/Arial.json", "weight": "Enum.FontWeight.Bold", "style": "Normal"}),
+            ),
+            (
+                "Color",
+                json!({"_type": "ColorSequence", "keypoints": [{"time": 0, "value": {"r": 1, "g": 0.5, "b": 0}}, {"time": 1, "value": {"r": 0, "g": 0, "b": 1}}]}),
+            ),
+            (
+                "Size",
+                json!({"_type": "NumberSequence", "keypoints": [{"time": 0, "value": 2, "envelope": 0}, {"time": 1, "value": 0.5, "envelope": 0.25}]}),
+            ),
+        ];
+        let document = |values: &[(&str, Value)]| {
+            let mut root = SettingsBytecodeInstance::new(
+                "editor:0".to_string(),
+                "Fx".to_string(),
+                "Folder".to_string(),
+                None,
+            );
+            for (name, value) in values {
+                root.properties.insert((*name).to_string(), value.clone());
+            }
+            SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances: vec![root],
+            }
+        };
+        let decoded = decode_settings_bytecode(TYPED_LAYOUT).unwrap();
+        assert_eq!(
+            Value::Object(decoded.instances[0].properties.clone()),
+            json!({
+                "FontFace": {"family": "rbxasset://fonts/families/Arial.json", "weight": "Bold", "style": "Normal"},
+                "Color": {"ColorSequence": {"keypoints": [{"time": 0, "color": [1.0, 0.5, 0.0]}, {"time": 1, "color": [0.0, 0.0, 1.0]}]}},
+                "Size": {"NumberSequence": {"keypoints": [{"time": 0, "value": 2, "envelope": 0}, {"time": 1, "value": 0.5, "envelope": 0.25}]}},
+            })
+        );
+        let bytes = encode_settings_bytecode(&document(&typed)).unwrap();
+        assert_eq!(decode_settings_bytecode(&bytes).unwrap(), decoded);
+        assert_eq!(encode_settings_bytecode(&decoded).unwrap(), bytes);
+        for (name, value) in typed {
+            let untyped = decoded.instances[0].properties[name].clone();
+            assert_eq!(
+                encode_settings_bytecode(&document(&[(name, value)])).unwrap(),
+                encode_settings_bytecode(&document(&[(name, untyped)])).unwrap(),
+                "{name}"
+            );
+        }
     }
 }
