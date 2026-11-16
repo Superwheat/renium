@@ -5241,6 +5241,8 @@ mod twins_repro;
 
 mod twins_subsets;
 
+mod merge_rules;
+
 #[test]
 fn a_file_identity_reused_for_another_class_is_a_new_instance_not_a_replacement() {
     let instance =

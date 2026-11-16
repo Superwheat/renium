@@ -574,12 +574,18 @@ fn merge(
     preference: ConflictPreference,
     rng: &mut Rng,
 ) -> Result<Merged, String> {
+    let (editor, studio) = (editor.snapshot(None), studio.snapshot(Some(rng)));
+    // A sync merges only the paths its two sides hold differently.
+    let differences = (rng.below(2) == 0)
+        .then(|| snapshot_differences(&editor, &studio))
+        .transpose()
+        .map_err(|error| format!("comparing the sides failed: {error:#}"))?;
     let (snapshot, conflicts, changes) = merge_snapshots_with_changes(
         Some(&shared.snapshot(None)),
-        &editor.snapshot(None),
-        &studio.snapshot(Some(rng)),
+        &editor,
+        &studio,
         preference,
-        None,
+        differences.as_ref(),
     )
     .map_err(|error| format!("the merge failed: {error:#}"))?;
     Ok(Merged {
