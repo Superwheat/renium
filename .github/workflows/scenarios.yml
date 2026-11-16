@@ -119,3 +119,53 @@ jobs:
           $bin = Join-Path $env:LOCALAPPDATA "Renium\bin"
           $env:RENIUM_SCENARIO_RBX = Join-Path $bin "rbx.exe"
           python -I tools/renium/scenarios/run.py --cleanup
+
+  speed:
+    name: Big place speed run (Windows)
+    # Times every sync path of the installed Renium on one big place, three
+    # times each, against the runs before it. The place is a private file on
+    # the maintainer's machine: the job log carries scenario names and seconds,
+    # and every path and command stays in the speed-reports folder there.
+    needs: windows
+    runs-on: ["self-hosted", "Windows", "X64"]
+    timeout-minutes: 60
+    # Its Studio must not share the machine with a matrix run's Studios.
+    concurrency:
+      group: scenario-matrix-windows
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          clean: false
+
+      # The place, the history of earlier runs and the installed Renium live
+      # in the profile a user has, not in the runner's own home.
+      - name: Time the installed Renium
+        run: |
+          $userProfile = [Environment]::GetFolderPath("UserProfile")
+          $env:USERPROFILE = $userProfile
+          $env:HOME = $userProfile
+          $env:HOMEDRIVE = $userProfile.Substring(0, 2)
+          $env:HOMEPATH = $userProfile.Substring(2)
+          $env:TEMP = Join-Path $env:LOCALAPPDATA "Temp"
+          $env:TMP = $env:TEMP
+          $bin = Join-Path $env:LOCALAPPDATA "Renium\bin"
+          $env:PATH = "$bin;$env:PATH"
+          $env:RENIUM_SPEED_RBX = Join-Path $bin "rbx.exe"
+          python -I tools/renium/scenarios/speed.py --record
+          if ($LASTEXITCODE -ne 0) {
+            throw "The speed run did not pass: a step failed, a result was wrong, or a scenario is much slower than the runs before it. The log of this run is in the speed-reports folder on the runner."
+          }
+
+      - name: Close what a cut-short run left open
+        if: always()
+        run: |
+          $userProfile = [Environment]::GetFolderPath("UserProfile")
+          $env:USERPROFILE = $userProfile
+          $env:HOME = $userProfile
+          $bin = Join-Path $env:LOCALAPPDATA "Renium\bin"
+          $env:RENIUM_SPEED_RBX = Join-Path $bin "rbx.exe"
+          python -I tools/renium/scenarios/speed.py --cleanup
