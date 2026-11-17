@@ -195,12 +195,10 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
 /// `RENIUM_PURGE_DELAY_MS` sets another delay for measuring.
 fn release_freed_memory_when_idle() {
     const MI_OPTION_PURGE_DECOMMITS: libmimalloc_sys::mi_option_t = 5;
-    const MI_OPTION_ABANDONED_PAGE_PURGE: libmimalloc_sys::mi_option_t = 12;
     const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
     const PURGE_DELAY_MS: std::ffi::c_long = 0;
     unsafe {
         libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DECOMMITS, 1);
-        libmimalloc_sys::mi_option_set(MI_OPTION_ABANDONED_PAGE_PURGE, 1);
         libmimalloc_sys::mi_option_set(
             MI_OPTION_PURGE_DELAY,
             std::env::var("RENIUM_PURGE_DELAY_MS")
