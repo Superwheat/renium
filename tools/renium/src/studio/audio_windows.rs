@@ -356,8 +356,8 @@ mod tests {
     impl AudioProcess {
         fn start(session: u128, reset: bool) -> Result<(Self, bool)> {
             use std::io::BufRead;
-            use std::process::{Command, Stdio};
-            let mut command = Command::new(std::env::current_exe()?);
+            use std::process::Stdio;
+            let mut command = crate::system::tools::hidden_command(std::env::current_exe()?);
             command
                 .args([
                     "--exact",

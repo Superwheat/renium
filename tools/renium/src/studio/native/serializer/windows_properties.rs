@@ -2060,7 +2060,7 @@ mod tests {
 
     #[test]
     fn engine_allocator_preserves_history_strings_and_delayed_callbacks() {
-        let result = std::process::Command::new(
+        let result = crate::system::tools::hidden_command(
             std::path::Path::new(env!("OUT_DIR")).join("allocator-test/renium-allocator-test.exe"),
         )
         .arg(std::path::Path::new(env!("OUT_DIR")).join("renium-studio-helper.dll"))

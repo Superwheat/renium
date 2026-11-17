@@ -1594,7 +1594,7 @@ mod notice_tests {
     fn a_reviewed_edit_sends_its_hold_notice_to_the_caller() {
         // Binding a context selects it process-wide; keep this wire test isolated.
         if std::env::var_os("RENIUM_TEST_REVIEWED_NOTICE").is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            let status = crate::system::tools::hidden_command(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "daemon::notice_tests::a_reviewed_edit_sends_its_hold_notice_to_the_caller",

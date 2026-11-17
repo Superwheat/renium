@@ -78,7 +78,7 @@ fn plugin_fallback_requires_the_typed_locator_verdict() {
 #[cfg(windows)]
 fn native_batch_pacing_finishes_without_a_frame_producer() {
     assert!(
-        std::process::Command::new(
+        crate::system::tools::hidden_command(
             std::path::Path::new(env!("OUT_DIR")).join("renium-batch-pacer-test.exe")
         )
         .status()
@@ -95,7 +95,7 @@ fn context_preparation_does_not_wait_for_the_property_queue() {
         "renium-property-task-test"
     };
     assert!(
-        std::process::Command::new(std::path::Path::new(env!("OUT_DIR")).join(name))
+        crate::system::tools::hidden_command(std::path::Path::new(env!("OUT_DIR")).join(name))
             .status()
             .expect("run property dispatch regression")
             .success()
@@ -110,7 +110,7 @@ fn macos_task_context_requires_the_owned_model_and_tagged_callback_contract() {
         "renium-macos-task-context-test"
     };
     assert!(
-        std::process::Command::new(std::path::Path::new(env!("OUT_DIR")).join(name))
+        crate::system::tools::hidden_command(std::path::Path::new(env!("OUT_DIR")).join(name))
             .status()
             .expect("run macOS queue ABI regression")
             .success()
@@ -125,7 +125,7 @@ fn terrain_observation_retains_one_subscription_and_validates_model_ownership() 
         "renium-terrain-observation-test"
     };
     assert!(
-        std::process::Command::new(std::path::Path::new(env!("OUT_DIR")).join(name))
+        crate::system::tools::hidden_command(std::path::Path::new(env!("OUT_DIR")).join(name))
             .status()
             .expect("run native Terrain lifecycle regression")
             .success()
@@ -141,7 +141,7 @@ fn terrain_transactions_allow_physics_rebuilds_and_retain_rejected_commit_rollba
         "renium-terrain-transaction-test"
     };
     assert!(
-        std::process::Command::new(std::path::Path::new(env!("OUT_DIR")).join(name))
+        crate::system::tools::hidden_command(std::path::Path::new(env!("OUT_DIR")).join(name))
             .status()
             .expect("run native Terrain transaction regression")
             .success()

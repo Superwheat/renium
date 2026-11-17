@@ -1270,7 +1270,7 @@ mod review_threshold_tests {
     fn a_staged_push_reviews_against_the_authored_projects_threshold() {
         // Pinning the staged context selects it process-wide; keep this isolated.
         if std::env::var_os("RENIUM_TEST_STAGED_REVIEW").is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            let status = crate::system::tools::hidden_command(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "automation::reconcile::push_plan::review_threshold_tests::a_staged_push_reviews_against_the_authored_projects_threshold",

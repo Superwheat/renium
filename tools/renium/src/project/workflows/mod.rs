@@ -2777,11 +2777,11 @@ mod daemon_record_tests {
     /// A process that outlives the test unless something stops it.
     fn sleeper() -> std::process::Child {
         let mut command = if cfg!(windows) {
-            let mut command = Command::new("ping");
+            let mut command = crate::system::tools::hidden_command("ping");
             command.args(["-n", "60", "127.0.0.1"]);
             command
         } else {
-            let mut command = Command::new("sleep");
+            let mut command = crate::system::tools::hidden_command("sleep");
             command.arg("60");
             command
         };
@@ -2830,7 +2830,7 @@ mod daemon_record_tests {
 fn terminate_recorded_daemon(pid: u32) -> Result<()> {
     // taskkill reports on its own stdout and stderr; captured, its lines stay
     // out of this command's output and its error joins the failure.
-    let output = Command::new("taskkill")
+    let output = crate::system::tools::hidden_command("taskkill")
         .args(["/PID", &pid.to_string(), "/F"])
         .stdin(Stdio::null())
         .output()

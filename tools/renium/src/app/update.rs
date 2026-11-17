@@ -3325,7 +3325,7 @@ mod result_tests {
     #[cfg(windows)]
     #[test]
     fn an_exited_process_held_open_by_a_handle_has_no_identity() {
-        let mut child = Command::new("cmd")
+        let mut child = crate::system::tools::hidden_command("cmd")
             .args(["/c", "exit 0"])
             .spawn()
             .expect("cmd spawns");

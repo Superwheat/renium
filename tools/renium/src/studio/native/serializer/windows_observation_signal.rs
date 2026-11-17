@@ -594,7 +594,7 @@ mod tests {
 
     #[test]
     fn native_signal_append_preserves_connection_ownership() -> Result<()> {
-        let status = std::process::Command::new(
+        let status = crate::system::tools::hidden_command(
             Path::new(env!("OUT_DIR")).join("renium-signal-append-test.exe"),
         )
         .status()?;

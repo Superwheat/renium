@@ -7,8 +7,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+fn hide_console(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
+}
+
 fn run(command: &mut Command, label: &str) {
-    let status = command
+    let status = hide_console(command)
         .status()
         .unwrap_or_else(|error| panic!("failed to start {label}: {error}"));
     assert!(status.success(), "{label} failed");
@@ -315,8 +324,7 @@ fn build_linux(out_dir: &Path) {
 }
 
 fn emit_build_metadata() {
-    let git_hash = Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
+    let git_hash = hide_console(Command::new("git").args(["rev-parse", "--short=12", "HEAD"]))
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -341,8 +349,7 @@ fn emit_build_metadata() {
 }
 
 fn head_reflog() -> Option<PathBuf> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--git-path", "logs/HEAD"])
+    let output = hide_console(Command::new("git").args(["rev-parse", "--git-path", "logs/HEAD"]))
         .output()
         .ok()
         .filter(|output| output.status.success())?;

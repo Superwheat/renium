@@ -99,9 +99,11 @@ impl Drop for AudioOutputGate {
 #[test]
 fn output_gate_preserves_forwarding_focus_and_crash_expiry() {
     assert!(
-        std::process::Command::new(Path::new(env!("OUT_DIR")).join("renium-audio-test.exe"))
-            .status()
-            .expect("run audio output regression")
-            .success()
+        crate::system::tools::hidden_command(
+            Path::new(env!("OUT_DIR")).join("renium-audio-test.exe")
+        )
+        .status()
+        .expect("run audio output regression")
+        .success()
     );
 }

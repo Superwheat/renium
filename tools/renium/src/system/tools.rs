@@ -5,8 +5,20 @@ use std::process::{Command, Output};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+pub(crate) fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let command = Command::new(program);
+    #[cfg(windows)]
+    let command = {
+        use std::os::windows::process::CommandExt;
+        let mut command = command;
+        command.creation_flags(0x0800_0000);
+        command
+    };
+    command
+}
+
 pub(crate) fn download_to_file(url: &str, destination: &Path) -> Result<()> {
-    let status = Command::new("curl")
+    let status = hidden_command("curl")
         .args([
             "-fsSL",
             "--retry",
@@ -152,7 +164,7 @@ fn run_external_tool_candidate(command: &str, args: &[String], cwd: &Path) -> io
                     format!("Could not find {command}"),
                 ));
             }
-            return Command::new("cmd")
+            return hidden_command("cmd")
                 .arg("/C")
                 .arg(command)
                 .args(args)
@@ -160,7 +172,7 @@ fn run_external_tool_candidate(command: &str, args: &[String], cwd: &Path) -> io
                 .output();
         }
     }
-    Command::new(command).args(args).current_dir(cwd).output()
+    hidden_command(command).args(args).current_dir(cwd).output()
 }
 
 /// Whether cmd would find the script: a path as given (relative to `cwd`),
@@ -196,6 +208,28 @@ fn tail_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn hidden_children_have_no_console() {
+        const MARK: &str = "RENIUM_TEST_NO_CONSOLE";
+        if std::env::var_os(MARK).is_some() {
+            // SAFETY: GetConsoleWindow has no input or ownership requirements.
+            assert!(unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() }.is_null());
+            return;
+        }
+        assert!(
+            hidden_command(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "system::tools::tests::hidden_children_have_no_console"
+                ])
+                .env(MARK, "1")
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
 
     #[test]
     fn a_missing_tool_is_reported_as_a_failed_launch() {

@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn rust_and_cpp_capture_protocol_round_trip_and_bounds() -> Result<()> {
         let executable = concat!(env!("OUT_DIR"), "/renium-capture-context-test.exe");
-        let output = std::process::Command::new(executable).output()?;
+        let output = crate::system::tools::hidden_command(executable).output()?;
         anyhow::ensure!(
             output.status.success(),
             "C++ context regression failed: {output:?}"
@@ -346,7 +346,7 @@ mod tests {
             put_u32(&mut parameters, PARAM_CAPTURE_MODE, 1);
             binding.encode(&mut parameters)?;
             fs::write(&input, &parameters)?;
-            let status = std::process::Command::new(executable)
+            let status = crate::system::tools::hidden_command(executable)
                 .arg(&input)
                 .arg(&output)
                 .status()?;

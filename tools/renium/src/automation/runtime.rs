@@ -4810,7 +4810,7 @@ mod tests {
         if std::env::var_os(MARK).is_some() {
             return true;
         }
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let status = crate::system::tools::hidden_command(std::env::current_exe().unwrap())
             .args(["--exact", &format!("automation::runtime::tests::{test}")])
             .env(MARK, "1")
             .status()

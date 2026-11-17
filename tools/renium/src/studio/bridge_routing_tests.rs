@@ -66,7 +66,7 @@ fn unfiltered_verify_uses_only_plugin_sources_when_native_capture_is_unavailable
     use crate::automation::{State, op, runtime::automation_parse_response_with_lease};
     // Isolate process-global project selection from the parallel test suite.
     if std::env::var_os("RENIUM_TEST_VERIFY_FALLBACK").is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let status = crate::system::tools::hidden_command(std::env::current_exe().unwrap())
             .args(["--exact", "studio::bridge::routing_tests::unfiltered_verify_uses_only_plugin_sources_when_native_capture_is_unavailable"])
             .env("RENIUM_TEST_VERIFY_FALLBACK", "1").status().unwrap();
         assert!(status.success());
@@ -215,7 +215,7 @@ pub(crate) fn connect(
 fn verify_push_dispatch_reads_sources_without_replacement_or_review() {
     // Runtime selection is process-global; keep this wire test isolated.
     if std::env::var_os("RENIUM_TEST_VERIFY_DISPATCH").is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let status = crate::system::tools::hidden_command(std::env::current_exe().unwrap())
             .args(["--exact", "studio::bridge::routing_tests::verify_push_dispatch_reads_sources_without_replacement_or_review"])
             .env("RENIUM_TEST_VERIFY_DISPATCH", "1").status().unwrap();
         assert!(status.success());
@@ -563,7 +563,7 @@ pub(crate) fn focus(bridge: &BridgeServer, runtime_id: &str) {
 fn native_export_stays_in_edit_during_rapid_play_server_replacement() {
     // Context selection is global; isolate the real routing test from other tests.
     if std::env::var_os("RENIUM_TEST_EXPORT_ROUTING").is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let status = crate::system::tools::hidden_command(std::env::current_exe().unwrap())
             .args(["--exact", "studio::bridge::routing_tests::native_export_stays_in_edit_during_rapid_play_server_replacement"])
             .env("RENIUM_TEST_EXPORT_ROUTING", "1").status().unwrap();
         assert!(status.success());

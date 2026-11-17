@@ -71,10 +71,13 @@ mod tests {
     #[test]
     fn native_string_returns_preserve_receiver_across_a_batch() {
         assert!(
-            std::process::Command::new(concat!(env!("OUT_DIR"), "/renium-functions-test.exe"))
-                .status()
-                .expect("run native function ABI regression")
-                .success()
+            crate::system::tools::hidden_command(concat!(
+                env!("OUT_DIR"),
+                "/renium-functions-test.exe"
+            ))
+            .status()
+            .expect("run native function ABI regression")
+            .success()
         );
     }
 
