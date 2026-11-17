@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - "v*"
+  # Started by hand on a tag: `gh workflow run release.yml --ref v1.2.3`.
+  # On any other ref the tag check below fails.
+  workflow_dispatch:
 
 permissions:
   contents: write
