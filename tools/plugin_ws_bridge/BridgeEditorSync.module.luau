@@ -610,7 +610,9 @@ local function validatedImportIdentities(raw: any, rootCount: number): any
 	if not isArray then
 		error("Imported identity strings must be an array")
 	end
-	local budget = BridgeParallel.newWorkBudget()
+	local observeWait, finishWork = BridgeConnection.profileWaitObserver(
+		"import identity metadata: scheduler yield", "import identity metadata: validation work")
+	local budget = BridgeParallel.newWorkBudget(nil, observeWait)
 	for _, value in ipairs(raw.strings) do
 		budget()
 		if type(value) ~= "string" then
@@ -642,6 +644,9 @@ local function validatedImportIdentities(raw: any, rootCount: number): any
 			ids[id] = true
 		end
 	end
+	if finishWork then
+		finishWork()
+	end
 	return { strings = raw.strings, nodes = nodes }
 end
 
@@ -652,7 +657,11 @@ local function prepareImportedIdentities(group: any)
 	local instances, childrenByParent, seen = {}, {}, {}
 	-- These walks have no engine writes. Amortize scheduler resumption while
 	-- retaining a bounded interval for other Studio work on large imports.
-	local budget = BridgeParallel.newWorkBudget(0.032)
+	local started = os.clock()
+	local childCalls = 0
+	local observeWait, finishWork = BridgeConnection.profileWaitObserver(
+		"import live identities: scheduler yield", "import live identities: validation work")
+	local budget = BridgeParallel.newWorkBudget(0.032, observeWait)
 	for offset = 0, buffer.len(nodes) - 20, 20 do
 		budget()
 		local parent, ordinal = buffer.readu32(nodes, offset), buffer.readu32(nodes, offset + 4)
@@ -664,6 +673,7 @@ local function prepareImportedIdentities(group: any)
 			local byName = childrenByParent[parent]
 			if byName == nil then
 				byName = {}
+				childCalls += 1
 				for _, child in ipairs(instances[parent]:GetChildren()) do
 					budget()
 					local childName = child.Name
@@ -693,12 +703,18 @@ local function prepareImportedIdentities(group: any)
 		instances[#instances + 1] = instance
 	end
 	group.importedSettingsInstances = instances
+	if finishWork then
+		finishWork()
+	end
+	BridgeConnection.profileStep("import live identity traversal", started, { instances = #instances, calls = childCalls })
 end
 
 -- Bind actual imported objects before any later rename/reparent can change a
 -- path. Retention may substitute a live package object for a staged duplicate.
 local function rememberImportedIdentities(prepared: { any }, ctx: { [string]: any }, aliases: { [Instance]: Instance }?)
-	local budget = BridgeParallel.newWorkBudget(0.032)
+	local observeWait, finishWork = BridgeConnection.profileWaitObserver(
+		"import identity registration: scheduler yield", "import identity registration: binding work")
+	local budget = BridgeParallel.newWorkBudget(0.032, observeWait)
 	for _, group in ipairs(prepared) do
 		for index, settingsId in ipairs(group.rootSettingsIds or {}) do
 			budget()
@@ -715,6 +731,9 @@ local function rememberImportedIdentities(prepared: { any }, ctx: { [string]: an
 				rememberMatchedSettingsInstance(group.serviceName, settingsId, if aliases then aliases[instance] or instance else instance, ctx)
 			end
 		end
+	end
+	if finishWork then
+		finishWork()
 	end
 end
 

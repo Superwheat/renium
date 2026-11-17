@@ -27,6 +27,7 @@ local services = { ReplicatedStorage = replicated, ServerStorage = server }
 -- import and the shipped rows a capture carries.
 local identity = luau.load(slice(source, "local function settingsIdText(", "local function getStateForService(")
 	.. "\nreturn { rememberRoots = rememberImportedIdentities, captured = capturedSettingsId }", { environment = {
+	BridgeConnection = require("../BridgeConnection.module"),
 	BridgeParallel = { newWorkBudget = function() return function() end end },
 	BridgeIdentity = { liveInstance = function(value)
 		return if value ~= nil and value.Parent ~= nil and value:IsDescendantOf(place) then value else nil

@@ -20,6 +20,7 @@ local denseArrayLength = luau.load(slice("local function denseArrayLength(", "lo
 local identity = luau.load(slice("local function settingsIdText(", "local function getStateForService(")
 	.. "\nreturn { validate = validatedImportIdentities, prepare = prepareImportedIdentities, remember = rememberImportedIdentities, captured = capturedSettingsId }",
 	{ environment = {
+		BridgeConnection = require("../BridgeConnection.module"),
 		denseArrayLength = denseArrayLength,
 		EncodingService = { Base64Decode = function(_, value) return value end },
 		BridgeParallel = { newWorkBudget = function() return function() budgetChecks += 1 end end },
@@ -179,6 +180,27 @@ do
 		assert(identity.captured(prepared.importedSettingsInstances[index], ctx) == nil)
 	end
 	duplicate:Destroy(); retained:Destroy()
+end
+
+do
+	local profile = require("../BridgeConnection.module")
+	profile.profileStart(os.clock())
+	local prepared = group()
+	local root = tree(service)
+	prepared.incomingByPayloadIndex[1] = root
+	identity.prepare(prepared)
+	identity.remember({ prepared }, {})
+	local labels = {}
+	for _, span in ipairs(profile.profileFinish().spans) do
+		labels[span[1]] = span
+		assert(span[2] >= 0 and span[3] >= span[2])
+	end
+	assert(labels["import identity metadata: validation work"])
+	assert(labels["import live identities: validation work"])
+	assert(labels["import identity registration: binding work"])
+	local counts = labels["import live identity traversal"][4]
+	assert(counts.instances == 4 and counts.calls == 2, "Count every validated row and actual GetChildren call")
+	root:Destroy()
 end
 
 for _, mutate in {
