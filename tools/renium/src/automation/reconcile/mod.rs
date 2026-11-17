@@ -104,6 +104,7 @@ const RECORD_VERSION: u8 = 2;
 const RECORD_DIR: &str = "reconcile";
 
 fn log_reconcile_timing(label: &str, started: Instant) {
+    crate::app::profile::record(label, started);
     log_global(
         4,
         format_args!("[renium] reconcile {label}: {:.1}ms", elapsed_ms(started)),

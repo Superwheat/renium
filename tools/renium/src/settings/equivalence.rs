@@ -133,6 +133,7 @@ fn align_settings_bytes(
     if reference_bytes == observed_bytes {
         return Ok(SettingsAlignment::Equivalent);
     }
+    let decode_started = std::time::Instant::now();
     let cache_key = settings_alignment_cache_key(reference_bytes, observed_bytes);
     if cache_key.is_some_and(settings_alignment_is_cached) {
         return Ok(SettingsAlignment::Equivalent);
@@ -152,7 +153,10 @@ fn align_settings_bytes(
     };
     let mut reference = reference?;
     let mut observed = observed?;
-    let mut phases = AlignmentPhases::new(observed.instances.len());
+    let mut phases = AlignmentPhases {
+        instances: observed.instances.len(),
+        started: decode_started,
+    };
     phases.end("decode");
     // Taken before alignment rewrites either document.
     let viewport_camera = keep_viewport_camera
@@ -261,13 +265,6 @@ struct AlignmentPhases {
 }
 
 impl AlignmentPhases {
-    fn new(instances: usize) -> Self {
-        Self {
-            instances,
-            started: std::time::Instant::now(),
-        }
-    }
-
     fn end(&mut self, phase: &str) {
         if self.instances >= 4_096 {
             crate::app::timing::log_timing(

@@ -3438,6 +3438,9 @@ fn automation_execute_request(
     );
     let elapsed = started.elapsed().as_millis();
     let level = if request.op == op::BIND { 4 } else { 3 };
+    if let Some(profile) = crate::app::profile::report(&name, started) {
+        log_global(4, format_args!("{}", profile.trim_end()));
+    }
     match &result {
         Ok(_) => log_global(level, format_args!("[renium] {name} ok in {elapsed} ms")),
         Err(failure) => log_global(

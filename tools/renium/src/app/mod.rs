@@ -4,6 +4,7 @@ pub(crate) mod context;
 pub(crate) mod crash;
 pub(crate) mod mcp;
 pub(crate) mod output;
+pub(crate) mod profile;
 pub(crate) mod report;
 pub(crate) mod setup;
 pub(crate) mod timing;

@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use serde_json::{Map, Value, json};
 
+use crate::app::profile;
 use crate::app::timing::{elapsed_ms, log_timing, log_timing_ms, verbose_timing_logs};
 use crate::bytecode::acquire_settings_file_lock;
 use crate::editor::paths::{project_script_file_names_in_layout, script_file_names};
@@ -315,15 +316,19 @@ impl DirectImportWorker {
                 // Conversion above is CPU-only; wait for the destination only
                 // before reading or writing it.
                 if let Some(ready) = &self.ready {
+                    let _waiting = profile::span(&format!("{service}: wait for the stage"));
                     ready()?;
                 }
-                import_service_state_with_sourcemap(
+                let node = import_service_state_with_sourcemap(
                     &state,
                     &self.roots.project_root,
                     &src_root,
                     self.roots.layout_src_root.as_deref(),
                     &service,
-                )
+                );
+                let _releasing = profile::span(&format!("{service}: release captured state"));
+                drop(state);
+                node
             });
         match result {
             Ok(node) => {
@@ -1266,6 +1271,7 @@ fn import_service_tree(
         mark_visited(&visited, state.service_root_index);
 
         let root_children = child_indices_for_instance(state, state.service_root_index);
+        let emitting = profile::span(&format!("{service}: write script files"));
         let expected_batch = emit_children_indices(
             state,
             root_children,
@@ -1277,6 +1283,7 @@ fn import_service_tree(
             &visited,
         )?;
         expected_batch.merge_into(&expected_paths);
+        drop(emitting);
 
         match settings_task.join() {
             Ok(result) => result?,
@@ -1441,9 +1448,14 @@ fn write_service_settings_file(
             preservation_started,
         );
         let state_to_write = preserved_state.as_ref().unwrap_or(state);
+        let encoding = profile::span(&format!("{service}: encode captured state"));
         let observed = encode_service_settings_binary(state_to_write)?;
+        drop(encoding);
         let alignment_started = Instant::now();
-        let aligned = match fs::read(&settings_path) {
+        let reading = profile::span(&format!("{service}: read stored file"));
+        let stored = fs::read(&settings_path);
+        drop(reading);
+        let aligned = match stored {
             Ok(reference) => {
                 match align_pulled_settings_bytes_to_reference(&reference, &observed)
                     .with_context(|| format!("Failed to align {}", settings_path.display()))?

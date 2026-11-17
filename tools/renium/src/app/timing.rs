@@ -17,6 +17,7 @@ pub(crate) fn elapsed_ms(started: Instant) -> f64 {
 }
 
 pub(crate) fn log_timing(label: &str, started: Instant) {
+    crate::app::profile::record(label, started);
     if quiet_timings() && global_log_enabled(5) {
         log_global(
             5,
@@ -31,6 +32,12 @@ pub(crate) fn log_timing(label: &str, started: Instant) {
 }
 
 pub(crate) fn log_timing_ms(label: &str, elapsed_ms: f64) {
+    let ended = Instant::now();
+    if let Some(started) = ended.checked_sub(std::time::Duration::from_secs_f64(
+        elapsed_ms.max(0.0) / 1000.0,
+    )) {
+        crate::app::profile::record_between(label, started, ended);
+    }
     if !global_log_enabled(TIMING_LOG_LEVEL) {
         return;
     }
