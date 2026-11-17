@@ -604,15 +604,37 @@ pub(crate) struct EditorBinaryExport {
 
 #[derive(Debug)]
 pub(crate) enum ServiceReaderFallback {
-    Planned(&'static str),
-    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    Disabled,
+    Platform,
+    PackageRoots,
     DiscoveryFailed(String),
+}
+
+#[derive(Clone)]
+pub(crate) struct PushSavedFields {
+    pub(crate) project: PathBuf,
+    pub(crate) runtime: String,
+    pub(crate) fields: Vec<crate::settings::equivalence::SavedFieldDifference>,
+}
+
+impl PushSavedFields {
+    pub(crate) fn validate(&self, project: &std::path::Path, runtime: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.project == project && self.runtime == runtime,
+            "Saved fields belong to a different project or Studio runtime; retry the push in its original place"
+        );
+        Ok(())
+    }
 }
 
 impl ServiceReaderFallback {
     pub(crate) fn reason(&self) -> &str {
         match self {
-            Self::Planned(reason) => reason,
+            Self::Disabled => {
+                "the native service reader was disabled by RENIUM_NATIVE_SERVICE_IMPORT"
+            }
+            Self::Platform => "the native service reader is unavailable on this platform",
+            Self::PackageRoots => "the import must preserve live package roots",
             Self::DiscoveryFailed(reason) => reason,
         }
     }

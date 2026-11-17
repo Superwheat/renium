@@ -375,11 +375,13 @@ impl RootWrite {
 
 #[derive(Default)]
 pub(crate) struct NativeRootVerification {
+    pub(crate) completed_dispatches: usize,
     fields: HashMap<(String, String), Map<String, Value>>,
 }
 
 impl NativeRootVerification {
     pub(crate) fn extend(&mut self, other: Self) {
+        self.completed_dispatches += other.completed_dispatches;
         for (key, fields) in other.fields {
             self.fields.entry(key).or_default().extend(fields);
         }
@@ -395,6 +397,7 @@ impl NativeRootVerification {
     }
 
     fn record(&mut self, write: RootWrite) {
+        self.completed_dispatches += 1;
         let key = Self::target_key(
             &write.class_name,
             &write.path_segments,
@@ -778,6 +781,7 @@ mod tests {
             });
         }
         late.extend(early);
+        assert_eq!(late.completed_dispatches, 2);
         let mut row = crate::editor::types::EditorPropertyChange {
             class_name: "Lighting".into(),
             path_segments: vec!["Lighting".into()],

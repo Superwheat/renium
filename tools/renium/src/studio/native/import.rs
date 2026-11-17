@@ -64,6 +64,21 @@ struct EditorPackageGroupPlan {
     change_generation: Option<u64>,
 }
 
+fn service_import_fallback(
+    plans: &[EditorPackageGroupPlan],
+    reader: Option<ServiceReaderFallback>,
+) -> Option<ServiceReaderFallback> {
+    if plans.iter().any(|plan| {
+        !plan.retained_roots.is_empty()
+            || !plan.package_roots.is_empty()
+            || !plan.mutation_package_roots.is_empty()
+    }) {
+        Some(ServiceReaderFallback::PackageRoots)
+    } else {
+        reader
+    }
+}
+
 fn externalize_imported_references(
     dom: &mut RbxWeakDom,
     imported_refs: &HashSet<RbxRef>,
@@ -2318,33 +2333,53 @@ fn native_import_services(changes: &EditorChangeSet) -> HashSet<String> {
     services
 }
 
-pub(crate) fn build_editor_binary_import(
+pub(crate) struct BinaryImportSelection {
+    services: HashSet<String>,
+    additive_roots: HashMap<String, HashSet<String>>,
+    pub(crate) fallback_reason: Option<ServiceReaderFallback>,
+}
+
+fn reader_fallback(
+    windows: bool,
+    disabled: bool,
+    probe: impl FnOnce() -> Result<()>,
+) -> Option<ServiceReaderFallback> {
+    if !windows {
+        return Some(ServiceReaderFallback::Platform);
+    }
+    if disabled {
+        return Some(ServiceReaderFallback::Disabled);
+    }
+    probe()
+        .err()
+        .map(|error| ServiceReaderFallback::DiscoveryFailed(format!("{error:#}")))
+}
+
+pub(crate) fn select_editor_binary_import(
     args: &PushEditorChangesArgs,
     changes: &EditorChangeSet,
     bridge: &BridgeServer,
-) -> Result<Option<EditorBinaryImport>> {
+) -> Result<Option<BinaryImportSelection>> {
     let mut services = native_import_services(changes);
     let additive_roots = additive_native_roots(changes, &services);
     services.extend(additive_roots.keys().cloned());
     if services.is_empty() {
         return Ok(None);
     }
-    #[cfg(windows)]
-    let fallback_reason =
-        if std::env::var_os("RENIUM_NATIVE_SERVICE_IMPORT").is_some_and(|value| value == "0") {
-            Some(ServiceReaderFallback::Planned(
-                "the native service reader was disabled by RENIUM_NATIVE_SERVICE_IMPORT",
-            ))
-        } else {
+    let disabled = args.disable_service_reader
+        || std::env::var_os("RENIUM_NATIVE_SERVICE_IMPORT").is_some_and(|value| value == "0");
+    let fallback_reason = reader_fallback(cfg!(windows), disabled, || {
+        #[cfg(windows)]
+        {
             let pid = crate::editor::review::studio_pid_for_bridge(bridge)?;
             crate::studio::native::serializer::prepare_service_reader(pid)
-                .err()
-                .map(|error| ServiceReaderFallback::DiscoveryFailed(format!("{error:#}")))
-        };
-    #[cfg(not(windows))]
-    let fallback_reason = Some(ServiceReaderFallback::Planned(
-        "the native service reader is unavailable on this platform",
-    ));
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = bridge;
+            unreachable!("platform handled before probe")
+        }
+    });
     if let Some(reason) = &fallback_reason {
         crate::app::output::log_global(
             5,
@@ -2354,6 +2389,27 @@ pub(crate) fn build_editor_binary_import(
             ),
         );
     }
+    Ok(Some(BinaryImportSelection {
+        services,
+        additive_roots,
+        fallback_reason,
+    }))
+}
+
+pub(crate) fn build_editor_binary_import(
+    args: &PushEditorChangesArgs,
+    changes: &EditorChangeSet,
+    bridge: &BridgeServer,
+    selection: Option<BinaryImportSelection>,
+) -> Result<Option<EditorBinaryImport>> {
+    let Some(BinaryImportSelection {
+        services,
+        additive_roots,
+        fallback_reason,
+    }) = selection
+    else {
+        return Ok(None);
+    };
     let document_overrides = changes
         .native_property_documents
         .iter()
@@ -2444,6 +2500,39 @@ fn additive_native_roots(
 #[cfg(test)]
 mod additive_import_tests {
     use super::*;
+
+    #[test]
+    fn planned_import_routes_and_discovery_failures_stay_distinct() {
+        assert!(matches!(
+            reader_fallback(false, false, || panic!()),
+            Some(ServiceReaderFallback::Platform)
+        ));
+        assert!(matches!(
+            reader_fallback(true, true, || panic!()),
+            Some(ServiceReaderFallback::Disabled)
+        ));
+        assert!(reader_fallback(true, false, || Ok(())).is_none());
+        let failed = || reader_fallback(true, false, || anyhow::bail!("ambiguous reader"));
+        assert!(
+            matches!(service_import_fallback(&[], failed()), Some(ServiceReaderFallback::DiscoveryFailed(reason)) if reason == "ambiguous reader")
+        );
+        let plans = [EditorPackageGroupPlan {
+            retained_roots: Vec::new(),
+            mutation_package_roots: Vec::new(),
+            change_generation: None,
+            package_roots: vec![EditorBinaryPackageRoot {
+                class_name: "Model".into(),
+                path_segments: vec!["Package".into()],
+                path_ordinals: vec![1],
+            }],
+        }];
+        for fallback in [None, failed()] {
+            assert!(matches!(
+                service_import_fallback(&plans, fallback),
+                Some(ServiceReaderFallback::PackageRoots)
+            ));
+        }
+    }
     use crate::editor::types::{EditorInstanceChange, EditorInstanceDescriptor};
 
     #[test]
@@ -3142,17 +3231,7 @@ fn build_editor_binary_import_for_services(
     let identities = crate::app::profile::span("native import clear regenerated engine identities");
     clear_import_engine_identities(&mut build.dom);
     drop(identities);
-    let fallback_reason = if package_plans.iter().any(|plan| {
-        !plan.retained_roots.is_empty()
-            || !plan.package_roots.is_empty()
-            || !plan.mutation_package_roots.is_empty()
-    }) {
-        Some(ServiceReaderFallback::Planned(
-            "the import must preserve live package roots",
-        ))
-    } else {
-        fallback_reason
-    };
+    let fallback_reason = service_import_fallback(&package_plans, fallback_reason);
     if fallback_reason.is_none() {
         let (bytes, groups, native_replacement) = payload::encode_services(
             &mut build.dom,

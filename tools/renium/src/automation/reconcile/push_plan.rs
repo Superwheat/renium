@@ -5,6 +5,16 @@ pub(crate) struct StagedPushResult {
     pub(crate) summary: Map<String, Value>,
 }
 
+#[derive(Debug)]
+pub(super) struct SkippedPushReview;
+
+impl std::fmt::Display for SkippedPushReview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The push was skipped at the Studio review (rbx rv skip, or no answer within 90 s); nothing was applied. Run the push again and answer with rbx rv apply, or pass --yes")
+    }
+}
+impl std::error::Error for SkippedPushReview {}
+
 #[derive(Default)]
 pub(crate) struct AppliedEditorChanges {
     pub(crate) accepted: BTreeMap<PathBuf, Option<PublishEntryState>>,
@@ -213,9 +223,7 @@ pub(crate) fn push_staged_project(
         validate_project,
     )?;
     if summary.get("skippedByReview").and_then(Value::as_bool) == Some(true) {
-        bail!(
-            "The push was skipped at the Studio review (rbx rv skip, or no answer within 90 s); nothing was applied. Run the push again and answer with rbx rv apply, or pass --yes"
-        );
+        return Err(SkippedPushReview.into());
     }
     for document in initial_documents.into_values() {
         if let Some(document) = Arc::into_inner(document) {
@@ -1397,6 +1405,7 @@ mod review_threshold_tests {
         let Err(skipped) = skipped else {
             panic!("a skipped review must not apply the staged push")
         };
+        assert!(skipped.is::<SkippedPushReview>());
         assert!(
             format!("{skipped:#}").contains("skipped at the Studio review"),
             "{skipped:#}"

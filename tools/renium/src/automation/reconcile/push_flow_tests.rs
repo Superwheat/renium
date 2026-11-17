@@ -123,6 +123,10 @@ impl Fixture {
     }
 
     fn run(&self) -> Result<Map<String, Value>> {
+        self.push(false)
+    }
+
+    fn push(&self, slow_import: bool) -> Result<Map<String, Value>> {
         let _reply = crate::daemon::fixture_early_response();
         let bridge = self.bridge.as_ref().unwrap();
         let lease = Arc::new(crate::studio::bridge::BridgeRequestLease::new(
@@ -137,13 +141,14 @@ impl Fixture {
             runtime_bootstrap_safe: true,
             service_generations: BTreeMap::new(),
         };
-        let args = PushEditorChangesArgs::new(
+        let mut args = PushEditorChangesArgs::new(
             crate::cli::ProjectSourceArgs {
                 project_root: self.context.root.clone().into(),
                 src_root: "src".into(),
             },
             crate::cli::BridgeConnectionArgs::local(0.1),
         );
+        args.slow_import = slow_import;
         let result = push_project(
             &self.context,
             bridge,
@@ -195,6 +200,50 @@ fn summary(verified: bool) -> Map<String, Value> {
         summary.insert("verifiedPushProof".into(), json!({"test":true}));
     }
     summary
+}
+
+#[test]
+fn refused_staged_push_discards_only_its_undo_entry_and_opt_in_survives_staging() -> Result<()> {
+    for allow in [false, true] {
+        let fixture = Fixture::new()?;
+        let directory = Path::new(&fixture.context.root).join(".renium/editor-history/sync");
+        let previous = directory.join("previous");
+        fs::create_dir_all(&previous)?;
+        fs::write(previous.join("keep"), "previous undo")?;
+        MUTATION.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |_, request| {
+                assert_eq!(request.args.slow_import, allow);
+                if !request.args.slow_import {
+                    return Err(crate::editor::sync::SlowImportRequired(
+                        "simulated reader failure".into(),
+                    )
+                    .into());
+                }
+                let mut accepted = summary(false);
+                accepted.insert("supplementalImportWrites".into(), json!(40));
+                Ok(StagedPushResult {
+                    generated: ProjectSnapshot::default(),
+                    summary: accepted,
+                })
+            }))
+        });
+        if allow {
+            let desired = fixture.desired.clone();
+            CAPTURES.with(|slot| slot.borrow_mut().push_back(Box::new(move |_| Ok(desired))));
+            assert_eq!(fixture.push(true)?["supplementalImportWrites"], 40);
+        } else {
+            assert!(
+                fixture
+                    .run()
+                    .unwrap_err()
+                    .is::<crate::editor::sync::SlowImportRequired>()
+            );
+            assert_eq!(fs::read_dir(directory)?.count(), 1);
+            assert!(!import_settle::pending(&fixture.context));
+        }
+        assert_eq!(fs::read_to_string(previous.join("keep"))?, "previous undo");
+    }
+    Ok(())
 }
 
 #[test]

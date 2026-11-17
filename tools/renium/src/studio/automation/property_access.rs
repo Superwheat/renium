@@ -257,13 +257,18 @@ pub(crate) fn saved_field_text(value: &Value, class_name: &str, property: &str) 
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn write_saved_field(
     bridge: &BridgeServer,
+    expected_runtime: &str,
     path: &[String],
     ordinals: &[usize],
     property: &str,
     value: &Value,
 ) -> Result<bool> {
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
-    let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
+    anyhow::ensure!(
+        info.runtime_id == expected_runtime,
+        "Studio changed before the saved field write; retry the push"
+    );
+    let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, expected_runtime)?;
     let title = crate::studio::native::serializer::target_name(pid, &info.place_name)?;
     let mut native = crate::studio::native::serializer::prepare_property(
         pid,
@@ -322,6 +327,7 @@ mod saved_field_text_tests {
 #[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn write_saved_field(
     _bridge: &BridgeServer,
+    _expected_runtime: &str,
     _path: &[String],
     _ordinals: &[usize],
     _property: &str,

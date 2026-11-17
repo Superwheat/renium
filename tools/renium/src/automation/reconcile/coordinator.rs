@@ -597,7 +597,7 @@ impl Coordinator {
             }
         } else {
             let phase = Instant::now();
-            sync_history = Some(history::SyncHistory::begin(
+            let history = sync_history.insert(history::SyncHistory::begin(
                 Path::new(&context.root),
                 &bound_context::source_dir(context)?,
                 &studio,
@@ -618,7 +618,8 @@ impl Coordinator {
                     expected_project: Some(&editor),
                     later_edits_follow: true,
                 },
-            )?
+            )
+            .map_err(|error| history.discard_if_refused(error))?
             .generated;
             // Studio now holds the project's content for these paths. Record
             // that before anything else can fail, or the next reconcile would
@@ -1108,7 +1109,8 @@ impl Coordinator {
                 expected_project: None,
                 later_edits_follow: false,
             },
-        )?;
+        )
+        .map_err(|error| history.discard_if_refused(error))?;
         summary.insert(
             "historyId".into(),
             Value::String(history.commit(&current, &generated)?),

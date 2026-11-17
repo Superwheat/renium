@@ -624,6 +624,7 @@ pub fn capabilities() -> Result<Value> {
         "controlAuthentication": "local-ed25519-v1",
         "protectedPropertyDefaultMode": "ask",
         "pluginResourceLeases": 1,
+        "slowImport": true,
         "ops": registry().iter().map(|operation| json!({
             "id": operation.id,
             "name": operation.name,

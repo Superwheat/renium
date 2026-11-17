@@ -4389,12 +4389,17 @@ fn pre_import_property(change: &EditorPropertyChange, name: &str, native_import:
             ))
 }
 
+pub(crate) struct EditorBatchResult {
+    pub(crate) summary: Map<String, Value>,
+    pub(crate) individual_dispatches: usize,
+}
+
 pub(crate) fn send_editor_change_batches(
     bridge: &BridgeServer,
     changes: &EditorChangeSet,
     binary_import: Option<&EditorBinaryImport>,
     transaction_id: Option<&str>,
-) -> Result<Map<String, Value>> {
+) -> Result<EditorBatchResult> {
     let mut summary = Map::new();
     summary.insert("ok".to_string(), Value::Bool(true));
     let instance_queued = changes
@@ -4417,7 +4422,10 @@ pub(crate) fn send_editor_change_batches(
         && changes.property_changes.is_empty()
     {
         summary.insert("noops".to_string(), json!(0));
-        return Ok(summary);
+        return Ok(EditorBatchResult {
+            summary,
+            individual_dispatches: 0,
+        });
     }
 
     // Material mode changes Terrain's default colors. Lighting changes rebuild
@@ -4509,7 +4517,10 @@ pub(crate) fn send_editor_change_batches(
             &native_root_verification,
             &mut summary,
         )?;
-        return Ok(summary);
+        return Ok(EditorBatchResult {
+            summary,
+            individual_dispatches: native_root_verification.completed_dispatches,
+        });
     }
 
     for instance_change in changes.instance_changes.iter().filter_map(|change| {
@@ -4896,7 +4907,10 @@ pub(crate) fn send_editor_change_batches(
         &native_root_verification,
         &mut summary,
     )?;
-    Ok(summary)
+    Ok(EditorBatchResult {
+        summary,
+        individual_dispatches: native_root_verification.completed_dispatches,
+    })
 }
 
 fn verify_in_place_editor_fields(

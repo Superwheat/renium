@@ -83,6 +83,30 @@ struct SyncHistoryRecord {
 }
 
 impl SyncHistory {
+    pub(super) fn discard_if_refused(&self, error: anyhow::Error) -> anyhow::Error {
+        if (error.is::<crate::editor::sync::SlowImportRequired>()
+            || error.is::<SkippedPushReview>())
+            && let Err(cleanup) = self.discard_uncommitted()
+        {
+            return error.context(format!(
+                "Failed to discard the refused push's undo record: {cleanup:#}"
+            ));
+        }
+        error
+    }
+
+    pub(super) fn discard_uncommitted(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.record.committed_at == 0,
+            "Cannot discard committed sync history"
+        );
+        fs::remove_dir_all(&self.directory).with_context(|| {
+            format!(
+                "Could not remove uncommitted history {}",
+                self.directory.display()
+            )
+        })
+    }
     pub(super) fn id(&self) -> Result<String> {
         Ok(self
             .directory

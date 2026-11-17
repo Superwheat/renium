@@ -91,7 +91,7 @@ pub(crate) fn push_project(
     context: &BoundContext,
     bridge: &BridgeServer,
     services: &[String],
-    push_args: PushEditorChangesArgs,
+    mut push_args: PushEditorChangesArgs,
     guard: Option<&StudioChangeGuard>,
     replace: bool,
 ) -> Result<Map<String, Value>> {
@@ -348,16 +348,20 @@ pub(crate) fn push_project(
             ),
         );
     }
-    for path in &differences {
-        if let Some(change) = prepared_settings.get(path) {
-            super::verify::note_saved_field_differences(
-                crate::settings::equivalence::saved_field_differences(
-                    &change.current,
-                    &change.previous,
-                ),
-            );
+    let mut saved_fields = Vec::new();
+    for field in prepared_settings.values().flat_map(|change| {
+        crate::settings::equivalence::saved_field_differences(&change.current, &change.previous)
+    }) {
+        if !saved_fields.contains(&field) {
+            saved_fields.push(field);
         }
     }
+    push_args.saved_fields =
+        (!saved_fields.is_empty()).then(|| crate::editor::types::PushSavedFields {
+            project: PathBuf::from(&context.root),
+            runtime: guard.runtime_id.clone(),
+            fields: saved_fields,
+        });
     if differences.is_empty() {
         tracking_release.proof = capture_push_proof(bridge, &guard)?;
         acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
@@ -459,10 +463,12 @@ pub(crate) fn push_project(
             expected_project: Some(&project),
             later_edits_follow: false,
         },
-    )?;
+    )
+    .map_err(|error| history.discard_if_refused(error))?;
     if push_applied_nothing(&pushed.summary) {
         // Studio holds or skipped the whole push, so there is nothing to
         // record or read back; the summary carries the hold and its next step.
+        history.discard_uncommitted()?;
         return Ok(pushed.summary);
     }
     pushed.summary.insert(

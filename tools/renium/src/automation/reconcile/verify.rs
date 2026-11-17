@@ -582,34 +582,6 @@ pub(crate) fn verification_value<'a>(
     }
 }
 
-// A saved field Studio exposes to no plugin API is applied after the plugin
-// push through the native property writer, so the retention check leaves it
-// alone and the push guard records what differs for that step.
-static SAVED_FIELD_DIFFERENCES: std::sync::Mutex<
-    Vec<crate::settings::equivalence::SavedFieldDifference>,
-> = std::sync::Mutex::new(Vec::new());
-
-pub(crate) fn note_saved_field_differences(
-    differences: impl IntoIterator<Item = crate::settings::equivalence::SavedFieldDifference>,
-) {
-    let mut pending = SAVED_FIELD_DIFFERENCES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for difference in differences {
-        if !pending.contains(&difference) {
-            pending.push(difference);
-        }
-    }
-}
-
-pub(crate) fn take_saved_field_differences()
--> Vec<crate::settings::equivalence::SavedFieldDifference> {
-    let mut pending = SAVED_FIELD_DIFFERENCES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    std::mem::take(&mut *pending)
-}
-
 fn saved_field_without_plugin_api(class_name: &str, name: &str) -> bool {
     rbx_reflection_database::get().is_ok_and(|database| {
         crate::editor::review::plugin_cannot_write_property(database, class_name, name)

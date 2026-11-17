@@ -159,6 +159,11 @@ pub(super) fn automation_failure_ref(error: &anyhow::Error) -> automation::Failu
 }
 
 fn classify_failure(error: &anyhow::Error) -> automation::Failure {
+    if error.is::<crate::editor::sync::SlowImportRequired>() {
+        const CODE: &str = "slow_import_required";
+        return automation::Failure::new(CODE, format!("{error:#}"), false, "context")
+            .detail(json!({"code":CODE}));
+    }
     if let Some(verification) =
         error.downcast_ref::<crate::editor::sync::EditorSourceVerificationError>()
     {
@@ -307,6 +312,7 @@ pub(super) fn automation_push_args(
     args.verify_sources = automation_bool(object, "verifySources", false)?;
     args.verify = automation_bool(object, "verify", false)?;
     args.slow_import = automation_bool(object, "slowImport", false)?;
+    args.disable_service_reader = automation_bool(object, "disableServiceReader", false)?;
     args.upsert_instances_only = automation_bool(object, "upsertInstancesOnly", false)?;
     args.override_packages = automation_bool(object, "overridePackages", false)?;
     args.link_cache_dir = automation_string(object, "linkCacheDir")
@@ -667,6 +673,13 @@ fn compact_push_summary(
         .and_then(Value::as_u64)
     {
         result.insert("supplementalImportWrites".into(), json!(count));
+    }
+    if let Some(count) = summary
+        .get("supplementalImportOfflineWrites")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+    {
+        result.insert("supplementalImportOfflineWrites".into(), json!(count));
     }
     let counts = push_counts(summary);
     let changed = !counts.is_empty()
@@ -5659,6 +5672,19 @@ mod tests {
                 panic!("expected push")
             };
             let request = crate::editor::sync::push_request_parameters(&args, false);
+            for (setting, disabled) in [(Some("0"), true), (Some("1"), false), (None, false)] {
+                let wire = crate::editor::sync::push_request_with_reader_setting(
+                    &args,
+                    false,
+                    setting.map(std::ffi::OsStr::new),
+                );
+                assert_eq!(
+                    automation_push_args(&context, &wire, true)
+                        .unwrap()
+                        .disable_service_reader,
+                    disabled
+                );
+            }
             let mut parameters: Value =
                 serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
             assert_eq!(
@@ -5668,6 +5694,15 @@ mod tests {
                 expected
             );
             parameters.as_object_mut().unwrap().remove("slowImport");
+            parameters
+                .as_object_mut()
+                .unwrap()
+                .remove("disableServiceReader");
+            assert!(
+                !automation_push_args(&context, &parameters, true)
+                    .unwrap()
+                    .disable_service_reader
+            );
             assert!(
                 !automation_push_args(&context, &parameters, true)
                     .unwrap()
@@ -5678,7 +5713,8 @@ mod tests {
 
     #[test]
     fn compact_push_reports_the_measured_import_write_count_including_zero() {
-        let parameters = json!({"supplementalImportWrites": 123});
+        let parameters =
+            json!({"supplementalImportWrites": 123,"supplementalImportOfflineWrites": 123});
         for count in [None, Some(0), Some(2)] {
             let mut summary = json!({"instanceCreated": 8, "sourceVerified": 1});
             if let Some(count) = count {
@@ -5692,6 +5728,23 @@ mod tests {
                 count
             );
             assert_eq!(reply["verified"], true);
+            assert!(!reply.contains_key("supplementalImportOfflineWrites"));
+        }
+        let offline = json!({"instanceCreated": 8, "sourceVerified": 1, "supplementalImportWrites":0,"supplementalImportOfflineWrites":40});
+        let reply = compact_push_summary(offline.as_object().unwrap(), &parameters, false);
+        assert_eq!(reply["supplementalImportWrites"], 0);
+        assert_eq!(reply["supplementalImportOfflineWrites"], 40);
+    }
+
+    #[test]
+    fn reader_diagnostics_cannot_change_the_slow_import_error_code() {
+        for reason in ["unsupported", "timeout", "unknown operation", "internal"] {
+            let error = anyhow::Error::new(crate::editor::sync::SlowImportRequired(reason.into()))
+                .context("push preflight");
+            let failure = classify_failure(&error).0;
+            assert_eq!(failure.c, "slow_import_required");
+            assert_eq!(failure.d.unwrap()["code"], failure.c);
+            assert!(failure.m.contains(reason));
         }
     }
 

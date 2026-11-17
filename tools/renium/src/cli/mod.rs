@@ -2978,6 +2978,10 @@ pub(super) struct PushEditorChangesArgs {
         long
     )]
     pub(super) slow_import: bool,
+    #[arg(skip)]
+    pub(crate) disable_service_reader: bool,
+    #[arg(skip)]
+    pub(crate) saved_fields: Option<crate::editor::types::PushSavedFields>,
     #[arg(
         help = "Skip the Studio review and protected property writes (prefer --yes)",
         long
@@ -3025,6 +3029,8 @@ impl PushEditorChangesArgs {
             verify: false,
             no_check: false,
             slow_import: false,
+            disable_service_reader: false,
+            saved_fields: None,
             no_review: false,
             yes: false,
             review_report: false,
