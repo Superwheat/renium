@@ -3160,6 +3160,7 @@ fn collab_operation(
         .filter(|value| !value.trim().is_empty())
         .context("Collaboration requests name the project root")?;
     let root = Path::new(root);
+    let _project = crate::system::project_access::acquire(root, || Ok(()))?;
     let manager = state.collab();
     let name = parameters
         .get("name")
@@ -3703,8 +3704,10 @@ fn automation_execute_request_inner(
                 bound_context::resolve(state, bridge, context_id)?
             };
             #[cfg(any(windows, target_os = "macos"))]
-            automation::reconcile::import_settle::wait(&context, bridge)
-                .map_err(automation_failure)?;
+            if !is_studio_review_decision(request) {
+                automation::reconcile::import_settle::wait(&context, bridge)
+                    .map_err(automation_failure)?;
+            }
             if operation.id == op::CONTEXT {
                 return serde_json::to_value(context).map_err(|error| {
                     automation::Failure::new("internal", error.to_string(), false, "bind")
@@ -3912,6 +3915,49 @@ fn automation_execute_request_inner(
     }
 }
 
+fn is_studio_review_decision(request: &automation::Request) -> bool {
+    request.op == op::REVIEW_APPLY && request.p.get("studioDecision") == Some(&Value::Bool(true))
+}
+
+fn request_project_access(
+    request: &automation::Request,
+    state: &automation::State,
+    lease: Option<&BridgeRequestLease>,
+) -> Result<Option<crate::system::project_access::ProjectAccess>> {
+    if is_studio_review_decision(request) {
+        return Ok(None);
+    }
+    let root = request
+        .cx
+        .and_then(|id| state.context(id))
+        .filter(|context| context.initialized)
+        .map(|context| PathBuf::from(context.root))
+        .or_else(|| {
+            matches!(
+                request.op,
+                op::COLLAB_START
+                    | op::COLLAB_JOIN
+                    | op::COLLAB_STOP
+                    | op::COLLAB_STATUS
+                    | op::COLLAB_AWARENESS
+            )
+            .then(|| {
+                request
+                    .p
+                    .get("root")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+            })
+            .flatten()
+        });
+    root.map(|root| {
+        crate::system::project_access::acquire(&root, || {
+            lease.map_or(Ok(()), BridgeRequestLease::ensure_active)
+        })
+    })
+    .transpose()
+}
+
 fn automation_response(
     mut request: automation::Request,
     state: &automation::State,
@@ -3925,7 +3971,7 @@ fn automation_response(
     // it waits; queuing the decision behind that push would deadlock until
     // the review times out.
     let unqueued_exception = match request.op {
-        op::REVIEW_APPLY => request.p.get("studioDecision").and_then(Value::as_bool) == Some(true),
+        op::REVIEW_APPLY => is_studio_review_decision(&request),
         op::STUDIO_AUDIO => request.p.get("global").and_then(Value::as_bool) == Some(true),
         op::PERFORMANCE_MONITOR => crate::studio::automation::monitor::is_edit_request(&request.p),
         _ => false,
@@ -4028,7 +4074,12 @@ fn execute_gated(
     request_lease: Option<&Arc<BridgeRequestLease>>,
 ) -> std::result::Result<Value, automation::Failure> {
     #[cfg(any(windows, target_os = "macos"))]
-    if let Some(context) = request.cx.and_then(|id| state.context(id)) {
+    if !is_studio_review_decision(request)
+        && let Some(context) = request.cx.and_then(|id| state.context(id))
+    {
+        if request.op == op::STUDIO_CLOSE {
+            automation::reconcile::import_settle::cancel_for_close(&context);
+        }
         automation::reconcile::import_settle::wait_for_request(
             &context,
             request_lease.map(Arc::as_ref),
@@ -4075,6 +4126,10 @@ fn execute_gated(
             request_lease.map(Arc::as_ref),
         )?),
     };
+    // Gate before project lock matches Live Sync's order. The request stack
+    // owns both through the continuation and all acknowledgment/cleanup.
+    let _project_access = request_project_access(request, state, request_lease.map(Arc::as_ref))
+        .map_err(automation_failure)?;
     let _lease_guard = match request_lease {
         Some(lease) => Some(
             bridge
@@ -4850,6 +4905,8 @@ mod tests {
                 }
                 let result = json!({
                     "ok": true,
+                    "accepted": true,
+                    "decision": params["decision"],
                     "window": window,
                     "running": false,
                     "starting": false,
@@ -5224,6 +5281,187 @@ mod tests {
             "a request left its selection behind"
         );
         let _ = std::fs::remove_dir_all(&studios.root);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn studio_review_decisions_bypass_a_running_import_and_its_gate() {
+        if !runs_in_its_own_process("studio_review_decisions_bypass_a_running_import_and_its_gate")
+        {
+            return;
+        }
+        use crate::automation::reconcile::import_settle;
+        let studios = TwoStudios::open();
+        let context = studios.state.context(studios.a).unwrap();
+        import_settle::fixture_running_import(&context).unwrap();
+        let gate = studios.bridge.acquire_edit_gate(Some("gate-a"), "push");
+        let (done, answer) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&studios);
+        let task = std::thread::spawn(move || {
+            for decision in ["apply", "skip"] {
+                let response = automation_parse_response_with_lease(
+                    &crate::automation::authorization::signed_fixture_request(
+                        &worker.state,
+                        json!({"v":1,"id":900,"op":op::REVIEW_APPLY,"cx":worker.a,
+                            "p":{"studioDecision":true,"decision":decision}}),
+                    ),
+                    &worker.state,
+                    &worker.bridge,
+                    0.1,
+                    None,
+                );
+                done.send((decision, response)).unwrap();
+            }
+        });
+        let first = answer.recv_timeout(Duration::from_secs(2));
+        let second = if first.is_ok() {
+            answer.recv_timeout(Duration::from_secs(2)).ok()
+        } else {
+            None
+        };
+        import_settle::finish_request(None).unwrap();
+        drop(gate);
+        task.join().unwrap();
+        for (decision, response) in [
+            first.expect("review waited for settlement"),
+            second.expect("skip waited for settlement"),
+        ] {
+            assert_eq!(
+                response.ok,
+                1,
+                "{}",
+                serde_json::to_string(&response).unwrap()
+            );
+            assert_eq!(response.r.unwrap()["decision"], decision);
+        }
+        let _ = fs::remove_dir_all(&studios.root);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn collaboration_without_context_waits_for_import_settlement() {
+        if !runs_in_its_own_process("collaboration_without_context_waits_for_import_settlement") {
+            return;
+        }
+        use crate::automation::reconcile::import_settle;
+        let studios = TwoStudios::open();
+        let context = studios.state.context(studios.a).unwrap();
+        import_settle::fixture_running_import(&context).unwrap();
+        let (done, answer) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&studios);
+        let root = context.root.clone();
+        let task = std::thread::spawn(move || {
+            let response = automation_parse_response_with_lease(
+                &crate::automation::authorization::signed_fixture_request(
+                    &worker.state,
+                    json!({"v":1,"id":901,"op":op::COLLAB_AWARENESS,"p":{"root":root,"state":{}}}),
+                ),
+                &worker.state,
+                &worker.bridge,
+                0.1,
+                None,
+            );
+            done.send(response).unwrap();
+        });
+        let blocked = answer.recv_timeout(Duration::from_millis(150)).is_err();
+        import_settle::finish_request(None).unwrap();
+        task.join().unwrap();
+        assert!(blocked, "context-free collaboration bypassed settlement");
+        answer.recv_timeout(Duration::from_secs(2)).unwrap();
+        let _ = fs::remove_dir_all(&studios.root);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn close_request_cancels_settlement_before_waiting_for_its_gate() {
+        if !runs_in_its_own_process("close_request_cancels_settlement_before_waiting_for_its_gate")
+        {
+            return;
+        }
+        use crate::automation::reconcile::import_settle;
+        let studios = TwoStudios::open();
+        let context = studios.state.context(studios.a).unwrap();
+        import_settle::fixture_running_import(&context).unwrap();
+        let gate = studios.bridge.acquire_edit_gate(Some("gate-a"), "push");
+        let client = Arc::new(BridgeRequestLease::new("finished-import-client".into()));
+        let active = studios.bridge.activate_request_lease(client).unwrap();
+        import_settle::continue_request(&context, &studios.bridge).unwrap();
+        let continuation = studios.bridge.active_request_lease().unwrap();
+        let close_lease = Arc::new(BridgeRequestLease::new("cancelled-close-client".into()));
+        let worker_lease = Arc::clone(&close_lease);
+        let worker = Arc::clone(&studios);
+        let task = std::thread::spawn(move || {
+            let request: automation::Request = serde_json::from_value(json!({
+                "v":1,"id":902,"op":op::STUDIO_CLOSE,"cx":worker.a,"p":{"terminate":true}
+            }))
+            .unwrap();
+            execute_gated(
+                &request,
+                Some(None),
+                &worker.state,
+                &worker.bridge,
+                0.1,
+                Some(&worker_lease),
+            )
+            .map_err(|error| error.0.m)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !continuation.is_cancelled() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let cancelled = continuation.is_cancelled();
+        // Cancel the fixture close before releasing the gate: no native window
+        // operation may run against the fake Studio/test process.
+        close_lease.cancel();
+        import_settle::finish_request(Some("settlement cancelled by close")).unwrap();
+        drop(active);
+        drop(gate);
+        assert!(task.join().unwrap().is_err());
+        assert!(
+            cancelled,
+            "close queued behind the continuation it needed to cancel"
+        );
+        let _ = fs::remove_dir_all(&studios.root);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn failed_recovery_pull_preserves_the_original_settlement_failure() {
+        if !runs_in_its_own_process(
+            "failed_recovery_pull_preserves_the_original_settlement_failure",
+        ) {
+            return;
+        }
+        use crate::automation::reconcile::import_settle;
+        let studios = TwoStudios::open();
+        let context = studios.state.context(studios.a).unwrap();
+        import_settle::fixture_running_import(&context).unwrap();
+        import_settle::finish_request(Some("original accepted-state mismatch")).unwrap();
+        let directory = fs::read_dir(Path::new(&context.root).join(".renium/import-settlement"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let pending = directory.join("pending.rmp");
+        let original = fs::read(&pending).unwrap();
+        let request: automation::Request = serde_json::from_value(json!({
+            "v":1,"id":903,"op":op::PULL,"cx":studios.a,"p":{}
+        }))
+        .unwrap();
+        // This fixture cannot capture service state, so the real recovery pull
+        // fails before publication. Its failure must not rewrite the journal.
+        let response = execute_gated(
+            &request,
+            Some(None),
+            &studios.state,
+            &studios.bridge,
+            0.1,
+            None,
+        );
+        assert!(response.is_err());
+        assert_eq!(fs::read(&pending).unwrap(), original);
+        let _ = fs::remove_dir_all(&studios.root);
     }
 
     #[test]

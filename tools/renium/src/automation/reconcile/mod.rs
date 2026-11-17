@@ -76,6 +76,8 @@ pub(crate) mod import_settle;
 mod merge;
 mod pairing;
 mod push_flow;
+#[cfg(all(test, any(windows, target_os = "macos")))]
+mod push_flow_tests;
 mod push_plan;
 mod reference_settlement;
 mod replacement;

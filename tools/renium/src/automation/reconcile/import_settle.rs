@@ -1,6 +1,6 @@
 //! A committed import keeps its request thread, gate and tracking guard until
 //! its accepted state is published. Only the response and request lease end
-//! early. The journal precedes mutation and survives process termination.
+//! early. Only verified commits are journaled, before the response leaves.
 use super::*;
 use std::cell::RefCell;
 use std::sync::{Condvar, LazyLock};
@@ -18,20 +18,30 @@ struct Record {
     before: StoredSnapshot,
     expected: StoredSnapshot,
     accepted: Option<StoredSnapshot>,
+    #[serde(default)]
     input: Option<Value>,
     summary: Map<String, Value>,
     error: Option<String>,
+    #[serde(default)]
+    journal_id: String,
 }
 
 struct Journal {
     directory: PathBuf,
     record: Record,
+    _ownership: crate::system::project_access::ProjectAccess,
 }
 
 struct Running {
     directory: PathBuf,
     runtime: Option<String>,
     owner: ThreadId,
+    lease: Option<Arc<crate::studio::bridge::BridgeRequestLease>>,
+}
+
+struct RecoveryPull {
+    directory: PathBuf,
+    _ownership: crate::system::project_access::ProjectAccess,
 }
 
 static RUNNING: LazyLock<(Mutex<Vec<Running>>, Condvar)> =
@@ -39,6 +49,9 @@ static RUNNING: LazyLock<(Mutex<Vec<Running>>, Condvar)> =
 
 thread_local! {
     static CURRENT: RefCell<Option<Journal>> = const { RefCell::new(None) };
+    // An explicit full pull can recover even a journal this version cannot
+    // decode. Keep its bytes untouched if that pull fails.
+    static RECOVERY_PULL: RefCell<Option<RecoveryPull>> = const { RefCell::new(None) };
 }
 
 fn directory(context: &BoundContext) -> PathBuf {
@@ -52,23 +65,41 @@ impl Journal {
     fn save(&self) -> Result<()> {
         atomic_write_file(
             &self.directory.join("pending.rmp"),
-            &rmp_serde::to_vec(&self.record)?,
+            &rmp_serde::to_vec_named(&self.record)?,
         )
     }
 
     fn load(context: &BoundContext) -> Result<Option<Self>> {
+        let ownership =
+            crate::system::project_access::acquire(Path::new(&context.root), || Ok(()))?;
         let directory = directory(context);
         let bytes = match fs::read(directory.join("pending.rmp")) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let record: Record = rmp_serde::from_slice(&bytes)?;
+        if resolved(&directory, &bytes) {
+            return Ok(None);
+        }
+        // Read the version before interpreting fields. Named fields allow
+        // compatible additions; arrays are the original version-one format.
+        let header: Value = rmp_serde::from_slice(&bytes)
+            .context("Cannot read the import settlement journal; run rbx pl to recover")?;
+        let version = header
+            .get("version")
+            .or_else(|| header.get(0))
+            .and_then(Value::as_u64);
         anyhow::ensure!(
-            record.version == 1,
+            version == Some(1),
             "Unsupported import settlement journal; run a full pull to recover"
         );
-        Ok(Some(Self { directory, record }))
+        let record: Record = rmp_serde::from_slice(&bytes)
+            .context("Cannot decode the import settlement journal; run rbx pl to recover")?;
+        Ok(Some(Self {
+            directory,
+            record,
+            _ownership: ownership,
+        }))
     }
 
     fn install(self) -> Result<()> {
@@ -80,6 +111,7 @@ impl Journal {
             directory: self.directory.clone(),
             runtime: self.record.runtime.clone(),
             owner: thread::current().id(),
+            lease: None,
         });
         CURRENT.with(|slot| *slot.borrow_mut() = Some(self));
         Ok(())
@@ -111,14 +143,19 @@ pub(super) fn can_continue(
 }
 
 pub(super) fn begin(context: &BoundContext, start: ImportStart<'_>) -> Result<()> {
+    let ownership = crate::system::project_access::acquire(Path::new(&context.root), || Ok(()))?;
     let directory = directory(context);
     anyhow::ensure!(
-        !directory.join("pending.rmp").exists(),
+        !pending(context),
         "An earlier import still needs settlement; run rbx pl"
     );
     let packs = directory.join("packs");
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| anyhow::anyhow!("Cannot identify import journal: {error}"))?;
     let record = Record {
         version: 1,
+        journal_id: nonce.iter().map(|byte| format!("{byte:02x}")).collect(),
         runtime: context.runtime_id.clone(),
         services: start.services.to_vec(),
         paths: start.paths.to_vec(),
@@ -130,17 +167,42 @@ pub(super) fn begin(context: &BoundContext, start: ImportStart<'_>) -> Result<()
         summary: Map::from_iter([("historyId".into(), json!(start.history_id))]),
         error: None,
     };
-    let journal = Journal { directory, record };
+    let journal = Journal {
+        directory,
+        record,
+        _ownership: ownership,
+    };
     journal.save()?;
     journal.install()
 }
 
 pub(crate) fn active() -> bool {
     CURRENT.with(|slot| slot.borrow().is_some())
+        || RECOVERY_PULL.with(|slot| slot.borrow().is_some())
 }
 
 pub(crate) fn pending(context: &BoundContext) -> bool {
-    directory(context).join("pending.rmp").exists()
+    let directory = directory(context);
+    match fs::read(directory.join("pending.rmp")) {
+        Ok(bytes) => !resolved(&directory, &bytes),
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    }
+}
+
+fn resolved(directory: &Path, pending: &[u8]) -> bool {
+    fs::read(directory.join("resolved.sha256"))
+        .is_ok_and(|digest| digest.as_slice() == Sha256::digest(pending).as_slice())
+}
+
+/// A completed journal stays completed even when Windows temporarily refuses
+/// deletion. The marker names these exact bytes, never a later import.
+fn resolve_journal(directory: &Path) -> Result<()> {
+    let bytes = fs::read(directory.join("pending.rmp"))?;
+    atomic_write_file(&directory.join("resolved.sha256"), &Sha256::digest(&bytes))?;
+    if fs::remove_file(directory.join("pending.rmp")).is_ok() {
+        let _ = fs::remove_dir_all(directory);
+    }
+    Ok(())
 }
 
 pub(crate) struct RequestCleanup;
@@ -190,22 +252,33 @@ fn accepted(snapshot: &ProjectSnapshot) -> Result<()> {
 /// Called before the gate is released, after Live Sync's acknowledgment too.
 /// A failed continuation never disappears with its already-answered client.
 pub(crate) fn finish_request(error: Option<&str>) -> Result<()> {
+    if let Some(recovery) = RECOVERY_PULL.with(|slot| slot.borrow_mut().take()) {
+        if error.is_none() {
+            resolve_journal(&recovery.directory)?;
+        }
+        return Ok(());
+    }
     let Some(mut journal) = CURRENT.with(|slot| slot.borrow_mut().take()) else {
         return Ok(());
     };
-    let result = if let Some(error) = error {
-        journal.record.error = Some(error.to_string());
+    let has_commit = journal
+        .record
+        .summary
+        .get("verifiedPushProof")
+        .is_some_and(|value| !value.is_null());
+    let result = if let Some(error) = error.filter(|_| has_commit) {
+        journal
+            .record
+            .error
+            .get_or_insert_with(|| error.to_string());
         log_global(
             3,
             format_args!("[renium] import settlement failed: {error}"),
         );
         journal.save()
     } else {
-        fs::remove_file(journal.directory.join("pending.rmp")).map_err(anyhow::Error::from)
+        resolve_journal(&journal.directory)
     };
-    if result.is_ok() && error.is_none() {
-        let _ = fs::remove_dir_all(&journal.directory);
-    }
     RUNNING
         .0
         .lock_recover()
@@ -216,6 +289,33 @@ pub(crate) fn finish_request(error: Option<&str>) -> Result<()> {
 
 pub(crate) fn wait(context: &BoundContext, bridge: &BridgeServer) -> Result<()> {
     wait_for_request(context, bridge.active_request_lease().as_deref())
+}
+
+pub(crate) fn continue_request(context: &BoundContext, bridge: &BridgeServer) -> Result<()> {
+    bridge.continue_request_lease()?;
+    let mut running = RUNNING.0.lock_recover();
+    let entry = running
+        .iter_mut()
+        .find(|entry| {
+            entry.owner == thread::current().id() && entry.directory == directory(context)
+        })
+        .context("Missing running import settlement")?;
+    entry.lease = bridge.active_request_lease();
+    Ok(())
+}
+
+/// Closing Studio explicitly cancels its read-only continuation before waiting
+/// for the gate. Client disconnect alone must never cancel the committed tail.
+pub(crate) fn cancel_for_close(context: &BoundContext) {
+    let directory = directory(context);
+    for entry in RUNNING.0.lock_recover().iter() {
+        if (entry.directory == directory
+            || entry.runtime.is_some() && entry.runtime == context.runtime_id)
+            && let Some(lease) = &entry.lease
+        {
+            lease.cancel();
+        }
+    }
 }
 
 pub(crate) fn wait_for_request(
@@ -259,10 +359,17 @@ pub(super) fn settle(
     services: &[String],
     mut work: ImportWork,
     proof: &Value,
-) -> Result<(ProjectSnapshot, Map<String, Value>)> {
+) -> Result<(Option<ProjectSnapshot>, Map<String, Value>)> {
     let root = Path::new(&context.root);
     let source = bound_context::source_dir(context)?;
-    ensure_original_or_accepted_files(root, &work.paths)?;
+    if let Err(error) = ensure_original_or_accepted_files(root, &work.paths) {
+        if !error.is::<NewerProjectFiles>() {
+            return Err(error);
+        }
+        // The caller can start editing as soon as its verified reply arrives.
+        // Leave those files alone; the next push reconciles the newer work.
+        return Ok((None, work.summary));
+    }
     let phase = Instant::now();
     let mut stage = ExportProjectStage::create(root, &source, services)?;
     let mut readback = capture_studio_services_in_memory(context, bridge, services, &stage, true)?;
@@ -293,11 +400,26 @@ pub(super) fn settle(
         );
         ensure_original_or_accepted_files(root, &work.paths)
     };
-    let current = publish_checked(stage, root, &work.paths, stable)?;
+    let current = match publish_checked(stage, root, &work.paths, stable) {
+        Ok(current) => current,
+        Err(error) if error.is::<NewerProjectFiles>() => return Ok((None, work.summary)),
+        Err(error) => return Err(error),
+    };
     let id = work.history.commit(&current, &ProjectSnapshot::default())?;
     work.summary.insert("historyId".into(), json!(id));
-    Ok((current, work.summary))
+    Ok((Some(current), work.summary))
 }
+
+#[derive(Debug)]
+struct NewerProjectFiles;
+
+impl std::fmt::Display for NewerProjectFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Project files changed during import settlement; newer files were preserved")
+    }
+}
+
+impl std::error::Error for NewerProjectFiles {}
 
 fn ensure_original_or_accepted_files(root: &Path, paths: &[PathBuf]) -> Result<()> {
     let current = capture_snapshot(root, paths)?;
@@ -312,10 +434,9 @@ fn ensure_original_or_accepted_files(root: &Path, paths: &[PathBuf]) -> Result<(
                 })
         })
     });
-    anyhow::ensure!(
-        files_match,
-        "Project files changed during import settlement; newer files were preserved"
-    );
+    if !files_match {
+        return Err(NewerProjectFiles.into());
+    }
     Ok(())
 }
 
@@ -336,11 +457,10 @@ fn publish_checked(
         &stable,
     )?;
     let current = capture_snapshot(root, paths)?;
+    if current != accepted_files {
+        return Err(NewerProjectFiles.into());
+    }
     history::ensure_published_state(&published, &current)?;
-    anyhow::ensure!(
-        current == accepted_files,
-        "Project files changed while the import was being published; newer files were preserved"
-    );
     Ok(current)
 }
 
@@ -355,50 +475,99 @@ pub(crate) fn before_request(
     if active() {
         return Ok(None);
     }
-    let Some(journal) = Journal::load(context)? else {
-        return Ok(None);
-    };
-    if matches!(operation, op::STUDIO_CLOSE | op::STUDIO_OPEN) {
-        crate::daemon::emit_request_notice(
-            "The project still has an unsettled import. Opening or closing Studio keeps its recovery record; run rbx pl to recover the accepted state.",
-        );
-        return Ok(None);
-    }
+    let ownership = crate::system::project_access::acquire(Path::new(&context.root), || {
+        bridge
+            .active_request_lease()
+            .map_or(Ok(()), |lease| lease.ensure_active())
+    })?;
     let full_pull = operation == op::PULL && {
         let args = automation_pull_args(context, parameters)?;
         let selected = crate::snapshot::import::parse_services(&args.services)?;
-        journal
-            .record
-            .services
+        DEFAULT_SYNC_SERVICES
             .iter()
-            .all(|service| selected.contains(service))
+            .all(|service| selected.iter().any(|name| name == service))
     };
-    if let Some(error) = &journal.record.error {
-        if full_pull {
+    // Do not decode an old/new/corrupt record before accepting the very
+    // recovery command named in its error. Failed pulls leave its bytes intact.
+    if full_pull && pending(context) {
+        crate::daemon::emit_request_notice(
+            "This full pull recovers the unfinished import from Studio. Project files are replaced only by the requested pull.",
+        );
+        RECOVERY_PULL.with(|slot| {
+            *slot.borrow_mut() = Some(RecoveryPull {
+                directory: directory(context),
+                _ownership: ownership,
+            })
+        });
+        return Ok(None);
+    }
+    let full_push = operation == op::PUSH
+        && parameters.get("verify") != Some(&Value::Bool(true))
+        && !super::super::runtime::push_is_filtered(parameters);
+    let journal = match Journal::load(context) {
+        Ok(journal) => journal,
+        Err(error) if full_push => {
             crate::daemon::emit_request_notice(&format!(
-                "The import committed, but settling its files failed: {error}. This pull recovers its accepted state."
+                "Cannot recover the old import record: {error:#}. This push reconciles the current files with Studio."
             ));
-            journal.install()?;
+            resolve_journal(&directory(context))?;
             return Ok(None);
         }
-        bail!(
-            "The import committed, but settling its files failed: {error}. Run rbx pl to recover; the import will not be repeated"
-        );
+        Err(error) => return Err(error),
+    };
+    let Some(journal) = journal else {
+        return Ok(None);
+    };
+    // Version one's old writer created records before committing. A proof
+    // was persisted only after commit and before answering the caller.
+    if journal
+        .record
+        .summary
+        .get("verifiedPushProof")
+        .is_none_or(Value::is_null)
+    {
+        resolve_journal(&journal.directory)?;
+        return Ok(None);
     }
-    if full_pull {
-        journal.install()?;
+    if matches!(operation, op::STUDIO_CLOSE | op::STUDIO_OPEN) {
+        crate::daemon::emit_request_notice(
+            "The project still has an unsettled import. Repeat rbx ps to reconcile your files, or run rbx pl to take Studio's state.",
+        );
         return Ok(None);
     }
     anyhow::ensure!(
-        operation == op::PUSH
-            && parameters.get("verify") != Some(&Value::Bool(true))
-            && !super::super::runtime::push_is_filtered(parameters),
-        "The last import is unsettled after the daemon stopped. Run rbx pl or repeat the whole push to settle it first; the import will not be repeated"
+        full_push,
+        "The last import still needs settlement: {}. Repeat rbx ps to reconcile your files, or run rbx pl to take Studio's state",
+        journal
+            .record
+            .error
+            .as_deref()
+            .unwrap_or("the daemon stopped before settlement finished")
     );
-    anyhow::ensure!(
-        context.runtime_id == journal.record.runtime,
-        "The unsettled import belongs to another Studio session. Run rbx pl to recover its accepted state"
-    );
+    let current = capture_snapshot(Path::new(&context.root), &journal.record.paths)?;
+    let files_match = journal.record.expected.matches(&current)
+        || journal.record.accepted.as_ref().is_some_and(|accepted| {
+            journal
+                .record
+                .expected
+                .matches_partial_publication(accepted, &current)
+        });
+    let retry = journal.record.error.is_some()
+        || context.runtime_id != journal.record.runtime
+        || !files_match;
+    let proof = &journal.record.summary["verifiedPushProof"];
+    if retry || !verified_full_push_proof_matches(context, bridge, proof)? {
+        crate::daemon::emit_request_notice(&format!(
+            "The earlier import was not settled: {}. This push reconciles the current files with Studio and preserves newer file edits.",
+            journal
+                .record
+                .error
+                .as_deref()
+                .unwrap_or("the files or Studio changed")
+        ));
+        resolve_journal(&journal.directory)?;
+        return Ok(None);
+    }
     let packs = journal.directory.join("packs");
     let expected = journal.record.expected.load_at(&packs, |_| true)?;
     let work = ImportWork {
@@ -415,8 +584,8 @@ pub(crate) fn before_request(
     let args = automation_push_args(context, parameters, true)?;
     let same_input = input.as_ref() == Some(&full_push_cache_input(&args, &services)?);
     journal.install()?;
-    recover(context, bridge, &services, work, input)?;
-    if same_input {
+    let settled = recover(context, bridge, &services, work, input)?;
+    if same_input && settled {
         Ok(Some(json!({"ok": true, "unchanged": true})))
     } else {
         finish_request(None)?;
@@ -445,7 +614,7 @@ fn recover(
     services: &[String],
     work: ImportWork,
     input: Option<Value>,
-) -> Result<()> {
+) -> Result<bool> {
     #[cfg(windows)]
     let mut attributes = None;
     let (guard, _) =
@@ -476,6 +645,9 @@ fn recover(
     let (current, _) = settle(context, bridge, services, work, &proof)?;
     release.proof = Some(proof);
     acknowledge_verified_push(bridge, services, &guard, &mut release)?;
+    let Some(current) = current else {
+        return Ok(false);
+    };
     retain_verified_full_push(
         bridge,
         input.as_ref(),
@@ -485,7 +657,28 @@ fn recover(
         #[cfg(windows)]
         &mut attributes,
     );
-    Ok(())
+    Ok(true)
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_running_import(context: &BoundContext) -> Result<()> {
+    let snapshot = ProjectSnapshot::default();
+    begin(
+        context,
+        ImportStart {
+            services: &["Workspace".into()],
+            paths: &[],
+            verification_paths: &HashSet::new(),
+            before: &snapshot,
+            expected: &snapshot,
+            input: None,
+            history_id: "fixture".into(),
+        },
+    )?;
+    committed(
+        &Map::from_iter([("verifiedPushProof".into(), json!({"fixture": true}))]),
+        &snapshot,
+    )
 }
 
 #[cfg(test)]
@@ -527,7 +720,291 @@ mod tests {
                 history_id: "test-history".into(),
             },
         )?;
+        committed(
+            &Map::from_iter([("verifiedPushProof".into(), json!({"test": true}))]),
+            &expected,
+        )?;
         Ok(expected)
+    }
+
+    fn interrupt_test_request() {
+        CURRENT.with(|slot| slot.borrow_mut().take());
+        RUNNING
+            .0
+            .lock_recover()
+            .retain(|entry| entry.owner != thread::current().id());
+        RUNNING.1.notify_all();
+    }
+
+    // Finding 1: both a normal pre-commit error and a process death in the
+    // original writer's pre-commit window must leave the next push usable.
+    #[test]
+    fn uncommitted_failures_and_restart_records_allow_the_next_push() -> Result<()> {
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        for stopped in [false, true] {
+            let root = crate::tests::support::temp_dir("uncommitted-import");
+            let _cleanup = OnDrop::new(|| {
+                let _ = fs::remove_dir_all(&root);
+            });
+            let context = context(&root);
+            begin_test(&context)?;
+            CURRENT.with(|slot| -> Result<()> {
+                let mut slot = slot.borrow_mut();
+                let journal = slot.as_mut().unwrap();
+                journal.record.summary.remove("verifiedPushProof");
+                // Reproduce the old array format, including its premature historyId.
+                atomic_write_file(
+                    &journal.directory.join("pending.rmp"),
+                    &rmp_serde::to_vec(&journal.record)?,
+                )
+            })?;
+            if stopped {
+                interrupt_test_request();
+            } else {
+                finish_request(Some("Studio update was rolled back before commit"))?;
+            }
+            assert!(before_request(&context, &bridge, op::PUSH, &json!({}))?.is_none());
+            assert!(!pending(&context));
+            assert_eq!(fs::read_to_string(root.join("src/A.luau"))?, "return 1");
+        }
+        Ok(())
+    }
+
+    // Finding 2: no engine call or pull is required to preserve a source edit
+    // made immediately after the caller's reply.
+    #[test]
+    fn newer_files_skip_settlement_and_leave_the_next_push_available() -> Result<()> {
+        let root = crate::tests::support::temp_dir("settle-newer-source");
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let context = context(&root);
+        let expected = begin_test(&context)?;
+        let paths = vec![PathBuf::from("src")];
+        let verification_paths = HashSet::from([PathBuf::from("src/A.luau")]);
+        let history =
+            history::SyncHistory::begin(&root, &root.join("src"), &expected, &verification_paths)?;
+        fs::write(root.join("src/A.luau"), "return 2")?;
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        let work = ImportWork {
+            before: ProjectSnapshot::default(),
+            expected,
+            paths,
+            verification_paths,
+            prepared: HashMap::new(),
+            history,
+            summary: Map::new(),
+        };
+        let (published, _) = settle(&context, &bridge, &["Workspace".into()], work, &json!({}))?;
+        assert!(published.is_none());
+        finish_request(None)?;
+        assert!(before_request(&context, &bridge, op::PUSH, &json!({}))?.is_none());
+        assert_eq!(fs::read_to_string(root.join("src/A.luau"))?, "return 2");
+        Ok(())
+    }
+
+    #[test]
+    fn closed_or_changed_studio_and_real_mismatches_allow_repush() -> Result<()> {
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        for changed_runtime in [false, true] {
+            let root = crate::tests::support::temp_dir("settle-repush");
+            let _cleanup = OnDrop::new(|| {
+                let _ = fs::remove_dir_all(&root);
+            });
+            let mut context = context(&root);
+            let expected = begin_test(&context)?;
+            let mut observed = expected.clone();
+            observed.entries.insert(
+                "src/A.luau".into(),
+                SnapshotEntry::File(b"return 999".to_vec()),
+            );
+            let (mismatches, detail) = verify_and_settle_native_import(
+                &ProjectSnapshot::default(),
+                &expected,
+                &mut observed,
+                &HashSet::from(["src/A.luau".into()]),
+                &mut HashMap::new(),
+            )?;
+            assert!(!mismatches.is_empty());
+            let error = retention_failure("pushed project changes", &mismatches, detail.as_deref());
+            finish_request(Some(&format!("{error:#}")))?;
+            if changed_runtime {
+                context.runtime_id = Some("reopened-studio".into());
+            }
+            assert!(before_request(&context, &bridge, op::PUSH, &json!({}))?.is_none());
+            assert_eq!(fs::read_to_string(root.join("src/A.luau"))?, "return 1");
+            assert!(!pending(&context));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn restart_with_a_lost_import_or_newer_files_allows_push_without_pull() -> Result<()> {
+        for newer_files in [false, true] {
+            let root = crate::tests::support::temp_dir("settle-restart-repush");
+            let _cleanup = OnDrop::new(|| {
+                let _ = fs::remove_dir_all(&root);
+            });
+            let mut context = context(&root);
+            begin_test(&context)?;
+            interrupt_test_request();
+            if newer_files {
+                fs::write(root.join("src/A.luau"), "newer source")?;
+            } else {
+                context.runtime_id = Some("reopened-unsaved-place".into());
+            }
+            let bridge = crate::studio::bridge::routing_tests::fixture();
+            assert!(before_request(&context, &bridge, op::PUSH, &json!({}))?.is_none());
+            assert!(!pending(&context));
+            assert_eq!(
+                fs::read_to_string(root.join("src/A.luau"))?,
+                if newer_files {
+                    "newer source"
+                } else {
+                    "return 1"
+                }
+            );
+        }
+        Ok(())
+    }
+
+    // Findings 3 and 6: recovery does not need a decodable record, and a
+    // failed pull cannot replace its original error with its own failure.
+    #[test]
+    fn full_pull_recovers_newer_or_malformed_journals_and_preserves_failed_attempts() -> Result<()>
+    {
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        for bytes in [
+            rmp_serde::to_vec_named(&json!({"version": 2, "future": "field"}))?,
+            vec![0xc1],
+        ] {
+            let root = crate::tests::support::temp_dir("settle-future-journal");
+            let _cleanup = OnDrop::new(|| {
+                let _ = fs::remove_dir_all(&root);
+            });
+            let context = context(&root);
+            begin_test(&context)?;
+            interrupt_test_request();
+            let file = directory(&context).join("pending.rmp");
+            fs::write(&file, &bytes)?;
+            assert!(Journal::load(&context).is_err());
+            assert!(before_request(&context, &bridge, op::PULL, &json!({}))?.is_none());
+            finish_request(Some("Studio closed during the recovery pull"))?;
+            assert_eq!(fs::read(&file)?, bytes);
+            assert!(before_request(&context, &bridge, op::PULL, &json!({}))?.is_none());
+            finish_request(None)?;
+            assert!(!pending(&context));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compatible_journal_fields_and_original_failure_survive_recovery() -> Result<()> {
+        let root = crate::tests::support::temp_dir("settle-journal-fields");
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let context = context(&root);
+        begin_test(&context)?;
+        finish_request(Some("original verification failure"))?;
+        let file = directory(&context).join("pending.rmp");
+        let mut map: Value = rmp_serde::from_slice(&fs::read(&file)?)?;
+        map.as_object_mut().unwrap().remove("journal_id");
+        map["compatibleFutureField"] = json!({"a": 1});
+        fs::write(&file, rmp_serde::to_vec_named(&map)?)?;
+        assert_eq!(
+            Journal::load(&context)?.unwrap().record.error.as_deref(),
+            Some("original verification failure")
+        );
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        before_request(&context, &bridge, op::PULL, &json!({}))?;
+        finish_request(Some("second failure while pulling"))?;
+        assert_eq!(
+            Journal::load(&context)?.unwrap().record.error.as_deref(),
+            Some("original verification failure")
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn completed_settlement_stays_complete_when_pending_file_cannot_be_deleted() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = crate::tests::support::temp_dir("settle-cleanup-sharing");
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let context = context(&root);
+        begin_test(&context)?;
+        let file = directory(&context).join("pending.rmp");
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&file)?;
+        finish_request(None)?;
+        assert!(file.exists());
+        assert!(!pending(&context));
+        assert!(Journal::load(&context)?.is_none());
+        drop(held);
+        // A marker for the prior exact bytes cannot resolve the next import.
+        begin_test(&context)?;
+        assert!(pending(&context));
+        finish_request(None)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_daemon_cannot_recover_a_live_journal_and_process_death_releases_it() -> Result<()> {
+        const ENV: &str = "RENIUM_TEST_SETTLE_SECOND_DAEMON";
+        if let Some(root) = std::env::var_os(ENV) {
+            let root = PathBuf::from(root);
+            let context = context(&root);
+            begin_test(&context)?;
+            fs::write(root.join("owner-ready"), [])?;
+            // Parent kills this process: no Rust destructor runs.
+            loop {
+                thread::park_timeout(Duration::from_secs(1));
+            }
+        }
+        let root = crate::tests::support::temp_dir("settle-two-daemons");
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let mut owner = crate::system::tools::hidden_command(std::env::current_exe()?)
+            .args(["--exact", "automation::reconcile::import_settle::tests::a_second_daemon_cannot_recover_a_live_journal_and_process_death_releases_it"])
+            .env(ENV, &root).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !root.join("owner-ready").exists() && Instant::now() < deadline {
+            anyhow::ensure!(
+                owner.try_wait()?.is_none(),
+                "owner process failed before taking its journal"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let context = context(&root);
+        let original = fs::read(directory(&context).join("pending.rmp"))?;
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        thread::scope(|scope| -> Result<()> {
+            let (done, received) = std::sync::mpsc::channel();
+            let context = &context;
+            let bridge = &bridge;
+            scope.spawn(move || {
+                let result = before_request(context, bridge, op::PULL, &json!({}));
+                let _ = done.send(result.map(|_| ()));
+                let _ = finish_request(Some("recovery pull failed"));
+            });
+            let blocked = received.recv_timeout(Duration::from_millis(150)).is_err();
+            let unchanged = fs::read(directory(context).join("pending.rmp"))? == original;
+            owner.kill()?;
+            owner.wait()?;
+            // Always release the child before asserting, including on baseline.
+            assert!(blocked, "another daemon recovered a live owner's journal");
+            assert!(unchanged);
+            received.recv_timeout(Duration::from_secs(5))??;
+            Ok(())
+        })?;
+        assert_eq!(fs::read(directory(&context).join("pending.rmp"))?, original);
+        Ok(())
     }
 
     #[test]

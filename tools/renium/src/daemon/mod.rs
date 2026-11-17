@@ -348,6 +348,25 @@ pub(crate) fn can_respond_before_settle() -> bool {
     EARLY_RESPONSE.with(|slot| slot.borrow().as_ref().is_some_and(|reply| !reply.sent))
 }
 
+#[cfg(test)]
+pub(crate) fn fixture_early_response() -> impl Drop {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    EARLY_RESPONSE.with(|slot| {
+        *slot.borrow_mut() = Some(EarlyResponse {
+            stream: stream.into(),
+            id: 1,
+            started: std::time::Instant::now(),
+            sent: false,
+        })
+    });
+    crate::system::files::OnDrop::new(move || {
+        EARLY_RESPONSE.with(|slot| slot.borrow_mut().take());
+        drop(client);
+    })
+}
+
 /// The request thread becomes the daemon's continuation. Its stack still
 /// owns the Edit gate, tracking guard, selection and Live Sync pause.
 /// The caller must switch to a daemon lease and persist recovery first.

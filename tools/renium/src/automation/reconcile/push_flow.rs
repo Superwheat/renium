@@ -433,23 +433,8 @@ pub(crate) fn push_project(
         );
     }
     #[cfg(any(windows, target_os = "macos"))]
-    let journaled = settle_native_import
+    let can_settle_in_background = settle_native_import
         && import_settle::can_continue(&stage, requires_stage, link_enforcement.is_some());
-    #[cfg(any(windows, target_os = "macos"))]
-    if journaled {
-        import_settle::begin(
-            context,
-            import_settle::ImportStart {
-                services,
-                paths: &source_paths,
-                verification_paths: &mutation_paths,
-                before: &studio,
-                expected: &project,
-                input: cache_input.as_ref(),
-                history_id: history.id()?,
-            },
-        )?;
-    }
     let mut pushed = push_staged_project(
         context,
         &stage,
@@ -490,7 +475,7 @@ pub(crate) fn push_project(
     }
 
     #[cfg(any(windows, target_os = "macos"))]
-    if let Some(proof) = journaled
+    if let Some(proof) = can_settle_in_background
         .then_some(())
         .filter(|_| replacement.is_none())
         .and_then(|()| committed_import_proof(context, &pushed.summary, &mutation_paths, services))
@@ -501,8 +486,23 @@ pub(crate) fn push_project(
         );
         let mut expected = project;
         expected.entries.extend(pushed.generated.entries);
+        // A journal records only a verified Studio commit whose caller can
+        // leave before publication. Failed/review-held pushes and synchronous
+        // readback never create recovery obligations.
+        import_settle::begin(
+            context,
+            import_settle::ImportStart {
+                services,
+                paths: &source_paths,
+                verification_paths: &mutation_paths,
+                before: &studio,
+                expected: &expected,
+                input: cache_input.as_ref(),
+                history_id: history.id()?,
+            },
+        )?;
         import_settle::committed(&pushed.summary, &expected)?;
-        bridge.continue_request_lease()?;
+        import_settle::continue_request(context, bridge)?;
         crate::automation::runtime::respond_to_verified_import(context, bridge, &pushed.summary);
         let (current, summary) = import_settle::settle(
             context,
@@ -525,15 +525,17 @@ pub(crate) fn push_project(
             tracking_release.retained_proof.is_some(),
             "Studio changed before import settlement was acknowledged"
         );
-        retain_verified_full_push(
-            bridge,
-            cache_input.as_ref(),
-            &source_paths,
-            current,
-            &tracking_release,
-            #[cfg(windows)]
-            &mut _native_attributes,
-        );
+        if let Some(current) = current {
+            retain_verified_full_push(
+                bridge,
+                cache_input.as_ref(),
+                &source_paths,
+                current,
+                &tracking_release,
+                #[cfg(windows)]
+                &mut _native_attributes,
+            );
+        }
         return Ok(summary);
     }
 
@@ -705,11 +707,6 @@ pub(crate) fn push_project(
         // changes outside that exact result invalidate the source snapshot.
         tracking_release.proof = pushed.summary.remove("verifiedPushProof");
     }
-    #[cfg(any(windows, target_os = "macos"))]
-    anyhow::ensure!(
-        !journaled || files_unchanged,
-        "Project files changed during import settlement; newer files were preserved"
-    );
     acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
     #[cfg(any(windows, target_os = "macos"))]
     retain_verified_full_push(
@@ -1046,6 +1043,10 @@ pub(crate) fn capture_studio_services_in_memory(
     stage: &ExportProjectStage,
     preserve_saved_settings: bool,
 ) -> Result<ProjectSnapshot> {
+    #[cfg(all(test, any(windows, target_os = "macos")))]
+    if let Some(result) = super::push_flow_tests::capture(context) {
+        return result;
+    }
     pin_edit_runtime(context, bridge)?;
     let mut args = automation_pull_args(context, &json!({"services": services}))?;
     args.project_root.clone_from(&stage.import_project_root);

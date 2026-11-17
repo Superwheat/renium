@@ -61,6 +61,52 @@ fn cancellation_before_the_continuation_handoff_fails_closed() {
 }
 
 #[test]
+fn cancelled_settlement_read_does_not_wait_for_a_hung_studio() {
+    let bridge = Arc::new(fixture());
+    let stream = connect(&bridge, 0, edit_info("hung-settlement", 20));
+    let (started, request_seen) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let peer = thread::spawn(move || {
+        let mut socket =
+            WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Client, None);
+        socket.read().unwrap();
+        started.send(()).unwrap();
+        released.recv().unwrap(); // Never answer the read or cancellation.
+    });
+    let (lease_sender, leases) = std::sync::mpsc::channel();
+    let (done, results) = std::sync::mpsc::channel();
+    let worker_bridge = Arc::clone(&bridge);
+    let worker = thread::spawn(move || {
+        let client = Arc::new(BridgeRequestLease::new("hung-client".into()));
+        let _active = worker_bridge.activate_request_lease(client).unwrap();
+        worker_bridge.continue_request_lease().unwrap();
+        lease_sender
+            .send(worker_bridge.active_request_lease().unwrap())
+            .unwrap();
+        let result = worker_bridge.call_for_runtime_with_timeout(
+            "getStudioChangeState",
+            json!({"start":false}),
+            BridgeTarget::Edit,
+            "hung-settlement",
+            Some(Duration::from_secs(5)),
+        );
+        done.send(result.map_err(|error| error.to_string()))
+            .unwrap();
+    });
+    let lease = leases.recv().unwrap();
+    request_seen.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(lease.cancel());
+    let response = results.recv_timeout(Duration::from_secs(1));
+    release.send(()).unwrap();
+    peer.join().unwrap();
+    worker.join().unwrap();
+    let error = response
+        .expect("settlement still waits for an unresponsive Studio")
+        .unwrap_err();
+    assert!(error.contains("settlement was cancelled"), "{error}");
+}
+
+#[test]
 fn unfiltered_verify_uses_only_plugin_sources_when_native_capture_is_unavailable() {
     use crate::automation::authorization::signed_fixture_request;
     use crate::automation::{State, op, runtime::automation_parse_response_with_lease};

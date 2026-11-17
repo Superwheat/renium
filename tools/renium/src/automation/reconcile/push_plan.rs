@@ -84,6 +84,10 @@ pub(crate) fn push_staged_project(
     bridge: &BridgeServer,
     request: StagedPushRequest<'_>,
 ) -> Result<StagedPushResult> {
+    #[cfg(all(test, any(windows, target_os = "macos")))]
+    if let Some(result) = super::push_flow_tests::mutation(context, &request) {
+        return result;
+    }
     let StagedPushRequest {
         plan,
         prepared_documents,

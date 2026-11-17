@@ -527,6 +527,16 @@ impl Mirror {
             if self.watcher.take_overflowed() {
                 rescan = true;
             }
+            // Keep notifications queued while a project request publishes its
+            // files. A stopped mirror must not wait behind that request.
+            let _project_access = match crate::system::project_access::try_acquire(&self.root) {
+                Ok(Some(held)) => held,
+                Ok(None) => continue,
+                Err(error) => {
+                    *self.stats.error.lock_recover() = Some(format!("{error:#}"));
+                    continue;
+                }
+            };
             if let Err(error) = self.flush_remote() {
                 *self.stats.error.lock_recover() = Some(format!("{error:#}"));
             }
@@ -958,6 +968,53 @@ mod tests {
 
     fn joined_pair() -> (Side, Side) {
         join(Side::new("collab-host", 1), Side::new("collab-guest", 2))
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn background_collaboration_keeps_remote_edits_queued_during_settlement() {
+        let (mut host, mut guest) = joined_pair();
+        host.save("remote edit\n");
+        host.flush_save();
+        send(&host, &guest);
+        let context = crate::automation::BoundContext {
+            id: 1,
+            initialized: true,
+            project: guest
+                .root
+                .join("renium.project.jsonc")
+                .display()
+                .to_string(),
+            root: guest.root.display().to_string(),
+            source: guest.root.join("src").display().to_string(),
+            experience: String::new(),
+            resource_lease: None,
+            place_id: None,
+            game_id: None,
+            selector: String::new(),
+            runtime_id: Some("collab-settle".into()),
+            plugin_build: None,
+            fingerprint: String::new(),
+        };
+        crate::automation::reconcile::import_settle::fixture_running_import(&context).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let mut mirror = guest.mirror.take().unwrap();
+        let task = std::thread::spawn(move || {
+            mirror.run(&worker_stop);
+            mirror
+        });
+        std::thread::sleep(POLL * 3);
+        let stayed = guest.read() == FIVE;
+        crate::automation::reconcile::import_settle::finish_request(None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while guest.read() == FIVE && Instant::now() < deadline {
+            std::thread::sleep(POLL);
+        }
+        stop.store(true, Ordering::Release);
+        guest.mirror = Some(task.join().unwrap());
+        assert!(stayed, "the collaboration worker wrote through settlement");
+        assert_eq!(guest.read(), "remote edit\n");
     }
 
     fn join(mut host: Side, mut guest: Side) -> (Side, Side) {

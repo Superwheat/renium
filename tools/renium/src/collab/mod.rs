@@ -373,6 +373,10 @@ impl Session {
             }
             *self.error.lock_recover() = None;
         }
+        let project_access = crate::system::project_access::acquire(&self.root, || {
+            anyhow::ensure!(!self.stop.load(Ordering::Acquire), "Collaboration stopped");
+            Ok(())
+        })?;
         let mut mirror = Mirror::open(
             &self.root,
             &self.name,
@@ -392,6 +396,7 @@ impl Session {
             mirror.refresh_inputs()?;
         }
         self.ready.store(true, Ordering::Release);
+        drop(project_access);
         mirror.run(&self.stop);
         Ok(())
     }

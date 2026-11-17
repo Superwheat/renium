@@ -696,6 +696,7 @@ pub(crate) struct BridgeServer {
 pub(crate) struct BridgeRequestLease {
     id: String,
     state: AtomicU8,
+    continuation: bool,
     /// The Edit runtime that last took a call under this lease: where the
     /// lease's cancellation goes, whatever the shared pins say by then.
     edit_runtime: Mutex<Option<String>>,
@@ -900,6 +901,7 @@ impl BridgeRequestLease {
         Self {
             id,
             state: AtomicU8::new(REQUEST_LEASE_PENDING),
+            continuation: false,
             edit_runtime: Mutex::new(None),
         }
     }
@@ -993,6 +995,11 @@ impl BridgeRequestLease {
 
     pub(crate) fn ensure_active(&self) -> Result<()> {
         if self.is_cancelled() {
+            if self.continuation {
+                bail!(
+                    "Import settlement was cancelled; repeat rbx ps to reconcile your files, or rbx pl to take Studio's state"
+                );
+            }
             bail!("Renium request was cancelled because its client disconnected");
         }
         Ok(())
@@ -1610,7 +1617,9 @@ impl BridgeServer {
         let previous = active
             .get(&thread_id)
             .context("No request lease to continue")?;
-        let lease = Arc::new(BridgeRequestLease::new(format!("{}-settle", previous.id)));
+        let mut lease = BridgeRequestLease::new(format!("{}-settle", previous.id));
+        lease.continuation = true;
+        let lease = Arc::new(lease);
         lease.arm()?;
         previous
             .state
@@ -4513,6 +4522,15 @@ impl BridgeServer {
         let mut cancel_acknowledged = false;
         let mut original_response: Option<Result<BridgeResponse>> = None;
         loop {
+            if let Some(lease) = bridge_socket.active_request_lease.as_deref()
+                && lease.continuation
+                && lease.is_cancelled()
+            {
+                // This tail only reads accepted state. Abandon its socket and
+                // journal the cancellation even when Studio cannot acknowledge.
+                // Mutating requests retain the ordinary cancellation handshake.
+                lease.ensure_active()?;
+            }
             if cancel_acknowledged && let Some(response) = original_response.take() {
                 return response;
             }
