@@ -177,18 +177,22 @@ class Context:
         return (self.root / relative).read_text(encoding="utf-8")
 
     def open_studio(self, wait: int = 120):
-        # Only a launch is spaced: a row that asks for the Studio its session
-        # already holds must not queue behind every other session's launches.
-        if not self.studio_open:
-            self.launch_wait += space_studio_launch()
-        result = self.rbx("so", self.place, json_mode=True, timeout=wait + 30)
+        # Only a launch takes a turn: a row that asks for the Studio its
+        # session already holds must not queue behind every other launch.
+        if self.studio_open:
+            result = self.rbx("so", self.place, json_mode=True, timeout=wait + 30)
+        else:
+            with LaunchTurn() as turn:
+                result = self.rbx("so", self.place, json_mode=True, timeout=wait + 30)
+            self.launch_wait += turn.waited
         self.studio_open = True
         self.guard_binding()
         return result
 
     def reopen_studio(self, wait: int = 120):
-        self.launch_wait += space_studio_launch()
-        result = self.rbx("ro", json_mode=True, timeout=wait + 30)
+        with LaunchTurn() as turn:
+            result = self.rbx("ro", json_mode=True, timeout=wait + 30)
+        self.launch_wait += turn.waited
         self.studio_open = True
         self.guard_binding()
         return result
@@ -632,50 +636,45 @@ def request_abort(reason: str) -> None:
     ABORT_FILE.write_text(reason, encoding="utf-8")
 
 
-# macOS needs the long gap (see space_studio_launch); Windows only needs the
-# launches not to land in the same instant.
-STUDIO_LAUNCH_GAP_SECONDS = float(os.environ.get("RENIUM_SCENARIO_LAUNCH_GAP", "8" if os.name != "nt" else "3"))
+# The least time between two Studio starts, beyond each waiting for the one
+# before it (see LaunchTurn): macOS needs it, Windows does not.
+STUDIO_LAUNCH_GAP_SECONDS = float(os.environ.get("RENIUM_SCENARIO_LAUNCH_GAP", "8" if os.name != "nt" else "0"))
 # Shards start this far apart so their first daemon calls do not pile up.
 SHARD_START_GAP_SECONDS = 5
 
 
-def space_studio_launch() -> float:
-    """Studio windows start at least STUDIO_LAUNCH_GAP_SECONDS apart across every
-    session on this machine: on macOS two windows starting together sign the
-    account out of Studio (the second refreshes the session with a replaced
-    cookie and is answered 401). Returns the seconds the caller waited."""
-    SESSION_ROOT.mkdir(parents=True, exist_ok=True)
-    lock = SESSION_ROOT / ".studio-launch.lock"
-    stamp = SESSION_ROOT / ".studio-launch.at"
-    started = time.monotonic()
-    deadline = started + 120
-    while time.monotonic() < deadline:
+class LaunchTurn:
+    """One Studio starts at a time across every session on this machine: the
+    turn is held until the command that opens it returns, which is when it
+    has connected. Startups that overlap slow each other down (on Windows
+    each one that begins inside another's takes about 5 s longer) until, with
+    many sessions, launches time out; and on macOS two windows starting
+    together sign the account out of Studio (the second refreshes the session
+    with a replaced cookie and is answered 401), so there a start also keeps
+    STUDIO_LAUNCH_GAP_SECONDS from the one before it. `waited` is how long
+    the turn took to come."""
+
+    def __enter__(self):
+        started = time.monotonic()
+        SESSION_ROOT.mkdir(parents=True, exist_ok=True)
+        self.handle = open(SESSION_ROOT / ".studio-launch.turn", "a+")
+        while not lock_file(self.handle, False):
+            time.sleep(0.25)
+        self.stamp = SESSION_ROOT / ".studio-launch.at"
         try:
-            handle = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except (FileExistsError, PermissionError):
-            # Windows answers "permission denied" while another runner's
-            # unlink of the lock is still pending; it is the same wait.
-            try:
-                if time.time() - lock.stat().st_mtime > 60:
-                    lock.unlink(missing_ok=True)
-            except OSError:
-                pass
-            time.sleep(0.2)
-            continue
-        try:
-            try:
-                last = float(stamp.read_text(encoding="utf-8").strip() or 0)
-            except (OSError, ValueError):
-                last = 0.0
-            wait = STUDIO_LAUNCH_GAP_SECONDS - (time.time() - last)
-            if wait > 0:
-                time.sleep(wait)
-            stamp.write_text(str(time.time()), encoding="utf-8")
-            return time.monotonic() - started
-        finally:
-            os.close(handle)
-            lock.unlink(missing_ok=True)
-    return time.monotonic() - started
+            last = float(self.stamp.read_text(encoding="utf-8").strip() or 0)
+        except (OSError, ValueError):
+            last = 0.0
+        wait = STUDIO_LAUNCH_GAP_SECONDS - (time.time() - last)
+        if wait > 0:
+            time.sleep(wait)
+        self.stamp.write_text(str(time.time()), encoding="utf-8")
+        self.waited = time.monotonic() - started
+        return self
+
+    def __exit__(self, *_):
+        unlock_file(self.handle)
+        self.handle.close()
 
 
 class RowGate:
@@ -849,6 +848,72 @@ def run_scenario(scenario: Scenario, keep: bool) -> dict:
         return run_scenario_locked(scenario, keep)
 
 
+# A session's Studio grows with every playtest it ran (measured: up to 4 GB
+# after a few minutes of rows). Studio holds back a new window with a "Low
+# System Resources" notice, or refuses it ("maximum allowed Studio windows"),
+# once the machine runs short, so a Studio this large is reopened between
+# rows, and one half this large when little memory is free.
+STUDIO_REOPEN_MB = float(os.environ.get("RENIUM_SCENARIO_STUDIO_MB", "3000"))
+LOW_FREE_MB = float(os.environ.get("RENIUM_SCENARIO_LOW_FREE_MB", "6000"))
+
+
+def process_megabytes(pid: int) -> float:
+    """The memory a process holds (its working set), 0 when it cannot be read."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class Counters(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+                    (name, ctypes.c_size_t)
+                    for name in ("PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")
+                ]
+
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            handle = kernel.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return 0.0
+            try:
+                counters = Counters()
+                counters.cb = ctypes.sizeof(Counters)
+                kernel.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD]
+                if not kernel.K32GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+                    return 0.0
+                return counters.WorkingSetSize / 1048576
+            finally:
+                kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+                kernel.CloseHandle(handle)
+        listing = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True, timeout=30).stdout.strip()
+        return float(listing) / 1024 if listing else 0.0
+    except Exception:
+        return 0.0
+
+
+def free_megabytes() -> float:
+    """Free physical memory; infinite where it is not read (only Windows is)."""
+    if os.name != "nt":
+        return float("inf")
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class Status(ctypes.Structure):
+            _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD)] + [
+                (name, ctypes.c_ulonglong)
+                for name in ("ullTotalPhys", "ullAvailPhys", "ullTotalPageFile", "ullAvailPageFile", "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")
+            ]
+
+        status = Status()
+        status.dwLength = ctypes.sizeof(Status)
+        if not ctypes.WinDLL("kernel32").GlobalMemoryStatusEx(ctypes.byref(status)):
+            return float("inf")
+        return status.ullAvailPhys / 1048576
+    except Exception:
+        return float("inf")
+
+
 SERVICE_COUNTS = (
     "local t = {} for _, s in ipairs({'Workspace','ReplicatedStorage','ServerScriptService','ServerStorage','StarterPlayer',"
     "'StarterGui','StarterPack','ReplicatedFirst','Lighting','SoundService','Teams','TextChatService'}) do "
@@ -879,6 +944,7 @@ class Session:
         self.counts: dict | None = None
         self.reopens = 0
         self.resets = 0
+        self.recycles = 0
         self.environment = dict(os.environ)
         self.slot = StudioSlot()
 
@@ -924,8 +990,9 @@ class Session:
     def open_studio(self, ctx: Context):
         self.slot.acquire()
         self.restore_place()
-        ctx.launch_wait += space_studio_launch()
-        ctx.rbx("so", self.place, timeout=150)
+        with LaunchTurn() as turn:
+            ctx.rbx("so", self.place, timeout=150)
+        ctx.launch_wait += turn.waited
         ctx.studio_open = True
         self.studio_open = True
         ctx.guard_binding()
@@ -962,6 +1029,12 @@ class Session:
                 raise_if_needs_user(str(error))
                 self.close_studio(ctx)
         if self.studio_open:
+            held = self.studio_megabytes(ctx)
+            if held >= STUDIO_REOPEN_MB or (held >= STUDIO_REOPEN_MB / 2 and free_megabytes() < LOW_FREE_MB):
+                ctx.log.append(f"# Studio holds {held:.0f} MB with {free_megabytes():.0f} MB free; reopening it")
+                self.close_studio(ctx)
+                self.recycles += 1
+        if self.studio_open:
             ctx.rbx("play", "-x", ok=None, timeout=60)
             ctx.rbx("lof", ok=None, timeout=60)
             ctx.rbx("dp", ok=None, timeout=60)
@@ -988,6 +1061,12 @@ class Session:
         self.open_studio(ctx)
         self.reopens += 1
         return "reopen"
+
+    def studio_megabytes(self, ctx: Context) -> float:
+        """The memory this session's Studio holds."""
+        status = ctx.rbx("status", ok=None, timeout=60)
+        pids = [int(c["pid"]) for c in (status.get("clients") or []) if c.get("role") == "edit" and c.get("pid")]
+        return max((process_megabytes(pid) for pid in pids), default=0.0)
 
     def finish(self, ctx: Context, keep: bool):
         self.close_studio(ctx)
@@ -1093,7 +1172,7 @@ def run_session(scenarios: list[Scenario], size: str, label: str, keep: bool, or
     finally:
         session.finish(ctx, keep or failed_any)
         row_lock.close()
-        print(f"session {label}: {session.resets} resets by push, {session.reopens} reopens", flush=True)
+        print(f"session {label}: {session.resets} resets by push, {session.reopens} reopens, {session.recycles} reopened for memory", flush=True)
     return outcomes
 
 

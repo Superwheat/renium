@@ -99,7 +99,7 @@ def session_rows(reset_errors=(), fail_first=None) -> tuple[list[str], int]:
             self.log, self.studio_open, self.row_started, self.launch_wait = [], True, 0.0, 0.0
 
     class StubSession:
-        resets = reopens = 0
+        resets = reopens = recycles = 0
         root = WORK / "stub-session"
         slot = types.SimpleNamespace(acquire=lambda: None)
 
@@ -153,7 +153,8 @@ def reset_after_a_failed_push(error: str) -> str:
     """The real Session.reset when its push fails with `error`: how it recovered,
     or what it raised."""
     session = object.__new__(run.Session)
-    session.environment, session.studio_open, session.counts, session.resets, session.reopens = dict(os.environ), True, {}, 0, 0
+    session.environment, session.studio_open, session.counts, session.resets, session.reopens, session.recycles = dict(os.environ), True, {}, 0, 0, 0
+    session.studio_megabytes = lambda ctx: 0.0
     session.restore_files = lambda: None
     session.close_studio = session.open_studio = lambda ctx: None
     ctx = types.SimpleNamespace(log=[], studio_open=True, guard_binding=lambda: None, luau=lambda source: {},

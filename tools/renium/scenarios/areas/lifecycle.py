@@ -1483,7 +1483,7 @@ SCENARIOS = [
     Scenario("LIFE-025", "so binds the last opened place", "small", slotted(so_binds_the_last_opened_place)),
     Scenario("LIFE-027", "daemon listing and restart", "small", slotted(daemon_listing_and_restart), default_daemon=True),
     Scenario("LIFE-028", "dm list fields", "small", daemon_list_fields, needs_studio=False, default_daemon=True),
-    Scenario("LIFE-029", "stale discovery cleanup", "small", stale_discovery_cleanup, needs_studio=False),
+    Scenario("LIFE-029", "stale discovery cleanup", "small", stale_discovery_cleanup, needs_studio=False, default_daemon=True),
     Scenario("LIFE-030", "named daemon isolation", "small", slotted(named_daemon_isolation), default_daemon=True),
     Scenario("LIFE-031", "--daemon NAME auto-start", "small", named_daemon_auto_start, needs_studio=False, default_daemon=True),
     Scenario("LIFE-033", "bd beside the default daemon", "small", bd_beside_the_default, needs_studio=False, default_daemon=True),
