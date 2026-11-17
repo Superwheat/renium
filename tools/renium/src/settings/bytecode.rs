@@ -1346,10 +1346,37 @@ fn encode_settings_bytecode_payload_collected(
     Ok(writer)
 }
 
+/// The level every store is compressed at. Level 6 with long-distance
+/// matching on several threads takes the time level 1 took on one, and a
+/// large store comes out a sixth smaller.
+const STORE_COMPRESSION_LEVEL: i32 = 6;
+/// How far back a match may lie: a store repeats values megabytes apart.
+/// Every zstd reader accepts this window without being told to.
+const STORE_WINDOW_LOG: u32 = 27;
+/// A payload from this size on is searched for distant matches and split
+/// over threads. What a store's bytes are depends on its size alone, never on
+/// the machine: zstd cuts the work by size, not by how many threads take it.
+const LARGE_STORE_PAYLOAD_BYTES: usize = 1 << 20;
+
+fn compression_workers() -> u32 {
+    thread::available_parallelism().map_or(1, |cores| cores.get().min(8) as u32)
+}
+
+fn compress_store_payload(payload: &[u8], workers: u32) -> Result<Vec<u8>> {
+    use zstd::zstd_safe::CParameter;
+    let mut compressor = zstd::bulk::Compressor::new(STORE_COMPRESSION_LEVEL)?;
+    if payload.len() >= LARGE_STORE_PAYLOAD_BYTES {
+        compressor.set_parameter(CParameter::EnableLongDistanceMatching(true))?;
+        compressor.set_parameter(CParameter::WindowLog(STORE_WINDOW_LOG))?;
+        compressor.set_parameter(CParameter::NbWorkers(workers.max(1)))?;
+    }
+    Ok(compressor.compress(payload)?)
+}
+
 fn wrap_settings_bytecode_payload(payload: &[u8]) -> Result<Vec<u8>> {
     let _span = crate::app::profile::span("store compress");
     check_settings_payload_len(payload.len(), "Decoded")?;
-    let zstd = zstd::bulk::compress(payload, 1)?;
+    let zstd = compress_store_payload(payload, compression_workers())?;
     check_settings_payload_len(zstd.len(), "Compressed")?;
     let mut writer = Vec::with_capacity(
         SETTINGS_BINARY_MAGIC.len()
@@ -4770,6 +4797,43 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A store's bytes are the same on every machine: the number of threads
+    /// that compress a large payload does not show in them, and a small
+    /// payload never takes the large path.
+    #[test]
+    fn a_store_payload_compresses_to_the_same_bytes_on_any_number_of_threads() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut payload = Vec::with_capacity(6 << 20);
+        while payload.len() < 6 << 20 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let length = 64 + (state >> 40) as usize % 4_000;
+            // Runs that repeat far apart, as a store's values do.
+            if state.is_multiple_of(3) && payload.len() > length {
+                let from = (state >> 8) as usize % (payload.len() - length);
+                payload.extend_from_within(from..from + length);
+            } else {
+                payload.extend(state.to_le_bytes().iter().cycle().take(length));
+            }
+        }
+        let one = compress_store_payload(&payload, 1).unwrap();
+        for workers in [2, 8, 32] {
+            assert!(
+                one == compress_store_payload(&payload, workers).unwrap(),
+                "{workers} threads"
+            );
+        }
+        assert!(zstd::bulk::decompress(&one, payload.len()).unwrap() == payload);
+        assert!(one.len() < zstd::bulk::compress(&payload, 1).unwrap().len());
+
+        let small = &payload[..LARGE_STORE_PAYLOAD_BYTES - 1];
+        let packed = compress_store_payload(small, 1).unwrap();
+        assert!(packed == compress_store_payload(small, 8).unwrap());
+        assert!(packed == zstd::bulk::compress(small, STORE_COMPRESSION_LEVEL).unwrap());
+        assert!(zstd::bulk::decompress(&packed, small.len()).unwrap() == small);
+    }
 
     #[test]
     fn large_numeric_columns_preserve_values_order_and_validation() {
