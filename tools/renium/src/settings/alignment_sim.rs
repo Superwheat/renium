@@ -711,4 +711,11 @@ fn a_stored_camera_without_an_enum_type_makes_the_answer_follow_the_camera() {
     assert!(!viewport_camera_lacks_enum_types(&settings_document(
         workspace_with_camera("ws", "cam")
     )));
+    // An enum property of the camera itself never gains a type.
+    let mut plain = workspace_with_camera("ws", "cam");
+    plain[1].properties.insert(
+        "CameraType".into(),
+        json!({"_type":"EnumItem", "name":"Fixed"}),
+    );
+    assert!(!viewport_camera_lacks_enum_types(&settings_document(plain)));
 }
