@@ -28,15 +28,15 @@ pub(super) fn mutation(
         .map(|mutation| mutation(context, request))
 }
 
-struct Fixture {
-    context: BoundContext,
-    bridge: Option<BridgeServer>,
+pub(super) struct Fixture {
+    pub(super) context: BoundContext,
+    pub(super) bridge: Option<BridgeServer>,
     plugin: Option<thread::JoinHandle<()>>,
-    desired: ProjectSnapshot,
+    pub(super) desired: ProjectSnapshot,
 }
 
 impl Fixture {
-    fn new() -> Result<Self> {
+    pub(super) fn new() -> Result<Self> {
         let root = crate::tests::support::temp_dir("push-coordinator-settle");
         fs::write(
             root.join("renium.project.jsonc"),
@@ -97,7 +97,10 @@ impl Fixture {
                     Some("getStudioChangeState" | "getStudioState")
                 ));
                 let reply = json!({"id":request["id"], "ok":true, "result":{
-                    "pushProofMatches":true, "retainedPushProof":{"test":true}, "retainedPushProofLocal":true
+                    "pushProofMatches":request["params"]["verifyPushProof"]["expired"] != true,
+                    "retainedPushProof":{"test":true}, "retainedPushProofLocal":true,
+                    "verifiedPushProof":{"test":true}, "runtimeId":"push-fixture",
+                    "seq":0, "tracking":true, "serviceGenerations":{"ReplicatedStorage":0}
                 }});
                 if socket
                     .send(Message::Text(reply.to_string().into()))
@@ -158,6 +161,14 @@ impl Fixture {
         )?;
         result
     }
+}
+
+pub(super) fn replace_capture(snapshot: ProjectSnapshot) {
+    CAPTURES.with(|slot| {
+        let mut captures = slot.borrow_mut();
+        captures.clear();
+        captures.push_back(Box::new(|_| Ok(snapshot)));
+    });
 }
 
 impl Drop for Fixture {

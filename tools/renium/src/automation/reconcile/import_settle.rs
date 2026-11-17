@@ -555,8 +555,7 @@ pub(crate) fn before_request(
     let retry = journal.record.error.is_some()
         || context.runtime_id != journal.record.runtime
         || !files_match;
-    let proof = &journal.record.summary["verifiedPushProof"];
-    if retry || !verified_full_push_proof_matches(context, bridge, proof)? {
+    if retry {
         crate::daemon::emit_request_notice(&format!(
             "The earlier import was not settled: {}. This push reconciles the current files with Studio and preserves newer file edits.",
             journal
@@ -584,6 +583,11 @@ pub(crate) fn before_request(
     let args = automation_push_args(context, parameters, true)?;
     let same_input = input.as_ref() == Some(&full_push_cache_input(&args, &services)?);
     journal.install()?;
+    // A daemon restart can end the native observer behind the old proof while
+    // Studio still holds the committed import. Recover under a fresh guard and
+    // verify the complete accepted capture before publishing; treating a lost
+    // observer as a new ordinary push would leave regenerated saved identities
+    // unsettled even when that push finds no authored differences.
     let settled = recover(context, bridge, &services, work, input)?;
     if same_input && settled {
         Ok(Some(json!({"ok": true, "unchanged": true})))
@@ -865,6 +869,56 @@ mod tests {
                 }
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn restart_with_expired_observer_verifies_and_settles_under_a_fresh_guard() -> Result<()> {
+        let fixture = super::super::push_flow_tests::Fixture::new()?;
+        let context = &fixture.context;
+        let paths = vec![PathBuf::from("src"), PathBuf::from("instances")];
+        let verification_paths = fixture.desired.entries.keys().cloned().collect();
+        let history = history::SyncHistory::begin(
+            Path::new(&context.root),
+            Path::new(&context.source),
+            &ProjectSnapshot::default(),
+            &verification_paths,
+        )?;
+        begin(
+            context,
+            ImportStart {
+                services: &["ReplicatedStorage".into()],
+                paths: &paths,
+                verification_paths: &verification_paths,
+                before: &ProjectSnapshot::default(),
+                expected: &fixture.desired,
+                input: None,
+                history_id: history.id()?,
+            },
+        )?;
+        committed(
+            &Map::from_iter([
+                ("historyId".into(), json!(history.id()?)),
+                ("verifiedPushProof".into(), json!({"expired":true})),
+            ]),
+            &fixture.desired,
+        )?;
+        interrupt_test_request();
+        super::super::push_flow_tests::replace_capture(fixture.desired.clone());
+        assert!(
+            before_request(
+                context,
+                fixture.bridge.as_ref().unwrap(),
+                op::PUSH,
+                &json!({})
+            )?
+            .is_none()
+        );
+        assert!(!pending(context));
+        assert!(
+            super::super::push_flow_tests::capture(context).is_none(),
+            "recovery must verify its fresh capture, even when the old observer expired"
+        );
         Ok(())
     }
 
