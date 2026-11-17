@@ -1912,3 +1912,188 @@ fn run_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
 fn store_documents_keep_the_codec_laws() {
     run_seeds(DEFAULT_SEEDS, run_seed);
 }
+
+fn parallel_columns(index: usize) -> Map<String, Value> {
+    let mut values = Map::from_iter([
+        ("Signed".into(), json!(i64::MIN + index as i64)),
+        ("Unsigned".into(), json!(u64::MAX - index as u64)),
+        ("Single".into(), json!(index as f64 / 8.0)),
+        ("Double".into(), json!(index as f64 + 0.1)),
+        (
+            "Enum".into(),
+            json!({"_type":"EnumItem", "name":if index.is_multiple_of(2) { "Plastic" } else { "FutureValue" }}),
+        ),
+        ("NumericSingles".into(), json!([index, -0.0, 0.125])),
+        ("NumericDoubles".into(), json!([index, 0.1, 1e39])),
+        (
+            "Object".into(),
+            json!({"_type":"FutureType", "value":index, "items":[false,null,"text"]}),
+        ),
+        (
+            "Outside".into(),
+            json!({"_type":"Ref", "instanceIndex":index+1, "pathSegments":["OtherService", "Name"], "pathOrdinals":[1,1]}),
+        ),
+    ]);
+    for (type_name, fields) in FIXED {
+        let mut object: Map<String, Value> = fields
+            .iter()
+            .map(|field| ((*field).into(), json!(index as f64 + 0.1)))
+            .collect();
+        object.insert("_type".into(), json!(type_name));
+        values.insert(type_name.into(), Value::Object(object));
+    }
+    if !index.is_multiple_of(3) {
+        for (name, value) in [
+            ("SparseFalse", json!(false)),
+            ("SparseTrue", json!(true)),
+            ("SparseInt", json!(index as i64 - 5)),
+            ("SparseSingle", json!(index as f64 / 8.0)),
+            ("SparseDouble", json!(index as f64 + 0.1)),
+            ("SparseEnum", json!({"_type":"EnumItem", "name":"Plastic"})),
+        ] {
+            values.insert(name.into(), value);
+        }
+    }
+    values
+}
+
+fn parallel_document(seed: u64) -> SettingsBytecode {
+    let mut rng = SimRng(seed);
+    let count = [0, 1, 2047, 2048, 4095, 4096, 4097, 8193][seed as usize % 8];
+    let mut ids = (0..count)
+        .map(|index| format!("debug:{index:x}"))
+        .collect::<Vec<_>>();
+    rng.shuffle(&mut ids);
+    let instances =
+        ids.into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut instance = SettingsBytecodeInstance::new(
+                    id,
+                    format!("duplicate-{}", rng.below(4)),
+                    if index == 0 {
+                        "Camera"
+                    } else {
+                        CLASSES[index % CLASSES.len()]
+                    }
+                    .into(),
+                    (index + 1 < count).then_some(count - 1),
+                );
+                instance
+                    .properties
+                    .insert("UniqueId".into(), json!("shared"));
+                instance.properties.extend(parallel_columns(index));
+                instance
+                    .properties
+                    .insert("Label".into(), json!(format!("text-{index}")));
+                instance.properties.insert(
+                    "Link".into(),
+                    json!({"_type":"Ref", "instanceIndex":1+rng.below(count)}),
+                );
+                instance.properties.insert("Nested".into(), json!([
+            {"Ref":{"instanceIndex":1+rng.below(count)}},
+            if seed.is_multiple_of(2) { json!({"_type":"EnumItem", "name":"Plastic"}) }
+            else { json!({"_type":"EnumItem", "enumType":"Material", "name":"Plastic"}) },
+        ]));
+                instance.properties.insert(
+                    "Mixed".into(),
+                    if index % 2 == 0 {
+                        json!(true)
+                    } else {
+                        json!(index)
+                    },
+                );
+                instance.properties.insert(
+                    "Vector".into(),
+                    json!({"_type":"Vector3", "x":index, "y":-0.0, "z":0.125}),
+                );
+                let mut components = [0_f64; 12];
+                for (at, component) in components.iter_mut().enumerate() {
+                    *component = if at < 3 {
+                        index as f64
+                    } else if seed.is_multiple_of(2) {
+                        ROTATIONS[index % ROTATIONS.len()][at - 3]
+                    } else {
+                        f64::from(rng.below(1_000_000) as f32 / 65536.0)
+                    };
+                }
+                instance.properties.insert(
+                    "CFrame".into(),
+                    json!({"_type":"CFrame", "components":components}),
+                );
+                instance.attributes.insert(
+                    "Tagged".into(),
+                    json!({"_type":"Vector3", "x":1, "y":2, "z":3}),
+                );
+                if index + 1 == count {
+                    instance.name = "Workspace".into();
+                    instance.class_name = "Workspace".into();
+                    instance.properties.insert(
+                        "CurrentCamera".into(),
+                        json!({"_type":"Ref", "instanceIndex":1}),
+                    );
+                }
+                instance
+            })
+            .collect();
+    SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances,
+    }
+}
+
+#[test]
+fn parallel_codec_keeps_serial_bytes_and_documents() {
+    let pools = [1, 4, 64].map(|workers| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap()
+    });
+    run_seeds(16, |seed, _| {
+        let document = parallel_document(seed);
+        let bytes = pools[0]
+            .install(|| encode_settings_bytecode(&document))
+            .map_err(|error| error.to_string())?;
+        let expected = pools[0]
+            .install(|| decode_settings_bytecode(&bytes))
+            .map_err(|error| error.to_string())?;
+        let mut state =
+            super::bytecode::parallel_codec_sim::captured_state(&expected, seed % 3 != 1);
+        state.dense_index_topology = seed % 3 != 0;
+        let service_bytes = pools[0]
+            .install(|| super::bytecode::encode_service_settings_binary(&state))
+            .map_err(|error| error.to_string())?;
+        for pool in &pools[1..] {
+            pool.install(|| -> Result<(), String> {
+                let encoded =
+                    encode_settings_bytecode(&document).map_err(|error| error.to_string())?;
+                if bytes != encoded {
+                    return Err("parallel encoder changed bytes".into());
+                }
+                if service_bytes
+                    != super::bytecode::encode_service_settings_binary(&state)
+                        .map_err(|error| error.to_string())?
+                {
+                    return Err("parallel service encoder changed bytes".into());
+                }
+                let decoded =
+                    decode_settings_bytecode(&bytes).map_err(|error| error.to_string())?;
+                if !same_document(&decoded, &expected) {
+                    return Err("parallel decoder changed values".into());
+                }
+                let mut legacy = bytes.clone();
+                legacy[7] = SETTINGS_BINARY_VERSION - 1;
+                let mut expected_legacy = expected.clone();
+                expected_legacy.version -= 1;
+                let decoded_legacy =
+                    decode_settings_bytecode(&legacy).map_err(|error| error.to_string())?;
+                if !same_document(&decoded_legacy, &expected_legacy) {
+                    return Err("parallel legacy decode changed values".into());
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    });
+}

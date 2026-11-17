@@ -436,6 +436,7 @@ pub(crate) fn is_null_reference_value(value: &Value) -> bool {
 }
 
 pub(crate) fn decode_settings_bytecode(bytes: &[u8]) -> Result<SettingsBytecode> {
+    let _span = crate::app::profile::span("store decode");
     let (version, decoded) = decode_settings_bytecode_container(bytes)?;
     decode_settings_bytecode_document(version, &decoded, &DecodeBudget::for_file(bytes.len()))
 }
@@ -462,6 +463,7 @@ fn decode_settings_bytecode_if_contains_any_string_set(
 }
 
 fn decode_settings_bytecode_container(bytes: &[u8]) -> Result<(u8, Vec<u8>)> {
+    let _span = crate::app::profile::span("store decompress");
     if bytes.len() > MAX_SETTINGS_BYTECODE_BYTES {
         bail!("Settings bytecode exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes");
     }
@@ -524,6 +526,7 @@ fn decode_settings_payload_header(
     reader: &mut BytecodeReader<'_>,
     budget: &DecodeBudget,
 ) -> Result<SettingsPayloadHeader> {
+    let _span = crate::app::profile::span("store header decode");
     let string_count = reader.read_collection_len("string count")?;
     let mut strings = Vec::with_capacity(reader.capacity(string_count, 1));
     for _ in 0..string_count {
@@ -577,12 +580,14 @@ fn decode_settings_bytecode_payload(
         instance_count,
         budget,
     };
+    let groups_span = crate::app::profile::span("store property columns decode");
     let decoded_groups = specs
         .par_iter()
         .map(|(property_name, kind, value_count, body)| {
             decode_property_group_body(body, property_name.as_str(), *kind, *value_count, scope)
         })
         .collect::<Result<Vec<_>>>()?;
+    drop(groups_span);
     apply_decoded_property_groups(&mut instances, &specs, decoded_groups);
 
     Ok(SettingsBytecode { version, instances })
@@ -719,16 +724,20 @@ enum DecodedGroupEntry {
     Attributes(usize, Map<String, Value>),
 }
 
-enum DecodedChunkEntry {
-    Property(usize, usize, Value),
-    Attributes(usize, Map<String, Value>),
+impl DecodedGroupEntry {
+    fn instance_index(&self) -> usize {
+        match self {
+            Self::Property(index, _) | Self::Attributes(index, _) => *index,
+        }
+    }
 }
 
 fn apply_decoded_property_groups(
     instances: &mut [SettingsBytecodeInstance],
     specs: &[(&String, u8, usize, &[u8])],
-    decoded_groups: Vec<Vec<DecodedGroupEntry>>,
+    mut decoded_groups: Vec<Vec<DecodedGroupEntry>>,
 ) {
+    let _span = crate::app::profile::span("store property columns apply");
     if instances.len() < SETTINGS_BINARY_PARALLEL_MIN_INSTANCES || rayon::current_num_threads() <= 1
     {
         for ((property_name, ..), entries) in specs.iter().zip(decoded_groups) {
@@ -752,44 +761,41 @@ fn apply_decoded_property_groups(
         .len()
         .div_ceil(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE);
     let mut by_chunk = (0..chunk_count).map(|_| Vec::new()).collect::<Vec<_>>();
-    for (property_index, entries) in decoded_groups.into_iter().enumerate() {
-        for entry in entries {
-            match entry {
-                DecodedGroupEntry::Property(instance_index, value) => {
-                    let chunk_index = instance_index / SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
-                    let local_index = instance_index % SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
-                    by_chunk[chunk_index].push(DecodedChunkEntry::Property(
-                        local_index,
-                        property_index,
-                        value,
-                    ));
-                }
-                DecodedGroupEntry::Attributes(instance_index, attributes) => {
-                    let chunk_index = instance_index / SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
-                    let local_index = instance_index % SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
-                    by_chunk[chunk_index]
-                        .push(DecodedChunkEntry::Attributes(local_index, attributes));
-                }
-            }
+    for (property_index, entries) in decoded_groups.iter_mut().enumerate() {
+        let mut remaining = entries.as_mut_slice();
+        // Both decoders validate strictly increasing indices within a group.
+        // Slice those ranges without copying every value through a serial queue;
+        // group order still decides which value wins across repeated groups.
+        while let Some(first) = remaining.first() {
+            let chunk_index = first.instance_index() / SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
+            let end = (chunk_index + 1) * SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
+            let count = remaining.partition_point(|entry| entry.instance_index() < end);
+            let (chunk, tail) = remaining.split_at_mut(count);
+            by_chunk[chunk_index].push((property_index, chunk));
+            remaining = tail;
         }
     }
     instances
         .par_chunks_mut(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE)
         .zip(by_chunk.into_par_iter())
-        .for_each(|(instances, entries)| {
-            for entry in entries {
-                match entry {
-                    DecodedChunkEntry::Property(instance_index, property_index, value) => {
-                        instances[instance_index]
-                            .properties
-                            .insert(specs[property_index].0.clone(), value);
-                    }
-                    DecodedChunkEntry::Attributes(instance_index, attributes) => {
-                        instances[instance_index].attributes = attributes;
+        .for_each(|(instances, groups)| {
+            for (property_index, entries) in groups {
+                for entry in entries {
+                    let index = entry.instance_index() % SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
+                    match entry {
+                        DecodedGroupEntry::Property(_, value) => {
+                            instances[index]
+                                .properties
+                                .insert(specs[property_index].0.clone(), std::mem::take(value));
+                        }
+                        DecodedGroupEntry::Attributes(_, attributes) => {
+                            instances[index].attributes = std::mem::take(attributes);
+                        }
                     }
                 }
             }
         });
+    decoded_groups.into_par_iter().for_each(drop);
 }
 
 /// What a value needs from its document: the string table, the instance
@@ -993,6 +999,7 @@ fn encode_settings_bytecode_with_reference_lookup(
     document: &SettingsBytecode,
     build_reference_lookup: bool,
 ) -> Result<Vec<u8>> {
+    let _span = crate::app::profile::span("store encode");
     validate_settings_hierarchy(&document.instances)?;
     validate_settings_record_properties(&document.instances)?;
     let canonical = canonical_attribute_document(document);
@@ -1157,6 +1164,7 @@ fn collect_settings_bytecode_data<'a>(
     document: &'a SettingsBytecode,
     lookup: &SettingsBinaryInstanceLookup<'_>,
 ) -> Result<SettingsBinaryCollection<'a>> {
+    let _span = crate::app::profile::span("store columns collect");
     if document.instances.len() < SETTINGS_BINARY_PARALLEL_MIN_INSTANCES
         || rayon::current_num_threads() <= 1
     {
@@ -1218,6 +1226,7 @@ fn encode_settings_bytecode_payload_collected(
     lookup: &SettingsBinaryInstanceLookup<'_>,
     collected: SettingsBinaryCollection<'_>,
 ) -> Result<Vec<u8>> {
+    let _span = crate::app::profile::span("store payload encode");
     let strings = sorted_counted_strings(collected.string_counts);
     let string_ids = build_id_map(&strings);
     let classes = sorted_counted_strings(collected.class_counts);
@@ -1298,6 +1307,7 @@ fn encode_settings_bytecode_payload_collected(
 }
 
 fn wrap_settings_bytecode_payload(payload: &[u8]) -> Result<Vec<u8>> {
+    let _span = crate::app::profile::span("store compress");
     if payload.len() > MAX_SETTINGS_BYTECODE_BYTES {
         bail!(
             "Decoded settings bytecode payload exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes"
@@ -1343,6 +1353,7 @@ fn document_root_service(document: &SettingsBytecode) -> Option<String> {
 }
 
 fn build_bytecode_instance_lookup(document: &SettingsBytecode) -> SettingsBinaryInstanceLookup<'_> {
+    let _span = crate::app::profile::span("store reference indexes");
     let root_service = document_root_service(document);
     let selectors = settings_document_reference_selectors(document, root_service.as_deref());
     let mut lookup = SettingsBinaryInstanceLookup {
@@ -1408,8 +1419,29 @@ fn settings_document_reference_selectors(
     document: &SettingsBytecode,
     root_service: Option<&str>,
 ) -> SettingsReferenceSelectors {
+    if document.instances.len() < SETTINGS_BINARY_PARALLEL_MIN_INSTANCES
+        || rayon::current_num_threads() <= 1
+    {
+        return settings_instance_reference_selectors(&document.instances, root_service);
+    }
+    document
+        .instances
+        .par_chunks(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE)
+        .map(|instances| settings_instance_reference_selectors(instances, root_service))
+        .reduce(SettingsReferenceSelectors::default, |left, right| {
+            SettingsReferenceSelectors {
+                settings_id: left.settings_id || right.settings_id,
+                path: left.path || right.path,
+            }
+        })
+}
+
+fn settings_instance_reference_selectors(
+    instances: &[SettingsBytecodeInstance],
+    root_service: Option<&str>,
+) -> SettingsReferenceSelectors {
     let mut selectors = SettingsReferenceSelectors::default();
-    for instance in &document.instances {
+    for instance in instances {
         for value in instance
             .properties
             .values()
@@ -2191,6 +2223,7 @@ fn collect_settings_binary_data<'a>(
     lookup: &SettingsBinaryInstanceLookup<'_>,
     instances: &'a [SettingsBinaryInstance<'a>],
 ) -> Result<SettingsBinaryCollection<'a>> {
+    let _span = crate::app::profile::span("captured store columns collect");
     if instances.len() < SETTINGS_BINARY_PARALLEL_MIN_INSTANCES || rayon::current_num_threads() <= 1
     {
         return collect_settings_binary_chunk(state, lookup, instances, 0);
@@ -2254,6 +2287,7 @@ fn write_service_settings_binary_file_inner(
 }
 
 pub(crate) fn encode_service_settings_binary(state: &ServiceState) -> Result<Vec<u8>> {
+    let _span = crate::app::profile::span("captured store encode");
     let instances = collect_service_settings_binary_instances(state);
     let lookup = build_settings_binary_instance_lookup(state, &instances);
     let collected = collect_settings_binary_data(state, &lookup, &instances)?;
@@ -2328,6 +2362,7 @@ pub(crate) fn encode_service_settings_binary(state: &ServiceState) -> Result<Vec
 fn collect_service_settings_binary_instances(
     state: &ServiceState,
 ) -> Vec<SettingsBinaryInstance<'_>> {
+    let _span = crate::app::profile::span("captured store records");
     if state.properties_default_elided && state.dense_index_topology {
         let mut out = Vec::with_capacity(state.instances.len());
         for (source_index, instance) in state.instances.iter().enumerate() {
@@ -2412,6 +2447,7 @@ fn build_settings_binary_instance_lookup<'a>(
     state: &'a ServiceState,
     instances: &[SettingsBinaryInstance<'a>],
 ) -> SettingsBinaryInstanceLookup<'a> {
+    let _span = crate::app::profile::span("captured store reference indexes");
     let root_service = state
         .instances
         .get(state.service_root_index)
@@ -2629,7 +2665,16 @@ fn add_count_key<'a>(counts: &mut SettingsStringCounts<'a>, text: SettingsString
 
 fn sorted_counted_strings<'a>(counts: SettingsStringCounts<'a>) -> Vec<SettingsString<'a>> {
     let mut items: Vec<(SettingsString<'a>, u64)> = counts.into_iter().collect();
-    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.as_ref().cmp(b.0.as_ref())));
+    let order = |a: &(SettingsString<'_>, u64), b: &(SettingsString<'_>, u64)| {
+        b.1.cmp(&a.1).then_with(|| a.0.as_ref().cmp(b.0.as_ref()))
+    };
+    if items.len() >= SETTINGS_BINARY_PARALLEL_MIN_INSTANCES && rayon::current_num_threads() > 1 {
+        // Counts have unique string keys, so the tie breaker makes this a total
+        // order independent of the map's iteration order or worker count.
+        items.par_sort_unstable_by(order);
+    } else {
+        items.sort_by(order);
+    }
     items.into_iter().map(|(text, _)| text).collect()
 }
 
@@ -2686,6 +2731,7 @@ fn write_settings_binary_property_groups<W: Write + ?Sized>(
     string_ids: &SettingsStringIdMap<'_>,
     lookup: &SettingsBinaryInstanceLookup<'_>,
 ) -> Result<()> {
+    let _span = crate::app::profile::span("store property columns encode");
     write_var_u64(writer, groups.len() as u64)?;
     let bodies = groups
         .par_iter()
@@ -2853,6 +2899,100 @@ fn write_property_group_values<W: Write + ?Sized>(
     lookup: &SettingsBinaryInstanceLookup<'_>,
     writer: &mut W,
 ) -> Result<()> {
+    if values.len() < SETTINGS_BINARY_PARALLEL_CHUNK_SIZE || rayon::current_num_threads() <= 1 {
+        return write_property_group_values_serial(values, kind, string_ids, lookup, writer);
+    }
+    let table = if kind == 16 {
+        let table = build_cframe_rotation_table(values)?;
+        write_cframe_table_header(table.as_ref(), writer)?;
+        table
+    } else {
+        None
+    };
+    let bodies = values
+        .par_chunks(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE)
+        .enumerate()
+        .map(|(chunk, items)| {
+            let start = chunk * SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
+            let previous = start.checked_sub(1).map(|index| &values[index]);
+            let rotations = table
+                .as_ref()
+                .map(|table| &table.values[start..start + items.len()]);
+            let mut body = Vec::new();
+            write_property_group_chunk(
+                items, kind, string_ids, lookup, rotations, previous, &mut body,
+            )?;
+            Ok(body)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for body in bodies {
+        writer.write_all(&body)?;
+    }
+    Ok(())
+}
+
+fn write_cframe_table_header<W: Write + ?Sized>(
+    table: Option<&CFrameRotationTable>,
+    writer: &mut W,
+) -> Result<()> {
+    writer.write_all(&[u8::from(table.is_some())])?;
+    if let Some(table) = table {
+        write_var_u64(writer, table.rotations.len() as u64)?;
+        for rotation in &table.rotations {
+            for component in rotation {
+                write_f32_bits(*component, writer)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_property_group_chunk<W: Write + ?Sized>(
+    values: &[SettingsBinaryValue<'_>],
+    kind: u8,
+    string_ids: &SettingsStringIdMap<'_>,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    rotations: Option<&[CFrameTableValue]>,
+    previous: Option<&SettingsBinaryValue<'_>>,
+    writer: &mut W,
+) -> Result<()> {
+    let mut previous_instance = previous.map_or(0, |item| item.instance_index);
+    let mut previous_target = 0;
+    // A chunk continues the preceding value's deltas, even when references
+    // point backwards. The rotation dictionary belongs to the whole group.
+    if kind == 17
+        && let Some(previous) = previous
+    {
+        write_resolved_ref_group_payload(
+            &previous.source,
+            lookup,
+            &mut previous_target,
+            &mut std::io::sink(),
+        )?;
+    }
+    for (offset, item) in values.iter().enumerate() {
+        write_property_group_instance_index(writer, &mut previous_instance, item.instance_index)?;
+        if let Some(rotations) = rotations {
+            for component in rotations[offset].position {
+                write_f32_bits(component, writer)?;
+            }
+            write_var_u64(writer, rotations[offset].rotation_index as u64)?;
+        } else if kind == 17 {
+            write_resolved_ref_group_payload(&item.source, lookup, &mut previous_target, writer)?;
+        } else {
+            write_binary_source_payload(&item.source, kind, string_ids, lookup, writer)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_property_group_values_serial<W: Write + ?Sized>(
+    values: &[SettingsBinaryValue<'_>],
+    kind: u8,
+    string_ids: &SettingsStringIdMap<'_>,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    writer: &mut W,
+) -> Result<()> {
     let mut previous_instance_index = 0_usize;
     if kind == 16 {
         if let Some(table) = build_cframe_rotation_table(values)? {
@@ -2961,16 +3101,23 @@ fn build_cframe_rotation_table(
     let mut rotations = Vec::new();
     let mut table_values = Vec::with_capacity(values.len());
 
-    for item in values {
-        let components = match &item.source {
-            SettingsBinaryValueSource::Native(NativeSettingsValue::CFrame(value)) => {
-                value.map(f32::to_bits)
-            }
-            SettingsBinaryValueSource::Native(_) | SettingsBinaryValueSource::Attributes(_) => {
-                bail!("Expected CFrame property group")
-            }
-            SettingsBinaryValueSource::Property(value) => cframe_component_bits(value)?,
-            SettingsBinaryValueSource::Settled(value) => cframe_component_bits(value)?,
+    let components = if values.len() >= SETTINGS_BINARY_PARALLEL_CHUNK_SIZE
+        && rayon::current_num_threads() > 1
+    {
+        Some(
+            values
+                .par_iter()
+                .with_min_len(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE)
+                .map(cframe_binary_components)
+                .collect::<Result<Vec<_>>>()?,
+        )
+    } else {
+        None
+    };
+    for (index, item) in values.iter().enumerate() {
+        let components = match &components {
+            Some(components) => components[index],
+            None => cframe_binary_components(item)?,
         };
         let position = [components[0], components[1], components[2]];
         let mut rotation = [0_u32; 9];
@@ -3000,6 +3147,19 @@ fn build_cframe_rotation_table(
         }))
     } else {
         Ok(None)
+    }
+}
+
+fn cframe_binary_components(item: &SettingsBinaryValue<'_>) -> Result<[u32; 12]> {
+    match &item.source {
+        SettingsBinaryValueSource::Native(NativeSettingsValue::CFrame(value)) => {
+            Ok(value.map(f32::to_bits))
+        }
+        SettingsBinaryValueSource::Native(_) | SettingsBinaryValueSource::Attributes(_) => {
+            bail!("Expected CFrame property group")
+        }
+        SettingsBinaryValueSource::Property(value) => cframe_component_bits(value),
+        SettingsBinaryValueSource::Settled(value) => cframe_component_bits(value),
     }
 }
 
@@ -5207,3 +5367,7 @@ mod tests {
 #[cfg(test)]
 #[path = "reference_index_sim.rs"]
 mod reference_index_sim;
+
+#[cfg(test)]
+#[path = "parallel_codec_sim.rs"]
+pub(crate) mod parallel_codec_sim;
