@@ -5078,6 +5078,13 @@ fn verify_native_property_rows(
         verified += result["verified"]
             .as_u64()
             .context("Studio omitted the verified property count")?;
+        #[cfg(any(windows, target_os = "macos"))]
+        if result["verifyMismatches"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        {
+            verified += verify_unreadable_properties(bridge, batch, &result)?;
+        }
         for mismatch in result["verifyMismatches"]
             .as_array()
             .context("Studio omitted container verification results")?
@@ -5097,6 +5104,114 @@ fn verify_native_property_rows(
     );
     summary.insert("nativePropertiesVerified".to_string(), json!(verified));
     Ok(verified)
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn unreadable_property_rows(
+    rows: &[EditorPropertyChange],
+    result: &Value,
+) -> Result<Vec<(usize, String)>> {
+    let Some(fields) = result.get("unverifiedProperties") else {
+        return Ok(Vec::new()); // Older plugins retain full snapshot verification.
+    };
+    let fields = fields
+        .as_array()
+        .context("Invalid unreadable property receipt")?;
+    let mut seen = HashSet::new();
+    let mut selected = Vec::with_capacity(fields.len());
+    for field in fields {
+        let index = field["row"]
+            .as_u64()
+            .and_then(|row| usize::try_from(row).ok())
+            .and_then(|row| row.checked_sub(1))
+            .context("Invalid unreadable property row")?;
+        let name = field["name"]
+            .as_str()
+            .context("Invalid unreadable property name")?;
+        anyhow::ensure!(
+            rows.get(index)
+                .is_some_and(|row| row.properties.contains_key(name))
+                && seen.insert((index, name)),
+            "Unreadable property receipt is outside the requested fields or duplicated"
+        );
+        selected.push((index, name.to_string()));
+    }
+    Ok(selected)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn verify_unreadable_properties(
+    bridge: &BridgeServer,
+    rows: &[EditorPropertyChange],
+    result: &Value,
+) -> Result<u64> {
+    use crate::studio::bridge::BridgeTarget;
+    let fields = unreadable_property_rows(rows, result)?;
+    if fields.is_empty() {
+        return Ok(0);
+    }
+    let started = Instant::now();
+    let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
+    let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
+    let title = serializer::target_name(pid, &info.place_name)?;
+    let mut verified = 0;
+    for (index, name) in fields {
+        let row = &rows[index];
+        let value = serializer::read_property(
+            pid,
+            &title,
+            &row.path_segments,
+            &row.path_ordinals,
+            &row.class_name,
+            &name,
+            Duration::from_secs(2),
+        )
+        .and_then(|text| {
+            native_property_matches(&row.class_name, &name, &row.properties[&name], &text)
+        });
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => {
+                // This is read-only. A locator/type/transport failure supplies no
+                // proof; the existing full capture remains the correctness path.
+                crate::app::output::log_global(
+                    3,
+                    format_args!(
+                        "[renium] native supplemental read unavailable: service={} class={} property={name}; full readback required: {error:#}",
+                        row.service, row.class_name
+                    ),
+                );
+                continue;
+            }
+        };
+        if value {
+            verified += 1;
+        } else {
+            crate::app::output::log_global(
+                5,
+                format_args!(
+                    "[renium] native supplemental read differs: service={} class={} property={name}; full readback required",
+                    row.service, row.class_name
+                ),
+            );
+        }
+    }
+    log_timing("native editor unreadable field verification", started);
+    Ok(verified)
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn native_property_matches(
+    class: &str,
+    name: &str,
+    expected: &Value,
+    actual: &str,
+) -> Result<bool> {
+    let expected =
+        crate::studio::automation::property_access::saved_field_text(expected, class, name)?;
+    Ok(crate::automation::property_access::property_text_matches(
+        class, name, &expected, actual,
+    ))
 }
 
 fn source_change_apply_order(
@@ -5298,6 +5413,72 @@ fn merge_editor_summary_checked(summary: &mut Map<String, Value>, result: &Value
 #[cfg(test)]
 mod source_change_tests {
     use super::*;
+
+    #[test]
+    fn unreadable_receipts_only_credit_requested_fields_once() {
+        let rows = vec![EditorPropertyChange {
+            properties: Map::from_iter([("SignalBehavior".into(), json!("Deferred"))]),
+            ..Default::default()
+        }];
+        assert!(
+            unreadable_property_rows(&rows, &json!({}))
+                .unwrap()
+                .is_empty()
+        );
+        let receipt = json!({"row": 1, "name": "SignalBehavior"});
+        assert_eq!(
+            unreadable_property_rows(&rows, &json!({"unverifiedProperties": [receipt]})).unwrap(),
+            vec![(0, "SignalBehavior".into())]
+        );
+        for fields in [
+            json!([receipt, receipt]),
+            json!([{"row":0,"name":"SignalBehavior"}]),
+            json!([{"row":2,"name":"SignalBehavior"}]),
+            json!([{"row":1,"name":"Other"}]),
+        ] {
+            assert!(
+                unreadable_property_rows(&rows, &json!({"unverifiedProperties": fields})).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn native_supplemental_comparison_uses_the_same_text_as_the_writer() {
+        assert!(
+            native_property_matches(
+                "ServerScriptService",
+                "LoadStringEnabled",
+                &json!(false),
+                "false"
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_property_matches(
+                "ServerScriptService",
+                "LoadStringEnabled",
+                &json!(false),
+                "true"
+            )
+            .unwrap()
+        );
+        // Bridge and saved JSON carry different enum metadata; both name the
+        // same value. Only the getter's actual enum name supplies the proof.
+        let expected = json!({"_type":"EnumItem", "name":"Future", "value":4});
+        assert!(native_property_matches("Lighting", "Technology", &expected, "Future").unwrap());
+        assert!(
+            !native_property_matches("Lighting", "Technology", &expected, "ShadowMap").unwrap()
+        );
+        assert!(
+            native_property_matches(
+                "Terrain",
+                "SmoothGrid",
+                &json!({"_type":"BinaryString"}),
+                ""
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn pre_import_settings_only_move_retained_scene_configuration() {
