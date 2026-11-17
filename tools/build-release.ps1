@@ -439,7 +439,7 @@ $releaseLicense = Join-Path $releaseDirectory "LICENSE"
 $releaseAgentInstructions = Join-Path $releaseDirectory "renium-agents.md"
 $releaseAgentGuides = Join-Path $releaseDirectory "renium-guides"
 $releaseReadmeText = [IO.File]::ReadAllText(
-    (Join-Path $repositoryRoot "tools\renium\RELEASE_README.md")
+    (Join-Path $repositoryRoot "tools\renium\package\RELEASE_README.md")
 ).Replace("{{VERSION}}", $cliVersion)
 [IO.File]::WriteAllText($releaseReadme, $releaseReadmeText, [Text.UTF8Encoding]::new($false))
 Copy-Item -LiteralPath (Join-Path $repositoryRoot "LICENSE") -Destination $releaseLicense
@@ -457,8 +457,8 @@ if ($env:OS -eq "Windows_NT") {
     $releaseRbx = Join-Path $releaseDirectory "rbx.cmd"
     $releaseInstaller = Join-Path $releaseDirectory "install.ps1"
     $releaseInstallerLauncher = Join-Path $releaseDirectory "Install Renium.cmd"
-    Copy-Item -LiteralPath (Join-Path $repositoryRoot "rbx.cmd") -Destination $releaseRbx
-    Copy-Item -LiteralPath (Join-Path $repositoryRoot "install.ps1") -Destination $releaseInstaller
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "tools\renium\package\rbx.cmd") -Destination $releaseRbx
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "tools\renium\package\install.ps1") -Destination $releaseInstaller
     & (Join-Path $repositoryRoot "tools\build-windows-launcher.ps1") `
         -InstallerScript $releaseInstaller `
         -Version $cliVersion `
@@ -468,12 +468,12 @@ if ($env:OS -eq "Windows_NT") {
 else {
     $releaseRbx = Join-Path $releaseDirectory "rbx"
     $releaseInstaller = Join-Path $releaseDirectory "install.sh"
-    Copy-Item -LiteralPath (Join-Path $repositoryRoot "rbx") -Destination $releaseRbx
-    Copy-Item -LiteralPath (Join-Path $repositoryRoot "install.sh") -Destination $releaseInstaller
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "tools\renium\package\rbx") -Destination $releaseRbx
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "tools\renium\package\install.sh") -Destination $releaseInstaller
     $releaseSupportFiles += @($releaseRbx, $releaseInstaller)
     if ($IsMacOS) {
         $releaseInstallerLauncher = Join-Path $releaseDirectory "Install Renium.command"
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot "tools\renium\install-macos.command") -Destination $releaseInstallerLauncher
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot "tools\renium\package\install-macos.command") -Destination $releaseInstallerLauncher
         $releaseSupportFiles += $releaseInstallerLauncher
     }
 }

@@ -4,12 +4,13 @@ import os from "node:os";
 import path from "node:path";
 
 const repository = path.resolve(import.meta.dirname, "..", "..", "..");
+const packageFiles = path.join(repository, "tools", "renium", "package");
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "renium-launcher-smoke-"));
 const expected = "f|Workspace";
 
 const run = (command, args, env) => {
   const output = childProcess.execFileSync(command, args, {
-    cwd: repository,
+    cwd: packageFiles,
     env: { ...process.env, ...env },
     encoding: "utf8",
   }).trim();
@@ -29,11 +30,11 @@ try {
     fs.writeFileSync(path.join(temporary, "fixture-asset"), "Renium installer fixture\n");
     childProcess.execFileSync(hasCommand("pwsh.exe") ? "pwsh.exe" : "powershell.exe", [
       "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(repository, "tools", "renium", "tests", "installer-manifest.ps1"),
-      "-Installer", path.join(repository, "install.ps1"), "-Fixture", temporary,
+      "-Installer", path.join(packageFiles, "install.ps1"), "-Fixture", temporary,
     ], { stdio: "inherit" });
     const stub = path.join(temporary, "renium-stub.cmd");
     fs.writeFileSync(stub, "@echo off\r\necho %1^|%2\r\n");
-    const launcher = path.join(repository, "rbx.cmd");
+    const launcher = path.join(packageFiles, "rbx.cmd");
     run("cmd.exe", ["/d", "/c", "rbx.cmd f Workspace"], { RENIUM_CLI: stub });
     run("powershell.exe", ["-NoProfile", "-Command", `& '${launcher}' f Workspace`], { RENIUM_CLI: stub });
     if (hasCommand("pwsh.exe")) {
@@ -43,7 +44,7 @@ try {
     const stub = path.join(temporary, "renium");
     fs.writeFileSync(stub, "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\"\n");
     fs.chmodSync(stub, 0o755);
-    const launcher = path.join(repository, "rbx");
+    const launcher = path.join(packageFiles, "rbx");
     run("bash", [launcher, "f", "Workspace"], { RENIUM_CLI: stub });
     if (hasCommand("zsh")) {
       run("zsh", [launcher, "f", "Workspace"], { RENIUM_CLI: stub });

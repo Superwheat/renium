@@ -78,7 +78,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version-file: .node-version
+          node-version-file: tools/renium-vscode-extension/.node-version
 
       # Self-hosted workspaces keep target directories between runs, and every
       # release leaves its predecessor's artifacts behind; wipe the cache once
@@ -142,7 +142,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version-file: .node-version
+          node-version-file: tools/renium-vscode-extension/.node-version
 
       # Self-hosted workspaces keep target directories between runs, and every
       # release leaves its predecessor's artifacts behind; wipe the cache once
@@ -206,7 +206,7 @@ jobs:
       # restoring it there would print that path into the public log.
       - uses: actions/setup-node@v4
         with:
-          node-version-file: .node-version
+          node-version-file: tools/renium-vscode-extension/.node-version
           cache: ${{ github.event_name != 'push' && 'npm' || '' }}
           cache-dependency-path: tools/renium-vscode-extension/package-lock.json
 

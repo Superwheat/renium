@@ -9,6 +9,7 @@ node_modules/**/.bin/**
 package-lock.json
 *.vsix
 .gitignore
+.node-version
 tsconfig.json
 tsconfig.test.json
 scripts/**

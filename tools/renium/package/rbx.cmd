@@ -7,7 +7,7 @@ if not "%RENIUM_CLI%"=="" if exist "%RENIUM_CLI%" set "CLI=%RENIUM_CLI%"
 if "%CLI%"=="" if exist "%~dp0renium.exe" set "CLI=%~dp0renium.exe"
 if "%CLI%"=="" if exist "%~dp0bin\renium.exe" set "CLI=%~dp0bin\renium.exe"
 if "%CLI%"=="" if exist "%LOCALAPPDATA%\Renium\bin\renium.exe" set "CLI=%LOCALAPPDATA%\Renium\bin\renium.exe"
-if "%CLI%"=="" if exist "%~dp0tools\renium\target\release\renium.exe" set "CLI=%~dp0tools\renium\target\release\renium.exe"
+if "%CLI%"=="" if exist "%~dp0..\target\release\renium.exe" set "CLI=%~dp0..\target\release\renium.exe"
 if "%CLI%"=="" for %%I in (renium.exe) do if not "%%~$PATH:I"=="" set "CLI=%%~$PATH:I"
 
 if "%CLI%"=="" (
