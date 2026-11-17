@@ -1,26 +1,85 @@
 use super::*;
+use std::io;
 
 #[derive(Clone, Copy)]
 struct ConversionScope<'a, 'b> {
     lookup: &'a SettingsBinaryInstanceLookup<'b>,
     instance_count: usize,
+    budget: &'a DecodeBudget,
+    string_ids: &'a SettingsStringIdMap<'a>,
+    wire_bytes: &'a AtomicUsize,
 }
 
 pub(super) fn convert(state: &ServiceState) -> Result<SettingsBytecode> {
     let _span = crate::app::profile::span("captured store document");
     let records = collect_service_settings_binary_instances(state);
-    if records.len() > MAX_SETTINGS_COLLECTION_ITEMS {
-        bail!("instance count exceeds safe collection limit");
-    }
     let lookup = build_settings_binary_instance_lookup(state, &records);
+    let collected = collect_settings_binary_data(state, &lookup, &records)?;
+    // Every file gets at least this budget. Outside the proved bounds, the
+    // actual wire path decides acceptance and the exact first error.
+    match convert_prepared(
+        state,
+        &records,
+        &lookup,
+        &collected,
+        &DecodeBudget::for_file(0),
+    ) {
+        Ok(document) => Ok(document),
+        Err(_) => {
+            let _span = crate::app::profile::span("captured store exact limit check");
+            decode_settings_bytecode(&encode_prepared_service_settings(
+                &records, &lookup, collected,
+            )?)
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn convert_with_budget(
+    state: &ServiceState,
+    budget: &DecodeBudget,
+) -> Result<SettingsBytecode> {
+    let records = collect_service_settings_binary_instances(state);
+    let lookup = build_settings_binary_instance_lookup(state, &records);
+    let collected = collect_settings_binary_data(state, &lookup, &records)?;
+    convert_prepared(state, &records, &lookup, &collected, budget)
+}
+
+fn convert_prepared(
+    state: &ServiceState,
+    records: &[SettingsBinaryInstance<'_>],
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    collected: &SettingsBinaryCollection<'_>,
+    budget: &DecodeBudget,
+) -> Result<SettingsBytecode> {
+    let _span = crate::app::profile::span("captured store validated conversion");
+    let strings = collected
+        .string_counts
+        .keys()
+        .map(|text| Cow::Borrowed(text.as_ref()))
+        .collect::<Vec<_>>();
+    let string_ids = strings
+        .iter()
+        .map(|text| (text.as_ref(), u64::MAX))
+        .collect();
+    let wire_bytes = AtomicUsize::new(validate_header(
+        records,
+        collected,
+        &strings,
+        &string_ids,
+        budget,
+    )?);
     let scope = ConversionScope {
-        lookup: &lookup,
+        lookup,
         instance_count: records.len(),
+        budget,
+        string_ids: &string_ids,
+        wire_bytes: &wire_bytes,
     };
     let instances = if records.len() < SETTINGS_BINARY_PARALLEL_MIN_INSTANCES
         || rayon::current_num_threads() <= 1
     {
-        convert_chunk(state, &records, scope)?
+        convert_chunk(state, records, scope)?
     } else {
         records
             .par_chunks(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE)
@@ -35,7 +94,89 @@ pub(super) fn convert(state: &ServiceState) -> Result<SettingsBytecode> {
         instances,
     };
     validate_settings_hierarchy(&document.instances)?;
+    let bound = wire_bytes.load(Ordering::Relaxed);
+    check_settings_payload_len(bound, "Decoded")?;
+    let compressed = zstd::zstd_safe::compress_bound(bound);
+    check_settings_payload_len(compressed, "Compressed")?;
+    check_settings_file_len(compressed.saturating_add(SETTINGS_BINARY_MAGIC.len() + 1 + 20))?;
     Ok(document)
+}
+
+#[derive(Default)]
+struct SizeWriter(usize);
+
+impl Write for SizeWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_header(
+    records: &[SettingsBinaryInstance<'_>],
+    collected: &SettingsBinaryCollection<'_>,
+    strings: &[SettingsString<'_>],
+    string_ids: &SettingsStringIdMap<'_>,
+    budget: &DecodeBudget,
+) -> Result<usize> {
+    let _span = crate::app::profile::span("captured store limit bounds");
+    checked_settings_collection_len(strings.len(), "string count")?;
+    for text in strings {
+        check_settings_string_len(text.len())?;
+    }
+    let classes = collected
+        .class_counts
+        .keys()
+        .map(|text| Cow::Borrowed(text.as_ref()))
+        .collect::<Vec<_>>();
+    let properties = collected
+        .property_counts
+        .keys()
+        .map(|text| Cow::Borrowed(text.as_ref()))
+        .collect::<Vec<_>>();
+    checked_settings_collection_len(classes.len(), "class count")?;
+    checked_settings_collection_len(properties.len(), "property count")?;
+    for text in classes.iter().chain(&properties) {
+        budget.take(text.len())?;
+    }
+    checked_settings_collection_len(records.len(), "instance count")?;
+    budget.instances(records.len())?;
+    checked_settings_collection_len(collected.property_groups.len(), "property group count")?;
+    let mut size = SizeWriter::default();
+    write_settings_binary_header(
+        &mut size,
+        strings,
+        string_ids,
+        &classes,
+        &properties,
+        records.len(),
+    )?;
+    for (index, record) in records.iter().enumerate() {
+        write_settings_binary_id(&mut size, string_ids, &record.settings_id)?;
+        write_binary_string_id(&mut size, string_ids, record.name)?;
+        write_binary_string_id(&mut size, string_ids, record.class_name)?;
+        write_var_u64(&mut size, encode_parent_index(record.parent_index, index)?)?;
+    }
+    write_var_u64(&mut size, collected.property_groups.len() as u64)?;
+    for ((name, kind), values) in &collected.property_groups {
+        checked_settings_collection_len(values.len(), "property value count")?;
+        if *kind == 16 {
+            // A rotation table cannot contain more rotations than its values.
+            // If that bound fails, the wire path checks the chosen table.
+            checked_cframe_rotation_count(values.len())?;
+        }
+        if !SETTINGS_RECORD_FIELDS.contains(name) {
+            budget.property_group(values.len(), name, *kind)?;
+        }
+        // Group header: property id, kind, count, byte length. All varints
+        // fit ten bytes. A CFrame table is chosen only when smaller than inline.
+        size.0 = size.0.saturating_add(31 + usize::from(*kind == 16));
+    }
+    Ok(size.0)
 }
 
 fn convert_chunk<'a>(
@@ -45,19 +186,34 @@ fn convert_chunk<'a>(
 ) -> Result<Vec<SettingsBytecodeInstance>> {
     let mut sources = Vec::new();
     let mut scratch = Vec::new();
+    let mut wire = SizeWriter::default();
     let mut instances = Vec::with_capacity(records.len());
     for record in records {
         let id = match &record.settings_id {
-            SettingsBinaryId::Text(text) => checked_string(text)?,
-            SettingsBinaryId::NumericDebug(id) => format!("debug:0_{id}"),
+            SettingsBinaryId::Text(text) => checked_string(text, scope.budget)?,
+            SettingsBinaryId::NumericDebug(id) => scope.budget.copied(&format!("debug:0_{id}"))?,
         };
         let mut instance = SettingsBytecodeInstance::new(
             id,
-            checked_string(record.name)?,
-            checked_string(record.class_name)?,
+            checked_string(record.name, scope.budget)?,
+            checked_string(record.class_name, scope.budget)?,
             record.parent_index,
         );
         visit_settings_binary_properties(state, record, scope.lookup, |name, kind, source| {
+            // Count through the real value writer with maximal-width string
+            // ids. Instance/ref deltas also fit ten bytes, independent of order.
+            wire.0 = wire.0.saturating_add(10);
+            if kind == 17 {
+                wire.0 = wire.0.saturating_add(10);
+            } else {
+                write_binary_source_payload(
+                    &source,
+                    kind,
+                    scope.string_ids,
+                    scope.lookup,
+                    &mut wire,
+                )?;
+            }
             // A decoder discards these columns, including native capture fields.
             if !SETTINGS_RECORD_FIELDS.contains(&name) {
                 sources.push((name, kind, source));
@@ -71,7 +227,7 @@ fn convert_chunk<'a>(
             .windows(2)
             .any(|pair| (pair[0].0, pair[0].1) == (pair[1].0, pair[1].1))
         {
-            bail!("Settings bytecode gives one instance two values of a property");
+            next_group_instance(0, 0, 1)?;
         }
         for (name, kind, source) in sources.drain(..) {
             if name == "Attributes" && kind == 8 {
@@ -83,19 +239,23 @@ fn convert_chunk<'a>(
                 instance.attributes = attributes;
             } else {
                 let value = normalize_source(&source, kind, scope, &mut scratch)?;
-                instance.properties.insert(checked_string(name)?, value);
+                instance.properties.insert(name.to_string(), value);
             }
         }
         instances.push(instance);
     }
+    scope
+        .wire_bytes
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+            Some(total.saturating_add(wire.0))
+        })
+        .unwrap();
     Ok(instances)
 }
 
-fn checked_string(text: &str) -> Result<String> {
-    if text.len() > MAX_SETTINGS_STRING_BYTES {
-        bail!("Settings string exceeds safe size limit of {MAX_SETTINGS_STRING_BYTES} bytes");
-    }
-    Ok(text.to_string())
+fn checked_string(text: &str, budget: &DecodeBudget) -> Result<String> {
+    check_settings_string_len(text.len())?;
+    budget.copied(text)
 }
 
 fn normalize_source(
@@ -105,7 +265,7 @@ fn normalize_source(
     scratch: &mut Vec<u8>,
 ) -> Result<Value> {
     match source {
-        SettingsBinaryValueSource::Native(value) => native_value(value, scope.instance_count),
+        SettingsBinaryValueSource::Native(value) => native_value(value, scope),
         SettingsBinaryValueSource::Property(value) => {
             property_value(value, source, kind, scope, scratch)
         }
@@ -129,6 +289,7 @@ fn property_value(
         0..=5 | 20 => Ok(value.clone()),
         6 => Ok(Value::String(checked_string(
             raw_string_payload(value).context("Expected string binary settings value")?,
+            scope.budget,
         )?)),
         19 => Ok(typed_object(
             "EnumItem",
@@ -136,6 +297,7 @@ fn property_value(
                 "name",
                 Value::String(checked_string(
                     raw_string_payload(value).context("Expected enum binary settings value")?,
+                    scope.budget,
                 )?),
             )],
         )),
@@ -143,9 +305,7 @@ fn property_value(
             let values = value
                 .as_array()
                 .context("Expected numeric array binary settings value")?;
-            if values.len() > MAX_SETTINGS_COLLECTION_ITEMS {
-                bail!("numeric array length exceeds safe collection limit");
-            }
+            scope.budget.numeric_array(values.len(), kind)?;
             Ok(Value::Array(
                 values
                     .iter()
@@ -173,7 +333,7 @@ fn property_value(
             for (index, field) in fields.iter().enumerate() {
                 components[index] = fixed_numeric_component_f32(
                     settings_number(object.get(*field).unwrap_or(&Value::Null))
-                        .context("Expected numeric fixed component")?,
+                        .with_context(|| format!("Expected numeric field {field}"))?,
                 );
             }
             Ok(fixed_value(fixed, &components[..fields.len()]))
@@ -183,24 +343,26 @@ fn property_value(
                 ref_payload_object(value).context("Expected Ref binary settings value")?;
             let index = resolve_ref_index(reference, scope.lookup)?
                 .context("Expected resolved Ref binary settings value")?;
-            reference_value(index, scope.instance_count)
+            decoded_reference(index, scope.instance_count)
         }
         _ => normalize_complex(source, kind, false, scope, scratch),
     }
 }
 
-fn native_value(value: &NativeSettingsValue, instance_count: usize) -> Result<Value> {
+fn native_value(value: &NativeSettingsValue, scope: ConversionScope<'_, '_>) -> Result<Value> {
     match value {
         NativeSettingsValue::Bool(value) => Ok(json!(value)),
         NativeSettingsValue::Int(value) => Ok(json!(value)),
         NativeSettingsValue::Float32(value) => Ok(json_number_f64(f64::from(*value))),
         NativeSettingsValue::Float64(value) => Ok(json_number_f64(*value)),
-        NativeSettingsValue::String(value) => Ok(Value::String(checked_string(value)?)),
+        NativeSettingsValue::String(value) => {
+            Ok(Value::String(checked_string(value, scope.budget)?))
+        }
         NativeSettingsValue::Enum(value) => Ok(typed_object(
             "EnumItem",
-            [("name", Value::String(checked_string(value)?))],
+            [("name", Value::String(checked_string(value, scope.budget)?))],
         )),
-        NativeSettingsValue::Ref(index) => reference_value(*index, instance_count),
+        NativeSettingsValue::Ref(index) => decoded_reference(*index, scope.instance_count),
         NativeSettingsValue::Vector2(_)
         | NativeSettingsValue::Vector3(_)
         | NativeSettingsValue::UDim(_)
@@ -216,13 +378,6 @@ fn native_value(value: &NativeSettingsValue, instance_count: usize) -> Result<Va
             ))
         }
     }
-}
-
-fn reference_value(index: usize, instance_count: usize) -> Result<Value> {
-    if index >= instance_count {
-        bail!("Invalid resolved ref index {index}");
-    }
-    Ok(typed_object("Ref", [("instanceIndex", json!(index + 1))]))
 }
 
 fn fixed_fields(kind: FixedNumericKind) -> (&'static str, &'static [&'static str]) {
@@ -275,7 +430,10 @@ fn normalize_complex(
     collect_binary_source_strings(source, scope.lookup, &mut counts)?;
     let strings = counts
         .into_keys()
-        .map(|value| checked_string(&value))
+        .map(|value| {
+            check_settings_string_len(value.len())?;
+            Ok(value.into_owned())
+        })
         .collect::<Result<Vec<_>>>()?;
     let ids = strings
         .iter()
@@ -284,11 +442,10 @@ fn normalize_complex(
         .collect();
     scratch.clear();
     write_binary_source_payload(source, kind, &ids, scope.lookup, scratch)?;
-    let budget = DecodeBudget::new(usize::MAX);
     let scope = ValueScope {
         strings: &strings,
         instance_count: scope.instance_count,
-        budget: &budget,
+        budget: scope.budget,
     };
     let mut reader = BytecodeReader::new(scratch);
     let value = if attributes {

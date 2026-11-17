@@ -2,6 +2,9 @@ use super::*;
 use crate::snapshot::types::NativeSettingsProperty;
 use crate::tests::support::{SimRng, run_seeds};
 
+#[path = "captured_limits_sim.rs"]
+mod limits;
+
 pub(crate) fn captured_state(document: &SettingsBytecode, native: bool) -> ServiceState {
     let mut children = vec![Vec::new(); document.instances.len()];
     let mut native_rows = Vec::new();
@@ -161,6 +164,10 @@ fn values(seed: u64) -> Vec<Value> {
         json!({"_type":"Float64", "value":0.1}),
         json!({"_type":"Int64", "value":42}),
         json!({"EnumItem":{"enumType":"FutureEnum", "name":"B"}}),
+        json!({"_type":"Ref", "debugId":"0_999"}),
+        json!({"ColorSequence":{"keypoints":[]}}),
+        json!({"NumberSequence":{"keypoints":[]}}),
+        json!({"Font":{"family":"asset://font","weight":"Bold","style":"Italic"}}),
     ];
     for (kind, fields) in [
         ("Vector2", &["x", "y"][..]),
@@ -315,6 +322,10 @@ fn generated_state(seed: u64, count: usize) -> ServiceState {
     );
     // Transported ids, debug ids and the fallback all have distinct precedence.
     for (index, row) in state.instances.iter_mut().enumerate() {
+        if seed.is_multiple_of(4) {
+            row.transported_settings_id = Some(format!("store:{index}"));
+            continue;
+        }
         match (index + seed as usize) % 5 {
             0 => row.transported_settings_id = Some(format!("editor:{index}")),
             1 => {
@@ -327,6 +338,16 @@ fn generated_state(seed: u64, count: usize) -> ServiceState {
             }
             _ => {}
         }
+    }
+    if let Some(row) = state.instances.first_mut() {
+        row.properties
+            .insert("Attributes".into(), json!({"Raw": false}));
+    }
+    if let Some(debug_id) = state.instances.iter().find_map(|row| row.debug_id.clone()) {
+        state.instances[state.service_root_index].properties.insert(
+            "DebugTarget".into(),
+            json!({"_type":"Ref","debugId":debug_id}),
+        );
     }
     state
 }
@@ -363,6 +384,13 @@ fn add_native_properties(state: &mut ServiceState, seed: u64) {
             value,
         });
     }
+    if count > 1 {
+        state.instances[1].properties.remove("RunContext");
+        rows[1].push(NativeSettingsProperty {
+            name: "RunContext".into(),
+            value: NativeSettingsValue::Enum("Server".into()),
+        });
+    }
     state.native_properties_by_instance = Some(rows);
 }
 
@@ -382,12 +410,20 @@ fn oracle(state: &ServiceState, pools: &[rayon::ThreadPool]) -> Result<bool, Str
                         .position(|(left, right)| left != right);
                     return Err(format!("captured conversion differs at row {differing:?}"));
                 }
-                if encode_settings_bytecode(expected).ok() != encode_settings_bytecode(&actual).ok()
-                {
+                let output = |document| {
+                    encode_settings_bytecode(document).map_err(|error| format!("{error:#}"))
+                };
+                if output(expected) != output(&actual) {
                     return Err("captured conversion changed encoded bytes".into());
                 }
             }
-            (Err(_), Err(_)) => {}
+            (Err(expected), Err(actual)) => {
+                if format!("{expected:#}") != format!("{actual:#}") {
+                    return Err(format!(
+                        "captured conversion error differs: {expected:#} vs {actual:#}"
+                    ));
+                }
+            }
             (Ok(_), Err(error)) => {
                 return Err(format!(
                     "captured conversion rejected accepted state: {error:#}"

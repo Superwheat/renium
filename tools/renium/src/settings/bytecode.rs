@@ -74,6 +74,40 @@ const INSTANCE_BYTES: usize = 256;
 /// what the instance is and where it sits.
 const SETTINGS_RECORD_FIELDS: [&str; 3] = ["Name", "ClassName", "Parent"];
 const MAX_SETTINGS_HIERARCHY_DEPTH: usize = 512;
+
+fn checked_settings_collection_len(len: usize, label: &str) -> Result<usize> {
+    if len > MAX_SETTINGS_COLLECTION_ITEMS {
+        bail!("{label} exceeds safe collection limit of {MAX_SETTINGS_COLLECTION_ITEMS} items");
+    }
+    Ok(len)
+}
+
+fn check_settings_string_len(len: usize) -> Result<()> {
+    if len > MAX_SETTINGS_STRING_BYTES {
+        bail!("Settings string exceeds safe size limit of {MAX_SETTINGS_STRING_BYTES} bytes");
+    }
+    Ok(())
+}
+
+fn check_settings_file_len(len: usize) -> Result<()> {
+    if len > MAX_SETTINGS_BYTECODE_BYTES {
+        bail!("Settings bytecode exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes");
+    }
+    Ok(())
+}
+
+fn check_settings_payload_len(len: usize, label: &str) -> Result<()> {
+    if len > MAX_SETTINGS_BYTECODE_BYTES {
+        bail!(
+            "{label} settings bytecode payload exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes"
+        );
+    }
+    Ok(())
+}
+
+fn checked_cframe_rotation_count(count: usize) -> Result<usize> {
+    checked_settings_collection_len(count, "CFrame rotation table count")
+}
 // One document per service store; memory is bounded by the instance and byte
 // limits below, so a project's whole set of small stores stays cached.
 const MAX_CACHED_SETTINGS_DOCUMENTS: usize = 64;
@@ -464,9 +498,7 @@ fn decode_settings_bytecode_if_contains_any_string_set(
 
 fn decode_settings_bytecode_container(bytes: &[u8]) -> Result<(u8, Vec<u8>)> {
     let _span = crate::app::profile::span("store decompress");
-    if bytes.len() > MAX_SETTINGS_BYTECODE_BYTES {
-        bail!("Settings bytecode exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes");
-    }
+    check_settings_file_len(bytes.len())?;
     let mut reader = BytecodeReader::new(bytes);
     reader.read_magic()?;
     let version = reader
@@ -478,16 +510,8 @@ fn decode_settings_bytecode_container(bytes: &[u8]) -> Result<(u8, Vec<u8>)> {
 
     let decoded_len = reader.read_len("compressed settings bytecode payload length")?;
     let encoded_len = reader.read_len("compressed settings bytecode byte length")?;
-    if decoded_len > MAX_SETTINGS_BYTECODE_BYTES {
-        bail!(
-            "Decoded settings bytecode payload exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes"
-        );
-    }
-    if encoded_len > MAX_SETTINGS_BYTECODE_BYTES {
-        bail!(
-            "Compressed settings bytecode payload exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes"
-        );
-    }
+    check_settings_payload_len(decoded_len, "Decoded")?;
+    check_settings_payload_len(encoded_len, "Compressed")?;
     let encoded = reader.read_bytes(encoded_len)?;
     reader.finish()?;
     let decoded = zstd::bulk::decompress(encoded, decoded_len)?;
@@ -531,9 +555,7 @@ fn decode_settings_payload_header(
     let mut strings = Vec::with_capacity(reader.capacity(string_count, 1));
     for _ in 0..string_count {
         let len = reader.read_len("string byte length")?;
-        if len > MAX_SETTINGS_STRING_BYTES {
-            bail!("Settings string exceeds safe size limit of {MAX_SETTINGS_STRING_BYTES} bytes");
-        }
+        check_settings_string_len(len)?;
         let bytes = reader.read_bytes(len)?;
         strings.push(String::from_utf8(bytes.to_vec()).context("Invalid UTF-8 settings string")?);
     }
@@ -628,7 +650,7 @@ fn decode_settings_instance_range(
     budget: &DecodeBudget,
 ) -> Result<Vec<SettingsBytecodeInstance>> {
     let mut reader = BytecodeReader::new(bytes);
-    budget.take(count.saturating_mul(INSTANCE_BYTES))?;
+    budget.instances(count)?;
     let mut instances = Vec::with_capacity(count);
     for offset in 0..count {
         let instance_index = first_index + offset;
@@ -852,6 +874,24 @@ impl DecodeBudget {
         self.take(text.len())?;
         Ok(text.to_string())
     }
+
+    fn instances(&self, count: usize) -> Result<()> {
+        self.take(count.saturating_mul(INSTANCE_BYTES))
+    }
+
+    fn property_group(&self, count: usize, name: &str, kind: u8) -> Result<()> {
+        self.take(count.saturating_mul(VALUE_SLOT_BYTES + name.len() + value_kind_bytes(kind)))
+    }
+
+    fn numeric_array(&self, count: usize, kind: u8) -> Result<()> {
+        let label = if kind == 21 {
+            "f32 numeric array length"
+        } else {
+            "numeric array length"
+        };
+        checked_settings_collection_len(count, label)?;
+        self.take(count.saturating_mul(VALUE_SLOT_BYTES))
+    }
 }
 
 /// The fixed memory of one value of a kind, beyond its slot: the map a typed
@@ -874,9 +914,9 @@ fn decode_property_group_body(
     scope: ValueScope<'_>,
 ) -> Result<Vec<DecodedGroupEntry>> {
     let ValueScope { instance_count, .. } = scope;
-    scope.budget.take(
-        value_count.saturating_mul(VALUE_SLOT_BYTES + property_name.len() + value_kind_bytes(kind)),
-    )?;
+    scope
+        .budget
+        .property_group(value_count, property_name, kind)?;
     let mut reader = BytecodeReader::new(body);
     let cframe_group_decoder = decode_cframe_group_header(kind, &mut reader)?;
     // Large numeric columns otherwise occupy one Rayon worker while the other
@@ -1308,17 +1348,9 @@ fn encode_settings_bytecode_payload_collected(
 
 fn wrap_settings_bytecode_payload(payload: &[u8]) -> Result<Vec<u8>> {
     let _span = crate::app::profile::span("store compress");
-    if payload.len() > MAX_SETTINGS_BYTECODE_BYTES {
-        bail!(
-            "Decoded settings bytecode payload exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes"
-        );
-    }
+    check_settings_payload_len(payload.len(), "Decoded")?;
     let zstd = zstd::bulk::compress(payload, 1)?;
-    if zstd.len() > MAX_SETTINGS_BYTECODE_BYTES {
-        bail!(
-            "Compressed settings bytecode payload exceeds safe size limit of {MAX_SETTINGS_BYTECODE_BYTES} bytes"
-        );
-    }
+    check_settings_payload_len(zstd.len(), "Compressed")?;
     let mut writer = Vec::with_capacity(
         SETTINGS_BINARY_MAGIC.len()
             + 1
@@ -1579,10 +1611,7 @@ impl<'a> BytecodeReader<'a> {
 
     fn read_collection_len(&mut self, label: &str) -> Result<usize> {
         let len = self.read_len(label)?;
-        if len > MAX_SETTINGS_COLLECTION_ITEMS {
-            bail!("{label} exceeds safe collection limit of {MAX_SETTINGS_COLLECTION_ITEMS} items");
-        }
-        Ok(len)
+        checked_settings_collection_len(len, label)
     }
 
     fn read_string<'b>(&mut self, strings: &'b [String], label: &str) -> Result<&'b str> {
@@ -1650,8 +1679,8 @@ fn decode_raw_value_payload(
         }
         8 => decode_object_payload(reader, scope, depth),
         9 => {
-            let len = reader.read_collection_len("numeric array length")?;
-            budget.take(len.saturating_mul(VALUE_SLOT_BYTES))?;
+            let len = reader.read_len("numeric array length")?;
+            budget.numeric_array(len, kind)?;
             let mut items = Vec::with_capacity(reader.capacity(len, 8));
             for _ in 0..len {
                 items.push(json_number_f64(read_f64(reader)?));
@@ -1660,8 +1689,8 @@ fn decode_raw_value_payload(
         }
         20 => Ok(json_number_f64(read_f32(reader)? as f64)),
         21 => {
-            let len = reader.read_collection_len("f32 numeric array length")?;
-            budget.take(len.saturating_mul(VALUE_SLOT_BYTES))?;
+            let len = reader.read_len("f32 numeric array length")?;
+            budget.numeric_array(len, kind)?;
             let mut items = Vec::with_capacity(reader.capacity(len, 4));
             for _ in 0..len {
                 items.push(json_number_f64(read_f32(reader)? as f64));
@@ -1679,16 +1708,7 @@ fn decode_raw_value_payload(
         ),
         15 => decode_fixed_numeric_payload(reader, "Color3", &["r", "g", "b"]),
         16 => decode_cframe_payload(reader),
-        17 => {
-            let target_index = reader.read_len("resolved ref index")?;
-            if target_index >= instance_count {
-                bail!("Invalid resolved ref index {target_index}");
-            }
-            Ok(typed_object(
-                "Ref",
-                [("instanceIndex", json!(target_index + 1))],
-            ))
-        }
+        17 => decoded_reference(reader.read_len("resolved ref index")?, instance_count),
         18 => decode_fixed_numeric_payload(reader, "Rect", &["minX", "minY", "maxX", "maxY"]),
         19 => Ok(typed_object(
             "EnumItem",
@@ -1710,6 +1730,18 @@ fn decode_raw_value_payload(
         }
         _ => bail!("Unknown settings bytecode value kind {kind}"),
     }
+}
+
+fn decoded_reference(index: usize, instance_count: usize) -> Result<Value> {
+    check_resolved_ref_index(index, instance_count)?;
+    Ok(typed_object("Ref", [("instanceIndex", json!(index + 1))]))
+}
+
+fn check_resolved_ref_index(index: usize, instance_count: usize) -> Result<()> {
+    if index >= instance_count {
+        bail!("Invalid resolved ref index {index}");
+    }
+    Ok(())
 }
 
 fn decode_object_payload(
@@ -1888,7 +1920,8 @@ fn decode_cframe_group_header(
     match mode {
         0 => Ok(CFrameGroupDecoder::Inline),
         1 => {
-            let rotation_count = reader.read_collection_len("CFrame rotation table count")?;
+            let rotation_count =
+                checked_cframe_rotation_count(reader.read_len("CFrame rotation table count")?)?;
             let mut rotations = Vec::with_capacity(reader.capacity(rotation_count, 36));
             for _ in 0..rotation_count {
                 let mut rotation = [0.0_f64; 9];
@@ -1954,9 +1987,7 @@ fn decode_resolved_ref_target(
     }
     let target_index =
         usize::try_from(target).context("Resolved ref target index does not fit in usize")?;
-    if target_index >= instance_count {
-        bail!("Invalid resolved ref index {target_index}");
-    }
+    check_resolved_ref_index(target_index, instance_count)?;
     *previous_target_index = target_index;
     Ok(target_index)
 }
@@ -2292,6 +2323,14 @@ pub(crate) fn encode_service_settings_binary(state: &ServiceState) -> Result<Vec
     let lookup = build_settings_binary_instance_lookup(state, &instances);
     let collected = collect_settings_binary_data(state, &lookup, &instances)?;
 
+    encode_prepared_service_settings(&instances, &lookup, collected)
+}
+
+fn encode_prepared_service_settings(
+    instances: &[SettingsBinaryInstance<'_>],
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    collected: SettingsBinaryCollection<'_>,
+) -> Result<Vec<u8>> {
     let strings = sorted_counted_strings(collected.string_counts);
     let string_ids = build_id_map(&strings);
     let classes = sorted_counted_strings(collected.class_counts);
@@ -2352,7 +2391,7 @@ pub(crate) fn encode_service_settings_binary(state: &ServiceState) -> Result<Vec
         &property_group_entries,
         &property_ids,
         &string_ids,
-        &lookup,
+        lookup,
     )?;
 
     let writer = wrap_settings_bytecode_payload(&payload)?;
