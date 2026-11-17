@@ -290,6 +290,8 @@ fn source_merged_by_identity(
         editor
     } else if same(editor, baseline) {
         studio
+    } else if let Some(merged) = merged_source(baseline, editor, studio, preference) {
+        return Some(merged);
     } else {
         match preference {
             ConflictPreference::Editor => editor,
@@ -608,6 +610,13 @@ pub(crate) fn merge_conflicting_entry(
         || (matches!(base, Some(SnapshotEntry::File(_)))
             && matches!(editor, None | Some(SnapshotEntry::File(_)))
             && matches!(studio, None | Some(SnapshotEntry::File(_))));
+    if !first_pairing
+        && is_source_path(path)
+        && let (Some(editor), Some(studio)) = (editor, studio)
+        && let Some(merged) = merged_source(base, editor, studio, preference)
+    {
+        return Some(merged);
+    }
     if ordinary_file_conflict {
         match preference {
             ConflictPreference::Editor => return editor.cloned(),
@@ -617,6 +626,42 @@ pub(crate) fn merge_conflicting_entry(
     }
     conflicts.push(format!("{} changed on both sides", path.display()));
     editor.cloned()
+}
+
+/// A script both sides edited since the last sync, merged line by line: an
+/// edit of one side to lines the other left alone is kept, whichever side
+/// made it. Where both changed the same lines differently, the preferred
+/// side's lines stand; with no preference there is no merged text, and the
+/// script stays a conflict with each side holding its own.
+fn merged_source(
+    base: Option<&SnapshotEntry>,
+    editor: &SnapshotEntry,
+    studio: &SnapshotEntry,
+    preference: ConflictPreference,
+) -> Option<SnapshotEntry> {
+    use crate::collab::document::{Overlap, merge_lines_resolving, with_line_endings_of};
+
+    let (Some(SnapshotEntry::File(base)), SnapshotEntry::File(editor), SnapshotEntry::File(studio)) =
+        (base, editor, studio)
+    else {
+        return None;
+    };
+    // Studio holds a script with line feeds alone; the three texts are merged
+    // that way and the file keeps the line endings it had.
+    let text = |bytes: &[u8]| {
+        String::from_utf8(crate::system::text::normalized_source_bytes(bytes).collect()).ok()
+    };
+    let (base, editor_text, studio) = (text(base)?, text(editor)?, text(studio)?);
+    let overlap = match preference {
+        ConflictPreference::Studio => Overlap::Remote,
+        ConflictPreference::Editor | ConflictPreference::None => Overlap::Local,
+    };
+    let (merged, overlaps) = merge_lines_resolving(&base, &editor_text, &studio, overlap);
+    if overlaps > 0 && preference == ConflictPreference::None {
+        return None;
+    }
+    let merged = with_line_endings_of(merged, std::str::from_utf8(editor).ok()?);
+    Some(SnapshotEntry::File(merged.into_bytes()))
 }
 
 pub(crate) fn is_source_path(path: &Path) -> bool {

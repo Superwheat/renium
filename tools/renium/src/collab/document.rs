@@ -329,6 +329,28 @@ pub(crate) fn merge_lines(
     remote: &str,
     labels: &MergeLabels<'_>,
 ) -> String {
+    merge_lines_resolving(base, local, remote, Overlap::Mark(labels)).0
+}
+
+/// What the merge writes where both sides changed the same lines
+/// differently.
+#[derive(Clone, Copy)]
+pub(crate) enum Overlap<'a> {
+    /// Both versions, between Git-style conflict markers.
+    Mark(&'a MergeLabels<'a>),
+    Local,
+    Remote,
+}
+
+/// `merge_lines` with a choice for the lines both sides changed, and how
+/// many such places there were.
+pub(crate) fn merge_lines_resolving(
+    base: &str,
+    local: &str,
+    remote: &str,
+    overlap: Overlap<'_>,
+) -> (String, usize) {
+    let mut overlaps = 0;
     let base_lines = split_lines(base);
     let local_hunks = hunks(base, local);
     let remote_hunks = hunks(base, remote);
@@ -378,14 +400,19 @@ pub(crate) fn merge_lines(
             push_terminated(&mut merged, &mine);
             merged.push_str(&theirs);
         } else {
-            push_conflict(&mut merged, labels, &mine, &theirs);
+            overlaps += 1;
+            match overlap {
+                Overlap::Mark(labels) => push_conflict(&mut merged, labels, &mine, &theirs),
+                Overlap::Local => merged.push_str(&mine),
+                Overlap::Remote => merged.push_str(&theirs),
+            }
         }
         cursor = cursor.max(span.end());
     }
     if cursor < base_lines.len() {
         merged.push_str(&base_lines[cursor..].concat());
     }
-    merged
+    (merged, overlaps)
 }
 
 fn apply_hunks(base_lines: &[&str], span: Span, hunks: &[Hunk]) -> String {

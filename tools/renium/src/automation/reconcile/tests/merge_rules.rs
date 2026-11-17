@@ -454,3 +454,178 @@ fn a_folder_a_side_still_holds_stays_when_its_last_script_is_removed() {
     assert!(changes.editor.contains(&folder), "{:?}", changes.editor);
     assert!(!changes.studio.contains(&folder), "{:?}", changes.studio);
 }
+
+fn merged_script(
+    base: &str,
+    files: &str,
+    studio: &str,
+    preference: ConflictPreference,
+) -> (SnapshotEntry, Vec<String>) {
+    let mut conflicts = Vec::new();
+    let merged = merge_entry(
+        Path::new("src/ServerScriptService/Main.luau"),
+        Some(&text(base)),
+        Some(&text(files)),
+        Some(&text(studio)),
+        preference,
+        false,
+        &mut conflicts,
+    );
+    (merged.value.unwrap(), conflicts)
+}
+
+/// A script both sides edited keeps both edits where they touch different
+/// lines, whatever the preference, and both sides are told to take it.
+#[test]
+fn edits_of_both_sides_to_different_lines_of_a_script_are_both_kept() {
+    let base = "local a = 1\nlocal b = 2\nlocal c = 3\nreturn a\n";
+    let files = "local a = 10\nlocal b = 2\nlocal c = 3\nreturn a\n";
+    let studio = "local a = 1\nlocal b = 2\nlocal c = 3\nreturn a + c\n";
+    let both = "local a = 10\nlocal b = 2\nlocal c = 3\nreturn a + c\n";
+    for preference in [
+        ConflictPreference::None,
+        ConflictPreference::Editor,
+        ConflictPreference::Studio,
+    ] {
+        let (merged, conflicts) = merged_script(base, files, studio, preference);
+        assert!(merged == text(both), "{preference:?}");
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+    }
+    let mut conflicts = Vec::new();
+    let merged = merge_entry(
+        Path::new("src/Main.luau"),
+        Some(&text(base)),
+        Some(&text(files)),
+        Some(&text(studio)),
+        ConflictPreference::None,
+        false,
+        &mut conflicts,
+    );
+    assert!(merged.editor_changed && merged.studio_changed);
+}
+
+/// Where both sides changed the same line differently, the preferred side's
+/// line stands and the other side's edits elsewhere are still kept; with no
+/// preference the script is a conflict and the files keep their text.
+#[test]
+fn the_same_line_changed_on_both_sides_follows_the_preference_alone() {
+    let base = "local a = 1\nlocal b = 2\nlocal c = 3\nreturn a\n";
+    let files = "local a = 10\nlocal b = 2\nlocal c = 3\nreturn a\n-- files\n";
+    let studio = "local a = 20\nlocal b = 2\nlocal c = 30\nreturn a\n";
+    let (merged, conflicts) = merged_script(base, files, studio, ConflictPreference::Editor);
+    assert!(merged == text("local a = 10\nlocal b = 2\nlocal c = 30\nreturn a\n-- files\n"));
+    assert!(conflicts.is_empty());
+    let (merged, conflicts) = merged_script(base, files, studio, ConflictPreference::Studio);
+    assert!(merged == text("local a = 20\nlocal b = 2\nlocal c = 30\nreturn a\n-- files\n"));
+    assert!(conflicts.is_empty());
+    let (merged, conflicts) = merged_script(base, files, studio, ConflictPreference::None);
+    assert!(merged == text(files));
+    assert_eq!(conflicts.len(), 1);
+    assert!(
+        conflicts[0].ends_with("changed on both sides"),
+        "{conflicts:?}"
+    );
+}
+
+/// The merged text goes into the file with the line endings the file had;
+/// Studio's line feeds do not rewrite every line of it.
+#[test]
+fn a_merged_script_keeps_the_line_endings_of_its_file() {
+    let base = "local a = 1\r\nlocal b = 2\r\nreturn a\r\n";
+    let files = "local a = 10\r\nlocal b = 2\r\nreturn a\r\n";
+    let studio = "local a = 1\nlocal b = 2\nreturn a + b\n";
+    let (merged, conflicts) = merged_script(base, files, studio, ConflictPreference::None);
+    assert!(merged == text("local a = 10\r\nlocal b = 2\r\nreturn a + b\r\n"));
+    assert!(conflicts.is_empty());
+}
+
+/// Only a script with a last-sync text is merged by line: a first pairing has
+/// no common text to merge from, and another kind of file is not text Renium
+/// may rewrite.
+#[test]
+fn only_a_script_with_a_last_sync_text_is_merged_by_line() {
+    let base = "a\nb\nc\n";
+    let files = "a2\nb\nc\n";
+    let studio = "a\nb\nc2\n";
+    let mut conflicts = Vec::new();
+    let first = merge_entry(
+        Path::new("src/Main.luau"),
+        Some(&text(base)),
+        Some(&text(files)),
+        Some(&text(studio)),
+        ConflictPreference::None,
+        true,
+        &mut conflicts,
+    );
+    assert!(first.value == Some(text(files)));
+    assert_eq!(conflicts.len(), 1);
+    let mut conflicts = Vec::new();
+    let notes = merge_entry(
+        Path::new("src/Notes.txt"),
+        Some(&text(base)),
+        Some(&text(files)),
+        Some(&text(studio)),
+        ConflictPreference::None,
+        false,
+        &mut conflicts,
+    );
+    assert!(notes.value == Some(text(files)));
+    assert_eq!(conflicts.len(), 1);
+    let mut conflicts = Vec::new();
+    let binary = merge_entry(
+        Path::new("src/Main.luau"),
+        Some(&SnapshotEntry::File(vec![0xff, b'\n', b'x'])),
+        Some(&SnapshotEntry::File(vec![0xff, b'\n', b'y'])),
+        Some(&SnapshotEntry::File(vec![0xfe, b'\n', b'x'])),
+        ConflictPreference::None,
+        false,
+        &mut conflicts,
+    );
+    assert!(binary.value == Some(SnapshotEntry::File(vec![0xff, b'\n', b'y'])));
+    assert_eq!(conflicts.len(), 1);
+}
+
+/// Merging by line gives what applying each side's edits to the last-sync
+/// text gives, for edits that never touch the same or neighbouring lines.
+#[test]
+fn a_line_merge_equals_both_sides_edits_applied_to_the_last_sync_text() {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state as usize % bound
+    };
+    for round in 0..400 {
+        let lines = 12 + next(40);
+        let base = (0..lines)
+            .map(|line| format!("line {line}\n"))
+            .collect::<Vec<_>>();
+        // Every third line may be edited, alternating between the sides, so
+        // two edits always have an untouched line between them.
+        let (mut files, mut studio, mut both) = (base.clone(), base.clone(), base.clone());
+        for (slot, line) in (0..lines).step_by(3).enumerate() {
+            let edit = match next(4) {
+                0 => Some(format!("changed {round} {line}\n")),
+                1 => Some(String::new()),
+                2 => Some(format!("line {line}\nadded {round} {line}\n")),
+                _ => None,
+            };
+            let Some(edit) = edit else { continue };
+            if slot % 2 == 0 {
+                files[line] = edit.clone();
+            } else {
+                studio[line] = edit.clone();
+            }
+            both[line] = edit;
+        }
+        let (merged, conflicts) = merged_script(
+            &base.concat(),
+            &files.concat(),
+            &studio.concat(),
+            ConflictPreference::None,
+        );
+        assert!(conflicts.is_empty(), "round {round}: {conflicts:?}");
+        assert!(merged == text(&both.concat()), "round {round}");
+    }
+}
