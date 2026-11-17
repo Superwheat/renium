@@ -1176,7 +1176,14 @@ fn encode_settings_bytecode_payload_with_reference_lookup(
             ..Default::default()
         }
     };
-    let collected = collect_settings_bytecode_data(document, &lookup)?;
+    encode_settings_bytecode_payload_using_lookup(document, &lookup)
+}
+
+fn encode_settings_bytecode_payload_using_lookup(
+    document: &SettingsBytecode,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+) -> Result<Vec<u8>> {
+    let collected = collect_settings_bytecode_data(document, lookup)?;
 
     let strings = sorted_counted_strings(collected.string_counts);
     let string_ids = build_id_map(&strings);
@@ -1251,7 +1258,7 @@ fn encode_settings_bytecode_payload_with_reference_lookup(
         &property_group_entries,
         &property_ids,
         &string_ids,
-        &lookup,
+        lookup,
     )?;
 
     Ok(writer)
@@ -1303,11 +1310,12 @@ fn document_root_service(document: &SettingsBytecode) -> Option<String> {
 }
 
 fn build_bytecode_instance_lookup(document: &SettingsBytecode) -> SettingsBinaryInstanceLookup<'_> {
-    let selectors = settings_document_reference_selectors(document);
+    let root_service = document_root_service(document);
+    let selectors = settings_document_reference_selectors(document, root_service.as_deref());
     let mut lookup = SettingsBinaryInstanceLookup {
         dense_instance_count: document.instances.len(),
         dense_instances: Some(&document.instances),
-        root_service: document_root_service(document),
+        root_service,
         by_settings_id: if selectors.settings_id {
             AHashMap::with_capacity(document.instances.len())
         } else {
@@ -1365,6 +1373,7 @@ struct SettingsReferenceSelectors {
 
 fn settings_document_reference_selectors(
     document: &SettingsBytecode,
+    root_service: Option<&str>,
 ) -> SettingsReferenceSelectors {
     let mut selectors = SettingsReferenceSelectors::default();
     for instance in &document.instances {
@@ -1373,7 +1382,7 @@ fn settings_document_reference_selectors(
             .values()
             .chain(instance.attributes.values())
         {
-            collect_settings_reference_selectors(value, &mut selectors);
+            collect_settings_reference_selectors(value, root_service, &mut selectors);
             if selectors.settings_id && selectors.path {
                 return selectors;
             }
@@ -1382,15 +1391,32 @@ fn settings_document_reference_selectors(
     selectors
 }
 
-fn collect_settings_reference_selectors(value: &Value, selectors: &mut SettingsReferenceSelectors) {
+fn collect_settings_reference_selectors(
+    value: &Value,
+    root_service: Option<&str>,
+    selectors: &mut SettingsReferenceSelectors,
+) {
     match value {
         Value::Array(values) => {
             for value in values {
-                collect_settings_reference_selectors(value, selectors);
+                collect_settings_reference_selectors(value, root_service, selectors);
             }
         }
         Value::Object(object) => {
             if let Some(reference) = ref_payload_object(value) {
+                // Resolution checks the path before consulting any local index.
+                // An outside path either stays outside or fails validation; its
+                // other selectors cannot make a local lookup useful.
+                if root_service.is_some_and(|service| {
+                    reference
+                        .get("pathSegments")
+                        .and_then(Value::as_array)
+                        .and_then(|segments| segments.first())
+                        .and_then(Value::as_str)
+                        .is_some_and(|root| root != service)
+                }) {
+                    return;
+                }
                 selectors.settings_id |= reference.get("instanceIndex").is_none()
                     && ["settingsId", "referent", "ref"]
                         .iter()
@@ -1400,7 +1426,7 @@ fn collect_settings_reference_selectors(value: &Value, selectors: &mut SettingsR
                     .any(|key| reference.contains_key(*key));
             } else {
                 for value in object.values() {
-                    collect_settings_reference_selectors(value, selectors);
+                    collect_settings_reference_selectors(value, root_service, selectors);
                 }
             }
         }
@@ -5144,3 +5170,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "reference_index_sim.rs"]
+mod reference_index_sim;
