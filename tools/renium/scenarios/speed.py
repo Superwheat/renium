@@ -68,10 +68,8 @@ class Run:
 
     def rbx(self, args, cwd: Path, place: Path | None = None, timeout: float = 900, ok: bool = True, json_mode: bool = True):
         argv = [RBX] + (["--output-mode", "json"] if json_mode else []) + [str(arg) for arg in args]
-        env = dict(os.environ, RENIUM_DAEMON_NAME=DAEMON)
-        env.pop("RENIUM_PLACE", None)
-        if place is not None:
-            env["RENIUM_PLACE"] = str(place)
+        env = dict(os.environ, RENIUM_DAEMON_NAME=DAEMON,
+                   RENIUM_PLACE=str(place or (cwd / "place.rbxl")))
         started = time.perf_counter()
         try:
             done = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, creationflags=NO_WINDOW)
