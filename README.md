@@ -50,11 +50,24 @@ that last shared state:
   are all kept,
 - a real conflict is reported and waits for you to pick a side.
 
-### An agent drives Studio itself
+### An agent works alone
 
-Through one MCP tool an AI coding agent starts playtests, runs Luau on the server or
-a client, sends input and takes screenshots. It builds a game and tests it without
-someone clicking for it.
+Any MCP server can run a script in Studio. Renium takes away the points where a
+person still had to step in:
+
+- **Studio itself.** It opens, reopens, saves and closes places, and continues past
+  Studio's low-memory prompt.
+- **Several players.** A playtest runs a local server and as many clients as the
+  test needs, each with its own Luau, console, input and capture.
+- **Real input in the background.** Clicks, keys, typing and movement go to a play
+  window that is not in front, so the agent tests while you keep using the PC.
+- **What the player sees.** Screenshots and recordings of each client come back
+  frame by frame, on an emulated phone or tablet too.
+- **Answers it can trust.** A push says what Studio now holds, and the server's and
+  each client's errors come back to the agent instead of the Output window.
+- **Protected data.** Terrain, mesh ids and protected properties are written
+  natively, and packages publish without a dialog.
+- **Studio updates.** After one, Renium finds Studio's internals again by itself.
 
 ## Install
 
