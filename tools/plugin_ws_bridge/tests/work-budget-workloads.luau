@@ -17,4 +17,12 @@ for _, slice in ipairs({ 0.008, 0.032 }) do
 	assert(budget() and waits == before + 1, "Long work must yield at its chosen deadline")
 	assert(not budget(), "Scheduler wait time must not consume the next work slice")
 end
+local observed = 0
+local budget = parallel.newWorkBudget(nil, function(started)
+	observed += 1
+	assert(math.abs(now - started - 0.1) < 0.00001)
+end)
+assert(not budget() and observed == 0)
+now += 0.009
+assert(budget() and observed == 1)
 print("work budgets retain bounded scheduler cooperation")

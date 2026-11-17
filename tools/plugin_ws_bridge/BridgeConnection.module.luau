@@ -18,6 +18,20 @@ function BridgeConnection.profileStep(label: string, started: number, counts: an
 	end
 end
 
+-- Child workers yield on separate coroutines. Keep their waits in the request
+-- that started them without changing which coroutine owns the request clock.
+function BridgeConnection.profileWaitObserver(label: string)
+	local profile = profiles[coroutine.running()]
+	if profile == nil then return nil end
+	return function(started: number)
+		if #profile.spans < 4096 then
+			profile.spans[#profile.spans + 1] = {
+				label, (started - profile.started) * 1000, (os.clock() - profile.started) * 1000,
+			}
+		end
+	end
+end
+
 function BridgeConnection.profileFinish(): any
 	local thread = coroutine.running()
 	local profile = profiles[thread]

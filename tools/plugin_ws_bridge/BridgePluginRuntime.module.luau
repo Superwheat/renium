@@ -3574,7 +3574,8 @@ function BridgePluginRuntime.start(context)
 		overlayCacheKey: string?,
 		stateOverride: ServiceState?
 	): (string, number)
-		local yieldForBudget = ParallelModule.newWorkBudget()
+		local yieldForBudget = ParallelModule.newWorkBudget(nil,
+			ConnectionModule.profileWaitObserver(`{serviceName}: overlay scheduler yield`))
 		local generation = Config.studioChanges.serviceGeneration(serviceName)
 		local state = stateOverride or getState(serviceName)
 		local includeStableIds = not not stableIdsEnabled

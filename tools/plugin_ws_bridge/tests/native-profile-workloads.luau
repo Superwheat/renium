@@ -26,6 +26,18 @@ assert(result.spans[2][4].instances == 42)
 assert(Profile.profileFinish() == nil)
 Profile.profileStep("disabled", now)
 assert(Profile.profileFinish() == nil)
+assert(Profile.profileWaitObserver("disabled") == nil)
+Profile.profileStart(now)
+local observe = assert(Profile.profileWaitObserver("scheduler yield"))
+local child = coroutine.create(function()
+	local started = now
+	now += 0.020
+	observe(started)
+end)
+assert(coroutine.resume(child))
+local waits = Profile.profileFinish()
+assert(#waits.spans == 1 and waits.spans[1][1] == "scheduler yield")
+assert(math.abs(waits.spans[1][3] - waits.spans[1][2] - 20) < 0.00001)
 
 local sent
 local Transport = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeTransport.module.luau"), {
