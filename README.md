@@ -16,8 +16,9 @@ plugin and reaches the rest:
   Terrain grid, mesh ids.
 - **Locked properties.** It reads and sets properties the scripting API refuses,
   such as `MeshPart.MeshId` and `CollisionFidelity`.
-- **Reserved functions.** It calls `HttpRbxApiService`, which Roblox keeps for its
-  own scripts: web requests to Roblox under Studio's login.
+- **Roblox's own web APIs.** It sends requests to Roblox as the signed-in Studio
+  user, through a service Roblox reserves for its own scripts. The APIs Studio
+  itself uses, such as the creator inventory, are reachable without an API key.
 - **The whole place at once.** A push hands Studio the place in Studio's own binary
   format. 200,000 instances arrive the way they do when Studio opens a place, not
   one script call at a time.
@@ -89,11 +90,11 @@ The helper does what a Studio plugin is not allowed to:
 
 - write Terrain from the files into Studio,
 - read and write locked properties,
-- call functions Roblox reserves for its own scripts,
+- send requests to Roblox's web APIs as the signed-in Studio user,
 - publish packages without dialogs,
 - capture play windows that are not in front and send input to them.
 
-By default, each read or write of a locked property and each reserved call waits
+By default, each read or write of a locked property and each such request waits
 for your approval.
 
 How the helper gets into Studio:
