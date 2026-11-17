@@ -306,6 +306,7 @@ pub(super) fn automation_push_args(
     args.target_properties = automation_strings(object, "targetProperties");
     args.verify_sources = automation_bool(object, "verifySources", false)?;
     args.verify = automation_bool(object, "verify", false)?;
+    args.slow_import = automation_bool(object, "slowImport", false)?;
     args.upsert_instances_only = automation_bool(object, "upsertInstancesOnly", false)?;
     args.override_packages = automation_bool(object, "overridePackages", false)?;
     args.link_cache_dir = automation_string(object, "linkCacheDir")
@@ -5627,6 +5628,52 @@ mod tests {
             connected_runtime_wait_seconds(&state, context.id, 8.0),
             RECENT_STUDIO_LAUNCH_WAIT_SECONDS
         );
+    }
+
+    #[test]
+    fn cli_slow_import_reaches_the_daemon_only_when_requested() {
+        use crate::cli::{Cli, Commands};
+        use clap::Parser;
+        let root = std::env::current_dir().unwrap();
+        let context = automation::BoundContext {
+            id: 1,
+            initialized: true,
+            project: "test".into(),
+            root: root.to_string_lossy().into_owned(),
+            source: "src".into(),
+            experience: String::new(),
+            resource_lease: None,
+            place_id: None,
+            game_id: None,
+            selector: String::new(),
+            runtime_id: None,
+            plugin_build: None,
+            fingerprint: String::new(),
+        };
+        for (argv, expected) in [
+            (vec!["rbx", "ps", "--slow-import"], true),
+            (vec!["rbx", "ps"], false),
+        ] {
+            let Commands::PushEditorChanges(args) = Cli::try_parse_from(argv).unwrap().command
+            else {
+                panic!("expected push")
+            };
+            let request = crate::editor::sync::push_request_parameters(&args, false);
+            let mut parameters: Value =
+                serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+            assert_eq!(
+                automation_push_args(&context, &parameters, true)
+                    .unwrap()
+                    .slow_import,
+                expected
+            );
+            parameters.as_object_mut().unwrap().remove("slowImport");
+            assert!(
+                !automation_push_args(&context, &parameters, true)
+                    .unwrap()
+                    .slow_import
+            );
+        }
     }
 
     #[test]

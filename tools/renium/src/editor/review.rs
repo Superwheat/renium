@@ -1082,7 +1082,15 @@ pub(crate) fn request_editor_push_review(
     project_root: Option<&Path>,
     report: bool,
 ) -> Result<EditorReviewOutcome> {
-    let (change_count, rows) = editor_review_payload(changes);
+    request_editor_push_review_payload(bridge, editor_review_payload(changes), project_root, report)
+}
+
+pub(crate) fn request_editor_push_review_payload(
+    bridge: &BridgeServer,
+    (change_count, rows): (u64, Vec<Value>),
+    project_root: Option<&Path>,
+    report: bool,
+) -> Result<EditorReviewOutcome> {
     if change_count == 0 {
         return Ok(EditorReviewOutcome::Proceed);
     }

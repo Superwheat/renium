@@ -2974,6 +2974,11 @@ pub(super) struct PushEditorChangesArgs {
     )]
     pub(crate) no_check: bool,
     #[arg(
+        help = "Allow individual saved-field writes if the bulk import reader fails its checks",
+        long
+    )]
+    pub(super) slow_import: bool,
+    #[arg(
         help = "Skip the Studio review and protected property writes (prefer --yes)",
         long
     )]
@@ -3019,6 +3024,7 @@ impl PushEditorChangesArgs {
             verify_sources: false,
             verify: false,
             no_check: false,
+            slow_import: false,
             no_review: false,
             yes: false,
             review_report: false,

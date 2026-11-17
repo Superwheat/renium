@@ -37,17 +37,18 @@ use crate::editor::paths::{
 };
 use crate::editor::review::{
     EditorReviewOutcome, OutsideReferencePaths, apply_protected_writes_offline,
-    is_externally_managed_editor_property, is_externally_managed_protected_write,
-    is_user_facing_protected_write, local_place_path_for_bridge, normalize_editor_bridge_value,
+    editor_review_payload, is_externally_managed_editor_property,
+    is_externally_managed_protected_write, is_user_facing_protected_write,
+    local_place_path_for_bridge, normalize_editor_bridge_value,
     protected_root_write_rows_with_live_values, protected_write_matches_previous,
     protected_write_rows_with_previous_values, request_editor_push_review,
-    request_protected_write_review, studio_pid_for_bridge,
+    request_editor_push_review_payload, request_protected_write_review, studio_pid_for_bridge,
 };
 use crate::editor::types::{
     EditorBinaryImport, EditorChangeSet, EditorHistoryEntry, EditorInstanceChange,
     EditorInstanceDescriptor, EditorInstancePath, EditorPreserveDescriptor, EditorPropertyChange,
     EditorPropertyFilter, EditorSettingsWrite, EditorSourceChange, EditorSourceTarget,
-    PreparedEditorDocuments, take_pre_routed_protected_writes,
+    PreparedEditorDocuments, ServiceReaderFallback, take_pre_routed_protected_writes,
 };
 use crate::project::config;
 use crate::project::layout::{apply_configured_project_layout, configured_project_layout};
@@ -1621,12 +1622,21 @@ pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Res
     resolve_cli_push_paths(&mut args, &invocation_root)?;
     apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
     add_service_store_paths(&mut args)?;
+    daemon_control_request(
+        op::PUSH,
+        Some(&args.project.project_root),
+        push_request_parameters(&args, named_scripts),
+        !args.no_review,
+    )
+}
+
+pub(crate) fn push_request_parameters(args: &PushEditorChangesArgs, named_scripts: bool) -> Value {
     let incremental = !args.changed_paths.is_empty()
         || !args.changed_paths_files.is_empty()
         || !args.target_settings_ids.is_empty()
         || !args.target_settings_id_files.is_empty()
         || !args.target_properties.is_empty();
-    let parameters = json!({
+    json!({
         "srcDir": args.project.src_root,
         "changedPaths": args.changed_paths,
         "changedPathsFiles": args.changed_paths_files,
@@ -1637,6 +1647,7 @@ pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Res
         "upsertInstancesOnly": args.upsert_instances_only,
         "verifySources": args.verify_sources,
         "verify": args.verify,
+        "slowImport": args.slow_import,
         "overridePackages": args.override_packages,
         "allowProtectedWrites": !args.no_review,
         "yes": args.yes || global_yes() || named_scripts,
@@ -1646,17 +1657,7 @@ pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Res
         "bridgePorts": args.bridge.ports,
         "destructive": !incremental,
         "deferToLiveSync": args.defer_to_live_sync,
-    });
-    // Every push the user has not opted out of with --no-review goes through
-    // the daemon's review so protected writes stay allowed; `yes` alone
-    // decides whether Studio shows its review for a large push.
-    let approved = !args.no_review;
-    daemon_control_request(
-        op::PUSH,
-        Some(&args.project.project_root),
-        parameters,
-        approved,
-    )
+    })
 }
 
 /// `-s SERVICE` names a service's store file the way `rbx pl -s` does.
@@ -3249,6 +3250,7 @@ fn verify_pushed_sources(
 struct ProtectedWritePlan {
     writes: Vec<Value>,
     apply_offline: bool,
+    supplemental: usize,
 }
 
 // Saved fields with no plugin API (Lighting.Technology, Players.BanningEnabled,
@@ -3333,12 +3335,17 @@ fn warn_unsupported_properties(summary: &Map<String, Value>) {
     );
 }
 
-fn prepare_protected_writes(
-    args: &PushEditorChangesArgs,
+struct PendingProtectedWrites {
+    writes: Vec<Value>,
+    supplemental: usize,
+}
+
+fn pending_protected_writes(
     bridge: &BridgeServer,
     summary: &mut Map<String, Value>,
     pre_routed: Vec<Value>,
-) -> Result<ProtectedWritePlan> {
+    imported_suffix: usize,
+) -> PendingProtectedWrites {
     let mut reported = summary
         .get("protectedWrites")
         .and_then(Value::as_array)
@@ -3369,7 +3376,16 @@ fn prepare_protected_writes(
         .filter(|(_, row)| {
             !is_externally_managed_protected_write(row) && is_user_facing_protected_write(row)
         })
-        .map(|(index, row)| ((studio_pending[index], live_checked[index]), row))
+        .map(|(index, row)| {
+            (
+                (
+                    studio_pending[index],
+                    live_checked[index],
+                    index >= reported_count - imported_suffix,
+                ),
+                row,
+            )
+        })
         .collect::<Vec<_>>();
     let unavailable_count = reported_count - applicable.len();
     let applicable_rows = applicable
@@ -3390,9 +3406,9 @@ fn prepare_protected_writes(
         .zip(enriched_rows)
         .map(|((flags, _), row)| (flags, row))
         .collect::<Vec<_>>();
-    let writes = enriched
+    let pending = enriched
         .iter()
-        .filter(|((studio_pending, live_checked), row)| {
+        .filter(|((studio_pending, live_checked, _), row)| {
             let differs = !protected_write_matches_previous(row);
             if *live_checked {
                 *studio_pending || differs
@@ -3400,8 +3416,44 @@ fn prepare_protected_writes(
                 differs
             }
         })
-        .map(|(_, row)| row.clone())
         .collect::<Vec<_>>();
+    let supplemental = pending
+        .iter()
+        .filter(|((_, _, imported), _)| *imported)
+        .count();
+    let writes: Vec<_> = pending.into_iter().map(|(_, row)| row.clone()).collect();
+    summary.remove("protectedWrites");
+    if !writes.is_empty() {
+        summary.insert("protectedPending".to_string(), json!(writes.len() as u64));
+    }
+    if unavailable_count > 0 {
+        summary.insert(
+            "unavailableProtectedSkipped".to_string(),
+            json!(unavailable_count as u64),
+        );
+    }
+    let already_current = enriched.len() - writes.len();
+    if already_current > 0 {
+        summary.insert(
+            "protectedAlreadyCurrent".to_string(),
+            json!(already_current as u64),
+        );
+    }
+    PendingProtectedWrites {
+        writes,
+        supplemental,
+    }
+}
+
+fn prepare_protected_writes(
+    args: &PushEditorChangesArgs,
+    bridge: &BridgeServer,
+    pending: PendingProtectedWrites,
+) -> Result<ProtectedWritePlan> {
+    let PendingProtectedWrites {
+        writes,
+        supplemental,
+    } = pending;
     if args.no_review && !writes.is_empty() {
         let named = writes
             .iter()
@@ -3433,23 +3485,6 @@ fn prepare_protected_writes(
             writes.len()
         );
     }
-    summary.remove("protectedWrites");
-    if !writes.is_empty() {
-        summary.insert("protectedPending".to_string(), json!(writes.len() as u64));
-    }
-    if unavailable_count > 0 {
-        summary.insert(
-            "unavailableProtectedSkipped".to_string(),
-            json!(unavailable_count as u64),
-        );
-    }
-    let already_current = enriched.len() - writes.len();
-    if already_current > 0 {
-        summary.insert(
-            "protectedAlreadyCurrent".to_string(),
-            json!(already_current as u64),
-        );
-    }
     let apply_offline = !args.no_review
         && !writes.is_empty()
         && (args.yes || global_yes() || request_protected_write_review(bridge, &writes)?);
@@ -3462,6 +3497,7 @@ fn prepare_protected_writes(
     Ok(ProtectedWritePlan {
         writes,
         apply_offline,
+        supplemental,
     })
 }
 
@@ -3521,30 +3557,46 @@ fn push_editor_changes_with_collected(
         )?;
     }
     log_timing("native editor package ownership", phase_started);
-    let review = if !args.no_review
+    let mut review_payload = (!args.no_review
         && !args.yes
         && !global_yes()
         && (!changes.instance_changes.is_empty()
             || !changes.source_changes.is_empty()
-            || !changes.property_changes.is_empty())
+            || !changes.property_changes.is_empty()))
+    .then(|| {
+        (
+            editor_review_payload(&changes),
+            skipped_editor_summary(&changes),
+        )
+    });
+    let mut review = || -> Result<Option<Map<String, Value>>> {
+        let Some((payload, skipped)) = review_payload.take() else {
+            return Ok(None);
+        };
+        Ok(
+            match request_editor_push_review_payload(
+                bridge,
+                payload,
+                Some(review_project_root(&args)),
+                args.review_report,
+            )? {
+                EditorReviewOutcome::Proceed => None,
+                EditorReviewOutcome::Skipped => Some(skipped),
+                EditorReviewOutcome::Held(held) => Some(held),
+            },
+        )
+    };
+    // Without an unmaterialized document, all possible individual writes
+    // are already represented in the property changes.
+    if (args.slow_import
+        || (changes.native_property_documents.is_empty()
+            && individual_import_write_count(&changes.property_changes)
+                <= MAX_INDIVIDUAL_IMPORT_WRITES))
+        && let Some(summary) = review()?
     {
-        request_editor_push_review(
-            bridge,
-            &changes,
-            Some(review_project_root(&args)),
-            args.review_report,
-        )?
-    } else {
-        EditorReviewOutcome::Proceed
-    };
-    let review_skipped = !review.proceeds();
-    let held_summary = match review {
-        EditorReviewOutcome::Held(summary) => Some(summary),
-        _ => None,
-    };
-    let binary_import = if review_skipped {
-        None
-    } else if prepared_binary_import.is_some() {
+        return Ok(summary);
+    }
+    let binary_import = if prepared_binary_import.is_some() {
         prepared_binary_import
     } else if let Some(projection) = projection.filter(|stage| stage.is_temporary()) {
         let mut projected_args = args.clone();
@@ -3570,22 +3622,42 @@ fn push_editor_changes_with_collected(
     }
     let mut pre_routed_protected_writes =
         take_pre_routed_protected_writes(&mut changes, binary_import.as_ref());
+    let mut rerouted_fields = 0;
     if !changes.deferred_native_rows.is_empty() && !super::native_roots::available(bridge)? {
         // Plugin-only imports cannot run the native follow-up transaction. Keep
         // its saved fields in the original transaction's protected snapshot.
-        pre_routed_protected_writes.extend(protected_write_rows(&std::mem::take(
-            &mut changes.deferred_native_rows,
-        )));
+        let rerouted = protected_write_rows(&std::mem::take(&mut changes.deferred_native_rows));
+        rerouted_fields = rerouted.len();
+        pre_routed_protected_writes.extend(rerouted);
     }
-    let supplemental_import_writes = binary_import
+    let fallback = binary_import
         .as_ref()
-        .map(|import| {
-            checked_individual_import_writes(
-                &changes.deferred_native_rows,
-                import.fallback_reason.as_deref(),
+        .and_then(|import| import.fallback_reason.as_ref());
+    let limit =
+        checked_individual_import_writes(&changes.deferred_native_rows, fallback, args.slow_import);
+    let requires_offline = if let Err(error) = limit {
+        // Only an independently pending protected write can carry these fields in
+        // the approved snapshot. Recheck the route before committing the import.
+        if args.no_review
+            || pre_routed_protected_writes.is_empty()
+            || pending_protected_writes(
+                bridge,
+                &mut Map::new(),
+                pre_routed_protected_writes.clone(),
+                rerouted_fields,
             )
-        })
-        .transpose()?;
+            .writes
+            .is_empty()
+        {
+            return Err(error);
+        }
+        true
+    } else {
+        false
+    };
+    if let Some(summary) = review()? {
+        return Ok(summary);
+    }
     let unstaged_replacements = changes
         .instance_changes
         .iter()
@@ -3601,27 +3673,20 @@ fn push_editor_changes_with_collected(
             unstaged_replacements.join(", ")
         );
     }
-    let mut history_transaction = if review_skipped || binary_import.is_some() {
+    let mut history_transaction = if binary_import.is_some() {
         None
     } else {
         save_editor_history_entries(bridge, &args.project.project_root, &changes)?
     };
     let phase_started = Instant::now();
-    if !review_skipped && let Some(validate_project) = validate_project {
+    if let Some(validate_project) = validate_project {
         validate_project()?;
     }
-    let mut transaction = if review_skipped {
-        None
-    } else {
-        EditorTransaction::begin(bridge, &changes, binary_import.as_ref(), guard)?
-    };
+    let mut transaction =
+        EditorTransaction::begin(bridge, &changes, binary_import.as_ref(), guard)?;
     let result = (|| {
         log_timing("native editor transaction begin", phase_started);
-        let mut summary = if let Some(held) = held_summary.clone() {
-            held
-        } else if review_skipped {
-            skipped_editor_summary(&changes)
-        } else {
+        let mut summary = {
             let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
             let phase_started = Instant::now();
             let result = send_editor_change_batches(
@@ -3633,15 +3698,13 @@ fn push_editor_changes_with_collected(
             log_timing("native editor change batches", phase_started);
             result?
         };
-        if !review_skipped {
+        {
             let errors = summary.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
             if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
                 bail!("Studio rejected or failed one or more editor push changes");
             }
         }
-        if (args.verify_sources || summary.contains_key("nativeVerifiedServices"))
-            && !review_skipped
-        {
+        if args.verify_sources || summary.contains_key("nativeVerifiedServices") {
             verify_pushed_sources(
                 bridge,
                 &changes,
@@ -3651,7 +3714,7 @@ fn push_editor_changes_with_collected(
         }
         if unchanged_sources > 0 {
             summary.insert("sourceUnchanged".to_string(), json!(unchanged_sources));
-            if args.verify_sources && !review_skipped {
+            if args.verify_sources {
                 let verified = summary
                     .get("sourceVerified")
                     .and_then(Value::as_u64)
@@ -3663,22 +3726,32 @@ fn push_editor_changes_with_collected(
             }
         }
         let phase_started = Instant::now();
-        let mut protected =
-            prepare_protected_writes(&args, bridge, &mut summary, pre_routed_protected_writes)?;
+        let pending = pending_protected_writes(
+            bridge,
+            &mut summary,
+            pre_routed_protected_writes,
+            rerouted_fields,
+        );
+        let mut protected = prepare_protected_writes(&args, bridge, pending)?;
+        if requires_offline && !protected.apply_offline {
+            bail!(
+                "The protected snapshot was not approved or is no longer needed. The import was rolled back. Repeat the push with --slow-import to allow individual writes."
+            );
+        }
         if protected.apply_offline && !changes.deferred_native_rows.is_empty() {
             // The offline apply reopens Studio after the commit, so the
             // follow-up transaction has no runtime to run in; the saved place
             // takes the imported instances' engine-set fields instead.
-            protected
-                .writes
-                .extend(protected_write_rows(&changes.deferred_native_rows));
+            let imported = protected_write_rows(&changes.deferred_native_rows);
+            protected.supplemental += imported.len();
+            protected.writes.extend(imported);
         }
         log_timing("native editor protected write preparation", phase_started);
         let phase_started = Instant::now();
-        if !review_skipped && let Some(validate_project) = validate_project {
+        if let Some(validate_project) = validate_project {
             validate_project()?;
         }
-        if !review_skipped {
+        {
             super::native_geometry::capture_generated(
                 bridge,
                 &mut changes,
@@ -3691,11 +3764,7 @@ fn push_editor_changes_with_collected(
                 finalize_settings(&mut changes)?;
             }
         }
-        let settings_transaction = if review_skipped {
-            None
-        } else {
-            Some(EditorSettingsTransaction::apply(&changes)?)
-        };
+        let settings_transaction = EditorSettingsTransaction::apply(&changes)?;
         if let Some(history_transaction) = history_transaction.as_mut() {
             history_transaction.publish()?;
         }
@@ -3746,24 +3815,23 @@ fn push_editor_changes_with_collected(
             summary.remove("fieldVerifiedServices");
         }
         log_timing("native editor transaction commit", phase_started);
-        if let Some(settings_transaction) = settings_transaction {
-            settings_transaction.commit();
-        }
+        settings_transaction.commit();
         if let Some(history_transaction) = history_transaction {
             history_transaction.commit();
         }
         // The files above record what Studio committed; a failure here leaves
         // both in step and reports the fields that still need a push.
-        if !review_skipped && !protected.apply_offline && !changes.deferred_native_rows.is_empty() {
+        let mut supplemental = 0;
+        if protected.apply_offline {
+            supplemental = protected.supplemental;
+        } else if !changes.deferred_native_rows.is_empty() {
             let phase_started = Instant::now();
             apply_deferred_native_rows(bridge, guard, &changes.deferred_native_rows, &mut summary)?;
+            supplemental = individual_import_write_count(&changes.deferred_native_rows);
             log_timing("native editor imported engine fields", phase_started);
         }
-        if let Some(count) = supplemental_import_writes {
-            summary.insert(
-                "supplementalImportWrites".into(),
-                json!(if protected.apply_offline { 0 } else { count }),
-            );
+        if binary_import.is_some() {
+            summary.insert("supplementalImportWrites".into(), json!(supplemental));
         }
         log_global(
             5,
@@ -3851,13 +3919,21 @@ fn defer_imported_native_root_rows(
 // fence and write. Check the plan before opening the import transaction.
 const MAX_INDIVIDUAL_IMPORT_WRITES: usize = 32;
 
+fn individual_import_write_count(rows: &[EditorPropertyChange]) -> usize {
+    rows.iter().map(|row| row.properties.len()).sum()
+}
+
 fn checked_individual_import_writes(
     rows: &[EditorPropertyChange],
-    fallback_reason: Option<&str>,
-) -> Result<usize> {
-    let count = rows.iter().map(|row| row.properties.len()).sum::<usize>();
-    if count <= MAX_INDIVIDUAL_IMPORT_WRITES {
-        return Ok(count);
+    fallback: Option<&ServiceReaderFallback>,
+    allow_slow: bool,
+) -> Result<()> {
+    let Some(ServiceReaderFallback::DiscoveryFailed(reason)) = fallback else {
+        return Ok(());
+    };
+    let count = individual_import_write_count(rows);
+    if allow_slow || count <= MAX_INDIVIDUAL_IMPORT_WRITES {
+        return Ok(());
     }
     let mut counts = BTreeMap::new();
     for row in rows {
@@ -3875,9 +3951,9 @@ fn checked_individual_import_writes(
         .map(|((class, name), n)| format!("{class}.{name} ({n})"))
         .collect::<Vec<_>>()
         .join(", ");
-    let reason = fallback_reason.unwrap_or("the native import payload does not cover these fields");
+    let seconds = count as f64 * 0.031;
     bail!(
-        "Import stopped before changing Studio: {reason}. The bulk import would need {count} individual supplemental field writes (limit {MAX_INDIVIDUAL_IMPORT_WRITES}), including {fields}. No fields were skipped or written."
+        "Import stopped before changing Studio: {reason}. The bulk import would need {count} individual supplemental field writes (limit {MAX_INDIVIDUAL_IMPORT_WRITES}), including {fields}. Estimated time: {seconds:.1} s at 31 ms per field. Repeat the same push with --slow-import (for a whole project: rbx ps --yes --slow-import)."
     );
 }
 
@@ -6260,29 +6336,32 @@ mod sync_tests {
             ..Default::default()
         };
         let mut rows = vec![row; MAX_INDIVIDUAL_IMPORT_WRITES / 2];
-        assert_eq!(
-            checked_individual_import_writes(&rows, None).unwrap(),
-            MAX_INDIVIDUAL_IMPORT_WRITES
-        );
+        let failed = ServiceReaderFallback::DiscoveryFailed("ambiguous reader".into());
+        assert!(checked_individual_import_writes(&rows, Some(&failed), false).is_ok());
         rows.push(EditorPropertyChange {
             class_name: "Other".into(),
             properties: Map::from_iter([("SavedC".into(), json!(0))]),
             ..Default::default()
         });
-        let error = checked_individual_import_writes(&rows, Some("service reader unavailable"))
+        let error = checked_individual_import_writes(&rows, Some(&failed), false)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("service reader unavailable"));
+        assert!(error.contains("ambiguous reader"));
+        assert!(error.contains("1.0 s at 31 ms per field"));
+        assert!(error.contains("rbx ps --yes --slow-import"));
         assert!(error.contains("33 individual supplemental field writes (limit 32)"));
         assert!(error.contains("Example.SavedA (16)"));
         assert!(error.contains("Other.SavedC (1)"));
-        assert!(checked_individual_import_writes(&[], None).is_ok());
+        assert!(checked_individual_import_writes(&rows, None, false).is_ok());
+        assert!(checked_individual_import_writes(&rows, Some(&failed), true).is_ok());
+        let planned = ServiceReaderFallback::Planned("ambiguous reader");
+        assert!(checked_individual_import_writes(&rows, Some(&planned), false).is_ok());
+        assert!(checked_individual_import_writes(&[], Some(&failed), false).is_ok());
     }
 
-    #[test]
-    fn imported_engine_fields_wait_for_the_import_to_land() {
-        use crate::editor::types::{EditorBinaryImportGroup, EditorPropertyChange};
-        let import = EditorBinaryImport {
+    pub(super) fn replacement_fixture() -> EditorBinaryImport {
+        use crate::editor::types::EditorBinaryImportGroup;
+        EditorBinaryImport {
             bytes: Vec::new(),
             native_replacement: None,
             fallback_reason: None,
@@ -6307,7 +6386,12 @@ mod sync_tests {
             post_apply_properties_by_path: HashMap::new(),
             external_references_post_applied: false,
             viewport_references_post_applied: false,
-        };
+        }
+    }
+
+    #[test]
+    fn imported_engine_fields_wait_for_the_import_to_land() {
+        let import = replacement_fixture();
         let row = |segments: &[&str], class_name: &str, properties: &[(&str, Value)]| {
             EditorPropertyChange {
                 service: "ReplicatedStorage".into(),
@@ -6351,7 +6435,7 @@ mod sync_tests {
         defer_imported_native_root_rows(&mut changes, Some(&import));
         assert_eq!(changes.deferred_native_rows.len(), 2);
         assert_eq!(
-            checked_individual_import_writes(&changes.deferred_native_rows, None).unwrap(),
+            individual_import_write_count(&changes.deferred_native_rows),
             2
         );
         assert_eq!(changes.property_changes.len(), 2);
@@ -7246,6 +7330,7 @@ mod saved_field_review_tests {
                 };
                 let request: Value = serde_json::from_str(&text).unwrap();
                 let result = match request["method"].as_str().unwrap() {
+                    "getEditorMutationPackages" => json!({ "packages": [] }),
                     "requestEditorPushReview" => {
                         json!({ "required": true, "reviewId": "studio-1" })
                     }
@@ -7307,6 +7392,76 @@ mod saved_field_review_tests {
             no_review: false,
             yes,
         }
+    }
+
+    #[test]
+    fn protected_snapshot_counts_only_pending_import_fields() {
+        let bridge = fixture();
+        let row = json!({"kind":"property", "className":"SurfaceAppearance", "name":"TexturePack", "value":"a"});
+        let mut current = row.clone();
+        current["oldValueKnown"] = json!(true);
+        current["oldValue"] = json!("a");
+        let mut filtered = row.clone();
+        filtered["name"] = json!("RBX_Ignored");
+        let mut summary = Map::from_iter([("protectedWrites".into(), json!([row]))]);
+        let pending =
+            pending_protected_writes(&bridge, &mut summary, vec![row, current, filtered], 3);
+        assert_eq!(pending.supplemental, 1);
+        assert_eq!(pending.writes.len(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unexpected_slow_import_is_refused_before_review_and_transaction() {
+        let root = project_with_threshold_zero("slow-import-review");
+        let (bridge, calls, plugin) = reviewing_bridge("skip");
+        let mut import = super::sync_tests::replacement_fixture();
+        import.fallback_reason = Some(ServiceReaderFallback::DiscoveryFailed(
+            "reader mismatch".into(),
+        ));
+        let row = EditorPropertyChange {
+            service: "ReplicatedStorage".into(),
+            class_name: "SurfaceAppearance".into(),
+            path_segments: vec!["ReplicatedStorage".into(), "Surface".into()],
+            path_ordinals: vec![1, 1],
+            properties: Map::from_iter([("TexturePack".into(), json!("rbxassetid://123"))]),
+            ..Default::default()
+        };
+        let args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: "src".into(),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        let error = push_editor_changes_with_collected(
+            args,
+            &bridge,
+            EditorChangeSet {
+                property_changes: vec![row; MAX_INDIVIDUAL_IMPORT_WRITES + 1],
+                ..Default::default()
+            },
+            CollectedPushOptions {
+                started: Instant::now(),
+                projection: None,
+                prepared_binary_import: Some(import),
+                guard: None,
+                validate_project: None,
+                finalize_settings: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reader mismatch"), "{error:#}");
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| call["method"] == "getEditorMutationPackages")
+        );
+        drop(bridge);
+        plugin.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
