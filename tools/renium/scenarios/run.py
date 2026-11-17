@@ -848,72 +848,6 @@ def run_scenario(scenario: Scenario, keep: bool) -> dict:
         return run_scenario_locked(scenario, keep)
 
 
-# A session's Studio grows with every playtest it ran (measured: up to 4 GB
-# after a few minutes of rows). Studio holds back a new window with a "Low
-# System Resources" notice, or refuses it ("maximum allowed Studio windows"),
-# once the machine runs short, so a Studio this large is reopened between
-# rows, and one half this large when little memory is free.
-STUDIO_REOPEN_MB = float(os.environ.get("RENIUM_SCENARIO_STUDIO_MB", "3000"))
-LOW_FREE_MB = float(os.environ.get("RENIUM_SCENARIO_LOW_FREE_MB", "6000"))
-
-
-def process_megabytes(pid: int) -> float:
-    """The memory a process holds (its working set), 0 when it cannot be read."""
-    try:
-        if os.name == "nt":
-            import ctypes
-            from ctypes import wintypes
-
-            class Counters(ctypes.Structure):
-                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
-                    (name, ctypes.c_size_t)
-                    for name in ("PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")
-                ]
-
-            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel.OpenProcess.restype = wintypes.HANDLE
-            handle = kernel.OpenProcess(0x1000, False, pid)
-            if not handle:
-                return 0.0
-            try:
-                counters = Counters()
-                counters.cb = ctypes.sizeof(Counters)
-                kernel.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD]
-                if not kernel.K32GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
-                    return 0.0
-                return counters.WorkingSetSize / 1048576
-            finally:
-                kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-                kernel.CloseHandle(handle)
-        listing = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True, timeout=30).stdout.strip()
-        return float(listing) / 1024 if listing else 0.0
-    except Exception:
-        return 0.0
-
-
-def free_megabytes() -> float:
-    """Free physical memory; infinite where it is not read (only Windows is)."""
-    if os.name != "nt":
-        return float("inf")
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        class Status(ctypes.Structure):
-            _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD)] + [
-                (name, ctypes.c_ulonglong)
-                for name in ("ullTotalPhys", "ullAvailPhys", "ullTotalPageFile", "ullAvailPageFile", "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")
-            ]
-
-        status = Status()
-        status.dwLength = ctypes.sizeof(Status)
-        if not ctypes.WinDLL("kernel32").GlobalMemoryStatusEx(ctypes.byref(status)):
-            return float("inf")
-        return status.ullAvailPhys / 1048576
-    except Exception:
-        return float("inf")
-
-
 SERVICE_COUNTS = (
     "local t = {} for _, s in ipairs({'Workspace','ReplicatedStorage','ServerScriptService','ServerStorage','StarterPlayer',"
     "'StarterGui','StarterPack','ReplicatedFirst','Lighting','SoundService','Teams','TextChatService'}) do "
@@ -944,7 +878,6 @@ class Session:
         self.counts: dict | None = None
         self.reopens = 0
         self.resets = 0
-        self.recycles = 0
         self.environment = dict(os.environ)
         self.slot = StudioSlot()
 
@@ -1029,12 +962,6 @@ class Session:
                 raise_if_needs_user(str(error))
                 self.close_studio(ctx)
         if self.studio_open:
-            held = self.studio_megabytes(ctx)
-            if held >= STUDIO_REOPEN_MB or (held >= STUDIO_REOPEN_MB / 2 and free_megabytes() < LOW_FREE_MB):
-                ctx.log.append(f"# Studio holds {held:.0f} MB with {free_megabytes():.0f} MB free; reopening it")
-                self.close_studio(ctx)
-                self.recycles += 1
-        if self.studio_open:
             ctx.rbx("play", "-x", ok=None, timeout=60)
             ctx.rbx("lof", ok=None, timeout=60)
             ctx.rbx("dp", ok=None, timeout=60)
@@ -1061,12 +988,6 @@ class Session:
         self.open_studio(ctx)
         self.reopens += 1
         return "reopen"
-
-    def studio_megabytes(self, ctx: Context) -> float:
-        """The memory this session's Studio holds."""
-        status = ctx.rbx("status", ok=None, timeout=60)
-        pids = [int(c["pid"]) for c in (status.get("clients") or []) if c.get("role") == "edit" and c.get("pid")]
-        return max((process_megabytes(pid) for pid in pids), default=0.0)
 
     def finish(self, ctx: Context, keep: bool):
         self.close_studio(ctx)
@@ -1172,7 +1093,7 @@ def run_session(scenarios: list[Scenario], size: str, label: str, keep: bool, or
     finally:
         session.finish(ctx, keep or failed_any)
         row_lock.close()
-        print(f"session {label}: {session.resets} resets by push, {session.reopens} reopens, {session.recycles} reopened for memory", flush=True)
+        print(f"session {label}: {session.resets} resets by push, {session.reopens} reopens", flush=True)
     return outcomes
 
 

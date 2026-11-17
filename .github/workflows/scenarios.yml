@@ -15,7 +15,7 @@ on:
         default: ""
       shards:
         type: string
-        default: "8"
+        default: "4"
   workflow_dispatch:
     inputs:
       only:
@@ -29,7 +29,7 @@ on:
       shards:
         description: Studios to run at once
         type: string
-        default: "8"
+        default: "4"
 
 permissions:
   contents: read
