@@ -162,10 +162,19 @@ fn align_settings_bytes(
             .is_some_and(|camera| keep_reference_viewport_camera(camera, observed))
     };
     let topology_matches = settings_topology_matches(&reference, &observed);
-    let positionally_equivalent =
+    let mut positionally_equivalent =
         topology_matches && positional_values_equivalent(&reference, &observed, None, false);
+    // A pull keeps the viewport camera. Where every instance stands as in the
+    // reference and the camera carries its stored id, the reference's camera
+    // goes back before anything else is compared: a store whose camera alone
+    // moved is unchanged the way one whose camera stood still is.
+    let camera_kept_early =
+        topology_matches && !positionally_equivalent && keep_camera(&mut observed);
+    if camera_kept_early {
+        positionally_equivalent = positional_values_equivalent(&reference, &observed, None, false);
+    }
     if positionally_equivalent {
-        if document_adds_enum_types(&reference, &observed) {
+        if positions_add_enum_types(&reference, &observed) {
             if !align_settings_ids_to_reference(&reference, &mut observed) {
                 bail!("duplicate instance identity is ambiguous after comparing references");
             }
@@ -174,7 +183,9 @@ fn align_settings_bytes(
             drop_settings_documents(reference, observed);
             return Ok(SettingsAlignment::Changed(upgraded));
         }
-        if let Some(key) = cache_key {
+        // The cache answers for the bytes alone, also to a caller that keeps
+        // no camera.
+        if let Some(key) = cache_key.filter(|_| !camera_kept_early) {
             cache_settings_alignment(key);
         }
         drop_settings_documents(reference, observed);
@@ -182,15 +193,20 @@ fn align_settings_bytes(
     }
     // A store whose instances stand where the reference's stand, under the
     // same ids, already carries the reference's identities: nothing is left
-    // to align, and its own bytes are what the encoder writes for it again.
-    // This is a pull after values changed in Studio, the common one.
+    // to align. This is a pull after values changed in Studio, the common
+    // one. Under store ids its own bytes are what the encoder writes for it
+    // again; any other id passes through the encoder, which normalizes it.
     if topology_matches && identities_already_aligned(&reference, &observed) {
         rayon::join(
             || stabilize_settings_reference_ids(&mut reference),
             || stabilize_settings_reference_ids(&mut observed),
         );
-        let camera_kept = keep_camera(&mut observed);
-        let aligned = if camera_kept {
+        let camera_kept = keep_camera(&mut observed) || camera_kept_early;
+        let keep_encoding = reference
+            .instances
+            .iter()
+            .all(|instance| is_store_identity(&instance.settings_id));
+        let aligned = if camera_kept || !keep_encoding {
             encode_settings_bytecode(&observed)?
         } else {
             observed_bytes.to_vec()
@@ -215,32 +231,81 @@ fn align_settings_bytes(
     if !align_settings_ids_to_reference(&reference, &mut observed) {
         bail!("duplicate instance identity is ambiguous after comparing references");
     }
-    let camera_kept = keep_camera(&mut observed);
+    let camera_kept = keep_camera(&mut observed) || camera_kept_early;
     let aligned = encode_settings_bytecode(&observed)?;
     finish_settings_alignment(reference, observed, aligned, cache_key, camera_kept)
 }
 
-/// Whether aligning `observed` to the reference would leave every instance
-/// where it stands. Each one has the id of the reference's instance at its
-/// position, that id is one a store gave (a debug id or a bare number is
-/// matched by content, not by id), no id stands twice, the viewport camera
-/// stands at one position in both, and no saved UniqueId points at another
-/// position: those are the matches the alignment makes before any other, in
-/// that order, and with all of them positional nothing is left to match.
+/// Equal, unique IDs can be kept when matching is guaranteed to preserve
+/// their positions. Store IDs are matched directly; runtime and numeric IDs
+/// additionally need the same topology and either exact persistent matches
+/// or unchanged duplicate subtrees with consistent incoming references.
+/// A moved persistent ID or viewport role invalidates either proof.
 fn identities_already_aligned(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
     let mut seen = AHashSet::with_capacity(reference.instances.len());
-    reference.instances.len() == observed.instances.len()
-        && reference
+    let mut all_store_ids = true;
+    if reference.instances.len() != observed.instances.len()
+        || !reference
             .instances
             .iter()
             .zip(&observed.instances)
             .all(|(reference, observed)| {
+                all_store_ids &= is_store_identity(&reference.settings_id);
                 reference.settings_id == observed.settings_id
-                    && is_store_identity(&reference.settings_id)
                     && seen.insert(reference.settings_id.as_str())
             })
-        && workspace_current_camera_index(reference) == workspace_current_camera_index(observed)
-        && persistent_identities_follow_mapping(reference, observed, Some)
+        || workspace_current_camera_index(reference) != workspace_current_camera_index(observed)
+    {
+        return false;
+    }
+    if all_store_ids {
+        persistent_identities_follow_mapping(reference, observed, Some)
+    } else {
+        settings_topology_matches(reference, observed)
+            && (positional_identities_match_exactly(reference, observed)
+                || positional_identity_preserved(reference, observed))
+    }
+}
+
+// Equal, unique IDs and topology are checked by the caller. The matcher
+// assigns the viewport first, then unique persistent IDs, then
+// non-debug IDs. A sole root without any of those is its unique root group.
+// Every other runtime ID still needs the content-based positional proof.
+fn positional_identities_match_exactly(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+) -> bool {
+    let reference_ids = persistent_identity_index(reference);
+    let observed_ids = persistent_identity_index(observed);
+    let camera = workspace_current_camera_index(observed);
+    let sole_root = reference
+        .instances
+        .iter()
+        .filter(|instance| instance.parent_index.is_none())
+        .count()
+        == 1;
+    observed
+        .instances
+        .iter()
+        .enumerate()
+        .all(|(index, instance)| {
+            if camera == Some(index) {
+                return true;
+            }
+            let persistent = persistent_identity(instance)
+                .filter(|id| observed_ids.get(id) == Some(&Some(index)))
+                .and_then(|id| reference_ids.get(id).copied().flatten())
+                .filter(|candidate| {
+                    reference.instances[*candidate].class_name == instance.class_name
+                });
+            persistent.map_or_else(
+                || {
+                    !instance.settings_id.starts_with("debug:")
+                        || (sole_root && instance.parent_index.is_none())
+                },
+                |candidate| candidate == index,
+            )
+        })
 }
 
 /// Whether the aligned store says the same as the reference, in which case
@@ -4047,28 +4112,39 @@ fn document_adds_enum_types(reference: &SettingsBytecode, observed: &SettingsByt
         .iter()
         .enumerate()
         .any(|(index, reference_instance)| {
-            let observed_instance = observed_by_id
+            observed_by_id
                 .get(reference_instance.settings_id.as_str())
                 .copied()
-                .or_else(|| observed.instances.get(index));
-            let Some(observed_instance) = observed_instance else {
-                return false;
-            };
-            let adds = |reference: &Map<String, Value>, observed: &Map<String, Value>| {
-                observed.iter().any(|(name, observed_value)| {
-                    reference.get(name).is_some_and(|reference_value| {
-                        reference_loses_enum_types(reference_value, observed_value)
-                    })
+                .or_else(|| observed.instances.get(index))
+                .is_some_and(|observed_instance| {
+                    instance_adds_enum_types(reference_instance, observed_instance)
                 })
-            };
-            adds(
-                &reference_instance.properties,
-                &observed_instance.properties,
-            ) || adds(
-                &reference_instance.attributes,
-                &observed_instance.attributes,
-            )
         })
+}
+
+/// The same for two documents whose instances pair by position, whatever
+/// their ids say.
+fn positions_add_enum_types(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
+    reference
+        .instances
+        .iter()
+        .zip(&observed.instances)
+        .any(|(reference, observed)| instance_adds_enum_types(reference, observed))
+}
+
+fn instance_adds_enum_types(
+    reference: &SettingsBytecodeInstance,
+    observed: &SettingsBytecodeInstance,
+) -> bool {
+    let adds = |reference: &Map<String, Value>, observed: &Map<String, Value>| {
+        observed.iter().any(|(name, observed_value)| {
+            reference.get(name).is_some_and(|reference_value| {
+                reference_loses_enum_types(reference_value, observed_value)
+            })
+        })
+    };
+    adds(&reference.properties, &observed.properties)
+        || adds(&reference.attributes, &observed.attributes)
 }
 
 /// Stores written before nested enum items kept their enum type hold only
@@ -6963,3 +7039,7 @@ mod already_aligned_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "alignment_sim.rs"]
+mod alignment_sim;
