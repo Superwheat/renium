@@ -177,7 +177,8 @@ fn insertion(
 
 pub(super) fn discover(image: &PeImage<'_>) -> Result<Discovery> {
     let class_table =
-        undo_selection::descriptor_vtable(image, b".?AVClassDescriptor@Reflection@RBX@@\0").ok();
+        undo_selection::descriptor_vtable(image, b".?AVClassDescriptor@Reflection@RBX@@\0")
+            .context("Cannot validate reflection ClassDescriptor RTTI for the service reader")?;
     let rdata = image.section(b".rdata")?;
     let data = &image.bytes[rdata.raw_offset..rdata.raw_offset + rdata.raw_size];
     let mut found = Vec::new();
@@ -224,7 +225,7 @@ pub(super) fn discover(image: &PeImage<'_>) -> Result<Discovery> {
                 }
                 for (index, &method) in methods.iter().enumerate() {
                     if let Some((record, pending, playback, metadata)) =
-                        insertion(image, method, class_table)
+                        insertion(image, method, Some(class_table))
                     {
                         let mut code = metadata.code.clone();
                         code.push(method);

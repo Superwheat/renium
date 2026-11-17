@@ -1721,7 +1721,10 @@ pub(crate) fn prepare_service_reader(pid: u32) -> Result<()> {
         .iter()
         .find(|module| module.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
         .context("Roblox Studio module was not found")?;
-    loader::prepare(&studio.path).map(|_| ())
+    let memory = ProcessMemory::open_read_only(pid)?;
+    loader::verify_loaded(&memory, studio)
+        .context("Live Studio service-reader preflight failed")?;
+    Ok(())
 }
 
 fn active_data_model(

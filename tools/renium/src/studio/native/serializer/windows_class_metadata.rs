@@ -124,7 +124,9 @@ fn follows_name(image: &mut impl Image, entry: usize, initial: State, depth: usi
     if code.values().any(Instruction::is_invalid) {
         return false;
     }
-    let mut states = HashMap::from([(entry, initial)]);
+    // Recursive checks share the image budget. Inspect the converged states in
+    // address order so the same executable always yields the same evidence.
+    let mut states = BTreeMap::from([(entry, initial)]);
     let mut pending = VecDeque::from([entry]);
     let mut remaining = 8192usize;
     while let Some(pc) = pending.pop_front() {

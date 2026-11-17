@@ -34,6 +34,7 @@ struct CachedLoader {
 }
 static LOADERS: OnceLock<Mutex<HashMap<PathBuf, CachedLoader>>> = OnceLock::new();
 
+#[cfg(test)]
 pub(super) fn prepare(path: &Path) -> Result<LoaderTrace> {
     Ok(prepared(path)?.trace)
 }
