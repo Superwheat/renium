@@ -4577,7 +4577,9 @@ fn fetch_live_source_batch(
 
 // A script whose Studio Source and class already equal the file is not a
 // change. Dropping it before the transaction keeps rollback capture, package
-// preflight and history recording scoped to real edits.
+// preflight and history recording scoped to real edits. A final line break
+// the file has and Studio lacks is an edit: a sync compares the two texts as
+// they are, so leaving it out would make the next one see Studio differ.
 fn drop_unchanged_source_changes(
     bridge: &BridgeServer,
     changes: &mut EditorChangeSet,
@@ -4600,7 +4602,7 @@ fn drop_unchanged_source_changes(
                 sources.get(index),
                 Some(Ok(live))
                     if live.class_name.as_deref() == Some(change.class_name.as_str())
-                        && editor_sources_match(
+                        && studio_holds_source(
                             change.source.as_deref().unwrap_or_default(),
                             &live.source
                         )
@@ -4727,10 +4729,16 @@ fn verify_editor_source_changes(
     })
 }
 
-fn editor_sources_match(expected: &str, actual: &str) -> bool {
+/// The text is the same but for how its line breaks are written, which is
+/// also what a sync takes for the same script.
+fn studio_holds_source(expected: &str, actual: &str) -> bool {
     expected == actual
         || normalized_source_bytes(expected.as_bytes())
             .eq(normalized_source_bytes(actual.as_bytes()))
+}
+
+fn editor_sources_match(expected: &str, actual: &str) -> bool {
+    studio_holds_source(expected, actual)
         || strip_one_source_line_ending(expected).is_some_and(|expected| {
             normalized_source_bytes(expected.as_bytes())
                 .eq(normalized_source_bytes(actual.as_bytes()))
@@ -6160,6 +6168,33 @@ fn log_change_set_composition(
 
 #[cfg(test)]
 mod sync_tests {
+
+    #[test]
+    fn a_final_line_break_only_the_file_has_is_an_edit_to_send() {
+        use super::{editor_sources_match, studio_holds_source};
+        // (file, Studio, already held, accepted after a write)
+        let cases = [
+            ("return 1", "return 1", true, true),
+            ("a\r\nb", "a\nb", true, true),
+            ("return 1\n", "return 1", false, true),
+            ("return 1\r\n", "return 1", false, true),
+            ("return 1", "return 1\n", false, false),
+            ("return 1\n\n", "return 1", false, false),
+            ("return 1", "return 2", false, false),
+        ];
+        for (file, studio, held, accepted) in cases {
+            assert_eq!(
+                studio_holds_source(file, studio),
+                held,
+                "{file:?} {studio:?}"
+            );
+            assert_eq!(
+                editor_sources_match(file, studio),
+                accepted,
+                "{file:?} {studio:?}"
+            );
+        }
+    }
 
     #[test]
     fn imported_engine_fields_wait_for_the_import_to_land() {
