@@ -3277,9 +3277,9 @@ local function verifyChangedProperty(instance, propertyName, rawValue, change, c
 		stats.verified += 1
 		return
 	end
-	-- These fields retain their existing verified native setter path.
-	if isNativeRootProperty(instance, propertyName)
-		or instance:IsA("MeshPart") and isMeshGeometryProperty(propertyName)
+	-- The host removes fields covered by exact native readback. A native
+	-- setter that was already equal still needs its readable value checked.
+	if instance:IsA("MeshPart") and isMeshGeometryProperty(propertyName)
 		or type(unreadableNames) == "table" and unreadableNames[propertyName] then
 		return
 	end

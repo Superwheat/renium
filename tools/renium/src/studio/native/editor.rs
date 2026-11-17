@@ -5026,6 +5026,9 @@ fn container_setting_rows(
             // captures omit it. Model pivots still require exact verification.
             if row.class_name == "Workspace" {
                 row.properties.remove("WorldPivot");
+                // The viewport camera stays in Studio and is deliberately
+                // excluded by the property writer and verifier too.
+                row.properties.remove("CurrentCamera");
             }
             row
         })
@@ -5047,6 +5050,17 @@ fn verify_native_property_rows(
         .map(|row| native_roots.verified_fields(row))
         .sum::<u64>();
     let mut mismatches = Vec::new();
+    // Credit the native setter's exact readback once. Ask the plugin to read
+    // the remaining fields, including native setters that were already equal
+    // and therefore needed no native invocation.
+    let rows = rows
+        .iter()
+        .cloned()
+        .map(|mut row| {
+            native_roots.remove_verified_properties(&mut row);
+            row
+        })
+        .collect::<Vec<_>>();
     for batch in rows.chunks(PROPERTY_BATCH_MAX_ITEMS) {
         let result = bridge.call(
             "applyEditorChanges",

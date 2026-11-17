@@ -423,6 +423,17 @@ impl NativeRootVerification {
             .filter(|(name, value)| fields.get(*name) == Some(*value))
             .count() as u64
     }
+
+    pub(crate) fn remove_verified_properties(
+        &self,
+        row: &mut crate::editor::types::EditorPropertyChange,
+    ) {
+        let key = Self::target_key(&row.class_name, &row.path_segments, &row.path_ordinals);
+        if let Some(fields) = self.fields.get(&key) {
+            row.properties
+                .retain(|name, value| fields.get(name) != Some(value));
+        }
+    }
 }
 
 pub(crate) fn apply(
@@ -874,11 +885,18 @@ mod tests {
             value: json!({"SmoothGrid": grid}),
         });
         assert_eq!(verified.verified_fields(&row), 1);
+        let mut remaining = row.clone();
+        verified.remove_verified_properties(&mut remaining);
+        assert!(!remaining.properties.contains_key("SmoothGrid"));
+        assert!(remaining.properties.contains_key("PhysicsGrid"));
         row.properties.insert(
             "SmoothGrid".into(),
             json!({"_type": "BinaryString", "base64": "ZA=="}),
         );
         assert_eq!(verified.verified_fields(&row), 0);
+        let mut remaining = row.clone();
+        verified.remove_verified_properties(&mut remaining);
+        assert_eq!(remaining.properties, row.properties);
         row.properties.insert("SmoothGrid".into(), grid);
         row.path_ordinals = vec![1, 2];
         assert_eq!(verified.verified_fields(&row), 0);

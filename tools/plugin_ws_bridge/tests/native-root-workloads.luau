@@ -353,7 +353,7 @@ do
 	local readable, current = false, "saved"
 	local verify = extract("local function verifyChangedProperty(", "local function verifyPropertyChange(", {
 		Workspace = {},
-		isNativeRootProperty = function() return false end,
+		isNativeRootProperty = function() return true end,
 		classHasProperty = function() return true end,
 		decodePropertyValue = function(_, _, value) return true, value end,
 		readProperty = function() return readable, current end,
@@ -370,6 +370,9 @@ do
 	current = "different"
 	verify(instance, "DistanceAttenuation", "saved", {}, {}, stats, nil, "ServerStorage")
 	assert(stats.verified == 1 and stats.mismatches == 1, "Readable mismatches must still reject the push")
+	current = "saved"
+	verify(instance, "SourceAssetId", "saved", {}, {}, stats, nil, "ServerStorage")
+	assert(stats.verified == 2, "A native setter that was already equal must receive readback credit")
 end
 do
 	local originalParent, matchedParent = {}, {}
