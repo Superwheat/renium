@@ -151,11 +151,62 @@ fn align_settings_bytes(
             decode_settings_bytecode(observed_bytes),
         )
     };
-    let mut reference = reference?;
-    let mut observed = observed?;
+    align_settings_documents(
+        reference?,
+        observed?,
+        AlignmentInput {
+            observed_bytes: Some(observed_bytes),
+            keep_viewport_camera,
+            cache_key,
+            started: decode_started,
+        },
+    )
+}
+
+/// A pull's alignment for a caller that holds both stores decoded already:
+/// the observed one straight from the captured state, never as bytes. Answers
+/// what `align_pulled_settings_bytes_to_reference` answers for the bytes the
+/// two documents encode to.
+pub(crate) fn align_pulled_settings_documents_to_reference(
+    reference: SettingsBytecode,
+    observed: SettingsBytecode,
+    started: std::time::Instant,
+) -> Result<SettingsAlignment> {
+    align_settings_documents(
+        reference,
+        observed,
+        AlignmentInput {
+            observed_bytes: None,
+            keep_viewport_camera: true,
+            cache_key: None,
+            started,
+        },
+    )
+}
+
+struct AlignmentInput<'a> {
+    /// The observed store as it came in, when it came in as bytes: written
+    /// back as it is where the encoder would write the same.
+    observed_bytes: Option<&'a [u8]>,
+    keep_viewport_camera: bool,
+    cache_key: Option<SettingsAlignmentCacheKey>,
+    started: std::time::Instant,
+}
+
+fn align_settings_documents(
+    mut reference: SettingsBytecode,
+    mut observed: SettingsBytecode,
+    input: AlignmentInput<'_>,
+) -> Result<SettingsAlignment> {
+    let AlignmentInput {
+        observed_bytes,
+        keep_viewport_camera,
+        cache_key,
+        started,
+    } = input;
     let mut phases = AlignmentPhases {
         instances: observed.instances.len(),
-        started: decode_started,
+        started,
     };
     phases.end("decode");
     // Taken before alignment rewrites either document.
@@ -216,10 +267,9 @@ fn align_settings_bytes(
             .instances
             .iter()
             .all(|instance| is_store_identity(&instance.settings_id));
-        let aligned = if camera_kept || !keep_encoding {
-            encode_settings_bytecode(&observed)?
-        } else {
-            observed_bytes.to_vec()
+        let aligned = match observed_bytes {
+            Some(bytes) if !camera_kept && keep_encoding => bytes.to_vec(),
+            _ => encode_settings_bytecode(&observed)?,
         };
         phases.end("encode in place");
         let result =

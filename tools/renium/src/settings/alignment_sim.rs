@@ -50,7 +50,31 @@ fn generated(seed: u64, count: usize) -> SettingsBytecode {
     settings_document(instances)
 }
 
+/// A pull that holds both stores decoded answers what one that holds their
+/// bytes answers.
+fn documents_answer_like_bytes(reference: &[u8], observed: &[u8]) {
+    let from_bytes = align_settings_bytes(reference, observed, true);
+    let from_documents = decode_settings_bytecode(reference).and_then(|reference| {
+        align_pulled_settings_documents_to_reference(
+            reference,
+            decode_settings_bytecode(observed)?,
+            std::time::Instant::now(),
+        )
+    });
+    match (from_bytes, from_documents) {
+        (Ok(SettingsAlignment::Equivalent), Ok(SettingsAlignment::Equivalent)) => {}
+        (Ok(SettingsAlignment::Changed(bytes)), Ok(SettingsAlignment::Changed(documents))) => {
+            assert!(bytes == documents, "the two entries write different stores")
+        }
+        (Err(bytes), Err(documents)) => assert_eq!(bytes.to_string(), documents.to_string()),
+        _ => panic!("the document entry answers differently"),
+    }
+}
+
 fn same_result(reference: &[u8], observed: &[u8], keep_camera: bool) {
+    if keep_camera {
+        documents_answer_like_bytes(reference, observed);
+    }
     let expected = align_settings_bytes_oracle(reference, observed, keep_camera);
     let actual = align_settings_bytes(reference, observed, keep_camera);
     match (expected, actual) {
@@ -381,12 +405,12 @@ fn workspace_with_camera(root: &str, camera: &str) -> Vec<SettingsBytecodeInstan
 }
 
 fn pulled(reference: &SettingsBytecode, observed: &SettingsBytecode) -> SettingsAlignment {
-    align_settings_bytes(
-        &encode_settings_bytecode(reference).unwrap(),
-        &encode_settings_bytecode(observed).unwrap(),
-        true,
-    )
-    .unwrap()
+    let (reference, observed) = (
+        encode_settings_bytecode(reference).unwrap(),
+        encode_settings_bytecode(observed).unwrap(),
+    );
+    documents_answer_like_bytes(&reference, &observed);
+    align_settings_bytes(&reference, &observed, true).unwrap()
 }
 
 fn with_moved_camera(reference: &SettingsBytecode) -> SettingsBytecode {
