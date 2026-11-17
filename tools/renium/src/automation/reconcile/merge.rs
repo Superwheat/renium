@@ -336,22 +336,35 @@ fn place_directories_above(
 }
 
 /// Removes the folders above a script file that left its place, as far up as
-/// they hold nothing any more.
+/// they hold nothing any more. A folder a side holds with nothing in it does
+/// not stand there for its scripts (a service's folder stays when its last
+/// script goes), so it is kept.
 fn drop_directories_emptied_above(
     file: &Path,
     merged: &mut BTreeMap<PathBuf, SnapshotEntry>,
+    sides: &SnapshotSides<'_>,
     touched: &mut BTreeSet<PathBuf>,
 ) {
-    for ancestor in file.ancestors().skip(1) {
-        // What a folder holds sorts right behind it.
-        let holds_something = merged
+    // What a folder holds sorts right behind it.
+    let holds_something = |entries: &BTreeMap<PathBuf, SnapshotEntry>, folder: &Path| {
+        entries
             .range::<Path, _>((
-                std::ops::Bound::Excluded(ancestor),
+                std::ops::Bound::Excluded(folder),
                 std::ops::Bound::Unbounded,
             ))
             .next()
-            .is_some_and(|(path, _)| path.starts_with(ancestor));
-        if ancestor.as_os_str().is_empty() || holds_something {
+            .is_some_and(|(path, _)| path.starts_with(folder))
+    };
+    let stands_empty = |snapshot: &ProjectSnapshot, folder: &Path| {
+        matches!(snapshot.entries.get(folder), Some(SnapshotEntry::Directory))
+            && !holds_something(&snapshot.entries, folder)
+    };
+    for ancestor in file.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty()
+            || holds_something(merged, ancestor)
+            || stands_empty(sides.editor, ancestor)
+            || stands_empty(sides.studio, ancestor)
+        {
             return;
         }
         if matches!(merged.get(ancestor), Some(SnapshotEntry::Directory)) {
@@ -517,7 +530,7 @@ pub(crate) fn settle_script_paths(
         place_directories_above(path, merged, sides, &mut touched);
     }
     for path in &vacated {
-        drop_directories_emptied_above(path, merged, &mut touched);
+        drop_directories_emptied_above(path, merged, sides, &mut touched);
     }
     for path in touched {
         let merged_entry = merged.get(&path);

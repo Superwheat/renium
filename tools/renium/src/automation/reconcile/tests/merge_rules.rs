@@ -371,3 +371,86 @@ fn additions_that_share_only_their_id_stay_apart() {
         ["A", "B"]
     );
 }
+
+/// One service holding a folder `Sub` and, when `script` is set, a script `A`
+/// in it; `folder` says whether the side holds the folder's directory.
+fn folder_snapshot(script: Option<&str>, folder: bool) -> ProjectSnapshot {
+    let service = Path::new("src/ReplicatedStorage");
+    let mut document = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![
+            SettingsBytecodeInstance::new(
+                "root".into(),
+                "ReplicatedStorage".into(),
+                "ReplicatedStorage".into(),
+                None,
+            ),
+            SettingsBytecodeInstance::new("sub".into(), "Sub".into(), "Folder".into(), Some(0)),
+        ],
+    };
+    let mut snapshot = ProjectSnapshot::default();
+    snapshot
+        .entries
+        .insert(service.to_path_buf(), SnapshotEntry::Directory);
+    if folder {
+        snapshot
+            .entries
+            .insert(service.join("Sub"), SnapshotEntry::Directory);
+    }
+    if let Some(source) = script {
+        document.instances.push(SettingsBytecodeInstance::new(
+            "a".into(),
+            "A".into(),
+            "ModuleScript".into(),
+            Some(1),
+        ));
+        snapshot
+            .entries
+            .insert(service.join("Sub").join("A.luau"), text(source));
+    }
+    snapshot.entries.insert(
+        service.join("__roblox_sync_settings.renium"),
+        SnapshotEntry::File(encode_settings_bytecode(&document).unwrap()),
+    );
+    snapshot
+}
+
+#[test]
+fn a_folder_a_side_still_holds_stays_when_its_last_script_is_removed() {
+    let folder = Path::new("src/ReplicatedStorage").join("Sub");
+    let script = folder.join("A.luau");
+    let with_script = folder_snapshot(Some("return 1"), true);
+    // Studio removed the script and reports the folder all the same, the way
+    // it reports a service's folder that holds no script.
+    let kept = folder_snapshot(None, true);
+    let (merged, conflicts, changes) = merge_snapshots_with_changes(
+        Some(&with_script),
+        &with_script,
+        &kept,
+        ConflictPreference::None,
+        None,
+    )
+    .unwrap();
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert!(!merged.entries.contains_key(&script));
+    assert!(merged.entries.get(&folder) == Some(&SnapshotEntry::Directory));
+    assert!(changes.editor.contains(&script));
+    assert!(!changes.editor.contains(&folder), "{:?}", changes.editor);
+    assert!(!changes.studio.contains(&folder), "{:?}", changes.studio);
+
+    // A side that no longer holds the folder takes it out of the files too.
+    let gone = folder_snapshot(None, false);
+    let (merged, conflicts, changes) = merge_snapshots_with_changes(
+        Some(&with_script),
+        &with_script,
+        &gone,
+        ConflictPreference::None,
+        None,
+    )
+    .unwrap();
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert!(!merged.entries.contains_key(&script));
+    assert!(!merged.entries.contains_key(&folder));
+    assert!(changes.editor.contains(&folder), "{:?}", changes.editor);
+    assert!(!changes.studio.contains(&folder), "{:?}", changes.studio);
+}
