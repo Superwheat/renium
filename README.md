@@ -21,24 +21,8 @@ get the offline tools, Open Cloud and plugins, but nothing that needs Studio.
 The installer sets up the Studio plugin and asks which editor, VS Code or Cursor,
 should get the extension. Restart the editor and Studio afterward. Later, `rbx upd`
 updates all three together. `renium` is another name for `rbx`.
-
-## Get started
-
-Open your place in Studio, then run this in an empty folder:
-
-```powershell
-rbx init
-rbx pl
-rbx lon
-```
-
-`rbx init` creates the project, `rbx pl` pulls the place into files and `rbx lon`
-starts Live Sync. Open the folder in your editor and work on either side. If the
-folder already holds a project, run only `rbx lon`, because a pull would replace
-your files with Studio's copy. To start from a place file, run `rbx init` in its
-folder, open the file with `rbx so Place.rbxl`, then pull. There is no server to
-start: the first `rbx` command starts Renium's background process, and the Studio
-plugin connects to it by itself.
+There is no server to start: the first `rbx` command starts Renium's background
+process, and the Studio plugin connects to it by itself.
 
 ## How sync works
 
