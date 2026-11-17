@@ -186,15 +186,16 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     Ok(())
 }
 
-/// Freed memory is handed back by `memory::release_when_idle`, not while a
-/// command runs: decoding a large store frees and takes hundreds of megabytes
-/// several times over, and giving each piece back at once makes the next
-/// step fault it in again.
+/// Freed memory stays with the daemon for two seconds before it goes back
+/// to the system: decoding a large store frees and takes hundreds of
+/// megabytes several times over, and giving each piece back at once makes
+/// the next step fault it in again. `memory::release_when_idle` hands back
+/// the rest after a run of commands.
 fn release_freed_memory_when_idle() {
     const MI_OPTION_PURGE_DECOMMITS: libmimalloc_sys::mi_option_t = 5;
     const MI_OPTION_ABANDONED_PAGE_PURGE: libmimalloc_sys::mi_option_t = 12;
     const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
-    const PURGE_DELAY_MS: std::ffi::c_long = 60_000;
+    const PURGE_DELAY_MS: std::ffi::c_long = 2_000;
     unsafe {
         libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DECOMMITS, 1);
         libmimalloc_sys::mi_option_set(MI_OPTION_ABANDONED_PAGE_PURGE, 1);
