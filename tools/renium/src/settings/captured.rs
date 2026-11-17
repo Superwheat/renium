@@ -1,4 +1,5 @@
 use super::*;
+use crate::settings::equivalence::SettingsAlignment;
 use crate::snapshot::types::NativeSettingsProperty;
 use sha2::{Digest, Sha256};
 use std::io;
@@ -18,7 +19,7 @@ pub(super) fn convert(state: &ServiceState) -> Result<SettingsBytecode> {
     let _span = crate::app::profile::span("captured store document");
     let records = collect_service_settings_binary_instances(state);
     let lookup = build_settings_binary_instance_lookup(state, &records);
-    let collected = collect_settings_binary_data(state, &lookup, &records)?;
+    let collected = collect_settings_binary_data(state, &lookup, &records, None)?;
     // Every file gets at least this budget. Outside the proved bounds, the
     // actual wire path decides acceptance and the exact first error.
     match convert_prepared(
@@ -45,7 +46,7 @@ pub(super) fn convert_with_budget(
 ) -> Result<SettingsBytecode> {
     let records = collect_service_settings_binary_instances(state);
     let lookup = build_settings_binary_instance_lookup(state, &records);
-    let collected = collect_settings_binary_data(state, &lookup, &records)?;
+    let collected = collect_settings_binary_data(state, &lookup, &records, None)?;
     convert_prepared(state, &records, &lookup, &collected, budget)
 }
 
@@ -67,10 +68,173 @@ pub(super) fn pulled_digest(state: &ServiceState) -> Result<PulledDigest> {
     let skeleton = skeleton(state, &records, &lookup)?;
     let viewport_camera =
         workspace_current_camera_index(&skeleton).map(|index| records[index].source_index);
+    let (digest, rows) = state_digests(state, viewport_camera);
     Ok(PulledDigest {
-        digest: state_digest(state, viewport_camera),
+        digest,
         viewport_camera_lacks_enum_types: viewport_camera_lacks_enum_types(&skeleton),
+        rows: Arc::new(rows),
     })
+}
+
+/// The most changed instances a pull compares one by one; past that it
+/// aligns the whole documents.
+const MAX_CHANGED_ROWS: usize = 2_048;
+
+pub(super) fn changed_values(
+    state: &ServiceState,
+    before: &PulledRows,
+    now: &PulledRows,
+    stored: &[u8],
+) -> Result<Option<SettingsAlignment>> {
+    use crate::settings::equivalence::{
+        instance_lacks_enum_types, is_store_identity, persistent_identity_of,
+        pulled_instance_unchanged,
+    };
+
+    let _span = crate::app::profile::span("captured store changed values");
+    // What is written here is the state's own encoding, which is what the
+    // alignment writes only where the two encoders agree, and the stored
+    // camera goes back by the positions of a state numbered as it stands.
+    if before.frame != now.frame
+        || before.rows.len() != now.rows.len()
+        || before.viewport_camera != now.viewport_camera
+        || !now.encodes_as_its_document
+        || !state.dense_index_topology
+    {
+        return Ok(None);
+    }
+    let mut changed = Vec::new();
+    for (index, (before, now)) in before.rows.iter().zip(&now.rows).enumerate() {
+        if before.placed != now.placed {
+            return Ok(None);
+        }
+        if before.values != now.values {
+            if changed.len() == MAX_CHANGED_ROWS {
+                return Ok(None);
+            }
+            changed.push(index);
+        }
+    }
+    let records = collect_service_settings_binary_instances(state);
+    // Rows are told apart by their place in the state, which is the store's
+    // order only where every instance is written where it stands.
+    if changed.is_empty()
+        || records.len() != now.rows.len()
+        || records
+            .iter()
+            .enumerate()
+            .any(|(index, record)| record.source_index != index)
+    {
+        return Ok(None);
+    }
+    let budget = DecodeBudget::for_file(stored.len());
+    let ids = records
+        .iter()
+        .map(|record| Ok(bare_instance(record, &budget)?.settings_id))
+        .collect::<Result<Vec<_>>>()?;
+    if ids.iter().collect::<AHashSet<_>>().len() != ids.len() {
+        return Ok(None);
+    }
+    // The alignment keeps every instance where it stands under ids a store
+    // gave, and under any other ids where each instance is told by a UniqueId
+    // of its own, or by an id that is not Studio's. Past that it matches
+    // instances by what they hold, which takes the whole documents.
+    let by_position = ids.iter().all(|id| is_store_identity(id)) || {
+        let mut unique = AHashMap::with_capacity(records.len());
+        for (index, instance) in state.instances.iter().enumerate() {
+            if let Some(id) = persistent_identity_of(&instance.properties) {
+                unique
+                    .entry(id)
+                    .and_modify(|at| *at = None)
+                    .or_insert(Some(index));
+            }
+        }
+        let sole_root = records
+            .iter()
+            .filter(|record| record.parent_index.is_none())
+            .count()
+            == 1;
+        records.iter().enumerate().all(|(index, record)| {
+            now.viewport_camera == Some(index)
+                || persistent_identity_of(&state.instances[index].properties)
+                    .is_some_and(|id| unique[id] == Some(index))
+                || !ids[index].starts_with("debug:")
+                || sole_root && record.parent_index.is_none()
+        })
+    };
+    if !by_position {
+        return Ok(None);
+    }
+    let mut rows = changed.clone();
+    rows.extend(now.viewport_camera);
+    let stored_rows = crate::settings::bytecode::property_edit::decode_rows(stored, &rows)?;
+    let lookup = build_settings_binary_instance_lookup(state, &records);
+    let scope = ConversionScope {
+        lookup: &lookup,
+        instance_count: records.len(),
+        budget: &budget,
+        string_ids: &SettingsStringIdMap::default(),
+        wire_bytes: None,
+    };
+    let mut captured_rows = Vec::with_capacity(rows.len());
+    for &row in &rows {
+        captured_rows.extend(convert_chunk(
+            state,
+            std::slice::from_ref(&records[row]),
+            scope,
+        )?);
+    }
+    // The file must be the one the earlier rows were taken of.
+    if stored_rows
+        .iter()
+        .zip(&captured_rows)
+        .any(|(stored, captured)| {
+            stored.settings_id != captured.settings_id
+                || stored.name != captured.name
+                || stored.class_name != captured.class_name
+                || stored.parent_index != captured.parent_index
+        })
+    {
+        return Ok(None);
+    }
+    // A stored camera whose enum items can gain their types makes the answer
+    // follow the captured camera, which no digest covers.
+    if now.viewport_camera.is_some() && stored_rows.last().is_some_and(instance_lacks_enum_types) {
+        return Ok(None);
+    }
+    // A stored instance the encoder of documents would write another way
+    // (an older store's) is compared and kept by the alignment.
+    let root_service = lookup.root_service.as_deref();
+    if stored_rows.iter().any(|stored| {
+        crate::settings::equivalence::forced_property_differs(&stored.properties)
+            || !values_encode_alike(&stored.properties, &stored.attributes, root_service)
+    }) {
+        return Ok(None);
+    }
+    let mut unchanged = true;
+    for (stored, captured) in stored_rows.iter().zip(&captured_rows).take(changed.len()) {
+        match pulled_instance_unchanged(stored, captured, root_service)? {
+            Some(same) => unchanged &= same,
+            None => return Ok(None),
+        }
+    }
+    if unchanged {
+        return Ok(Some(SettingsAlignment::Equivalent));
+    }
+    // A pull keeps the stored viewport camera whatever the captured one says.
+    let kept_camera = now.viewport_camera.and_then(|camera| {
+        let stored = stored_rows.last()?;
+        let captured = captured_rows.last()?;
+        (stored.properties != captured.properties || stored.attributes != captured.attributes)
+            .then_some(ReplacedRow {
+                source_index: camera,
+                instance: stored,
+            })
+    });
+    let collected = collect_settings_binary_data(state, &lookup, &records, kept_camera)?;
+    Ok(Some(SettingsAlignment::Changed(
+        encode_prepared_service_settings(&records, &lookup, collected)?,
+    )))
 }
 
 /// The state's document without its values: every instance with its id, name,
@@ -82,7 +246,9 @@ fn skeleton(
     records: &[SettingsBinaryInstance<'_>],
     lookup: &SettingsBinaryInstanceLookup<'_>,
 ) -> Result<SettingsBytecode> {
-    let budget = DecodeBudget::new(usize::MAX);
+    // The values converted here are held to what a whole store may hold: a
+    // state past that has no digest, and its pull says why.
+    let budget = DecodeBudget::new(MAX_SETTINGS_BYTECODE_BYTES);
     let scope = ConversionScope {
         lookup,
         instance_count: records.len(),
@@ -90,12 +256,13 @@ fn skeleton(
         string_ids: &SettingsStringIdMap::default(),
         wire_bytes: None,
     };
+    let unlimited = DecodeBudget::new(usize::MAX);
     let mut instances = Vec::with_capacity(records.len());
     for record in records {
         if record.parent_index.is_none() || record.class_name == "Camera" {
             instances.extend(convert_chunk(state, std::slice::from_ref(record), scope)?);
         } else {
-            instances.push(bare_instance(record, &budget)?);
+            instances.push(bare_instance(record, &unlimited)?);
         }
     }
     validate_settings_hierarchy(&instances)?;
@@ -107,9 +274,14 @@ fn skeleton(
 
 /// Names the way the state is digested: a digest taken another way is never
 /// taken for one of these.
-const STATE_DIGEST_SCHEME: &[u8] = b"renium captured state 1";
+const STATE_DIGEST_SCHEME: &[u8] = b"renium captured state 2";
 
+#[cfg(test)]
 pub(super) fn state_digest(state: &ServiceState, viewport_camera: Option<usize>) -> [u8; 32] {
+    state_digests(state, viewport_camera).0
+}
+
+fn state_digests(state: &ServiceState, viewport_camera: Option<usize>) -> ([u8; 32], PulledRows) {
     use crate::settings::equivalence::{digest_map, digest_text};
 
     // Every field by name: a field added to the state is a field to digest.
@@ -124,19 +296,24 @@ pub(super) fn state_digest(state: &ServiceState, viewport_camera: Option<usize>)
         dense_index_topology,
     } = state;
     let shared = Mutex::new(AHashMap::new());
-    let rows = instances
+    let root_service = instances
+        .get(*service_root_index)
+        .map(|instance| instance.name.as_str());
+    let (rows, alike): (Vec<_>, Vec<_>) = instances
         .par_iter()
         .enumerate()
         .map(|(index, instance)| {
             let native = native_properties_by_instance
                 .as_ref()
                 .and_then(|rows| rows.get(index));
-            instance_state_digest(instance, native, viewport_camera == Some(index), &shared)
+            (
+                instance_state_digest(instance, native, viewport_camera == Some(index), &shared),
+                instance_encodes_as_its_document(instance, native, root_service),
+            )
         })
-        .collect::<Vec<_>>();
+        .unzip();
     let count = |digest: &mut Sha256, count: usize| digest.update((count as u64).to_le_bytes());
     let mut digest = Sha256::new();
-    digest.update(STATE_DIGEST_SCHEME);
     digest.update([
         u8::from(*properties_default_elided),
         u8::from(*dense_index_topology),
@@ -166,11 +343,47 @@ pub(super) fn state_digest(state: &ServiceState, viewport_camera: Option<usize>)
         digest_text(&mut digest, class);
         digest_map(&mut digest, defaults);
     }
+    let frame = <[u8; 32]>::from(digest.finalize());
+    let mut digest = Sha256::new();
+    digest.update(STATE_DIGEST_SCHEME);
+    digest.update(frame);
     count(&mut digest, rows.len());
-    for row in rows {
-        digest.update(row);
+    for row in &rows {
+        digest.update(row.placed);
+        digest.update(row.values);
     }
-    digest.finalize().into()
+    (
+        digest.finalize().into(),
+        PulledRows {
+            frame,
+            rows,
+            viewport_camera,
+            encodes_as_its_document: alike.into_iter().all(|alike| alike),
+        },
+    )
+}
+
+/// Whether the state's encoding of this instance is the encoding of its
+/// document (see `values_encode_alike`).
+fn instance_encodes_as_its_document(
+    instance: &SnapshotInstance,
+    native: Option<&Vec<NativeSettingsProperty>>,
+    root_service: Option<&str>,
+) -> bool {
+    let holds = |name: &str| {
+        instance
+            .properties
+            .get(name)
+            .map(|value| value == &Value::Bool(true))
+            .or_else(|| {
+                native?
+                    .iter()
+                    .find(|property| property.name == name)
+                    .map(|property| matches!(property.value, NativeSettingsValue::Bool(true)))
+            })
+    };
+    !(holds("TextScaled") == Some(true) && holds("TextWrapped") != Some(true))
+        && values_encode_alike(&instance.properties, &instance.attributes, root_service)
 }
 
 /// The digests of the values many instances share, by where each value is
@@ -182,7 +395,7 @@ fn instance_state_digest(
     native: Option<&Vec<NativeSettingsProperty>>,
     viewport_camera: bool,
     shared: &SharedValueDigests,
-) -> [u8; 32] {
+) -> PulledRow {
     use crate::settings::equivalence::{digest_map, digest_text};
 
     let SnapshotInstance {
@@ -230,11 +443,41 @@ fn instance_state_digest(
     for index in [instance_index, parent_index] {
         digest.update(index.map_or(0, |index| index as u64 + 1).to_le_bytes());
     }
-    if viewport_camera {
-        digest.update([0xff]);
-        return digest.finalize().into();
+    // The UniqueId says which stored instance this is, like an id.
+    if let Some(unique) = properties.get("UniqueId") {
+        crate::settings::equivalence::digest_value(&mut digest, unique);
     }
-    digest_map(&mut digest, properties);
+    for property in native.into_iter().flatten() {
+        if property.name == "UniqueId" {
+            digest_native_value(&mut digest, &property.value, shared);
+        }
+    }
+    let half = |digest: Sha256| {
+        let whole = <[u8; 32]>::from(digest.finalize());
+        <[u8; 16]>::try_from(&whole[..16]).unwrap()
+    };
+    let placed = half(digest);
+    let mut digest = Sha256::new();
+    if viewport_camera {
+        return PulledRow {
+            placed,
+            values: half(digest),
+        };
+    }
+    digest.update([1]);
+    // A store holds none of the record's own properties, so their values are
+    // no part of its document: a script's text changes without its store.
+    // Their presence is, since a property the instance holds hides the typed
+    // one of its name.
+    digest.update((properties.len() as u64).to_le_bytes());
+    for (name, value) in properties {
+        digest_text(&mut digest, name);
+        if is_record_property(name) {
+            digest.update([0xfe]);
+        } else {
+            crate::settings::equivalence::digest_value(&mut digest, value);
+        }
+    }
     digest_map(&mut digest, attributes);
     digest.update(
         native
@@ -246,7 +489,10 @@ fn instance_state_digest(
         digest_text(&mut digest, name);
         digest_native_value(&mut digest, value, shared);
     }
-    digest.finalize().into()
+    PulledRow {
+        placed,
+        values: half(digest),
+    }
 }
 
 fn digest_native_value(

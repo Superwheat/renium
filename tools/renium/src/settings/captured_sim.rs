@@ -2,6 +2,8 @@ use super::*;
 use crate::snapshot::types::NativeSettingsProperty;
 use crate::tests::support::{SimRng, run_seeds};
 
+#[path = "captured_changed_sim.rs"]
+mod changed;
 #[path = "captured_limits_sim.rs"]
 mod limits;
 
@@ -699,6 +701,251 @@ fn a_captured_digest_follows_every_field_of_the_state() {
         .unwrap()
         .push(Vec::new());
     assert!(captured::state_digest(&state, Some(1)) != with_empty_rows);
+}
+
+/// A script's text is no part of its store, so an edit of it leaves the
+/// digest; whether the instance holds a text at all is part of it, and so is
+/// the id Studio gives the instance.
+#[test]
+fn a_captured_digest_leaves_out_a_scripts_text() {
+    let mut state = digested_state(false);
+    state.instances[3].class_name = "Script".into();
+    state.instances[3]
+        .properties
+        .insert("Source".into(), json!("print(1)"));
+    let digest = |state: &ServiceState| pulled_digest_from_service_state(state).unwrap().digest;
+    let mut edited = state.clone();
+    edited.instances[3]
+        .properties
+        .insert("Source".into(), json!("print(2)"));
+    assert!(
+        encode_service_settings_binary(&state).unwrap()
+            == encode_service_settings_binary(&edited).unwrap()
+    );
+    assert!(digest(&state) == digest(&edited));
+    let mut without = state.clone();
+    without.instances[3].properties.remove("Source");
+    assert!(digest(&state) != digest(&without));
+    let mut renumbered = state.clone();
+    renumbered.instances[3].debug_id = Some("0_77".into());
+    assert!(digest(&state) != digest(&renumbered));
+}
+
+/// What places the viewport camera in its store is digested like any other
+/// instance's; only its values are left out.
+#[test]
+fn a_captured_digest_follows_where_the_viewport_camera_stands() {
+    let state = digested_state(false);
+    let edits: &[fn(&mut ServiceState)] = &[
+        |state| state.instances[1].transported_settings_id = Some("moved".into()),
+        |state| state.instances[1].path.push('x'),
+        |state| state.instances[1].debug_id = Some("0_99".into()),
+        |state| state.instances[1].instance_id = None,
+    ];
+    let unchanged = pulled_digest_from_service_state(&state).unwrap().digest;
+    for (index, edit) in edits.iter().enumerate() {
+        let mut edited = state.clone();
+        edit(&mut edited);
+        assert!(
+            pulled_digest_from_service_state(&edited).unwrap().digest != unchanged,
+            "camera edit {index}"
+        );
+    }
+}
+
+/// Two shared values in one state are each digested by their own content, on
+/// one thread as on many.
+#[test]
+fn a_captured_digest_tells_two_shared_values_of_one_state_apart() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let holding = |left: &str, right: &str| {
+        let mut state = digested_state(true);
+        let rows = state.native_properties_by_instance.as_mut().unwrap();
+        for (row, text) in [(2, left), (3, right)] {
+            rows[row].push(NativeSettingsProperty {
+                name: "Typed".into(),
+                value: NativeSettingsValue::Shared(Arc::new(json!({"data": text}))),
+            });
+        }
+        pool.install(|| captured::state_digest(&state, Some(1)))
+    };
+    assert!(holding("a", "b") != holding("a", "a"));
+    assert!(holding("a", "b") != holding("b", "a"));
+}
+
+/// Which instance a child stands under is part of the digest, not only the
+/// children in their order.
+#[test]
+fn a_captured_digest_tells_the_lists_of_children_apart() {
+    let state = digested_state(false);
+    let mut left = state.clone();
+    let mut right = state.clone();
+    left.children_by_index = vec![vec![1, 2], vec![], vec![3], vec![]];
+    right.children_by_index = vec![vec![1], vec![2], vec![3], vec![]];
+    assert!(captured::state_digest(&left, Some(1)) != captured::state_digest(&right, Some(1)));
+}
+
+/// The digest says of the viewport camera what the document says: that it
+/// holds an enum item without its type.
+#[test]
+fn a_captured_digest_says_when_the_viewport_camera_lacks_enum_types() {
+    let mut state = digested_state(false);
+    assert!(
+        !pulled_digest_from_service_state(&state)
+            .unwrap()
+            .viewport_camera_lacks_enum_types
+    );
+    state.instances[1].properties.insert(
+        "Mode".into(),
+        json!({"items":[{"_type":"EnumItem", "name":"Plastic"}]}),
+    );
+    assert!(
+        crate::settings::equivalence::viewport_camera_lacks_enum_types(
+            &settings_bytecode_from_service_state(&state).unwrap()
+        )
+    );
+    assert!(
+        pulled_digest_from_service_state(&state)
+            .unwrap()
+            .viewport_camera_lacks_enum_types
+    );
+}
+
+/// A viewport camera that holds more than a whole store may hold gives no
+/// digest, so its pull goes the way that says so.
+#[test]
+fn a_camera_past_what_a_store_holds_has_no_digest() {
+    let mut state = digested_state(false);
+    for index in 0..5 {
+        state.instances[1].properties.insert(
+            format!("Huge{index}"),
+            json!(format!("{index}{}", "a".repeat(30 << 20))),
+        );
+    }
+    assert!(encode_service_settings_binary(&state).is_err());
+    assert!(pulled_digest_from_service_state(&state).is_err());
+}
+
+/// A state says whether its own encoding is its document's: not with a label
+/// scaled and not wrapped, an attribute in a wrapped form or one a store has
+/// no form for, or a reference by an id or a path into its own service,
+/// wherever such a value stands, the viewport camera included.
+#[test]
+fn a_state_the_two_encoders_write_apart_says_so() {
+    type Edit = Box<dyn Fn(&mut ServiceState)>;
+    let alike = |edit: &dyn Fn(&mut ServiceState)| {
+        [false, true].map(|native| {
+            let mut state = digested_state(native);
+            edit(&mut state);
+            pulled_digest_from_service_state(&state)
+                .unwrap()
+                .rows
+                .encodes_as_its_document()
+        })
+    };
+    assert_eq!(alike(&|_| {}), [true, true]);
+    let property = |row: usize, name: &'static str, value: Value| {
+        move |state: &mut ServiceState| {
+            state.instances[row]
+                .properties
+                .insert(name.into(), value.clone());
+        }
+    };
+    let attribute = |row: usize, value: Value| {
+        move |state: &mut ServiceState| {
+            state.instances[row]
+                .attributes
+                .insert("Look".into(), value.clone());
+        }
+    };
+    let apart: Vec<Edit> = vec![
+        Box::new(property(3, "TextScaled", json!(true))),
+        Box::new(|state| {
+            state.instances[3]
+                .properties
+                .insert("TextScaled".into(), json!(true));
+            state.instances[3]
+                .properties
+                .insert("TextWrapped".into(), json!(false));
+        }),
+        Box::new(attribute(3, json!({"BrickColor": 21}))),
+        Box::new(attribute(1, json!({"BrickColor": 21}))),
+        Box::new(attribute(
+            3,
+            json!({"family": "a", "weight": 400, "style": "Normal"}),
+        )),
+        Box::new(attribute(3, json!([1, 2]))),
+        Box::new(property(
+            3,
+            "Target",
+            json!({"_type": "Ref", "settingsId": "Part"}),
+        )),
+        Box::new(property(
+            3,
+            "Target",
+            json!({"_type": "Ref", "referent": "Part"}),
+        )),
+        Box::new(property(
+            3,
+            "Target",
+            json!({"_type": "Ref", "pathSegments": ["Workspace", "Part"]}),
+        )),
+        Box::new(property(
+            3,
+            "Nested",
+            json!({"list": [{"Ref": {"instanceIndex": 2}}]}),
+        )),
+        Box::new(property(3, "Attributes", json!({"Raw": false}))),
+    ];
+    for (index, edit) in apart.iter().enumerate() {
+        assert_eq!(alike(edit.as_ref()), [false, false], "edit {index}");
+    }
+    let still: Vec<Edit> = vec![
+        Box::new(|state| {
+            state.instances[3]
+                .properties
+                .insert("TextScaled".into(), json!(true));
+            state.instances[3]
+                .properties
+                .insert("TextWrapped".into(), json!(true));
+        }),
+        Box::new(attribute(3, json!({"_type": "BrickColor", "number": 21}))),
+        Box::new(attribute(3, json!("text"))),
+        Box::new(property(
+            3,
+            "Target",
+            json!({"_type": "Ref", "instanceIndex": 2}),
+        )),
+        Box::new(property(
+            3,
+            "Target",
+            json!({"_type": "Ref", "pathSegments": ["Lighting", "Sun"], "pathOrdinals": [1, 1]}),
+        )),
+    ];
+    for (index, edit) in still.iter().enumerate() {
+        assert_eq!(alike(edit.as_ref()), [true, true], "edit {index}");
+    }
+    // The typed values of a capture count like the others.
+    let mut state = digested_state(true);
+    state.native_properties_by_instance.as_mut().unwrap()[3].push(NativeSettingsProperty {
+        name: "TextScaled".into(),
+        value: NativeSettingsValue::Bool(true),
+    });
+    let pulled = |state: &ServiceState| {
+        pulled_digest_from_service_state(state)
+            .unwrap()
+            .rows
+            .encodes_as_its_document()
+    };
+    assert!(!pulled(&state));
+    state.native_properties_by_instance.as_mut().unwrap()[3].push(NativeSettingsProperty {
+        name: "TextWrapped".into(),
+        value: NativeSettingsValue::Bool(true),
+    });
+    assert!(pulled(&state));
 }
 
 /// A typed value's digest tells its kind and its content, and a shared value

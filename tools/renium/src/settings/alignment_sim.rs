@@ -61,6 +61,7 @@ fn documents_answer_like_bytes(reference: &[u8], observed: &[u8]) {
             &|| Ok(observed.to_vec()),
             std::time::Instant::now(),
         )
+        .map(|pulled| pulled.alignment)
     });
     match (from_bytes, from_documents) {
         (Ok(SettingsAlignment::Equivalent), Ok(SettingsAlignment::Equivalent)) => {}
@@ -316,7 +317,7 @@ fn align_settings_bytes_oracle(
         );
     }
     match align_settings_ids_for_contiguous_structural_change(&mut reference, &mut observed) {
-        ContiguousStructuralAlignment::Aligned => {
+        ContiguousStructuralAlignment::Aligned { .. } => {
             keep_camera(&mut observed);
             let aligned = encode_settings_bytecode_with_dense_references(&observed)?;
             drop_settings_documents(reference, observed);
@@ -576,6 +577,46 @@ fn an_edit_beside_a_moved_camera_is_written_with_the_stored_camera() {
             true,
         );
     }
+}
+
+/// A pull says whether the store it leaves holds the observed document as it
+/// came: after an instance was added it does while every instance kept its
+/// id, and not once the stored ids took the place of the observed ones.
+#[test]
+fn a_pull_says_whether_the_store_it_leaves_is_the_observed_document() {
+    let reference = generated(2, 12);
+    let pull = |observed: &SettingsBytecode| {
+        align_pulled_settings_documents_to_reference(
+            reference.clone(),
+            observed.clone(),
+            &|| encode_settings_bytecode(observed),
+            std::time::Instant::now(),
+        )
+        .unwrap()
+    };
+    let mut added = reference.clone();
+    added
+        .instances
+        .push(settings_instance("editor:new", "Added", "Folder", Some(0)));
+    let kept = pull(&added);
+    assert!(matches!(kept.alignment, SettingsAlignment::Changed(_)));
+    assert!(kept.stored_as_observed);
+
+    let mut renumbered = added.clone();
+    renumbered.instances[5].settings_id = "debug:0_77".into();
+    let rewritten = pull(&renumbered);
+    let SettingsAlignment::Changed(bytes) = &rewritten.alignment else {
+        panic!("an added instance leaves the store as it was");
+    };
+    assert_eq!(
+        decode_settings_bytecode(bytes).unwrap().instances[5].settings_id,
+        reference.instances[5].settings_id
+    );
+    assert!(!rewritten.stored_as_observed);
+
+    let unchanged = pull(&reference);
+    assert!(matches!(unchanged.alignment, SettingsAlignment::Equivalent));
+    assert!(unchanged.stored_as_observed);
 }
 
 /// The digest a pull remembers an unchanged store by leaves out what the

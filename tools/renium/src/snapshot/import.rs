@@ -25,9 +25,10 @@ use crate::roblox::schema::{MATERIAL_SERVICE_CLASS, USE_2022_MATERIALS_PROPERTY}
 use crate::roblox::services::DEFAULT_SYNC_SERVICES;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
-    SettingsBytecode, child_indices_for_instance, decode_settings_bytecode,
-    encode_service_settings_binary, pulled_digest_from_service_state,
-    settings_bytecode_from_service_state, write_fresh_service_settings_binary_file,
+    PulledDigest, PulledRows, SettingsBytecode, child_indices_for_instance,
+    decode_settings_bytecode, encode_service_settings_binary, pull_changed_values,
+    pulled_digest_from_service_state, settings_bytecode_from_service_state,
+    write_fresh_service_settings_binary_file,
 };
 use crate::settings::equivalence::{
     SettingsAlignment, align_pulled_settings_bytes_to_reference,
@@ -1447,7 +1448,11 @@ fn write_service_settings_file(
             && !observed.viewport_camera_lacks_enum_types
             && let Ok(bytes) = fs::read(&settings_path)
         {
-            remember_unchanged_pull(Sha256::digest(&bytes).into(), observed.digest);
+            remember_pull(
+                Sha256::digest(&bytes).into(),
+                observed.digest,
+                Some(observed.rows),
+            );
         }
     } else {
         let lock_started = Instant::now();
@@ -1464,10 +1469,13 @@ fn write_service_settings_file(
             preservation_started,
         );
         let state_to_write = preserved_state.as_ref().unwrap_or(state);
-        // The captured state becomes a document while the stored file is
-        // read; the store is encoded once, after the two are aligned. A store
-        // whose file and observed state are the ones the last pull found
-        // unchanged is unchanged again, and nothing is decoded for it.
+        // A store whose file and observed state are the ones the last pull
+        // found unchanged is unchanged again, and nothing is decoded for it.
+        // One whose file holds an earlier state's own document, where only
+        // values changed since, is compared in the changed instances alone.
+        // For any other the captured state becomes a document while the
+        // stored file is read, and the store is encoded once, after the two
+        // are aligned.
         let alignment_started = Instant::now();
         let stored_file = (|| -> Result<Option<StoredFile>> {
             let _reading = profile::span(&format!("{service}: read stored file"));
@@ -1480,40 +1488,73 @@ fn write_service_settings_file(
                 }
             };
             let digest = <[u8; 32]>::from(Sha256::digest(&bytes));
-            let unchanged_with = unchanged_pulls().lock_recover().get(&digest).copied();
-            Ok(Some((bytes, digest, unchanged_with)))
+            let remembered = remembered_pull(&digest);
+            Ok(Some((bytes, digest, remembered)))
         })();
         // A digest of the captured state says whether it is the state a pull
         // left this file alone with before. While nothing changed, no document
-        // of the captured store is built.
-        let pulled = matches!(&stored_file, Ok(Some(_)))
+        // of the captured store is built. A file no pull remembers is aligned
+        // whatever the digest says, which is then taken beside the documents.
+        let mut pulled = matches!(&stored_file, Ok(Some((_, _, Some(_)))))
             .then(|| pulled_digest_from_service_state(state_to_write).ok())
-            .flatten()
-            .map(|pulled| pulled.digest);
+            .flatten();
         let unchanged_again = matches!(
-            &stored_file,
-            Ok(Some((_, _, Some(expected)))) if pulled == Some(*expected)
+            (&stored_file, &pulled),
+            (Ok(Some((_, _, Some(remembered)))), Some(pulled)) if remembered.digest == pulled.digest
         );
-        let (stored, observed) = if unchanged_again {
+        let changed_values = match (&stored_file, &pulled) {
+            (Ok(Some((bytes, _, Some(remembered)))), Some(pulled))
+                if !unchanged_again && !pull_aligns_whole_documents() =>
+            {
+                remembered.rows.as_ref().and_then(|before| {
+                    let _comparing = profile::span(&format!("{service}: changed values"));
+                    pull_changed_values(state_to_write, before, &pulled.rows, bytes)
+                        .ok()
+                        .flatten()
+                        .map(|alignment| (alignment, before.clone()))
+                })
+            }
+            _ => None,
+        };
+        let stored_digest = match &stored_file {
+            Ok(Some((_, digest, _))) => Some(*digest),
+            _ => None,
+        };
+        let digest_beside = pulled.is_none() && stored_digest.is_some();
+        let (stored, observed) = if unchanged_again || changed_values.is_some() {
             (Ok(None), Ok(None))
         } else {
-            rayon::join(
-                || -> Result<Option<StoredSettings>> {
-                    let Some((bytes, digest, _)) = stored_file? else {
-                        return Ok(None);
-                    };
-                    Ok(Some(StoredSettings {
-                        digest,
-                        document: decode_stored_settings(&settings_path, &bytes)?,
-                    }))
+            let (documents, digest) = rayon::join(
+                || {
+                    rayon::join(
+                        || -> Result<Option<StoredSettings>> {
+                            let Some((bytes, digest, _)) = stored_file? else {
+                                return Ok(None);
+                            };
+                            Ok(Some(StoredSettings {
+                                digest,
+                                document: decode_stored_settings(&settings_path, &bytes)?,
+                            }))
+                        },
+                        || {
+                            let _converting =
+                                profile::span(&format!("{service}: captured store document"));
+                            Ok::<_, anyhow::Error>(Some(settings_bytecode_from_service_state(
+                                state_to_write,
+                            )?))
+                        },
+                    )
                 },
                 || {
-                    let _converting = profile::span(&format!("{service}: captured store document"));
-                    Ok::<_, anyhow::Error>(Some(settings_bytecode_from_service_state(
-                        state_to_write,
-                    )?))
+                    digest_beside
+                        .then(|| pulled_digest_from_service_state(state_to_write).ok())
+                        .flatten()
                 },
-            )
+            );
+            if digest_beside {
+                pulled = digest;
+            }
+            documents
         };
         let aligned = (|| -> Result<Option<Vec<u8>>> {
             if unchanged_again {
@@ -1523,6 +1564,28 @@ fn write_service_settings_file(
                 );
                 return Ok(None);
             }
+            if let (Some((alignment, before)), Some(stored), Some(pulled)) =
+                (changed_values, stored_digest, &pulled)
+            {
+                return Ok(match alignment {
+                    // The file still holds the earlier state's document.
+                    SettingsAlignment::Equivalent => {
+                        remember_pull(stored, pulled.digest, Some(before));
+                        None
+                    }
+                    SettingsAlignment::Changed(written) => {
+                        forget_pull(&stored);
+                        remember_pull(
+                            Sha256::digest(&written).into(),
+                            pulled.digest,
+                            Some(pulled.rows.clone()),
+                        );
+                        Some(written)
+                    }
+                });
+            }
+            #[cfg(test)]
+            WHOLLY_ALIGNED.lock_recover().push(settings_path.clone());
             // A captured state the decoder would refuse goes the way it went
             // before: its own bytes are written or compared as they are.
             let Ok(Some(observed)) = observed else {
@@ -1532,21 +1595,43 @@ fn write_service_settings_file(
                 Some(stored) => {
                     let reference = stored.document;
                     let answer_follows_camera = viewport_camera_lacks_enum_types(&reference);
-                    match align_pulled_settings_documents_to_reference(
+                    let pulled_alignment = align_pulled_settings_documents_to_reference(
                         reference,
                         observed,
                         &|| encode_service_settings_binary(state_to_write),
                         alignment_started,
                     )
-                    .with_context(|| format!("Failed to align {}", settings_path.display()))?
-                    {
+                    .with_context(|| format!("Failed to align {}", settings_path.display()))?;
+                    // The rows are those of the file only where it holds the
+                    // state's document as the state itself encodes it.
+                    let rows = |pulled: &PulledDigest| {
+                        (pulled_alignment.stored_as_observed
+                            && pulled.rows.encodes_as_its_document())
+                        .then(|| pulled.rows.clone())
+                    };
+                    match pulled_alignment.alignment {
                         SettingsAlignment::Equivalent => {
-                            if !answer_follows_camera && let Some(pulled) = pulled {
-                                remember_unchanged_pull(stored.digest, pulled);
+                            if !answer_follows_camera && let Some(pulled) = &pulled {
+                                remember_pull(stored.digest, pulled.digest, rows(pulled));
                             }
                             None
                         }
-                        SettingsAlignment::Changed(aligned) => Some(aligned),
+                        SettingsAlignment::Changed(aligned) => {
+                            forget_pull(&stored.digest);
+                            // A file that holds the captured state's own
+                            // document is left alone by a pull of that state.
+                            if !answer_follows_camera
+                                && let Some(pulled) = &pulled
+                                && let Some(rows) = rows(pulled)
+                            {
+                                remember_pull(
+                                    Sha256::digest(&aligned).into(),
+                                    pulled.digest,
+                                    Some(rows),
+                                );
+                            }
+                            Some(aligned)
+                        }
                     }
                 }
                 // A store that is not there yet gets the captured state's own bytes.
@@ -1574,9 +1659,13 @@ fn write_service_settings_file(
     Ok(())
 }
 
-/// A stored file's bytes, their digest, and the observed store a pull found
-/// these bytes unchanged against.
-type StoredFile = (Vec<u8>, [u8; 32], Option<[u8; 32]>);
+/// The stores whose pull aligned whole documents, for the tests of the pulls
+/// that need not.
+#[cfg(test)]
+static WHOLLY_ALIGNED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// A stored file's bytes, their digest, and what a pull remembers of them.
+type StoredFile = (Vec<u8>, [u8; 32], Option<RememberedPull>);
 
 /// A store file as a pull read it: the digest of its bytes and its document.
 struct StoredSettings {
@@ -1593,21 +1682,87 @@ fn decode_stored_settings(settings_path: &Path, bytes: &[u8]) -> Result<Settings
 /// digest of the observed store it was compared with. The alignment answers
 /// from those two alone, wherever the file lies (a pull works on a staged
 /// copy of the project), so the same two again are unchanged again.
-fn unchanged_pulls() -> &'static Mutex<UnchangedPulls> {
-    static PULLS: OnceLock<Mutex<UnchangedPulls>> = OnceLock::new();
+fn remembered_pulls() -> &'static Mutex<RememberedPulls> {
+    static PULLS: OnceLock<Mutex<RememberedPulls>> = OnceLock::new();
     PULLS.get_or_init(Mutex::default)
 }
 
-type UnchangedPulls = HashMap<[u8; 32], [u8; 32]>;
+type RememberedPulls = HashMap<[u8; 32], RememberedPull>;
 
-const MAX_UNCHANGED_PULLS: usize = 1_024;
+#[derive(Clone)]
+struct RememberedPull {
+    digest: [u8; 32],
+    /// The digest's parts for each instance of a state whose own document the
+    /// file holds: a later state is compared with them instance by instance.
+    rows: Option<Arc<PulledRows>>,
+}
 
-fn remember_unchanged_pull(stored: [u8; 32], observed: [u8; 32]) {
-    let mut pulls = unchanged_pulls().lock_recover();
-    if pulls.len() >= MAX_UNCHANGED_PULLS && !pulls.contains_key(&stored) {
+const MAX_REMEMBERED_PULLS: usize = 1_024;
+/// 32 bytes are kept for each instance.
+const MAX_REMEMBERED_ROWS: usize = 4_000_000;
+
+fn remember_pull(stored: [u8; 32], observed: [u8; 32], rows: Option<Arc<PulledRows>>) {
+    remember_pull_within(
+        &mut remembered_pulls().lock_recover(),
+        (stored, observed),
+        rows,
+        (MAX_REMEMBERED_PULLS, MAX_REMEMBERED_ROWS),
+    );
+}
+
+/// Remembers the pull of one file, within `(pulls, rows)` at most: past the
+/// first every pull is forgotten, past the second the rows of every other
+/// file, and rows that alone are past it are not kept.
+fn remember_pull_within(
+    pulls: &mut RememberedPulls,
+    (stored, observed): ([u8; 32], [u8; 32]),
+    rows: Option<Arc<PulledRows>>,
+    (most_pulls, most_rows): (usize, usize),
+) {
+    if pulls.len() >= most_pulls && !pulls.contains_key(&stored) {
         pulls.clear();
     }
-    pulls.insert(stored, observed);
+    let rows = rows.filter(|rows| rows.len() <= most_rows);
+    let held = pulls
+        .iter()
+        .filter(|(file, _)| **file != stored)
+        .filter_map(|(_, pull)| pull.rows.as_ref())
+        .map(|rows| rows.len())
+        .sum::<usize>();
+    if rows
+        .as_ref()
+        .is_some_and(|rows| held + rows.len() > most_rows)
+    {
+        for pull in pulls.values_mut() {
+            pull.rows = None;
+        }
+    }
+    pulls.insert(
+        stored,
+        RememberedPull {
+            digest: observed,
+            rows,
+        },
+    );
+}
+
+/// What a pull remembers of a file, read and let go at once: a caller that
+/// goes on to digest a state does so on the pool, where a thread that waits
+/// takes up another service's work, which must find the memory free.
+fn remembered_pull(stored: &[u8; 32]) -> Option<RememberedPull> {
+    remembered_pulls().lock_recover().get(stored).cloned()
+}
+
+/// A file a pull replaced is not read again.
+fn forget_pull(stored: &[u8; 32]) {
+    remembered_pulls().lock_recover().remove(stored);
+}
+
+/// `RENIUM_PULL_WHOLE_DOCUMENTS` makes every changed store take the whole
+/// alignment, to measure it against the comparison of changed instances.
+fn pull_aligns_whole_documents() -> bool {
+    static WHOLE: OnceLock<bool> = OnceLock::new();
+    *WHOLE.get_or_init(|| std::env::var_os("RENIUM_PULL_WHOLE_DOCUMENTS").is_some())
 }
 
 /// The pull as it worked before it aligned documents: the captured state is
@@ -2151,11 +2306,215 @@ mod projection_tests {
         let written = fs::read(&store)?;
         let digest = <[u8; 32]>::from(Sha256::digest(&written));
         assert_eq!(
-            unchanged_pulls().lock_recover().get(&digest).copied(),
+            remembered_pull(&digest).map(|pull| pull.digest),
             Some(pulled_digest_from_service_state(&state)?.digest)
         );
         import_service_tree(&state, &root, &source, None, "ReplicatedStorage")?;
         assert!(fs::read(&store)? == written);
+        Ok(())
+    }
+
+    fn workspace_state(camera: Map<String, Value>, transparency: f64) -> Result<ServiceState> {
+        workspace_state_of(camera, transparency, 40)
+    }
+
+    fn workspace_state_of(
+        camera: Map<String, Value>,
+        transparency: f64,
+        parts: usize,
+    ) -> Result<ServiceState> {
+        let mut instances = vec![
+            SnapshotInstance {
+                name: "Workspace".into(),
+                class_name: "Workspace".into(),
+                instance_index: Some(1),
+                properties: Map::from_iter([(
+                    "CurrentCamera".into(),
+                    json!({"_type":"Ref","instanceIndex":2}),
+                )]),
+                ..Default::default()
+            },
+            SnapshotInstance {
+                name: "Camera".into(),
+                class_name: "Camera".into(),
+                instance_index: Some(2),
+                parent_index: Some(1),
+                properties: camera,
+                ..Default::default()
+            },
+        ];
+        for index in 0..parts {
+            instances.push(SnapshotInstance {
+                name: format!("Part{index}"),
+                class_name: "Part".into(),
+                instance_index: Some(index + 3),
+                parent_index: Some(1),
+                properties: Map::from_iter([(
+                    "Transparency".into(),
+                    json!(if index == 7 { transparency } else { 0.5 }),
+                )]),
+                ..Default::default()
+            });
+        }
+        build_service_state_from_instances("Workspace", None, instances, HashMap::new(), true)
+    }
+
+    /// A pull after a value changed in Studio compares the changed instance
+    /// alone: no whole documents are aligned, the stored camera stays, and
+    /// the store it writes is remembered like one a first pull wrote.
+    #[test]
+    fn a_changed_value_is_pulled_without_aligning_the_whole_store() -> Result<()> {
+        let parent = std::env::temp_dir().join("renium-changed-value-tests");
+        fs::create_dir_all(&parent)?;
+        let root = crate::system::files::create_unique_directory(&parent, "changed-")?;
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let source = root.join("src");
+        let camera = |field_of_view: f64| {
+            Map::from_iter([("FieldOfView".to_string(), json!(field_of_view))])
+        };
+        let store = service_settings_path(&source.join("Workspace"));
+        import_service_tree(
+            &workspace_state(camera(70.0), 0.5)?,
+            &root,
+            &source,
+            None,
+            "Workspace",
+        )?;
+        let first = fs::read(&store)?;
+        for (round, transparency) in [0.25, 0.75, 0.75].into_iter().enumerate() {
+            let before = fs::read(&store)?;
+            let state = workspace_state(camera(40.0 + round as f64), transparency)?;
+            import_service_tree(&state, &root, &source, None, "Workspace")?;
+            let written = fs::read(&store)?;
+            assert_eq!(written != before, round < 2, "round {round}");
+            let document = decode_settings_bytecode(&written)?;
+            assert_eq!(
+                document.instances[9].properties["Transparency"],
+                json!(transparency)
+            );
+            assert_eq!(document.instances[1].properties["FieldOfView"], json!(70.0));
+            let remembered = remembered_pull(&Sha256::digest(&written).into())
+                .expect("the written store is remembered");
+            assert!(remembered.digest == pulled_digest_from_service_state(&state)?.digest);
+            assert!(remembered.rows.is_some());
+        }
+        assert!(first != fs::read(&store)?);
+        assert!(!WHOLLY_ALIGNED.lock_recover().contains(&store));
+        Ok(())
+    }
+
+    /// What the pulls remember is bound: past the bound on rows the other
+    /// files' rows go and their digests stay, rows past it alone are not
+    /// kept, and past the bound on pulls everything goes.
+    #[test]
+    fn what_the_pulls_remember_is_bound() -> Result<()> {
+        let rows = |parts: usize| -> Result<Arc<PulledRows>> {
+            let state = workspace_state_of(Map::new(), 0.5, parts)?;
+            Ok(pulled_digest_from_service_state(&state)?.rows)
+        };
+        let (small, large) = (rows(8)?, rows(28)?);
+        assert_eq!((small.len(), large.len()), (10, 30));
+        let mut pulls = RememberedPulls::new();
+        let file = |number: u8| [number; 32];
+        let held = |pulls: &RememberedPulls, number: u8| {
+            pulls.get(&file(number)).map(|pull| pull.rows.is_some())
+        };
+        remember_pull_within(&mut pulls, (file(1), file(9)), Some(small.clone()), (3, 30));
+        remember_pull_within(&mut pulls, (file(2), file(9)), Some(small.clone()), (3, 30));
+        assert_eq!((held(&pulls, 1), held(&pulls, 2)), (Some(true), Some(true)));
+        // The same file again counts once.
+        remember_pull_within(&mut pulls, (file(2), file(8)), Some(small.clone()), (3, 30));
+        assert_eq!((held(&pulls, 1), held(&pulls, 2)), (Some(true), Some(true)));
+        assert!(pulls[&file(2)].digest == file(8));
+        remember_pull_within(&mut pulls, (file(3), file(9)), Some(large.clone()), (3, 30));
+        assert_eq!(
+            (held(&pulls, 1), held(&pulls, 2), held(&pulls, 3)),
+            (Some(false), Some(false), Some(true))
+        );
+        remember_pull_within(&mut pulls, (file(3), file(9)), Some(large), (3, 29));
+        assert_eq!(held(&pulls, 3), Some(false));
+        remember_pull_within(&mut pulls, (file(4), file(9)), None, (3, 30));
+        assert_eq!(pulls.len(), 1);
+        assert_eq!(held(&pulls, 4), Some(false));
+        Ok(())
+    }
+
+    /// A label whose text is scaled and not wrapped is written wrapped by
+    /// the encoder of documents alone, so a pull after a change elsewhere
+    /// aligns the whole store, and answers what a pull from bytes answers.
+    #[test]
+    fn a_store_the_two_encoders_write_apart_is_aligned_whole() -> Result<()> {
+        let parent = std::env::temp_dir().join("renium-forced-property-tests");
+        fs::create_dir_all(&parent)?;
+        let root = crate::system::files::create_unique_directory(&parent, "forced-")?;
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let source = root.join("src");
+        let state = |transparency: f64| -> Result<ServiceState> {
+            let mut state = workspace_state_of(
+                Map::from_iter([("FieldOfView".to_string(), json!(33.0))]),
+                transparency,
+                12,
+            )?;
+            let label = &mut state.instances[5];
+            label.class_name = "TextLabel".into();
+            label.properties.insert("TextScaled".into(), json!(true));
+            label.properties.insert("TextWrapped".into(), json!(false));
+            Ok(state)
+        };
+        let store = service_settings_path(&source.join("Workspace"));
+        import_service_tree(&state(0.125)?, &root, &source, None, "Workspace")?;
+        assert!(
+            !pulled_digest_from_service_state(&state(0.125)?)?
+                .rows
+                .encodes_as_its_document()
+        );
+        import_service_tree(&state(0.875)?, &root, &source, None, "Workspace")?;
+        let bytes = fs::read(&store)?;
+        // The file is not the state's own encoding, so no rows go with it.
+        assert!(
+            remembered_pull(&Sha256::digest(&bytes).into()).is_none_or(|pull| pull.rows.is_none())
+        );
+        let written = decode_settings_bytecode(&bytes)?;
+        assert_eq!(written.instances[5].properties["TextWrapped"], json!(true));
+        assert_eq!(
+            written.instances[9].properties["Transparency"],
+            json!(0.875)
+        );
+        assert!(WHOLLY_ALIGNED.lock_recover().contains(&store));
+        Ok(())
+    }
+
+    /// A camera past what a store may hold fails its pull the way it failed
+    /// before a digest could answer for the state.
+    #[test]
+    fn a_camera_past_the_store_limit_fails_the_pull() -> Result<()> {
+        let parent = std::env::temp_dir().join("renium-camera-limit-tests");
+        fs::create_dir_all(&parent)?;
+        let root = crate::system::files::create_unique_directory(&parent, "limit-")?;
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let source = root.join("src");
+        let small = workspace_state(Map::from_iter([("FieldOfView".into(), json!(70))]), 0.5)?;
+        let huge = workspace_state(
+            (0..5)
+                .map(|index| {
+                    (
+                        format!("Huge{index}"),
+                        json!(format!("{index}{}", "a".repeat(30 << 20))),
+                    )
+                })
+                .chain([("FieldOfView".into(), json!(70))])
+                .collect(),
+            0.5,
+        )?;
+        assert!(encode_service_settings_binary(&huge).is_err());
+        import_service_tree(&small, &root, &source, None, "Workspace")?;
+        assert!(import_service_tree(&huge, &root, &source, None, "Workspace").is_err());
         Ok(())
     }
 

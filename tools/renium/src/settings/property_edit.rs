@@ -79,6 +79,66 @@ fn decode_for_property_edit(bytes: &[u8]) -> Result<(SettingsBytecode, RetainedP
     ))
 }
 
+/// The instances at `rows` of a store file, each as decoding the whole file
+/// gives it. The values of every other row are dropped column by column, so
+/// the document is never whole in memory.
+pub(crate) fn decode_rows(bytes: &[u8], rows: &[usize]) -> Result<Vec<SettingsBytecodeInstance>> {
+    let _span = crate::app::profile::span("store rows decode");
+    let (_, payload) = decode_settings_bytecode_container(bytes)?;
+    let budget = DecodeBudget::for_file(bytes.len());
+    let mut reader = BytecodeReader::new(&payload);
+    let SettingsPayloadHeader {
+        strings,
+        properties,
+        mut instances,
+        instance_count,
+    } = decode_settings_payload_header(&mut reader, &budget)?;
+    let specs = read_settings_property_groups(&mut reader, &properties)?;
+    let mut wanted = vec![false; instance_count];
+    for &row in rows {
+        *wanted
+            .get_mut(row)
+            .with_context(|| format!("The store has no instance {row}"))? = true;
+    }
+    let mut occurrences = AHashMap::<&str, usize>::new();
+    for (name, ..) in &specs {
+        *occurrences.entry(name.as_str()).or_default() += 1;
+    }
+    let scope = ValueScope {
+        strings: &strings,
+        instance_count,
+        budget: &budget,
+    };
+    let groups = specs
+        .par_iter()
+        .map(|&(name, kind, count, body)| {
+            // Groups of one property can overwrite a row in their order, which
+            // the ordinary decoder keeps.
+            if occurrences[name.as_str()] == 1
+                && let Some((column, mut decoded)) =
+                    decode_compact_column(body, name, kind, count, scope)?
+            {
+                decoded.retain(|entry| wanted[entry.instance_index()]);
+                for (index, value) in &column.values {
+                    if wanted[*index] {
+                        decoded.push(DecodedGroupEntry::Property(
+                            *index,
+                            materialized_value(value, kind)?,
+                        ));
+                    }
+                }
+                return Ok(decoded);
+            }
+            let mut decoded = decode_property_group_body(body, name, kind, count, scope)?;
+            decoded.retain(|entry| wanted[entry.instance_index()]);
+            Ok(decoded)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    reader.finish()?;
+    apply_decoded_property_groups(&mut instances, &specs, groups);
+    Ok(rows.iter().map(|&row| instances[row].clone()).collect())
+}
+
 fn decode_compact_column(
     body: &[u8],
     name: &str,

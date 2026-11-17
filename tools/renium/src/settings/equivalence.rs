@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -159,6 +160,7 @@ fn align_settings_bytes(
             keep_viewport_camera,
             cache_key,
             started: decode_started,
+            stored_as_observed: None,
         },
     )
 }
@@ -173,8 +175,9 @@ pub(crate) fn align_pulled_settings_documents_to_reference(
     observed: SettingsBytecode,
     observed_bytes: &dyn Fn() -> Result<Vec<u8>>,
     started: std::time::Instant,
-) -> Result<SettingsAlignment> {
-    align_settings_documents(
+) -> Result<PulledAlignment> {
+    let stored_as_observed = AtomicBool::new(false);
+    let alignment = align_settings_documents(
         reference,
         observed,
         AlignmentInput {
@@ -182,8 +185,64 @@ pub(crate) fn align_pulled_settings_documents_to_reference(
             keep_viewport_camera: true,
             cache_key: None,
             started,
+            stored_as_observed: Some(&stored_as_observed),
         },
-    )
+    )?;
+    Ok(PulledAlignment {
+        alignment,
+        stored_as_observed: stored_as_observed.into_inner(),
+    })
+}
+
+/// A pull's alignment, and whether the store it leaves on disk holds the
+/// observed document, with the viewport camera a pull keeps: exactly so where
+/// the store was left as it was, and as the encoder of documents writes that
+/// document where the store was written.
+pub(crate) struct PulledAlignment {
+    pub(crate) alignment: SettingsAlignment,
+    pub(crate) stored_as_observed: bool,
+}
+
+/// Whether a pull holds the observed instance for unchanged against the
+/// stored one, for two instances that stand at one position under one id,
+/// name, class and parent. `None` where that takes the whole documents to
+/// say: an enum item that gains its type, or a property under an older name.
+pub(crate) fn pulled_instance_unchanged(
+    reference: &SettingsBytecodeInstance,
+    observed: &SettingsBytecodeInstance,
+    service: Option<&str>,
+) -> Result<Option<bool>> {
+    if instance_adds_enum_types(reference, observed) {
+        return Ok(None);
+    }
+    let mut named = SettingsBytecode {
+        version: super::bytecode::SETTINGS_BINARY_VERSION,
+        instances: vec![reference.clone(), observed.clone()],
+    };
+    canonicalize_settings_property_names(&mut named)?;
+    if named.instances[0] != *reference || named.instances[1] != *observed {
+        return Ok(None);
+    }
+    let no_ids = AHashMap::new();
+    let ids = PairedStoreIds {
+        service,
+        left: &no_ids,
+        right: &no_ids,
+    };
+    Ok(Some(
+        reference.properties.get("UniqueId") == observed.properties.get("UniqueId")
+            && (reference.class_name == "PackageLink"
+                || reconciliation_maps_equal_with_ids(
+                    &reference.class_name,
+                    &reference.properties,
+                    &observed.properties,
+                    ids,
+                ) && reconciliation_values_map_equal_with_ids(
+                    &reference.attributes,
+                    &observed.attributes,
+                    ids,
+                )),
+    ))
 }
 
 pub(super) fn digest_text(digest: &mut Sha256, text: &str) {
@@ -241,6 +300,13 @@ pub(super) fn digest_value(digest: &mut Sha256, value: &Value) {
 /// captured stores that differ in the camera alone then get different
 /// answers.
 pub(crate) fn viewport_camera_lacks_enum_types(document: &SettingsBytecode) -> bool {
+    workspace_current_camera_index(document)
+        .is_some_and(|index| instance_lacks_enum_types(&document.instances[index]))
+}
+
+/// Whether an instance holds an enum item that can gain its type (see
+/// `viewport_camera_lacks_enum_types`).
+pub(crate) fn instance_lacks_enum_types(instance: &SettingsBytecodeInstance) -> bool {
     fn lacks(value: &Value) -> bool {
         match value {
             Value::Object(map) => {
@@ -260,10 +326,7 @@ pub(crate) fn viewport_camera_lacks_enum_types(document: &SettingsBytecode) -> b
         Value::Array(values) => values.iter().any(lacks),
         _ => false,
     };
-    workspace_current_camera_index(document).is_some_and(|index| {
-        let camera = &document.instances[index];
-        camera.properties.values().any(inside) || camera.attributes.values().any(lacks)
-    })
+    instance.properties.values().any(inside) || instance.attributes.values().any(lacks)
 }
 
 /// The observed store as it came in: its bytes, or how to get them. Under
@@ -279,6 +342,18 @@ struct AlignmentInput<'a> {
     keep_viewport_camera: bool,
     cache_key: Option<SettingsAlignmentCacheKey>,
     started: std::time::Instant,
+    /// Set where the store the alignment leaves holds exactly the observed
+    /// document, with the viewport camera it kept.
+    stored_as_observed: Option<&'a AtomicBool>,
+}
+
+fn same_instances(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
+    reference.instances.len() == observed.instances.len()
+        && reference
+            .instances
+            .par_iter()
+            .zip(&observed.instances)
+            .all(|(reference, observed)| reference == observed)
 }
 
 fn align_settings_documents(
@@ -291,6 +366,7 @@ fn align_settings_documents(
         keep_viewport_camera,
         cache_key,
         started,
+        stored_as_observed,
     } = input;
     let mut phases = AlignmentPhases {
         instances: observed.instances.len(),
@@ -334,6 +410,9 @@ fn align_settings_documents(
         if let Some(key) = cache_key.filter(|_| !camera_kept_early) {
             cache_settings_alignment(key);
         }
+        if let Some(stored_as_observed) = stored_as_observed {
+            stored_as_observed.store(same_instances(&reference, &observed), Ordering::Relaxed);
+        }
         drop_settings_documents(reference, observed);
         return Ok(SettingsAlignment::Equivalent);
     }
@@ -364,16 +443,29 @@ fn align_settings_documents(
             }
         };
         phases.end("encode in place");
+        // The bytes written here are the observed document's own.
+        let same = stored_as_observed.map(|_| same_instances(&reference, &observed));
         let result =
             finish_settings_alignment(reference, observed, aligned, cache_key, camera_kept);
+        if let (Some(stored_as_observed), Some(same), Ok(result)) =
+            (stored_as_observed, same, &result)
+        {
+            stored_as_observed.store(
+                same || matches!(result, SettingsAlignment::Changed(_)),
+                Ordering::Relaxed,
+            );
+        }
         phases.end("final comparison");
         return result;
     }
     match align_settings_ids_for_contiguous_structural_change(&mut reference, &mut observed) {
-        ContiguousStructuralAlignment::Aligned => {
+        ContiguousStructuralAlignment::Aligned { ids_kept } => {
             phases.end("structural matching");
             keep_camera(&mut observed);
             let aligned = encode_settings_bytecode_with_dense_references(&observed)?;
+            if let Some(stored_as_observed) = stored_as_observed {
+                stored_as_observed.store(ids_kept, Ordering::Relaxed);
+            }
             drop_settings_documents(reference, observed);
             phases.end("encode after structural matching");
             return Ok(SettingsAlignment::Changed(aligned));
@@ -1023,7 +1115,12 @@ fn settings_topology_matches(reference: &SettingsBytecode, observed: &SettingsBy
 }
 
 pub(crate) fn persistent_identity(instance: &SettingsBytecodeInstance) -> Option<&str> {
-    let value = instance.properties.get("UniqueId")?.as_object()?;
+    persistent_identity_of(&instance.properties)
+}
+
+/// The same from an instance's properties alone.
+pub(crate) fn persistent_identity_of(properties: &Map<String, Value>) -> Option<&str> {
+    let value = properties.get("UniqueId")?.as_object()?;
     if value.get("_type")?.as_str()? != "UniqueId" {
         return None;
     }
@@ -1074,7 +1171,7 @@ fn persistent_identities_follow_mapping(
 /// matched back with a capture. A debug id is Studio's own and recycled
 /// between sessions, and a bare number is the position an import numbers an
 /// instance by; neither says which stored instance it is.
-fn is_store_identity(id: &str) -> bool {
+pub(crate) fn is_store_identity(id: &str) -> bool {
     !id.starts_with("debug:") && !id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
@@ -2081,7 +2178,10 @@ fn positional_values_equivalent(
 enum ContiguousStructuralAlignment {
     NotApplicable,
     PreparedMismatch,
-    Aligned,
+    /// With whether every observed instance kept the id it came with.
+    Aligned {
+        ids_kept: bool,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -2282,12 +2382,14 @@ fn align_settings_ids_for_contiguous_structural_change(
             remap.insert(current.to_string(), desired.to_string());
         }
     }
+    let mut ids_kept = true;
     for (index, instance) in observed.instances.iter_mut().enumerate() {
         if let Some(reference_index) = index_map.observed_to_reference(index) {
-            instance
-                .settings_id
-                .clone_from(&reference.instances[reference_index].settings_id);
+            let id = &reference.instances[reference_index].settings_id;
+            ids_kept &= instance.settings_id == *id;
+            instance.settings_id.clone_from(id);
         } else if let Some(replacement) = inserted_replacements[index - changed_at].take() {
+            ids_kept = false;
             instance.settings_id = replacement;
         }
     }
@@ -2355,7 +2457,7 @@ fn align_settings_ids_for_contiguous_structural_change(
         return ContiguousStructuralAlignment::PreparedMismatch;
     }
 
-    ContiguousStructuralAlignment::Aligned
+    ContiguousStructuralAlignment::Aligned { ids_kept }
 }
 
 fn settings_parent_id(document: &SettingsBytecode, index: usize) -> Option<&str> {

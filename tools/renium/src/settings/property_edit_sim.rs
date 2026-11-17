@@ -168,6 +168,35 @@ fn property_edits_preserve_eager_encoder_bytes() {
     });
 }
 
+/// Payloads of one length that agree where they are sampled are still told
+/// apart: each row keeps its own.
+#[test]
+fn payloads_alike_in_length_and_sample_keep_their_own_rows() {
+    let root = SettingsBytecodeInstance::new("root".into(), "Root".into(), "Folder".into(), None);
+    let mut instances = vec![root];
+    for (index, text) in ["AAAAAAAAAAAAAAAA", "ABAAAAAAAAAAAAAA", "AAAAAAAAAAAAAAAA"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut part = SettingsBytecodeInstance::new(
+            format!("part{index}"),
+            format!("Part{index}"),
+            "MeshPart".into(),
+            Some(0),
+        );
+        part.properties.insert(
+            "PhysicsData".into(),
+            json!({"_type":"BinaryString", "base64": text}),
+        );
+        instances.push(part);
+    }
+    let document = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances,
+    };
+    check_codec_document(&encode_settings_bytecode(&document).unwrap()).unwrap();
+}
+
 #[test]
 fn property_edit_decoder_retains_group_overwrite_and_error_rules() {
     let instance =

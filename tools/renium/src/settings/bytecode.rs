@@ -44,6 +44,104 @@ pub(crate) fn settings_bytecode_from_service_state(
 pub(crate) struct PulledDigest {
     pub(crate) digest: [u8; 32],
     pub(crate) viewport_camera_lacks_enum_types: bool,
+    pub(crate) rows: Arc<PulledRows>,
+}
+
+/// The digest's parts: one for what the state holds beside its instances,
+/// and two for each instance, in the state's order. What places an instance
+/// in its store (ids, name, class, parent, paths and its UniqueId) is apart
+/// from the values it holds.
+pub(crate) struct PulledRows {
+    frame: [u8; 32],
+    rows: Vec<PulledRow>,
+    /// Where the viewport camera stands, whose values no digest covers.
+    viewport_camera: Option<usize>,
+    /// Whether the state's own encoding is the encoding of its document
+    /// (see `values_encode_alike`).
+    encodes_as_its_document: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct PulledRow {
+    placed: [u8; 16],
+    values: [u8; 16],
+}
+
+impl PulledRows {
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether a store written from the state's document is the state's own
+    /// encoding, so that the file holds exactly what these rows were taken of.
+    pub(crate) fn encodes_as_its_document(&self) -> bool {
+        self.encodes_as_its_document
+    }
+}
+
+/// Whether the encoder of documents writes these values of an instance as
+/// the encoder of captured states writes them. It settles a forced property
+/// (see `forced_property_differs`), gives an attribute in a wrapped form its
+/// type, refuses an attribute it has no form for, and finds the instance of
+/// the store that a reference names by an id or a path; the encoder of states
+/// does none of these. A reference by position, and one whose path leads into
+/// another service, they write alike.
+fn values_encode_alike(
+    properties: &Map<String, Value>,
+    attributes: &Map<String, Value>,
+    root_service: Option<&str>,
+) -> bool {
+    fn references_alike(value: &Value, root_service: Option<&str>) -> bool {
+        match value {
+            Value::Array(items) => items
+                .iter()
+                .all(|item| references_alike(item, root_service)),
+            Value::Object(object) => {
+                let named = SETTINGS_REFERENCE_SELECTOR_KEYS[1..]
+                    .iter()
+                    .any(|key| object.contains_key(*key));
+                if object.get("Ref").is_some_and(Value::is_object) {
+                    return false;
+                }
+                if named {
+                    return matches!(
+                        strict_reference_path(object),
+                        Ok(Some((segments, _)))
+                            if root_service.is_some_and(|root| {
+                                segments.first().is_some_and(|service| service != root)
+                            })
+                    );
+                }
+                object
+                    .values()
+                    .all(|item| references_alike(item, root_service))
+            }
+            _ => true,
+        }
+    }
+    !properties.contains_key("Attributes")
+        && attributes.values().all(|value| {
+            canonical_attribute_value(value).is_none()
+                && collect_attribute_value_strings(value, &mut SettingsStringCounts::default())
+                    .is_ok()
+        })
+        && properties
+            .values()
+            .chain(attributes.values())
+            .all(|value| references_alike(value, root_service))
+}
+
+/// What a pull of `state` leaves of the stored file `stored`, where that file
+/// holds exactly the document of an earlier state with the rows `before`, and
+/// only values changed since, in instances a pull can compare one by one.
+/// `None` where the pull has to align the whole documents.
+pub(crate) fn pull_changed_values(
+    state: &ServiceState,
+    before: &PulledRows,
+    now: &PulledRows,
+    stored: &[u8],
+) -> Result<Option<crate::settings::equivalence::SettingsAlignment>> {
+    captured::changed_values(state, before, now, stored)
 }
 
 /// The `PulledDigest` of this state, without holding its document.
@@ -414,19 +512,24 @@ pub(crate) fn child_indices_for_instance(state: &ServiceState, parent_index: usi
         .map_or(&[][..], Vec::as_slice)
 }
 
+/// What no store holds as a property: the record's own fields and a script's
+/// text, by their exact names. Roblox property names are case-sensitive, and
+/// `AnimationRigData` carries real `name` and `parent` tables beside the
+/// instance's Name and Parent.
+fn is_record_property(name: &str) -> bool {
+    matches!(
+        name,
+        "Source" | "ClassName" | "Parent" | "Name" | "RobloxLocked"
+    )
+}
+
 pub(crate) fn should_skip_binary_property(
     state: &ServiceState,
     instance: &SnapshotInstance,
     name: &str,
     raw_value: &Value,
 ) -> bool {
-    // The record's own fields, by their exact names: Roblox property names
-    // are case-sensitive, and `AnimationRigData` carries real `name` and
-    // `parent` tables beside the instance's Name and Parent.
-    if matches!(
-        name,
-        "Source" | "ClassName" | "Parent" | "Name" | "RobloxLocked"
-    ) {
+    if is_record_property(name) {
         return true;
     }
     if name == "RunContext" && instance.class_name != "Script" {
@@ -2197,11 +2300,40 @@ fn push_settings_binary_value<'a>(
     Ok(())
 }
 
+/// One instance whose values the encoder takes from a document's instance
+/// in place of the captured state's.
+#[derive(Clone, Copy)]
+struct ReplacedRow<'a> {
+    source_index: usize,
+    instance: &'a SettingsBytecodeInstance,
+}
+
+fn visit_replaced_row<'a>(
+    instance: &'a SettingsBytecodeInstance,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    mut visit: impl FnMut(&'a str, u8, SettingsBinaryValueSource<'a>) -> Result<()>,
+) -> Result<()> {
+    for (name, value) in &instance.properties {
+        let source = SettingsBinaryValueSource::of_property(value);
+        let kind = binary_source_value_kind(&source, lookup)?;
+        if kind != 0 {
+            visit(name.as_str(), kind, source)?;
+        }
+    }
+    if !instance.attributes.is_empty() {
+        let source = SettingsBinaryValueSource::Attributes(&instance.attributes);
+        let kind = binary_source_value_kind(&source, lookup)?;
+        visit("Attributes", kind, source)?;
+    }
+    Ok(())
+}
+
 fn collect_settings_binary_chunk<'a>(
     state: &'a ServiceState,
     lookup: &SettingsBinaryInstanceLookup<'_>,
     instances: &'a [SettingsBinaryInstance<'a>],
     base_index: usize,
+    replaced: Option<ReplacedRow<'a>>,
 ) -> Result<SettingsBinaryCollection<'a>> {
     let mut out = SettingsBinaryCollection::default();
 
@@ -2214,9 +2346,13 @@ fn collect_settings_binary_chunk<'a>(
         add_count(&mut out.string_counts, record.class_name);
         add_count(&mut out.class_counts, record.class_name);
 
-        visit_settings_binary_properties(state, record, lookup, |name, kind, source| {
+        let push = |name, kind, source| {
             push_settings_binary_value(&mut out, lookup, instance_index, name, kind, source)
-        })?;
+        };
+        match replaced.filter(|row| row.source_index == record.source_index) {
+            Some(row) => visit_replaced_row(row.instance, lookup, push)?,
+            None => visit_settings_binary_properties(state, record, lookup, push)?,
+        }
     }
 
     Ok(out)
@@ -2322,11 +2458,12 @@ fn collect_settings_binary_data<'a>(
     state: &'a ServiceState,
     lookup: &SettingsBinaryInstanceLookup<'_>,
     instances: &'a [SettingsBinaryInstance<'a>],
+    replaced: Option<ReplacedRow<'a>>,
 ) -> Result<SettingsBinaryCollection<'a>> {
     let _span = crate::app::profile::span("captured store columns collect");
     if instances.len() < SETTINGS_BINARY_PARALLEL_MIN_INSTANCES || rayon::current_num_threads() <= 1
     {
-        return collect_settings_binary_chunk(state, lookup, instances, 0);
+        return collect_settings_binary_chunk(state, lookup, instances, 0, replaced);
     }
 
     let partials = instances
@@ -2338,6 +2475,7 @@ fn collect_settings_binary_data<'a>(
                 lookup,
                 records,
                 chunk_index * SETTINGS_BINARY_PARALLEL_CHUNK_SIZE,
+                replaced,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2390,7 +2528,7 @@ pub(crate) fn encode_service_settings_binary(state: &ServiceState) -> Result<Vec
     let _span = crate::app::profile::span("captured store encode");
     let instances = collect_service_settings_binary_instances(state);
     let lookup = build_settings_binary_instance_lookup(state, &instances);
-    let collected = collect_settings_binary_data(state, &lookup, &instances)?;
+    let collected = collect_settings_binary_data(state, &lookup, &instances, None)?;
 
     encode_prepared_service_settings(&instances, &lookup, collected)
 }
