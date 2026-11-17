@@ -78,8 +78,8 @@ pub(crate) fn record_between(label: &str, started: Instant, ended: Instant) {
     if !enabled() {
         return;
     }
-    let label = match committed_megabytes() {
-        Some(megabytes) => format!("{label} [{megabytes} MB held]"),
+    let label = match held_memory() {
+        Some(held) => format!("{label} [{held}]"),
         None => label.to_string(),
     };
     let mut state = STATE.lock_recover();
@@ -103,15 +103,28 @@ pub(crate) struct CountingAllocator;
 #[cfg(feature = "count-live-memory")]
 static LIVE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The most bytes in use at one time since a step last read it.
+#[cfg(feature = "count-live-memory")]
+static MOST_LIVE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "count-live-memory")]
+fn count_allocated(size: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let live = LIVE_BYTES.fetch_add(size, Relaxed) + size;
+    if live > MOST_LIVE_BYTES.load(Relaxed) {
+        MOST_LIVE_BYTES.fetch_max(live, Relaxed);
+    }
+}
+
 #[cfg(feature = "count-live-memory")]
 unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        LIVE_BYTES.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        count_allocated(layout.size());
         unsafe { mimalloc::MiMalloc.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-        LIVE_BYTES.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        count_allocated(layout.size());
         unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
     }
 
@@ -123,7 +136,7 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
     unsafe fn realloc(&self, pointer: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         let moved = unsafe { mimalloc::MiMalloc.realloc(pointer, layout, size) };
         if !moved.is_null() {
-            LIVE_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            count_allocated(size);
             LIVE_BYTES.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
         }
         moved
@@ -133,20 +146,30 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
 /// The memory the process holds as a step ends, when `RENIUM_PROFILE_MEMORY`
 /// is set: each step of the profile then says where the memory stood, which
 /// shows the step that grows it. A `count-live-memory` build gives the bytes
-/// in use; any other build what the allocator has committed.
-fn committed_megabytes() -> Option<usize> {
+/// in use, the most in use since the step recorded before, and what the
+/// process has committed; any other build the committed memory alone.
+fn held_memory() -> Option<String> {
     static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*WANTED.get_or_init(|| std::env::var_os("RENIUM_PROFILE_MEMORY").is_some()) {
         return None;
     }
+    let committed = committed_megabytes();
     #[cfg(feature = "count-live-memory")]
-    return Some(LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20);
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let live = LIVE_BYTES.load(Relaxed);
+        let most = MOST_LIVE_BYTES.swap(live, Relaxed).max(live);
+        Some(format!(
+            "{} MB held, {} MB at most, {committed} MB committed",
+            live >> 20,
+            most >> 20
+        ))
+    }
     #[cfg(not(feature = "count-live-memory"))]
-    committed_by_the_allocator()
+    Some(format!("{committed} MB held"))
 }
 
-#[cfg(not(feature = "count-live-memory"))]
-fn committed_by_the_allocator() -> Option<usize> {
+fn committed_megabytes() -> usize {
     let mut committed = 0usize;
     let mut unused = [0usize; 7];
     let [
@@ -170,7 +193,7 @@ fn committed_by_the_allocator() -> Option<usize> {
             faults,
         );
     }
-    Some(committed >> 20)
+    committed >> 20
 }
 
 /// A step that lasts until the value is dropped.
