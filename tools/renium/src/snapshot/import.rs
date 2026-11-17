@@ -326,8 +326,9 @@ impl DirectImportWorker {
                     self.roots.layout_src_root.as_deref(),
                     &service,
                 );
-                let _releasing = profile::span(&format!("{service}: release captured state"));
-                drop(state);
+                // Freeing a large captured service takes a few hundred
+                // milliseconds that nothing after it waits for.
+                rayon::spawn(move || drop(state));
                 node
             });
         match result {
@@ -1296,11 +1297,13 @@ fn import_service_tree(
         );
 
         if cleanup_required {
+            let _cleaning = profile::span(&format!("{service}: remove files Studio dropped"));
             let cleanup_handle =
                 spawn_cleanup_service_dir(service_dir.clone(), Arc::clone(&expected_paths));
             join_cleanup_handle(service, cleanup_handle)?;
         }
 
+        let _mapping = profile::span(&format!("{service}: build sourcemap"));
         Ok(build_service_sourcemap_from_state(
             state,
             project_root,
