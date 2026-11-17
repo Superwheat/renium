@@ -156,6 +156,111 @@ fn import_identity_metadata_is_linear_for_deep_place_sized_trees() -> Result<()>
 }
 
 #[test]
+fn native_import_paths_preserve_ordinals_in_wide_mixed_class_siblings() -> Result<()> {
+    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+    let service = dom.insert(
+        dom.root_ref(),
+        RbxInstanceBuilder::new("Workspace").with_name("Renamed service"),
+    );
+    let count = 4096;
+    for index in 0..count {
+        dom.insert(
+            service,
+            RbxInstanceBuilder::new(if index % 2 == 0 { "Folder" } else { "Part" })
+                .with_name(if index % 3 == 0 { "Other" } else { "Duplicate" }),
+        );
+    }
+    let services = vec![("Workspace".to_string(), service)];
+    let groups = pending_editor_binary_groups(&dom, &services)?;
+    let plan = EditorPackageGroupPlan {
+        retained_roots: Vec::new(),
+        package_roots: Vec::new(),
+        mutation_package_roots: Vec::new(),
+        change_generation: None,
+    };
+    let (_, groups, _) = encode_services(
+        &mut dom,
+        &services,
+        &HashMap::new(),
+        groups,
+        vec![plan],
+        &mut HashMap::new(),
+    )?;
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].root_paths.len(), count);
+    let mut duplicate = 0;
+    let mut other = 0;
+    for (index, path) in groups[0].root_paths.iter().enumerate() {
+        let (name, ordinal) = if index % 3 == 0 {
+            other += 1;
+            ("Other", other)
+        } else {
+            duplicate += 1;
+            ("Duplicate", duplicate)
+        };
+        assert_eq!(path.path_segments, ["Workspace", name]);
+        assert_eq!(path.path_ordinals, [1, ordinal]);
+    }
+    Ok(())
+}
+
+#[test]
+fn native_import_parallel_metadata_preserves_service_order_and_identity_scopes() -> Result<()> {
+    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+    let names = ["ServerStorage", "Workspace", "ReplicatedStorage"];
+    let mut ids = HashMap::new();
+    let services = names
+        .iter()
+        .map(|name| {
+            let service = dom.insert(dom.root_ref(), RbxInstanceBuilder::new(*name));
+            let root = dom.insert(service, RbxInstanceBuilder::new("Folder").with_name("Root"));
+            ids.insert(root, format!("editor:{name}"));
+            (name.to_string(), service)
+        })
+        .collect::<Vec<_>>();
+    let groups = pending_editor_binary_groups(&dom, &services)?;
+    let plans = names
+        .iter()
+        .map(|_| EditorPackageGroupPlan {
+            retained_roots: Vec::new(),
+            package_roots: Vec::new(),
+            mutation_package_roots: Vec::new(),
+            change_generation: None,
+        })
+        .collect();
+    let (_, groups, _) = encode_services(
+        &mut dom,
+        &services,
+        &ids,
+        groups,
+        plans,
+        &mut HashMap::new(),
+    )?;
+    assert_eq!(
+        groups
+            .iter()
+            .map(|group| group.service.as_str())
+            .collect::<Vec<_>>(),
+        names
+    );
+    for group in groups {
+        assert_eq!(
+            group.root_paths[0].path_segments,
+            [group.service.as_str(), "Root"]
+        );
+        let identities = group.instance_identities.unwrap();
+        assert_eq!(base64::decode(&identities.nodes)?.len(), 20);
+        for name in names {
+            assert_eq!(
+                identities.strings.contains(&format!("editor:{name}")),
+                group.service == name
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn import_identity_tree_covers_a_subtree_across_native_batches() -> Result<()> {
     let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
     let service = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
@@ -644,6 +749,9 @@ pub(super) fn encode_services(
     let mut aliases = Vec::new();
     let mut first_ordinals = HashMap::new();
     let mut referent_offset = 0;
+    // All hierarchy edits are complete. Index siblings once while preparing
+    // paths; rescanning them for every imported root is quadratic for wide trees.
+    let mut paths = crate::rbx::model::RbxDomPaths::new(dom);
     drop(combine_classes);
     let combine_payloads =
         crate::app::profile::span("native encode concatenate payloads and bind receipts");
@@ -660,10 +768,13 @@ pub(super) fn encode_services(
                     source_ordinal: *source_ordinal,
                 });
             } else {
-                first_ordinals.insert(receipt.referent, ordinal);
+                // Only repeated ancestor anchors can occur in another batch.
+                // Do not allocate a lookup entry for every created instance.
+                if repeated.contains(&receipt.referent) {
+                    first_ordinals.insert(receipt.referent, ordinal);
+                }
                 if let Some(mode) = requested.get(&receipt.referent) {
-                    let (path_segments, path_ordinals) =
-                        rbx_dom_instance_path_parts(dom, receipt.referent);
+                    let (path_segments, path_ordinals) = paths.parts(receipt.referent);
                     bindings.push(EditorNativeBinding {
                         path_segments,
                         path_ordinals,
@@ -688,9 +799,10 @@ pub(super) fn encode_services(
     drop(combine_payloads);
     let _groups = crate::app::profile::span("native encode group paths and identity rows");
     let groups = groups
-        .into_iter()
+        .into_par_iter()
         .zip(package_plans)
         .map(|(group, plan)| {
+            let mut paths = crate::rbx::model::RbxDomPaths::new(dom);
             let _service = crate::app::profile::span(&format!(
                 "{}: native import paths and identities ({} roots)",
                 group.service,
@@ -706,7 +818,7 @@ pub(super) fn encode_services(
                 .roots
                 .iter()
                 .map(|root| {
-                    let (path_segments, path_ordinals) = rbx_dom_instance_path_parts(dom, *root);
+                    let (path_segments, path_ordinals) = paths.parts(*root);
                     EditorBinaryRootPath {
                         path_segments,
                         path_ordinals,
