@@ -661,6 +661,12 @@ fn compact_push_summary(
     if result.contains_key("skippedByReview") || result.contains_key("heldForReview") {
         return result;
     }
+    if let Some(count) = summary
+        .get("supplementalImportWrites")
+        .and_then(Value::as_u64)
+    {
+        result.insert("supplementalImportWrites".into(), json!(count));
+    }
     let counts = push_counts(summary);
     let changed = !counts.is_empty()
         || ["protectedApplied", "savedFieldsApplied", "packageModified"]
@@ -5621,6 +5627,25 @@ mod tests {
             connected_runtime_wait_seconds(&state, context.id, 8.0),
             RECENT_STUDIO_LAUNCH_WAIT_SECONDS
         );
+    }
+
+    #[test]
+    fn compact_push_reports_the_measured_import_write_count_including_zero() {
+        let parameters = json!({"supplementalImportWrites": 123});
+        for count in [None, Some(0), Some(2)] {
+            let mut summary = json!({"instanceCreated": 8, "sourceVerified": 1});
+            if let Some(count) = count {
+                summary["supplementalImportWrites"] = json!(count);
+            }
+            let reply = compact_push_summary(summary.as_object().unwrap(), &parameters, false);
+            assert_eq!(
+                reply
+                    .get("supplementalImportWrites")
+                    .and_then(Value::as_u64),
+                count
+            );
+            assert_eq!(reply["verified"], true);
+        }
     }
 
     #[test]
