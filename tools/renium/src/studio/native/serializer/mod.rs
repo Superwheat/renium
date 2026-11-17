@@ -348,6 +348,7 @@ pub(crate) fn register_history_if_available(
     token: &str,
     terrain: bool,
 ) -> anyhow::Result<bool> {
+    let _profile = crate::app::profile::span("native transaction history registration");
     let key = (pid, token.to_string());
     if crate::system::LockRecover::lock_recover(&REGISTERED_HISTORY_TOKENS).contains(&key) {
         return Ok(true);

@@ -30,6 +30,7 @@ pub(super) fn instance_identities(
     if ids.is_empty() {
         return Ok(None);
     }
+    let tree_profile = crate::app::profile::span("native import identity tree rows");
     let mut strings = Vec::new();
     let mut indices = AHashMap::new();
     let mut nodes = Vec::new();
@@ -71,6 +72,8 @@ pub(super) fn instance_identities(
         }
         pending.extend(children.into_iter().rev());
     }
+    drop(tree_profile);
+    let _encode = crate::app::profile::span("native import identity base64 encoding");
     Ok(
         (!nodes.is_empty()).then(|| crate::editor::types::EditorBinaryStructure {
             strings,

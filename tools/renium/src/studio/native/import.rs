@@ -3134,7 +3134,9 @@ fn build_editor_binary_import_for_services(
         }
     }
     let phase_started = Instant::now();
+    let identities = crate::app::profile::span("native import clear regenerated engine identities");
     clear_import_engine_identities(&mut build.dom);
+    drop(identities);
     // Temporary A/B selection while the transaction adapter is integrated.
     // Existing package and partial-service workflows retain their current path.
     if allow_service_replacement

@@ -629,6 +629,7 @@ impl<'a> EditorTransaction<'a> {
         services: Vec<String>,
         guard: Option<&StudioChangeGuard>,
     ) -> Value {
+        let _profile = crate::app::profile::span("native transaction parameters");
         let native_import = binary_import.is_some();
         let native_import_services = binary_import
             .into_iter()
@@ -902,7 +903,10 @@ impl<'a> EditorTransaction<'a> {
             fnv1a_hex(services.join("\0").as_bytes())
         );
         let upload_services = services.clone();
-        let native_properties_available = super::native_roots::available(bridge)?;
+        let native_properties_available = {
+            let _profile = crate::app::profile::span("native transaction property capability");
+            super::native_roots::available(bridge)?
+        };
         let parameters = |services| {
             let mut parameters = Self::parameters(changes, binary_import, &id, services, guard);
             parameters["nativePropertiesAvailable"] = json!(native_properties_available);
