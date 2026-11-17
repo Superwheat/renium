@@ -55,8 +55,9 @@ When the files and Studio were both edited since the last sync, Renium merges th
 Any MCP server can run a script in Studio. Renium takes away the points where a
 person still had to step in:
 
-- **Studio itself.** It opens, reopens, saves and closes places, and continues past
-  Studio's low-memory prompt.
+- **Studio itself.** It opens, reopens, saves and closes places. It answers the
+  prompts Studio puts in the way: auto-recovery, the lighting technology migration,
+  the package-changes notice and the low-memory warning.
 - **Several players.** A playtest runs a local server and as many clients as the
   test needs. Each client has its own Luau, console, input and capture.
 - **Real input in the background.** Clicks, keys, typing and movement go to a play
