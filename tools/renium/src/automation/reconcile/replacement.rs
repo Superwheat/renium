@@ -32,12 +32,24 @@ pub(crate) fn prepare_project_replacement(
             if desired.entries.get(path) == observed.entries.get(path) {
                 return Ok((path.clone(), None));
             }
+            let step_started = std::time::Instant::now();
             let (current, previous) = rayon::join(
                 || settings_document(desired.entries.get(path)),
                 || settings_document(observed.entries.get(path)),
             );
             let mut current = current?;
             let previous = previous?;
+            let instances = current.instances.len().max(previous.instances.len());
+            let step = |name: &str, started: std::time::Instant| {
+                if instances >= 4_096 {
+                    crate::app::timing::log_timing(
+                        &format!("replacement preparation of {instances} instances: {name}"),
+                        started,
+                    );
+                }
+                std::time::Instant::now()
+            };
+            let step_started = step("decode", step_started);
             if settings_documents_positionally_equivalent(&current, &previous) {
                 drop_settings_documents(current, previous);
                 return Ok((path.clone(), None));
@@ -64,17 +76,21 @@ pub(crate) fn prepare_project_replacement(
                 retained
             } else {
                 let mut previous = previous;
+                let step_started = step("comparison by position", step_started);
                 if !align_settings_ids_to_reference(&current, &mut previous) {
                     bail!(
                         "Could not align existing Studio objects in {}",
                         path.display()
                     );
                 }
+                let step_started = step("identity matching", step_started);
                 crate::settings::equivalence::inherit_workspace_viewport_reference(
                     &mut current,
                     &previous,
                 );
-                if settings_documents_equivalent(&current, &previous) {
+                let equivalent = settings_documents_equivalent(&current, &previous);
+                let step_started = step("comparison", step_started);
+                if equivalent {
                     drop_settings_documents(current, previous);
                     return Ok((path.clone(), None));
                 }
@@ -101,6 +117,7 @@ pub(crate) fn prepare_project_replacement(
                 // With no incoming authored objects there is no native payload
                 // to replace this service. Keep outgoing identities so the delta
                 // planner can remove them, including children of locked containers.
+                step("search for a reusable instance", step_started);
                 if reusable || service_has_only_native_containers(&current) {
                     previous
                 } else {

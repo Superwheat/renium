@@ -152,6 +152,8 @@ fn align_settings_bytes(
     };
     let mut reference = reference?;
     let mut observed = observed?;
+    let mut phases = AlignmentPhases::new(observed.instances.len());
+    phases.end("decode");
     // Taken before alignment rewrites either document.
     let viewport_camera = keep_viewport_camera
         .then(|| reference_viewport_camera(&reference))
@@ -173,6 +175,7 @@ fn align_settings_bytes(
     if camera_kept_early {
         positionally_equivalent = positional_values_equivalent(&reference, &observed, None, false);
     }
+    phases.end("comparison by position");
     if positionally_equivalent {
         if positions_add_enum_types(&reference, &observed) {
             if !align_settings_ids_to_reference(&reference, &mut observed) {
@@ -196,12 +199,15 @@ fn align_settings_bytes(
     // to align. This is a pull after values changed in Studio, the common
     // one. Under store ids its own bytes are what the encoder writes for it
     // again; any other id passes through the encoder, which normalizes it.
-    if topology_matches && identities_already_aligned(&reference, &observed) {
+    let already_aligned = topology_matches && identities_already_aligned(&reference, &observed);
+    phases.end("identity check");
+    if already_aligned {
         rayon::join(
             || stabilize_settings_reference_ids(&mut reference),
             || stabilize_settings_reference_ids(&mut observed),
         );
         let camera_kept = keep_camera(&mut observed) || camera_kept_early;
+        phases.end("reference ids");
         let keep_encoding = reference
             .instances
             .iter()
@@ -211,13 +217,19 @@ fn align_settings_bytes(
         } else {
             observed_bytes.to_vec()
         };
-        return finish_settings_alignment(reference, observed, aligned, cache_key, camera_kept);
+        phases.end("encode in place");
+        let result =
+            finish_settings_alignment(reference, observed, aligned, cache_key, camera_kept);
+        phases.end("final comparison");
+        return result;
     }
     match align_settings_ids_for_contiguous_structural_change(&mut reference, &mut observed) {
         ContiguousStructuralAlignment::Aligned => {
+            phases.end("structural matching");
             keep_camera(&mut observed);
             let aligned = encode_settings_bytecode_with_dense_references(&observed)?;
             drop_settings_documents(reference, observed);
+            phases.end("encode after structural matching");
             return Ok(SettingsAlignment::Changed(aligned));
         }
         ContiguousStructuralAlignment::PreparedMismatch => {}
@@ -228,12 +240,46 @@ fn align_settings_bytes(
             );
         }
     }
+    phases.end("structural attempt");
     if !align_settings_ids_to_reference(&reference, &mut observed) {
         bail!("duplicate instance identity is ambiguous after comparing references");
     }
+    phases.end("identity matching");
     let camera_kept = keep_camera(&mut observed) || camera_kept_early;
     let aligned = encode_settings_bytecode(&observed)?;
-    finish_settings_alignment(reference, observed, aligned, cache_key, camera_kept)
+    phases.end("encode");
+    let result = finish_settings_alignment(reference, observed, aligned, cache_key, camera_kept);
+    phases.end("final comparison");
+    result
+}
+
+/// Step timings of one alignment in the trace log, for stores large enough
+/// to matter.
+struct AlignmentPhases {
+    instances: usize,
+    started: std::time::Instant,
+}
+
+impl AlignmentPhases {
+    fn new(instances: usize) -> Self {
+        Self {
+            instances,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn end(&mut self, phase: &str) {
+        if self.instances >= 4_096 {
+            crate::app::timing::log_timing(
+                &format!(
+                    "settings alignment of {} instances: {phase}",
+                    self.instances
+                ),
+                self.started,
+            );
+        }
+        self.started = std::time::Instant::now();
+    }
 }
 
 /// Equal, unique IDs can be kept when matching is guaranteed to preserve
@@ -2431,13 +2477,13 @@ fn settings_documents_match(
         .instances
         .iter()
         .map(|instance| instance.settings_id.as_str())
-        .collect::<HashSet<_>>();
+        .collect::<AHashSet<_>>();
     let right_by_id = right
         .instances
         .iter()
         .enumerate()
         .map(|(index, instance)| (instance.settings_id.as_str(), index))
-        .collect::<HashMap<_, _>>();
+        .collect::<AHashMap<_, _>>();
     if left_ids.len() != left.instances.len() || right_by_id.len() != right.instances.len() {
         return false;
     }
@@ -2447,8 +2493,9 @@ fn settings_documents_match(
         left: &no_ids,
         right: &no_ids,
     };
+    // Each instance is compared on its own; a large store uses every core.
     left.instances
-        .iter()
+        .par_iter()
         .enumerate()
         .all(|(left_index, left_instance)| {
             let Some(right_index) = right_by_id.get(left_instance.settings_id.as_str()).copied()
