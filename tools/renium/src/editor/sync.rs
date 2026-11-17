@@ -3318,24 +3318,43 @@ struct ProtectedWritePlan {
 // Path2D.Transparency, ...) are ordinary settings a user can change in Studio,
 // so the push writes them natively without an approval; whatever cannot be
 // written is named in the result.
+pub(crate) fn finish_committed_saved_fields(
+    saved: &crate::editor::types::PushSavedFields,
+    project: &Path,
+    bridge: &BridgeServer,
+    summary: &mut Map<String, Value>,
+) {
+    let receipt = summary.get("protectedOfflineApply").cloned();
+    if let Err(error) =
+        apply_saved_field_differences(saved, project, bridge, summary, receipt.as_ref())
+    {
+        record_unsupported_properties(
+            summary,
+            saved
+                .fields
+                .iter()
+                .map(|field| format!("{} ({error:#})", field.label())),
+        );
+    }
+    warn_unsupported_properties(summary);
+}
+
 fn apply_saved_field_differences(
-    args: &PushEditorChangesArgs,
+    saved: &crate::editor::types::PushSavedFields,
+    project: &Path,
     bridge: &BridgeServer,
     summary: &mut Map<String, Value>,
     offline_receipt: Option<&Value>,
 ) -> Result<()> {
-    let Some(saved) = &args.saved_fields else {
-        return Ok(());
-    };
     let (runtime, _replacement_gate) = match offline_receipt {
         Some(receipt) => {
             saved.validate(
-                review_project_root(args),
+                project,
                 receipt["previousRuntimeId"].as_str().unwrap_or_default(),
             )?;
             let runtime =
                 super::review::snapshot_replacement_runtime(Some(&saved.runtime), receipt)?;
-            let gate = bridge.try_acquire_runtime_gate(runtime, "push").context(
+            let gate = bridge.acquire_runtime_gate_within(runtime, "push", bridge.active_request_lease().as_deref(), Some(Duration::from_secs(1)))?.context(
                 "The reopened place is busy. Its saved fields are still pending; retry the push.",
             )?;
             anyhow::ensure!(
@@ -3346,7 +3365,7 @@ fn apply_saved_field_differences(
         }
         None => {
             let current = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
-            saved.validate(review_project_root(args), &current.runtime_id)?;
+            saved.validate(project, &current.runtime_id)?;
             (saved.runtime.as_str(), None)
         }
     };
@@ -3765,6 +3784,7 @@ fn push_with_root_availability(
         args.yes || global_yes(),
         || {
             !pre_routed_protected_writes.is_empty()
+                && local_place_path_for_bridge(bridge).is_some()
                 && !pending_protected_writes(
                     bridge,
                     &mut Map::new(),
@@ -3975,11 +3995,14 @@ fn push_with_root_availability(
         if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
             bail!("Studio rejected or failed one or more editor push changes");
         }
-        apply_saved_field_differences(&args, bridge, &mut summary, offline_receipt.as_ref())?;
         if let Some(receipt) = offline_receipt {
             summary.insert("protectedOfflineApply".into(), receipt);
+        } else {
+            summary.remove("protectedOfflineApply");
         }
-        warn_unsupported_properties(&summary);
+        if args.saved_fields.is_none() {
+            warn_unsupported_properties(&summary);
+        }
         Ok(summary)
     })();
     EditorTransaction::finish(transaction.as_mut(), result)
@@ -7647,10 +7670,8 @@ mod saved_field_review_tests {
         .unwrap_err();
         assert!(error.to_string().contains("reader mismatch"), "{error:#}");
         assert!(
-            error
-                .to_string()
-                .contains("--yes approves writing the local place file offline"),
-            "{error:#}"
+            !error.to_string().contains("--yes"),
+            "cloud place: {error:#}"
         );
         assert_eq!(
             calls
@@ -7761,7 +7782,7 @@ mod saved_field_review_tests {
             fields: vec![field],
         };
         let mut args_a = args_for(&a);
-        args_a.saved_fields = Some(batch.clone());
+        args_a.saved_fields = Some(Arc::new(batch.clone()));
         let (bridge, calls, plugin) = reviewing_bridge("skip");
         let summary = push_editor_changes_with_collected(
             args_a,
@@ -7788,14 +7809,12 @@ mod saved_field_review_tests {
         assert_eq!(summary["skippedByReview"], true);
         let calls_before = calls.lock().unwrap().len();
         assert!(calls_before > 0);
-        let mut args_b = args_for(&b);
+        let args_b = args_for(&b);
         let mut summary = Map::new();
-        apply_saved_field_differences(&args_b, &bridge, &mut summary, None).unwrap();
-        assert!(summary.is_empty());
+        assert!(args_b.saved_fields.is_none());
         assert!(batch.validate(&a, "later-runtime").is_err());
-        args_b.saved_fields = Some(batch);
         assert!(
-            apply_saved_field_differences(&args_b, &bridge, &mut summary, None)
+            apply_saved_field_differences(&batch, &b, &bridge, &mut summary, None)
                 .unwrap_err()
                 .to_string()
                 .contains("different project or Studio runtime")
@@ -7829,14 +7848,7 @@ mod saved_field_review_tests {
     fn offline_saved_fields_require_the_originating_place_and_its_connected_successor() {
         let root = project_with_threshold_zero("saved-fields-reopen");
         let (bridge, calls, plugin) = reviewing_bridge("skip");
-        let mut args = PushEditorChangesArgs::new(
-            ProjectSourceArgs {
-                project_root: root.clone(),
-                src_root: "src".into(),
-            },
-            BridgeConnectionArgs::local(0.1),
-        );
-        args.saved_fields = Some(crate::editor::types::PushSavedFields {
+        let saved = crate::editor::types::PushSavedFields {
             project: root.clone(),
             runtime: "previous".into(),
             fields: vec![crate::settings::equivalence::SavedFieldDifference {
@@ -7846,20 +7858,21 @@ mod saved_field_review_tests {
                 ambiguous: true,
                 value: json!(0),
             }],
-        });
+        };
         let receipt = json!({"ok":true,"previousRuntimeId":"previous","reopenedRuntimeId":"saved-field-review"});
         let mut summary = Map::new();
         let busy = bridge
             .try_acquire_runtime_gate("saved-field-review", "test")
             .unwrap();
         assert!(
-            apply_saved_field_differences(&args, &bridge, &mut summary, Some(&receipt))
+            apply_saved_field_differences(&saved, &root, &bridge, &mut summary, Some(&receipt))
                 .unwrap_err()
                 .to_string()
                 .contains("busy")
         );
         drop(busy);
-        apply_saved_field_differences(&args, &bridge, &mut summary, Some(&receipt)).unwrap();
+        apply_saved_field_differences(&saved, &root, &bridge, &mut summary, Some(&receipt))
+            .unwrap();
         assert!(summary.contains_key("unsupportedProperties"));
         for (key, wrong) in [
             ("previousRuntimeId", "another-project-runtime"),
@@ -7868,7 +7881,8 @@ mod saved_field_review_tests {
             let mut bad = receipt.clone();
             bad[key] = json!(wrong);
             assert!(
-                apply_saved_field_differences(&args, &bridge, &mut Map::new(), Some(&bad)).is_err()
+                apply_saved_field_differences(&saved, &root, &bridge, &mut Map::new(), Some(&bad))
+                    .is_err()
             );
         }
         assert!(calls.lock().unwrap().is_empty());

@@ -356,12 +356,13 @@ pub(crate) fn push_project(
             saved_fields.push(field);
         }
     }
-    push_args.saved_fields =
-        (!saved_fields.is_empty()).then(|| crate::editor::types::PushSavedFields {
+    push_args.saved_fields = (!saved_fields.is_empty()).then(|| {
+        Arc::new(crate::editor::types::PushSavedFields {
             project: PathBuf::from(&context.root),
             runtime: guard.runtime_id.clone(),
             fields: saved_fields,
-        });
+        })
+    });
     if differences.is_empty() {
         tracking_release.proof = capture_push_proof(bridge, &guard)?;
         acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
@@ -451,6 +452,7 @@ pub(crate) fn push_project(
     #[cfg(any(windows, target_os = "macos"))]
     let can_settle_in_background = settle_native_import
         && import_settle::can_continue(&stage, requires_stage, link_enforcement.is_some());
+    let saved_fields = push_args.saved_fields.clone();
     let mut pushed = push_staged_project(
         context,
         &stage,
@@ -475,6 +477,14 @@ pub(crate) fn push_project(
         "historyId".into(),
         Value::String(history.commit(&project, &pushed.generated)?),
     );
+    if let Some(saved) = saved_fields {
+        crate::editor::sync::finish_committed_saved_fields(
+            &saved,
+            &root,
+            bridge,
+            &mut pushed.summary,
+        );
+    }
     log_reconcile_timing("full push mutation", phase);
 
     let replacement = reopened_push_context(context, &pushed.summary)?;

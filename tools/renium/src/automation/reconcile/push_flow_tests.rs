@@ -31,26 +31,61 @@ pub(super) fn mutation(
 pub(super) struct Fixture {
     pub(super) context: BoundContext,
     pub(super) bridge: Option<BridgeServer>,
+    service: String,
     plugin: Option<thread::JoinHandle<()>>,
     pub(super) desired: ProjectSnapshot,
 }
 
+fn fixture_runtime(bridge: &BridgeServer, runtime: &'static str) -> thread::JoinHandle<()> {
+    let stream = crate::studio::bridge::routing_tests::connect(
+        bridge,
+        0,
+        crate::studio::bridge::routing_tests::edit_info(runtime, 20),
+    );
+    thread::spawn(move || {
+        let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
+        while let Ok(Message::Text(text)) = socket.read() {
+            let request: Value = serde_json::from_str(&text).unwrap();
+            assert!(matches!(
+                request["method"].as_str(),
+                Some("getStudioChangeState" | "getStudioState")
+            ));
+            let reply = json!({"id":request["id"], "ok":true, "result":{
+                "pushProofMatches":request["params"]["verifyPushProof"]["expired"] != true,
+                "retainedPushProof":{"test":true}, "retainedPushProofLocal":true,
+                "verifiedPushProof":{"test":true}, "runtimeId":runtime,
+                "seq":0, "tracking":true, "serviceGenerations":{"ReplicatedStorage":0,"Workspace":0}
+            }});
+            if socket
+                .send(Message::Text(reply.to_string().into()))
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
 impl Fixture {
     pub(super) fn new() -> Result<Self> {
+        Self::for_service("ReplicatedStorage")
+    }
+
+    fn for_service(service_name: &str) -> Result<Self> {
         let root = crate::tests::support::temp_dir("push-coordinator-settle");
         fs::write(
             root.join("renium.project.jsonc"),
             r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
         )?;
-        let service = PathBuf::from("src/ReplicatedStorage");
+        let service = Path::new("src").join(service_name);
         fs::create_dir_all(root.join(&service))?;
         let document = SettingsBytecode {
             version: SETTINGS_BINARY_VERSION,
             instances: vec![
                 SettingsBytecodeInstance::new(
                     "root".into(),
-                    "ReplicatedStorage".into(),
-                    "ReplicatedStorage".into(),
+                    service_name.into(),
+                    service_name.into(),
                     None,
                 ),
                 SettingsBytecodeInstance::new(
@@ -83,39 +118,14 @@ impl Fixture {
             fingerprint: String::new(),
         };
         let bridge = crate::studio::bridge::routing_tests::fixture();
-        let stream = crate::studio::bridge::routing_tests::connect(
-            &bridge,
-            0,
-            crate::studio::bridge::routing_tests::edit_info("push-fixture", 20),
-        );
-        let plugin = thread::spawn(move || {
-            let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
-            while let Ok(Message::Text(text)) = socket.read() {
-                let request: Value = serde_json::from_str(&text).unwrap();
-                assert!(matches!(
-                    request["method"].as_str(),
-                    Some("getStudioChangeState" | "getStudioState")
-                ));
-                let reply = json!({"id":request["id"], "ok":true, "result":{
-                    "pushProofMatches":request["params"]["verifyPushProof"]["expired"] != true,
-                    "retainedPushProof":{"test":true}, "retainedPushProofLocal":true,
-                    "verifiedPushProof":{"test":true}, "runtimeId":"push-fixture",
-                    "seq":0, "tracking":true, "serviceGenerations":{"ReplicatedStorage":0}
-                }});
-                if socket
-                    .send(Message::Text(reply.to_string().into()))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
+        let plugin = fixture_runtime(&bridge, "push-fixture");
         CAPTURES.with(|slot| {
             slot.borrow_mut()
                 .push_back(Box::new(|_| Ok(ProjectSnapshot::default())))
         });
         Ok(Self {
             context,
+            service: service_name.into(),
             bridge: Some(bridge),
             plugin: Some(plugin),
             desired,
@@ -152,7 +162,7 @@ impl Fixture {
         let result = push_project(
             &self.context,
             bridge,
-            &["ReplicatedStorage".into()],
+            std::slice::from_ref(&self.service),
             args,
             Some(&guard),
             true,
@@ -243,6 +253,84 @@ fn refused_staged_push_discards_only_its_undo_entry_and_opt_in_survives_staging(
         }
         assert_eq!(fs::read_to_string(previous.join("keep"))?, "previous undo");
     }
+    Ok(())
+}
+
+#[test]
+fn offline_commit_keeps_undo_receipt_and_reopened_readback_when_saved_fields_are_busy() -> Result<()>
+{
+    let fixture = Fixture::for_service("Workspace")?;
+    let root = Path::new(&fixture.context.root);
+    let store = fixture
+        .desired
+        .entries
+        .keys()
+        .find(|path| path.extension().is_some_and(|ext| ext == "renium"))
+        .context("missing fixture store")?
+        .clone();
+    let mut document =
+        crate::settings::bytecode::decode_settings_bytecode(&fs::read(root.join(&store))?)?;
+
+    document.instances[0]
+        .properties
+        .insert("StreamingMinRadius".into(), json!(64));
+    let stage =
+        ExportProjectStage::create_for_comparison(root, Path::new("src"), &["Workspace".into()])?;
+    let mut before = capture_snapshot(root, stage.publish_paths())?;
+    before.entries.insert(
+        store.clone(),
+        SnapshotEntry::File(encode_settings_bytecode(&document)?),
+    );
+    document.instances[0]
+        .properties
+        .insert("StreamingMinRadius".into(), json!(128));
+    document.instances[1].name = "Renamed".into();
+    fs::write(root.join(&store), encode_settings_bytecode(&document)?)?;
+    let desired = capture_snapshot(root, stage.publish_paths())?;
+    replace_capture(before);
+    let bridge = fixture.bridge.as_ref().unwrap();
+    let reopened = fixture_runtime(bridge, "saved-reopened");
+    bridge.pin_runtime(crate::studio::bridge::BridgeTarget::Edit, "push-fixture");
+    let busy = bridge
+        .try_acquire_runtime_gate("saved-reopened", "test")
+        .unwrap();
+    let receipt =
+        json!({"ok":true,"previousRuntimeId":"push-fixture","reopenedRuntimeId":"saved-reopened"});
+    let sent_receipt = receipt.clone();
+    MUTATION.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_, request| {
+            assert_eq!(request.args.saved_fields.as_ref().unwrap().fields.len(), 1);
+            let mut summary = summary(false);
+            summary.insert("protectedOfflineApply".into(), sent_receipt);
+            Ok(StagedPushResult {
+                generated: ProjectSnapshot::default(),
+                summary,
+            })
+        }));
+    });
+    CAPTURES.with(|slot| {
+        slot.borrow_mut().push_back(Box::new(move |context| {
+            assert_eq!(context.runtime_id.as_deref(), Some("saved-reopened"));
+            Ok(desired)
+        }))
+    });
+    let result = fixture.run()?;
+    assert_eq!(result["protectedOfflineApply"], receipt);
+    assert!(
+        result["unsupportedProperties"][0]
+            .as_str()
+            .is_some_and(|s| s.contains("Workspace.StreamingMinRadius") && s.contains("busy"))
+    );
+    let entry = result["historyId"].as_str().unwrap();
+    assert!(
+        root.join(".renium/editor-history/sync")
+            .join(entry)
+            .join("sync.rmp")
+            .is_file()
+    );
+    drop(busy);
+    drop(fixture);
+    reopened.join().unwrap();
     Ok(())
 }
 
