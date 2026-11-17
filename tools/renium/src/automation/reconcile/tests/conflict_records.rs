@@ -499,7 +499,7 @@ fn an_instance_one_side_edited_and_the_other_removed_is_a_removal_with_the_edit(
     assert_eq!(conflict.studio, Some(json!({"Transparency": 0.2})));
     assert_eq!(
         conflict.detail,
-        "Workspace/Door: Studio changed it and the files removed it"
+        "Workspace/Door: Studio changed it and the files removed it; deciding studio keeps it; deciding editor removes it unless another decision brings it back"
     );
     let (merged, open) = store_merge(
         [&base, &files, &studio],
@@ -517,7 +517,7 @@ fn an_instance_one_side_edited_and_the_other_removed_is_a_removal_with_the_edit(
     assert_eq!(conflict.absent, ["studio"]);
     assert_eq!(
         conflict.detail,
-        "Workspace/Door: the files changed it and Studio removed it"
+        "Workspace/Door: the files changed it and Studio removed it; deciding studio removes it unless another decision brings it back; deciding editor keeps it"
     );
 }
 
@@ -548,7 +548,7 @@ fn an_instance_added_under_a_parent_the_other_side_removed_follows_its_decision(
     assert_eq!(conflict.absent, ["files"]);
     assert_eq!(
         conflict.detail,
-        "Workspace/Folder/Child: Studio put it under a parent the files removed; deciding studio keeps it and brings Workspace/Folder back, deciding editor removes it"
+        "Workspace/Folder/Child: Studio put it under a parent the files removed; deciding studio keeps it, bringing Workspace/Folder back if removed; deciding editor removes it"
     );
     let (merged, open) = store_merge(
         [&base, &files, &studio],
@@ -645,7 +645,7 @@ fn contradicting_decisions_lose_no_work_and_the_record_says_why() {
         .unwrap();
     assert!(
         orphan.detail.ends_with(
-            "deciding studio removes it, deciding editor keeps it and brings Workspace/P back"
+            "deciding studio removes it; deciding editor keeps it, bringing Workspace/P back if removed"
         ),
         "{}",
         orphan.detail
@@ -671,6 +671,288 @@ fn contradicting_decisions_lose_no_work_and_the_record_says_why() {
     assert_eq!(p.attributes["Edited"], json!(true));
     let y = named(&merged, "Y").unwrap();
     assert_eq!(merged.instances[y.parent_index.unwrap()].name, "P");
+}
+
+/// One Workspace store as a whole comparison's snapshot.
+fn store_snapshot(document: &SettingsBytecode) -> ProjectSnapshot {
+    ProjectSnapshot {
+        entries: BTreeMap::from([(
+            PathBuf::from(STORE),
+            reference_merge_store(document.instances.clone()),
+        )]),
+    }
+}
+
+/// A whole comparison of one store: the merged store, the conflicts left
+/// open, and the decisions taken without effect.
+fn compared(
+    documents: [&SettingsBytecode; 3],
+    decisions: ConflictDecisions,
+) -> Result<(SettingsBytecode, Vec<Conflict>, Vec<MootDecision>)> {
+    let [base, files, studio] = documents.map(store_snapshot);
+    let (merged, open, changes) =
+        merge_snapshots_with_changes(Some(&base), &files, &studio, decisions, None)?;
+    Ok((
+        settings_document(merged.entries.get(Path::new(STORE)))?,
+        open,
+        changes.moot_decisions,
+    ))
+}
+
+fn id_about(open: &[Conflict], instance: &str) -> String {
+    open.iter()
+        .find(|conflict| conflict.instance.as_ref().unwrap().id == instance)
+        .unwrap()
+        .id
+        .clone()
+}
+
+#[test]
+fn an_orphan_s_decision_holds_when_its_parent_is_kept() {
+    let [base, files, studio] = removed_parent_with_an_added_child();
+    let documents = [&base, &files, &studio];
+    let open = store_merge(documents, ConflictPreference::None.into())
+        .1
+        .unwrap();
+    let (removal, orphan) = (id_about(&open, "p"), id_about(&open, "y"));
+    // P kept as the files have it, Y removed as Studio has it: both hold.
+    let both = decided(
+        ConflictPreference::None,
+        &[
+            (&removal, ConflictSide::Editor),
+            (&orphan, ConflictSide::Studio),
+        ],
+    );
+    let (merged, after) = store_merge(documents, both.clone());
+    assert!(after.unwrap().is_empty());
+    assert_eq!(
+        named(&merged, "P").unwrap().attributes["Edited"],
+        json!(true)
+    );
+    assert!(
+        named(&merged, "Y").is_none(),
+        "Y's record says deciding studio removes it"
+    );
+    let (merged, after, moot) = compared(documents, both).unwrap();
+    assert!(after.is_empty() && moot.is_empty(), "{after:#?} {moot:?}");
+    assert!(named(&merged, "P").is_some() && named(&merged, "Y").is_none());
+    // P kept with Y undecided: Y still waits for its own decision.
+    let (_, after) = store_merge(
+        documents,
+        decided(
+            ConflictPreference::None,
+            &[(&removal, ConflictSide::Editor)],
+        ),
+    );
+    assert!(after.unwrap().iter().any(|conflict| conflict.id == orphan));
+    let (merged, after) = store_merge(
+        documents,
+        decided(
+            ConflictPreference::None,
+            &[
+                (&removal, ConflictSide::Editor),
+                (&orphan, ConflictSide::Editor),
+            ],
+        ),
+    );
+    assert!(after.unwrap().is_empty());
+    let y = named(&merged, "Y").unwrap();
+    assert_eq!(merged.instances[y.parent_index.unwrap()].name, "P");
+    // The preference for the files keeps both, as deciding both for them.
+    let (merged, after) = store_merge(documents, ConflictPreference::Editor.into());
+    assert!(after.unwrap().is_empty());
+    assert!(named(&merged, "P").is_some() && named(&merged, "Y").is_some());
+}
+
+#[test]
+fn a_removal_another_decision_overrules_is_reported_with_that_decision() {
+    let [base, files, studio] = removed_parent_with_an_added_child();
+    let documents = [&base, &files, &studio];
+    let (_, open, _) = compared(documents, ConflictPreference::None.into()).unwrap();
+    let (removal, orphan) = (id_about(&open, "p"), id_about(&open, "y"));
+    let record = open.iter().find(|conflict| conflict.id == removal).unwrap();
+    assert_eq!(
+        record.detail,
+        "Workspace/P: the files changed it and Studio removed it; deciding studio removes it unless another decision brings it back; deciding editor keeps it"
+    );
+    let (merged, after, moot) = compared(
+        documents,
+        decided(
+            ConflictPreference::None,
+            &[
+                (&removal, ConflictSide::Studio),
+                (&orphan, ConflictSide::Editor),
+            ],
+        ),
+    )
+    .unwrap();
+    assert!(after.is_empty());
+    assert!(named(&merged, "P").is_some());
+    assert_eq!(
+        moot,
+        [MootDecision {
+            id: removal,
+            decision: ConflictSide::Studio,
+            by: vec![orphan],
+        }]
+    );
+    let (_, _, moot) = compared(documents, ConflictPreference::Studio.into()).unwrap();
+    assert!(
+        moot.is_empty(),
+        "a preference is no decision by id: {moot:?}"
+    );
+}
+
+#[test]
+fn keeping_an_instance_the_other_side_removed_names_the_parent_it_brings_back() {
+    let base = document(vec![
+        root(),
+        instance("p", "P", "Folder", Some(0), json!({})),
+        instance("x", "X", "Part", Some(1), json!({})),
+    ]);
+    let files = document(vec![root()]);
+    let mut studio = base.clone();
+    studio.instances[2]
+        .attributes
+        .insert("Edited".into(), json!(true));
+    let documents = [&base, &files, &studio];
+    let open = store_merge(documents, ConflictPreference::None.into())
+        .1
+        .unwrap();
+    let [record] = open.as_slice() else {
+        panic!("{open:#?}");
+    };
+    assert_eq!(
+        record.detail,
+        "Workspace/P/X: Studio changed it and the files removed it; deciding studio keeps it, bringing Workspace/P back if removed; deciding editor removes it unless another decision brings it back"
+    );
+    let (merged, after) = store_merge(
+        documents,
+        decided(
+            ConflictPreference::None,
+            &[(&record.id, ConflictSide::Studio)],
+        ),
+    );
+    assert!(after.unwrap().is_empty());
+    let x = named(&merged, "X").unwrap();
+    assert_eq!(merged.instances[x.parent_index.unwrap()].name, "P");
+}
+
+#[test]
+fn a_reference_s_decision_holds_when_its_target_is_kept() {
+    let base = document(vec![root(), instance("t", "T", "Part", Some(0), json!({}))]);
+    let mut files = base.clone();
+    files.instances[1]
+        .attributes
+        .insert("Edited".into(), json!(true));
+    files.instances.push(instance(
+        "r",
+        "R",
+        "ObjectValue",
+        Some(0),
+        json!({"Value": {"_type": "Ref", "settingsId": "t"}}),
+    ));
+    let studio = document(vec![root()]);
+    let documents = [&base, &files, &studio];
+    let open = store_merge(documents, ConflictPreference::None.into())
+        .1
+        .unwrap();
+    let (removal, reference) = (id_about(&open, "t"), id_about(&open, "r"));
+    assert_eq!(
+        open.iter()
+            .find(|conflict| conflict.id == reference)
+            .unwrap()
+            .detail,
+        "Workspace/R: Value refers to \"Workspace/T\", which Studio removed; deciding studio clears Value; deciding editor keeps Value, bringing Workspace/T back if removed"
+    );
+    let value =
+        |merged: &SettingsBytecode| named(merged, "R").unwrap().properties.get("Value").cloned();
+    let (merged, after) = store_merge(
+        documents,
+        decided(
+            ConflictPreference::None,
+            &[
+                (&removal, ConflictSide::Editor),
+                (&reference, ConflictSide::Studio),
+            ],
+        ),
+    );
+    assert!(after.unwrap().is_empty());
+    assert!(named(&merged, "T").is_some());
+    assert_eq!(value(&merged), Some(json!({"_type": "Ref"})));
+    let (_, after) = store_merge(
+        documents,
+        decided(
+            ConflictPreference::None,
+            &[(&removal, ConflictSide::Editor)],
+        ),
+    );
+    assert!(
+        after
+            .unwrap()
+            .iter()
+            .any(|conflict| conflict.id == reference)
+    );
+    let (merged, after) = store_merge(
+        documents,
+        decided(
+            ConflictPreference::None,
+            &[
+                (&removal, ConflictSide::Editor),
+                (&reference, ConflictSide::Editor),
+            ],
+        ),
+    );
+    assert!(after.unwrap().is_empty());
+    assert_eq!(
+        value(&merged).and_then(|value| value.get("settingsId").cloned()),
+        Some(json!("t"))
+    );
+}
+
+#[test]
+fn a_decision_for_values_that_changed_since_is_refused_with_what_is_open_now() {
+    let base = document(vec![
+        root(),
+        instance("door", "Door", "Part", Some(0), json!({"Transparency": 0})),
+    ]);
+    let mut files = base.clone();
+    files.instances[1]
+        .properties
+        .insert("Transparency".into(), json!(0.5));
+    let mut studio = base.clone();
+    studio.instances[1]
+        .properties
+        .insert("Transparency".into(), json!(0.2));
+    let (_, listed, _) =
+        compared([&base, &files, &studio], ConflictPreference::None.into()).unwrap();
+    let listed = listed[0].id.clone();
+    studio.instances[1]
+        .properties
+        .insert("Transparency".into(), json!(0.3));
+    let error = compared(
+        [&base, &files, &studio],
+        decided(ConflictPreference::None, &[(&listed, ConflictSide::Studio)]),
+    )
+    .map(|_| ())
+    .unwrap_err();
+    let message = error.to_string();
+    let refusal = error.downcast_ref::<RefusedDecisions>().unwrap();
+    assert_eq!(refusal.unknown, std::slice::from_ref(&listed));
+    let [now] = refusal.open.as_slice() else {
+        panic!("{:#?}", refusal.open);
+    };
+    assert_ne!(now.id, listed);
+    assert_eq!(now.studio, Some(json!(0.3)));
+    assert!(
+        message.contains(&format!("No open conflict has the id {listed}"))
+            && message.contains(&format!(
+                "open now: {} Workspace/Door: property Transparency: Studio has 0.3",
+                now.id
+            ))
+            && message.ends_with("nothing was applied"),
+        "{message}"
+    );
 }
 
 #[test]

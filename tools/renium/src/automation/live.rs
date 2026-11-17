@@ -1076,6 +1076,7 @@ impl Manager {
         #[cfg(any(windows, target_os = "macos"))]
         let terrain_observer = terrain::Observer::start(&context, &bridge);
         self.coordinator.reconcile(&context, &bridge, &mut setup)?;
+        let moot_decisions = std::mem::take(&mut setup.moot_decisions);
         log_live_timing("startup reconcile", phase);
         let phase = Instant::now();
         let project = open_watch_project(&context)?;
@@ -1184,8 +1185,12 @@ impl Manager {
             bail!("Live sync watcher stopped before startup");
         }
         log_live_timing("startup total", total_started);
+        let mut status = control.snapshot();
+        if !moot_decisions.is_empty() {
+            status["mootDecisions"] = json!(moot_decisions);
+        }
         Ok(StartResult {
-            status: control.snapshot(),
+            status,
             created: Some(session_alias),
         })
     }

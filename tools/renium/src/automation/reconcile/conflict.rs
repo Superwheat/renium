@@ -382,6 +382,16 @@ impl Conflict {
         )
     }
 
+    /// Whether two records are about the same thing, whatever values each
+    /// shows.
+    pub(crate) fn same_subject(&self, other: &Conflict) -> bool {
+        self.kind == other.kind
+            && self.path == other.path
+            && self.field == other.field
+            && self.instance.as_ref().map(|instance| &instance.id)
+                == other.instance.as_ref().map(|instance| &instance.id)
+    }
+
     /// Whether a scoped push or pull of these project paths settles it.
     pub(crate) fn covered_by_paths(&self, paths: &[PathBuf]) -> bool {
         if self.path.is_empty() {
@@ -550,7 +560,60 @@ pub(crate) struct ConflictLog {
     /// The ids the same comparison meets on the way to its decisions: a
     /// decision another decision made moot still names a conflict of it.
     found: HashSet<String>,
+    /// The removals decisions took, by store and instance, with each
+    /// decision's id.
+    removed: HashMap<(String, String), String>,
+    /// Decisions that had no effect, with the decisions that made them moot.
+    moot: BTreeMap<String, BTreeSet<String>>,
 }
+
+/// A decision that had no effect: another decision made its conflict moot
+/// or brought back what it removed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct MootDecision {
+    pub(crate) id: String,
+    pub(crate) decision: ConflictSide,
+    /// The decisions that made it moot.
+    pub(crate) by: Vec<String>,
+}
+
+/// Decisions a comparison could not take; it applies none of its
+/// decisions.
+#[derive(Debug)]
+pub(crate) struct RefusedDecisions {
+    /// Why each decision for a conflict met but not decidable that way was
+    /// refused.
+    pub(crate) reasons: Vec<String>,
+    /// The ids no conflict of the comparison has.
+    pub(crate) unknown: Vec<String>,
+    /// The conflicts open now, none of them decided.
+    pub(crate) open: Vec<Conflict>,
+}
+
+impl std::fmt::Display for RefusedDecisions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = self.reasons.clone();
+        if !self.unknown.is_empty() {
+            let ids = self.unknown.iter().map(String::as_str).collect::<Vec<_>>();
+            parts.push(unknown_decisions_message(&ids));
+            if !self.open.is_empty() {
+                let mut shown = self
+                    .open
+                    .iter()
+                    .take(3)
+                    .map(|conflict| format!("{} {}", conflict.id, conflict.detail))
+                    .collect::<Vec<_>>();
+                if self.open.len() > 3 {
+                    shown.push(format!("and {} more", self.open.len() - 3));
+                }
+                parts.push(format!("open now: {}", shown.join("; ")));
+            }
+        }
+        write!(formatter, "{}; nothing was applied", parts.join("; "))
+    }
+}
+
+impl std::error::Error for RefusedDecisions {}
 
 impl ConflictLog {
     pub(crate) fn new(decisions: impl Into<ConflictDecisions>) -> Self {
@@ -561,6 +624,8 @@ impl ConflictLog {
             applied: BTreeSet::new(),
             refused: BTreeMap::new(),
             found: HashSet::new(),
+            removed: HashMap::new(),
+            moot: BTreeMap::new(),
         }
     }
 
@@ -572,6 +637,10 @@ impl ConflictLog {
     /// The ids of every conflict this comparison met, settled or open.
     pub(crate) fn met(&self) -> HashSet<String> {
         self.ids.keys().cloned().collect()
+    }
+
+    pub(crate) fn has_met(&self, id: &str) -> bool {
+        self.ids.contains_key(id)
     }
 
     /// Takes the ids the comparison meets on the way to its decisions.
@@ -637,6 +706,20 @@ impl ConflictLog {
                 return None;
             }
             self.applied.insert(conflict.id.clone());
+            let removes = match side {
+                ConflictSide::Studio => "studio",
+                ConflictSide::Editor => "files",
+            };
+            if conflict.kind == ConflictKind::Removal
+                && conflict.discriminator.is_empty()
+                && conflict.absent.iter().any(|place| place == removes)
+                && let Some(instance) = &conflict.instance
+            {
+                self.removed.insert(
+                    (conflict.path.clone(), instance.id.clone()),
+                    conflict.id.clone(),
+                );
+            }
             return Some(side);
         }
         if !conflict.decidable {
@@ -667,57 +750,107 @@ impl ConflictLog {
         &self.open
     }
 
+    /// Hears that the decision of `by` brought back the instance `instance`
+    /// of the store at `path`: a decision that removed it had no effect.
+    pub(crate) fn restored(&mut self, path: &str, instance: &str, by: &mut Conflict) {
+        let Some(id) = self
+            .removed
+            .get(&(path.to_string(), instance.to_string()))
+            .cloned()
+        else {
+            return;
+        };
+        self.assign_id(by);
+        if by.id != id {
+            self.moot.entry(id).or_default().insert(by.id.clone());
+        }
+    }
+
+    /// Notes a decision other decisions made moot.
+    pub(crate) fn made_moot(&mut self, id: &str, by: impl IntoIterator<Item = String>) {
+        self.moot.entry(id.to_string()).or_default().extend(by);
+    }
+
+    /// The decisions this comparison took without effect.
+    pub(crate) fn moot(&self) -> Vec<MootDecision> {
+        self.moot
+            .iter()
+            .filter_map(|(id, by)| {
+                Some(MootDecision {
+                    id: id.clone(),
+                    decision: *self.decisions.by_id.get(id)?,
+                    by: by.iter().cloned().collect(),
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn retain(&mut self, keep: impl FnMut(&Conflict) -> bool) {
         self.open.retain(keep);
     }
 
-    /// The open conflicts in order, or an error for each decision that named
-    /// no conflict of this comparison or could not be applied: a stale
-    /// decision never settles something else. A decision whose conflict
-    /// another decision made moot (a parent another one brought back) is
-    /// no error.
-    /// Whether a decision named no conflict this run met: one another
-    /// decision made moot, or a stale one, which only the conflicts met on
+    /// The decisions that named no conflict this run met: ones another
+    /// decision made moot, or stale ones, which only the conflicts met on
     /// the way to the decisions tell apart.
-    pub(crate) fn has_unmatched_decisions(&self) -> bool {
-        self.decisions.by_id.keys().any(|id| {
-            !self.applied.contains(id)
-                && !self.refused.contains_key(id)
-                && !self
-                    .open
-                    .iter()
-                    .any(|conflict| conflict.id == *id && !conflict.decidable)
-        })
+    pub(crate) fn unmatched_decisions(&self) -> Vec<String> {
+        self.decisions
+            .by_id
+            .keys()
+            .filter(|id| {
+                !self.applied.contains(*id)
+                    && !self.refused.contains_key(*id)
+                    && !self
+                        .open
+                        .iter()
+                        .any(|conflict| conflict.id == **id && !conflict.decidable)
+            })
+            .cloned()
+            .collect()
     }
 
+    /// The open conflicts in order, or [`RefusedDecisions`] for every
+    /// decision that named no conflict of this comparison or could not be
+    /// applied: a stale decision never settles something else. A decision
+    /// whose conflict another decision made moot (a parent another one
+    /// brought back) is no error.
     pub(crate) fn finish(mut self) -> Result<Vec<Conflict>> {
-        let mut errors = Vec::new();
+        let mut reasons = Vec::new();
         let mut unknown = Vec::new();
         for id in self.decisions.by_id.keys() {
             if self.applied.contains(id) {
                 continue;
             }
             if let Some(reason) = self.refused.get(id) {
-                errors.push(reason.clone());
+                reasons.push(reason.clone());
             } else if let Some(conflict) = self
                 .open
                 .iter()
                 .find(|conflict| conflict.id == *id && !conflict.decidable)
             {
-                errors.push(format!(
+                reasons.push(format!(
                     "Conflict {id} cannot be settled by choosing a side: {}",
                     conflict.detail
                 ));
             } else if !self.found.contains(id) {
-                unknown.push(id.as_str());
+                unknown.push(id.clone());
             }
         }
-        if !unknown.is_empty() {
-            errors.push(unknown_decisions_message(&unknown));
+        self.order_open();
+        if !reasons.is_empty() || !unknown.is_empty() {
+            let decisions = &self.decisions;
+            self.open
+                .retain(|conflict| !decisions.by_id.contains_key(&conflict.id));
+            return Err(RefusedDecisions {
+                reasons,
+                unknown,
+                open: self.open,
+            }
+            .into());
         }
-        if !errors.is_empty() {
-            bail!("{}; nothing was applied", errors.join("; "));
-        }
+        Ok(self.open)
+    }
+
+    fn order_open(&mut self) {
         // One conflict two steps of the merge met alike is listed once.
         self.open.sort_by(|left, right| {
             (&left.path, &left.id, &left.detail).cmp(&(&right.path, &right.id, &right.detail))
@@ -733,7 +866,6 @@ impl ConflictLog {
             };
             (&left.path, at(left), &left.detail).cmp(&(&right.path, at(right), &right.detail))
         });
-        Ok(self.open)
     }
 }
 

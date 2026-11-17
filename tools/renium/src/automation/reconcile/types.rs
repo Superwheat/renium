@@ -275,6 +275,8 @@ pub(crate) struct MergeChanges {
     /// identity the merge gave it: a store may name another instance by an
     /// identity the merge had to give away.
     pub(crate) editor_script_paths: HashMap<PathBuf, HashMap<String, PathBuf>>,
+    /// The decisions the merge took without effect.
+    pub(crate) moot_decisions: Vec<MootDecision>,
 }
 
 pub(crate) struct MergedEntry {

@@ -538,16 +538,19 @@ fn reference_conflict(
     let place = |held: bool| held.then(|| json!(label));
     let effect = |held: bool| {
         if held {
-            format!("brings {label} back")
+            format!(
+                "keeps {}, bringing {label} back if removed",
+                reference.field
+            )
         } else {
-            format!("clears {}", reference.field)
+            format!("clears {} if {label} stays removed", reference.field)
         }
     };
     Conflict::new(
         ConflictKind::Reference,
         &reference.store,
         format!(
-            "{}: {}: {} refers to {label} (id={target_id}), which {} removed; deciding studio {}, deciding editor {}",
+            "{}: {}: {} refers to {label} (id={target_id}), which {} removed; deciding studio {}; deciding editor {}",
             conflict_path(&reference.store),
             holder.name,
             reference.field,
@@ -614,6 +617,7 @@ fn decide(
                 .entry((reference.service.clone(), side))
                 .or_default()
                 .insert(target_id.clone());
+            conflicts.restored(&conflict_path(&targets.store), target_id, &mut conflict);
         } else {
             settlement
                 .clears

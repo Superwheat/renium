@@ -581,6 +581,7 @@ pub(crate) enum VcConflictKind {
 
 /// What the base and each side hold where a conflict is about values;
 /// `None` where that place lacks it.
+#[derive(Clone)]
 pub(crate) struct VcConflictValues {
     pub(crate) base: Option<Value>,
     pub(crate) ours: Option<Value>,
@@ -589,6 +590,7 @@ pub(crate) struct VcConflictValues {
 
 /// One conflict of a store merge. `path` and `detail` are the text
 /// `vc-merge` prints; the other fields say what it is about.
+#[derive(Clone)]
 pub(crate) struct VcMergeConflict {
     pub(crate) path: String,
     pub(crate) detail: String,
@@ -618,6 +620,10 @@ pub(crate) struct VcMergeConflict {
 pub(crate) trait VcResolve {
     /// The side a conflict takes (`true` ours), or `None` to leave it open.
     fn resolve(&mut self, conflict: &VcMergeConflict) -> Option<bool>;
+
+    /// Hears that the decision of `by` brought back an instance the merge
+    /// had removed, which overrules a decision that removed it.
+    fn restored(&mut self, _settings_id: &str, _by: &VcMergeConflict) {}
 }
 
 /// One preference for every value conflict and one for every structural
@@ -674,6 +680,13 @@ impl<'a> MergeSides<'a> {
     fn record(&self, ours: bool, index: usize) -> VcMergedInstance {
         let side = usize::from(!ours);
         preferred_instance(self.documents[side], index, self.remaps[side], self.service)
+    }
+
+    /// A side's parent of an instance, with the id the merge uses.
+    fn parent_of(&self, ours: bool, id: &str) -> Option<String> {
+        let side = usize::from(!ours);
+        let parent = settings_parent_id(self.documents[side], self.index(ours, id)?)?;
+        Some(self.remaps[side].get(&parent).cloned().unwrap_or(parent))
     }
 
     /// Where a side holds an instance.
@@ -1023,31 +1036,61 @@ struct Placement {
     /// Orphans no decision placed; each stays a conflict when another
     /// decision brings its parent back.
     undecided: BTreeSet<String>,
+    /// Instances present only by a decision: a contested removal it kept,
+    /// or one it brought back. What hangs under them or refers to them is
+    /// still decided as if they were removed.
+    kept: HashSet<String>,
+    /// The conflict whose decision placed each record, where one did.
+    origins: HashMap<String, VcMergeConflict>,
+    /// Instances brought back since the resolver last heard of them.
+    restored: Vec<String>,
 }
+
+/// The side an orphan takes (`true` ours), with the conflict whose
+/// decision chose it.
+type Placed = (bool, Option<VcMergeConflict>);
 
 /// An instance whose parent the merge left out follows the side its
 /// conflict takes instead of vanishing with that parent. Where that side
 /// still has the parent, the parent comes back: the other side's removal
 /// loses to this side's use of it. Where that side removed the parent, the
 /// instance stays where that side has it. Only an instance that side does
-/// not have goes with its parent. `side_of` answers the side for an orphan
-/// (`true` ours), or `None` to leave it; a restored parent follows the side
-/// that restored it.
+/// not have goes with its parent. An instance under a parent that is
+/// present only by a decision is decided the same way, so its decision
+/// holds whatever the parent's. `side_of` answers the side for an orphan,
+/// or `None` to leave it; a restored parent follows the side that restored
+/// it.
 fn reattach_orphans(
     merged: &mut Vec<VcMergedInstance>,
     sides: &MergeSides<'_>,
     placement: &mut Placement,
-    mut side_of: impl FnMut(&VcMergedInstance) -> Option<bool>,
+    mut side_of: impl FnMut(&VcMergedInstance) -> Option<Placed>,
 ) {
     let Placement {
         follows,
         left_out,
         undecided,
+        kept,
+        origins,
+        restored,
     } = placement;
     let mut present = merged
         .iter()
         .map(|record| record.settings_id.clone())
         .collect::<HashSet<_>>();
+    let mut decide = |record: &VcMergedInstance,
+                      follows: &mut HashMap<String, bool>,
+                      origins: &mut HashMap<String, VcMergeConflict>| {
+        if let Some(side) = follows.get(&record.settings_id) {
+            return Some(*side);
+        }
+        let (side, origin) = side_of(record)?;
+        follows.insert(record.settings_id.clone(), side);
+        if let Some(origin) = origin {
+            origins.insert(record.settings_id.clone(), origin);
+        }
+        Some(side)
+    };
     // Every orphan takes its side before any parent comes back, so a parent
     // one decision brings back does not overrule another that put its
     // instance where its own side holds it, or left it out.
@@ -1056,20 +1099,13 @@ fn reattach_orphans(
         let Some(parent) = record
             .parent_id
             .as_ref()
-            .filter(|parent| !present.contains(*parent))
+            .filter(|parent| !present.contains(*parent) || kept.contains(*parent))
         else {
             continue;
         };
-        let side = match follows.get(&record.settings_id) {
-            Some(side) => *side,
-            None => {
-                let Some(side) = side_of(record) else {
-                    undecided.insert(record.settings_id.clone());
-                    continue;
-                };
-                follows.insert(record.settings_id.clone(), side);
-                side
-            }
+        let Some(side) = decide(record, follows, origins) else {
+            undecided.insert(record.settings_id.clone());
+            continue;
         };
         if sides.index(side, parent).is_some() {
             continue;
@@ -1099,21 +1135,17 @@ fn reattach_orphans(
             continue;
         };
         let id = merged[index].settings_id.clone();
-        let side = match follows.get(&id) {
-            Some(side) => *side,
-            None => match side_of(&merged[index]) {
-                Some(side) => {
-                    follows.insert(id.clone(), side);
-                    side
-                }
-                None => {
-                    index += 1;
-                    continue;
-                }
-            },
+        let Some(side) = decide(&merged[index], follows, origins) else {
+            index += 1;
+            continue;
         };
         if let Some(parent_index) = sides.index(side, &parent) {
             present.insert(parent.clone());
+            kept.insert(parent.clone());
+            if let Some(origin) = origins.get(&id).cloned() {
+                origins.insert(parent.clone(), origin);
+            }
+            restored.push(parent.clone());
             follows.insert(parent, side);
             merged.push(sides.record(side, parent_index));
             index += 1;
@@ -1124,6 +1156,16 @@ fn reattach_orphans(
         } else {
             left_out.insert(id);
             index += 1;
+        }
+    }
+}
+
+/// Tells the resolver which instances decisions brought back, and by
+/// which conflict, since it last heard.
+fn report_restores(placement: &mut Placement, resolver: &mut dyn VcResolve) {
+    for id in std::mem::take(&mut placement.restored) {
+        if let Some(origin) = placement.origins.get(&id) {
+            resolver.restored(&id, origin);
         }
     }
 }
@@ -1140,7 +1182,7 @@ fn orphan_conflict(
         sides.path_on(ours, parent),
         sides.index(ours, &record.settings_id),
     ) {
-        (Some(parent), _) => format!("keeps it and brings {parent} back"),
+        (Some(parent), _) => format!("keeps it, bringing {parent} back if removed"),
         (None, Some(own)) => match parent_path(sides.document(ours), own) {
             Some(Value::String(path)) => format!("puts it under {path}"),
             _ => "keeps it where that side holds it".to_string(),
@@ -1155,16 +1197,22 @@ fn orphan_conflict(
         instance_path: sides.child_path(parent, &record.name),
         field: None,
         values: Some(sides.paths(parent)),
-        follows: removals.get(parent).copied().flatten(),
+        follows: removals.get(parent).and_then(|removal| removal.side),
         decidable: true,
         part_of_removal: removals.contains_key(&record.settings_id),
         effects: Some([effect(true), effect(false)]),
     }
 }
 
-/// The removals both sides contested, by the removed instance's id: the
-/// side a decision took (`true` ours), or `None` while open.
-type Removals = HashMap<String, Option<bool>>;
+/// A removal both sides contested: the side its decision took (`true`
+/// ours), or `None` while open, and its conflict.
+struct Removal {
+    side: Option<bool>,
+    conflict: VcMergeConflict,
+}
+
+/// The removals both sides contested, by the removed instance's id.
+type Removals = HashMap<String, Removal>;
 
 /// The side an orphan takes: the decision on its own removal when it is
 /// one side's removal (that conflict places it), else its conflict's.
@@ -1173,11 +1221,17 @@ fn orphan_side(
     sides: &MergeSides<'_>,
     removals: &Removals,
     record: &VcMergedInstance,
-) -> Option<bool> {
-    if let Some(Some(side)) = removals.get(&record.settings_id) {
-        return Some(*side);
+) -> Option<Placed> {
+    if let Some(Removal {
+        side: Some(side),
+        conflict,
+    }) = removals.get(&record.settings_id)
+    {
+        return Some((*side, Some(conflict.clone())));
     }
-    resolver.resolve(&orphan_conflict(record, sides, removals))
+    let conflict = orphan_conflict(record, sides, removals);
+    let side = resolver.resolve(&conflict)?;
+    Some((side, Some(conflict)))
 }
 
 /// The conflict of an instance one side changed and the other removed.
@@ -1185,6 +1239,7 @@ fn orphan_side(
 fn removal_conflict(
     base: (&SettingsBytecode, usize),
     edited: (&SettingsBytecode, usize),
+    sides: &MergeSides<'_>,
     ours_edited: bool,
     source_changed: bool,
 ) -> VcMergeConflict {
@@ -1192,6 +1247,16 @@ fn removal_conflict(
     let (document, index) = edited;
     let (before, after) = changed_fields(base, edited, source_changed);
     let path = settings_instance_path(document, index);
+    let id = &base_document.instances[base_index].settings_id;
+    let keep = match sides
+        .parent_of(ours_edited, id)
+        .filter(|parent| sides.index(!ours_edited, parent).is_none())
+        .and_then(|parent| sides.path_on(ours_edited, &parent))
+    {
+        Some(parent) => format!("keeps it, bringing {parent} back if removed"),
+        None => "keeps it".to_string(),
+    };
+    let remove = "removes it unless another decision brings it back".to_string();
     VcMergeConflict {
         instance_path: path.clone(),
         path,
@@ -1202,7 +1267,7 @@ fn removal_conflict(
         }
         .to_string(),
         kind: VcConflictKind::Removal,
-        settings_id: base_document.instances[base_index].settings_id.clone(),
+        settings_id: id.clone(),
         field: None,
         values: Some(VcConflictValues {
             base: Some(before),
@@ -1212,7 +1277,11 @@ fn removal_conflict(
         follows: None,
         decidable: true,
         part_of_removal: false,
-        effects: None,
+        effects: Some(if ours_edited {
+            [keep, remove]
+        } else {
+            [remove, keep]
+        }),
     }
 }
 
@@ -1418,7 +1487,7 @@ fn reference_conflict(
         decidable: true,
         part_of_removal: false,
         effects: Some([true, false].map(|ours| match sides.path_on(ours, target) {
-            Some(path) => format!("brings {path} back"),
+            Some(path) => format!("keeps {field}, bringing {path} back if removed"),
             None => format!("clears {field}"),
         })),
     }
@@ -1466,10 +1535,11 @@ impl ReferenceSettlement<'_> {
 /// it, the other adds a reference to it, and no field was changed on both
 /// sides. The reference's conflict decides: the instance comes back when the
 /// side it takes still has it, and the reference is cleared when that side
-/// removed it; an open one stays a conflict. A restored instance's own
-/// references follow the side that restored it. A reference that was
-/// already broken on the side it came from is not the merge's doing and
-/// stays as it is.
+/// removed it; an open one stays a conflict. A reference to an instance
+/// present only by a decision is decided the same way, so its decision
+/// holds whatever the instance's. A restored instance's own references
+/// follow the side that restored it. A reference that was already broken
+/// on the side it came from is not the merge's doing and stays as it is.
 fn settle_references_to_removed_instances(
     merged: &mut Vec<VcMergedInstance>,
     settlement: &mut ReferenceSettlement<'_>,
@@ -1482,7 +1552,7 @@ fn settle_references_to_removed_instances(
     else {
         return;
     };
-    if dangling_references(merged, &service).is_empty() {
+    if settlement.placement.kept.is_empty() && dangling_references(merged, &service).is_empty() {
         return;
     }
     let sides = settlement.sides;
@@ -1514,7 +1584,9 @@ fn settle_references_to_removed_instances(
                         return;
                     };
                     let pair = (record.settings_id.clone(), target.to_string());
-                    if !dangling.contains(&pair) || !broken_by_merge.contains(&pair) {
+                    if !broken_by_merge.contains(&pair)
+                        || !dangling.contains(&pair) && !settlement.placement.kept.contains(target)
+                    {
                         return;
                     }
                     let referring = (record.settings_id.as_str(), record.name.as_str());
@@ -1522,7 +1594,11 @@ fn settle_references_to_removed_instances(
                         && let Some(index) = sides.index(side, target)
                         && present.insert(target.to_string())
                     {
-                        restored.push((side, index));
+                        restored.push((
+                            side,
+                            index,
+                            reference_conflict(referring, field, target, sides, Some(side)),
+                        ));
                     }
                 });
             }
@@ -1530,12 +1606,13 @@ fn settle_references_to_removed_instances(
         if restored.is_empty() {
             break dangling;
         }
-        for (side, index) in restored {
+        for (side, index, origin) in restored {
             let record = sides.record(side, index);
-            settlement
-                .placement
-                .follows
-                .insert(record.settings_id.clone(), side);
+            let placement = &mut *settlement.placement;
+            placement.follows.insert(record.settings_id.clone(), side);
+            placement.kept.insert(record.settings_id.clone());
+            placement.restored.push(record.settings_id.clone());
+            placement.origins.insert(record.settings_id.clone(), origin);
             merged.push(record);
         }
         let removals = settlement.removals;
@@ -1543,6 +1620,7 @@ fn settle_references_to_removed_instances(
         reattach_orphans(merged, sides, settlement.placement, |record| {
             orphan_side(resolver, sides, removals, record)
         });
+        report_restores(settlement.placement, &mut *settlement.resolver);
     };
     for record in merged.iter_mut() {
         let referring = record.settings_id.clone();
@@ -1558,24 +1636,25 @@ fn settle_references_to_removed_instances(
                     return;
                 };
                 let pair = (referring.clone(), target.clone());
-                if !dangling.contains(&pair) || !broken_by_merge.contains(&pair) {
+                if !broken_by_merge.contains(&pair)
+                    || !dangling.contains(&pair) && !settlement.placement.kept.contains(&target)
+                {
                     return;
                 }
-                if settlement
-                    .side((&referring, &name), field, &target)
-                    .is_some()
-                {
-                    for selector in SETTINGS_REFERENCE_SELECTOR_KEYS {
-                        object.remove(selector);
+                match settlement.side((&referring, &name), field, &target) {
+                    Some(side) if sides.index(side, &target).is_none() => {
+                        for selector in SETTINGS_REFERENCE_SELECTOR_KEYS {
+                            object.remove(selector);
+                        }
                     }
-                } else {
-                    conflicts.push(reference_conflict(
+                    Some(_) => {}
+                    None => conflicts.push(reference_conflict(
                         (&referring, &name),
                         field,
                         &target,
                         sides,
                         settlement.placement.follows.get(&referring).copied(),
-                    ));
+                    )),
                 }
             });
         }
@@ -1610,7 +1689,7 @@ pub(crate) fn restore_removed_instances(
     }
     let sides = MergeSides::new([source, source], [&no_remap, &no_remap], &service);
     reattach_orphans(&mut records, &sides, &mut Placement::default(), |_| {
-        Some(true)
+        Some((true, None))
     });
     for record in &mut records {
         if is_lua_source_class(&record.class_name) {
@@ -1705,7 +1784,8 @@ fn resolve_parent_cycles(
             if let Some(own_index) = sides.index(side, &id) {
                 merged[*index].parent_id = settings_parent_id(sides.document(side), own_index);
             }
-            placement.follows.insert(id, side);
+            placement.follows.insert(id.clone(), side);
+            placement.origins.insert(id, conflict.clone());
         }
     }
     let remaining = if decided {
@@ -1900,6 +1980,8 @@ fn merge_prepared_settings_documents(
     let mut merged_ids: HashSet<String> = HashSet::new();
     let empty_properties = Map::new();
     let mut removals = Removals::new();
+    let no_remap = HashMap::new();
+    let sides = MergeSides::new([ours, theirs], [&no_remap, &theirs_id_remap], &service);
 
     for (ours_index, instance) in ours.instances.iter().enumerate() {
         let id = &instance.settings_id;
@@ -2005,11 +2087,18 @@ fn merge_prepared_settings_documents(
                 let conflict = removal_conflict(
                     (base, base_index),
                     (ours, ours_index),
+                    &sides,
                     true,
                     ours_source_changes.contains(id),
                 );
                 let side = resolver.resolve(&conflict);
-                removals.insert(id.clone(), side);
+                removals.insert(
+                    id.clone(),
+                    Removal {
+                        side,
+                        conflict: conflict.clone(),
+                    },
+                );
                 if side.is_none() {
                     conflicts.push(conflict);
                 }
@@ -2056,15 +2145,21 @@ fn merge_prepared_settings_documents(
             let conflict = removal_conflict(
                 (base, base_index),
                 (theirs, theirs_index),
+                &sides,
                 false,
                 theirs_source_changes.contains(id),
             );
-            match resolver.resolve(&conflict) {
-                Some(true) => {
-                    removals.insert(id.clone(), Some(true));
-                }
+            let side = resolver.resolve(&conflict);
+            removals.insert(
+                id.clone(),
+                Removal {
+                    side,
+                    conflict: conflict.clone(),
+                },
+            );
+            match side {
+                Some(true) => {}
                 Some(false) => {
-                    removals.insert(id.clone(), Some(false));
                     let mut properties = instance.properties.clone();
                     let mut attributes = instance.attributes.clone();
                     remap_store_reference_ids(&mut properties, &theirs_id_remap, &service);
@@ -2079,10 +2174,7 @@ fn merge_prepared_settings_documents(
                     });
                     merged_ids.insert(id.clone());
                 }
-                None => {
-                    removals.insert(id.clone(), None);
-                    conflicts.push(conflict);
-                }
+                None => conflicts.push(conflict),
             }
             continue;
         }
@@ -2109,12 +2201,18 @@ fn merge_prepared_settings_documents(
         );
     }
 
-    let no_remap = HashMap::new();
-    let sides = MergeSides::new([ours, theirs], [&no_remap, &theirs_id_remap], &service);
-    let mut placement = Placement::default();
+    let mut placement = Placement {
+        kept: removals
+            .iter()
+            .filter(|(id, removal)| removal.side.is_some() && merged_ids.contains(*id))
+            .map(|(id, _)| id.clone())
+            .collect(),
+        ..Placement::default()
+    };
     reattach_orphans(&mut merged, &sides, &mut placement, |record| {
         orphan_side(&mut *resolver, &sides, &removals, record)
     });
+    report_restores(&mut placement, &mut *resolver);
     // Breaking a cycle moves an instance to the decided side's parent, which
     // the merge may have removed, and restoring a removed parent can close a
     // cycle; the two steps repeat until neither applies. Every round but the
@@ -2133,6 +2231,7 @@ fn merge_prepared_settings_documents(
         reattach_orphans(&mut merged, &sides, &mut placement, |record| {
             orphan_side(&mut *resolver, &sides, &removals, record)
         });
+        report_restores(&mut placement, &mut *resolver);
     }
     let mut settlement = ReferenceSettlement {
         sides: &sides,
@@ -2146,6 +2245,7 @@ fn merge_prepared_settings_documents(
         follows,
         left_out,
         undecided,
+        ..
     } = &placement;
     let present = merged
         .iter()

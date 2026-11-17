@@ -799,31 +799,28 @@ pub(crate) fn align_first_pairing(
         .zip(&editor_keys)
         .map(|(instance, key)| (instance.settings_id.clone(), key))
         .collect::<HashMap<_, _>>();
+    let service = store_service(studio).map(str::to_string);
+    // A persistent identity proves which instance moved; its pair's parent
+    // and name are then fields like any other, each its own conflict below.
+    // Only twins the pairing could not prove stay undecided here.
     for (index, (instance, key)) in studio.instances.iter().zip(&studio_keys).enumerate() {
-        let moved_identity = resolved.locked[index].is_some_and(|target| {
-            let expected = &editor.instances[target];
-            instance.name != expected.name
-                || match (instance.parent_index, expected.parent_index) {
-                    (Some(source), Some(target)) => resolved.partners[source] != Some(target),
-                    (None, None) => false,
-                    _ => true,
-                }
-        });
-        if moved_identity
-            // The preliminary ID aligner can choose another equivalent twin.
-            // A validated assignment supersedes that guess even when it kept
-            // the original ordinal. Persistent moves are checked above.
-            || !resolved.proven[index]
-                && editor_key_by_id
-                    .get(&instance.settings_id)
-                    .is_some_and(|editor_key| *editor_key != key)
+        // The preliminary ID aligner can choose another equivalent twin. A
+        // validated assignment supersedes that guess even when it kept the
+        // original ordinal.
+        if !resolved.proven[index]
+            && editor_key_by_id
+                .get(&instance.settings_id)
+                .is_some_and(|editor_key| *editor_key != key)
         {
             let at = settings_instance_path(studio, index);
+            let service = service.as_deref().unwrap_or("SERVICE");
             conflicts.settle(
                 Conflict::new(
                     ConflictKind::Pairing,
                     path,
-                    format!("{shown} has the same instance identity at different paths: {at}"),
+                    format!(
+                        "{shown} has the same instance identity at different paths: {at}; one side's whole service settles it: `rbx lof`, then `rbx pl -s {service}` (Studio's) or `rbx ps -s {service}` (the files'), then `rbx lon`"
+                    ),
                 )
                 .instance(&instance.settings_id, at.clone())
                 .discriminated("moved")
@@ -841,7 +838,6 @@ pub(crate) fn align_first_pairing(
     }
 
     let id_remap = first_pairing_id_remap(editor, studio, &resolved.partners);
-    let service = store_service(studio).map(str::to_string);
     for instance in &mut studio.instances {
         if let Some(id) = id_remap.get(&instance.settings_id) {
             instance.settings_id.clone_from(id);

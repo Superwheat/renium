@@ -46,10 +46,9 @@ fn review_renamed_unique_id_cannot_be_reassigned_by_content() {
         studio.instances[renamed].settings_id
     );
     assert!(
-        conflicts
-            .iter()
-            .any(|value| value.contains("same instance identity at different paths")),
-        "known identity was silently reassigned"
+        conflicts.iter().any(|value| value
+            == "Workspace/OldName: name: Studio has \"Twin\", the files have \"OldName\""),
+        "known identity was silently reassigned: {conflicts:?}"
     );
     assert_eq!(
         studio.instances[renamed].settings_id,
@@ -369,9 +368,8 @@ fn moved_unique_id_keeps_its_partner_and_reports_the_move() {
     assert_eq!(resolved.partners[destination], Some(right));
     let conflicts = twin_align(&mut editor, &mut studio);
     assert!(
-        conflicts
-            .iter()
-            .any(|c| c.contains("same instance identity at different paths")),
+        conflicts.iter().any(|c| c
+            == "Workspace/Left/Twin: parent: Studio has \"Workspace/Right\", the files have \"Workspace/Left\""),
         "{conflicts:?}"
     );
     assert_eq!(
@@ -380,6 +378,74 @@ fn moved_unique_id_keeps_its_partner_and_reports_the_move() {
     );
     assert_eq!(studio.instances[moved].parent_index, Some(destination));
     assert_twin_ids_unique(&studio);
+}
+
+#[test]
+fn a_moved_unique_id_is_decided_by_its_parent_record() {
+    let mut editor = twin_document();
+    let left = twin_add(&mut editor, 0, "Left", "Folder", json!({}));
+    twin_add(&mut editor, 0, "Right", "Folder", json!({}));
+    let known = twin_add(
+        &mut editor,
+        left,
+        "Twin",
+        "StringValue",
+        json!({"Value":"known"}),
+    );
+    review_uid(&mut editor, known, 1);
+    let mut studio = twin_observation(&editor);
+    let moved = studio
+        .instances
+        .iter()
+        .position(|i| persistent_identity(i).is_some())
+        .unwrap();
+    let right = studio
+        .instances
+        .iter()
+        .position(|i| i.name == "Right")
+        .unwrap();
+    studio.instances[moved].parent_index = Some(right);
+    let (files, live) = (review_snapshot(&editor), review_snapshot(&studio));
+    let (_, open, _) =
+        merge_snapshots_with_changes(None, &files, &live, ConflictPreference::None, None).unwrap();
+    let [record] = open.as_slice() else {
+        panic!("{open:#?}");
+    };
+    assert!(record.decidable);
+    assert_eq!(record.kind, ConflictKind::Parent);
+    assert_eq!(record.files, Some(json!("Workspace/Left")));
+    assert_eq!(record.studio, Some(json!("Workspace/Right")));
+    for (side, parent) in [
+        (ConflictSide::Studio, "Right"),
+        (ConflictSide::Editor, "Left"),
+    ] {
+        let decisions = ConflictDecisions {
+            preference: ConflictPreference::None,
+            by_id: BTreeMap::from([(record.id.clone(), side)]),
+        };
+        let (merged, open, _) =
+            merge_snapshots_with_changes(None, &files, &live, decisions, None).unwrap();
+        assert!(open.is_empty(), "{open:#?}");
+        let merged = settings_document(
+            merged
+                .entries
+                .get(Path::new("src/Workspace/__roblox_sync_settings.renium")),
+        )
+        .unwrap();
+        let twins = merged
+            .instances
+            .iter()
+            .filter(|instance| persistent_identity(instance).is_some())
+            .collect::<Vec<_>>();
+        let [twin] = twins.as_slice() else {
+            panic!("{twins:#?}");
+        };
+        assert_eq!(
+            merged.instances[twin.parent_index.unwrap()].name,
+            parent,
+            "{side:?}"
+        );
+    }
 }
 
 #[test]

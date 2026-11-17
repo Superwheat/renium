@@ -2517,7 +2517,7 @@ fn a_merge_settles_a_reference_to_an_instance_the_other_side_removed_from_anothe
             .map(|conflict| conflict.detail.as_str())
             .collect::<Vec<_>>(),
         [
-            "instances/ReplicatedStorage.renium: Pointer: Value refers to Workspace.Kit.Target (id=target), which Studio removed; deciding studio clears Value, deciding editor brings Workspace.Kit.Target back"
+            "instances/ReplicatedStorage.renium: Pointer: Value refers to Workspace.Kit.Target (id=target), which Studio removed; deciding studio clears Value if Workspace.Kit.Target stays removed; deciding editor keeps Value, bringing Workspace.Kit.Target back if removed"
         ]
     );
     let (names, value, conflicts, changes) = merge(ConflictPreference::Editor);
@@ -2531,6 +2531,96 @@ fn a_merge_settles_a_reference_to_an_instance_the_other_side_removed_from_anothe
     assert_eq!(names, ["Workspace"]);
     assert_eq!(value, Some(json!({"_type": "Ref"})));
     assert!(changes.editor.contains(&replicated_path));
+}
+
+#[test]
+fn a_decision_another_decision_made_moot_is_reported_with_that_decision() {
+    let reference = json!({
+        "_type": "Ref",
+        "settingsId": "target",
+        "pathSegments": ["Workspace", "Kit", "Target"],
+        "pathOrdinals": [1, 1, 1],
+    });
+    let workspace = |target: Option<Value>| {
+        let mut instances = vec![reference_merge_instance(
+            "ws",
+            "Workspace",
+            "Workspace",
+            None,
+            None,
+        )];
+        if let Some(edited) = target {
+            instances.push(reference_merge_instance(
+                "kit",
+                "Kit",
+                "Folder",
+                Some(0),
+                None,
+            ));
+            let mut target = reference_merge_instance("target", "Target", "Folder", Some(1), None);
+            target.attributes.insert("Edited".into(), edited);
+            instances.push(target);
+        }
+        reference_merge_store(instances)
+    };
+    let replicated = |value: Option<&Value>| {
+        reference_merge_store(vec![
+            reference_merge_instance("rs", "ReplicatedStorage", "ReplicatedStorage", None, None),
+            reference_merge_instance("pointer", "Pointer", "ObjectValue", Some(0), value),
+        ])
+    };
+    let snapshot = |workspace, replicated| ProjectSnapshot {
+        entries: BTreeMap::from([
+            (PathBuf::from("instances/Workspace.renium"), workspace),
+            (
+                PathBuf::from("instances/ReplicatedStorage.renium"),
+                replicated,
+            ),
+        ]),
+    };
+    // The files edit Target and point Pointer at it; Studio removes Kit.
+    let baseline = snapshot(workspace(Some(json!(false))), replicated(None));
+    let editor = snapshot(workspace(Some(json!(true))), replicated(Some(&reference)));
+    let studio = snapshot(workspace(None), replicated(None));
+    let merge = |decisions: ConflictDecisions| {
+        merge_snapshots_with_changes(Some(&baseline), &editor, &studio, decisions, None).unwrap()
+    };
+    let (_, open, _) = merge(ConflictPreference::None.into());
+    let id_of = |instance: &str| {
+        open.iter()
+            .find(|conflict| conflict.instance.as_ref().unwrap().id == instance)
+            .unwrap()
+            .id
+            .clone()
+    };
+    let (removal, pointer) = (id_of("target"), id_of("pointer"));
+    let (merged, open, changes) = merge(ConflictDecisions {
+        preference: ConflictPreference::None,
+        by_id: BTreeMap::from([
+            (removal.clone(), ConflictSide::Editor),
+            (pointer.clone(), ConflictSide::Studio),
+        ]),
+    });
+    assert!(open.is_empty(), "{open:#?}");
+    assert_eq!(
+        changes.moot_decisions,
+        [MootDecision {
+            id: pointer,
+            decision: ConflictSide::Studio,
+            by: vec![removal],
+        }]
+    );
+    let value = settings_document(
+        merged
+            .entries
+            .get(Path::new("instances/ReplicatedStorage.renium")),
+    )
+    .unwrap()
+    .instances[1]
+        .properties
+        .get("Value")
+        .cloned();
+    assert_eq!(value, Some(reference), "Target stays, so Value is kept");
 }
 
 fn reference_merge_instance(
@@ -2714,7 +2804,7 @@ fn a_merge_settles_a_reference_whose_target_the_other_side_replaced_at_its_path(
             .map(|conflict| conflict.detail.as_str())
             .collect::<Vec<_>>(),
         [
-            "instances/ReplicatedStorage.renium: Pointer: Value refers to Workspace.Kit.Target (id=target), which Studio removed; deciding studio clears Value, deciding editor brings Workspace.Kit.Target back"
+            "instances/ReplicatedStorage.renium: Pointer: Value refers to Workspace.Kit.Target (id=target), which Studio removed; deciding studio clears Value if Workspace.Kit.Target stays removed; deciding editor keeps Value, bringing Workspace.Kit.Target back if removed"
         ]
     );
     let (targets, value, conflicts) = merge(ConflictPreference::Editor);

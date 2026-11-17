@@ -31,6 +31,25 @@ pub(crate) struct PairSetup {
     /// Project paths edited while the reconcile ran. Studio has not received
     /// them, so Live Sync keeps them pending instead of absorbing them.
     pub(crate) unsynced_paths: Vec<PathBuf>,
+    /// The decisions the comparison took without effect.
+    pub(crate) moot_decisions: Vec<MootDecision>,
+}
+
+/// What a comparison of the captured sides gives.
+enum Comparison {
+    /// Both sides hold the same project.
+    Same,
+    Merged {
+        merged: ProjectSnapshot,
+        conflicts: Vec<Conflict>,
+        changes: Box<MergeChanges>,
+    },
+    /// Decisions the comparison could not take, with the conflicts open
+    /// now; nothing is applied.
+    Refused {
+        message: String,
+        open: Vec<Conflict>,
+    },
 }
 
 #[derive(Default)]
@@ -156,6 +175,16 @@ impl Coordinator {
         bridge: &BridgeServer,
         configuration: PairConfiguration,
     ) -> Result<PairSetup> {
+        let identity = PairIdentity::from_context(context, bridge)?;
+        self.prepare_pair(context, identity, configuration)
+    }
+
+    fn prepare_pair(
+        &self,
+        context: &BoundContext,
+        identity: PairIdentity,
+        configuration: PairConfiguration,
+    ) -> Result<PairSetup> {
         let PairConfiguration {
             mode: requested_mode,
             conflict_preference,
@@ -163,7 +192,6 @@ impl Coordinator {
             decisions,
             runtime_settings,
         } = configuration;
-        let identity = PairIdentity::from_context(context, bridge)?;
         let current_runtime_id = context.runtime_id.clone();
         let current_local_file_stamp = local_file_stamp(identity.local_file.as_deref())?;
         let pair_key = identity.pair_key();
@@ -293,6 +321,7 @@ impl Coordinator {
             bootstrap_studio_from_editor,
             runtime_replacement_unproven,
             unsynced_paths: Vec::new(),
+            moot_decisions: Vec::new(),
         })
     }
 
@@ -432,78 +461,63 @@ impl Coordinator {
         } = capture_for_reconcile(context, bridge, setup, &record, &studio_state)?;
         let phase = Instant::now();
         let side_differences = snapshot_differences(&editor, &studio)?;
-        let sides_match = side_differences.is_empty();
         log_reconcile_timing("side comparison", phase);
-        if sides_match {
-            refuse_unmatched_decisions(&setup.decisions)?;
-            let phase = Instant::now();
-            setup.unsynced_paths = unsynced_project_paths(context, &publish_paths, &editor)?.0;
-            let baseline_matches = record
-                .baseline
-                .as_ref()
-                .is_some_and(|baseline| baseline.matches(&editor));
-            log_reconcile_timing("baseline comparison", phase);
-            if !baseline_matches || record.has_open_review() || record.resolution_required {
+        let phase = Instant::now();
+        let comparison = compare_sides(
+            setup,
+            &record,
+            [&editor, &studio],
+            &side_differences,
+            || {
                 let phase = Instant::now();
-                record.baseline = Some(StoredSnapshot::write(
-                    Path::new(&context.root),
-                    &setup.key,
-                    &editor,
-                )?);
-                record.clear_review();
-                record.resolution_required = false;
-                log_reconcile_timing("baseline write", phase);
+                let baseline = match loaded_baseline {
+                    Some(baseline) => Some(baseline),
+                    None => record
+                        .baseline
+                        .as_ref()
+                        .map(|baseline| baseline.load(Path::new(&context.root), &setup.key))
+                        .transpose()?,
+                };
+                log_reconcile_timing("baseline load", phase);
+                Ok(baseline)
+            },
+        )?;
+        let (mut merged, conflicts, mut changes) = match comparison {
+            Comparison::Merged {
+                merged,
+                conflicts,
+                changes,
+            } => (merged, conflicts, *changes),
+            Comparison::Refused { message, open } => {
+                return hold_refused(context, setup, &mut record, &studio_state, message, open);
             }
-            continue_clean_verify(setup, &mut record);
-            record.note_setup(setup);
-            record.studio_checkpoint =
-                reconciled_studio_checkpoint(context, bridge, &studio_state, &studio_guard);
-            write_record(context, &setup.key, &record)?;
-            setup.resolution_required = false;
-            return Ok(());
-        }
-        let phase = Instant::now();
-        let baseline = match loaded_baseline {
-            Some(baseline) => Some(baseline),
-            None => record
-                .baseline
-                .as_ref()
-                .map(|baseline| baseline.load(Path::new(&context.root), &setup.key))
-                .transpose()?,
-        };
-        log_reconcile_timing("baseline load", phase);
-        let phase = Instant::now();
-        let decisions = comparison_decisions(setup, &record);
-        log_global(
-            5,
-            format_args!(
-                "[renium] reconcile merge input: baseline={} preference={:?} resolution={:?} decisions={}",
-                baseline.is_some(),
-                decisions.preference,
-                setup.resolution_preference,
-                decisions.by_id.len()
-            ),
-        );
-        let (mut merged, conflicts, mut changes) = if setup.bootstrap_studio_from_editor {
-            refuse_unmatched_decisions(&setup.decisions)?;
-            (
-                editor.clone(),
-                Vec::new(),
-                MergeChanges {
-                    editor: HashSet::new(),
-                    studio: side_differences.clone(),
-                    aligned_studio: HashMap::new(),
-                    editor_script_paths: HashMap::new(),
-                },
-            )
-        } else {
-            merge_snapshots_with_changes(
-                baseline.as_ref(),
-                &editor,
-                &studio,
-                decisions,
-                Some(&side_differences),
-            )?
+            Comparison::Same => {
+                let phase = Instant::now();
+                setup.unsynced_paths = unsynced_project_paths(context, &publish_paths, &editor)?.0;
+                let baseline_matches = record
+                    .baseline
+                    .as_ref()
+                    .is_some_and(|baseline| baseline.matches(&editor));
+                log_reconcile_timing("baseline comparison", phase);
+                if !baseline_matches || record.has_open_review() || record.resolution_required {
+                    let phase = Instant::now();
+                    record.baseline = Some(StoredSnapshot::write(
+                        Path::new(&context.root),
+                        &setup.key,
+                        &editor,
+                    )?);
+                    record.clear_review();
+                    record.resolution_required = false;
+                    log_reconcile_timing("baseline write", phase);
+                }
+                continue_clean_verify(setup, &mut record);
+                record.note_setup(setup);
+                record.studio_checkpoint =
+                    reconciled_studio_checkpoint(context, bridge, &studio_state, &studio_guard);
+                write_record(context, &setup.key, &record)?;
+                setup.resolution_required = false;
+                return Ok(());
+            }
         };
         log_global(
             5,
@@ -547,6 +561,7 @@ impl Coordinator {
         if verify_mode_holds(context, setup, &mut record, &changes)? {
             return Ok(());
         }
+        setup.moot_decisions = std::mem::take(&mut changes.moot_decisions);
 
         let mut sync_history = None;
         let phase = Instant::now();
@@ -780,6 +795,7 @@ impl Coordinator {
             bootstrap_studio_from_editor: false,
             runtime_replacement_unproven: false,
             unsynced_paths: Vec::new(),
+            moot_decisions: Vec::new(),
         })
     }
 
@@ -1464,6 +1480,145 @@ fn comparison_decisions(setup: &PairSetup, record: &PairRecord) -> ConflictDecis
     }
 }
 
+/// Compares the captured sides of a pair: the files first, then Studio,
+/// with what differs between them. Decisions that name nothing this
+/// comparison meets are refused before anything is applied; otherwise the
+/// sides merge by the decisions. `baseline` loads the last sync when the
+/// sides differ.
+fn compare_sides(
+    setup: &PairSetup,
+    record: &PairRecord,
+    sides: [&ProjectSnapshot; 2],
+    side_differences: &HashSet<PathBuf>,
+    baseline: impl FnOnce() -> Result<Option<ProjectSnapshot>>,
+) -> Result<Comparison> {
+    let [editor, studio] = sides;
+    let refused = |error: anyhow::Error| Comparison::Refused {
+        message: error.to_string(),
+        open: Vec::new(),
+    };
+    if side_differences.is_empty() {
+        if let Err(error) = refuse_unmatched_decisions(&setup.decisions) {
+            return Ok(refused(error));
+        }
+        return Ok(Comparison::Same);
+    }
+    let baseline = baseline()?;
+    let decisions = comparison_decisions(setup, record);
+    log_global(
+        5,
+        format_args!(
+            "[renium] reconcile merge input: baseline={} preference={:?} resolution={:?} decisions={}",
+            baseline.is_some(),
+            decisions.preference,
+            setup.resolution_preference,
+            decisions.by_id.len()
+        ),
+    );
+    if setup.bootstrap_studio_from_editor {
+        if let Err(error) = refuse_unmatched_decisions(&setup.decisions) {
+            return Ok(refused(error));
+        }
+        return Ok(Comparison::Merged {
+            merged: editor.clone(),
+            conflicts: Vec::new(),
+            changes: Box::new(MergeChanges {
+                studio: side_differences.clone(),
+                ..MergeChanges::default()
+            }),
+        });
+    }
+    let preference = decisions.preference;
+    let error = match merge_snapshots_with_changes(
+        baseline.as_ref(),
+        editor,
+        studio,
+        decisions,
+        Some(side_differences),
+    ) {
+        Ok((merged, conflicts, changes)) => {
+            return Ok(Comparison::Merged {
+                merged,
+                conflicts,
+                changes: Box::new(changes),
+            });
+        }
+        Err(error) => error,
+    };
+    let Some(refusal) = error.downcast_ref::<RefusedDecisions>() else {
+        return Err(error);
+    };
+    let (_, open, _) = merge_snapshots_with_changes(
+        baseline.as_ref(),
+        editor,
+        studio,
+        preference,
+        Some(side_differences),
+    )?;
+    Ok(Comparison::Refused {
+        message: refusal_message(refusal, &record.conflicts, &open),
+        open,
+    })
+}
+
+/// Why decisions were refused. A decision for a listed conflict whose
+/// values changed since names it, with the id and record it has now; one
+/// for a listed conflict nothing matches any more says so.
+fn refusal_message(refusal: &RefusedDecisions, listed: &[Conflict], open: &[Conflict]) -> String {
+    let mut parts = refusal.reasons.clone();
+    let mut unknown = Vec::new();
+    for id in &refusal.unknown {
+        let Some(before) = listed.iter().find(|conflict| conflict.id == *id) else {
+            unknown.push(id.as_str());
+            continue;
+        };
+        let now = open
+            .iter()
+            .filter(|conflict| conflict.same_subject(before))
+            .max_by_key(|conflict| {
+                conflict
+                    .detail
+                    .chars()
+                    .zip(before.detail.chars())
+                    .take_while(|(now, then)| now == then)
+                    .count()
+            });
+        parts.push(match now {
+            Some(now) => format!(
+                "Conflict {id} changed since it was listed; it is {} now: {}",
+                now.id, now.detail
+            ),
+            None => format!("Conflict {id} is no longer open: {}", before.detail),
+        });
+    }
+    if !unknown.is_empty() {
+        parts.push(unknown_decisions_message(&unknown));
+    }
+    format!("{}; nothing was applied", parts.join("; "))
+}
+
+/// Keeps both sides as they are after refusing decisions: the conflicts
+/// open now are recorded and listed, and the refusal is the error.
+fn hold_refused(
+    context: &BoundContext,
+    setup: &mut PairSetup,
+    record: &mut PairRecord,
+    studio_state: &Value,
+    message: String,
+    open: Vec<Conflict>,
+) -> Result<()> {
+    if open.is_empty() {
+        setup.mode = PairMode::Verify;
+        setup.resolution_required = false;
+        setup.conflicts.clear();
+        setup.differences.clear();
+    } else {
+        hold_for_conflicts(context, setup, record, studio_state, open)?;
+    }
+    setup.error = Some(message);
+    Ok(())
+}
+
 /// Keeps both sides as they are and records the open conflicts, with the
 /// evidence about each, for the caller to decide.
 fn hold_for_conflicts(
@@ -1620,6 +1775,7 @@ mod decision_tests {
             bootstrap_studio_from_editor: false,
             runtime_replacement_unproven: false,
             unsynced_paths: Vec::new(),
+            moot_decisions: Vec::new(),
         }
     }
 
@@ -1776,5 +1932,200 @@ mod decision_tests {
         assert_eq!(replicated.studio_changed, Some(true));
         assert_eq!(workspace.studio_changed, Some(false));
         assert_eq!(replicated.files_changed_at, None, "no store file on disk");
+    }
+
+    const STORE: &str = "instances/Workspace.renium";
+
+    /// The last sync, the files and Studio of a Door whose Transparency was
+    /// 0, the files set to 0.5 and Studio to `studio`.
+    fn door(studio: f64) -> [ProjectSnapshot; 3] {
+        [0.0, 0.5, studio].map(|transparency| {
+            let root = SettingsBytecodeInstance::new(
+                "ws".into(),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            );
+            let mut door =
+                SettingsBytecodeInstance::new("door".into(), "Door".into(), "Part".into(), Some(0));
+            door.properties
+                .insert("Transparency".into(), json!(transparency));
+            let bytes = encode_settings_bytecode(&SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances: vec![root, door],
+            })
+            .unwrap();
+            ProjectSnapshot {
+                entries: BTreeMap::from([(PathBuf::from(STORE), SnapshotEntry::File(bytes))]),
+            }
+        })
+    }
+
+    fn undecided_record(conflicts: Vec<Conflict>) -> PairRecord {
+        let mut record = record(conflicts, None);
+        record.conflict_preference = ConflictPreference::None;
+        record
+    }
+
+    fn compare(
+        setup: &PairSetup,
+        record: &PairRecord,
+        [base, files, studio]: &[ProjectSnapshot; 3],
+    ) -> Comparison {
+        let differences = snapshot_differences(files, studio).unwrap();
+        compare_sides(setup, record, [files, studio], &differences, || {
+            Ok(Some(base.clone()))
+        })
+        .unwrap()
+    }
+
+    fn transparency(merged: &ProjectSnapshot) -> Value {
+        settings_document(merged.entries.get(Path::new(STORE)))
+            .unwrap()
+            .instances[1]
+            .properties["Transparency"]
+            .clone()
+    }
+
+    #[test]
+    fn a_comparison_takes_each_decision_by_its_id() {
+        let sides = door(0.2);
+        let record = undecided_record(Vec::new());
+        let Comparison::Merged { conflicts, .. } = compare(&setup(&[], None), &record, &sides)
+        else {
+            panic!("the sides differ");
+        };
+        let [conflict] = conflicts.as_slice() else {
+            panic!("{conflicts:#?}");
+        };
+        for (side, value) in [(ConflictSide::Studio, 0.2), (ConflictSide::Editor, 0.5)] {
+            let Comparison::Merged {
+                merged, conflicts, ..
+            } = compare(&setup(&[(&conflict.id, side)], None), &record, &sides)
+            else {
+                panic!("{side:?} was refused");
+            };
+            assert!(conflicts.is_empty(), "{conflicts:#?}");
+            assert_eq!(transparency(&merged), json!(value), "{side:?}");
+        }
+    }
+
+    #[test]
+    fn decisions_are_refused_where_the_sides_match_or_studio_is_rebuilt() {
+        let [base, files, _] = door(0.2);
+        let same = [base, files.clone(), files];
+        let record = undecided_record(Vec::new());
+        let decided = setup(&[("0a1b2c3d", ConflictSide::Studio)], None);
+        assert!(matches!(
+            compare(&setup(&[], None), &record, &same),
+            Comparison::Same
+        ));
+        let Comparison::Refused { message, open } = compare(&decided, &record, &same) else {
+            panic!("a decision with nothing to decide was taken");
+        };
+        assert!(
+            message.contains("0a1b2c3d") && message.ends_with("nothing was applied"),
+            "{message}"
+        );
+        assert!(open.is_empty());
+
+        let sides = door(0.2);
+        let mut rebuilt = setup(&[], None);
+        rebuilt.bootstrap_studio_from_editor = true;
+        let Comparison::Merged { changes, .. } = compare(&rebuilt, &record, &sides) else {
+            panic!("rebuilding Studio from the files was refused");
+        };
+        assert!(changes.studio.contains(Path::new(STORE)));
+        let mut rebuilt = decided;
+        rebuilt.bootstrap_studio_from_editor = true;
+        let Comparison::Refused { message, .. } = compare(&rebuilt, &record, &sides) else {
+            panic!("a decision was taken while Studio is rebuilt from the files");
+        };
+        assert!(message.contains("0a1b2c3d"), "{message}");
+    }
+
+    #[test]
+    fn a_decision_for_a_conflict_that_changed_names_it_and_its_new_record() {
+        let record = undecided_record(Vec::new());
+        let Comparison::Merged { conflicts, .. } = compare(&setup(&[], None), &record, &door(0.2))
+        else {
+            panic!("the sides differ");
+        };
+        let listed = conflicts[0].id.clone();
+        let record = undecided_record(conflicts);
+        let Comparison::Refused { message, open } = compare(
+            &setup(
+                &[
+                    (&listed, ConflictSide::Studio),
+                    ("0a1b2c3d", ConflictSide::Editor),
+                ],
+                None,
+            ),
+            &record,
+            &door(0.3),
+        ) else {
+            panic!("a decision for values that changed was taken");
+        };
+        let [now] = open.as_slice() else {
+            panic!("{open:#?}");
+        };
+        assert_ne!(now.id, listed);
+        assert_eq!(now.studio, Some(json!(0.3)));
+        assert!(
+            message.contains(&format!(
+                "Conflict {listed} changed since it was listed; it is {} now: Workspace/Door: property Transparency: Studio has 0.3",
+                now.id
+            )) && message.contains("No open conflict has the id 0a1b2c3d")
+                && message.ends_with("nothing was applied"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_decision_with_nothing_open_is_refused_before_a_session_is_touched() {
+        let root = crate::tests::support::temp_dir("prepare-decisions");
+        let context = BoundContext {
+            id: 1,
+            initialized: true,
+            project: root
+                .join("renium.project.jsonc")
+                .to_string_lossy()
+                .into_owned(),
+            root: root.to_string_lossy().into_owned(),
+            experience: String::new(),
+            source: root.join("src").to_string_lossy().into_owned(),
+            resource_lease: None,
+            place_id: Some(2),
+            game_id: Some(1),
+            selector: String::new(),
+            runtime_id: Some("runtime".into()),
+            plugin_build: None,
+            fingerprint: String::new(),
+        };
+        let identity = PairIdentity {
+            game_id: Some(1),
+            place_id: Some(2),
+            ..setup(&[], None).identity
+        };
+        let configuration = |decisions: &[(&str, ConflictSide)]| PairConfiguration {
+            mode: PairMode::Reconcile,
+            conflict_preference: ConflictPreference::None,
+            resolution_preference: None,
+            decisions: setup(decisions, None).decisions,
+            runtime_settings: Map::new(),
+        };
+        let coordinator = Coordinator::default();
+        let refused = coordinator
+            .prepare_pair(
+                &context,
+                identity.clone(),
+                configuration(&[("0a1b2c3d", ConflictSide::Studio)]),
+            )
+            .map(|_| ());
+        let prepared = coordinator.prepare_pair(&context, identity, configuration(&[]));
+        fs::remove_dir_all(&root).unwrap();
+        let error = refused.unwrap_err().to_string();
+        assert!(error.contains("0a1b2c3d"), "{error}");
+        assert!(prepared.unwrap().decisions.is_empty());
     }
 }

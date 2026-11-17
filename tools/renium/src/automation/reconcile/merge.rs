@@ -15,7 +15,9 @@ pub(crate) fn merge_snapshots(
 /// Merges the files and Studio against the last sync. Each conflict takes
 /// the side its decision names, else the preference's; the ones left are
 /// returned open. A decision that names no conflict of this comparison, or
-/// one no side can be chosen for, fails the merge.
+/// one no side can be chosen for, fails the merge with
+/// [`RefusedDecisions`]. A decision whose conflict other decisions made
+/// moot is reported in the changes, with those decisions.
 pub(crate) fn merge_snapshots_with_changes(
     baseline: Option<&ProjectSnapshot>,
     editor: &ProjectSnapshot,
@@ -30,13 +32,41 @@ pub(crate) fn merge_snapshots_with_changes(
     };
     let decisions = decisions.into();
     let mut conflicts = ConflictLog::new(decisions.clone());
-    let (merged, changes) = merge_sides(&sides, &mut conflicts, known_differences)?;
-    if conflicts.has_unmatched_decisions() {
-        let found =
+    let (merged, mut changes) = merge_sides(&sides, &mut conflicts, known_differences)?;
+    let unmatched = conflicts.unmatched_decisions();
+    if !unmatched.is_empty() {
+        let MetWhileDeciding { found, rounds } =
             conflicts_met_while_deciding(&sides, &decisions, &conflicts, known_differences)?;
-        conflicts.found_before_decisions(found);
+        let moot = unmatched
+            .iter()
+            .map(|id| found.get(id).map(|round| (id, &rounds[*round])))
+            .collect::<Option<Vec<_>>>();
+        conflicts.found_before_decisions(found.keys().cloned().collect());
+        let probe = MootProbe {
+            sides: &sides,
+            decisions: &decisions,
+            known_differences,
+        };
+        for (id, before) in moot.unwrap_or_default() {
+            let suspects = decisions
+                .by_id
+                .keys()
+                .filter(|suspect| *suspect != id && !before.contains_key(*suspect))
+                .cloned()
+                .collect();
+            conflicts.made_moot(id, probe.decisions_making_moot(id, before, suspects)?);
+        }
     }
+    changes.moot_decisions = conflicts.moot();
     Ok((merged, conflicts.finish()?, changes))
+}
+
+/// The conflicts met on the way to a comparison's decisions.
+struct MetWhileDeciding {
+    /// The round that first met each id.
+    found: HashMap<String, usize>,
+    /// The decisions each round took.
+    rounds: Vec<BTreeMap<String, ConflictSide>>,
 }
 
 /// The conflicts a comparison meets on the way to its decisions: those it
@@ -51,10 +81,11 @@ fn conflicts_met_while_deciding(
     decisions: &ConflictDecisions,
     decided: &ConflictLog,
     known_differences: Option<&HashSet<PathBuf>>,
-) -> Result<HashSet<String>> {
-    let mut found = HashSet::new();
+) -> Result<MetWhileDeciding> {
+    let mut found = HashMap::new();
+    let mut rounds = Vec::new();
     if decisions.by_id.is_empty() {
-        return Ok(found);
+        return Ok(MetWhileDeciding { found, rounds });
     }
     // Each round takes at least one more decision, so the rounds end.
     let mut taken = None;
@@ -62,23 +93,84 @@ fn conflicts_met_while_deciding(
         let usable = decisions
             .by_id
             .iter()
-            .filter(|(id, _)| found.contains(*id))
+            .filter(|(id, _)| found.contains_key(*id))
             .map(|(id, side)| (id.clone(), *side))
             .collect::<BTreeMap<_, _>>();
         if usable.len() == decisions.by_id.len() || taken == Some(usable.len()) {
-            return Ok(found);
+            return Ok(MetWhileDeciding { found, rounds });
         }
         taken = Some(usable.len());
-        if usable.keys().eq(decided.applied()) {
-            found.extend(decided.met());
-            continue;
+        let met = if usable.keys().eq(decided.applied()) {
+            decided.met()
+        } else {
+            let mut probe = ConflictLog::new(ConflictDecisions {
+                preference: decisions.preference,
+                by_id: usable.clone(),
+            });
+            merge_sides(sides, &mut probe, known_differences)?;
+            probe.met()
+        };
+        for id in met {
+            found.entry(id).or_insert(rounds.len());
         }
+        rounds.push(usable);
+    }
+}
+
+/// Runs a comparison again with fewer decisions, to find which ones made
+/// another decision's conflict moot.
+struct MootProbe<'a> {
+    sides: &'a SnapshotSides<'a>,
+    decisions: &'a ConflictDecisions,
+    known_differences: Option<&'a HashSet<PathBuf>>,
+}
+
+impl MootProbe<'_> {
+    /// Whether the comparison with the decisions `before` and `extra`
+    /// meets the conflict `id`.
+    fn meets(
+        &self,
+        id: &str,
+        before: &BTreeMap<String, ConflictSide>,
+        extra: &[String],
+    ) -> Result<bool> {
+        let mut by_id = before.clone();
+        by_id.extend(
+            extra
+                .iter()
+                .map(|suspect| (suspect.clone(), self.decisions.by_id[suspect])),
+        );
         let mut probe = ConflictLog::new(ConflictDecisions {
-            preference: decisions.preference,
-            by_id: usable,
+            preference: self.decisions.preference,
+            by_id,
         });
-        merge_sides(sides, &mut probe, known_differences)?;
-        found.extend(probe.met());
+        merge_sides(self.sides, &mut probe, self.known_differences)?;
+        Ok(probe.has_met(id))
+    }
+
+    /// The decisions that make the conflict `id` moot: of the `suspects`,
+    /// taken beyond the decisions `before` (with which the comparison meets
+    /// it), the half that keeps it from being met, halved again until one
+    /// is left or only both halves together do.
+    fn decisions_making_moot(
+        &self,
+        id: &str,
+        before: &BTreeMap<String, ConflictSide>,
+        mut suspects: Vec<String>,
+    ) -> Result<Vec<String>> {
+        while suspects.len() > 1 {
+            let rest = suspects.split_off(suspects.len() / 2);
+            if !self.meets(id, before, &suspects)? {
+                continue;
+            }
+            if !self.meets(id, before, &rest)? {
+                suspects = rest;
+                continue;
+            }
+            suspects.extend(rest);
+            break;
+        }
+        Ok(suspects)
     }
 }
 
@@ -1299,15 +1391,21 @@ impl VcResolve for StoreResolver<'_> {
             .consult(&mut record, conflict.follows.map(studio_when))
             .map(|side| side == ConflictSide::Studio)
     }
+
+    fn restored(&mut self, settings_id: &str, by: &VcMergeConflict) {
+        let mut record = store_conflict(self.store, by);
+        self.log
+            .restored(&conflict_path(self.store), settings_id, &mut record);
+    }
 }
 
-/// What deciding each side does, for a conflict that hangs on another
-/// instance.
+/// What deciding each side does, for a conflict whose outcome reaches
+/// beyond its own field.
 fn effects_sentence(conflict: &VcMergeConflict) -> String {
     conflict
         .effects
         .as_ref()
-        .map(|[studio, files]| format!("; deciding studio {studio}, deciding editor {files}"))
+        .map(|[studio, files]| format!("; deciding studio {studio}; deciding editor {files}"))
         .unwrap_or_default()
 }
 
@@ -1389,9 +1487,10 @@ pub(crate) fn store_conflict(store: &Path, conflict: &VcMergeConflict) -> Confli
             ConflictKind::Removal,
             "",
             format!(
-                "{at}: {} changed it and {} removed it",
+                "{at}: {} changed it and {} removed it{}",
                 holder(studio),
-                other(studio)
+                other(studio),
+                effects_sentence(conflict)
             ),
         ),
         VcConflictKind::Cycle => (

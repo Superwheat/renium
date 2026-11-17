@@ -2324,6 +2324,7 @@ fn compact_live_daemon_status(value: &Value) -> Value {
         "previousError",
         "terrainObservation",
         "nativeCapture",
+        "mootDecisions",
     ] {
         if let Some(value) = source.get(key) {
             result.insert(key.to_string(), value.clone());
@@ -6520,6 +6521,13 @@ mod settled_start_tests {
         let compact = compact_live_daemon_status(&few);
         assert!(compact.get("moreConflicts").is_none());
         assert!(open_conflicts(&json!({"daemon": {"running": true, "conflicts": []}})).is_none());
+    }
+
+    #[test]
+    fn a_started_session_shows_the_decisions_it_took_without_effect() {
+        let moot = json!([{"id": "0a1b2c3d", "decision": "studio", "by": ["4e5f6a7b"]}]);
+        let daemon = json!({"running": true, "pushes": 0, "mootDecisions": moot});
+        assert_eq!(compact_live_daemon_status(&daemon)["mootDecisions"], moot);
     }
 }
 
