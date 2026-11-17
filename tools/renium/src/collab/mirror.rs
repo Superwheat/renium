@@ -1008,7 +1008,10 @@ mod tests {
         let stayed = guest.read() == FIVE;
         crate::automation::reconcile::import_settle::finish_request(None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
-        while guest.read() == FIVE && Instant::now() < deadline {
+        // The mirror replaces the file; a read can land between its two steps.
+        let unchanged =
+            || std::fs::read_to_string(guest.root.join(FILE)).map_or(true, |text| text == FIVE);
+        while unchanged() && Instant::now() < deadline {
             std::thread::sleep(POLL);
         }
         stop.store(true, Ordering::Release);

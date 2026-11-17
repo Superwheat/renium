@@ -6112,4 +6112,117 @@ mod tests {
             "an ordinary close cancelled the settlement of an already answered push"
         );
     }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn close_during_settlement(
+        close_on_a: bool,
+        local_action: Option<&str>,
+        cancel_close_after: Option<Duration>,
+        watch: Duration,
+    ) -> (bool, Option<std::result::Result<Value, String>>) {
+        use crate::automation::reconcile::import_settle;
+        let studios = TwoStudios::open();
+        let context = studios.state.context(studios.a).unwrap();
+        import_settle::fixture_running_import(&context).unwrap();
+        let gate = studios.bridge.acquire_edit_gate(Some("gate-a"), "push");
+        let client = Arc::new(BridgeRequestLease::new("finished-import-client".into()));
+        let active = studios.bridge.activate_request_lease(client).unwrap();
+        import_settle::continue_request(&context, &studios.bridge).unwrap();
+        let continuation = studios.bridge.active_request_lease().unwrap();
+        let close_lease = Arc::new(BridgeRequestLease::new("review-close".into()));
+        let worker_lease = Arc::clone(&close_lease);
+        let worker = Arc::clone(&studios);
+        let cx = if close_on_a { studios.a } else { studios.b };
+        let parameters = match local_action {
+            Some(action) => json!({ "localAction": action }),
+            None => json!({}),
+        };
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let request: automation::Request = serde_json::from_value(json!({
+                "v":1,"id":905,"op":op::STUDIO_CLOSE,"cx":cx,"p":parameters
+            }))
+            .unwrap();
+            let result = execute_gated(
+                &request,
+                Some(None),
+                &worker.state,
+                &worker.bridge,
+                0.1,
+                Some(&worker_lease),
+            )
+            .map_err(|error| error.0.m);
+            let _ = done.send(result);
+        });
+        if let Some(after) = cancel_close_after {
+            std::thread::sleep(after);
+            close_lease.cancel();
+        }
+        let deadline = Instant::now() + watch;
+        let mut close_result = None;
+        while !continuation.is_cancelled() && Instant::now() < deadline {
+            if let Ok(result) = finished.try_recv() {
+                close_result = Some(result);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let cancelled = continuation.is_cancelled();
+        close_lease.cancel();
+        import_settle::finish_request(None).unwrap();
+        drop(active);
+        drop(gate);
+        if close_result.is_none() {
+            close_result = finished.recv_timeout(Duration::from_secs(5)).ok();
+        }
+        let _ = fs::remove_dir_all(&studios.root);
+        (cancelled, close_result)
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn terminating_studio_b_leaves_studio_a_settling() {
+        if !runs_in_its_own_process("terminating_studio_b_leaves_studio_a_settling") {
+            return;
+        }
+        let (cancelled, _) =
+            close_during_settlement(false, Some("terminate"), None, Duration::from_millis(500));
+        assert!(
+            !cancelled,
+            "closing Studio B cancelled Studio A's settlement"
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn a_close_cancelled_while_waiting_leaves_settlement_alone() {
+        if !runs_in_its_own_process("a_close_cancelled_while_waiting_leaves_settlement_alone") {
+            return;
+        }
+        let (cancelled, result) = close_during_settlement(
+            true,
+            None,
+            Some(Duration::from_millis(100)),
+            Duration::from_millis(600),
+        );
+        assert!(!cancelled, "a cancelled close cancelled the settlement");
+        assert!(
+            result.as_ref().is_some_and(|result| result.is_err()),
+            "{result:?}"
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn an_ordinary_close_cancels_only_after_its_grace() {
+        if !runs_in_its_own_process("an_ordinary_close_cancels_only_after_its_grace") {
+            return;
+        }
+        let grace = crate::automation::reconcile::import_settle::CLOSE_WAITS_FOR_SETTLEMENT;
+        let started = Instant::now();
+        let (cancelled, _) =
+            close_during_settlement(true, None, None, grace + Duration::from_secs(5));
+        let waited = started.elapsed();
+        assert!(cancelled, "a hung settlement was never cancelled");
+        assert!(waited + Duration::from_millis(500) >= grace, "{waited:?}");
+    }
 }

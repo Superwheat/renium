@@ -98,7 +98,7 @@ impl Journal {
         anyhow::ensure!(
             record.paths.iter().all(|path| path
                 .components()
-                .all(|part| matches!(part, Component::Normal(_)))),
+                .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))),
             "The import settlement journal names a path outside the project; run rbx pl to recover"
         );
         Ok(Some(Self {
@@ -311,8 +311,9 @@ pub(crate) fn continue_request(context: &BoundContext, bridge: &BridgeServer) ->
 }
 
 /// How long a close that keeps the place lets a running settlement publish
-/// before it cancels it.
-const CLOSE_WAITS_FOR_SETTLEMENT: Duration = Duration::from_secs(30);
+/// before it cancels it. Tests wait it out, so it is short there.
+pub(crate) const CLOSE_WAITS_FOR_SETTLEMENT: Duration =
+    Duration::from_secs(if cfg!(test) { 2 } else { 30 });
 
 /// A close that discards the place cancels the read-only continuation of its
 /// Studio at once. Any other close lets the settlement publish first and
@@ -632,7 +633,19 @@ pub(crate) fn before_request(
     // verify the complete accepted capture before publishing; treating a lost
     // observer as a new ordinary push would leave regenerated saved identities
     // unsettled even when that push finds no authored differences.
-    let settled = recover(context, bridge, &services, work, input)?;
+    let settled = match recover(context, bridge, &services, work, input) {
+        Ok(settled) => settled,
+        // Studio no longer holds what the earlier push left there, or cannot
+        // prove it. Nothing of that push is repeated or reported as failed:
+        // this push reconciles the files with Studio as it is now.
+        Err(error) => {
+            crate::daemon::emit_request_notice(&format!(
+                "The earlier import could not be settled: {error}. This push reconciles the current files with Studio."
+            ));
+            finish_request(None)?;
+            return Ok(None);
+        }
+    };
     if same_input && settled {
         Ok(Some(json!({"ok": true, "unchanged": true})))
     } else {
@@ -1439,6 +1452,98 @@ mod tests {
             );
             resolve_journal(&directory(&context))?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_studio_change_while_unsettled_does_not_fail_the_next_full_push() -> Result<()> {
+        let fixture = super::super::push_flow_tests::Fixture::new()?;
+        let context = &fixture.context;
+        let paths = vec![PathBuf::from("src"), PathBuf::from("instances")];
+        let verification_paths = fixture.desired.entries.keys().cloned().collect();
+        let history = history::SyncHistory::begin(
+            Path::new(&context.root),
+            Path::new(&context.source),
+            &ProjectSnapshot::default(),
+            &verification_paths,
+        )?;
+        begin(
+            context,
+            ImportStart {
+                services: &["ReplicatedStorage".into()],
+                paths: &paths,
+                verification_paths: &verification_paths,
+                before: &ProjectSnapshot::default(),
+                expected: &fixture.desired,
+                input: None,
+                history_id: history.id()?,
+            },
+        )?;
+        committed(
+            &Map::from_iter([
+                ("historyId".into(), json!(history.id()?)),
+                ("verifiedPushProof".into(), json!({"expired": true})),
+            ]),
+            &fixture.desired,
+        )?;
+        interrupt_test_request();
+        super::super::push_flow_tests::replace_capture(ProjectSnapshot::default());
+        let result = before_request(
+            context,
+            fixture.bridge.as_ref().unwrap(),
+            op::PUSH,
+            &json!({}),
+        );
+        assert!(
+            result.is_ok(),
+            "the user's full push failed: {:#}",
+            result.unwrap_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_journal_of_a_dot_relative_source_root_stays_recoverable() -> Result<()> {
+        let root = crate::tests::support::temp_dir("settle-dot-source-root");
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        fs::write(
+            root.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"sourceRoot":"./src","tree":{}}"#,
+        )?;
+        fs::create_dir_all(root.join("src/Workspace"))?;
+        config::load_project(None, Some(&root))?;
+        let stage = ExportProjectStage::create_for_comparison(
+            &root,
+            Path::new("./src"),
+            &["Workspace".into()],
+        )?;
+        let paths = stage.publish_paths().to_vec();
+        assert!(
+            paths.iter().any(|path| path.starts_with("./src")),
+            "{paths:?}"
+        );
+        let context = context(&root);
+        begin(
+            &context,
+            ImportStart {
+                services: &["Workspace".into()],
+                paths: &paths,
+                verification_paths: &HashSet::new(),
+                before: &ProjectSnapshot::default(),
+                expected: &ProjectSnapshot::default(),
+                input: None,
+                history_id: "dot-history".into(),
+            },
+        )?;
+        committed(
+            &Map::from_iter([("verifiedPushProof".into(), json!({"test": true}))]),
+            &ProjectSnapshot::default(),
+        )?;
+        interrupt_test_request();
+        let loaded = Journal::load(&context);
+        assert!(loaded.is_ok(), "{:#}", loaded.err().unwrap());
         Ok(())
     }
 }
