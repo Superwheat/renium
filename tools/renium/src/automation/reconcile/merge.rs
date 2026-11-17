@@ -290,7 +290,7 @@ fn source_merged_by_identity(
         editor
     } else if same(editor, baseline) {
         studio
-    } else if let Some(merged) = merged_source(baseline, editor, studio, preference) {
+    } else if let Some(merged) = merged_source(baseline, editor, studio) {
         return Some(merged);
     } else {
         match preference {
@@ -613,7 +613,7 @@ pub(crate) fn merge_conflicting_entry(
     if !first_pairing
         && is_source_path(path)
         && let (Some(editor), Some(studio)) = (editor, studio)
-        && let Some(merged) = merged_source(base, editor, studio, preference)
+        && let Some(merged) = merged_source(base, editor, studio)
     {
         return Some(merged);
     }
@@ -630,14 +630,12 @@ pub(crate) fn merge_conflicting_entry(
 
 /// A script both sides edited since the last sync, merged line by line (see
 /// `text_merge`): an edit of one side to lines the other left alone is kept,
-/// whichever side made it. Where both changed the same lines differently,
-/// the preferred side's lines stand; with no preference there is no merged
-/// text, and the script stays a conflict with each side holding its own.
+/// whichever side made it. Where the two edits conflict there is no merged
+/// text: the script is one choice between the two sides' whole texts.
 fn merged_source(
     base: Option<&SnapshotEntry>,
     editor: &SnapshotEntry,
     studio: &SnapshotEntry,
-    preference: ConflictPreference,
 ) -> Option<SnapshotEntry> {
     use crate::collab::document::with_line_endings_of;
 
@@ -663,7 +661,7 @@ fn merged_source(
         return None;
     }
     let (base, editor_text, studio) = (text(base)?, text(editor)?, text(studio)?);
-    let merged = text_merge::merge_script_lines(&base, &editor_text, &studio, preference)?;
+    let merged = text_merge::merge_script_lines(&base, &editor_text, &studio)?;
     let merged = with_line_endings_of(merged, std::str::from_utf8(editor).ok()?);
     Some(SnapshotEntry::File(merged.into_bytes()))
 }

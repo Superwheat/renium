@@ -504,19 +504,20 @@ fn edits_of_both_sides_to_different_lines_of_a_script_are_both_kept() {
     assert!(merged.editor_changed && merged.studio_changed);
 }
 
-/// Where both sides changed the same line differently, the preferred side's
-/// line stands and the other side's edits elsewhere are still kept; with no
-/// preference the script is a conflict and the files keep their text.
+/// Where both sides changed the same line differently, the script is one
+/// choice: the preferred side's whole text stands, and no text is put
+/// together from both; with no preference the script is a conflict and the
+/// files keep their text.
 #[test]
-fn the_same_line_changed_on_both_sides_follows_the_preference_alone() {
+fn the_same_line_changed_on_both_sides_is_one_choice_between_the_two_texts() {
     let base = "local a = 1\nlocal b = 2\nlocal c = 3\nreturn a\n";
     let files = "local a = 10\nlocal b = 2\nlocal c = 3\nreturn a\n-- files\n";
     let studio = "local a = 20\nlocal b = 2\nlocal c = 30\nreturn a\n";
     let (merged, conflicts) = merged_script(base, files, studio, ConflictPreference::Editor);
-    assert!(merged == text("local a = 10\nlocal b = 2\nlocal c = 30\nreturn a\n-- files\n"));
+    assert!(merged == text(files));
     assert!(conflicts.is_empty());
     let (merged, conflicts) = merged_script(base, files, studio, ConflictPreference::Studio);
-    assert!(merged == text("local a = 20\nlocal b = 2\nlocal c = 30\nreturn a\n-- files\n"));
+    assert!(merged == text(studio));
     assert!(conflicts.is_empty());
     let (merged, conflicts) = merged_script(base, files, studio, ConflictPreference::None);
     assert!(merged == text(files));

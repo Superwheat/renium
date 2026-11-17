@@ -8,24 +8,17 @@
 //!
 //! The lines between two anchors form one region. A region comes from the
 //! side that changed it when the other left it alone, and from either when
-//! both made it the same. Where both changed it differently: lines replaced
-//! one for one on both sides are settled line by line, each from the side
-//! that changed it or from the preferred side; any other region comes whole
-//! from the preferred side. Lines one side added are never combined with
-//! lines the other added.
+//! both made it the same. A region both changed, each keeping its number of
+//! lines and moving none of them, is settled by rows: the rows
+//! no side changed part it into runs, and a run only one side changed is
+//! that side's. Everything else both sides changed is a conflict, and a
+//! conflict leaves no merged text at all: the caller takes one side's whole
+//! script, so no text is ever put together from two answers to one conflict.
 
 use std::collections::HashMap;
 
-use super::ConflictPreference;
-
-/// The merged text, or `None` when both sides changed a region differently
-/// and no side is preferred.
-pub(super) fn merge_script_lines(
-    base: &str,
-    editor: &str,
-    studio: &str,
-    preference: ConflictPreference,
-) -> Option<String> {
+/// The merged text, or `None` when the two sides conflict.
+pub(super) fn merge_script_lines(base: &str, editor: &str, studio: &str) -> Option<String> {
     let (base, editor, studio) = (lines(base), lines(editor), lines(studio));
     let mut merged = String::new();
     let (mut at_base, mut at_editor, mut at_studio) = (0, 0, 0);
@@ -37,7 +30,6 @@ pub(super) fn merge_script_lines(
             &base[at_base..to_base],
             &editor[at_editor..to_editor],
             &studio[at_studio..to_studio],
-            preference,
         )?;
         region.into_iter().for_each(|line| merged.push_str(line));
         if let Some(anchor) = base.get(to_base) {
@@ -110,18 +102,10 @@ fn longest_rising(values: &[usize]) -> Vec<bool> {
     chosen
 }
 
-/// The lines a region ends with, or `None` for a conflict nobody settles.
-fn region<'a>(
-    base: &[&'a str],
-    editor: &[&'a str],
-    studio: &[&'a str],
-    preference: ConflictPreference,
-) -> Option<Vec<&'a str>> {
-    if editor == studio || studio == base {
-        return Some(editor.to_vec());
-    }
-    if editor == base {
-        return Some(studio.to_vec());
+/// The lines a region ends with, or `None` for a conflict.
+fn region<'a>(base: &[&'a str], editor: &[&'a str], studio: &[&'a str]) -> Option<Vec<&'a str>> {
+    if let Some(side) = changed_side(base, editor, studio) {
+        return Some(side.to_vec());
     }
     // Both sides added lines where there were none, and one of them added the
     // other's lines and more: a sync that stopped halfway leaves this.
@@ -133,55 +117,72 @@ fn region<'a>(
             return Some(editor.to_vec());
         }
     }
-    let preferred = |editor: &'a str, studio: &'a str| match preference {
-        ConflictPreference::Editor => Some(editor),
-        ConflictPreference::Studio => Some(studio),
-        ConflictPreference::None => None,
-    };
-    // Each side has as many lines here as there were, and no text of the
-    // region stands at one place on one side and at another on another: no
-    // line moved, so each line of the region is one line on every side. A
-    // line only one side changed is then that side's, also next to a line the
-    // two disagree about.
-    if base.len() == editor.len()
-        && base.len() == studio.len()
-        && !stands_elsewhere(editor, base)
-        && !stands_elsewhere(studio, base)
-        && !stands_elsewhere(editor, studio)
-    {
-        return base
-            .iter()
-            .zip(editor)
-            .zip(studio)
-            .map(|((base, editor), studio)| {
-                if editor == studio || studio == base {
-                    Some(*editor)
-                } else if editor == base {
-                    Some(*studio)
-                } else {
-                    preferred(editor, studio)
-                }
-            })
-            .collect();
+    if !rows_are_the_same_lines(base, editor, studio) {
+        return None;
     }
-    match preference {
-        ConflictPreference::Editor => Some(editor.to_vec()),
-        ConflictPreference::Studio => Some(studio.to_vec()),
-        ConflictPreference::None => None,
+    let quiet = |row: usize| base[row] == editor[row] && base[row] == studio[row];
+    let mut merged = Vec::with_capacity(base.len());
+    let mut row = 0;
+    while row < base.len() {
+        // A run of rows a side changed ends at the next row all three hold
+        // alike; a row no side changed is a run of its own.
+        let end = (row + 1..base.len())
+            .find(|next| quiet(row) || quiet(*next))
+            .unwrap_or(base.len());
+        merged.extend(changed_side(
+            &base[row..end],
+            &editor[row..end],
+            &studio[row..end],
+        )?);
+        row = end;
+    }
+    Some(merged)
+}
+
+/// The side whose lines stand where at most one side changed them, or both
+/// changed them alike.
+fn changed_side<'s, 'a>(
+    base: &[&'a str],
+    editor: &'s [&'a str],
+    studio: &'s [&'a str],
+) -> Option<&'s [&'a str]> {
+    if editor == studio || studio == base {
+        Some(editor)
+    } else if editor == base {
+        Some(studio)
+    } else {
+        None
     }
 }
 
-/// Whether a line of `lines` is also a line of `other` at another place.
-fn stands_elsewhere(lines: &[&str], other: &[&str]) -> bool {
-    let mut places = std::collections::HashMap::<&str, (usize, usize)>::new();
-    for (place, line) in other.iter().enumerate() {
-        places.entry(line).or_insert((place, 0)).1 += 1;
+/// Whether every row of the region is one line on all three sides: each side
+/// has as many lines as there were, and a text a side wrote into a row
+/// stands nowhere on the other side but in that row. A side that moved a
+/// line, or took one out and put another in elsewhere, wrote a text the
+/// other side still holds in the row it was in, and fails this.
+fn rows_are_the_same_lines(base: &[&str], editor: &[&str], studio: &[&str]) -> bool {
+    if base.len() != editor.len() || base.len() != studio.len() {
+        return false;
     }
-    lines.iter().enumerate().any(|(place, line)| {
-        places
-            .get(line)
-            .is_some_and(|(first, count)| *count > 1 || *first != place)
-    })
+    let (in_editor, in_studio) = (places(editor), places(studio));
+    let wrote_in_place = |side: &[&str], other: &HashMap<&str, (usize, usize)>| {
+        side.iter().enumerate().all(|(row, line)| {
+            *line == base[row]
+                || other
+                    .get(line)
+                    .is_none_or(|(first, count)| *count == 1 && *first == row)
+        })
+    };
+    wrote_in_place(editor, &in_studio) && wrote_in_place(studio, &in_editor)
+}
+
+/// The first row each text of `lines` stands in, and in how many rows.
+fn places<'a>(lines: &[&'a str]) -> HashMap<&'a str, (usize, usize)> {
+    let mut places = HashMap::with_capacity(lines.len());
+    for (row, line) in lines.iter().enumerate() {
+        places.entry(*line).or_insert((row, 0)).1 += 1;
+    }
+    places
 }
 
 fn lines(text: &str) -> Vec<&str> {
@@ -192,12 +193,6 @@ fn lines(text: &str) -> Vec<&str> {
 mod tests {
     use super::*;
 
-    const ANY: [ConflictPreference; 3] = [
-        ConflictPreference::None,
-        ConflictPreference::Editor,
-        ConflictPreference::Studio,
-    ];
-
     #[test]
     fn a_line_added_next_to_a_line_the_other_side_changed_is_written_once() {
         for (base, editor, studio) in [
@@ -206,65 +201,79 @@ mod tests {
             ("a\n", "X\na\n", "X\nA\n"),
             ("a\nb\n", "a\nb\nX\n", "a\nB\nX\n"),
         ] {
-            for preference in ANY {
-                let merged = merge_script_lines(base, editor, studio, preference);
-                assert!(
-                    merged
-                        .as_deref()
-                        .is_none_or(|text| text == editor || text == studio),
-                    "{preference:?} {base:?}: {merged:?}"
-                );
-            }
+            let merged = merge_script_lines(base, editor, studio);
+            assert!(
+                merged
+                    .as_deref()
+                    .is_none_or(|text| text == editor || text == studio),
+                "{base:?}: {merged:?}"
+            );
         }
     }
 
-    /// In a block where both sides only replaced lines, a line one side
-    /// changed is kept next to a line the two disagree about.
+    /// Lines that repeat between two edits part them like any line both
+    /// sides left alone.
     #[test]
-    fn replaced_lines_are_settled_one_by_one() {
-        let base = "a\nb\nc\nd\n";
-        let editor = "a\nb files\nc files\nd\n";
-        let studio = "a\nb studio\nc\nd studio\n";
-        assert!(merge_script_lines(base, editor, studio, ConflictPreference::None).is_none());
-        assert_eq!(
-            merge_script_lines(base, editor, studio, ConflictPreference::Editor).unwrap(),
-            "a\nb files\nc files\nd studio\n"
-        );
-        assert_eq!(
-            merge_script_lines(base, editor, studio, ConflictPreference::Studio).unwrap(),
-            "a\nb studio\nc files\nd studio\n"
-        );
-        // A side that dropped a line and added another has moved lines, and
-        // the block is one choice again.
-        assert_eq!(
-            merge_script_lines(
-                "p
-q
-",
-                "q
-N
-",
-                "p
-Q
-",
-                ConflictPreference::Studio
-            )
-            .unwrap(),
-            "p
-Q
-"
-        );
-        // Neighbouring lines changed by one side each are no conflict.
-        assert_eq!(
-            merge_script_lines(
-                "a\nb\nc\n",
-                "a\nB\nc\n",
-                "a\nb\nC\n",
-                ConflictPreference::None
-            )
-            .unwrap(),
-            "a\nB\nC\n"
-        );
+    fn edits_parted_by_lines_that_repeat_are_both_kept() {
+        for (base, editor, studio, both) in [
+            (
+                "a = 1\ntask.wait(1)\nb = 1\ntask.wait(1)\nc = 1\n",
+                "a = 2\ntask.wait(1)\nb = 1\ntask.wait(1)\nc = 1\n",
+                "a = 1\ntask.wait(1)\nb = 2\ntask.wait(1)\nc = 1\n",
+                "a = 2\ntask.wait(1)\nb = 2\ntask.wait(1)\nc = 1\n",
+            ),
+            (
+                "local t = {\n\t0,\n\t0,\n\t1,\n\t0,\n}\n",
+                "local t = {\n\t5,\n\t0,\n\t1,\n\t0,\n}\n",
+                "local t = {\n\t0,\n\t0,\n\t1,\n\t7,\n}\n",
+                "local t = {\n\t5,\n\t0,\n\t1,\n\t7,\n}\n",
+            ),
+            (
+                "a()\n\n\nb()\n\n\nc()\n\n\n",
+                "A()\n\n\nb()\n\n\nc()\n\n\n",
+                "a()\n\n\nB()\n\n\nc()\n\n\n",
+                "A()\n\n\nB()\n\n\nc()\n\n\n",
+            ),
+        ] {
+            assert_eq!(
+                merge_script_lines(base, editor, studio).as_deref(),
+                Some(both)
+            );
+            assert_eq!(
+                merge_script_lines(base, studio, editor).as_deref(),
+                Some(both)
+            );
+        }
+    }
+
+    /// Rows next to each other changed by one side each, a rename one side
+    /// made across a row the other edited, and a moved line beside an edit
+    /// are conflicts: no text is put together from parts of both answers.
+    #[test]
+    fn edits_that_touch_or_cross_a_moved_line_are_a_conflict() {
+        for (base, editor, studio) in [
+            ("a\nb\nc\n", "a\nB\nc\n", "a\nb\nC\n"),
+            (
+                "a\nb\nc\nd\n",
+                "a\nb files\nc files\nd\n",
+                "a\nb studio\nc\nd studio\n",
+            ),
+            (
+                "local x = 1\nprint(x)\nreturn 0\n",
+                "local y = 1\nprint(y)\nreturn 0\n",
+                "local x = 1\nprint(x + 1)\nreturn 0\n",
+            ),
+            ("a\nb\nc\nd\n", "a\nc\nb\nd\n", "a\nb\nc\nD\n"),
+            ("a\nb\nc\n", "b\na\nc\n", "a\nB\nc\n"),
+            ("p\nq\n", "q\nN\n", "p\nQ\n"),
+            // The same new text written into different rows.
+            ("\n\n\n\n", "N\n\n\n\n", "\n\n\nN\n"),
+            // A line taken out and another put in further down.
+            ("x\ny\ny\ny\nw\n", "y\ny\ny\nw\nz\n", "x\ny\nY\ny\nw\n"),
+        ] {
+            assert_eq!(merge_script_lines(base, editor, studio), None, "{base:?}");
+            assert_eq!(merge_script_lines(base, studio, editor), None, "{base:?}");
+        }
     }
 
     /// A block both sides hold is one block, also where its lines repeat
@@ -273,119 +282,43 @@ Q
     fn a_block_both_sides_hold_is_written_once_where_blank_lines_and_ends_repeat() {
         for (base, editor, studio) in [
             (
-                "local a = 1
-
-return a
-",
-                "local a = 1
-
-local b = 2
-
-return a
-",
-                "local a = 10
-
-local b = 2
-
-return a
-",
+                "local a = 1\n\nreturn a\n",
+                "local a = 1\n\nlocal b = 2\n\nreturn a\n",
+                "local a = 10\n\nlocal b = 2\n\nreturn a\n",
             ),
             (
-                "local function f()
-end
-
-return f
-",
-                "local function f()
-end
-
-local function g()
-end
-
-return f
-",
-                "local function f()
-	print(1)
-end
-
-local function g()
-end
-
-return f
-",
+                "local function f()\nend\n\nreturn f\n",
+                "local function f()\nend\n\nlocal function g()\nend\n\nreturn f\n",
+                "local function f()\n\tprint(1)\nend\n\nlocal function g()\nend\n\nreturn f\n",
             ),
             (
-                "if a then
-end
-return a
-",
-                "if a then
-end
-if b then
-end
-return a
-",
-                "if a then
-	x()
-end
-if b then
-end
-return a
-",
+                "if a then\nend\nreturn a\n",
+                "if a then\nend\nif b then\nend\nreturn a\n",
+                "if a then\n\tx()\nend\nif b then\nend\nreturn a\n",
             ),
             (
-                "x
-y
-x
-y
-z
-",
-                "x
-x
-y
-x
-y
-z
-",
-                "x
-y
-x
-y
-x
-y
-z
-",
+                "x\ny\nx\ny\nz\n",
+                "x\nx\ny\nx\ny\nz\n",
+                "x\ny\nx\ny\nx\ny\nz\n",
             ),
         ] {
-            for preference in ANY {
-                let merged = merge_script_lines(base, editor, studio, preference);
-                assert!(
-                    merged
-                        .as_deref()
-                        .is_none_or(|text| text == editor || text == studio),
-                    "{preference:?}: {merged:?}"
-                );
-            }
+            let merged = merge_script_lines(base, editor, studio);
+            assert!(
+                merged
+                    .as_deref()
+                    .is_none_or(|text| text == editor || text == studio),
+                "{merged:?}"
+            );
         }
     }
 
     /// A text made of a few repeating lines, edited at random.
     fn repeating(rng: &mut Rng, from: &[String]) -> Vec<String> {
         let line = |rng: &mut Rng| match rng.below(5) {
-            0 => "
-"
-            .to_string(),
-            1 => "end
-"
-            .to_string(),
-            2 => "	x()
-"
-            .to_string(),
-            _ => format!(
-                "local v = {}
-",
-                rng.below(3)
-            ),
+            0 => "\n".to_string(),
+            1 => "end\n".to_string(),
+            2 => "\tx()\n".to_string(),
+            _ => format!("local v = {}\n", rng.below(3)),
         };
         let mut text = Vec::new();
         for kept in from {
@@ -410,10 +343,7 @@ z
         let mut new = 0;
         let mut fresh = |text: &mut Vec<String>| {
             new += 1;
-            text.push(format!(
-                "new line {round} {new}
-"
-            ));
+            text.push(format!("new line {round} {new}\n"));
         };
         for kept in from {
             match rng.below(9) {
@@ -445,38 +375,62 @@ z
                 .collect::<Vec<_>>();
             let base = repeating(&mut rng, &seed)
                 .into_iter()
-                .chain((0..rng.below(8)).map(|line| {
-                    format!(
-                        "local v = {}
-",
-                        line % 3
-                    )
-                }))
+                .chain((0..rng.below(8)).map(|line| format!("local v = {}\n", line % 3)))
                 .collect::<Vec<_>>();
             let files = repeating(&mut rng, &base);
             let studio = with_new_lines(&mut rng, &files, round);
             let (base, files, studio) = (base.concat(), files.concat(), studio.concat());
             let explain = || format!("round {round}: {base:?} {files:?} {studio:?}");
-            match merge_script_lines(&base, &files, &studio, ConflictPreference::None) {
+            let merged = merge_script_lines(&base, &files, &studio);
+            match &merged {
                 Some(merged) => {
                     clean += 1;
-                    assert!(merged == studio, "{} gave {merged:?}", explain());
-                    for preference in ANY {
-                        let preferred = merge_script_lines(&base, &files, &studio, preference);
-                        assert!(preferred.as_deref() == Some(&studio), "{}", explain());
-                    }
+                    assert!(*merged == studio, "{} gave {merged:?}", explain());
                 }
                 None => conflicts += 1,
             }
-            let swapped = merge_script_lines(&base, &studio, &files, ConflictPreference::None);
+            // The answer does not depend on which side is called which.
             assert!(
-                swapped.as_deref().is_none_or(|merged| merged == studio),
-                "{} swapped gave {swapped:?}",
+                merged == merge_script_lines(&base, &studio, &files),
+                "{} differs when swapped",
                 explain()
             );
         }
         assert!(
             clean > 1_000 && conflicts > 200,
+            "{clean} clean, {conflicts} conflicts"
+        );
+    }
+
+    /// Among lines that repeat, a line each side put a new one in place of
+    /// is replaced by both when a line stands between the two, and the two
+    /// conflict when they are the same line or neighbours.
+    #[test]
+    fn replaced_rows_of_a_repeating_text_merge_unless_they_touch() {
+        let mut rng = Rng(0x0dd0_5eed_1234_abcd);
+        let (mut clean, mut conflicts) = (0, 0);
+        for round in 0..3_000 {
+            let count = 2 + rng.below(12);
+            let base = (0..count)
+                .map(|_| ["\n", "end\n", "\tx()\n"][rng.below(3)].to_string())
+                .collect::<Vec<_>>();
+            let (at_files, at_studio) = (rng.below(count), rng.below(count));
+            let (mut files, mut studio) = (base.clone(), base.clone());
+            files[at_files] = format!("files {round}\n");
+            studio[at_studio] = format!("studio {round}\n");
+            let mut both = files.clone();
+            both[at_studio] = studio[at_studio].clone();
+            let merged = merge_script_lines(&base.concat(), &files.concat(), &studio.concat());
+            if at_files.abs_diff(at_studio) > 1 {
+                clean += 1;
+                assert_eq!(merged, Some(both.concat()), "round {round}: {base:?}");
+            } else {
+                conflicts += 1;
+                assert_eq!(merged, None, "round {round}: {base:?}");
+            }
+        }
+        assert!(
+            clean > 1_000 && conflicts > 300,
             "{clean} clean, {conflicts} conflicts"
         );
     }
@@ -496,10 +450,7 @@ z
                 .enumerate()
                 .map(|(place, line)| {
                     if place % 3 == 0 {
-                        format!(
-                            "only {place}
-"
-                        )
+                        format!("only {place}\n")
                     } else {
                         line
                     }
@@ -578,72 +529,52 @@ z
                 .collect::<String>();
             let editor = edited(&mut rng, count, "the files");
             let studio = edited(&mut rng, count, "Studio");
-            let merge = |preference| merge_script_lines(&base, &editor, &studio, preference);
-            let none = merge(ConflictPreference::None);
 
             // A side that changed nothing takes the other's text, and two
             // equal sides are their own merge.
-            for preference in ANY {
-                assert!(
-                    merge_script_lines(&base, &editor, &base, preference).as_deref()
-                        == Some(&editor)
-                );
-                assert!(
-                    merge_script_lines(&base, &base, &studio, preference).as_deref()
-                        == Some(&studio)
-                );
-                assert!(
-                    merge_script_lines(&base, &editor, &editor, preference).as_deref()
-                        == Some(&editor)
-                );
-            }
+            assert!(merge_script_lines(&base, &editor, &base).as_deref() == Some(&editor));
+            assert!(merge_script_lines(&base, &base, &studio).as_deref() == Some(&studio));
+            assert!(merge_script_lines(&base, &editor, &editor).as_deref() == Some(&editor));
+
+            let merged = merge_script_lines(&base, &editor, &studio);
             // The answer does not depend on which side is called which.
             assert!(
-                none == merge_script_lines(&base, &studio, &editor, ConflictPreference::None),
+                merged == merge_script_lines(&base, &studio, &editor),
                 "round {round}"
             );
-            // A preference only matters where there is a conflict, and with
-            // one there is always a text.
-            let (by_editor, by_studio) = (
-                merge(ConflictPreference::Editor).unwrap(),
-                merge(ConflictPreference::Studio).unwrap(),
-            );
-            match &none {
-                Some(text) => {
-                    clean += 1;
-                    assert!(*text == by_editor && *text == by_studio, "round {round}");
-                }
-                None => conflicts += 1,
+            let Some(merged) = merged else {
+                conflicts += 1;
+                continue;
+            };
+            clean += 1;
+            let mut seen = std::collections::HashSet::new();
+            for line in lines(&merged) {
+                // No line is written twice: no side holds one twice.
+                assert!(
+                    seen.insert(line.trim_end_matches('\n')),
+                    "round {round}: {line:?} twice in {merged:?}"
+                );
+                // Every line is one a side wrote or left.
+                assert!(
+                    lines(&editor).contains(&line) || lines(&studio).contains(&line),
+                    "round {round}: {line:?} is from neither side"
+                );
             }
-            for merged in [&by_editor, &by_studio] {
-                let mut seen = std::collections::HashSet::new();
-                for line in lines(merged) {
-                    // No line is written twice: no side holds one twice.
-                    assert!(
-                        seen.insert(line.trim_end_matches('\n')),
-                        "round {round}: {line:?} twice in {merged:?}"
-                    );
-                    // Every line is one a side wrote or left.
-                    assert!(
-                        lines(&editor).contains(&line) || lines(&studio).contains(&line),
-                        "round {round}: {line:?} is from neither side"
-                    );
-                }
-            }
-            // A line both sides dropped or replaced does not come back, and
-            // a line a side added that the other did not contest is there.
+            // A line a side dropped or replaced does not come back, and a
+            // line a side added is there.
             for line in lines(&base) {
-                let kept = lines(&editor).contains(&line) || lines(&studio).contains(&line);
-                assert!(kept || !lines(&by_editor).contains(&line), "round {round}");
+                let kept = lines(&editor).contains(&line) && lines(&studio).contains(&line);
+                assert!(
+                    kept == lines(&merged).contains(&line),
+                    "round {round}: {line:?} in {merged:?}"
+                );
             }
-            if let Some(text) = &none {
-                for line in lines(&editor).into_iter().chain(lines(&studio)) {
-                    let added = !lines(&base).contains(&line);
-                    assert!(
-                        !added || lines(text).contains(&line),
-                        "round {round}: {line:?} lost"
-                    );
-                }
+            for line in lines(&editor).into_iter().chain(lines(&studio)) {
+                let added = !lines(&base).contains(&line);
+                assert!(
+                    !added || lines(&merged).contains(&line),
+                    "round {round}: {line:?} lost"
+                );
             }
         }
         assert!(
