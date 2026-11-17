@@ -1649,10 +1649,26 @@ fn remap_positional_ids(reference: &SettingsBytecode, observed: &mut SettingsByt
         .map(|(observed, reference)| (observed.settings_id.clone(), reference.settings_id.clone()))
         .collect::<HashMap<_, _>>();
     let service = store_service(observed).map(str::to_string);
-    for (observed, reference) in observed.instances.iter_mut().zip(&reference.instances) {
-        observed.settings_id.clone_from(&reference.settings_id);
-        remap_record_reference_ids(&mut observed.properties, &remap, service.as_deref());
-        remap_record_reference_ids(&mut observed.attributes, &remap, service.as_deref());
+    let rename =
+        |(observed, reference): (&mut SettingsBytecodeInstance, &SettingsBytecodeInstance)| {
+            observed.settings_id.clone_from(&reference.settings_id);
+            remap_record_reference_ids(&mut observed.properties, &remap, service.as_deref());
+            remap_record_reference_ids(&mut observed.attributes, &remap, service.as_deref());
+        };
+    // Every record is walked for references: seconds on a large store when
+    // one thread does it.
+    if observed.instances.len() >= 2_048 && rayon::current_num_threads() > 1 {
+        observed
+            .instances
+            .par_iter_mut()
+            .zip(reference.instances.par_iter())
+            .for_each(rename);
+    } else {
+        observed
+            .instances
+            .iter_mut()
+            .zip(&reference.instances)
+            .for_each(rename);
     }
 }
 
