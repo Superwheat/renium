@@ -7,6 +7,10 @@ license-file = "../../LICENSE"
 repository = "https://github.com/Superwheat/renium"
 build = "build.rs"
 
+[features]
+# Counts live bytes for memory profiles; slower, never shipped.
+count-live-memory = []
+
 [dependencies]
 regex = "1"
 anyhow = "1.0.100"

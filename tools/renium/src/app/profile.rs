@@ -78,15 +78,96 @@ pub(crate) fn record_between(label: &str, started: Instant, ended: Instant) {
     if !enabled() {
         return;
     }
+    let label = match committed_megabytes() {
+        Some(megabytes) => format!("{label} [{megabytes} MB held]"),
+        None => label.to_string(),
+    };
     let mut state = STATE.lock_recover();
     if state.records.len() < MAX_RECORDS {
         state.records.push(Record {
-            label: label.to_string(),
+            label,
             thread: std::thread::current().id(),
             started,
             ended,
         });
     }
+}
+
+/// A build with the `count-live-memory` feature counts every allocation, so a
+/// profile can say how many bytes are in use, apart from what the allocator
+/// has freed and not yet given back. Counting costs time: such a build is for
+/// finding what holds memory, never for timing.
+#[cfg(feature = "count-live-memory")]
+pub(crate) struct CountingAllocator;
+
+#[cfg(feature = "count-live-memory")]
+static LIVE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "count-live-memory")]
+unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        LIVE_BYTES.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        unsafe { mimalloc::MiMalloc.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        LIVE_BYTES.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+        LIVE_BYTES.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        unsafe { mimalloc::MiMalloc.dealloc(pointer, layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        LIVE_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+        LIVE_BYTES.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        unsafe { mimalloc::MiMalloc.realloc(pointer, layout, size) }
+    }
+}
+
+/// The memory the process holds as a step ends, when `RENIUM_PROFILE_MEMORY`
+/// is set: each step of the profile then says where the memory stood, which
+/// shows the step that grows it. A `count-live-memory` build gives the bytes
+/// in use; any other build what the allocator has committed.
+fn committed_megabytes() -> Option<usize> {
+    static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*WANTED.get_or_init(|| std::env::var_os("RENIUM_PROFILE_MEMORY").is_some()) {
+        return None;
+    }
+    #[cfg(feature = "count-live-memory")]
+    return Some(LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20);
+    #[cfg(not(feature = "count-live-memory"))]
+    committed_by_the_allocator()
+}
+
+#[cfg(not(feature = "count-live-memory"))]
+fn committed_by_the_allocator() -> Option<usize> {
+    let mut committed = 0usize;
+    let mut unused = [0usize; 7];
+    let [
+        elapsed,
+        user,
+        system,
+        resident,
+        peak_resident,
+        peak_committed,
+        faults,
+    ] = &mut unused;
+    unsafe {
+        libmimalloc_sys::mi_process_info(
+            elapsed,
+            user,
+            system,
+            resident,
+            peak_resident,
+            &mut committed,
+            peak_committed,
+            faults,
+        );
+    }
+    Some(committed >> 20)
 }
 
 /// A step that lasts until the value is dropped.

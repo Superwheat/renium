@@ -7,8 +7,12 @@ use anyhow::{Context, Result};
 use clap::FromArgMatches;
 use serde_json::json;
 
+#[cfg(not(feature = "count-live-memory"))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(feature = "count-live-memory")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: app::profile::CountingAllocator = app::profile::CountingAllocator;
 
 macro_rules! eprintln {
     ($format:literal $(, $argument:expr)* $(,)?) => {{
