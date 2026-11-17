@@ -32,16 +32,14 @@ instance. `rbx vci` makes Git show and merge a store as text.
 
 ### It stays fast on a big place
 
-The same 202,000-instance place, on a desktop PC with Windows:
+On that 202,000-instance place:
 
 | | Time |
 |---|---|
-| Push the whole project into an empty place, verified | 11 s |
-| Push again with nothing changed | 0.4 s |
-| Pull the whole place with nothing changed | 5 s |
-| Pull after one property changed in Studio | 4.5 s |
+| Send the whole project to an empty Studio place | 11 s |
+| Bring one property changed in Studio into the files | 4.5 s |
 
-Times are from version 0.6.5.
+Times are from version 0.6.5 on a Windows desktop.
 
 ### Both sides can change
 
@@ -60,22 +58,10 @@ someone clicking for it, through its terminal or through one MCP tool.
 
 ## Install
 
-Download the package for your system from
-[Releases](https://github.com/Superwheat/renium/releases/latest).
-
-| System | Install |
-|---|---|
-| Windows (x64, ARM64) | Run `Install-Renium.cmd`. It picks the right build, checks each download against the release's checksums and puts `rbx` on PATH. |
-| macOS (Apple Silicon, Intel) | Extract the ZIP and open `Install Renium.command`. Capture and input may need Screen Recording or Accessibility permission. |
-| Linux (x64, ARM64) | Extract the ZIP and run `./install.sh`. Studio does not run on Linux, so you get the offline tools, Open Cloud and plugins, but nothing that needs Studio. |
-
-The installer sets up the Studio plugin and asks which editor, VS Code or Cursor,
-should get the extension. Restart the editor and Studio afterward.
-
-- `rbx upd` updates all three together.
-- `renium` is another name for `rbx`.
-- There is no server to start. The first `rbx` command starts Renium's background
-  process, and the Studio plugin connects to it by itself.
+Get the package for Windows, macOS or Linux from
+[Releases](https://github.com/Superwheat/renium/releases/latest). It sets up the
+`rbx` command, the Studio plugin and the VS Code or Cursor extension, and `rbx upd`
+updates all three.
 
 ## How sync works
 
@@ -123,47 +109,13 @@ Renium is updated.
 
 ## Working with an AI agent
 
-### In a project
-
-`rbx init` writes `RENIUM.md` and a `RENIUM/` folder of topic guides into the
-project. It adds short pointers to them in `AGENTS.md` and `CLAUDE.md` without
-removing what is already there.
-
-An agent such as Claude Code or Codex reads `RENIUM.md` (about 1,200 tokens) and
-opens a topic guide only when a task needs it.
-
-### How an agent calls Renium
-
-The agent runs `rbx` in its terminal, or calls it as one MCP tool, `rbx`, whose
-input is the argument list. Either way it loads no tool schemas.
-
-### What the installer sets up
-
-- It adds a short note about `rbx` to the global instructions of Claude Code, Codex,
-  Gemini CLI, OpenCode and Windsurf when it finds them.
-- It registers `rbx mcp` as the `renium` MCP server in the configs of Claude Code,
-  Codex, Cursor, Windsurf, Gemini CLI and OpenCode.
-- It keeps a `.renium.bak` copy of each file it changes.
-
-`rbx mcp --install` and `rbx mcp --uninstall` do the same by hand.
-
-### Commands agents use most
-
-Each command prints compact JSON, and `print` output comes back to the command
-instead of Studio's Output window.
-
-| Task | Command |
-|---|---|
-| Run Luau in Edit, or on the server during Play | `rbx l "return workspace.Gravity"` |
-| Run Luau on play client 1 | `rbx lc "return game.Players.LocalPlayer.Name" 1` |
-| Start Play with a server and two clients | `rbx play -s --players 2` |
-| Wait until something is true in the game | `rbx wait "workspace:GetAttribute('Ready')" -t 30` |
-| Read the server's errors | `rbx co --server --level error` |
-| Click and press keys in a client | `rbx inp -p 1 click Shop.BuyButton wait 100 key E` |
-| Screenshot a client window | `rbx sc --client -p 1 -o shot.png` |
-| Find saved instances with Studio closed | `rbx f Workspace -n Door` |
-
-`rbx` lists every command and `rbx COMMAND --help` shows its options.
+- `rbx init` writes `RENIUM.md` and a folder of topic guides into the project. An
+  agent reads about 1,200 tokens and opens a guide only when a task needs it.
+- The agent runs `rbx` in its terminal, or as one MCP tool whose input is the
+  argument list, so it loads no tool schemas.
+- The installer registers that tool and adds a short note for Claude Code, Codex,
+  Cursor, Windsurf, Gemini CLI and OpenCode. It keeps a `.renium.bak` copy of each
+  file it changes.
 
 ## Help
 
