@@ -2051,6 +2051,11 @@ fn decode_native_serialization_batch(
     property_filter: Arc<HashMap<String, HashSet<String>>>,
     identity_rows: Option<&[u8]>,
 ) -> Result<HashMap<String, NativeServiceDom>> {
+    let _profile = crate::app::profile::span(&format!(
+        "{}: decode and partition {} bytes",
+        batch.id,
+        bytes.len()
+    ));
     let groups = batch
         .services
         .iter()
@@ -2127,9 +2132,13 @@ fn decode_native_serialization_batch(
             expected_instances
         );
     }
+    let identities = crate::app::profile::span("native capture validate every identity");
     let captured_debug_ids = identity_rows
         .map(|rows| native_capture_debug_ids(&flat.instances, rows))
         .transpose()?;
+    drop(identities);
+    let references =
+        crate::app::profile::span("native capture partition bounds and cross-service references");
     let mut spans = Vec::with_capacity(groups.len());
     let mut root_offset = 0;
     let mut expected_start = 0;
@@ -2256,10 +2265,15 @@ fn decode_native_serialization_batch(
     }
     let path_segments_by_ref = Arc::new(path_segments_by_ref);
     let path_ordinals_by_ref = Arc::new(path_ordinals_by_ref);
+    drop(references);
     let root_indices = flat.root_indices;
     let mut source_instances = flat.instances.into_iter();
     let mut doms = HashMap::with_capacity(groups.len());
     for (group_index, group) in groups.into_iter().enumerate() {
+        let _service = crate::app::profile::span(&format!(
+            "{}: partition {} native instances",
+            group.service, group.instance_count
+        ));
         let (start, end, root_start, root_end) = spans[group_index];
         let mut instances = source_instances
             .by_ref()

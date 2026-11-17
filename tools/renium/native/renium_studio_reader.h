@@ -36,7 +36,7 @@ struct CreatedWire
 };
 struct Response
 {
-    std::uint32_t magic = 0x52494E52, version = 6, status = 1, count = 0;
+    std::uint32_t magic = 0x52494E52, version = 7, status = 1, count = 0;
     std::uint64_t queueMicros = 0, readMicros = 0, identityMicros = 0;
     std::uint64_t historySkipped = 0;
     std::uint32_t state = 0, batchCount = 0;
@@ -59,7 +59,10 @@ static_assert(sizeof(ReaderTiming) == 136);
 // producer. The completion event orders access; a wait is never added to the
 // engine work it already contains. Raw QPC ticks avoid cumulative rounding gaps.
 struct ReaderClock {
+    struct Interval { std::uint64_t phase, start, end; };
+    static_assert(sizeof(Interval) == 24);
     ReaderTiming value;
+    std::vector<Interval> intervals;
     LARGE_INTEGER last{};
     ReaderPhase phase = ReaderPhase::Setup;
     bool enabled;
@@ -75,6 +78,8 @@ struct ReaderClock {
             const auto elapsed = static_cast<std::uint64_t>(now.QuadPart - last.QuadPart);
             value.ticks[static_cast<unsigned>(phase)] += elapsed;
             value.total += elapsed;
+            intervals.push_back({ static_cast<std::uint64_t>(phase),
+                static_cast<std::uint64_t>(last.QuadPart), static_cast<std::uint64_t>(now.QuadPart) });
             last = now;
         }
         phase = next;
@@ -838,6 +843,13 @@ inline DWORD Queue(Parameters* parameters)
     if (!WriteFile(task->output, &task->clock.value, sizeof(ReaderTiming), &timingWritten, nullptr)
         || timingWritten != sizeof(ReaderTiming))
         throw std::runtime_error("Cannot publish native import accounting");
+    const std::uint64_t intervalCount = task->clock.intervals.size();
+    const DWORD intervalBytes = static_cast<DWORD>(intervalCount * sizeof(ReaderClock::Interval));
+    if (!WriteFile(task->output, &intervalCount, sizeof(intervalCount), &timingWritten, nullptr)
+        || timingWritten != sizeof(intervalCount)
+        || (intervalBytes && (!WriteFile(task->output, task->clock.intervals.data(), intervalBytes, &timingWritten, nullptr)
+            || timingWritten != intervalBytes)))
+        throw std::runtime_error("Cannot publish native import timeline");
     return parameters->status == 4 ? 0 : parameters->status;
 }
 inline DWORD Boundary(Parameters* parameters)

@@ -5,3 +5,4 @@ pub(crate) mod import;
 pub(crate) mod serializer;
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) mod snapshot;
+pub(crate) mod timing;

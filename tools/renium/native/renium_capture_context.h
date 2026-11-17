@@ -4,7 +4,16 @@
 #include <cstring>
 #include <stdexcept>
 
-static constexpr std::uint32_t ReniumSerializerVersion = 2;
+static constexpr std::uint32_t ReniumSerializerVersion = 3;
+
+// Renium's own wire layout, independent of the engine's objects. QPC is shared
+// across processes; the host pins it to an Instant before invoking the helper.
+struct CaptureTimeline
+{
+    std::uint64_t frequency;
+    std::uint64_t ticks[10];
+};
+static_assert(sizeof(CaptureTimeline) == 88);
 
 struct SharedInstance
 {
@@ -64,9 +73,11 @@ struct ReniumSerializerParams
     std::uint64_t contextObserved;
     std::uint32_t contextRead;
     std::uint32_t contextReserved;
+    CaptureTimeline timeline;
 };
 
-static_assert(sizeof(ReniumSerializerParams) == 5936);
+static_assert(sizeof(ReniumSerializerParams) == 6024);
+static_assert(offsetof(ReniumSerializerParams, timeline) == 5936);
 static_assert(offsetof(ReniumSerializerParams, status) == 68);
 static_assert(offsetof(ReniumSerializerParams, placeMode) == 136);
 static_assert(offsetof(ReniumSerializerParams, dataModelInstanceOffset) == 140);
@@ -101,8 +112,10 @@ struct CaptureContextResponse
     std::uint32_t fieldOffset, instanceSize;
     std::uint64_t pointerMask, observed;
     std::uint32_t read, reserved;
+    CaptureTimeline timeline;
 };
-static_assert(sizeof(CaptureContextResponse) == 352);
+static_assert(sizeof(CaptureContextResponse) == 440);
+static_assert(offsetof(CaptureContextResponse, timeline) == 352);
 static_assert(offsetof(CaptureContextResponse, fieldOffset) == 320);
 static_assert(offsetof(CaptureContextResponse, instanceSize) == 324);
 static_assert(offsetof(CaptureContextResponse, pointerMask) == 328);
@@ -113,7 +126,7 @@ inline CaptureContextResponse MakeCaptureResponse(const ReniumSerializerParams& 
 {
     CaptureContextResponse response{{0x50414352, p.captureMode ? ReniumSerializerVersion : 1, p.status, result,
         p.outputSize, p.identitySize, p.queueMicros, p.serializeMicros, p.identityMicros, p.writeMicros, {}},
-        p.contextFieldOffset, p.dataModelInstanceSize, p.contextPointerMask, p.contextObserved, p.contextRead, 0};
+        p.contextFieldOffset, p.dataModelInstanceSize, p.contextPointerMask, p.contextObserved, p.contextRead, 0, p.timeline};
     std::memcpy(response.base.error, p.error, sizeof(response.base.error) - 1);
     return response;
 }

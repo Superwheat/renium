@@ -399,6 +399,7 @@ static DWORD RunCore(RunState* state)
     state->stream = new std::ostringstream(std::ios::binary | std::ios::out);
     state->streamBuilt = true;
     QueryPerformanceCounter(&started);
+    params->timeline.ticks[3] = started.QuadPart;
     if (params->placeMode)
     {
         // Rust already validated this build's layout and captured these roots.
@@ -434,6 +435,7 @@ static DWORD RunCore(RunState* state)
     }
     QueryPerformanceCounter(&finished);
     params->serializeMicros = ElapsedMicros(started, finished, frequency);
+    params->timeline.ticks[4] = finished.QuadPart;
     CheckSerializerDeadline(state);
     if (params->captureMode)
     {
@@ -446,6 +448,9 @@ static DWORD RunCore(RunState* state)
         params->identityMicros = ElapsedMicros(started, finished, frequency);
         CheckCaptureWindow(params);
     }
+    LARGE_INTEGER identityFinished{};
+    QueryPerformanceCounter(&identityFinished);
+    params->timeline.ticks[5] = identityFinished.QuadPart;
     params->status = 3;
 
     if (!params->captureMode)
@@ -481,6 +486,7 @@ static DWORD RunCore(RunState* state)
     }
 
     QueryPerformanceCounter(&started);
+    params->timeline.ticks[6] = started.QuadPart;
     bool wrote = WriteSnapshotBytes(state, payload.data(), payload.size());
     if (wrote && params->captureMode)
         wrote = WriteSnapshotBytes(state, state->identities->data(), params->identitySize);
@@ -490,6 +496,7 @@ static DWORD RunCore(RunState* state)
     state->file = nullptr;
     QueryPerformanceCounter(&finished);
     params->writeMicros = ElapsedMicros(started, finished, frequency);
+    params->timeline.ticks[7] = finished.QuadPart;
     if (!wrote)
     {
         if (state->fileCreated) DeleteFileW(params->outputPath);
@@ -667,6 +674,9 @@ static DWORD RunSerializer(ReniumSerializerParams* params, const std::atomic<boo
     state.cancelled = cancelled;
     const auto result = RunCppCaught(&state);
     CleanupCaught(&state);
+    LARGE_INTEGER cleaned{};
+    QueryPerformanceCounter(&cleaned);
+    params->timeline.ticks[8] = cleaned.QuadPart;
     SetMxcsr(params->initialMxcsr);
     if ((result || params->status != 4) && state.fileCreated) DeleteFileW(params->outputPath);
     return result ? result : (params->status == 4 ? 0 : params->status);
@@ -752,6 +762,11 @@ static DWORD QueueSerializer(ReniumSerializerParams* params)
         !params->timeoutMs || params->timeoutMs > 15000)
         return 0xE008;
     ValidateSerializerProtocol(*params);
+    LARGE_INTEGER entered{}, clockFrequency{};
+    QueryPerformanceCounter(&entered);
+    QueryPerformanceFrequency(&clockFrequency);
+    params->timeline.frequency = clockFrequency.QuadPart;
+    params->timeline.ticks[0] = entered.QuadPart;
     if (params->captureMode) ValidateCaptureContextBinding(*params);
     auto owner = reinterpret_cast<void*>(params->dataModelOwner);
     if (!AddOwnerReference(owner)) throw std::runtime_error("DataModel owner expired");
@@ -765,9 +780,11 @@ static DWORD QueueSerializer(ReniumSerializerParams* params)
     LARGE_INTEGER queued{}, frequency{};
     QueryPerformanceCounter(&queued);
     QueryPerformanceFrequency(&frequency);
+    task->result.timeline.ticks[1] = queued.QuadPart;
     std::function<void()> work{[task, queued, frequency]() {
         LARGE_INTEGER started{};
         QueryPerformanceCounter(&started);
+        task->result.timeline.ticks[2] = started.QuadPart;
         task->result.queueMicros = ElapsedMicros(queued, started, frequency);
         if (!RemainingMilliseconds(task->result.deadlineTick))
         {
@@ -787,6 +804,9 @@ static DWORD QueueSerializer(ReniumSerializerParams* params)
         throw std::runtime_error("Native snapshot exceeded its response deadline");
     }
     *params = task->result;
+    LARGE_INTEGER completed{};
+    QueryPerformanceCounter(&completed);
+    params->timeline.ticks[9] = completed.QuadPart;
     task->delivered = params->status == 4;
     return task->delivered ? 0 : params->status;
 }

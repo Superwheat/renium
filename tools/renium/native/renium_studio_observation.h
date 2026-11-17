@@ -13,7 +13,7 @@ struct Params {
     std::uintptr_t relayOffset, fireRelay;
     HANDLE host;
 };
-static_assert(sizeof(Params) == 6048);
+static_assert(sizeof(Params) == sizeof(ReniumSerializerParams) + 112);
 static_assert(offsetof(Params, signalOffset) == sizeof(ReniumSerializerParams));
 static_assert(offsetof(Params, appendAbi) == sizeof(ReniumSerializerParams) + 4);
 

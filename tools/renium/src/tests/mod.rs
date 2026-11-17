@@ -722,6 +722,23 @@ fn parse_bridge_raw_chunk_preserves_payload() {
 }
 
 #[test]
+fn profiled_bridge_chunks_preserve_binary_text_and_legacy_metadata() {
+    let header = serde_json::json!({"id":9,"start":1,"nextStart":6,"total":5,
+        "pluginServerMs":3.0,"pluginEncodeMs":1.0,"serializationComplete":true,
+        "nativeProfile":{"version":1,"elapsedMs":3.0,"spans":[["overlay",0,2]]}});
+    let payload = "a\nb\0c";
+    let (id, chunk) = parse_bridge_raw_chunk(format!("RBS5 {header}\n{payload}"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, 9);
+    assert_eq!(chunk.chunk, payload);
+    assert!(chunk.serialization_complete);
+    assert_eq!(chunk.plugin_server_ms, Some(3.0));
+    assert!(parse_bridge_raw_chunk("RBS5 {}".into()).is_err());
+    assert!(parse_bridge_raw_chunk("RBS5 {}\n".into()).is_err());
+}
+
+#[test]
 fn parse_bridge_raw_chunk_accepts_payload_cache_hits() {
     let frame = "RBS3 43 1 1 5543299 0.75 0 1 1 Ymxha2Uz\n".to_string();
     let (id, chunk) = parse_bridge_raw_chunk(frame).unwrap().unwrap();

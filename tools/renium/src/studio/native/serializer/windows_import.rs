@@ -43,6 +43,9 @@ pub(crate) fn read_service_payload(
     timeout: Duration,
     invoked: &mut bool,
 ) -> Result<NativeReadReceipt> {
+    let prepare_profile = crate::app::profile::span(
+        "native import discovery, payload transfer and dispatch preparation",
+    );
     let started = Instant::now();
     anyhow::ensure!(
         (32..=512 * 1024 * 1024).contains(&bytes.len()),
@@ -370,21 +373,26 @@ pub(crate) fn read_service_payload(
     put_u32(
         &mut parameters,
         1436,
-        u32::from(crate::app::output::global_log_enabled(5)),
+        u32::from(crate::app::profile::enabled()),
     );
     let remote = memory.allocate(parameters.len())?;
     memory.write(remote.address, &parameters)?;
     let helper_started = Instant::now();
+    drop(prepare_profile);
+    let helper_profile = crate::app::profile::span("native import helper round trip");
+    let clock = super::super::super::timing::CounterAnchor::now();
     *invoked = true;
     let exit = remote.run_owned(entry, capture_remaining_ms(started, timeout)?)?;
     let helper_finished = Instant::now();
+    drop(helper_profile);
+    let _receipt_profile = crate::app::profile::span("native import receive and validate receipt");
     let helper_wall_ms = helper_finished.duration_since(helper_started).as_secs_f64() * 1000.0;
     let mut response = [0; RESPONSE];
     transport
         .read_exact(&mut response)
         .context("Native import outcome is unavailable; do not retry the mutation")?;
     anyhow::ensure!(
-        read_u32(&response, 0)? == 0x52494E52 && read_u32(&response, 4)? == 6,
+        read_u32(&response, 0)? == 0x52494E52 && read_u32(&response, 4)? == 7,
         "Native import receipt header is invalid"
     );
     let status = read_u32(&response, 8)?;
@@ -402,8 +410,11 @@ pub(crate) fn read_service_payload(
             && (status != 4 || count == expected_created)
             && history_skipped <= count
             && transport.metadata()?.len()
-                == (RESPONSE + count * CREATED_ROW + replacement.batches.len() * 8 + READER_TIMING)
-                    as u64,
+                >= (RESPONSE
+                    + count * CREATED_ROW
+                    + replacement.batches.len() * 8
+                    + READER_TIMING
+                    + 8) as u64,
         "Native import creation receipt is incomplete"
     );
     anyhow::ensure!(
@@ -453,6 +464,37 @@ pub(crate) fn read_service_payload(
         measured == total,
         "Native timing phases do not cover the helper timeline"
     );
+    let mut interval_count = [0; 8];
+    transport.read_exact(&mut interval_count)?;
+    let interval_count = usize::try_from(u64::from_le_bytes(interval_count))?;
+    anyhow::ensure!(
+        interval_count <= replacement.batches.len() * 16 + 32,
+        "Native import timeline exceeds its bound"
+    );
+    let mut intervals = vec![0; interval_count * 24];
+    transport.read_exact(&mut intervals)?;
+    anyhow::ensure!(
+        transport.metadata()?.len()
+            == (RESPONSE
+                + count * CREATED_ROW
+                + replacement.batches.len() * 8
+                + READER_TIMING
+                + 8
+                + intervals.len()) as u64,
+        "Native import timeline is truncated or has trailing bytes"
+    );
+    for row in intervals.chunks_exact(24) {
+        let phase = usize::try_from(read_u64(row, 0)?)?;
+        let name = names
+            .get(phase)
+            .context("Invalid native import timeline phase")?;
+        clock.record(
+            "native import helper",
+            frequency,
+            &[read_u64(row, 8)?, read_u64(row, 16)?],
+            &[*name],
+        );
+    }
     crate::app::output::log_global(
         5,
         format_args!(

@@ -79,7 +79,7 @@ use crate::system::LockRecover;
 use crate::system::files::{atomic_write_file, fnv1a};
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dll"));
-const PARAM_SIZE: usize = 5936;
+const PARAM_SIZE: usize = 6024;
 const PARAM_STATUS: usize = 68;
 const PARAM_OUTPUT_SIZE: usize = 72;
 const PARAM_CONTEXT_MICROS: usize = 80;
@@ -100,8 +100,8 @@ const PARAM_SELF_OFFSET: usize = 5816;
 const PARAM_IDENTITY_BINDING: usize = 5840;
 const PARAM_IDENTITY_GETTER: usize = 5848;
 const PARAM_DEBUG_ID_GETTER: usize = 5856;
-const CAPTURE_HEADER_SIZE: usize = 352;
-const CAPTURE_HEADER_MAGIC: u32 = 0x50414352; // RCAP; capture uses version 2.
+const CAPTURE_HEADER_SIZE: usize = 440;
+const CAPTURE_HEADER_MAGIC: u32 = 0x50414352; // RCAP; capture uses version 3.
 const PARAM_CAPTURE_MODE: usize = 5880;
 const PARAM_PARENT_OFFSET: usize = 5884;
 const PARAM_WINDOW: usize = 5888;
@@ -3014,7 +3014,9 @@ fn capture_live_services_once(
     timeout: Duration,
     memory: &ProcessMemory,
 ) -> Result<NativeCapture> {
+    let _profile = crate::app::profile::span("native capture host and helper");
     let started = Instant::now();
+    let discovery = crate::app::profile::span("native capture structural discovery and bindings");
     capture_remaining_ms(started, timeout)?;
     anyhow::ensure!(
         !services.is_empty() && services.len() <= MAX_ROOTS,
@@ -3067,6 +3069,8 @@ fn capture_live_services_once(
         &current_modules,
         capture_remaining_ms(started, timeout)?,
     )?;
+    drop(discovery);
+    let prepare = crate::app::profile::span("native capture transport and dispatch preparation");
     let entry = helper
         .checked_add(helper_export_rva("ReniumCaptureRun")?)
         .context("Studio capture helper address overflowed")?;
@@ -3130,7 +3134,12 @@ fn capture_live_services_once(
     put_u32(&mut parameters, PARAM_TIMEOUT, remaining.min(15_000));
     let remote = memory.allocate(parameters.len())?;
     memory.write(remote.address, &parameters)?;
+    drop(prepare);
+    let helper_span = crate::app::profile::span("native capture helper round trip");
+    let clock = super::super::timing::CounterAnchor::now();
     let exit = remote.run_owned(entry, capture_remaining_ms(started, timeout)?)?;
+    drop(helper_span);
+    let receive = crate::app::profile::span("native capture receive and validate transport");
     // The helper has freed its input. Response is exclusively file-backed.
     let mut header = [0; CAPTURE_HEADER_SIZE];
     transport
@@ -3147,6 +3156,37 @@ fn capture_live_services_once(
     task_context.log_helper_reading(pid, &header)?;
     let (byte_count, identity_count) =
         capture_lengths(&header, services.len(), transport.metadata()?.len())?;
+    let ticks = (0..10)
+        .map(|i| read_u64(&header, 360 + i * 8))
+        .collect::<Result<Vec<_>>>()?;
+    clock.record(
+        "native capture helper",
+        read_u64(&header, 352)?,
+        &ticks,
+        &[
+            "task allocation and ownership",
+            "DataModel queue wait",
+            "target validation",
+            "engine serialize selected services",
+            "identity and hierarchy walk",
+            "open transport",
+            "write binary and identities",
+            "cleanup",
+            "completion handoff",
+        ],
+    );
+    crate::app::output::log_global(
+        4,
+        format_args!(
+            "[renium] native capture helper: services={} engine_calls=1 bytes={byte_count} instances={} identity_bytes={identity_count} queue_ms={:.3} serialize_ms={:.3} identity_ms={:.3} write_ms={:.3}",
+            services.len(),
+            identity_count / CAPTURE_ROW_SIZE,
+            read_u64(&header, 32)? as f64 / 1000.0,
+            read_u64(&header, 40)? as f64 / 1000.0,
+            read_u64(&header, 48)? as f64 / 1000.0,
+            read_u64(&header, 56)? as f64 / 1000.0,
+        ),
+    );
     let mut bytes = vec![0; byte_count];
     let mut identities = vec![0; identity_count];
     transport
@@ -3161,6 +3201,7 @@ fn capture_live_services_once(
         capture_window(pid, studio_title)? == window,
         "Studio window changed during native capture"
     );
+    drop(receive);
     Ok(NativeCapture {
         attempts: 1,
         bytes,

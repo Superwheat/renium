@@ -71,7 +71,7 @@ static void UnitTests()
         p.taskContext = pointer;
         Refuses(p, "Invalid DataModel capture task-context binding");
     }
-    for (auto version : {0u, 1u, 3u, 0xffffffffu}) {
+    for (auto version : {0u, 1u, 2u, 4u, 0xffffffffu}) {
         auto p = Fixture(0x48, ~7ull);
         p.protocolVersion = version;
         Refuses(p, "Incompatible native serializer protocol");
@@ -81,7 +81,13 @@ static void UnitTests()
     const char* error = "DataModel task context changed before capture";
     std::memcpy(p.error, error, std::strlen(error));
     auto response = MakeCaptureResponse(p, p.status);
-    assert(response.base.version == 2 && CaptureResponseSize(p) == 352);
+    assert(response.base.version == 3 && CaptureResponseSize(p) == 440);
+    p.timeline.frequency = 1000;
+    p.timeline.ticks[3] = 120;
+    p.timeline.ticks[4] = 160;
+    response = MakeCaptureResponse(p, p.status);
+    assert(response.timeline.frequency == 1000);
+    assert(response.timeline.ticks[3] == 120 && response.timeline.ticks[4] == 160);
     assert(response.base.status == p.status && response.base.exitCode == p.status);
     assert(std::string(response.base.error) == error);
     // Observation shares the parameter prefix but keeps its original wire header.

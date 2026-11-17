@@ -2,7 +2,7 @@
 //! queued helper check. All offsets are relative to the DataModel Instance.
 use super::*;
 
-pub(super) const SERIALIZER_VERSION: u32 = 2;
+pub(super) const SERIALIZER_VERSION: u32 = 3;
 pub(super) const PARAM_PROTOCOL_VERSION: usize = 5900;
 pub(super) const PARAM_CONTEXT_FIELD: usize = 5904;
 pub(super) const PARAM_INSTANCE_SIZE: usize = 5908;
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn capture_protocol_rejects_wrong_versions_sizes_and_missing_proof() -> Result<()> {
         let binding = bind_context_field(&HashSet::from([field(0xa0, !15)]), 0x188)?;
-        for version in [0, 1, 3, u32::MAX] {
+        for version in [0, 1, 2, 4, u32::MAX] {
             let mut params = vec![0; PARAM_SIZE];
             put_u32(&mut params, PARAM_PROTOCOL_VERSION, version);
             assert!(binding.encode(&mut params).is_err());

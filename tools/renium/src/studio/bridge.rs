@@ -4411,6 +4411,7 @@ impl BridgeServer {
         timeout: Option<Duration>,
         lease_id: Option<&str>,
     ) -> Result<BridgeResponse> {
+        let _profile = crate::app::profile::span(&format!("{method}: bridge request"));
         let started = Instant::now();
         let timeout = timeout.unwrap_or_else(|| bridge_response_timeout(method));
         if timeout.is_zero() {
@@ -4466,6 +4467,7 @@ impl BridgeServer {
         params: &Value,
         lease_id: Option<&str>,
     ) -> Result<String> {
+        let _profile = crate::app::profile::span(&format!("{method}: encode request"));
         #[derive(Serialize)]
         struct BridgeRequest<'a> {
             id: u64,
@@ -4474,6 +4476,8 @@ impl BridgeServer {
             lease_id: Option<&'a str>,
             method: &'a str,
             params: &'a Value,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            profile: Option<bool>,
         }
 
         let payload = serde_json::to_string(&BridgeRequest {
@@ -4482,6 +4486,7 @@ impl BridgeServer {
             lease_id,
             method,
             params,
+            profile: crate::app::profile::enabled().then_some(true),
         })?;
         if payload.len() > MAX_BRIDGE_REQUEST_BYTES {
             return Err(anyhow::Error::new(BridgeRequestTooLarge {
@@ -4498,6 +4503,8 @@ impl BridgeServer {
         method: &str,
         payload: String,
     ) -> Result<()> {
+        let _profile =
+            crate::app::profile::span(&format!("{method}: send {} request bytes", payload.len()));
         bridge_socket
             .socket
             .send(Message::Text(payload.into()))
@@ -4516,6 +4523,8 @@ impl BridgeServer {
         method: &str,
         timeout: Duration,
     ) -> Result<BridgeResponse> {
+        let response_started = Instant::now();
+        let _profile = crate::app::profile::span(&format!("{method}: wait and receive response"));
         let deadline = Instant::now() + timeout;
         let mut unrelated_messages = 0usize;
         let mut cancel_sent = false;
@@ -4591,10 +4600,29 @@ impl BridgeServer {
             };
             match message {
                 Message::Text(text) => {
+                    let received = Instant::now();
+                    let _decode = crate::app::profile::span(&format!(
+                        "{method}: decode {} response bytes",
+                        text.len()
+                    ));
                     if text.starts_with("RBS2 ")
                         || text.starts_with("RBS3 ")
                         || text.starts_with("RBS4 ")
+                        || text.starts_with("RBS5 ")
                     {
+                        if let Some(header) = text
+                            .strip_prefix("RBS5 ")
+                            .and_then(|s| s.split_once('\n').map(|p| p.0))
+                            && let Ok(metadata) = serde_json::from_str::<Value>(header)
+                            && metadata["id"].as_u64() == Some(id)
+                        {
+                            crate::studio::native::timing::record_reply(
+                                method,
+                                response_started,
+                                received,
+                                &metadata["nativeProfile"],
+                            );
+                        }
                         if let Some((raw_id, chunk)) = parse_bridge_raw_chunk(text.to_string())? {
                             if raw_id != id {
                                 unrelated_messages = unrelated_messages.saturating_add(1);
@@ -4645,6 +4673,12 @@ impl BridgeServer {
                         }
                         continue;
                     }
+                    crate::studio::native::timing::record_reply(
+                        method,
+                        response_started,
+                        received,
+                        &parsed["result"]["nativeProfile"],
+                    );
                     let ok = parsed.get("ok").and_then(Value::as_bool).unwrap_or(false);
                     let response = if ok {
                         let result = parsed
@@ -4701,6 +4735,21 @@ impl Drop for BridgeServer {
 }
 
 pub(crate) fn parse_bridge_raw_chunk(mut text: String) -> Result<Option<(u64, BridgeChunk)>> {
+    if text.starts_with("RBS5 ") {
+        let payload_index = text
+            .find('\n')
+            .context("Invalid profiled bridge frame: missing separator")?
+            + 1;
+        let mut metadata: Value = serde_json::from_str(&text[5..payload_index - 1])?;
+        let id = metadata["id"]
+            .as_u64()
+            .context("Invalid profiled bridge frame id")?;
+        metadata["chunk"] = Value::String(String::new());
+        let mut chunk: BridgeChunk = serde_json::from_value(metadata)?;
+        chunk.chunk = text.split_off(payload_index);
+        validate_bridge_chunk(&chunk)?;
+        return Ok(Some((id, chunk)));
+    }
     let version = if text.starts_with("RBS4 ") {
         4
     } else if text.starts_with("RBS3 ") {

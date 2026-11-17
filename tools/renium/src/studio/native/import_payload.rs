@@ -346,6 +346,8 @@ pub(super) fn encode_services(
     Vec<EditorBinaryImportGroup>,
     EditorNativeReplacement,
 )> {
+    let trim_profile =
+        crate::app::profile::span("native encode retained bindings and excluded children");
     anyhow::ensure!(
         groups.len() == package_plans.len(),
         "Native import plans differ"
@@ -388,6 +390,8 @@ pub(super) fn encode_services(
     remove_excluded_children(dom, &requested, &included)?;
     let database = rbx_reflection_database::get()?;
     filter_retained_properties(dom, &requested, post_apply, database)?;
+    drop(trim_profile);
+    let tree_profile = crate::app::profile::span("native encode subtree sizes and traversal order");
     let limit = NATIVE_IMPORT_BATCH_INSTANCES;
     let mut preorder = Vec::new();
     let mut subtree_sizes = AHashMap::<RbxRef, usize>::new();
@@ -413,6 +417,9 @@ pub(super) fn encode_services(
             }
         }
     }
+    drop(tree_profile);
+    let partition_profile =
+        crate::app::profile::span("native encode partitions and primary ownership");
     let mut partitions = Vec::<Vec<RbxRef>>::new();
     let mut members = Vec::new();
     let mut cursor = 0;
@@ -433,6 +440,9 @@ pub(super) fn encode_services(
         .enumerate()
         .flat_map(|(index, members)| members.iter().map(move |referent| (*referent, index)))
         .collect::<AHashMap<_, _>>();
+    drop(partition_profile);
+    let reference_profile =
+        crate::app::profile::span("native encode ancestor anchors and crossing references");
     let batch_references = partitions
         .par_iter_mut()
         .enumerate()
@@ -496,6 +506,8 @@ pub(super) fn encode_services(
     // others. Studio constructor defaults can differ from serialized defaults.
     // Merge class schemas, not all instance property maps, on the coordinator.
     // Workers retain references into the same immutable DOM.
+    drop(reference_profile);
+    let schema_profile = crate::app::profile::span("native encode shared class schema");
     let schemas = preorder
         .par_chunks(4096)
         .map(|members| {
@@ -523,10 +535,19 @@ pub(super) fn encode_services(
             }
         }
     }
+    drop(schema_profile);
+    let workers_profile = crate::app::profile::span("native encode parallel batches");
     let encoded = partitions
         .par_iter()
         .enumerate()
         .map(|(index, members)| {
+            let _batch = crate::app::profile::span(&format!(
+                "native encode batch {index}: {} instances",
+                members.len()
+            ));
+            let bindings_profile = crate::app::profile::span(&format!(
+                "native encode batch {index}: binding selection"
+            ));
             let bindings = members
                 .iter()
                 .filter_map(|referent| {
@@ -542,9 +563,18 @@ pub(super) fn encode_services(
                     mode.map(|mode| (*referent, mode))
                 })
                 .collect::<HashMap<_, _>>();
+            drop(bindings_profile);
+            let serialize_profile = crate::app::profile::span(&format!(
+                "native encode batch {index}: binary serialization"
+            ));
             let mut bytes = Vec::new();
             let receipts = rbx_binary::Serializer::new()
                 .serialize_selection_with_bindings(&mut bytes, dom, members, &bindings, &schema)?;
+            drop(serialize_profile);
+            let _receipt_profile = crate::app::profile::span(&format!(
+                "native encode batch {index}: receipt and class counts ({} bytes)",
+                bytes.len()
+            ));
             let receipts = receipts
                 .into_iter()
                 .filter(|receipt| {
@@ -575,6 +605,9 @@ pub(super) fn encode_services(
             Ok((bytes, receipts, classes))
         })
         .collect::<Result<Vec<_>>>()?;
+    drop(workers_profile);
+    let _combine =
+        crate::app::profile::span("native encode join payloads, identities and receipt plans");
     let mut counts = std::collections::BTreeMap::<String, u32>::new();
     for (_, _, classes) in &encoded {
         for class in classes {

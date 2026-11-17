@@ -1965,6 +1965,22 @@ fn prepare(
     };
     let dispatched = Instant::now();
     prepared.invoke(if read_class.is_some() { 3 } else { 0 })?;
+    for (phase, from, to) in [
+        ("target and descriptor discovery", started, descriptor_found),
+        (
+            "reflection getter and setter discovery",
+            descriptor_found,
+            reflected,
+        ),
+        (
+            "identity binding and dispatch preparation",
+            reflected,
+            dispatched,
+        ),
+        ("Studio property task", dispatched, Instant::now()),
+    ] {
+        crate::app::profile::record_between(&format!("{property}: {phase}"), from, to);
+    }
     crate::app::output::log_global(
         5,
         format_args!(
