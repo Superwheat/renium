@@ -30,6 +30,37 @@ pub(crate) fn fixture() -> BridgeServer {
 }
 
 #[test]
+fn committed_continuation_survives_client_disconnect_and_keeps_its_gate() {
+    let bridge = fixture();
+    let client = Arc::new(BridgeRequestLease::new("import-client".into()));
+    let gate = bridge.acquire_request_gate();
+    let request = bridge.activate_request_lease(Arc::clone(&client)).unwrap();
+    bridge.continue_request_lease().unwrap();
+    let continuation = bridge.active_request_lease().unwrap();
+    assert!(!Arc::ptr_eq(&client, &continuation));
+    assert!(!client.cancel());
+    assert!(continuation.ensure_active().is_ok());
+    assert!(bridge.try_acquire_request_gate().is_none());
+    drop(request);
+    assert!(bridge.active_request_lease().is_none());
+    drop(gate);
+    assert!(bridge.try_acquire_request_gate().is_some());
+}
+
+#[test]
+fn cancellation_before_the_continuation_handoff_fails_closed() {
+    let bridge = fixture();
+    let client = Arc::new(BridgeRequestLease::new("cancelled-import".into()));
+    let _request = bridge.activate_request_lease(Arc::clone(&client)).unwrap();
+    assert!(client.cancel());
+    assert!(bridge.continue_request_lease().is_err());
+    assert!(Arc::ptr_eq(
+        &client,
+        &bridge.active_request_lease().unwrap()
+    ));
+}
+
+#[test]
 fn unfiltered_verify_uses_only_plugin_sources_when_native_capture_is_unavailable() {
     use crate::automation::authorization::signed_fixture_request;
     use crate::automation::{State, op, runtime::automation_parse_response_with_lease};

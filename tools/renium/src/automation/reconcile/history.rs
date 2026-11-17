@@ -83,6 +83,20 @@ struct SyncHistoryRecord {
 }
 
 impl SyncHistory {
+    pub(super) fn id(&self) -> Result<String> {
+        Ok(self
+            .directory
+            .file_name()
+            .context("History has no ID")?
+            .to_string_lossy()
+            .into_owned())
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    pub(super) fn open(directory: PathBuf) -> Result<Self> {
+        let record = rmp_serde::from_slice(&fs::read(directory.join("sync.rmp"))?)?;
+        Ok(Self { directory, record })
+    }
+
     pub(crate) fn begin(
         root: &Path,
         source: &Path,
@@ -150,12 +164,7 @@ impl SyncHistory {
             "Studio changes were applied, but undo history could not be finalized; recovery data remains in {}",
             self.directory.display(),
         ))?;
-        Ok(self
-            .directory
-            .file_name()
-            .context("History has no ID")?
-            .to_string_lossy()
-            .into_owned())
+        self.id()
     }
 
     fn save(&self) -> Result<()> {

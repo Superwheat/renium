@@ -71,6 +71,8 @@ mod coordinator;
 mod escape_tests;
 mod guards;
 mod identity;
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) mod import_settle;
 mod merge;
 mod pairing;
 mod push_flow;

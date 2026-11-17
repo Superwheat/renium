@@ -94,6 +94,30 @@ impl StoredSnapshot {
             })
     }
 
+    /// A process can stop between atomic file replacements. Every path must
+    /// still be one of the two journaled states; an unrelated edit never fits.
+    pub(super) fn matches_partial_publication(
+        &self,
+        accepted: &Self,
+        snapshot: &ProjectSnapshot,
+    ) -> bool {
+        let paths = self
+            .entries
+            .keys()
+            .chain(accepted.entries.keys())
+            .chain(snapshot.entries.keys())
+            .collect::<std::collections::BTreeSet<_>>();
+        paths.into_iter().all(|path| {
+            let current = snapshot.entries.get(path);
+            let matches = |stored: Option<&StoredEntry>| match (stored, current) {
+                (None, None) => true,
+                (Some(stored), Some(current)) => stored.matches(current),
+                _ => false,
+            };
+            matches(self.entries.get(path)) || matches(accepted.entries.get(path))
+        })
+    }
+
     pub(super) fn load(&self, root: &Path, key: &str) -> Result<ProjectSnapshot> {
         self.load_selected(root, key, |_| true)
     }

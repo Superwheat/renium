@@ -55,6 +55,28 @@ use crate::system::LockRecover;
 
 const RECENT_STUDIO_LAUNCH_WAIT_SECONDS: f64 = 30.0;
 
+thread_local! {
+    static IMPORT_REPLY_PARAMETERS: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn respond_to_verified_import(
+    context: &automation::BoundContext,
+    bridge: &BridgeServer,
+    summary: &Map<String, Value>,
+) {
+    let parameters = IMPORT_REPLY_PARAMETERS
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or(json!({}));
+    let mut result = Value::Object(compact_push_summary(summary, &parameters, false));
+    result["filesSettling"] = json!(true);
+    attach_persistence(
+        &mut result,
+        edit_persistence(bridge, context.runtime_id.as_deref()),
+    );
+    crate::daemon::respond_before_settle(result);
+}
+
 fn automation_object(
     value: &Value,
 ) -> std::result::Result<&Map<String, Value>, automation::Failure> {
@@ -682,7 +704,7 @@ fn automation_value_is_non_empty(value: &Value) -> bool {
     }
 }
 
-fn push_is_filtered(parameters: &Value) -> bool {
+pub(super) fn push_is_filtered(parameters: &Value) -> bool {
     [
         "changedPaths",
         "changedPathsFiles",
@@ -1613,6 +1635,10 @@ fn automation_dispatch_operation(
         }
         .map(|(result, _)| result),
         op::PUSH => {
+            IMPORT_REPLY_PARAMETERS.with(|slot| *slot.borrow_mut() = Some(parameters.clone()));
+            let _reply = crate::system::files::OnDrop::new(|| {
+                IMPORT_REPLY_PARAMETERS.with(|slot| slot.borrow_mut().take());
+            });
             bridge.wait_for_all_target(bridge_wait_seconds, BridgeTarget::Main)?;
             let args = automation_push_args(context, parameters, reviewed)?;
             if args.verify {
@@ -1940,6 +1966,13 @@ fn automation_dispatch_managed(
     bridge_wait_seconds: f64,
     reviewed: bool,
 ) -> std::result::Result<Value, automation::Failure> {
+    #[cfg(any(windows, target_os = "macos"))]
+    if let Some(result) =
+        automation::reconcile::import_settle::before_request(context, bridge, operation, parameters)
+            .map_err(automation_failure)?
+    {
+        return Ok(result);
+    }
     // A source comparison must neither capture/acknowledge a push baseline nor
     // settle file changes that it did not send to Studio.
     if operation == op::PUSH
@@ -2620,6 +2653,9 @@ fn automation_live_operation(
     bridge: &Arc<BridgeServer>,
     bridge_wait_seconds: f64,
 ) -> std::result::Result<Value, automation::Failure> {
+    #[cfg(any(windows, target_os = "macos"))]
+    automation::reconcile::import_settle::before_request(context, bridge, operation, parameters)
+        .map_err(automation_failure)?;
     let mut result = automation_live_operation_result(
         operation,
         context,
@@ -2950,6 +2986,12 @@ fn restore_persisted_live_sync(
     bridge: &Arc<BridgeServer>,
     bridge_wait_seconds: f64,
 ) -> std::result::Result<(), automation::Failure> {
+    // Do not let restoring a persisted watcher reconcile an import whose
+    // accepted file state has not yet been published (including after restart).
+    #[cfg(any(windows, target_os = "macos"))]
+    if automation::reconcile::import_settle::pending(context) {
+        return Ok(());
+    }
     if context.runtime_id.is_none()
         || !state
             .live_sync()
@@ -3660,6 +3702,9 @@ fn automation_execute_request_inner(
             } else {
                 bound_context::resolve(state, bridge, context_id)?
             };
+            #[cfg(any(windows, target_os = "macos"))]
+            automation::reconcile::import_settle::wait(&context, bridge)
+                .map_err(automation_failure)?;
             if operation.id == op::CONTEXT {
                 return serde_json::to_value(context).map_err(|error| {
                     automation::Failure::new("internal", error.to_string(), false, "bind")
@@ -3982,6 +4027,14 @@ fn execute_gated(
     bridge_wait_seconds: f64,
     request_lease: Option<&Arc<BridgeRequestLease>>,
 ) -> std::result::Result<Value, automation::Failure> {
+    #[cfg(any(windows, target_os = "macos"))]
+    if let Some(context) = request.cx.and_then(|id| state.context(id)) {
+        automation::reconcile::import_settle::wait_for_request(
+            &context,
+            request_lease.map(Arc::as_ref),
+        )
+        .map_err(automation_failure)?;
+    }
     let cancelled = |error: anyhow::Error| {
         automation::Failure::new("cancelled", error.to_string(), false, "retry")
     };
@@ -4030,7 +4083,14 @@ fn execute_gated(
         ),
         None => None,
     };
+    #[cfg(any(windows, target_os = "macos"))]
+    let _settlement_cleanup = automation::reconcile::import_settle::RequestCleanup;
     let result = automation_execute_request(request, state, bridge, bridge_wait_seconds);
+    #[cfg(any(windows, target_os = "macos"))]
+    automation::reconcile::import_settle::finish_request(
+        result.as_ref().err().map(|failure| failure.0.m.as_str()),
+    )
+    .map_err(automation_failure)?;
     if result.is_ok()
         && let Some(lease) = request_lease
     {
@@ -4158,6 +4218,12 @@ fn edit_request_guard<'a>(
         automation::Failure::new("cancelled", error.to_string(), false, "retry")
     };
     let runtime_id = edit_gate_runtime(request, state, bridge, bridge_wait_seconds)?;
+    #[cfg(any(windows, target_os = "macos"))]
+    if let Some(mut context) = request.cx.and_then(|id| state.context(id)) {
+        context.runtime_id.clone_from(&runtime_id);
+        automation::reconcile::import_settle::wait_for_request(&context, lease)
+            .map_err(automation_failure)?;
+    }
     let limit = admission_limit(request.op);
     let alone = runtime_id.is_some() && edit_runtime_gate_alone(request.op);
     let (runtime_gate, request_gate) = match runtime_id.as_deref() {

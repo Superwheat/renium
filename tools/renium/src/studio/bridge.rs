@@ -1011,9 +1011,11 @@ impl Drop for BridgeRequestLeaseGuard<'_> {
         let mut active = self.bridge.active_request_leases.lock_recover();
         if active
             .get(&self.thread_id)
-            .is_some_and(|current| Arc::ptr_eq(current, &self.lease))
+            .is_some_and(|current| self.owns_activation || Arc::ptr_eq(current, &self.lease))
+            && let Some(current) = active.remove(&self.thread_id)
+            && self.owns_activation
         {
-            active.remove(&self.thread_id);
+            current.disarm();
         }
         if self.owns_activation {
             self.lease.disarm();
@@ -1597,6 +1599,34 @@ impl BridgeServer {
             .lock_recover()
             .get(&thread::current().id())
             .cloned()
+    }
+
+    /// Continue committed work on this thread independently of the client.
+    /// The gate and runtime selection stay held; cancellation either wins
+    /// before the handoff or can no longer cancel the finished client lease.
+    pub(crate) fn continue_request_lease(&self) -> Result<()> {
+        let thread_id = thread::current().id();
+        let mut active = self.active_request_leases.lock_recover();
+        let previous = active
+            .get(&thread_id)
+            .context("No request lease to continue")?;
+        let lease = Arc::new(BridgeRequestLease::new(format!("{}-settle", previous.id)));
+        lease.arm()?;
+        previous
+            .state
+            .compare_exchange(
+                REQUEST_LEASE_ARMED,
+                REQUEST_LEASE_FINISHED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| {
+                anyhow::anyhow!("Client disconnected before the import settlement handoff")
+            })?;
+        active.insert(thread_id, Arc::clone(&lease));
+        // The original activation guard owns this slot until the entire
+        // request (including Live Sync acknowledgment) has finished.
+        Ok(())
     }
 
     #[cfg(test)]

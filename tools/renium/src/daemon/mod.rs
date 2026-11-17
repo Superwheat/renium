@@ -334,6 +334,47 @@ fn refuse_control_connection(stream: &TcpStream) {
 thread_local! {
     static REQUEST_NOTICE_SINK: std::cell::RefCell<Option<(crate::system::net::SharedTcpStream, u64)>> =
         const { std::cell::RefCell::new(None) };
+    static EARLY_RESPONSE: std::cell::RefCell<Option<EarlyResponse>> = const { std::cell::RefCell::new(None) };
+}
+
+struct EarlyResponse {
+    stream: crate::system::net::SharedTcpStream,
+    id: u64,
+    started: std::time::Instant,
+    sent: bool,
+}
+
+pub(crate) fn can_respond_before_settle() -> bool {
+    EARLY_RESPONSE.with(|slot| slot.borrow().as_ref().is_some_and(|reply| !reply.sent))
+}
+
+/// The request thread becomes the daemon's continuation. Its stack still
+/// owns the Edit gate, tracking guard, selection and Live Sync pause.
+/// The caller must switch to a daemon lease and persist recovery first.
+pub(crate) fn respond_before_settle(result: Value) {
+    EARLY_RESPONSE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(reply) = slot.as_mut().filter(|reply| !reply.sent) else {
+            return;
+        };
+        reply.sent = true;
+        REQUEST_NOTICE_SINK.with(|sink| sink.borrow_mut().take());
+        let response = automation::Response::success(reply.id, reply.started, result);
+        let written = serde_json::to_string(&response)
+            .map_err(io::Error::other)
+            .and_then(|line| {
+                writeln!(reply.stream, "{line}")?;
+                reply.stream.flush()
+            });
+        if let Err(error) = written {
+            // The import is committed. A disconnected caller must not abort
+            // settlement; its durable journal still describes the outcome.
+            crate::app::output::log_global(
+                3,
+                format_args!("[renium] import response disconnected: {error}"),
+            );
+        }
+    });
 }
 
 /// Sends an interim notice line to the caller of the request this thread is
@@ -469,6 +510,17 @@ fn handle_daemon_control_connection(
         REQUEST_NOTICE_SINK.with(|sink| {
             *sink.borrow_mut() = request_notice_sink(trimmed, &notice_stream);
         });
+        EARLY_RESPONSE.with(|slot| {
+            *slot.borrow_mut() =
+                serde_json::from_str::<RequestEnvelope>(trimmed)
+                    .ok()
+                    .map(|envelope| EarlyResponse {
+                        stream: notice_stream.clone(),
+                        id: envelope.id,
+                        started: std::time::Instant::now(),
+                        sent: false,
+                    });
+        });
         let response = automation_parse_response_with_lease(
             trimmed,
             state,
@@ -477,6 +529,12 @@ fn handle_daemon_control_connection(
             Some(Arc::clone(&request_lease)),
         );
         REQUEST_NOTICE_SINK.with(|sink| sink.borrow_mut().take());
+        let sent =
+            EARLY_RESPONSE.with(|slot| slot.borrow_mut().take().is_some_and(|reply| reply.sent));
+        if sent {
+            reader.finish();
+            continue;
+        }
         let response = serde_json::to_string(&response)?;
         let write_result = (|| -> io::Result<()> {
             writeln!(writer, "{response}")?;
@@ -1385,6 +1443,98 @@ mod notice_tests {
     use std::net::{TcpListener, TcpStream};
 
     use super::*;
+
+    #[test]
+    fn a_connection_can_queue_its_next_request_during_settlement() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let server = crate::system::net::SharedTcpStream::from(listener.accept().unwrap().0);
+        let reader = control_reader::ControlReader::start(server.clone(), |_| {
+            panic!("a completed client lease must not cancel settlement")
+        })
+        .unwrap();
+        let (bridge, _) =
+            BridgeServer::listen_with_initial_wait("127.0.0.1", &[0], 0.0, false).unwrap();
+        client.write_all(b"push\n").unwrap();
+        assert!(matches!(
+            reader.next(),
+            Some(control_reader::Request::Line(_))
+        ));
+        let lease = Arc::new(BridgeRequestLease::new("early-response".into()));
+        assert!(reader.activate(Arc::clone(&lease)));
+        let held = bridge.activate_request_lease(lease).unwrap();
+        EARLY_RESPONSE.with(|slot| {
+            *slot.borrow_mut() = Some(EarlyResponse {
+                stream: server,
+                id: 1,
+                started: Instant::now(),
+                sent: false,
+            })
+        });
+        bridge.continue_request_lease().unwrap();
+        respond_before_settle(json!({"ok": true, "filesSettling": true}));
+        let mut client = BufReader::new(client);
+        let mut response = String::new();
+        client.read_line(&mut response).unwrap();
+        client.get_mut().write_all(b"pull\n").unwrap();
+        // The control reader can accept the next line while the handler still
+        // owns the continuation. It is dispatched only after that tail returns.
+        assert!(
+            matches!(reader.next(), Some(control_reader::Request::Line(line)) if line == "pull\n")
+        );
+        assert!(
+            bridge
+                .active_request_lease()
+                .unwrap()
+                .ensure_active()
+                .is_ok()
+        );
+        drop(client);
+        assert!(reader.next().is_none());
+        assert!(
+            bridge
+                .active_request_lease()
+                .unwrap()
+                .ensure_active()
+                .is_ok()
+        );
+        reader.finish();
+        drop(held);
+        EARLY_RESPONSE.with(|slot| slot.borrow_mut().take());
+    }
+
+    #[test]
+    fn early_reply_is_flushed_once_and_does_not_depend_on_the_caller_staying() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let server = listener.accept().unwrap().0;
+        EARLY_RESPONSE.with(|slot| {
+            *slot.borrow_mut() = Some(EarlyResponse {
+                stream: server.into(),
+                id: 42,
+                started: Instant::now(),
+                sent: false,
+            })
+        });
+        assert!(can_respond_before_settle());
+        respond_before_settle(json!({"ok": true, "verified": true, "filesSettling": true}));
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let response: automation::Response = serde_json::from_str(&line).unwrap();
+        assert_eq!(response.id, 42);
+        assert_eq!(response.r.unwrap()["filesSettling"], true);
+        drop(reader);
+        assert!(!can_respond_before_settle());
+        respond_before_settle(json!({"mustNotSend": true}));
+        assert!(EARLY_RESPONSE.with(|slot| slot.borrow_mut().take().unwrap().sent));
+    }
 
     #[test]
     fn every_wire_envelope_asks_for_notices_and_a_reviews_parameters_stay_clean() {

@@ -356,7 +356,11 @@ def push(run: Run, source: Path, root: Path) -> None:
         place = folder / "place.rbxl"
         shutil.copy2(empty, place)
         open_studio(run, folder, place, "open an empty place in Studio")
-        run.timed("push, whole project into an empty place", ["ps", "--yes"], folder, place=place, timeout=3600)
+        data, _ = run.timed("push, whole project into an empty place", ["ps", "--yes"], folder, place=place, timeout=3600)
+        expect((data or {}).get("verified") is True, "the whole import was not verified")
+        # This read queues behind the actual continuation, including when the
+        # push caller has already disconnected. No delay estimates completion.
+        run.timed("settle after the push into an empty place", ["l", "return true"], folder, place=place, timeout=1800)
         data, _ = run.timed("push again, nothing changed", ["ps", "--yes"], folder, place=place, timeout=1800)
         expect((data or {}).get("unchanged") is True, "a second push into the filled place still changed it")
         before_pull = project_files(folder)

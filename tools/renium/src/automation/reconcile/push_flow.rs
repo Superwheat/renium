@@ -12,7 +12,7 @@ fn push_applied_nothing(summary: &Map<String, Value>) -> bool {
 /// lease: the old one stops only once the proof check inside the lease has
 /// passed, and the new relay starts from the path the state names.
 #[cfg(windows)]
-fn arm_native_attribute_relay(
+pub(super) fn arm_native_attribute_relay(
     state: &Value,
     bridge: &BridgeServer,
     services: &[String],
@@ -109,11 +109,9 @@ pub(crate) fn push_project(
         }
     };
     #[cfg(any(windows, target_os = "macos"))]
-    let cache_input = if replace && guard.is_none() {
-        Some(full_push_cache_input(&push_args, services)?)
-    } else {
-        None
-    };
+    let cache_input = (replace && guard.is_none())
+        .then(|| full_push_cache_input(&push_args, services))
+        .transpose()?;
     #[cfg(windows)]
     let mut _native_attributes = None;
     let phase = Instant::now();
@@ -434,6 +432,24 @@ pub(crate) fn push_project(
             },
         );
     }
+    #[cfg(any(windows, target_os = "macos"))]
+    let journaled = settle_native_import
+        && import_settle::can_continue(&stage, requires_stage, link_enforcement.is_some());
+    #[cfg(any(windows, target_os = "macos"))]
+    if journaled {
+        import_settle::begin(
+            context,
+            import_settle::ImportStart {
+                services,
+                paths: &source_paths,
+                verification_paths: &mutation_paths,
+                before: &studio,
+                expected: &project,
+                input: cache_input.as_ref(),
+                history_id: history.id()?,
+            },
+        )?;
+    }
     let mut pushed = push_staged_project(
         context,
         &stage,
@@ -471,6 +487,54 @@ pub(crate) fn push_project(
         tracking_release
             .guard_id
             .clone_from(&guard.tracking_guard_id);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    if let Some(proof) = journaled
+        .then_some(())
+        .filter(|_| replacement.is_none())
+        .and_then(|()| committed_import_proof(context, &pushed.summary, &mutation_paths, services))
+    {
+        anyhow::ensure!(
+            verified_full_push_proof_matches(context, bridge, &proof)?,
+            "Studio changed after the import committed; its files still need settlement"
+        );
+        let mut expected = project;
+        expected.entries.extend(pushed.generated.entries);
+        import_settle::committed(&pushed.summary, &expected)?;
+        bridge.continue_request_lease()?;
+        crate::automation::runtime::respond_to_verified_import(context, bridge, &pushed.summary);
+        let (current, summary) = import_settle::settle(
+            context,
+            bridge,
+            services,
+            import_settle::ImportWork {
+                before: studio,
+                expected,
+                paths: source_paths.clone(),
+                verification_paths: mutation_paths,
+                prepared: prepared_verification,
+                history,
+                summary: pushed.summary,
+            },
+            &proof,
+        )?;
+        tracking_release.proof = Some(proof);
+        acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
+        anyhow::ensure!(
+            tracking_release.retained_proof.is_some(),
+            "Studio changed before import settlement was acknowledged"
+        );
+        retain_verified_full_push(
+            bridge,
+            cache_input.as_ref(),
+            &source_paths,
+            current,
+            &tracking_release,
+            #[cfg(windows)]
+            &mut _native_attributes,
+        );
+        return Ok(summary);
     }
 
     // A full import allocates new native identities and settles service state.
@@ -641,6 +705,11 @@ pub(crate) fn push_project(
         // changes outside that exact result invalidate the source snapshot.
         tracking_release.proof = pushed.summary.remove("verifiedPushProof");
     }
+    #[cfg(any(windows, target_os = "macos"))]
+    anyhow::ensure!(
+        !journaled || files_unchanged,
+        "Project files changed during import settlement; newer files were preserved"
+    );
     acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
     #[cfg(any(windows, target_os = "macos"))]
     retain_verified_full_push(
@@ -653,6 +722,42 @@ pub(crate) fn push_project(
         &mut _native_attributes,
     );
     Ok(pushed.summary)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn committed_import_proof(
+    context: &BoundContext,
+    summary: &Map<String, Value>,
+    paths: &HashSet<PathBuf>,
+    services: &[String],
+) -> Option<Value> {
+    let verified = ["nativeVerifiedServices", "fieldVerifiedServices"]
+        .into_iter()
+        .filter_map(|key| summary.get(key).and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<HashSet<_>>();
+    let covered = services_for_snapshot_paths(context, paths)
+        .iter()
+        .all(|service| verified.contains(service.as_str()));
+    let proof = summary
+        .get("verifiedPushProof")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .filter(|_| {
+            covered && summary.get("sourceVerifyFailed").and_then(Value::as_u64) == Some(0)
+        });
+    if proof.is_some() {
+        log_native_settlement_fallbacks(services, &verified);
+    } else {
+        log_global(
+            5,
+            format_args!(
+                "[renium] import settlement stays synchronous: incomplete commit proof or receipt coverage"
+            ),
+        );
+    }
+    proof
 }
 
 fn log_native_settlement_fallbacks(services: &[String], verified: &HashSet<&str>) {
@@ -706,7 +811,7 @@ fn capture_push_readback(
     }
 }
 
-fn stage_verified_import_readback(
+pub(super) fn stage_verified_import_readback(
     stage: &mut ExportProjectStage,
     readback: &ProjectSnapshot,
 ) -> Result<()> {
