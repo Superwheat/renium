@@ -112,6 +112,24 @@ pub(crate) fn align_settings_bytes_to_reference(
     reference_bytes: &[u8],
     observed_bytes: &[u8],
 ) -> Result<SettingsAlignment> {
+    align_settings_bytes(reference_bytes, observed_bytes, false)
+}
+
+/// As `align_settings_bytes_to_reference`, for a store pulled out of Studio:
+/// its viewport camera keeps the values the reference holds for it. The
+/// aligned store is written once, with the camera already in place.
+pub(crate) fn align_pulled_settings_bytes_to_reference(
+    reference_bytes: &[u8],
+    observed_bytes: &[u8],
+) -> Result<SettingsAlignment> {
+    align_settings_bytes(reference_bytes, observed_bytes, true)
+}
+
+fn align_settings_bytes(
+    reference_bytes: &[u8],
+    observed_bytes: &[u8],
+    keep_viewport_camera: bool,
+) -> Result<SettingsAlignment> {
     if reference_bytes == observed_bytes {
         return Ok(SettingsAlignment::Equivalent);
     }
@@ -134,6 +152,15 @@ pub(crate) fn align_settings_bytes_to_reference(
     };
     let mut reference = reference?;
     let mut observed = observed?;
+    // Taken before alignment rewrites either document.
+    let viewport_camera = keep_viewport_camera
+        .then(|| reference_viewport_camera(&reference))
+        .flatten();
+    let keep_camera = |observed: &mut SettingsBytecode| {
+        viewport_camera
+            .as_ref()
+            .is_some_and(|camera| keep_reference_viewport_camera(camera, observed))
+    };
     let positionally_equivalent = settings_topology_matches(&reference, &observed)
         && positional_values_equivalent(&reference, &observed, None, false);
     if positionally_equivalent {
@@ -141,6 +168,7 @@ pub(crate) fn align_settings_bytes_to_reference(
             if !align_settings_ids_to_reference(&reference, &mut observed) {
                 bail!("duplicate instance identity is ambiguous after comparing references");
             }
+            keep_camera(&mut observed);
             let upgraded = encode_settings_bytecode(&observed)?;
             drop_settings_documents(reference, observed);
             return Ok(SettingsAlignment::Changed(upgraded));
@@ -153,6 +181,7 @@ pub(crate) fn align_settings_bytes_to_reference(
     }
     match align_settings_ids_for_contiguous_structural_change(&mut reference, &mut observed) {
         ContiguousStructuralAlignment::Aligned => {
+            keep_camera(&mut observed);
             let aligned = encode_settings_bytecode_with_dense_references(&observed)?;
             drop_settings_documents(reference, observed);
             return Ok(SettingsAlignment::Changed(aligned));
@@ -168,13 +197,16 @@ pub(crate) fn align_settings_bytes_to_reference(
     if !align_settings_ids_to_reference(&reference, &mut observed) {
         bail!("duplicate instance identity is ambiguous after comparing references");
     }
+    let camera_kept = keep_camera(&mut observed);
     let aligned = encode_settings_bytecode(&observed)?;
     canonicalize_settings_property_names(&mut reference)?;
     canonicalize_settings_property_names(&mut observed)?;
     let result = if settings_documents_match(&reference, &observed, false)
         && !document_adds_enum_types(&reference, &observed)
     {
-        if let Some(key) = cache_key {
+        // The cache answers for the bytes alone, also to a caller that keeps
+        // no camera: a pair that only matches with the camera kept stays out.
+        if let Some(key) = cache_key.filter(|_| !camera_kept) {
             cache_settings_alignment(key);
         }
         SettingsAlignment::Equivalent
@@ -2344,6 +2376,64 @@ pub(crate) fn align_reconciliation_protected_workspace_cameras(
             .attributes
             .clone_from(&reference_instance.attributes);
     }
+}
+
+/// The cameras of a Workspace store as it stood before alignment, for the
+/// values its viewport camera keeps through a pull.
+pub(crate) struct ReferenceViewportCamera {
+    root_names_camera: bool,
+    current: Option<String>,
+    cameras: Vec<SettingsBytecodeInstance>,
+}
+
+pub(crate) fn reference_viewport_camera(
+    reference: &SettingsBytecode,
+) -> Option<ReferenceViewportCamera> {
+    let root = reference
+        .instances
+        .iter()
+        .find(|instance| instance.parent_index.is_none() && instance.class_name == "Workspace")?;
+    Some(ReferenceViewportCamera {
+        root_names_camera: root.properties.contains_key("CurrentCamera"),
+        current: workspace_current_camera_index(reference)
+            .map(|index| reference.instances[index].settings_id.clone()),
+        cameras: reference
+            .instances
+            .iter()
+            .filter(|instance| instance.class_name == "Camera")
+            .cloned()
+            .collect(),
+    })
+}
+
+/// Gives the observed viewport camera the values the reference holds for the
+/// same identity; says whether that changed it. A reference that names no
+/// current camera takes the observed one for it when it holds a camera of
+/// that identity (see `inherit_workspace_viewport_reference`).
+pub(crate) fn keep_reference_viewport_camera(
+    reference: &ReferenceViewportCamera,
+    observed: &mut SettingsBytecode,
+) -> bool {
+    let Some(index) = workspace_current_camera_index(observed) else {
+        return false;
+    };
+    let observed = &mut observed.instances[index];
+    if reference.root_names_camera && reference.current.as_ref() != Some(&observed.settings_id) {
+        return false;
+    }
+    let Some(saved) = reference
+        .cameras
+        .iter()
+        .find(|camera| camera.settings_id == observed.settings_id)
+    else {
+        return false;
+    };
+    if observed.properties == saved.properties && observed.attributes == saved.attributes {
+        return false;
+    }
+    observed.properties.clone_from(&saved.properties);
+    observed.attributes.clone_from(&saved.attributes);
+    true
 }
 
 /// Upgrade old stores only after identity alignment has matched the live
@@ -6395,3 +6485,173 @@ mod verify_noise_tests {
 
 #[cfg(test)]
 mod rotation_tests;
+
+#[cfg(test)]
+mod viewport_camera_tests {
+    use super::*;
+    use crate::tests::support::{settings_document, settings_instance};
+    use serde_json::json;
+
+    /// What a pull writes for `pulled` over the store `store`.
+    fn pulled_over(store: &SettingsBytecode, pulled: &SettingsBytecode) -> SettingsBytecode {
+        let aligned = align_pulled_settings_bytes_to_reference(
+            &encode_settings_bytecode(store).unwrap(),
+            &encode_settings_bytecode(pulled).unwrap(),
+        )
+        .unwrap();
+        match aligned {
+            SettingsAlignment::Changed(bytes) => decode_settings_bytecode(&bytes).unwrap(),
+            SettingsAlignment::Equivalent => store.clone(),
+        }
+    }
+
+    #[test]
+    fn a_pull_keeps_the_stores_viewport_camera_values() {
+        let mut root = settings_instance("ws", "Workspace", "Workspace", None);
+        root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type": "Ref", "settingsId": "cam"}),
+        );
+        let mut camera = settings_instance("cam", "Camera", "Camera", Some(0));
+        camera.properties.insert("FieldOfView".into(), json!(70.0));
+        let mut part = settings_instance("part", "Part", "Part", Some(0));
+        part.properties.insert("Anchored".into(), json!(true));
+        let store = settings_document(vec![root.clone(), camera.clone(), part.clone()]);
+
+        let mut pulled_camera = camera;
+        pulled_camera
+            .properties
+            .insert("FieldOfView".into(), json!(60.0));
+        let mut pulled_part = part;
+        pulled_part
+            .properties
+            .insert("Anchored".into(), json!(false));
+        let pulled = settings_document(vec![root, pulled_camera, pulled_part]);
+
+        let kept = pulled_over(&store, &pulled);
+        assert_eq!(
+            kept.instances[1].properties.get("FieldOfView"),
+            Some(&json!(70.0))
+        );
+        assert_eq!(
+            kept.instances[2].properties.get("Anchored"),
+            Some(&json!(false))
+        );
+        // The same pair, compared without a camera to keep, differs: the
+        // answer for the pull must not be remembered for that caller.
+        let plain = align_settings_bytes_to_reference(
+            &encode_settings_bytecode(&store).unwrap(),
+            &encode_settings_bytecode(&pulled).unwrap(),
+        )
+        .unwrap();
+        let SettingsAlignment::Changed(plain) = plain else {
+            panic!("a changed camera and part are a change");
+        };
+        assert_eq!(
+            decode_settings_bytecode(&plain).unwrap().instances[1]
+                .properties
+                .get("FieldOfView"),
+            Some(&json!(60.0))
+        );
+    }
+
+    #[test]
+    fn a_pull_that_changed_only_the_viewport_camera_changes_nothing() {
+        let mut root = settings_instance("ws", "Workspace", "Workspace", None);
+        root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type": "Ref", "settingsId": "cam"}),
+        );
+        let mut camera = settings_instance("cam", "Camera", "Camera", Some(0));
+        camera.properties.insert("FieldOfView".into(), json!(70.0));
+        let store = settings_document(vec![root.clone(), camera.clone()]);
+        let mut pulled_camera = camera;
+        pulled_camera
+            .properties
+            .insert("FieldOfView".into(), json!(60.0));
+        let pulled = settings_document(vec![root, pulled_camera]);
+        let (store_bytes, pulled_bytes) = (
+            encode_settings_bytecode(&store).unwrap(),
+            encode_settings_bytecode(&pulled).unwrap(),
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                align_pulled_settings_bytes_to_reference(&store_bytes, &pulled_bytes).unwrap(),
+                SettingsAlignment::Equivalent
+            ));
+            assert!(matches!(
+                align_settings_bytes_to_reference(&store_bytes, &pulled_bytes).unwrap(),
+                SettingsAlignment::Changed(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_pull_keeps_the_viewport_camera_of_a_store_that_names_no_current_camera() {
+        let root = settings_instance("ws", "Workspace", "Workspace", None);
+        let mut viewport = settings_instance("cam", "Camera", "Camera", Some(0));
+        viewport
+            .properties
+            .insert("FieldOfView".into(), json!(70.0));
+        let mut other = settings_instance("cam2", "Camera", "Camera", Some(0));
+        other.properties.insert("FieldOfView".into(), json!(50.0));
+        let store = settings_document(vec![root.clone(), viewport.clone(), other.clone()]);
+
+        let mut pulled_root = root;
+        pulled_root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type": "Ref", "settingsId": "cam"}),
+        );
+        let mut pulled_viewport = viewport;
+        pulled_viewport
+            .properties
+            .insert("FieldOfView".into(), json!(60.0));
+        let mut pulled_other = other;
+        pulled_other
+            .properties
+            .insert("FieldOfView".into(), json!(55.0));
+        let pulled = settings_document(vec![pulled_root, pulled_viewport, pulled_other]);
+
+        let kept = pulled_over(&store, &pulled);
+        assert_eq!(
+            kept.instances[1].properties.get("FieldOfView"),
+            Some(&json!(70.0)),
+            "the matched viewport row keeps the store's values"
+        );
+        assert_eq!(
+            kept.instances[2].properties.get("FieldOfView"),
+            Some(&json!(55.0)),
+            "another Camera is pulled like any instance"
+        );
+        assert_eq!(
+            kept.instances[0].properties.get("CurrentCamera"),
+            Some(&json!({"_type": "Ref", "instanceIndex": 2})),
+            "the pulled store records the reference to the viewport row"
+        );
+    }
+
+    #[test]
+    fn a_viewport_camera_of_another_identity_is_pulled() {
+        let root = settings_instance("ws", "Workspace", "Workspace", None);
+        let mut saved = settings_instance("old-cam", "Camera", "Camera", Some(0));
+        saved.properties.insert("FieldOfView".into(), json!(70.0));
+        let store = settings_document(vec![root.clone(), saved]);
+
+        let mut pulled_root = root;
+        pulled_root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type": "Ref", "settingsId": "cam"}),
+        );
+        let mut live = settings_instance("cam", "Camera", "Camera", Some(0));
+        live.properties.insert("FieldOfView".into(), json!(60.0));
+        let mut pulled = settings_document(vec![pulled_root, live]);
+
+        // The step by itself never takes a camera for the viewport by its name.
+        let reference = reference_viewport_camera(&store).unwrap();
+        assert!(!keep_reference_viewport_camera(&reference, &mut pulled));
+        assert_eq!(
+            pulled.instances[1].properties.get("FieldOfView"),
+            Some(&json!(60.0))
+        );
+    }
+}

@@ -24,14 +24,10 @@ use crate::roblox::schema::{MATERIAL_SERVICE_CLASS, USE_2022_MATERIALS_PROPERTY}
 use crate::roblox::services::DEFAULT_SYNC_SERVICES;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
-    SettingsBytecode, child_indices_for_instance, decode_settings_bytecode,
-    encode_service_settings_binary, encode_settings_bytecode,
+    SettingsBytecode, child_indices_for_instance, encode_service_settings_binary,
     write_fresh_service_settings_binary_file,
 };
-use crate::settings::equivalence::{
-    SettingsAlignment, align_reconciliation_protected_workspace_cameras,
-    align_settings_bytes_to_reference, inherit_workspace_viewport_reference,
-};
+use crate::settings::equivalence::{SettingsAlignment, align_pulled_settings_bytes_to_reference};
 use crate::settings::tree::editor_service_root_index;
 use crate::snapshot::codec::parse_source_range_batch;
 use crate::snapshot::export::{
@@ -1448,14 +1444,14 @@ fn write_service_settings_file(
         let observed = encode_service_settings_binary(state_to_write)?;
         let alignment_started = Instant::now();
         let aligned = match fs::read(&settings_path) {
-            Ok(reference) => match align_settings_bytes_to_reference(&reference, &observed)
-                .with_context(|| format!("Failed to align {}", settings_path.display()))?
-            {
-                SettingsAlignment::Equivalent => None,
-                SettingsAlignment::Changed(aligned) => {
-                    Some(keep_store_viewport_camera(&reference, aligned)?)
+            Ok(reference) => {
+                match align_pulled_settings_bytes_to_reference(&reference, &observed)
+                    .with_context(|| format!("Failed to align {}", settings_path.display()))?
+                {
+                    SettingsAlignment::Equivalent => None,
+                    SettingsAlignment::Changed(aligned) => Some(aligned),
                 }
-            },
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Some(observed),
             Err(error) => {
                 return Err(error)
@@ -1485,18 +1481,6 @@ fn write_service_settings_file(
 /// A store written before `CurrentCamera` was saved names none; identity
 /// alignment has matched the live viewport to its row by then, so the store
 /// inherits the pulled reference for the comparison and keeps that row too.
-fn keep_store_viewport_camera(reference: &[u8], aligned: Vec<u8>) -> Result<Vec<u8>> {
-    let mut store = decode_settings_bytecode(reference)?;
-    let mut pulled = decode_settings_bytecode(&aligned)?;
-    let before = pulled.clone();
-    inherit_workspace_viewport_reference(&mut store, &pulled);
-    align_reconciliation_protected_workspace_cameras(&store, &mut pulled);
-    if pulled == before {
-        return Ok(aligned);
-    }
-    encode_settings_bytecode(&pulled)
-}
-
 pub(crate) fn state_with_preserved_material_service_settings(
     service: &str,
     state: &ServiceState,
@@ -1949,128 +1933,6 @@ fn write_script_source_file(source_path: &Path, source: &str, fresh_stage: bool)
 #[cfg(test)]
 mod projection_tests {
     use super::*;
-
-    #[test]
-    fn a_pull_keeps_the_stores_viewport_camera_values() {
-        use crate::tests::support::{settings_document, settings_instance};
-
-        let mut root = settings_instance("ws", "Workspace", "Workspace", None);
-        root.properties.insert(
-            "CurrentCamera".into(),
-            json!({"_type": "Ref", "settingsId": "cam"}),
-        );
-        let mut camera = settings_instance("cam", "Camera", "Camera", Some(0));
-        camera.properties.insert("FieldOfView".into(), json!(70.0));
-        let mut part = settings_instance("part", "Baseplate", "Part", Some(0));
-        part.properties.insert("Anchored".into(), json!(true));
-        let store = settings_document(vec![root.clone(), camera.clone(), part.clone()]);
-
-        let mut pulled_camera = camera.clone();
-        pulled_camera
-            .properties
-            .insert("FieldOfView".into(), json!(60.0));
-        let mut pulled_part = part.clone();
-        pulled_part
-            .properties
-            .insert("Anchored".into(), json!(false));
-        let pulled = settings_document(vec![root, pulled_camera, pulled_part]);
-
-        let kept = keep_store_viewport_camera(
-            &encode_settings_bytecode(&store).unwrap(),
-            encode_settings_bytecode(&pulled).unwrap(),
-        )
-        .unwrap();
-        let kept = decode_settings_bytecode(&kept).unwrap();
-        assert_eq!(
-            kept.instances[1].properties.get("FieldOfView"),
-            Some(&json!(70.0))
-        );
-        assert_eq!(
-            kept.instances[2].properties.get("Anchored"),
-            Some(&json!(false))
-        );
-    }
-
-    #[test]
-    fn a_pull_keeps_the_viewport_camera_of_a_store_that_names_no_current_camera() {
-        use crate::tests::support::{settings_document, settings_instance};
-
-        let root = settings_instance("ws", "Workspace", "Workspace", None);
-        let mut viewport = settings_instance("cam", "Camera", "Camera", Some(0));
-        viewport
-            .properties
-            .insert("FieldOfView".into(), json!(70.0));
-        let mut other = settings_instance("cam2", "Camera", "Camera", Some(0));
-        other.properties.insert("FieldOfView".into(), json!(50.0));
-        let store = settings_document(vec![root.clone(), viewport.clone(), other.clone()]);
-
-        let mut pulled_root = root;
-        pulled_root.properties.insert(
-            "CurrentCamera".into(),
-            json!({"_type": "Ref", "settingsId": "cam"}),
-        );
-        let mut pulled_viewport = viewport;
-        pulled_viewport
-            .properties
-            .insert("FieldOfView".into(), json!(60.0));
-        let mut pulled_other = other;
-        pulled_other
-            .properties
-            .insert("FieldOfView".into(), json!(55.0));
-        let pulled = settings_document(vec![pulled_root, pulled_viewport, pulled_other]);
-
-        let kept = keep_store_viewport_camera(
-            &encode_settings_bytecode(&store).unwrap(),
-            encode_settings_bytecode(&pulled).unwrap(),
-        )
-        .unwrap();
-        let kept = decode_settings_bytecode(&kept).unwrap();
-        assert_eq!(
-            kept.instances[1].properties.get("FieldOfView"),
-            Some(&json!(70.0)),
-            "the matched viewport row keeps the store's values"
-        );
-        assert_eq!(
-            kept.instances[2].properties.get("FieldOfView"),
-            Some(&json!(55.0)),
-            "another Camera is pulled like any instance"
-        );
-        assert_eq!(
-            kept.instances[0].properties.get("CurrentCamera"),
-            Some(&json!({"_type": "Ref", "instanceIndex": 2})),
-            "the pulled store records the reference to the viewport row"
-        );
-    }
-
-    #[test]
-    fn a_viewport_camera_matched_by_name_alone_is_pulled() {
-        use crate::tests::support::{settings_document, settings_instance};
-
-        let root = settings_instance("ws", "Workspace", "Workspace", None);
-        let mut saved = settings_instance("old-cam", "Camera", "Camera", Some(0));
-        saved.properties.insert("FieldOfView".into(), json!(70.0));
-        let store = settings_document(vec![root.clone(), saved]);
-
-        let mut pulled_root = root;
-        pulled_root.properties.insert(
-            "CurrentCamera".into(),
-            json!({"_type": "Ref", "settingsId": "cam"}),
-        );
-        let mut live = settings_instance("cam", "Camera", "Camera", Some(0));
-        live.properties.insert("FieldOfView".into(), json!(60.0));
-        let pulled = settings_document(vec![pulled_root, live]);
-
-        let kept = keep_store_viewport_camera(
-            &encode_settings_bytecode(&store).unwrap(),
-            encode_settings_bytecode(&pulled).unwrap(),
-        )
-        .unwrap();
-        let kept = decode_settings_bytecode(&kept).unwrap();
-        assert_eq!(
-            kept.instances[1].properties.get("FieldOfView"),
-            Some(&json!(60.0))
-        );
-    }
 
     #[test]
     fn memory_projection_matches_fresh_import_bytes_and_paths() -> Result<()> {
