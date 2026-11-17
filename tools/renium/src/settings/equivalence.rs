@@ -161,8 +161,9 @@ fn align_settings_bytes(
             .as_ref()
             .is_some_and(|camera| keep_reference_viewport_camera(camera, observed))
     };
-    let positionally_equivalent = settings_topology_matches(&reference, &observed)
-        && positional_values_equivalent(&reference, &observed, None, false);
+    let topology_matches = settings_topology_matches(&reference, &observed);
+    let positionally_equivalent =
+        topology_matches && positional_values_equivalent(&reference, &observed, None, false);
     if positionally_equivalent {
         if document_adds_enum_types(&reference, &observed) {
             if !align_settings_ids_to_reference(&reference, &mut observed) {
@@ -178,6 +179,23 @@ fn align_settings_bytes(
         }
         drop_settings_documents(reference, observed);
         return Ok(SettingsAlignment::Equivalent);
+    }
+    // A store whose instances stand where the reference's stand, under the
+    // same ids, already carries the reference's identities: nothing is left
+    // to align, and its own bytes are what the encoder writes for it again.
+    // This is a pull after values changed in Studio, the common one.
+    if topology_matches && identities_already_aligned(&reference, &observed) {
+        rayon::join(
+            || stabilize_settings_reference_ids(&mut reference),
+            || stabilize_settings_reference_ids(&mut observed),
+        );
+        let camera_kept = keep_camera(&mut observed);
+        let aligned = if camera_kept {
+            encode_settings_bytecode(&observed)?
+        } else {
+            observed_bytes.to_vec()
+        };
+        return finish_settings_alignment(reference, observed, aligned, cache_key, camera_kept);
     }
     match align_settings_ids_for_contiguous_structural_change(&mut reference, &mut observed) {
         ContiguousStructuralAlignment::Aligned => {
@@ -199,6 +217,33 @@ fn align_settings_bytes(
     }
     let camera_kept = keep_camera(&mut observed);
     let aligned = encode_settings_bytecode(&observed)?;
+    finish_settings_alignment(reference, observed, aligned, cache_key, camera_kept)
+}
+
+/// Every instance of `observed` has the id of the reference's instance at its
+/// position, and no id stands twice.
+fn identities_already_aligned(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
+    let mut seen = AHashSet::with_capacity(reference.instances.len());
+    reference.instances.len() == observed.instances.len()
+        && reference
+            .instances
+            .iter()
+            .zip(&observed.instances)
+            .all(|(reference, observed)| {
+                reference.settings_id == observed.settings_id
+                    && seen.insert(reference.settings_id.as_str())
+            })
+}
+
+/// Whether the aligned store says the same as the reference, in which case
+/// the reference's bytes stay.
+fn finish_settings_alignment(
+    mut reference: SettingsBytecode,
+    mut observed: SettingsBytecode,
+    aligned: Vec<u8>,
+    cache_key: Option<SettingsAlignmentCacheKey>,
+    camera_kept: bool,
+) -> Result<SettingsAlignment> {
     canonicalize_settings_property_names(&mut reference)?;
     canonicalize_settings_property_names(&mut observed)?;
     let result = if settings_documents_match(&reference, &observed, false)
@@ -6553,6 +6598,63 @@ mod viewport_camera_tests {
                 .get("FieldOfView"),
             Some(&json!(60.0))
         );
+    }
+
+    #[test]
+    fn a_store_that_already_holds_the_references_ids_is_written_as_it_came() {
+        let root = settings_instance("ws", "Workspace", "Workspace", None);
+        let mut part = settings_instance("part", "Part", "Part", Some(0));
+        part.properties.insert("Anchored".into(), json!(true));
+        let mut value = settings_instance("value", "ObjectValue", "ObjectValue", Some(0));
+        value.properties.insert(
+            "Value".into(),
+            json!({"_type": "Ref", "settingsId": "part"}),
+        );
+        let store = settings_document(vec![root.clone(), part.clone(), value.clone()]);
+        let mut edited_part = part.clone();
+        edited_part
+            .properties
+            .insert("Anchored".into(), json!(false));
+        let pulled = settings_document(vec![root.clone(), edited_part, value.clone()]);
+        let (store_bytes, pulled_bytes) = (
+            encode_settings_bytecode(&store).unwrap(),
+            encode_settings_bytecode(&pulled).unwrap(),
+        );
+        for aligned in [
+            align_pulled_settings_bytes_to_reference(&store_bytes, &pulled_bytes).unwrap(),
+            align_settings_bytes_to_reference(&store_bytes, &pulled_bytes).unwrap(),
+        ] {
+            let SettingsAlignment::Changed(aligned) = aligned else {
+                panic!("an edited value is a change");
+            };
+            assert!(
+                aligned == pulled_bytes,
+                "the pulled bytes are kept as they are"
+            );
+        }
+
+        // The same instances under other ids are aligned the long way and
+        // come out under the reference's ids.
+        let mut renamed_part = part;
+        renamed_part.settings_id = "studio-1".into();
+        renamed_part
+            .properties
+            .insert("Anchored".into(), json!(false));
+        let mut renamed_value = value;
+        renamed_value.settings_id = "studio-2".into();
+        renamed_value.properties.insert(
+            "Value".into(),
+            json!({"_type": "Ref", "settingsId": "studio-1"}),
+        );
+        let renamed = settings_document(vec![root, renamed_part, renamed_value]);
+        let SettingsAlignment::Changed(aligned) = align_pulled_settings_bytes_to_reference(
+            &store_bytes,
+            &encode_settings_bytecode(&renamed).unwrap(),
+        )
+        .unwrap() else {
+            panic!("an edited value is a change");
+        };
+        assert!(aligned == pulled_bytes, "other ids align to the same store");
     }
 
     #[test]
