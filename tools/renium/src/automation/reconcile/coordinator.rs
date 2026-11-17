@@ -2,28 +2,7 @@ use super::*;
 
 /// A failed push can leave the pair record holding its conflicts; the next
 /// write names the ways out instead of stopping at the state.
-/// A recorded conflict names its project path first (`src/A.luau changed on
-/// both sides`, `instances/X.renium: path: detail`); a push of that path, or
-/// of a directory above it, resolves it.
-fn conflict_covered_by_paths(conflict: &str, paths: &[PathBuf]) -> bool {
-    let text = conflict.replace('\\', "/");
-    let text = text
-        .strip_prefix("push: ")
-        .or_else(|| text.strip_prefix("pull: "))
-        .unwrap_or(&text);
-    paths.iter().any(|path| {
-        let path = path.to_string_lossy().replace('\\', "/");
-        let path = path.trim_end_matches('/');
-        !path.is_empty()
-            && text.starts_with(path)
-            && text[path.len()..]
-                .chars()
-                .next()
-                .is_none_or(|next| matches!(next, ' ' | ':' | '/'))
-    })
-}
-
-const UNRESOLVED_CHANGES: &str = "Reconciliation state has unresolved changes. `rbx lst --details` lists them; `rbx lon --prefer studio|editor` resolves them and also pushes the other side's one-sided edits; `rbx lof` then a scoped push (`-p`/`-f` with `-u`) leaves the rest of Studio untouched";
+const UNRESOLVED_CHANGES: &str = "Reconciliation state has unresolved changes. `rbx lst` lists them; decide each with `rbx lon --resolve ID=studio|editor`, or all with `rbx lon --prefer studio|editor` (either also pushes the other side's one-sided edits); `rbx lof` then a scoped push (`-p`/`-f` with `-u`) leaves the rest of Studio untouched";
 
 #[derive(Default)]
 pub(crate) struct TargetOwners {
@@ -36,9 +15,13 @@ pub(crate) struct PairSetup {
     pub(crate) identity: PairIdentity,
     pub(crate) mode: PairMode,
     pub(crate) resolution_preference: Option<ConflictPreference>,
+    /// The side each conflict decided by id takes in this comparison.
+    pub(crate) decisions: BTreeMap<String, ConflictSide>,
     pub(crate) resolution_required: bool,
     pub(crate) error: Option<String>,
-    pub(crate) conflicts: Vec<String>,
+    pub(crate) conflicts: Vec<Conflict>,
+    /// What verify mode found different, path by path.
+    pub(crate) differences: Vec<String>,
     pub(crate) requires_reconcile: bool,
     pub(crate) runtime_id: Option<String>,
     pub(crate) local_file_stamp: Option<LocalFileStamp>,
@@ -177,6 +160,7 @@ impl Coordinator {
             mode: requested_mode,
             conflict_preference,
             resolution_preference,
+            decisions,
             runtime_settings,
         } = configuration;
         let identity = PairIdentity::from_context(context, bridge)?;
@@ -218,7 +202,15 @@ impl Coordinator {
             local_file_stamp: None,
             local_file_digest: None,
             studio_checkpoint: None,
+            differences: Vec::new(),
         });
+        // With nothing open, every decision is stale; it is refused before a
+        // running session is touched. Open conflicts are checked by the
+        // comparison that decides them.
+        if !decisions.is_empty() && record.conflicts.is_empty() {
+            let ids = decisions.keys().map(String::as_str).collect::<Vec<_>>();
+            bail!("{}", unknown_decisions_message(&ids));
+        }
         let runtime_replaced =
             record.last_runtime_id.is_some() && record.last_runtime_id != current_runtime_id;
         let current_local_file_digest = if runtime_replaced
@@ -255,7 +247,7 @@ impl Coordinator {
             || configuration_changed
             || mode_changed
             || record.conflict_preference != conflict_preference
-            || !record.conflicts.is_empty()
+            || record.has_open_review()
             || runtime_replaced;
         if configuration_changed {
             note_configuration_change(&mut record);
@@ -282,11 +274,13 @@ impl Coordinator {
             identity,
             mode,
             resolution_preference,
+            decisions,
             conflicts: record.conflicts.clone(),
+            differences: record.differences.clone(),
             resolution_required: !unresolved_local
                 && owner_conflict.is_none()
                 && (record.resolution_required
-                    || !record.conflicts.is_empty()
+                    || record.has_open_review()
                         && conflict_preference == ConflictPreference::None),
             error: unresolved_local
                 .then(|| {
@@ -447,6 +441,7 @@ impl Coordinator {
         let sides_match = side_differences.is_empty();
         log_reconcile_timing("side comparison", phase);
         if sides_match {
+            refuse_unmatched_decisions(setup)?;
             let phase = Instant::now();
             setup.unsynced_paths = unsynced_project_paths(context, &publish_paths, &editor)?.0;
             let baseline_matches = record
@@ -454,14 +449,14 @@ impl Coordinator {
                 .as_ref()
                 .is_some_and(|baseline| baseline.matches(&editor));
             log_reconcile_timing("baseline comparison", phase);
-            if !baseline_matches || !record.conflicts.is_empty() || record.resolution_required {
+            if !baseline_matches || record.has_open_review() || record.resolution_required {
                 let phase = Instant::now();
                 record.baseline = Some(StoredSnapshot::write(
                     Path::new(&context.root),
                     &setup.key,
                     &editor,
                 )?);
-                record.conflicts.clear();
+                record.clear_review();
                 record.resolution_required = false;
                 log_reconcile_timing("baseline write", phase);
             }
@@ -495,7 +490,8 @@ impl Coordinator {
                 setup.resolution_preference
             ),
         );
-        let (mut merged, conflicts, mut changes) = if setup.bootstrap_studio_from_editor {
+        let (mut merged, mut conflicts, mut changes) = if setup.bootstrap_studio_from_editor {
+            refuse_unmatched_decisions(setup)?;
             (
                 editor.clone(),
                 Vec::new(),
@@ -511,7 +507,10 @@ impl Coordinator {
                 baseline.as_ref(),
                 &editor,
                 &studio,
-                merge_preference,
+                ConflictDecisions {
+                    preference: merge_preference,
+                    by_id: setup.decisions.clone(),
+                },
                 Some(&side_differences),
             )?
         };
@@ -551,7 +550,9 @@ impl Coordinator {
         log_reconcile_timing("merge", phase);
 
         if !conflicts.is_empty() {
+            attach_conflict_evidence(context, &record, &studio_state, &mut conflicts);
             record.conflicts = conflicts;
+            record.differences.clear();
             record.resolution_required = setup.resolution_preference.is_none()
                 && record.conflict_preference == ConflictPreference::None;
             record.note_setup(setup);
@@ -560,6 +561,7 @@ impl Coordinator {
             setup.resolution_required = record.resolution_required;
             setup.error = Some(conflict_message(&record.conflicts));
             setup.conflicts = record.conflicts.clone();
+            setup.differences.clear();
             return Ok(());
         }
 
@@ -731,7 +733,7 @@ impl Coordinator {
             &setup.key,
             &baseline,
         )?);
-        record.conflicts.clear();
+        record.clear_review();
         record.resolution_required = false;
         record.note_setup(setup);
         record.studio_checkpoint =
@@ -787,9 +789,11 @@ impl Coordinator {
             identity,
             mode: record.mode,
             resolution_preference: None,
+            decisions: BTreeMap::new(),
             resolution_required: record.resolution_required,
             error: None,
             conflicts: Vec::new(),
+            differences: Vec::new(),
             requires_reconcile: true,
             runtime_id: context.runtime_id.clone(),
             local_file_stamp: current_local_file_stamp,
@@ -846,7 +850,10 @@ impl Coordinator {
         // conflicts are resolved; the others stay for the next `lon`.
         record
             .conflicts
-            .retain(|conflict| !conflict_covered_by_paths(conflict, &paths));
+            .retain(|conflict| !conflict.covered_by_paths(&paths));
+        record
+            .differences
+            .retain(|line| !conflict_covered_by_paths(line, &paths));
         let baseline = record
             .baseline
             .as_mut()
@@ -891,7 +898,7 @@ impl Coordinator {
         let pair_lock = self.pair_lock(key);
         let _pair = pair_lock.lock_recover();
         let mut record = load_record(context, key)?.context("Reconciliation state is missing")?;
-        if record.baseline.is_none() || !record.conflicts.is_empty() {
+        if record.baseline.is_none() || record.has_open_review() {
             return Ok(());
         }
         record.studio_checkpoint = Some(checkpoint);
@@ -910,7 +917,7 @@ impl Coordinator {
         if record.mode != PairMode::Reconcile {
             bail!("Live Sync is not allowed to write in verify mode");
         }
-        if !record.conflicts.is_empty() {
+        if record.has_open_review() {
             bail!("{UNRESOLVED_CHANGES}");
         }
         let root = Path::new(&context.root);
@@ -993,7 +1000,7 @@ impl Coordinator {
         if record.mode != PairMode::Reconcile {
             bail!("Live Sync is not allowed to write in verify mode");
         }
-        if !record.conflicts.is_empty() {
+        if record.has_open_review() {
             bail!("{UNRESOLVED_CHANGES}");
         }
         let baseline = record
@@ -1366,7 +1373,7 @@ fn continue_clean_verify(setup: &mut PairSetup, record: &mut PairRecord) {
 /// between both sides. The Studio checkpoint goes so no service is skipped.
 pub(crate) fn note_configuration_change(record: &mut PairRecord) {
     record.studio_checkpoint = None;
-    record.conflicts.clear();
+    record.clear_review();
     record.resolution_required = false;
 }
 
@@ -1408,10 +1415,12 @@ fn verify_mode_holds(
         continue_clean_verify(setup, record);
         return Ok(false);
     }
-    record.conflicts = verify_difference_lines(&changes.studio, &changes.editor);
+    record.differences = verify_difference_lines(&changes.studio, &changes.editor);
+    record.conflicts.clear();
     record.resolution_required = false;
-    setup.error = Some(conflict_message(&record.conflicts[..1]));
-    setup.conflicts = record.conflicts.clone();
+    setup.error = Some(format!("Sync needs review: {VERIFY_DIFFERENCE_HEADING}"));
+    setup.differences = record.differences.clone();
+    setup.conflicts.clear();
     record.note_setup(setup);
     write_record(context, &setup.key, record)?;
     setup.resolution_required = false;
@@ -1426,7 +1435,7 @@ pub(crate) fn verify_difference_lines(
     pull: &HashSet<PathBuf>,
 ) -> Vec<String> {
     const LIMIT: usize = 60;
-    let mut lines = vec!["Studio and project files differ".to_string()];
+    let mut lines = vec![VERIFY_DIFFERENCE_HEADING.to_string()];
     let mut entries = push
         .iter()
         .map(|path| format!("push: {}", path.display()))
@@ -1439,6 +1448,56 @@ pub(crate) fn verify_difference_lines(
         lines.push(format!("{} more paths", total - LIMIT));
     }
     lines
+}
+
+/// A comparison that meets no conflict at all has nothing a decision could
+/// name: the decisions are stale, and nothing is applied.
+fn refuse_unmatched_decisions(setup: &PairSetup) -> Result<()> {
+    if setup.decisions.is_empty() {
+        return Ok(());
+    }
+    let ids = setup
+        .decisions
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    bail!("{}; nothing was applied", unknown_decisions_message(&ids))
+}
+
+/// Adds what the disk and Studio's change tracker say about each conflict:
+/// when its file was last written, and, for a store, whether Studio's
+/// service changed since the last sync, when the tracker can tell.
+fn attach_conflict_evidence(
+    context: &BoundContext,
+    record: &PairRecord,
+    studio_state: &Value,
+    conflicts: &mut [Conflict],
+) {
+    let root = Path::new(&context.root);
+    let changed_services = record
+        .studio_checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.changed_services(context, studio_state));
+    for conflict in conflicts {
+        if conflict.path.is_empty() {
+            continue;
+        }
+        let relative = PathBuf::from(&conflict.path);
+        if let Ok(modified) = fs::metadata(root.join(&relative)).and_then(|meta| meta.modified()) {
+            conflict.files_changed_at = Some(crate::app::report::utc_stamp(modified));
+        }
+        let is_store = relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_service_settings_file_name);
+        if let Some(changed) = &changed_services
+            && is_store
+            && let [service] =
+                services_for_snapshot_paths(context, &HashSet::from([relative])).as_slice()
+        {
+            conflict.studio_changed = Some(changed.contains(service));
+        }
+    }
 }
 
 /// Pairs each changed Studio settings document, as the merge aligned it, with
@@ -1464,7 +1523,7 @@ fn prepared_studio_settings_changes(
 
 #[cfg(test)]
 mod conflict_cover_tests {
-    use super::conflict_covered_by_paths;
+    use super::{Conflict, ConflictKind, conflict_covered_by_paths};
     use std::path::PathBuf;
 
     #[test]
@@ -1490,5 +1549,14 @@ mod conflict_cover_tests {
             &script
         ));
         assert!(!conflict_covered_by_paths("3 more paths", &script));
+        let record = Conflict::new(
+            ConflictKind::Property,
+            std::path::Path::new(r"instances\ServerStorage.renium"),
+            "ServerStorage/Maps/A: property Value".to_string(),
+        );
+        assert!(record.covered_by_paths(&store));
+        assert!(!record.covered_by_paths(&script));
+        let sentence = Conflict::legacy(store_conflict.to_string());
+        assert!(sentence.covered_by_paths(&store));
     }
 }

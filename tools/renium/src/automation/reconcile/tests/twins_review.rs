@@ -418,7 +418,7 @@ fn reference_to_a_twin_with_a_changed_descendant_is_not_interchangeable() {
     assert!(
         conflicts
             .iter()
-            .any(|c| c.contains("Workspace.Outside: property Value")),
+            .any(|c| c.contains("Workspace/Outside: property Value")),
         "{conflicts:?}"
     );
     assert_eq!(

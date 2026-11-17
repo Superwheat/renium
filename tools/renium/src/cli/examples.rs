@@ -182,7 +182,7 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("st", "Examples:\n  rbx st --event-wait-seconds 1"),
     (
         "lon",
-        "Examples:\n  rbx lon\n  rbx lon --prefer studio\n  rbx lon --prefer editor",
+        "Examples:\n  rbx lon\n  rbx lon --resolve 0a1b2c3d=studio --resolve 4e5f6a7b=editor\n  rbx lon --prefer studio\n  rbx lon --prefer editor",
     ),
     ("lof", "Examples:\n  rbx lof"),
     ("lst", "Examples:\n  rbx lst\n  rbx lst --wait 10"),

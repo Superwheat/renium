@@ -710,9 +710,9 @@ pub(crate) fn align_first_pairing(
     path: &Path,
     editor: &mut SettingsBytecode,
     studio: &mut SettingsBytecode,
-    preference: ConflictPreference,
-    conflicts: &mut Vec<String>,
+    conflicts: &mut ConflictLog,
 ) -> FirstPairingAlignment {
+    let shown = conflict_path(path);
     let mut alignment = FirstPairingAlignment::default();
     drop_joints_studio_migrated(editor, studio);
     align_settings_ids_to_reference(editor, studio);
@@ -775,11 +775,22 @@ pub(crate) fn align_first_pairing(
             && editor.instances[editor_index].class_name
                 != studio.instances[studio_index].class_name
         {
-            conflicts.push(format!(
-                "{} has different classes for {}",
-                path.display(),
-                render_pairing_key(&pairing_interner, *key)
-            ));
+            let at = render_pairing_key(&pairing_interner, *key);
+            conflicts.settle(
+                Conflict::new(
+                    ConflictKind::Pairing,
+                    path,
+                    format!("{shown} has different classes for {at}"),
+                )
+                .instance(&editor.instances[editor_index].settings_id, at)
+                .field("ClassName")
+                .values(
+                    None,
+                    Some(&json!(editor.instances[editor_index].class_name)),
+                    Some(&json!(studio.instances[studio_index].class_name)),
+                )
+                .undecidable(),
+            );
         }
     }
     let editor_key_by_id = editor
@@ -807,10 +818,25 @@ pub(crate) fn align_first_pairing(
                     .get(&instance.settings_id)
                     .is_some_and(|editor_key| *editor_key != key)
         {
-            conflicts.push(format!(
-                "{} has the same instance identity at different paths",
-                path.display()
-            ));
+            let at = settings_instance_path(studio, index);
+            conflicts.settle(
+                Conflict::new(
+                    ConflictKind::Pairing,
+                    path,
+                    format!("{shown} has the same instance identity at different paths: {at}"),
+                )
+                .instance(&instance.settings_id, at.clone())
+                .discriminated("moved")
+                .values(
+                    None,
+                    editor_key_by_id
+                        .get(&instance.settings_id)
+                        .map(|key| json!(render_structural_key(&structural_interner, **key)))
+                        .as_ref(),
+                    Some(&json!(at)),
+                )
+                .undecidable(),
+            );
         }
     }
 
@@ -855,33 +881,168 @@ pub(crate) fn align_first_pairing(
                 })
         };
         if duplicate_slot && !stable_pairs.contains(key) {
-            conflicts.push(format!(
-                "{} has ambiguous duplicate instances at {}",
-                path.display(),
-                render_structural_key(&structural_interner, *key)
-            ));
+            let at = render_structural_key(&structural_interner, *key);
+            conflicts.settle(
+                Conflict::new(
+                    ConflictKind::Pairing,
+                    path,
+                    format!("{shown} has ambiguous duplicate instances at {at}"),
+                )
+                .instance(&editor.instances[*editor_index].settings_id, at)
+                .discriminated("duplicate")
+                .undecidable(),
+            );
             continue;
         }
-        match preference {
-            ConflictPreference::None => conflicts.push(format!(
-                "{} has different values for {}{}",
-                path.display(),
-                render_structural_key(&structural_interner, *key),
-                describe_instance_differences(editor, *editor_index, studio, studio_index)
-            )),
-            ConflictPreference::Editor => {
-                if alignment.studio_before.is_none() {
+        settle_first_pairing_values(
+            path,
+            (&mut *editor, *editor_index),
+            (&mut *studio, studio_index),
+            conflicts,
+            &mut alignment,
+        );
+    }
+    alignment
+}
+
+/// Settles what two records a first pairing matched hold differently, one
+/// conflict per field. Where every field takes one side the whole record
+/// does; otherwise each field takes its own side, and a parent is left to
+/// the merge that follows, which meets the same conflict.
+fn settle_first_pairing_values(
+    path: &Path,
+    editor: (&mut SettingsBytecode, usize),
+    studio: (&mut SettingsBytecode, usize),
+    conflicts: &mut ConflictLog,
+    alignment: &mut FirstPairingAlignment,
+) {
+    let (editor, editor_index) = editor;
+    let (studio, studio_index) = studio;
+    let at = settings_instance_path(editor, editor_index);
+    let id = editor.instances[editor_index].settings_id.clone();
+    let differences = instance_differences(editor, editor_index, studio, studio_index);
+    let mut records = differences
+        .iter()
+        .map(|difference| {
+            let subject = match difference.kind {
+                ConflictKind::Property => format!("{at}: property {}", difference.field),
+                ConflictKind::Attribute => format!("{at}: attribute {}", difference.field),
+                other => format!("{at}: {}", other.name()),
+            };
+            let conflict = Conflict::new(
+                difference.kind,
+                path,
+                values_sentence(
+                    &subject,
+                    None,
+                    difference.files.as_ref(),
+                    difference.studio.as_ref(),
+                ),
+            )
+            .instance(&id, at.clone())
+            .values(None, difference.files.as_ref(), difference.studio.as_ref());
+            match difference.kind {
+                ConflictKind::Property | ConflictKind::Attribute => {
+                    conflict.field(&difference.field)
+                }
+                _ => conflict,
+            }
+        })
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        records.push(
+            Conflict::new(
+                ConflictKind::Pairing,
+                path,
+                format!(
+                    "{} has different values for {at}{}",
+                    conflict_path(path),
+                    describe_unlisted_difference(editor, editor_index, studio, studio_index)
+                ),
+            )
+            .instance(&id, at.clone()),
+        );
+    }
+    let mut sides = Vec::with_capacity(records.len());
+    let mut open = Vec::new();
+    for mut record in records {
+        match conflicts.consult(&mut record, None) {
+            Some(side) => sides.push(side),
+            None => open.push(record),
+        }
+    }
+    if !open.is_empty() {
+        for record in open {
+            conflicts.record(record);
+        }
+        return;
+    }
+    let toward =
+        |side: ConflictSide, alignment: &mut FirstPairingAlignment, studio: &SettingsBytecode| {
+            match side {
+                ConflictSide::Editor if alignment.studio_before.is_none() => {
                     alignment.studio_before = Some(studio.clone());
                 }
-                copy_settings_instance(editor, *editor_index, studio, studio_index)
+                ConflictSide::Studio => alignment.editor_overwritten = true,
+                ConflictSide::Editor => {}
             }
-            ConflictPreference::Studio => {
-                alignment.editor_overwritten = true;
-                copy_settings_instance(studio, studio_index, editor, *editor_index)
+        };
+    if differences.is_empty() || sides.iter().all(|side| *side == sides[0]) {
+        toward(sides[0], alignment, studio);
+        match sides[0] {
+            ConflictSide::Editor => {
+                copy_settings_instance(editor, editor_index, studio, studio_index);
+            }
+            ConflictSide::Studio => {
+                copy_settings_instance(studio, studio_index, editor, editor_index);
+            }
+        }
+        return;
+    }
+    for (difference, side) in differences.iter().zip(sides) {
+        toward(side, alignment, studio);
+        match side {
+            ConflictSide::Editor => {
+                copy_field(difference, editor, editor_index, studio, studio_index)
+            }
+            ConflictSide::Studio => {
+                copy_field(difference, studio, studio_index, editor, editor_index)
             }
         }
     }
-    alignment
+}
+
+/// Gives the target record the source's value of one field.
+fn copy_field(
+    difference: &FieldDifference,
+    source: &SettingsBytecode,
+    source_index: usize,
+    target: &mut SettingsBytecode,
+    target_index: usize,
+) {
+    let source = &source.instances[source_index];
+    let target = &mut target.instances[target_index];
+    let (from, to) = match difference.kind {
+        ConflictKind::Name => {
+            target.name.clone_from(&source.name);
+            return;
+        }
+        ConflictKind::Class => {
+            target.class_name.clone_from(&source.class_name);
+            return;
+        }
+        ConflictKind::Property => (&source.properties, &mut target.properties),
+        ConflictKind::Attribute => (&source.attributes, &mut target.attributes),
+        _ => return,
+    };
+    match from.get(&difference.field) {
+        Some(value) => {
+            to.insert(difference.field.clone(), value.clone());
+        }
+        None => {
+            to.remove(&difference.field);
+        }
+    }
 }
 
 pub(crate) fn protect_package_links(
@@ -889,8 +1050,16 @@ pub(crate) fn protect_package_links(
     base: Option<&SettingsBytecode>,
     editor: &mut SettingsBytecode,
     studio: &mut SettingsBytecode,
-    conflicts: &mut Vec<String>,
+    conflicts: &mut ConflictLog,
 ) {
+    let shown = conflict_path(path);
+    let mut refuse = |id: &str, at: String, detail: String| {
+        conflicts.settle(
+            Conflict::new(ConflictKind::Package, path, detail)
+                .instance(id, at)
+                .undecidable(),
+        );
+    };
     let base_by_id = base
         .into_iter()
         .flat_map(|document| document.instances.iter().enumerate())
@@ -912,6 +1081,11 @@ pub(crate) fn protect_package_links(
         .map(|(index, instance)| (instance.settings_id.clone(), index))
         .collect::<HashMap<_, _>>();
 
+    let base_path = |index: usize| {
+        base.map_or_else(String::new, |document| {
+            settings_instance_path(document, index)
+        })
+    };
     for (id, (base_index, base_instance)) in &base_by_id {
         // A PackageLink gone from both sides (unlinked in Studio by `upl` and
         // stripped from the files by a shared link) is agreement, not a
@@ -924,32 +1098,39 @@ pub(crate) fn protect_package_links(
             let parent = base
                 .and_then(|document| settings_parent_id(document, *base_index))
                 .unwrap_or("unknown");
-            conflicts.push(format!(
-                "{} removes PackageLink {} ({id}) directly while parent {parent} remains in Studio",
-                path.display(),
-                base_instance.name
-            ));
+            refuse(
+                id,
+                base_path(*base_index),
+                format!(
+                    "{shown} removes PackageLink {} ({id}) directly while parent {parent} remains in Studio",
+                    base_instance.name
+                ),
+            );
         }
         if !editor_by_id.contains_key(id)
             && studio_by_id.contains_key(id)
             && !base
                 .is_some_and(|document| package_parent_is_missing(document, *base_index, editor))
         {
-            conflicts.push(format!(
-                "{} omits PackageLink {}; ordinary sync preserves package relationships",
-                path.display(),
-                base_instance.name
-            ));
+            refuse(
+                id,
+                base_path(*base_index),
+                format!(
+                    "{shown} omits PackageLink {}; ordinary sync preserves package relationships",
+                    base_instance.name
+                ),
+            );
         }
     }
 
     for (id, editor_index) in editor_by_id {
         let Some(studio_index) = studio_by_id.get(&id).copied() else {
             if !base_by_id.contains_key(&id) {
-                conflicts.push(format!(
-                    "{} cannot create a PackageLink from project files",
-                    path.display()
-                ));
+                refuse(
+                    &id,
+                    settings_instance_path(editor, editor_index),
+                    format!("{shown} cannot create a PackageLink from project files"),
+                );
             }
             continue;
         };
@@ -961,11 +1142,14 @@ pub(crate) fn protect_package_links(
             || editor_instance.class_name != studio_instance.class_name
             || editor_parent != studio_parent
         {
-            conflicts.push(format!(
-                "{} directly renames or reparents PackageLink {}",
-                path.display(),
-                studio_instance.name
-            ));
+            refuse(
+                &id,
+                settings_instance_path(studio, studio_index),
+                format!(
+                    "{shown} directly renames or reparents PackageLink {}",
+                    studio_instance.name
+                ),
+            );
             continue;
         }
         editor.instances[editor_index]
@@ -1058,41 +1242,64 @@ fn comparison_properties(
     }
 }
 
-/// What differs between the two records of one instance, in the form the
-/// conflict summary groups by (`: property NAME: ...`, `; attribute NAME: ...`),
-/// with Studio's side first.
-pub(crate) fn describe_instance_differences(
+/// One field two records of an instance hold differently: `field` names a
+/// property or attribute, or `Name`, `ClassName`, `Parent`.
+pub(crate) struct FieldDifference {
+    pub(crate) kind: ConflictKind,
+    pub(crate) field: String,
+    pub(crate) studio: Option<Value>,
+    pub(crate) files: Option<Value>,
+}
+
+/// What differs between the two records of one instance, field by field,
+/// under the rules the comparison applies. A parent is told by its id: the
+/// two records stand at the same path.
+pub(crate) fn instance_differences(
     editor: &SettingsBytecode,
     editor_index: usize,
     studio: &SettingsBytecode,
     studio_index: usize,
-) -> String {
+) -> Vec<FieldDifference> {
     let files = &editor.instances[editor_index];
     let live = &studio.instances[studio_index];
     let database = rbx_reflection_database::get().ok();
-    let mut parts = Vec::new();
+    let mut differences = Vec::new();
+    let mut push =
+        |kind: ConflictKind, field: &str, studio: Option<&Value>, files: Option<&Value>| {
+            differences.push(FieldDifference {
+                kind,
+                field: field.to_string(),
+                studio: studio.cloned(),
+                files: files.cloned(),
+            });
+        };
     if live.name != files.name {
-        parts.push(format!(
-            "property Name: {:?} vs {:?}",
-            live.name, files.name
-        ));
+        push(
+            ConflictKind::Name,
+            "Name",
+            Some(&json!(live.name)),
+            Some(&json!(files.name)),
+        );
     }
     if live.class_name != files.class_name {
-        parts.push(format!(
-            "property ClassName: {} vs {}",
-            live.class_name, files.class_name
-        ));
+        push(
+            ConflictKind::Class,
+            "ClassName",
+            Some(&json!(live.class_name)),
+            Some(&json!(files.class_name)),
+        );
     }
     let (live_parent, files_parent) = (
         settings_parent_id(studio, studio_index),
         settings_parent_id(editor, editor_index),
     );
     if live_parent != files_parent {
-        parts.push(format!(
-            "parent identity: {} vs {}",
-            live_parent.unwrap_or("none"),
-            files_parent.unwrap_or("none")
-        ));
+        push(
+            ConflictKind::Parent,
+            "Parent",
+            live_parent.map(|id| json!(id)).as_ref(),
+            files_parent.map(|id| json!(id)).as_ref(),
+        );
     }
     let (live_properties, files_properties) =
         (comparison_properties(live), comparison_properties(files));
@@ -1125,10 +1332,7 @@ pub(crate) fn describe_instance_differences(
         ) {
             continue;
         }
-        parts.push(format!(
-            "property {name}: {}",
-            describe_value_difference(name, left, right)
-        ));
+        push(ConflictKind::Property, name, left, right);
     }
     let mut attributes = live
         .attributes
@@ -1144,64 +1348,35 @@ pub(crate) fn describe_instance_differences(
         {
             continue;
         }
-        parts.push(format!(
-            "attribute {name}: {}",
-            describe_value_difference(name, left, right)
-        ));
+        push(ConflictKind::Attribute, name, left, right);
     }
-    if parts.is_empty() {
-        let only = |a: &Map<String, Value>, b: &Map<String, Value>| {
-            a.keys()
-                .filter(|name| !b.contains_key(*name))
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        parts.push(format!(
-            "records differ; keys only in studio [{}], only in files [{}], attributes only in studio [{}], only in files [{}]",
-            only(&live.properties, &files.properties),
-            only(&files.properties, &live.properties),
-            only(&live.attributes, &files.attributes),
-            only(&files.attributes, &live.attributes)
-        ));
-    }
-    format!(": {}", parts.join("; "))
+    differences
 }
 
-fn describe_value_difference(name: &str, studio: Option<&Value>, files: Option<&Value>) -> String {
-    if name == "Source"
-        && let (Some(Value::String(live)), Some(Value::String(saved))) = (studio, files)
-    {
-        let first = live
-            .lines()
-            .zip(saved.lines())
-            .position(|(a, b)| a != b)
-            .map_or_else(
-                || live.lines().count().min(saved.lines().count()) + 1,
-                |index| index + 1,
-            );
-        return format!(
-            "studio {} lines vs files {} lines, first difference at line {first}",
-            live.lines().count(),
-            saved.lines().count()
-        );
-    }
-    format!("{} vs {}", describe_value(studio), describe_value(files))
-}
-
-fn describe_value(value: Option<&Value>) -> String {
-    let Some(value) = value else {
-        return "absent".to_string();
+/// Why two records that differ in no field the comparison lists still
+/// differ: the keys only one of them holds.
+fn describe_unlisted_difference(
+    editor: &SettingsBytecode,
+    editor_index: usize,
+    studio: &SettingsBytecode,
+    studio_index: usize,
+) -> String {
+    let files = &editor.instances[editor_index];
+    let live = &studio.instances[studio_index];
+    let only = |a: &Map<String, Value>, b: &Map<String, Value>| {
+        a.keys()
+            .filter(|name| !b.contains_key(*name))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",")
     };
-    let text = match value {
-        Value::String(text) => format!("{text:?}"),
-        other => other.to_string(),
-    };
-    if text.chars().count() > 60 {
-        format!("{}…", text.chars().take(59).collect::<String>())
-    } else {
-        text
-    }
+    format!(
+        ": records differ; keys only in studio [{}], only in files [{}], attributes only in studio [{}], only in files [{}]",
+        only(&live.properties, &files.properties),
+        only(&files.properties, &live.properties),
+        only(&live.attributes, &files.attributes),
+        only(&files.attributes, &live.attributes)
+    )
 }
 
 pub(crate) fn copy_settings_instance(

@@ -14,8 +14,8 @@ use walkdir::WalkDir;
 
 use super::context as bound_context;
 use super::reconcile::{
-    AppliedEditorChanges, BaselineSide, Coordinator, PairConfiguration, PairMode, PairSetup,
-    push_project_delta, studio_change_guard_from_state,
+    AppliedEditorChanges, BaselineSide, Conflict, Coordinator, PairConfiguration, PairMode,
+    PairSetup, push_project_delta, studio_change_guard_from_state,
 };
 use super::runtime::{
     acknowledge_pulled_changes, automation_failure_ref, automation_pull_args, automation_push_args,
@@ -95,7 +95,9 @@ struct Status {
     #[serde(skip_serializing_if = "Option::is_none")]
     terrain_observation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    conflicts: Option<Vec<String>>,
+    conflicts: Option<Vec<Conflict>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    differences: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -631,16 +633,19 @@ impl Control {
     }
 
     fn fail(&self, error: String) {
-        self.fail_with_conflicts(error, Vec::new());
+        self.fail_with_review(error, Vec::new(), Vec::new());
     }
 
-    fn fail_with_conflicts(&self, error: String, conflicts: Vec<String>) {
+    /// Fails with what waits for a decision: open conflicts, or verify
+    /// mode's differences.
+    fn fail_with_review(&self, error: String, conflicts: Vec<Conflict>, differences: Vec<String>) {
         log_global(3, format_args!("[renium] live sync error: {error}"));
         let mut status = self.status.lock_recover();
         status.last_error = Some(error.clone());
         status.last_error_at = Some((crate::app::timing::current_millis() / 1000) as u64);
         status.error = Some(error);
         status.conflicts = (!conflicts.is_empty()).then_some(conflicts);
+        status.differences = (!differences.is_empty()).then_some(differences);
         drop(status);
         self.notify_sync_state();
     }
@@ -649,6 +654,7 @@ impl Control {
         let mut status = self.status.lock_recover();
         status.error = None;
         status.conflicts = None;
+        status.differences = None;
         drop(status);
         self.notify_sync_state();
     }
@@ -767,7 +773,7 @@ pub(crate) fn unsettled_reason(daemon: &Value, studio: &Value) -> Option<String>
         .max(paths.len());
     let reason = if daemon["resolutionRequired"].as_bool() == Some(true) {
         format!(
-            "a conflict needs resolution ({}); resolve it with rbx lon --prefer studio|editor",
+            "a conflict needs resolution ({}); `rbx lst` lists each conflict: decide them with rbx lon --resolve ID=studio|editor, or all with --prefer studio|editor",
             error.unwrap_or("Studio and project files changed the same content")
         )
     } else if let Some(error) = error {
@@ -1092,7 +1098,7 @@ impl Manager {
             setup.resolution_required,
         ));
         if let Some(error) = setup.error.clone() {
-            control.fail_with_conflicts(error, setup.conflicts.clone());
+            control.fail_with_review(error, setup.conflicts.clone(), setup.differences.clone());
         }
         #[cfg(any(windows, target_os = "macos"))]
         {
@@ -3042,8 +3048,11 @@ impl LiveLoop {
                 self.control
                     .set_resolution_required(setup.resolution_required);
                 if let Some(error) = setup.error.clone() {
-                    self.control
-                        .fail_with_conflicts(error, setup.conflicts.clone());
+                    self.control.fail_with_review(
+                        error,
+                        setup.conflicts.clone(),
+                        setup.differences.clone(),
+                    );
                 } else {
                     self.control.clear_error();
                 }
@@ -3234,8 +3243,11 @@ impl LiveLoop {
                 self.control
                     .set_resolution_required(setup.resolution_required);
                 if let Some(error) = setup.error.clone() {
-                    self.control
-                        .fail_with_conflicts(error, setup.conflicts.clone());
+                    self.control.fail_with_review(
+                        error,
+                        setup.conflicts.clone(),
+                        setup.differences.clone(),
+                    );
                     self.push_ready = false;
                     return Ok(false);
                 }

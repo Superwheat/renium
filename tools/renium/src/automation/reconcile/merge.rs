@@ -6,24 +6,82 @@ pub(crate) fn merge_snapshots(
     editor: &ProjectSnapshot,
     studio: &ProjectSnapshot,
     preference: ConflictPreference,
-) -> Result<(ProjectSnapshot, Vec<String>)> {
+) -> Result<(ProjectSnapshot, Vec<Conflict>)> {
     let (merged, conflicts, _) =
         merge_snapshots_with_changes(baseline, editor, studio, preference, None)?;
     Ok((merged, conflicts))
 }
 
+/// Merges the files and Studio against the last sync. Each conflict takes
+/// the side its decision names, else the preference's; the ones left are
+/// returned open. A decision that names no conflict of this comparison, or
+/// one no side can be chosen for, fails the merge.
 pub(crate) fn merge_snapshots_with_changes(
     baseline: Option<&ProjectSnapshot>,
     editor: &ProjectSnapshot,
     studio: &ProjectSnapshot,
-    preference: ConflictPreference,
+    decisions: impl Into<ConflictDecisions>,
     known_differences: Option<&HashSet<PathBuf>>,
-) -> Result<(ProjectSnapshot, Vec<String>, MergeChanges)> {
+) -> Result<(ProjectSnapshot, Vec<Conflict>, MergeChanges)> {
     let sides = SnapshotSides {
         baseline,
         editor,
         studio,
     };
+    let decisions = decisions.into();
+    let found = conflicts_met_while_deciding(&sides, &decisions, known_differences)?;
+    let mut conflicts = ConflictLog::new(decisions);
+    conflicts.found_before_decisions(found);
+    let (merged, changes) = merge_sides(&sides, &mut conflicts, known_differences)?;
+    Ok((merged, conflicts.finish()?, changes))
+}
+
+/// The conflicts a comparison meets on the way to its decisions: those it
+/// meets undecided, then those that appear once the decisions naming them
+/// are taken, and so on. One decision can make another's conflict moot (a
+/// parent another one brings back); that decision still names a conflict
+/// of this comparison, while one this never meets is stale.
+fn conflicts_met_while_deciding(
+    sides: &SnapshotSides<'_>,
+    decisions: &ConflictDecisions,
+    known_differences: Option<&HashSet<PathBuf>>,
+) -> Result<HashSet<String>> {
+    let mut found = HashSet::new();
+    if decisions.by_id.is_empty() {
+        return Ok(found);
+    }
+    // Each round takes at least one more decision, so the rounds end.
+    let mut taken = None;
+    loop {
+        let usable = decisions
+            .by_id
+            .iter()
+            .filter(|(id, _)| found.contains(*id))
+            .map(|(id, side)| (id.clone(), *side))
+            .collect::<BTreeMap<_, _>>();
+        if usable.len() == decisions.by_id.len() || taken == Some(usable.len()) {
+            return Ok(found);
+        }
+        taken = Some(usable.len());
+        let mut probe = ConflictLog::new(ConflictDecisions {
+            preference: decisions.preference,
+            by_id: usable,
+        });
+        merge_sides(sides, &mut probe, known_differences)?;
+        found.extend(probe.met());
+    }
+}
+
+fn merge_sides(
+    sides: &SnapshotSides<'_>,
+    conflicts: &mut ConflictLog,
+    known_differences: Option<&HashSet<PathBuf>>,
+) -> Result<(ProjectSnapshot, MergeChanges)> {
+    let SnapshotSides {
+        baseline,
+        editor,
+        studio,
+    } = *sides;
     let mut paths = baseline
         .into_iter()
         .flat_map(|snapshot| snapshot.entries.keys())
@@ -34,7 +92,6 @@ pub(crate) fn merge_snapshots_with_changes(
     paths.sort();
     paths.dedup();
     let mut merged = BTreeMap::new();
-    let mut conflicts = Vec::new();
     let mut changes = MergeChanges::default();
     for path in paths {
         let base = baseline.and_then(|snapshot| snapshot.entries.get(&path));
@@ -53,16 +110,15 @@ pub(crate) fn merge_snapshots_with_changes(
             .and_then(|name| name.to_str())
             .is_some_and(is_service_settings_file_name)
         {
-            merge_settings_entry(&path, &sides, preference, base.is_none(), &mut conflicts)?
+            merge_settings_entry(&path, sides, base.is_none(), conflicts)?
         } else {
             merge_entry(
                 &path,
                 base,
                 editor_entry,
                 studio_entry,
-                preference,
                 baseline.is_none(),
-                &mut conflicts,
+                conflicts,
             )
         };
         if result.editor_changed {
@@ -82,23 +138,14 @@ pub(crate) fn merge_snapshots_with_changes(
         }
     }
     reference_settlement::settle_references_between_stores(
-        &sides,
-        preference,
+        sides,
         &mut merged,
-        &mut conflicts,
+        conflicts,
         &mut changes,
     )?;
-    keep_directories_implied_by_files(&mut merged, &sides, &mut changes);
-    settle_script_paths(
-        &sides,
-        preference,
-        &mut merged,
-        &mut conflicts,
-        &mut changes,
-    )?;
-    conflicts.sort();
-    conflicts.dedup();
-    Ok((ProjectSnapshot { entries: merged }, conflicts, changes))
+    keep_directories_implied_by_files(&mut merged, sides, &mut changes);
+    settle_script_paths(sides, &mut merged, conflicts, &mut changes)?;
+    Ok((ProjectSnapshot { entries: merged }, changes))
 }
 
 /// A directory stands as long as a file beneath it does. A capture of a
@@ -268,14 +315,15 @@ pub(crate) fn changed_script_source_ids(
 /// or gave it its first child or took its last, while the other side may have
 /// edited the text. The files merged path by path know nothing of that, so
 /// the text is merged by the script's identity instead. A conflict names the
-/// path the files hold the script at.
+/// path the files hold the script at, and the script in the merged store.
 fn source_merged_by_identity(
     paths: (&Path, &Path),
+    script: (&str, &SettingsBytecode),
     baseline: Option<&SnapshotEntry>,
     editor: Option<&SnapshotEntry>,
     studio: Option<&SnapshotEntry>,
-    preference: ConflictPreference,
-    conflicts: &mut Vec<String>,
+    conflicts: &mut ConflictLog,
+    open: &mut Vec<Conflict>,
 ) -> Option<SnapshotEntry> {
     let (desired, editor_path) = paths;
     let (Some(editor @ SnapshotEntry::File(_)), Some(studio @ SnapshotEntry::File(_))) =
@@ -293,11 +341,24 @@ fn source_merged_by_identity(
     } else if let Some(merged) = merged_source(baseline, editor, studio) {
         return Some(merged);
     } else {
-        match preference {
-            ConflictPreference::Editor => editor,
-            ConflictPreference::Studio => studio,
-            ConflictPreference::None => {
-                conflicts.push(format!("{} changed on both sides", editor_path.display()));
+        let (id, store) = script;
+        let at = store
+            .instances
+            .iter()
+            .position(|instance| instance.settings_id == id)
+            .map_or_else(String::new, |index| settings_instance_path(store, index));
+        let mut conflict = Conflict::new(
+            ConflictKind::Script,
+            editor_path,
+            format!("{} changed on both sides", conflict_path(editor_path)),
+        )
+        .instance(id, at)
+        .texts(baseline, Some(editor), Some(studio));
+        match conflicts.consult(&mut conflict, None) {
+            Some(ConflictSide::Editor) => editor,
+            Some(ConflictSide::Studio) => studio,
+            None => {
+                open.push(conflict);
                 editor
             }
         }
@@ -384,9 +445,8 @@ fn drop_directories_emptied_above(
 /// folders that leaves empty.
 pub(crate) fn settle_script_paths(
     sides: &SnapshotSides<'_>,
-    preference: ConflictPreference,
     merged: &mut BTreeMap<PathBuf, SnapshotEntry>,
-    conflicts: &mut Vec<String>,
+    conflicts: &mut ConflictLog,
     changes: &mut MergeChanges,
 ) -> Result<()> {
     let (baseline, editor, studio) = (sides.baseline, sides.editor, sides.studio);
@@ -429,7 +489,8 @@ pub(crate) fn settle_script_paths(
             .unwrap_or_default();
         let editor_paths = script_paths_by_settings_id(&editor.entries, &settings_path)?;
         let studio_paths = script_paths_by_settings_id(&studio.entries, &settings_path)?;
-        let merged_paths = script_paths_by_settings_id(merged, &settings_path)?;
+        let merged_store = settings_document(merged.get(&settings_path))?;
+        let merged_paths = script_paths_of(&merged_store, &settings_path)?;
         // Each side by the identities the merged store uses. Where the merge
         // left a side's store as it was, that store is the merged one.
         let editor_by_merged_id = changes
@@ -465,11 +526,12 @@ pub(crate) fn settle_script_paths(
             }
             let Some(source) = source_merged_by_identity(
                 (desired, editor_path),
+                (id, &merged_store),
                 baseline_path
                     .and_then(|path| baseline.and_then(|snapshot| snapshot.entries.get(path))),
                 editor.entries.get(editor_path),
                 studio.entries.get(studio_path),
-                preference,
+                conflicts,
                 &mut identity_conflicts,
             ) else {
                 continue;
@@ -522,12 +584,20 @@ pub(crate) fn settle_script_paths(
     }
     // What the path by path merge said about those files is void: a file one
     // side moved away and the other edited is no conflict of its own.
+    let settled_paths = settled_by_identity
+        .iter()
+        .map(|path| conflict_path(path))
+        .collect::<HashSet<_>>();
     conflicts.retain(|conflict| {
-        !settled_by_identity
-            .iter()
-            .any(|path| *conflict == format!("{} changed on both sides", path.display()))
+        !(matches!(
+            conflict.kind,
+            ConflictKind::Script | ConflictKind::File | ConflictKind::Removal
+        ) && conflict.instance.is_none()
+            && settled_paths.contains(&conflict.path))
     });
-    conflicts.append(&mut identity_conflicts);
+    for conflict in identity_conflicts {
+        conflicts.record(conflict);
+    }
     for path in &placed {
         place_directories_above(path, merged, sides, &mut touched);
     }
@@ -558,9 +628,8 @@ pub(crate) fn merge_entry(
     base: Option<&SnapshotEntry>,
     editor: Option<&SnapshotEntry>,
     studio: Option<&SnapshotEntry>,
-    preference: ConflictPreference,
     first_pairing: bool,
-    conflicts: &mut Vec<String>,
+    conflicts: &mut ConflictLog,
 ) -> MergedEntry {
     let unchanged = |side: Option<&SnapshotEntry>| {
         if first_pairing {
@@ -576,15 +645,7 @@ pub(crate) fn merge_entry(
     } else if unchanged(studio) {
         editor.cloned()
     } else {
-        merge_conflicting_entry(
-            path,
-            base,
-            editor,
-            studio,
-            preference,
-            first_pairing,
-            conflicts,
-        )
+        merge_conflicting_entry(path, base, editor, studio, first_pairing, conflicts)
     };
     MergedEntry {
         editor_changed: !entries_equivalent(path, editor, value.as_ref()),
@@ -595,14 +656,16 @@ pub(crate) fn merge_entry(
     }
 }
 
+/// What a path both sides changed ends as: the line merge of a script, else
+/// the side its conflict takes. A conflict where a folder or a link stands
+/// on a side is never settled by choosing a side; it keeps the files.
 pub(crate) fn merge_conflicting_entry(
     path: &Path,
     base: Option<&SnapshotEntry>,
     editor: Option<&SnapshotEntry>,
     studio: Option<&SnapshotEntry>,
-    preference: ConflictPreference,
     first_pairing: bool,
-    conflicts: &mut Vec<String>,
+    conflicts: &mut ConflictLog,
 ) -> Option<SnapshotEntry> {
     let ordinary_file_conflict = ((first_pairing || base.is_none())
         && matches!(editor, Some(SnapshotEntry::File(_)))
@@ -617,15 +680,41 @@ pub(crate) fn merge_conflicting_entry(
     {
         return Some(merged);
     }
-    if ordinary_file_conflict {
-        match preference {
-            ConflictPreference::Editor => return editor.cloned(),
-            ConflictPreference::Studio => return studio.cloned(),
-            ConflictPreference::None => {}
-        }
+    let removed_by = match (base, editor, studio) {
+        (Some(SnapshotEntry::File(_)), None, Some(_)) => Some("the files"),
+        (Some(SnapshotEntry::File(_)), Some(_), None) => Some("Studio"),
+        _ => None,
+    };
+    let shown = conflict_path(path);
+    let (kind, detail) = match removed_by {
+        Some(remover) => (
+            ConflictKind::Removal,
+            format!(
+                "{shown}: {} changed it and {remover} removed it",
+                if remover == "Studio" {
+                    "the files"
+                } else {
+                    "Studio"
+                }
+            ),
+        ),
+        None if is_source_path(path) => (
+            ConflictKind::Script,
+            format!("{shown} changed on both sides"),
+        ),
+        None => (ConflictKind::File, format!("{shown} changed on both sides")),
+    };
+    let mut conflict = Conflict::new(kind, path, detail).texts(base, editor, studio);
+    if !ordinary_file_conflict {
+        conflict = conflict.undecidable();
+        conflict
+            .detail
+            .push_str("; a folder or link stands on one side, so settle it by hand");
     }
-    conflicts.push(format!("{} changed on both sides", path.display()));
-    editor.cloned()
+    match conflicts.settle(conflict) {
+        Some(ConflictSide::Studio) => studio.cloned(),
+        _ => editor.cloned(),
+    }
 }
 
 /// A script both sides edited since the last sync, merged line by line (see
@@ -855,9 +944,8 @@ pub(crate) fn first_three_way_property_difference(
 pub(crate) fn merge_settings_entry(
     path: &Path,
     sides: &SnapshotSides<'_>,
-    preference: ConflictPreference,
     first_pairing: bool,
-    conflicts: &mut Vec<String>,
+    conflicts: &mut ConflictLog,
 ) -> Result<MergedEntry> {
     let base = sides
         .baseline
@@ -874,9 +962,12 @@ pub(crate) fn merge_settings_entry(
         });
     }
     if !first_pairing && editor.is_none() && studio.is_some() {
-        if !matches!(preference, ConflictPreference::Studio) {
-            conflicts.push(missing_store_message(path));
-        }
+        // Studio's store may stand; the files' deletion may not empty the
+        // service, so only Studio can be chosen.
+        let mut conflict = Conflict::new(ConflictKind::Store, path, missing_store_message(path))
+            .only(ConflictSide::Studio);
+        conflict.absent = vec!["files".to_string()];
+        conflicts.settle(conflict);
         return Ok(MergedEntry {
             value: studio.cloned(),
             editor_changed: true,
@@ -902,21 +993,15 @@ pub(crate) fn merge_settings_entry(
     remove_reconciliation_derived_properties(&mut studio_doc);
     let editor_script_paths;
     let (merged, editor_equivalent, studio_equivalent, aligned_studio) = if first_pairing {
-        let previous_conflicts = conflicts.len();
-        let alignment = align_first_pairing(
-            path,
-            &mut editor_doc,
-            &mut studio_doc,
-            preference,
-            conflicts,
-        );
+        let previous_conflicts = conflicts.open().len();
+        let alignment = align_first_pairing(path, &mut editor_doc, &mut studio_doc, conflicts);
         editor_script_paths = script_paths_of(&editor_doc, path)?;
         crate::settings::equivalence::inherit_workspace_viewport_reference(
             &mut editor_doc,
             &studio_doc,
         );
         align_reconciliation_protected_workspace_cameras(&editor_doc, &mut studio_doc);
-        if conflicts.len() > previous_conflicts {
+        if conflicts.open().len() > previous_conflicts {
             let studio_equivalent = settings_documents_equivalent(&studio_doc, &editor_doc);
             (editor_doc, true, studio_equivalent, Some(studio_doc))
         } else {
@@ -925,17 +1010,13 @@ pub(crate) fn merge_settings_entry(
                 version: editor_doc.version.max(studio_doc.version),
                 instances: Vec::new(),
             };
-            let (merged, merge_conflicts) = merge_reconciliation_settings_documents(
-                &empty,
-                &editor_doc,
-                &studio_doc,
-                preference,
+            let merged = merge_reconciliation_settings_documents(
+                path,
+                [&empty, &editor_doc, &studio_doc],
+                conflicts,
                 &no_source_changes,
                 &no_source_changes,
             );
-            conflicts.extend(merge_conflicts.into_iter().map(|conflict| {
-                format!("{}: {}: {}", path.display(), conflict.path, conflict.detail)
-            }));
             let editor_equivalent = !alignment.editor_overwritten
                 && settings_documents_equivalent(&editor_doc, &merged);
             let studio_equivalent = alignment.studio_before.is_none()
@@ -1018,17 +1099,13 @@ pub(crate) fn merge_settings_entry(
         {
             (editor_doc, true, false, Some(studio_doc))
         } else {
-            let (merged, merge_conflicts) = merge_reconciliation_settings_documents(
-                &base_doc,
-                &editor_doc,
-                &studio_doc,
-                preference,
+            let merged = merge_reconciliation_settings_documents(
+                path,
+                [&base_doc, &editor_doc, &studio_doc],
+                conflicts,
                 &editor_source_changes,
                 &studio_source_changes,
             );
-            conflicts.extend(merge_conflicts.into_iter().map(|conflict| {
-                format!("{}: {}: {}", path.display(), conflict.path, conflict.detail)
-            }));
             let editor_equivalent = settings_documents_equivalent(&editor_doc, &merged);
             let studio_equivalent = settings_documents_equivalent(&studio_doc, &merged);
             (
@@ -1135,15 +1212,16 @@ fn collect_referenced_ids(value: &Value, wanted: &HashSet<&str>, output: &mut Ha
     }
 }
 
+/// Merges one store's three documents (the last sync, the files, Studio);
+/// its conflicts go to `conflicts`, each settled by its decision first.
 pub(crate) fn merge_reconciliation_settings_documents(
-    base: &SettingsBytecode,
-    editor: &SettingsBytecode,
-    studio: &SettingsBytecode,
-    preference: ConflictPreference,
+    store: &Path,
+    documents: [&SettingsBytecode; 3],
+    conflicts: &mut ConflictLog,
     editor_source_changes: &HashSet<String>,
     studio_source_changes: &HashSet<String>,
-) -> (SettingsBytecode, Vec<VcMergeConflict>) {
-    let prefer_studio = preference_bool(preference).map(|prefer_editor| !prefer_editor);
+) -> SettingsBytecode {
+    let [base, editor, studio] = documents;
     let mut interner = PathInterner::new();
     let editor_paths = structural_path_ids(editor, &mut interner);
     let studio_paths = structural_path_ids(studio, &mut interner);
@@ -1175,21 +1253,171 @@ pub(crate) fn merge_reconciliation_settings_documents(
         })
         .map(|(_, (instance, _))| instance.settings_id.clone())
         .collect();
-    merge_aligned_settings_documents(
+    let (merged, open) = merge_aligned_settings_documents(
         base,
         studio,
         editor,
-        prefer_studio,
-        studio_source_changes,
-        editor_source_changes,
+        &mut StoreResolver {
+            store,
+            log: conflicts,
+        },
+        (studio_source_changes, editor_source_changes),
         &aligned_additions,
-    )
+    );
+    for conflict in &open {
+        conflicts.record(store_conflict(store, conflict));
+    }
+    merged
 }
 
-pub(crate) fn preference_bool(preference: ConflictPreference) -> Option<bool> {
-    match preference {
-        ConflictPreference::None => None,
-        ConflictPreference::Editor => Some(true),
-        ConflictPreference::Studio => Some(false),
+/// Settles a store merge's conflicts by the comparison's decisions. The
+/// store merge's ours is Studio and its theirs the files.
+struct StoreResolver<'a> {
+    store: &'a Path,
+    log: &'a mut ConflictLog,
+}
+
+impl VcResolve for StoreResolver<'_> {
+    fn resolve(&mut self, conflict: &VcMergeConflict) -> Option<bool> {
+        let mut record = store_conflict(self.store, conflict);
+        self.log
+            .consult(&mut record, conflict.follows.map(studio_when))
+            .map(|side| side == ConflictSide::Studio)
     }
+}
+
+fn studio_when(ours: bool) -> ConflictSide {
+    if ours {
+        ConflictSide::Studio
+    } else {
+        ConflictSide::Editor
+    }
+}
+
+/// A store merge's conflict as a record, its sides named: the merge's ours
+/// is Studio and its theirs the files.
+pub(crate) fn store_conflict(store: &Path, conflict: &VcMergeConflict) -> Conflict {
+    let at = &conflict.instance_path;
+    let field = conflict.field.as_deref().unwrap_or_default();
+    let values = conflict.values.as_ref();
+    let base = values.and_then(|values| values.base.as_ref());
+    let studio = values.and_then(|values| values.ours.as_ref());
+    let files = values.and_then(|values| values.theirs.as_ref());
+    let holder = |studio: Option<&Value>| {
+        if studio.is_some() {
+            "Studio"
+        } else {
+            "the files"
+        }
+    };
+    let other = |studio: Option<&Value>| {
+        if studio.is_some() {
+            "the files"
+        } else {
+            "Studio"
+        }
+    };
+    let (kind, discriminator, detail) = match conflict.kind {
+        VcConflictKind::Property | VcConflictKind::Attribute => {
+            let kind = if conflict.kind == VcConflictKind::Property {
+                ConflictKind::Property
+            } else {
+                ConflictKind::Attribute
+            };
+            (
+                kind,
+                "",
+                values_sentence(
+                    &format!("{at}: {} {field}", kind.name()),
+                    Some(base),
+                    files,
+                    studio,
+                ),
+            )
+        }
+        VcConflictKind::Name => (
+            ConflictKind::Name,
+            "",
+            values_sentence(&format!("{at}: name"), Some(base), files, studio),
+        ),
+        VcConflictKind::ClassName => (
+            ConflictKind::Class,
+            "",
+            values_sentence(&format!("{at}: class"), Some(base), files, studio),
+        ),
+        VcConflictKind::Parent => (
+            ConflictKind::Parent,
+            "",
+            values_sentence(&format!("{at}: parent"), Some(base), files, studio),
+        ),
+        VcConflictKind::Orphan if !conflict.part_of_removal => (
+            ConflictKind::Removal,
+            "orphan",
+            format!(
+                "{at}: {} put it under a parent {} removed",
+                holder(studio),
+                other(studio)
+            ),
+        ),
+        // An orphan that is itself a removal is that one conflict, with one
+        // decision.
+        VcConflictKind::Removal | VcConflictKind::Orphan => (
+            ConflictKind::Removal,
+            "",
+            format!(
+                "{at}: {} changed it and {} removed it",
+                holder(studio),
+                other(studio)
+            ),
+        ),
+        VcConflictKind::Cycle => (
+            ConflictKind::Parent,
+            if conflict.decidable {
+                "cycle"
+            } else {
+                "cycle left"
+            },
+            format!(
+                "{at}: {}{}",
+                conflict
+                    .detail
+                    .strip_prefix("Parent: ")
+                    .unwrap_or(&conflict.detail),
+                if conflict.decidable {
+                    ""
+                } else {
+                    " that a decision left standing"
+                }
+            ),
+        ),
+        VcConflictKind::Reference => (
+            ConflictKind::Reference,
+            "",
+            format!(
+                "{at}: {field} refers to {}, which {} removed",
+                quoted_value(studio.or(files)),
+                other(studio)
+            ),
+        ),
+    };
+    let mut record = Conflict::new(kind, store, detail)
+        .instance(&conflict.settings_id, at.clone())
+        .discriminated(discriminator);
+    if let Some(field) = &conflict.field {
+        record = record.field(field);
+    }
+    record = match conflict.kind {
+        // What each side holds the parent or target at; the last sync's is
+        // not known here.
+        VcConflictKind::Orphan | VcConflictKind::Cycle | VcConflictKind::Reference => {
+            let mut record = record.values(None, files, studio);
+            record.absent.retain(|place| place != "base");
+            record
+        }
+        _ => record.values(base, files, studio),
+    };
+    if !conflict.decidable {
+        record = record.undecidable();
+    }
+    record
 }

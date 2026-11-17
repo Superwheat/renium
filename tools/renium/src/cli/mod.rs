@@ -2674,6 +2674,13 @@ pub(super) struct StudioChangeStateArgs {
     )]
     pub(super) prefer: Option<String>,
     #[arg(
+        help = "Decide one conflict by the id `rbx lst` shows (repeatable; files = editor)",
+        long = "resolve",
+        value_name = "ID=studio|editor",
+        value_parser = crate::automation::reconcile::conflict_decision_argument
+    )]
+    pub(super) resolve: Vec<String>,
+    #[arg(
         help = "First-connection mode: reconcile applies the comparison, verify only reports differences (default: liveSync.initialSyncPriority)",
         long,
         value_name = "reconcile|verify"
@@ -2709,6 +2716,7 @@ impl StudioChangeStateArgs {
             context_bound: false,
             details,
             prefer: None,
+            resolve: Vec::new(),
             initial_sync_priority: None,
             initial_conflict_preference: None,
         }

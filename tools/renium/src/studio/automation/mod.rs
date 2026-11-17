@@ -2013,6 +2013,7 @@ fn live_operation_parameters(args: &StudioChangeStateArgs) -> Value {
         "settleWaitSeconds": args.settle_wait_seconds.map(|seconds| seconds.clamp(0.0, 120.0)),
         "contextBound": args.context_bound,
         "resolveConflictPreference": args.prefer,
+        "resolveConflicts": args.resolve,
         "initialSyncPriority": args.initial_sync_priority,
         "initialConflictPreference": args.initial_conflict_preference,
         "compact": !args.details,
@@ -2039,6 +2040,48 @@ fn merge_settled_status(result: &mut Value, settled: Value) {
     }
 }
 
+/// How many conflicts a Live Sync status shows without `--details`.
+const SHOWN_CONFLICTS: usize = 20;
+
+/// What a caller does with open conflicts.
+const DECIDE_CONFLICTS: &str = "Decide each conflict from its values: `rbx lon --resolve ID=studio|editor` (once per conflict; files = editor), or `rbx lon --prefer studio|editor` for all of them. A run that leaves any conflict open applies nothing and keeps no decision, so repeat earlier --resolve values with new ones. Ask the user only where both sides hold work you cannot account for. `rbx lof`, then a scoped push (-p/-f with -u), leaves the rest of Studio untouched.";
+
+/// The open conflicts a Live Sync result carries, with how many more the
+/// compact status left out.
+fn open_conflicts(result: &Value) -> Option<(Vec<Value>, u64)> {
+    let conflicts = result
+        .pointer("/daemon/conflicts")
+        .and_then(Value::as_array)
+        .filter(|conflicts| !conflicts.is_empty())?;
+    let more = result
+        .pointer("/daemon/moreConflicts")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Some((conflicts.clone(), more))
+}
+
+/// Prints the conflicts that wait for a decision, each as its record, with
+/// what to do next, and fails.
+fn report_open_conflicts(error: &str, conflicts: Vec<Value>, more: u64) -> Result<()> {
+    let mut next = DECIDE_CONFLICTS.to_string();
+    if more > 0 {
+        next.push_str(&format!(
+            " {more} more conflicts are not shown; `rbx lst --details` lists all."
+        ));
+    }
+    let mut report = json!({
+        "ok": false,
+        "error": error,
+        "next": next,
+        "conflicts": conflicts,
+    });
+    if more > 0 {
+        report["moreConflicts"] = json!(more);
+    }
+    print_json_output(&report, false)?;
+    Err(ReportedFailure.into())
+}
+
 fn finish_studio_change_state_command(
     operation: u16,
     has_preference: bool,
@@ -2058,31 +2101,18 @@ fn finish_studio_change_state_command(
         if operation == op::LIVE_START && has_preference {
             bail!(error.to_string());
         }
-        let conflicts = result
-            .pointer("/daemon/conflicts")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let listing = if details && conflicts.len() > 3 {
-            format!(
-                "\nAll {} conflicts:\n{}",
-                conflicts.len(),
-                conflicts.join("\n")
-            )
-        } else if error.contains(" more (") {
-            "\n`rbx lst --details` lists every conflict and what differs".to_string()
-        } else {
-            String::new()
-        };
-        bail!(
-            "{error}{listing}\nResolve with one:\nrbx lon --prefer studio\nrbx lon --prefer editor\nrbx lof, then push only the paths you need (-p/-f with -u)"
-        );
+        if open_conflicts(&result).is_none() {
+            bail!(
+                "{error}\nResolve with one:\nrbx lon --prefer studio\nrbx lon --prefer editor\nrbx lof, then push only the paths you need (-p/-f with -u)"
+            );
+        }
+    }
+    if failed && let Some((conflicts, more)) = open_conflicts(&result) {
+        let error = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Studio and project files changed the same content");
+        return report_open_conflicts(error, conflicts, more);
     }
     if failed {
         let error = result
@@ -2090,7 +2120,7 @@ fn finish_studio_change_state_command(
             .and_then(Value::as_str)
             .unwrap_or("Live Sync could not complete the requested operation");
         let differences = result
-            .pointer("/daemon/conflicts")
+            .pointer("/daemon/differences")
             .and_then(Value::as_array)
             .map(|items| {
                 items
@@ -2316,6 +2346,22 @@ fn compact_live_daemon_status(value: &Value) -> Value {
         && let Some(paths) = source.get("pendingPaths")
     {
         result.insert("pendingPaths".to_string(), paths.clone());
+    }
+    if let Some(conflicts) = source
+        .get("conflicts")
+        .and_then(Value::as_array)
+        .filter(|conflicts| !conflicts.is_empty())
+    {
+        result.insert(
+            "conflicts".to_string(),
+            Value::Array(conflicts.iter().take(SHOWN_CONFLICTS).cloned().collect()),
+        );
+        if conflicts.len() > SHOWN_CONFLICTS {
+            result.insert(
+                "moreConflicts".to_string(),
+                json!(conflicts.len() - SHOWN_CONFLICTS),
+            );
+        }
     }
     Value::Object(result)
 }
@@ -6404,6 +6450,39 @@ mod settled_start_tests {
         assert_eq!(parameters["bridgeWaitSeconds"], 3.0);
         assert_eq!(parameters["reset"], false);
         assert!(parameters["resolveConflictPreference"].is_null());
+        assert_eq!(parameters["resolveConflicts"], json!([]));
+        let decided = StudioChangeStateArgs {
+            resolve: vec!["0a1b2c3d=studio".into()],
+            ..StudioChangeStateArgs::plain(BridgeConnectionArgs::local(3.0), false)
+        };
+        assert_eq!(
+            live_operation_parameters(&decided)["resolveConflicts"],
+            json!(["0a1b2c3d=studio"])
+        );
+    }
+
+    #[test]
+    fn a_compact_status_shows_twenty_conflicts_and_counts_the_rest() {
+        let conflict = |index: usize| json!({"id": format!("{index:08x}"), "kind": "property"});
+        let daemon = json!({
+            "running": true,
+            "resolutionRequired": true,
+            "error": "Sync needs review",
+            "conflicts": (0..25).map(conflict).collect::<Vec<_>>(),
+            "differences": ["push: src/A.luau"],
+        });
+        let compact = compact_live_daemon_status(&daemon);
+        assert_eq!(compact["conflicts"].as_array().unwrap().len(), 20);
+        assert_eq!(compact["conflicts"][19], conflict(19));
+        assert_eq!(compact["moreConflicts"], 5);
+        assert!(compact.get("differences").is_none());
+        let (shown, more) = open_conflicts(&json!({"ok": false, "daemon": compact})).unwrap();
+        assert_eq!((shown.len(), more), (20, 5));
+
+        let few = json!({"running": true, "conflicts": [conflict(1)]});
+        let compact = compact_live_daemon_status(&few);
+        assert!(compact.get("moreConflicts").is_none());
+        assert!(open_conflicts(&json!({"daemon": {"running": true, "conflicts": []}})).is_none());
     }
 }
 

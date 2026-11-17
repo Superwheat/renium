@@ -251,8 +251,8 @@ pub(crate) struct PairRecord {
     pub(crate) baseline: Option<StoredSnapshot>,
     #[serde(default)]
     pub(crate) head: Option<RecoveryHead>,
-    #[serde(default)]
-    pub(crate) conflicts: Vec<String>,
+    #[serde(default, with = "stored")]
+    pub(crate) conflicts: Vec<Conflict>,
     #[serde(default)]
     pub(crate) resolution_required: bool,
     #[serde(default)]
@@ -263,6 +263,43 @@ pub(crate) struct PairRecord {
     pub(crate) local_file_digest: Option<String>,
     #[serde(default)]
     pub(crate) studio_checkpoint: Option<StudioCheckpoint>,
+    /// What verify mode found different, path by path (`push:` / `pull:`).
+    #[serde(default)]
+    pub(crate) differences: Vec<String>,
+}
+
+impl PairRecord {
+    /// Whether conflicts or verify differences wait for a decision; writes
+    /// hold until they are settled.
+    pub(crate) fn has_open_review(&self) -> bool {
+        !self.conflicts.is_empty() || !self.differences.is_empty()
+    }
+
+    pub(crate) fn clear_review(&mut self) {
+        self.conflicts.clear();
+        self.differences.clear();
+    }
+
+    /// Brings a record that kept conflicts as sentences to this version:
+    /// verify mode's difference lines go back to `differences`, and every
+    /// other sentence stays a conflict no side can be chosen for, so the
+    /// writes it held stay held until the next comparison.
+    pub(super) fn upgrade(&mut self) {
+        if self.version != SENTENCE_CONFLICTS_RECORD_VERSION {
+            return;
+        }
+        let (differences, conflicts) = std::mem::take(&mut self.conflicts)
+            .into_iter()
+            .partition::<Vec<_>, _>(|conflict| {
+                conflict.path.is_empty() && is_difference_line(&conflict.detail)
+            });
+        self.differences = differences
+            .into_iter()
+            .map(|conflict| conflict.detail)
+            .collect();
+        self.conflicts = conflicts;
+        self.version = RECORD_VERSION;
+    }
 }
 
 pub(crate) fn saved_pair_identities(root: &Path, experience: &Path) -> Result<Vec<PairIdentity>> {
@@ -292,8 +329,10 @@ pub(crate) fn saved_pair_identities(root: &Path, experience: &Path) -> Result<Ve
         let Ok(record) = rmp_serde::from_slice::<PairRecord>(&bytes) else {
             continue;
         };
-        if record.version != RECORD_VERSION
-            || record.identity.project != project
+        if !matches!(
+            record.version,
+            RECORD_VERSION | SENTENCE_CONFLICTS_RECORD_VERSION
+        ) || record.identity.project != project
             || record.identity.experience != experience
         {
             continue;
@@ -366,6 +405,7 @@ pub(crate) fn load_record(context: &BoundContext, key: &str) -> Result<Option<Pa
     };
     let mut record: PairRecord = rmp_serde::from_slice(&bytes)
         .with_context(|| format!("Failed to decode {}", path.display()))?;
+    record.upgrade();
     if let Some(baseline) = record.baseline.as_mut()
         && baseline.migrate_store_paths(Path::new(&context.root))?
     {

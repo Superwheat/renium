@@ -20,8 +20,8 @@ project unasked.
 
 `rbx status` shows the connection to Studio, `rbx lst` shows Live Sync and
 `rbx lof` stops it. A first-connection conflict waits for your choice: the editor
-asks, the CLI prints the commands that resolve it, and `rbx lst --details` shows
-both values. Unsaved editor buffers do not sync, and file edits made during Play
+asks, and the CLI lists each conflict with its id and the values of both sides;
+`rbx lon --resolve ID=studio|editor` decides one, `--prefer` all of them. Unsaved editor buffers do not sync, and file edits made during Play
 wait for Edit mode. While Live Sync reports no problem, there is no need to push,
 poll or playtest after each save. After a failure, read `rbx lst --details`, fix the cause, then run `rbx rp`
 to retry or `rbx dp` to discard.

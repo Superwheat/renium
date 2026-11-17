@@ -52,16 +52,14 @@ fn a_preference_settles_a_conflict_between_files_and_no_other() {
             ConflictPreference::Editor,
             ConflictPreference::Studio,
         ] {
-            let mut conflicts = Vec::new();
-            let kept = merge_conflicting_entry(
-                path,
-                base,
-                editor,
-                studio,
-                preference,
-                first_pairing,
-                &mut conflicts,
-            );
+            let mut conflicts = ConflictLog::new(preference);
+            let kept =
+                merge_conflicting_entry(path, base, editor, studio, first_pairing, &mut conflicts);
+            let conflicts = conflicts
+                .open()
+                .iter()
+                .map(|conflict| conflict.detail.clone())
+                .collect::<Vec<_>>();
             let settled = settles && !matches!(preference, ConflictPreference::None);
             let expected = if settled && matches!(preference, ConflictPreference::Studio) {
                 studio
@@ -73,8 +71,36 @@ fn a_preference_settles_a_conflict_between_files_and_no_other() {
                 conflicts,
                 if settled {
                     Vec::new()
+                } else if matches!(base, Some(SnapshotEntry::File(_)))
+                    && (editor.is_none() || studio.is_none())
+                {
+                    vec![format!(
+                        "src/Notes.txt: {} changed it and {} removed it{}",
+                        if editor.is_none() {
+                            "Studio"
+                        } else {
+                            "the files"
+                        },
+                        if editor.is_none() {
+                            "the files"
+                        } else {
+                            "Studio"
+                        },
+                        if settles {
+                            ""
+                        } else {
+                            "; a folder or link stands on one side, so settle it by hand"
+                        }
+                    )]
                 } else {
-                    vec![format!("{} changed on both sides", path.display())]
+                    vec![format!(
+                        "src/Notes.txt changed on both sides{}",
+                        if settles {
+                            ""
+                        } else {
+                            "; a folder or link stands on one side, so settle it by hand"
+                        }
+                    )]
                 },
                 "case {index} {preference:?}"
             );
@@ -292,22 +318,15 @@ fn merged_additions(
         document.instances.extend(additions);
         document
     };
-    let (merged, conflicts) = merge_reconciliation_settings_documents(
-        &store(Vec::new()),
-        &store(editor),
-        &store(studio),
-        ConflictPreference::Editor,
+    let mut conflicts = ConflictLog::new(ConflictPreference::Editor);
+    let merged = merge_reconciliation_settings_documents(
+        Path::new("instances/Workspace.renium"),
+        [&store(Vec::new()), &store(editor), &store(studio)],
+        &mut conflicts,
         &HashSet::new(),
         &HashSet::new(),
     );
-    assert!(
-        conflicts.is_empty(),
-        "{:?}",
-        conflicts
-            .iter()
-            .map(|conflict| format!("{}: {}", conflict.path, conflict.detail))
-            .collect::<Vec<_>>()
-    );
+    assert!(conflicts.open().is_empty(), "{:?}", conflicts.open());
     let mut names = merged
         .instances
         .iter()
@@ -461,17 +480,21 @@ fn merged_script(
     studio: &str,
     preference: ConflictPreference,
 ) -> (SnapshotEntry, Vec<String>) {
-    let mut conflicts = Vec::new();
+    let mut conflicts = ConflictLog::new(preference);
     let merged = merge_entry(
         Path::new("src/ServerScriptService/Main.luau"),
         Some(&text(base)),
         Some(&text(files)),
         Some(&text(studio)),
-        preference,
         false,
         &mut conflicts,
     );
-    (merged.value.unwrap(), conflicts)
+    let details = conflicts
+        .open()
+        .iter()
+        .map(|conflict| conflict.detail.clone())
+        .collect();
+    (merged.value.unwrap(), details)
 }
 
 /// A script both sides edited keeps both edits where they touch different
@@ -491,13 +514,12 @@ fn edits_of_both_sides_to_different_lines_of_a_script_are_both_kept() {
         assert!(merged == text(both), "{preference:?}");
         assert!(conflicts.is_empty(), "{conflicts:?}");
     }
-    let mut conflicts = Vec::new();
+    let mut conflicts = ConflictLog::new(ConflictPreference::None);
     let merged = merge_entry(
         Path::new("src/Main.luau"),
         Some(&text(base)),
         Some(&text(files)),
         Some(&text(studio)),
-        ConflictPreference::None,
         false,
         &mut conflicts,
     );
@@ -548,42 +570,39 @@ fn only_a_script_with_a_last_sync_text_is_merged_by_line() {
     let base = "a\nb\nc\n";
     let files = "a2\nb\nc\n";
     let studio = "a\nb\nc2\n";
-    let mut conflicts = Vec::new();
+    let mut conflicts = ConflictLog::new(ConflictPreference::None);
     let first = merge_entry(
         Path::new("src/Main.luau"),
         Some(&text(base)),
         Some(&text(files)),
         Some(&text(studio)),
-        ConflictPreference::None,
         true,
         &mut conflicts,
     );
     assert!(first.value == Some(text(files)));
-    assert_eq!(conflicts.len(), 1);
-    let mut conflicts = Vec::new();
+    assert_eq!(conflicts.open().len(), 1);
+    let mut conflicts = ConflictLog::new(ConflictPreference::None);
     let notes = merge_entry(
         Path::new("src/Notes.txt"),
         Some(&text(base)),
         Some(&text(files)),
         Some(&text(studio)),
-        ConflictPreference::None,
         false,
         &mut conflicts,
     );
     assert!(notes.value == Some(text(files)));
-    assert_eq!(conflicts.len(), 1);
-    let mut conflicts = Vec::new();
+    assert_eq!(conflicts.open().len(), 1);
+    let mut conflicts = ConflictLog::new(ConflictPreference::None);
     let binary = merge_entry(
         Path::new("src/Main.luau"),
         Some(&SnapshotEntry::File(vec![0xff, b'\n', b'x'])),
         Some(&SnapshotEntry::File(vec![0xff, b'\n', b'y'])),
         Some(&SnapshotEntry::File(vec![0xfe, b'\n', b'x'])),
-        ConflictPreference::None,
         false,
         &mut conflicts,
     );
     assert!(binary.value == Some(SnapshotEntry::File(vec![0xff, b'\n', b'y'])));
-    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts.open().len(), 1);
 }
 
 /// Merging by line gives what applying each side's edits to the last-sync

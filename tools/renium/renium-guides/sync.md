@@ -31,18 +31,11 @@ On failure, inspect `rbx lst --details`, fix the cause, then retry with `rbx rp`
 
 Live Sync compares each side with their last common Renium state: one-sided changes transfer, independent edits merge, conflicts wait without overwriting either side. Something you added that both sides now lack was deleted in Studio and synced; ask before restoring it.
 
-A place closed without saving can reopen older than the files: set `rbx cfg set liveSync.initialSyncPriority verify` before `rbx ro` and read `rbx lst --details`.
+A place closed without saving can reopen older than the files: set `rbx cfg set liveSync.initialSyncPriority verify` before `rbx ro`, then read `rbx lst --details`.
 
-`rbx lst --details` shows both values and verify paths as `push:` (files differ) or `pull:` (Studio differs); `rbx lon --prefer studio|editor` overrides verify for that run. Keep the side you can account for: `studio` after merely opening the place, `editor` when the files carry your work; ask only when both sides hold edits you did not make. A preference settles only what both sides changed: a file that differs from the last sync, or a script only the files hold, goes to Studio as your edit under either preference. When the differences include files you cannot account for (older copies, a folder brought in from elsewhere), do not resolve over them: ask, or take Studio's version of a service with `rbx lof`, `rbx pl -s SERVICE` and `rbx lon`. That pull replaces the service's files and removes scripts Studio lacks; `rbx rev --sync ID` with the `historyId` it returned restores them.
+`rbx lon`/`rbx lst` list open conflicts as records: `id`, `kind`, `path`, `instance`, `field`, values `base` (last sync), `files`, `studio` (scripts: `filesDiff`/`studioDiff`), `absent`, evidence `filesChangedAt`/`studioChanged`. Decide each from its values: `rbx lon --resolve ID=studio|editor`, repeated, all in one run (any conflict left open: nothing applies); `--prefer studio|editor` decides all. Keep the side whose work you can account for: `studio` after just opening the place, `editor` when the files hold your edits; ask the user only where both sides hold work you cannot account for. `decidable: false` (PackageLink edits, ambiguous pairings): fix by hand. Decisions settle only what both sides changed; one-sided changes go over. Files you cannot account for (older copies, foreign folders): ask, or take Studio's service with `rbx lof`, `rbx pl -s SERVICE`, `rbx lon`; that pull removes scripts Studio lacks, and `rbx rev --sync ID` with its `historyId` restores them.
 
-```powershell
-rbx cfg get liveSync.initialSyncPriority
-rbx cfg set liveSync.initialSyncPriority reconcile
-rbx cfg set liveSync.initialConflictPreference none
-```
-
-`reconcile` applies the comparison; `verify` only reports differences and holds pushes and pulls (`pushesPaused` in `rbx status`) until a side is chosen; with no differences the session continues in reconcile.
-Conflict preferences: `none`, `studio`, `editor` (project files). A preference resolves ordinary conflicts, never direct PackageLink edits.
+`rbx cfg set liveSync.initialSyncPriority reconcile|verify`: `reconcile` applies the comparison; `verify` lists paths in `rbx lst --details` as `push:` (files differ) or `pull:` (Studio differs) and holds pushes and pulls (`pushesPaused` in `rbx status`) until `rbx lon --prefer` or `--resolve`; without differences it continues in reconcile. `liveSync.initialConflictPreference`: `none`, `studio`, `editor`.
 
 ## Manual sync
 

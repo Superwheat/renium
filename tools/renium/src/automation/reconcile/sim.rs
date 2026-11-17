@@ -534,7 +534,7 @@ fn first_tree(rng: &mut Rng, counter: &mut u64) -> Tree {
 struct Merged {
     tree: Result<Tree, String>,
     paths: BTreeSet<PathBuf>,
-    conflicts: Vec<String>,
+    conflicts: Vec<Conflict>,
     changes: MergeChanges,
 }
 
@@ -571,7 +571,7 @@ fn merge(
     shared: &Tree,
     editor: &Tree,
     studio: &Tree,
-    preference: ConflictPreference,
+    preference: impl Into<ConflictDecisions>,
     rng: &mut Rng,
 ) -> Result<Merged, String> {
     let (editor, studio) = (editor.snapshot(None), studio.snapshot(Some(rng)));
@@ -742,4 +742,533 @@ fn run_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
 #[test]
 fn seeded_edits_on_both_sides_merge_to_the_modeled_tree() {
     run_seeds(DEFAULT_SEEDS, run_seed);
+}
+
+/// Edits one side without regard for the other: a rename, a move or a
+/// removal can meet the other side's edit of the same instance, which is
+/// where the structural conflicts come from.
+fn edit_freely(tree: &mut Tree, rng: &mut Rng, counter: &mut u64, side: Side) -> Option<Op> {
+    *counter += 1;
+    let fresh = *counter;
+    let movable = tree
+        .nodes
+        .keys()
+        .filter(|id| *id != ROOT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let of_class = |class: &str| {
+        movable
+            .iter()
+            .filter(|id| tree.nodes[*id].class == class)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    // Half the edits of a field go to the same few instances, so the two
+    // sides meet on one instance often.
+    let hot = movable.iter().take(3).cloned().collect::<HashSet<_>>();
+    let choose = |rng: &mut Rng, candidates: Vec<String>| {
+        let focused = candidates
+            .iter()
+            .filter(|id| hot.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !focused.is_empty() && rng.below(2) == 0 {
+            rng.pick(&focused)
+        } else {
+            rng.pick(&candidates)
+        }
+    };
+    let op = match rng.below(10) {
+        0 | 1 => Op::Value(choose(rng, of_class("StringValue"))?, format!("v{fresh}")),
+        2 => {
+            let id = choose(rng, movable.clone())?;
+            let value = (rng.below(3) != 0).then(|| format!("a{fresh}"));
+            Op::Attribute(id, format!("K{}", rng.below(2)), value)
+        }
+        3 => Op::Source(
+            choose(rng, of_class("ModuleScript"))?,
+            format!("return {fresh}\n"),
+        ),
+        4 => Op::Rename(choose(rng, movable.clone())?, format!("N{fresh}")),
+        5 => {
+            let id = rng.pick(&movable)?;
+            let parent = rng.pick(&tree.nodes.keys().cloned().collect::<Vec<_>>())?;
+            if tree.subtree(&id).contains(&parent) {
+                return None;
+            }
+            Op::Move(id, parent)
+        }
+        6 => Op::Delete(rng.pick(&movable)?),
+        _ => {
+            let parent = rng.pick(&tree.nodes.keys().cloned().collect::<Vec<_>>())?;
+            let class = ["Folder", "StringValue", "ModuleScript"][rng.below(3)];
+            let id = format!("{}{fresh}", if side == Side::Editor { "e" } else { "s" });
+            Op::Add(
+                id,
+                Node {
+                    name: format!("N{fresh}"),
+                    class: class.to_string(),
+                    parent: Some(parent),
+                    value: (class == "StringValue").then(|| format!("v{fresh}")),
+                    attributes: BTreeMap::new(),
+                    source: (class == "ModuleScript").then(|| format!("return {fresh}\n")),
+                },
+            )
+        }
+    };
+    op.apply(tree);
+    Some(op)
+}
+
+fn other_side(side: ConflictSide) -> ConflictSide {
+    match side {
+        ConflictSide::Studio => ConflictSide::Editor,
+        ConflictSide::Editor => ConflictSide::Studio,
+    }
+}
+
+fn decisions(by_id: &BTreeMap<String, ConflictSide>) -> ConflictDecisions {
+    ConflictDecisions {
+        preference: ConflictPreference::None,
+        by_id: by_id.clone(),
+    }
+}
+
+/// What tells a conflict apart: its kind, file, instance, field.
+fn conflict_identity(conflict: &Conflict) -> String {
+    format!(
+        "{:?} {} {:?} {:?} {}",
+        conflict.kind,
+        conflict.path,
+        conflict.instance.as_ref().map(|instance| &instance.id),
+        conflict.field,
+        conflict.discriminator
+    )
+}
+
+/// The ids of a run's open conflicts with what each is about; an id two
+/// different conflicts share is a failure.
+fn identities(merged: &Merged) -> Result<BTreeMap<String, String>, String> {
+    let mut found = BTreeMap::new();
+    for conflict in &merged.conflicts {
+        let identity = conflict_identity(conflict);
+        if let Some(other) = found.insert(conflict.id.clone(), identity.clone())
+            && other != identity
+        {
+            return Err(format!(
+                "two conflicts share the id {}: {other} and {identity}",
+                conflict.id
+            ));
+        }
+    }
+    Ok(found)
+}
+
+/// Whether the trees of two runs differ only where the conflict decides:
+/// its instance and field, its script's text, the instance a removal is
+/// about with what hangs under it, or, for an orphan, also the parents a
+/// decision brings back.
+fn outside_scope(conflict: &Conflict, decided: &Tree, flipped: &Tree) -> Option<String> {
+    let ids = decided
+        .nodes
+        .keys()
+        .chain(flipped.nodes.keys())
+        .filter(|id| decided.nodes.get(*id) != flipped.nodes.get(*id))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let only = |id: &str, clear: &dyn Fn(&mut Node)| {
+        let (Some(left), Some(right)) = (decided.nodes.get(id), flipped.nodes.get(id)) else {
+            return false;
+        };
+        let (mut left, mut right) = (left.clone(), right.clone());
+        clear(&mut left);
+        clear(&mut right);
+        left == right
+    };
+    let instance = conflict
+        .instance
+        .as_ref()
+        .map(|instance| instance.id.as_str());
+    let field = conflict.field.clone().unwrap_or_default();
+    let ancestors = |instance: &str| {
+        [decided, flipped]
+            .into_iter()
+            .flat_map(|tree| tree.ancestors(instance))
+            .collect::<BTreeSet<_>>()
+    };
+    let within = match (conflict.kind, instance) {
+        // A cycle's members take one side's parents, whose chains come back
+        // with them.
+        (ConflictKind::Parent, Some(_)) if conflict.discriminator.starts_with("cycle") => {
+            let (members, others): (Vec<_>, Vec<_>) = ids
+                .iter()
+                .partition(|id| only(id, &|node: &mut Node| node.parent = None));
+            let chains = members
+                .iter()
+                .flat_map(|member| ancestors(member.as_str()))
+                .collect::<BTreeSet<_>>();
+            others.iter().all(|id| chains.contains(*id))
+        }
+        // An instance placed under a parent the other side removed stands
+        // under that parent's chain, which comes back with it.
+        (ConflictKind::Parent, Some(instance)) => {
+            let chain = ancestors(instance);
+            ids.iter().all(|id| {
+                (id == instance && only(id, &|node: &mut Node| node.parent = None))
+                    || chain.contains(id)
+            })
+        }
+        (kind, Some(instance))
+            if matches!(
+                kind,
+                ConflictKind::Property | ConflictKind::Attribute | ConflictKind::Name
+            ) =>
+        {
+            ids.iter().all(|id| {
+                id == instance
+                    && only(id, &|node: &mut Node| match kind {
+                        ConflictKind::Property => node.value = None,
+                        ConflictKind::Attribute => {
+                            node.attributes.remove(&field);
+                        }
+                        _ => node.name.clear(),
+                    })
+            })
+        }
+        // An instance kept against a removal stands under the parents it
+        // stood under, which come back with it.
+        (ConflictKind::Removal, Some(instance)) => {
+            let mut allowed = ancestors(instance);
+            allowed.extend(
+                [decided, flipped]
+                    .into_iter()
+                    .flat_map(|tree| tree.subtree(instance)),
+            );
+            ids.is_subset(&allowed)
+        }
+        (ConflictKind::Script, Some(instance)) => ids
+            .iter()
+            .all(|id| id == instance && only(id, &|node: &mut Node| node.source = None)),
+        (_, None) => {
+            let owners = [decided, flipped]
+                .into_iter()
+                .flat_map(|tree| {
+                    script_paths(tree)
+                        .into_iter()
+                        .filter(|(_, path)| conflict_path(path) == conflict.path)
+                        .map(|(id, _)| id)
+                })
+                .collect::<BTreeSet<_>>();
+            ids.iter()
+                .all(|id| owners.contains(id) && only(id, &|node: &mut Node| node.source = None))
+        }
+        _ => false,
+    };
+    (!within).then(|| {
+        ids.iter()
+            .map(|id| {
+                format!(
+                    "{id}: {:?} against {:?}",
+                    decided.nodes.get(id),
+                    flipped.nodes.get(id)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
+/// The fields both sides changed, each to its own value, on an instance all
+/// three trees hold: (instance, kind, field).
+fn contested_fields(
+    shared: &Tree,
+    editor: &Tree,
+    studio: &Tree,
+) -> Vec<(String, ConflictKind, Option<String>)> {
+    let mut contested = Vec::new();
+    for (id, base) in &shared.nodes {
+        let (Some(files), Some(live)) = (editor.nodes.get(id), studio.nodes.get(id)) else {
+            continue;
+        };
+        let both = |pick: &dyn Fn(&Node) -> Option<String>| {
+            let (base, files, live) = (pick(base), pick(files), pick(live));
+            files != base && live != base && files != live
+        };
+        if both(&|node| node.value.clone()) {
+            contested.push((
+                id.clone(),
+                ConflictKind::Property,
+                Some("Value".to_string()),
+            ));
+        }
+        if both(&|node| Some(node.name.clone())) {
+            contested.push((id.clone(), ConflictKind::Name, None));
+        }
+        let keys = [base, files, live]
+            .into_iter()
+            .flat_map(|node| node.attributes.keys())
+            .collect::<BTreeSet<_>>();
+        for key in keys {
+            if both(&|node| node.attributes.get(key).cloned()) {
+                contested.push((id.clone(), ConflictKind::Attribute, Some(key.clone())));
+            }
+        }
+    }
+    contested
+}
+
+fn same_outcome(what: &str, left: &Merged, right: &Merged) -> Result<(), String> {
+    if left.tree != right.tree {
+        return Err(format!(
+            "{what}: the trees differ: {:?} against {:?}",
+            left.tree, right.tree
+        ));
+    }
+    if left.paths != right.paths {
+        return Err(format!(
+            "{what}: the files differ: {:?}",
+            left.paths
+                .symmetric_difference(&right.paths)
+                .collect::<Vec<_>>()
+        ));
+    }
+    for (side, left, right) in [
+        ("files", &left.changes.editor, &right.changes.editor),
+        ("Studio", &left.changes.studio, &right.changes.studio),
+    ] {
+        if left != right {
+            return Err(format!(
+                "{what}: the changes to {side} differ: {left:?} against {right:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A run with every conflict it met decided toward one side.
+struct AllDecided {
+    decided: BTreeMap<String, ConflictSide>,
+    records: BTreeMap<String, Conflict>,
+    run: Merged,
+}
+
+/// Decides every conflict a run meets toward `side`, run after run, until
+/// none is open. `None` when a conflict no side settles stays open.
+fn decide_all(
+    shared: &Tree,
+    sides: [&Tree; 2],
+    side: ConflictSide,
+    rng: &mut Rng,
+) -> Result<Option<AllDecided>, String> {
+    let mut decided = BTreeMap::new();
+    let mut records = BTreeMap::new();
+    for _ in 0..12 {
+        let run = merge(shared, sides[0], sides[1], decisions(&decided), rng)
+            .map_err(|error| format!("deciding {decided:?}: {error}"))?;
+        if run.conflicts.is_empty() {
+            return Ok(Some(AllDecided {
+                decided,
+                records,
+                run,
+            }));
+        }
+        for conflict in &run.conflicts {
+            if !conflict.decidable {
+                return Ok(None);
+            }
+            if decided.contains_key(&conflict.id) {
+                return Err(format!(
+                    "the decided conflict {} stays open: {}",
+                    conflict.id, conflict.detail
+                ));
+            }
+            decided.insert(conflict.id.clone(), side);
+            records.insert(conflict.id.clone(), conflict.clone());
+        }
+    }
+    Err("deciding every conflict met never ends".to_string())
+}
+
+/// The laws of deciding conflicts one by one, over edits both sides made
+/// freely to one shared tree.
+fn run_decision_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
+    let mut rng = Rng(seed);
+    let mut counter = 0;
+    let shared = first_tree(&mut rng, &mut counter);
+    let mut sides = [shared.clone(), shared.clone()];
+    let mut files_ops = Vec::new();
+    for _ in 0..1 + rng.below(6) {
+        if let Some(op) = edit_freely(&mut sides[0], &mut rng, &mut counter, Side::Editor) {
+            log.push(format!("Editor: {op:?}"));
+            files_ops.push(op);
+        }
+    }
+    // Studio answers some of the files' field edits with its own value of
+    // the same field.
+    for op in files_ops {
+        counter += 1;
+        let fresh = counter;
+        let answer = match op {
+            Op::Value(id, _) => Op::Value(id, format!("v{fresh}")),
+            Op::Attribute(id, key, _) => Op::Attribute(id, key, Some(format!("a{fresh}"))),
+            Op::Source(id, _) => Op::Source(id, format!("return {fresh}\n")),
+            Op::Rename(id, _) => Op::Rename(id, format!("N{fresh}")),
+            _ => continue,
+        };
+        let id = match &answer {
+            Op::Value(id, _) | Op::Attribute(id, ..) | Op::Source(id, _) | Op::Rename(id, _) => id,
+            _ => continue,
+        };
+        if rng.below(2) == 0 && sides[1].nodes.contains_key(id) {
+            log.push(format!("Studio: {answer:?}"));
+            answer.apply(&mut sides[1]);
+        }
+    }
+    for _ in 0..1 + rng.below(6) {
+        if let Some(op) = edit_freely(&mut sides[1], &mut rng, &mut counter, Side::Studio) {
+            log.push(format!("Studio: {op:?}"));
+        }
+    }
+    let [editor, studio] = &sides;
+
+    // Ids are unique and stable: a second run, with Studio's siblings in
+    // another order, gives every conflict the id it had.
+    let open = merge(&shared, editor, studio, ConflictPreference::None, &mut rng)?;
+    let again = merge(&shared, editor, studio, ConflictPreference::None, &mut rng)?;
+    let ids = identities(&open)?;
+    if identities(&again)? != ids {
+        return Err(format!(
+            "the ids changed between two runs: {ids:?} against {:?}",
+            identities(&again)?
+        ));
+    }
+
+    // A decision for an id no conflict of the run has is refused.
+    let stale = (0u32..)
+        .map(|value| format!("{value:08x}"))
+        .find(|id| !ids.contains_key(id))
+        .unwrap();
+    let mut by_id = BTreeMap::from([(stale.clone(), ConflictSide::Studio)]);
+    match merge(&shared, editor, studio, decisions(&by_id), &mut rng) {
+        Err(error) if error.contains(&stale) => {}
+        Err(error) => return Err(format!("a stale decision failed without its id: {error}")),
+        Ok(_) => return Err(format!("the stale decision {stale} was taken")),
+    }
+    by_id.clear();
+
+    // Undecided conflicts apply nothing: a field both sides changed is an
+    // open conflict while nothing decides it, so the run applies nothing.
+    for (id, kind, field) in contested_fields(&shared, editor, studio) {
+        if !open.conflicts.iter().any(|conflict| {
+            conflict.kind == kind
+                && conflict.field == field
+                && conflict
+                    .instance
+                    .as_ref()
+                    .is_some_and(|instance| instance.id == id)
+        }) {
+            return Err(format!(
+                "both sides changed {kind:?} {field:?} of {id} and no conflict is open"
+            ));
+        }
+    }
+    if open.conflicts.is_empty() {
+        return Ok(());
+    }
+
+    // Undecided conflicts apply nothing: a run that leaves one undecided
+    // still reports it open.
+    let decidable = open
+        .conflicts
+        .iter()
+        .filter(|conflict| conflict.decidable)
+        .collect::<Vec<_>>();
+    if let Some(undecided) = decidable.iter().find(|conflict| {
+        matches!(
+            conflict.kind,
+            ConflictKind::Property | ConflictKind::Attribute | ConflictKind::Name
+        )
+    }) {
+        for conflict in &decidable {
+            if conflict.id != undecided.id {
+                by_id.insert(conflict.id.clone(), ConflictSide::Studio);
+            }
+        }
+        let partial = merge(&shared, editor, studio, decisions(&by_id), &mut rng)
+            .map_err(|error| format!("leaving {} undecided: {error}", undecided.id))?;
+        if !partial.conflicts.iter().any(|open| open.id == undecided.id) {
+            return Err(format!(
+                "the undecided conflict {} is not open: {}",
+                undecided.id, undecided.detail
+            ));
+        }
+    }
+
+    // A run with every conflict decided toward one side equals the run
+    // that prefers that side.
+    let side = if rng.below(2) == 0 {
+        ConflictSide::Studio
+    } else {
+        ConflictSide::Editor
+    };
+    let Some(AllDecided {
+        decided,
+        records,
+        run: all,
+    }) = decide_all(&shared, [editor, studio], side, &mut rng)?
+    else {
+        return Ok(());
+    };
+    let preference = match side {
+        ConflictSide::Studio => ConflictPreference::Studio,
+        ConflictSide::Editor => ConflictPreference::Editor,
+    };
+    let preferred = merge(&shared, editor, studio, preference, &mut rng)?;
+    if !preferred.conflicts.is_empty() {
+        return Ok(());
+    }
+    same_outcome(
+        &format!("every conflict decided for {side:?}"),
+        &all,
+        &preferred,
+    )?;
+
+    // Deciding one conflict for the other side changes only what that
+    // conflict is about.
+    let Ok(all_tree) = &all.tree else {
+        return Ok(());
+    };
+    let mut flips = decided.keys().cloned().collect::<Vec<_>>();
+    rng.shuffle(&mut flips);
+    for id in flips.into_iter().take(8) {
+        let mut flipped = decided.clone();
+        flipped.insert(id.clone(), other_side(side));
+        // A decision whose conflict only the flipped one brought about is
+        // stale now, and the run refuses it: nothing to compare.
+        let run = match merge(&shared, editor, studio, decisions(&flipped), &mut rng) {
+            Err(error) if error.contains("No open conflict has the id") => continue,
+            run => run.map_err(|error| format!("{id} flipped: {error}"))?,
+        };
+        if !run.conflicts.is_empty() {
+            continue;
+        }
+        let conflict = &records[&id];
+        let tree = run
+            .tree
+            .as_ref()
+            .map_err(|error| format!("{id} flipped: {error}"))?;
+        if let Some(outside) = outside_scope(conflict, all_tree, tree) {
+            return Err(format!(
+                "deciding {id} ({}, {}) the other way changed more than it: {outside}",
+                conflict.detail,
+                conflict_identity(conflict)
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn seeded_decisions_by_id_keep_the_laws_of_a_conflict_record() {
+    run_seeds(300, run_decision_seed);
 }

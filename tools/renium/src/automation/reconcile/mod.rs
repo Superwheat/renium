@@ -33,7 +33,9 @@ use crate::editor::types::{
     EditorChangeSet, EditorInstanceChange, EditorInstancePath, EditorPropertyChange,
     PreparedEditorDocuments,
 };
-use crate::project::version_control::{VcMergeConflict, merge_aligned_settings_documents};
+use crate::project::version_control::{
+    VcConflictKind, VcMergeConflict, VcResolve, merge_aligned_settings_documents,
+};
 use crate::project::{config, config::project_watch_inputs};
 use crate::roblox::services::DEFAULT_SYNC_SERVICES;
 use crate::settings::bytecode::{
@@ -56,7 +58,7 @@ use crate::snapshot::export::{
     export_snapshots_with_warm_bridge,
 };
 use crate::snapshot::import::service_projection_in_memory;
-use crate::snapshot::refs::{remap_record_reference_ids, store_service};
+use crate::snapshot::refs::{remap_record_reference_ids, settings_instance_path, store_service};
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
 use crate::system::files::{
     OnDrop, absolutize_under, atomic_write_file, canonical_path, create_unique_directory, fnv1a,
@@ -66,6 +68,7 @@ use crate::system::files::{
 pub(crate) mod history;
 mod store;
 
+mod conflict;
 mod coordinator;
 #[cfg(test)]
 mod escape_tests;
@@ -90,6 +93,7 @@ mod text_merge;
 mod types;
 pub(crate) mod verify;
 
+pub(crate) use conflict::*;
 pub(crate) use coordinator::*;
 pub(crate) use guards::*;
 pub(crate) use identity::*;
@@ -105,7 +109,9 @@ pub(crate) use verify::*;
 use crate::system::LockRecover;
 use store::StoredSnapshot;
 
-const RECORD_VERSION: u8 = 2;
+const RECORD_VERSION: u8 = 3;
+/// The record version that kept conflicts as sentences; it still loads.
+const SENTENCE_CONFLICTS_RECORD_VERSION: u8 = 2;
 const RECORD_DIR: &str = "reconcile";
 
 fn log_reconcile_timing(label: &str, started: Instant) {
@@ -166,6 +172,8 @@ pub(crate) struct PairConfiguration {
     pub(crate) mode: PairMode,
     pub(crate) conflict_preference: ConflictPreference,
     pub(crate) resolution_preference: Option<ConflictPreference>,
+    /// The side each conflict decided by id takes in this comparison.
+    pub(crate) decisions: BTreeMap<String, ConflictSide>,
     pub(crate) runtime_settings: Map<String, Value>,
 }
 

@@ -519,45 +519,6 @@ pub(crate) fn align_snapshot_ids(
     Ok(aligned)
 }
 
-pub(crate) fn conflict_message(conflicts: &[String]) -> String {
-    let shown = conflicts.iter().take(3).cloned().collect::<Vec<_>>();
-    let remainder = &conflicts[shown.len()..];
-    if remainder.is_empty() {
-        return format!("Sync needs review: {}", shown.join("; "));
-    }
-    let mut counts = Vec::<(String, usize)>::new();
-    for conflict in remainder {
-        let subject = conflict
-            .split_once(": property ")
-            .map(|(_, rest)| ("property", rest))
-            .or_else(|| {
-                conflict
-                    .split_once(": attribute ")
-                    .map(|(_, rest)| ("attribute", rest))
-            })
-            .and_then(|(kind, rest)| {
-                rest.split(':')
-                    .next()
-                    .map(|name| format!("{kind} {}", name.trim()))
-            })
-            .unwrap_or_else(|| "other".to_string());
-        match counts.iter_mut().find(|(name, _)| *name == subject) {
-            Some((_, count)) => *count += 1,
-            None => counts.push((subject, 1)),
-        }
-    }
-    let breakdown = counts
-        .iter()
-        .map(|(name, count)| format!("{name} x{count}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "Sync needs review: {}; and {} more ({breakdown})",
-        shown.join("; "),
-        remainder.len()
-    )
-}
-
 pub(crate) fn sync_services() -> Vec<String> {
     DEFAULT_SYNC_SERVICES
         .iter()

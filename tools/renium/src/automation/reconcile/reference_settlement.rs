@@ -5,10 +5,11 @@
 //! each store changed on one side only, both merges are clean, and the
 //! reference is left without a target. This pass looks at the merged stores
 //! together and settles such a reference the way one store's merge settles
-//! its own: a conflict without a preference; with one, the instance comes
-//! back when the preferred side still has it, and the reference is cleared
-//! when that side removed it. An instance that comes back is settled in
-//! turn, with the references it holds into its own store.
+//! its own: by the side its conflict takes, the instance comes back when
+//! that side still has it, and the reference is cleared when that side
+//! removed it; an open conflict changes neither. An instance that comes back
+//! is settled in turn, with the references it holds into its own store,
+//! which follow the side that brought it back.
 
 use super::*;
 use crate::bytecode::edit::{instance_path_key, instance_path_parts_key};
@@ -279,15 +280,18 @@ struct BrokenReference {
     reference: Map<String, Value>,
     service: String,
     target: usize,
+    /// The side that brought the holder back, when the settlement did.
+    follows: Option<ConflictSide>,
 }
 
 /// The references to lost instances: every one that leads into another
 /// store, and those the instances in `restored` (put back by the settlement,
-/// by store) hold into their own store, which no store's merge has seen.
+/// by store, with the side that brought each back) hold into their own
+/// store, which no store's merge has seen.
 fn broken_references(
     merged: &BTreeMap<PathBuf, SnapshotEntry>,
     lost: &BTreeMap<String, LostTargets>,
-    restored: &BTreeMap<PathBuf, HashSet<String>>,
+    restored: &BTreeMap<PathBuf, HashMap<String, ConflictSide>>,
     holders: &mut BTreeMap<PathBuf, SettingsBytecode>,
 ) -> Result<Vec<BrokenReference>> {
     let needles = lost
@@ -312,7 +316,8 @@ fn broken_references(
         let found = broken.len();
         let restored = restored.get(path);
         for (instance, holder) in document.instances.iter().enumerate() {
-            let restored = restored.is_some_and(|ids| ids.contains(&holder.settings_id));
+            let follows = restored.and_then(|ids| ids.get(&holder.settings_id).copied());
+            let restored = follows.is_some();
             for (attribute, record) in [(false, &holder.properties), (true, &holder.attributes)] {
                 for (field, value) in record {
                     for_each_reference(value, &mut |reference| {
@@ -332,6 +337,7 @@ fn broken_references(
                                 reference: reference.clone(),
                                 service: service.to_string(),
                                 target,
+                                follows,
                             });
                         }
                     });
@@ -388,7 +394,8 @@ impl MergeOutcome<'_> {
     }
 
     /// Gives restored scripts their source files back: the merge dropped
-    /// each with its instance, and the preferred side still has it.
+    /// each with its instance, and the side that brought it back still has
+    /// it.
     fn restore_script_sources(
         &mut self,
         store: &Path,
@@ -505,27 +512,64 @@ fn lost_targets(
     Ok(lost)
 }
 
-/// What the preference decides for the references the merge broke.
+/// What the decisions settle for the references the merge broke.
 #[derive(Default)]
 struct Settlement {
-    /// The lost instances to put back, by service.
-    restores: BTreeMap<String, HashSet<String>>,
+    /// The lost instances to put back, by service and the side that brings
+    /// them back.
+    restores: BTreeMap<(String, ConflictSide), HashSet<String>>,
     /// The references to clear, by store.
     clears: BTreeMap<PathBuf, Vec<BrokenReference>>,
 }
 
+/// The conflict of a reference whose target the other side removed;
+/// `held` says whether the files and Studio still hold the target.
+fn reference_conflict(
+    reference: &BrokenReference,
+    targets: &LostTargets,
+    holders: &BTreeMap<PathBuf, SettingsBytecode>,
+    held: [bool; 2],
+) -> Conflict {
+    let holder_document = &holders[&reference.store];
+    let holder = &holder_document.instances[reference.instance];
+    let target_id = &targets.base.instances[reference.target].settings_id;
+    let label = targets.label(reference.target);
+    let [on_editor, on_studio] = held;
+    let place = |held: bool| held.then(|| json!(label));
+    Conflict::new(
+        ConflictKind::Reference,
+        &reference.store,
+        format!(
+            "{}: {}: {} refers to {label} (id={target_id}), which {} removed",
+            conflict_path(&reference.store),
+            holder.name,
+            reference.field,
+            if on_studio { "the files" } else { "Studio" }
+        ),
+    )
+    .instance(
+        &holder.settings_id,
+        settings_instance_path(holder_document, reference.instance),
+    )
+    .field(&reference.field)
+    .values(
+        Some(&json!(label)),
+        place(on_editor).as_ref(),
+        place(on_studio).as_ref(),
+    )
+}
+
 /// Decides each broken reference. One that was already broken on the side
-/// it came from is not the merge's doing and stays as it is. Without a
-/// preference the others are conflicts; with one, the target comes back
-/// when the preferred side still has it and the reference is cleared when
-/// that side removed it.
+/// it came from is not the merge's doing and stays as it is. The others
+/// take the side their conflict takes: the target comes back when that side
+/// still has it and the reference is cleared when that side removed it; an
+/// open conflict changes neither.
 fn decide(
     broken: Vec<BrokenReference>,
     lost: &BTreeMap<String, LostTargets>,
     holders: &BTreeMap<PathBuf, SettingsBytecode>,
     sides: &SnapshotSides<'_>,
-    prefer_editor: Option<bool>,
-    conflicts: &mut Vec<String>,
+    conflicts: &mut ConflictLog,
 ) -> Result<Settlement> {
     let mut editor = Side::new(sides.editor);
     let mut studio = Side::new(sides.studio);
@@ -541,25 +585,24 @@ fn decide(
         if !valid_on(&mut editor)? && !valid_on(&mut studio)? {
             continue;
         }
-        let target_id = &targets.base.instances[reference.target].settings_id;
-        let preferred = match prefer_editor {
-            Some(true) => &mut editor,
-            Some(false) => &mut studio,
-            None => {
-                conflicts.push(format!(
-                    "{}: {}: {}: refers to {} (id={target_id}), which the other side removed",
-                    reference.store.display(),
-                    holders[&reference.store].instances[reference.instance].name,
-                    reference.field,
-                    targets.label(reference.target),
-                ));
-                continue;
-            }
+        let held = [
+            editor.has_target(targets, &reference.service, reference.target)?,
+            studio.has_target(targets, &reference.service, reference.target)?,
+        ];
+        let mut conflict = reference_conflict(&reference, targets, holders, held);
+        let Some(side) = conflicts.consult(&mut conflict, reference.follows) else {
+            conflicts.record(conflict);
+            continue;
         };
-        if preferred.has_target(targets, &reference.service, reference.target)? {
+        let target_id = &targets.base.instances[reference.target].settings_id;
+        let kept = match side {
+            ConflictSide::Editor => held[0],
+            ConflictSide::Studio => held[1],
+        };
+        if kept {
             settlement
                 .restores
-                .entry(reference.service.clone())
+                .entry((reference.service.clone(), side))
                 .or_default()
                 .insert(target_id.clone());
         } else {
@@ -579,21 +622,14 @@ fn decide(
 /// runs again until a round restores nothing.
 pub(super) fn settle_references_between_stores(
     sides: &SnapshotSides<'_>,
-    preference: ConflictPreference,
     merged: &mut BTreeMap<PathBuf, SnapshotEntry>,
-    conflicts: &mut Vec<String>,
+    conflicts: &mut ConflictLog,
     changes: &mut MergeChanges,
 ) -> Result<()> {
     let Some(baseline) = sides.baseline else {
         return Ok(());
     };
-    let prefer_editor = preference_bool(preference);
-    let preferred = if prefer_editor == Some(true) {
-        sides.editor
-    } else {
-        sides.studio
-    };
-    let mut restored = BTreeMap::<PathBuf, HashSet<String>>::new();
+    let mut restored = BTreeMap::<PathBuf, HashMap<String, ConflictSide>>::new();
     loop {
         let lost = lost_targets(baseline, merged, changes)?;
         if lost.is_empty() {
@@ -604,7 +640,7 @@ pub(super) fn settle_references_between_stores(
         if broken.is_empty() {
             return Ok(());
         }
-        let settlement = decide(broken, &lost, &holders, sides, prefer_editor, conflicts)?;
+        let settlement = decide(broken, &lost, &holders, sides, conflicts)?;
         let mut outcome = MergeOutcome {
             sides,
             merged,
@@ -616,11 +652,18 @@ pub(super) fn settle_references_between_stores(
             }
         }
         let mut gained = false;
-        for (service, settings_ids) in settlement.restores {
+        for ((service, side), settings_ids) in settlement.restores {
             let store = &lost[&service].store;
+            let preferred = match side {
+                ConflictSide::Editor => sides.editor,
+                ConflictSide::Studio => sides.studio,
+            };
             let added = outcome.restore_targets(store, &settings_ids, baseline, preferred)?;
             gained |= !added.is_empty();
-            restored.entry(store.clone()).or_default().extend(added);
+            restored
+                .entry(store.clone())
+                .or_default()
+                .extend(added.into_iter().map(|id| (id, side)));
         }
         if !gained {
             return Ok(());

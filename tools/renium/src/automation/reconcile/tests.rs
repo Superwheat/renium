@@ -75,15 +75,18 @@ fn twin_observation(editor: &SettingsBytecode) -> SettingsBytecode {
 }
 
 fn twin_align(editor: &mut SettingsBytecode, studio: &mut SettingsBytecode) -> Vec<String> {
-    let mut conflicts = Vec::new();
+    let mut conflicts = ConflictLog::new(ConflictPreference::None);
     let _ = align_first_pairing(
         Path::new("instances/Workspace.renium"),
         editor,
         studio,
-        ConflictPreference::None,
         &mut conflicts,
     );
     conflicts
+        .open()
+        .iter()
+        .map(|conflict| conflict.detail.clone())
+        .collect()
 }
 
 fn assert_twin_ids_unique(document: &SettingsBytecode) {
@@ -454,6 +457,7 @@ fn load_record_drops_a_baseline_whose_packs_are_missing() -> Result<()> {
             seq: 7,
             service_generations: BTreeMap::new(),
         }),
+        differences: Vec::new(),
     };
     write_record(&context, "pair", &record)?;
     let intact = load_record(&context, "pair")?.unwrap();
@@ -522,6 +526,7 @@ fn pulled_baseline_records_studio_bytes_even_when_restoration_publishes_no_file_
         local_file_stamp: None,
         local_file_digest: None,
         studio_checkpoint: None,
+        differences: Vec::new(),
     };
     write_record(&context, "pull-test", &record)?;
     let studio = SnapshotEntry::File(b"return 'studio'".to_vec());
@@ -1296,6 +1301,7 @@ fn project_binding_uses_saved_pairing_without_enabling_live_sync() {
         local_file_stamp: None,
         local_file_digest: None,
         studio_checkpoint: None,
+        differences: Vec::new(),
     };
     let write = |name: &str, record: &PairRecord| {
         fs::write(records.join(name), rmp_serde::to_vec(record).unwrap()).unwrap();
@@ -2347,7 +2353,7 @@ fn a_configuration_change_keeps_the_baseline_and_forces_a_full_capture() {
         runtime_settings: Map::new(),
         baseline: Some(StoredSnapshot::write(&root, "pair", &snapshot).unwrap()),
         head: None,
-        conflicts: vec!["stale".into()],
+        conflicts: vec![Conflict::legacy("stale".into())],
         resolution_required: true,
         last_runtime_id: None,
         local_file_stamp: None,
@@ -2358,6 +2364,7 @@ fn a_configuration_change_keeps_the_baseline_and_forces_a_full_capture() {
             seq: 7,
             service_generations: BTreeMap::new(),
         }),
+        differences: Vec::new(),
     };
     note_configuration_change(&mut record);
     assert!(record.baseline.as_ref().unwrap().matches(&snapshot));
@@ -2505,11 +2512,13 @@ fn a_merge_settles_a_reference_to_an_instance_the_other_side_removed_from_anothe
     };
     let (_, _, conflicts, _) = merge(ConflictPreference::None);
     assert_eq!(
-        conflicts,
-        [format!(
-            "{}: Pointer: Value: refers to Workspace.Kit.Target (id=target), which the other side removed",
-            replicated_path.display()
-        )]
+        conflicts
+            .iter()
+            .map(|conflict| conflict.detail.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "instances/ReplicatedStorage.renium: Pointer: Value refers to Workspace.Kit.Target (id=target), which Studio removed"
+        ]
     );
     let (names, value, conflicts, changes) = merge(ConflictPreference::Editor);
     assert!(conflicts.is_empty(), "{conflicts:?}");
@@ -2624,15 +2633,14 @@ fn aligning_new_instances_keeps_the_ids_of_references_into_other_services() {
 fn a_first_pairing_keeps_the_ids_of_references_into_other_services() {
     let mut editor = workspace_with_outside_holder(&[("fresh", "A", "Folder")], Some("holder"));
     let mut studio = workspace_with_outside_holder(&[("2", "A", "Folder")], Some("studio-holder"));
-    let mut conflicts = Vec::new();
+    let mut conflicts = ConflictLog::new(ConflictPreference::None);
     align_first_pairing(
         Path::new("instances/Workspace.renium"),
         &mut editor,
         &mut studio,
-        ConflictPreference::None,
         &mut conflicts,
     );
-    assert!(conflicts.is_empty(), "{conflicts:?}");
+    assert!(conflicts.open().is_empty(), "{:?}", conflicts.open());
     assert_eq!(studio.instances[1].settings_id, "fresh");
     assert_eq!(*held_reference(&studio), outside_reference_to_id_2());
 }
@@ -2701,11 +2709,13 @@ fn a_merge_settles_a_reference_whose_target_the_other_side_replaced_at_its_path(
     let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<BTreeSet<_>>();
     let (_, _, conflicts) = merge(ConflictPreference::None);
     assert_eq!(
-        conflicts,
-        [format!(
-            "{}: Pointer: Value: refers to Workspace.Kit.Target (id=target), which the other side removed",
-            replicated_path.display()
-        )]
+        conflicts
+            .iter()
+            .map(|conflict| conflict.detail.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "instances/ReplicatedStorage.renium: Pointer: Value refers to Workspace.Kit.Target (id=target), which Studio removed"
+        ]
     );
     let (targets, value, conflicts) = merge(ConflictPreference::Editor);
     assert!(conflicts.is_empty(), "{conflicts:?}");
@@ -2865,7 +2875,7 @@ fn a_package_link_both_sides_already_lack_is_not_a_removal_conflict() {
         instances: vec![root.clone(), car.clone()],
     };
     let path = Path::new("instances/Workspace.renium");
-    let mut conflicts = Vec::new();
+    let mut conflicts = ConflictLog::new(ConflictPreference::None);
     pairing::protect_package_links(
         path,
         Some(&base),
@@ -2873,8 +2883,8 @@ fn a_package_link_both_sides_already_lack_is_not_a_removal_conflict() {
         &mut unlinked.clone(),
         &mut conflicts,
     );
-    assert!(conflicts.is_empty(), "{conflicts:?}");
-    let mut conflicts = Vec::new();
+    assert!(conflicts.open().is_empty(), "{:?}", conflicts.open());
+    let mut conflicts = ConflictLog::new(ConflictPreference::Studio);
     pairing::protect_package_links(
         path,
         Some(&base),
@@ -2882,8 +2892,14 @@ fn a_package_link_both_sides_already_lack_is_not_a_removal_conflict() {
         &mut unlinked.clone(),
         &mut conflicts,
     );
-    assert_eq!(conflicts.len(), 1, "{conflicts:?}");
-    assert!(conflicts[0].contains("removes PackageLink"));
+    let open = conflicts.open();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert!(open[0].detail.contains("removes PackageLink"));
+    assert_eq!(open[0].kind, ConflictKind::Package);
+    assert!(
+        !open[0].decidable,
+        "no preference settles a PackageLink edit"
+    );
 }
 
 #[test]
@@ -3083,7 +3099,7 @@ fn first_pairing_unions_separate_files_and_blocks_same_file_conflicts() {
     assert!(
         conflicts
             .iter()
-            .any(|conflict| conflict.contains("different classes"))
+            .any(|conflict| conflict.detail.contains("different classes"))
     );
 }
 
@@ -3442,7 +3458,12 @@ fn source_edit_conflicts_with_script_deletion_before_source_enters_baseline() {
     let (_, conflicts) =
         merge_snapshots(Some(&baseline), &editor, &studio, ConflictPreference::None).unwrap();
     assert_eq!(conflicts.len(), 1);
-    assert!(conflicts[0].contains("deleted here but modified on the other side"));
+    assert!(
+        conflicts[0]
+            .detail
+            .contains("the files changed it and Studio removed it"),
+        "{conflicts:?}"
+    );
 
     let (merged, conflicts) = merge_snapshots(
         Some(&baseline),
@@ -3481,7 +3502,12 @@ fn source_edit_conflicts_with_script_deletion_before_source_enters_baseline() {
     let (_, conflicts) =
         merge_snapshots(Some(&baseline), &studio, &editor, ConflictPreference::None).unwrap();
     assert_eq!(conflicts.len(), 1);
-    assert!(conflicts[0].contains("modified here but deleted on the other side"));
+    assert!(
+        conflicts[0]
+            .detail
+            .contains("Studio changed it and the files removed it"),
+        "{conflicts:?}"
+    );
 
     let (merged, conflicts) = merge_snapshots(
         Some(&baseline),
@@ -3817,11 +3843,11 @@ fn matched_new_property_conflicts_do_not_become_copies() {
         .properties
         .insert("Text".to_string(), json!("studio"));
     align_new_instance_ids(&base, &editor, &mut studio).unwrap();
-    let (merged, conflicts) = merge_reconciliation_settings_documents(
-        &base,
-        &editor,
-        &studio,
-        ConflictPreference::None,
+    let mut conflicts = ConflictLog::new(ConflictPreference::None);
+    let merged = merge_reconciliation_settings_documents(
+        Path::new("instances/StarterGui.renium"),
+        [&base, &editor, &studio],
+        &mut conflicts,
         &HashSet::new(),
         &HashSet::new(),
     );
@@ -3833,7 +3859,12 @@ fn matched_new_property_conflicts_do_not_become_copies() {
             .count(),
         1
     );
-    assert!(conflicts.iter().any(|c| c.detail.contains("Text")));
+    assert!(
+        conflicts
+            .open()
+            .iter()
+            .any(|c| c.field.as_deref() == Some("Text"))
+    );
 }
 
 #[test]
@@ -4041,19 +4072,19 @@ fn new_duplicates_keep_persistent_identity_after_edits_and_reordering() {
     );
     studio.instances.swap(1, 2);
     let mut first_pair = studio.clone();
-    let mut first_pair_conflicts = Vec::new();
+    let mut first_pair_conflicts = ConflictLog::new(ConflictPreference::None);
     align_first_pairing(
         Path::new("instances/Workspace.renium"),
         &mut editor.clone(),
         &mut first_pair,
-        ConflictPreference::None,
         &mut first_pair_conflicts,
     );
+    let first_pair_conflicts = first_pair_conflicts.open();
     assert!(!first_pair_conflicts.is_empty());
     assert!(
-        first_pair_conflicts.iter().all(
-            |conflict| !conflict.contains("ambiguous") && !conflict.contains("different paths")
-        ),
+        first_pair_conflicts
+            .iter()
+            .all(|conflict| conflict.kind != ConflictKind::Pairing),
         "{first_pair_conflicts:?}"
     );
     align_new_instance_ids(&base, &editor, &mut studio).unwrap();
@@ -4064,11 +4095,11 @@ fn new_duplicates_keep_persistent_identity_after_edits_and_reordering() {
         "debug:old-1"
     );
     assert_eq!(studio.instances[2].properties["Transparency"], 0.7);
-    let (merged, conflicts) = merge_reconciliation_settings_documents(
-        &base,
-        &editor,
-        &studio,
-        ConflictPreference::None,
+    let mut conflicts = ConflictLog::new(ConflictPreference::None);
+    let merged = merge_reconciliation_settings_documents(
+        Path::new("instances/Workspace.renium"),
+        [&base, &editor, &studio],
+        &mut conflicts,
         &HashSet::new(),
         &HashSet::new(),
     );
@@ -4078,7 +4109,7 @@ fn new_duplicates_keep_persistent_identity_after_edits_and_reordering() {
         "matched parts must not be duplicated"
     );
     assert!(
-        !conflicts.is_empty(),
+        !conflicts.open().is_empty(),
         "identity matching must retain the real value conflict"
     );
 }
@@ -4108,16 +4139,16 @@ fn first_pairing_ignores_only_the_identified_viewport_camera() {
     studio.instances[2]
         .properties
         .insert("FieldOfView".into(), json!(100));
-    let mut conflicts = Vec::new();
+    let mut conflicts = ConflictLog::new(ConflictPreference::None);
     align_first_pairing(
         Path::new("instances/Workspace.renium"),
         &mut editor.clone(),
         &mut studio,
-        ConflictPreference::None,
         &mut conflicts,
     );
+    let conflicts = conflicts.open();
     assert_eq!(conflicts.len(), 1, "{conflicts:?}");
-    assert!(conflicts[0].contains("AuthoredCamera"));
+    assert!(conflicts[0].detail.contains("AuthoredCamera"));
     assert_eq!(studio.instances[1].properties["FieldOfView"], 70);
 }
 
@@ -4543,7 +4574,7 @@ fn ordinary_reconciliation_never_deletes_a_package_link() {
     assert!(
         conflicts
             .iter()
-            .any(|conflict| conflict.contains("PackageLink"))
+            .any(|conflict| conflict.detail.contains("PackageLink"))
     );
     assert!(
         validate_editor_package_links(&baseline, &editor, std::slice::from_ref(&settings_path))
@@ -5471,6 +5502,8 @@ mod twins_subsets;
 
 mod merge_rules;
 
+mod conflict_records;
+
 #[test]
 fn a_file_identity_reused_for_another_class_is_a_new_instance_not_a_replacement() {
     let instance =
@@ -5839,9 +5872,13 @@ fn a_store_missing_from_the_files_is_a_conflict_not_a_deletion() {
             merge_snapshots(Some(&baseline), &editor, &studio, preference).unwrap();
         assert_eq!(conflicts.len(), 1, "{conflicts:?}");
         assert!(
-            conflicts[0].contains("instances/Workspace.renium is missing")
-                && conflicts[0].contains("`rbx pl`")
-                && conflicts[0].contains("`rbx ps instances/Workspace.renium -u`"),
+            conflicts[0]
+                .detail
+                .contains("instances/Workspace.renium is missing")
+                && conflicts[0].detail.contains("`rbx pl`")
+                && conflicts[0]
+                    .detail
+                    .contains("`rbx ps instances/Workspace.renium -u`"),
             "{}",
             conflicts[0]
         );
@@ -5953,7 +5990,7 @@ fn a_packed_link_script_compares_by_its_inline_text_against_the_capture() {
     assert!(
         conflicts
             .iter()
-            .any(|conflict| conflict.contains("ReplicatedStorage.Shared.Util")),
+            .any(|conflict| conflict.detail.contains("ReplicatedStorage/Shared/Util")),
         "control: the raw capture conflicts on the packed script: {conflicts:?}"
     );
 
@@ -5983,7 +6020,7 @@ fn a_packed_link_script_compares_by_its_inline_text_against_the_capture() {
     assert!(
         conflicts
             .iter()
-            .any(|conflict| conflict.contains("ReplicatedStorage.Shared.Util")),
+            .any(|conflict| conflict.detail.contains("ReplicatedStorage/Shared/Util")),
         "a Studio edit of the packed text is still a difference: {conflicts:?}"
     );
 }
@@ -6214,11 +6251,11 @@ fn both_sides_editing_a_script_one_side_renamed_is_a_conflict_at_the_files_path(
     let (_, conflicts) =
         merge_snapshots(Some(&baseline), &editor, &studio, ConflictPreference::None).unwrap();
     assert_eq!(
-        conflicts,
-        [format!(
-            "{} changed on both sides",
-            Path::new("src/ReplicatedStorage").join("A.luau").display()
-        )]
+        conflicts
+            .iter()
+            .map(|conflict| conflict.detail.as_str())
+            .collect::<Vec<_>>(),
+        ["src/ReplicatedStorage/A.luau changed on both sides"]
     );
     for (preference, text) in [
         (ConflictPreference::Editor, "return 'edit'"),

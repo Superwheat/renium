@@ -1189,7 +1189,9 @@ fn live_sync_summary(status: &Value) -> Option<Value> {
             summary[key] = value.clone();
         }
     }
-    if summary["pending"].as_u64() > Some(0) {
+    if summary["resolutionRequired"] == json!(true) {
+        summary["see"] = json!("rbx lst");
+    } else if summary["pending"].as_u64() > Some(0) {
         summary["see"] = json!("rbx lst --details");
     }
     Some(summary)
@@ -3127,6 +3129,19 @@ fn pair_configuration(
     if resolution.is_some_and(|value| !matches!(value, "studio" | "editor")) {
         bail!("p.resolveConflictPreference must be studio or editor");
     }
+    let decisions = match request.get("resolveConflicts") {
+        None | Some(Value::Null) => Default::default(),
+        Some(Value::Array(items)) => automation::reconcile::parse_conflict_decisions(
+            items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .context("p.resolveConflicts holds ID=side strings")
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )?,
+        Some(_) => bail!("p.resolveConflicts must be a list of ID=studio|editor"),
+    };
     let raw_preference = runtime_settings
         .get("initialConflictPreference")
         .and_then(Value::as_str)
@@ -3135,7 +3150,7 @@ fn pair_configuration(
                 .get("initialConflictPreference")
                 .and_then(Value::as_str)
         });
-    let mode = if resolution.is_some() {
+    let mode = if resolution.is_some() || !decisions.is_empty() {
         automation::reconcile::PairMode::Reconcile
     } else {
         automation::reconcile::PairMode::parse(raw_mode)
@@ -3145,6 +3160,7 @@ fn pair_configuration(
         conflict_preference: automation::reconcile::ConflictPreference::parse(raw_preference),
         resolution_preference: resolution
             .map(|value| automation::reconcile::ConflictPreference::parse(Some(value))),
+        decisions,
         runtime_settings,
     })
 }
@@ -5777,6 +5793,45 @@ mod tests {
             configuration.mode,
             automation::reconcile::PairMode::Reconcile
         );
+    }
+
+    #[test]
+    fn decisions_by_id_reach_the_comparison_and_bad_ones_are_refused() {
+        let request = json!({
+            "initialSyncPriority": "verify",
+            "resolveConflicts": ["0a1b2c3d=studio", "ffff0000=files"]
+        });
+        let configuration = pair_configuration(&json!({}), request.as_object().unwrap()).unwrap();
+        assert_eq!(
+            configuration.mode,
+            automation::reconcile::PairMode::Reconcile
+        );
+        assert_eq!(
+            configuration.decisions.into_iter().collect::<Vec<_>>(),
+            vec![
+                (
+                    "0a1b2c3d".to_string(),
+                    automation::reconcile::ConflictSide::Studio
+                ),
+                (
+                    "ffff0000".to_string(),
+                    automation::reconcile::ConflictSide::Editor
+                ),
+            ]
+        );
+        for refused in [
+            json!(["0a1b2c3d"]),
+            json!(["0A1B2C3D=studio"]),
+            json!(["0a1b2c3d=both"]),
+            json!(["0a1b2c3d=studio", "0a1b2c3d=editor"]),
+            json!("0a1b2c3d=studio"),
+        ] {
+            let request = json!({ "resolveConflicts": refused });
+            assert!(
+                pair_configuration(&json!({}), request.as_object().unwrap()).is_err(),
+                "{refused}"
+            );
+        }
     }
 
     #[test]
