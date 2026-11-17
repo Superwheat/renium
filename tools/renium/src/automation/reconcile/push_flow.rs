@@ -479,11 +479,10 @@ pub(crate) fn push_project(
         .then_some(())
         .filter(|_| replacement.is_none())
         .and_then(|()| committed_import_proof(context, &pushed.summary, &mutation_paths, services))
+        // A Studio that changed since the commit gets the full readback below
+        // before the push answers.
+        .filter(|proof| verified_full_push_proof_matches(context, bridge, proof).unwrap_or(false))
     {
-        anyhow::ensure!(
-            verified_full_push_proof_matches(context, bridge, &proof)?,
-            "Studio changed after the import committed; its files still need settlement"
-        );
         let mut expected = project;
         expected.entries.extend(pushed.generated.entries);
         // A journal records only a verified Studio commit whose caller can

@@ -95,6 +95,12 @@ impl Journal {
         );
         let record: Record = rmp_serde::from_slice(&bytes)
             .context("Cannot decode the import settlement journal; run rbx pl to recover")?;
+        anyhow::ensure!(
+            record.paths.iter().all(|path| path
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))),
+            "The import settlement journal names a path outside the project; run rbx pl to recover"
+        );
         Ok(Some(Self {
             directory,
             record,
@@ -304,23 +310,53 @@ pub(crate) fn continue_request(context: &BoundContext, bridge: &BridgeServer) ->
     Ok(())
 }
 
-/// Closing Studio explicitly cancels its read-only continuation before waiting
-/// for the gate. Client disconnect alone must never cancel the committed tail.
-pub(crate) fn cancel_for_close(context: &BoundContext) {
+/// How long a close that keeps the place lets a running settlement publish
+/// before it cancels it.
+const CLOSE_WAITS_FOR_SETTLEMENT: Duration = Duration::from_secs(30);
+
+/// A close that discards the place cancels the read-only continuation of its
+/// Studio at once. Any other close lets the settlement publish first and
+/// cancels it only when that takes too long: a hung Studio must not keep its
+/// own close waiting. A client disconnect alone never cancels the committed
+/// tail, and closing another Studio of the project leaves it alone.
+pub(crate) fn yield_to_close(
+    context: &BoundContext,
+    discards_place: bool,
+    lease: Option<&crate::studio::bridge::BridgeRequestLease>,
+) -> Result<()> {
+    if !discards_place {
+        wait_while_running(
+            context,
+            lease,
+            Some(Instant::now() + CLOSE_WAITS_FOR_SETTLEMENT),
+        )?;
+    }
     let directory = directory(context);
     for entry in RUNNING.0.lock_recover().iter() {
-        if (entry.directory == directory
-            || entry.runtime.is_some() && entry.runtime == context.runtime_id)
-            && let Some(lease) = &entry.lease
-        {
+        let of_this_studio = match &context.runtime_id {
+            Some(runtime) => entry.runtime.as_ref() == Some(runtime),
+            None => entry.directory == directory,
+        };
+        if of_this_studio && let Some(lease) = &entry.lease {
             lease.cancel();
         }
     }
+    Ok(())
 }
 
 pub(crate) fn wait_for_request(
     context: &BoundContext,
     lease: Option<&crate::studio::bridge::BridgeRequestLease>,
+) -> Result<()> {
+    wait_while_running(context, lease, None)
+}
+
+/// Waits for the settlements of this project or Studio that other requests
+/// run, to `deadline` at the latest.
+fn wait_while_running(
+    context: &BoundContext,
+    lease: Option<&crate::studio::bridge::BridgeRequestLease>,
+    deadline: Option<Instant>,
 ) -> Result<()> {
     let directory = directory(context);
     let mut running = RUNNING.0.lock_recover();
@@ -328,7 +364,8 @@ pub(crate) fn wait_for_request(
         entry.owner != thread::current().id()
             && (entry.directory == directory
                 || entry.runtime.is_some() && entry.runtime == context.runtime_id)
-    }) {
+    }) && deadline.is_none_or(|deadline| Instant::now() < deadline)
+    {
         if let Some(lease) = lease {
             lease.ensure_active()?;
         }
@@ -475,6 +512,11 @@ pub(crate) fn before_request(
     if active() {
         return Ok(None);
     }
+    // Without a journal there is nothing to recover and no lock to take.
+    if !pending(context) {
+        return Ok(None);
+    }
+    // Another daemon that settles this project holds the lock until it is done.
     let ownership = crate::system::project_access::acquire(Path::new(&context.root), || {
         bridge
             .active_request_lease()
@@ -513,7 +555,10 @@ pub(crate) fn before_request(
             resolve_journal(&directory(context))?;
             return Ok(None);
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            unsettled_notice(operation, &format!("{error:#}"));
+            return Ok(None);
+        }
     };
     let Some(journal) = journal else {
         return Ok(None);
@@ -529,21 +574,20 @@ pub(crate) fn before_request(
         resolve_journal(&journal.directory)?;
         return Ok(None);
     }
-    if matches!(operation, op::STUDIO_CLOSE | op::STUDIO_OPEN) {
-        crate::daemon::emit_request_notice(
-            "The project still has an unsettled import. Repeat rbx ps to reconcile your files, or run rbx pl to take Studio's state.",
+    // Only a full push or a full pull settles the import. Every other command
+    // runs on the files and the Studio as they are, as it did after a push
+    // whose readback failed before pushes answered early.
+    if !full_push {
+        unsettled_notice(
+            operation,
+            journal
+                .record
+                .error
+                .as_deref()
+                .unwrap_or("the daemon stopped before settlement finished"),
         );
         return Ok(None);
     }
-    anyhow::ensure!(
-        full_push,
-        "The last import still needs settlement: {}. Repeat rbx ps to reconcile your files, or run rbx pl to take Studio's state",
-        journal
-            .record
-            .error
-            .as_deref()
-            .unwrap_or("the daemon stopped before settlement finished")
-    );
     let current = capture_snapshot(Path::new(&context.root), &journal.record.paths)?;
     let files_match = journal.record.expected.matches(&current)
         || journal.record.accepted.as_ref().is_some_and(|accepted| {
@@ -594,6 +638,19 @@ pub(crate) fn before_request(
     } else {
         finish_request(None)?;
         Ok(None)
+    }
+}
+
+/// Says, on the commands that sync or end the session, that the files of the
+/// last push were not settled and what settles them.
+fn unsettled_notice(operation: u16, reason: &str) {
+    if matches!(
+        operation,
+        op::PUSH | op::PULL | op::LIVE_START | op::STUDIO_CLOSE | op::STUDIO_OPEN
+    ) {
+        crate::daemon::emit_request_notice(&format!(
+            "The files of the last push were not settled: {reason}. Repeat rbx ps to reconcile your files, or run rbx pl to take Studio's state."
+        ));
     }
 }
 
@@ -1324,6 +1381,64 @@ mod tests {
                 received.recv_timeout(Duration::from_secs(5)).unwrap();
             }
         });
+        Ok(())
+    }
+
+    /// A settlement that failed after the push was answered leaves every
+    /// command but a full push or pull running as before.
+    #[test]
+    fn a_settlement_error_does_not_refuse_ordinary_commands() -> Result<()> {
+        let root = crate::tests::support::temp_dir("review-settle-error-commands");
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let context = context(&root);
+        begin_test(&context)?;
+        finish_request(Some(
+            "Studio changed during import settlement; the committed import was not repeated",
+        ))?;
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        for operation in [
+            op::LUAU,
+            op::FIND,
+            op::CONSOLE,
+            op::PLAY_START,
+            op::LIVE_START,
+        ] {
+            before_request(&context, &bridge, operation, &json!({}))
+                .map_err(|error| anyhow::anyhow!("op {operation} refused: {error:#}"))?;
+        }
+        Ok(())
+    }
+
+    /// A journal that names a path outside the project is not followed.
+    #[test]
+    fn a_journal_path_outside_the_project_is_refused() -> Result<()> {
+        let root = crate::tests::support::temp_dir("settle-journal-outside-path");
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let context = context(&root);
+        for outside in ["../outside", "C:/outside", "/outside"] {
+            begin_test(&context)?;
+            CURRENT.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let journal = slot.as_mut().unwrap();
+                journal.record.paths.push(PathBuf::from(outside));
+                journal.save()
+            })?;
+            interrupt_test_request();
+            let error = Journal::load(&context)
+                .err()
+                .map(|error| format!("{error:#}"));
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("outside the project")),
+                "{outside}: {error:?}"
+            );
+            resolve_journal(&directory(&context))?;
+        }
         Ok(())
     }
 }

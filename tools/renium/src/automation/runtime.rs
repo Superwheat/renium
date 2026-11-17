@@ -3920,43 +3920,35 @@ fn is_studio_review_decision(request: &automation::Request) -> bool {
     request.op == op::REVIEW_APPLY && request.p.get("studioDecision") == Some(&Value::Bool(true))
 }
 
+/// A collaboration request names its project itself and runs outside the
+/// request queue, so it holds the project's lock while it runs and waits out
+/// an import settlement that way. Every other request meets an unsettled
+/// import in `import_settle::before_request` and holds no lock of its own:
+/// requests of one project run beside each other as their gates allow.
 fn request_project_access(
     request: &automation::Request,
-    state: &automation::State,
     lease: Option<&BridgeRequestLease>,
 ) -> Result<Option<crate::system::project_access::ProjectAccess>> {
-    if is_studio_review_decision(request) {
+    if !matches!(
+        request.op,
+        op::COLLAB_START
+            | op::COLLAB_JOIN
+            | op::COLLAB_STOP
+            | op::COLLAB_STATUS
+            | op::COLLAB_AWARENESS
+    ) {
         return Ok(None);
     }
-    let root = request
-        .cx
-        .and_then(|id| state.context(id))
-        .filter(|context| context.initialized)
-        .map(|context| PathBuf::from(context.root))
-        .or_else(|| {
-            matches!(
-                request.op,
-                op::COLLAB_START
-                    | op::COLLAB_JOIN
-                    | op::COLLAB_STOP
-                    | op::COLLAB_STATUS
-                    | op::COLLAB_AWARENESS
-            )
-            .then(|| {
-                request
-                    .p
-                    .get("root")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from)
+    request
+        .p
+        .get("root")
+        .and_then(Value::as_str)
+        .map(|root| {
+            crate::system::project_access::acquire(Path::new(root), || {
+                lease.map_or(Ok(()), BridgeRequestLease::ensure_active)
             })
-            .flatten()
-        });
-    root.map(|root| {
-        crate::system::project_access::acquire(&root, || {
-            lease.map_or(Ok(()), BridgeRequestLease::ensure_active)
         })
-    })
-    .transpose()
+        .transpose()
 }
 
 fn automation_response(
@@ -4079,7 +4071,14 @@ fn execute_gated(
         && let Some(context) = request.cx.and_then(|id| state.context(id))
     {
         if request.op == op::STUDIO_CLOSE {
-            automation::reconcile::import_settle::cancel_for_close(&context);
+            let discards_place =
+                request.p.get("localAction").and_then(Value::as_str) == Some("terminate");
+            automation::reconcile::import_settle::yield_to_close(
+                &context,
+                discards_place,
+                request_lease.map(Arc::as_ref),
+            )
+            .map_err(automation_failure)?;
         }
         automation::reconcile::import_settle::wait_for_request(
             &context,
@@ -4127,9 +4126,7 @@ fn execute_gated(
             request_lease.map(Arc::as_ref),
         )?),
     };
-    // Gate before project lock matches Live Sync's order. The request stack
-    // owns both through the continuation and all acknowledgment/cleanup.
-    let _project_access = request_project_access(request, state, request_lease.map(Arc::as_ref))
+    let _project_access = request_project_access(request, request_lease.map(Arc::as_ref))
         .map_err(automation_failure)?;
     let _lease_guard = match request_lease {
         Some(lease) => Some(
@@ -5393,7 +5390,7 @@ mod tests {
         let worker = Arc::clone(&studios);
         let task = std::thread::spawn(move || {
             let request: automation::Request = serde_json::from_value(json!({
-                "v":1,"id":902,"op":op::STUDIO_CLOSE,"cx":worker.a,"p":{"terminate":true}
+                "v":1,"id":902,"op":op::STUDIO_CLOSE,"cx":worker.a,"p":{"localAction":"terminate"}
             }))
             .unwrap();
             execute_gated(
@@ -5904,6 +5901,215 @@ mod tests {
         assert_eq!(
             result["daemon"]["previousError"],
             "Source changed on both sides"
+        );
+    }
+
+    /// An unqueued Live Sync request and a queued request of one project
+    /// both finish: neither holds something the other waits for.
+    #[test]
+    fn live_stop_and_a_queued_request_of_one_project_never_deadlock() {
+        if !runs_in_its_own_process("live_stop_and_a_queued_request_of_one_project_never_deadlock")
+        {
+            return;
+        }
+        let studios = TwoStudios::open();
+        // An `rbx l` on gate-a holds that runtime's gate alone.
+        let running = studios
+            .bridge
+            .try_acquire_runtime_gate("gate-a", "luau")
+            .unwrap();
+        let queued_lease = Arc::new(BridgeRequestLease::new("queued-edit".into()));
+        let (done, answers) = std::sync::mpsc::channel();
+        {
+            let worker = Arc::clone(&studios);
+            let lease = Arc::clone(&queued_lease);
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let request: automation::Request = serde_json::from_value(json!({
+                    "v":1,"id":910,"op":op::MULTI_EDIT,"cx":worker.a,"p":{"window":"gate-a"}
+                }))
+                .unwrap();
+                let result = execute_gated(
+                    &request,
+                    Some(None),
+                    &worker.state,
+                    &worker.bridge,
+                    0.1,
+                    Some(&lease),
+                );
+                let _ = done.send(("queued edit", result.map_err(|failure| failure.0.m)));
+            });
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        {
+            let worker = Arc::clone(&studios);
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let request: automation::Request = serde_json::from_value(json!({
+                    "v":1,"id":911,"op":op::LIVE_STOP,"cx":worker.a,"p":{}
+                }))
+                .unwrap();
+                let result =
+                    execute_gated(&request, None, &worker.state, &worker.bridge, 0.1, None);
+                let _ = done.send(("live stop", result.map_err(|failure| failure.0.m)));
+            });
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        drop(running);
+        let first = answers.recv_timeout(Duration::from_secs(5));
+        let second = answers.recv_timeout(Duration::from_secs(5));
+        queued_lease.cancel();
+        assert!(
+            first.is_ok() && second.is_ok(),
+            "deadlock: first={first:?} second={second:?}"
+        );
+        let _ = std::fs::remove_dir_all(&studios.root);
+    }
+
+    /// A slow request on one Studio does not hold requests on another Studio
+    /// of the same project.
+    #[test]
+    fn another_studio_of_the_project_is_not_held_by_a_slow_request() {
+        if !runs_in_its_own_process("another_studio_of_the_project_is_not_held_by_a_slow_request") {
+            return;
+        }
+        use crate::automation::authorization::signed_fixture_request;
+        use crate::studio::bridge::routing_tests::{connect, edit_info, fixture};
+        use tungstenite::{Message, WebSocket};
+        let root = crate::tests::support::temp_dir("review-project-lock");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+        )
+        .unwrap();
+        let bridge = Arc::new(fixture());
+        let state = Arc::new(automation::State::default());
+        let mut contexts = Vec::new();
+        for (window, place) in [("slow-a", 31), ("fast-b", 32)] {
+            let peer = connect(&bridge, 0, edit_info(window, place));
+            std::thread::spawn(move || {
+                let mut peer =
+                    WebSocket::from_raw_socket(peer, tungstenite::protocol::Role::Client, None);
+                while let Ok(message) = peer.read() {
+                    let Message::Text(text) = message else {
+                        continue;
+                    };
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    if window == "slow-a" && request["method"] == "multiEdit" {
+                        std::thread::sleep(Duration::from_millis(2500));
+                    }
+                    let answer = json!({ "id": request["id"], "ok": true,
+                        "result": { "ok": true, "window": window, "output": [], "messages": [] } });
+                    if peer.send(Message::Text(answer.to_string().into())).is_err() {
+                        break;
+                    }
+                }
+            });
+            let bound = automation_parse_response_with_lease(
+                &signed_fixture_request(
+                    &state,
+                    json!({ "v": 1, "id": place, "op": op::BIND,
+                        "p": { "root": root, "place": format!("10:{place}") } }),
+                ),
+                &state,
+                &bridge,
+                0.1,
+                None,
+            );
+            assert_eq!(bound.ok, 1, "{}", serde_json::to_string(&bound).unwrap());
+            contexts.push(bound.r.unwrap()["id"].as_u64().unwrap());
+        }
+        let (a, b) = (contexts[0], contexts[1]);
+        let slow = {
+            let (bridge, state) = (Arc::clone(&bridge), Arc::clone(&state));
+            std::thread::spawn(move || {
+                automation_parse_response_with_lease(
+                    &signed_fixture_request(
+                        &state,
+                        json!({ "v": 1, "id": 940, "op": op::MULTI_EDIT, "cx": a, "p": {} }),
+                    ),
+                    &state,
+                    &bridge,
+                    0.1,
+                    None,
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(400));
+        for (id, operation) in [(941, op::STUDIO_STATUS), (942, op::CONSOLE)] {
+            let started = Instant::now();
+            let _ = automation_parse_response_with_lease(
+                &signed_fixture_request(
+                    &state,
+                    json!({ "v": 1, "id": id, "op": operation, "cx": b, "p": {} }),
+                ),
+                &state,
+                &bridge,
+                0.1,
+                None,
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(1200),
+                "op {operation} on the other Studio waited {:?} behind Studio A's request",
+                started.elapsed()
+            );
+        }
+        let _ = slow.join();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A close that keeps the place lets the settlement of an already
+    /// answered push finish.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn an_ordinary_close_after_the_early_reply_does_not_cancel_settlement() {
+        if !runs_in_its_own_process(
+            "an_ordinary_close_after_the_early_reply_does_not_cancel_settlement",
+        ) {
+            return;
+        }
+        use crate::automation::reconcile::import_settle;
+        let studios = TwoStudios::open();
+        let context = studios.state.context(studios.a).unwrap();
+        import_settle::fixture_running_import(&context).unwrap();
+        let gate = studios.bridge.acquire_edit_gate(Some("gate-a"), "push");
+        let client = Arc::new(BridgeRequestLease::new("finished-import-client".into()));
+        let active = studios.bridge.activate_request_lease(client).unwrap();
+        import_settle::continue_request(&context, &studios.bridge).unwrap();
+        let continuation = studios.bridge.active_request_lease().unwrap();
+        let close_lease = Arc::new(BridgeRequestLease::new("ordinary-close-client".into()));
+        let worker_lease = Arc::clone(&close_lease);
+        let worker = Arc::clone(&studios);
+        let task = std::thread::spawn(move || {
+            let request: automation::Request = serde_json::from_value(json!({
+                "v":1,"id":904,"op":op::STUDIO_CLOSE,"cx":worker.a,"p":{"save":true}
+            }))
+            .unwrap();
+            execute_gated(
+                &request,
+                Some(None),
+                &worker.state,
+                &worker.bridge,
+                0.1,
+                Some(&worker_lease),
+            )
+            .map_err(|error| error.0.m)
+        });
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !continuation.is_cancelled() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let cancelled = continuation.is_cancelled();
+        close_lease.cancel();
+        import_settle::finish_request(None).unwrap();
+        drop(active);
+        drop(gate);
+        let _ = task.join();
+        let _ = fs::remove_dir_all(&studios.root);
+        assert!(
+            !cancelled,
+            "an ordinary close cancelled the settlement of an already answered push"
         );
     }
 }
