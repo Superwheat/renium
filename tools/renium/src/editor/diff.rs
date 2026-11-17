@@ -1194,6 +1194,7 @@ mod native_property_tests {
         EditorBinaryImport {
             bytes: Vec::new(),
             native_replacement: None,
+            fallback_reason: None,
             instance_count: 18,
             external_references_post_applied: true,
             viewport_references_post_applied: true,
@@ -1514,6 +1515,7 @@ mod native_property_tests {
         let mut import = EditorBinaryImport {
             bytes: Vec::new(),
             native_replacement: None,
+            fallback_reason: None,
             instance_count: 6,
             external_references_post_applied: true,
             viewport_references_post_applied: false,

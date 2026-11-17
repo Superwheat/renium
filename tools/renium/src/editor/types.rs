@@ -606,6 +606,8 @@ pub(crate) struct EditorBinaryImport {
     pub(crate) bytes: Vec<u8>,
     pub(crate) groups: Vec<EditorBinaryImportGroup>,
     pub(crate) native_replacement: Option<EditorNativeReplacement>,
+    /// Why this plan uses Studio's plugin deserializer instead of the service reader.
+    pub(crate) fallback_reason: Option<String>,
     pub(crate) instance_count: usize,
     pub(crate) post_apply_properties_by_class: HashMap<String, HashSet<String>>,
     pub(crate) post_apply_properties_by_path: HashMap<String, HashSet<String>>,

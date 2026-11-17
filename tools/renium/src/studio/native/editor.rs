@@ -5602,6 +5602,7 @@ mod source_change_tests {
         let import = EditorBinaryImport {
             bytes: vec![],
             groups,
+            fallback_reason: None,
             native_replacement: Some(EditorNativeReplacement {
                 plan: EditorNativePlan {
                     bindings: vec![],

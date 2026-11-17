@@ -2330,25 +2330,25 @@ pub(crate) fn build_editor_binary_import(
         return Ok(None);
     }
     #[cfg(windows)]
-    let allow_service_replacement = if !changes.files_to_studio_filters_active
-        && std::env::var_os("RENIUM_NATIVE_SERVICE_IMPORT").is_none_or(|value| value != "0")
-    {
-        let pid = crate::editor::review::studio_pid_for_bridge(bridge)?;
-        match crate::studio::native::serializer::prepare_service_reader(pid) {
-            Ok(()) => true,
-            Err(error) => {
-                crate::app::output::log_global(
-                    5,
-                    format_args!("[renium] using binary import transport: {error:#}"),
-                );
-                false
-            }
-        }
+    let fallback_reason = if changes.files_to_studio_filters_active {
+        Some("the push has active service filters".to_owned())
+    } else if std::env::var_os("RENIUM_NATIVE_SERVICE_IMPORT").is_some_and(|value| value == "0") {
+        Some("the native service reader was disabled by RENIUM_NATIVE_SERVICE_IMPORT".to_owned())
     } else {
-        false
+        let pid = crate::editor::review::studio_pid_for_bridge(bridge)?;
+        crate::studio::native::serializer::prepare_service_reader(pid)
+            .err()
+            .map(|error| format!("{error:#}"))
     };
     #[cfg(not(windows))]
-    let allow_service_replacement = false;
+    let fallback_reason =
+        Some("the native service reader is unavailable on this platform".to_owned());
+    if let Some(reason) = &fallback_reason {
+        crate::app::output::log_global(
+            5,
+            format_args!("[renium] using binary import transport: {reason}"),
+        );
+    }
     let document_overrides = changes
         .native_property_documents
         .iter()
@@ -2369,7 +2369,7 @@ pub(crate) fn build_editor_binary_import(
         &additive_roots,
         &root_ids,
         bridge,
-        allow_service_replacement,
+        fallback_reason,
     )
 }
 
@@ -2750,7 +2750,7 @@ fn build_editor_binary_import_for_services(
     additive_roots: &HashMap<String, HashSet<String>>,
     additive_root_ids: &AdditiveRootIds,
     bridge: &BridgeServer,
-    allow_service_replacement: bool,
+    fallback_reason: Option<String>,
 ) -> Result<Option<EditorBinaryImport>> {
     let project_root = resolve_project_root_if_present(&args.project.project_root)?;
     let src_root = absolutize_under(&project_root, &args.project.src_root);
@@ -3139,7 +3139,7 @@ fn build_editor_binary_import_for_services(
     drop(identities);
     // Temporary A/B selection while the transaction adapter is integrated.
     // Existing package and partial-service workflows retain their current path.
-    if allow_service_replacement
+    if fallback_reason.is_none()
         && package_plans.iter().all(|plan| {
             plan.retained_roots.is_empty()
                 && plan.package_roots.is_empty()
@@ -3170,6 +3170,7 @@ fn build_editor_binary_import_for_services(
             bytes,
             groups,
             native_replacement: Some(native_replacement),
+            fallback_reason: None,
             instance_count,
             post_apply_properties_by_class: import_property_omissions(
                 build.omitted_properties_by_class,
@@ -3279,6 +3280,8 @@ fn build_editor_binary_import_for_services(
         bytes,
         groups,
         native_replacement: None,
+        fallback_reason: fallback_reason
+            .or_else(|| Some("the import must preserve live package roots".to_owned())),
         instance_count,
         post_apply_properties_by_class: import_property_omissions(
             build.omitted_properties_by_class,

@@ -3577,6 +3577,15 @@ fn push_editor_changes_with_collected(
             &mut changes.deferred_native_rows,
         )));
     }
+    let supplemental_import_writes = binary_import
+        .as_ref()
+        .map(|import| {
+            checked_individual_import_writes(
+                &changes.deferred_native_rows,
+                import.fallback_reason.as_deref(),
+            )
+        })
+        .transpose()?;
     let unstaged_replacements = changes
         .instance_changes
         .iter()
@@ -3750,6 +3759,12 @@ fn push_editor_changes_with_collected(
             apply_deferred_native_rows(bridge, guard, &changes.deferred_native_rows, &mut summary)?;
             log_timing("native editor imported engine fields", phase_started);
         }
+        if let Some(count) = supplemental_import_writes {
+            summary.insert(
+                "supplementalImportWrites".into(),
+                json!(if protected.apply_offline { 0 } else { count }),
+            );
+        }
         log_global(
             5,
             format_args!(
@@ -3830,6 +3845,40 @@ fn defer_imported_native_root_rows(
             || !change.deleted_attributes.is_empty()
     });
     changes.deferred_native_rows = deferred;
+}
+
+// Each of these fields needs a separate Studio target lookup, transaction
+// fence and write. Check the plan before opening the import transaction.
+const MAX_INDIVIDUAL_IMPORT_WRITES: usize = 32;
+
+fn checked_individual_import_writes(
+    rows: &[EditorPropertyChange],
+    fallback_reason: Option<&str>,
+) -> Result<usize> {
+    let count = rows.iter().map(|row| row.properties.len()).sum::<usize>();
+    if count <= MAX_INDIVIDUAL_IMPORT_WRITES {
+        return Ok(count);
+    }
+    let mut counts = BTreeMap::new();
+    for row in rows {
+        for name in row.properties.keys() {
+            *counts
+                .entry((row.class_name.as_str(), name.as_str()))
+                .or_insert(0_usize) += 1;
+        }
+    }
+    let mut counts: Vec<_> = counts.into_iter().collect();
+    counts.sort_by_key(|&(key, n)| (std::cmp::Reverse(n), key));
+    let fields = counts
+        .iter()
+        .take(5)
+        .map(|((class, name), n)| format!("{class}.{name} ({n})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let reason = fallback_reason.unwrap_or("the native import payload does not cover these fields");
+    bail!(
+        "Import stopped before changing Studio: {reason}. The bulk import would need {count} individual supplemental field writes (limit {MAX_INDIVIDUAL_IMPORT_WRITES}), including {fields}. No fields were skipped or written."
+    );
 }
 
 fn protected_write_rows(rows: &[EditorPropertyChange]) -> Vec<Value> {
@@ -6201,11 +6250,42 @@ mod sync_tests {
     }
 
     #[test]
+    fn supplemental_write_limit_counts_fields_and_names_the_reason_before_commit() {
+        let row = EditorPropertyChange {
+            class_name: "Example".into(),
+            properties: Map::from_iter([
+                ("SavedA".into(), json!(true)),
+                ("SavedB".into(), json!(7)),
+            ]),
+            ..Default::default()
+        };
+        let mut rows = vec![row; MAX_INDIVIDUAL_IMPORT_WRITES / 2];
+        assert_eq!(
+            checked_individual_import_writes(&rows, None).unwrap(),
+            MAX_INDIVIDUAL_IMPORT_WRITES
+        );
+        rows.push(EditorPropertyChange {
+            class_name: "Other".into(),
+            properties: Map::from_iter([("SavedC".into(), json!(0))]),
+            ..Default::default()
+        });
+        let error = checked_individual_import_writes(&rows, Some("service reader unavailable"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("service reader unavailable"));
+        assert!(error.contains("33 individual supplemental field writes (limit 32)"));
+        assert!(error.contains("Example.SavedA (16)"));
+        assert!(error.contains("Other.SavedC (1)"));
+        assert!(checked_individual_import_writes(&[], None).is_ok());
+    }
+
+    #[test]
     fn imported_engine_fields_wait_for_the_import_to_land() {
         use crate::editor::types::{EditorBinaryImportGroup, EditorPropertyChange};
         let import = EditorBinaryImport {
             bytes: Vec::new(),
             native_replacement: None,
+            fallback_reason: None,
             groups: vec![EditorBinaryImportGroup {
                 additive: false,
                 service: "ReplicatedStorage".to_string(),
@@ -6270,6 +6350,10 @@ mod sync_tests {
         };
         defer_imported_native_root_rows(&mut changes, Some(&import));
         assert_eq!(changes.deferred_native_rows.len(), 2);
+        assert_eq!(
+            checked_individual_import_writes(&changes.deferred_native_rows, None).unwrap(),
+            2
+        );
         assert_eq!(changes.property_changes.len(), 2);
         assert!(
             changes.property_changes[0]
