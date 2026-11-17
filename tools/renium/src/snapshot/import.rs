@@ -26,7 +26,7 @@ use crate::roblox::services::DEFAULT_SYNC_SERVICES;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     SettingsBytecode, child_indices_for_instance, decode_settings_bytecode,
-    encode_service_settings_binary, encode_settings_bytecode, settings_bytecode_from_service_state,
+    encode_service_settings_binary, settings_bytecode_from_service_state,
     write_fresh_service_settings_binary_file,
 };
 use crate::settings::equivalence::{
@@ -1493,49 +1493,55 @@ fn write_service_settings_file(
             },
             || {
                 let _converting = profile::span(&format!("{service}: captured store document"));
-                let observed = settings_bytecode_from_service_state(state_to_write)?;
+                let observed = settings_bytecode_from_service_state(state_to_write)
+                    .with_context(|| format!("Failed to align {}", settings_path.display()))?;
                 let digest = pulled_settings_document_digest(&observed);
                 Ok::<_, anyhow::Error>((observed, digest))
             },
         );
-        let (observed, observed_digest) = observed?;
-        let aligned = match stored? {
-            Some(stored) if remembered == Some((stored.digest, observed_digest)) => {
-                profile::record(
-                    &format!("{service}: unchanged since the last pull"),
-                    alignment_started,
-                );
-                None
-            }
-            Some(stored) => {
-                let reference = match stored.document {
-                    Some(document) => document,
-                    None => decode_stored_settings(&settings_path, &stored.bytes)?,
-                };
-                match align_pulled_settings_documents_to_reference(
-                    reference,
-                    observed,
-                    alignment_started,
-                )
-                .with_context(|| format!("Failed to align {}", settings_path.display()))?
-                {
-                    SettingsAlignment::Equivalent => {
-                        unchanged_pulls()
-                            .lock_recover()
-                            .insert(settings_path.clone(), (stored.digest, observed_digest));
-                        None
-                    }
-                    SettingsAlignment::Changed(aligned) => {
-                        unchanged_pulls().lock_recover().remove(&settings_path);
-                        Some(aligned)
+        let aligned = (|| -> Result<Option<Vec<u8>>> {
+            let (observed, observed_digest) = observed?;
+            Ok(match stored? {
+                Some(stored) if remembered == Some((stored.digest, observed_digest)) => {
+                    profile::record(
+                        &format!("{service}: unchanged since the last pull"),
+                        alignment_started,
+                    );
+                    None
+                }
+                Some(stored) => {
+                    let reference = match stored.document {
+                        Some(document) => document,
+                        None => decode_stored_settings(&settings_path, &stored.bytes)?,
+                    };
+                    match align_pulled_settings_documents_to_reference(
+                        reference,
+                        observed,
+                        &|| encode_service_settings_binary(state_to_write),
+                        alignment_started,
+                    )
+                    .with_context(|| format!("Failed to align {}", settings_path.display()))?
+                    {
+                        SettingsAlignment::Equivalent => {
+                            unchanged_pulls()
+                                .lock_recover()
+                                .insert(settings_path.clone(), (stored.digest, observed_digest));
+                            None
+                        }
+                        SettingsAlignment::Changed(aligned) => {
+                            unchanged_pulls().lock_recover().remove(&settings_path);
+                            Some(aligned)
+                        }
                     }
                 }
-            }
-            None => Some(encode_settings_bytecode(&observed)?),
-        };
+                // A store that is not there yet gets the captured state's own bytes.
+                None => Some(encode_service_settings_binary(state_to_write)?),
+            })
+        })();
         if cfg!(debug_assertions) {
-            assert_pull_matches_the_byte_path(state_to_write, &settings_path, aligned.as_deref())?;
+            assert_pull_matches_the_byte_path(state_to_write, &settings_path, &aligned);
         }
+        let aligned = aligned?;
         log_timing(
             &format!("{service}: align settings file"),
             alignment_started,
@@ -1581,29 +1587,43 @@ fn unchanged_pulls() -> &'static Mutex<UnchangedPulls> {
 /// By store file: the digest of the file and of the observed store.
 type UnchangedPulls = HashMap<PathBuf, ([u8; 32], [u8; 32])>;
 
-/// What the pull is about to write is what it wrote when it encoded the
-/// captured state, decoded it again and aligned the two files' bytes. Every
-/// pull of a debug build checks it.
+/// What the pull is about to write, or that it fails, is what it did when it
+/// encoded the captured state, decoded it again and aligned the two files'
+/// bytes. Every pull of a debug build checks it.
 fn assert_pull_matches_the_byte_path(
     state: &ServiceState,
     settings_path: &Path,
-    aligned: Option<&[u8]>,
-) -> Result<()> {
-    let observed = encode_service_settings_binary(state)?;
-    let expected = match fs::read(settings_path) {
-        Ok(reference) => match align_pulled_settings_bytes_to_reference(&reference, &observed)? {
-            SettingsAlignment::Equivalent => None,
-            SettingsAlignment::Changed(aligned) => Some(aligned),
-        },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(observed),
-        Err(error) => return Err(error.into()),
+    aligned: &Result<Option<Vec<u8>>>,
+) {
+    let expected = (|| -> Result<Option<Vec<u8>>> {
+        let observed = encode_service_settings_binary(state)?;
+        Ok(match fs::read(settings_path) {
+            Ok(reference) => {
+                match align_pulled_settings_bytes_to_reference(&reference, &observed)? {
+                    SettingsAlignment::Equivalent => None,
+                    SettingsAlignment::Changed(aligned) => Some(aligned),
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Some(observed),
+            Err(error) => return Err(error.into()),
+        })
+    })();
+    let same = match (&expected, aligned) {
+        (Ok(expected), Ok(aligned)) => expected == aligned,
+        (Err(_), Err(_)) => true,
+        _ => false,
     };
     assert!(
-        expected.as_deref() == aligned,
-        "{}: the pull from documents differs from the pull from bytes",
-        settings_path.display()
+        same,
+        "{}: the pull from documents differs from the pull from bytes (bytes: {}, documents: {})",
+        settings_path.display(),
+        expected
+            .as_ref()
+            .map_or_else(|error| format!("{error:#}"), |_| "ok".into()),
+        aligned
+            .as_ref()
+            .map_or_else(|error| format!("{error:#}"), |_| "ok".into()),
     );
-    Ok(())
 }
 
 pub(crate) fn state_with_preserved_material_service_settings(

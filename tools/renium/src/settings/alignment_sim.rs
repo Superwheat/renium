@@ -58,6 +58,7 @@ fn documents_answer_like_bytes(reference: &[u8], observed: &[u8]) {
         align_pulled_settings_documents_to_reference(
             reference,
             decode_settings_bytecode(observed)?,
+            &|| Ok(observed.to_vec()),
             std::time::Instant::now(),
         )
     });

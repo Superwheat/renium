@@ -155,7 +155,7 @@ fn align_settings_bytes(
         reference?,
         observed?,
         AlignmentInput {
-            observed_bytes: Some(observed_bytes),
+            observed_bytes: ObservedBytes::Given(observed_bytes),
             keep_viewport_camera,
             cache_key,
             started: decode_started,
@@ -165,18 +165,20 @@ fn align_settings_bytes(
 
 /// A pull's alignment for a caller that holds both stores decoded already:
 /// the observed one straight from the captured state, never as bytes. Answers
-/// what `align_pulled_settings_bytes_to_reference` answers for the bytes the
-/// two documents encode to.
+/// what `align_pulled_settings_bytes_to_reference` answers for the stored
+/// file and the bytes `observed_bytes` gives, which are only asked for where
+/// the observed store is written as it came in.
 pub(crate) fn align_pulled_settings_documents_to_reference(
     reference: SettingsBytecode,
     observed: SettingsBytecode,
+    observed_bytes: &dyn Fn() -> Result<Vec<u8>>,
     started: std::time::Instant,
 ) -> Result<SettingsAlignment> {
     align_settings_documents(
         reference,
         observed,
         AlignmentInput {
-            observed_bytes: None,
+            observed_bytes: ObservedBytes::Encode(observed_bytes),
             keep_viewport_camera: true,
             cache_key: None,
             started,
@@ -272,10 +274,16 @@ fn digest_value(digest: &mut Sha256, value: &Value) {
     }
 }
 
+/// The observed store as it came in: its bytes, or how to get them. Under
+/// store ids, with nothing to rewrite, those bytes are what is written.
+#[derive(Clone, Copy)]
+enum ObservedBytes<'a> {
+    Given(&'a [u8]),
+    Encode(&'a dyn Fn() -> Result<Vec<u8>>),
+}
+
 struct AlignmentInput<'a> {
-    /// The observed store as it came in, when it came in as bytes: written
-    /// back as it is where the encoder would write the same.
-    observed_bytes: Option<&'a [u8]>,
+    observed_bytes: ObservedBytes<'a>,
     keep_viewport_camera: bool,
     cache_key: Option<SettingsAlignmentCacheKey>,
     started: std::time::Instant,
@@ -355,9 +363,13 @@ fn align_settings_documents(
             .instances
             .iter()
             .all(|instance| is_store_identity(&instance.settings_id));
-        let aligned = match observed_bytes {
-            Some(bytes) if !camera_kept && keep_encoding => bytes.to_vec(),
-            _ => encode_settings_bytecode(&observed)?,
+        let aligned = if camera_kept || !keep_encoding {
+            encode_settings_bytecode(&observed)?
+        } else {
+            match observed_bytes {
+                ObservedBytes::Given(bytes) => bytes.to_vec(),
+                ObservedBytes::Encode(encode) => encode()?,
+            }
         };
         phases.end("encode in place");
         let result =
