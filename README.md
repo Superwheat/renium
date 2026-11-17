@@ -7,28 +7,28 @@ for working with AI coding agents.
 
 ### It syncs what a plugin cannot
 
-Rojo, Argon and the Studio MCP servers reach Studio through a plugin, and a plugin
-may only read and set what scripts are allowed to. The Terrain voxel grid as Studio
-saves it, `MeshPart.MeshId` and every property scripts are blocked from stay out of
-their reach.
+Rojo, Argon and the Studio MCP servers work through a Studio plugin. A plugin cannot:
 
-Renium adds a native helper beside its plugin. It reads the place the way Studio
-saves it and writes it back the same way, so a push rebuilds the place itself and
-not the part of it a script can describe.
+- set `MeshPart.MeshId`,
+- write Terrain the way Studio saves it,
+- read or set the properties Roblox locks away from scripts.
+
+Renium can. Beside its plugin it has a native helper that reads and writes a place
+the way Studio itself saves it. A push puts back the whole place, not only the part
+a script could set.
 
 ### The project is about the size of the place
 
-Scripts are plain `.luau` files. Everything else is one compressed binary store per
-service, such as `instances/Workspace.renium`: Studio's own saved data, packed in
-columns.
+Scripts are plain `.luau` files. Everything else is one compressed binary file per
+service, for example `instances/Workspace.renium`.
 
 | | Size |
 |---|---|
 | A place of 202,000 instances as an `.rbxl` | 37 MB |
 | The same place as a Renium project | 41 MB (37 MB of stores, 4 MB of scripts) |
 
-The stores are 18 files, one per service, instead of a file or a folder for each
-instance. `rbx vci` makes Git show and merge a store as text.
+That is 18 store files instead of a file or a folder for every instance. With
+Renium's Git setup they still show and merge as text.
 
 ### It stays fast on a big place
 
@@ -43,12 +43,12 @@ Times are from version 0.6.5 on a Windows desktop.
 
 ### Both sides can change
 
-If files and Studio both changed since they last agreed, Renium compares each with
-that last shared state:
+When the files and Studio were both edited since the last sync, Renium merges them:
 
-- edits to different instances, different properties or different lines of a script
-  are all kept,
-- a real conflict is reported and waits for you to pick a side.
+- Edits to different instances, different properties or different lines of a script
+  are all kept.
+- Edits to the same value are reported with both versions. Nothing is overwritten
+  until one of them is chosen.
 
 ### An agent works alone
 
@@ -58,67 +58,49 @@ person still had to step in:
 - **Studio itself.** It opens, reopens, saves and closes places, and continues past
   Studio's low-memory prompt.
 - **Several players.** A playtest runs a local server and as many clients as the
-  test needs, each with its own Luau, console, input and capture.
+  test needs. Each client has its own Luau, console, input and capture.
 - **Real input in the background.** Clicks, keys, typing and movement go to a play
   window that is not in front, so the agent tests while you keep using the PC.
-- **What the player sees.** Screenshots and recordings of each client come back
-  frame by frame, on an emulated phone or tablet too.
-- **Answers it can trust.** A push says what Studio now holds, and the server's and
-  each client's errors come back to the agent instead of the Output window.
-- **Protected data.** Terrain, mesh ids and protected properties are written
-  natively, and packages publish without a dialog.
-- **Studio updates.** After one, Renium finds Studio's internals again by itself.
+- **What the player sees.** Each client can be screenshotted or recorded, also as an
+  emulated phone or tablet, and the agent reads the frames.
+- **Answers it can trust.** A push says what Studio now holds. Errors from the
+  server and from each client come back to the agent.
+- **Protected data.** Terrain, mesh ids and locked properties are written natively.
+  Packages publish without a dialog.
+- **Studio updates.** After a Studio update, Renium finds what it needs inside
+  Studio again by itself.
 
 ## Install
 
 Get the package for Windows, macOS or Linux from
-[Releases](https://github.com/Superwheat/renium/releases/latest). It sets up the
-`rbx` command, the Studio plugin and the VS Code or Cursor extension, and `rbx upd`
-updates all three.
-
-## How sync works
-
-- **Scripts** are plain `.luau` files under `src/`.
-- **Everything else** in a service, from parts and UI to Terrain and the scripts' own
-  properties, goes into a store at `instances/<Service>.renium`.
-- **Both directions.** Saved files go to Studio, and Studio edits come back as files.
-- **Git.** The stores are compressed binary, so Rojo, Argon and editors without
-  Renium cannot read them. Run `rbx vci` once and Git shows and merges them as text.
-- **Rojo.** A Rojo project converts with `rbx init`, and `rbx ir --preview` shows the
-  result first.
+[Releases](https://github.com/Superwheat/renium/releases/latest). It sets up
+Renium, its Studio plugin and the VS Code or Cursor extension. An existing Rojo
+project can be converted.
 
 ## The native helper
 
-The helper does what a Studio plugin is not allowed to. It:
+The helper does what a Studio plugin is not allowed to:
 
-- writes Terrain from the files into Studio,
-- reads and writes protected properties,
-- publishes packages without dialogs,
-- captures or sends input to play windows that are not in front.
+- write Terrain from the files into Studio,
+- read and write locked properties,
+- publish packages without dialogs,
+- capture play windows that are not in front and send input to them.
 
-Each protected read or write through the helper waits for your approval by default.
+By default, each read or write of a locked property waits for your approval.
 
-Editing voxels needs no helper. A script, or `rbx l --edit`, changes them through
-the Terrain API (`FillBlock`, `WriteVoxels`) as in any plugin.
+How the helper gets into Studio:
 
-### How the helper gets into Studio
+- **Windows:** Renium loads it into the running Studio.
+- **macOS:** Renium patches the installed Studio app. It renames the engine to
+  `Contents/MacOS/RobloxStudio.bin` and installs its own launcher as
+  `Contents/MacOS/RobloxStudio` with an ad-hoc signature. The original launcher and
+  signature are kept under `~/Library/Application Support/Renium`, and
+  `rbx setup --uninstall` restores them. A Studio update removes the patch until
+  Renium applies it again.
 
-- **Windows:** Renium loads the helper into the running Studio.
-- **macOS:** Renium patches the installed Studio app. `rbx setup`, which the
-  installer runs, and `rbx upd` apply the patch, and opening Studio with `rbx so`
-  checks it.
-
-The macOS patch renames the engine to `Contents/MacOS/RobloxStudio.bin` and installs
-Renium's launcher as `Contents/MacOS/RobloxStudio` with an ad-hoc signature. The
-original launcher and code signature are kept under
-`~/Library/Application Support/Renium`, so `rbx setup --uninstall` restores them. A
-Studio update clears the patch until Renium applies it again.
-
-### After a Studio update
-
-The helper depends on Studio's internals. After a Studio update Renium finds them
-again by itself. When that fails, the affected command stops with an error until
-Renium is updated.
+The helper depends on Studio's internals. If Renium cannot find them after a Studio
+update, the commands that need the helper stop with an error until Renium is
+updated.
 
 ## Working with an AI agent
 
@@ -135,15 +117,13 @@ Renium is updated.
   release is announced.
 - **Bugs:** [GitHub issues](https://github.com/Superwheat/renium/issues).
   `rbx report -m "what went wrong"` writes a diagnostics zip to attach.
-- **CLI guide:** [tools/renium/README.md](tools/renium/README.md) covers the project
-  layout, Live Sync, saved data, playtests, publishing, troubleshooting and building
-  from source.
-- **Editor extension:** the
-  [extension readme](tools/renium-vscode-extension/readme.md) covers the editor side.
+- **Full guide:** [tools/renium/README.md](tools/renium/README.md) covers the project
+  layout, Live Sync, saved data, playtests, publishing and building from source.
+- **Editor extension:** see the
+  [extension readme](tools/renium-vscode-extension/readme.md).
 - **Contributing:** read [AGENTS.md](AGENTS.md).
 
 ## License
 
-Renium is licensed under the GNU Affero General Public License v3.0 with the Commons
-Clause condition, which does not grant the right to sell the software. See
-[LICENSE](LICENSE).
+GNU Affero General Public License v3.0 with the Commons Clause condition, which does
+not grant the right to sell the software. See [LICENSE](LICENSE).
