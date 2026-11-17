@@ -25,7 +25,7 @@ columns.
 | | Size |
 |---|---|
 | A place of 202,000 instances as an `.rbxl` | 37 MB |
-| The same place as a Renium project | 48 MB (44 MB of stores, 4 MB of scripts) |
+| The same place as a Renium project | 41 MB (37 MB of stores, 4 MB of scripts) |
 
 The stores are 18 files, one per service, instead of a file or a folder for each
 instance. `rbx vci` makes Git show and merge a store as text.
