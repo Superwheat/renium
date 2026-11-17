@@ -1678,6 +1678,17 @@ mod native_identity_tests {
                 .contains("contains 7 instances; expected 8")
         );
         let mut services = decode();
+        assert_eq!(
+            services["Workspace"].captured_debug_ids.as_deref().unwrap(),
+            ["id0", "id2", "id4", "id3", "id5"]
+        );
+        assert_eq!(
+            services["ReplicatedStorage"]
+                .captured_debug_ids
+                .as_deref()
+                .unwrap(),
+            ["id1", "id6"]
+        );
         assert_eq!(services["Workspace"].captured_root_properties.len(), 5);
         for instance in &services["Workspace"].instances {
             if instance.class.as_str() == "Part" {
@@ -2218,14 +2229,15 @@ fn decode_native_serialization_batch(
     if global_index_by_dense_ref.contains(&usize::MAX) {
         bail!("Native serialization batch has an incomplete dense referent map");
     }
-    let mut sibling_counts = HashMap::<(Option<usize>, String), usize>::new();
+    let mut sibling_counts = HashMap::<(Option<usize>, &str), usize>::new();
     let mut ordinal_by_global_index = Vec::with_capacity(total_instances);
     for instance in &flat.instances {
-        let key = (instance.parent_index, instance.name.clone());
+        let key = (instance.parent_index, instance.name.as_str());
         let ordinal = sibling_counts.entry(key).or_insert(0);
         *ordinal += 1;
         ordinal_by_global_index.push(*ordinal);
     }
+    drop(sibling_counts);
     let mut cross_service_targets = HashSet::new();
     for (group_index, (start, end, _, _)) in spans.iter().copied().enumerate() {
         for instance in &flat.instances[start..end] {
@@ -2266,6 +2278,7 @@ fn decode_native_serialization_batch(
     drop(references);
     let root_indices = flat.root_indices;
     let mut source_instances = flat.instances.into_iter();
+    let mut captured_debug_ids = captured_debug_ids.map(Vec::into_iter);
     let mut doms = HashMap::with_capacity(groups.len());
     for (group_index, group) in groups.into_iter().enumerate() {
         let _service = crate::app::profile::span(&format!(
@@ -2309,7 +2322,7 @@ fn decode_native_serialization_batch(
                 instance.parent_index = Some(0);
             }
         }
-        let (identity, captured_debug_ids) = if let Some(ids) = &captured_debug_ids {
+        let (identity, captured_debug_ids) = if let Some(ids) = &mut captured_debug_ids {
             anyhow::ensure!(
                 instances.len() == group.instance_count,
                 "Native captured {} instance count changed",
@@ -2326,7 +2339,7 @@ fn decode_native_serialization_batch(
                     native_index_by_overlay_index: Vec::new(),
                     new_index_by_dense_ref,
                 },
-                Some(ids[start..end].to_vec()),
+                Some(ids.by_ref().take(end - start).collect()),
             )
         } else {
             (
@@ -2390,6 +2403,10 @@ fn decode_native_serialization_batch(
     if source_instances.next().is_some() {
         bail!("Native serialization batch contains trailing instances");
     }
+    anyhow::ensure!(
+        captured_debug_ids.is_none_or(|mut ids| ids.next().is_none()),
+        "Native serialization batch contains trailing identities"
+    );
     Ok(doms)
 }
 
@@ -3488,6 +3505,7 @@ fn capture_native_export(
     serialization_complete: &AtomicBool,
     attempts: &std::sync::atomic::AtomicUsize,
 ) -> Result<Mutex<HashMap<String, NativeServiceDom>>> {
+    let _profile = crate::app::profile::span("native capture pipeline");
     let info = bridge.cached_bridge_info_for_target(crate::studio::bridge::BridgeTarget::Edit)?;
     let pid = bridge
         .studio_pid_for_runtime(crate::studio::bridge::BridgeTarget::Edit, &info.runtime_id)?;
@@ -3511,9 +3529,13 @@ fn capture_native_export(
         filter,
         Some(&captured.identities),
     );
+    let capture_attempts = captured.attempts;
+    let release = crate::app::profile::span("native capture release serialized buffers");
+    drop(captured);
+    drop(release);
     decoded
         .map(Mutex::new)
-        .map_err(|error| capture_join_error(pid, captured.attempts, error))
+        .map_err(|error| capture_join_error(pid, capture_attempts, error))
 }
 
 pub(crate) fn run_workers_and_drain<T: Send, R>(
