@@ -93,7 +93,22 @@ use app::{context, update};
 use cli::{Cli, Commands};
 use studio::target::set_place_filter;
 
+/// The allocator's options are set by number, which this version of it gives
+/// them: a version with other options stops the build here until the numbers
+/// in this file and in `daemon` are checked against it.
+const _: () = assert!(libmimalloc_sys::_mi_option_last == 47);
+
+/// A page of the allocator takes its memory from the system as it fills.
+/// Every thread keeps part-filled pages of its own for each size of value,
+/// and taking each page whole at its first use held twice what a pull had in
+/// use: 2.7 GB against 1.6 GB for the first pull of 200,000 instances.
+fn take_allocator_pages_as_they_fill() {
+    const MI_OPTION_PAGE_COMMIT_ON_DEMAND: libmimalloc_sys::mi_option_t = 40;
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PAGE_COMMIT_ON_DEMAND, 1) };
+}
+
 fn main() -> ExitCode {
+    take_allocator_pages_as_they_fill();
     let started = std::time::Instant::now();
     let code = main_result();
     let discarding = app::profile::span("free discarded data");
