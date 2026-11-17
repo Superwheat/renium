@@ -1432,7 +1432,13 @@ mod tests {
             let _ = fs::remove_dir_all(&root);
         });
         let context = context(&root);
-        for outside in ["../outside", "C:/outside", "/outside"] {
+        // A drive prefix is a path of its own only on Windows.
+        let outside: &[&str] = if cfg!(windows) {
+            &["../outside", "C:/outside", "/outside"]
+        } else {
+            &["../outside", "/outside"]
+        };
+        for outside in outside {
             begin_test(&context)?;
             CURRENT.with(|slot| {
                 let mut slot = slot.borrow_mut();
