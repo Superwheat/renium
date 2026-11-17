@@ -3305,7 +3305,11 @@ end
 
 local function verifyPropertyChange(instance, change, ctx, stats, unreadableNames, serviceName)
 	for _, propertyName in ipairs(changedPropertyNames(change.properties or {}, true)) do
+		local before, mismatches = stats.verified, #stats.verifyMismatches
 		verifyChangedProperty(instance, propertyName, change.properties[propertyName], change, ctx, stats, unreadableNames, serviceName)
+		if stats.verified == before and #stats.verifyMismatches == mismatches then
+			stats.unverifiedProperties[#stats.unverifiedProperties + 1] = { row = stats.verificationRow, name = propertyName }
+		end
 	end
 	for attributeName, rawValue in pairs(change.attributes or {}) do
 		attributeName = tostring(attributeName)
@@ -9958,6 +9962,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			protectedWrites = {},
 			verifyOnly = verifyOnly,
 			verifyMismatches = if verifyOnly then {} else nil,
+			unverifiedProperties = if verifyOnly then {} else nil,
 			verified = 0,
 		}
 		local touchedServices = {}
@@ -10018,13 +10023,15 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local propertyChanges = params.propertyChanges
 		if not aborted and type(propertyChanges) == "table" then
 			if not aborted then
-				for _, change in ipairs(propertyChanges) do
+				for index, change in ipairs(propertyChanges) do
+					stats.verificationRow = if verifyOnly then index else nil
 					if not runStep(applyPropertyChange, change, ctx, stats, touchedServices) then
 						break
 					end
 				end
 			end
 		end
+		stats.verificationRow = nil
 
 		if not aborted and chunkChange ~= nil and chunkChange.mode == "beginReconcileService" then
 			local okSession = pcall(function()

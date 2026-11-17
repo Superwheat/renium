@@ -350,6 +350,20 @@ do
 	assert(resolve(record, {}) == nil, "A recorded deletion must not reuse its stale parent path")
 end
 do
+	local verify = extract("local function verifyPropertyChange(", "local function expectContainerSettings(", {
+		changedPropertyNames = function() return { "Readable", "Blocked", "Wrong" } end,
+		verifyChangedProperty = function(_, name, _, _, _, stats)
+			if name == "Readable" then stats.verified += 1 end
+			if name == "Wrong" then table.insert(stats.verifyMismatches, name) end
+		end,
+	}, "verifyPropertyChange")
+	local stats = { verified = 0, verificationRow = 7, verifyMismatches = {}, unverifiedProperties = {} }
+	verify({}, { properties = { Readable = 1, Blocked = 2, Wrong = 3 } }, {}, stats, {}, "Workspace")
+	assert(stats.verified == 1 and #stats.verifyMismatches == 1)
+	assert(#stats.unverifiedProperties == 1 and stats.unverifiedProperties[1].row == 7
+		and stats.unverifiedProperties[1].name == "Blocked", "Only unread fields may request native verification")
+end
+do
 	local readable, current = false, "saved"
 	local verify = extract("local function verifyChangedProperty(", "local function verifyPropertyChange(", {
 		Workspace = {},
