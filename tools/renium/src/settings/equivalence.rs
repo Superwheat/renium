@@ -274,6 +274,36 @@ fn digest_value(digest: &mut Sha256, value: &Value) {
     }
 }
 
+/// Whether the stored viewport camera holds an enum item without its type.
+/// A pull puts the stored camera back, so a captured store whose camera moved
+/// leaves such a store as it is, while one whose camera stood still gives it
+/// the type: two captured stores that differ in the camera alone then get
+/// different answers.
+pub(crate) fn viewport_camera_lacks_enum_types(document: &SettingsBytecode) -> bool {
+    fn lacks(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => {
+                map.get("_type").and_then(Value::as_str) == Some("EnumItem")
+                    && map
+                        .get("enumType")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                    || map.values().any(lacks)
+            }
+            Value::Array(values) => values.iter().any(lacks),
+            _ => false,
+        }
+    }
+    workspace_current_camera_index(document).is_some_and(|index| {
+        let camera = &document.instances[index];
+        camera
+            .properties
+            .values()
+            .chain(camera.attributes.values())
+            .any(lacks)
+    })
+}
+
 /// The observed store as it came in: its bytes, or how to get them. Under
 /// store ids, with nothing to rewrite, those bytes are what is written.
 #[derive(Clone, Copy)]

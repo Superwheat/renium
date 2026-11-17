@@ -32,6 +32,7 @@ use crate::settings::bytecode::{
 use crate::settings::equivalence::{
     SettingsAlignment, align_pulled_settings_bytes_to_reference,
     align_pulled_settings_documents_to_reference, pulled_settings_document_digest,
+    viewport_camera_lacks_enum_types,
 };
 use crate::settings::tree::editor_service_root_index;
 use crate::snapshot::codec::parse_source_range_batch;
@@ -1491,14 +1492,17 @@ fn write_service_settings_file(
             },
             || {
                 let _converting = profile::span(&format!("{service}: captured store document"));
-                let observed = settings_bytecode_from_service_state(state_to_write)
-                    .with_context(|| format!("Failed to align {}", settings_path.display()))?;
+                let observed = settings_bytecode_from_service_state(state_to_write)?;
                 let digest = pulled_settings_document_digest(&observed);
                 Ok::<_, anyhow::Error>((observed, digest))
             },
         );
         let aligned = (|| -> Result<Option<Vec<u8>>> {
-            let (observed, observed_digest) = observed?;
+            // A captured state the decoder would refuse goes the way it went
+            // before: its own bytes are written or compared as they are.
+            let Ok((observed, observed_digest)) = observed else {
+                return pull_from_bytes(state_to_write, &settings_path);
+            };
             Ok(match stored? {
                 Some(stored) if stored.unchanged_with == Some(observed_digest) => {
                     profile::record(
@@ -1512,6 +1516,7 @@ fn write_service_settings_file(
                         Some(document) => document,
                         None => decode_stored_settings(&settings_path, &stored.bytes)?,
                     };
+                    let answer_follows_camera = viewport_camera_lacks_enum_types(&reference);
                     match align_pulled_settings_documents_to_reference(
                         reference,
                         observed,
@@ -1521,7 +1526,9 @@ fn write_service_settings_file(
                     .with_context(|| format!("Failed to align {}", settings_path.display()))?
                     {
                         SettingsAlignment::Equivalent => {
-                            remember_unchanged_pull(stored.digest, observed_digest);
+                            if !answer_follows_camera {
+                                remember_unchanged_pull(stored.digest, observed_digest);
+                            }
                             None
                         }
                         SettingsAlignment::Changed(aligned) => Some(aligned),
@@ -1552,12 +1559,7 @@ fn write_service_settings_file(
     Ok(())
 }
 
-/// The viewport camera is Studio's: the comparisons hide it and `rbx bs`
-/// refuses to edit it, so a pull keeps the store's row for the camera the
-/// root's `CurrentCamera` names instead of writing Studio's current values.
-/// A store written before `CurrentCamera` was saved names none; identity
-/// alignment has matched the live viewport to its row by then, so the store
-/// inherits the pulled reference for the comparison and keeps that row too.
+/// A store file as a pull read it.
 struct StoredSettings {
     bytes: Vec<u8>,
     digest: [u8; 32],
@@ -1592,27 +1594,37 @@ fn remember_unchanged_pull(stored: [u8; 32], observed: [u8; 32]) {
     pulls.insert(stored, observed);
 }
 
-/// What the pull is about to write, or that it fails, is what it did when it
-/// encoded the captured state, decoded it again and aligned the two files'
-/// bytes. Every pull of a debug build checks it.
+/// The pull as it worked before it aligned documents: the captured state is
+/// encoded, and its bytes are aligned with the stored file's. A captured
+/// state the decoder refuses still takes this way, and every pull of a debug
+/// build is checked against it.
+fn pull_from_bytes(state: &ServiceState, settings_path: &Path) -> Result<Option<Vec<u8>>> {
+    let observed = encode_service_settings_binary(state)?;
+    Ok(match fs::read(settings_path) {
+        Ok(reference) => {
+            match align_pulled_settings_bytes_to_reference(&reference, &observed)
+                .with_context(|| format!("Failed to align {}", settings_path.display()))?
+            {
+                SettingsAlignment::Equivalent => None,
+                SettingsAlignment::Changed(aligned) => Some(aligned),
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(observed),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read {}", settings_path.display()));
+        }
+    })
+}
+
+/// What the pull is about to write, or that it fails, is what
+/// `pull_from_bytes` gives.
 fn assert_pull_matches_the_byte_path(
     state: &ServiceState,
     settings_path: &Path,
     aligned: &Result<Option<Vec<u8>>>,
 ) {
-    let expected = (|| -> Result<Option<Vec<u8>>> {
-        let observed = encode_service_settings_binary(state)?;
-        Ok(match fs::read(settings_path) {
-            Ok(reference) => {
-                match align_pulled_settings_bytes_to_reference(&reference, &observed)? {
-                    SettingsAlignment::Equivalent => None,
-                    SettingsAlignment::Changed(aligned) => Some(aligned),
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Some(observed),
-            Err(error) => return Err(error.into()),
-        })
-    })();
+    let expected = pull_from_bytes(state, settings_path);
     let same = match (&expected, aligned) {
         (Ok(expected), Ok(aligned)) => expected == aligned,
         (Err(_), Err(_)) => true,

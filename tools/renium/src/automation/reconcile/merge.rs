@@ -651,6 +651,17 @@ fn merged_source(
     let text = |bytes: &[u8]| {
         String::from_utf8(crate::system::text::normalized_source_bytes(bytes).collect()).ok()
     };
+    // A file that mixes line endings, or ends lines with a carriage return
+    // alone, cannot get its own endings back after the merge; it keeps the
+    // old handling.
+    let (returns, feeds) = (
+        editor.iter().filter(|byte| **byte == b'\r').count(),
+        editor.iter().filter(|byte| **byte == b'\n').count(),
+    );
+    let pairs = editor.windows(2).filter(|pair| pair == b"\r\n").count();
+    if returns != pairs || (pairs > 0 && feeds != pairs) {
+        return None;
+    }
     let (base, editor_text, studio) = (text(base)?, text(editor)?, text(studio)?);
     let overlap = match preference {
         ConflictPreference::Studio => Overlap::Remote,

@@ -680,3 +680,35 @@ fn stores_that_differ_only_in_the_viewport_camera_are_unchanged_together() {
         }
     }
 }
+
+/// A stored camera that holds an enum item without its type makes the answer
+/// follow the camera, so a pull of such a store is not remembered.
+#[test]
+fn a_stored_camera_without_an_enum_type_makes_the_answer_follow_the_camera() {
+    let untyped = json!({"items":[{"_type":"EnumItem", "name":"Plastic"}]});
+    let typed = json!({"items":[{"_type":"EnumItem", "name":"Plastic", "enumType":"Material"}]});
+    let mut instances = workspace_with_camera("ws", "cam");
+    instances[1].properties.insert("Mode".into(), untyped);
+    instances.push(settings_instance("part", "Part", "Part", Some(0)));
+    let reference = settings_document(instances);
+    let mut moved = with_moved_camera(&reference);
+    moved.instances[1]
+        .properties
+        .insert("Mode".into(), typed.clone());
+    let mut still = reference.clone();
+    still.instances[1].properties.insert("Mode".into(), typed);
+    assert!(pulled_settings_document_digest(&moved) == pulled_settings_document_digest(&still));
+    assert!(matches!(
+        pulled(&reference, &moved),
+        SettingsAlignment::Equivalent
+    ));
+    assert!(matches!(
+        pulled(&reference, &still),
+        SettingsAlignment::Changed(_)
+    ));
+    assert!(viewport_camera_lacks_enum_types(&reference));
+    assert!(!viewport_camera_lacks_enum_types(&still));
+    assert!(!viewport_camera_lacks_enum_types(&settings_document(
+        workspace_with_camera("ws", "cam")
+    )));
+}

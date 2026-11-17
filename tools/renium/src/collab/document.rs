@@ -397,8 +397,30 @@ pub(crate) fn merge_lines_resolving(
         } else if remote_start == next_remote {
             merged.push_str(&mine);
         } else if span.len == 0 {
-            push_terminated(&mut merged, &mine);
-            merged.push_str(&theirs);
+            match overlap {
+                Overlap::Mark(_) => {
+                    push_terminated(&mut merged, &mine);
+                    merged.push_str(&theirs);
+                }
+                // Where a side is asked for, two different texts added at one
+                // point are a choice between them, unless one side added the
+                // other's lines and more.
+                Overlap::Local | Overlap::Remote => {
+                    let (mine_lines, their_lines) = (split_lines(&mine), split_lines(&theirs));
+                    if their_lines.starts_with(&mine_lines) {
+                        merged.push_str(&theirs);
+                    } else if mine_lines.starts_with(&their_lines) {
+                        merged.push_str(&mine);
+                    } else {
+                        overlaps += 1;
+                        merged.push_str(if matches!(overlap, Overlap::Local) {
+                            &mine
+                        } else {
+                            &theirs
+                        });
+                    }
+                }
+            }
         } else {
             overlaps += 1;
             match overlap {

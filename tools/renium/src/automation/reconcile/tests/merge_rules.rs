@@ -629,3 +629,76 @@ fn a_line_merge_equals_both_sides_edits_applied_to_the_last_sync_text() {
         assert!(merged == text(&both.concat()), "round {round}");
     }
 }
+
+/// Two different texts added at the same point are a choice like any other
+/// overlap; they are not both kept one after the other.
+#[test]
+fn different_lines_added_at_one_point_are_a_choice_not_a_concatenation() {
+    let base = "local a = 1\nreturn a\n";
+    let files = "local a = 1\nlocal b = 2\nreturn a\n";
+    let studio = "local a = 1\nlocal c = 3\nreturn a\n";
+    let (merged, conflicts) = merged_script(base, files, studio, ConflictPreference::None);
+    assert!(merged == text(files));
+    assert_eq!(conflicts.len(), 1);
+    let (merged, conflicts) = merged_script(base, files, studio, ConflictPreference::Editor);
+    assert!(merged == text(files) && conflicts.is_empty());
+    let (merged, conflicts) = merged_script(base, files, studio, ConflictPreference::Studio);
+    assert!(merged == text(studio) && conflicts.is_empty());
+
+    // Two scripts written from nothing are two versions, not one script.
+    let (first, second) = (
+        "return function() return 1 end\n",
+        "return function() return 2 end\n",
+    );
+    let (merged, conflicts) = merged_script("", first, second, ConflictPreference::None);
+    assert!(merged == text(first));
+    assert_eq!(conflicts.len(), 1);
+
+    // Each side appended a different last line.
+    let (merged, conflicts) = merged_script(
+        "return a\n",
+        "return a\n-- files\n",
+        "return a\n-- studio\n",
+        ConflictPreference::None,
+    );
+    assert!(merged == text("return a\n-- files\n"));
+    assert_eq!(conflicts.len(), 1);
+}
+
+/// A side that added the other side's lines and more has both sides' text:
+/// a sync that stopped halfway does not double the lines it already wrote.
+#[test]
+fn lines_added_at_one_point_merge_when_one_side_holds_the_others_and_more() {
+    let base = "local a = 1\nreturn a\n";
+    let shorter = "local a = 1\nlocal b = 2\nreturn a\n";
+    let longer = "local a = 1\nlocal b = 2\nlocal c = 3\nreturn a\n";
+    for preference in [
+        ConflictPreference::None,
+        ConflictPreference::Editor,
+        ConflictPreference::Studio,
+    ] {
+        for (files, studio) in [(shorter, longer), (longer, shorter)] {
+            let (merged, conflicts) = merged_script(base, files, studio, preference);
+            assert!(merged == text(longer), "{preference:?}");
+            assert!(conflicts.is_empty(), "{conflicts:?}");
+        }
+    }
+    // A last line without its line break is not the start of a longer one.
+    let (merged, conflicts) = merged_script("a\n", "a\nx", "a\nxy", ConflictPreference::None);
+    assert!(merged == text("a\nx"));
+    assert_eq!(conflicts.len(), 1);
+}
+
+/// A file with mixed line endings, or with carriage returns alone, is not
+/// merged by line: its endings could not be given back.
+#[test]
+fn a_script_with_mixed_or_bare_carriage_return_endings_is_not_merged_by_line() {
+    for (base, files, studio) in [
+        ("a\rb\rc\r", "A\rb\rc\r", "a\rb\rC\r"),
+        ("a\r\nb\nc\r\n", "A\r\nb\nc\r\n", "a\nb\nC\n"),
+    ] {
+        let (merged, conflicts) = merged_script(base, files, studio, ConflictPreference::None);
+        assert!(merged == text(files));
+        assert_eq!(conflicts.len(), 1);
+    }
+}
