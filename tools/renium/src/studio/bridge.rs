@@ -3409,6 +3409,12 @@ impl BridgeServer {
         if !Self::is_transport_error_text(&error_text) {
             return Err(error);
         }
+        crate::app::output::log_global(
+            4,
+            format_args!(
+                "[renium] retiring bridge transport on port {socket_port} role {role}: {error_text}"
+            ),
+        );
         Self::remove_connection(channel, socket_role, connection);
         Ok(format!("port {socket_port} role {role}: {error_text}"))
     }

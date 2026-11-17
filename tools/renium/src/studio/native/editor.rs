@@ -4258,8 +4258,9 @@ fn send_editor_service_replacement(
                 "nativeCreated": created.len() / serializer::CREATED_ROW,
                 "nativeReceiptChunk": final_receipt,
             }),
-        )?;
+        );
         log_timing("native import complete", import_step_started);
+        let response = response?;
         if let Some(timings) = response.get("nativeCompleteTimings") {
             crate::app::output::log_global(
                 5,
