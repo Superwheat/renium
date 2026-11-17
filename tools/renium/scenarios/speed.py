@@ -54,6 +54,7 @@ class Run:
     def __init__(self, rounds: int, log_path: Path):
         self.rounds = rounds
         self.samples: dict[str, list[float]] = {}
+        self.supplemental_import_writes: list[int] = []
         self.log_path = log_path
         self.log_file = log_path.open("w", encoding="utf-8")
         self.opened: list[Path] = []
@@ -354,8 +355,13 @@ def push(run: Run, source: Path, root: Path) -> None:
         place = folder / "place.rbxl"
         shutil.copy2(empty, place)
         open_studio(run, folder, place, "open an empty place in Studio")
-        data, _ = run.timed("push, whole project into an empty place", ["ps", "--yes"], folder, place=place, timeout=3600)
-        expect((data or {}).get("verified") is True, "the whole import was not verified")
+        data, _ = run.timed("push, whole project into an empty place", ["ps", "--yes"], folder, place=place, timeout=3600, ok=False)
+        expect((data or {}).get("ok") is True and data.get("verified") is True, "the whole import was not verified")
+        writes = data.get("supplementalImportWrites")
+        expect(type(writes) is int and writes >= 0, "the push did not report its supplemental write count")
+        run.supplemental_import_writes.append(writes)
+        run.log(f"Whole import needed {writes} individual supplemental field writes")
+        expect(writes == 0, f"the whole import fell back to {writes} individual supplemental field writes")
         # This read queues behind the actual continuation, including when the
         # push caller has already disconnected. No delay estimates completion.
         run.timed("settle after the push into an empty place", ["l", "return true"], folder, place=place, timeout=1800)
@@ -487,6 +493,9 @@ def main() -> int:
     records = history()
     slower = report(run, records)
     record = {"stamp": stamp, **version(run), "rounds": args.rounds, "phases": phases, "averages": {name: round(statistics.fmean(values), 3) for name, values in run.samples.items()}, "samples": {name: [round(value, 3) for value in values] for name, values in run.samples.items()}, "failure": failure, "slower": slower}
+    if run.supplemental_import_writes:
+        record["supplementalImportWrites"] = run.supplemental_import_writes
+        print("Individual supplemental import writes per round:", *run.supplemental_import_writes)
     (REPORTS / f"{stamp}.json").write_text(json.dumps(record, indent=1), encoding="utf-8")
     if failure:
         print(f"FAILED: {failure}. The log of this run in the speed-reports folder has the commands.")
