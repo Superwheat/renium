@@ -628,18 +628,18 @@ pub(crate) fn merge_conflicting_entry(
     editor.cloned()
 }
 
-/// A script both sides edited since the last sync, merged line by line: an
-/// edit of one side to lines the other left alone is kept, whichever side
-/// made it. Where both changed the same lines differently, the preferred
-/// side's lines stand; with no preference there is no merged text, and the
-/// script stays a conflict with each side holding its own.
+/// A script both sides edited since the last sync, merged line by line (see
+/// `text_merge`): an edit of one side to lines the other left alone is kept,
+/// whichever side made it. Where both changed the same lines differently,
+/// the preferred side's lines stand; with no preference there is no merged
+/// text, and the script stays a conflict with each side holding its own.
 fn merged_source(
     base: Option<&SnapshotEntry>,
     editor: &SnapshotEntry,
     studio: &SnapshotEntry,
     preference: ConflictPreference,
 ) -> Option<SnapshotEntry> {
-    use crate::collab::document::{Overlap, merge_lines_resolving, with_line_endings_of};
+    use crate::collab::document::with_line_endings_of;
 
     let (Some(SnapshotEntry::File(base)), SnapshotEntry::File(editor), SnapshotEntry::File(studio)) =
         (base, editor, studio)
@@ -663,14 +663,7 @@ fn merged_source(
         return None;
     }
     let (base, editor_text, studio) = (text(base)?, text(editor)?, text(studio)?);
-    let overlap = match preference {
-        ConflictPreference::Studio => Overlap::Remote,
-        ConflictPreference::Editor | ConflictPreference::None => Overlap::Local,
-    };
-    let (merged, overlaps) = merge_lines_resolving(&base, &editor_text, &studio, overlap);
-    if overlaps > 0 && preference == ConflictPreference::None {
-        return None;
-    }
+    let merged = text_merge::merge_script_lines(&base, &editor_text, &studio, preference)?;
     let merged = with_line_endings_of(merged, std::str::from_utf8(editor).ok()?);
     Some(SnapshotEntry::File(merged.into_bytes()))
 }

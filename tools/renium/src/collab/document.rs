@@ -329,28 +329,6 @@ pub(crate) fn merge_lines(
     remote: &str,
     labels: &MergeLabels<'_>,
 ) -> String {
-    merge_lines_resolving(base, local, remote, Overlap::Mark(labels)).0
-}
-
-/// What the merge writes where both sides changed the same lines
-/// differently.
-#[derive(Clone, Copy)]
-pub(crate) enum Overlap<'a> {
-    /// Both versions, between Git-style conflict markers.
-    Mark(&'a MergeLabels<'a>),
-    Local,
-    Remote,
-}
-
-/// `merge_lines` with a choice for the lines both sides changed, and how
-/// many such places there were.
-pub(crate) fn merge_lines_resolving(
-    base: &str,
-    local: &str,
-    remote: &str,
-    overlap: Overlap<'_>,
-) -> (String, usize) {
-    let mut overlaps = 0;
     let base_lines = split_lines(base);
     let local_hunks = hunks(base, local);
     let remote_hunks = hunks(base, remote);
@@ -397,44 +375,17 @@ pub(crate) fn merge_lines_resolving(
         } else if remote_start == next_remote {
             merged.push_str(&mine);
         } else if span.len == 0 {
-            match overlap {
-                Overlap::Mark(_) => {
-                    push_terminated(&mut merged, &mine);
-                    merged.push_str(&theirs);
-                }
-                // Where a side is asked for, two different texts added at one
-                // point are a choice between them, unless one side added the
-                // other's lines and more.
-                Overlap::Local | Overlap::Remote => {
-                    let (mine_lines, their_lines) = (split_lines(&mine), split_lines(&theirs));
-                    if their_lines.starts_with(&mine_lines) {
-                        merged.push_str(&theirs);
-                    } else if mine_lines.starts_with(&their_lines) {
-                        merged.push_str(&mine);
-                    } else {
-                        overlaps += 1;
-                        merged.push_str(if matches!(overlap, Overlap::Local) {
-                            &mine
-                        } else {
-                            &theirs
-                        });
-                    }
-                }
-            }
+            push_terminated(&mut merged, &mine);
+            merged.push_str(&theirs);
         } else {
-            overlaps += 1;
-            match overlap {
-                Overlap::Mark(labels) => push_conflict(&mut merged, labels, &mine, &theirs),
-                Overlap::Local => merged.push_str(&mine),
-                Overlap::Remote => merged.push_str(&theirs),
-            }
+            push_conflict(&mut merged, labels, &mine, &theirs);
         }
         cursor = cursor.max(span.end());
     }
     if cursor < base_lines.len() {
         merged.push_str(&base_lines[cursor..].concat());
     }
-    (merged, overlaps)
+    merged
 }
 
 fn apply_hunks(base_lines: &[&str], span: Span, hunks: &[Hunk]) -> String {

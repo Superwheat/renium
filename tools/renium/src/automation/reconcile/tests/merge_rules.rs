@@ -702,3 +702,27 @@ fn a_script_with_mixed_or_bare_carriage_return_endings_is_not_merged_by_line() {
         assert_eq!(conflicts.len(), 1);
     }
 }
+
+/// A line one side added next to a line the other side changed, when the
+/// other side holds that added line too, is written once.
+#[test]
+fn an_insertion_next_to_the_other_sides_replacement_is_not_doubled() {
+    for (base, files, studio) in [
+        ("a\nb\n", "a\nX\nb\n", "a\nX\nB\n"),
+        ("a\nb\n", "a\nX\nb\n", "A\nX\nb\n"),
+        ("a\n", "X\na\n", "X\nA\n"),
+        ("a\nb\n", "a\nb\nX\n", "a\nB\nX\n"),
+    ] {
+        for preference in [
+            ConflictPreference::None,
+            ConflictPreference::Editor,
+            ConflictPreference::Studio,
+        ] {
+            let (merged, _) = merged_script(base, files, studio, preference);
+            assert!(
+                merged == text(files) || merged == text(studio),
+                "{preference:?}: {base:?}"
+            );
+        }
+    }
+}

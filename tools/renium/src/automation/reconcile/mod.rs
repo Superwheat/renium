@@ -82,6 +82,7 @@ mod sim;
 mod staging;
 #[cfg(test)]
 mod tests;
+mod text_merge;
 mod types;
 pub(crate) mod verify;
 
