@@ -4,8 +4,10 @@ use super::*;
 #[path = "property_edit_sim.rs"]
 pub(crate) mod sim;
 
-/// Unedited scalar and fixed numeric columns need no per-row property maps.
-/// Values whose decoded form changes their wire kind use the ordinary codec.
+/// Unedited scalar and fixed numeric columns need no per-row property maps,
+/// and a binary payload many rows hold (a collision mesh) is kept once for all
+/// of them. Values whose decoded form changes their wire kind use the ordinary
+/// codec.
 #[derive(Default)]
 pub(crate) struct RetainedPropertyColumns {
     columns: Vec<PropertyColumn>,
@@ -84,6 +86,9 @@ fn decode_compact_column(
     count: usize,
     scope: ValueScope<'_>,
 ) -> Result<Option<(PropertyColumn, Vec<DecodedGroupEntry>)>> {
+    if kind == 8 && name != "Attributes" {
+        return decode_payload_column(body, name, count, scope).map(Some);
+    }
     if !matches!(kind, 1..=3 | 5 | 6 | 11..=20) {
         return Ok(None);
     }
@@ -140,6 +145,73 @@ fn decode_compact_column(
         },
         decoded,
     )))
+}
+
+/// From this size on the text of a binary payload is held once for all the
+/// rows that have it.
+const SHARED_PAYLOAD_MIN_BYTES: usize = if cfg!(test) { 4 } else { 256 };
+
+/// A column of complex values: a binary payload (`_type` and `base64`, and
+/// nothing else) of some size becomes one shared value for every row that
+/// holds it, any other value goes to its row as the ordinary decoder gives it.
+fn decode_payload_column(
+    body: &[u8],
+    name: &str,
+    count: usize,
+    scope: ValueScope<'_>,
+) -> Result<(PropertyColumn, Vec<DecodedGroupEntry>)> {
+    scope.budget.property_group(count, name, 8)?;
+    let mut reader = BytecodeReader::new(body);
+    decode_cframe_group_header(8, &mut reader)?;
+    let mut held = AHashMap::<(usize, u64), Vec<std::sync::Arc<Value>>>::new();
+    let (mut values, mut decoded) = (Vec::new(), Vec::new());
+    let mut index = 0;
+    for position in 0..count {
+        index = next_group_instance(index, reader.read_len("property instance index")?, position)?;
+        if index >= scope.instance_count {
+            bail!("Invalid property instance index {index}");
+        }
+        let value = decode_raw_value_payload(&mut reader, 8, scope, 0)?;
+        let Some(text) =
+            binary_payload_text(&value).filter(|text| text.len() >= SHARED_PAYLOAD_MIN_BYTES)
+        else {
+            decoded.push(DecodedGroupEntry::Property(index, value));
+            continue;
+        };
+        // Told apart by length and a sample of the text, then by the value.
+        let sample = text
+            .bytes()
+            .step_by(text.len() / 8 + 1)
+            .fold(0_u64, |sample, byte| {
+                sample.wrapping_mul(0x100_0000_01b3) ^ u64::from(byte)
+            });
+        let alike = held.entry((text.len(), sample)).or_default();
+        let shared = match alike.iter().find(|held| ***held == value) {
+            Some(held) => std::sync::Arc::clone(held),
+            None => {
+                alike.push(std::sync::Arc::new(value));
+                std::sync::Arc::clone(alike.last().context("Expected the value just held")?)
+            }
+        };
+        values.push((index, NativeSettingsValue::Shared(shared)));
+    }
+    reader.finish()?;
+    Ok((
+        PropertyColumn {
+            name: name.to_string(),
+            kind: 8,
+            values,
+        },
+        decoded,
+    ))
+}
+
+/// The text of a value that is a binary payload and nothing more.
+fn binary_payload_text(value: &Value) -> Option<&str> {
+    let object = value.as_object()?;
+    (object.len() == 2 && object.get("_type")?.is_string())
+        .then(|| object.get("base64")?.as_str())
+        .flatten()
 }
 
 fn decode_fixed_column_value(
@@ -227,6 +299,21 @@ impl RetainedPropertyColumns {
                     .properties
                     .contains_key(&column.name)
                 {
+                    continue;
+                }
+                if let NativeSettingsValue::Shared(shared) = value {
+                    // Written as the JSON value it holds, as its row would be.
+                    let source = SettingsBinaryValueSource::of_property(shared);
+                    anyhow::ensure!(
+                        binary_source_value_kind(&source, &lookup)? == column.kind,
+                        "A retained payload of {} changed its wire kind",
+                        column.name
+                    );
+                    collect_binary_source_strings(&source, &lookup, &mut collected.string_counts)?;
+                    values.push(SettingsBinaryValue {
+                        instance_index: *index,
+                        source,
+                    });
                     continue;
                 }
                 collect_native_value_strings(value, &mut collected.string_counts);
