@@ -25,10 +25,14 @@ use crate::roblox::schema::{MATERIAL_SERVICE_CLASS, USE_2022_MATERIALS_PROPERTY}
 use crate::roblox::services::DEFAULT_SYNC_SERVICES;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
-    SettingsBytecode, child_indices_for_instance, encode_service_settings_binary,
+    SettingsBytecode, child_indices_for_instance, decode_settings_bytecode,
+    encode_service_settings_binary, encode_settings_bytecode, settings_bytecode_from_service_state,
     write_fresh_service_settings_binary_file,
 };
-use crate::settings::equivalence::{SettingsAlignment, align_pulled_settings_bytes_to_reference};
+use crate::settings::equivalence::{
+    SettingsAlignment, align_pulled_settings_bytes_to_reference,
+    align_pulled_settings_documents_to_reference,
+};
 use crate::settings::tree::editor_service_root_index;
 use crate::snapshot::codec::parse_source_range_batch;
 use crate::snapshot::export::{
@@ -1451,28 +1455,46 @@ fn write_service_settings_file(
             preservation_started,
         );
         let state_to_write = preserved_state.as_ref().unwrap_or(state);
-        let encoding = profile::span(&format!("{service}: encode captured state"));
-        let observed = encode_service_settings_binary(state_to_write)?;
-        drop(encoding);
+        // The stored file is decoded while the captured state becomes a
+        // document of its own; the store is encoded once, after the two are
+        // aligned.
         let alignment_started = Instant::now();
-        let reading = profile::span(&format!("{service}: read stored file"));
-        let stored = fs::read(&settings_path);
-        drop(reading);
-        let aligned = match stored {
-            Ok(reference) => {
-                match align_pulled_settings_bytes_to_reference(&reference, &observed)
-                    .with_context(|| format!("Failed to align {}", settings_path.display()))?
+        let (stored, observed) = rayon::join(
+            || -> Result<Option<SettingsBytecode>> {
+                let _reading = profile::span(&format!("{service}: read and decode stored file"));
+                match fs::read(&settings_path) {
+                    Ok(reference) => decode_settings_bytecode(&reference)
+                        .map(Some)
+                        .with_context(|| format!("Failed to align {}", settings_path.display())),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error)
+                        .with_context(|| format!("Failed to read {}", settings_path.display())),
+                }
+            },
+            || {
+                let _converting = profile::span(&format!("{service}: captured store document"));
+                settings_bytecode_from_service_state(state_to_write)
+            },
+        );
+        let observed = observed?;
+        let aligned = match stored? {
+            Some(reference) => {
+                match align_pulled_settings_documents_to_reference(
+                    reference,
+                    observed,
+                    alignment_started,
+                )
+                .with_context(|| format!("Failed to align {}", settings_path.display()))?
                 {
                     SettingsAlignment::Equivalent => None,
                     SettingsAlignment::Changed(aligned) => Some(aligned),
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Some(observed),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("Failed to read {}", settings_path.display()));
-            }
+            None => Some(encode_settings_bytecode(&observed)?),
         };
+        if cfg!(debug_assertions) {
+            assert_pull_matches_the_byte_path(state_to_write, &settings_path, aligned.as_deref())?;
+        }
         log_timing(
             &format!("{service}: align settings file"),
             alignment_started,
@@ -1496,6 +1518,31 @@ fn write_service_settings_file(
 /// A store written before `CurrentCamera` was saved names none; identity
 /// alignment has matched the live viewport to its row by then, so the store
 /// inherits the pulled reference for the comparison and keeps that row too.
+/// What the pull is about to write is what it wrote when it encoded the
+/// captured state, decoded it again and aligned the two files' bytes. Every
+/// pull of a debug build checks it.
+fn assert_pull_matches_the_byte_path(
+    state: &ServiceState,
+    settings_path: &Path,
+    aligned: Option<&[u8]>,
+) -> Result<()> {
+    let observed = encode_service_settings_binary(state)?;
+    let expected = match fs::read(settings_path) {
+        Ok(reference) => match align_pulled_settings_bytes_to_reference(&reference, &observed)? {
+            SettingsAlignment::Equivalent => None,
+            SettingsAlignment::Changed(aligned) => Some(aligned),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(observed),
+        Err(error) => return Err(error.into()),
+    };
+    assert!(
+        expected.as_deref() == aligned,
+        "{}: the pull from documents differs from the pull from bytes",
+        settings_path.display()
+    );
+    Ok(())
+}
+
 pub(crate) fn state_with_preserved_material_service_settings(
     service: &str,
     state: &ServiceState,

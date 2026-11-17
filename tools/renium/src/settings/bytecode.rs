@@ -31,7 +31,6 @@ mod captured;
 pub(crate) mod captured_sim;
 
 /// The same document as decoding `encode_service_settings_binary(state)`.
-#[allow(dead_code)]
 pub(crate) fn settings_bytecode_from_service_state(
     state: &ServiceState,
 ) -> Result<SettingsBytecode> {
