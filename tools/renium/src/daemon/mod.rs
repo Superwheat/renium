@@ -186,20 +186,28 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     Ok(())
 }
 
-/// Freed memory stays with the daemon for two seconds before it goes back
-/// to the system: decoding a large store frees and takes hundreds of
-/// megabytes several times over, and giving each piece back at once makes
-/// the next step fault it in again. `memory::release_when_idle` hands back
-/// the rest after a run of commands.
+/// Freed memory goes back to the system at once. A command frees gigabytes
+/// that the steps after it do not take again from the same thread, so holding
+/// them even for seconds stacked each command's memory on the one before it:
+/// on a place of 200,000 instances that was 6 to 8 GB against 3 to 5 GB, at no
+/// difference in time that could be measured. `memory::release_when_idle`
+/// hands back what the thread caches still hold after a run of commands.
+/// `RENIUM_PURGE_DELAY_MS` sets another delay for measuring.
 fn release_freed_memory_when_idle() {
     const MI_OPTION_PURGE_DECOMMITS: libmimalloc_sys::mi_option_t = 5;
     const MI_OPTION_ABANDONED_PAGE_PURGE: libmimalloc_sys::mi_option_t = 12;
     const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
-    const PURGE_DELAY_MS: std::ffi::c_long = 2_000;
+    const PURGE_DELAY_MS: std::ffi::c_long = 0;
     unsafe {
         libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DECOMMITS, 1);
         libmimalloc_sys::mi_option_set(MI_OPTION_ABANDONED_PAGE_PURGE, 1);
-        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, PURGE_DELAY_MS);
+        libmimalloc_sys::mi_option_set(
+            MI_OPTION_PURGE_DELAY,
+            std::env::var("RENIUM_PURGE_DELAY_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(PURGE_DELAY_MS),
+        );
     }
 }
 

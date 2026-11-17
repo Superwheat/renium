@@ -80,7 +80,11 @@ pub(crate) fn release_when_idle() {
     else {
         return;
     };
-    if RELEASE_PENDING.load(Ordering::Relaxed) && idle_for >= IDLE_BEFORE_RELEASE {
+    let idle_before_release = std::env::var("RENIUM_IDLE_RELEASE_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map_or(IDLE_BEFORE_RELEASE, Duration::from_millis);
+    if RELEASE_PENDING.load(Ordering::Relaxed) && idle_for >= idle_before_release {
         RELEASE_PENDING.store(false, Ordering::Relaxed);
         release_now();
     }
