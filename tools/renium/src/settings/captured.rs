@@ -1,4 +1,6 @@
 use super::*;
+use crate::snapshot::types::NativeSettingsProperty;
+use sha2::{Digest, Sha256};
 use std::io;
 
 #[derive(Clone, Copy)]
@@ -7,7 +9,9 @@ struct ConversionScope<'a, 'b> {
     instance_count: usize,
     budget: &'a DecodeBudget,
     string_ids: &'a SettingsStringIdMap<'a>,
-    wire_bytes: &'a AtomicUsize,
+    /// Where the size of the encoded store is counted, for a conversion that
+    /// has a limit to keep.
+    wire_bytes: Option<&'a AtomicUsize>,
 }
 
 pub(super) fn convert(state: &ServiceState) -> Result<SettingsBytecode> {
@@ -45,57 +49,260 @@ pub(super) fn convert_with_budget(
     convert_prepared(state, &records, &lookup, &collected, budget)
 }
 
-/// The digest `pulled_settings_document_digest` gives this state's document,
-/// taken chunk by chunk: the document is never whole in memory. No decoder
-/// memory limit applies: the digest only says whether this is a state a pull
-/// took before, and that pull decided whether its store may be written.
+/// A digest of everything this state holds, except what its viewport camera
+/// holds: a pull puts the stored camera back whatever the captured one says.
+/// A store's document comes from its state alone, so two states with one
+/// digest give one document apart from that camera, and no document is built
+/// to find that out. No decoder memory limit applies: the digest only says
+/// whether this is a state a pull took before, and that pull decided whether
+/// its store may be written.
 pub(super) fn pulled_digest(state: &ServiceState) -> Result<PulledDigest> {
     use crate::settings::equivalence::{
-        pulled_instance_digest, pulled_settings_skeleton_digest, viewport_camera_lacks_enum_types,
+        viewport_camera_lacks_enum_types, workspace_current_camera_index,
     };
 
     let _span = crate::app::profile::span("captured store digest");
     let records = collect_service_settings_binary_instances(state);
     let lookup = build_settings_binary_instance_lookup(state, &records);
-    let collected = collect_settings_binary_data(state, &lookup, &records)?;
-    let rows = convert_prepared_each(
-        state,
-        &records,
-        &lookup,
-        &collected,
-        &DecodeBudget::new(usize::MAX),
-        |mut instance| {
-            let digest = pulled_instance_digest(&instance, false);
-            let as_viewport_camera =
-                (instance.class_name == "Camera").then(|| pulled_instance_digest(&instance, true));
-            // A service root's values say which camera is the viewport's, and
-            // a camera's own say whether its enum values carry their types.
-            if instance.parent_index.is_some() && instance.class_name != "Camera" {
-                instance.properties = Map::new();
-                instance.attributes = Map::new();
-            }
-            (instance, digest, as_viewport_camera)
-        },
-    )?;
-    let mut skeleton = SettingsBytecode {
-        version: SETTINGS_BINARY_VERSION,
-        instances: Vec::with_capacity(rows.len()),
-    };
-    let mut digests = Vec::with_capacity(rows.len());
-    let mut cameras = HashMap::new();
-    for (index, (instance, digest, as_viewport_camera)) in rows.into_iter().enumerate() {
-        skeleton.instances.push(instance);
-        digests.push(digest);
-        if let Some(digest) = as_viewport_camera {
-            cameras.insert(index, digest);
-        }
-    }
-    validate_settings_hierarchy(&skeleton.instances)?;
+    let skeleton = skeleton(state, &records, &lookup)?;
+    let viewport_camera =
+        workspace_current_camera_index(&skeleton).map(|index| records[index].source_index);
     Ok(PulledDigest {
-        digest: pulled_settings_skeleton_digest(&skeleton, digests, &cameras)
-            .context("The viewport camera of the captured store is not a Camera")?,
+        digest: state_digest(state, viewport_camera),
         viewport_camera_lacks_enum_types: viewport_camera_lacks_enum_types(&skeleton),
     })
+}
+
+/// The state's document without its values: every instance with its id, name,
+/// class and parent. Only a service root, whose values name the viewport
+/// camera, and the cameras, whose values say whether their enum items carry
+/// their types, hold what the document gives them.
+fn skeleton(
+    state: &ServiceState,
+    records: &[SettingsBinaryInstance<'_>],
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+) -> Result<SettingsBytecode> {
+    let budget = DecodeBudget::new(usize::MAX);
+    let scope = ConversionScope {
+        lookup,
+        instance_count: records.len(),
+        budget: &budget,
+        string_ids: &SettingsStringIdMap::default(),
+        wire_bytes: None,
+    };
+    let mut instances = Vec::with_capacity(records.len());
+    for record in records {
+        if record.parent_index.is_none() || record.class_name == "Camera" {
+            instances.extend(convert_chunk(state, std::slice::from_ref(record), scope)?);
+        } else {
+            instances.push(bare_instance(record, &budget)?);
+        }
+    }
+    validate_settings_hierarchy(&instances)?;
+    Ok(SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances,
+    })
+}
+
+/// Names the way the state is digested: a digest taken another way is never
+/// taken for one of these.
+const STATE_DIGEST_SCHEME: &[u8] = b"renium captured state 1";
+
+pub(super) fn state_digest(state: &ServiceState, viewport_camera: Option<usize>) -> [u8; 32] {
+    use crate::settings::equivalence::{digest_map, digest_text};
+
+    // Every field by name: a field added to the state is a field to digest.
+    let ServiceState {
+        instances,
+        native_properties_by_instance,
+        children_by_index,
+        source_in_subtree,
+        service_root_index,
+        class_defaults_by_class,
+        properties_default_elided,
+        dense_index_topology,
+    } = state;
+    let shared = Mutex::new(AHashMap::new());
+    let rows = instances
+        .par_iter()
+        .enumerate()
+        .map(|(index, instance)| {
+            let native = native_properties_by_instance
+                .as_ref()
+                .and_then(|rows| rows.get(index));
+            instance_state_digest(instance, native, viewport_camera == Some(index), &shared)
+        })
+        .collect::<Vec<_>>();
+    let count = |digest: &mut Sha256, count: usize| digest.update((count as u64).to_le_bytes());
+    let mut digest = Sha256::new();
+    digest.update(STATE_DIGEST_SCHEME);
+    digest.update([
+        u8::from(*properties_default_elided),
+        u8::from(*dense_index_topology),
+    ]);
+    count(&mut digest, *service_root_index);
+    count(
+        &mut digest,
+        native_properties_by_instance
+            .as_ref()
+            .map_or(0, |rows| rows.len() + 1),
+    );
+    count(&mut digest, children_by_index.len());
+    for children in children_by_index {
+        count(&mut digest, children.len());
+        for child in children {
+            count(&mut digest, *child);
+        }
+    }
+    count(&mut digest, source_in_subtree.len());
+    for holds_source in source_in_subtree {
+        digest.update([u8::from(*holds_source)]);
+    }
+    let mut classes = class_defaults_by_class.iter().collect::<Vec<_>>();
+    classes.sort_unstable_by_key(|(class, _)| class.as_str());
+    count(&mut digest, classes.len());
+    for (class, defaults) in classes {
+        digest_text(&mut digest, class);
+        digest_map(&mut digest, defaults);
+    }
+    count(&mut digest, rows.len());
+    for row in rows {
+        digest.update(row);
+    }
+    digest.finalize().into()
+}
+
+/// The digests of the values many instances share, by where each value is
+/// held: one is digested once however many instances hold it.
+type SharedValueDigests = Mutex<AHashMap<usize, [u8; 32]>>;
+
+fn instance_state_digest(
+    instance: &SnapshotInstance,
+    native: Option<&Vec<NativeSettingsProperty>>,
+    viewport_camera: bool,
+    shared: &SharedValueDigests,
+) -> [u8; 32] {
+    use crate::settings::equivalence::{digest_map, digest_text};
+
+    let SnapshotInstance {
+        path,
+        path_segments,
+        name,
+        class_name,
+        properties,
+        source_key,
+        parent_path,
+        attributes,
+        debug_id,
+        parent_debug_id,
+        transported_settings_id,
+        instance_id,
+        parent_instance_id,
+        instance_index,
+        parent_index,
+    } = instance;
+    let mut digest = Sha256::new();
+    digest_text(&mut digest, path);
+    digest.update((path_segments.len() as u64).to_le_bytes());
+    for segment in path_segments {
+        digest_text(&mut digest, segment);
+    }
+    digest_text(&mut digest, name);
+    digest_text(&mut digest, class_name.as_str());
+    for text in [
+        source_key,
+        parent_path,
+        debug_id,
+        parent_debug_id,
+        transported_settings_id,
+        instance_id,
+        parent_instance_id,
+    ] {
+        match text {
+            Some(text) => {
+                digest.update([1]);
+                digest_text(&mut digest, text);
+            }
+            None => digest.update([0]),
+        }
+    }
+    for index in [instance_index, parent_index] {
+        digest.update(index.map_or(0, |index| index as u64 + 1).to_le_bytes());
+    }
+    if viewport_camera {
+        digest.update([0xff]);
+        return digest.finalize().into();
+    }
+    digest_map(&mut digest, properties);
+    digest_map(&mut digest, attributes);
+    digest.update(
+        native
+            .map_or(0, |values| values.len() as u64 + 1)
+            .to_le_bytes(),
+    );
+    for property in native.into_iter().flatten() {
+        let NativeSettingsProperty { name, value } = property;
+        digest_text(&mut digest, name);
+        digest_native_value(&mut digest, value, shared);
+    }
+    digest.finalize().into()
+}
+
+fn digest_native_value(
+    digest: &mut Sha256,
+    value: &NativeSettingsValue,
+    shared: &SharedValueDigests,
+) {
+    let floats = |digest: &mut Sha256, kind: u8, values: &[f32]| {
+        digest.update([kind]);
+        for value in values {
+            digest.update(value.to_bits().to_le_bytes());
+        }
+    };
+    match value {
+        NativeSettingsValue::Bool(value) => digest.update([1, u8::from(*value)]),
+        NativeSettingsValue::Int(value) => {
+            digest.update([2]);
+            digest.update(value.to_le_bytes());
+        }
+        NativeSettingsValue::Float32(value) => floats(digest, 3, &[*value]),
+        NativeSettingsValue::Float64(value) => {
+            digest.update([4]);
+            digest.update(value.to_bits().to_le_bytes());
+        }
+        NativeSettingsValue::String(value) => {
+            digest.update([5]);
+            crate::settings::equivalence::digest_text(digest, value);
+        }
+        NativeSettingsValue::Ref(index) => {
+            digest.update([6]);
+            digest.update((*index as u64).to_le_bytes());
+        }
+        NativeSettingsValue::Vector2(values) => floats(digest, 7, values),
+        NativeSettingsValue::Vector3(values) => floats(digest, 8, values),
+        NativeSettingsValue::UDim(values) => floats(digest, 9, values),
+        NativeSettingsValue::UDim2(values) => floats(digest, 10, values),
+        NativeSettingsValue::Color3(values) => floats(digest, 11, values),
+        NativeSettingsValue::CFrame(values) => floats(digest, 12, values),
+        NativeSettingsValue::Rect(values) => floats(digest, 13, values),
+        NativeSettingsValue::Enum(value) => {
+            digest.update([14]);
+            crate::settings::equivalence::digest_text(digest, value);
+        }
+        NativeSettingsValue::Shared(value) => {
+            digest.update([15]);
+            let held_at = Arc::as_ptr(value) as usize;
+            let known = shared.lock_recover().get(&held_at).copied();
+            digest.update(known.unwrap_or_else(|| {
+                let mut of_value = Sha256::new();
+                crate::settings::equivalence::digest_value(&mut of_value, value);
+                let of_value = <[u8; 32]>::from(of_value.finalize());
+                shared.lock_recover().insert(held_at, of_value);
+                of_value
+            }));
+        }
+    }
 }
 
 fn convert_prepared(
@@ -147,7 +354,7 @@ fn convert_prepared_each<T: Send>(
         instance_count: records.len(),
         budget,
         string_ids: &string_ids,
-        wire_bytes: &wire_bytes,
+        wire_bytes: Some(&wire_bytes),
     };
     let kept_chunk = |records: &[SettingsBinaryInstance<'_>]| -> Result<Vec<T>> {
         Ok(convert_chunk(state, records, scope)?
@@ -263,30 +470,23 @@ fn convert_chunk<'a>(
     let mut wire = SizeWriter::default();
     let mut instances = Vec::with_capacity(records.len());
     for record in records {
-        let id = match &record.settings_id {
-            SettingsBinaryId::Text(text) => checked_string(text, scope.budget)?,
-            SettingsBinaryId::NumericDebug(id) => scope.budget.copied(&format!("debug:0_{id}"))?,
-        };
-        let mut instance = SettingsBytecodeInstance::new(
-            id,
-            checked_string(record.name, scope.budget)?,
-            checked_string(record.class_name, scope.budget)?,
-            record.parent_index,
-        );
+        let mut instance = bare_instance(record, scope.budget)?;
         visit_settings_binary_properties(state, record, scope.lookup, |name, kind, source| {
             // Count through the real value writer with maximal-width string
             // ids. Instance/ref deltas also fit ten bytes, independent of order.
-            wire.0 = wire.0.saturating_add(10);
-            if kind == 17 {
+            if scope.wire_bytes.is_some() {
                 wire.0 = wire.0.saturating_add(10);
-            } else {
-                write_binary_source_payload(
-                    &source,
-                    kind,
-                    scope.string_ids,
-                    scope.lookup,
-                    &mut wire,
-                )?;
+                if kind == 17 {
+                    wire.0 = wire.0.saturating_add(10);
+                } else {
+                    write_binary_source_payload(
+                        &source,
+                        kind,
+                        scope.string_ids,
+                        scope.lookup,
+                        &mut wire,
+                    )?;
+                }
             }
             // A decoder discards these columns, including native capture fields.
             if !SETTINGS_RECORD_FIELDS.contains(&name) {
@@ -318,13 +518,31 @@ fn convert_chunk<'a>(
         }
         instances.push(instance);
     }
-    scope
-        .wire_bytes
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
-            Some(total.saturating_add(wire.0))
-        })
-        .unwrap();
+    if let Some(wire_bytes) = scope.wire_bytes {
+        wire_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                Some(total.saturating_add(wire.0))
+            })
+            .unwrap();
+    }
     Ok(instances)
+}
+
+/// The document's instance of a record, before its values.
+fn bare_instance(
+    record: &SettingsBinaryInstance<'_>,
+    budget: &DecodeBudget,
+) -> Result<SettingsBytecodeInstance> {
+    let id = match &record.settings_id {
+        SettingsBinaryId::Text(text) => checked_string(text, budget)?,
+        SettingsBinaryId::NumericDebug(id) => budget.copied(&format!("debug:0_{id}"))?,
+    };
+    Ok(SettingsBytecodeInstance::new(
+        id,
+        checked_string(record.name, budget)?,
+        checked_string(record.class_name, budget)?,
+        record.parent_index,
+    ))
 }
 
 fn checked_string(text: &str, budget: &DecodeBudget) -> Result<String> {

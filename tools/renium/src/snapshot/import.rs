@@ -31,8 +31,7 @@ use crate::settings::bytecode::{
 };
 use crate::settings::equivalence::{
     SettingsAlignment, align_pulled_settings_bytes_to_reference,
-    align_pulled_settings_documents_to_reference, pulled_settings_document_digest,
-    viewport_camera_lacks_enum_types,
+    align_pulled_settings_documents_to_reference, viewport_camera_lacks_enum_types,
 };
 use crate::settings::tree::editor_service_root_index;
 use crate::snapshot::codec::parse_source_range_batch;
@@ -1484,42 +1483,35 @@ fn write_service_settings_file(
             let unchanged_with = unchanged_pulls().lock_recover().get(&digest).copied();
             Ok(Some((bytes, digest, unchanged_with)))
         })();
-        // A file a pull left alone before is first checked against a digest of
-        // the captured state taken chunk by chunk. While nothing changed, the
-        // captured store's document is never whole in memory.
+        // A digest of the captured state says whether it is the state a pull
+        // left this file alone with before. While nothing changed, no document
+        // of the captured store is built.
+        let pulled = matches!(&stored_file, Ok(Some(_)))
+            .then(|| pulled_digest_from_service_state(state_to_write).ok())
+            .flatten()
+            .map(|pulled| pulled.digest);
         let unchanged_again = matches!(
             &stored_file,
-            Ok(Some((_, _, Some(expected))))
-                if pulled_digest_from_service_state(state_to_write)
-                    .is_ok_and(|observed| observed.digest == *expected)
+            Ok(Some((_, _, Some(expected)))) if pulled == Some(*expected)
         );
         let (stored, observed) = if unchanged_again {
             (Ok(None), Ok(None))
         } else {
             rayon::join(
                 || -> Result<Option<StoredSettings>> {
-                    let Some((bytes, digest, unchanged_with)) = stored_file? else {
+                    let Some((bytes, digest, _)) = stored_file? else {
                         return Ok(None);
                     };
-                    // Decoded here, next to the conversion, unless a pull left a
-                    // file of these bytes alone before.
-                    let document = if unchanged_with.is_some() {
-                        None
-                    } else {
-                        Some(decode_stored_settings(&settings_path, &bytes)?)
-                    };
                     Ok(Some(StoredSettings {
-                        bytes,
                         digest,
-                        unchanged_with,
-                        document,
+                        document: decode_stored_settings(&settings_path, &bytes)?,
                     }))
                 },
                 || {
                     let _converting = profile::span(&format!("{service}: captured store document"));
-                    let observed = settings_bytecode_from_service_state(state_to_write)?;
-                    let digest = pulled_settings_document_digest(&observed);
-                    Ok::<_, anyhow::Error>(Some((observed, digest)))
+                    Ok::<_, anyhow::Error>(Some(settings_bytecode_from_service_state(
+                        state_to_write,
+                    )?))
                 },
             )
         };
@@ -1533,22 +1525,12 @@ fn write_service_settings_file(
             }
             // A captured state the decoder would refuse goes the way it went
             // before: its own bytes are written or compared as they are.
-            let Ok(Some((observed, observed_digest))) = observed else {
+            let Ok(Some(observed)) = observed else {
                 return pull_from_bytes(state_to_write, &settings_path);
             };
             Ok(match stored? {
-                Some(stored) if stored.unchanged_with == Some(observed_digest) => {
-                    profile::record(
-                        &format!("{service}: unchanged since the last pull"),
-                        alignment_started,
-                    );
-                    None
-                }
                 Some(stored) => {
-                    let reference = match stored.document {
-                        Some(document) => document,
-                        None => decode_stored_settings(&settings_path, &stored.bytes)?,
-                    };
+                    let reference = stored.document;
                     let answer_follows_camera = viewport_camera_lacks_enum_types(&reference);
                     match align_pulled_settings_documents_to_reference(
                         reference,
@@ -1559,8 +1541,8 @@ fn write_service_settings_file(
                     .with_context(|| format!("Failed to align {}", settings_path.display()))?
                     {
                         SettingsAlignment::Equivalent => {
-                            if !answer_follows_camera {
-                                remember_unchanged_pull(stored.digest, observed_digest);
+                            if !answer_follows_camera && let Some(pulled) = pulled {
+                                remember_unchanged_pull(stored.digest, pulled);
                             }
                             None
                         }
@@ -1596,13 +1578,10 @@ fn write_service_settings_file(
 /// these bytes unchanged against.
 type StoredFile = (Vec<u8>, [u8; 32], Option<[u8; 32]>);
 
-/// A store file as a pull read it, with its document once that is decoded.
+/// A store file as a pull read it: the digest of its bytes and its document.
 struct StoredSettings {
-    bytes: Vec<u8>,
     digest: [u8; 32],
-    /// The observed store a pull found these bytes unchanged against.
-    unchanged_with: Option<[u8; 32]>,
-    document: Option<SettingsBytecode>,
+    document: SettingsBytecode,
 }
 
 fn decode_stored_settings(settings_path: &Path, bytes: &[u8]) -> Result<SettingsBytecode> {

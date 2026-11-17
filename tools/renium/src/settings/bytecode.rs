@@ -38,9 +38,8 @@ pub(crate) fn settings_bytecode_from_service_state(
 }
 
 /// What a pull needs to know of a captured state to say it is one it took
-/// before: the digest its alignment gives the state's store document
-/// (`pulled_settings_document_digest`), and whether that document's viewport
-/// camera holds an enum value without its type
+/// before: a digest of all the state holds apart from its viewport camera's
+/// values, and whether that camera holds an enum value without its type
 /// (`viewport_camera_lacks_enum_types`).
 pub(crate) struct PulledDigest {
     pub(crate) digest: [u8; 32],

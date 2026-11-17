@@ -414,6 +414,14 @@ fn pulled(reference: &SettingsBytecode, observed: &SettingsBytecode) -> Settings
     align_settings_bytes(&reference, &observed, true).unwrap()
 }
 
+/// The digest a pull takes of a captured state that gives this document.
+fn pull_digest(document: &SettingsBytecode) -> [u8; 32] {
+    let state = crate::settings::bytecode::captured_sim::captured_state(document, false);
+    crate::settings::bytecode::pulled_digest_from_service_state(&state)
+        .unwrap()
+        .digest
+}
+
 fn with_moved_camera(reference: &SettingsBytecode) -> SettingsBytecode {
     let mut observed = reference.clone();
     observed.instances[1]
@@ -585,13 +593,13 @@ fn the_pull_digest_ignores_the_viewport_camera_and_nothing_else() {
     part.attributes.insert("Level".into(), json!(1));
     instances.push(part);
     let reference = settings_document(instances);
-    let digest = pulled_settings_document_digest(&reference);
+    let digest = pull_digest(&reference);
 
     let mut moved = with_moved_camera(&reference);
     moved.instances[1]
         .attributes
         .insert("Seen".into(), json!(true));
-    assert!(pulled_settings_document_digest(&moved) == digest);
+    assert!(pull_digest(&moved) == digest);
 
     let edits: [fn(&mut SettingsBytecode); 9] = [
         |document| document.instances[3].settings_id.push('x'),
@@ -622,7 +630,7 @@ fn the_pull_digest_ignores_the_viewport_camera_and_nothing_else() {
         let mut edited = reference.clone();
         edit(&mut edited);
         assert!(
-            pulled_settings_document_digest(&edited) != digest,
+            pull_digest(&edited) != digest,
             "edit {index} left the digest as it was"
         );
     }
@@ -635,8 +643,8 @@ fn the_pull_digest_ignores_the_viewport_camera_and_nothing_else() {
     whole.instances[3]
         .attributes
         .insert("Level".into(), json!(1.0));
-    assert!(pulled_settings_document_digest(&text) != digest);
-    assert!(pulled_settings_document_digest(&whole) != digest);
+    assert!(pull_digest(&text) != digest);
+    assert!(pull_digest(&whole) != digest);
 }
 
 /// Two observed stores that differ only in what the viewport camera holds
@@ -662,10 +670,7 @@ fn stores_that_differ_only_in_the_viewport_camera_are_unchanged_together() {
                 }
             }
             let moved = with_moved_camera(&observed);
-            assert!(
-                pulled_settings_document_digest(&observed)
-                    == pulled_settings_document_digest(&moved)
-            );
+            assert!(pull_digest(&observed) == pull_digest(&moved));
             let unchanged = |observed: &SettingsBytecode| {
                 matches!(pulled(&reference, observed), SettingsAlignment::Equivalent)
             };
@@ -697,7 +702,7 @@ fn a_stored_camera_without_an_enum_type_makes_the_answer_follow_the_camera() {
         .insert("Mode".into(), typed.clone());
     let mut still = reference.clone();
     still.instances[1].properties.insert("Mode".into(), typed);
-    assert!(pulled_settings_document_digest(&moved) == pulled_settings_document_digest(&still));
+    assert!(pull_digest(&moved) == pull_digest(&still));
     assert!(matches!(
         pulled(&reference, &moved),
         SettingsAlignment::Equivalent

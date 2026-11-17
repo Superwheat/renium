@@ -186,78 +186,12 @@ pub(crate) fn align_pulled_settings_documents_to_reference(
     )
 }
 
-/// A digest of everything a pull's alignment reads from an observed store,
-/// except what the viewport camera holds: a pull puts the stored camera back
-/// whatever the observed one says, so two observed stores with one digest
-/// align to the same answer against the same stored file.
-pub(crate) fn pulled_settings_document_digest(document: &SettingsBytecode) -> [u8; 32] {
-    let camera = workspace_current_camera_index(document);
-    let instances = document
-        .instances
-        .par_iter()
-        .enumerate()
-        .map(|(index, instance)| pulled_instance_digest(instance, camera == Some(index)))
-        .collect::<Vec<_>>();
-    pulled_settings_digest(document.version, &instances)
-}
-
-/// One instance's part of `pulled_settings_document_digest`. The viewport
-/// camera gives only what places it in the store.
-pub(crate) fn pulled_instance_digest(
-    instance: &SettingsBytecodeInstance,
-    viewport_camera: bool,
-) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest_text(&mut digest, &instance.settings_id);
-    digest_text(&mut digest, &instance.name);
-    digest_text(&mut digest, &instance.class_name);
-    digest.update(
-        instance
-            .parent_index
-            .map_or(0, |parent| parent as u64 + 1)
-            .to_le_bytes(),
-    );
-    if viewport_camera {
-        digest.update([0xff]);
-    } else {
-        digest_map(&mut digest, &instance.properties);
-        digest_map(&mut digest, &instance.attributes);
-    }
-    digest.finalize().into()
-}
-
-fn pulled_settings_digest(version: u8, instances: &[[u8; 32]]) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update([version]);
-    digest.update((instances.len() as u64).to_le_bytes());
-    for instance in instances {
-        digest.update(instance);
-    }
-    digest.finalize().into()
-}
-
-/// The digest `pulled_settings_document_digest` gives a store, from the
-/// digests of its instances and a skeleton of it: every instance with its id,
-/// name, class and parent, and the values of the service root, which name the
-/// viewport camera. `as_viewport_camera` holds, for every instance of class
-/// Camera, the digest it has as that camera.
-pub(crate) fn pulled_settings_skeleton_digest(
-    skeleton: &SettingsBytecode,
-    mut instances: Vec<[u8; 32]>,
-    as_viewport_camera: &HashMap<usize, [u8; 32]>,
-) -> Option<[u8; 32]> {
-    if let Some(camera) = workspace_current_camera_index(skeleton) {
-        instances[camera] = *as_viewport_camera.get(&camera)?;
-    }
-    Some(pulled_settings_digest(skeleton.version, &instances))
-}
-
-fn digest_text(digest: &mut Sha256, text: &str) {
+pub(super) fn digest_text(digest: &mut Sha256, text: &str) {
     digest.update((text.len() as u64).to_le_bytes());
     digest.update(text.as_bytes());
 }
 
-fn digest_map(digest: &mut Sha256, map: &Map<String, Value>) {
+pub(super) fn digest_map(digest: &mut Sha256, map: &Map<String, Value>) {
     digest.update((map.len() as u64).to_le_bytes());
     for (name, value) in map {
         digest_text(digest, name);
@@ -265,7 +199,7 @@ fn digest_map(digest: &mut Sha256, map: &Map<String, Value>) {
     }
 }
 
-fn digest_value(digest: &mut Sha256, value: &Value) {
+pub(super) fn digest_value(digest: &mut Sha256, value: &Value) {
     match value {
         Value::Null => digest.update([0]),
         Value::Bool(value) => digest.update([1, u8::from(*value)]),
@@ -2766,7 +2700,8 @@ pub(crate) fn is_reconciliation_protected_workspace_camera(
     reference.get("instanceIndex").and_then(Value::as_u64) == Some(index as u64 + 1)
 }
 
-fn workspace_current_camera_index(document: &SettingsBytecode) -> Option<usize> {
+/// The camera a Workspace store's root names as the viewport's.
+pub(crate) fn workspace_current_camera_index(document: &SettingsBytecode) -> Option<usize> {
     document
         .instances
         .iter()

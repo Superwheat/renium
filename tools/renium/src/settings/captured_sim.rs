@@ -420,20 +420,21 @@ fn oracle(state: &ServiceState, pools: &[rayon::ThreadPool]) -> Result<bool, Str
                 if output(expected) != output(&actual) {
                     return Err("captured conversion changed encoded bytes".into());
                 }
-                // A digest taken chunk by chunk is the document's own.
-                let document =
-                    crate::settings::equivalence::pulled_settings_document_digest(&actual);
-                if pool
-                    .install(|| pulled_digest_from_service_state(state))
-                    .is_ok_and(|pulled| {
-                        pulled.digest != document
-                            || pulled.viewport_camera_lacks_enum_types
-                                != crate::settings::equivalence::viewport_camera_lacks_enum_types(
-                                    &actual,
-                                )
-                    })
-                {
-                    return Err("captured digest differs from its document's".into());
+                // The digest is the same on every pool, and says of the
+                // viewport camera what the document says.
+                let digest = |pool: &rayon::ThreadPool| {
+                    pool.install(|| pulled_digest_from_service_state(state))
+                        .map(|pulled| (pulled.digest, pulled.viewport_camera_lacks_enum_types))
+                        .map_err(|error| format!("{error:#}"))
+                };
+                let pulled = digest(pool);
+                if pulled != digest(&pools[0]) {
+                    return Err("captured digest differs between pools".into());
+                }
+                if pulled.is_ok_and(|(_, lacks)| {
+                    lacks != crate::settings::equivalence::viewport_camera_lacks_enum_types(&actual)
+                }) {
+                    return Err("captured digest differs from its document on the camera".into());
                 }
             }
             (Err(expected), Err(actual)) => {
@@ -515,10 +516,10 @@ fn a_shared_value_is_stored_as_the_json_value_it_holds() {
     }
 }
 
-/// A digest taken chunk by chunk from a captured state is its document's own,
-/// and leaves out what the viewport camera holds.
+/// A captured state's digest leaves out what the viewport camera holds, and
+/// follows a value anywhere else.
 #[test]
-fn a_captured_digest_is_its_documents_and_leaves_out_the_viewport_camera() {
+fn a_captured_digest_leaves_out_the_viewport_camera() {
     let document = |field_of_view: f64, transparency: f64| {
         let instance = |id: String, class: &str, parent| {
             SettingsBytecodeInstance::new(id.clone(), id, class.into(), parent)
@@ -547,17 +548,332 @@ fn a_captured_digest_is_its_documents_and_leaves_out_the_viewport_camera() {
     for native in [false, true] {
         let digest = |field_of_view, transparency| {
             let state = captured_state(&document(field_of_view, transparency), native);
-            let streamed = pulled_digest_from_service_state(&state).unwrap().digest;
-            let converted = settings_bytecode_from_service_state(&state).unwrap();
-            assert!(
-                streamed
-                    == crate::settings::equivalence::pulled_settings_document_digest(&converted)
-            );
-            streamed
+            pulled_digest_from_service_state(&state).unwrap().digest
         };
         let unchanged = digest(70.0, 0.5);
         assert!(unchanged == digest(55.0, 0.5), "native={native}");
         assert!(unchanged != digest(70.0, 0.25), "native={native}");
+    }
+}
+
+/// A Workspace state with a viewport camera, a spare camera and parts, with
+/// every field of an instance and of the state in use.
+fn digested_state(native: bool) -> ServiceState {
+    let instance = |id: &str, class: &str, parent| {
+        SettingsBytecodeInstance::new(id.into(), id.into(), class.into(), parent)
+    };
+    let mut root = instance("Workspace", "Workspace", None);
+    root.properties.insert(
+        "CurrentCamera".into(),
+        json!({"_type": "Ref", "instanceIndex": 2}),
+    );
+    let mut camera = instance("Camera", "Camera", Some(0));
+    camera.properties.insert("FieldOfView".into(), json!(70.0));
+    let mut spare = instance("Spare", "Camera", Some(0));
+    spare.properties.insert("FieldOfView".into(), json!(70.0));
+    let mut part = instance("Part", "Part", Some(0));
+    part.properties.insert("Transparency".into(), json!(0.5));
+    part.attributes.insert("Level".into(), json!(1));
+    let mut state = captured_state(
+        &SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root, camera, spare, part],
+        },
+        native,
+    );
+    for (index, row) in state.instances.iter_mut().enumerate() {
+        row.path = format!("Workspace/{index}");
+        row.path_segments = vec!["Workspace".into(), index.to_string()];
+        row.source_key = Some(format!("source{index}"));
+        row.parent_path = Some("Workspace".into());
+        row.debug_id = Some(format!("0_{}", index + 1));
+        row.parent_debug_id = Some("0_1".into());
+        row.instance_id = Some(format!("instance{index}"));
+        row.parent_instance_id = Some("instance0".into());
+    }
+    state.class_defaults_by_class.insert(
+        "Part".into(),
+        Map::from_iter([("Anchored".into(), json!(false))]),
+    );
+    state
+}
+
+/// Every field of a captured state changes its digest, and of the cameras
+/// only the viewport's values do not.
+#[test]
+fn a_captured_digest_follows_every_field_of_the_state() {
+    type Edit = fn(&mut ServiceState);
+    let edits: &[Edit] = &[
+        |state| state.instances[3].path.push('x'),
+        |state| state.instances[3].path_segments.push("x".into()),
+        |state| state.instances[3].path_segments[1].push('x'),
+        |state| state.instances[3].name.push('x'),
+        |state| state.instances[3].class_name = "Folder".into(),
+        |state| {
+            state.instances[3]
+                .properties
+                .insert("Reflectance".into(), json!(0.25));
+        },
+        |state| state.instances[3].source_key = None,
+        |state| state.instances[3].source_key = Some("other".into()),
+        |state| state.instances[3].parent_path = None,
+        |state| {
+            state.instances[3]
+                .attributes
+                .insert("Level".into(), json!(2));
+        },
+        |state| state.instances[3].debug_id = Some("0_9".into()),
+        |state| state.instances[3].parent_debug_id = None,
+        |state| state.instances[3].transported_settings_id = Some("other".into()),
+        |state| state.instances[3].instance_id = None,
+        |state| state.instances[3].parent_instance_id = Some("other".into()),
+        |state| state.instances[3].instance_index = None,
+        |state| state.instances[3].parent_index = Some(3),
+        |state| state.instances[1].name.push('x'),
+        |state| {
+            state.instances[2]
+                .attributes
+                .insert("Seen".into(), json!(true));
+        },
+        |state| state.children_by_index[0].push(3),
+        |state| state.children_by_index.push(Vec::new()),
+        |state| state.source_in_subtree[3] = !state.source_in_subtree[3],
+        |state| state.service_root_index = 1,
+        |state| {
+            state
+                .class_defaults_by_class
+                .insert("Folder".into(), Map::new());
+        },
+        |state| {
+            state.class_defaults_by_class.get_mut("Part").unwrap()["Anchored"] = json!(true);
+        },
+        |state| state.properties_default_elided = !state.properties_default_elided,
+        |state| state.dense_index_topology = !state.dense_index_topology,
+        |state| {
+            state.instances.pop();
+        },
+    ];
+    for native in [false, true] {
+        let state = digested_state(native);
+        let digest = |state: &ServiceState| captured::state_digest(state, Some(1));
+        let unchanged = digest(&state);
+        assert!(unchanged == digest(&state.clone()));
+        for (index, edit) in edits.iter().enumerate() {
+            let mut edited = state.clone();
+            edit(&mut edited);
+            assert!(
+                digest(&edited) != unchanged,
+                "edit {index} left the digest as it was (native={native})"
+            );
+        }
+        let mut moved = state.clone();
+        moved.instances[1]
+            .properties
+            .insert("FieldOfView".into(), json!(55.0));
+        moved.instances[1]
+            .attributes
+            .insert("Seen".into(), json!(true));
+        if let Some(rows) = &mut moved.native_properties_by_instance {
+            rows[1].push(NativeSettingsProperty {
+                name: "Focus".into(),
+                value: NativeSettingsValue::Vector3([1.0, 2.0, 3.0]),
+            });
+        }
+        assert!(digest(&moved) == unchanged, "native={native}");
+        assert!(captured::state_digest(&moved, None) != captured::state_digest(&state, None));
+        assert!(captured::state_digest(&state, None) != unchanged);
+        assert!(
+            pulled_digest_from_service_state(&state).unwrap().digest == unchanged,
+            "the viewport camera is the one the root names (native={native})"
+        );
+    }
+    let mut state = digested_state(false);
+    let rows = vec![Vec::new(); state.instances.len()];
+    let without = captured::state_digest(&state, Some(1));
+    state.native_properties_by_instance = Some(rows.clone());
+    let with_empty_rows = captured::state_digest(&state, Some(1));
+    assert!(without != with_empty_rows);
+    state
+        .native_properties_by_instance
+        .as_mut()
+        .unwrap()
+        .push(Vec::new());
+    assert!(captured::state_digest(&state, Some(1)) != with_empty_rows);
+}
+
+/// A typed value's digest tells its kind and its content, and a shared value
+/// is digested by what it holds, not by where it is held.
+#[test]
+fn a_captured_digest_tells_typed_values_apart() {
+    let shared = |text: &str| NativeSettingsValue::Shared(Arc::new(json!({"data": text})));
+    let values = [
+        NativeSettingsValue::Bool(false),
+        NativeSettingsValue::Bool(true),
+        NativeSettingsValue::Int(1),
+        NativeSettingsValue::Int(2),
+        NativeSettingsValue::Float32(1.0),
+        NativeSettingsValue::Float32(2.0),
+        NativeSettingsValue::Float64(1.0),
+        NativeSettingsValue::Float64(2.0),
+        NativeSettingsValue::String("a".into()),
+        NativeSettingsValue::String("b".into()),
+        NativeSettingsValue::Ref(1),
+        NativeSettingsValue::Ref(2),
+        NativeSettingsValue::Vector2([1.0, 2.0]),
+        NativeSettingsValue::Vector2([1.0, 3.0]),
+        NativeSettingsValue::Vector3([1.0, 2.0, 3.0]),
+        NativeSettingsValue::Vector3([1.0, 2.0, 4.0]),
+        NativeSettingsValue::UDim([1.0, 2.0]),
+        NativeSettingsValue::UDim([1.0, 3.0]),
+        NativeSettingsValue::UDim2([1.0, 2.0, 3.0, 4.0]),
+        NativeSettingsValue::UDim2([1.0, 2.0, 3.0, 5.0]),
+        NativeSettingsValue::Color3([1.0, 2.0, 3.0]),
+        NativeSettingsValue::Color3([1.0, 2.0, 4.0]),
+        NativeSettingsValue::CFrame([0.5; 12]),
+        NativeSettingsValue::CFrame([0.25; 12]),
+        NativeSettingsValue::Rect([1.0, 2.0, 3.0, 4.0]),
+        NativeSettingsValue::Rect([1.0, 2.0, 3.0, 5.0]),
+        NativeSettingsValue::Enum("a".into()),
+        NativeSettingsValue::Enum("b".into()),
+        shared("a"),
+        shared("b"),
+    ];
+    let digest = |value: &NativeSettingsValue| {
+        let mut state = digested_state(true);
+        state.native_properties_by_instance.as_mut().unwrap()[3].push(NativeSettingsProperty {
+            name: "Typed".into(),
+            value: value.clone(),
+        });
+        captured::state_digest(&state, Some(1))
+    };
+    let digests = values.iter().map(digest).collect::<Vec<_>>();
+    for (left, left_digest) in digests.iter().enumerate() {
+        for (right, right_digest) in digests.iter().enumerate().skip(left + 1) {
+            assert!(left_digest != right_digest, "values {left} and {right}");
+        }
+    }
+    assert!(digest(&shared("a")) == digests[28]);
+    // One value held by two instances is digested as two values of it are.
+    let held_once = Arc::new(json!({"data": "a"}));
+    let state_holding = |values: [NativeSettingsValue; 2]| {
+        let mut state = digested_state(true);
+        let rows = state.native_properties_by_instance.as_mut().unwrap();
+        for (row, value) in [2, 3].into_iter().zip(values) {
+            rows[row].push(NativeSettingsProperty {
+                name: "Typed".into(),
+                value,
+            });
+        }
+        captured::state_digest(&state, Some(1))
+    };
+    assert!(
+        state_holding([
+            NativeSettingsValue::Shared(held_once.clone()),
+            NativeSettingsValue::Shared(held_once),
+        ]) == state_holding([shared("a"), shared("a")])
+    );
+}
+
+/// Two captured states with one digest give one document: whatever an edit
+/// changes in the document changes the digest.
+#[test]
+fn captured_states_with_one_digest_give_one_document() {
+    let seen = std::sync::atomic::AtomicUsize::new(0);
+    run_seeds(96, |seed, _| {
+        let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let mut state = generated_state(seed, 8 + seed as usize % 24);
+        if seed % 2 == 0 {
+            add_native_properties(&mut state, seed);
+        }
+        state.properties_default_elided = seed % 3 != 0;
+        state.dense_index_topology = seed % 5 != 0;
+        if !state.dense_index_topology {
+            sparse_indices(&mut state);
+        }
+        for _ in 0..6 {
+            let mut edited = state.clone();
+            let at = rng.below(edited.instances.len());
+            match rng.below(9) {
+                0 => {
+                    edited.instances[at]
+                        .properties
+                        .insert("Scalar".into(), json!(rng.next()));
+                }
+                1 => {
+                    edited.instances[at]
+                        .attributes
+                        .insert("Edited".into(), json!(rng.below(4)));
+                }
+                2 => edited.instances[at].name.push('x'),
+                3 => edited.instances[at].class_name = "Part".into(),
+                4 => {
+                    edited.instances[at].properties.remove("Scalar");
+                }
+                5 => {
+                    let count = edited.instances.len();
+                    edited.instances[at].properties.insert(
+                        "Target".into(),
+                        json!({"_type":"Ref", "instanceIndex":1 + rng.below(count)}),
+                    );
+                }
+                6 => {
+                    if let Some(row) = edited
+                        .native_properties_by_instance
+                        .as_mut()
+                        .and_then(|rows| rows.get_mut(at))
+                    {
+                        match row.first_mut() {
+                            Some(property) => {
+                                property.value = NativeSettingsValue::Int(rng.next() as i64);
+                            }
+                            None => row.push(NativeSettingsProperty {
+                                name: "Added".into(),
+                                value: NativeSettingsValue::Bool(true),
+                            }),
+                        }
+                    }
+                }
+                7 => {
+                    edited.instances[at]
+                        .properties
+                        .insert("RobloxLocked".into(), json!(true));
+                }
+                _ => edited.properties_default_elided = !edited.properties_default_elided,
+            }
+            let documents = (
+                settings_bytecode_from_service_state(&state),
+                settings_bytecode_from_service_state(&edited),
+            );
+            let (Ok(mut before), Ok(mut after)) = documents else {
+                continue;
+            };
+            // What the viewport camera holds is no part of the digest.
+            for document in [&mut before, &mut after] {
+                if let Some(camera) =
+                    crate::settings::equivalence::workspace_current_camera_index(document)
+                {
+                    document.instances[camera].properties.clear();
+                    document.instances[camera].attributes.clear();
+                }
+            }
+            let digests = (
+                pulled_digest_from_service_state(&state),
+                pulled_digest_from_service_state(&edited),
+            );
+            let (Ok(left), Ok(right)) = digests else {
+                return Err("a state with a document has no digest".into());
+            };
+            if !crate::settings::codec_sim::same_document(&before, &after) {
+                seen.fetch_add(1, Ordering::Relaxed);
+                if left.digest == right.digest {
+                    return Err("two documents under one digest".into());
+                }
+            }
+        }
+        Ok(())
+    });
+    if std::env::var_os("RENIUM_SIM_SEED").is_none() {
+        assert!(seen.load(Ordering::Relaxed) >= 96);
     }
 }
 
