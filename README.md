@@ -12,7 +12,7 @@ directions.
 ## Install
 
 Download the package for your system from
-[Releases](https://github.com/renium-rbx/renium/releases/latest).
+[Releases](https://github.com/Superwheat/renium/releases/latest).
 
 | System | Install |
 |---|---|
@@ -127,7 +127,7 @@ instead of Studio's Output window.
 
 - **Questions:** the [Discord server](https://discord.gg/wwTFHSSNn3), where every
   release is announced.
-- **Bugs:** [GitHub issues](https://github.com/renium-rbx/renium/issues).
+- **Bugs:** [GitHub issues](https://github.com/Superwheat/renium/issues).
   `rbx report -m "what went wrong"` writes a diagnostics zip to attach.
 - **CLI guide:** [tools/renium/README.md](tools/renium/README.md) covers the project
   layout, Live Sync, saved data, playtests, publishing, troubleshooting and building

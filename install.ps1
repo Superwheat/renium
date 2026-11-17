@@ -8,7 +8,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$repository = "renium-rbx/renium"
+$repository = "Superwheat/renium"
 $installRoot = Join-Path $env:LOCALAPPDATA "Renium\bin"
 $stableLauncherRoot = Join-Path $env:USERPROFILE ".renium\bin"
 $stableLauncher = Join-Path $stableLauncherRoot "rbx.cmd"

@@ -19,6 +19,7 @@
 - The Play recipe in the agent guide waits on the state the check reads instead of on elapsed game time. In measured agent runs a copied `workspace.DistributedGameTime > 10` added 3 to 25 seconds to a Play start that was ready after 5.
 - The agent guide says that a user who asks to sync or start sync means Live Sync (`rbx lon`), what Live Sync moves in each direction, and to start in verify mode on a just-opened place whose files the agent cannot account for. The sync guide says what `rbx lon` does in a new or partly pulled folder and that a preference does not hold back a file-side difference.
 - A `hint:` line now and then tells a caller what costs it tokens: a chunk sent whole for the third time with only its strings and numbers changed (keep it in a file, send the values), and runs whose own text is full of unrounded numbers (return the values). In measured agent sessions half of all Luau tokens were such resent chunks.
+- The update check, the installers, the bug report link, the project schema URLs and the documentation point at `Superwheat/renium`, where the repository is again.
 
 ### Bug fixes
 
