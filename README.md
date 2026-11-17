@@ -53,8 +53,10 @@ When the files and Studio were both edited since the last sync, Renium merges th
 
 - Edits to different instances, different properties or different lines of a script
   are all kept.
-- Edits to the same value are reported with both versions. Nothing is overwritten
-  until one of them is chosen.
+- Edits to the same value come back as a list of conflicts. Each one carries the
+  last synced value and both new ones, or both diffs for a script, so an agent
+  decides each conflict by itself. Nothing is overwritten until every conflict has
+  an answer.
 
 ### An agent works alone
 
