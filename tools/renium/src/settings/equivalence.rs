@@ -1059,6 +1059,72 @@ impl IdentityCandidateIndex {
     }
 }
 
+fn identity_group_proposals(
+    context: &IdentityScoreContext<'_>,
+    observed_group: &[usize],
+    candidates: &[usize],
+) -> Vec<(usize, usize)> {
+    let (representatives, multiplicities) = identity_candidate_representatives(
+        context.reference,
+        context.reference_graph,
+        context
+            .subtree_keys
+            .map(|(reference, _)| reference.as_slice()),
+        candidates,
+    );
+    let unreferenced = |index: usize| {
+        context.observed_graph.outgoing[index].is_empty()
+            && context.observed_graph.incoming[index].is_empty()
+    };
+    let content_index =
+        if representatives.len() > 1 && observed_group.iter().any(|index| unreferenced(*index)) {
+            IdentityCandidateIndex::build(context.reference, &representatives)
+        } else {
+            None
+        };
+    let propose = |&index: &usize| {
+        let mut best = None;
+        let mut best_candidate = None;
+        let mut tied = false;
+        let narrowed = content_index
+            .as_ref()
+            .filter(|_| unreferenced(index))
+            .and_then(|lookup| lookup.matching(&context.observed.instances[index]));
+        let count = narrowed.map_or(representatives.len(), <[_]>::len);
+        for offset in 0..count {
+            let candidate =
+                narrowed.map_or_else(|| representatives[offset], |values| values[offset].1);
+            let Some(score) = identity_score(context, candidate, index) else {
+                continue;
+            };
+            match best {
+                None => {
+                    best = Some(score);
+                    best_candidate = Some(candidate);
+                    tied = multiplicities[&candidate] > 1;
+                }
+                Some(current) if score > current => {
+                    best = Some(score);
+                    best_candidate = Some(candidate);
+                    tied = multiplicities[&candidate] > 1;
+                }
+                Some(current) if score == current => tied = true,
+                _ => {}
+            }
+        }
+        best_candidate
+            .filter(|_| !tied)
+            .map(|candidate| (index, candidate))
+    };
+    // Scores use one immutable assignment snapshot. Preserve observed order;
+    // conflicting proposals are rejected before any assignment is applied.
+    if observed_group.len() >= 32 && rayon::current_num_threads() > 1 {
+        observed_group.par_iter().filter_map(propose).collect()
+    } else {
+        observed_group.iter().filter_map(propose).collect()
+    }
+}
+
 impl<'a> IdentityAssignment<'a> {
     fn new(reference: &'a SettingsBytecode, observed: &'a SettingsBytecode) -> Self {
         Self {
@@ -1279,61 +1345,10 @@ impl<'a> IdentityAssignment<'a> {
                 assigned_observed: &self.assigned_observed,
                 subtree_keys: inputs.subtree_keys,
             };
-            let mut proposals = Vec::with_capacity(observed_group.len());
+            let proposals = identity_group_proposals(&score_context, &observed_group, &candidates);
             let mut proposal_counts = HashMap::<usize, usize>::new();
-            let (representatives, multiplicities) = identity_candidate_representatives(
-                reference,
-                inputs.reference_graph,
-                inputs
-                    .subtree_keys
-                    .map(|(reference, _)| reference.as_slice()),
-                &candidates,
-            );
-            let unreferenced = |index: usize| {
-                inputs.observed_graph.outgoing[index].is_empty()
-                    && inputs.observed_graph.incoming[index].is_empty()
-            };
-            let content_index = if representatives.len() > 1
-                && observed_group.iter().any(|index| unreferenced(*index))
-            {
-                IdentityCandidateIndex::build(reference, &representatives)
-            } else {
-                None
-            };
-            for &index in &observed_group {
-                let mut best = None;
-                let mut best_candidate = None;
-                let mut tied = false;
-                let narrowed = content_index
-                    .as_ref()
-                    .filter(|_| unreferenced(index))
-                    .and_then(|lookup| lookup.matching(&observed.instances[index]));
-                let count = narrowed.map_or(representatives.len(), <[_]>::len);
-                for offset in 0..count {
-                    let candidate =
-                        narrowed.map_or_else(|| representatives[offset], |values| values[offset].1);
-                    let Some(score) = identity_score(&score_context, candidate, index) else {
-                        continue;
-                    };
-                    match best {
-                        None => {
-                            best = Some(score);
-                            best_candidate = Some(candidate);
-                            tied = multiplicities[&candidate] > 1;
-                        }
-                        Some(current) if score > current => {
-                            best = Some(score);
-                            best_candidate = Some(candidate);
-                            tied = multiplicities[&candidate] > 1;
-                        }
-                        Some(current) if score == current => tied = true,
-                        _ => {}
-                    }
-                }
-                if !tied && let Some(candidate) = best_candidate {
-                    proposals.push((index, candidate));
-                    *proposal_counts.entry(candidate).or_default() += 1;
-                }
+            for (_, candidate) in &proposals {
+                *proposal_counts.entry(*candidate).or_default() += 1;
             }
             let mut assigned = false;
             for (index, candidate) in proposals {
@@ -1361,7 +1376,10 @@ impl<'a> IdentityAssignment<'a> {
             // neither side has reference edges. Leave ties for the existing
             // fallback pass instead of rescoring them at every hierarchy depth.
             if !assigned
-                && observed_group.iter().all(|index| unreferenced(*index))
+                && observed_group.iter().all(|index| {
+                    inputs.observed_graph.outgoing[*index].is_empty()
+                        && inputs.observed_graph.incoming[*index].is_empty()
+                })
                 && candidates.iter().all(|index| {
                     inputs.reference_graph.outgoing[*index].is_empty()
                         && inputs.reference_graph.incoming[*index].is_empty()
@@ -4104,6 +4122,10 @@ fn align_equivalent_map_values(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "identity_sim.rs"]
+mod identity_sim;
 
 #[cfg(test)]
 mod tests {
