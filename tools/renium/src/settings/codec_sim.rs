@@ -3,7 +3,7 @@
 //! Each seed generates a store document, a tree of instances whose
 //! properties and attributes reach every value path of the encoder, and
 //! states for each value the form decoding must give back. With
-//! d1 = decode(encode(d0)), four laws must hold:
+//! d1 = decode(encode(d0)), five laws must hold:
 //!
 //! 1. d1 holds d0's instances: the same ids, names, classes and parents, in
 //!    the same order. The structure decode gives them without values, and the
@@ -23,6 +23,8 @@
 //!    references kept; where no reference differs, dense(d0) == encode(d0)
 //!    byte for byte; and dense(d1) == encode(d1), since a decoded store
 //!    names every local target by index.
+//! 5. Keeping untouched property columns in their compact form while
+//!    editing selected rows produces exactly the eager encoder's bytes.
 //!
 //! The canonical forms, as the codec writes and reads them:
 //!
@@ -1797,6 +1799,8 @@ fn laws(doc: &Doc) -> Result<(), String> {
         .expect("the plain encoder refuses nothing");
     values_stated(doc, false, &plain, &d1, "law 2")?;
     reencoded(&bytes, &d1)?;
+    super::bytecode::property_edit::sim::check_codec_document(&bytes)
+        .map_err(|error| format!("law 5: selective property edit differs: {error:#}"))?;
     dense_kept(doc, &d0, &d1, &bytes, &plain)
 }
 

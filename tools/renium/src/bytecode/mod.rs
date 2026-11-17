@@ -58,6 +58,7 @@ use crate::rbx::model::{
     BytecodeModelImportRefs, canonicalize_settings_references_for_move,
     canonicalize_settings_references_for_moves, source_structure_settings_document,
 };
+use crate::settings::bytecode::property_edit::{RetainedPropertyColumns, read_for_property_edit};
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode,
     stabilize_reference_objects,
@@ -2927,7 +2928,18 @@ fn set_store_properties(
         BTreeSet::from([settings_file.clone()])
     };
     let _locks = lock_existing_service_stores(locked_stores.iter().map(PathBuf::as_path))?;
-    let document = SettingsBytecode::read_file(&settings_file)?;
+    // Retained columns keep row indices, so moves and source-path changes need
+    // the complete document. Value-only edits materialize their selected rows.
+    let keep_columns = !structural
+        && !assigned().any(|(property, _)| {
+            property_affects_source_path(scope, property) || property.eq_ignore_ascii_case("source")
+        });
+    let (mut document, mut retained_columns) = if keep_columns {
+        let (document, numeric) = read_for_property_edit(&settings_file)?;
+        (document, Some(numeric))
+    } else {
+        (SettingsBytecode::read_file(&settings_file)?, None)
+    };
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let indices = edits
         .iter()
@@ -2941,6 +2953,9 @@ fn set_store_properties(
             .map(|resolved| resolved.index)
         })
         .collect::<Result<Vec<_>>>()?;
+    if let Some(numeric) = &mut retained_columns {
+        numeric.materialize(&mut document, &indices)?;
+    }
     let links = store_link_enforcement(&settings_file, args.override_packages)?;
     let mut edit = StorePropertyEdit {
         settings_file: &settings_file,
@@ -2949,6 +2964,7 @@ fn set_store_properties(
         scope,
         links: &links,
         document,
+        retained_columns,
         references: references::ReferencedStores::default(),
         before: None,
         moved: HashSet::new(),
@@ -2975,6 +2991,7 @@ struct StorePropertyEdit<'a> {
     scope: PropertyScope,
     links: &'a LinkEnforcement,
     document: SettingsBytecode,
+    retained_columns: Option<RetainedPropertyColumns>,
     /// The stores the written references point into.
     references: references::ReferencedStores,
     /// The document and its script paths before the first assignment that
@@ -3123,7 +3140,10 @@ impl StorePropertyEdit<'_> {
         if self.store_edited {
             writes.insert(
                 self.settings_file.to_path_buf(),
-                encode_settings_bytecode(&self.document)?,
+                match &self.retained_columns {
+                    Some(numeric) => numeric.encode(&self.document)?,
+                    None => encode_settings_bytecode(&self.document)?,
+                },
             );
         }
         if !self.moved.is_empty() {

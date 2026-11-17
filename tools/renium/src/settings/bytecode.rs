@@ -21,6 +21,9 @@ use crate::snapshot::types::{NativeSettingsValue, ServiceState, SnapshotInstance
 use crate::system::LockRecover;
 use crate::system::files::write_bytes_if_changed;
 
+#[path = "property_edit.rs"]
+pub(crate) mod property_edit;
+
 const SETTINGS_BINARY_MAGIC: &[u8] = b"RBSSET\0";
 const SETTINGS_BINARY_MIN_VERSION: u8 = 10;
 pub(crate) const SETTINGS_BINARY_VERSION: u8 = 11;
@@ -555,6 +558,29 @@ fn decode_settings_bytecode_payload(
         instance_count,
     } = decode_settings_payload_header(reader, budget)?;
 
+    let specs = read_settings_property_groups(reader, &properties)?;
+    let scope = ValueScope {
+        strings: &strings,
+        instance_count,
+        budget,
+    };
+    let decoded_groups = specs
+        .par_iter()
+        .map(|(property_name, kind, value_count, body)| {
+            decode_property_group_body(body, property_name.as_str(), *kind, *value_count, scope)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    apply_decoded_property_groups(&mut instances, &specs, decoded_groups);
+
+    Ok(SettingsBytecode { version, instances })
+}
+
+type PropertyGroup<'a, 'b> = (&'a String, u8, usize, &'b [u8]);
+
+fn read_settings_property_groups<'a, 'b>(
+    reader: &mut BytecodeReader<'b>,
+    properties: &'a [String],
+) -> Result<Vec<PropertyGroup<'a, 'b>>> {
     let group_count = reader.read_collection_len("property group count")?;
     let mut specs = Vec::with_capacity(reader.capacity(group_count, 4));
     for _ in 0..group_count {
@@ -571,20 +597,7 @@ fn decode_settings_bytecode_payload(
         }
         specs.push((property_name, kind, value_count, body));
     }
-    let scope = ValueScope {
-        strings: &strings,
-        instance_count,
-        budget,
-    };
-    let decoded_groups = specs
-        .par_iter()
-        .map(|(property_name, kind, value_count, body)| {
-            decode_property_group_body(body, property_name.as_str(), *kind, *value_count, scope)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    apply_decoded_property_groups(&mut instances, &specs, decoded_groups);
-
-    Ok(SettingsBytecode { version, instances })
+    Ok(specs)
 }
 
 fn decode_settings_instance_range(
@@ -1184,7 +1197,14 @@ fn encode_settings_bytecode_payload_using_lookup(
     lookup: &SettingsBinaryInstanceLookup<'_>,
 ) -> Result<Vec<u8>> {
     let collected = collect_settings_bytecode_data(document, lookup)?;
+    encode_settings_bytecode_payload_collected(document, lookup, collected)
+}
 
+fn encode_settings_bytecode_payload_collected(
+    document: &SettingsBytecode,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    collected: SettingsBinaryCollection<'_>,
+) -> Result<Vec<u8>> {
     let strings = sorted_counted_strings(collected.string_counts);
     let string_ids = build_id_map(&strings);
     let classes = sorted_counted_strings(collected.class_counts);
@@ -1864,6 +1884,18 @@ fn decode_resolved_ref_group_payload(
     instance_count: usize,
     previous_target_index: &mut usize,
 ) -> Result<Value> {
+    let target_index = decode_resolved_ref_target(reader, instance_count, previous_target_index)?;
+    Ok(typed_object(
+        "Ref",
+        [("instanceIndex", json!(target_index + 1))],
+    ))
+}
+
+fn decode_resolved_ref_target(
+    reader: &mut BytecodeReader<'_>,
+    instance_count: usize,
+    previous_target_index: &mut usize,
+) -> Result<usize> {
     let raw_delta = reader
         .read_var_u64()
         .context("Missing resolved ref target index delta")?;
@@ -1881,10 +1913,7 @@ fn decode_resolved_ref_group_payload(
         bail!("Invalid resolved ref index {target_index}");
     }
     *previous_target_index = target_index;
-    Ok(typed_object(
-        "Ref",
-        [("instanceIndex", json!(target_index + 1))],
-    ))
+    Ok(target_index)
 }
 
 fn typed_object<const N: usize>(
