@@ -50,11 +50,11 @@ that last shared state:
   are all kept,
 - a real conflict is reported and waits for you to pick a side.
 
-### Studio runs from a terminal
+### An agent drives Studio itself
 
-The same `rbx` command starts playtests, runs Luau on the server or a client, sends
-input and takes screenshots. An AI coding agent can build a game and test it without
-someone clicking for it, through its terminal or through one MCP tool.
+Through one MCP tool an AI coding agent starts playtests, runs Luau on the server or
+a client, sends input and takes screenshots. It builds a game and tests it without
+someone clicking for it.
 
 ## Install
 
@@ -109,13 +109,12 @@ Renium is updated.
 
 ## Working with an AI agent
 
-- `rbx init` writes `RENIUM.md` and a folder of topic guides into the project. An
-  agent reads about 1,200 tokens and opens a guide only when a task needs it.
-- The agent runs `rbx` in its terminal, or as one MCP tool whose input is the
-  argument list, so it loads no tool schemas.
-- The installer registers that tool and adds a short note for Claude Code, Codex,
-  Cursor, Windsurf, Gemini CLI and OpenCode. It keeps a `.renium.bak` copy of each
-  file it changes.
+- Renium is one MCP tool whose input is an argument list, so an agent loads no tool
+  schemas.
+- The installer registers it for Claude Code, Codex, Cursor, Windsurf, Gemini CLI
+  and OpenCode. It keeps a `.renium.bak` copy of each file it changes.
+- A project carries `RENIUM.md` and a folder of topic guides. An agent reads about
+  1,200 tokens and opens a guide only when a task needs it.
 
 ## Help
 
