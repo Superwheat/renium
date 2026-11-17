@@ -50,6 +50,10 @@ use crate::settings::bytecode::{
     SettingsBytecode, SettingsBytecodeInstance, settings_reference_index, strict_reference_path,
 };
 
+#[cfg(test)]
+#[path = "geometry_tests.rs"]
+pub(super) mod geometry_tests;
+
 #[derive(Default)]
 pub(crate) struct BytecodeRbxBuildOptions<'a> {
     pub source_path: Option<&'a Path>,
@@ -937,6 +941,7 @@ fn matching_geometry(
 /// at the same path in the base when their sources agree, and otherwise the
 /// one value the base holds for that asset, if there is exactly one.
 pub(crate) fn fill_engine_geometry_from(dom: &mut RbxWeakDom, base: &RbxWeakDom) {
+    let mut base_paths = crate::rbx::model::RbxDomPaths::new(base);
     let mut by_path: HashMap<(Vec<String>, Vec<usize>), (GeometrySources, GeometryValues)> =
         HashMap::new();
     let mut by_identity: HashMap<
@@ -970,12 +975,13 @@ pub(crate) fn fill_engine_geometry_from(dom: &mut RbxWeakDom, base: &RbxWeakDom)
                     .or_insert(Some(value.clone()));
             }
         }
-        let path = crate::rbx::model::rbx_dom_instance_path_parts(base, instance.referent());
+        let path = base_paths.parts(instance.referent());
         by_path.insert(path, (sources, values));
     }
     if by_path.is_empty() {
         return;
     }
+    let mut paths = crate::rbx::model::RbxDomPaths::new(dom);
     let targets = dom
         .descendants()
         .filter(|instance| {
@@ -983,13 +989,12 @@ pub(crate) fn fill_engine_geometry_from(dom: &mut RbxWeakDom, base: &RbxWeakDom)
                 .iter()
                 .any(|name| !has_data(instance, name))
         })
-        .map(|instance| instance.referent())
+        .map(|instance| (instance.referent(), paths.parts(instance.referent())))
         .collect::<Vec<_>>();
     let mut filled: HashMap<rbx_dom_weak::Ustr, usize> = HashMap::new();
     let mut missing: HashMap<rbx_dom_weak::Ustr, usize> = HashMap::new();
     let mut logged = 0usize;
-    for referent in targets {
-        let path = crate::rbx::model::rbx_dom_instance_path_parts(dom, referent);
+    for (referent, path) in targets {
         let Some(instance) = dom.get_by_ref_mut(referent) else {
             continue;
         };

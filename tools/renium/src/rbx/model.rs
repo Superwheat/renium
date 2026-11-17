@@ -179,6 +179,67 @@ pub(crate) fn rbx_dom_instance_path_parts(
     dom: &RbxWeakDom,
     referent: RbxRef,
 ) -> (Vec<String>, Vec<usize>) {
+    rbx_dom_path_parts_with(dom, referent, |current, parent, name| {
+        dom.get_by_ref(parent).map_or(1, |parent| {
+            parent
+                .children()
+                .iter()
+                .take_while(|sibling_ref| **sibling_ref != current)
+                .filter(|sibling_ref| {
+                    dom.get_by_ref(**sibling_ref)
+                        .is_some_and(|sibling| sibling.name == name)
+                })
+                .count()
+                + 1
+        })
+    })
+}
+
+/// Sibling ordinals belong to one immutable hierarchy. Index a parent's
+/// children once when a path first needs them, without retaining full paths
+/// for instances the caller never asks about.
+pub(crate) struct RbxDomPaths<'a> {
+    dom: &'a RbxWeakDom,
+    ordinals: AHashMap<RbxRef, usize>,
+}
+
+impl<'a> RbxDomPaths<'a> {
+    pub(crate) fn new(dom: &'a RbxWeakDom) -> Self {
+        Self {
+            dom,
+            ordinals: AHashMap::new(),
+        }
+    }
+
+    pub(crate) fn parts(&mut self, referent: RbxRef) -> (Vec<String>, Vec<usize>) {
+        let dom = self.dom;
+        rbx_dom_path_parts_with(dom, referent, |current, parent, name| {
+            if let Some(ordinal) = self.ordinals.get(&current) {
+                return *ordinal;
+            }
+            let mut counts = AHashMap::<&str, usize>::new();
+            if let Some(parent) = dom.get_by_ref(parent) {
+                for child in parent.children() {
+                    if let Some(instance) = dom.get_by_ref(*child) {
+                        let count = counts.entry(&instance.name).or_default();
+                        *count += 1;
+                        self.ordinals.insert(*child, *count);
+                    }
+                }
+            }
+            self.ordinals
+                .get(&current)
+                .copied()
+                .unwrap_or_else(|| counts.get(name).copied().unwrap_or_default() + 1)
+        })
+    }
+}
+
+fn rbx_dom_path_parts_with(
+    dom: &RbxWeakDom,
+    referent: RbxRef,
+    mut sibling_ordinal: impl FnMut(RbxRef, RbxRef, &str) -> usize,
+) -> (Vec<String>, Vec<usize>) {
     let mut segments = Vec::new();
     let mut ordinals = Vec::new();
     let mut current = referent;
@@ -196,18 +257,7 @@ pub(crate) fn rbx_dom_instance_path_parts(
             let ordinal = if service_root {
                 1
             } else {
-                dom.get_by_ref(parent).map_or(1, |parent| {
-                    parent
-                        .children()
-                        .iter()
-                        .take_while(|sibling_ref| **sibling_ref != current)
-                        .filter(|sibling_ref| {
-                            dom.get_by_ref(**sibling_ref)
-                                .is_some_and(|sibling| sibling.name == instance.name)
-                        })
-                        .count()
-                        + 1
-                })
+                sibling_ordinal(current, parent, &instance.name)
             };
             ordinals.push(ordinal);
         }

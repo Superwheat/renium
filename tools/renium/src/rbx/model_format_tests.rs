@@ -6,6 +6,53 @@ use rbx_dom_weak::types::{Ref, Variant};
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 use serde_json::json;
 
+#[test]
+fn indexed_paths_match_sibling_scans_for_generated_hierarchies() {
+    use super::model::RbxDomPaths;
+    use crate::tests::support::{SimRng, run_seeds};
+    run_seeds(128, |seed, _| {
+        let mut rng = SimRng(seed);
+        let mut dom = WeakDom::new(
+            InstanceBuilder::new(["DataModel", "Workspace", "Folder"][rng.below(3)])
+                .with_name("Root"),
+        );
+        let mut ids = vec![dom.root_ref()];
+        for index in 0..192 {
+            let parent = if index % 3 == 0 {
+                0
+            } else {
+                rng.below(ids.len())
+            };
+            let class = ["Folder", "Part", "Workspace", "ServerStorage"][rng.below(4)];
+            let name = ["", "a", "a", "a.b", "A", "世界"][rng.below(6)];
+            ids.push(dom.insert(ids[parent], InstanceBuilder::new(class).with_name(name)));
+        }
+        for round in 0..2 {
+            rng.shuffle(&mut ids);
+            let mut paths = RbxDomPaths::new(&dom);
+            for id in &ids {
+                let expected = rbx_dom_instance_path_parts(&dom, *id);
+                if paths.parts(*id) != expected || paths.parts(*id) != expected {
+                    return Err(format!("path differs in round {round}"));
+                }
+            }
+            drop(paths);
+            // An index borrows the hierarchy, so edits require a new index.
+            for id in ids
+                .iter()
+                .filter(|id| **id != dom.root_ref())
+                .copied()
+                .take(8)
+                .collect::<Vec<_>>()
+            {
+                dom.get_by_ref_mut(id).unwrap().name = "changed".into();
+                dom.transfer_within(id, dom.root_ref());
+            }
+        }
+        Ok(())
+    });
+}
+
 fn external_target(dom: &WeakDom) -> Ref {
     let reference = dom
         .descendants()
