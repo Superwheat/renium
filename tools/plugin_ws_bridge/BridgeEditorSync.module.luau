@@ -9304,7 +9304,15 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			or not bit32.btest(params.nativeState, 8) then
 			error("Native insertion did not return a complete creation receipt")
 		end
+		local timings = {}
+		local phaseStarted = os.clock()
+		local function finishPhase(name: string)
+			local now = os.clock()
+			timings[name] = (now - phaseStarted) * 1000
+			phaseStarted = now
+		end
 		local additions = ctx.finishNativeImportObservations(transaction.transactionId, native.createdById)
+		finishPhase("observations")
 		transaction.assertOwnership()
 		native.readerFinished = true
 		local undo = transaction.nativeUndo
@@ -9324,6 +9332,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			error(`Native insertion failed: {tostring(params.nativeError or params.nativeStatus)}`)
 		end
 		transaction.historyRecording = beginHistoryRecording("Sync properties from filesystem")
+		finishPhase("rootsAndHistory")
 		for _, group in ipairs(undo.prepared) do
 			local byName, indices, ordered = {}, {}, {}
 			local incomingSet = {}
@@ -9362,17 +9371,20 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			group.incoming = ordered
 			prepareImportedIdentities(group)
 		end
+		finishPhase("identityValidation")
 		transaction.assertOwnership()
 		rememberImportedIdentities(undo.prepared, ctx, undo.packageAliases)
+		finishPhase("identityRegistration")
 		runWithStudioChangeSuppression(ctx, function()
 			ReferenceOverlay.apply(native.referenceOverlay, undo.replacements, ctx)
 		end)
+		finishPhase("references")
 		transaction.state = "prepared"
 		transaction.nativeStats = {
 			requests = 1, instanceCreated = native.receivedCreated, lastMs = (os.clock() - native.started) * 1000,
 		}
 		return { ok = true, requests = 1, instanceCreated = native.receivedCreated,
-			binaryBytes = session.totalBytes, nativeInserted = true }
+			binaryBytes = session.totalBytes, nativeInserted = true, nativeCompleteTimings = timings }
 	end
 
 	function api.finishBinaryImport(params: { [string]: any }): { [string]: any }
