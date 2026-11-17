@@ -6272,3 +6272,55 @@ fn a_script_kept_against_its_removal_does_not_take_the_text_of_the_one_that_reus
         Some("print('new')")
     );
 }
+
+/// Two store files found equivalent are remembered by their bytes, and two
+/// that differ are compared again every time.
+#[test]
+fn equivalent_store_files_are_remembered_by_their_bytes() {
+    let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+    let store = |id: &str, transparency: f64| {
+        let mut part = SettingsBytecodeInstance::new(
+            id.to_string(),
+            "Part".to_string(),
+            "Part".to_string(),
+            Some(0),
+        );
+        part.properties
+            .insert("Transparency".to_string(), json!(transparency));
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "root".to_string(),
+                    "Workspace".to_string(),
+                    "Workspace".to_string(),
+                    None,
+                ),
+                part,
+            ],
+        };
+        encode_settings_bytecode(&document).unwrap()
+    };
+    let digest = |bytes: &[u8]| <[u8; 32]>::from(Sha256::digest(bytes));
+    let (files, studio, changed) = (store("a", 0.5), store("b", 0.5), store("b", 0.25));
+    assert!(files != studio);
+    let equivalent = |left: &[u8], right: &[u8]| {
+        snapshot_entry_equivalent(
+            &path,
+            Some(&SnapshotEntry::File(left.to_vec())),
+            Some(&SnapshotEntry::File(right.to_vec())),
+            None,
+        )
+        .unwrap()
+    };
+    let remembered = |left: &[u8], right: &[u8]| {
+        super::verify::equivalent_stores()
+            .lock_recover()
+            .contains(&(digest(left), digest(right)))
+    };
+    assert!(equivalent(&files, &studio));
+    assert!(remembered(&files, &studio));
+    assert!(equivalent(&files, &studio));
+    assert!(!equivalent(&files, &changed));
+    assert!(!remembered(&files, &changed));
+}

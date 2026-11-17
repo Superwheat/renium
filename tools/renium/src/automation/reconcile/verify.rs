@@ -800,6 +800,18 @@ pub(crate) fn snapshot_entry_equivalent(
         .and_then(|name| name.to_str())
         .is_some_and(is_service_settings_file_name)
     {
+        // Whether two store files are equivalent depends on their bytes
+        // alone, so a pair found equivalent before is not decoded again.
+        let pair = match (left, right) {
+            (SnapshotEntry::File(left), SnapshotEntry::File(right)) => Some(rayon::join(
+                || <[u8; 32]>::from(Sha256::digest(left)),
+                || <[u8; 32]>::from(Sha256::digest(right)),
+            )),
+            _ => None,
+        };
+        if pair.is_some_and(|pair| equivalent_stores().lock_recover().contains(&pair)) {
+            return Ok(true);
+        }
         let (left, right) = rayon::join(
             || settings_document(Some(left)),
             || settings_document(Some(right)),
@@ -866,6 +878,13 @@ pub(crate) fn snapshot_entry_equivalent(
             ),
         );
         if let Some(equivalent) = equivalent {
+            if equivalent && let Some(pair) = pair {
+                let mut pairs = equivalent_stores().lock_recover();
+                if pairs.len() >= 4_096 {
+                    pairs.clear();
+                }
+                pairs.insert(pair);
+            }
             return Ok(equivalent);
         }
         {
@@ -876,6 +895,16 @@ pub(crate) fn snapshot_entry_equivalent(
         }
     }
     Ok(false)
+}
+
+/// The digests of two store files, left then right.
+type StorePair = ([u8; 32], [u8; 32]);
+
+/// The pairs of store files a comparison found equivalent, by the digests of
+/// their bytes.
+pub(super) fn equivalent_stores() -> &'static Mutex<HashSet<StorePair>> {
+    static PAIRS: std::sync::OnceLock<Mutex<HashSet<StorePair>>> = std::sync::OnceLock::new();
+    PAIRS.get_or_init(Default::default)
 }
 
 pub(crate) fn retention_failure(
