@@ -122,6 +122,7 @@ fn fallback_serialization_yields_and_rejects_interleaved_edits() -> mlua::Result
         getState = function() return state end
         refreshMatchedSettingsIds = function() return false end
         ChunkingModule = {jsonEncodeTimed = function(payload) return payload, 0 end}
+        ConnectionModule = {profileStep = function() end, profileWaitObserver = function() return nil end}
     "#).exec()?;
     let parallel: mlua::Table = lua
         .load(include_str!(
