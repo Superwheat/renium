@@ -468,8 +468,10 @@ fn positional_identities_match_exactly(
     reference: &SettingsBytecode,
     observed: &SettingsBytecode,
 ) -> bool {
-    let reference_ids = persistent_identity_index(reference);
-    let observed_ids = persistent_identity_index(observed);
+    let (reference_ids, observed_ids) = rayon::join(
+        || persistent_identity_index(reference),
+        || persistent_identity_index(observed),
+    );
     let camera = workspace_current_camera_index(observed);
     let sole_root = reference
         .instances
@@ -479,7 +481,7 @@ fn positional_identities_match_exactly(
         == 1;
     observed
         .instances
-        .iter()
+        .par_iter()
         .enumerate()
         .all(|(index, instance)| {
             if camera == Some(index) {
@@ -4300,10 +4302,10 @@ fn document_adds_enum_types(reference: &SettingsBytecode, observed: &SettingsByt
         .instances
         .iter()
         .map(|instance| (instance.settings_id.as_str(), instance))
-        .collect::<HashMap<_, _>>();
+        .collect::<AHashMap<_, _>>();
     reference
         .instances
-        .iter()
+        .par_iter()
         .enumerate()
         .any(|(index, reference_instance)| {
             observed_by_id
@@ -4321,7 +4323,7 @@ fn document_adds_enum_types(reference: &SettingsBytecode, observed: &SettingsByt
 fn positions_add_enum_types(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
     reference
         .instances
-        .iter()
+        .par_iter()
         .zip(&observed.instances)
         .any(|(reference, observed)| instance_adds_enum_types(reference, observed))
 }
