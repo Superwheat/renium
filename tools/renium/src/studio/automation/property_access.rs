@@ -263,11 +263,7 @@ pub(crate) fn write_saved_field(
     property: &str,
     value: &Value,
 ) -> Result<bool> {
-    let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
-    anyhow::ensure!(
-        info.runtime_id == expected_runtime,
-        "Studio changed before the saved field write; retry the push"
-    );
+    let info = bridge.cached_bridge_info_for_runtime(BridgeTarget::Edit, expected_runtime)?;
     let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, expected_runtime)?;
     let title = crate::studio::native::serializer::target_name(pid, &info.place_name)?;
     let mut native = crate::studio::native::serializer::prepare_property(

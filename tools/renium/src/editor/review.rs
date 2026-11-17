@@ -1186,6 +1186,22 @@ pub(crate) fn request_editor_push_review_payload(
     )
 }
 
+pub(crate) fn snapshot_replacement_runtime<'a>(
+    previous: Option<&str>,
+    receipt: &'a Value,
+) -> Result<&'a str> {
+    receipt["reopenedRuntimeId"]
+        .as_str()
+        .filter(|id| {
+            !id.is_empty()
+                && receipt["ok"] == true
+                && previous.is_some()
+                && previous == receipt["previousRuntimeId"].as_str()
+                && Some(*id) != previous
+        })
+        .context("Protected snapshot did not identify its replacement Studio runtime")
+}
+
 pub(crate) fn request_protected_write_review(
     bridge: &BridgeServer,
     rows: &[Value],

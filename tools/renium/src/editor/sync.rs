@@ -3322,14 +3322,34 @@ fn apply_saved_field_differences(
     args: &PushEditorChangesArgs,
     bridge: &BridgeServer,
     summary: &mut Map<String, Value>,
+    offline_receipt: Option<&Value>,
 ) -> Result<()> {
     let Some(saved) = &args.saved_fields else {
         return Ok(());
     };
-    let runtime = bridge
-        .cached_bridge_info_for_target(BridgeTarget::Edit)?
-        .runtime_id;
-    saved.validate(review_project_root(args), &runtime)?;
+    let (runtime, _replacement_gate) = match offline_receipt {
+        Some(receipt) => {
+            saved.validate(
+                review_project_root(args),
+                receipt["previousRuntimeId"].as_str().unwrap_or_default(),
+            )?;
+            let runtime =
+                super::review::snapshot_replacement_runtime(Some(&saved.runtime), receipt)?;
+            let gate = bridge.try_acquire_runtime_gate(runtime, "push").context(
+                "The reopened place is busy. Its saved fields are still pending; retry the push.",
+            )?;
+            anyhow::ensure!(
+                bridge.edit_runtime(Some(runtime)).is_some(),
+                "The reopened place disconnected. Its saved fields are still pending; reopen the place and retry the push."
+            );
+            (runtime, Some(gate))
+        }
+        None => {
+            let current = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
+            saved.validate(review_project_root(args), &current.runtime_id)?;
+            (saved.runtime.as_str(), None)
+        }
+    };
     let mut applied = 0u64;
     let mut unsupported = Vec::new();
     for difference in &saved.fields {
@@ -3343,7 +3363,7 @@ fn apply_saved_field_differences(
         }
         match crate::studio::automation::property_access::write_saved_field(
             bridge,
-            &saved.runtime,
+            runtime,
             &difference.path_segments,
             &[],
             &difference.property,
@@ -3779,6 +3799,10 @@ fn push_with_root_availability(
         save_editor_history_entries(bridge, &args.project.project_root, &changes)?
     };
     let phase_started = Instant::now();
+    if let Some(saved) = &args.saved_fields {
+        let current = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
+        saved.validate(review_project_root(&args), &current.runtime_id)?;
+    }
     if let Some(validate_project) = validate_project {
         validate_project()?;
     }
@@ -3867,6 +3891,7 @@ fn push_with_root_availability(
         log_timing("native editor settings apply", phase_started);
         let phase_started = Instant::now();
         let mut commit_status = None;
+        let mut offline_receipt = None;
         if protected.apply_offline {
             let transaction = transaction
                 .as_mut()
@@ -3876,7 +3901,7 @@ fn push_with_root_availability(
                 commit_status = Some(transaction.commit()?);
                 Ok(())
             })?;
-            summary.insert("protectedOfflineApply".to_string(), result);
+            offline_receipt = Some(result);
             summary.insert(
                 "protectedApplied".to_string(),
                 json!(protected.writes.len() as u64),
@@ -3950,7 +3975,10 @@ fn push_with_root_availability(
         if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
             bail!("Studio rejected or failed one or more editor push changes");
         }
-        apply_saved_field_differences(&args, bridge, &mut summary)?;
+        apply_saved_field_differences(&args, bridge, &mut summary, offline_receipt.as_ref())?;
+        if let Some(receipt) = offline_receipt {
+            summary.insert("protectedOfflineApply".into(), receipt);
+        }
         warn_unsupported_properties(&summary);
         Ok(summary)
     })();
@@ -7762,12 +7790,12 @@ mod saved_field_review_tests {
         assert!(calls_before > 0);
         let mut args_b = args_for(&b);
         let mut summary = Map::new();
-        apply_saved_field_differences(&args_b, &bridge, &mut summary).unwrap();
+        apply_saved_field_differences(&args_b, &bridge, &mut summary, None).unwrap();
         assert!(summary.is_empty());
         assert!(batch.validate(&a, "later-runtime").is_err());
         args_b.saved_fields = Some(batch);
         assert!(
-            apply_saved_field_differences(&args_b, &bridge, &mut summary)
+            apply_saved_field_differences(&args_b, &bridge, &mut summary, None)
                 .unwrap_err()
                 .to_string()
                 .contains("different project or Studio runtime")
@@ -7795,6 +7823,58 @@ mod saved_field_review_tests {
             );
         }
         require_slow_import_capability(&crate::automation::capabilities().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn offline_saved_fields_require_the_originating_place_and_its_connected_successor() {
+        let root = project_with_threshold_zero("saved-fields-reopen");
+        let (bridge, calls, plugin) = reviewing_bridge("skip");
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: "src".into(),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.saved_fields = Some(crate::editor::types::PushSavedFields {
+            project: root.clone(),
+            runtime: "previous".into(),
+            fields: vec![crate::settings::equivalence::SavedFieldDifference {
+                path_segments: vec!["A".into()],
+                property: "P".into(),
+                class_name: "Folder".into(),
+                ambiguous: true,
+                value: json!(0),
+            }],
+        });
+        let receipt = json!({"ok":true,"previousRuntimeId":"previous","reopenedRuntimeId":"saved-field-review"});
+        let mut summary = Map::new();
+        let busy = bridge
+            .try_acquire_runtime_gate("saved-field-review", "test")
+            .unwrap();
+        assert!(
+            apply_saved_field_differences(&args, &bridge, &mut summary, Some(&receipt))
+                .unwrap_err()
+                .to_string()
+                .contains("busy")
+        );
+        drop(busy);
+        apply_saved_field_differences(&args, &bridge, &mut summary, Some(&receipt)).unwrap();
+        assert!(summary.contains_key("unsupportedProperties"));
+        for (key, wrong) in [
+            ("previousRuntimeId", "another-project-runtime"),
+            ("reopenedRuntimeId", "disconnected"),
+        ] {
+            let mut bad = receipt.clone();
+            bad[key] = json!(wrong);
+            assert!(
+                apply_saved_field_differences(&args, &bridge, &mut Map::new(), Some(&bad)).is_err()
+            );
+        }
+        assert!(calls.lock().unwrap().is_empty());
+        drop(bridge);
+        plugin.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

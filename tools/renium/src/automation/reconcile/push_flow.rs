@@ -946,20 +946,12 @@ pub(crate) fn reopened_push_context(
     let Some(reopened) = summary.get("protectedOfflineApply") else {
         return Ok(None);
     };
-    let previous = reopened["previousRuntimeId"].as_str();
-    let runtime = reopened["reopenedRuntimeId"]
-        .as_str()
-        .filter(|value| !value.is_empty());
-    anyhow::ensure!(
-        reopened["ok"] == true
-            && previous.is_some()
-            && previous == context.runtime_id.as_deref()
-            && runtime.is_some()
-            && runtime != previous,
-        "Protected snapshot did not identify its replacement Studio runtime"
-    );
+    let runtime = crate::editor::review::snapshot_replacement_runtime(
+        context.runtime_id.as_deref(),
+        reopened,
+    )?;
     let mut replacement = context.clone();
-    replacement.runtime_id = runtime.map(str::to_string);
+    replacement.runtime_id = Some(runtime.to_owned());
     Ok(Some(replacement))
 }
 
