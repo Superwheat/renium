@@ -1,13 +1,62 @@
 # Renium
 
-Renium keeps a Roblox Studio place and a folder on your computer in sync, in both
-directions.
+Two-way sync between Roblox Studio and a project folder, made for large places and
+for working with AI coding agents.
 
-- **The whole place is in the folder**, not only the scripts. The map, UI, lighting
-  and settings get Git history like code.
-- **Studio runs from a terminal.** The same `rbx` command runs playtests, Luau, input
-  and screenshots, so an AI coding agent can build and test a game without someone
-  clicking for it.
+## Why Renium
+
+### It syncs what a plugin cannot
+
+Rojo, Argon and the Studio MCP servers reach Studio through a plugin, and a plugin
+may only read and set what scripts are allowed to. The Terrain voxel grid as Studio
+saves it, `MeshPart.MeshId` and every property scripts are blocked from stay out of
+their reach.
+
+Renium adds a native helper beside its plugin. It reads the place the way Studio
+saves it and writes it back the same way, so a push rebuilds the place itself and
+not the part of it a script can describe.
+
+### The project is about the size of the place
+
+Scripts are plain `.luau` files. Everything else is one compressed binary store per
+service, such as `instances/Workspace.renium`: Studio's own saved data, packed in
+columns.
+
+| | Size |
+|---|---|
+| A place of 202,000 instances as an `.rbxl` | 37 MB |
+| The same place as a Renium project | 48 MB (44 MB of stores, 4 MB of scripts) |
+
+The stores are 18 files, one per service, instead of a file or a folder for each
+instance. `rbx vci` makes Git show and merge a store as text.
+
+### It stays fast on a big place
+
+The same 202,000-instance place, on a desktop PC with Windows:
+
+| | Time |
+|---|---|
+| Push the whole project into an empty place, verified | 11 s |
+| Push again with nothing changed | 0.4 s |
+| Pull the whole place with nothing changed | 5 s |
+| Pull after one property changed in Studio | 4.5 s |
+
+Times are from version 0.6.5.
+
+### Both sides can change
+
+If files and Studio both changed since they last agreed, Renium compares each with
+that last shared state:
+
+- edits to different instances, different properties or different lines of a script
+  are all kept,
+- a real conflict is reported and waits for you to pick a side.
+
+### Studio runs from a terminal
+
+The same `rbx` command starts playtests, runs Luau on the server or a client, sends
+input and takes screenshots. An AI coding agent can build a game and test it without
+someone clicking for it, through its terminal or through one MCP tool.
 
 ## Install
 
@@ -32,13 +81,8 @@ should get the extension. Restart the editor and Studio afterward.
 
 - **Scripts** are plain `.luau` files under `src/`.
 - **Everything else** in a service, from parts and UI to Terrain and the scripts' own
-  properties, goes into a store at `instances/<Service>.renium`. A store is built
-  from what Studio itself saves, so nothing is reduced to what a model file can
-  describe.
+  properties, goes into a store at `instances/<Service>.renium`.
 - **Both directions.** Saved files go to Studio, and Studio edits come back as files.
-- **Conflicts.** If both sides changed while Live Sync was off, Renium compares each
-  with the last state they shared. Separate edits merge, and a real conflict waits
-  for you to choose.
 - **Git.** The stores are compressed binary, so Rojo, Argon and editors without
   Renium cannot read them. Run `rbx vci` once and Git shows and merges them as text.
 - **Rojo.** A Rojo project converts with `rbx init`, and `rbx ir --preview` shows the
@@ -46,9 +90,7 @@ should get the extension. Restart the editor and Studio afterward.
 
 ## The native helper
 
-A Studio plugin cannot set some saved data: the voxel grid Terrain is saved as,
-`MeshPart.MeshId`, and the engine properties scripts are blocked from. Renium uses a
-native helper for those. The helper:
+The helper does what a Studio plugin is not allowed to. It:
 
 - writes Terrain from the files into Studio,
 - reads and writes protected properties,
