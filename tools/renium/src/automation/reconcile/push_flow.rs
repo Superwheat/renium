@@ -231,7 +231,7 @@ pub(crate) fn push_project(
                 .as_ref()
                 .is_none_or(|loaded| loaded.project.adapters.is_empty())
         {
-            capture_studio_services_in_memory(context, bridge, services, &stage)
+            capture_studio_services_in_memory(context, bridge, services, &stage, false)
                 .map(|studio| (stage, studio))
         } else {
             capture_studio_services_with_stage(context, bridge, services, false, stage)
@@ -425,17 +425,14 @@ pub(crate) fn push_project(
     for (path, change) in prepared_settings {
         let service = settings_service_name(&path, &change.current, &change.previous)?;
         let desired = Arc::new(change.current);
-        let native = plan.initial_native_services.contains(&service);
         prepared_documents.insert(service, Arc::clone(&desired));
-        if !native {
-            prepared_verification.insert(
-                path,
-                PreparedPushVerification {
-                    previous: change.previous,
-                    desired,
-                },
-            );
-        }
+        prepared_verification.insert(
+            path,
+            PreparedPushVerification {
+                previous: change.previous,
+                desired,
+            },
+        );
     }
     let mut pushed = push_staged_project(
         context,
@@ -564,18 +561,20 @@ pub(crate) fn push_project(
         return Ok(pushed.summary);
     }
     let verification_services = if settle_native_import {
+        log_native_settlement_fallbacks(services, &verified_services);
         services.to_vec()
     } else {
         services_for_snapshot_paths(context, &verification_paths)
     };
     let phase = Instant::now();
-    let (readback_stage, mut readback) = capture_push_readback(
+    let (mut readback_stage, mut readback, settle_verified_capture) = capture_push_readback(
         context,
         bridge,
         &verification_services,
         &src_dir,
         requires_stage,
         import_readback,
+        link_enforcement.is_none(),
     )?;
     if let Some(enforcement) = &link_enforcement {
         super::staging::pack_read_only_link_scripts_with(
@@ -593,13 +592,23 @@ pub(crate) fn push_project(
     prepared_verification.retain(|path, _| {
         entries_equivalent(path, project.entries.get(path), current.entries.get(path))
     });
-    let (mismatches, details) = snapshot_intended_delta_mismatches(
-        &studio,
-        &current,
-        &readback,
-        &verification_paths,
-        &mut prepared_verification,
-    )?;
+    let (mismatches, details) = if settle_verified_capture {
+        verify_and_settle_native_import(
+            &studio,
+            &current,
+            &mut readback,
+            &verification_paths,
+            &mut prepared_verification,
+        )?
+    } else {
+        snapshot_intended_delta_mismatches(
+            &studio,
+            &current,
+            &readback,
+            &verification_paths,
+            &mut prepared_verification,
+        )?
+    };
     log_reconcile_timing("full push verification", phase);
     if !mismatches.is_empty() {
         return Err(retention_failure(
@@ -607,6 +616,11 @@ pub(crate) fn push_project(
             &mismatches,
             details.as_deref(),
         ));
+    }
+    if settle_verified_capture {
+        let phase = Instant::now();
+        stage_verified_import_readback(&mut readback_stage, &readback)?;
+        log_reconcile_timing("full push stage verified readback", phase);
     }
     let mut expected_after_push = project;
     expected_after_push.entries.extend(pushed.generated.entries);
@@ -641,6 +655,22 @@ pub(crate) fn push_project(
     Ok(pushed.summary)
 }
 
+fn log_native_settlement_fallbacks(services: &[String], verified: &HashSet<&str>) {
+    for service in services {
+        let reason = if verified.contains(service.as_str()) {
+            "loader receipt proves creation and applied fields, but does not attest every accepted saved value or generated identity"
+        } else {
+            "service has no complete native loader verification receipt"
+        };
+        log_global(
+            5,
+            format_args!(
+                "[renium] native import settlement: service={service} full_readback=true reason={reason}"
+            ),
+        );
+    }
+}
+
 fn capture_push_readback(
     context: &BoundContext,
     bridge: &BridgeServer,
@@ -648,7 +678,8 @@ fn capture_push_readback(
     src_dir: &Path,
     requires_stage: bool,
     import_readback: Option<ExportProjectStage>,
-) -> Result<(ExportProjectStage, ProjectSnapshot)> {
+    allow_memory_settle: bool,
+) -> Result<(ExportProjectStage, ProjectSnapshot, bool)> {
     let settle_import = import_readback.is_some();
     let root = Path::new(&context.root);
     let stage = if let Some(stage) = import_readback {
@@ -658,18 +689,35 @@ fn capture_push_readback(
     } else {
         ExportProjectStage::create_for_comparison(root, src_dir, services)?
     };
-    if !settle_import
+    if (!settle_import || allow_memory_settle)
         && !requires_stage
         && stage
             .loaded
             .as_ref()
             .is_none_or(|loaded| loaded.project.adapters.is_empty())
     {
-        let snapshot = capture_studio_services_in_memory(context, bridge, services, &stage)?;
-        Ok((stage, snapshot))
+        let snapshot =
+            capture_studio_services_in_memory(context, bridge, services, &stage, settle_import)?;
+        Ok((stage, snapshot, settle_import))
     } else {
-        capture_studio_services_with_stage(context, bridge, services, settle_import, stage)
+        let (stage, snapshot) =
+            capture_studio_services_with_stage(context, bridge, services, settle_import, stage)?;
+        Ok((stage, snapshot, false))
     }
+}
+
+fn stage_verified_import_readback(
+    stage: &mut ExportProjectStage,
+    readback: &ProjectSnapshot,
+) -> Result<()> {
+    let previous = capture_snapshot(&stage.project_root, stage.publish_paths())?;
+    let paths = project_replacement_paths(readback, &previous);
+    apply_snapshot_paths(&stage.project_root, &paths, readback)?;
+    // Capture already built the map from its hierarchy. Rebuilding it from
+    // stores here would decode the whole place again.
+    stage.finish_projection(false)?;
+    stage.mark_settings_aligned();
+    Ok(())
 }
 
 /// Writes a verified import's state to the files and refreshes its undo
@@ -751,14 +799,21 @@ fn native_import_readback_publishes_once_and_protects_newer_files() -> Result<()
         fs::write(stage.project_root.join(&path), &accepted)?;
         Ok(stage)
     };
-    let stage = prepare()?;
+    let mut stage = prepare()?;
+    crate::project::sourcemap::generate_project_sourcemap(&stage.project_root)?;
     let paths = stage.publish_paths().to_vec();
+    let checked = capture_snapshot(&stage.project_root, &paths)?;
+    stage_verified_import_readback(&mut stage, &checked)?;
+    let map = fs::read(stage.project_root.join("sourcemap.json"))?;
+    assert!(!map.is_empty(), "The verified capture must publish its map");
     let after = publish_native_import_readback(stage, &root, &paths)?;
+    assert_eq!(fs::read(root.join("sourcemap.json"))?, map);
     assert!(after.entries[&path] == SnapshotEntry::File(accepted.clone()));
     let modified = fs::metadata(root.join(&path))?.modified()?;
     assert!(publish_native_import_readback(prepare()?, &root, &paths)? == after);
     assert_eq!(fs::metadata(root.join(&path))?.modified()?, modified);
-    let stage = prepare()?;
+    let mut stage = prepare()?;
+    stage_verified_import_readback(&mut stage, &checked)?;
     fs::write(root.join(&path), &original)?;
     assert!(publish_native_import_readback(stage, &root, &paths).is_err());
     assert_eq!(fs::read(root.join(path))?, original);
@@ -884,6 +939,7 @@ pub(crate) fn capture_studio_services_in_memory(
     bridge: &BridgeServer,
     services: &[String],
     stage: &ExportProjectStage,
+    preserve_saved_settings: bool,
 ) -> Result<ProjectSnapshot> {
     pin_edit_runtime(context, bridge)?;
     let mut args = automation_pull_args(context, &json!({"services": services}))?;
@@ -892,9 +948,31 @@ pub(crate) fn capture_studio_services_in_memory(
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Main)?;
     let src_root = stage.import_project_root.join(&stage.import_src_dir);
     let layout_src_root = stage.layout_src_root(Path::new(&context.root));
+    let sourcemap = preserve_saved_settings.then(|| {
+        crate::snapshot::import::SourcemapWriter::start(stage.project_root.clone(), false, None)
+    });
     let projections = capture_exported_services(&args, bridge, &info, |service, state| {
-        service_projection_in_memory(&state, &src_root, layout_src_root.as_deref(), service)
+        let preserved = if preserve_saved_settings {
+            crate::snapshot::import::state_with_preserved_material_service_settings(
+                service,
+                &state,
+                &service_settings_path(&src_root.join(service)),
+            )?
+        } else {
+            None
+        };
+        let state = preserved.as_ref().unwrap_or(&state);
+        let projection =
+            service_projection_in_memory(state, &src_root, layout_src_root.as_deref(), service)?;
+        if let Some(writer) = &sourcemap {
+            stage_captured_service_map(stage, service, state, &projection, writer)?;
+        }
+        Ok(projection)
     })?;
+    if let Some(writer) = sourcemap {
+        writer.request_finish();
+        writer.join()?;
+    }
     let mut entries = BTreeMap::new();
     for projection in projections {
         for (path, bytes) in projection {
@@ -909,6 +987,90 @@ pub(crate) fn capture_studio_services_in_memory(
         }
     }
     Ok(ProjectSnapshot { entries })
+}
+
+fn stage_captured_service_map(
+    stage: &ExportProjectStage,
+    service: &str,
+    state: &crate::snapshot::types::ServiceState,
+    projection: &BTreeMap<PathBuf, Option<Vec<u8>>>,
+    writer: &crate::snapshot::import::SourcemapWriter,
+) -> Result<()> {
+    // The existing map builder resolves script paths against files. Stage only
+    // the captured sources here; verified stores are published after checking.
+    for (path, bytes) in projection {
+        if let Some(bytes) = bytes.as_ref().filter(|_| is_source_path(path)) {
+            fs::create_dir_all(path.parent().context("Captured source has no parent")?)?;
+            fs::write(path, bytes)?;
+        }
+    }
+    let service_dir = stage
+        .import_project_root
+        .join(&stage.import_src_dir)
+        .join(service);
+    let node = crate::project::sourcemap::build_service_sourcemap_from_state(
+        state,
+        &stage.project_root,
+        &service_dir,
+    );
+    writer
+        .sender()
+        .send(crate::snapshot::import::SourcemapWriterMessage::Service(
+            service.to_string(),
+            node,
+        ))?;
+    Ok(())
+}
+
+#[test]
+fn captured_import_map_includes_new_sources_without_decoding_stores() -> Result<()> {
+    use crate::snapshot::import::{SourcemapWriter, build_service_state_from_instances};
+    use crate::snapshot::types::SnapshotInstance;
+    let root = crate::tests::support::temp_dir("captured-import-map");
+    let _cleanup = OnDrop::new(|| {
+        let _ = fs::remove_dir_all(&root);
+    });
+    let service = "ReplicatedStorage";
+    let stage = ExportProjectStage::create(&root, Path::new("src"), &[service.into()])?;
+    let state = build_service_state_from_instances(
+        service,
+        None,
+        vec![
+            SnapshotInstance {
+                name: service.into(),
+                class_name: service.into(),
+                instance_index: Some(1),
+                ..Default::default()
+            },
+            SnapshotInstance {
+                name: "Module".into(),
+                class_name: "ModuleScript".into(),
+                instance_index: Some(2),
+                parent_index: Some(1),
+                properties: Map::from_iter([("Source".into(), json!("return 7"))]),
+                ..Default::default()
+            },
+        ],
+        HashMap::new(),
+        true,
+    )?;
+    let source = stage.import_project_root.join(&stage.import_src_dir);
+    let projection = service_projection_in_memory(&state, &source, None, service)?;
+    let writer = SourcemapWriter::start(stage.project_root.clone(), false, None);
+    stage_captured_service_map(&stage, service, &state, &projection, &writer)?;
+    writer.request_finish();
+    writer.join()?;
+    let map =
+        crate::project::sourcemap::load_existing_sourcemap_root(&stage.project_root)?.unwrap();
+    assert_eq!(
+        map.children[0].children[0].file_paths,
+        ["src/ReplicatedStorage/Module.luau"]
+    );
+    assert!(
+        !service_settings_path(&source.join(service)).exists(),
+        "The map must not decode a stored service"
+    );
+    Ok(())
 }
 
 pub(crate) fn services_for_snapshot_paths(

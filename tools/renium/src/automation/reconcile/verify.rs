@@ -31,11 +31,63 @@ pub(crate) fn snapshot_intended_delta_mismatches(
     paths: &HashSet<PathBuf>,
     prepared: &mut HashMap<PathBuf, PreparedPushVerification>,
 ) -> Result<(Vec<PathBuf>, Option<String>)> {
-    let jobs = paths
+    let result = verify_snapshot_delta(before, desired, observed, paths, prepared, false)?;
+    Ok((result.mismatches, result.detail))
+}
+
+/// Keep the exact documents that verification aligned. Native import receipts
+/// supply store identities, but do not contain regenerated saved values; those
+/// still come from Studio's export. Publication must use this checked capture.
+pub(crate) fn verify_and_settle_native_import(
+    before: &ProjectSnapshot,
+    desired: &ProjectSnapshot,
+    observed: &mut ProjectSnapshot,
+    paths: &HashSet<PathBuf>,
+    prepared: &mut HashMap<PathBuf, PreparedPushVerification>,
+) -> Result<(Vec<PathBuf>, Option<String>)> {
+    let result = verify_snapshot_delta(before, desired, observed, paths, prepared, true)?;
+    if result.mismatches.is_empty() {
+        observed.entries.extend(result.accepted.entries);
+    }
+    Ok((result.mismatches, result.detail))
+}
+
+struct SnapshotVerification {
+    mismatches: Vec<PathBuf>,
+    detail: Option<String>,
+    accepted: ProjectSnapshot,
+}
+
+#[derive(Default)]
+struct SettingsVerification {
+    mismatch: Option<String>,
+    accepted: Option<Vec<u8>>,
+}
+
+fn verify_snapshot_delta(
+    before: &ProjectSnapshot,
+    desired: &ProjectSnapshot,
+    observed: &ProjectSnapshot,
+    paths: &HashSet<PathBuf>,
+    prepared: &mut HashMap<PathBuf, PreparedPushVerification>,
+    settle: bool,
+) -> Result<SnapshotVerification> {
+    let settings_path = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_service_settings_file_name)
+    };
+    let mut jobs = paths
         .iter()
         .filter(|path| {
             !entries_equivalent(path, before.entries.get(*path), desired.entries.get(*path))
         })
+        .collect::<HashSet<_>>();
+    if settle {
+        jobs.extend(observed.entries.keys().filter(|path| settings_path(path)));
+    }
+    let jobs = jobs
+        .into_iter()
         .map(|path| (path, prepared.remove(path)))
         .collect::<Vec<_>>();
     // Services have independent identity graphs. Share the captured snapshots,
@@ -44,38 +96,51 @@ pub(crate) fn snapshot_intended_delta_mismatches(
         .into_par_iter()
         .map(|(path, prepared)| {
             let desired_entry = desired.entries.get(path);
-            let mismatch = if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(is_service_settings_file_name)
-            {
-                settings_delta_mismatch(
+            let result = if settings_path(path) {
+                settings_delta_verification(
                     path,
                     before.entries.get(path),
                     desired_entry,
                     observed.entries.get(path),
                     prepared,
+                    settle,
                 )?
             } else if entries_equivalent(path, observed.entries.get(path), desired_entry) {
-                None
+                SettingsVerification::default()
             } else {
-                Some(format!(
-                    "{} differs from the requested value",
-                    path.display()
-                ))
+                SettingsVerification {
+                    mismatch: Some(format!(
+                        "{} differs from the requested value",
+                        path.display()
+                    )),
+                    accepted: None,
+                }
             };
-            Ok(mismatch.map(|detail| (path.clone(), detail)))
+            Ok((path, result))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut differences = results.into_iter().flatten().collect::<Vec<_>>();
+    let mut differences = Vec::new();
+    let mut accepted = ProjectSnapshot::default();
+    for (path, result) in results {
+        if let Some(detail) = result.mismatch {
+            differences.push((path.clone(), detail));
+        }
+        if let Some(bytes) = result.accepted {
+            accepted
+                .entries
+                .insert(path.clone(), SnapshotEntry::File(bytes));
+        }
+    }
     differences.sort_by(|left, right| left.0.cmp(&right.0));
     let detail = differences.first().map(|(_, detail)| detail.clone());
-    Ok((
-        differences.into_iter().map(|(path, _)| path).collect(),
+    Ok(SnapshotVerification {
+        mismatches: differences.into_iter().map(|(path, _)| path).collect(),
         detail,
-    ))
+        accepted,
+    })
 }
 
+#[cfg(test)]
 pub(crate) fn settings_delta_mismatch(
     path: &Path,
     before: Option<&SnapshotEntry>,
@@ -83,6 +148,17 @@ pub(crate) fn settings_delta_mismatch(
     observed: Option<&SnapshotEntry>,
     prepared: Option<PreparedPushVerification>,
 ) -> Result<Option<String>> {
+    Ok(settings_delta_verification(path, before, desired, observed, prepared, false)?.mismatch)
+}
+
+fn settings_delta_verification(
+    path: &Path,
+    before: Option<&SnapshotEntry>,
+    desired: Option<&SnapshotEntry>,
+    observed: Option<&SnapshotEntry>,
+    prepared: Option<PreparedPushVerification>,
+    settle: bool,
+) -> Result<SettingsVerification> {
     let before_aligned = prepared.is_some();
     // The three stores decode side by side: on a large service each takes a
     // good part of a second.
@@ -101,6 +177,9 @@ pub(crate) fn settings_delta_mismatch(
     );
     let (mut before, desired) = requested?;
     let mut observed = observed?;
+    let viewport = settle
+        .then(|| crate::settings::equivalence::reference_viewport_camera(&desired))
+        .flatten();
     if desired.instances.is_empty()
         && !before.instances.is_empty()
         && !observed.instances.is_empty()
@@ -234,6 +313,14 @@ pub(crate) fn settings_delta_mismatch(
     drop(before_by_id);
     drop(desired_by_id);
     drop(observed_by_id);
+    let accepted = if settle && mismatch.is_none() {
+        if let Some(camera) = viewport {
+            crate::settings::equivalence::keep_reference_viewport_camera(&camera, &mut observed);
+        }
+        Some(encode_settings_bytecode(&observed)?)
+    } else {
+        None
+    };
     rayon::join(
         || drop_settings_documents(before, observed),
         || {
@@ -242,7 +329,7 @@ pub(crate) fn settings_delta_mismatch(
             }
         },
     );
-    Ok(mismatch)
+    Ok(SettingsVerification { mismatch, accepted })
 }
 
 pub(crate) fn added_instance_mismatch(

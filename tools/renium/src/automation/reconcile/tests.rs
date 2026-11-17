@@ -4193,6 +4193,109 @@ fn prepared_full_push_reuses_the_same_duplicate_and_reference_mapping() {
 }
 
 #[test]
+fn native_import_settlement_keeps_checked_values_and_rejects_failed_captures() -> Result<()> {
+    let path = PathBuf::from("instances/Workspace.renium");
+    let mut root =
+        SettingsBytecodeInstance::new("root".into(), "Workspace".into(), "Workspace".into(), None);
+    root.properties.insert(
+        "CurrentCamera".into(),
+        json!({"_type":"Ref", "settingsId":"viewport"}),
+    );
+    let mut camera =
+        SettingsBytecodeInstance::new("viewport".into(), "Camera".into(), "Camera".into(), Some(0));
+    camera.properties.insert("FieldOfView".into(), json!(70));
+    let mut before = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![root, camera],
+    };
+    let mut desired = before.clone();
+    let mut part =
+        SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), Some(0));
+    part.properties.insert("Transparency".into(), json!(0.25));
+    part.properties.insert(
+        "UniqueId".into(),
+        json!({"_type":"UniqueId", "value":format!("{:032x}", 1)}),
+    );
+    desired.instances.push(part);
+    let mut observed = desired.clone();
+    observed.instances[1]
+        .properties
+        .insert("FieldOfView".into(), json!(90));
+    observed.instances[2].properties.insert(
+        "UniqueId".into(),
+        json!({"_type":"UniqueId", "value":format!("{:032x}", 2)}),
+    );
+    let snapshot = |document: &SettingsBytecode| -> Result<ProjectSnapshot> {
+        Ok(ProjectSnapshot {
+            entries: BTreeMap::from([(
+                path.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(document)?),
+            )]),
+        })
+    };
+    let desired_snapshot = snapshot(&desired)?;
+    let before_snapshot = snapshot(&before)?;
+    let paths = HashSet::from([path.clone()]);
+    let mut readback = snapshot(&observed)?;
+    let mut prepared = HashMap::from([(
+        path.clone(),
+        PreparedPushVerification {
+            previous: std::mem::replace(
+                &mut before,
+                SettingsBytecode {
+                    version: SETTINGS_BINARY_VERSION,
+                    instances: Vec::new(),
+                },
+            ),
+            desired: Arc::new(desired.clone()),
+        },
+    )]);
+    let (failures, _) = verify_and_settle_native_import(
+        &before_snapshot,
+        &desired_snapshot,
+        &mut readback,
+        &paths,
+        &mut prepared,
+    )?;
+    assert!(failures.is_empty());
+    let settled = settings_document(readback.entries.get(&path))?;
+    assert_eq!(settled.instances[1].properties["FieldOfView"], json!(70));
+    assert_eq!(
+        settled.instances[2].properties["UniqueId"],
+        observed.instances[2].properties["UniqueId"]
+    );
+    assert!(matches!(
+        crate::settings::equivalence::align_pulled_settings_bytes_to_reference(
+            match &readback.entries[&path] {
+                SnapshotEntry::File(bytes) => bytes,
+                _ => unreachable!(),
+            },
+            &encode_settings_bytecode(&observed)?,
+        )?,
+        crate::settings::equivalence::SettingsAlignment::Equivalent
+    ));
+
+    observed.instances[2]
+        .properties
+        .insert("Transparency".into(), json!(0.5));
+    let mut rejected = snapshot(&observed)?;
+    let original = rejected.clone();
+    let (failures, _) = verify_and_settle_native_import(
+        &before_snapshot,
+        &desired_snapshot,
+        &mut rejected,
+        &paths,
+        &mut HashMap::new(),
+    )?;
+    assert_eq!(failures, vec![path]);
+    assert!(
+        rejected == original,
+        "A failed verification must not produce settled bytes"
+    );
+    Ok(())
+}
+
+#[test]
 fn viewport_retention_does_not_skip_other_camera_mutations_or_verification() {
     let path = Path::new("src/Workspace/__roblox_sync_settings.renium");
     let mut root =
