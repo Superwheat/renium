@@ -650,7 +650,9 @@ local function prepareImportedIdentities(group: any)
 	if identities == nil then return end
 	local nodes, strings = identities.nodes, identities.strings
 	local instances, childrenByParent, seen = {}, {}, {}
-	local budget = BridgeParallel.newWorkBudget()
+	-- These walks have no engine writes. Amortize scheduler resumption while
+	-- retaining a bounded interval for other Studio work on large imports.
+	local budget = BridgeParallel.newWorkBudget(0.032)
 	for offset = 0, buffer.len(nodes) - 20, 20 do
 		budget()
 		local parent, ordinal = buffer.readu32(nodes, offset), buffer.readu32(nodes, offset + 4)
@@ -688,7 +690,7 @@ end
 -- Bind actual imported objects before any later rename/reparent can change a
 -- path. Retention may substitute a live package object for a staged duplicate.
 local function rememberImportedIdentities(prepared: { any }, ctx: { [string]: any }, aliases: { [Instance]: Instance }?)
-	local budget = BridgeParallel.newWorkBudget()
+	local budget = BridgeParallel.newWorkBudget(0.032)
 	for _, group in ipairs(prepared) do
 		for index, settingsId in ipairs(group.rootSettingsIds or {}) do
 			budget()

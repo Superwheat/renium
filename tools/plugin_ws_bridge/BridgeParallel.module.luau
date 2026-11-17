@@ -6,14 +6,15 @@ local PARALLEL_TARGET_ITEMS_PER_WORKER = 256
 -- task.spawn runs on the same Luau scheduler: workers must still share frames
 -- with Studio's built-in plugins. Check at item boundaries, keeping small jobs
 -- synchronous and returning whether callers need to invalidate a local cache.
-function BridgeParallel.newWorkBudget()
-	local deadline = os.clock() + 0.008
+function BridgeParallel.newWorkBudget(sliceSeconds: number?)
+	local slice = sliceSeconds or 0.008
+	local deadline = os.clock() + slice
 	return function()
 		if os.clock() < deadline then
 			return false
 		end
 		task.wait()
-		deadline = os.clock() + 0.008
+		deadline = os.clock() + slice
 		return true
 	end
 end
