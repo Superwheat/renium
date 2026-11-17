@@ -184,6 +184,94 @@ pub(crate) fn align_pulled_settings_documents_to_reference(
     )
 }
 
+/// A digest of everything a pull's alignment reads from an observed store,
+/// except what the viewport camera holds: a pull puts the stored camera back
+/// whatever the observed one says, so two observed stores with one digest
+/// align to the same answer against the same stored file.
+pub(crate) fn pulled_settings_document_digest(document: &SettingsBytecode) -> [u8; 32] {
+    let camera = workspace_current_camera_index(document);
+    let chunks = document
+        .instances
+        .par_chunks(2_048)
+        .enumerate()
+        .map(|(chunk, instances)| {
+            let mut digest = Sha256::new();
+            for (offset, instance) in instances.iter().enumerate() {
+                digest_text(&mut digest, &instance.settings_id);
+                digest_text(&mut digest, &instance.name);
+                digest_text(&mut digest, &instance.class_name);
+                digest.update(
+                    instance
+                        .parent_index
+                        .map_or(0, |parent| parent as u64 + 1)
+                        .to_le_bytes(),
+                );
+                if camera == Some(chunk * 2_048 + offset) {
+                    digest.update([0xff]);
+                    continue;
+                }
+                digest_map(&mut digest, &instance.properties);
+                digest_map(&mut digest, &instance.attributes);
+            }
+            <[u8; 32]>::from(digest.finalize())
+        })
+        .collect::<Vec<_>>();
+    let mut digest = Sha256::new();
+    digest.update([document.version]);
+    digest.update((document.instances.len() as u64).to_le_bytes());
+    for chunk in chunks {
+        digest.update(chunk);
+    }
+    digest.finalize().into()
+}
+
+fn digest_text(digest: &mut Sha256, text: &str) {
+    digest.update((text.len() as u64).to_le_bytes());
+    digest.update(text.as_bytes());
+}
+
+fn digest_map(digest: &mut Sha256, map: &Map<String, Value>) {
+    digest.update((map.len() as u64).to_le_bytes());
+    for (name, value) in map {
+        digest_text(digest, name);
+        digest_value(digest, value);
+    }
+}
+
+fn digest_value(digest: &mut Sha256, value: &Value) {
+    match value {
+        Value::Null => digest.update([0]),
+        Value::Bool(value) => digest.update([1, u8::from(*value)]),
+        Value::Number(number) => {
+            if let Some(value) = number.as_u64() {
+                digest.update([2]);
+                digest.update(value.to_le_bytes());
+            } else if let Some(value) = number.as_i64() {
+                digest.update([3]);
+                digest.update(value.to_le_bytes());
+            } else {
+                digest.update([4]);
+                digest.update(number.as_f64().map_or(u64::MAX, f64::to_bits).to_le_bytes());
+            }
+        }
+        Value::String(text) => {
+            digest.update([5]);
+            digest_text(digest, text);
+        }
+        Value::Array(values) => {
+            digest.update([6]);
+            digest.update((values.len() as u64).to_le_bytes());
+            for value in values {
+                digest_value(digest, value);
+            }
+        }
+        Value::Object(map) => {
+            digest.update([7]);
+            digest_map(digest, map);
+        }
+    }
+}
+
 struct AlignmentInput<'a> {
     /// The observed store as it came in, when it came in as bytes: written
     /// back as it is where the encoder would write the same.

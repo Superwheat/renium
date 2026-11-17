@@ -568,3 +568,114 @@ fn an_edit_beside_a_moved_camera_is_written_with_the_stored_camera() {
         );
     }
 }
+
+/// The digest a pull remembers an unchanged store by leaves out what the
+/// viewport camera holds and nothing else.
+#[test]
+fn the_pull_digest_ignores_the_viewport_camera_and_nothing_else() {
+    let mut instances = workspace_with_camera("ws", "cam");
+    let mut second_camera = settings_instance("cam2", "Spare", "Camera", Some(0));
+    second_camera
+        .properties
+        .insert("FieldOfView".into(), json!(70));
+    instances.push(second_camera);
+    let mut part = settings_instance("part", "Part", "Part", Some(0));
+    part.properties.insert("Transparency".into(), json!(0.5));
+    part.attributes.insert("Level".into(), json!(1));
+    instances.push(part);
+    let reference = settings_document(instances);
+    let digest = pulled_settings_document_digest(&reference);
+
+    let mut moved = with_moved_camera(&reference);
+    moved.instances[1]
+        .attributes
+        .insert("Seen".into(), json!(true));
+    assert!(pulled_settings_document_digest(&moved) == digest);
+
+    let edits: [fn(&mut SettingsBytecode); 9] = [
+        |document| document.instances[3].settings_id.push('x'),
+        |document| document.instances[3].name.push('x'),
+        |document| document.instances[3].class_name = "Folder".into(),
+        |document| document.instances[3].parent_index = Some(2),
+        |document| {
+            document.instances[3]
+                .properties
+                .insert("Transparency".into(), json!(0.25));
+        },
+        |document| {
+            document.instances[3]
+                .attributes
+                .insert("Level".into(), json!(2));
+        },
+        |document| {
+            document.instances[2]
+                .properties
+                .insert("FieldOfView".into(), json!(55));
+        },
+        |document| document.instances[1].name.push('x'),
+        |document| {
+            document.instances.pop();
+        },
+    ];
+    for (index, edit) in edits.iter().enumerate() {
+        let mut edited = reference.clone();
+        edit(&mut edited);
+        assert!(
+            pulled_settings_document_digest(&edited) != digest,
+            "edit {index} left the digest as it was"
+        );
+    }
+    // A number is told from the same digits as text, and 1 from 1.0.
+    let mut text = reference.clone();
+    text.instances[3]
+        .properties
+        .insert("Transparency".into(), json!("0.5"));
+    let mut whole = reference.clone();
+    whole.instances[3]
+        .attributes
+        .insert("Level".into(), json!(1.0));
+    assert!(pulled_settings_document_digest(&text) != digest);
+    assert!(pulled_settings_document_digest(&whole) != digest);
+}
+
+/// Two observed stores that differ only in what the viewport camera holds
+/// are both unchanged against a stored file, or neither is.
+#[test]
+fn stores_that_differ_only_in_the_viewport_camera_are_unchanged_together() {
+    for seed in 1..=24 {
+        let reference = generated(seed, 14 + seed as usize);
+        for edit in 0..4 {
+            let mut observed = reference.clone();
+            match edit {
+                0 => {}
+                1 => {
+                    observed.instances[0]
+                        .properties
+                        .insert("Gravity".into(), json!(150));
+                }
+                2 => observed.instances[2].name.push('x'),
+                _ => {
+                    observed.instances[3]
+                        .attributes
+                        .insert("Level".into(), json!(seed));
+                }
+            }
+            let moved = with_moved_camera(&observed);
+            assert!(
+                pulled_settings_document_digest(&observed)
+                    == pulled_settings_document_digest(&moved)
+            );
+            let unchanged = |observed: &SettingsBytecode| {
+                matches!(pulled(&reference, observed), SettingsAlignment::Equivalent)
+            };
+            assert!(
+                unchanged(&observed) == unchanged(&moved),
+                "seed {seed} edit {edit}"
+            );
+            assert!(
+                unchanged(&observed) == (edit == 0),
+                "seed {seed} edit {edit}"
+            );
+        }
+    }
+}

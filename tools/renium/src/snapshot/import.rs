@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, PoisonError, mpsc};
+use std::sync::{Condvar, Mutex, OnceLock, PoisonError, mpsc};
 use std::thread;
 use std::time::Instant;
 
@@ -31,7 +31,7 @@ use crate::settings::bytecode::{
 };
 use crate::settings::equivalence::{
     SettingsAlignment, align_pulled_settings_bytes_to_reference,
-    align_pulled_settings_documents_to_reference,
+    align_pulled_settings_documents_to_reference, pulled_settings_document_digest,
 };
 use crate::settings::tree::editor_service_root_index;
 use crate::snapshot::codec::parse_source_range_batch;
@@ -46,6 +46,7 @@ use crate::system::files::{
     OnDrop, path_key, sanitize_name, service_settings_path, unique_child_stem,
     write_bytes_if_changed_in_existing_dir,
 };
+use sha2::{Digest, Sha256};
 
 struct DirectImportTask {
     service: String,
@@ -1455,30 +1456,62 @@ fn write_service_settings_file(
             preservation_started,
         );
         let state_to_write = preserved_state.as_ref().unwrap_or(state);
-        // The stored file is decoded while the captured state becomes a
-        // document of its own; the store is encoded once, after the two are
-        // aligned.
+        // The captured state becomes a document while the stored file is
+        // read; the store is encoded once, after the two are aligned. A store
+        // whose file and observed state are the ones the last pull found
+        // unchanged is unchanged again, and nothing is decoded for it.
         let alignment_started = Instant::now();
+        let remembered = unchanged_pulls()
+            .lock_recover()
+            .get(&settings_path)
+            .copied();
         let (stored, observed) = rayon::join(
-            || -> Result<Option<SettingsBytecode>> {
-                let _reading = profile::span(&format!("{service}: read and decode stored file"));
-                match fs::read(&settings_path) {
-                    Ok(reference) => decode_settings_bytecode(&reference)
-                        .map(Some)
-                        .with_context(|| format!("Failed to align {}", settings_path.display())),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-                    Err(error) => Err(error)
-                        .with_context(|| format!("Failed to read {}", settings_path.display())),
-                }
+            || -> Result<Option<StoredSettings>> {
+                let _reading = profile::span(&format!("{service}: read stored file"));
+                let bytes = match fs::read(&settings_path) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("Failed to read {}", settings_path.display())
+                        });
+                    }
+                };
+                let digest = <[u8; 32]>::from(Sha256::digest(&bytes));
+                // Decoded here, next to the conversion, unless the file is
+                // the one the last pull left alone.
+                let document = if remembered.is_some_and(|(file, _)| file == digest) {
+                    None
+                } else {
+                    Some(decode_stored_settings(&settings_path, &bytes)?)
+                };
+                Ok(Some(StoredSettings {
+                    bytes,
+                    digest,
+                    document,
+                }))
             },
             || {
                 let _converting = profile::span(&format!("{service}: captured store document"));
-                settings_bytecode_from_service_state(state_to_write)
+                let observed = settings_bytecode_from_service_state(state_to_write)?;
+                let digest = pulled_settings_document_digest(&observed);
+                Ok::<_, anyhow::Error>((observed, digest))
             },
         );
-        let observed = observed?;
+        let (observed, observed_digest) = observed?;
         let aligned = match stored? {
-            Some(reference) => {
+            Some(stored) if remembered == Some((stored.digest, observed_digest)) => {
+                profile::record(
+                    &format!("{service}: unchanged since the last pull"),
+                    alignment_started,
+                );
+                None
+            }
+            Some(stored) => {
+                let reference = match stored.document {
+                    Some(document) => document,
+                    None => decode_stored_settings(&settings_path, &stored.bytes)?,
+                };
                 match align_pulled_settings_documents_to_reference(
                     reference,
                     observed,
@@ -1486,8 +1519,16 @@ fn write_service_settings_file(
                 )
                 .with_context(|| format!("Failed to align {}", settings_path.display()))?
                 {
-                    SettingsAlignment::Equivalent => None,
-                    SettingsAlignment::Changed(aligned) => Some(aligned),
+                    SettingsAlignment::Equivalent => {
+                        unchanged_pulls()
+                            .lock_recover()
+                            .insert(settings_path.clone(), (stored.digest, observed_digest));
+                        None
+                    }
+                    SettingsAlignment::Changed(aligned) => {
+                        unchanged_pulls().lock_recover().remove(&settings_path);
+                        Some(aligned)
+                    }
                 }
             }
             None => Some(encode_settings_bytecode(&observed)?),
@@ -1518,6 +1559,28 @@ fn write_service_settings_file(
 /// A store written before `CurrentCamera` was saved names none; identity
 /// alignment has matched the live viewport to its row by then, so the store
 /// inherits the pulled reference for the comparison and keeps that row too.
+struct StoredSettings {
+    bytes: Vec<u8>,
+    digest: [u8; 32],
+    document: Option<SettingsBytecode>,
+}
+
+fn decode_stored_settings(settings_path: &Path, bytes: &[u8]) -> Result<SettingsBytecode> {
+    decode_settings_bytecode(bytes)
+        .with_context(|| format!("Failed to align {}", settings_path.display()))
+}
+
+/// For each store the last pull found unchanged: the digest of its file and
+/// of the observed store it was compared with. The alignment answers from
+/// those two alone, so the same two again are unchanged again.
+fn unchanged_pulls() -> &'static Mutex<UnchangedPulls> {
+    static PULLS: OnceLock<Mutex<UnchangedPulls>> = OnceLock::new();
+    PULLS.get_or_init(Mutex::default)
+}
+
+/// By store file: the digest of the file and of the observed store.
+type UnchangedPulls = HashMap<PathBuf, ([u8; 32], [u8; 32])>;
+
 /// What the pull is about to write is what it wrote when it encoded the
 /// captured state, decoded it again and aligned the two files' bytes. Every
 /// pull of a debug build checks it.
