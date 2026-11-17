@@ -484,7 +484,16 @@ mod disasm_dump_tests {
                             i.memory_displacement64()
                         ),
                         OpKind::NearBranch64 => format!("{:#x}", i.near_branch_target()),
-                        _ => format!("{:#x}", i.immediate(index)),
+                        OpKind::Immediate8
+                        | OpKind::Immediate8_2nd
+                        | OpKind::Immediate16
+                        | OpKind::Immediate32
+                        | OpKind::Immediate64
+                        | OpKind::Immediate8to16
+                        | OpKind::Immediate8to32
+                        | OpKind::Immediate8to64
+                        | OpKind::Immediate32to64 => format!("{:#x}", i.immediate(index)),
+                        kind => format!("{kind:?}"),
                     });
                 }
                 println!("{:#x}: {:?} {}", i.ip(), i.mnemonic(), operands.join(", "));

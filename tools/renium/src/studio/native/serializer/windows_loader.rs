@@ -43,6 +43,7 @@ struct PreparedLoader {
     trace: LoaderTrace,
     history: HistoryTrace,
     history_table: std::sync::Arc<Vec<usize>>,
+    metadata: history::Evidence,
     code: std::sync::Arc<Vec<(usize, Vec<u8>)>>,
 }
 
@@ -70,6 +71,18 @@ pub(super) fn verify_loaded(
             }),
         "Loaded Studio history table changed"
     );
+    for &(rva, target) in &prepared.metadata.pointers {
+        anyhow::ensure!(
+            memory.read_u64(studio.base + rva)? as usize == studio.base + target,
+            "Loaded Studio reflection metadata changed; native import is unavailable"
+        );
+    }
+    for &rva in &prepared.metadata.names {
+        anyhow::ensure!(
+            memory.read_vec(studio.base + rva, 19)? == b"LuaSourceContainer\0",
+            "Loaded Studio reflection class name changed; native import is unavailable"
+        );
+    }
     Ok((prepared.trace, prepared.history))
 }
 
@@ -90,7 +103,8 @@ fn prepared(path: &Path) -> Result<PreparedLoader> {
         let bytes = mapped.bytes();
         let trace = trace_loader(bytes)?;
         let image = PeImage::parse(bytes)?;
-        let (history, history_code) = history::discover(&image)?;
+        let discovered = history::discover(&image)?;
+        let history = discovered.trace;
         let table = image.rva_to_offset(history.table - 8)?;
         let history_table = (0..=history.slots)
             .map(|index| {
@@ -108,7 +122,7 @@ fn prepared(path: &Path) -> Result<PreparedLoader> {
             trace.factory.instance_reader,
         ]
         .into_iter()
-        .chain(history_code)
+        .chain(discovered.code)
         {
             if code.iter().any(|(address, _)| *address == rva) {
                 continue;
@@ -125,6 +139,7 @@ fn prepared(path: &Path) -> Result<PreparedLoader> {
             trace,
             history,
             history_table: std::sync::Arc::new(history_table),
+            metadata: discovered.metadata,
             code: std::sync::Arc::new(code),
         })
     })()
@@ -148,6 +163,8 @@ enum Input {
     Boolean,
     InvertedBoolean,
     Flags,
+    ExtraFlags,
+    ExtraFlagsWithBit,
     Instance(usize),
     Stack(i64),
     Extra5,
@@ -185,42 +202,33 @@ fn loader_calls(bytes: &[u8], rva: usize) -> Vec<(usize, usize)> {
         (Register::RDX, Stream),
         (Register::R8, DataModel),
         (Register::R9, Boolean),
+        (Register::RSP, Stack(0)),
     ]);
     let mut result = Vec::new();
     let mut stack_zero = false;
+    let mut boolean_test = false;
+    let mut extra_flags_valid = true;
     for i in Decoder::with_ip(64, bytes, rva as u64, DecoderOptions::NONE) {
         if i.is_invalid() {
             return Vec::new();
         }
         let destination = i.op0_register().full_register();
+        let tested_boolean = boolean_test;
+        if i.rflags_modified() != 0 {
+            boolean_test = false;
+        }
         match i.mnemonic() {
             Mnemonic::Call => {
-                if i.op0_kind() == OpKind::NearBranch64
-                    && stack_zero
-                    && registers.get(&Register::RCX) == Some(&Context)
-                    && registers.get(&Register::RDX) == Some(&Stream)
-                    && registers.get(&Register::R9) == Some(&Flags)
-                    && let Some(Instance(offset)) = registers.get(&Register::R8)
-                {
-                    result.push((i.near_branch_target() as usize, *offset));
+                if let Some(candidate) = loader_candidate(&i, &registers, stack_zero) {
+                    result.push(candidate);
                 }
                 clear_volatile(&mut registers);
                 stack_zero = false;
+                boolean_test = false;
+                extra_flags_valid = false;
             }
             Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Lea if i.op0_kind() == OpKind::Register => {
-                let value = if i.op1_kind() == OpKind::Register {
-                    registers.get(&i.op1_register().full_register()).copied()
-                } else if i.mnemonic() == Mnemonic::Lea
-                    && i.op1_kind() == OpKind::Memory
-                    && i.memory_index() == Register::None
-                    && registers.get(&i.memory_base().full_register()) == Some(&DataModel)
-                    && i.memory_displacement64() <= 0x800
-                    && i.memory_displacement64() % 8 == 0
-                {
-                    Some(Instance(i.memory_displacement64() as usize))
-                } else {
-                    None
-                };
+                let value = loader_register_move(&i, &registers, extra_flags_valid);
                 registers.remove(&destination);
                 if let Some(value) = value {
                     registers.insert(destination, value);
@@ -228,24 +236,36 @@ fn loader_calls(bytes: &[u8], rva: usize) -> Vec<(usize, usize)> {
             }
             Mnemonic::Xor if i.op0_kind() == OpKind::Register => {
                 let prior = registers.remove(&destination);
-                if i.op1_kind() == OpKind::Register
-                    && destination == i.op1_register().full_register()
-                {
-                    registers.insert(destination, Zero);
-                } else if prior == Some(Boolean)
-                    && i.op1_kind() == OpKind::Immediate8to32
-                    && i.immediate8to32() == 1
-                {
-                    registers.insert(destination, InvertedBoolean);
+                if let Some(value) = loader_xor(&i, prior) {
+                    registers.insert(destination, value);
                 }
             }
-            Mnemonic::Shl
+            Mnemonic::Shl | Mnemonic::Or | Mnemonic::Cmovne => {
+                let value = loader_flag(&i, &registers, tested_boolean, extra_flags_valid);
+                registers.remove(&destination);
+                if let Some(value) = value {
+                    registers.insert(destination, value);
+                }
+            }
+            Mnemonic::Test
                 if i.op0_kind() == OpKind::Register
-                    && registers.get(&destination) == Some(&InvertedBoolean)
-                    && i.op1_kind() == OpKind::Immediate8
-                    && i.immediate8() == 2 =>
+                    && i.op1_kind() == OpKind::Register
+                    && i.op0_register() == i.op1_register()
+                    && registers.get(&destination) == Some(&Boolean) =>
             {
-                registers.insert(destination, Flags);
+                boolean_test = true;
+            }
+            Mnemonic::Push if i.op0_kind() == OpKind::Register => {
+                loader_move_stack(&mut registers, -8);
+            }
+            Mnemonic::Sub
+                if i.op0_register() == Register::RSP
+                    && matches!(
+                        i.op1_kind(),
+                        OpKind::Immediate32to64 | OpKind::Immediate8to64
+                    ) =>
+            {
+                loader_move_stack(&mut registers, -(i.immediate(1) as i64));
             }
             // The adapter passes null only when its original model was null.
             Mnemonic::Cmove
@@ -259,6 +279,7 @@ fn loader_calls(bytes: &[u8], rva: usize) -> Vec<(usize, usize)> {
                     && i.memory_displacement64() == 0x20 =>
             {
                 stack_zero = i.op1_kind() == OpKind::Register
+                    && i.memory_size().size() == 8
                     && registers.get(&i.op1_register().full_register()) == Some(&Zero);
             }
             _ if i.op0_kind() == OpKind::Register
@@ -271,6 +292,18 @@ fn loader_calls(bytes: &[u8], rva: usize) -> Vec<(usize, usize)> {
             }
             _ => {}
         }
+        if i.op0_kind() == OpKind::Memory
+            && !matches!(i.mnemonic(), Mnemonic::Cmp | Mnemonic::Test)
+            && let Some(at) = loader_stack_address(&i, &registers)
+            && at < 0x34
+            && at + i.memory_size().size() as i64 > 0x30
+        {
+            extra_flags_valid = false;
+        }
+        if i.flow_control() == FlowControl::ConditionalBranch {
+            boolean_test = false;
+            registers.retain(|_, value| !matches!(value, ExtraFlags | ExtraFlagsWithBit));
+        }
         // No provenance flows through an unconditional jump into another block.
         if matches!(
             i.flow_control(),
@@ -278,9 +311,151 @@ fn loader_calls(bytes: &[u8], rva: usize) -> Vec<(usize, usize)> {
         ) {
             registers.clear();
             stack_zero = false;
+            boolean_test = false;
+            extra_flags_valid = false;
         }
     }
     result
+}
+
+fn loader_flag(
+    i: &iced_x86::Instruction,
+    registers: &HashMap<Register, Input>,
+    tested_boolean: bool,
+    extra_flags_valid: bool,
+) -> Option<Input> {
+    use Input::*;
+    let prior = registers.get(&i.op0_register().full_register());
+    match i.mnemonic() {
+        Mnemonic::Shl
+            if i.op0_kind() == OpKind::Register
+                && prior == Some(&InvertedBoolean)
+                && i.op1_kind() == OpKind::Immediate8
+                && i.immediate8() == 2 =>
+        {
+            Some(Flags)
+        }
+        // base | (boolean ? 0 : 4), with the base from the sixth ABI argument.
+        Mnemonic::Or
+            if i.op0_register().size() == 4
+                && prior == Some(&ExtraFlags)
+                && i.op1_kind() == OpKind::Immediate8to32
+                && i.immediate8to32() == 4 =>
+        {
+            Some(ExtraFlagsWithBit)
+        }
+        Mnemonic::Cmovne
+            if tested_boolean
+                && extra_flags_valid
+                && i.op0_register().size() == 4
+                && prior == Some(&ExtraFlagsWithBit)
+                && loader_extra_flags(i, registers) == Some(ExtraFlags) =>
+        {
+            Some(Flags)
+        }
+        _ => None,
+    }
+}
+
+fn loader_candidate(
+    i: &iced_x86::Instruction,
+    registers: &HashMap<Register, Input>,
+    stack_zero: bool,
+) -> Option<(usize, usize)> {
+    let Input::Instance(offset) = registers.get(&Register::R8)? else {
+        return None;
+    };
+    (i.op0_kind() == OpKind::NearBranch64
+        && stack_zero
+        && registers.get(&Register::RCX) == Some(&Input::Context)
+        && registers.get(&Register::RDX) == Some(&Input::Stream)
+        && registers.get(&Register::R9) == Some(&Input::Flags))
+    .then_some((i.near_branch_target() as usize, *offset))
+}
+
+fn loader_xor(i: &iced_x86::Instruction, prior: Option<Input>) -> Option<Input> {
+    if i.op1_kind() == OpKind::Register
+        && i.op0_register() == i.op1_register()
+        && i.op0_register().size() >= 4
+    {
+        Some(Input::Zero)
+    } else if prior == Some(Input::Boolean)
+        && i.op1_kind() == OpKind::Immediate8to32
+        && i.immediate8to32() == 1
+    {
+        Some(Input::InvertedBoolean)
+    } else {
+        None
+    }
+}
+
+fn loader_register_move(
+    i: &iced_x86::Instruction,
+    registers: &HashMap<Register, Input>,
+    extra_flags_valid: bool,
+) -> Option<Input> {
+    if i.op1_kind() == OpKind::Register {
+        let value = *registers.get(&i.op1_register().full_register())?;
+        let pointer = matches!(
+            value,
+            Input::Context
+                | Input::Stream
+                | Input::DataModel
+                | Input::Instance(_)
+                | Input::Stack(_)
+        );
+        (!pointer || i.op0_register().size() == 8 && i.op1_register().size() == 8).then_some(value)
+    } else if i.mnemonic() == Mnemonic::Lea
+        && i.op0_register().size() == 8
+        && i.op1_kind() == OpKind::Memory
+        && i.memory_index() == Register::None
+        && registers.get(&i.memory_base().full_register()) == Some(&Input::DataModel)
+        && i.memory_displacement64() <= 0x800
+        && i.memory_displacement64().is_multiple_of(8)
+    {
+        Some(Input::Instance(i.memory_displacement64() as usize))
+    } else if i.mnemonic() == Mnemonic::Lea && i.op0_register().size() == 8 {
+        loader_stack_address(i, registers).map(Input::Stack)
+    } else if extra_flags_valid && i.op0_register().size() == 4 {
+        loader_extra_flags(i, registers)
+    } else {
+        None
+    }
+}
+
+fn loader_stack_address(
+    i: &iced_x86::Instruction,
+    registers: &HashMap<Register, Input>,
+) -> Option<i64> {
+    if i.memory_index() != Register::None {
+        return None;
+    }
+    let Input::Stack(base) = registers.get(&i.memory_base().full_register())? else {
+        return None;
+    };
+    base.checked_add(i.memory_displacement64() as i64)
+}
+
+fn loader_extra_flags(
+    i: &iced_x86::Instruction,
+    registers: &HashMap<Register, Input>,
+) -> Option<Input> {
+    // Windows x64's sixth argument is entry RSP+0x30, independent of the
+    // compiler's local frame or choice of frame register.
+    (i.op1_kind() == OpKind::Memory
+        && i.memory_size().size() == 4
+        && loader_stack_address(i, registers) == Some(0x30))
+    .then_some(Input::ExtraFlags)
+}
+
+fn loader_move_stack(registers: &mut HashMap<Register, Input>, delta: i64) {
+    let next = match registers.remove(&Register::RSP) {
+        Some(Input::Stack(at)) => at.checked_add(delta).filter(|at| (-4096..=0).contains(at)),
+        _ => None,
+    };
+    if let Some(at) = next {
+        registers.insert(Register::RSP, Input::Stack(at));
+    }
 }
 
 // The outer loader supplies a result object and twelve arguments to the binary
@@ -704,6 +879,54 @@ mod tests {
                 loader_calls(&changed, 0x1000).is_empty(),
                 "accepted mutation {offset}"
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn loader_accepts_conditional_extra_flags_only_with_proven_stack_and_condition() -> Result<()> {
+        let original = "574883EC308B742468488BE983CE04488BCA4584C9498BF8488BDA0F45742468E8000000004C8D87F001000033C948894C2420448BCE488BD34C0F44C1488BCDE800000000C3";
+        let code = hex(original)?;
+        let found = loader_calls(&code, 0x1000);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, 0x1f0);
+        // The incoming argument stays at entry RSP+0x30 when the compiler
+        // changes its frame size, register allocation and model subobject.
+        let relocated = original
+            .replace("EC30", "EC40")
+            .replace("2468", "2478")
+            .replace("8B7424", "8B5C24")
+            .replace("83CE04", "83CB04")
+            .replace("488BDA", "488BF2")
+            .replace("457424", "455C24")
+            .replace("448BCE488BD3", "448BCB488BD6")
+            .replace("87F0010000", "8710020000");
+        let found = loader_calls(&hex(&relocated)?, 0x2000);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, 0x210);
+        for (from, to) in [
+            ("EC30", "EC20"),                     // wrong incoming argument
+            ("8B742468", "8B742460"),             // fifth argument is not flags
+            ("8B742468", "668B742468"),           // partial load
+            ("83CE04", "83CE08"),                 // wrong flag
+            ("33C9", "32C9"),                     // byte clear cannot prove a null pointer
+            ("48894C2420", "894C2420"),           // partial fifth argument
+            ("488BE9", "8BE990"),                 // truncated context pointer
+            ("4584C9", "4584C0"),                 // different boolean
+            ("4584C9", "4584C94885C0"),           // condition overwritten
+            ("0F45742468", "0F44742468"),         // reversed choice
+            ("0F45742468", "0F45742460"),         // different source
+            ("0F45742468", "74000F45742468"),     // intervening branch
+            ("4584C9", "C7442468000000004584C9"), // incoming flags overwritten
+        ] {
+            assert!(original.contains(from));
+            assert!(
+                loader_calls(&hex(&original.replace(from, to))?, 0x1000).is_empty(),
+                "accepted {from} -> {to}"
+            );
+        }
+        for end in 0..code.len() - 2 {
+            assert!(loader_calls(&code[..end], 0x1000).is_empty());
         }
         Ok(())
     }

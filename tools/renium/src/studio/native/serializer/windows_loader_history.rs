@@ -3,6 +3,16 @@
 use super::*;
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 
+#[path = "windows_class_metadata.rs"]
+mod metadata;
+pub(super) use metadata::Evidence;
+
+pub(super) struct Discovery {
+    pub trace: HistoryTrace,
+    pub code: Vec<usize>,
+    pub metadata: Evidence,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HistoryTrace {
     pub table: usize,
@@ -20,13 +30,11 @@ fn function<'a>(image: &PeImage<'a>, rva: usize) -> Option<&'a [u8]> {
     (start == offset && end - start <= 16_384).then_some(&image.bytes[start..end])
 }
 
-fn source_class(image: &PeImage<'_>, rva: usize) -> bool {
-    let Some(bytes) = function(image, rva) else {
-        return false;
-    };
-    Decoder::with_ip(64, bytes, rva as u64, DecoderOptions::NONE)
+fn source_class(image: &PeImage<'_>, rva: usize, class_table: Option<usize>) -> Option<Evidence> {
+    let bytes = function(image, rva)?;
+    let direct = Decoder::with_ip(64, bytes, rva as u64, DecoderOptions::NONE)
         .into_iter()
-        .any(|i| {
+        .find(|i| {
             i.mnemonic() == Mnemonic::Lea
                 && i.op0_register() == Register::R8
                 && i.is_ip_rel_memory_operand()
@@ -36,7 +44,15 @@ fn source_class(image: &PeImage<'_>, rva: usize) -> bool {
                     .is_some_and(|offset| {
                         image.bytes.get(offset..offset + 19) == Some(b"LuaSourceContainer\0")
                     })
-        })
+        });
+    if let Some(name) = direct {
+        return Some(Evidence {
+            code: vec![rva],
+            names: vec![name.ip_rel_memory_address() as usize],
+            ..Evidence::default()
+        });
+    }
+    metadata::source(image, rva, class_table?)
 }
 
 fn history_field(i: &Instruction, size: usize) -> Option<usize> {
@@ -49,7 +65,11 @@ fn history_field(i: &Instruction, size: usize) -> Option<usize> {
     .then_some(offset)
 }
 
-fn insertion(image: &PeImage<'_>, rva: usize) -> Option<(usize, usize, usize, usize)> {
+fn insertion(
+    image: &PeImage<'_>,
+    rva: usize,
+    class_table: Option<usize>,
+) -> Option<(usize, usize, usize, Evidence)> {
     let bytes = function(image, rva)?;
     let code = Decoder::with_ip(64, bytes, rva as u64, DecoderOptions::NONE)
         .into_iter()
@@ -121,9 +141,12 @@ fn insertion(image: &PeImage<'_>, rva: usize) -> Option<(usize, usize, usize, us
     let sources = calls
         .iter()
         .enumerate()
-        .filter(|(_, (_, i))| source_class(image, i.near_branch_target() as usize))
+        .filter_map(|(index, (at, i))| {
+            source_class(image, i.near_branch_target() as usize, class_table)
+                .map(|evidence| (index, *at, evidence))
+        })
         .collect::<Vec<_>>();
-    let [(source_index, (source_at, source))] = sources.as_slice() else {
+    let [(source_index, source_at, evidence)] = sources.as_slice() else {
         return None;
     };
     // Admission, identity context, entry and capture precede the script-only
@@ -149,15 +172,12 @@ fn insertion(image: &PeImage<'_>, rva: usize) -> Option<(usize, usize, usize, us
     {
         return None;
     }
-    Some((
-        *record,
-        *pending,
-        playback,
-        source.near_branch_target() as usize,
-    ))
+    Some((*record, *pending, playback, evidence.clone()))
 }
 
-pub(super) fn discover(image: &PeImage<'_>) -> Result<(HistoryTrace, Vec<usize>)> {
+pub(super) fn discover(image: &PeImage<'_>) -> Result<Discovery> {
+    let class_table =
+        undo_selection::descriptor_vtable(image, b".?AVClassDescriptor@Reflection@RBX@@\0").ok();
     let rdata = image.section(b".rdata")?;
     let data = &image.bytes[rdata.raw_offset..rdata.raw_offset + rdata.raw_size];
     let mut found = Vec::new();
@@ -203,9 +223,13 @@ pub(super) fn discover(image: &PeImage<'_>) -> Result<(HistoryTrace, Vec<usize>)
                     continue;
                 }
                 for (index, &method) in methods.iter().enumerate() {
-                    if let Some((record, pending, playback, source)) = insertion(image, method) {
-                        found.push((
-                            HistoryTrace {
+                    if let Some((record, pending, playback, metadata)) =
+                        insertion(image, method, class_table)
+                    {
+                        let mut code = metadata.code.clone();
+                        code.push(method);
+                        found.push(Discovery {
+                            trace: HistoryTrace {
                                 table: image.offset_to_rva(table_offset)?,
                                 slots: methods.len(),
                                 insertion: index,
@@ -213,8 +237,9 @@ pub(super) fn discover(image: &PeImage<'_>) -> Result<(HistoryTrace, Vec<usize>)
                                 pending,
                                 playback,
                             },
-                            vec![method, source],
-                        ));
+                            code,
+                            metadata,
+                        });
                     }
                 }
             }
