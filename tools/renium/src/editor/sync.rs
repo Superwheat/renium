@@ -4032,7 +4032,6 @@ fn apply_deferred_native_rows(
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
         summary.insert("propertyUpdated".into(), json!(previous + updated));
-        summary.insert("importedEngineFields".into(), json!(fields as u64));
         Ok(())
     })();
     EditorTransaction::finish(transaction.as_mut(), result).with_context(|| {
