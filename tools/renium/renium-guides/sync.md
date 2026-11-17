@@ -13,6 +13,7 @@ rbx lof
 `ps` pushes files or directories; for store edits pass the store file with `-i ID` per instance (with its subtree), or `-u` to upsert without deleting; deletions need the store file without `-i`.
 A push, `prop` or `del` above `liveSync.changesThreshold` (default 5; 0 = all) applies nothing and returns `heldForReview` with the change list in `review`: check it, then rerun with `--yes`. Script files named on the `ps` command line are syntax-checked as `ck` checks them (an error stops the push) and apply without the hold; `ps -s SERVICE` pushes a service's store file. Editor and Live Sync pushes open a Studio panel instead (`rbx rv apply|skip`). `--no-review` also disables protected writes.
 Work in the place folder or add `--place <alias|placeId>`.
+If bulk reader discovery fails, keep the same `ps` arguments and add `--slow-import` to allow individual field writes.
 
 ## Live Sync
 

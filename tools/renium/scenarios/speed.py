@@ -359,6 +359,8 @@ def push(run: Run, source: Path, root: Path) -> None:
         expect((data or {}).get("ok") is True and data.get("verified") is True, "the whole import was not verified")
         writes = data.get("supplementalImportWrites")
         expect(type(writes) is int and writes >= 0, "the push did not report its supplemental write count")
+        offline = data.get("supplementalImportOfflineWrites", 0)
+        expect(type(offline) is int and offline == 0, "the whole import used supplemental offline place-file writes")
         run.supplemental_import_writes.append(writes)
         run.log(f"Whole import needed {writes} individual supplemental field writes")
         expect(writes == 0, f"the whole import fell back to {writes} individual supplemental field writes")
