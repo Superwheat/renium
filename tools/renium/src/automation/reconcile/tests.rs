@@ -1996,6 +1996,22 @@ fn push_verification_follows_game_settings_policy_without_hiding_saved_values() 
             &settings_document(Some(&observed)).unwrap()
         ));
 
+        // A store that differs from Studio in the capacity alone gives a
+        // push nothing to write; with another field it is a difference.
+        let observed_capacity = document(name, Some(12), false);
+        assert!(super::verify::differs_only_in_externally_managed_fields(
+            &desired_document,
+            &observed_capacity
+        ));
+        assert!(super::verify::differs_only_in_externally_managed_fields(
+            &desired_document,
+            &document(name, None, false)
+        ));
+        assert!(!super::verify::differs_only_in_externally_managed_fields(
+            &desired_document,
+            &document(name, Some(12), true)
+        ));
+
         // This policy applies to properties of the actual service root,
         // not attributes, a same-named Folder, or a nested instance.
         let missing = Map::new();

@@ -497,6 +497,49 @@ pub(crate) fn verification_values_equal(
     }
 }
 
+/// Whether two stores differ in nothing a push writes: only in the fields of
+/// a service root that Roblox takes from elsewhere (the player capacity set in
+/// Game Settings). Such a store is not a difference a push can settle.
+pub(crate) fn differs_only_in_externally_managed_fields(
+    current: &SettingsBytecode,
+    previous: &SettingsBytecode,
+) -> bool {
+    let managed = |instance: &SettingsBytecodeInstance, property: &str| {
+        instance.parent_index.is_none()
+            && is_externally_managed_editor_property(
+                &instance.name,
+                &instance.class_name,
+                std::slice::from_ref(&instance.name),
+                property,
+            )
+    };
+    let holds_managed = |document: &SettingsBytecode| {
+        document.instances.iter().any(|instance| {
+            instance
+                .properties
+                .keys()
+                .any(|property| managed(instance, property))
+        })
+    };
+    if !holds_managed(current) && !holds_managed(previous) {
+        return false;
+    }
+    let without_managed = |document: &SettingsBytecode| {
+        let mut document = document.clone();
+        for index in 0..document.instances.len() {
+            let kept = document.instances[index]
+                .properties
+                .iter()
+                .filter(|(property, _)| !managed(&document.instances[index], property))
+                .map(|(property, value)| (property.clone(), value.clone()))
+                .collect();
+            document.instances[index].properties = kept;
+        }
+        document
+    };
+    settings_documents_equivalent(&without_managed(current), &without_managed(previous))
+}
+
 pub(crate) fn verification_skips_property(
     instance: &SettingsBytecodeInstance,
     name: &str,

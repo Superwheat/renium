@@ -313,6 +313,18 @@ pub(crate) fn push_project(
         )?;
         differences
     };
+    let differences = differences
+        .into_iter()
+        .filter(|path| {
+            prepared_settings.get(path).is_none_or(|change| {
+                !super::verify::differs_only_in_externally_managed_fields(
+                    &change.current,
+                    &change.previous,
+                )
+            })
+        })
+        .collect::<HashSet<_>>();
+    prepared_settings.retain(|path, _| differences.contains(path));
     log_reconcile_timing(
         if replace {
             "full replacement preparation"
