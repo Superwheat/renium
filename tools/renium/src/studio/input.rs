@@ -639,33 +639,47 @@ mod platform {
         if let Some(button) = startup_dialog_button(&title) {
             return Some((pid, button));
         }
-        // Studio raises the package notice while it loads a place, before any
-        // push is watching for it, and it blocks the plugin until answered.
-        (owned && title == "Roblox Studio" && shows_package_changes_message(hwnd))
-            .then_some((pid, "OK"))
+        // Studio raises these while it starts or loads a place, before any
+        // command is watching for them, and they block the plugin until answered.
+        (owned && title == "Roblox Studio")
+            .then(|| generic_notice_button(hwnd))
+            .flatten()
+            .map(|button| (pid, button))
     }
 
-    fn shows_package_changes_message(hwnd: HWND) -> bool {
-        (|| -> Result<bool> {
+    /// The notices Studio shows under its own name, told apart by their text,
+    /// each with the button that acknowledges it: the package notice, and the
+    /// warning that the machine is low on memory, which holds a window back
+    /// until it is answered.
+    const GENERIC_NOTICES: [(&str, &str); 2] = [
+        (PACKAGE_CHANGES_MESSAGE, "OK"),
+        ("Low System Resources", "Continue"),
+    ];
+
+    fn generic_notice_button(hwnd: HWND) -> Option<&'static str> {
+        (|| -> Result<Option<&'static str>> {
             let _com = ComGuard::initialize()?;
             let automation: IUIAutomation =
                 unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
                     .context("Could not start Windows UI Automation")?;
             let root = unsafe { automation.ElementFromHandle(AutomationHwnd(hwnd)) }
                 .context("Could not inspect a Studio dialog")?;
-            let condition = unsafe {
-                automation.CreatePropertyCondition(
-                    UIA_NamePropertyId,
-                    &VARIANT::from(PACKAGE_CHANGES_MESSAGE),
-                )
+            for (text, button) in GENERIC_NOTICES {
+                let condition = unsafe {
+                    automation.CreatePropertyCondition(UIA_NamePropertyId, &VARIANT::from(text))
+                }
+                .context("Could not create the Studio notice text query")?;
+                let Ok(message) = (unsafe { root.FindFirst(TreeScope_Descendants, &condition) })
+                else {
+                    continue;
+                };
+                if unsafe { message.CurrentName() }.is_ok_and(|name| name == text) {
+                    return Ok(Some(button));
+                }
             }
-            .context("Could not create the package dialog message query")?;
-            let Ok(message) = (unsafe { root.FindFirst(TreeScope_Descendants, &condition) }) else {
-                return Ok(false);
-            };
-            Ok(unsafe { message.CurrentName() }.is_ok_and(|name| name == PACKAGE_CHANGES_MESSAGE))
+            Ok(None)
         })()
-        .unwrap_or(false)
+        .unwrap_or(None)
     }
 
     fn dismiss_auto_recovery_until_closed(hwnd: HWND) {
