@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -5,6 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use serde_json::{Map, Value, json};
 
 use crate::app::output::{print_json_output, visible};
@@ -285,6 +287,7 @@ pub(crate) fn settings_doc_to_text(document: &SettingsBytecode) -> String {
     {
         stack.push((root, String::new()));
     }
+    let mut rows = Vec::with_capacity(document.instances.len());
     while let Some((index, parent_path)) = stack.pop() {
         let instance = &document.instances[index];
         let path = if parent_path.is_empty() {
@@ -292,57 +295,97 @@ pub(crate) fn settings_doc_to_text(document: &SettingsBytecode) -> String {
         } else {
             format!("{parent_path}/{}", visible(&instance.name))
         };
-        let _ = writeln!(
-            out,
-            "= {path} [{}] id={}",
-            visible(&instance.class_name),
-            visible(&instance.settings_id)
-        );
-        let mut property_record = instance.properties.clone();
-        stabilize_reference_output(
-            document,
-            &path_segments_by_index,
-            &path_ordinals_by_index,
-            &canonical_settings_ids_by_index,
-            &mut property_record,
-        );
-        let mut properties: Vec<(&String, &Value)> = property_record.iter().collect();
-        properties.sort_by(|a, b| a.0.cmp(b.0));
-        for (key, value) in properties {
-            if key == "Source"
-                && let Some(text) = value.as_str()
-            {
-                let _ = writeln!(
-                    out,
-                    "  Source = <{} lines, {} bytes, fnv1a={}>",
-                    text.lines().count(),
-                    text.len(),
-                    fnv1a_hex(text.as_bytes())
-                );
-                continue;
-            }
-            let _ = writeln!(out, "  {} = {}", visible(key), visible(&value.to_string()));
-        }
-        let mut attribute_record = instance.attributes.clone();
-        stabilize_reference_output(
-            document,
-            &path_segments_by_index,
-            &path_ordinals_by_index,
-            &canonical_settings_ids_by_index,
-            &mut attribute_record,
-        );
-        let mut attributes: Vec<(&String, &Value)> = attribute_record.iter().collect();
-        attributes.sort_by(|a, b| a.0.cmp(b.0));
-        for (key, value) in attributes {
-            let _ = writeln!(out, "  @{} = {}", visible(key), visible(&value.to_string()));
-        }
         if let Some(kids) = children.get(&Some(index)) {
             for kid in kids.iter().rev() {
                 stack.push((*kid, path.clone()));
             }
         }
+        rows.push((index, path));
+    }
+    let render = |rows: &[(usize, String)]| {
+        let mut out = String::new();
+        for (index, path) in rows {
+            let instance = &document.instances[*index];
+            let _ = writeln!(
+                out,
+                "= {path} [{}] id={}",
+                visible(&instance.class_name),
+                visible(&instance.settings_id)
+            );
+            let property_record = text_record(&instance.properties, |record| {
+                stabilize_reference_output(
+                    document,
+                    &path_segments_by_index,
+                    &path_ordinals_by_index,
+                    &canonical_settings_ids_by_index,
+                    record,
+                )
+            });
+            let mut properties: Vec<(&String, &Value)> = property_record.iter().collect();
+            properties.sort_by(|a, b| a.0.cmp(b.0));
+            for (key, value) in properties {
+                if key == "Source"
+                    && let Some(text) = value.as_str()
+                {
+                    let _ = writeln!(
+                        out,
+                        "  Source = <{} lines, {} bytes, fnv1a={}>",
+                        text.lines().count(),
+                        text.len(),
+                        fnv1a_hex(text.as_bytes())
+                    );
+                    continue;
+                }
+                let _ = writeln!(out, "  {} = {}", visible(key), visible(&value.to_string()));
+            }
+            let attribute_record = text_record(&instance.attributes, |record| {
+                stabilize_reference_output(
+                    document,
+                    &path_segments_by_index,
+                    &path_ordinals_by_index,
+                    &canonical_settings_ids_by_index,
+                    record,
+                )
+            });
+            let mut attributes: Vec<(&String, &Value)> = attribute_record.iter().collect();
+            attributes.sort_by(|a, b| a.0.cmp(b.0));
+            for (key, value) in attributes {
+                let _ = writeln!(out, "  @{} = {}", visible(key), visible(&value.to_string()));
+            }
+        }
+        out
+    };
+    // Indexed chunks preserve the traversal order, regardless of worker order.
+    let blocks = if rows.len() >= 2_048 && rayon::current_num_threads() > 1 {
+        rows.par_chunks(512).map(render).collect::<Vec<_>>()
+    } else {
+        vec![render(&rows)]
+    };
+    out.reserve(blocks.iter().map(String::len).sum());
+    for block in blocks {
+        out.push_str(&block);
     }
     out
+}
+
+fn text_record<'a>(
+    record: &'a Map<String, Value>,
+    stabilize: impl FnOnce(&mut Map<String, Value>),
+) -> Cow<'a, Map<String, Value>> {
+    // Stabilization visits only reference objects. Ordinary fields can be
+    // rendered directly, including strings large enough to dominate copying.
+    let has_reference = record.values().any(|value| {
+        let mut found = false;
+        for_each_reference(value, &mut |_| found = true);
+        found
+    });
+    if has_reference {
+        let mut record = record.clone();
+        stabilize(&mut record);
+        Cow::Owned(record)
+    } else {
+        Cow::Borrowed(record)
+    }
 }
 
 pub(crate) fn vc_textconv(args: VcTextconvArgs) -> Result<()> {
@@ -1606,3 +1649,7 @@ pub(crate) fn vc_merge(args: VcMergeArgs) -> Result<()> {
         args.pretty,
     )
 }
+
+#[cfg(test)]
+#[path = "text_sim.rs"]
+mod text_sim;
