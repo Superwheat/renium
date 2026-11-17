@@ -608,6 +608,7 @@ pub(super) fn encode_services(
     drop(workers_profile);
     let _combine =
         crate::app::profile::span("native encode join payloads, identities and receipt plans");
+    let combine_classes = crate::app::profile::span("native encode merge class counts");
     let mut counts = std::collections::BTreeMap::<String, u32>::new();
     for (_, _, classes) in &encoded {
         for class in classes {
@@ -643,6 +644,9 @@ pub(super) fn encode_services(
     let mut aliases = Vec::new();
     let mut first_ordinals = HashMap::new();
     let mut referent_offset = 0;
+    drop(combine_classes);
+    let combine_payloads =
+        crate::app::profile::span("native encode concatenate payloads and bind receipts");
     for (payload, receipts, batch_classes) in encoded {
         let start = bytes.len();
         bytes.extend_from_slice(&payload);
@@ -681,10 +685,17 @@ pub(super) fn encode_services(
         });
         referent_offset += instance_count;
     }
+    drop(combine_payloads);
+    let _groups = crate::app::profile::span("native encode group paths and identity rows");
     let groups = groups
         .into_iter()
         .zip(package_plans)
         .map(|(group, plan)| {
+            let _service = crate::app::profile::span(&format!(
+                "{}: native import paths and identities ({} roots)",
+                group.service,
+                group.roots.len()
+            ));
             anyhow::ensure!(
                 plan.retained_roots.is_empty()
                     && plan.package_roots.is_empty()

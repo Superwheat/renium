@@ -3138,6 +3138,7 @@ fn capture_live_services_once(
     let helper_span = crate::app::profile::span("native capture helper round trip");
     let clock = super::super::timing::CounterAnchor::now();
     let exit = remote.run_owned(entry, capture_remaining_ms(started, timeout)?)?;
+    let returned = Instant::now();
     drop(helper_span);
     let receive = crate::app::profile::span("native capture receive and validate transport");
     // The helper has freed its input. Response is exclusively file-backed.
@@ -3174,6 +3175,12 @@ fn capture_live_services_once(
             "cleanup",
             "completion handoff",
         ],
+    );
+    clock.record_transport(
+        "native capture helper",
+        read_u64(&header, 352)?,
+        &ticks,
+        returned,
     );
     crate::app::output::log_global(
         4,

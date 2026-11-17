@@ -136,6 +136,49 @@ impl CounterAnchor {
             );
         }
     }
+
+    /// The injected thread starts after dispatch and exits after its last tick.
+    /// Those OS handoffs belong to transport, not to the engine serializer.
+    pub(crate) fn record_transport(
+        &self,
+        label: &str,
+        frequency: u64,
+        ticks: &[u64],
+        returned: Instant,
+    ) {
+        let Some((start, end)) = counter_transport_bounds(
+            self.ticks,
+            self.frequency,
+            frequency,
+            ticks,
+            returned.saturating_duration_since(self.instant),
+        ) else {
+            return;
+        };
+        profile::record_between(
+            &format!("{label}: remote thread launch"),
+            self.instant,
+            self.instant + start,
+        );
+        profile::record_between(
+            &format!("{label}: remote thread completion"),
+            self.instant + end,
+            returned,
+        );
+    }
+}
+
+#[cfg(any(windows, test))]
+fn counter_transport_bounds(
+    anchor: u64,
+    frequency: u64,
+    remote_frequency: u64,
+    ticks: &[u64],
+    elapsed: Duration,
+) -> Option<(Duration, Duration)> {
+    let intervals = counter_intervals(anchor, frequency, remote_frequency, ticks)?;
+    let bounds = (intervals.first()?.0, intervals.last()?.1);
+    (bounds.1 <= elapsed).then_some(bounds)
 }
 
 #[cfg(any(windows, test))]
@@ -206,5 +249,18 @@ mod tests {
         ] {
             assert!(counter_intervals(1000, 1000, frequency, &ticks).is_none());
         }
+    }
+
+    #[test]
+    fn native_transport_timing_requires_a_helper_inside_the_round_trip() {
+        let elapsed = Duration::from_millis(20);
+        assert_eq!(
+            counter_transport_bounds(1000, 1000, 1000, &[1003, 1018], elapsed),
+            Some((Duration::from_millis(3), Duration::from_millis(18)))
+        );
+        for ticks in [&[1003, 1021][..], &[999, 1018], &[1018, 1003], &[]] {
+            assert!(counter_transport_bounds(1000, 1000, 1000, ticks, elapsed).is_none());
+        }
+        assert!(counter_transport_bounds(1000, 1000, 999, &[1003, 1018], elapsed).is_none());
     }
 }
