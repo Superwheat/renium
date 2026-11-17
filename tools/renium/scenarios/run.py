@@ -114,6 +114,7 @@ class Context:
     studio_open: bool = False
     session: "Session | None" = None
     row_started: float = 0.0
+    launch_wait: float = 0.0
 
     def rbx(self, *args: str, stdin: str | None = None, timeout: float = 300, json_mode: bool = True, ok: bool | None = True, cwd: Path | None = None) -> CommandResult:
         """Runs rbx in the scratch project (or cwd) with JSON output; by default asserts ok:true."""
@@ -176,14 +177,17 @@ class Context:
         return (self.root / relative).read_text(encoding="utf-8")
 
     def open_studio(self, wait: int = 120):
-        space_studio_launch()
+        # Only a launch is spaced: a row that asks for the Studio its session
+        # already holds must not queue behind every other session's launches.
+        if not self.studio_open:
+            self.launch_wait += space_studio_launch()
         result = self.rbx("so", self.place, json_mode=True, timeout=wait + 30)
         self.studio_open = True
         self.guard_binding()
         return result
 
     def reopen_studio(self, wait: int = 120):
-        space_studio_launch()
+        self.launch_wait += space_studio_launch()
         result = self.rbx("ro", json_mode=True, timeout=wait + 30)
         self.studio_open = True
         self.guard_binding()
@@ -567,10 +571,12 @@ def assign_shards(scenarios: list, count: int, seed: int) -> list:
     }
     loads = [0.0] * count
     shards = [[] for _ in range(count)]
+    # Shard 0 runs against the default daemon and holds only the rows about
+    # that daemon. Every other shard drives a named daemon of its own, where
+    # no Studio the user has open can answer one of its rows.
+    ordinary = range(1, count) if count > 1 else range(count)
     for scenario in sorted(scenarios, key=lambda s: -expected[s.id]):
-        # Rows about the default daemon itself stay on shard 0, the one shard
-        # that runs against it; every other shard drives its own named daemon.
-        index = 0 if scenario.default_daemon else min(range(count), key=lambda i: loads[i])
+        index = 0 if scenario.default_daemon else min(ordinary, key=lambda i: loads[i])
         shards[index].append(scenario)
         loads[index] += expected[scenario.id]
     return shards
@@ -626,20 +632,23 @@ def request_abort(reason: str) -> None:
     ABORT_FILE.write_text(reason, encoding="utf-8")
 
 
-STUDIO_LAUNCH_GAP_SECONDS = 8.0
+# macOS needs the long gap (see space_studio_launch); Windows only needs the
+# launches not to land in the same instant.
+STUDIO_LAUNCH_GAP_SECONDS = float(os.environ.get("RENIUM_SCENARIO_LAUNCH_GAP", "8" if os.name != "nt" else "3"))
 # Shards start this far apart so their first daemon calls do not pile up.
 SHARD_START_GAP_SECONDS = 5
 
 
-def space_studio_launch():
+def space_studio_launch() -> float:
     """Studio windows start at least STUDIO_LAUNCH_GAP_SECONDS apart across every
     session on this machine: on macOS two windows starting together sign the
     account out of Studio (the second refreshes the session with a replaced
-    cookie and is answered 401)."""
+    cookie and is answered 401). Returns the seconds the caller waited."""
     SESSION_ROOT.mkdir(parents=True, exist_ok=True)
     lock = SESSION_ROOT / ".studio-launch.lock"
     stamp = SESSION_ROOT / ".studio-launch.at"
-    deadline = time.monotonic() + 120
+    started = time.monotonic()
+    deadline = started + 120
     while time.monotonic() < deadline:
         try:
             handle = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -662,10 +671,11 @@ def space_studio_launch():
             if wait > 0:
                 time.sleep(wait)
             stamp.write_text(str(time.time()), encoding="utf-8")
-            return
+            return time.monotonic() - started
         finally:
             os.close(handle)
             lock.unlink(missing_ok=True)
+    return time.monotonic() - started
 
 
 class RowGate:
@@ -914,7 +924,7 @@ class Session:
     def open_studio(self, ctx: Context):
         self.slot.acquire()
         self.restore_place()
-        space_studio_launch()
+        ctx.launch_wait += space_studio_launch()
         ctx.rbx("so", self.place, timeout=150)
         ctx.studio_open = True
         self.studio_open = True
@@ -1065,6 +1075,7 @@ def run_session(scenarios: list[Scenario], size: str, label: str, keep: bool, or
                 outcome["reason"] = f"{type(error).__name__}: {error}\n{traceback.format_exc()[-1500:]}"
             session.studio_open = ctx.studio_open
             outcome["seconds"] = round(time.monotonic() - started, 1)
+            outcome["launchWaitSeconds"] = round(ctx.launch_wait, 1)
             outcome["log"] = ctx.log
             outcomes.append(outcome)
             failed_any |= outcome["status"] != "pass"
@@ -1131,24 +1142,31 @@ def run_parallel(argv: list[str], parallel: int, seed: int, selected: list[Scena
     # The rows are split here, once: shards start seconds apart, and a split
     # each shard worked out for itself could differ when the recorded
     # durations changed in between, running one row twice and another never.
-    assigned = assign_shards(selected, parallel, seed)
-    for shard in range(parallel):
+    lanes = parallel + 1 if parallel > 1 else parallel
+    assigned = assign_shards(selected, lanes, seed)
+    phases = []
+    phase_started = time.monotonic()
+    for shard in range(lanes):
         if not assigned[shard]:
             continue
         log = REPORTS / f"{stamp}-shard{shard}.log"
         handle = open(log, "w", encoding="utf-8")
-        command = [sys.executable, "-I", str(HERE / "run.py"), *argv, "--seed", str(seed), "--shard", f"{shard}/{parallel}", "--only", ",".join(s.id for s in assigned[shard]), "--child", "--report-prefix", f"{stamp}-shard{shard}"]
+        command = [sys.executable, "-I", str(HERE / "run.py"), *argv, "--seed", str(seed), "--shard", f"{shard}/{lanes}", "--only", ",".join(s.id for s in assigned[shard]), "--child", "--report-prefix", f"{stamp}-shard{shard}"]
         env = dict(os.environ)
+        # One slot beyond the shards: a row that opens a second Studio takes
+        # it and runs here instead of waiting for the final serial phase.
+        env.setdefault("RENIUM_SCENARIO_STUDIOS", str(max(STUDIO_SLOTS, lanes + 1)))
         if shard > 0:
             # Each shard beyond the first drives a daemon of its own: every rbx
             # call of the shard inherits the name, and the default daemon
             # forwards the Studios that daemon opens to its ports (launch
-            # tickets). Rows that need the default daemon sit on shard 0.
+            # tickets). Shard 0 holds the rows that need the default daemon.
             env["RENIUM_DAEMON_NAME"] = f"shard{shard}"
         processes.append((shard, subprocess.Popen(command, cwd=HERE, env=env, stdout=handle, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL), handle))
         time.sleep(SHARD_START_GAP_SECONDS)
     wait_for_shards(processes, stamp, len(selected), brief)
-    for shard in range(1, parallel):
+    phases.append((f"{len(processes)} shards", time.monotonic() - phase_started))
+    for shard in range(1, lanes):
         subprocess.run([RBX, "dm", "stop", f"shard{shard}"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
     outcomes = []
     for shard, _, _ in processes:
@@ -1166,14 +1184,18 @@ def run_parallel(argv: list[str], parallel: int, seed: int, selected: list[Scena
         # Rows that need a lone Studio or a second slot ran into the other
         # shards; they run again alone now that those shards are done.
         print("\nfinal serial phase for " + str(len(retry)) + " row(s) (exclusive rows and rows that need a lone Studio)", flush=True)
+        phase_started = time.monotonic()
         replaced = run_serial_phase(argv, retry, seed, f"{stamp}-final", brief)
+        phases.append((f"{len(retry)} rows alone", time.monotonic() - phase_started))
         outcomes = [replaced.get(o["id"], o) for o in outcomes]
     failed = [o["id"] for o in outcomes if o["status"] in ("fail", "error")]
     if rerun_failed and failed and not abort_requested():
         # One more attempt, alone, tells a row that fails from one that lost
         # a race with the other shards; the report keeps the first outcome.
         print(f"\nsecond run for {len(failed)} row(s) that did not pass", flush=True)
+        phase_started = time.monotonic()
         second = run_serial_phase(argv, failed, seed, f"{stamp}-rerun", brief)
+        phases.append((f"{len(failed)} rows again", time.monotonic() - phase_started))
         for index, first in enumerate(outcomes):
             again = second.get(first["id"])
             if again is None:
@@ -1205,6 +1227,10 @@ def run_parallel(argv: list[str], parallel: int, seed: int, selected: list[Scena
     aborted = abort_requested()
     if aborted:
         print(f"\nRUN ABORTED: {aborted}")
+    # Where the time went, so a wait that paces the whole run shows up here.
+    row_seconds = sum(float(o.get("seconds") or 0) for o in outcomes)
+    launch_wait = sum(float(o.get("launchWaitSeconds") or 0) for o in outcomes)
+    print("\ntime: " + "; ".join(f"{name} {seconds / 60:.1f} min" for name, seconds in phases) + f"; rows {row_seconds / 60:.1f} min in all, {launch_wait / 60:.1f} of them waiting to launch Studio")
     print(f"\n{passed}/{len(outcomes) - skipped} passed; {skipped} skipped; seed {seed}; report {report.name if brief else report}")
     return 0 if passed + skipped == len(outcomes) else 1
 
@@ -1279,7 +1305,7 @@ def main() -> int:
     parser.add_argument("--isolated", action="store_true", help="a fresh copy and a fresh Studio per row (only for rows that test opening and closing)")
     parser.add_argument("--seed", type=int, help="row order seed for a session run (printed; default random)")
     parser.add_argument("--shard", default="", help="i/n: run the i-th of n interleaved slices of the shuffled rows")
-    parser.add_argument("--parallel", type=int, default=1, help="run n sessions at once, each with its own Studio")
+    parser.add_argument("--parallel", type=int, default=1, help="run n sessions at once, each with its own Studio and daemon, beside one session for the rows about the default daemon")
     parser.add_argument("--report-prefix", default="", help=argparse.SUPPRESS)
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--long", action="store_true", help="include rows that wait for many minutes on purpose (PLAY-036)")

@@ -96,7 +96,7 @@ def session_rows(reset_errors=(), fail_first=None) -> tuple[list[str], int]:
 
     class StubContext:
         def __init__(self):
-            self.log, self.studio_open, self.row_started = [], True, 0.0
+            self.log, self.studio_open, self.row_started, self.launch_wait = [], True, 0.0, 0.0
 
     class StubSession:
         resets = reopens = 0
@@ -202,7 +202,7 @@ def main() -> int:
     # split depends on recorded durations, so it is read with none recorded,
     # the state every case starts from.
     shutil.rmtree(run.REPORTS, ignore_errors=True)
-    second_of_shard_one = run.assign_shards([run.Scenario(id=name, title="", size="small", run=lambda ctx: None) for name in "ABCD"], 2, 7)[1][1].id
+    second_of_shard_one = run.assign_shards([run.Scenario(id=name, title="", size="small", run=lambda ctx: None) for name in "ABCD"], 3, 7)[1][1].id
     code, printed, report = drive({"shard": {second_of_shard_one: "die"}})
     assert code == 1, printed
     assert status_of(report)[second_of_shard_one] == "error", report
