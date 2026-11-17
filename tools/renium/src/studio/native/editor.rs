@@ -4260,6 +4260,12 @@ fn send_editor_service_replacement(
             }),
         )?;
         log_timing("native import complete", import_step_started);
+        if let Some(timings) = response.get("nativeCompleteTimings") {
+            crate::app::output::log_global(
+                5,
+                format_args!("[renium] native import complete phases_ms={timings}"),
+            );
+        }
         anyhow::ensure!(
             response["ok"] == true
                 && response["nativeInserted"] == true
