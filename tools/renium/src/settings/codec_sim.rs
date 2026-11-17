@@ -1543,7 +1543,7 @@ fn same_map(left: &Map<String, Value>, right: &Map<String, Value>) -> bool {
             .all(|(key, value)| right.get(key).is_some_and(|other| same(value, other)))
 }
 
-fn same_document(left: &SettingsBytecode, right: &SettingsBytecode) -> bool {
+pub(crate) fn same_document(left: &SettingsBytecode, right: &SettingsBytecode) -> bool {
     left.version == right.version
         && left.instances.len() == right.instances.len()
         && left
@@ -1558,6 +1558,10 @@ fn same_document(left: &SettingsBytecode, right: &SettingsBytecode) -> bool {
                     && same_map(&left.properties, &right.properties)
                     && same_map(&left.attributes, &right.attributes)
             })
+}
+
+pub(crate) fn captured_input(seed: u64) -> SettingsBytecode {
+    generate(seed).input()
 }
 
 fn shown(value: &Value) -> String {

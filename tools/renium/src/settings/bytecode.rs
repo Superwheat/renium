@@ -24,6 +24,20 @@ use crate::system::files::write_bytes_if_changed;
 #[path = "property_edit.rs"]
 pub(crate) mod property_edit;
 
+#[path = "captured.rs"]
+mod captured;
+#[cfg(test)]
+#[path = "captured_sim.rs"]
+pub(crate) mod captured_sim;
+
+/// The same document as decoding `encode_service_settings_binary(state)`.
+#[allow(dead_code)]
+pub(crate) fn settings_bytecode_from_service_state(
+    state: &ServiceState,
+) -> Result<SettingsBytecode> {
+    captured::convert(state)
+}
+
 const SETTINGS_BINARY_MAGIC: &[u8] = b"RBSSET\0";
 const SETTINGS_BINARY_MIN_VERSION: u8 = 10;
 pub(crate) const SETTINGS_BINARY_VERSION: u8 = 11;
@@ -2097,67 +2111,58 @@ fn collect_settings_binary_chunk<'a>(
         add_count(&mut out.string_counts, record.class_name);
         add_count(&mut out.class_counts, record.class_name);
 
-        let instance = &state.instances[record.source_index];
-        if let Some(native_properties) = state
-            .native_properties_by_instance
-            .as_ref()
-            .and_then(|values| values.get(record.source_index))
-        {
-            for property in native_properties {
-                if instance.properties.contains_key(property.name.as_str())
-                    || property.name == "RunContext" && instance.class_name != "Script"
-                {
-                    continue;
-                }
-                let property_name = property.name.as_str();
-                let source = SettingsBinaryValueSource::Native(&property.value);
-                let kind = binary_source_value_kind(&source, lookup)?;
-                push_settings_binary_value(
-                    &mut out,
-                    lookup,
-                    instance_index,
-                    property_name,
-                    kind,
-                    source,
-                )?;
-            }
-        }
-        for (property_name, raw_value) in &instance.properties {
-            if should_skip_binary_property(state, instance, property_name, raw_value) {
-                continue;
-            }
-            let property_name = property_name.as_str();
-            let source = SettingsBinaryValueSource::of_property(raw_value);
-            let kind = binary_source_value_kind(&source, lookup)?;
-            if kind == 0 {
-                continue;
-            }
-            push_settings_binary_value(
-                &mut out,
-                lookup,
-                instance_index,
-                property_name,
-                kind,
-                source,
-            )?;
-        }
-
-        if !instance.attributes.is_empty() {
-            let property_name = "Attributes";
-            let source = SettingsBinaryValueSource::Attributes(&instance.attributes);
-            let kind = binary_source_value_kind(&source, lookup)?;
-            push_settings_binary_value(
-                &mut out,
-                lookup,
-                instance_index,
-                property_name,
-                kind,
-                source,
-            )?;
-        }
+        visit_settings_binary_properties(state, record, lookup, |name, kind, source| {
+            push_settings_binary_value(&mut out, lookup, instance_index, name, kind, source)
+        })?;
     }
 
     Ok(out)
+}
+
+fn visit_settings_binary_properties<'a>(
+    state: &'a ServiceState,
+    record: &SettingsBinaryInstance<'_>,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    mut visit: impl FnMut(&'a str, u8, SettingsBinaryValueSource<'a>) -> Result<()>,
+) -> Result<()> {
+    let instance = &state.instances[record.source_index];
+    if let Some(native_properties) = state
+        .native_properties_by_instance
+        .as_ref()
+        .and_then(|values| values.get(record.source_index))
+    {
+        for property in native_properties {
+            if instance.properties.contains_key(property.name.as_str())
+                || property.name == "RunContext" && instance.class_name != "Script"
+            {
+                continue;
+            }
+            let property_name = property.name.as_str();
+            let source = SettingsBinaryValueSource::Native(&property.value);
+            let kind = binary_source_value_kind(&source, lookup)?;
+            visit(property_name, kind, source)?;
+        }
+    }
+    for (property_name, raw_value) in &instance.properties {
+        if should_skip_binary_property(state, instance, property_name, raw_value) {
+            continue;
+        }
+        let property_name = property_name.as_str();
+        let source = SettingsBinaryValueSource::of_property(raw_value);
+        let kind = binary_source_value_kind(&source, lookup)?;
+        if kind == 0 {
+            continue;
+        }
+        visit(property_name, kind, source)?;
+    }
+
+    if !instance.attributes.is_empty() {
+        let property_name = "Attributes";
+        let source = SettingsBinaryValueSource::Attributes(&instance.attributes);
+        let kind = binary_source_value_kind(&source, lookup)?;
+        visit(property_name, kind, source)?;
+    }
+    Ok(())
 }
 
 fn merge_settings_binary_collection<'a>(
