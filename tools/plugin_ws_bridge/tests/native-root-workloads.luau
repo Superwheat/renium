@@ -560,6 +560,14 @@ for _, interruption in ipairs({ "change", "cancel" }) do
 end
 print("Commit proof: post-commit edits invalidate equality; capture-time edits and cancellation retain rollback")
 
+generation = 0
+commitContext.capturePushProof = nil
+local alreadyRegistered = pending()
+alreadyRegistered.nativeServiceImport = { readerFinished = true, identitiesRegistered = true }
+local beforeRegistered = identified
+assert(commit({ transactionId = "snapshot" }, {}).state == "committed")
+assert(identified == beforeRegistered, "Live native imports must not repeat the completed identity registration")
+
 do
 	local sessions = { inline = { transactionId = "transaction", nativeHeld = {}, leaseId = "lease" } }
 	local completed = {}

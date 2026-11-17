@@ -666,13 +666,21 @@ local function prepareImportedIdentities(group: any)
 				byName = {}
 				for _, child in ipairs(instances[parent]:GetChildren()) do
 					budget()
-					local siblings = byName[child.Name] or {}
-					byName[child.Name] = siblings
-					siblings[#siblings + 1] = child
+					local childName = child.Name
+					local siblings = byName[childName]
+					if siblings == nil then
+						byName[childName] = child
+					elseif typeof(siblings) == "Instance" then
+						byName[childName] = { siblings, child }
+					else
+						siblings[#siblings + 1] = child
+					end
 				end
 				childrenByParent[parent] = byName
 			end
-			instance = byName[name] and byName[name][ordinal]
+			local siblings = byName[name]
+			instance = if typeof(siblings) == "Instance" then (if ordinal == 1 then siblings else nil)
+				else siblings and siblings[ordinal]
 		end
 		if instance == nil or instance.Name ~= name or instance.ClassName ~= class or seen[instance]
 			or (parent ~= 0 and instance.Parent ~= instances[parent]) then
@@ -7567,7 +7575,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				and next(session.nativeRootWrites or {}) == nil
 			ReferenceOverlay.commitNative(session.nativeUndo, ctx)
 			assertCommitActive()
-			rememberImportedIdentities(session.nativeUndo.prepared, ctx, session.nativeUndo.packageAliases)
+			-- Live native insertion already bound every validated identity in
+			-- complete. Commit reparents staged imports; live insertion's objects
+			-- and package aliases are unchanged, so its second walk adds nothing.
+			if session.nativeServiceImport == nil or not session.nativeServiceImport.identitiesRegistered then
+				rememberImportedIdentities(session.nativeUndo.prepared, ctx, session.nativeUndo.packageAliases)
+			end
 			for original, replacement in pairs(session.nativeUndo.replacements) do
 				session.instanceReplacements[original] = replacement
 			end
@@ -9380,6 +9393,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		finishPhase("identityValidation")
 		transaction.assertOwnership()
 		rememberImportedIdentities(undo.prepared, ctx, undo.packageAliases)
+		native.identitiesRegistered = true
 		finishPhase("identityRegistration")
 		runWithStudioChangeSuppression(ctx, function()
 			ReferenceOverlay.apply(native.referenceOverlay, undo.replacements, ctx)
