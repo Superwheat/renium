@@ -2517,7 +2517,7 @@ fn a_merge_settles_a_reference_to_an_instance_the_other_side_removed_from_anothe
             .map(|conflict| conflict.detail.as_str())
             .collect::<Vec<_>>(),
         [
-            "instances/ReplicatedStorage.renium: Pointer: Value refers to Workspace.Kit.Target (id=target), which Studio removed"
+            "instances/ReplicatedStorage.renium: Pointer: Value refers to Workspace.Kit.Target (id=target), which Studio removed; deciding studio clears Value, deciding editor brings Workspace.Kit.Target back"
         ]
     );
     let (names, value, conflicts, changes) = merge(ConflictPreference::Editor);
@@ -2714,7 +2714,7 @@ fn a_merge_settles_a_reference_whose_target_the_other_side_replaced_at_its_path(
             .map(|conflict| conflict.detail.as_str())
             .collect::<Vec<_>>(),
         [
-            "instances/ReplicatedStorage.renium: Pointer: Value refers to Workspace.Kit.Target (id=target), which Studio removed"
+            "instances/ReplicatedStorage.renium: Pointer: Value refers to Workspace.Kit.Target (id=target), which Studio removed; deciding studio clears Value, deciding editor brings Workspace.Kit.Target back"
         ]
     );
     let (targets, value, conflicts) = merge(ConflictPreference::Editor);

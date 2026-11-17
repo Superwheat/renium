@@ -609,6 +609,9 @@ pub(crate) struct VcMergeConflict {
     /// one is part of: keeping the instance places it, removing it leaves
     /// nothing to place.
     pub(crate) part_of_removal: bool,
+    /// For a conflict that hangs on another instance (a removed parent or
+    /// target): what deciding ours, then theirs, does.
+    pub(crate) effects: Option<[String; 2]>,
 }
 
 /// Settles the conflicts of a store merge as the merge meets them.
@@ -813,6 +816,7 @@ impl VcMergeContext<'_> {
             follows: None,
             decidable: true,
             part_of_removal: false,
+            effects: None,
         }
     }
 
@@ -1016,6 +1020,9 @@ struct Placement {
     /// Instances their decision left out with their removed parent; they
     /// stay out when another decision brings that parent back.
     left_out: HashSet<String>,
+    /// Orphans no decision placed; each stays a conflict when another
+    /// decision brings its parent back.
+    undecided: BTreeSet<String>,
 }
 
 /// An instance whose parent the merge left out follows the side its
@@ -1032,7 +1039,11 @@ fn reattach_orphans(
     placement: &mut Placement,
     mut side_of: impl FnMut(&VcMergedInstance) -> Option<bool>,
 ) {
-    let Placement { follows, left_out } = placement;
+    let Placement {
+        follows,
+        left_out,
+        undecided,
+    } = placement;
     let mut present = merged
         .iter()
         .map(|record| record.settings_id.clone())
@@ -1053,6 +1064,7 @@ fn reattach_orphans(
             Some(side) => *side,
             None => {
                 let Some(side) = side_of(record) else {
+                    undecided.insert(record.settings_id.clone());
                     continue;
                 };
                 follows.insert(record.settings_id.clone(), side);
@@ -1116,17 +1128,25 @@ fn reattach_orphans(
     }
 }
 
-/// The conflict of an instance whose parent the merge left out. An
-/// instance that is itself one side's removal is placed by that removal's
-/// decision; another one without a decision of its own follows the one
-/// that removed its parent.
+/// The conflict of an instance whose parent the merge left out, with what
+/// each side's decision does to it and to that parent.
 fn orphan_conflict(
     record: &VcMergedInstance,
     sides: &MergeSides<'_>,
     removals: &Removals,
 ) -> VcMergeConflict {
     let parent = record.parent_id.as_deref().unwrap_or_default();
-    let own = removals.get(&record.settings_id);
+    let effect = |ours: bool| match (
+        sides.path_on(ours, parent),
+        sides.index(ours, &record.settings_id),
+    ) {
+        (Some(parent), _) => format!("keeps it and brings {parent} back"),
+        (None, Some(own)) => match parent_path(sides.document(ours), own) {
+            Some(Value::String(path)) => format!("puts it under {path}"),
+            _ => "keeps it where that side holds it".to_string(),
+        },
+        (None, None) => "removes it".to_string(),
+    };
     VcMergeConflict {
         path: record.name.clone(),
         detail: format!("added under a parent (id={parent}) deleted on the other side"),
@@ -1135,12 +1155,10 @@ fn orphan_conflict(
         instance_path: sides.child_path(parent, &record.name),
         field: None,
         values: Some(sides.paths(parent)),
-        follows: own
-            .copied()
-            .flatten()
-            .or_else(|| removals.get(parent).copied().flatten()),
+        follows: removals.get(parent).copied().flatten(),
         decidable: true,
-        part_of_removal: own.is_some(),
+        part_of_removal: removals.contains_key(&record.settings_id),
+        effects: Some([effect(true), effect(false)]),
     }
 }
 
@@ -1148,13 +1166,17 @@ fn orphan_conflict(
 /// side a decision took (`true` ours), or `None` while open.
 type Removals = HashMap<String, Option<bool>>;
 
-/// The side an orphan follows: its conflict's.
+/// The side an orphan takes: the decision on its own removal when it is
+/// one side's removal (that conflict places it), else its conflict's.
 fn orphan_side(
     resolver: &mut dyn VcResolve,
     sides: &MergeSides<'_>,
     removals: &Removals,
     record: &VcMergedInstance,
 ) -> Option<bool> {
+    if let Some(Some(side)) = removals.get(&record.settings_id) {
+        return Some(*side);
+    }
     resolver.resolve(&orphan_conflict(record, sides, removals))
 }
 
@@ -1190,6 +1212,7 @@ fn removal_conflict(
         follows: None,
         decidable: true,
         part_of_removal: false,
+        effects: None,
     }
 }
 
@@ -1292,6 +1315,7 @@ fn cycle_conflict(
         follows: None,
         decidable,
         part_of_removal: false,
+        effects: None,
     }
 }
 
@@ -1393,6 +1417,10 @@ fn reference_conflict(
         follows,
         decidable: true,
         part_of_removal: false,
+        effects: Some([true, false].map(|ours| match sides.path_on(ours, target) {
+            Some(path) => format!("brings {path} back"),
+            None => format!("clears {field}"),
+        })),
     }
 }
 
@@ -2114,7 +2142,30 @@ fn merge_prepared_settings_documents(
         decided: HashMap::new(),
     };
     settle_references_to_removed_instances(&mut merged, &mut settlement, &mut conflicts);
-    let Placement { follows, left_out } = &placement;
+    let Placement {
+        follows,
+        left_out,
+        undecided,
+    } = &placement;
+    let present = merged
+        .iter()
+        .map(|record| record.settings_id.as_str())
+        .collect::<HashSet<_>>();
+    // An orphan whose parent another decision brought back is still its
+    // own conflict; one whose parent stays out is reported as it is left.
+    conflicts.extend(
+        merged
+            .iter()
+            .filter(|record| {
+                undecided.contains(&record.settings_id)
+                    && !follows.contains_key(&record.settings_id)
+                    && record
+                        .parent_id
+                        .as_deref()
+                        .is_some_and(|parent| present.contains(parent))
+            })
+            .map(|record| orphan_conflict(record, &sides, &removals)),
+    );
     finish_settings_merge(
         merged,
         version,

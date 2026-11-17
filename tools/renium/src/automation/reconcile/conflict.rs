@@ -206,6 +206,10 @@ pub(crate) struct Conflict {
     /// Tells apart, in the id, two conflicts about the same field.
     #[serde(skip)]
     pub(crate) discriminator: String,
+    /// A digest of the whole values each place holds, uncut: an id names
+    /// the conflict as shown, with these values, and nothing else.
+    #[serde(skip)]
+    held: String,
 }
 
 fn decidable_by_default() -> bool {
@@ -247,6 +251,7 @@ impl Conflict {
             files_changed_at: None,
             studio_changed: None,
             discriminator: String::new(),
+            held: String::new(),
         }
     }
 
@@ -303,6 +308,9 @@ impl Conflict {
             .filter(|(_, value)| value.is_none())
             .map(|(name, _)| name.to_string())
             .collect();
+        self.held = digest_of(
+            [base, files, studio].map(|value| value.map(|value| value.to_string().into_bytes())),
+        );
         self
     }
 
@@ -349,20 +357,28 @@ impl Conflict {
             .filter(|(_, entry)| entry.is_none())
             .map(|(name, _)| name.to_string())
             .collect();
+        self.held = digest_of([base, files, studio].map(|entry| {
+            entry.map(|entry| match entry {
+                SnapshotEntry::File(bytes) => [b"file\0".as_slice(), bytes].concat(),
+                other => entry_description(other).into_bytes(),
+            })
+        }));
         self
     }
 
-    /// What tells this conflict apart from every other of a comparison.
+    /// What tells this conflict apart from every other of a comparison:
+    /// what it is about, and the values each place holds.
     fn identity(&self) -> String {
         format!(
-            "{}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}",
             self.kind.name(),
             self.path,
             self.instance
                 .as_ref()
                 .map_or("", |instance| instance.id.as_str()),
             self.field.as_deref().unwrap_or(""),
-            self.discriminator
+            self.discriminator,
+            self.held
         )
     }
 
@@ -394,6 +410,23 @@ pub(crate) fn conflict_covered_by_paths(text: &str, paths: &[PathBuf]) -> bool {
                 .next()
                 .is_none_or(|next| matches!(next, ' ' | ':' | '/'))
     })
+}
+
+/// A digest of the last sync's, the files' and Studio's whole values, each
+/// told apart from a missing one.
+fn digest_of(values: [Option<Vec<u8>>; 3]) -> String {
+    let mut digest = Sha256::new();
+    for value in values {
+        match value {
+            Some(bytes) => {
+                digest.update([1]);
+                digest.update((bytes.len() as u64).to_le_bytes());
+                digest.update(bytes);
+            }
+            None => digest.update([0]),
+        }
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn short_hash(input: &str) -> String {
@@ -511,7 +544,7 @@ pub(crate) struct ConflictLog {
     /// Every id given out, with the identity of its conflict.
     ids: HashMap<String, String>,
     /// The ids whose decision a comparison applied.
-    applied: HashSet<String>,
+    applied: BTreeSet<String>,
     /// Decisions a comparison could not apply, with the reason.
     refused: BTreeMap<String, String>,
     /// The ids the same comparison meets on the way to its decisions: a
@@ -525,10 +558,15 @@ impl ConflictLog {
             decisions: decisions.into(),
             open: Vec::new(),
             ids: HashMap::new(),
-            applied: HashSet::new(),
+            applied: BTreeSet::new(),
             refused: BTreeMap::new(),
             found: HashSet::new(),
         }
+    }
+
+    /// The ids whose decision this comparison applied, in order.
+    pub(crate) fn applied(&self) -> &BTreeSet<String> {
+        &self.applied
     }
 
     /// The ids of every conflict this comparison met, settled or open.
@@ -564,10 +602,10 @@ impl ConflictLog {
         }
     }
 
-    /// The side a conflict takes: the decision for its id, else `follows`
-    /// (the side an earlier decision it hangs on took), else the
-    /// comparison's preference; `None` leaves it open. The conflict gets
-    /// its id; nothing is recorded.
+    /// The side a conflict takes: the decision for its id; without one,
+    /// under a preference, `follows` (the side an earlier decision it hangs
+    /// on took) or the preference; else `None`, which leaves it open. The
+    /// conflict gets its id; nothing is recorded.
     pub(crate) fn consult(
         &mut self,
         conflict: &mut Conflict,
@@ -604,9 +642,10 @@ impl ConflictLog {
         if !conflict.decidable {
             return None;
         }
-        follows
-            .or(self.decisions.preference.side())
-            .filter(|side| allowed(*side))
+        // A decision by id settles only its own conflict; what hangs on it
+        // follows it only where a preference settles everything anyway.
+        let preference = self.decisions.preference.side()?;
+        Some(follows.unwrap_or(preference)).filter(|side| allowed(*side))
     }
 
     /// Records a conflict nothing settled.
@@ -637,6 +676,20 @@ impl ConflictLog {
     /// decision never settles something else. A decision whose conflict
     /// another decision made moot (a parent another one brought back) is
     /// no error.
+    /// Whether a decision named no conflict this run met: one another
+    /// decision made moot, or a stale one, which only the conflicts met on
+    /// the way to the decisions tell apart.
+    pub(crate) fn has_unmatched_decisions(&self) -> bool {
+        self.decisions.by_id.keys().any(|id| {
+            !self.applied.contains(id)
+                && !self.refused.contains_key(id)
+                && !self
+                    .open
+                    .iter()
+                    .any(|conflict| conflict.id == *id && !conflict.decidable)
+        })
+    }
+
     pub(crate) fn finish(mut self) -> Result<Vec<Conflict>> {
         let mut errors = Vec::new();
         let mut unknown = Vec::new();
@@ -816,6 +869,32 @@ mod tests {
             "instances/Workspace.renium",
             "a path names the same file on every system"
         );
+    }
+
+    #[test]
+    fn an_id_names_the_values_shown_so_a_decision_never_meets_other_ones() {
+        let with = |files: &Value| {
+            id_of(property("Transparency").values(Some(&json!(0)), Some(files), Some(&json!(0.2))))
+        };
+        assert_eq!(with(&json!(0.5)), with(&json!(0.5)));
+        assert_ne!(with(&json!(0.5)), with(&json!(0.6)));
+        // Values that differ only past the cut a record shows.
+        let long = |tail: &str| json!(format!("{}{tail}", "x".repeat(3_000)));
+        assert_ne!(with(&long("a")), with(&long("b")));
+        let missing =
+            id_of(property("Transparency").values(Some(&json!(0)), None, Some(&json!(0.2))));
+        assert_ne!(missing, with(&Value::Null));
+        let text = |files: &str| {
+            id_of(
+                Conflict::new(ConflictKind::Script, Path::new("src/A.luau"), "a".into()).texts(
+                    Some(&SnapshotEntry::File(b"a\n".to_vec())),
+                    Some(&SnapshotEntry::File(files.as_bytes().to_vec())),
+                    Some(&SnapshotEntry::File(b"c\n".to_vec())),
+                ),
+            )
+        };
+        assert_eq!(text("b\n"), text("b\n"));
+        assert_ne!(text("b\n"), text("b\r\n"));
     }
 
     #[test]

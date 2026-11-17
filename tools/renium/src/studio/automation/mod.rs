@@ -6462,6 +6462,43 @@ mod settled_start_tests {
     }
 
     #[test]
+    fn open_conflicts_print_as_records_with_what_to_do_next() {
+        let conflict = json!({"id": "0a1b2c3d", "kind": "property", "field": "Transparency"});
+        let result = json!({
+            "ok": false,
+            "error": "Sync needs review: Workspace/Door: property Transparency",
+            "daemon": {
+                "running": true,
+                "resolutionRequired": true,
+                "conflicts": [conflict],
+                "moreConflicts": 3,
+            },
+        });
+        let (outcome, printed, _) =
+            crate::app::output::capture_output(crate::app::output::CaptureMode::Structured, || {
+                finish_studio_change_state_command(op::LIVE_STATUS, false, result.clone(), false)
+            });
+        assert!(outcome.unwrap_err().is::<ReportedFailure>());
+        let printed = printed.unwrap();
+        assert_eq!(printed["ok"], false);
+        assert_eq!(printed["conflicts"], json!([conflict]));
+        assert_eq!(printed["moreConflicts"], 3);
+        let next = printed["next"].as_str().unwrap();
+        assert!(
+            next.contains("rbx lon --resolve ID=studio|editor")
+                && next.contains("3 more conflicts are not shown"),
+            "{next}"
+        );
+        // A comparison that held without a record keeps the plain text.
+        let mut bare = result;
+        bare["daemon"]["conflicts"] = json!([]);
+        let error = finish_studio_change_state_command(op::LIVE_STATUS, false, bare, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rbx lon --prefer studio"), "{error}");
+    }
+
+    #[test]
     fn a_compact_status_shows_twenty_conflicts_and_counts_the_rest() {
         let conflict = |index: usize| json!({"id": format!("{index:08x}"), "kind": "property"});
         let daemon = json!({

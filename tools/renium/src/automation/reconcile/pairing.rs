@@ -1252,8 +1252,8 @@ pub(crate) struct FieldDifference {
 }
 
 /// What differs between the two records of one instance, field by field,
-/// under the rules the comparison applies. A parent is told by its id: the
-/// two records stand at the same path.
+/// under the rules the comparison applies. A parent differs by its id and
+/// is shown by its path, as the merge that follows shows it.
 pub(crate) fn instance_differences(
     editor: &SettingsBytecode,
     editor_index: usize,
@@ -1294,11 +1294,16 @@ pub(crate) fn instance_differences(
         settings_parent_id(editor, editor_index),
     );
     if live_parent != files_parent {
+        let parent_path = |document: &SettingsBytecode, index: usize| {
+            document.instances[index]
+                .parent_index
+                .map(|parent| json!(settings_instance_path(document, parent)))
+        };
         push(
             ConflictKind::Parent,
             "Parent",
-            live_parent.map(|id| json!(id)).as_ref(),
-            files_parent.map(|id| json!(id)).as_ref(),
+            parent_path(studio, studio_index).as_ref(),
+            parent_path(editor, editor_index).as_ref(),
         );
     }
     let (live_properties, files_properties) =

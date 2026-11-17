@@ -548,7 +548,7 @@ fn an_instance_added_under_a_parent_the_other_side_removed_follows_its_decision(
     assert_eq!(conflict.absent, ["files"]);
     assert_eq!(
         conflict.detail,
-        "Workspace/Folder/Child: Studio put it under a parent the files removed"
+        "Workspace/Folder/Child: Studio put it under a parent the files removed; deciding studio keeps it and brings Workspace/Folder back, deciding editor removes it"
     );
     let (merged, open) = store_merge(
         [&base, &files, &studio],
@@ -569,6 +569,175 @@ fn an_instance_added_under_a_parent_the_other_side_removed_follows_its_decision(
     );
     assert!(open.unwrap().is_empty());
     assert!(named(&merged, "Child").is_none() && named(&merged, "Folder").is_none());
+}
+
+/// The files edit P and add Y under it; Studio deletes P.
+fn removed_parent_with_an_added_child() -> [SettingsBytecode; 3] {
+    let base = document(vec![
+        root(),
+        instance("p", "P", "Folder", Some(0), json!({})),
+    ]);
+    let mut files = base.clone();
+    files.instances[1]
+        .attributes
+        .insert("Edited".into(), json!(true));
+    files
+        .instances
+        .push(instance("y", "Y", "Folder", Some(1), json!({})));
+    let studio = document(vec![root()]);
+    [base, files, studio]
+}
+
+#[test]
+fn deciding_a_removal_leaves_the_orphan_under_it_open() {
+    let [base, files, studio] = removed_parent_with_an_added_child();
+    let documents = [&base, &files, &studio];
+    let open = store_merge(documents, ConflictPreference::None.into())
+        .1
+        .unwrap();
+    assert_eq!(open.len(), 2, "{open:#?}");
+    let id_of = |instance: &str| {
+        open.iter()
+            .find(|conflict| conflict.instance.as_ref().unwrap().id == instance)
+            .unwrap()
+            .id
+            .clone()
+    };
+    let (removal, orphan) = (id_of("p"), id_of("y"));
+    let after = store_merge(
+        documents,
+        decided(
+            ConflictPreference::None,
+            &[(&removal, ConflictSide::Studio)],
+        ),
+    )
+    .1
+    .unwrap();
+    assert!(
+        after.iter().any(|conflict| conflict.id == orphan),
+        "the orphan has no decision of its own: {after:#?}"
+    );
+    // Both decided alike: P and Y go.
+    let (merged, after) = store_merge(
+        documents,
+        decided(
+            ConflictPreference::None,
+            &[
+                (&removal, ConflictSide::Studio),
+                (&orphan, ConflictSide::Studio),
+            ],
+        ),
+    );
+    assert!(after.unwrap().is_empty());
+    assert!(named(&merged, "P").is_none() && named(&merged, "Y").is_none());
+}
+
+#[test]
+fn contradicting_decisions_lose_no_work_and_the_record_says_why() {
+    let [base, files, studio] = removed_parent_with_an_added_child();
+    let documents = [&base, &files, &studio];
+    let open = store_merge(documents, ConflictPreference::None.into())
+        .1
+        .unwrap();
+    let orphan = open
+        .iter()
+        .find(|conflict| conflict.instance.as_ref().unwrap().id == "y")
+        .unwrap();
+    assert!(
+        orphan.detail.ends_with(
+            "deciding studio removes it, deciding editor keeps it and brings Workspace/P back"
+        ),
+        "{}",
+        orphan.detail
+    );
+    let removal = open
+        .iter()
+        .find(|conflict| conflict.id != orphan.id)
+        .unwrap();
+    // P removed as Studio did, Y kept as the files have it: Y keeps its
+    // parent, with the files' edit of it.
+    let (merged, after) = store_merge(
+        documents,
+        decided(
+            ConflictPreference::None,
+            &[
+                (&removal.id, ConflictSide::Studio),
+                (&orphan.id, ConflictSide::Editor),
+            ],
+        ),
+    );
+    assert!(after.unwrap().is_empty());
+    let p = named(&merged, "P").expect("Y's decision brings P back");
+    assert_eq!(p.attributes["Edited"], json!(true));
+    let y = named(&merged, "Y").unwrap();
+    assert_eq!(merged.instances[y.parent_index.unwrap()].name, "P");
+}
+
+#[test]
+fn deciding_a_cycle_leaves_a_reference_conflict_open() {
+    let base = document(vec![
+        root(),
+        instance("a", "A", "ObjectValue", Some(0), json!({})),
+        instance("b", "B", "Folder", Some(0), json!({})),
+        instance("t", "T", "Part", Some(0), json!({})),
+    ]);
+    let files = document(vec![
+        root(),
+        instance("a", "A", "ObjectValue", Some(0), json!({})),
+        instance("b", "B", "Folder", Some(1), json!({})),
+    ]);
+    let studio = document(vec![
+        root(),
+        instance("b", "B", "Folder", Some(0), json!({})),
+        instance(
+            "a",
+            "A",
+            "ObjectValue",
+            Some(1),
+            json!({"Value": {"_type": "Ref", "settingsId": "t"}}),
+        ),
+        instance("t", "T", "Part", Some(0), json!({})),
+    ]);
+    let documents = [&base, &files, &studio];
+    let open = store_merge(documents, ConflictPreference::None.into())
+        .1
+        .unwrap();
+    let cycle = open
+        .iter()
+        .find(|conflict| conflict.detail.contains("cycle"))
+        .expect("a cycle conflict");
+    let reference = open
+        .iter()
+        .find(|conflict| conflict.kind == ConflictKind::Reference)
+        .expect("a reference conflict");
+    let after = store_merge(
+        documents,
+        decided(
+            ConflictPreference::None,
+            &[(&cycle.id, ConflictSide::Studio)],
+        ),
+    )
+    .1
+    .unwrap();
+    assert!(
+        after.iter().any(|conflict| conflict.id == reference.id),
+        "the reference has no decision of its own: {after:#?}"
+    );
+    let (merged, after) = store_merge(
+        documents,
+        decided(
+            ConflictPreference::None,
+            &[
+                (&cycle.id, ConflictSide::Studio),
+                (&reference.id, ConflictSide::Studio),
+            ],
+        ),
+    );
+    assert!(after.unwrap().is_empty());
+    assert!(
+        named(&merged, "T").is_some(),
+        "Studio's side keeps the target"
+    );
 }
 
 #[test]
@@ -957,5 +1126,8 @@ fn a_record_with_sentence_conflicts_still_loads_and_keeps_writes_held() {
     );
     record.conflicts = log.finish().unwrap();
     let decoded: PairRecord = rmp_serde::from_slice(&rmp_serde::to_vec(&record).unwrap()).unwrap();
-    assert_eq!(decoded.conflicts, record.conflicts);
+    assert_eq!(
+        serde_json::to_value(&decoded.conflicts).unwrap(),
+        serde_json::to_value(&record.conflicts).unwrap()
+    );
 }

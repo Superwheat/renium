@@ -536,15 +536,24 @@ fn reference_conflict(
     let label = targets.label(reference.target);
     let [on_editor, on_studio] = held;
     let place = |held: bool| held.then(|| json!(label));
+    let effect = |held: bool| {
+        if held {
+            format!("brings {label} back")
+        } else {
+            format!("clears {}", reference.field)
+        }
+    };
     Conflict::new(
         ConflictKind::Reference,
         &reference.store,
         format!(
-            "{}: {}: {} refers to {label} (id={target_id}), which {} removed",
+            "{}: {}: {} refers to {label} (id={target_id}), which {} removed; deciding studio {}, deciding editor {}",
             conflict_path(&reference.store),
             holder.name,
             reference.field,
-            if on_studio { "the files" } else { "Studio" }
+            if on_studio { "the files" } else { "Studio" },
+            effect(on_studio),
+            effect(on_editor)
         ),
     )
     .instance(

@@ -204,13 +204,7 @@ impl Coordinator {
             studio_checkpoint: None,
             differences: Vec::new(),
         });
-        // With nothing open, every decision is stale; it is refused before a
-        // running session is touched. Open conflicts are checked by the
-        // comparison that decides them.
-        if !decisions.is_empty() && record.conflicts.is_empty() {
-            let ids = decisions.keys().map(String::as_str).collect::<Vec<_>>();
-            bail!("{}", unknown_decisions_message(&ids));
-        }
+        refuse_decisions_with_nothing_open(&decisions, &record)?;
         let runtime_replaced =
             record.last_runtime_id.is_some() && record.last_runtime_id != current_runtime_id;
         let current_local_file_digest = if runtime_replaced
@@ -441,7 +435,7 @@ impl Coordinator {
         let sides_match = side_differences.is_empty();
         log_reconcile_timing("side comparison", phase);
         if sides_match {
-            refuse_unmatched_decisions(setup)?;
+            refuse_unmatched_decisions(&setup.decisions)?;
             let phase = Instant::now();
             setup.unsynced_paths = unsynced_project_paths(context, &publish_paths, &editor)?.0;
             let baseline_matches = record
@@ -479,19 +473,19 @@ impl Coordinator {
         };
         log_reconcile_timing("baseline load", phase);
         let phase = Instant::now();
-        let merge_preference = setup
-            .resolution_preference
-            .unwrap_or(record.conflict_preference);
+        let decisions = comparison_decisions(setup, &record);
         log_global(
             5,
             format_args!(
-                "[renium] reconcile merge input: baseline={} preference={merge_preference:?} resolution={:?}",
+                "[renium] reconcile merge input: baseline={} preference={:?} resolution={:?} decisions={}",
                 baseline.is_some(),
-                setup.resolution_preference
+                decisions.preference,
+                setup.resolution_preference,
+                decisions.by_id.len()
             ),
         );
-        let (mut merged, mut conflicts, mut changes) = if setup.bootstrap_studio_from_editor {
-            refuse_unmatched_decisions(setup)?;
+        let (mut merged, conflicts, mut changes) = if setup.bootstrap_studio_from_editor {
+            refuse_unmatched_decisions(&setup.decisions)?;
             (
                 editor.clone(),
                 Vec::new(),
@@ -507,10 +501,7 @@ impl Coordinator {
                 baseline.as_ref(),
                 &editor,
                 &studio,
-                ConflictDecisions {
-                    preference: merge_preference,
-                    by_id: setup.decisions.clone(),
-                },
+                decisions,
                 Some(&side_differences),
             )?
         };
@@ -550,19 +541,7 @@ impl Coordinator {
         log_reconcile_timing("merge", phase);
 
         if !conflicts.is_empty() {
-            attach_conflict_evidence(context, &record, &studio_state, &mut conflicts);
-            record.conflicts = conflicts;
-            record.differences.clear();
-            record.resolution_required = setup.resolution_preference.is_none()
-                && record.conflict_preference == ConflictPreference::None;
-            record.note_setup(setup);
-            write_record(context, &setup.key, &record)?;
-            setup.mode = PairMode::Verify;
-            setup.resolution_required = record.resolution_required;
-            setup.error = Some(conflict_message(&record.conflicts));
-            setup.conflicts = record.conflicts.clone();
-            setup.differences.clear();
-            return Ok(());
+            return hold_for_conflicts(context, setup, &mut record, &studio_state, conflicts);
         }
 
         if verify_mode_holds(context, setup, &mut record, &changes)? {
@@ -1450,18 +1429,63 @@ pub(crate) fn verify_difference_lines(
     lines
 }
 
-/// A comparison that meets no conflict at all has nothing a decision could
-/// name: the decisions are stale, and nothing is applied.
-fn refuse_unmatched_decisions(setup: &PairSetup) -> Result<()> {
-    if setup.decisions.is_empty() {
+/// With nothing open in the pair, every decision is stale; it is refused
+/// before a running session is touched. Open conflicts are checked by the
+/// comparison that decides them.
+fn refuse_decisions_with_nothing_open(
+    decisions: &BTreeMap<String, ConflictSide>,
+    record: &PairRecord,
+) -> Result<()> {
+    if decisions.is_empty() || !record.conflicts.is_empty() {
         return Ok(());
     }
-    let ids = setup
-        .decisions
-        .keys()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
+    let ids = decisions.keys().map(String::as_str).collect::<Vec<_>>();
+    bail!("{}", unknown_decisions_message(&ids))
+}
+
+/// A comparison that meets no conflict at all has nothing a decision could
+/// name: the decisions are stale, and nothing is applied.
+fn refuse_unmatched_decisions(decisions: &BTreeMap<String, ConflictSide>) -> Result<()> {
+    if decisions.is_empty() {
+        return Ok(());
+    }
+    let ids = decisions.keys().map(String::as_str).collect::<Vec<_>>();
     bail!("{}; nothing was applied", unknown_decisions_message(&ids))
+}
+
+/// How this comparison settles conflicts: the decisions by id it was given,
+/// and the preference of this run, else the pair's.
+fn comparison_decisions(setup: &PairSetup, record: &PairRecord) -> ConflictDecisions {
+    ConflictDecisions {
+        preference: setup
+            .resolution_preference
+            .unwrap_or(record.conflict_preference),
+        by_id: setup.decisions.clone(),
+    }
+}
+
+/// Keeps both sides as they are and records the open conflicts, with the
+/// evidence about each, for the caller to decide.
+fn hold_for_conflicts(
+    context: &BoundContext,
+    setup: &mut PairSetup,
+    record: &mut PairRecord,
+    studio_state: &Value,
+    mut conflicts: Vec<Conflict>,
+) -> Result<()> {
+    attach_conflict_evidence(context, record, studio_state, &mut conflicts);
+    record.conflicts = conflicts;
+    record.differences.clear();
+    record.resolution_required = setup.resolution_preference.is_none()
+        && record.conflict_preference == ConflictPreference::None;
+    record.note_setup(setup);
+    write_record(context, &setup.key, record)?;
+    setup.mode = PairMode::Verify;
+    setup.resolution_required = record.resolution_required;
+    setup.error = Some(conflict_message(&record.conflicts));
+    setup.conflicts = record.conflicts.clone();
+    setup.differences.clear();
+    Ok(())
 }
 
 /// Adds what the disk and Studio's change tracker say about each conflict:
@@ -1558,5 +1582,199 @@ mod conflict_cover_tests {
         assert!(!record.covered_by_paths(&script));
         let sentence = Conflict::legacy(store_conflict.to_string());
         assert!(sentence.covered_by_paths(&store));
+    }
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+
+    fn setup(
+        decisions: &[(&str, ConflictSide)],
+        resolution: Option<ConflictPreference>,
+    ) -> PairSetup {
+        PairSetup {
+            key: "pair".into(),
+            identity: PairIdentity {
+                experience: String::new(),
+                project: String::new(),
+                fingerprint: String::new(),
+                game_id: None,
+                place_id: None,
+                local_file: None,
+            },
+            mode: PairMode::Reconcile,
+            resolution_preference: resolution,
+            decisions: decisions
+                .iter()
+                .map(|(id, side)| ((*id).to_string(), *side))
+                .collect(),
+            resolution_required: false,
+            error: None,
+            conflicts: Vec::new(),
+            differences: Vec::new(),
+            requires_reconcile: true,
+            runtime_id: Some("runtime".into()),
+            local_file_stamp: None,
+            local_file_digest: None,
+            bootstrap_studio_from_editor: false,
+            runtime_replacement_unproven: false,
+            unsynced_paths: Vec::new(),
+        }
+    }
+
+    fn record(conflicts: Vec<Conflict>, checkpoint: Option<StudioCheckpoint>) -> PairRecord {
+        PairRecord {
+            version: RECORD_VERSION,
+            identity: setup(&[], None).identity,
+            mode: PairMode::Reconcile,
+            conflict_preference: ConflictPreference::Editor,
+            runtime_settings: Map::new(),
+            baseline: None,
+            head: None,
+            conflicts,
+            resolution_required: false,
+            last_runtime_id: None,
+            local_file_stamp: None,
+            local_file_digest: None,
+            studio_checkpoint: checkpoint,
+            differences: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_comparison_takes_the_decisions_by_id_and_the_run_s_preference() {
+        let decided = comparison_decisions(
+            &setup(&[("0a1b2c3d", ConflictSide::Studio)], None),
+            &record(Vec::new(), None),
+        );
+        assert_eq!(decided.preference, ConflictPreference::Editor);
+        assert_eq!(
+            decided.by_id.into_iter().collect::<Vec<_>>(),
+            [("0a1b2c3d".to_string(), ConflictSide::Studio)]
+        );
+        let preferred = comparison_decisions(
+            &setup(&[], Some(ConflictPreference::Studio)),
+            &record(Vec::new(), None),
+        );
+        assert_eq!(preferred.preference, ConflictPreference::Studio);
+    }
+
+    #[test]
+    fn a_decision_with_nothing_open_is_refused_before_and_after_a_comparison() {
+        let decisions = setup(&[("0a1b2c3d", ConflictSide::Studio)], None).decisions;
+        let open = vec![Conflict::legacy("src/A.luau changed on both sides".into())];
+        let error = refuse_decisions_with_nothing_open(&decisions, &record(Vec::new(), None))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("0a1b2c3d"), "{error}");
+        refuse_decisions_with_nothing_open(&decisions, &record(open, None)).unwrap();
+        refuse_decisions_with_nothing_open(&BTreeMap::new(), &record(Vec::new(), None)).unwrap();
+        let error = refuse_unmatched_decisions(&decisions)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("0a1b2c3d") && error.ends_with("nothing was applied"),
+            "{error}"
+        );
+        refuse_unmatched_decisions(&BTreeMap::new()).unwrap();
+    }
+
+    #[test]
+    fn held_conflicts_carry_the_evidence_of_the_disk_and_the_change_tracker() {
+        let root = crate::tests::support::temp_dir("held-conflicts");
+        fs::create_dir_all(root.join("src/ReplicatedStorage")).unwrap();
+        fs::write(root.join("src/ReplicatedStorage/A.luau"), b"return 1").unwrap();
+        let context = BoundContext {
+            id: 1,
+            initialized: true,
+            project: root
+                .join("renium.project.jsonc")
+                .to_string_lossy()
+                .into_owned(),
+            root: root.to_string_lossy().into_owned(),
+            experience: String::new(),
+            source: root.join("src").to_string_lossy().into_owned(),
+            resource_lease: None,
+            place_id: None,
+            game_id: None,
+            selector: String::new(),
+            runtime_id: Some("runtime".into()),
+            plugin_build: None,
+            fingerprint: String::new(),
+        };
+        let services = sync_services();
+        let generations = |changed: &str| {
+            services
+                .iter()
+                .map(|service| {
+                    (
+                        service.clone(),
+                        json!(if service == changed { 2 } else { 1 }),
+                    )
+                })
+                .collect::<Map<_, _>>()
+        };
+        let checkpoint = StudioCheckpoint {
+            runtime_id: "runtime".into(),
+            change_tracker_version: 1,
+            seq: 1,
+            service_generations: services
+                .iter()
+                .map(|service| (service.clone(), 1))
+                .collect(),
+        };
+        let state = json!({
+            "tracking": true,
+            "trackedServices": services.len(),
+            "runtimeId": "runtime",
+            "changeTrackerVersion": 1,
+            "seq": 2,
+            "dirtyServices": [],
+            "fullSyncServices": [],
+            "checkpointGenerations": generations("ReplicatedStorage"),
+        });
+        let script = Conflict::new(
+            ConflictKind::Script,
+            Path::new("src/ReplicatedStorage/A.luau"),
+            "src/ReplicatedStorage/A.luau changed on both sides".into(),
+        );
+        let store = |service: &str| {
+            Conflict::new(
+                ConflictKind::Property,
+                &Path::new("src").join(service).join("store.renium"),
+                format!("{service}/Door: property Transparency"),
+            )
+        };
+        let mut setup = setup(&[], None);
+        let mut record = record(Vec::new(), Some(checkpoint));
+        hold_for_conflicts(
+            &context,
+            &mut setup,
+            &mut record,
+            &state,
+            vec![script, store("ReplicatedStorage"), store("Workspace")],
+        )
+        .unwrap();
+        let written = load_record(&context, "pair").unwrap().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(setup.mode, PairMode::Verify);
+        assert!(
+            setup
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("Sync needs review: ")
+        );
+        assert_eq!(written.conflicts.len(), 3);
+        let [script, replicated, workspace] = written.conflicts.as_slice() else {
+            unreachable!()
+        };
+        let stamp = script.files_changed_at.as_deref().unwrap();
+        assert!(stamp.len() == 20 && stamp.ends_with('Z'), "{stamp}");
+        assert_eq!(script.studio_changed, None, "a script file is not a store");
+        assert_eq!(replicated.studio_changed, Some(true));
+        assert_eq!(workspace.studio_changed, Some(false));
+        assert_eq!(replicated.files_changed_at, None, "no store file on disk");
     }
 }

@@ -29,10 +29,13 @@ pub(crate) fn merge_snapshots_with_changes(
         studio,
     };
     let decisions = decisions.into();
-    let found = conflicts_met_while_deciding(&sides, &decisions, known_differences)?;
-    let mut conflicts = ConflictLog::new(decisions);
-    conflicts.found_before_decisions(found);
+    let mut conflicts = ConflictLog::new(decisions.clone());
     let (merged, changes) = merge_sides(&sides, &mut conflicts, known_differences)?;
+    if conflicts.has_unmatched_decisions() {
+        let found =
+            conflicts_met_while_deciding(&sides, &decisions, &conflicts, known_differences)?;
+        conflicts.found_before_decisions(found);
+    }
     Ok((merged, conflicts.finish()?, changes))
 }
 
@@ -40,10 +43,13 @@ pub(crate) fn merge_snapshots_with_changes(
 /// meets undecided, then those that appear once the decisions naming them
 /// are taken, and so on. One decision can make another's conflict moot (a
 /// parent another one brings back); that decision still names a conflict
-/// of this comparison, while one this never meets is stale.
+/// of this comparison, while one this never meets is stale. A round with
+/// just the decisions `decided` applied is that comparison again, and takes
+/// what it met instead of merging.
 fn conflicts_met_while_deciding(
     sides: &SnapshotSides<'_>,
     decisions: &ConflictDecisions,
+    decided: &ConflictLog,
     known_differences: Option<&HashSet<PathBuf>>,
 ) -> Result<HashSet<String>> {
     let mut found = HashSet::new();
@@ -63,6 +69,10 @@ fn conflicts_met_while_deciding(
             return Ok(found);
         }
         taken = Some(usable.len());
+        if usable.keys().eq(decided.applied()) {
+            found.extend(decided.met());
+            continue;
+        }
         let mut probe = ConflictLog::new(ConflictDecisions {
             preference: decisions.preference,
             by_id: usable,
@@ -1264,7 +1274,9 @@ pub(crate) fn merge_reconciliation_settings_documents(
         (studio_source_changes, editor_source_changes),
         &aligned_additions,
     );
-    for conflict in &open {
+    // An orphan that is itself one side's removal is that removal's
+    // conflict, which is open on its own.
+    for conflict in open.iter().filter(|conflict| !conflict.part_of_removal) {
         conflicts.record(store_conflict(store, conflict));
     }
     merged
@@ -1279,11 +1291,24 @@ struct StoreResolver<'a> {
 
 impl VcResolve for StoreResolver<'_> {
     fn resolve(&mut self, conflict: &VcMergeConflict) -> Option<bool> {
+        if conflict.part_of_removal {
+            return None;
+        }
         let mut record = store_conflict(self.store, conflict);
         self.log
             .consult(&mut record, conflict.follows.map(studio_when))
             .map(|side| side == ConflictSide::Studio)
     }
+}
+
+/// What deciding each side does, for a conflict that hangs on another
+/// instance.
+fn effects_sentence(conflict: &VcMergeConflict) -> String {
+    conflict
+        .effects
+        .as_ref()
+        .map(|[studio, files]| format!("; deciding studio {studio}, deciding editor {files}"))
+        .unwrap_or_default()
 }
 
 fn studio_when(ours: bool) -> ConflictSide {
@@ -1350,18 +1375,17 @@ pub(crate) fn store_conflict(store: &Path, conflict: &VcMergeConflict) -> Confli
             "",
             values_sentence(&format!("{at}: parent"), Some(base), files, studio),
         ),
-        VcConflictKind::Orphan if !conflict.part_of_removal => (
+        VcConflictKind::Orphan => (
             ConflictKind::Removal,
             "orphan",
             format!(
-                "{at}: {} put it under a parent {} removed",
+                "{at}: {} put it under a parent {} removed{}",
                 holder(studio),
-                other(studio)
+                other(studio),
+                effects_sentence(conflict)
             ),
         ),
-        // An orphan that is itself a removal is that one conflict, with one
-        // decision.
-        VcConflictKind::Removal | VcConflictKind::Orphan => (
+        VcConflictKind::Removal => (
             ConflictKind::Removal,
             "",
             format!(
@@ -1394,9 +1418,10 @@ pub(crate) fn store_conflict(store: &Path, conflict: &VcMergeConflict) -> Confli
             ConflictKind::Reference,
             "",
             format!(
-                "{at}: {field} refers to {}, which {} removed",
+                "{at}: {field} refers to {}, which {} removed{}",
                 quoted_value(studio.or(files)),
-                other(studio)
+                other(studio),
+                effects_sentence(conflict)
             ),
         ),
     };
