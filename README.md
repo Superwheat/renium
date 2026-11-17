@@ -7,15 +7,20 @@ for working with AI coding agents.
 
 ### It syncs what a plugin cannot
 
-Rojo, Argon and the Studio MCP servers work through a Studio plugin. A plugin cannot:
+Rojo, Argon and the Studio MCP servers work through a Studio plugin, and a plugin
+only gets what Roblox exposes to scripts. Renium has a native helper beside its
+plugin and reaches the rest:
 
-- set `MeshPart.MeshId`,
-- write Terrain the way Studio saves it,
-- read or set the properties Roblox locks away from scripts.
-
-Renium can. Beside its plugin it has a native helper that reads and writes a place
-the way Studio itself saves it. A push puts back the whole place, not only the part
-a script could set.
+- **Everything Studio saves.** It reads a place the way Studio writes a place file.
+  The project holds what scripts never see: collision meshes, union geometry, the
+  Terrain grid, mesh ids.
+- **Locked properties.** It reads and sets properties the scripting API refuses,
+  such as `MeshPart.MeshId` and `CollisionFidelity`.
+- **Reserved functions.** It calls `HttpRbxApiService`, which Roblox keeps for its
+  own scripts: web requests to Roblox under Studio's login.
+- **The whole place at once.** A push hands Studio the place in Studio's own binary
+  format. 200,000 instances arrive the way they do when Studio opens a place, not
+  one script call at a time.
 
 ### The project is about the size of the place
 
@@ -84,10 +89,12 @@ The helper does what a Studio plugin is not allowed to:
 
 - write Terrain from the files into Studio,
 - read and write locked properties,
+- call functions Roblox reserves for its own scripts,
 - publish packages without dialogs,
 - capture play windows that are not in front and send input to them.
 
-By default, each read or write of a locked property waits for your approval.
+By default, each read or write of a locked property and each reserved call waits
+for your approval.
 
 How the helper gets into Studio:
 
