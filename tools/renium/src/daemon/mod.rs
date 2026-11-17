@@ -337,6 +337,7 @@ thread_local! {
     static EARLY_RESPONSE: std::cell::RefCell<Option<EarlyResponse>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 struct EarlyResponse {
     stream: crate::system::net::SharedTcpStream,
     id: u64,
@@ -344,11 +345,13 @@ struct EarlyResponse {
     sent: bool,
 }
 
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) fn can_respond_before_settle() -> bool {
     EARLY_RESPONSE.with(|slot| slot.borrow().as_ref().is_some_and(|reply| !reply.sent))
 }
 
 #[cfg(test)]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) fn fixture_early_response() -> impl Drop {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -370,6 +373,7 @@ pub(crate) fn fixture_early_response() -> impl Drop {
 /// The request thread becomes the daemon's continuation. Its stack still
 /// owns the Edit gate, tracking guard, selection and Live Sync pause.
 /// The caller must switch to a daemon lease and persist recovery first.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) fn respond_before_settle(result: Value) {
     EARLY_RESPONSE.with(|slot| {
         let mut slot = slot.borrow_mut();

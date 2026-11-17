@@ -96,6 +96,7 @@ impl StoredSnapshot {
 
     /// A process can stop between atomic file replacements. Every path must
     /// still be one of the two journaled states; an unrelated edit never fits.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     pub(super) fn matches_partial_publication(
         &self,
         accepted: &Self,

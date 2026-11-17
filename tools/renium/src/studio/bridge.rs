@@ -1611,6 +1611,7 @@ impl BridgeServer {
     /// Continue committed work on this thread independently of the client.
     /// The gate and runtime selection stay held; cancellation either wins
     /// before the handoff or can no longer cancel the finished client lease.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     pub(crate) fn continue_request_lease(&self) -> Result<()> {
         let thread_id = thread::current().id();
         let mut active = self.active_request_leases.lock_recover();
