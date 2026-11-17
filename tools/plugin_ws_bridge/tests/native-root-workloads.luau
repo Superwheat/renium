@@ -480,6 +480,7 @@ end
 local pendingSessions = {}
 local attached, documents, finished, generation = 0, 0, 0, 0
 local identified = 0
+local commitPhase = nil
 local commitContext = { studioChangeGeneration = function() return generation end }
 local onFinish = nil
 local commit = extract("local function commitTransactionUnsafe(", "function api.commitTransaction(", {
@@ -488,7 +489,7 @@ local commit = extract("local function commitTransactionUnsafe(", "function api.
 	assertTransactionLease = function() end,
 	captureOperationCancellation = function() return {} end,
 	assertSessionOwnership = function() end,
-	setTrackedOperationPhase = function() end,
+	setTrackedOperationPhase = function(_, phase) commitPhase = phase end,
 	TransactionState = {
 		drainJournal = function() return {} end,
 		finishJournal = function() return {} end,
@@ -503,7 +504,10 @@ local commit = extract("local function commitTransactionUnsafe(", "function api.
 		assert(prepared == pendingSessions.snapshot.nativeUndo.prepared and ctx == commitContext)
 		identified += 1
 	end,
-	ScriptDocumentState = { apply = function() documents += 1 end },
+	ScriptDocumentState = { apply = function()
+		assert(commitPhase == "scriptDocuments")
+		documents += 1
+	end },
 	ctx = commitContext,
 	cancelExpectedEvent = function() end,
 	finishHistoryRecording = function() finished += 1;if onFinish then onFinish() end end,
@@ -540,7 +544,10 @@ print("Protected snapshot: staged content, repeat preparation, single commit and
 
 generation = 0
 pending()
-commitContext.capturePushProof = function() return generation end
+commitContext.capturePushProof = function()
+	assert(commitPhase == "verifiedPushProof", "Proof capture must not be charged to script documents")
+	return generation
+end
 onFinish = function() generation += 1 end
 local committed = commit({ transactionId = "snapshot" }, {})
 assert(committed.verifiedPushProof == 0 and generation == 1,

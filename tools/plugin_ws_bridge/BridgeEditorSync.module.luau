@@ -7605,6 +7605,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			)
 		end
 		assertCommitActive()
+		setTrackedOperationPhase(operation, "postCommitProperties")
 		local postCommitPropertyChanges = session.postCommitPropertyChanges
 		if #postCommitPropertyChanges > 0 and not session.commitPrepared then
 			local updated = 0
@@ -7675,9 +7676,11 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		-- during FinishRecording can edit Studio after commit; capturing afterward
 		-- would mistake those newer values for the files that were just pushed.
 		local verifiedPushProof, pushProofUnavailable = nil, nil
+		setTrackedOperationPhase(operation, "verifiedPushProof")
 		if ctx.capturePushProof then
 			verifiedPushProof, pushProofUnavailable = ctx.capturePushProof()
 		end
+		setTrackedOperationPhase(operation, "commitFenceValidation")
 		assertCommitActive()
 		TransactionState.drainJournal(session, ctx)
 		assertStudioUnchanged()

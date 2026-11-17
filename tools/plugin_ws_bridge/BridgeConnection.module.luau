@@ -20,15 +20,27 @@ end
 
 -- Child workers yield on separate coroutines. Keep their waits in the request
 -- that started them without changing which coroutine owns the request clock.
-function BridgeConnection.profileWaitObserver(label: string)
+function BridgeConnection.profileWaitObserver(label: string, workLabel: string?)
 	local profile = profiles[coroutine.running()]
 	if profile == nil then return nil end
-	return function(started: number)
-		if #profile.spans < 4096 then
+	local resumed = os.clock()
+	local function workUntil(finished: number)
+		if workLabel ~= nil and #profile.spans < 4096 then
 			profile.spans[#profile.spans + 1] = {
-				label, (started - profile.started) * 1000, (os.clock() - profile.started) * 1000,
+				workLabel, (resumed - profile.started) * 1000, (finished - profile.started) * 1000,
 			}
 		end
+	end
+	return function(started: number)
+		workUntil(started)
+		resumed = os.clock()
+		if #profile.spans < 4096 then
+			profile.spans[#profile.spans + 1] = {
+				label, (started - profile.started) * 1000, (resumed - profile.started) * 1000,
+			}
+		end
+	end, function()
+		workUntil(os.clock())
 	end
 end
 

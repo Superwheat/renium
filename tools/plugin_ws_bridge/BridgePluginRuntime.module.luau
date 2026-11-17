@@ -828,8 +828,13 @@ function BridgePluginRuntime.start(context)
 		nativeLastChangeByService.Workspace = "SmoothGrid"
 	end
 	Config.captureTerrainProof = function(): string
+		local started = os.clock()
 		local payload = game:GetService("SerializationService"):SerializeInstancesAsync({ game:GetService("Workspace").Terrain })
-		return buffer.tostring(EncodingService:ComputeBufferHash(payload, Enum.HashAlgorithm.Blake3))
+		ConnectionModule.profileStep("Terrain proof serialization", started, { instances = 1, bytes = buffer.len(payload) })
+		started = os.clock()
+		local digest = buffer.tostring(EncodingService:ComputeBufferHash(payload, Enum.HashAlgorithm.Blake3))
+		ConnectionModule.profileStep("Terrain proof hash", started, { bytes = buffer.len(payload) })
+		return digest
 	end
 	Config.observeProofDocuments = function(changed): { RBXScriptConnection }
 		local editor = game:GetService("ScriptEditorService")
@@ -3574,8 +3579,12 @@ function BridgePluginRuntime.start(context)
 		overlayCacheKey: string?,
 		stateOverride: ServiceState?
 	): (string, number)
-		local yieldForBudget = ParallelModule.newWorkBudget(nil,
-			ConnectionModule.profileWaitObserver(`{serviceName}: overlay scheduler yield`))
+		local observeWait = nil
+		local yieldForBudget = ParallelModule.newWorkBudget(nil, function(started)
+			if observeWait then
+				observeWait(started)
+			end
+		end)
 		local generation = Config.studioChanges.serviceGeneration(serviceName)
 		local state = stateOverride or getState(serviceName)
 		local includeStableIds = not not stableIdsEnabled
@@ -3786,7 +3795,13 @@ function BridgePluginRuntime.start(context)
 			ConnectionModule.profileStep(`{serviceName}: wait for overlay worker`, slotStarted)
 			acquired = true
 			local buildStarted = os.clock()
+			local finishWork
+			observeWait, finishWork = ConnectionModule.profileWaitObserver(
+				`{serviceName}: overlay scheduler yield`, `{serviceName}: overlay row computation`)
 			local built = buildPayload()
+			if finishWork then
+				finishWork()
+			end
 			ConnectionModule.profileStep(`{serviceName}: build overlay rows`, buildStarted, { instances = math.min(take, total - startPos + 1) })
 			return built
 		end, debug.traceback)

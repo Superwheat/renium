@@ -38,6 +38,22 @@ assert(coroutine.resume(child))
 local waits = Profile.profileFinish()
 assert(#waits.spans == 1 and waits.spans[1][1] == "scheduler yield")
 assert(math.abs(waits.spans[1][3] - waits.spans[1][2] - 20) < 0.00001)
+Profile.profileStart(now)
+local observeSlice, finishSlice = Profile.profileWaitObserver("wait", "compute")
+now += 0.008
+local waitStarted = now
+now += 0.030
+observeSlice(waitStarted)
+now += 0.004
+finishSlice()
+local slices = Profile.profileFinish()
+assert(#slices.spans == 3)
+for index, expected in ipairs({ { "compute", 0, 8 }, { "wait", 8, 38 }, { "compute", 38, 42 } }) do
+	local span = slices.spans[index]
+	assert(span[1] == expected[1])
+	assert(math.abs(span[2] - expected[2]) < 0.00001 and math.abs(span[3] - expected[3]) < 0.00001,
+		"Active overlay slices and waits must cover the real intervals without overlap")
+end
 
 local sent
 local Transport = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeTransport.module.luau"), {
