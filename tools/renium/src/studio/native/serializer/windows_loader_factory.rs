@@ -95,17 +95,7 @@ fn follow_factory_instruction(
                 }
                 *found = Some(candidate);
             }
-            for r in [
-                Register::RAX,
-                Register::RCX,
-                Register::RDX,
-                Register::R8,
-                Register::R9,
-                Register::R10,
-                Register::R11,
-            ] {
-                registers.remove(&r);
-            }
+            clear_volatile(registers);
             if let Some(value) = result {
                 registers.insert(Register::RAX, value);
             }

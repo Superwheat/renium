@@ -9,6 +9,7 @@ mod factory;
 #[path = "windows_loader_history.rs"]
 mod history;
 pub(super) use history::HistoryTrace;
+const SOURCE_CLASS_NAME: &[u8] = b"LuaSourceContainer\0";
 
 pub(super) fn discover_factory(
     image: &PeImage<'_>,
@@ -44,7 +45,8 @@ struct PreparedLoader {
     trace: LoaderTrace,
     history: HistoryTrace,
     history_table: std::sync::Arc<Vec<usize>>,
-    metadata: history::Evidence,
+    metadata_pointers: Vec<(usize, usize)>,
+    metadata_names: Vec<usize>,
     code: std::sync::Arc<Vec<(usize, Vec<u8>)>>,
 }
 
@@ -72,15 +74,15 @@ pub(super) fn verify_loaded(
             }),
         "Loaded Studio history table changed"
     );
-    for &(rva, target) in &prepared.metadata.pointers {
+    for &(rva, target) in &prepared.metadata_pointers {
         anyhow::ensure!(
             memory.read_u64(studio.base + rva)? as usize == studio.base + target,
             "Loaded Studio reflection metadata changed; native import is unavailable"
         );
     }
-    for &rva in &prepared.metadata.names {
+    for &rva in &prepared.metadata_names {
         anyhow::ensure!(
-            memory.read_vec(studio.base + rva, 19)? == b"LuaSourceContainer\0",
+            memory.read_vec(studio.base + rva, SOURCE_CLASS_NAME.len())? == SOURCE_CLASS_NAME,
             "Loaded Studio reflection class name changed; native import is unavailable"
         );
     }
@@ -140,7 +142,8 @@ fn prepared(path: &Path) -> Result<PreparedLoader> {
             trace,
             history,
             history_table: std::sync::Arc::new(history_table),
-            metadata: discovered.metadata,
+            metadata_pointers: discovered.metadata.pointers.into_iter().collect(),
+            metadata_names: discovered.metadata.names.into_iter().collect(),
             code: std::sync::Arc::new(code),
         })
     })()
@@ -182,7 +185,7 @@ pub(super) struct LoaderTrace {
 }
 
 // Volatile argument registers cannot carry provenance across an engine call.
-fn clear_volatile(registers: &mut HashMap<Register, Input>) {
+fn clear_volatile<T>(registers: &mut HashMap<Register, T>) {
     for register in [
         Register::RAX,
         Register::RCX,
@@ -449,13 +452,18 @@ fn loader_extra_flags(
     .then_some(Input::ExtraFlags)
 }
 
-fn loader_move_stack(registers: &mut HashMap<Register, Input>, delta: i64) {
-    let next = match registers.remove(&Register::RSP) {
-        Some(Input::Stack(at)) => at.checked_add(delta).filter(|at| (-4096..=0).contains(at)),
-        _ => None,
+fn adjusted_stack(registers: &HashMap<Register, Input>, delta: i64) -> Option<i64> {
+    let Input::Stack(at) = registers.get(&Register::RSP)? else {
+        return None;
     };
-    if let Some(at) = next {
+    at.checked_add(delta)
+}
+
+fn loader_move_stack(registers: &mut HashMap<Register, Input>, delta: i64) {
+    if let Some(at) = adjusted_stack(registers, delta).filter(|at| (-4096..=0).contains(at)) {
         registers.insert(Register::RSP, Input::Stack(at));
+    } else {
+        registers.remove(&Register::RSP);
     }
 }
 
@@ -472,14 +480,7 @@ fn reader_call(bytes: &[u8], rva: usize) -> Option<usize> {
     ]);
     let mut stack = HashMap::from([(0x28, (Extra5, 8)), (0x30, (Extra6, 8))]);
     let address = |i: &iced_x86::Instruction, registers: &HashMap<Register, Input>| {
-        if i.memory_index() != Register::None {
-            return None;
-        }
-        let Stack(base) = registers.get(&i.memory_base().full_register())? else {
-            return None;
-        };
-        base.checked_add(i.memory_displacement64() as i64)
-            .filter(|offset| (-4096..=4096).contains(offset))
+        loader_stack_address(i, registers).filter(|offset| (-4096..=4096).contains(offset))
     };
     let mut decoder = Decoder::with_ip(64, bytes, rva as u64, DecoderOptions::NONE);
     for _ in 0..64 {
@@ -527,10 +528,7 @@ fn reader_call(bytes: &[u8], rva: usize) -> Option<usize> {
                 registers.insert(destination, Zero);
             }
             Mnemonic::Push if i.op0_kind() == OpKind::Register && i.op0_register().size() == 8 => {
-                let Stack(offset) = *registers.get(&Register::RSP)? else {
-                    return None;
-                };
-                let next = offset.checked_sub(8)?;
+                let next = adjusted_stack(&registers, -8)?;
                 registers.insert(Register::RSP, Stack(next));
                 reader_stack_write(&mut stack, next, registers.get(&destination).copied(), 8);
             }
@@ -541,10 +539,7 @@ fn reader_call(bytes: &[u8], rva: usize) -> Option<usize> {
                         OpKind::Immediate32to64 | OpKind::Immediate8to64
                     ) =>
             {
-                let Stack(offset) = *registers.get(&Register::RSP)? else {
-                    return None;
-                };
-                let next = offset.checked_sub(i.immediate(1) as i64)?;
+                let next = adjusted_stack(&registers, -(i.immediate(1) as i64))?;
                 if !(-4096..0).contains(&next) {
                     return None;
                 }
@@ -822,6 +817,16 @@ mod tests {
     fn installed_studio_builds_expose_the_reader_contract() -> Result<()> {
         for path in std::env::var("RENIUM_STUDIO_EXES")?.split(';') {
             let prepared = prepared(Path::new(path))?;
+            // Inspect the same file independently of the preparation cache.
+            let mapped = ImageView::open(Path::new(path))?;
+            let image = PeImage::parse(mapped.bytes())?;
+            let first = history::discover(&image)?;
+            let second = history::discover(&image)?;
+            assert_eq!(first.trace, prepared.history);
+            assert_eq!(first.trace, second.trace);
+            assert_eq!(first.code, second.code);
+            assert_eq!(first.metadata.pointers, second.metadata.pointers);
+            assert_eq!(first.metadata.names, second.metadata.names);
             println!(
                 "{path}: {:?}; history {:?}",
                 prepared.trace, prepared.history

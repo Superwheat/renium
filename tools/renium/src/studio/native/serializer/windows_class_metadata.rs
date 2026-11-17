@@ -1,8 +1,7 @@
-//! Follow reflected class construction through read-only metadata. The metadata
-//! field positions come from the constructor's loads, never a checked-in layout.
+//! Follow the constructor's loads of reflected class metadata.
 use super::*;
 use iced_x86::{InstructionInfoFactory, OpAccess};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Value {
@@ -62,21 +61,11 @@ fn moved(image: &mut impl Image, state: &State, i: &Instruction) -> Option<Value
     }
 }
 
-fn invalidate(state: &mut State, i: &Instruction) {
+fn invalidate(state: &mut State, i: &Instruction, info: &mut InstructionInfoFactory) {
     if i.mnemonic() == Mnemonic::Call {
-        for reg in [
-            Register::RAX,
-            Register::RCX,
-            Register::RDX,
-            Register::R8,
-            Register::R9,
-            Register::R10,
-            Register::R11,
-        ] {
-            state.registers.remove(&reg);
-        }
+        clear_volatile(&mut state.registers);
     } else {
-        for reg in InstructionInfoFactory::new().info(i).used_registers() {
+        for reg in info.info(i).used_registers() {
             if matches!(
                 reg.access(),
                 OpAccess::Write
@@ -129,6 +118,7 @@ fn follows_name(image: &mut impl Image, entry: usize, initial: State, depth: usi
     let mut states = BTreeMap::from([(entry, initial)]);
     let mut pending = VecDeque::from([entry]);
     let mut remaining = 8192usize;
+    let mut info = InstructionInfoFactory::new();
     while let Some(pc) = pending.pop_front() {
         let Some(left) = remaining.checked_sub(1) else {
             return false;
@@ -145,7 +135,7 @@ fn follows_name(image: &mut impl Image, entry: usize, initial: State, depth: usi
         let value = matches!(i.mnemonic(), Mnemonic::Mov | Mnemonic::Lea)
             .then(|| moved(image, &state, i))
             .flatten();
-        invalidate(&mut state, i);
+        invalidate(&mut state, i, &mut info);
         state.named |= named;
         if let Some(value) = value {
             state
@@ -198,21 +188,20 @@ fn class_stamp(state: &State, i: &Instruction, table: usize) -> bool {
 #[derive(Clone, Default)]
 pub(in super::super) struct Evidence {
     pub code: Vec<usize>,
-    pub pointers: Vec<(usize, usize)>,
-    pub names: Vec<usize>,
+    pub pointers: BTreeSet<(usize, usize)>,
+    pub names: BTreeSet<usize>,
 }
 
 struct ClassImage<'a, 'b> {
     image: &'a PeImage<'b>,
     class_table: usize,
     evidence: Evidence,
+    remaining_analyses: usize,
 }
 
 impl Image for ClassImage<'_, '_> {
     fn code(&mut self, address: usize) -> Option<Vec<u8>> {
-        if self.evidence.code.len() >= 32 {
-            return None;
-        }
+        self.remaining_analyses = self.remaining_analyses.checked_sub(1)?;
         let bytes = function(self.image, address)?;
         if !self.evidence.code.contains(&address) {
             self.evidence.code.push(address);
@@ -232,7 +221,7 @@ impl Image for ClassImage<'_, '_> {
         let target = (read_u64(self.image.bytes, offset).ok()? as usize)
             .checked_sub(self.image.image_base)?;
         self.image.rva_to_offset(target).ok()?;
-        self.evidence.pointers.push((address, target));
+        self.evidence.pointers.insert((address, target));
         Some(target)
     }
     fn is_name(&mut self, address: usize) -> bool {
@@ -240,10 +229,10 @@ impl Image for ClassImage<'_, '_> {
             .image
             .rva_to_offset(address)
             .ok()
-            .and_then(|at| self.image.bytes.get(at..at + 19))
-            == Some(b"LuaSourceContainer\0");
+            .and_then(|at| self.image.bytes.get(at..at + SOURCE_CLASS_NAME.len()))
+            == Some(SOURCE_CLASS_NAME);
         if found {
-            self.evidence.names.push(address);
+            self.evidence.names.insert(address);
         }
         found
     }
@@ -257,6 +246,7 @@ pub(super) fn source(image: &PeImage<'_>, entry: usize, class_table: usize) -> O
         image,
         class_table,
         evidence: Evidence::default(),
+        remaining_analyses: 32,
     };
     follows_name(&mut probe, entry, State::default(), 0).then_some(probe.evidence)
 }
@@ -285,7 +275,7 @@ mod tests {
         }
     }
     #[test]
-    fn metadata_name_follows_constructor_loads_and_rtti_not_a_record_offset() -> Result<()> {
+    fn metadata_name_follows_constructor_loads_and_rtti() -> Result<()> {
         for field in [0x18u8, 0x38, 0x68] {
             // Save this and metadata, load the name into RDX, call the base
             // descriptor constructor, and stamp the complete ClassDescriptor.

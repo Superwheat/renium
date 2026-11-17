@@ -1,5 +1,5 @@
 //! Locate the history insertion callback through its complete-object RTTI,
-//! record selection and LuaSourceContainer tail. No build-specific addresses.
+//! record selection and LuaSourceContainer tail.
 use super::*;
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 
@@ -42,13 +42,14 @@ fn source_class(image: &PeImage<'_>, rva: usize, class_table: Option<usize>) -> 
                     .rva_to_offset(i.ip_rel_memory_address() as usize)
                     .ok()
                     .is_some_and(|offset| {
-                        image.bytes.get(offset..offset + 19) == Some(b"LuaSourceContainer\0")
+                        image.bytes.get(offset..offset + SOURCE_CLASS_NAME.len())
+                            == Some(SOURCE_CLASS_NAME)
                     })
         });
     if let Some(name) = direct {
         return Some(Evidence {
             code: vec![rva],
-            names: vec![name.ip_rel_memory_address() as usize],
+            names: [name.ip_rel_memory_address() as usize].into(),
             ..Evidence::default()
         });
     }
@@ -138,6 +139,9 @@ fn insertion(
         .enumerate()
         .filter(|(_, i)| i.mnemonic() == Mnemonic::Call && i.op0_kind() == OpKind::NearBranch64)
         .collect::<Vec<_>>();
+    if calls.len() != 9 || calls[1].1.near_branch_target() != calls[7].1.near_branch_target() {
+        return None;
+    }
     let sources = calls
         .iter()
         .enumerate()
@@ -151,10 +155,7 @@ fn insertion(
     };
     // Admission, identity context, entry and capture precede the script-only
     // tail. After it: ScriptGuid setup, identity restore, shared_ptr release.
-    if *source_index != 5
-        || calls.len() != 9
-        || calls[1].1.near_branch_target() != calls[7].1.near_branch_target()
-    {
+    if *source_index != 5 {
         return None;
     }
     let tail = code.get(source_at + 1..source_at + 6)?;
@@ -248,7 +249,8 @@ pub(super) fn discover(image: &PeImage<'_>) -> Result<Discovery> {
     }
     anyhow::ensure!(
         found.len() == 1,
-        "Studio history insertion layout is unrecognized; Renium's native reader detector needs updating"
+        "Studio history insertion check found {} validated callbacks; the service reader requires exactly one",
+        found.len()
     );
     Ok(found.remove(0))
 }
