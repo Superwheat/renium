@@ -90,8 +90,16 @@ use cli::{Cli, Commands};
 use studio::target::set_place_filter;
 
 fn main() -> ExitCode {
+    let started = std::time::Instant::now();
     let code = main_result();
+    let discarding = app::profile::span("free discarded data");
     system::files::wait_for_discards();
+    drop(discarding);
+    // A command that ran in this process says where its time went, like one
+    // the daemon served.
+    if let Some(profile) = app::profile::report("command in this process", started) {
+        eprintln!("{}", profile.trim_end());
+    }
     code
 }
 
