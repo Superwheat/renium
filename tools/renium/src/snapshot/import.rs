@@ -2052,6 +2052,26 @@ impl SourceOutput {
     }
 }
 
+/// The store of a captured state as a comparison with the project reads it:
+/// the project's own file where a pull would leave that file alone for this
+/// state (its own document, or one the state differs from by nothing a pull
+/// counts as a change), so that nothing is encoded or decoded to find the
+/// two alike, and the state's encoding anywhere else. A pull keeps the
+/// stored viewport camera, and so does this.
+fn captured_store_bytes(state: &ServiceState, stored: &Path) -> Result<Vec<u8>> {
+    if let Ok(bytes) = fs::read(stored) {
+        let remembered = remembered_pull(&Sha256::digest(&bytes).into());
+        if remembered.is_some_and(|remembered| {
+            remembered.rows.is_some()
+                && pulled_digest_from_service_state(state)
+                    .is_ok_and(|pulled| pulled.digest == remembered.digest)
+        }) {
+            return Ok(bytes);
+        }
+    }
+    encode_service_settings_binary(state)
+}
+
 /// Project the same settings, script names and directories as a fresh import,
 /// without touching disk or constructing the full editor sourcemap. Existing
 /// script files are looked for under `layout_src_root` (or `src_root`).
@@ -2070,7 +2090,7 @@ pub(crate) fn service_projection_in_memory(
     let output = SourceOutput::Memory(Mutex::new(BTreeMap::new()));
     output.directory(&service_dir)?;
     let (settings, sources) = rayon::join(
-        || encode_service_settings_binary(state),
+        || captured_store_bytes(state, &service_settings_path(&layout_dir)),
         || {
             let visited = (0..state.instances.len())
                 .map(|_| AtomicBool::new(false))
@@ -2402,6 +2422,99 @@ mod projection_tests {
         }
         assert!(first != fs::read(&store)?);
         assert!(!WHOLLY_ALIGNED.lock_recover().contains(&store));
+        Ok(())
+    }
+
+    /// A capture compared with the project is the project's own file while
+    /// Studio holds what a pull left there, whatever its camera does, and the
+    /// state's encoding once a value changed.
+    #[test]
+    fn a_capture_of_what_a_pull_left_is_the_stored_file() -> Result<()> {
+        let parent = std::env::temp_dir().join("renium-captured-store-tests");
+        fs::create_dir_all(&parent)?;
+        let root = crate::system::files::create_unique_directory(&parent, "captured-")?;
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let source = root.join("src");
+        let camera = |field_of_view: f64| {
+            Map::from_iter([("FieldOfView".to_string(), json!(field_of_view))])
+        };
+        // Values of this test's own: what a pull remembers goes by the
+        // bytes of the store, which another test's store must not share.
+        let pulled = workspace_state(camera(71.0), 0.375)?;
+        import_service_tree(&pulled, &root, &source, None, "Workspace")?;
+        let store = service_settings_path(&source.join("Workspace"));
+        let stored = fs::read(&store)?;
+        let settings = |state: &ServiceState| -> Result<Vec<u8>> {
+            Ok(
+                service_projection_in_memory(state, &source, None, "Workspace")?
+                    .remove(&store)
+                    .flatten()
+                    .expect("the projection holds the store"),
+            )
+        };
+        let moved = workspace_state(camera(41.0), 0.375)?;
+        assert!(encode_service_settings_binary(&moved)? != stored);
+        assert!(settings(&moved)? == stored);
+        let changed = workspace_state(camera(41.0), 0.625)?;
+        assert!(settings(&changed)? == encode_service_settings_binary(&changed)?);
+        fs::write(&store, encode_service_settings_binary(&changed)?)?;
+        assert!(settings(&moved)? == encode_service_settings_binary(&moved)?);
+        Ok(())
+    }
+
+    /// Captures of many services are compared at once, each from a thread of
+    /// its own and each digesting its state on the shared pool: none of them
+    /// may wait for another while it holds what the pulls remember.
+    #[test]
+    fn captures_of_many_services_are_compared_at_once() -> Result<()> {
+        let parent = std::env::temp_dir().join("renium-captured-stores-tests");
+        fs::create_dir_all(&parent)?;
+        let root = crate::system::files::create_unique_directory(&parent, "captured-")?;
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let services = (0..8)
+            .map(|index| {
+                let source = root.join(format!("src{index}"));
+                let state = workspace_state_of(
+                    Map::from_iter([("FieldOfView".to_string(), json!(50.0))]),
+                    0.0625 + index as f64 / 64.0,
+                    6_000,
+                )?;
+                import_service_tree(&state, &root, &source, None, "Workspace")?;
+                Ok((Arc::new(state), source))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // More comparisons wait for the pool than it has threads, so a
+        // thread that waits inside one digest takes up the next comparison.
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap(),
+        );
+        let (done, finished) = mpsc::channel();
+        let waiting = services.len() * 2;
+        for (state, source) in services.into_iter().cycle().take(waiting) {
+            let (done, pool) = (done.clone(), pool.clone());
+            thread::spawn(move || {
+                let store = service_settings_path(&source.join("Workspace"));
+                let alike = (0..10).all(|_| {
+                    pool.install(|| captured_store_bytes(&state, &store)).ok()
+                        == fs::read(&store).ok()
+                });
+                let _ = done.send(alike);
+            });
+        }
+        for _ in 0..waiting {
+            assert_eq!(
+                finished.recv_timeout(std::time::Duration::from_secs(90)),
+                Ok(true),
+                "the comparisons wait for one another"
+            );
+        }
         Ok(())
     }
 
