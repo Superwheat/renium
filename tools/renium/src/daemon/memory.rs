@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 use crate::app::output::log_global;
 use crate::system::LockRecover;
 
-const IDLE_BEFORE_RELEASE: Duration = Duration::from_secs(1);
+/// Commands come in runs: a store edit, a push, a pull. Memory a command
+/// freed stays with the daemon for the next one and goes back to the system
+/// once nothing has run for this long.
+const IDLE_BEFORE_RELEASE: Duration = Duration::from_secs(30);
 const HEAVY_REQUEST: Duration = Duration::from_millis(50);
 const PAYLOAD_CACHE_IDLE_LIMIT: Duration = Duration::from_secs(5 * 60);
 

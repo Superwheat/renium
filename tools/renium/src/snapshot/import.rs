@@ -1461,10 +1461,6 @@ fn write_service_settings_file(
         // whose file and observed state are the ones the last pull found
         // unchanged is unchanged again, and nothing is decoded for it.
         let alignment_started = Instant::now();
-        let remembered = unchanged_pulls()
-            .lock_recover()
-            .get(&settings_path)
-            .copied();
         let (stored, observed) = rayon::join(
             || -> Result<Option<StoredSettings>> {
                 let _reading = profile::span(&format!("{service}: read stored file"));
@@ -1478,9 +1474,10 @@ fn write_service_settings_file(
                     }
                 };
                 let digest = <[u8; 32]>::from(Sha256::digest(&bytes));
-                // Decoded here, next to the conversion, unless the file is
-                // the one the last pull left alone.
-                let document = if remembered.is_some_and(|(file, _)| file == digest) {
+                // Decoded here, next to the conversion, unless a pull left a
+                // file of these bytes alone before.
+                let unchanged_with = unchanged_pulls().lock_recover().get(&digest).copied();
+                let document = if unchanged_with.is_some() {
                     None
                 } else {
                     Some(decode_stored_settings(&settings_path, &bytes)?)
@@ -1488,6 +1485,7 @@ fn write_service_settings_file(
                 Ok(Some(StoredSettings {
                     bytes,
                     digest,
+                    unchanged_with,
                     document,
                 }))
             },
@@ -1502,7 +1500,7 @@ fn write_service_settings_file(
         let aligned = (|| -> Result<Option<Vec<u8>>> {
             let (observed, observed_digest) = observed?;
             Ok(match stored? {
-                Some(stored) if remembered == Some((stored.digest, observed_digest)) => {
+                Some(stored) if stored.unchanged_with == Some(observed_digest) => {
                     profile::record(
                         &format!("{service}: unchanged since the last pull"),
                         alignment_started,
@@ -1523,15 +1521,10 @@ fn write_service_settings_file(
                     .with_context(|| format!("Failed to align {}", settings_path.display()))?
                     {
                         SettingsAlignment::Equivalent => {
-                            unchanged_pulls()
-                                .lock_recover()
-                                .insert(settings_path.clone(), (stored.digest, observed_digest));
+                            remember_unchanged_pull(stored.digest, observed_digest);
                             None
                         }
-                        SettingsAlignment::Changed(aligned) => {
-                            unchanged_pulls().lock_recover().remove(&settings_path);
-                            Some(aligned)
-                        }
+                        SettingsAlignment::Changed(aligned) => Some(aligned),
                     }
                 }
                 // A store that is not there yet gets the captured state's own bytes.
@@ -1568,6 +1561,8 @@ fn write_service_settings_file(
 struct StoredSettings {
     bytes: Vec<u8>,
     digest: [u8; 32],
+    /// The observed store a pull found these bytes unchanged against.
+    unchanged_with: Option<[u8; 32]>,
     document: Option<SettingsBytecode>,
 }
 
@@ -1576,16 +1571,26 @@ fn decode_stored_settings(settings_path: &Path, bytes: &[u8]) -> Result<Settings
         .with_context(|| format!("Failed to align {}", settings_path.display()))
 }
 
-/// For each store the last pull found unchanged: the digest of its file and
-/// of the observed store it was compared with. The alignment answers from
-/// those two alone, so the same two again are unchanged again.
+/// For a stored file a pull found unchanged, by the digest of its bytes: the
+/// digest of the observed store it was compared with. The alignment answers
+/// from those two alone, wherever the file lies (a pull works on a staged
+/// copy of the project), so the same two again are unchanged again.
 fn unchanged_pulls() -> &'static Mutex<UnchangedPulls> {
     static PULLS: OnceLock<Mutex<UnchangedPulls>> = OnceLock::new();
     PULLS.get_or_init(Mutex::default)
 }
 
-/// By store file: the digest of the file and of the observed store.
-type UnchangedPulls = HashMap<PathBuf, ([u8; 32], [u8; 32])>;
+type UnchangedPulls = HashMap<[u8; 32], [u8; 32]>;
+
+const MAX_UNCHANGED_PULLS: usize = 1_024;
+
+fn remember_unchanged_pull(stored: [u8; 32], observed: [u8; 32]) {
+    let mut pulls = unchanged_pulls().lock_recover();
+    if pulls.len() >= MAX_UNCHANGED_PULLS && !pulls.contains_key(&stored) {
+        pulls.clear();
+    }
+    pulls.insert(stored, observed);
+}
 
 /// What the pull is about to write, or that it fails, is what it did when it
 /// encoded the captured state, decoded it again and aligned the two files'
