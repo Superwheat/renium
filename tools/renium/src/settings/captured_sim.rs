@@ -79,6 +79,10 @@ fn native_value(value: &Value) -> Option<NativeSettingsValue> {
             .map(NativeSettingsValue::Int)
             .or_else(|| value.as_f64().map(NativeSettingsValue::Float64)),
         Value::Object(fields) => match fields.get("_type")?.as_str()? {
+            // A payload the capture holds once for every instance that has it.
+            "SharedString" | "BinaryString" => Some(NativeSettingsValue::Shared(
+                std::sync::Arc::new(value.clone()),
+            )),
             "Ref" => {
                 settings_reference_index(fields.get("instanceIndex")?).map(NativeSettingsValue::Ref)
             }
@@ -416,6 +420,15 @@ fn oracle(state: &ServiceState, pools: &[rayon::ThreadPool]) -> Result<bool, Str
                 if output(expected) != output(&actual) {
                     return Err("captured conversion changed encoded bytes".into());
                 }
+                // A digest taken chunk by chunk is the document's own.
+                let document =
+                    crate::settings::equivalence::pulled_settings_document_digest(&actual);
+                if pool
+                    .install(|| pulled_digest_from_service_state(state))
+                    .is_ok_and(|digest| digest != document)
+                {
+                    return Err("captured digest differs from its document's".into());
+                }
             }
             (Err(expected), Err(actual)) => {
                 if format!("{expected:#}") != format!("{actual:#}") {
@@ -449,6 +462,96 @@ fn sparse_indices(state: &mut ServiceState) {
                 reference.insert("instanceIndex".into(), json!(sparse(index as usize)));
             }
         });
+    }
+}
+
+/// A value the capture holds once for many instances is written, and
+/// converted, as the JSON value it stands for.
+#[test]
+fn a_shared_value_is_stored_as_the_json_value_it_holds() {
+    let payload = json!({"_type": "SharedString", "base64": "AAECAwQFBgcICQ=="});
+    let mut document = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![SettingsBytecodeInstance::new(
+            "root".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        )],
+    };
+    for name in ["A", "B"] {
+        let mut part =
+            SettingsBytecodeInstance::new(name.into(), name.into(), "MeshPart".into(), Some(0));
+        part.properties
+            .insert("PhysicalConfigData".into(), payload.clone());
+        part.properties.insert("Anchored".into(), json!(true));
+        document.instances.push(part);
+    }
+    let as_json = captured_state(&document, false);
+    let as_shared = captured_state(&document, true);
+    let shared = as_shared
+        .native_properties_by_instance
+        .iter()
+        .flatten()
+        .flatten()
+        .filter(|property| matches!(property.value, NativeSettingsValue::Shared(_)))
+        .count();
+    assert_eq!(shared, 2);
+    let bytes = encode_service_settings_binary(&as_shared).unwrap();
+    assert!(bytes == encode_service_settings_binary(&as_json).unwrap());
+    let converted = settings_bytecode_from_service_state(&as_shared).unwrap();
+    assert!(crate::settings::codec_sim::same_document(
+        &converted,
+        &decode_settings_bytecode(&bytes).unwrap()
+    ));
+    for part in &converted.instances[1..] {
+        assert_eq!(part.properties["PhysicalConfigData"], payload);
+    }
+}
+
+/// A digest taken chunk by chunk from a captured state is its document's own,
+/// and leaves out what the viewport camera holds.
+#[test]
+fn a_captured_digest_is_its_documents_and_leaves_out_the_viewport_camera() {
+    let document = |field_of_view: f64, transparency: f64| {
+        let instance = |id: String, class: &str, parent| {
+            SettingsBytecodeInstance::new(id.clone(), id, class.into(), parent)
+        };
+        let mut root = instance("Workspace".into(), "Workspace", None);
+        root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type": "Ref", "instanceIndex": 2}),
+        );
+        let mut camera = instance("Camera".into(), "Camera", Some(0));
+        camera
+            .properties
+            .insert("FieldOfView".into(), json!(field_of_view));
+        let mut instances = vec![root, camera];
+        for index in 0..9_000 {
+            let mut part = instance(format!("Part{index}"), "Part", Some(0));
+            let value = if index == 8_765 { transparency } else { 0.5 };
+            part.properties.insert("Transparency".into(), json!(value));
+            instances.push(part);
+        }
+        SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances,
+        }
+    };
+    for native in [false, true] {
+        let digest = |field_of_view, transparency| {
+            let state = captured_state(&document(field_of_view, transparency), native);
+            let streamed = pulled_digest_from_service_state(&state).unwrap();
+            let converted = settings_bytecode_from_service_state(&state).unwrap();
+            assert!(
+                streamed
+                    == crate::settings::equivalence::pulled_settings_document_digest(&converted)
+            );
+            streamed
+        };
+        let unchanged = digest(70.0, 0.5);
+        assert!(unchanged == digest(55.0, 0.5), "native={native}");
+        assert!(unchanged != digest(70.0, 0.25), "native={native}");
     }
 }
 

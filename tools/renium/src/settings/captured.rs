@@ -45,6 +45,53 @@ pub(super) fn convert_with_budget(
     convert_prepared(state, &records, &lookup, &collected, budget)
 }
 
+/// The digest `pulled_settings_document_digest` gives this state's document,
+/// taken chunk by chunk: the document is never whole in memory. No decoder
+/// memory limit applies: the digest only says whether this is a state a pull
+/// took before, and that pull decided whether its store may be written.
+pub(super) fn pulled_digest(state: &ServiceState) -> Result<[u8; 32]> {
+    use crate::settings::equivalence::{pulled_instance_digest, pulled_settings_skeleton_digest};
+
+    let _span = crate::app::profile::span("captured store digest");
+    let records = collect_service_settings_binary_instances(state);
+    let lookup = build_settings_binary_instance_lookup(state, &records);
+    let collected = collect_settings_binary_data(state, &lookup, &records)?;
+    let rows = convert_prepared_each(
+        state,
+        &records,
+        &lookup,
+        &collected,
+        &DecodeBudget::new(usize::MAX),
+        |mut instance| {
+            let digest = pulled_instance_digest(&instance, false);
+            let as_viewport_camera =
+                (instance.class_name == "Camera").then(|| pulled_instance_digest(&instance, true));
+            // Only a service root's values say which camera is the viewport's.
+            if instance.parent_index.is_some() {
+                instance.properties = Map::new();
+                instance.attributes = Map::new();
+            }
+            (instance, digest, as_viewport_camera)
+        },
+    )?;
+    let mut skeleton = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: Vec::with_capacity(rows.len()),
+    };
+    let mut digests = Vec::with_capacity(rows.len());
+    let mut cameras = HashMap::new();
+    for (index, (instance, digest, as_viewport_camera)) in rows.into_iter().enumerate() {
+        skeleton.instances.push(instance);
+        digests.push(digest);
+        if let Some(digest) = as_viewport_camera {
+            cameras.insert(index, digest);
+        }
+    }
+    validate_settings_hierarchy(&skeleton.instances)?;
+    pulled_settings_skeleton_digest(&skeleton, digests, &cameras)
+        .context("The viewport camera of the captured store is not a Camera")
+}
+
 fn convert_prepared(
     state: &ServiceState,
     records: &[SettingsBinaryInstance<'_>],
@@ -52,6 +99,26 @@ fn convert_prepared(
     collected: &SettingsBinaryCollection<'_>,
     budget: &DecodeBudget,
 ) -> Result<SettingsBytecode> {
+    let document = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: convert_prepared_each(state, records, lookup, collected, budget, |instance| {
+            instance
+        })?,
+    };
+    validate_settings_hierarchy(&document.instances)?;
+    Ok(document)
+}
+
+/// Converts the state chunk by chunk and keeps of each instance what `keep`
+/// returns for it, in order. The hierarchy is the caller's to check.
+fn convert_prepared_each<T: Send>(
+    state: &ServiceState,
+    records: &[SettingsBinaryInstance<'_>],
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    collected: &SettingsBinaryCollection<'_>,
+    budget: &DecodeBudget,
+    keep: impl Fn(SettingsBytecodeInstance) -> T + Sync,
+) -> Result<Vec<T>> {
     let _span = crate::app::profile::span("captured store validated conversion");
     let strings = collected
         .string_counts
@@ -76,30 +143,31 @@ fn convert_prepared(
         string_ids: &string_ids,
         wire_bytes: &wire_bytes,
     };
+    let kept_chunk = |records: &[SettingsBinaryInstance<'_>]| -> Result<Vec<T>> {
+        Ok(convert_chunk(state, records, scope)?
+            .into_iter()
+            .map(&keep)
+            .collect())
+    };
     let instances = if records.len() < SETTINGS_BINARY_PARALLEL_MIN_INSTANCES
         || rayon::current_num_threads() <= 1
     {
-        convert_chunk(state, records, scope)?
+        kept_chunk(records)?
     } else {
         records
             .par_chunks(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE)
-            .map(|records| convert_chunk(state, records, scope))
+            .map(kept_chunk)
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .flatten()
             .collect()
     };
-    let document = SettingsBytecode {
-        version: SETTINGS_BINARY_VERSION,
-        instances,
-    };
-    validate_settings_hierarchy(&document.instances)?;
     let bound = wire_bytes.load(Ordering::Relaxed);
     check_settings_payload_len(bound, "Decoded")?;
     let compressed = zstd::zstd_safe::compress_bound(bound);
     check_settings_payload_len(compressed, "Compressed")?;
     check_settings_file_len(compressed.saturating_add(SETTINGS_BINARY_MAGIC.len() + 1 + 20))?;
-    Ok(document)
+    Ok(instances)
 }
 
 #[derive(Default)]
@@ -363,6 +431,7 @@ fn native_value(value: &NativeSettingsValue, scope: ConversionScope<'_, '_>) -> 
             [("name", Value::String(checked_string(value, scope.budget)?))],
         )),
         NativeSettingsValue::Ref(index) => decoded_reference(*index, scope.instance_count),
+        NativeSettingsValue::Shared(value) => Ok(Value::clone(value)),
         NativeSettingsValue::Vector2(_)
         | NativeSettingsValue::Vector3(_)
         | NativeSettingsValue::UDim(_)

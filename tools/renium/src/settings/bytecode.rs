@@ -37,6 +37,12 @@ pub(crate) fn settings_bytecode_from_service_state(
     captured::convert(state)
 }
 
+/// The digest a pull's alignment gives this state's store document
+/// (`pulled_settings_document_digest`), without holding that document.
+pub(crate) fn pulled_digest_from_service_state(state: &ServiceState) -> Result<[u8; 32]> {
+    captured::pulled_digest(state)
+}
+
 const SETTINGS_BINARY_MAGIC: &[u8] = b"RBSSET\0";
 const SETTINGS_BINARY_MIN_VERSION: u8 = 10;
 pub(crate) const SETTINGS_BINARY_VERSION: u8 = 11;
@@ -2227,6 +2233,18 @@ fn visit_settings_binary_properties<'a>(
                 continue;
             }
             let property_name = property.name.as_str();
+            // A shared value is the JSON value it stands for, to every reader.
+            if let NativeSettingsValue::Shared(value) = &property.value {
+                if should_skip_binary_property(state, instance, property_name, value) {
+                    continue;
+                }
+                let source = SettingsBinaryValueSource::of_property(value);
+                let kind = binary_source_value_kind(&source, lookup)?;
+                if kind != 0 {
+                    visit(property_name, kind, source)?;
+                }
+                continue;
+            }
             let source = SettingsBinaryValueSource::Native(&property.value);
             let kind = binary_source_value_kind(&source, lookup)?;
             visit(property_name, kind, source)?;
@@ -2900,6 +2918,8 @@ fn native_value_kind(value: &NativeSettingsValue) -> u8 {
         NativeSettingsValue::CFrame(_) => 16,
         NativeSettingsValue::Rect(_) => 18,
         NativeSettingsValue::Enum(_) => 19,
+        // Visited as the JSON value it holds, never as a typed value.
+        NativeSettingsValue::Shared(_) => 0,
     }
 }
 
@@ -2953,6 +2973,9 @@ fn write_native_value_payload<W: Write + ?Sized>(
             for value in values {
                 writer.write_all(&value.to_le_bytes())?;
             }
+        }
+        NativeSettingsValue::Shared(_) => {
+            bail!("A shared settings value is written as the JSON value it holds")
         }
     }
     Ok(())

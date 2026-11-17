@@ -26,8 +26,8 @@ use crate::roblox::services::DEFAULT_SYNC_SERVICES;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     SettingsBytecode, child_indices_for_instance, decode_settings_bytecode,
-    encode_service_settings_binary, settings_bytecode_from_service_state,
-    write_fresh_service_settings_binary_file,
+    encode_service_settings_binary, pulled_digest_from_service_state,
+    settings_bytecode_from_service_state, write_fresh_service_settings_binary_file,
 };
 use crate::settings::equivalence::{
     SettingsAlignment, align_pulled_settings_bytes_to_reference,
@@ -1462,45 +1462,70 @@ fn write_service_settings_file(
         // whose file and observed state are the ones the last pull found
         // unchanged is unchanged again, and nothing is decoded for it.
         let alignment_started = Instant::now();
-        let (stored, observed) = rayon::join(
-            || -> Result<Option<StoredSettings>> {
-                let _reading = profile::span(&format!("{service}: read stored file"));
-                let bytes = match fs::read(&settings_path) {
-                    Ok(bytes) => bytes,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("Failed to read {}", settings_path.display())
-                        });
-                    }
-                };
-                let digest = <[u8; 32]>::from(Sha256::digest(&bytes));
-                // Decoded here, next to the conversion, unless a pull left a
-                // file of these bytes alone before.
-                let unchanged_with = unchanged_pulls().lock_recover().get(&digest).copied();
-                let document = if unchanged_with.is_some() {
-                    None
-                } else {
-                    Some(decode_stored_settings(&settings_path, &bytes)?)
-                };
-                Ok(Some(StoredSettings {
-                    bytes,
-                    digest,
-                    unchanged_with,
-                    document,
-                }))
-            },
-            || {
-                let _converting = profile::span(&format!("{service}: captured store document"));
-                let observed = settings_bytecode_from_service_state(state_to_write)?;
-                let digest = pulled_settings_document_digest(&observed);
-                Ok::<_, anyhow::Error>((observed, digest))
-            },
+        let stored_file = (|| -> Result<Option<StoredFile>> {
+            let _reading = profile::span(&format!("{service}: read stored file"));
+            let bytes = match fs::read(&settings_path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to read {}", settings_path.display()));
+                }
+            };
+            let digest = <[u8; 32]>::from(Sha256::digest(&bytes));
+            let unchanged_with = unchanged_pulls().lock_recover().get(&digest).copied();
+            Ok(Some((bytes, digest, unchanged_with)))
+        })();
+        // A file a pull left alone before is first checked against a digest of
+        // the captured state taken chunk by chunk. While nothing changed, the
+        // captured store's document is never whole in memory.
+        let unchanged_again = matches!(
+            &stored_file,
+            Ok(Some((_, _, Some(expected))))
+                if pulled_digest_from_service_state(state_to_write)
+                    .is_ok_and(|observed| observed == *expected)
         );
+        let (stored, observed) = if unchanged_again {
+            (Ok(None), Ok(None))
+        } else {
+            rayon::join(
+                || -> Result<Option<StoredSettings>> {
+                    let Some((bytes, digest, unchanged_with)) = stored_file? else {
+                        return Ok(None);
+                    };
+                    // Decoded here, next to the conversion, unless a pull left a
+                    // file of these bytes alone before.
+                    let document = if unchanged_with.is_some() {
+                        None
+                    } else {
+                        Some(decode_stored_settings(&settings_path, &bytes)?)
+                    };
+                    Ok(Some(StoredSettings {
+                        bytes,
+                        digest,
+                        unchanged_with,
+                        document,
+                    }))
+                },
+                || {
+                    let _converting = profile::span(&format!("{service}: captured store document"));
+                    let observed = settings_bytecode_from_service_state(state_to_write)?;
+                    let digest = pulled_settings_document_digest(&observed);
+                    Ok::<_, anyhow::Error>(Some((observed, digest)))
+                },
+            )
+        };
         let aligned = (|| -> Result<Option<Vec<u8>>> {
+            if unchanged_again {
+                profile::record(
+                    &format!("{service}: unchanged since the last pull"),
+                    alignment_started,
+                );
+                return Ok(None);
+            }
             // A captured state the decoder would refuse goes the way it went
             // before: its own bytes are written or compared as they are.
-            let Ok((observed, observed_digest)) = observed else {
+            let Ok(Some((observed, observed_digest))) = observed else {
                 return pull_from_bytes(state_to_write, &settings_path);
             };
             Ok(match stored? {
@@ -1560,6 +1585,10 @@ fn write_service_settings_file(
 }
 
 /// A store file as a pull read it.
+/// A stored file's bytes, their digest, and the observed store a pull found
+/// these bytes unchanged against.
+type StoredFile = (Vec<u8>, [u8; 32], Option<[u8; 32]>);
+
 struct StoredSettings {
     bytes: Vec<u8>,
     digest: [u8; 32],

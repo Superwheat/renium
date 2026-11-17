@@ -59,6 +59,9 @@ pub(crate) enum NativeSettingsValue {
     CFrame([f32; 12]),
     Rect([f32; 4]),
     Enum(String),
+    /// A value many instances hold alike, such as a collision mesh: its
+    /// JSON form, held once for all of them.
+    Shared(std::sync::Arc<Value>),
 }
 #[derive(Clone)]
 pub(crate) struct ServiceState {

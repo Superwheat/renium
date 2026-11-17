@@ -968,12 +968,76 @@ pub(crate) struct RbxSettingsConversionOptions<'a> {
     pub(crate) native_filter: Option<&'a NativePropertyFilter>,
 }
 
+/// The typed and JSON records of one captured instance. A shared string of
+/// some size comes as one value for every instance that holds it.
 pub(crate) fn rbx_properties_to_native_settings_records<'a>(
     class_name: &str,
     property_entries: impl IntoIterator<Item = (&'a rbx_dom_weak::Ustr, &'a RbxVariant)>,
     database: &ReflectionDatabase<'_>,
     refs: &BytecodeModelImportRefs,
     native_filter: Option<&NativePropertyFilter>,
+) -> NativeSettingsRecords {
+    native_settings_records(
+        class_name,
+        property_entries,
+        database,
+        refs,
+        native_filter,
+        true,
+    )
+}
+
+/// The same records with every shared string as JSON of its own, for a
+/// caller that goes on to edit the JSON values.
+pub(crate) fn rbx_properties_to_unshared_native_settings_records<'a>(
+    class_name: &str,
+    property_entries: impl IntoIterator<Item = (&'a rbx_dom_weak::Ustr, &'a RbxVariant)>,
+    database: &ReflectionDatabase<'_>,
+    refs: &BytecodeModelImportRefs,
+    native_filter: Option<&NativePropertyFilter>,
+) -> NativeSettingsRecords {
+    native_settings_records(
+        class_name,
+        property_entries,
+        database,
+        refs,
+        native_filter,
+        false,
+    )
+}
+
+/// From this size on a shared string is held once for all its instances.
+const SHARED_PAYLOAD_MIN_BYTES: usize = 256;
+
+/// The JSON form of a shared string, one value for every instance that holds
+/// it, kept for as long as a captured state uses it.
+fn shared_payload_value(
+    shared: &rbx_dom_weak::types::SharedString,
+    json: impl FnOnce() -> Option<Value>,
+) -> Option<std::sync::Arc<Value>> {
+    static PAYLOADS: std::sync::Mutex<Option<HashMap<[u8; 32], std::sync::Weak<Value>>>> =
+        std::sync::Mutex::new(None);
+    let key = <[u8; 32]>::try_from(shared.hash().as_bytes()).ok()?;
+    let mut payloads = crate::system::LockRecover::lock_recover(&PAYLOADS);
+    let payloads = payloads.get_or_insert_with(HashMap::new);
+    if let Some(value) = payloads.get(&key).and_then(std::sync::Weak::upgrade) {
+        return Some(value);
+    }
+    let value = std::sync::Arc::new(json()?);
+    if payloads.len() >= 4_096 {
+        payloads.retain(|_, held| held.strong_count() > 0);
+    }
+    payloads.insert(key, std::sync::Arc::downgrade(&value));
+    Some(value)
+}
+
+fn native_settings_records<'a>(
+    class_name: &str,
+    property_entries: impl IntoIterator<Item = (&'a rbx_dom_weak::Ustr, &'a RbxVariant)>,
+    database: &ReflectionDatabase<'_>,
+    refs: &BytecodeModelImportRefs,
+    native_filter: Option<&NativePropertyFilter>,
+    share_payloads: bool,
 ) -> NativeSettingsRecords {
     let mut native_properties = Vec::new();
     let mut properties = Map::new();
@@ -1054,6 +1118,17 @@ pub(crate) fn rbx_properties_to_native_settings_records<'a>(
             native_properties.push(NativeSettingsProperty {
                 name: output_name.to_string(),
                 value,
+            });
+        } else if share_payloads
+            && let RbxVariant::SharedString(shared) = variant
+            && shared.data().len() >= SHARED_PAYLOAD_MIN_BYTES
+            && let Some(value) = shared_payload_value(shared, || {
+                rbx_variant_to_settings_json(variant, descriptor, database, refs)
+            })
+        {
+            native_properties.push(NativeSettingsProperty {
+                name: output_name.to_string(),
+                value: NativeSettingsValue::Shared(value),
             });
         } else if let Some(value) =
             rbx_variant_to_settings_json(variant, descriptor, database, refs)

@@ -16,7 +16,8 @@ use crate::cli::ImportPlaceArgs;
 use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
 use crate::rbx::decode::{
-    NativePropertyFilter, native_property_filter, rbx_properties_to_native_settings_records,
+    NativePropertyFilter, native_property_filter,
+    rbx_properties_to_unshared_native_settings_records,
 };
 use crate::rbx::encode::settings_root_indices;
 use crate::rbx::model::{BytecodeModelImportRefs, RbxPlaceFormat, is_service_class};
@@ -461,7 +462,7 @@ fn convert_service(
             .iter()
             .map(|(name, value)| (name, value));
         let (mut native_properties, mut properties, mut attributes, source) =
-            rbx_properties_to_native_settings_records(
+            rbx_properties_to_unshared_native_settings_records(
                 class_name,
                 properties,
                 database,
