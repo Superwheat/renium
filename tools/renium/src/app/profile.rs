@@ -21,6 +21,7 @@ const MAX_RECORDS: usize = 200_000;
 /// Clock reads on two threads do not order perfectly.
 const SLACK_NANOS: u64 = 20_000;
 
+#[derive(Clone)]
 struct Record {
     label: String,
     thread: ThreadId,
@@ -28,7 +29,41 @@ struct Record {
     ended: Instant,
 }
 
-static RECORDS: Mutex<Vec<Record>> = Mutex::new(Vec::new());
+struct ProfileState {
+    records: Vec<Record>,
+    requests: Vec<Instant>,
+}
+
+static STATE: Mutex<ProfileState> = Mutex::new(ProfileState {
+    records: Vec::new(),
+    requests: Vec::new(),
+});
+
+pub(crate) struct Request(Option<Instant>);
+
+/// Keep a shorter concurrent request from consuming an ongoing request's steps.
+pub(crate) fn request(started: Instant) -> Request {
+    if enabled() {
+        STATE.lock_recover().requests.push(started);
+        Request(Some(started))
+    } else {
+        Request(None)
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        let Some(started) = self.0 else { return };
+        let mut state = STATE.lock_recover();
+        if let Some(index) = state.requests.iter().position(|time| *time == started) {
+            state.requests.swap_remove(index);
+        }
+        let earliest = state.requests.iter().copied().min();
+        state
+            .records
+            .retain(|record| earliest.is_some_and(|start| record.started >= start));
+    }
+}
 
 pub(crate) fn enabled() -> bool {
     global_log_enabled(PROFILE_LOG_LEVEL)
@@ -43,9 +78,9 @@ pub(crate) fn record_between(label: &str, started: Instant, ended: Instant) {
     if !enabled() {
         return;
     }
-    let mut records = RECORDS.lock_recover();
-    if records.len() < MAX_RECORDS {
-        records.push(Record {
+    let mut state = STATE.lock_recover();
+    if state.records.len() < MAX_RECORDS {
+        state.records.push(Record {
             label: label.to_string(),
             thread: std::thread::current().id(),
             started,
@@ -90,24 +125,38 @@ pub(crate) fn report(name: &str, started: Instant) -> Option<String> {
         return None;
     }
     let ended = Instant::now();
-    let mut taken = Vec::new();
-    {
-        let mut records = RECORDS.lock_recover();
-        let mut kept = Vec::new();
-        for record in records.drain(..) {
-            if record.started >= started && record.ended <= ended {
-                taken.push(record);
-            } else if record.ended > ended {
-                // A step of another command that is still running.
-                kept.push(record);
-            }
-        }
-        *records = kept;
-    }
+    let taken = take_records(&mut STATE.lock_recover(), started, ended);
     if taken.is_empty() {
         return None;
     }
     Some(render(name, started, ended, taken))
+}
+
+fn take_records(state: &mut ProfileState, started: Instant, ended: Instant) -> Vec<Record> {
+    let other = state
+        .requests
+        .iter()
+        .copied()
+        .filter(|time| *time != started)
+        .min();
+    let mut taken = Vec::new();
+    let mut kept = Vec::new();
+    for record in state.records.drain(..) {
+        let retain = record.ended > ended || other.is_some_and(|time| record.started >= time);
+        if record.started >= started && record.ended <= ended {
+            if retain {
+                taken.push(record.clone());
+            } else {
+                taken.push(record);
+                continue;
+            }
+        }
+        if retain {
+            kept.push(record);
+        }
+    }
+    state.records = kept;
+    taken
 }
 
 fn render(name: &str, started: Instant, ended: Instant, mut taken: Vec<Record>) -> String {
@@ -259,9 +308,9 @@ fn write_node(
         text.push_str("  (other thread)");
     }
     text.push('\n');
-    // A step under half a percent of the command and under a millisecond is
-    // counted, not listed.
-    let floor = (total / 200).max(1_000_000);
+    // Keep small-step summaries, but never hide a step of twenty milliseconds
+    // merely because the enclosing command is long.
+    let floor = (total / 200).clamp(1_000_000, 20_000_000);
     let (mut hidden, mut hidden_nanos) = (0, 0);
     for &child in &node.children {
         let child_duration = nodes[child].end - nodes[child].start;
@@ -295,6 +344,51 @@ mod tests {
             end,
             children: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_short_concurrent_request_cannot_discard_the_ongoing_import_timeline() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let record = |label: &str, from, to| Record {
+            label: label.into(),
+            thread: std::thread::current().id(),
+            started: at(from),
+            ended: at(to),
+        };
+        let mut state = ProfileState {
+            records: vec![record("load", 1, 5), record("settle", 12, 18)],
+            requests: vec![start, at(10)],
+        };
+        assert!(take_records(&mut state, at(10), at(11)).is_empty());
+        assert_eq!(state.records.len(), 2);
+        state.requests.pop();
+        let imported = take_records(&mut state, start, at(20));
+        assert_eq!(
+            imported
+                .iter()
+                .map(|r| r.label.as_str())
+                .collect::<Vec<_>>(),
+            ["load", "settle"]
+        );
+        assert!(state.records.is_empty());
+    }
+
+    #[test]
+    fn long_commands_still_show_each_twenty_millisecond_step() {
+        let start = Instant::now();
+        let output = render(
+            "command",
+            start,
+            start + Duration::from_secs(30),
+            vec![Record {
+                label: "transport write".into(),
+                thread: std::thread::current().id(),
+                started: start,
+                ended: start + Duration::from_millis(25),
+            }],
+        );
+        assert!(output.contains("25.0ms transport write"));
     }
 
     #[test]

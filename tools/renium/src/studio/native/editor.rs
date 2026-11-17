@@ -81,9 +81,7 @@ use crate::system::files::{
     absolutize_under, path_extension_is, resolve_project_root_if_present, service_settings_path,
 };
 
-use crate::app::timing::{
-    current_millis, elapsed_ms, log_timing, log_timing_ms, verbose_timing_logs,
-};
+use crate::app::timing::{current_millis, elapsed_ms, log_timing, verbose_timing_logs};
 #[cfg(any(windows, target_os = "macos"))]
 use crate::studio::native::serializer;
 use crate::system::LockRecover;
@@ -2402,6 +2400,10 @@ fn match_native_capture_overlay(
     let Some(captured) = native.captured_debug_ids.take() else {
         return Ok(());
     };
+    let _profile = crate::app::profile::span(&format!(
+        "native overlay join {} captured identities",
+        captured.len()
+    ));
     anyhow::ensure!(
         debug_ids.len() == captured.len(),
         "Native capture overlay identity count changed"
@@ -2552,6 +2554,10 @@ fn convert_native_service_output(
     settings_ids: Vec<(usize, String)>,
     export_started_ms: f64,
 ) -> Result<(ServiceExportOutput, Vec<usize>)> {
+    let prepare = crate::app::profile::span(&format!(
+        "{}: prepare overlay identity and reference maps",
+        group.service
+    ));
     let NativeServiceDom {
         instances: native_instances,
         new_index_by_dense_ref,
@@ -2633,6 +2639,7 @@ fn convert_native_service_output(
         new_index_by_dense_ref: Some(new_index_by_dense_ref),
         path_segments_by_index: Vec::new(),
     };
+    drop(prepare);
     let conversion_started = Instant::now();
     let converted = native_instances
         .into_par_iter()
@@ -2943,6 +2950,10 @@ fn editor_binary_export_parts_once<'a>(
     let capture_attempts = std::sync::atomic::AtomicUsize::new(0);
     let native_capture = export.native_capture;
     let fetch_overlay = |group: &EditorBinaryExportGroup| {
+        let _profile = crate::app::profile::span(&format!(
+            "{}: fetch and decode native overlay",
+            group.service
+        ));
         let selective_refs = group.instance_count >= NATIVE_SERIALIZATION_SERVICE_LIMIT
             && group
                 .class_names
@@ -3439,7 +3450,12 @@ fn editor_binary_export_parts_once<'a>(
         )
     })?;
     log_chunk_fetch_metrics("native editor overlay payloads", metrics);
-    log_timing_ms("native editor overlay compact expansion", compact_expand_ms);
+    crate::app::output::log_global(
+        4,
+        format_args!(
+            "[renium] native editor overlay compact expansion: cumulative_ms={compact_expand_ms:.1}"
+        ),
+    );
     log_timing("native editor streaming export", stream_started);
     #[cfg(windows)]
     let report = native_capture.then(|| CaptureReport {

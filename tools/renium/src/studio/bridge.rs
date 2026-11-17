@@ -4411,7 +4411,7 @@ impl BridgeServer {
         timeout: Option<Duration>,
         lease_id: Option<&str>,
     ) -> Result<BridgeResponse> {
-        let _profile = crate::app::profile::span(&format!("{method}: bridge request"));
+        let _profile = crate::app::profile::span(&format!("bridge request {method}"));
         let started = Instant::now();
         let timeout = timeout.unwrap_or_else(|| bridge_response_timeout(method));
         if timeout.is_zero() {
@@ -4523,8 +4523,8 @@ impl BridgeServer {
         method: &str,
         timeout: Duration,
     ) -> Result<BridgeResponse> {
-        let response_started = Instant::now();
         let _profile = crate::app::profile::span(&format!("{method}: wait and receive response"));
+        let response_started = Instant::now();
         let deadline = Instant::now() + timeout;
         let mut unrelated_messages = 0usize;
         let mut cancel_sent = false;

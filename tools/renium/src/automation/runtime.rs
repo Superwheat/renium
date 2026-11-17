@@ -3470,6 +3470,7 @@ fn automation_execute_request(
     bridge_wait_seconds: f64,
 ) -> std::result::Result<Value, automation::Failure> {
     let started = Instant::now();
+    let _profile_request = crate::app::profile::request(started);
     let request_guard = crate::daemon::memory::begin_request(
         automation::opcode_by_id(request.op).map_or("unknown", |operation| operation.name),
     );
