@@ -73,6 +73,7 @@ impl StoredSnapshot {
         directory: &Path,
         entries: impl Iterator<Item = (&'a PathBuf, &'a SnapshotEntry)>,
     ) -> Result<Self> {
+        let _span = crate::app::profile::span("last-sync copy: write");
         Ok(Self {
             entries: store_entries(directory, entries)?,
         })
@@ -83,6 +84,7 @@ impl StoredSnapshot {
     }
 
     pub(super) fn matches(&self, snapshot: &ProjectSnapshot) -> bool {
+        let _span = crate::app::profile::span("last-sync copy: compare with a snapshot");
         self.entries.len() == snapshot.entries.len()
             && self.entries.iter().all(|(path, stored)| {
                 snapshot
@@ -113,6 +115,7 @@ impl StoredSnapshot {
         scopes: &[PathBuf],
         current: &ProjectSnapshot,
     ) -> Result<()> {
+        let _span = crate::app::profile::span("last-sync copy: replace part");
         let scope_set = ScopeSet::new(scopes);
         self.entries.retain(|path, _| !scope_set.contains(path));
         self.entries.extend(store_entries(
@@ -189,6 +192,7 @@ impl StoredSnapshot {
         key: &str,
         selected: impl Fn(&Path) -> bool,
     ) -> Result<ProjectSnapshot> {
+        let _span = crate::app::profile::span("last-sync copy: read");
         self.load_at(&pack_directory(root, key), selected)
     }
 
