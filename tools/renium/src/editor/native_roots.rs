@@ -379,6 +379,12 @@ pub(crate) struct NativeRootVerification {
 }
 
 impl NativeRootVerification {
+    pub(crate) fn extend(&mut self, other: Self) {
+        for (key, fields) in other.fields {
+            self.fields.entry(key).or_default().extend(fields);
+        }
+    }
+
     fn target_key(class: &str, path: &[String], ordinals: &[usize]) -> (String, String) {
         let mut ordinals = ordinals.to_vec();
         ordinals.resize(path.len(), 1);
@@ -742,6 +748,41 @@ fn apply_write(_: &BridgeServer, _: &str, _: &RootWrite, _: &str) -> Result<()> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn early_and_late_native_proofs_keep_exact_targets_and_values() {
+        let mut early = NativeRootVerification::default();
+        let mut late = NativeRootVerification::default();
+        for (proof, name, value) in [
+            (&mut early, "LightingStyle", json!("Realistic")),
+            (&mut late, "PrioritizeLightingQuality", json!(true)),
+        ] {
+            proof.record(RootWrite {
+                index: 1,
+                class_name: "Lighting".into(),
+                path_segments: vec!["Lighting".into()],
+                path_ordinals: vec![1],
+                name: name.into(),
+                value,
+            });
+        }
+        late.extend(early);
+        let mut row = crate::editor::types::EditorPropertyChange {
+            class_name: "Lighting".into(),
+            path_segments: vec!["Lighting".into()],
+            path_ordinals: vec![1],
+            properties: serde_json::from_value(json!({
+                "LightingStyle": "Realistic", "PrioritizeLightingQuality": true
+            }))
+            .unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(late.verified_fields(&row), 2);
+        row.properties.insert("LightingStyle".into(), json!("Soft"));
+        assert_eq!(late.verified_fields(&row), 1);
+        row.path_ordinals = vec![2];
+        assert_eq!(late.verified_fields(&row), 0);
+    }
 
     #[test]
     fn model_scale_uses_validated_native_metadata() {

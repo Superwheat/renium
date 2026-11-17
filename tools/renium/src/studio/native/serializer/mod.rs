@@ -75,6 +75,19 @@ fn plugin_fallback_requires_the_typed_locator_verdict() {
 }
 
 #[test]
+#[cfg(windows)]
+fn native_batch_pacing_finishes_without_a_frame_producer() {
+    assert!(
+        std::process::Command::new(
+            std::path::Path::new(env!("OUT_DIR")).join("renium-batch-pacer-test.exe")
+        )
+        .status()
+        .expect("run native batch pacing regression")
+        .success()
+    );
+}
+
+#[test]
 fn context_preparation_does_not_wait_for_the_property_queue() {
     let name = if cfg!(windows) {
         "renium-property-task-test.exe"

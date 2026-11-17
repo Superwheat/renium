@@ -540,6 +540,7 @@ impl NativeProperty {
     }
 
     fn invoke(&mut self, operation: u32) -> Result<()> {
+        let started = Instant::now();
         let remaining = self.remaining()?;
         let timeout = u32::try_from(
             remaining
@@ -559,6 +560,15 @@ impl NativeProperty {
         let exit = remote.run(self.entrypoint, timeout + 500)?;
         self.memory
             .read(remote.address, &mut self.parameters[..SIZE])?;
+        crate::app::output::log_global(
+            5,
+            format_args!(
+                "[renium] native property task: property={} operation={operation} total_ms={:.3} queue_ms={:.3}",
+                self.property,
+                started.elapsed().as_secs_f64() * 1000.0,
+                read_u32(&self.parameters, 131500)? as f64 / 1000.0,
+            ),
+        );
         let status = read_u32(&self.parameters, 84)?;
         if exit != 0 || status != 4 {
             bail!(
@@ -1870,6 +1880,7 @@ fn prepare(
     read_class: Option<&str>,
     model_path: Option<&[String]>,
 ) -> Result<(NativeProperty, String)> {
+    let started = Instant::now();
     let deadline = Instant::now() + timeout;
     let current_modules = modules(pid)?;
     let studio = current_modules
@@ -1893,7 +1904,9 @@ fn prepare(
         "Native snapshot target changed class"
     );
     let descriptor = find_class_member_descriptor(&memory, entry.instance, model.layout, property)?;
+    let descriptor_found = Instant::now();
     let (getter, setter) = reflection_functions(&memory, studio, &layout, descriptor)?;
+    let reflected = Instant::now();
     let (binding, identity_getter) =
         identity_binding(&memory, studio, &layout, &model, entry.instance)?;
     let mut parameters = vec![0; SIZE];
@@ -1950,7 +1963,18 @@ fn prepare(
         entrypoint: helper + helper_export_rva("ReniumReadProperty")?,
         deadline,
     };
+    let dispatched = Instant::now();
     prepared.invoke(if read_class.is_some() { 3 } else { 0 })?;
+    crate::app::output::log_global(
+        5,
+        format_args!(
+            "[renium] native property preparation: property={property} target_ms={:.3} reflection_ms={:.3} identity_and_dispatch_ms={:.3} task_ms={:.3}",
+            descriptor_found.duration_since(started).as_secs_f64() * 1000.0,
+            reflected.duration_since(descriptor_found).as_secs_f64() * 1000.0,
+            dispatched.duration_since(reflected).as_secs_f64() * 1000.0,
+            dispatched.elapsed().as_secs_f64() * 1000.0,
+        ),
+    );
     let identity: [u8; 16] = prepared.parameters[IDENTITY..IDENTITY + 16].try_into()?;
     if identity == [0; 16] {
         bail!("Studio target has no stable instance identity");

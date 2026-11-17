@@ -1349,6 +1349,7 @@ struct PropertyReadParams
     std::uint64_t extraInputSize;
 };
 static_assert(sizeof(PropertyReadParams) == 132048);
+static_assert(offsetof(PropertyReadParams, reserved) == 131500);
 
 #include "renium_studio_functions.h"
 
@@ -1535,7 +1536,14 @@ static DWORD RunPropertyRead(PropertyReadParams* params)
     if (!task->completed) return 0xE406;
     // Keep the DataModel alive through submission/wait, but do not put a strong
     // reference to it inside its own queue (which could form a shutdown cycle).
-    std::function<void()> readTask{[task]() {
+    LARGE_INTEGER queued{}, frequency{};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&queued);
+    std::function<void()> readTask{[task, queued, frequency]() {
+        LARGE_INTEGER started{};
+        QueryPerformanceCounter(&started);
+        task->result.reserved = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            ElapsedMicros(queued, started, frequency), UINT32_MAX));
         ReadPropertyCaught(task.get());
         SetEvent(task->completed);
     }};

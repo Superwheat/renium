@@ -12,7 +12,10 @@ use crate::rbx::encode::rbx_logical_property_name;
 use ahash::{AHashMap, AHashSet};
 use rbx_binary::InstanceBindingMode;
 
-const NATIVE_IMPORT_BATCH_INSTANCES: usize = 512;
+// Each engine read finalizes the loaded scene. Hundreds of tiny reads repeat
+// that work over an ever larger place; retain bounded chunks without doing a
+// whole engine load for every small subtree.
+const NATIVE_IMPORT_BATCH_INSTANCES: usize = 32768;
 
 // Fixed-width tree rows avoid repeating full paths for every descendant.
 // Each row is (parent row, sibling/root ordinal, name, class, settings id).
@@ -157,7 +160,7 @@ fn import_identity_tree_covers_a_subtree_across_native_batches() -> Result<()> {
     let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
     let service = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
     let root = dom.insert(service, RbxInstanceBuilder::new("Folder").with_name("Bulk"));
-    let count = 6000;
+    let count = NATIVE_IMPORT_BATCH_INSTANCES + 100;
     assert!(count > NATIVE_IMPORT_BATCH_INSTANCES);
     let names = (0..count)
         .map(|index| format!("Part{index:05}{}", "x".repeat(91)))

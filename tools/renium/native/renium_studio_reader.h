@@ -6,6 +6,7 @@
 #include <memory_resource>
 #include <unordered_map>
 #include <unordered_set>
+#include "renium_batch_pacer.h"
 
 namespace renium_reader {
 using Create = SharedInstance*(__fastcall*)(void*, SharedInstance*, void*, bool);
@@ -515,29 +516,6 @@ static_assert(sizeof(Alias) == 12);
 static_assert(sizeof(ClassWire) == 264);
 static_assert(sizeof(TargetWire) == 80);
 
-// Sleep(1) rounds to the process timer interval and can consume nearly two
-// milliseconds for every batch. Keep the scheduling gap without changing the
-// system timer resolution or occupying a worker with a spin wait.
-struct BatchPacer
-{
-    HANDLE timer = nullptr;
-    explicit BatchPacer(bool enabled)
-    {
-        if (enabled) timer = CreateWaitableTimerExW(nullptr, nullptr,
-            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_MODIFY_STATE | SYNCHRONIZE);
-    }
-    ~BatchPacer() { if (timer) CloseHandle(timer); }
-    void Wait(DWORD milliseconds)
-    {
-        LARGE_INTEGER due{};
-        due.QuadPart = -static_cast<LONGLONG>(milliseconds) * 10000;
-        if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)
-            && WaitForSingleObject(timer, milliseconds + 100) == WAIT_OBJECT_0) return;
-        // Older Windows versions can lack high-resolution waitable timers.
-        Sleep(milliseconds);
-    }
-};
-
 struct Task
 {
     Parameters result;
@@ -780,8 +758,6 @@ inline DWORD Queue(Parameters* parameters)
     LARGE_INTEGER frequency{};
     QueryPerformanceFrequency(&frequency);
     BatchPacer pacer(parameters->batchPauseMs != 0 && task->inputs.size() > 1);
-    const auto frames = renium_observation::FindFrames(parameters->dataModel);
-    auto lastFrame = frames ? frames->counter.load(std::memory_order_acquire) : 0;
     std::uint64_t workSincePauseMicros = 0;
     // Return the DataModel lock between bounded subtrees. The exact
     // creation context and strong anchors span batches; other constructors forward.
@@ -845,33 +821,11 @@ inline DWORD Queue(Parameters* parameters)
         // gap after a bounded amount of reader work. Pausing after every small
         // batch adds hundreds of redundant timer waits to a full-place import.
         workSincePauseMicros += task->batchMicros[task->inputIndex];
-        if (frames && frames->active.load(std::memory_order_acquire)) {
-            const auto current = frames->counter.load(std::memory_order_acquire);
-            if (current != lastFrame) {
-                task->clock.value.framesDelivered += current - lastFrame;
-                lastFrame = current;
-                workSincePauseMicros = 0;
-            }
-        }
         if (parameters->batchPauseMs && workSincePauseMicros >= 16000) {
             task->clock.Next(ReaderPhase::Pacing);
-            if (frames && frames->active.load(std::memory_order_acquire)) {
-                ++task->clock.value.frameWaits;
-                // Resume as soon as an actual Heartbeat runs. Fixed OS sleeps
-                // can both waste already-delivered frames and miss starved ones.
-                // Bound this wait when a background Studio stops emitting frames.
-                const auto until = GetTickCount64() + 16;
-                while (frames->active.load(std::memory_order_acquire)
-                    && frames->counter.load(std::memory_order_acquire) == lastFrame) {
-                    const auto now = GetTickCount64();
-                    if (now >= until || WaitForSingleObject(frames->changed,
-                        static_cast<DWORD>(until - now)) != WAIT_OBJECT_0) break;
-                }
-                const auto current = frames->counter.load(std::memory_order_acquire);
-                if (current == lastFrame) ++task->clock.value.frameTimeouts;
-                task->clock.value.framesDelivered += current - lastFrame;
-                lastFrame = current;
-            } else pacer.Wait(parameters->batchPauseMs);
+            // Yield to Studio without requiring a Heartbeat or rendered frame.
+            // A background or paused viewport must not gate native import work.
+            pacer.Wait(parameters->batchPauseMs);
             workSincePauseMicros = 0;
             task->clock.Next(ReaderPhase::Producer);
         }

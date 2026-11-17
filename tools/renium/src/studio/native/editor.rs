@@ -4121,6 +4121,7 @@ fn send_editor_service_replacement(
     let import_id = format!("{}-{}", current_millis(), fnv1a_hex(&import.bytes));
     let pid = studio_pid_for_bridge(bridge)?;
     let title = studio_title_for_bridge(bridge, pid)?;
+    let import_step_started = Instant::now();
     let begin = bridge.call("beginEditorBinaryImport", json!({
         "importId": &import_id, "transactionId": transaction_id,
         "totalBytes": import.bytes.len(), "totalChunks": import.bytes.len().div_ceil(2 * 1024 * 1024),
@@ -4131,6 +4132,7 @@ fn send_editor_service_replacement(
         "nativeReceiptFormat": 2,
         "nativeHandoff": 1,
     }))?;
+    log_timing("native import begin", import_step_started);
     let mut invoked = false;
     let result = (|| {
         anyhow::ensure!(
@@ -4144,6 +4146,7 @@ fn send_editor_service_replacement(
         let held = begin
             .get("nativeTargets")
             .context("Studio did not return native transaction targets")?;
+        let import_step_started = Instant::now();
         let ready = bridge.call(
             "finishEditorBinaryImport",
             json!({
@@ -4151,6 +4154,8 @@ fn send_editor_service_replacement(
                 "nativeHandoff": 1,
             }),
         )?;
+        log_timing("native import prepare", import_step_started);
+        let import_step_started = Instant::now();
         // Native code must not run merely because a target lookup succeeded.
         // The plugin first arms rollback, owns the mutation and its observation.
         anyhow::ensure!(
@@ -4168,6 +4173,8 @@ fn send_editor_service_replacement(
                 == Some(true),
             "Studio did not authorize native invocation"
         );
+        log_timing("native import invoke permission", import_step_started);
+        let import_step_started = Instant::now();
         // Keep the binary batches, but share one native task and factory scope.
         // Its creation ordinals already match the transaction-wide identity plan.
         let (created, outcome) = match serializer::read_service_payload(
@@ -4192,6 +4199,8 @@ fn send_editor_service_replacement(
                 )));
             }
         };
+        log_timing("native import load", import_step_started);
+        let import_step_started = Instant::now();
         // The helper's fixed-width ABI is not the bridge's wire format. Keep
         // exact identities/ordinals, without transporting 48-byte padded strings.
         let mut chunks = vec![Vec::new()];
@@ -4239,6 +4248,8 @@ fn send_editor_service_replacement(
                 }),
             )?;
         }
+        log_timing("native import receipt upload", import_step_started);
+        let import_step_started = Instant::now();
         let response = bridge.call(
             "finishEditorBinaryImport",
             json!({
@@ -4248,6 +4259,7 @@ fn send_editor_service_replacement(
                 "nativeReceiptChunk": final_receipt,
             }),
         )?;
+        log_timing("native import complete", import_step_started);
         anyhow::ensure!(
             response["ok"] == true
                 && response["nativeInserted"] == true
@@ -4305,12 +4317,17 @@ fn combined_editor_change_batch(
     Ok((serde_json::to_vec(&request)?.len() <= MAX_BRIDGE_CHUNK_BYTES).then_some(request))
 }
 
-fn material_mode_value(change: &EditorPropertyChange) -> Option<&Value> {
-    (change.service == "MaterialService"
-        && change.class_name == "MaterialService"
-        && change.path_segments == ["MaterialService"])
-    .then(|| change.properties.get("Use2022Materials"))
-    .flatten()
+fn pre_import_property(change: &EditorPropertyChange, name: &str, native_import: bool) -> bool {
+    change.service == change.class_name
+        && change.path_segments == [change.class_name.as_str()]
+        && (matches!(
+            (change.class_name.as_str(), name),
+            ("MaterialService", "Use2022Materials")
+        ) || native_import
+            && matches!(
+                (change.class_name.as_str(), name),
+                ("Lighting", "LightingStyle" | "PrioritizeLightingQuality")
+            ))
 }
 
 pub(crate) fn send_editor_change_batches(
@@ -4344,31 +4361,42 @@ pub(crate) fn send_editor_change_batches(
         return Ok(summary);
     }
 
-    // Material mode changes Terrain's default colors. Complete that engine
-    // setter before ordinary properties restore the explicitly saved palette.
-    let material_changes = changes
+    // Material mode changes Terrain's default colors. Lighting changes rebuild
+    // the rendered scene: set them before populating it. These retained fields
+    // are excluded from the binary payload and use the ordinary undo fences.
+    let native_import = binary_import.is_some_and(|import| import.native_replacement.is_some());
+    let pre_import_changes = changes
         .property_changes
         .iter()
         .filter_map(|change| {
-            let value = material_mode_value(change)?;
             let mut first = change.clone();
-            first.properties = Map::from_iter([("Use2022Materials".into(), value.clone())]);
+            first
+                .properties
+                .retain(|name, _| pre_import_property(change, name, native_import));
+            if first.properties.is_empty() {
+                return None;
+            }
             first.reset_properties.clear();
             first.attributes.clear();
             first.deleted_attributes.clear();
             Some(first)
         })
         .collect::<Vec<_>>();
-    if !material_changes.is_empty() {
+    let mut pre_import_verification =
+        crate::editor::native_roots::NativeRootVerification::default();
+    if !pre_import_changes.is_empty() {
+        let started = Instant::now();
         let result = bridge.call(
             "applyEditorChanges",
             json!({
                 "instanceChanges": [], "sourceChanges": [],
-                "propertyChanges": material_changes, "transactionId": transaction_id,
+                "propertyChanges": pre_import_changes, "transactionId": transaction_id,
             }),
         )?;
         merge_editor_summary_checked(&mut summary, &result)?;
-        crate::editor::native_roots::apply(bridge, &mut summary, transaction_id)?;
+        pre_import_verification =
+            crate::editor::native_roots::apply(bridge, &mut summary, transaction_id)?;
+        log_timing("native editor pre-import root apply", started);
     }
 
     let mut payload_verified_services = std::collections::BTreeSet::new();
@@ -4391,7 +4419,7 @@ pub(crate) fn send_editor_change_batches(
     }
 
     if binary_import.is_none()
-        && material_changes.is_empty()
+        && pre_import_changes.is_empty()
         && let Some(request) = combined_editor_change_batch(changes, transaction_id)?
     {
         let result = bridge.call("applyEditorChanges", request)?;
@@ -4620,9 +4648,9 @@ pub(crate) fn send_editor_change_batches(
             !imported || property_change_needs_post_native_apply(change) && !payload_container;
         if send_all {
             let mut remaining = change.clone();
-            if material_mode_value(change).is_some() {
-                remaining.properties.remove("Use2022Materials");
-            }
+            remaining
+                .properties
+                .retain(|name, _| !pre_import_property(change, name, native_import));
             if !remaining.properties.is_empty()
                 || !remaining.reset_properties.is_empty()
                 || !remaining.attributes.is_empty()
@@ -4657,9 +4685,9 @@ pub(crate) fn send_editor_change_batches(
                 crate::editor::native_roots::is_property(&change.class_name, name)
                     || retained_name(name)
             });
-            if material_mode_value(change).is_some() {
-                remaining.properties.remove("Use2022Materials");
-            }
+            remaining
+                .properties
+                .retain(|name, _| !pre_import_property(change, name, native_import));
             if !remaining.properties.is_empty()
                 || !remaining.reset_properties.is_empty()
                 || !remaining.attributes.is_empty()
@@ -4692,7 +4720,7 @@ pub(crate) fn send_editor_change_batches(
     }
     summary.insert(
         "propertySent".to_string(),
-        json!((property_changes.len() + material_changes.len()) as u64),
+        json!((property_changes.len() + pre_import_changes.len()) as u64),
     );
     let started = Instant::now();
     send_property_batches(bridge, &property_changes, transaction_id, &mut summary)?;
@@ -4713,8 +4741,9 @@ pub(crate) fn send_editor_change_batches(
         .get("nativeGeometryWrites")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
-    let native_root_verification =
+    let mut native_root_verification =
         crate::editor::native_roots::apply(bridge, &mut summary, transaction_id)?;
+    native_root_verification.extend(pre_import_verification);
     log_timing(
         &format!("native editor root apply ({root_writes} writes)"),
         started,
@@ -4756,7 +4785,7 @@ pub(crate) fn send_editor_change_batches(
         let mut rows = container_setting_rows(changes, import);
         rows.extend(property_changes);
         if import.native_replacement.is_none() {
-            rows.extend(material_changes);
+            rows.extend(pre_import_changes);
             rows.retain(|row| payload_verified_services.contains(&row.service));
         }
         let verified_fields = verify_native_property_rows(
@@ -4770,6 +4799,12 @@ pub(crate) fn send_editor_change_batches(
             .iter()
             .map(|row| row.properties.len() + row.attributes.len() + row.deleted_attributes.len())
             .sum::<usize>();
+        crate::app::output::log_global(
+            5,
+            format_args!(
+                "[renium] native import field proof: verified={verified_fields} expected={expected_fields}"
+            ),
+        );
         // The native factory or detached tree checked its complete receipt. Verify the
         // retained containers and every value applied outside that reader here,
         // rather than exporting all newly loaded instances a second time.
@@ -5243,6 +5278,37 @@ fn merge_editor_summary_checked(summary: &mut Map<String, Value>, result: &Value
 #[cfg(test)]
 mod source_change_tests {
     use super::*;
+
+    #[test]
+    fn pre_import_settings_only_move_retained_scene_configuration() {
+        for (class, property, needs_import) in [
+            ("MaterialService", "Use2022Materials", false),
+            ("Lighting", "LightingStyle", true),
+            ("Lighting", "PrioritizeLightingQuality", true),
+        ] {
+            let mut change = EditorPropertyChange {
+                service: class.into(),
+                class_name: class.into(),
+                path_segments: vec![class.into()],
+                ..Default::default()
+            };
+            assert!(pre_import_property(&change, property, true));
+            assert_eq!(pre_import_property(&change, property, false), !needs_import);
+            assert!(!pre_import_property(&change, "Name", true));
+            change.path_segments.push("Child".into());
+            assert!(!pre_import_property(&change, property, true));
+            change.path_segments.pop();
+            change.service = "Workspace".into();
+            assert!(!pre_import_property(&change, property, true));
+        }
+        let terrain = EditorPropertyChange {
+            service: "Workspace".into(),
+            class_name: "Terrain".into(),
+            path_segments: vec!["Workspace".into(), "Terrain".into()],
+            ..Default::default()
+        };
+        assert!(!pre_import_property(&terrain, "SmoothGrid", true));
+    }
 
     #[test]
     fn imported_containers_keep_model_pivots_but_not_workspace_pivot() {

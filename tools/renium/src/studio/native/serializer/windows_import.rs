@@ -378,7 +378,7 @@ pub(crate) fn read_service_payload(
     *invoked = true;
     let exit = remote.run_owned(entry, capture_remaining_ms(started, timeout)?)?;
     let helper_finished = Instant::now();
-    let _helper_wall_ms = helper_finished.duration_since(helper_started).as_secs_f64() * 1000.0;
+    let helper_wall_ms = helper_finished.duration_since(helper_started).as_secs_f64() * 1000.0;
     let mut response = [0; RESPONSE];
     transport
         .read_exact(&mut response)
@@ -452,6 +452,21 @@ pub(crate) fn read_service_payload(
     anyhow::ensure!(
         measured == total,
         "Native timing phases do not cover the helper timeline"
+    );
+    crate::app::output::log_global(
+        5,
+        format_args!(
+            "[renium] native import helper: prepare_ms={:.3} helper_ms={helper_wall_ms:.3} total_ms={:.3} instances={count} batches={} history_skipped={history_skipped} factory_ms={:.3} constructor_ms={:.3} frames={} frame_waits={} frame_timeouts={} phases_ms={}",
+            helper_started.duration_since(started).as_secs_f64() * 1000.0,
+            total as f64 * 1000.0 / frequency as f64,
+            replacement.batches.len(),
+            read_u64(&accounting, 96)? as f64 * 1000.0 / frequency as f64,
+            read_u64(&accounting, 104)? as f64 * 1000.0 / frequency as f64,
+            read_u64(&accounting, 112)?,
+            read_u64(&accounting, 120)?,
+            read_u64(&accounting, 128)?,
+            Value::Object(phases),
+        ),
     );
     let mut ordinals = HashSet::with_capacity(count);
     let mut identities = HashSet::with_capacity(count);

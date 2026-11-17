@@ -580,6 +580,7 @@ fn main() {
     println!("cargo:rerun-if-changed=native/renium_task_context_macos.h");
     println!("cargo:rerun-if-changed=native/renium_tagged_callback.h");
     println!("cargo:rerun-if-changed=native/renium_property_task.h");
+    println!("cargo:rerun-if-changed=native/renium_batch_pacer.h");
     println!("cargo:rerun-if-changed=native/tests/macos-task-context-fixture.h");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
@@ -592,6 +593,13 @@ fn main() {
     generate_config_settings(&out_dir);
     let target = env::var("TARGET").expect("TARGET is missing");
     if host == target || (target_os == "macos" && host.contains("apple-darwin")) {
+        if target_os == "windows" {
+            build_native_test(
+                &out_dir,
+                "batch-pacer",
+                Path::new("native/tests/batch_pacer_windows.cpp"),
+            );
+        }
         build_native_test(
             &out_dir,
             "terrain-observation",

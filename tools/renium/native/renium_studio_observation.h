@@ -1,27 +1,8 @@
 // One temporary native signal subscription replaces per-instance Lua attribute
 // subscriptions during a full export or transient native push. It observes;
 // it never suppresses Studio's events or other subscribers.
-#include <unordered_map>
 #include "renium_signal_append.h"
 namespace renium_observation {
-// Frame progress belongs to the same DataModel/observation lease as the relay.
-// A reader holds the counter independently; cancellation wakes it before the
-// native observer releases its connection. No Studio instance is read unlocked.
-struct FrameProgress {
-    std::atomic<std::uint64_t> counter{0};
-    std::atomic<bool> active{true};
-    HANDLE changed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    FrameProgress() { if (!changed) throw std::runtime_error("Cannot observe Studio frame progress"); }
-    ~FrameProgress() { CloseHandle(changed); }
-};
-static std::mutex frameMutex;
-static std::unordered_map<std::uintptr_t, std::weak_ptr<FrameProgress>> framesByModel;
-static std::shared_ptr<FrameProgress> FindFrames(std::uintptr_t model) {
-    std::lock_guard<std::mutex> lock(frameMutex);
-    const auto found = framesByModel.find(model);
-    return found == framesByModel.end() ? nullptr : found->second.lock();
-}
-
 struct Params {
     ReniumSerializerParams base;
     std::uint32_t signalOffset, appendAbi;
@@ -44,7 +25,6 @@ struct Task {
     std::atomic<bool> cancelled{false};
     std::vector<void*> owners;
     std::shared_ptr<Task> installed;
-    std::shared_ptr<FrameProgress> frames;
     std::string error;
 };
 
@@ -57,9 +37,7 @@ static void Fire(Task* task, const SharedInstance* input) {
 static void __fastcall Changed(void* node, const SharedInstance* input, void* descriptor) {
     auto task = *reinterpret_cast<Task**>(static_cast<unsigned char*>(node) + 0x28);
     const auto& p = task->params;
-    if (task->frames && input->instance == p.relay.instance && descriptor == p.descriptor) {
-        task->frames->counter.fetch_add(1, std::memory_order_release);
-        SetEvent(task->frames->changed);
+    if (input->instance == p.relay.instance && descriptor == p.descriptor) {
         ReleaseOwnerReference(input->owner);
         return;
     }
@@ -84,14 +62,6 @@ static void __fastcall Changed(void* node, const SharedInstance* input, void* de
 
 static void Finish(Task* task) {
     auto& p = task->params;
-    if (task->frames) {
-        task->frames->active.store(false, std::memory_order_release);
-        SetEvent(task->frames->changed);
-        std::lock_guard<std::mutex> lock(frameMutex);
-        const auto found = framesByModel.find(p.base.dataModel + p.base.dataModelInstanceOffset);
-        if (found != framesByModel.end() && found->second.lock() == task->frames)
-            framesByModel.erase(found);
-    }
     if (task->relayArmed) {
         task->relayArmed = false;
         // Restore local listeners before unarming, including timeout/cancel.
@@ -162,13 +132,6 @@ static void Begin(const std::shared_ptr<Task>& task) {
     task->installed = task;
     if (p.relay.instance) {
         task->relayArmed = true;
-        task->frames = std::make_shared<FrameProgress>();
-        {
-            std::lock_guard<std::mutex> lock(frameMutex);
-            auto& existing = framesByModel[p.base.dataModel + p.base.dataModelInstanceOffset];
-            if (!existing.expired()) throw std::runtime_error("Studio already has a native frame observer");
-            existing = task->frames;
-        }
         Fire(task.get(), &p.relay);
     }
 }
