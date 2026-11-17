@@ -220,8 +220,13 @@ fn align_settings_bytes(
     finish_settings_alignment(reference, observed, aligned, cache_key, camera_kept)
 }
 
-/// Every instance of `observed` has the id of the reference's instance at its
-/// position, and no id stands twice.
+/// Whether aligning `observed` to the reference would leave every instance
+/// where it stands. Each one has the id of the reference's instance at its
+/// position, that id is one a store gave (a debug id or a bare number is
+/// matched by content, not by id), no id stands twice, the viewport camera
+/// stands at one position in both, and no saved UniqueId points at another
+/// position: those are the matches the alignment makes before any other, in
+/// that order, and with all of them positional nothing is left to match.
 fn identities_already_aligned(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
     let mut seen = AHashSet::with_capacity(reference.instances.len());
     reference.instances.len() == observed.instances.len()
@@ -231,8 +236,11 @@ fn identities_already_aligned(reference: &SettingsBytecode, observed: &SettingsB
             .zip(&observed.instances)
             .all(|(reference, observed)| {
                 reference.settings_id == observed.settings_id
+                    && is_store_identity(&reference.settings_id)
                     && seen.insert(reference.settings_id.as_str())
             })
+        && workspace_current_camera_index(reference) == workspace_current_camera_index(observed)
+        && persistent_identities_follow_mapping(reference, observed, Some)
 }
 
 /// Whether the aligned store says the same as the reference, in which case
@@ -1425,6 +1433,20 @@ impl<'a> IdentityAssignment<'a> {
 }
 
 pub(crate) fn align_settings_ids_to_reference(
+    reference: &SettingsBytecode,
+    observed: &mut SettingsBytecode,
+) -> bool {
+    // A store read back after it was aligned once: matching would leave
+    // each instance where it stands.
+    if identities_already_aligned(reference, observed)
+        && settings_topology_matches(reference, observed)
+    {
+        return true;
+    }
+    align_settings_ids_by_matching(reference, observed)
+}
+
+fn align_settings_ids_by_matching(
     reference: &SettingsBytecode,
     observed: &mut SettingsBytecode,
 ) -> bool {
@@ -6754,6 +6776,152 @@ mod viewport_camera_tests {
         assert_eq!(
             pulled.instances[1].properties.get("FieldOfView"),
             Some(&json!(60.0))
+        );
+    }
+}
+
+#[cfg(test)]
+mod already_aligned_tests {
+    use super::*;
+    use crate::tests::support::{settings_document, settings_instance};
+    use serde_json::json;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+    }
+
+    fn unique_id(number: usize) -> Value {
+        json!({"_type": "UniqueId", "value": format!("{:032x}", number + 1)})
+    }
+
+    /// A Workspace store of same-named siblings, some of them cameras, under
+    /// ids of every kind the alignment tells apart.
+    fn store(rng: &mut Rng) -> SettingsBytecode {
+        let mut root = settings_instance("ws", "Workspace", "Workspace", None);
+        let count = 3 + rng.below(6);
+        let mut instances = Vec::new();
+        for index in 0..count {
+            let class = ["Part", "Camera", "Folder"][rng.below(3)];
+            let id = match rng.below(12) {
+                0 | 1 => format!("debug:{index}"),
+                2 | 3 => format!("{index:x}"),
+                // A broken store: the id of the instance before it.
+                4 if index > 0 => format!("editor:{}", index - 1),
+                _ => format!("editor:{index}"),
+            };
+            let name = ["A", "B"][rng.below(2)];
+            let mut instance = settings_instance(&id, name, class, Some(0));
+            instance
+                .properties
+                .insert("Mark".into(), json!(rng.below(3)));
+            if rng.below(3) == 0 {
+                instance
+                    .properties
+                    .insert("UniqueId".into(), unique_id(index));
+            }
+            instances.push(instance);
+        }
+        let cameras = instances
+            .iter()
+            .filter(|instance| instance.class_name == "Camera")
+            .map(|instance| instance.settings_id.clone())
+            .collect::<Vec<_>>();
+        if !cameras.is_empty() && rng.below(2) == 0 {
+            root.properties.insert(
+                "CurrentCamera".into(),
+                json!({"_type": "Ref", "settingsId": cameras[rng.below(cameras.len())]}),
+            );
+        }
+        settings_document(std::iter::once(root).chain(instances).collect())
+    }
+
+    /// What Studio may hand back for that store: values edited, a saved
+    /// UniqueId moved to a sibling, another camera in the viewport, two
+    /// siblings of one name with their contents traded.
+    fn edited(store: &SettingsBytecode, rng: &mut Rng) -> SettingsBytecode {
+        let mut edited = store.clone();
+        let last = edited.instances.len() - 1;
+        for _ in 0..rng.below(4) {
+            let index = 1 + rng.below(last);
+            match rng.below(5) {
+                0 | 1 => {
+                    edited.instances[index]
+                        .properties
+                        .insert("Mark".into(), json!(rng.below(3)));
+                }
+                4 => {
+                    // Two siblings of one name trade what they hold.
+                    let other = 1 + rng.below(last);
+                    if edited.instances[index].name == edited.instances[other].name
+                        && edited.instances[index].class_name == edited.instances[other].class_name
+                    {
+                        let held = edited.instances[index].properties.clone();
+                        edited.instances[index].properties =
+                            edited.instances[other].properties.clone();
+                        edited.instances[other].properties = held;
+                    }
+                }
+                2 => {
+                    let other = 1 + rng.below(last);
+                    let moved = edited.instances[index].properties.remove("UniqueId");
+                    let back = edited.instances[other].properties.remove("UniqueId");
+                    for (target, value) in [(other, moved), (index, back)] {
+                        if let Some(value) = value {
+                            edited.instances[target]
+                                .properties
+                                .insert("UniqueId".into(), value);
+                        }
+                    }
+                }
+                _ => {
+                    if edited.instances[index].class_name == "Camera" {
+                        let id = edited.instances[index].settings_id.clone();
+                        edited.instances[0].properties.insert(
+                            "CurrentCamera".into(),
+                            json!({"_type": "Ref", "settingsId": id}),
+                        );
+                    }
+                }
+            }
+        }
+        edited
+    }
+
+    #[test]
+    fn a_store_said_to_be_aligned_is_one_the_matching_leaves_as_it_is() {
+        let (mut said_aligned, mut said_not) = (0, 0);
+        for seed in 1..=4_000u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let reference = store(&mut rng);
+            let observed = edited(&reference, &mut rng);
+            if !identities_already_aligned(&reference, &observed) {
+                said_not += 1;
+                continue;
+            }
+            said_aligned += 1;
+            let mut matched = observed.clone();
+            assert!(
+                align_settings_ids_by_matching(&reference, &mut matched),
+                "seed {seed}: the matching refused a store said to be aligned"
+            );
+            let mut expected = observed;
+            stabilize_settings_reference_ids(&mut expected);
+            stabilize_settings_reference_ids(&mut matched);
+            assert!(
+                matched == expected,
+                "seed {seed}: the matching moved an identity of a store said to be aligned"
+            );
+        }
+        assert!(
+            said_aligned > 200 && said_not > 200,
+            "the seeds must reach both answers: {said_aligned} aligned, {said_not} not"
         );
     }
 }

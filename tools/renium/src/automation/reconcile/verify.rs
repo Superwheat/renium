@@ -84,14 +84,23 @@ pub(crate) fn settings_delta_mismatch(
     prepared: Option<PreparedPushVerification>,
 ) -> Result<Option<String>> {
     let before_aligned = prepared.is_some();
-    let (mut before, desired) = match prepared {
-        Some(prepared) => (prepared.previous, prepared.desired),
-        None => (
-            settings_document(before)?,
-            Arc::new(settings_document(desired)?),
-        ),
-    };
-    let mut observed = settings_document(observed)?;
+    // The three stores decode side by side: on a large service each takes a
+    // good part of a second.
+    let (requested, observed) = rayon::join(
+        || -> Result<_> {
+            Ok(match prepared {
+                Some(prepared) => (prepared.previous, prepared.desired),
+                None => {
+                    let (before, desired) =
+                        rayon::join(|| settings_document(before), || settings_document(desired));
+                    (before?, Arc::new(desired?))
+                }
+            })
+        },
+        || settings_document(observed),
+    );
+    let (mut before, desired) = requested?;
+    let mut observed = observed?;
     if desired.instances.is_empty()
         && !before.instances.is_empty()
         && !observed.instances.is_empty()
