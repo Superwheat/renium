@@ -5871,6 +5871,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 
 	local function setTrackedOperationPhase(operation, phase: string)
 		if activeOperation == operation then
+			BridgeConnection.profileStep(`{operation.kind}: {operation.phase}`, operation.phaseStartedAt)
 			operation.phase = phase
 			operation.phaseStartedAt = os.clock()
 		end
@@ -5878,6 +5879,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 
 	local function finishTrackedOperation(operation)
 		if activeOperation == operation then
+			BridgeConnection.profileStep(`{operation.kind}: {operation.phase}`, operation.phaseStartedAt)
 			activeOperation = nil
 		end
 	end
@@ -7324,6 +7326,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	function api.beginTransaction(params: { [string]: any }): { [string]: any }
+		local profileStarted = os.clock()
 		for _, session in pairs(editorTransactions) do
 			retireInvalidatedTransaction(session)
 		end
@@ -7402,6 +7405,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 		local studioGenerations = captureStudioGenerations(serviceNames)
+		BridgeConnection.profileStep("transaction validation, paths and packages", profileStarted)
+		profileStarted = os.clock()
 		local snapshot = TransactionState.captureSnapshot(snapshotServices, {
 			forceStructural = params.hasInstanceChanges == true or next(packageSnapshotRoots) ~= nil,
 			captureAllScriptDocuments = nativeImport,
@@ -7414,6 +7419,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			restrictedMutationServices = snapshotRestricted,
 		}, ctx)
 		assertSessionOwnership(operationCancellation)
+		BridgeConnection.profileStep("transaction rollback snapshot", profileStarted)
+		profileStarted = os.clock()
 		if
 			not studioMatchesTransactionExpectation(params, serviceNames)
 			or studioGenerationsChanged(studioGenerations)
@@ -7481,6 +7488,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		editorTransactions[transactionId] = session
 		armSessionExpiry(editorTransactions, transactionId, session)
+		BridgeConnection.profileStep("transaction journal and history", profileStarted)
 		return {
 			ok = true,
 			found = true,
@@ -7788,6 +7796,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	function api.beginBinaryExport(params: { [string]: any }): { [string]: any }
+		local profileStarted = os.clock()
 		pruneExpiredSessions(binaryExports)
 		local operationCancellation = captureOperationCancellation()
 		assertSessionOwnership(operationCancellation)
@@ -7919,6 +7928,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			ctx = ctx,
 		}
 		local captureIgnoredProperties = { archivable = not nativeCapture }
+		BridgeConnection.profileStep("export service selection and roots", profileStarted, { services = #serviceNames })
+		profileStarted = os.clock()
 		if not metadataOnly then
 			local guardedServices = table.create(#serviceNames)
 			for index, serviceName in ipairs(serviceNames) do
@@ -7939,6 +7950,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			session.snapshotCleanupPending = false
 			table.clear(session.snapshotRoots)
 		end
+		BridgeConnection.profileStep("export observation guard", profileStarted)
 		session.onExpire = function()
 			if session.released then
 				return
@@ -7958,10 +7970,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		armSessionExpiry(binaryExports, exportId, session)
 		local beginOk, beginResult = xpcall(function()
 			if not metadataOnly then
+				local documentsStarted = os.clock()
 				local scriptSourcesByInstance = {}
 				for _, entry in ipairs(ScriptDocumentState.capture(serviceNames)) do
 					scriptSourcesByInstance[entry.instance] = entry.source
 				end
+				BridgeConnection.profileStep("export open script documents", documentsStarted)
 				assertSessionOwnership(operationCancellation)
 				local serializerWorkerCount = if partitioned and not nativeCapture
 					then math.clamp(math.floor(tonumber(params.serializationWorkers) or #groups), 1, #groups)
@@ -7973,7 +7987,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 				for serviceIndex, serviceName in ipairs(serviceNames) do
 					assertSessionOwnership(operationCancellation)
+					local serviceStarted = os.clock()
 					local state = ctx.prepareNativeState(serviceName, scriptSourcesByInstance)
+					BridgeConnection.profileStep(`{serviceName}: enumerate native state`, serviceStarted, { instances = #state.instances })
+					serviceStarted = os.clock()
 					-- ItemChanged does not cover every attribute edit. Subscribe to
 					-- the already enumerated graph before its serializer can start.
 					ReferenceOverlay.watchNativeDescendantAttributes(session.nativeGuard, serviceName, state.instances)
@@ -7995,6 +8012,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					if partitioned and serviceIndex <= serializerWorkerCount then
 						NativeSerialization.appendServiceJob(session, serviceName, rootsByService[serviceName])
 					end
+					BridgeConnection.profileStep(`{serviceName}: attributes, identities and root properties`, serviceStarted)
 				end
 				if nativeCapture then
 					-- Place-mode capture includes real service roots. Until its
@@ -8045,6 +8063,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				session.status = "ready"
 			end
 			local propertySchemaByClass = {}
+			local schemaStarted = os.clock()
 			local enumValueNamesByType = {}
 			for _, serviceName in ipairs(serviceNames) do
 				assertSessionOwnership(operationCancellation)
@@ -8082,6 +8101,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					end
 				end
 			end
+			BridgeConnection.profileStep("export class schemas and serialization schedule", schemaStarted)
 			if partitioned and not nativeCapture then
 				NativeSerialization.finishSchedule(
 					session,
@@ -9328,6 +9348,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local function finishPhase(name: string)
 			local now = os.clock()
 			timings[name] = (now - phaseStarted) * 1000
+			BridgeConnection.profileStep(`import complete: {name}`, phaseStarted)
 			phaseStarted = now
 		end
 		local additions = ctx.finishNativeImportObservations(transaction.transactionId, native.createdById)

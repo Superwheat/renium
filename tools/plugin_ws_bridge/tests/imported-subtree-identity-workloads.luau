@@ -117,6 +117,7 @@ for _, case in { { "deserialize", 0 }, { "native", 0 }, { "deserialize", 6000 },
 		ctx.finishNativeImportObservations = function() return { ReplicatedStorage = { [root] = prepared.target } } end
 		local complete = luau.load(slice("\tlocal function finishNativeServiceImport(", "\tfunction api.finishBinaryImport(")
 			.. "\nreturn finishNativeServiceImport", { environment = {
+				BridgeConnection = require("../BridgeConnection.module"),
 				ctx = ctx, pathCacheKey = key,
 				prepareImportedIdentities = identity.prepare, rememberImportedIdentities = identity.remember,
 				beginHistoryRecording = function() return "recording" end,

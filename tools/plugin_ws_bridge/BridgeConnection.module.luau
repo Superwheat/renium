@@ -1,5 +1,31 @@
 local BridgeConnection = {}
 
+-- Request-local clocks: yielding overlay workers must never share a timeline.
+-- These measurements authorize nothing and are sent only to an opted-in host.
+local profiles = setmetatable({}, { __mode = "k" })
+function BridgeConnection.profileStart(started: number?)
+	if started ~= nil then
+		profiles[coroutine.running()] = { started = started, spans = {} }
+	end
+end
+
+function BridgeConnection.profileStep(label: string, started: number, counts: any?)
+	local profile = profiles[coroutine.running()]
+	if profile ~= nil and #profile.spans < 4096 then
+		profile.spans[#profile.spans + 1] = {
+			label, (started - profile.started) * 1000, (os.clock() - profile.started) * 1000, counts,
+		}
+	end
+end
+
+function BridgeConnection.profileFinish(): any
+	local thread = coroutine.running()
+	local profile = profiles[thread]
+	profiles[thread] = nil
+	if profile == nil then return nil end
+	return { version = 1, elapsedMs = (os.clock() - profile.started) * 1000, spans = profile.spans }
+end
+
 function BridgeConnection.removeQueuedRequestsByLease(queue, leaseId: string): { any }
 	local removed = {}
 	local retainedIndex = 1
@@ -483,6 +509,10 @@ function BridgeConnection.create(context)
 		end
 		local started = os.clock()
 		local exclusive = context.isExclusiveMethod(method, params)
+		BridgeConnection.profileStart(params.__reniumProfileStarted)
+		if params.__reniumProfileStarted ~= nil then
+			BridgeConnection.profileStep("request decode and plugin admission", params.__reniumProfileStarted)
+		end
 		local sessionOwned = exclusive or context.isSessionOwnedMethod(method)
 		local ownsSession = not sessionOwned or context.validateSessionLock(sessionGeneration)
 		local okCall, result
@@ -502,6 +532,12 @@ function BridgeConnection.create(context)
 			end
 		end
 		local serverMs = (os.clock() - started) * 1000
+		BridgeConnection.profileStep("plugin handler", started)
+		local profile = BridgeConnection.profileFinish()
+		if profile ~= nil and okCall and type(result) == "table" then
+			result = table.clone(result)
+			result.nativeProfile = profile
+		end
 		local recipients
 		if replayRequest then
 			replayRequest.completed = true
@@ -603,6 +639,7 @@ function BridgeConnection.create(context)
 	end
 
 	local function validatedRequest(channelId, client, message)
+		local received = os.clock()
 		if type(message) ~= "string" then
 			sendRequestError(channelId, client, nil, "Bridge request must be text")
 			return nil
@@ -653,6 +690,8 @@ function BridgeConnection.create(context)
 			return nil
 		end
 		pruneCancelledRequestLeases()
+		-- Never accept an epoch supplied by the caller.
+		params.__reniumProfileStarted = if payload.profile == true then received else nil
 		if leaseId ~= nil and cancelledRequestLeases[leaseId] ~= nil then
 			sendRequestError(channelId, client, id, "Renium request lease was cancelled")
 			return nil

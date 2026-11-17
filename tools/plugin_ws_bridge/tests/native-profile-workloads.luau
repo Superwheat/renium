@@ -1,0 +1,47 @@
+local fs = require("@lune/fs")
+local luau = require("@lune/luau")
+local serde = require("@lune/serde")
+local now = 10
+local Profile = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeConnection.module.luau"), {
+	environment = { os = { clock = function() return now end } },
+})()
+Profile.profileStart(10)
+now = 10.001
+Profile.profileStep("queue", 10)
+local worker = coroutine.create(function()
+	Profile.profileStart(now)
+	now += 0.003
+	Profile.profileStep("worker", 10.001)
+	local result = Profile.profileFinish()
+	assert(#result.spans == 1 and result.spans[1][1] == "worker")
+end)
+assert(coroutine.resume(worker))
+now = 10.006
+Profile.profileStep("handler", 10.001, { instances = 42 })
+local result = Profile.profileFinish()
+assert(result.version == 1 and #result.spans == 2)
+assert(math.abs(result.elapsedMs - 6) < 0.00001)
+assert(math.abs(result.spans[2][3] - result.spans[2][2] - 5) < 0.00001)
+assert(result.spans[2][4].instances == 42)
+assert(Profile.profileFinish() == nil)
+Profile.profileStep("disabled", now)
+assert(Profile.profileFinish() == nil)
+
+local sent
+local Transport = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeTransport.module.luau"), {
+	environment = { game = { GetService = function() return {
+		JSONEncode = function(_, value) return serde.encode("json", value) end,
+	} end } },
+})()
+local client = { Send = function(_, message) sent = message end }
+local chunk = { start = 1, nextStart = 6, total = 5, chunk = "a\nb\0c", nativeProfile = result }
+assert(Transport.sendSuccessResponse(1, client, 12, "getEditorBinaryOverlayChunk", chunk, 6))
+local separator = assert(sent:find("\n", 1, true))
+assert(sent:sub(1, 5) == "RBS5 ")
+assert(sent:sub(separator + 1) == chunk.chunk)
+local header = serde.decode("json", sent:sub(6, separator - 1))
+assert(header.id == 12 and header.nativeProfile.spans[2][4].instances == 42)
+chunk.nativeProfile = nil
+assert(Transport.sendSuccessResponse(1, client, 12, "getEditorBinaryOverlayChunk", chunk, 6))
+assert(sent:sub(1, 5) == "RBS2 ", "legacy hosts must keep the existing wire format")
+print("Renium native profile clock and transport tests passed")

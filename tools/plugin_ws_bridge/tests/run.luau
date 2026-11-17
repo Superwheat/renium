@@ -39,6 +39,7 @@ require("./font-transport-workloads")
 require("./mesh-content-workloads")
 require("./viewport-native-workloads")
 require("./connection-workloads")
+require("./native-profile-workloads")
 require("./play-status-workloads")
 require("./console-cursor-workloads")
 require("./play-clients-workloads")
@@ -263,6 +264,7 @@ do
 			end
 			luau.load(editorSyncSource:sub(first, last - 1), { environment = {
 				api = api, ctx = ctx, binaryExports = exports, NativeSerialization = native,
+				BridgeConnection = Connection,
 				pruneExpiredSessions = function() end, armSessionExpiry = function() end,
 				captureOperationCancellation = function() return {} end,
 				assertSessionOwnership = function() end, currentRequestLeaseId = function() return "lease" end,

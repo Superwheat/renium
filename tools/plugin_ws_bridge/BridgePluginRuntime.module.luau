@@ -3780,9 +3780,14 @@ function BridgePluginRuntime.start(context)
 
 		local acquired = false
 		local ok, payload = xpcall(function()
+			local slotStarted = os.clock()
 			Config.acquireDemandSerializerSlot()
+			ConnectionModule.profileStep(`{serviceName}: wait for overlay worker`, slotStarted)
 			acquired = true
-			return buildPayload()
+			local buildStarted = os.clock()
+			local built = buildPayload()
+			ConnectionModule.profileStep(`{serviceName}: build overlay rows`, buildStarted, { instances = math.min(take, total - startPos + 1) })
+			return built
 		end, debug.traceback)
 		if acquired then
 			Config.releaseDemandSerializerSlot()
@@ -3793,7 +3798,9 @@ function BridgePluginRuntime.start(context)
 		if not state.nativeExportOnly and Config.studioChanges.serviceGeneration(serviceName) ~= generation then
 			error(`Studio changed {serviceName} while serializing the export; retry the sync`)
 		end
+		local encodeStarted = os.clock()
 		local encoded, encodeMs = ChunkingModule.jsonEncodeTimed(payload)
+		ConnectionModule.profileStep(`{serviceName}: encode overlay JSON`, encodeStarted, { bytes = #encoded })
 
 		Config.cacheBatchPayload(state.batchCacheByKey, state.batchCacheKeys, key, encoded, 256)
 		return encoded, encodeMs
@@ -3923,6 +3930,7 @@ function BridgePluginRuntime.start(context)
 			return buffer.tostring(EncodingService:Base64Encode(compressed))
 		end)
 		local compressionMs = (os.clock() - started) * 1000
+		ConnectionModule.profileStep("compress overlay payload", started, { bytes = #encoded })
 		if not ok or type(compressedText) ~= "string" or #compressedText >= #encoded or #compressedText > maxLen then
 			return nil
 		end
@@ -4015,6 +4023,7 @@ function BridgePluginRuntime.start(context)
 			overlayCacheKey,
 			stateOverride
 		)
+		local payloadStarted = os.clock()
 		local result = buildInstanceBatchPayload(
 			encoded,
 			math.max(0, encodeMs or 0),
@@ -4024,6 +4033,7 @@ function BridgePluginRuntime.start(context)
 			knownPayloadHash,
 			payloadCacheEnabled
 		)
+		ConnectionModule.profileStep(`{serviceName}: hash and chunk overlay payload`, payloadStarted, { bytes = #result.chunk, cacheHit = result.payloadCacheHit })
 		if
 			type(overlayId) == "string"
 			and overlayId ~= ""

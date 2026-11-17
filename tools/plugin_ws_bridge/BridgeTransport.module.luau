@@ -32,6 +32,18 @@ local function isRawChunkResult(method, result)
 end
 
 local function sendRawChunkResponse(client, id, result, serverMs)
+	if result.nativeProfile ~= nil then
+		local metadata = table.clone(result)
+		metadata.chunk = nil
+		metadata.id = id
+		metadata.pluginServerMs = serverMs
+		local ok, header = pcall(HttpService.JSONEncode, HttpService, metadata)
+		if not ok then return false, "Failed to encode bridge timing header" end
+		if #result.chunk > MAX_RAW_CHUNK_BYTES or #header > 1024 * 1024 then
+			return false, "Bridge profiled chunk exceeds safe size limit"
+		end
+		return pcall(client.Send, client, `RBS5 {header}\n{result.chunk}`)
+	end
 	local startValue = math.max(1, tonumber(result.start) or 1)
 	local nextStartValue = math.max(startValue, tonumber(result.nextStart) or startValue)
 	local totalValue = math.max(0, tonumber(result.total) or 0)
