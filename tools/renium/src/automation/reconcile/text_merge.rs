@@ -14,13 +14,19 @@
 //! that side's. Everything else both sides changed is a conflict, and a
 //! conflict leaves no merged text at all: the caller takes one side's whole
 //! script, so no text is ever put together from two answers to one conflict.
+//!
+//! A line both sides moved, each to another place, leaves its old place in
+//! one region and each new place in a region of its own, and no region sees
+//! the two disagree. The merged text is therefore counted: it holds no text
+//! more often than the two sides added it, nor less often than they took it
+//! out, or the script is a conflict.
 
 use std::collections::HashMap;
 
 /// The merged text, or `None` when the two sides conflict.
 pub(super) fn merge_script_lines(base: &str, editor: &str, studio: &str) -> Option<String> {
     let (base, editor, studio) = (lines(base), lines(editor), lines(studio));
-    let mut merged = String::new();
+    let mut merged = Vec::with_capacity(editor.len().max(studio.len()));
     let (mut at_base, mut at_editor, mut at_studio) = (0, 0, 0);
     // The end of the three texts closes the last region.
     let mut stops = anchors(&base, &editor, &studio);
@@ -31,13 +37,33 @@ pub(super) fn merge_script_lines(base: &str, editor: &str, studio: &str) -> Opti
             &editor[at_editor..to_editor],
             &studio[at_studio..to_studio],
         )?;
-        region.into_iter().for_each(|line| merged.push_str(line));
-        if let Some(anchor) = base.get(to_base) {
-            merged.push_str(anchor);
-        }
+        merged.extend(region);
+        merged.extend(base.get(to_base));
         (at_base, at_editor, at_studio) = (to_base + 1, to_editor + 1, to_studio + 1);
     }
-    Some(merged)
+    counts_follow_both_sides(&base, &editor, &studio, &merged).then(|| merged.concat())
+}
+
+/// Whether the merge holds every text as often as the sides' edits allow: at
+/// most as often as before plus what each side added of it, at least as
+/// often as before less what each side took out.
+fn counts_follow_both_sides(
+    base: &[&str],
+    editor: &[&str],
+    studio: &[&str],
+    merged: &[&str],
+) -> bool {
+    let mut counts = HashMap::<&str, [isize; 4]>::with_capacity(merged.len());
+    for (text, lines) in [base, editor, studio, merged].into_iter().enumerate() {
+        for line in lines {
+            counts.entry(line).or_default()[text] += 1;
+        }
+    }
+    counts.values().all(|[base, editor, studio, merged]| {
+        let added = (editor - base).max(0) + (studio - base).max(0);
+        let removed = (base - editor).max(0) + (base - studio).max(0);
+        (base - removed..=base + added).contains(merged)
+    })
 }
 
 /// Where each anchor line stands in the three texts, in order.
@@ -274,6 +300,34 @@ mod tests {
             assert_eq!(merge_script_lines(base, editor, studio), None, "{base:?}");
             assert_eq!(merge_script_lines(base, studio, editor), None, "{base:?}");
         }
+    }
+
+    /// A line both sides moved, each to another place, is not written at
+    /// both places, and a repeated line both moved is not dropped.
+    #[test]
+    fn a_line_both_sides_moved_is_a_conflict() {
+        for (base, editor, studio) in [
+            ("a\nb\nw\n", "b\na\nw\n", "b\nw\na\n"),
+            ("a\nb\na\nw\n", "b\na\nw\na\n", "a\nb\nw\na\n"),
+        ] {
+            assert_eq!(merge_script_lines(base, editor, studio), None, "{base:?}");
+            assert_eq!(merge_script_lines(base, studio, editor), None, "{base:?}");
+        }
+        // The same line added or taken out by both at places far apart is
+        // two edits, not a move.
+        assert_eq!(
+            merge_script_lines(
+                "a\n\nb\nc\n\nd\n",
+                "a\n\n\nb\nc\n\nd\n",
+                "a\n\nb\nc\n\n\nd\n"
+            )
+            .as_deref(),
+            Some("a\n\n\nb\nc\n\n\nd\n")
+        );
+        assert_eq!(
+            merge_script_lines("a\n\nb\nc\n\nd\n", "a\nb\nc\n\nd\n", "a\n\nb\nc\nd\n").as_deref(),
+            Some("a\nb\nc\nd\n")
+        );
     }
 
     /// A block both sides hold is one block, also where its lines repeat
