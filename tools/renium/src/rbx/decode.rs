@@ -506,6 +506,44 @@ mod tests {
         assert_eq!(direct["Model"][0].name, "WorldPivot");
     }
 
+    /// A shared string of some size is one value for every instance that
+    /// holds it; a small one, and any for a caller that edits the JSON,
+    /// stays a JSON value of its own.
+    #[test]
+    fn a_shared_string_is_held_once_for_all_its_instances() {
+        let database = rbx_reflection_database::get().unwrap();
+        let refs = BytecodeModelImportRefs::default();
+        let name = rbx_dom_weak::Ustr::from("PhysicalConfigData");
+        let records = |bytes: Vec<u8>, shared: bool| {
+            let value = RbxVariant::SharedString(rbx_dom_weak::types::SharedString::new(bytes));
+            let entries = [(&name, &value)];
+            if shared {
+                rbx_properties_to_native_settings_records(
+                    "MeshPart", entries, database, &refs, None,
+                )
+            } else {
+                rbx_properties_to_unshared_native_settings_records(
+                    "MeshPart", entries, database, &refs, None,
+                )
+            }
+        };
+        let payload = |fill: u8| vec![fill; SHARED_PAYLOAD_MIN_BYTES];
+        let (first, first_json, _, _) = records(payload(7), true);
+        let (second, _, _, _) = records(payload(7), true);
+        let (other, _, _, _) = records(payload(8), true);
+        let held = |native: &[NativeSettingsProperty]| match &native[0].value {
+            NativeSettingsValue::Shared(value) => std::sync::Arc::clone(value),
+            _ => panic!("expected a shared value"),
+        };
+        assert!(first_json.is_empty() && first[0].name == "PhysicalConfigData");
+        assert!(std::sync::Arc::ptr_eq(&held(&first), &held(&second)));
+        assert!(!std::sync::Arc::ptr_eq(&held(&first), &held(&other)));
+        let (_, plain, _, _) = records(payload(7), false);
+        assert_eq!(*held(&first), plain["PhysicalConfigData"]);
+        let (native, json, _, _) = records(vec![7; SHARED_PAYLOAD_MIN_BYTES - 1], true);
+        assert!(native.is_empty() && json.contains_key("PhysicalConfigData"));
+    }
+
     #[test]
     fn native_records_keep_the_engine_type_of_content_the_database_does_not_know() {
         let database = rbx_reflection_database::get().unwrap();
@@ -1015,17 +1053,32 @@ fn shared_payload_value(
     shared: &rbx_dom_weak::types::SharedString,
     json: impl FnOnce() -> Option<Value>,
 ) -> Option<std::sync::Arc<Value>> {
-    static PAYLOADS: std::sync::Mutex<Option<HashMap<[u8; 32], std::sync::Weak<Value>>>> =
-        std::sync::Mutex::new(None);
+    /// The values in use by their content hash, and the size at which the
+    /// ones no state holds any more are next dropped.
+    static PAYLOADS: std::sync::Mutex<(Option<SharedPayloads>, usize)> =
+        std::sync::Mutex::new((None, 4_096));
+    type SharedPayloads = HashMap<[u8; 32], std::sync::Weak<Value>>;
     let key = <[u8; 32]>::try_from(shared.hash().as_bytes()).ok()?;
-    let mut payloads = crate::system::LockRecover::lock_recover(&PAYLOADS);
-    let payloads = payloads.get_or_insert_with(HashMap::new);
-    if let Some(value) = payloads.get(&key).and_then(std::sync::Weak::upgrade) {
+    let held = |payloads: &Option<SharedPayloads>| {
+        payloads
+            .as_ref()?
+            .get(&key)
+            .and_then(std::sync::Weak::upgrade)
+    };
+    if let Some(value) = held(&crate::system::LockRecover::lock_recover(&PAYLOADS).0) {
         return Some(value);
     }
+    // Built outside the lock: other threads convert other instances meanwhile.
     let value = std::sync::Arc::new(json()?);
-    if payloads.len() >= 4_096 {
+    let mut guard = crate::system::LockRecover::lock_recover(&PAYLOADS);
+    if let Some(value) = held(&guard.0) {
+        return Some(value);
+    }
+    let (payloads, prune_at) = &mut *guard;
+    let payloads = payloads.get_or_insert_with(HashMap::new);
+    if payloads.len() >= *prune_at {
         payloads.retain(|_, held| held.strong_count() > 0);
+        *prune_at = (payloads.len() * 2).max(4_096);
     }
     payloads.insert(key, std::sync::Arc::downgrade(&value));
     Some(value)

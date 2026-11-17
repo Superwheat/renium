@@ -1442,6 +1442,14 @@ fn write_service_settings_file(
     let started = Instant::now();
     if fresh_stage {
         write_fresh_service_settings_binary_file(&settings_path, state)?;
+        // The file holds this state's own bytes, so the next pull that
+        // captures the same state leaves it alone without decoding it.
+        if let Ok(observed) = pulled_digest_from_service_state(state)
+            && !observed.viewport_camera_lacks_enum_types
+            && let Ok(bytes) = fs::read(&settings_path)
+        {
+            remember_unchanged_pull(Sha256::digest(&bytes).into(), observed.digest);
+        }
     } else {
         let lock_started = Instant::now();
         let _lock = acquire_settings_file_lock(&settings_path)?;
@@ -1483,7 +1491,7 @@ fn write_service_settings_file(
             &stored_file,
             Ok(Some((_, _, Some(expected))))
                 if pulled_digest_from_service_state(state_to_write)
-                    .is_ok_and(|observed| observed == *expected)
+                    .is_ok_and(|observed| observed.digest == *expected)
         );
         let (stored, observed) = if unchanged_again {
             (Ok(None), Ok(None))
@@ -1584,11 +1592,11 @@ fn write_service_settings_file(
     Ok(())
 }
 
-/// A store file as a pull read it.
 /// A stored file's bytes, their digest, and the observed store a pull found
 /// these bytes unchanged against.
 type StoredFile = (Vec<u8>, [u8; 32], Option<[u8; 32]>);
 
+/// A store file as a pull read it, with its document once that is decoded.
 struct StoredSettings {
     bytes: Vec<u8>,
     digest: [u8; 32],
@@ -2124,6 +2132,53 @@ fn write_script_source_file(source_path: &Path, source: &str, fresh_stage: bool)
 #[cfg(test)]
 mod projection_tests {
     use super::*;
+
+    /// A store a first pull wrote is remembered with the state it was written
+    /// from: pulling that state again decodes nothing and changes nothing.
+    #[test]
+    fn a_freshly_written_store_is_left_alone_by_the_next_pull_of_its_state() -> Result<()> {
+        let parent = std::env::temp_dir().join("renium-fresh-store-tests");
+        fs::create_dir_all(&parent)?;
+        let root = crate::system::files::create_unique_directory(&parent, "fresh-")?;
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let source = root.join("src");
+        let mut instances = vec![SnapshotInstance {
+            name: "ReplicatedStorage".into(),
+            class_name: "ReplicatedStorage".into(),
+            instance_index: Some(1),
+            ..Default::default()
+        }];
+        for index in 0..40 {
+            instances.push(SnapshotInstance {
+                name: format!("Value{index}"),
+                class_name: "NumberValue".into(),
+                instance_index: Some(index + 2),
+                parent_index: Some(1),
+                properties: Map::from_iter([("Value".into(), json!(index))]),
+                ..Default::default()
+            });
+        }
+        let state = build_service_state_from_instances(
+            "ReplicatedStorage",
+            None,
+            instances,
+            HashMap::new(),
+            true,
+        )?;
+        import_service_tree(&state, &root, &source, None, "ReplicatedStorage")?;
+        let store = service_settings_path(&source.join("ReplicatedStorage"));
+        let written = fs::read(&store)?;
+        let digest = <[u8; 32]>::from(Sha256::digest(&written));
+        assert_eq!(
+            unchanged_pulls().lock_recover().get(&digest).copied(),
+            Some(pulled_digest_from_service_state(&state)?.digest)
+        );
+        import_service_tree(&state, &root, &source, None, "ReplicatedStorage")?;
+        assert!(fs::read(&store)? == written);
+        Ok(())
+    }
 
     #[test]
     fn memory_projection_matches_fresh_import_bytes_and_paths() -> Result<()> {

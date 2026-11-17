@@ -121,9 +121,12 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
-        LIVE_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
-        LIVE_BYTES.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
-        unsafe { mimalloc::MiMalloc.realloc(pointer, layout, size) }
+        let moved = unsafe { mimalloc::MiMalloc.realloc(pointer, layout, size) };
+        if !moved.is_null() {
+            LIVE_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            LIVE_BYTES.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        }
+        moved
     }
 }
 

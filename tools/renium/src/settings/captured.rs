@@ -49,8 +49,10 @@ pub(super) fn convert_with_budget(
 /// taken chunk by chunk: the document is never whole in memory. No decoder
 /// memory limit applies: the digest only says whether this is a state a pull
 /// took before, and that pull decided whether its store may be written.
-pub(super) fn pulled_digest(state: &ServiceState) -> Result<[u8; 32]> {
-    use crate::settings::equivalence::{pulled_instance_digest, pulled_settings_skeleton_digest};
+pub(super) fn pulled_digest(state: &ServiceState) -> Result<PulledDigest> {
+    use crate::settings::equivalence::{
+        pulled_instance_digest, pulled_settings_skeleton_digest, viewport_camera_lacks_enum_types,
+    };
 
     let _span = crate::app::profile::span("captured store digest");
     let records = collect_service_settings_binary_instances(state);
@@ -66,8 +68,9 @@ pub(super) fn pulled_digest(state: &ServiceState) -> Result<[u8; 32]> {
             let digest = pulled_instance_digest(&instance, false);
             let as_viewport_camera =
                 (instance.class_name == "Camera").then(|| pulled_instance_digest(&instance, true));
-            // Only a service root's values say which camera is the viewport's.
-            if instance.parent_index.is_some() {
+            // A service root's values say which camera is the viewport's, and
+            // a camera's own say whether its enum values carry their types.
+            if instance.parent_index.is_some() && instance.class_name != "Camera" {
                 instance.properties = Map::new();
                 instance.attributes = Map::new();
             }
@@ -88,8 +91,11 @@ pub(super) fn pulled_digest(state: &ServiceState) -> Result<[u8; 32]> {
         }
     }
     validate_settings_hierarchy(&skeleton.instances)?;
-    pulled_settings_skeleton_digest(&skeleton, digests, &cameras)
-        .context("The viewport camera of the captured store is not a Camera")
+    Ok(PulledDigest {
+        digest: pulled_settings_skeleton_digest(&skeleton, digests, &cameras)
+            .context("The viewport camera of the captured store is not a Camera")?,
+        viewport_camera_lacks_enum_types: viewport_camera_lacks_enum_types(&skeleton),
+    })
 }
 
 fn convert_prepared(

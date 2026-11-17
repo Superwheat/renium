@@ -425,7 +425,13 @@ fn oracle(state: &ServiceState, pools: &[rayon::ThreadPool]) -> Result<bool, Str
                     crate::settings::equivalence::pulled_settings_document_digest(&actual);
                 if pool
                     .install(|| pulled_digest_from_service_state(state))
-                    .is_ok_and(|digest| digest != document)
+                    .is_ok_and(|pulled| {
+                        pulled.digest != document
+                            || pulled.viewport_camera_lacks_enum_types
+                                != crate::settings::equivalence::viewport_camera_lacks_enum_types(
+                                    &actual,
+                                )
+                    })
                 {
                     return Err("captured digest differs from its document's".into());
                 }
@@ -541,7 +547,7 @@ fn a_captured_digest_is_its_documents_and_leaves_out_the_viewport_camera() {
     for native in [false, true] {
         let digest = |field_of_view, transparency| {
             let state = captured_state(&document(field_of_view, transparency), native);
-            let streamed = pulled_digest_from_service_state(&state).unwrap();
+            let streamed = pulled_digest_from_service_state(&state).unwrap().digest;
             let converted = settings_bytecode_from_service_state(&state).unwrap();
             assert!(
                 streamed

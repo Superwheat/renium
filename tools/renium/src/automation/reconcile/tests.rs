@@ -6273,6 +6273,29 @@ fn a_script_kept_against_its_removal_does_not_take_the_text_of_the_one_that_reus
     );
 }
 
+/// A pair that is remembered is answered from its bytes alone.
+#[test]
+fn a_remembered_pair_of_store_files_is_not_decoded_again() {
+    let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+    let (left, right) = (
+        b"not a store: left".to_vec(),
+        b"not a store: right".to_vec(),
+    );
+    let digest = |bytes: &[u8]| <[u8; 32]>::from(Sha256::digest(bytes));
+    super::verify::equivalent_stores()
+        .lock_recover()
+        .insert((digest(&left), digest(&right)));
+    assert!(
+        snapshot_entry_equivalent(
+            &path,
+            Some(&SnapshotEntry::File(left)),
+            Some(&SnapshotEntry::File(right)),
+            None
+        )
+        .unwrap()
+    );
+}
+
 /// Two store files found equivalent are remembered by their bytes, and two
 /// that differ are compared again every time.
 #[test]
