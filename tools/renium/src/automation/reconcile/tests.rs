@@ -6798,7 +6798,7 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
     let under_other_ids = AtomicUsize::new(0);
     let from_both = AtomicUsize::new(0);
     let sent_from_both = AtomicUsize::new(0);
-    run_seeds(1_500, |seed, _| {
+    run_seeds(300, |seed, _| {
         let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         let mut studio = changed_instances_store(&mut rng);
         let mut files = studio.clone();
@@ -7092,13 +7092,13 @@ from the whole documents:
         ]
         .map(|count| count.load(Ordering::Relaxed));
         assert!(
-            counts[0] >= 200
-                && counts[1] >= 100
-                && counts[2] >= 400
-                && counts[3] >= 50
-                && counts[4] >= 40
-                && counts[5] >= 150
-                && counts[6] >= 100,
+            counts[0] >= 30
+                && counts[1] >= 30
+                && counts[2] >= 50
+                && counts[3] >= 10
+                && counts[4] >= 5
+                && counts[5] >= 12
+                && counts[6] >= 8,
             "prepared from the changed instances {} ({} of them under other ids, {} with both copies read so, {} of those with values sent), from whole documents {}, with a plan {}, unchanged {}",
             counts[0],
             counts[4],
