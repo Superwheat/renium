@@ -484,6 +484,7 @@ fn typed_key(value: &NativeSettingsValue) -> Option<TypedKey<'_>> {
         NativeSettingsValue::Ref(index) => TypedKey::Number(4, *index as u64),
         NativeSettingsValue::String(text) => TypedKey::Text(5, text),
         NativeSettingsValue::Enum(text) => TypedKey::Text(6, text),
+        NativeSettingsValue::UniqueId(text) => TypedKey::Text(14, text),
         NativeSettingsValue::Vector2(values) => floats(7, values),
         NativeSettingsValue::Vector3(values) => floats(8, values),
         NativeSettingsValue::UDim(values) => floats(9, values),
