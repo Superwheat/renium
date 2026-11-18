@@ -140,24 +140,29 @@ fn values_encode_alike(
 /// holds exactly the document of an earlier state with the rows `before`, and
 /// only values changed since, in instances a pull can compare one by one.
 /// `None` where the pull has to align the whole documents.
+/// Import's dedicated settings thread supplies its export's gate to bound
+/// encoding allocations; comparisons do not hold it. Other callers use None.
 pub(crate) fn pull_changed_values(
     state: &ServiceState,
     before: &PulledRows,
     now: &PulledRows,
     stored: &[u8],
+    store_gate: Option<&Mutex<()>>,
 ) -> Result<Option<crate::settings::equivalence::SettingsAlignment>> {
-    captured::changed_values(state, before, now, stored)
+    captured::changed_values(state, before, now, stored, store_gate)
 }
 
 /// The same for a stored file no pull remembers, by comparing the two
 /// documents instance by instance. The answer comes with whether every
 /// instance but the viewport camera is the same in both.
+/// The optional gate has the same dedicated-thread contract as above.
 pub(crate) fn pull_changed_document_rows(
     state: &ServiceState,
     now: &PulledRows,
     stored: &[u8],
+    store_gate: Option<&Mutex<()>>,
 ) -> Result<Option<(crate::settings::equivalence::SettingsAlignment, bool)>> {
-    captured::changed_document_rows(state, now, stored)
+    captured::changed_document_rows(state, now, stored, store_gate)
 }
 
 /// The digest and the UniqueId digest `property_edit::whole_row_digests`
@@ -3230,7 +3235,7 @@ fn native_fixed_components(value: &NativeSettingsValue) -> Option<&[f32]> {
         NativeSettingsValue::Vector2(value) | NativeSettingsValue::UDim(value) => Some(value),
         NativeSettingsValue::Vector3(value) | NativeSettingsValue::Color3(value) => Some(value),
         NativeSettingsValue::UDim2(value) | NativeSettingsValue::Rect(value) => Some(value),
-        NativeSettingsValue::CFrame(value) => Some(value),
+        NativeSettingsValue::CFrame(value) => Some(value.as_ref()),
         _ => None,
     }
 }

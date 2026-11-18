@@ -659,7 +659,7 @@ fn decode_fixed_column_value(
         FixedNumericKind::UDim => NativeSettingsValue::UDim([components[0], components[1]]),
         FixedNumericKind::UDim2 => NativeSettingsValue::UDim2(components[..4].try_into()?),
         FixedNumericKind::Color3 => NativeSettingsValue::Color3(components[..3].try_into()?),
-        FixedNumericKind::CFrame => NativeSettingsValue::CFrame(components),
+        FixedNumericKind::CFrame => NativeSettingsValue::CFrame(Box::new(components)),
         FixedNumericKind::Rect => NativeSettingsValue::Rect(components[..4].try_into()?),
     })
 }

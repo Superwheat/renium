@@ -257,7 +257,7 @@ fn captured(document: &SettingsBytecode, native: bool) -> ServiceState {
                 frame[..3].copy_from_slice(&[1.0, 2.0, 3.0]);
                 typed.push(NativeSettingsProperty {
                     name: "Pivot".into(),
-                    value: NativeSettingsValue::CFrame(frame),
+                    value: NativeSettingsValue::CFrame(Box::new(frame)),
                 });
             }
         }
@@ -622,7 +622,7 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
                 return Ok(());
             };
             let answered = match &rows {
-                Some(before) => pull_changed_values(&state, before, &now.rows, &file)
+                Some(before) => pull_changed_values(&state, before, &now.rows, &file, None)
                     .map_err(|error| format!("round {round}: {error:#}"))?,
                 None => None,
             };
@@ -636,7 +636,7 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
                 ));
             }
             // A file compared with no memory of it answers the same.
-            let unremembered = pull_changed_document_rows(&state, &now.rows, &file)
+            let unremembered = pull_changed_document_rows(&state, &now.rows, &file, None)
                 .map_err(|error| format!("round {round}: {error:#}"))?;
             // Studio numbered the instances anew since the file was written.
             let other_ids = !reference
@@ -887,7 +887,7 @@ fn namesakes_that_traded_their_values_take_the_whole_alignment() {
     let state = captured(&twins(2, true, [0.75, 0.25]), false);
     let now = pulled_digest_from_service_state(&state).unwrap();
     assert!(
-        pull_changed_document_rows(&state, &now.rows, &file)
+        pull_changed_document_rows(&state, &now.rows, &file, None)
             .unwrap()
             .is_none()
     );
@@ -906,7 +906,7 @@ fn namesakes_that_traded_their_values_take_the_whole_alignment() {
     // Siblings that only took other values stand where they stood.
     let state = captured(&twins(2, true, [0.25, 0.75]), false);
     let now = pulled_digest_from_service_state(&state).unwrap();
-    let (answer, same) = pull_changed_document_rows(&state, &now.rows, &file)
+    let (answer, same) = pull_changed_document_rows(&state, &now.rows, &file, None)
         .unwrap()
         .expect("instances that hold the stored values are compared at their places");
     assert!(!same);
@@ -928,7 +928,7 @@ fn instances_under_namesakes_take_the_whole_alignment() {
     let state = captured(&twins_with_leaves(2, [0.75, 0.25]), false);
     let now = pulled_digest_from_service_state(&state).unwrap();
     assert!(
-        pull_changed_document_rows(&state, &now.rows, &file)
+        pull_changed_document_rows(&state, &now.rows, &file, None)
             .unwrap()
             .is_none()
     );
@@ -959,7 +959,7 @@ fn instances_nothing_tells_apart_take_the_whole_alignment_under_other_ids() {
     // The place opened again: nothing changed but the ids.
     let reopened = captured(&twins(2, false, [0.25, 0.75]), false);
     let before = pulled_digest_from_service_state(&reopened).unwrap();
-    let (answer, same) = pull_changed_document_rows(&reopened, &before.rows, &file)
+    let (answer, same) = pull_changed_document_rows(&reopened, &before.rows, &file, None)
         .unwrap()
         .expect("a store that differs in its ids alone is compared by its instances");
     assert!(matches!(answer, SettingsAlignment::Equivalent) && same);
@@ -967,12 +967,12 @@ fn instances_nothing_tells_apart_take_the_whole_alignment_under_other_ids() {
     let traded = captured(&twins(2, false, [0.75, 0.25]), false);
     let now = pulled_digest_from_service_state(&traded).unwrap();
     assert!(
-        pull_changed_values(&traded, &before.rows, &now.rows, &file)
+        pull_changed_values(&traded, &before.rows, &now.rows, &file, None)
             .unwrap()
             .is_none()
     );
     assert!(
-        pull_changed_document_rows(&traded, &now.rows, &file)
+        pull_changed_document_rows(&traded, &now.rows, &file, None)
             .unwrap()
             .is_none()
     );
@@ -994,7 +994,7 @@ fn instances_nothing_tells_apart_take_the_whole_alignment_under_other_ids() {
         let before = pulled_digest_from_service_state(&reopened).unwrap();
         let changed = captured(&changed, native);
         let now = pulled_digest_from_service_state(&changed).unwrap();
-        let answer = pull_changed_values(&changed, &before.rows, &now.rows, &file)
+        let answer = pull_changed_values(&changed, &before.rows, &now.rows, &file, None)
             .unwrap()
             .expect("instances with a UniqueId of their own are compared from memory");
         let SettingsAlignment::Changed(written) = answer else {
@@ -1073,14 +1073,14 @@ fn namesakes_beside_a_new_instance_take_the_whole_alignment() {
     let traded = with_new([0.75, 0.25]);
     let now = pulled_digest_from_service_state(&traded).unwrap();
     assert!(
-        pull_changed_document_rows(&traded, &now.rows, &file)
+        pull_changed_document_rows(&traded, &now.rows, &file, None)
             .unwrap()
             .is_none()
     );
     // With the values they had, each is the stored one at its place.
     let grown = with_new([0.25, 0.75]);
     let now = pulled_digest_from_service_state(&grown).unwrap();
-    let (answer, _) = pull_changed_document_rows(&grown, &now.rows, &file)
+    let (answer, _) = pull_changed_document_rows(&grown, &now.rows, &file, None)
         .unwrap()
         .expect("a new instance beside instances that hold the stored values");
     let SettingsAlignment::Changed(written) = answer else {
@@ -1136,7 +1136,7 @@ fn a_stored_camera_that_points_at_an_instance_takes_the_whole_alignment_beside_a
     let state = captured(&workspace(false), false);
     let now = pulled_digest_from_service_state(&state).unwrap();
     assert!(
-        pull_changed_document_rows(&state, &now.rows, &file)
+        pull_changed_document_rows(&state, &now.rows, &file, None)
             .unwrap()
             .is_none()
     );
@@ -1162,7 +1162,7 @@ fn a_unique_id_two_stored_instances_hold_tells_none_of_them() {
     let state = captured(&left, false);
     let now = pulled_digest_from_service_state(&state).unwrap();
     assert!(
-        pull_changed_document_rows(&state, &now.rows, &file)
+        pull_changed_document_rows(&state, &now.rows, &file, None)
             .unwrap()
             .is_none()
     );
@@ -1198,7 +1198,7 @@ fn a_new_instance_under_an_id_the_store_holds_takes_another() {
     }
     let state = captured(&grown, false);
     let now = pulled_digest_from_service_state(&state).unwrap();
-    let (answer, _) = pull_changed_document_rows(&state, &now.rows, &file)
+    let (answer, _) = pull_changed_document_rows(&state, &now.rows, &file, None)
         .unwrap()
         .expect("new instances beside instances that hold the stored values");
     let SettingsAlignment::Changed(written) = answer else {
@@ -1267,7 +1267,7 @@ fn a_renamed_property_beside_a_camera_that_points_at_an_instance_is_written() {
         .unwrap();
     let state = captured(&workspace_with_a_subject("size"), false);
     let now = pulled_digest_from_service_state(&state).unwrap();
-    let (answer, _) = pull_changed_document_rows(&state, &now.rows, &file)
+    let (answer, _) = pull_changed_document_rows(&state, &now.rows, &file, None)
         .unwrap()
         .expect("one changed instance under the store's own ids");
     let aligned = align_pulled_settings_documents_to_reference(
@@ -1314,7 +1314,7 @@ fn a_value_under_an_old_name_takes_the_whole_alignment_under_other_ids() {
     let state = captured(&with_pointer(2, true), false);
     let now = pulled_digest_from_service_state(&state).unwrap();
     assert!(
-        pull_changed_document_rows(&state, &now.rows, &file)
+        pull_changed_document_rows(&state, &now.rows, &file, None)
             .unwrap()
             .is_none()
     );
@@ -1339,7 +1339,7 @@ fn what_the_engine_sets_makes_no_instance_differ() {
         encode_service_settings_binary(&captured(&with_engine_state(false, 0), false)).unwrap();
     let state = captured(&with_engine_state(true, 3), false);
     let now = pulled_digest_from_service_state(&state).unwrap();
-    let (answer, same) = pull_changed_document_rows(&state, &now.rows, &file)
+    let (answer, same) = pull_changed_document_rows(&state, &now.rows, &file, None)
         .unwrap()
         .expect("instances at their places under their ids");
     assert!(matches!(answer, SettingsAlignment::Equivalent) && same);
@@ -1373,7 +1373,7 @@ fn a_root_stored_under_another_id_takes_the_whole_alignment() {
     let state = captured(&traded, false);
     let now = pulled_digest_from_service_state(&state).unwrap();
     assert!(
-        pull_changed_document_rows(&state, &now.rows, &file)
+        pull_changed_document_rows(&state, &now.rows, &file, None)
             .unwrap()
             .is_none()
     );
@@ -1382,7 +1382,7 @@ fn a_root_stored_under_another_id_takes_the_whole_alignment() {
     stored.instances[0].settings_id = "1".into();
     stored.instances[1].settings_id = "debug:0_100".into();
     let file = encode_settings_bytecode(&stored).unwrap();
-    let (answer, _) = pull_changed_document_rows(&state, &now.rows, &file)
+    let (answer, _) = pull_changed_document_rows(&state, &now.rows, &file, None)
         .unwrap()
         .expect("a sole root under its id and instances with their UniqueIds stand");
     let SettingsAlignment::Changed(written) = answer else {
@@ -1543,7 +1543,7 @@ fn a_state_numbered_by_another_rule_is_aligned_whole() {
             .insert("Probe".into(), json!(0.375));
         let state = numbered(&changed, sparse);
         let now = pulled_digest_from_service_state(&state).unwrap().rows;
-        pull_changed_values(&state, &before, &now, &file)
+        pull_changed_values(&state, &before, &now, &file, None)
             .unwrap()
             .is_some()
     };

@@ -280,6 +280,7 @@ struct DirectImportWorker {
     pending_signal: Arc<(Mutex<()>, Condvar)>,
     sourcemap_sender: Option<mpsc::Sender<SourcemapWriterMessage>>,
     run_started: Instant,
+    store_gate: Arc<Mutex<()>>,
 }
 
 impl DirectImportWorker {
@@ -331,6 +332,7 @@ impl DirectImportWorker {
                     &src_root,
                     self.roots.layout_src_root.as_deref(),
                     &service,
+                    &self.store_gate,
                 );
                 // Freeing a large captured service takes a few hundred
                 // milliseconds that nothing after it waits for.
@@ -413,6 +415,7 @@ impl DirectImportDispatcher {
             pending_signal: Arc::clone(&pending_signal),
             sourcemap_sender,
             run_started,
+            store_gate: Arc::new(Mutex::new(())),
         };
         let mut workers = Vec::with_capacity(worker_count);
         for worker_index in 0..worker_count {
@@ -513,10 +516,18 @@ pub(crate) fn import_service_state_with_sourcemap(
     src_root: &Path,
     layout_src_root: Option<&Path>,
     service: &str,
+    store_gate: &Mutex<()>,
 ) -> Result<SourcemapNode> {
     let import_started = Instant::now();
     let write_tree_started = Instant::now();
-    let node = import_service_tree(state, project_root, src_root, layout_src_root, service)?;
+    let node = import_service_tree_with_store_gate(
+        state,
+        project_root,
+        src_root,
+        layout_src_root,
+        service,
+        Some(store_gate),
+    )?;
     log_timing(&format!("{service}: write src tree"), write_tree_started);
     log_timing(&format!("{service}: import service total"), import_started);
     Ok(node)
@@ -1245,12 +1256,31 @@ fn name_child_indices(state: &ServiceState, child_indices: &[usize]) -> Vec<(usi
 /// Scripts keep the file names and forms the project already has. The files
 /// are looked for under `src_root`, or under `layout_src_root` when the import
 /// writes into a stage that carries no copy of them.
+#[cfg(test)]
 fn import_service_tree(
     state: &ServiceState,
     project_root: &Path,
     src_root: &Path,
     layout_src_root: Option<&Path>,
     service: &str,
+) -> Result<SourcemapNode> {
+    import_service_tree_with_store_gate(
+        state,
+        project_root,
+        src_root,
+        layout_src_root,
+        service,
+        None,
+    )
+}
+
+fn import_service_tree_with_store_gate(
+    state: &ServiceState,
+    project_root: &Path,
+    src_root: &Path,
+    layout_src_root: Option<&Path>,
+    service: &str,
+    store_gate: Option<&Mutex<()>>,
 ) -> Result<SourcemapNode> {
     let service_dir = src_root.join(sanitize_name(service));
     let layout_dir = layout_src_root.map_or_else(
@@ -1269,6 +1299,7 @@ fn import_service_tree(
                 &service_dir,
                 &expected_paths,
                 fresh_service_dir,
+                store_gate,
             )
         });
 
@@ -1424,6 +1455,7 @@ fn write_service_settings_file(
     service_dir: &Path,
     expected_paths: &ImportPathSets,
     fresh_stage: bool,
+    store_gate: Option<&Mutex<()>>,
 ) -> Result<()> {
     let settings_path = service_settings_path(service_dir);
     // A cloned project can retain its store without an empty script folder.
@@ -1441,7 +1473,13 @@ fn write_service_settings_file(
     }
     let started = Instant::now();
     if fresh_stage {
-        write_fresh_service_settings_binary_file(&settings_path, state)?;
+        // A fresh capture encodes every store while other services are still
+        // converting. Bound those temporary buffers per export; scripts,
+        // sourcemaps, existing-store comparisons and other places can proceed.
+        {
+            let _store_guard = store_gate.map(LockRecover::lock_recover);
+            write_fresh_service_settings_binary_file(&settings_path, state)?;
+        }
         // The file holds this state's own bytes, so the next pull that
         // captures the same state leaves it alone without decoding it.
         if let Ok(observed) = pulled_digest_from_service_state(state)
@@ -1518,13 +1556,19 @@ fn write_service_settings_file(
                     .as_ref()
                     .and_then(|remembered| remembered.rows.clone())
                     .and_then(|before| {
-                        pull_changed_values(state_to_write, &before, &pulled.rows, bytes)
-                            .ok()
-                            .flatten()
-                            .map(|alignment| (alignment, Some(before)))
+                        pull_changed_values(
+                            state_to_write,
+                            &before,
+                            &pulled.rows,
+                            bytes,
+                            store_gate,
+                        )
+                        .ok()
+                        .flatten()
+                        .map(|alignment| (alignment, Some(before)))
                     })
                     .or_else(|| {
-                        pull_changed_document_rows(state_to_write, &pulled.rows, bytes)
+                        pull_changed_document_rows(state_to_write, &pulled.rows, bytes, store_gate)
                             .ok()
                             .flatten()
                             .map(|(alignment, same)| (alignment, same.then(|| pulled.rows.clone())))
@@ -1535,6 +1579,13 @@ fn write_service_settings_file(
         let stored_digest = match &stored_file {
             Ok(Some((_, digest, _))) => Some(*digest),
             _ => None,
+        };
+        // Whole-document reconciliation also owns large temporary values. The
+        // ordinary row comparison above takes the gate only if it must encode.
+        let _store_guard = if !unchanged_again && changed_values.is_none() {
+            store_gate.map(LockRecover::lock_recover)
+        } else {
+            None
         };
         let (stored, observed) = if unchanged_again || changed_values.is_some() {
             (Ok(None), Ok(None))
@@ -2286,6 +2337,127 @@ fn write_script_source_file(source_path: &Path, source: &str, fresh_stage: bool)
 #[cfg(test)]
 mod projection_tests {
     use super::*;
+
+    #[test]
+    fn store_gate_keeps_scripts_and_other_exports_running() -> Result<()> {
+        let parent = std::env::temp_dir().join("renium-store-gate-tests");
+        fs::create_dir_all(&parent)?;
+        let root = crate::system::files::create_unique_directory(&parent, "gate-")?;
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let worker = |project_root: PathBuf| DirectImportWorker {
+            queue: Arc::new(DirectImportTaskQueue::new(1)),
+            ready: None,
+            roots: DirectImportRoots {
+                project_root,
+                src_dir: "src".into(),
+                layout_src_root: None,
+            },
+            first_error: Arc::new(Mutex::new(None)),
+            service_nodes: Arc::new(Mutex::new(HashMap::new())),
+            pending_tasks: Arc::new(AtomicUsize::new(0)),
+            pending_signal: Arc::new((Mutex::new(()), Condvar::new())),
+            sourcemap_sender: None,
+            run_started: Instant::now(),
+            store_gate: Arc::new(Mutex::new(())),
+        };
+        let parts = |value| ExportedSnapshotParts {
+            class_defaults: json!({}),
+            instances: vec![
+                SnapshotInstance {
+                    name: "ReplicatedStorage".into(),
+                    class_name: "ReplicatedStorage".into(),
+                    instance_index: Some(1),
+                    ..Default::default()
+                },
+                SnapshotInstance {
+                    name: "Probe".into(),
+                    class_name: "ModuleScript".into(),
+                    instance_index: Some(2),
+                    parent_index: Some(1),
+                    properties: Map::from_iter([(
+                        "Source".into(),
+                        json!(format!("return {value}")),
+                    )]),
+                    attributes: Map::from_iter([("Revision".into(), json!(value))]),
+                    ..Default::default()
+                },
+            ],
+            native_properties_by_instance: None,
+        };
+        let blocked = worker(root.join("blocked"));
+        let independent = worker(root.join("independent"));
+        let service_dir = root.join("blocked/src/ReplicatedStorage");
+        let store = service_settings_path(&service_dir);
+        thread::scope(|scope| -> Result<()> {
+            let held = blocked.store_gate.lock_recover();
+            let task = scope.spawn(|| blocked.import_service("ReplicatedStorage".into(), parts(1)));
+            let script = service_dir.join("Probe.luau");
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            while !script.exists() && Instant::now() < deadline {
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(fs::read_to_string(script)?, "return 1");
+            assert!(
+                !store.exists(),
+                "the import worker must honor its store gate"
+            );
+            let (done, received) = mpsc::channel();
+            scope.spawn(move || {
+                let result = independent.import_service("ReplicatedStorage".into(), parts(1));
+                let _ = done.send(result);
+            });
+            received.recv_timeout(std::time::Duration::from_secs(10))??;
+            assert!(!store.exists(), "another export must not release this gate");
+            drop(held);
+            task.join().expect("import worker")?;
+            Ok(())
+        })?;
+        for (before_value, after_value, forget) in [(1, 2, false), (2, 3, true)] {
+            let before = fs::read(&store)?;
+            decode_settings_bytecode(&before)?;
+            let digest = <[u8; 32]>::from(Sha256::digest(&before));
+            thread::scope(|scope| -> Result<()> {
+                let held = blocked.store_gate.lock_recover();
+                // An unchanged store does not need the encoder, even while another
+                // service owns the gate. A changed store waits only after comparison.
+                let (done, received) = mpsc::channel();
+                let worker = &blocked;
+                let task = scope.spawn(move || -> Result<()> {
+                    worker.import_service("ReplicatedStorage".into(), parts(before_value))?;
+                    done.send(())?;
+                    if forget {
+                        forget_pull(&digest);
+                    }
+                    worker.import_service("ReplicatedStorage".into(), parts(after_value))?;
+                    done.send(())?;
+                    Ok(())
+                });
+                received.recv_timeout(std::time::Duration::from_secs(10))?;
+                let script = service_dir.join("Probe.luau");
+                let expected = format!("return {after_value}");
+                let deadline = Instant::now() + std::time::Duration::from_secs(10);
+                while fs::read_to_string(&script).ok().as_deref() != Some(expected.as_str())
+                    && Instant::now() < deadline
+                {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert_eq!(fs::read_to_string(script)?, expected);
+                assert!(
+                    received
+                        .recv_timeout(std::time::Duration::from_millis(100))
+                        .is_err()
+                );
+                assert_eq!(fs::read(&store)?, before);
+                drop(held);
+                task.join().expect("import worker")?;
+                Ok(())
+            })?;
+            assert_ne!(fs::read(&store)?, before);
+        }
+        Ok(())
+    }
 
     /// A store a first pull wrote is remembered with the state it was written
     /// from: pulling that state again decodes nothing and changes nothing.

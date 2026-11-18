@@ -118,9 +118,9 @@ fn native_value(value: &Value) -> Option<NativeSettingsValue> {
                 fields,
                 ["minX", "minY", "maxX", "maxY"],
             )?)),
-            "CFrame" => Some(NativeSettingsValue::CFrame(
+            "CFrame" => Some(NativeSettingsValue::CFrame(Box::new(
                 cframe_component_bits(value).ok()?.map(f32::from_bits),
-            )),
+            ))),
             _ => None,
         },
         _ => None,
@@ -235,9 +235,9 @@ fn native_values(seed: u64, count: usize) -> Vec<NativeSettingsValue> {
         NativeSettingsValue::UDim2([0.1, number, 0.0, -0.0]),
         NativeSettingsValue::Color3([0.1, number, f32::NEG_INFINITY]),
         NativeSettingsValue::Rect([0.1, number, 0.0, -0.0]),
-        NativeSettingsValue::CFrame([
+        NativeSettingsValue::CFrame(Box::new([
             number, -0.0, 0.1, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0,
-        ]),
+        ])),
     ]
 }
 
@@ -986,8 +986,8 @@ fn a_captured_digest_tells_typed_values_apart() {
         NativeSettingsValue::UDim2([1.0, 2.0, 3.0, 5.0]),
         NativeSettingsValue::Color3([1.0, 2.0, 3.0]),
         NativeSettingsValue::Color3([1.0, 2.0, 4.0]),
-        NativeSettingsValue::CFrame([0.5; 12]),
-        NativeSettingsValue::CFrame([0.25; 12]),
+        NativeSettingsValue::CFrame(Box::new([0.5; 12])),
+        NativeSettingsValue::CFrame(Box::new([0.25; 12])),
         NativeSettingsValue::Rect([1.0, 2.0, 3.0, 4.0]),
         NativeSettingsValue::Rect([1.0, 2.0, 3.0, 5.0]),
         NativeSettingsValue::Enum("a".into()),

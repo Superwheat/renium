@@ -76,6 +76,9 @@ pub(super) fn measure(service: &str, state: &ServiceState) {
     let mut enum_types = Strings::default();
     let mut path_segment_storage = 0;
     let mut native = 0;
+    let mut native_slots = 0;
+    let mut native_occupied = 0;
+    let mut cframes = 0;
     let mut shared = 0;
     let mut shared_seen = HashSet::new();
     for instance in &state.instances {
@@ -120,10 +123,16 @@ pub(super) fn measure(service: &str, state: &ServiceState) {
     if let Some(rows) = &state.native_properties_by_instance {
         native += rows.capacity() * size_of::<Vec<NativeSettingsProperty>>();
         for row in rows {
+            native_slots += row.capacity();
+            native_occupied += row.len();
             native += row.capacity() * size_of::<NativeSettingsProperty>();
             for property in row {
                 native += property.name.capacity();
                 match &property.value {
+                    NativeSettingsValue::CFrame(value) => {
+                        cframes += 1;
+                        native += std::mem::size_of_val(value.as_ref());
+                    }
                     NativeSettingsValue::String(value)
                     | NativeSettingsValue::Enum(value)
                     | NativeSettingsValue::UniqueId(value) => native += value.capacity(),
@@ -154,6 +163,9 @@ pub(super) fn measure(service: &str, state: &ServiceState) {
         "enumNames": enum_names.report(enums), "enumTypes": enum_types.report(enums),
         "attributesHeap": attributes, "strings": strings, "pathSegmentStorage": path_segment_storage,
         "nativeRows": native, "nativeSharedValues": shared,
+        "nativeSlots": native_slots, "nativePropertySize": size_of::<NativeSettingsProperty>(),
+        "nativeOccupied": native_occupied,
+        "cframeCount": cframes,
         "children": state.children_by_index.capacity() * size_of::<Vec<usize>>()
             + state.children_by_index.iter().map(|c| c.capacity()*size_of::<usize>()).sum::<usize>(),
         "sourceBits": state.source_in_subtree.capacity(),

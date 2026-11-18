@@ -106,7 +106,8 @@ pub(crate) enum NativeSettingsValue {
     UDim([f32; 2]),
     UDim2([f32; 4]),
     Color3([f32; 3]),
-    CFrame([f32; 12]),
+    // Keep the largest payload out of every property's inline storage.
+    CFrame(Box<[f32; 12]>),
     Rect([f32; 4]),
     Enum(String),
     /// A value many instances hold alike, such as a collision mesh: its

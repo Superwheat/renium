@@ -969,9 +969,9 @@ fn rbx_variant_to_native_settings_value(
             let value = RbxColor3::from(*value);
             Some(NativeSettingsValue::Color3([value.r, value.g, value.b]))
         }
-        RbxVariant::CFrame(value) | RbxVariant::OptionalCFrame(Some(value)) => {
-            Some(NativeSettingsValue::CFrame(rbx_cframe_components(*value)))
-        }
+        RbxVariant::CFrame(value) | RbxVariant::OptionalCFrame(Some(value)) => Some(
+            NativeSettingsValue::CFrame(Box::new(rbx_cframe_components(*value))),
+        ),
         RbxVariant::Rect(value) => Some(NativeSettingsValue::Rect([
             value.min.x,
             value.min.y,
@@ -1105,6 +1105,20 @@ fn shared_payload_value(
     Some(value)
 }
 
+pub(crate) fn native_property_keeps_json(
+    class_name: &str,
+    name: &str,
+    native_filter: Option<&NativePropertyFilter>,
+) -> bool {
+    // Attributes is also the store's envelope name, not an ordinary typed row.
+    name == "Attributes"
+        || class_name == "Script" && name == "RunContext"
+        || native_filter.is_some_and(|filter| {
+            filter.reconstruct_decal_color_map && name == "TextureContent"
+                || filter.reconstruct_weld_enabled && name == "State"
+        })
+}
+
 fn native_settings_records<'a>(
     class_name: &str,
     property_entries: impl IntoIterator<Item = (&'a rbx_dom_weak::Ustr, &'a RbxVariant)>,
@@ -1164,11 +1178,7 @@ fn native_settings_records<'a>(
             Some(renamed) => PropertyName::from(renamed.as_str()),
             None => PropertyName::held(property_name),
         };
-        let keep_json = class_name == "Script" && output_name == "RunContext"
-            || native_filter.is_some_and(|filter| {
-                filter.reconstruct_decal_color_map && output_name == "TextureContent"
-                    || filter.reconstruct_weld_enabled && output_name == "State"
-            });
+        let keep_json = native_property_keeps_json(class_name, output_name, native_filter);
         // A number or a content value for a member the reflection database
         // does not know keeps its engine type in the store, so a later build
         // writes it as the engine declared it: a number is not left out and a

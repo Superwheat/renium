@@ -1745,6 +1745,103 @@ mod native_identity_tests {
         }
     }
 
+    #[test]
+    fn native_conversion_shares_enum_values_without_changing_the_store() -> Result<()> {
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        let database = rbx_reflection_database::get()?;
+        let dependencies = NativeServiceFinishDependencies {
+            bridge: &bridge,
+            export_id: "enum-test",
+            enum_value_names_by_type: &HashMap::new(),
+            database,
+            native_filters: &HashMap::new(),
+            run_started: Instant::now(),
+        };
+        let enum_value =
+            json!({"_type":"EnumItem","enumType":"Enum.Future","name":"Chosen","value":7});
+        let run_context =
+            json!({"_type":"EnumItem","enumType":"Enum.RunContext","name":"Client","value":2});
+        let group: EditorBinaryExportGroup = serde_json::from_value(json!({
+            "service":"Workspace", "targetPath":["Workspace"], "count":3, "instanceCount":4,
+            "classNames":["Workspace","Folder","Script"], "rootProperties":{"RootEnum":enum_value},
+        }))?;
+        let native = NativeServiceDom {
+            instances: vec![
+                flat_instance(1, None, "Workspace", "Workspace", Vec::new()),
+                flat_instance(2, Some(0), "First", "Folder", Vec::new()),
+                flat_instance(3, Some(0), "Second", "Folder", Vec::new()),
+                flat_instance(4, Some(0), "Script", "Script", Vec::new()),
+            ],
+            new_index_by_dense_ref: Some(vec![0, 1, 2, 3]),
+            native_index_by_overlay_index: vec![0, 1, 2, 3],
+            captured_debug_ids: None,
+            captured_root_properties: Map::new(),
+            path_segments_by_ref: Arc::default(),
+            path_ordinals_by_ref: Arc::default(),
+        };
+        let overlays = (0..4)
+            .map(|index| NativeOverlayItem {
+                instance_index: index + 1,
+                class_index: [0, 1, 1, 2][index],
+                properties: if index == 3 {
+                    Map::from_iter([("RunContext".into(), run_context.clone())])
+                } else if index == 0 {
+                    Map::new()
+                } else {
+                    Map::from_iter([("FutureProperty".into(), enum_value.clone())])
+                },
+                attributes: Map::new(),
+            })
+            .collect();
+        let (output, _) = convert_native_service_output(
+            &dependencies,
+            &group,
+            native,
+            overlays,
+            (0..4).map(|index| Some(format!("id{index}"))).collect(),
+            Vec::new(),
+            0.0,
+        )?;
+        let state =
+            crate::snapshot::export::exported_parts_to_service_state("Workspace", output.parts)?;
+        assert_eq!(state.instances[0].properties["RootEnum"], enum_value);
+        assert_eq!(state.instances[3].properties["RunContext"], run_context);
+        assert!(!state.instances[1].properties.contains_key("FutureProperty"));
+        let shared = |index: usize| {
+            let row = state.native_properties_by_instance.as_ref().unwrap()[index]
+                .iter()
+                .find(|row| row.name == "FutureProperty")
+                .unwrap();
+            match &row.value {
+                NativeSettingsValue::Shared(value) => value,
+                _ => panic!("shared enum"),
+            }
+        };
+        assert!(Arc::ptr_eq(shared(1), shared(2)));
+        let mut json_state = state.clone();
+        for (instance, rows) in json_state
+            .instances
+            .iter_mut()
+            .zip(json_state.native_properties_by_instance.as_mut().unwrap())
+        {
+            rows.retain(|row| {
+                if let NativeSettingsValue::Shared(value) = &row.value {
+                    instance
+                        .properties
+                        .insert(row.name.clone(), value.as_ref().clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        assert_eq!(
+            crate::settings::bytecode::encode_service_settings_binary(&state)?,
+            crate::settings::bytecode::encode_service_settings_binary(&json_state)?,
+        );
+        Ok(())
+    }
+
     fn flat_instance(
         referent: u128,
         parent_index: Option<usize>,
@@ -2596,9 +2693,12 @@ fn convert_native_service_output(
         native_index_by_overlay_index,
         path_segments_by_ref,
         path_ordinals_by_ref,
-        captured_debug_ids: _,
+        captured_debug_ids,
         captured_root_properties,
     } = native;
+    // The overlay identity join is complete; conversion keeps the overlay's
+    // owned identities, not a second copy from the native capture.
+    drop(captured_debug_ids);
     if debug_ids.len() != native_instances.len() {
         bail!(
             "Native debug ids contain {} {} instances; expected {}",
@@ -2673,6 +2773,7 @@ fn convert_native_service_output(
     };
     drop(prepare);
     let conversion_started = Instant::now();
+    let enum_values = crate::snapshot::native_enums::NativeEnums::default();
     let (instances, native_properties_by_instance): (Vec<SnapshotInstance>, Vec<Vec<NativeSettingsProperty>>) = native_instances
         .into_par_iter()
         .zip(overlay_by_index.into_par_iter())
@@ -2780,6 +2881,14 @@ fn convert_native_service_output(
                     native_properties.retain(|property| property.name != "Archivable");
                     properties.insert("Archivable".to_string(), Value::Bool(false));
                 }
+                if index != 0 {
+                    enum_values.compact(&mut properties, &mut native_properties, |name| {
+                        crate::rbx::decode::native_property_keeps_json(
+                            rbx_instance.class.as_str(), name, native_filter,
+                        )
+                    });
+                }
+                native_properties.shrink_to_fit();
                 Ok((
                     SnapshotInstance {
                         name: rbx_instance.name,

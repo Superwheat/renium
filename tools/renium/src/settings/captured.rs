@@ -95,6 +95,7 @@ pub(super) fn changed_values(
     before: &PulledRows,
     now: &PulledRows,
     stored: &[u8],
+    store_gate: Option<&Mutex<()>>,
 ) -> Result<Option<SettingsAlignment>> {
     let _span = crate::app::profile::span("captured store changed values");
     if before.frame != now.frame
@@ -129,7 +130,7 @@ pub(super) fn changed_values(
         file: stored,
         read: None,
     };
-    changed_rows(state, now, (records, &places), &changed, stored)
+    changed_rows(state, now, (records, &places), &changed, stored, store_gate)
 }
 
 /// What is written for a store compared by its instances is the state's own
@@ -159,6 +160,7 @@ pub(super) fn changed_document_rows(
     state: &ServiceState,
     now: &PulledRows,
     stored: &[u8],
+    store_gate: Option<&Mutex<()>>,
 ) -> Result<Option<(SettingsAlignment, bool)>> {
     let _span = crate::app::profile::span("captured store compared by instance");
     if !comparable_by_instance(state, now) {
@@ -234,7 +236,7 @@ pub(super) fn changed_document_rows(
         }),
     };
     Ok(
-        changed_rows(state, now, (records, &places), &changed, stored)?
+        changed_rows(state, now, (records, &places), &changed, stored, store_gate)?
             .map(|alignment| (alignment, changed.is_empty() && !renamed)),
     )
 }
@@ -576,12 +578,22 @@ fn changed_rows<'a>(
     (records, places): (Vec<SettingsBinaryInstance<'a>>, &Places),
     changed: &[usize],
     stored: StoredRows<'_>,
+    store_gate: Option<&Mutex<()>>,
 ) -> Result<Option<SettingsAlignment>> {
     use crate::settings::bytecode::property_edit::decode_rows;
     use crate::settings::equivalence::{
         instance_lacks_enum_types, pulled_instance_values_unchanged,
         reconciliation_value_contains_reference as holds_reference,
     };
+
+    crate::app::output::log_global(
+        4,
+        format_args!(
+            "[renium] captured store comparison: {} changed rows of {}",
+            changed.len(),
+            records.len()
+        ),
+    );
 
     let budget = DecodeBudget::for_file(stored.file.len());
     let (camera, mut read) = match stored.read {
@@ -791,15 +803,27 @@ fn changed_rows<'a>(
         }
     }
     // A pull keeps the stored viewport camera whatever the captured one says.
-    let kept_camera = now.viewport_camera.and_then(|camera| {
-        let stored = stored_rows.last()?;
-        let captured = captured_rows.last()?;
-        (stored.properties != captured.properties || stored.attributes != captured.attributes)
-            .then_some(ReplacedRow {
-                source_index: camera,
-                instance: stored,
+    let kept_camera_index = now.viewport_camera.filter(|_| {
+        stored_rows
+            .last()
+            .zip(captured_rows.last())
+            .is_some_and(|(stored, captured)| {
+                stored.properties != captured.properties || stored.attributes != captured.attributes
             })
     });
+    let kept_camera = kept_camera_index.zip(stored_rows.pop());
+    // Comparison is finished. Only the old camera can participate in the
+    // encoding; do not retain decoded changed rows beside the output columns.
+    drop(stored_rows);
+    drop(captured_rows);
+    drop(read);
+    let kept_camera = kept_camera.as_ref().map(|(camera, stored)| ReplacedRow {
+        source_index: *camera,
+        instance: stored,
+    });
+    // Comparisons run in parallel. Only the new store's columns and compressed
+    // output share the export's allocation gate with other encoders.
+    let _store_guard = store_gate.map(LockRecover::lock_recover);
     let collected = collect_settings_binary_data(state, &lookup, &records, kept_camera)?;
     Ok(Some(SettingsAlignment::Changed(
         encode_prepared_service_settings(&records, &lookup, collected)?,
@@ -1340,7 +1364,7 @@ fn digest_native_value(
         NativeSettingsValue::UDim(values) => floats(digest, 9, values),
         NativeSettingsValue::UDim2(values) => floats(digest, 10, values),
         NativeSettingsValue::Color3(values) => floats(digest, 11, values),
-        NativeSettingsValue::CFrame(values) => floats(digest, 12, values),
+        NativeSettingsValue::CFrame(values) => floats(digest, 12, values.as_ref()),
         NativeSettingsValue::Rect(values) => floats(digest, 13, values),
         NativeSettingsValue::Enum(value) => {
             digest.update([14]);
