@@ -652,12 +652,6 @@ fn changed_rows<'a>(
             None => return whole("an enum item of a changed instance gains its type"),
         }
     }
-    // The alignment compares instances at their places as they hold their
-    // values, and what it aligned under the names of today: where the two
-    // say different things, which of them counts is its to say.
-    if same_values.iter().all(|same| *same) != same_under_todays_names {
-        return whole("a changed instance compares otherwise under the names of today");
-    }
     let renamed = read.as_ref().is_some_and(|read| read.renamed)
         || pairs().any(|(stored, captured)| {
             stored.properties.get(UNIQUE_ID) != captured.properties.get(UNIQUE_ID)
@@ -728,19 +722,38 @@ fn changed_rows<'a>(
     if !kept {
         return whole("nothing tells every instance for the stored one at its place");
     }
-    // Under other ids than the state's the alignment knows the camera only
-    // once it matched the instances, and puts a stored camera that holds a
-    // reference back in another form than it compares: that one it decides.
-    if !own_ids
+    // The alignment puts the stored camera back before it compares anything
+    // where the state's camera carries the stored one's id. Under another id
+    // it knows the camera only once it matched the instances, and puts a
+    // stored camera that holds a reference back in another form than it
+    // compares: that one it decides.
+    let camera_by_id = now
+        .viewport_camera
+        .is_none_or(|camera| places.ids[camera] == written_ids[camera]);
+    if !camera_by_id
         && camera_holds_a_reference
         && let (Some(stored), Some(captured)) = (stored_rows.last(), captured_rows.last())
         && (stored.properties != captured.properties || stored.attributes != captured.attributes)
     {
         return whole("the stored viewport camera holds a reference and differs");
     }
-    // A store with other instances than the state is written.
-    if moved.is_none() && !renamed && same_values.iter().all(|same| *same) {
-        return Ok(Some(SettingsAlignment::Equivalent));
+    // The alignment first compares the instances at their places as they
+    // hold their values; where that fails, it matches them and compares
+    // what they hold under the names their properties go by today. A store
+    // that says the same either way stays, with two limits. A stored camera
+    // that holds a reference never compares alike the second way, so such a
+    // store is written. And under other ids than the state's the first
+    // comparison is not the comparison of instance with instance made here,
+    // so only the second counts. One with other instances is written.
+    let same_as_held = same_values.iter().all(|same| *same);
+    if moved.is_none() && !renamed {
+        let same_as_named = same_under_todays_names && !camera_holds_a_reference;
+        if same_as_named || own_ids && same_as_held {
+            return Ok(Some(SettingsAlignment::Equivalent));
+        }
+        if same_as_held {
+            return whole("instances that hold the stored values compare otherwise by name");
+        }
     }
     // A pull keeps the stored viewport camera whatever the captured one says.
     let kept_camera = now.viewport_camera.and_then(|camera| {

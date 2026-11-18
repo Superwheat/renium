@@ -1222,6 +1222,102 @@ fn a_new_instance_under_an_id_the_store_holds_takes_another() {
     assert!(matches!(aligned.alignment, SettingsAlignment::Changed(bytes) if bytes == written));
 }
 
+/// A Workspace whose camera points at its one part, the part's size under
+/// `size_name`.
+fn workspace_with_a_subject(size_name: &str) -> SettingsBytecode {
+    let mut root =
+        SettingsBytecodeInstance::new("1".into(), "Workspace".into(), "Workspace".into(), None);
+    root.properties.insert(
+        "CurrentCamera".into(),
+        json!({"_type": "Ref", "instanceIndex": 2}),
+    );
+    let mut camera = SettingsBytecodeInstance::new(
+        "editor:camera".into(),
+        "Camera".into(),
+        "Camera".into(),
+        Some(0),
+    );
+    camera.properties.insert("FieldOfView".into(), json!(70.0));
+    camera.properties.insert(
+        "CameraSubject".into(),
+        json!({"_type": "Ref", "instanceIndex": 3}),
+    );
+    let mut part = SettingsBytecodeInstance::new(
+        "editor:part".into(),
+        "Subject".into(),
+        "Part".into(),
+        Some(0),
+    );
+    part.properties.insert(size_name.into(), size(4));
+    SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![root, camera, part],
+    }
+}
+
+/// A value under the name it once went by is the stored value to a pull,
+/// but the alignment says so only once it compares by today's names, and a
+/// stored camera that holds a reference never compares alike there: the
+/// store is written, as the alignment writes it.
+#[test]
+fn a_renamed_property_beside_a_camera_that_points_at_an_instance_is_written() {
+    let file = encode_service_settings_binary(&captured(&workspace_with_a_subject("Size"), false))
+        .unwrap();
+    let state = captured(&workspace_with_a_subject("size"), false);
+    let now = pulled_digest_from_service_state(&state).unwrap();
+    let (answer, _) = pull_changed_document_rows(&state, &now.rows, &file)
+        .unwrap()
+        .expect("one changed instance under the store's own ids");
+    let aligned = align_pulled_settings_documents_to_reference(
+        decode_settings_bytecode(&file).unwrap(),
+        settings_bytecode_from_service_state(&state).unwrap(),
+        &|| encode_service_settings_binary(&state),
+        std::time::Instant::now(),
+    )
+    .unwrap();
+    let (SettingsAlignment::Changed(written), SettingsAlignment::Changed(expected)) =
+        (answer, aligned.alignment)
+    else {
+        panic!("the store is kept");
+    };
+    assert!(written == expected);
+}
+
+/// Under other ids than the store's, instances that hold the stored values
+/// as they are but another one by today's names are the alignment's to
+/// answer for: it compares them as they are only where its first look at
+/// the whole store finds nothing else, which the changed instances do not
+/// show.
+#[test]
+fn a_value_under_an_old_name_takes_the_whole_alignment_under_other_ids() {
+    let with_pointer = |session: usize, old_name: bool| {
+        let mut document = twins(session, true, [0.25, 0.75]);
+        for (index, twin) in document.instances.iter_mut().enumerate().skip(1) {
+            twin.properties.insert(
+                "UniqueId".into(),
+                json!({"_type": "UniqueId", "value": format!("{:024x}{index:08x}", 1)}),
+            );
+        }
+        document.instances[2]
+            .properties
+            .insert("Target".into(), json!({"_type": "Ref", "instanceIndex": 2}));
+        if old_name {
+            document.instances[1]
+                .properties
+                .insert("size".into(), size(3));
+        }
+        document
+    };
+    let file = encode_service_settings_binary(&captured(&with_pointer(1, false), false)).unwrap();
+    let state = captured(&with_pointer(2, true), false);
+    let now = pulled_digest_from_service_state(&state).unwrap();
+    assert!(
+        pull_changed_document_rows(&state, &now.rows, &file)
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// A root is told by being the only one, unless a store holds another
 /// instance under the root's id: the alignment then takes the root for that
 /// one.
