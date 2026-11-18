@@ -290,20 +290,33 @@ fn row_digests_of(
         {
             let mut cells = decoded.into_iter().map(&mut entry).collect::<Vec<_>>();
             cells.reserve(column.values.len());
-            // A payload many rows hold is digested once.
+            // A payload many rows hold is digested once, and so is a typed
+            // value: the instances of one mesh hold the same sizes, and a
+            // column of enum items holds a few names.
             let mut shared = AHashMap::<usize, [u8; 16]>::new();
+            let mut typed = AHashMap::<TypedKey<'_>, [u8; 16]>::new();
             for (row, value) in &column.values {
                 let digest = match value {
                     NativeSettingsValue::Shared(held) if kept != Some(*row) => *shared
                         .entry(std::sync::Arc::as_ptr(held) as usize)
                         .or_insert_with(|| value_digest(held)),
                     value => {
-                        let value = materialized_value(value, kind)?;
-                        let digest = value_digest(&value);
-                        if kept_of_all || kept == Some(*row) {
-                            held.push(DecodedGroupEntry::Property(*row, value));
+                        let keep = kept_of_all || kept == Some(*row);
+                        let key = if keep { None } else { typed_key(value) };
+                        match key.as_ref().and_then(|key| typed.get(key)) {
+                            Some(digest) => *digest,
+                            None => {
+                                let value = materialized_value(value, kind)?;
+                                let digest = value_digest(&value);
+                                if keep {
+                                    held.push(DecodedGroupEntry::Property(*row, value));
+                                }
+                                if let Some(key) = key {
+                                    typed.insert(key, digest);
+                                }
+                                digest
+                            }
                         }
-                        digest
                     }
                 };
                 cells.push(cell(*row, place, digest));
@@ -406,6 +419,42 @@ fn row_digests_of(
         moved,
         instances,
     }))
+}
+
+/// What tells one typed value of a column from another: its kind and its
+/// bits or its text. Two values with one key give one JSON value.
+#[derive(PartialEq, Eq, Hash)]
+enum TypedKey<'a> {
+    Number(u8, u64),
+    Floats(u8, [u32; 12]),
+    Text(u8, &'a str),
+}
+
+fn typed_key(value: &NativeSettingsValue) -> Option<TypedKey<'_>> {
+    fn floats<const N: usize>(tag: u8, values: &[f32; N]) -> TypedKey<'static> {
+        let mut bits = [0; 12];
+        for (bit, value) in bits.iter_mut().zip(values) {
+            *bit = value.to_bits();
+        }
+        TypedKey::Floats(tag, bits)
+    }
+    Some(match value {
+        NativeSettingsValue::Bool(value) => TypedKey::Number(0, u64::from(*value)),
+        NativeSettingsValue::Int(value) => TypedKey::Number(1, *value as u64),
+        NativeSettingsValue::Float32(value) => TypedKey::Number(2, u64::from(value.to_bits())),
+        NativeSettingsValue::Float64(value) => TypedKey::Number(3, value.to_bits()),
+        NativeSettingsValue::Ref(index) => TypedKey::Number(4, *index as u64),
+        NativeSettingsValue::String(text) => TypedKey::Text(5, text),
+        NativeSettingsValue::Enum(text) => TypedKey::Text(6, text),
+        NativeSettingsValue::Vector2(values) => floats(7, values),
+        NativeSettingsValue::Vector3(values) => floats(8, values),
+        NativeSettingsValue::UDim(values) => floats(9, values),
+        NativeSettingsValue::UDim2(values) => floats(10, values),
+        NativeSettingsValue::Color3(values) => floats(11, values),
+        NativeSettingsValue::CFrame(values) => floats(12, values),
+        NativeSettingsValue::Rect(values) => floats(13, values),
+        NativeSettingsValue::Shared(_) => return None,
+    })
 }
 
 fn decode_compact_column(
