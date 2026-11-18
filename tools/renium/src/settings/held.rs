@@ -40,7 +40,9 @@ const RELEASED_AFTER_SECONDS: u64 = 30 * 60;
 const SWEEP_EVERY_SECONDS: u64 = 60;
 
 pub(crate) struct Payload {
-    value: Value,
+    /// Shared with whoever handed it over (`held_copy`): a capture keeps
+    /// the same allocation.
+    value: Arc<Value>,
     digest: OnceLock<[u8; 16]>,
     /// When it was last used, in seconds of the process, never zero.
     used: AtomicU64,
@@ -158,8 +160,16 @@ fn known(text: &str) -> Option<u64> {
 }
 
 fn insert(value: Value) -> Value {
-    let Some(text) = payload_text(&value) else {
+    if payload_text(&value).is_none() {
         return value;
+    }
+    insert_shared(Arc::new(value))
+}
+
+/// The handle of a payload, which is held from now on unless it is already.
+fn insert_shared(value: Arc<Value>) -> Value {
+    let Some(text) = payload_text(&value) else {
+        return Value::clone(&value);
     };
     let hash = HASHER.hash_one(text);
     let mut store = STORE.write().unwrap_or_else(PoisonError::into_inner);
@@ -190,15 +200,15 @@ pub(crate) fn held(value: Value) -> Value {
     }
 }
 
-/// `held` of a value another holder keeps: its text is copied only the first
-/// time the process sees it.
-pub(crate) fn held_copy(value: &Value) -> Value {
+/// `held` of a value another holder keeps: the two share it, and its text
+/// is never copied.
+pub(crate) fn held_copy(value: &Arc<Value>) -> Value {
     match payload_text(value) {
         Some(text) => match known(text) {
             Some(id) => handle(id),
-            None => insert(value.clone()),
+            None => insert_shared(Arc::clone(value)),
         },
-        None => value.clone(),
+        None => Value::clone(value),
     }
 }
 
@@ -294,7 +304,7 @@ pub(crate) fn same_properties(left: &Map<String, Value>, right: &Map<String, Val
 /// Every handle in `value`, at any depth, replaced by its payload.
 pub(crate) fn resolve_all(value: &mut Value) {
     if let Some(held) = value.as_object().and_then(held_payload_of) {
-        *value = held.value.clone();
+        *value = Value::clone(&held.value);
         return;
     }
     match value {
@@ -370,7 +380,7 @@ mod tests {
     #[test]
     fn a_shared_payload_of_some_size_is_held_once_and_resolves_to_itself() {
         let value = payload_of(HELD_TYPE, b'Q', MIN_HELD_TEXT);
-        let (first, second) = (held(value.clone()), held_copy(&value));
+        let (first, second) = (held(value.clone()), held_copy(&Arc::new(value.clone())));
         assert_eq!(first, second);
         assert!(is_a_handle(&first));
         assert!(resolve(&first).same_payload(&resolve(&second)));
@@ -394,7 +404,7 @@ mod tests {
             json!({"_type": HELD_TYPE, "held": 0}),
         ] {
             assert_eq!(held(value.clone()), value);
-            assert_eq!(held_copy(&value), value);
+            assert_eq!(held_copy(&Arc::new(value.clone())), value);
             assert!(!is_a_handle(&value) && !holds_a_handle(&value));
             assert!(matches!(resolve(&value), Resolved::Plain(_)));
         }
