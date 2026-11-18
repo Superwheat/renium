@@ -692,15 +692,20 @@ impl Coordinator {
             log_reconcile_timing("readback capture", phase);
             let phase = Instant::now();
             if !changes.editor.is_empty() {
-                let compared = readback
-                    .entries
-                    .keys()
-                    .chain(merged.entries.keys())
-                    .cloned()
-                    .collect();
-                let mismatches =
-                    reconciled_path_differences(&readback, &merged, &compared, &pending)?;
-                let mut paths = mismatches.into_iter().collect::<Vec<_>>();
+                let mismatches = if pending.is_empty() {
+                    snapshot_differences(&readback, &merged)?
+                        .into_iter()
+                        .collect()
+                } else {
+                    let compared = readback
+                        .entries
+                        .keys()
+                        .chain(merged.entries.keys())
+                        .cloned()
+                        .collect();
+                    reconciled_path_differences(&readback, &merged, &compared, &pending)?
+                };
+                let mut paths: Vec<PathBuf> = mismatches;
                 paths.sort();
                 let mut detail = None;
                 for path in &paths {
@@ -738,11 +743,35 @@ impl Coordinator {
                     publish_studio_paths(context, readback_stage, &changes.editor, &editor)?;
                 }
                 let synchronized = changes.studio.union(&changes.editor).cloned().collect();
-                record_pushed_baseline(context, &setup.key, &mut record, &synchronized, &readback)?;
+                if record.baseline.is_none() {
+                    // A pairing that had no baseline takes the merged project
+                    // with Studio as it stands, so the pending values stay
+                    // changes of the files.
+                    let mut as_it_stands = merged.clone();
+                    overlay_snapshot_paths(&mut as_it_stands, &readback, &synchronized);
+                    record.baseline = Some(StoredSnapshot::write(
+                        Path::new(&context.root),
+                        &setup.key,
+                        &as_it_stands,
+                    )?);
+                } else {
+                    record_pushed_baseline(
+                        context,
+                        &setup.key,
+                        &mut record,
+                        &synchronized,
+                        &readback,
+                    )?;
+                }
                 if let Some(mut history) = sync_history.take() {
                     let files = capture_snapshot(Path::new(&context.root), &publish_paths)?;
                     history.commit(&files, &ProjectSnapshot::default())?;
                 }
+                // The comparison is settled: what it found before is gone, as
+                // after any other reconcile that reached Studio.
+                record.clear_review();
+                record.resolution_required = false;
+                setup.resolution_required = false;
                 record.studio_checkpoint = None;
                 record.note_setup(setup);
                 write_record(context, &setup.key, &record)?;

@@ -561,7 +561,17 @@ fn reconcile_keeps_pending_deferred_fields_and_retries_against_the_actual_baseli
                 },
             )?;
             let mut record = load_record(&fixture.context, &setup.key)?.unwrap();
-            record.baseline = Some(StoredSnapshot::write(root, &setup.key, &baseline)?);
+            // A pairing that has no baseline yet gets one from this reconcile.
+            record.baseline = if remote_edit || unreported {
+                Some(StoredSnapshot::write(root, &setup.key, &baseline)?)
+            } else {
+                None
+            };
+            // What an earlier comparison left open is settled by this one.
+            record
+                .differences
+                .push("push: an earlier difference".into());
+            record.resolution_required = true;
             write_record(&fixture.context, &setup.key, &record)?;
             MUTATION.with(|slot| *slot.borrow_mut() = Some(Box::new(|_, _| {
                 let mut committed = summary(false);
@@ -584,6 +594,8 @@ fn reconcile_keeps_pending_deferred_fields_and_retries_against_the_actual_baseli
             assert_eq!(files.instances[2].properties["Transparency"], 0.75);
             assert_eq!(files.instances[2].properties["CanCollide"], remote_edit);
             let record = load_record(&fixture.context, &setup.key)?.unwrap();
+            assert!(record.differences.is_empty() && record.conflicts.is_empty());
+            assert!(!record.resolution_required && !setup.resolution_required);
             let saved = record.baseline.unwrap().load(root, &setup.key)?;
             assert!(
                 snapshot_path_differences(&saved, &actual, &HashSet::from([store.clone()]))?
