@@ -159,10 +159,16 @@ pub(super) fn automation_failure_ref(error: &anyhow::Error) -> automation::Failu
 }
 
 fn classify_failure(error: &anyhow::Error) -> automation::Failure {
-    if error.is::<crate::editor::sync::SlowImportRequired>() {
-        const CODE: &str = "slow_import_required";
-        return automation::Failure::new(CODE, format!("{error:#}"), false, "context")
-            .detail(json!({"code":CODE}));
+    let review_code = if error.is::<crate::editor::sync::SlowImportRequired>() {
+        Some("slow_import_required")
+    } else if error.is::<automation::reconcile::SkippedPushReview>() {
+        Some("review_skipped")
+    } else {
+        None
+    };
+    if let Some(code) = review_code {
+        return automation::Failure::new(code, format!("{error:#}"), false, "context")
+            .detail(json!({"code":code}));
     }
     if let Some(verification) =
         error.downcast_ref::<crate::editor::sync::EditorSourceVerificationError>()
@@ -620,6 +626,9 @@ fn compact_push_summary(
         "ok".to_string(),
         summary.get("ok").cloned().unwrap_or(Value::Bool(true)),
     );
+    if parameters["confirmImportOptions"] == true {
+        result.insert("confirmedImportOptions".into(), json!(true));
+    }
     if summary.get("verifyOnly") == Some(&Value::Bool(true)) {
         result.insert("verifyOnly".to_string(), Value::Bool(true));
         for key in [
@@ -3040,7 +3049,12 @@ fn restore_persisted_live_sync(
         ) {
             Ok(_) => return Ok(()),
             Err(failure)
-                if attempts < 3 && automation::live::is_concurrent_edit_message(&failure.0.m) =>
+                if attempts < 3
+                    && !matches!(
+                        failure.0.c.as_str(),
+                        "slow_import_required" | "review_skipped"
+                    )
+                    && automation::live::is_concurrent_edit_message(&failure.0.m) =>
             {
                 attempts += 1;
                 state.live_sync().clear_restore_failure(context);
@@ -5734,13 +5748,23 @@ mod tests {
         let reply = compact_push_summary(offline.as_object().unwrap(), &parameters, false);
         assert_eq!(reply["supplementalImportWrites"], 0);
         assert_eq!(reply["supplementalImportOfflineWrites"], 40);
+        assert!(!reply.contains_key("confirmedImportOptions"));
+        let confirmed = compact_push_summary(
+            offline.as_object().unwrap(),
+            &json!({"confirmImportOptions":true}),
+            false,
+        );
+        assert_eq!(confirmed["confirmedImportOptions"], true);
     }
 
     #[test]
     fn reader_diagnostics_cannot_change_the_slow_import_error_code() {
         for reason in ["unsupported", "timeout", "unknown operation", "internal"] {
-            let error = anyhow::Error::new(crate::editor::sync::SlowImportRequired(reason.into()))
-                .context("push preflight");
+            let error = anyhow::Error::new(crate::editor::sync::SlowImportRequired {
+                message: reason.into(),
+                live_scope: None,
+            })
+            .context("push preflight");
             let failure = classify_failure(&error).0;
             assert_eq!(failure.c, "slow_import_required");
             assert_eq!(failure.d.unwrap()["code"], failure.c);

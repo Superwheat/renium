@@ -430,7 +430,13 @@ pub(crate) fn push_project(
     }
     let mutation_paths = differences.clone();
     let phase = Instant::now();
-    let mut history = history::SyncHistory::begin(&root, &src_dir, &studio, &mutation_paths)?;
+    let mut history = history::SyncHistory::begin_push(
+        &root,
+        &src_dir,
+        &studio,
+        &mutation_paths,
+        &mut push_args,
+    )?;
     let settle_native_import = replace && !plan.initial_native_services.is_empty();
     if !replace {
         apply_snapshot_paths(&stage.project_root, &mutation_paths, &project)?;
@@ -465,26 +471,22 @@ pub(crate) fn push_project(
             expected_project: Some(&project),
             later_edits_follow: false,
         },
-    )
-    .map_err(|error| history.discard_if_refused(error))?;
+    )?;
     if push_applied_nothing(&pushed.summary) {
         // Studio holds or skipped the whole push, so there is nothing to
         // record or read back; the summary carries the hold and its next step.
-        history.discard_uncommitted()?;
         return Ok(pushed.summary);
     }
     pushed.summary.insert(
         "historyId".into(),
         Value::String(history.commit(&project, &pushed.generated)?),
     );
-    if let Some(saved) = saved_fields {
-        crate::editor::sync::finish_committed_saved_fields(
-            &saved,
-            &root,
-            bridge,
-            &mut pushed.summary,
-        );
-    }
+    crate::editor::sync::finish_committed_saved_fields(
+        saved_fields.as_deref(),
+        &root,
+        bridge,
+        &mut pushed.summary,
+    );
     log_reconcile_timing("full push mutation", phase);
 
     let replacement = reopened_push_context(context, &pushed.summary)?;
@@ -1015,6 +1017,10 @@ pub(crate) fn capture_studio_services_with_stage(
     generate_sourcemap: bool,
     stage: ExportProjectStage,
 ) -> Result<(ExportProjectStage, ProjectSnapshot)> {
+    #[cfg(all(test, any(windows, target_os = "macos")))]
+    if let Some(snapshot) = super::push_flow_tests::capture(context) {
+        return Ok((stage, snapshot?));
+    }
     let stage =
         import_studio_services_into_stage(context, bridge, services, generate_sourcemap, stage)?;
     let snapshot = capture_snapshot(&stage.project_root, stage.publish_paths())?;

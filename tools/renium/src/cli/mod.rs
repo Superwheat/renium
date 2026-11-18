@@ -3002,6 +3002,8 @@ pub(super) struct PushEditorChangesArgs {
     #[arg(skip)]
     pub(crate) disable_service_reader: bool,
     #[arg(skip)]
+    pub(crate) mutation_started: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    #[arg(skip)]
     pub(crate) saved_fields: Option<std::sync::Arc<crate::editor::types::PushSavedFields>>,
     #[arg(
         help = "Skip the Studio review and protected property writes (prefer --yes)",
@@ -3051,6 +3053,7 @@ impl PushEditorChangesArgs {
             no_check: false,
             slow_import: false,
             disable_service_reader: false,
+            mutation_started: None,
             saved_fields: None,
             no_review: false,
             yes: false,

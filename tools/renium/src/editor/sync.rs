@@ -79,6 +79,7 @@ use crate::system::files::{
 use crate::system::text::normalized_source_bytes;
 
 struct EditorTransaction<'a> {
+    mutation_started: Option<&'a std::sync::atomic::AtomicBool>,
     bridge: &'a BridgeServer,
     id: String,
     plugin_session_id: Option<String>,
@@ -266,6 +267,7 @@ mod transaction_recovery_tests {
 
     fn transaction(bridge: &BridgeServer) -> EditorTransaction<'_> {
         EditorTransaction {
+            mutation_started: None,
             bridge,
             id: "retained".into(),
             plugin_session_id: Some("original-plugin-session".into()),
@@ -392,7 +394,8 @@ mod transaction_recovery_tests {
             supplemental: 1,
         };
         args.yes = true;
-        let protected = prepare_protected_writes(&args, &bridge, pending).unwrap();
+        let protected =
+            prepare_protected_writes(&args, &bridge, pending, false, &HashSet::new()).unwrap();
         assert!(protected.apply_offline);
         let snapshot = crate::editor::review::patch_place_protected_writes(
             &root.join("missing.rbxl"),
@@ -926,6 +929,7 @@ impl<'a> EditorTransaction<'a> {
         changes: &EditorChangeSet,
         binary_import: Option<&EditorBinaryImport>,
         guard: Option<&StudioChangeGuard>,
+        mutation_started: Option<&'a std::sync::atomic::AtomicBool>,
     ) -> Result<Option<Self>> {
         let mut services = changes.services().map(str::to_string).collect::<Vec<_>>();
         services.sort();
@@ -948,11 +952,17 @@ impl<'a> EditorTransaction<'a> {
             parameters["nativePropertiesAvailable"] = json!(native_properties_available);
             parameters
         };
+        if let Some(started) = mutation_started {
+            started.store(true, std::sync::atomic::Ordering::Release);
+        }
         let result = editor_transaction_begin_result(
             bridge.call("beginEditorTransaction", parameters(services)),
             || Self::upload(bridge, &id, parameters(upload_services)),
         )?;
         if result.get("studioChanged").and_then(Value::as_bool) == Some(true) {
+            if let Some(started) = mutation_started {
+                started.store(false, std::sync::atomic::Ordering::Release);
+            }
             return Err(StudioChangedBeforePush.into());
         }
         let package_mutation = result
@@ -960,6 +970,7 @@ impl<'a> EditorTransaction<'a> {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let mut transaction = Self {
+            mutation_started,
             bridge,
             id,
             plugin_session_id: result
@@ -1275,7 +1286,11 @@ impl<'a> EditorTransaction<'a> {
             (Err(error), _) => Err(error),
             (Ok(()), watcher) => watcher
                 .context("Studio did not finish accepting rollback package changes")
-                .map(|_| ()),
+                .map(|_| {
+                    if let Some(started) = self.mutation_started {
+                        started.store(false, std::sync::atomic::Ordering::Release);
+                    }
+                }),
         }
     }
 
@@ -1649,7 +1664,14 @@ fn name_script_paths(args: &mut PushEditorChangesArgs, invocation_root: &Path) -
     Ok(())
 }
 
-pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Result<Value> {
+pub(crate) fn push_editor_changes_result(args: PushEditorChangesArgs) -> Result<Value> {
+    push_editor_changes_via(args, daemon_control_request)
+}
+
+fn push_editor_changes_via(
+    mut args: PushEditorChangesArgs,
+    mut send: impl FnMut(u16, Option<&Path>, Value, bool) -> Result<Value>,
+) -> Result<Value> {
     let invocation_root = std::env::current_dir()?;
     name_script_paths(&mut args, &invocation_root)?;
     let named_scripts = only_named_scripts(&args);
@@ -1657,25 +1679,63 @@ pub(crate) fn push_editor_changes_result(mut args: PushEditorChangesArgs) -> Res
     resolve_cli_push_paths(&mut args, &invocation_root)?;
     apply_configured_project_layout(&mut args.project.project_root, &mut args.project.src_root)?;
     add_service_store_paths(&mut args)?;
-    let parameters = push_request_parameters(&args, named_scripts);
-    if args.slow_import {
-        let transport = json!({"bridgePorts": parameters["bridgePorts"], "bridgeWaitSeconds": parameters["bridgeWaitSeconds"]});
-        require_slow_import_capability(&daemon_control_request(op::CAP, None, transport, false)?)?;
-    }
-    daemon_control_request(
+    let mut parameters = push_request_parameters(&args, named_scripts);
+    let disable = parameters["disableServiceReader"] == true;
+    let options = match (args.slow_import, disable) {
+        (true, true) => "--slow-import and RENIUM_NATIVE_SERVICE_IMPORT=0",
+        (true, false) => "--slow-import",
+        (false, true) => "RENIUM_NATIVE_SERVICE_IMPORT=0",
+        (false, false) => {
+            return send(
+                op::PUSH,
+                Some(&args.project.project_root),
+                parameters,
+                !args.no_review,
+            );
+        }
+    };
+    let transport = json!({"bridgePorts": parameters["bridgePorts"], "bridgeWaitSeconds": parameters["bridgeWaitSeconds"]});
+    let advertised = match send(op::CAP, None, transport, false) {
+        Ok(reply) => Some(reply["slowImport"] == true),
+        Err(error)
+            if error.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                )
+            }) =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    parameters["confirmImportOptions"] = json!(true);
+    let reply = send(
         op::PUSH,
         Some(&args.project.project_root),
         parameters,
         !args.no_review,
-    )
-}
-
-fn require_slow_import_capability(capabilities: &Value) -> Result<()> {
-    anyhow::ensure!(
-        capabilities["slowImport"] == true,
-        "The selected daemon is older and does not support --slow-import. Restart that daemon with this CLI build, then repeat the scoped push."
     );
-    Ok(())
+    let warning = match advertised {
+        Some(true) => None,
+        Some(false) => Some(format!(
+            "The selected daemon is older and ignores {options}. Restart that daemon with this CLI build to use the requested options."
+        )),
+        None => Some(format!(
+            "The capability check timed out. An older daemon may ignore {options}. Restart that daemon with this CLI build to confirm support."
+        )),
+    };
+    let mut result = reply.map_err(|error| match &warning {
+        Some(message) => error.context(message.clone()),
+        None => error,
+    })?;
+    if let Some(fields) = result.as_object_mut() {
+        let confirmed = fields.remove("confirmedImportOptions") == Some(Value::Bool(true));
+        if !confirmed && let Some(warning) = warning {
+            fields.insert("importOptionWarning".into(), json!(warning));
+        }
+    }
+    Ok(result)
 }
 
 pub(crate) fn push_request_parameters(args: &PushEditorChangesArgs, named_scripts: bool) -> Value {
@@ -3319,11 +3379,12 @@ struct ProtectedWritePlan {
 // so the push writes them natively without an approval; whatever cannot be
 // written is named in the result.
 pub(crate) fn finish_committed_saved_fields(
-    saved: &crate::editor::types::PushSavedFields,
+    saved: Option<&crate::editor::types::PushSavedFields>,
     project: &Path,
     bridge: &BridgeServer,
     summary: &mut Map<String, Value>,
 ) {
+    let Some(saved) = saved else { return };
     let receipt = summary.get("protectedOfflineApply").cloned();
     if let Err(error) =
         apply_saved_field_differences(saved, project, bridge, summary, receipt.as_ref())
@@ -3345,6 +3406,33 @@ fn apply_saved_field_differences(
     bridge: &BridgeServer,
     summary: &mut Map<String, Value>,
     offline_receipt: Option<&Value>,
+) -> Result<()> {
+    apply_saved_field_writes(
+        saved,
+        project,
+        bridge,
+        summary,
+        offline_receipt,
+        |runtime, field| {
+            crate::studio::automation::property_access::write_saved_field(
+                bridge,
+                runtime,
+                &field.path_segments,
+                &[],
+                &field.property,
+                &field.value,
+            )
+        },
+    )
+}
+
+fn apply_saved_field_writes(
+    saved: &crate::editor::types::PushSavedFields,
+    project: &Path,
+    bridge: &BridgeServer,
+    summary: &mut Map<String, Value>,
+    offline_receipt: Option<&Value>,
+    mut write: impl FnMut(&str, &crate::settings::equivalence::SavedFieldDifference) -> Result<bool>,
 ) -> Result<()> {
     let (runtime, _replacement_gate) = match offline_receipt {
         Some(receipt) => {
@@ -3380,14 +3468,7 @@ fn apply_saved_field_differences(
             ));
             continue;
         }
-        match crate::studio::automation::property_access::write_saved_field(
-            bridge,
-            runtime,
-            &difference.path_segments,
-            &[],
-            &difference.property,
-            &difference.value,
-        ) {
+        match write(runtime, difference) {
             Ok(true) => applied += 1,
             Ok(false) => {}
             Err(error) => unsupported.push(format!("{} ({error:#})", difference.label())),
@@ -3454,6 +3535,7 @@ fn pending_protected_writes(
     summary: &mut Map<String, Value>,
     pre_routed: Vec<Value>,
     imported_suffix: usize,
+    local_place: &dyn Fn(&BridgeServer) -> Option<PathBuf>,
 ) -> PendingProtectedWrites {
     let mut reported = summary
         .get("protectedWrites")
@@ -3504,7 +3586,7 @@ fn pending_protected_writes(
     let enriched_rows = if applicable_rows.is_empty() {
         applicable_rows
     } else {
-        local_place_path_for_bridge(bridge)
+        local_place(bridge)
             .and_then(|path| {
                 protected_write_rows_with_previous_values(&path, &applicable_rows).ok()
             })
@@ -3554,10 +3636,22 @@ fn pending_protected_writes(
     }
 }
 
+fn protected_write_intent(row: &Value) -> Value {
+    let mut intent = row.clone();
+    if let Some(fields) = intent.as_object_mut() {
+        for key in ["oldValue", "oldValueKnown", "oldValueMissing"] {
+            fields.remove(key);
+        }
+    }
+    intent
+}
+
 fn prepare_protected_writes(
     args: &PushEditorChangesArgs,
     bridge: &BridgeServer,
     pending: PendingProtectedWrites,
+    offline_route: bool,
+    approved: &HashSet<Value>,
 ) -> Result<ProtectedWritePlan> {
     let PendingProtectedWrites {
         writes,
@@ -3594,9 +3688,26 @@ fn prepare_protected_writes(
             writes.len()
         );
     }
-    let apply_offline = !args.no_review
-        && !writes.is_empty()
-        && (args.yes || global_yes() || request_protected_write_review(bridge, &writes)?);
+    let needs_approval = !args.yes && !global_yes();
+    let apply_offline = if offline_route {
+        if needs_approval {
+            let additional = writes
+                .iter()
+                .filter(|row| !approved.contains(&protected_write_intent(row)))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !request_protected_write_review(bridge, &additional)? {
+                bail!(
+                    "Studio reported additional protected writes and their offline application was declined"
+                );
+            }
+        }
+        true
+    } else {
+        !writes.is_empty()
+            && !args.no_review
+            && (!needs_approval || request_protected_write_review(bridge, &writes)?)
+    };
     if crate::app::output::global_log_enabled(5) && !writes.is_empty() {
         eprintln!(
             "[renium] protected writes: {}",
@@ -3641,8 +3752,34 @@ fn push_editor_changes_with_collected(
         changes,
         options,
         super::native_roots::available,
+        PLACE_FILE,
     )
 }
+
+type ApplyPlaceFile<'a> = dyn Fn(
+        &BridgeServer,
+        &PushEditorChangesArgs,
+        &[Value],
+        &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Value>
+    + 'a;
+type PlacePath<'a> = dyn Fn(&BridgeServer) -> Option<PathBuf> + 'a;
+type ReadPending<'a> = dyn Fn(&BridgeServer, &mut Map<String, Value>, Vec<Value>, usize) -> PendingProtectedWrites
+    + 'a;
+
+struct PlaceFileAccess<'a> {
+    path: &'a PlacePath<'a>,
+    pending: &'a ReadPending<'a>,
+    apply: &'a ApplyPlaceFile<'a>,
+}
+
+const PLACE_FILE: PlaceFileAccess<'static> = PlaceFileAccess {
+    path: &local_place_path_for_bridge,
+    pending: &|bridge, summary, rows, suffix| {
+        pending_protected_writes(bridge, summary, rows, suffix, &local_place_path_for_bridge)
+    },
+    apply: &|bridge, args, rows, commit| apply_protected_writes_offline(bridge, args, rows, commit),
+};
 
 fn push_with_root_availability(
     args: PushEditorChangesArgs,
@@ -3650,6 +3787,7 @@ fn push_with_root_availability(
     mut changes: EditorChangeSet,
     options: CollectedPushOptions<'_>,
     root_writes_available: impl FnOnce(&BridgeServer) -> Result<bool>,
+    place: PlaceFileAccess<'_>,
 ) -> Result<serde_json::Map<String, Value>> {
     let CollectedPushOptions {
         started,
@@ -3694,7 +3832,8 @@ fn push_with_root_availability(
             skipped_editor_summary(&changes),
         )
     });
-    let mut review = || -> Result<Option<Map<String, Value>>> {
+    let review_payload_present = review_payload.is_some();
+    let mut review = |report| -> Result<Option<Map<String, Value>>> {
         let Some((payload, skipped)) = review_payload.take() else {
             return Ok(None);
         };
@@ -3703,7 +3842,7 @@ fn push_with_root_availability(
                 bridge,
                 payload,
                 Some(review_project_root(&args)),
-                args.review_report,
+                report,
             )? {
                 EditorReviewOutcome::Proceed => None,
                 EditorReviewOutcome::Skipped => Some(skipped),
@@ -3711,13 +3850,12 @@ fn push_with_root_availability(
             },
         )
     };
-    // Without an unmaterialized document, all possible individual writes
-    // are already represented in the property changes.
+    // A review can return immediately when its outcome cannot depend on the reader.
     if (args.slow_import
-        || (changes.native_property_documents.is_empty()
-            && individual_import_write_count(&changes.property_changes)
-                <= MAX_INDIVIDUAL_IMPORT_WRITES))
-        && let Some(summary) = review()?
+        || (prepared_binary_import.is_none()
+            && (!cfg!(windows) || crate::studio::native::import::service_reader_disabled(&args)))
+        || (review_payload_present && individual_writes_fit_before_build(&changes)))
+        && let Some(summary) = review(args.review_report)?
     {
         return Ok(summary);
     }
@@ -3735,7 +3873,7 @@ fn push_with_root_availability(
                 .and_then(|plan| plan.fallback_reason.as_ref())
         });
     if !matches!(fallback, Some(ServiceReaderFallback::DiscoveryFailed(_)))
-        && let Some(summary) = review()?
+        && let Some(summary) = review(args.review_report)?
     {
         return Ok(summary);
     }
@@ -3776,28 +3914,42 @@ fn push_with_root_availability(
     let fallback = binary_import
         .as_ref()
         .and_then(|import| import.fallback_reason.as_ref());
-    let preapproved_offline = check_import_route(
+    let pending_before = std::cell::LazyCell::new(|| {
+        if pre_routed_protected_writes.is_empty()
+            || !(place.path)(bridge).is_some_and(|path| path.is_file())
+        {
+            return Vec::new();
+        }
+        (place.pending)(
+            bridge,
+            &mut Map::new(),
+            pre_routed_protected_writes.clone(),
+            rerouted_fields,
+        )
+        .writes
+    });
+    let requires_offline = check_import_route(
         &changes.deferred_native_rows,
         fallback,
         args.slow_import,
         !args.no_review,
-        args.yes || global_yes(),
-        || {
-            !pre_routed_protected_writes.is_empty()
-                && local_place_path_for_bridge(bridge).is_some()
-                && !pending_protected_writes(
-                    bridge,
-                    &mut Map::new(),
-                    pre_routed_protected_writes.clone(),
-                    rerouted_fields,
-                )
-                .writes
-                .is_empty()
-        },
+        || !pending_before.is_empty(),
     )?;
-    if let Some(summary) = review()? {
+    if let Some(summary) = review(args.review_report && !requires_offline)? {
         return Ok(summary);
     }
+    let needs_approval = !args.no_review && !args.yes && !global_yes();
+    let offline_route = requires_offline || (needs_approval && !pending_before.is_empty());
+    let mut approved = HashSet::new();
+    if offline_route && needs_approval {
+        let mut rows = Vec::clone(&pending_before);
+        rows.extend(protected_write_rows(&changes.deferred_native_rows));
+        if !request_protected_write_review(bridge, &rows)? {
+            return Ok(skipped_editor_summary(&changes));
+        }
+        approved.extend(rows.iter().map(protected_write_intent));
+    }
+    drop(pending_before);
     let unstaged_replacements = changes
         .instance_changes
         .iter()
@@ -3826,8 +3978,13 @@ fn push_with_root_availability(
     if let Some(validate_project) = validate_project {
         validate_project()?;
     }
-    let mut transaction =
-        EditorTransaction::begin(bridge, &changes, binary_import.as_ref(), guard)?;
+    let mut transaction = EditorTransaction::begin(
+        bridge,
+        &changes,
+        binary_import.as_ref(),
+        guard,
+        args.mutation_started.as_deref(),
+    )?;
     let result = (|| {
         log_timing("native editor transaction begin", phase_started);
         let mut summary = {
@@ -3870,14 +4027,14 @@ fn push_with_root_availability(
             }
         }
         let phase_started = Instant::now();
-        let pending = pending_protected_writes(
+        let pending = (place.pending)(
             bridge,
             &mut summary,
             pre_routed_protected_writes,
             rerouted_fields,
         );
-        let mut protected = prepare_protected_writes(&args, bridge, pending)?;
-        protected.apply_offline |= preapproved_offline;
+        let mut protected =
+            prepare_protected_writes(&args, bridge, pending, offline_route, &approved)?;
         if protected.apply_offline && !changes.deferred_native_rows.is_empty() {
             // The offline apply reopens Studio after the commit, so the
             // follow-up transaction has no runtime to run in; the saved place
@@ -3917,7 +4074,7 @@ fn push_with_root_availability(
                 .as_mut()
                 .context("Protected snapshot requires an active transaction")?;
             transaction.prepare_snapshot()?;
-            let result = apply_protected_writes_offline(bridge, &args, &protected.writes, || {
+            let result = (place.apply)(bridge, &args, &protected.writes, &mut || {
                 commit_status = Some(transaction.commit()?);
                 Ok(())
             })?;
@@ -4075,16 +4232,63 @@ fn defer_imported_native_root_rows(
 // fence and write. Check the plan before opening the import transaction.
 const MAX_INDIVIDUAL_IMPORT_WRITES: usize = 32;
 
+fn individual_writes_fit_before_build(changes: &EditorChangeSet) -> bool {
+    let mut budget = MAX_INDIVIDUAL_IMPORT_WRITES;
+    for row in &changes.property_changes {
+        if property_change_needs_post_native_apply(row) || row.path_segments.len() < 2 {
+            continue;
+        }
+        let count = row
+            .properties
+            .keys()
+            .filter(|name| super::native_roots::is_property(&row.class_name, name))
+            .count();
+        let Some(left) = budget.checked_sub(count) else {
+            return false;
+        };
+        budget = left;
+    }
+    // A stored spelling may be an alias. Count every stored property until
+    // materialization has resolved it to its logical name.
+    for store in changes.native_property_documents.values() {
+        for instance in &store.instances {
+            if instance.parent_index.is_some() {
+                let Some(left) = budget.checked_sub(instance.properties.len()) else {
+                    return false;
+                };
+                budget = left;
+            }
+        }
+    }
+    true
+}
+
 fn individual_import_write_count(rows: &[EditorPropertyChange]) -> usize {
     rows.iter().map(|row| row.properties.len()).sum()
 }
 
 #[derive(Debug)]
-pub(crate) struct SlowImportRequired(pub(crate) String);
+pub(crate) struct SlowImportRequired {
+    pub(crate) message: String,
+    pub(crate) live_scope: Option<String>,
+}
+impl SlowImportRequired {
+    pub(crate) fn live_message(&self) -> String {
+        let next = self.live_scope.as_ref().map_or_else(
+            || "Inspect the pending instances with rbx lst and select the intended settings IDs for a scoped push.".into(),
+            |scope| format!("Inspect pending edits with rbx lst. To push the first affected subtree individually, use {scope}."),
+        );
+        format!("[slow_import_required] {} {next}", self.message)
+    }
+}
 
 impl std::fmt::Display for SlowImportRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        write!(
+            f,
+            "{} Add --slow-import to the original push arguments to allow individual writes.",
+            self.message
+        )
     }
 }
 impl std::error::Error for SlowImportRequired {}
@@ -4094,7 +4298,6 @@ fn check_import_route(
     fallback: Option<&ServiceReaderFallback>,
     allow_slow: bool,
     offline_allowed: bool,
-    approved: bool,
     pending_offline: impl FnOnce() -> bool,
 ) -> Result<bool> {
     let Some(ServiceReaderFallback::DiscoveryFailed(reason)) = fallback else {
@@ -4105,7 +4308,7 @@ fn check_import_route(
         return Ok(false);
     }
     let pending = offline_allowed && pending_offline();
-    if pending && approved {
+    if pending {
         return Ok(true);
     }
     let mut counts = BTreeMap::new();
@@ -4124,18 +4327,64 @@ fn check_import_route(
         .map(|((class, name), n)| format!("{class}.{name} ({n})"))
         .collect::<Vec<_>>()
         .join(", ");
-    let route = if offline_allowed && !pending {
-        "Studio may report protected writes during import. The offline route and duration cannot be determined before review.".into()
+    let route = if offline_allowed {
+        "Studio may report additional protected writes during import. The final route and duration are unknown.".into()
     } else {
-        let seconds = count as f64 * 0.031;
-        let offline = if pending {
-            " Alternatively, --yes approves writing the local place file offline and reopening Studio."
-        } else {
-            ""
-        };
-        format!("Individual writes would take about {seconds:.1} s at 31 ms per field.{offline}")
+        format!(
+            "Individual writes would take about {:.1} s at 31 ms per field.",
+            count as f64 * 0.031
+        )
     };
-    Err(SlowImportRequired(format!("Import stopped before changing Studio: {reason}. The fallback plans {count} individual supplemental field writes (limit {MAX_INDIVIDUAL_IMPORT_WRITES}), including {fields}. {route} For rbx ps, add --slow-import to the original arguments. For a compound command or Live Sync, inspect pending edits with rbx lst and run rbx ps <affected-store> -i <settings-id> --slow-import for the intended instances.")).into())
+    let target = rows
+        .iter()
+        .find_map(|row| {
+            let service = (!row.service.is_empty()).then_some(&row.service)?;
+            Some(match &row.settings_id {
+                Some(id) => format!(
+                    " First affected store {service}, settings ID {}.",
+                    json!(id)
+                ),
+                None => format!(
+                    " First affected store {service}, path {}.",
+                    json!(row.path_segments)
+                ),
+            })
+        })
+        .unwrap_or_default();
+    let message = format!(
+        "Import stopped before changing Studio: {reason}. The fallback plans {count} individual supplemental field writes (limit {MAX_INDIVIDUAL_IMPORT_WRITES}), including {fields}.{target} {route}"
+    );
+    let safe_argument = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with('-')
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+    };
+    let live_scope = rows.iter().find_map(|row| {
+        let id = row.settings_id.as_deref()?;
+        if row.service.is_empty() || id.is_empty() {
+            return None;
+        }
+        Some(if safe_argument(&row.service) && safe_argument(id) {
+            format!("rbx ps -s {} -i {id} --slow-import", row.service)
+        } else {
+            format!(
+                "rbx with arguments {}",
+                json!([
+                    "ps",
+                    "-s",
+                    row.service,
+                    format!("--target-settings-id={id}"),
+                    "--slow-import"
+                ])
+            )
+        })
+    });
+    Err(SlowImportRequired {
+        message,
+        live_scope,
+    }
+    .into())
 }
 
 fn protected_write_rows(rows: &[EditorPropertyChange]) -> Vec<Value> {
@@ -4170,7 +4419,7 @@ fn apply_deferred_native_rows(
     };
     let mut transaction = None;
     let result = (|| {
-        transaction = EditorTransaction::begin(bridge, &changes, None, guard)?;
+        transaction = EditorTransaction::begin(bridge, &changes, None, guard, None)?;
         let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
         let applied = send_editor_change_batches(bridge, &changes, None, transaction_id)?;
         let follow_up = applied.summary;
@@ -4250,7 +4499,7 @@ fn apply_editor_change_with_warm_bridge(
         );
         return Ok(summary);
     }
-    let mut transaction = EditorTransaction::begin(bridge, &changes, None, None)?;
+    let mut transaction = EditorTransaction::begin(bridge, &changes, None, None, None)?;
     let result = (|| {
         let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
         let mut summary =
@@ -6523,37 +6772,33 @@ mod sync_tests {
         };
         let mut rows = vec![row; MAX_INDIVIDUAL_IMPORT_WRITES / 2];
         let failed = ServiceReaderFallback::DiscoveryFailed("ambiguous reader".into());
-        assert!(
-            !check_import_route(&rows, Some(&failed), false, true, false, || panic!()).unwrap()
-        );
+        assert!(!check_import_route(&rows, Some(&failed), false, true, || panic!()).unwrap());
         rows.push(EditorPropertyChange {
             class_name: "Other".into(),
             properties: Map::from_iter([("SavedC".into(), json!(0))]),
             ..Default::default()
         });
-        let error = check_import_route(&rows, Some(&failed), false, true, false, || true)
+        let error = check_import_route(&rows, Some(&failed), false, false, || panic!())
             .unwrap_err()
             .to_string();
         assert!(error.contains("ambiguous reader"));
         assert!(error.contains("1.0 s at 31 ms per field"));
         assert!(error.contains("--slow-import"));
-        assert!(error.contains("--yes approves writing the local place file offline"));
         assert!(!error.contains("rbx ps --yes"));
         assert!(error.contains("33 individual supplemental field writes (limit 32)"));
         assert!(error.contains("Example.SavedA (16)"));
         assert!(error.contains("Other.SavedC (1)"));
-        assert!(check_import_route(&rows, Some(&failed), false, true, true, || true).unwrap());
-        let unknown =
-            check_import_route(&rows, Some(&failed), false, true, true, || false).unwrap_err();
+        assert!(check_import_route(&rows, Some(&failed), false, true, || true).unwrap());
+        let unknown = check_import_route(&rows, Some(&failed), false, true, || false).unwrap_err();
         assert!(unknown.is::<SlowImportRequired>());
         let unknown = unknown.to_string();
-        assert!(unknown.contains("Studio may report protected writes"));
+        assert!(unknown.contains("Studio may report additional protected writes"));
         assert!(!unknown.contains("31 ms"));
-        assert!(unknown.contains("rbx ps <affected-store> -i <settings-id> --slow-import"));
+        assert!(unknown.contains("Add --slow-import"));
         let individual =
-            check_import_route(&rows, Some(&failed), false, false, true, || panic!()).unwrap_err();
+            check_import_route(&rows, Some(&failed), false, false, || panic!()).unwrap_err();
         assert!(individual.to_string().contains("1.0 s at 31 ms"));
-        assert!(!check_import_route(&rows, Some(&failed), true, true, false, || panic!()).unwrap());
+        assert!(!check_import_route(&rows, Some(&failed), true, true, || panic!()).unwrap());
         for fallback in [
             None,
             Some(ServiceReaderFallback::Platform),
@@ -6561,8 +6806,7 @@ mod sync_tests {
             Some(ServiceReaderFallback::PackageRoots),
         ] {
             assert!(
-                !check_import_route(&rows, fallback.as_ref(), false, true, false, || panic!())
-                    .unwrap()
+                !check_import_route(&rows, fallback.as_ref(), false, true, || panic!()).unwrap()
             );
         }
     }
@@ -7526,6 +7770,13 @@ mod saved_field_review_tests {
     fn reviewing_bridge(
         decision: &'static str,
     ) -> (BridgeServer, Arc<Mutex<Vec<Value>>>, JoinHandle<()>) {
+        reviewing_bridge_with_offline(decision, decision)
+    }
+
+    fn reviewing_bridge_with_offline(
+        decision: &'static str,
+        offline: &'static str,
+    ) -> (BridgeServer, Arc<Mutex<Vec<Value>>>, JoinHandle<()>) {
         let bridge = fixture();
         let stream = connect(&bridge, 0, edit_info("saved-field-review", 21));
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -7542,9 +7793,34 @@ mod saved_field_review_tests {
                     "requestEditorPushReview" => {
                         json!({ "required": true, "reviewId": "studio-1" })
                     }
-                    "getEditorPushReviewDecision" => {
-                        json!({ "decided": true, "decision": decision })
+                    "applyEditorChanges" if decision == "count" => {
+                        let params = &request["params"];
+                        let mut writes = Vec::new();
+                        for row in params["propertyChanges"].as_array().into_iter().flatten() {
+                            for (name, value) in row["properties"].as_object().into_iter().flatten()
+                            {
+                                writes.push(json!({"index": writes.len()+1,"className":row["className"],
+                                    "pathSegments":row["pathSegments"],"pathOrdinals":row["pathOrdinals"],
+                                    "name":name,"value":value}));
+                            }
+                        }
+                        if params["verifyOnly"] == true {
+                            // The fixture can only confirm fields already checked by the writer.
+                            json!({"ok":true, "verifyOnly":true, "errors":0, "verified":0,
+                                "verifyMismatches":writes.iter().map(|w| w["name"].clone()).collect::<Vec<_>>()})
+                        } else {
+                            json!({"ok":true,"propertyUpdated":writes.len(),"nativeRootWrites":writes})
+                        }
                     }
+                    "requestProtectedWriteReview" => json!({"required":true,"reviewId":"offline"}),
+                    "getEditorPushReviewDecision" => {
+                        json!({ "decided": true, "decision": if request["params"]["reviewId"] == "offline" {offline} else {decision} })
+                    }
+                    "rollbackEditorTransaction" => json!({"state":"rolledBack"}),
+                    "commitEditorTransaction" if request["params"]["prepareOnly"] == true => {
+                        json!({"state":"prepared","committed":false})
+                    }
+                    "commitEditorTransaction" => json!({"state":"committed","committed":true}),
                     _ => json!({}),
                 };
                 seen.lock().unwrap().push(request.clone());
@@ -7612,8 +7888,13 @@ mod saved_field_review_tests {
         let mut filtered = row.clone();
         filtered["name"] = json!("RBX_Ignored");
         let mut summary = Map::from_iter([("protectedWrites".into(), json!([row]))]);
-        let pending =
-            pending_protected_writes(&bridge, &mut summary, vec![row, current, filtered], 3);
+        let pending = pending_protected_writes(
+            &bridge,
+            &mut summary,
+            vec![row, current, filtered],
+            3,
+            PLACE_FILE.path,
+        );
         assert_eq!(pending.supplemental, 1);
         assert_eq!(pending.writes.len(), 2);
     }
@@ -7666,6 +7947,7 @@ mod saved_field_review_tests {
                 finalize_settings: None,
             },
             |_| Ok(true),
+            PLACE_FILE,
         )
         .unwrap_err();
         assert!(error.to_string().contains("reader mismatch"), "{error:#}");
@@ -7687,10 +7969,12 @@ mod saved_field_review_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn planned_fallback_holds_a_large_review_before_opening_the_store() {
-        let root = project_with_threshold_zero("review-before-import-build");
-        let (bridge, calls, plugin) = reviewing_bridge("skip");
+    fn push_reviewed_offline_import(decision: &'static str, snapshot_fails: bool, count: usize) {
+        let root = project_with_threshold_zero("review-offline-before-import");
+        let path = root.join("local.rbxlx");
+        fs::write(&path, r#"<roblox version="4"></roblox>"#).unwrap();
+        let (bridge, calls, plugin) = reviewing_bridge_with_offline("apply", decision);
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut args = PushEditorChangesArgs::new(
             ProjectSourceArgs {
                 project_root: root.clone(),
@@ -7698,30 +7982,41 @@ mod saved_field_review_tests {
             },
             BridgeConnectionArgs::local(0.1),
         );
-        args.disable_service_reader = true;
-        args.review_report = true;
+        args.review_report = count > MAX_INDIVIDUAL_IMPORT_WRITES;
+        args.mutation_started = Some(Arc::clone(&started));
+        let mut import = super::sync_tests::replacement_fixture();
+        import.fallback_reason = Some(ServiceReaderFallback::DiscoveryFailed(
+            "reader unavailable".into(),
+        ));
         let service = "ReplicatedStorage";
-        let changes = EditorChangeSet {
-            instance_changes: vec![EditorInstanceChange {
-                mode: "reconcileService".into(),
+        let mut properties = (0..count)
+            .map(|i| EditorPropertyChange {
                 service: service.into(),
+                settings_id: Some(format!("part{i}")),
+                path_segments: vec![service.into(), format!("Surface{i}")],
+                class_name: "SurfaceAppearance".into(),
+                properties: Map::from_iter([("TexturePack".into(), json!(format!("value{i}")))]),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        properties.push(EditorPropertyChange {
+            service: "Workspace".into(),
+            path_segments: vec!["Workspace".into(), "OutsideImport".into()],
+            class_name: "MaterialVariant".into(),
+            properties: Map::from_iter([("TexturePack".into(), json!("requested"))]),
+            ..Default::default()
+        });
+        let changes = EditorChangeSet {
+            property_changes: properties,
+            instance_changes: vec![EditorInstanceChange {
+                service: service.into(),
+                mode: "reconcileService".into(),
                 allow_deletes: true,
-                instances: vec![],
-                preserve_instances: vec![],
+                instances: Vec::new(),
+                preserve_instances: Vec::new(),
             }],
-            property_changes: vec![
-                EditorPropertyChange {
-                    service: service.into(),
-                    class_name: "Folder".into(),
-                    path_segments: vec![service.into(), "Folder".into()],
-                    properties: Map::from_iter([("Archivable".into(), json!(true))]),
-                    ..Default::default()
-                };
-                MAX_INDIVIDUAL_IMPORT_WRITES + 1
-            ],
             ..Default::default()
         };
-        // There is no store to encode. The review must still return the hold.
         let result = push_with_root_availability(
             args,
             &bridge,
@@ -7729,28 +8024,340 @@ mod saved_field_review_tests {
             CollectedPushOptions {
                 started: Instant::now(),
                 projection: None,
-                prepared_binary_import: None,
+                prepared_binary_import: Some(import),
                 guard: None,
                 validate_project: None,
                 finalize_settings: None,
             },
-            |_| panic!("unexpected individual write preparation"),
+            |_| Ok(true),
+            PlaceFileAccess {
+                path: &|_| Some(path.clone()),
+                pending: &|bridge, summary, rows, suffix| {
+                    if started.load(std::sync::atomic::Ordering::Acquire) && !snapshot_fails {
+                        // The first protected value now agrees, but the supplemental rows still need the approved snapshot.
+                        assert_eq!(rows.len(), 1);
+                        PendingProtectedWrites {
+                            writes: Vec::new(),
+                            supplemental: 0,
+                        }
+                    } else {
+                        pending_protected_writes(bridge, summary, rows, suffix, &|_| {
+                            Some(path.clone())
+                        })
+                    }
+                },
+                apply: &|_, _, rows, commit| {
+                    assert_eq!(rows.len(), count + usize::from(snapshot_fails));
+                    if snapshot_fails {
+                        bail!("snapshot writer unavailable")
+                    }
+                    commit()?;
+                    Ok(json!({"successor":"reopened"}))
+                },
+            },
+        );
+        let calls = calls.lock().unwrap().clone();
+        let methods: Vec<_> = calls
+            .iter()
+            .map(|r| r["method"].as_str().unwrap())
+            .collect();
+        let review = methods
+            .iter()
+            .position(|m| *m == "requestEditorPushReview")
+            .unwrap();
+        let panel = methods
+            .iter()
+            .position(|m| *m == "requestProtectedWriteReview")
+            .unwrap();
+        assert!(review < panel);
+        assert_eq!(calls[review]["params"]["report"], false);
+        assert_eq!(
+            calls[panel]["params"]["rows"].as_array().unwrap().len(),
+            count + 1
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| **m == "requestProtectedWriteReview")
+                .count(),
+            1
+        );
+        if decision == "skip" {
+            assert_eq!(result.unwrap()["skippedByReview"], true);
+            assert!(!methods.contains(&"beginEditorTransaction"));
+            assert!(!started.load(std::sync::atomic::Ordering::Acquire));
+        } else {
+            assert!(
+                methods
+                    .iter()
+                    .position(|m| *m == "beginEditorTransaction")
+                    .unwrap()
+                    > panel
+            );
+            if snapshot_fails {
+                let error = result.unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("snapshot writer unavailable"),
+                    "{error:#}"
+                );
+                assert!(methods.contains(&"rollbackEditorTransaction"));
+                assert!(!started.load(std::sync::atomic::Ordering::Acquire));
+            } else {
+                let summary = result.unwrap();
+                assert_eq!(summary["supplementalImportWrites"], 0);
+                assert_eq!(summary["supplementalImportOfflineWrites"], count);
+                assert_eq!(summary["protectedOfflineApply"]["successor"], "reopened");
+            }
+        }
+        drop(bridge);
+        plugin.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn declining_reviewed_offline_import_leaves_studio_untouched() {
+        push_reviewed_offline_import("skip", false, 33);
+        push_reviewed_offline_import("skip", false, 1);
+    }
+
+    // On Linux the transaction uses just the bridge; its place-file I/O is supplied above.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_approval_carries_import_rows_and_snapshot_failure_rolls_back_the_push() {
+        push_reviewed_offline_import("apply", false, 33);
+        push_reviewed_offline_import("apply", true, 33);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opted_in_push_counts_successful_individual_writes_and_keeps_both_batch_proofs() {
+        use crate::editor::native_roots::RECORDED_WRITES;
+        let root = project_with_threshold_zero("count-individual-writes");
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            RECORDED_WRITES.replace(None);
+            let _ = fs::remove_dir_all(&root);
+        });
+        RECORDED_WRITES.replace(Some(Vec::new()));
+        let (bridge, calls, plugin) = reviewing_bridge("count");
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: "src".into(),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.slow_import = true;
+        args.yes = true;
+        let mut import = super::sync_tests::replacement_fixture();
+        import.fallback_reason = Some(ServiceReaderFallback::DiscoveryFailed("no reader".into()));
+        let service = "ReplicatedStorage";
+        let properties = (0..33)
+            .map(|i| EditorPropertyChange {
+                service: service.into(),
+                settings_id: Some(format!("part{i}")),
+                class_name: "SurfaceAppearance".into(),
+                path_ordinals: vec![1, 1],
+                path_segments: vec![service.into(), format!("Surface{i}")],
+                properties: Map::from_iter([(
+                    "TexturePack".into(),
+                    json!(format!("rbxassetid://{}", i + 1)),
+                )]),
+                ..Default::default()
+            })
+            .collect();
+        let changes = EditorChangeSet {
+            property_changes: properties,
+            instance_changes: vec![EditorInstanceChange {
+                service: service.into(),
+                mode: "reconcileService".into(),
+                allow_deletes: true,
+                instances: vec![],
+                preserve_instances: vec![],
+            }],
+            ..Default::default()
+        };
+        let summary = push_with_root_availability(
+            args,
+            &bridge,
+            changes,
+            CollectedPushOptions {
+                started: Instant::now(),
+                projection: None,
+                prepared_binary_import: Some(import),
+                guard: None,
+                validate_project: None,
+                finalize_settings: None,
+            },
+            |_| Ok(true),
+            PLACE_FILE,
         )
         .unwrap();
-        assert_eq!(result["heldForReview"], true);
-        let methods = calls
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|r| r["method"].clone())
-            .collect::<Vec<_>>();
+        assert_eq!(summary["supplementalImportWrites"], 33);
+        assert!(summary.get("supplementalImportOfflineWrites").is_none());
+        let writes = RECORDED_WRITES.replace(Some(vec![])).unwrap();
+        assert_eq!(writes.len(), 33);
+        for (i, w) in writes.iter().enumerate() {
+            assert_eq!(
+                *w,
+                json!([
+                    [service, format!("Surface{i}")],
+                    "TexturePack",
+                    format!("rbxassetid://{}", i + 1)
+                ])
+            );
+        }
+        let row = |class: &str, name: &str| EditorPropertyChange {
+            service: class.into(),
+            class_name: class.into(),
+            path_segments: vec![class.into()],
+            path_ordinals: vec![1],
+            properties: Map::from_iter([(name.into(), json!(true))]),
+            ..Default::default()
+        };
+        let changes = EditorChangeSet {
+            property_changes: vec![
+                row("MaterialService", "Use2022Materials"),
+                row("Lighting", "PrioritizeLightingQuality"),
+            ],
+            ..Default::default()
+        };
+        let batch = send_editor_change_batches(&bridge, &changes, None, Some("proof")).unwrap();
+        assert_eq!(batch.individual_dispatches, 2);
         assert_eq!(
-            methods,
+            batch.summary["fieldVerifiedServices"],
+            json!(["Lighting", "MaterialService"])
+        );
+        assert_eq!(
+            RECORDED_WRITES.take().unwrap(),
             [
-                json!("getEditorMutationPackages"),
-                json!("requestEditorPushReview")
+                json!([["MaterialService"], "Use2022Materials", true]),
+                json!([["Lighting"], "PrioritizeLightingQuality", true])
             ]
         );
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r["params"]["verifyOnly"] == true)
+        );
+        drop(bridge);
+        plugin.join().unwrap();
+    }
+
+    #[test]
+    fn reviews_that_cannot_reach_the_cap_hold_before_reader_selection_or_encoding() {
+        use crate::studio::native::import::SELECTION_CALLS;
+        for (disabled, count) in [(true, 33), (false, MAX_INDIVIDUAL_IMPORT_WRITES)] {
+            let selections = SELECTION_CALLS.get();
+            let root = project_with_threshold_zero("review-before-import-build");
+            let (bridge, calls, plugin) = reviewing_bridge("skip");
+            let mut args = PushEditorChangesArgs::new(
+                ProjectSourceArgs {
+                    project_root: root.clone(),
+                    src_root: "src".into(),
+                },
+                BridgeConnectionArgs::local(0.1),
+            );
+            args.disable_service_reader = disabled;
+            args.review_report = true;
+            let service = "ReplicatedStorage";
+            let changes = EditorChangeSet {
+                instance_changes: vec![EditorInstanceChange {
+                    mode: "reconcileService".into(),
+                    service: service.into(),
+                    allow_deletes: true,
+                    instances: vec![],
+                    preserve_instances: vec![],
+                }],
+                property_changes: vec![
+                    EditorPropertyChange {
+                        service: service.into(),
+                        class_name: "SurfaceAppearance".into(),
+                        path_segments: vec![service.into(), "Folder".into()],
+                        properties: Map::from_iter([("TexturePack".into(), json!("uri"))]),
+                        ..Default::default()
+                    };
+                    count
+                ],
+                ..Default::default()
+            };
+            // There is no store to encode. The review must still return the hold.
+            let result = push_with_root_availability(
+                args,
+                &bridge,
+                changes,
+                CollectedPushOptions {
+                    started: Instant::now(),
+                    projection: None,
+                    prepared_binary_import: None,
+                    guard: None,
+                    validate_project: None,
+                    finalize_settings: None,
+                },
+                |_| panic!("unexpected individual write preparation"),
+                PLACE_FILE,
+            )
+            .unwrap();
+            assert_eq!(result["heldForReview"], true);
+            assert_eq!(SELECTION_CALLS.get(), selections);
+            let methods = calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r["method"].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                methods,
+                [
+                    json!("getEditorMutationPackages"),
+                    json!("requestEditorPushReview")
+                ]
+            );
+            drop(bridge);
+            plugin.join().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_push_checks_saved_field_ownership_before_it_starts_a_transaction() {
+        let root = project_with_threshold_zero("saved-field-origin");
+        let (bridge, calls, plugin) = reviewing_bridge("apply");
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: "src".into(),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        args.yes = true;
+        args.saved_fields = Some(Arc::new(crate::editor::types::PushSavedFields {
+            project: root.clone(),
+            runtime: "different-runtime".into(),
+            fields: vec![],
+        }));
+        let error = push_editor_changes_with_collected(
+            args,
+            &bridge,
+            EditorChangeSet::default(),
+            CollectedPushOptions {
+                started: Instant::now(),
+                projection: None,
+                prepared_binary_import: Some(super::sync_tests::replacement_fixture()),
+                guard: None,
+                validate_project: None,
+                finalize_settings: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("different project or Studio runtime"),
+            "{error:#}"
+        );
+        assert!(calls.lock().unwrap().is_empty());
         drop(bridge);
         plugin.join().unwrap();
         fs::remove_dir_all(root).unwrap();
@@ -7828,23 +8435,6 @@ mod saved_field_review_tests {
     }
 
     #[test]
-    fn slow_import_requires_a_daemon_that_advertises_it() {
-        for reply in [
-            json!({}),
-            json!({"slowImport":false}),
-            json!({"slowImport":"yes"}),
-        ] {
-            assert!(
-                require_slow_import_capability(&reply)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("daemon is older")
-            );
-        }
-        require_slow_import_capability(&crate::automation::capabilities().unwrap()).unwrap();
-    }
-
-    #[test]
     fn compound_commands_accept_the_opt_in_only_with_their_push() {
         use crate::cli::{Cli, Commands};
         use clap::{FromArgMatches, Parser};
@@ -7877,6 +8467,63 @@ mod saved_field_review_tests {
     }
 
     #[test]
+    fn push_negotiates_import_options_and_sends_once_even_on_capability_timeout() {
+        let root = project_with_threshold_zero("push-capabilities");
+        for (slow, disable, support, ack, error_text) in [
+            (true, false, Some(false), false, Some("daemon is older")),
+            (
+                false,
+                true,
+                Some(false),
+                false,
+                Some("ignores RENIUM_NATIVE_SERVICE_IMPORT=0"),
+            ),
+            (true, true, None, false, Some("capability check timed out")),
+            (true, false, None, true, None),
+            (false, true, Some(true), false, None),
+        ] {
+            let mut args = PushEditorChangesArgs::new(
+                ProjectSourceArgs {
+                    project_root: root.clone(),
+                    src_root: "src".into(),
+                },
+                BridgeConnectionArgs::local(0.1),
+            );
+            args.slow_import = slow;
+            args.disable_service_reader = disable;
+            let mut calls = Vec::new();
+            let result = push_editor_changes_via(args, |op, project, params, _| {
+                calls.push(op);
+                if op == op::CAP {
+                    assert!(project.is_none());
+                    return support
+                        .map(|s| json!({"slowImport":s}))
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+                }
+                assert_eq!(project, Some(root.as_path()));
+                assert_eq!(params["slowImport"] == true, slow);
+                assert_eq!(params["disableServiceReader"] == true, disable);
+                assert_eq!(params["confirmImportOptions"], true);
+                Ok(json!({"unchanged":true, "confirmedImportOptions":ack}))
+            })
+            .unwrap();
+            assert_eq!(calls, [op::CAP, op::PUSH]);
+            assert_eq!(result["unchanged"], true);
+            assert!(result.get("confirmedImportOptions").is_none());
+            match error_text {
+                Some(text) => assert!(
+                    result["importOptionWarning"]
+                        .as_str()
+                        .unwrap()
+                        .contains(text)
+                ),
+                None => assert!(result.get("importOptionWarning").is_none()),
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn offline_saved_fields_require_the_originating_place_and_its_connected_successor() {
         let root = project_with_threshold_zero("saved-fields-reopen");
         let (bridge, calls, plugin) = reviewing_bridge("skip");
@@ -7906,6 +8553,26 @@ mod saved_field_review_tests {
         apply_saved_field_differences(&saved, &root, &bridge, &mut summary, Some(&receipt))
             .unwrap();
         assert!(summary.contains_key("unsupportedProperties"));
+        let mut writable = saved.clone();
+        writable.fields[0].ambiguous = false;
+        let mut seen = Vec::new();
+        apply_saved_field_writes(
+            &writable,
+            &root,
+            &bridge,
+            &mut summary,
+            Some(&receipt),
+            |runtime, field| {
+                seen.push((runtime.to_owned(), field.label()));
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            [("saved-field-review".to_owned(), writable.fields[0].label())]
+        );
+        assert_eq!(summary["savedFieldsApplied"], 1);
         for (key, wrong) in [
             ("previousRuntimeId", "another-project-runtime"),
             ("reopenedRuntimeId", "disconnected"),

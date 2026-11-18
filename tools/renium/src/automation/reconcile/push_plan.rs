@@ -6,7 +6,7 @@ pub(crate) struct StagedPushResult {
 }
 
 #[derive(Debug)]
-pub(super) struct SkippedPushReview;
+pub(crate) struct SkippedPushReview;
 
 impl std::fmt::Display for SkippedPushReview {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -94,10 +94,6 @@ pub(crate) fn push_staged_project(
     bridge: &BridgeServer,
     request: StagedPushRequest<'_>,
 ) -> Result<StagedPushResult> {
-    #[cfg(all(test, any(windows, target_os = "macos")))]
-    if let Some(result) = super::push_flow_tests::mutation(context, &request) {
-        return result;
-    }
     let StagedPushRequest {
         plan,
         prepared_documents,
@@ -196,6 +192,10 @@ pub(crate) fn push_staged_project(
         .filter(|(service, _)| plan.initial_native_services.contains(*service))
         .map(|(service, document)| (service.clone(), Arc::clone(document)))
         .collect::<HashMap<_, _>>();
+    #[cfg(all(test, any(windows, target_os = "macos")))]
+    if let Some(result) = super::push_flow_tests::mutation(context, &push_args, &plan) {
+        return result;
+    }
     let mut generated = ProjectSnapshot::default();
     let summary = push_reconciled_editor_changes_with_warm_bridge(
         push_args,

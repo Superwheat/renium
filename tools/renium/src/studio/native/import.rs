@@ -47,6 +47,10 @@ use crate::system::files::{
 #[path = "import_payload.rs"]
 mod payload;
 
+#[cfg(test)]
+#[path = "import_route_tests.rs"]
+mod import_route_tests;
+
 #[derive(Clone)]
 struct PendingEditorBinaryGroup {
     service: String,
@@ -2355,22 +2359,34 @@ fn reader_fallback(
         .map(|error| ServiceReaderFallback::DiscoveryFailed(format!("{error:#}")))
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SELECTION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn service_reader_disabled(args: &PushEditorChangesArgs) -> bool {
+    args.disable_service_reader
+        || std::env::var_os("RENIUM_NATIVE_SERVICE_IMPORT").is_some_and(|value| value == "0")
+}
+
 pub(crate) fn select_editor_binary_import(
     args: &PushEditorChangesArgs,
     changes: &EditorChangeSet,
     bridge: &BridgeServer,
 ) -> Result<Option<BinaryImportSelection>> {
+    #[cfg(test)]
+    SELECTION_CALLS.set(SELECTION_CALLS.get() + 1);
     let mut services = native_import_services(changes);
     let additive_roots = additive_native_roots(changes, &services);
     services.extend(additive_roots.keys().cloned());
     if services.is_empty() {
         return Ok(None);
     }
-    let disabled = args.disable_service_reader
-        || std::env::var_os("RENIUM_NATIVE_SERVICE_IMPORT").is_some_and(|value| value == "0");
+    let disabled = service_reader_disabled(args);
     let fallback_reason = reader_fallback(cfg!(windows), disabled, || {
         #[cfg(windows)]
         {
+            let _span = crate::app::profile::span("native service reader preflight");
             let pid = crate::editor::review::studio_pid_for_bridge(bridge)?;
             crate::studio::native::serializer::prepare_service_reader(pid)
         }

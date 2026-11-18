@@ -753,8 +753,27 @@ fn studio_skipped_native_task(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains("0xE40F"))
 }
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    pub(crate) static RECORDED_WRITES: std::cell::RefCell<Option<Vec<serde_json::Value>>> = const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(not(any(windows, target_os = "macos")))]
-fn apply_write(_: &BridgeServer, _: &str, _: &RootWrite, _: &str) -> Result<()> {
+fn apply_write(_: &BridgeServer, _: &str, _write: &RootWrite, _: &str) -> Result<()> {
+    #[cfg(all(test, target_os = "linux"))]
+    if RECORDED_WRITES.with_borrow_mut(|writes| {
+        if let Some(writes) = writes {
+            writes.push(serde_json::json!([
+                _write.path_segments,
+                _write.name,
+                _write.value
+            ]));
+            return true;
+        }
+        false
+    }) {
+        return Ok(());
+    }
     anyhow::bail!("Native root property sync requires Windows or macOS")
 }
 

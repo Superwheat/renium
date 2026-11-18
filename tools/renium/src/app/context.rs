@@ -65,6 +65,12 @@ pub(crate) fn select_automation(
     project: PathBuf,
     place: Option<String>,
 ) -> Selection {
+    // A test with a thread-local mock Studio also stages nested requests on
+    // that thread. Its temporary project must never select a peer for another test.
+    #[cfg(test)]
+    if THREAD_SELECTED.with(|selected| selected.borrow().is_some()) {
+        return select_automation_for_thread(runtime, project, place);
+    }
     Selection(Restore::Process(std::mem::replace(
         &mut *SELECTED.lock_recover(),
         SelectedContext {

@@ -7,7 +7,11 @@ use std::thread;
 use tungstenite::{Message, WebSocket, protocol::Role};
 
 type Capture = Box<dyn FnOnce(&BoundContext) -> Result<ProjectSnapshot>>;
-type Mutation = Box<dyn FnOnce(&BoundContext, &StagedPushRequest<'_>) -> Result<StagedPushResult>>;
+struct MutationInput<'a> {
+    plan: &'a ReconcilePushPlan,
+    args: &'a PushEditorChangesArgs,
+}
+type Mutation = Box<dyn FnOnce(&BoundContext, MutationInput<'_>) -> Result<StagedPushResult>>;
 thread_local! {
     static CAPTURES: RefCell<VecDeque<Capture>> = RefCell::new(VecDeque::new());
     static MUTATION: RefCell<Option<Mutation>> = RefCell::new(None);
@@ -21,14 +25,16 @@ pub(super) fn capture(context: &BoundContext) -> Option<Result<ProjectSnapshot>>
 
 pub(super) fn mutation(
     context: &BoundContext,
-    request: &StagedPushRequest<'_>,
+    args: &PushEditorChangesArgs,
+    plan: &ReconcilePushPlan,
 ) -> Option<Result<StagedPushResult>> {
     MUTATION
         .with(|slot| slot.borrow_mut().take())
-        .map(|mutation| mutation(context, request))
+        .map(|mutation| mutation(context, MutationInput { args, plan }))
 }
 
 pub(super) struct Fixture {
+    _selection: crate::app::context::Selection,
     pub(super) context: BoundContext,
     pub(super) bridge: Option<BridgeServer>,
     service: String,
@@ -124,6 +130,7 @@ impl Fixture {
                 .push_back(Box::new(|_| Ok(ProjectSnapshot::default())))
         });
         Ok(Self {
+            _selection: bound_context::select_for_thread(&context),
             context,
             service: service_name.into(),
             bridge: Some(bridge),
@@ -221,12 +228,19 @@ fn refused_staged_push_discards_only_its_undo_entry_and_opt_in_survives_staging(
         fs::create_dir_all(&previous)?;
         fs::write(previous.join("keep"), "previous undo")?;
         MUTATION.with(|slot| {
-            *slot.borrow_mut() = Some(Box::new(move |_, request| {
+            *slot.borrow_mut() = Some(Box::new(move |context, request| {
+                assert_ne!(request.args.project.project_root, Path::new(&context.root));
+                assert_eq!(
+                    request.args.link_project_root.as_deref(),
+                    Some(Path::new(&context.root))
+                );
+                assert!(!request.args.changed_paths.is_empty());
                 assert_eq!(request.args.slow_import, allow);
                 if !request.args.slow_import {
-                    return Err(crate::editor::sync::SlowImportRequired(
-                        "simulated reader failure".into(),
-                    )
+                    return Err(crate::editor::sync::SlowImportRequired {
+                        message: "simulated reader failure".into(),
+                        live_scope: None,
+                    }
                     .into());
                 }
                 let mut accepted = summary(false);
@@ -252,6 +266,123 @@ fn refused_staged_push_discards_only_its_undo_entry_and_opt_in_survives_staging(
             assert!(!import_settle::pending(&fixture.context));
         }
         assert_eq!(fs::read_to_string(previous.join("keep"))?, "previous undo");
+    }
+    Ok(())
+}
+
+#[test]
+fn staged_push_keeps_undo_only_if_the_mutation_may_have_started() -> Result<()> {
+    for result in ["held", "skipped", "preflight", "unknown outcome"] {
+        let fixture = Fixture::new()?;
+        MUTATION.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |_, args| {
+                if result == "held" {
+                    return Ok(StagedPushResult {
+                        generated: ProjectSnapshot::default(),
+                        summary: Map::from_iter([("heldForReview".into(), json!(true))]),
+                    });
+                }
+                if result == "skipped" {
+                    return Err(SkippedPushReview.into());
+                }
+                if result == "unknown outcome" {
+                    args.args
+                        .mutation_started
+                        .as_ref()
+                        .unwrap()
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                bail!("{result}")
+            }));
+        });
+        let response = fixture.run();
+        if result == "held" {
+            assert_eq!(response?["heldForReview"], true);
+        } else {
+            assert!(response.is_err());
+        }
+        let directory = Path::new(&fixture.context.root).join(".renium/editor-history/sync");
+        assert_eq!(
+            fs::read_dir(directory)?.count(),
+            usize::from(result == "unknown outcome"),
+            "{result}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn both_live_coordinator_paths_remove_undo_on_an_uncommitted_refusal() -> Result<()> {
+    for incremental in [false, true] {
+        let mut fixture = Fixture::new()?;
+        fixture.context.experience.clone_from(&fixture.context.root);
+        let root = Path::new(&fixture.context.root);
+        let context = &fixture.context;
+        let bridge = fixture.bridge.as_ref().unwrap();
+        let coordinator = Coordinator::default();
+        let mut setup = coordinator.prepare(
+            context,
+            bridge,
+            PairConfiguration {
+                mode: PairMode::Reconcile,
+                conflict_preference: ConflictPreference::Editor,
+                resolution_preference: Some(ConflictPreference::Editor),
+                decisions: Default::default(),
+                runtime_settings: Map::new(),
+            },
+        )?;
+        let mut record = load_record(context, &setup.key)?.unwrap();
+        record.baseline = Some(StoredSnapshot::write(
+            root,
+            &setup.key,
+            &ProjectSnapshot::default(),
+        )?);
+        write_record(context, &setup.key, &record)?;
+        let undo = root.join(".renium/editor-history/sync");
+        let previous = undo.join("previous");
+        fs::create_dir_all(&previous)?;
+        MUTATION.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|_, request| {
+                assert!(
+                    !request
+                        .args
+                        .mutation_started
+                        .as_ref()
+                        .unwrap()
+                        .load(std::sync::atomic::Ordering::Acquire)
+                );
+                bail!("fixture preflight refusal")
+            }))
+        });
+        let error = if incremental {
+            let path = fixture
+                .desired
+                .entries
+                .keys()
+                .find(|p| p.extension().is_some_and(|ext| ext == "renium"))
+                .unwrap();
+            coordinator
+                .push_editor_changes(
+                    context,
+                    &setup.key,
+                    bridge,
+                    std::slice::from_ref(path),
+                    None,
+                )
+                .err()
+        } else {
+            coordinator
+                .reconcile_with_gate_held(context, bridge, &mut setup)
+                .err()
+        }
+        .context("expected a staged refusal")?;
+        assert!(
+            error.to_string().contains("fixture preflight refusal"),
+            "{error:#}"
+        );
+        assert!(MUTATION.with(|slot| slot.borrow().is_none()));
+        assert!(previous.is_dir());
+        assert_eq!(fs::read_dir(undo)?.count(), 1);
     }
     Ok(())
 }

@@ -597,11 +597,13 @@ impl Coordinator {
             }
         } else {
             let phase = Instant::now();
-            let history = sync_history.insert(history::SyncHistory::begin(
+            let mut args = automation_push_args(context, &json!({ "yes": true }), false)?;
+            sync_history = Some(history::SyncHistory::begin_push(
                 Path::new(&context.root),
                 &bound_context::source_dir(context)?,
                 &studio,
                 &changes.studio,
+                &mut args,
             )?);
             apply_snapshot_paths(&stage.project_root, &changes.studio, &merged)?;
             log_reconcile_timing("staged project write", phase);
@@ -614,12 +616,11 @@ impl Coordinator {
                     plan: push_plan,
                     prepared_documents: HashMap::new(),
                     guard: Some(&studio_guard),
-                    args: automation_push_args(context, &json!({ "yes": true }), false)?,
+                    args,
                     expected_project: Some(&editor),
                     later_edits_follow: true,
                 },
-            )
-            .map_err(|error| history.discard_if_refused(error))?
+            )?
             .generated;
             // Studio now holds the project's content for these paths. Record
             // that before anything else can fail, or the next reconcile would
@@ -1093,7 +1094,9 @@ impl Coordinator {
         apply_snapshot_paths(&stage.project_root, &changed, &current)?;
         log_reconcile_timing("incremental staged write", phase);
         let phase = Instant::now();
-        let mut history = history::SyncHistory::begin(root, &source, &previous, &changed)?;
+        let mut args = automation_push_args(context, &json!({ "yes": true }), false)?;
+        let mut history =
+            history::SyncHistory::begin_push(root, &source, &previous, &changed, &mut args)?;
         let StagedPushResult {
             generated,
             mut summary,
@@ -1105,12 +1108,11 @@ impl Coordinator {
                 plan,
                 prepared_documents,
                 guard,
-                args: automation_push_args(context, &json!({ "yes": true }), false)?,
+                args,
                 expected_project: None,
                 later_edits_follow: false,
             },
-        )
-        .map_err(|error| history.discard_if_refused(error))?;
+        )?;
         summary.insert(
             "historyId".into(),
             Value::String(history.commit(&current, &generated)?),

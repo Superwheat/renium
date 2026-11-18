@@ -8,6 +8,7 @@ use crate::project::sourcemap::generate_project_sourcemap_at;
 pub(crate) struct SyncHistory {
     directory: PathBuf,
     record: SyncHistoryRecord,
+    mutation_started: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Undo data for project files a Studio export replaced: the backups the
@@ -83,16 +84,18 @@ struct SyncHistoryRecord {
 }
 
 impl SyncHistory {
-    pub(super) fn discard_if_refused(&self, error: anyhow::Error) -> anyhow::Error {
-        if (error.is::<crate::editor::sync::SlowImportRequired>()
-            || error.is::<SkippedPushReview>())
-            && let Err(cleanup) = self.discard_uncommitted()
-        {
-            return error.context(format!(
-                "Failed to discard the refused push's undo record: {cleanup:#}"
-            ));
-        }
-        error
+    pub(super) fn begin_push(
+        root: &Path,
+        source: &Path,
+        before: &ProjectSnapshot,
+        paths: &HashSet<PathBuf>,
+        args: &mut PushEditorChangesArgs,
+    ) -> Result<Self> {
+        let mut history = Self::begin(root, source, before, paths)?;
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        history.mutation_started = Some(Arc::clone(&started));
+        args.mutation_started = Some(started);
+        Ok(history)
     }
 
     pub(super) fn discard_uncommitted(&self) -> Result<()> {
@@ -118,7 +121,11 @@ impl SyncHistory {
     #[cfg(any(windows, target_os = "macos"))]
     pub(super) fn open(directory: PathBuf) -> Result<Self> {
         let record = rmp_serde::from_slice(&fs::read(directory.join("sync.rmp"))?)?;
-        Ok(Self { directory, record })
+        Ok(Self {
+            directory,
+            record,
+            mutation_started: None,
+        })
     }
 
     pub(crate) fn begin(
@@ -155,6 +162,7 @@ impl SyncHistory {
         )?;
         let history = Self {
             directory: directory.clone(),
+            mutation_started: None,
             record: SyncHistoryRecord {
                 version: 1,
                 committed_at: 0,
@@ -196,6 +204,20 @@ impl SyncHistory {
             &self.directory.join("sync.rmp"),
             &rmp_serde::to_vec(&self.record)?,
         )
+    }
+}
+
+impl Drop for SyncHistory {
+    fn drop(&mut self) {
+        if self.record.committed_at == 0
+            && self
+                .mutation_started
+                .as_ref()
+                .is_some_and(|started| !started.load(std::sync::atomic::Ordering::Acquire))
+            && let Err(error) = self.discard_uncommitted()
+        {
+            log_global(2, format_args!("[renium] {error:#}"));
+        }
     }
 }
 
@@ -442,6 +464,7 @@ pub(crate) fn revert_sync(root: &Path, source: &Path, id: &str) -> Result<Revert
     }
     let mut history = SyncHistory {
         record: rmp_serde::from_slice(&fs::read(&record_path)?)?,
+        mutation_started: None,
         directory,
     };
     if history.record.version != 1 || history.record.reverted {

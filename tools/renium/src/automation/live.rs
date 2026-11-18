@@ -1140,7 +1140,7 @@ impl Manager {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
                         log_global(5, format_args!("[renium] live worker failed: {error:#}"));
-                        worker_control.fail(format!("{error:#}"));
+                        worker_control.fail(live_failure_message(&error));
                     }
                     Err(panic) => {
                         let message = panic
@@ -3105,7 +3105,8 @@ impl LiveLoop {
                 self.concurrent_edit_retries = 0;
                 self.control.set_mode(PairMode::Verify);
                 self.control.fail(format!(
-                    "Live sync could not reconcile concurrent changes: {error:#}"
+                    "Live sync could not reconcile changes: {}",
+                    live_failure_message(&error)
                 ));
                 self.push_ready = false;
                 self.rescan_pending = true;
@@ -3377,7 +3378,7 @@ impl LiveLoop {
             return Err(error);
         }
         let retry = failure.0.rt == 1;
-        self.control.fail(failure.0.m);
+        self.control.fail(live_failure_message(&error));
         self.push_ready = retry;
         if retry {
             self.push_retry_delay = next_retry_delay(self.push_retry_delay);
@@ -3710,7 +3711,22 @@ const CONCURRENT_EDIT_RETRY_DELAY: Duration = Duration::from_millis(500);
 // A file or Studio change that landed while a sync pass was staged is
 // ordinary activity (an editor saving, a collaborator moving a part), not a
 // failure: the next pass simply starts from the newer state.
+fn live_failure_message(error: &anyhow::Error) -> String {
+    if let Some(refusal) = error.downcast_ref::<crate::editor::sync::SlowImportRequired>() {
+        return refusal.live_message();
+    }
+    if error.is::<super::reconcile::SkippedPushReview>() {
+        return format!("[review_skipped] {error:#}");
+    }
+    format!("{error:#}")
+}
+
 fn is_concurrent_edit_failure(error: &anyhow::Error) -> bool {
+    if error.is::<crate::editor::sync::SlowImportRequired>()
+        || error.is::<super::reconcile::SkippedPushReview>()
+    {
+        return false;
+    }
     is_concurrent_edit_message(&format!("{error:#}"))
 }
 
@@ -3727,6 +3743,25 @@ pub(crate) fn is_concurrent_edit_message(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_refusals_keep_their_code_and_scope_when_a_diagnostic_mentions_a_race() {
+        let row = crate::editor::sync::SlowImportRequired {
+            message: "Studio changed while preparing the reader; retry the sync".into(),
+            live_scope: Some("rbx ps -s Workspace -i part42 --slow-import".into()),
+        };
+        assert!(!row.to_string().contains("rbx lst"));
+        let scope = row.live_scope.clone().unwrap();
+        let error = anyhow::Error::new(row).context("queued push");
+        assert!(!is_concurrent_edit_failure(&error));
+        let message = live_failure_message(&error);
+        assert!(message.starts_with("[slow_import_required]") && message.contains(&scope));
+        let skip = anyhow::Error::new(super::super::reconcile::SkippedPushReview)
+            .context("Studio changed while preparing; retry the sync");
+        assert!(!is_concurrent_edit_failure(&skip));
+        assert!(live_failure_message(&skip).starts_with("[review_skipped]"));
+        assert_eq!(automation_failure_ref(&skip).0.c, "review_skipped");
+    }
 
     #[test]
     fn edits_racing_a_reconcile_are_retried_quietly_and_real_failures_are_not() {
