@@ -347,46 +347,68 @@ mod tests {
     use super::*;
     #[test]
     fn root_lookup_ignores_unreadable_unrelated_labels() -> Result<()> {
-        let roots = [
-            (
-                SharedEntry {
-                    instance: 1,
-                    owner: 101,
-                },
-                None,
-                None,
-            ),
-            (
-                SharedEntry {
-                    instance: 2,
-                    owner: 102,
-                },
-                Some("Workspace".into()),
-                None,
-            ),
-            (
-                SharedEntry {
-                    instance: 3,
-                    owner: 103,
-                },
-                None,
-                Some("ordinary".into()),
-            ),
-        ];
-        for (name, expected) in [("Workspace", 2), ("ordinary", 3)] {
+        // Synthetic objects in this test process exercise the real memory
+        // readers and resolve_paths. No Studio process or installed layout.
+        let string = |text: &str| {
+            let mut bytes = Box::new([0u8; 32]);
+            bytes[..text.len()].copy_from_slice(text.as_bytes());
+            bytes[16..24].copy_from_slice(&(text.len() as u64).to_le_bytes());
+            bytes[24..32].copy_from_slice(&15u64.to_le_bytes());
+            bytes
+        };
+        let class = string("Workspace");
+        let label = string("ordinary");
+        let descriptor = Box::new([0usize, class.as_ptr() as usize]);
+        let service = Box::new([descriptor.as_ptr() as usize, 0]);
+        let ordinary = Box::new([0usize, label.as_ptr() as usize]);
+        let unreadable = Box::new([0usize; 2]);
+        let model = ActiveDataModel {
+            outer: 0,
+            owner: 0,
+            roots: [&unreadable, &service, &ordinary]
+                .into_iter()
+                .map(|row| SharedEntry {
+                    instance: row.as_ptr() as usize,
+                    owner: 0,
+                })
+                .collect(),
+            layout: InstanceLayout {
+                class_descriptor: 0,
+                name: 8,
+                data_model_instance: 0,
+                self_pointer: 0,
+                children: 0,
+            },
+        };
+        let memory = ProcessMemory::open_read_only(std::process::id())?;
+        for (name, expected) in [
+            ("Workspace", service.as_ptr() as usize),
+            ("ordinary", ordinary.as_ptr() as usize),
+        ] {
             let names = vec![name.to_string()];
-            let found = resolve_indexed(
+            let found = resolve_paths(
+                &memory,
+                &model,
                 &[NativePropertyPath {
                     segments: &names,
                     ordinals: &[1],
                 }],
                 Instant::now() + Duration::from_secs(1),
-                |label| Ok(matching_root_labels(&roots, label, label == "Workspace")),
-                |_| panic!("root path has no child lookup"),
             )?;
             assert_eq!(found[0][0].instance, expected);
         }
-        assert!(matching_root_labels(&roots, "missing", false).is_empty());
+        assert!(
+            resolve_paths(
+                &memory,
+                &model,
+                &[NativePropertyPath {
+                    segments: &["missing".into()],
+                    ordinals: &[1]
+                }],
+                Instant::now() + Duration::from_secs(1)
+            )
+            .is_err()
+        );
         Ok(())
     }
     #[test]

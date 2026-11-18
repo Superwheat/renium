@@ -5,6 +5,10 @@ use std::collections::HashMap;
 
 use crate::studio::bridge::BridgeServer;
 
+#[cfg(any(windows, target_os = "macos", test))]
+#[path = "native_root_access.rs"]
+mod access;
+
 #[cfg(target_os = "macos")]
 pub(crate) fn available(bridge: &BridgeServer) -> Result<bool> {
     use crate::studio::{bridge::BridgeTarget, native::serializer};
@@ -486,7 +490,7 @@ fn prepared_targets(response: Value, writes: &[RootWrite]) -> Result<Vec<Prepare
         .collect()
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", test))]
 struct PreparedRootWrites {
     runtime_id: String,
     pid: u32,
@@ -495,8 +499,7 @@ struct PreparedRootWrites {
     positions: HashMap<usize, usize>,
     #[cfg(windows)]
     properties: Option<crate::studio::native::serializer::NativePropertyBatch>,
-    #[cfg(target_os = "macos")]
-    identities: Vec<String>,
+    identities: Option<Vec<String>>,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -506,7 +509,16 @@ impl PreparedRootWrites {
         let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
         let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
         let title = serializer::target_name(pid, &info.place_name)?;
-        let targets = describe_root_batch(bridge, &info, transaction_id, writes)?;
+        let mut targets = describe_root_batch(bridge, &info, transaction_id, writes)?;
+        #[cfg(target_os = "macos")]
+        let identities = prepare_identity_batch(&mut targets, |services| {
+            capture_target_identities(pid, &title, services)
+        });
+        #[cfg(not(target_os = "macos"))]
+        let identities = {
+            let _ = &mut targets;
+            None
+        };
         let positions = targets
             .iter()
             .enumerate()
@@ -530,8 +542,6 @@ impl PreparedRootWrites {
                 None,
             )?)
         };
-        #[cfg(target_os = "macos")]
-        let identities = capture_target_identities(pid, &title, &targets)?;
         Ok(Self {
             runtime_id: info.runtime_id,
             pid,
@@ -540,13 +550,12 @@ impl PreparedRootWrites {
             positions,
             #[cfg(windows)]
             properties,
-            #[cfg(target_os = "macos")]
             identities,
         })
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", test))]
 fn check_prepared_identity(expected: &str, actual: &str) -> Result<()> {
     ensure!(
         !expected.is_empty() && expected == actual,
@@ -559,31 +568,75 @@ fn check_prepared_identity(expected: &str, actual: &str) -> Result<()> {
 fn capture_target_identities(
     pid: u32,
     title: &str,
-    targets: &[PreparedRootTarget],
-) -> Result<Vec<String>> {
-    if targets.is_empty() {
-        return Ok(Vec::new());
-    }
+    services: &[String],
+) -> Result<Option<HashMap<String, rbx_dom_weak::types::UniqueId>>> {
     #[cfg(target_arch = "aarch64")]
     {
-        let services = targets
-            .iter()
-            .map(|target| target.path_segments[0].clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let identities = crate::studio::native::serializer::capture_identities(
-            pid, title, &services, std::time::Duration::from_secs(30))?
-            .context("Cannot bind native targets to their engine identities; update Renium or reopen the selected place")?;
-        bind_target_identities(targets, &identities)
+        crate::studio::native::serializer::capture_identities(
+            pid,
+            title,
+            services,
+            std::time::Duration::from_secs(30),
+        )
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let _ = (pid, title);
-        anyhow::bail!(
-            "Native target identity capture is unavailable on this architecture; use per-write target lookup"
-        )
+        let _ = (pid, title, services);
+        Ok(None)
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn prepare_identity_batch(
+    targets: &mut Vec<PreparedRootTarget>,
+    capture: impl FnOnce(&[String]) -> Result<Option<HashMap<String, rbx_dom_weak::types::UniqueId>>>,
+) -> Option<Vec<String>> {
+    if targets.is_empty() {
+        return None;
+    }
+    let services = targets
+        .iter()
+        .map(|target| target.path_segments[0].clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let result = capture(&services).and_then(|identities| {
+        bind_target_identities(
+            targets,
+            &identities.context("Native identity capture is unavailable")?,
+        )
+    });
+    match result {
+        Ok(identities) => Some(identities),
+        Err(error) => {
+            log_batch_fallback(&error);
+            targets.clear();
+            None
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn log_batch_fallback(error: &anyhow::Error) {
+    crate::app::output::log_global(
+        3,
+        format_args!(
+            "[renium] native target batch unavailable: {error:#}; using per-write target lookup"
+        ),
+    );
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn identity_batch_scope_supported(writes: &[RootWrite], capture_available: bool) -> Result<bool> {
+    let database = rbx_reflection_database::get()?;
+    Ok(capture_available
+        && writes.iter().all(|write| {
+            write
+                .path_segments
+                .first()
+                .and_then(|name| database.classes.get(name.as_str()))
+                .is_some_and(|class| class.tags.contains(&rbx_reflection::ClassTag::Service))
+        }))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -621,22 +674,12 @@ fn describe_root_batch(
     if writes.is_empty() || !supports_target_batch(info, cfg!(target_os = "macos")) {
         return Ok(Vec::new());
     }
-    #[cfg(target_os = "macos")]
+    // The native identity capture is service-scoped. Keep this policy compiled
+    // on every platform; only the capture call itself is platform-specific.
+    if cfg!(target_os = "macos")
+        && !identity_batch_scope_supported(writes, cfg!(target_arch = "aarch64"))?
     {
-        let database = rbx_reflection_database::get()?;
-        // The native identity capture is service-scoped. Ordinary top-level
-        // instances and older macOS helpers retain the released per-write path.
-        if !cfg!(target_arch = "aarch64")
-            || writes.iter().any(|write| {
-                !write
-                    .path_segments
-                    .first()
-                    .and_then(|name| database.classes.get(name))
-                    .is_some_and(|class| class.tags.contains(&rbx_reflection::ClassTag::Service))
-            })
-        {
-            return Ok(Vec::new());
-        }
+        return Ok(Vec::new());
     }
     let response = bridge.call_for_runtime_with_timeout(
         "getEditorTransactionState",
@@ -644,8 +687,14 @@ fn describe_root_batch(
         crate::studio::bridge::BridgeTarget::Edit,
         &info.runtime_id,
         Some(std::time::Duration::from_secs(30)),
-    )?;
-    prepared_targets(response, writes)
+    ).and_then(|response| prepared_targets(response, writes));
+    match response {
+        Ok(targets) => Ok(targets),
+        Err(error) => {
+            log_batch_fallback(&error);
+            Ok(Vec::new())
+        }
+    }
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -719,7 +768,10 @@ pub(crate) fn apply(
                 .context("Native target batch is unavailable; retry the push")?,
         )?;
         #[cfg(not(any(windows, target_os = "macos")))]
-        apply_write(bridge, transaction_id, &write, &text)?;
+        {
+            let _ = (bridge, transaction_id, text);
+            unavailable_root_write()?;
+        }
         // Keep exact native readback local to this transaction and requested
         // values. Terrain also rechecks both grids at the native commit boundary.
         verified.record(write);
@@ -727,7 +779,12 @@ pub(crate) fn apply(
     Ok(verified)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(not(any(windows, target_os = "macos")))]
+fn unavailable_root_write() -> Result<()> {
+    anyhow::bail!("Native root property sync requires Windows or macOS")
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
 fn apply_write(
     bridge: &BridgeServer,
     transaction_id: &str,
@@ -790,7 +847,7 @@ fn apply_write(
         "Terrain transfer has no grids"
     );
     let mut terrain = if is_terrain {
-        Some(crate::studio::native::serializer::prepare_terrain(
+        Some(access::prepare_terrain(
             pid,
             title,
             &path_segments,
@@ -805,13 +862,15 @@ fn apply_write(
     } else {
         #[cfg(windows)]
         let property = if let Some(properties) = &mut prepared.properties {
-            properties.prepare(
-                position.context("Native target is missing from its batch; retry the push")?,
-                property_name,
-                std::time::Duration::from_secs(2),
-            )
+            properties
+                .prepare(
+                    position.context("Native target is missing from its batch; retry the push")?,
+                    property_name,
+                    std::time::Duration::from_secs(2),
+                )
+                .map(access::Property::Engine)
         } else {
-            crate::studio::native::serializer::prepare_property(
+            access::prepare_property(
                 pid,
                 title,
                 &path_segments,
@@ -820,8 +879,8 @@ fn apply_write(
                 std::time::Duration::from_secs(2),
             )
         };
-        #[cfg(target_os = "macos")]
-        let property = crate::studio::native::serializer::prepare_property(
+        #[cfg(not(windows))]
+        let property = access::prepare_property(
             pid,
             title,
             &path_segments,
@@ -838,21 +897,27 @@ fn apply_write(
         })?)
     };
     let discovered = std::time::Instant::now();
-    #[cfg(target_os = "macos")]
-    if let Some(position) = position {
+    if let Some(identities) = &prepared.identities {
+        let position =
+            position.context("Native target is missing from its identity batch; retry the push")?;
         let actual = if let Some(property) = &property {
-            &property.instance_id
+            property.instance_id()
         } else {
             terrain
                 .as_ref()
                 .context("Native Terrain target is missing")?
                 .instance_id()
         };
-        check_prepared_identity(&prepared.identities[position], actual)?;
+        check_prepared_identity(
+            identities
+                .get(position)
+                .context("Native target has no batch identity; retry the push")?,
+            actual,
+        )?;
     }
     if let Some(property) = &property {
         ensure!(
-            property.class_name == write.class_name,
+            property.class_name() == write.class_name,
             "Native root target changed class"
         );
         property.ensure_writable()?;
@@ -876,9 +941,7 @@ fn apply_write(
             .as_str()
             .context("Studio omitted the native write recording")?;
         // A native import can start a new recording after its insertion phase.
-        crate::studio::native::serializer::register_history_if_available(
-            pid, title, token, is_terrain,
-        )?;
+        access::register_history(pid, title, token, is_terrain)?;
         if let Some(terrain) = &mut terrain {
             terrain.expect(
                 begin["terrainBaseline"]
@@ -900,7 +963,7 @@ fn apply_write(
             write.name
         );
         property.restart_deadline(remaining);
-        let target_id = property.instance_id.clone();
+        let target_id = property.instance_id().to_string();
         let mut skipped = 0;
         loop {
             let error =
@@ -921,7 +984,7 @@ fn apply_write(
                 return Err(error);
             }
             skipped += 1;
-            *property = crate::studio::native::serializer::prepare_property(
+            *property = access::prepare_property(
                 pid,
                 title,
                 &path_segments,
@@ -937,7 +1000,7 @@ fn apply_write(
                 )
             })?;
             ensure!(
-                property.class_name == write.class_name && property.instance_id == target_id,
+                property.class_name() == write.class_name && property.instance_id() == target_id,
                 "Native root target was replaced before the retry"
             );
             property.ensure_writable()?;
@@ -996,17 +1059,17 @@ fn apply_write(
     Ok(())
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", test))]
 const SKIPPED_NATIVE_TASK_RETRIES: usize = 1;
 
 // The plugin's rollback fence around one native write (BridgeEditorSync
 // task.delay(5, ...)), less the time its expiry callback needs.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", test))]
 const NATIVE_WRITE_FENCE: std::time::Duration = std::time::Duration::from_millis(4500);
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", test))]
 fn write_native_property(
-    property: &mut crate::studio::native::serializer::NativeProperty,
+    property: &mut access::Property,
     write: &RootWrite,
     property_name: &str,
     text: &str,
@@ -1030,7 +1093,7 @@ fn write_native_property(
 
 /// The helper reports 0xE40F when Studio never ran the queued task before its
 /// deadline, as the status of a discarded task or as the wait's own exit code.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", test))]
 fn studio_skipped_native_task(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -1057,21 +1120,13 @@ fn record_test_write(write: &RootWrite) -> bool {
     })
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
-fn apply_write(_: &BridgeServer, _: &str, _: &RootWrite, _: &str) -> Result<()> {
-    anyhow::bail!("Native root property sync requires Windows or macOS")
-}
+#[cfg(test)]
+#[path = "native_root_write_tests.rs"]
+mod write_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn batch_lookup_cannot_write_a_same_named_sibling() {
-        assert!(check_prepared_identity("original-instance", "original-instance").is_ok());
-        assert!(check_prepared_identity("original-instance", "shifted-sibling").is_err());
-        assert!(check_prepared_identity("", "").is_err());
-    }
 
     #[test]
     fn target_identity_batch_binds_plugin_instances_and_negotiates_old_plugins() -> Result<()> {

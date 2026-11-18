@@ -17,8 +17,8 @@ pub(super) use functions::dispatch_code;
 
 #[path = "windows_terrain.rs"]
 mod terrain;
-pub(crate) use terrain::prepare_terrain;
 pub(super) use terrain::probe as probe_terrain;
+pub(crate) use terrain::{NativeTerrain, prepare_terrain};
 #[path = "windows_terrain_observation.rs"]
 mod terrain_observation;
 pub(crate) use terrain_observation::observe_terrain;

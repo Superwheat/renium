@@ -48,8 +48,8 @@ pub(crate) use undo_selection::keep_selection_across_undo;
 #[path = "windows_tests.rs"]
 mod tests;
 pub(crate) use properties::{
-    NativeProperty, NativePropertyBatch, NativePropertyPath, observe_terrain, prepare_property,
-    prepare_terrain, read_property, register_history,
+    NativeProperty, NativePropertyBatch, NativePropertyPath, NativeTerrain, observe_terrain,
+    prepare_property, prepare_terrain, read_property, register_history,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT,
