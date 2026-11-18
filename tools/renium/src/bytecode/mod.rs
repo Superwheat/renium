@@ -2433,6 +2433,7 @@ fn finish_set_property(args: BytecodeSetPropertyArgs, mut result: Value) -> Resu
             &properties,
             &attributes,
             crate::bytecode::edit::PushedScope::Instance,
+            args.slow_import,
         )?;
     }
     print_json_output(&result, args.pretty)
@@ -2536,6 +2537,7 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
             settings_file.clone(),
             ids.clone(),
             crate::bytecode::edit::PushedScope::Instance,
+            args.slow_import,
         )?;
         let (properties, attributes) = if args.scope.eq_ignore_ascii_case("attribute") {
             (Vec::new(), set_names)
@@ -2669,6 +2671,7 @@ pub(crate) fn bytecode_rename_where(
         .collect::<Vec<_>>();
     let (outcomes, studio) = set_store_properties(
         &BytecodeSetPropertyArgs {
+            slow_import: false,
             where_query: None,
             input: BytecodeFileArgs::settings_file(settings_file.clone()),
             selector: BytecodeInstanceSelectorArgs::by_settings_id(None),
@@ -2715,6 +2718,7 @@ pub(crate) fn bytecode_rename_where(
             settings_file.clone(),
             ids.clone(),
             crate::bytecode::edit::PushedScope::Subtree,
+            false,
         )?;
         let after = SettingsBytecode::read_file(&settings_file)?;
         let after_paths = build_editor_instance_paths(&after, &service);

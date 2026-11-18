@@ -269,6 +269,7 @@ fn metadata_property_change(
     push: bool,
 ) -> BytecodeSetPropertyArgs {
     BytecodeSetPropertyArgs {
+        slow_import: false,
         where_query: None,
         input: BytecodeFileArgs::settings_file(settings_file),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(settings_id),
@@ -422,6 +423,7 @@ pub(crate) fn clone_instance_command(
             &[],
             &[],
             crate::bytecode::edit::PushedScope::Subtree,
+            false,
         )?;
     }
     crate::app::output::print_json_output(&result, false)
@@ -551,6 +553,7 @@ fn move_between_stores(
             &[],
             &[],
             crate::bytecode::edit::PushedScope::Subtree,
+            false,
         )?;
     }
     crate::app::output::print_json_output(&result, false)
@@ -589,6 +592,7 @@ fn move_within_store(args: BytecodeSetPropertyArgs, push: bool) -> Result<()> {
             &[],
             &[],
             crate::bytecode::edit::PushedScope::Subtree,
+            false,
         )?;
     }
     crate::app::output::print_json_output(&result, false)
@@ -1107,6 +1111,7 @@ pub(crate) fn import_path_command(
     }
     if args.push && !changed_paths.is_empty() {
         push_editor_changes(PushEditorChangesArgs {
+            slow_import: args.slow_import,
             changed_paths,
             yes: true,
             ..PushEditorChangesArgs::new(

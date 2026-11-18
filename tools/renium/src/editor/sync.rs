@@ -7845,6 +7845,38 @@ mod saved_field_review_tests {
     }
 
     #[test]
+    fn compound_commands_accept_the_opt_in_only_with_their_push() {
+        use crate::cli::{Cli, Commands};
+        use clap::{FromArgMatches, Parser};
+        for (command, args, push) in [
+            ("imp", vec!["script.luau"], "--push"),
+            ("rv", vec!["--sync", "latest"], "--apply-studio"),
+            ("bs", vec!["Workspace", "-p", "Name=target"], "--push"),
+        ] {
+            let argv = ["rbx", command]
+                .into_iter()
+                .chain(args.iter().copied())
+                .collect::<Vec<_>>();
+            assert!(Cli::try_parse_from(argv.iter().copied().chain(["--slow-import"])).is_err());
+            let argv = argv
+                .into_iter()
+                .chain([push, "--slow-import"])
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            let matches = crate::cli::invocation_command(&argv)
+                .try_get_matches_from(&argv)
+                .unwrap();
+            let parsed = Cli::from_arg_matches(&matches).unwrap();
+            assert!(match parsed.command {
+                Commands::ImportPath(args) => args.slow_import,
+                Commands::EditorRevert(args) => args.slow_import,
+                Commands::BytecodeSetProperty(args) => args.slow_import,
+                _ => unreachable!(),
+            });
+        }
+    }
+
+    #[test]
     fn offline_saved_fields_require_the_originating_place_and_its_connected_successor() {
         let root = project_with_threshold_zero("saved-fields-reopen");
         let (bridge, calls, plugin) = reviewing_bridge("skip");

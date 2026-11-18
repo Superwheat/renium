@@ -280,6 +280,7 @@ pub(crate) fn bytecode_add_batch(
                 store.settings_file,
                 store.settings_ids,
                 crate::bytecode::edit::PushedScope::Subtree,
+                false,
             )?;
             verified &= ["verified", "unchanged"]
                 .iter()
@@ -1850,6 +1851,7 @@ mod tests {
         let store = root.join("instances").join("Lighting.renium");
         let result =
             crate::bytecode::bytecode_set_property_result(crate::cli::BytecodeSetPropertyArgs {
+                slow_import: false,
                 where_query: None,
                 input: crate::cli::BytecodeFileArgs::settings_file(store.clone()),
                 selector: crate::cli::BytecodeInstanceSelectorArgs::default(),

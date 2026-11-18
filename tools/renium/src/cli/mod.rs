@@ -41,6 +41,20 @@ pub(crate) fn command() -> clap::Command {
     )
 }
 
+/// The explicit restore-and-push switch disambiguates rv from a panel decision.
+pub(crate) fn invocation_command(arguments: &[std::ffi::OsString]) -> clap::Command {
+    let command = command();
+    if arguments.iter().any(|arg| arg == "rv")
+        && arguments.iter().any(|arg| arg == "--apply-studio")
+    {
+        command
+            .mut_subcommand("rv", |cmd| cmd.name("review-decision"))
+            .mut_subcommand("rev", |cmd| cmd.alias("rv"))
+    } else {
+        command
+    }
+}
+
 #[derive(Parser)]
 #[command(author, version, disable_help_subcommand = true)]
 pub(super) struct Cli {
@@ -363,6 +377,7 @@ pub(super) enum Commands {
     NativeProbe(NativeProbeArgs),
     #[command(
         name = "ip",
+        alias = "imp",
         alias = "import-path",
         about = "Import a script file or directory into the project"
     )]
@@ -2026,6 +2041,12 @@ pub(super) struct ImportPathArgs {
     pub(super) dry_run: bool,
     #[arg(help = "Push the imported files to Studio", long)]
     pub(super) push: bool,
+    #[arg(
+        long,
+        requires = "push",
+        help = "Allow individual saved-field writes if the bulk import reader fails its checks"
+    )]
+    pub(super) slow_import: bool,
 }
 
 #[derive(Parser)]
@@ -3170,6 +3191,12 @@ pub(super) struct EditorRevertArgs {
     #[arg(help = "Also push the restored files to Studio", long)]
     pub(super) apply_studio: bool,
     #[arg(
+        long,
+        requires = "apply_studio",
+        help = "Allow individual saved-field writes if the bulk import reader fails its checks"
+    )]
+    pub(super) slow_import: bool,
+    #[arg(
         help = "Write the saved file content to stdout instead of restoring it",
         long,
         requires = "path",
@@ -3310,6 +3337,12 @@ pub(super) struct BytecodeSetPropertyArgs {
         long
     )]
     pub(super) push: bool,
+    #[arg(
+        long,
+        requires = "push",
+        help = "Allow individual saved-field writes if the bulk import reader fails its checks"
+    )]
+    pub(super) slow_import: bool,
     #[arg(
         short = 'j',
         long,

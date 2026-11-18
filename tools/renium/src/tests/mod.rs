@@ -1688,6 +1688,7 @@ fn ordinary_remove_rejects_package_bearing_instances_and_links() {
     .unwrap();
 
     let error = bytecode_set_property(BytecodeSetPropertyArgs {
+        slow_import: false,
         where_query: None,
         input: BytecodeFileArgs::settings_file(settings_path.clone()),
         selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("package-link".into())),
@@ -1803,6 +1804,7 @@ fn store_writes_keep_composite_property_values_typed() {
     .unwrap();
     let set = |property: &str, value: &str| {
         bytecode_set_property(BytecodeSetPropertyArgs {
+            slow_import: false,
             where_query: None,
             input: BytecodeFileArgs::settings_file(settings_path.clone()),
             selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("step".into())),

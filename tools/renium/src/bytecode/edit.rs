@@ -296,6 +296,7 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
             &property_names,
             &attribute_names,
             PushedScope::Subtree,
+            false,
         )?;
     }
     print_json_output(&result, args.pretty)
@@ -320,6 +321,7 @@ pub(crate) fn push_stored_instance_reading(
     properties: &[String],
     attributes: &[String],
     scope: PushedScope,
+    slow_import: bool,
 ) -> Result<()> {
     let settings_file = result
         .get("settingsFile")
@@ -331,8 +333,12 @@ pub(crate) fn push_stored_instance_reading(
         .and_then(Value::as_str)
         .map(str::to_string)
         .context("The store edit did not name its instance; push the store file with `rbx ps`")?;
-    result["push"] =
-        push_stored_instances(settings_file.clone(), vec![settings_id.clone()], scope)?;
+    result["push"] = push_stored_instances(
+        settings_file.clone(),
+        vec![settings_id.clone()],
+        scope,
+        slow_import,
+    )?;
     let document = SettingsBytecode::read_file(&settings_file)?;
     let Some(index) = document
         .instances
@@ -571,13 +577,12 @@ pub(crate) fn push_stored_instances(
     settings_file: PathBuf,
     settings_ids: Vec<String>,
     scope: PushedScope,
+    slow_import: bool,
 ) -> Result<Value> {
-    crate::editor::sync::push_editor_changes_result(stored_instances_push(
-        settings_file,
-        settings_ids,
-        scope,
-    ))
-    .context("The store was written but the push failed; push it with `rbx ps`")
+    let mut args = stored_instances_push(settings_file, settings_ids, scope);
+    args.slow_import = slow_import;
+    crate::editor::sync::push_editor_changes_result(args)
+        .context("The store was written but the push failed; push it with `rbx ps`")
 }
 
 /// The push `push_stored_instances` sends, for the project in the working

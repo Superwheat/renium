@@ -1028,6 +1028,7 @@ fn apply_reverted_paths(
 ) -> Result<Option<Value>> {
     if args.apply_studio && !changed_paths.is_empty() {
         return push_editor_changes_result(PushEditorChangesArgs {
+            slow_import: args.slow_import,
             changed_paths,
             verify_sources: true,
             verify: false,
