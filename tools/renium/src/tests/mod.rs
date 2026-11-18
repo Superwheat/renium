@@ -2813,22 +2813,29 @@ fn place_export_parallel_chunks_preserve_order_references_and_source() {
         fs::write(root.join(service).join("Controller.luau"), "return 42\n").unwrap();
         documents.insert(service.to_string(), settings_document(rows));
     }
-    let overrides = documents
-        .iter()
-        .map(|(name, doc)| (name.clone(), doc))
-        .collect();
     let mut expected = None;
-    for workers in [1, 4] {
+    for (workers, transfer) in [(1, false), (4, false), (1, true), (4, true)] {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(workers)
             .build()
             .unwrap();
         let build = pool
             .install(|| {
-                crate::rbx::model::build_rbx_place(
+                let inputs = documents
+                    .iter()
+                    .map(|(service, document)| {
+                        let input = if transfer {
+                            crate::rbx::model::RbxPlaceDocument::Owned(document.clone())
+                        } else {
+                            crate::rbx::model::RbxPlaceDocument::Borrowed(document)
+                        };
+                        (service.clone(), input)
+                    })
+                    .collect();
+                crate::rbx::model::build_rbx_place_with_documents(
                     &root,
                     vec!["Workspace".into(), "ServerStorage".into()],
-                    Some(&overrides),
+                    inputs,
                     true,
                     true,
                     false,
@@ -2866,7 +2873,7 @@ fn place_export_parallel_chunks_preserve_order_references_and_source() {
         if let Some(expected) = &expected {
             assert!(
                 &bytes == expected,
-                "Worker count changed the serialized place"
+                "Worker count or ownership transfer changed the serialized place"
             );
         } else {
             expected = Some(bytes);

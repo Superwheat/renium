@@ -62,6 +62,14 @@ pub(crate) struct BytecodeRbxBuildOptions<'a> {
     pub unresolved_reference_properties: Option<&'a mut HashSet<rbx_dom_weak::Ustr>>,
 }
 
+/// Values detached from a prepared row. Structural metadata and reference
+/// indexes remain available while each converted chunk releases these maps.
+pub(crate) struct BytecodeRbxValues<'a> {
+    pub(crate) properties: &'a Map<String, Value>,
+    pub(crate) attributes: &'a Map<String, Value>,
+    pub(crate) initial_size: Option<RbxVector3>,
+}
+
 pub(crate) struct BytecodeRbxEncoder<'a, 'db> {
     document: &'a SettingsBytecode,
     database: &'db ReflectionDatabase<'db>,
@@ -87,9 +95,24 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
     pub fn build(
         &mut self,
         index: usize,
+        options: BytecodeRbxBuildOptions<'_>,
+    ) -> Result<RbxInstanceBuilder> {
+        self.build_with_values(index, None, options)
+    }
+
+    pub(crate) fn build_with_values(
+        &mut self,
+        index: usize,
+        values: Option<BytecodeRbxValues<'_>>,
         mut options: BytecodeRbxBuildOptions<'_>,
     ) -> Result<RbxInstanceBuilder> {
         let instance: &'a SettingsBytecodeInstance = &self.document.instances[index];
+        let properties = values
+            .as_ref()
+            .map_or(&instance.properties, |values| values.properties);
+        let attributes = values
+            .as_ref()
+            .map_or(&instance.attributes, |values| values.attributes);
         let referent = *self
             .refs
             .by_index
@@ -98,7 +121,7 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
         let mut builder = RbxInstanceBuilder::with_referent_and_property_capacity(
             instance.class_name.as_str(),
             referent,
-            instance.properties.len() + usize::from(!instance.attributes.is_empty()),
+            properties.len() + usize::from(!attributes.is_empty()),
         )
         .with_name(instance.name.clone());
         let class_metadata = self
@@ -114,14 +137,19 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                 decal: rbx_reflection_class_is_a(self.database, &instance.class_name, "Decal"),
                 properties: AHashMap::new(),
             });
-        let synthesized_initial_size = synthesized_mesh_initial_size_for_rbx_export_class(
-            self.document,
-            index,
-            class_metadata.triangle_mesh_part,
+        let synthesized_initial_size = values.map_or_else(
+            || {
+                synthesized_mesh_initial_size_for_rbx_export_class(
+                    self.document,
+                    index,
+                    class_metadata.triangle_mesh_part,
+                )
+            },
+            |values| values.initial_size,
         );
         let decal = class_metadata.decal;
 
-        for (name, value) in &instance.properties {
+        for (name, value) in properties {
             if name == "Enabled"
                 && rbx_reflection_class_is_a(self.database, &instance.class_name, "BaseScript")
             {
@@ -132,8 +160,9 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
             }
             let property_metadata = class_metadata
                 .properties
-                .entry(name.as_str())
-                .or_insert_with(|| {
+                .get(name.as_str())
+                .copied()
+                .unwrap_or_else(|| {
                     let serialized_name =
                         if class_metadata.triangle_mesh_part && name == "FluidFidelity" {
                             Some("FluidFidelityInternal")
@@ -160,7 +189,7 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                             serialized_name.unwrap_or(name),
                         )
                     };
-                    BytecodeExportPropertyMetadata {
+                    let metadata = BytecodeExportPropertyMetadata {
                         property,
                         descriptor,
                         serialized_name,
@@ -168,7 +197,9 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                             && name == "CollisionFidelity",
                         skipped: model_property_name_is_skipped(name)
                             || name.eq_ignore_ascii_case("Source"),
-                    }
+                    };
+                    class_metadata.properties.insert(name.clone(), metadata);
+                    metadata
                 });
             if property_metadata.skipped {
                 continue;
@@ -285,14 +316,15 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
         if is_lua_source_class(&instance.class_name) {
             builder.add_property(
                 "Source",
-                RbxVariant::String(bytecode_export_script_source(
+                RbxVariant::String(bytecode_export_script_source_values(
                     instance,
+                    properties,
                     options.source_path,
                 )?),
             );
         }
 
-        let mut attributes = json_attributes_to_rbx(&instance.attributes, self.database, self.refs)
+        let mut attributes = json_attributes_to_rbx(attributes, self.database, self.refs)
             .with_context(|| {
                 format!(
                     "{} ({}) attributes cannot be represented in a Roblox model",
@@ -423,7 +455,15 @@ pub(crate) fn bytecode_export_script_source(
     instance: &SettingsBytecodeInstance,
     source_path: Option<&Path>,
 ) -> Result<String> {
-    let stored_source = instance.properties.get("Source").and_then(Value::as_str);
+    bytecode_export_script_source_values(instance, &instance.properties, source_path)
+}
+
+fn bytecode_export_script_source_values(
+    instance: &SettingsBytecodeInstance,
+    properties: &Map<String, Value>,
+    source_path: Option<&Path>,
+) -> Result<String> {
+    let stored_source = properties.get("Source").and_then(Value::as_str);
     if stored_source == Some(EXTERNAL_SOURCE_MARKER) {
         let path = source_path.with_context(|| {
             format!(

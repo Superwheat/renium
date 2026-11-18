@@ -12,6 +12,10 @@ use crate::rbx::encode::rbx_logical_property_name;
 use ahash::{AHashMap, AHashSet};
 use rbx_binary::InstanceBindingMode;
 
+#[cfg(test)]
+#[path = "import_memory_tests.rs"]
+mod memory_tests;
+
 // Each engine read finalizes the loaded scene. Hundreds of tiny reads repeat
 // that work over an ever larger place; retain bounded chunks without doing a
 // whole engine load for every small subtree.

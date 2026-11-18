@@ -21,9 +21,11 @@ use crate::rbx::decode::{
     rbx_properties_to_settings_records,
 };
 use crate::rbx::encode::{collect_rbx_subtree_preorder, rbx_property_descriptor};
+#[cfg(test)]
+use crate::rbx::model::build_rbx_place;
 use crate::rbx::model::{
-    BytecodeModelImportRefs, build_rbx_place, rbx_dom_instance_by_path_unique,
-    rbx_dom_instance_path_parts, rbx_dom_path_import_refs,
+    BytecodeModelImportRefs, RbxPlaceDocument, build_rbx_place_with_documents,
+    rbx_dom_instance_by_path_unique, rbx_dom_instance_path_parts, rbx_dom_path_import_refs,
 };
 use crate::roblox::schema::PropertySchemaMap;
 use crate::roblox::services::{explorer_service_order, is_engine_managed_container};
@@ -2420,31 +2422,49 @@ pub(crate) fn build_editor_binary_import(
     bridge: &BridgeServer,
     selection: Option<BinaryImportSelection>,
 ) -> Result<Option<EditorBinaryImport>> {
-    let Some(BinaryImportSelection {
-        services,
-        additive_roots,
-        fallback_reason,
-    }) = selection
-    else {
+    let Some(selection) = selection else {
         return Ok(None);
     };
     let document_overrides = changes
         .native_property_documents
         .iter()
-        .map(|(service, document)| (service.clone(), document.as_ref()))
+        .map(|(service, document)| {
+            (
+                service.clone(),
+                RbxPlaceDocument::Shared(std::sync::Arc::clone(document)),
+            )
+        })
         .chain(changes.settings_writes.iter().filter_map(|write| {
             let service = crate::editor::paths::service_from_changed_path(
                 &args.project.project_root.join(&args.project.src_root),
                 &write.path,
             )?;
-            Some((service, &write.document))
+            Some((service, RbxPlaceDocument::Borrowed(&write.document)))
         }))
         .collect::<HashMap<_, _>>();
+    build_editor_binary_import_with_documents(args, changes, bridge, selection, document_overrides)
+}
+
+/// Transfers the prepared inputs after the caller has collected any fields it
+/// needs outside the binary import. Other Arc owners remain valid, but keep
+/// their documents alive; a unique owner is consumed during service conversion.
+pub(crate) fn build_editor_binary_import_with_documents(
+    args: &PushEditorChangesArgs,
+    changes: &EditorChangeSet,
+    bridge: &BridgeServer,
+    selection: BinaryImportSelection,
+    document_overrides: HashMap<String, RbxPlaceDocument<'_>>,
+) -> Result<Option<EditorBinaryImport>> {
+    let BinaryImportSelection {
+        services,
+        additive_roots,
+        fallback_reason,
+    } = selection;
     let root_ids = additive_root_ids(changes, &additive_roots);
     build_editor_binary_import_for_services(
         args,
         services,
-        Some(&document_overrides),
+        document_overrides,
         &additive_roots,
         &root_ids,
         bridge,
@@ -2858,7 +2878,7 @@ fn import_allocates_new_engine_identities_without_losing_saved_content() {
 fn build_editor_binary_import_for_services(
     args: &PushEditorChangesArgs,
     services: HashSet<String>,
-    document_overrides: Option<&HashMap<String, &SettingsBytecode>>,
+    mut document_overrides: HashMap<String, RbxPlaceDocument<'_>>,
     additive_roots: &HashMap<String, HashSet<String>>,
     additive_root_ids: &AdditiveRootIds,
     bridge: &BridgeServer,
@@ -2878,11 +2898,8 @@ fn build_editor_binary_import_for_services(
     let (build, live_preflight) = rayon::join(
         || {
             let started = Instant::now();
-            let mut narrowed = HashMap::new();
             for (service, roots) in additive_roots {
-                let selected = if let Some(document) =
-                    document_overrides.and_then(|documents| documents.get(service))
-                {
+                let selected = if let Some(document) = document_overrides.get(service) {
                     independent_additive_document(document, service, roots)
                 } else {
                     let path = service_settings_path(&src_root.join(service));
@@ -2894,34 +2911,25 @@ fn build_editor_binary_import_for_services(
                     if selected.is_none() {
                         // Keep the decoded document for the ordinary reference
                         // path too, rather than reading and decoding it again.
-                        narrowed.insert(service.clone(), document);
+                        document_overrides
+                            .insert(service.clone(), RbxPlaceDocument::Owned(document));
                         continue;
                     }
                     drop_settings_document(document);
                     selected
                 };
                 if let Some(document) = selected {
-                    narrowed.insert(service.clone(), document);
+                    document_overrides.insert(service.clone(), RbxPlaceDocument::Owned(document));
                 }
             }
-            let mut overrides = document_overrides.cloned().unwrap_or_default();
-            overrides.extend(
-                narrowed
-                    .iter()
-                    .map(|(service, document)| (service.clone(), document)),
-            );
-            let result = build_rbx_place(
+            let result = build_rbx_place_with_documents(
                 &src_root,
                 build_services,
-                Some(&overrides),
+                document_overrides,
                 true,
                 true,
                 false,
             );
-            drop(overrides);
-            for document in narrowed.into_values() {
-                drop_settings_document(document);
-            }
             log_timing("native editor import place build", started);
             result.and_then(|mut build| {
                 // CurrentCamera is role metadata, not a property to apply.
