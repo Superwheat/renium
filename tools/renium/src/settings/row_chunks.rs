@@ -219,6 +219,57 @@ impl RetainedRowColumns {
         Ok(())
     }
 
+    /// Gives the rows marked in `wanted` their maps, all in one pass over the
+    /// columns, with the values of every other row dropped as they are
+    /// decoded. No range may have been read before.
+    pub(crate) fn materialize_selected(
+        mut self,
+        document: &mut SettingsBytecode,
+        wanted: &[bool],
+    ) -> Result<()> {
+        let _span = crate::app::profile::span("store selected rows materialize");
+        anyhow::ensure!(
+            document.instances.len() == self.instance_count
+                && wanted.len() == self.instance_count
+                && self.next_row == 0,
+            "Store rows are selected from a store nothing was read of; restart the store read"
+        );
+        let scope = ValueScope {
+            strings: &self.strings,
+            instance_count: self.instance_count,
+            budget: &self.budget,
+        };
+        let groups = self
+            .groups
+            .par_iter()
+            .zip(self.cursors.par_iter_mut())
+            .map(|(group, cursor)| {
+                let mut entries = Vec::new();
+                cursor.visit_until(group, &self.payload, self.instance_count, scope, |entry| {
+                    if wanted[entry.instance_index()] {
+                        entries.push(entry);
+                    }
+                    Ok(())
+                })?;
+                Ok(entries)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let specs = self
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    &group.name,
+                    group.kind,
+                    group.count,
+                    &self.payload[group.bytes.clone()],
+                )
+            })
+            .collect::<Vec<_>>();
+        apply_decoded_property_groups(&mut document.instances, &specs, groups);
+        Ok(())
+    }
+
     pub(crate) fn finish(mut self) -> Result<()> {
         anyhow::ensure!(
             self.next_row == self.instance_count

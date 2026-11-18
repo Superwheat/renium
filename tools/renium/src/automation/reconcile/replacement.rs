@@ -499,7 +499,7 @@ fn replaced_store_alone(
     desired: Option<&SnapshotEntry>,
     observed: Option<&SnapshotEntry>,
 ) -> Result<Option<(SettingsBytecode, SettingsBytecode)>> {
-    use crate::settings::bytecode::property_edit::{decode_for_row_chunks, decode_rows};
+    use crate::settings::bytecode::property_edit::decode_for_row_chunks;
     use crate::settings::equivalence::stabilize_settings_reference_ids;
 
     let Some(SnapshotEntry::File(desired_bytes)) = desired else {
@@ -532,7 +532,6 @@ fn replaced_store_alone(
     {
         return Ok(None);
     }
-    drop(columns);
     let skeleton = &current.instances;
     let count = skeleton.len();
     let previous = settings_document(observed)?;
@@ -610,17 +609,17 @@ fn replaced_store_alone(
     if read.len() == count {
         return Ok(None);
     }
-    let Ok((rows, _)) = decode_rows(desired_bytes, &read) else {
-        return Ok(None);
-    };
-    for instance in &mut current.instances {
-        crate::settings::held::stand_unchanged(&mut instance.properties);
+    let mut wanted = vec![false; count];
+    for index in read {
+        wanted[index] = true;
     }
-    for (index, mut row) in read.iter().zip(rows) {
-        for value in row.properties.values_mut() {
-            *value = crate::settings::held::held(std::mem::take(value));
+    if columns.materialize_selected(&mut current, &wanted).is_err() {
+        return Ok(None);
+    }
+    for (instance, wanted) in current.instances.iter_mut().zip(wanted) {
+        if !wanted {
+            crate::settings::held::stand_unchanged(&mut instance.properties);
         }
-        current.instances[*index] = row;
     }
     stabilize_settings_reference_ids(&mut current);
     canonicalize_settings_property_names(&mut current)?;
