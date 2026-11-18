@@ -3317,6 +3317,7 @@ function BridgePluginRuntime.start(context)
 			codecVersion = CODEC_VERSION,
 			bridgeRole = Config.bridgeRole,
 			exportAllProperties = EXPORT_ALL_PROPERTIES,
+			nativeRootTargetBatch = true,
 		}
 	end
 

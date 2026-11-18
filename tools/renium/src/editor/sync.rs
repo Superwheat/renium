@@ -4577,6 +4577,15 @@ fn apply_deferred_native_rows(
                 format!("{}.{} ({error:#}; the import committed, retry the push to write this field)", row.path_segments.join("."), name)
             })));
             summary.insert("supplementalImportPendingWrites".into(), json!(fields));
+            summary.insert(
+                "supplementalImportPendingFields".into(),
+                json!(
+                    rows.iter()
+                        .map(crate::editor::types::PendingImportFields::from)
+                        .collect::<Vec<_>>()
+                ),
+            );
+            summary.insert("verified".into(), json!(false));
             0
         }
     }
@@ -8531,6 +8540,17 @@ mod saved_field_review_tests {
         .unwrap();
         if fail {
             assert_eq!(summary["supplementalImportPendingWrites"], 33);
+            assert_eq!(
+                summary["supplementalImportPendingFields"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                33
+            );
+            assert_eq!(
+                summary["supplementalImportPendingFields"][0]["properties"]["TexturePack"],
+                "rbxassetid://1"
+            );
             assert_eq!(
                 summary["unsupportedProperties"].as_array().unwrap().len(),
                 33

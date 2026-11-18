@@ -491,7 +491,7 @@ struct PreparedRootWrites {
     targets: Vec<PreparedRootTarget>,
     positions: HashMap<usize, usize>,
     #[cfg(windows)]
-    properties: crate::studio::native::serializer::NativePropertyBatch,
+    properties: Option<crate::studio::native::serializer::NativePropertyBatch>,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -501,31 +501,30 @@ impl PreparedRootWrites {
         let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
         let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
         let title = serializer::target_name(pid, &info.place_name)?;
-        let response = bridge.call_for_runtime_with_timeout(
-            "getEditorTransactionState",
-            serde_json::json!({"transactionId": transaction_id, "describeNativeRootWrites": writes.iter().map(|write| write.index).collect::<Vec<_>>()}),
-            BridgeTarget::Edit, &info.runtime_id, Some(std::time::Duration::from_secs(30)),
-        )?;
-        let targets = prepared_targets(response, writes)?;
+        let targets = describe_root_batch(bridge, &info, transaction_id, writes)?;
         let positions = targets
             .iter()
             .enumerate()
             .map(|(index, target)| (target.index, index))
             .collect();
         #[cfg(windows)]
-        let properties = serializer::NativePropertyBatch::new(
-            pid,
-            &title,
-            &targets
-                .iter()
-                .map(|target| serializer::NativePropertyPath {
-                    segments: &target.path_segments,
-                    ordinals: &target.path_ordinals,
-                })
-                .collect::<Vec<_>>(),
-            std::time::Duration::from_secs(30),
-            None,
-        )?;
+        let properties = if targets.is_empty() {
+            None
+        } else {
+            Some(serializer::NativePropertyBatch::new(
+                pid,
+                &title,
+                &targets
+                    .iter()
+                    .map(|target| serializer::NativePropertyPath {
+                        segments: &target.path_segments,
+                        ordinals: &target.path_ordinals,
+                    })
+                    .collect::<Vec<_>>(),
+                std::time::Duration::from_secs(30),
+                None,
+            )?)
+        };
         Ok(Self {
             runtime_id: info.runtime_id,
             pid,
@@ -536,6 +535,52 @@ impl PreparedRootWrites {
             properties,
         })
     }
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn describe_root_batch(
+    bridge: &BridgeServer,
+    info: &crate::studio::bridge::BridgeInfoPayload,
+    transaction_id: &str,
+    writes: &[RootWrite],
+) -> Result<Vec<PreparedRootTarget>> {
+    if writes.is_empty() || !info.native_root_target_batch {
+        return Ok(Vec::new());
+    }
+    let response = bridge.call_for_runtime_with_timeout(
+        "getEditorTransactionState",
+        serde_json::json!({"transactionId":transaction_id, "describeNativeRootWrites":writes.iter().map(|write| write.index).collect::<Vec<_>>()}),
+        crate::studio::bridge::BridgeTarget::Edit,
+        &info.runtime_id,
+        Some(std::time::Duration::from_secs(30)),
+    )?;
+    prepared_targets(response, writes)
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn describe_root_write(
+    bridge: &BridgeServer,
+    runtime_id: &str,
+    transaction_id: &str,
+    write: &RootWrite,
+) -> Result<PreparedRootTarget> {
+    let response = bridge.call_for_runtime_with_timeout(
+        "getEditorTransactionState",
+        serde_json::json!({"transactionId":transaction_id, "nativeRootWrite":write.index, "describeNativeRootWrite":true}),
+        crate::studio::bridge::BridgeTarget::Edit,
+        runtime_id,
+        Some(std::time::Duration::from_secs(2)),
+    )?;
+    // The released per-write protocol has no class field. The native property
+    // preparation below checks the class against the queued write as before.
+    let mut targets = prepared_targets(
+        serde_json::json!({"nativeRootTargets":[{
+            "index":response["nativeRootWrite"], "className":write.class_name,
+            "pathSegments":response["pathSegments"], "pathOrdinals":response["pathOrdinals"]
+        }]}),
+        std::slice::from_ref(write),
+    )?;
+    Ok(targets.remove(0))
 }
 
 pub(crate) fn apply(
@@ -604,11 +649,14 @@ fn apply_write(
     let pid = prepared.pid;
     let title = &prepared.title;
     let runtime_id = &prepared.runtime_id;
-    let position = *prepared
-        .positions
-        .get(&write.index)
-        .context("Native target is missing from its batch; retry the push")?;
-    let target = &prepared.targets[position];
+    let position = prepared.positions.get(&write.index).copied();
+    let described;
+    let target = if let Some(position) = position {
+        &prepared.targets[position]
+    } else {
+        described = describe_root_write(bridge, runtime_id, transaction_id, write)?;
+        &described
+    };
     let path_segments = target.path_segments.clone();
     let path_ordinals = target.path_ordinals.clone();
     let property_name = match (write.class_name.as_str(), write.name.as_str()) {
@@ -665,10 +713,22 @@ fn apply_write(
         None
     } else {
         #[cfg(windows)]
-        let property =
-            prepared
-                .properties
-                .prepare(position, property_name, std::time::Duration::from_secs(2));
+        let property = if let Some(properties) = &mut prepared.properties {
+            properties.prepare(
+                position.context("Native target is missing from its batch; retry the push")?,
+                property_name,
+                std::time::Duration::from_secs(2),
+            )
+        } else {
+            crate::studio::native::serializer::prepare_property(
+                pid,
+                title,
+                &path_segments,
+                &path_ordinals,
+                property_name,
+                std::time::Duration::from_secs(2),
+            )
+        };
         #[cfg(target_os = "macos")]
         let property = crate::studio::native::serializer::prepare_property(
             pid,
@@ -903,6 +963,61 @@ fn apply_write(_: &BridgeServer, _: &str, _: &RootWrite, _: &str) -> Result<()> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn released_plugin_keeps_per_write_target_lookup_and_empty_pushes_do_not_negotiate()
+    -> Result<()> {
+        use crate::studio::bridge::{BridgeInfoPayload, routing_tests};
+        use tungstenite::{Message, WebSocket, protocol::Role};
+        let bridge = routing_tests::fixture();
+        let info = routing_tests::edit_info("released-plugin", 20);
+        let stream = routing_tests::connect(&bridge, 0, info);
+        let plugin = std::thread::spawn(move || {
+            let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
+            for index in 1..=2 {
+                let Message::Text(text) = socket.read().unwrap() else {
+                    panic!("missing describe")
+                };
+                let request: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(request["method"], "getEditorTransactionState");
+                assert_eq!(request["params"]["describeNativeRootWrite"], true);
+                assert_eq!(request["params"]["nativeRootWrite"], index);
+                assert!(request["params"].get("describeNativeRootWrites").is_none());
+                socket.send(Message::Text(json!({"id":request["id"],"ok":true,"result":{
+                    "nativeRootWrite":index,"pathSegments":["Workspace","moved"],"pathOrdinals":[1,index+1]
+                }}).to_string().into())).unwrap();
+            }
+        });
+        let info = BridgeInfoPayload {
+            runtime_id: "released-plugin".into(),
+            ..Default::default()
+        };
+        let writes: Vec<RootWrite> = (1..=2)
+            .map(|index| {
+                serde_json::from_value(json!({
+            "index":index,"className":"SurfaceAppearance","pathSegments":["Workspace","planned"],
+            "pathOrdinals":[1,index],"name":"TexturePack","value":"saved"
+        })).unwrap()
+            })
+            .collect();
+        assert!(describe_root_batch(&bridge, &info, "transaction", &writes)?.is_empty());
+        for write in &writes {
+            let target = describe_root_write(&bridge, &info.runtime_id, "transaction", write)?;
+            assert_eq!(target.path_segments, ["Workspace", "moved"]);
+            assert_eq!(target.path_ordinals, [1, write.index + 1]);
+        }
+        plugin.join().unwrap();
+        // No bridge connection is necessary when the reader handled every field.
+        let empty = routing_tests::fixture();
+        let info = BridgeInfoPayload {
+            native_root_target_batch: true,
+            ..Default::default()
+        };
+        assert!(describe_root_batch(&empty, &info, "transaction", &[])?.is_empty());
+        let mut summary = Map::from_iter([("nativeRootWrites".into(), json!([]))]);
+        apply(&empty, &mut summary, Some("transaction"))?;
+        Ok(())
+    }
 
     #[test]
     fn batch_targets_bind_every_queued_index_and_class() {

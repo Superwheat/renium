@@ -18,6 +18,32 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Exact values a committed import could not apply in its deferred transaction.
+/// Verification may tolerate these fields only on this target and at this value.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PendingImportFields {
+    pub(crate) service: String,
+    pub(crate) settings_id: Option<String>,
+    pub(crate) class_name: String,
+    pub(crate) path_segments: Vec<String>,
+    pub(crate) path_ordinals: Vec<usize>,
+    pub(crate) properties: Map<String, Value>,
+}
+
+impl From<&EditorPropertyChange> for PendingImportFields {
+    fn from(row: &EditorPropertyChange) -> Self {
+        Self {
+            service: row.service.clone(),
+            settings_id: row.settings_id.clone(),
+            class_name: row.class_name.clone(),
+            path_segments: row.path_segments.clone(),
+            path_ordinals: row.path_ordinals.clone(),
+            properties: row.properties.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EditorSourceChange {

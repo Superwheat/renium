@@ -220,6 +220,113 @@ fn summary(verified: bool) -> Map<String, Value> {
 }
 
 #[test]
+fn committed_deferred_failures_survive_full_push_readback_without_masking_other_fields()
+-> Result<()> {
+    use crate::editor::types::PendingImportFields;
+    for mutation in [
+        "",
+        "unreported",
+        "wrong_target",
+        "wrong_value",
+        "wrong_class",
+        "wrong_ordinal",
+    ] {
+        let fixture = Fixture::new()?;
+        let root = Path::new(&fixture.context.root);
+        let store = fixture
+            .desired
+            .entries
+            .keys()
+            .find(|path| path.extension().is_some_and(|ext| ext == "renium"))
+            .unwrap()
+            .clone();
+        let mut desired = decode_settings_bytecode(&fs::read(root.join(&store))?)?;
+        let mut pending = Vec::new();
+        for index in 0..33 {
+            let id = format!("part{index}");
+            let name = format!("Part{index}");
+            let mut part =
+                SettingsBytecodeInstance::new(id.clone(), name.clone(), "Part".into(), Some(0));
+            part.properties.insert("Transparency".into(), json!(0.75));
+            part.properties.insert("Anchored".into(), json!(true));
+            desired.instances.push(part);
+            pending.push(PendingImportFields {
+                service: "ReplicatedStorage".into(),
+                settings_id: Some(id),
+                class_name: "Part".into(),
+                path_segments: vec!["ReplicatedStorage".into(), name],
+                path_ordinals: vec![1, 1],
+                properties: Map::from_iter([("Transparency".into(), json!(0.75))]),
+            });
+        }
+        let bytes = encode_settings_bytecode(&desired)?;
+        fs::write(root.join(&store), &bytes)?;
+        let mut observed = desired.clone();
+        for part in observed.instances.iter_mut().skip(2) {
+            part.properties.insert("Transparency".into(), json!(0.0));
+        }
+        match mutation {
+            "unreported" => {
+                observed.instances[2]
+                    .properties
+                    .insert("Anchored".into(), json!(false));
+            }
+            "wrong_target" => pending[0].settings_id = Some("part1".into()),
+            "wrong_value" => {
+                pending[0]
+                    .properties
+                    .insert("Transparency".into(), json!(0.5));
+            }
+            "wrong_class" => pending[0].class_name = "Folder".into(),
+            "wrong_ordinal" => pending[0].path_ordinals[1] = 2,
+            _ => {}
+        }
+        let mut readback = fixture.desired.clone();
+        readback.entries.insert(
+            store.clone(),
+            SnapshotEntry::File(encode_settings_bytecode(&observed)?),
+        );
+        CAPTURES.with(|slot| slot.borrow_mut().push_back(Box::new(move |_| Ok(readback))));
+        MUTATION.with(|slot| *slot.borrow_mut() = Some(Box::new(move |_, request| {
+            assert!(request.args.slow_import);
+            let mut committed = summary(false);
+            committed.insert("supplementalImportPendingWrites".into(), json!(33));
+            committed.insert("supplementalImportPendingFields".into(), json!(pending));
+            committed.insert("unsupportedProperties".into(), json!(["deferred write failed; the import committed, retry the push to write this field"]));
+            Ok(StagedPushResult { generated:ProjectSnapshot::default(), summary:committed })
+        })));
+        let result = fixture.push(true);
+        if mutation.is_empty() {
+            let result = result?;
+            assert_eq!(result["supplementalImportPendingWrites"], 33);
+            assert_eq!(result["verified"], false);
+            assert!(
+                result["unsupportedProperties"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("retry the push")
+            );
+            let id = result["historyId"].as_str().unwrap();
+            assert!(
+                root.join(".renium/editor-history/sync")
+                    .join(id)
+                    .join("sync.rmp")
+                    .is_file()
+            );
+        } else {
+            assert!(result.is_err(), "accepted {mutation}");
+        }
+        assert_eq!(
+            fs::read(root.join(&store))?,
+            bytes,
+            "pending requested values were lost"
+        );
+        assert!(!import_settle::pending(&fixture.context));
+    }
+    Ok(())
+}
+
+#[test]
 fn refused_staged_push_discards_only_its_undo_entry_and_opt_in_survives_staging() -> Result<()> {
     for allow in [false, true] {
         let fixture = Fixture::new()?;

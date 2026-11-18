@@ -489,6 +489,14 @@ pub(crate) fn push_project(
     );
     log_reconcile_timing("full push mutation", phase);
 
+    let pending_fields: Vec<crate::editor::types::PendingImportFields> = pushed
+        .summary
+        .get("supplementalImportPendingFields")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+
     if pushed
         .summary
         .get("protectedOfflineApply")
@@ -518,6 +526,7 @@ pub(crate) fn push_project(
     #[cfg(any(windows, target_os = "macos"))]
     if let Some(proof) = can_settle_in_background
         .then_some(())
+        .filter(|_| pending_fields.is_empty())
         .filter(|_| replacement.is_none())
         .and_then(|()| committed_import_proof(context, &pushed.summary, &mutation_paths, services))
         // A Studio that changed since the commit gets the full readback below
@@ -602,7 +611,8 @@ pub(crate) fn push_project(
     // Native replacement validates the loader receipt, retained settings,
     // supplemental writes and script buffers before committing. Re-export only
     // services outside that contract, transformed outputs or newer file edits.
-    if !settle_native_import
+    if pending_fields.is_empty()
+        && !settle_native_import
         && !requires_stage
         && replacement.is_none()
         && stage
@@ -629,9 +639,10 @@ pub(crate) fn push_project(
                 || !entries_equivalent(path, project.entries.get(path), current.entries.get(path))
         });
     }
-    if verification_paths.is_empty()
-        || (pushed.generated.entries.is_empty()
-            && exact_source_push_verified(&pushed.summary, &verification_paths))
+    if pending_fields.is_empty()
+        && (verification_paths.is_empty()
+            || (pushed.generated.entries.is_empty()
+                && exact_source_push_verified(&pushed.summary, &verification_paths)))
     {
         if project == current && !requires_stage && replacement.is_none() {
             tracking_release.proof = pushed.summary.remove("verifiedPushProof");
@@ -698,23 +709,15 @@ pub(crate) fn push_project(
     prepared_verification.retain(|path, _| {
         entries_equivalent(path, project.entries.get(path), current.entries.get(path))
     });
-    let (mismatches, details) = if settle_verified_capture {
-        verify_and_settle_native_import(
-            &studio,
-            &current,
-            &mut readback,
-            &verification_paths,
-            &mut prepared_verification,
-        )?
-    } else {
-        snapshot_intended_delta_mismatches(
-            &studio,
-            &current,
-            &readback,
-            &verification_paths,
-            &mut prepared_verification,
-        )?
-    };
+    let (mismatches, details) = verify::verify_committed_push_readback(
+        &studio,
+        &current,
+        &mut readback,
+        &verification_paths,
+        &mut prepared_verification,
+        &pending_fields,
+        settle_verified_capture,
+    )?;
     log_reconcile_timing("full push verification", phase);
     if !mismatches.is_empty() {
         return Err(retention_failure(
@@ -722,6 +725,15 @@ pub(crate) fn push_project(
             &mismatches,
             details.as_deref(),
         ));
+    }
+    if !pending_fields.is_empty() {
+        // Keep desired pending values in the files for the retry. Publishing the
+        // actual readback would erase them; caching equality would hide them.
+        pushed.summary.insert("verified".into(), Value::Bool(false));
+        pushed.summary.remove("verifiedPushProof");
+        tracking_release.proof = None;
+        acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
+        return Ok(pushed.summary);
     }
     if settle_verified_capture {
         let phase = Instant::now();

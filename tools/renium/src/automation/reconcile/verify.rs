@@ -1,4 +1,41 @@
 use super::*;
+use crate::editor::types::PendingImportFields;
+
+#[derive(Clone, Copy, Default)]
+struct Verification<'a> {
+    settle: bool,
+    pending: &'a [PendingImportFields],
+}
+
+pub(crate) fn verify_committed_push_readback(
+    before: &ProjectSnapshot,
+    desired: &ProjectSnapshot,
+    observed: &mut ProjectSnapshot,
+    paths: &HashSet<PathBuf>,
+    prepared: &mut HashMap<PathBuf, PreparedPushVerification>,
+    pending: &[PendingImportFields],
+    settle: bool,
+) -> Result<(Vec<PathBuf>, Option<String>)> {
+    if pending.is_empty() {
+        return if settle {
+            verify_and_settle_native_import(before, desired, observed, paths, prepared)
+        } else {
+            snapshot_intended_delta_mismatches(before, desired, observed, paths, prepared)
+        };
+    }
+    let result = verify_snapshot_delta(
+        before,
+        desired,
+        observed,
+        paths,
+        prepared,
+        Verification {
+            settle: false,
+            pending,
+        },
+    )?;
+    Ok((result.mismatches, result.detail))
+}
 
 #[cfg(test)]
 pub(crate) fn snapshots_equivalent(
@@ -31,7 +68,14 @@ pub(crate) fn snapshot_intended_delta_mismatches(
     paths: &HashSet<PathBuf>,
     prepared: &mut HashMap<PathBuf, PreparedPushVerification>,
 ) -> Result<(Vec<PathBuf>, Option<String>)> {
-    let result = verify_snapshot_delta(before, desired, observed, paths, prepared, false)?;
+    let result = verify_snapshot_delta(
+        before,
+        desired,
+        observed,
+        paths,
+        prepared,
+        Verification::default(),
+    )?;
     Ok((result.mismatches, result.detail))
 }
 
@@ -45,7 +89,17 @@ pub(crate) fn verify_and_settle_native_import(
     paths: &HashSet<PathBuf>,
     prepared: &mut HashMap<PathBuf, PreparedPushVerification>,
 ) -> Result<(Vec<PathBuf>, Option<String>)> {
-    let result = verify_snapshot_delta(before, desired, observed, paths, prepared, true)?;
+    let result = verify_snapshot_delta(
+        before,
+        desired,
+        observed,
+        paths,
+        prepared,
+        Verification {
+            settle: true,
+            ..Default::default()
+        },
+    )?;
     if result.mismatches.is_empty() {
         observed.entries.extend(result.accepted.entries);
     }
@@ -70,7 +124,7 @@ fn verify_snapshot_delta(
     observed: &ProjectSnapshot,
     paths: &HashSet<PathBuf>,
     prepared: &mut HashMap<PathBuf, PreparedPushVerification>,
-    settle: bool,
+    policy: Verification<'_>,
 ) -> Result<SnapshotVerification> {
     let settings_path = |path: &Path| {
         path.file_name()
@@ -83,7 +137,7 @@ fn verify_snapshot_delta(
             !entries_equivalent(path, before.entries.get(*path), desired.entries.get(*path))
         })
         .collect::<HashSet<_>>();
-    if settle {
+    if policy.settle {
         jobs.extend(observed.entries.keys().filter(|path| settings_path(path)));
     }
     let jobs = jobs
@@ -103,7 +157,7 @@ fn verify_snapshot_delta(
                     desired_entry,
                     observed.entries.get(path),
                     prepared,
-                    settle,
+                    policy,
                 )?
             } else if entries_equivalent(path, observed.entries.get(path), desired_entry) {
                 SettingsVerification::default()
@@ -148,7 +202,15 @@ pub(crate) fn settings_delta_mismatch(
     observed: Option<&SnapshotEntry>,
     prepared: Option<PreparedPushVerification>,
 ) -> Result<Option<String>> {
-    Ok(settings_delta_verification(path, before, desired, observed, prepared, false)?.mismatch)
+    Ok(settings_delta_verification(
+        path,
+        before,
+        desired,
+        observed,
+        prepared,
+        Verification::default(),
+    )?
+    .mismatch)
 }
 
 fn settings_delta_verification(
@@ -157,7 +219,7 @@ fn settings_delta_verification(
     desired: Option<&SnapshotEntry>,
     observed: Option<&SnapshotEntry>,
     prepared: Option<PreparedPushVerification>,
-    settle: bool,
+    policy: Verification<'_>,
 ) -> Result<SettingsVerification> {
     let before_aligned = prepared.is_some();
     // The three stores decode side by side: on a large service each takes a
@@ -177,7 +239,8 @@ fn settings_delta_verification(
     );
     let (mut before, desired) = requested?;
     let mut observed = observed?;
-    let viewport = settle
+    let viewport = policy
+        .settle
         .then(|| crate::settings::equivalence::reference_viewport_camera(&desired))
         .flatten();
     if desired.instances.is_empty()
@@ -209,6 +272,9 @@ fn settings_delta_verification(
             );
         }
     }
+    // This is a local comparison document only. It is never published or kept
+    // as an equality proof when the push has pending writes.
+    mask_reported_pending_fields(path, &desired, &mut observed, policy.pending)?;
     let before_by_id = before
         .instances
         .iter()
@@ -313,7 +379,7 @@ fn settings_delta_verification(
     drop(before_by_id);
     drop(desired_by_id);
     drop(observed_by_id);
-    let accepted = if settle && mismatch.is_none() {
+    let accepted = if policy.settle && mismatch.is_none() {
         if let Some(camera) = viewport {
             crate::settings::equivalence::keep_reference_viewport_camera(&camera, &mut observed);
         }
@@ -330,6 +396,73 @@ fn settings_delta_verification(
         },
     );
     Ok(SettingsVerification { mismatch, accepted })
+}
+
+fn mask_reported_pending_fields(
+    path: &Path,
+    desired: &SettingsBytecode,
+    observed: &mut SettingsBytecode,
+    pending: &[PendingImportFields],
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let service = settings_service_name(path, desired, observed)?;
+    let rows = pending
+        .iter()
+        .filter(|row| row.service == service)
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let paths = crate::editor::paths::build_editor_instance_paths(desired, &service);
+    let by_path = paths
+        .iter()
+        .enumerate()
+        .filter_map(|(index, path)| {
+            path.as_ref().map(|path| {
+                (
+                    (path.path_segments.as_slice(), path.path_ordinals.as_slice()),
+                    index,
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    let observed_by_id = observed
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| (instance.settings_id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    for row in rows {
+        let Some(&index) =
+            by_path.get(&(row.path_segments.as_slice(), row.path_ordinals.as_slice()))
+        else {
+            continue;
+        };
+        let expected = &desired.instances[index];
+        if expected.class_name != row.class_name
+            || row
+                .settings_id
+                .as_ref()
+                .is_some_and(|id| id != &expected.settings_id)
+        {
+            continue;
+        }
+        let Some(&actual_index) = observed_by_id.get(&expected.settings_id) else {
+            continue;
+        };
+        let actual = &mut observed.instances[actual_index];
+        if actual.class_name != row.class_name {
+            continue;
+        }
+        for (name, value) in &row.properties {
+            if expected.properties.get(name) == Some(value) {
+                actual.properties.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn added_instance_mismatch(

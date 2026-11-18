@@ -472,6 +472,8 @@ pub(crate) struct BridgeInfoPayload {
     pub(crate) codec_version: String,
     pub(crate) export_all_properties: bool,
     pub(crate) registration_ack: bool,
+    /// Optional additive protocol: old plugins keep per-write target lookup.
+    pub(crate) native_root_target_batch: bool,
 }
 
 /// One Studio registers once per bridge channel; a registration made before
