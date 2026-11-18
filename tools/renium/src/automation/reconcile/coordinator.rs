@@ -608,7 +608,7 @@ impl Coordinator {
             apply_snapshot_paths(&stage.project_root, &changes.studio, &merged)?;
             log_reconcile_timing("staged project write", phase);
             let phase = Instant::now();
-            let generated = push_staged_project(
+            let pushed = push_staged_project(
                 context,
                 &stage,
                 bridge,
@@ -620,8 +620,15 @@ impl Coordinator {
                     expected_project: Some(&editor),
                     later_edits_follow: true,
                 },
-            )?
-            .generated;
+            )?;
+            let pending: Vec<crate::editor::types::PendingImportFields> = pushed
+                .summary
+                .get("supplementalImportPendingFields")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default();
+            let generated = pushed.generated;
             // Studio now holds the project's content for these paths. Record
             // that before anything else can fail, or the next reconcile would
             // mistake Renium's own push for a Studio edit and report a conflict.
@@ -648,7 +655,8 @@ impl Coordinator {
                         &mut captured,
                     )?;
                 }
-                let mismatches = snapshot_path_differences(&captured, &merged, &changes.studio)?;
+                let mismatches =
+                    reconciled_path_differences(&captured, &merged, &changes.studio, &pending)?;
                 if !mismatches.is_empty() {
                     let details = snapshot_mismatch_details(&captured, &merged, &mismatches)?;
                     return Err(retention_failure(
@@ -684,7 +692,14 @@ impl Coordinator {
             log_reconcile_timing("readback capture", phase);
             let phase = Instant::now();
             if !changes.editor.is_empty() {
-                let mismatches = snapshot_differences(&readback, &merged)?;
+                let compared = readback
+                    .entries
+                    .keys()
+                    .chain(merged.entries.keys())
+                    .cloned()
+                    .collect();
+                let mismatches =
+                    reconciled_path_differences(&readback, &merged, &compared, &pending)?;
                 let mut paths = mismatches.into_iter().collect::<Vec<_>>();
                 paths.sort();
                 let mut detail = None;
@@ -707,6 +722,40 @@ impl Coordinator {
                 if let Some(detail) = detail {
                     bail!("Studio did not retain the reconciled project state: {detail}");
                 }
+            }
+            if !pending.is_empty() {
+                // Preserve the actual Studio baseline so the files' pending
+                // values remain changes to retry. When both sides changed a
+                // store, publish the reviewed merge, which includes Studio's
+                // edits and keeps the requested pending values.
+                if !changes.editor.is_empty() {
+                    let overlap = changes
+                        .editor
+                        .intersection(&changes.studio)
+                        .cloned()
+                        .collect();
+                    apply_snapshot_paths(&readback_stage.project_root, &overlap, &merged)?;
+                    publish_studio_paths(context, readback_stage, &changes.editor, &editor)?;
+                }
+                let synchronized = changes.studio.union(&changes.editor).cloned().collect();
+                record_pushed_baseline(context, &setup.key, &mut record, &synchronized, &readback)?;
+                if let Some(mut history) = sync_history.take() {
+                    let files = capture_snapshot(Path::new(&context.root), &publish_paths)?;
+                    history.commit(&files, &ProjectSnapshot::default())?;
+                }
+                record.studio_checkpoint = None;
+                record.note_setup(setup);
+                write_record(context, &setup.key, &record)?;
+                setup.unsynced_paths = changes.studio.iter().cloned().collect();
+                setup.unsynced_paths.sort();
+                setup.error = Some(format!(
+                    "Studio committed; {} deferred fields remain pending. Retry the push to write them.",
+                    pending
+                        .iter()
+                        .map(|row| row.properties.len())
+                        .sum::<usize>()
+                ));
+                return Ok(());
             }
             if !changes.editor.is_empty() {
                 publish_studio_paths(context, readback_stage, &changes.editor, &editor)?;

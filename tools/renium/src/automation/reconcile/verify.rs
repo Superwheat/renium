@@ -61,6 +61,48 @@ pub(crate) fn snapshot_path_differences(
     Ok(differences)
 }
 
+/// Full reconciliation comparison, with only this commit's reported pending
+/// fields masked in a temporary document. Extra instances and unrelated fields
+/// still use the ordinary whole-store comparison. Nothing masked is published.
+pub(crate) fn reconciled_path_differences(
+    observed: &ProjectSnapshot,
+    desired: &ProjectSnapshot,
+    paths: &HashSet<PathBuf>,
+    pending: &[PendingImportFields],
+) -> Result<Vec<PathBuf>> {
+    if pending.is_empty() {
+        return snapshot_path_differences(observed, desired, paths);
+    }
+    let mut differences = Vec::new();
+    for path in paths {
+        let actual = observed.entries.get(path);
+        let expected = desired.entries.get(path);
+        let comparison = if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_service_settings_file_name)
+            && actual.is_some()
+            && expected.is_some()
+        {
+            let expected = settings_document(expected)?;
+            let mut actual = settings_document(actual)?;
+            if align_settings_ids_to_reference(&expected, &mut actual) {
+                mask_reported_pending_fields(path, &expected, &mut actual, pending)?;
+                Some(SnapshotEntry::File(encode_settings_bytecode(&actual)?))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if !snapshot_entry_equivalent(path, comparison.as_ref().or(actual), expected, None)? {
+            differences.push(path.clone());
+        }
+    }
+    differences.sort();
+    Ok(differences)
+}
+
 pub(crate) fn snapshot_intended_delta_mismatches(
     before: &ProjectSnapshot,
     desired: &ProjectSnapshot,
@@ -416,6 +458,13 @@ fn mask_reported_pending_fields(
         return Ok(());
     }
     let paths = crate::editor::paths::build_editor_instance_paths(desired, &service);
+    let ids = crate::editor::review::EditorReferenceIds::new(
+        desired
+            .instances
+            .iter()
+            .map(|instance| instance.settings_id.as_str()),
+    )
+    .in_service(&service);
     let by_path = paths
         .iter()
         .enumerate()
@@ -457,9 +506,95 @@ fn mask_reported_pending_fields(
             continue;
         }
         for (name, value) in &row.properties {
-            if expected.properties.get(name) == Some(value) {
-                actual.properties.insert(name.clone(), value.clone());
+            if let Some(saved) = verification_value(&expected.properties, name, true) {
+                let normalized =
+                    crate::editor::review::normalize_editor_bridge_value(saved, None, &paths, &ids);
+                if reconciliation_property_values_equal(
+                    &row.class_name,
+                    name,
+                    Some(&normalized),
+                    Some(value),
+                ) {
+                    actual.properties.insert(name.clone(), saved.clone());
+                }
             }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn reported_pending_values_use_the_push_normalization_and_readback_equivalence() -> Result<()> {
+    use crate::editor::review::{EditorReferenceIds, normalize_editor_bridge_value};
+    let colors = rbx_dom_weak::types::MaterialColors::default().encode();
+    for saved in [
+        json!({"_type":"MaterialColors","base64":base64::encode(colors)}),
+        json!({"BrickColor":21}),
+        json!({"NumberSequence":{"keypoints":[{"time":0,"value":1,"envelope":0},{"time":1,"value":2,"envelope":0}]}}),
+        json!({"ColorSequence":{"keypoints":[{"time":0,"color":[1,0,0]},{"time":1,"color":[0,1,0]}]}}),
+        json!({"_type":"EnumItem","name":"Plastic"}),
+    ] {
+        let mut requested =
+            normalize_editor_bridge_value(&saved, None, &[], &EditorReferenceIds::default());
+        if requested["_type"] == "EnumItem" {
+            requested["enumType"] = json!("Material");
+        }
+        assert_ne!(saved, requested);
+        let mut instance =
+            SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), Some(0));
+        instance
+            .properties
+            .insert("FutureSavedField".into(), saved.clone());
+        let desired = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "root".into(),
+                    "Workspace".into(),
+                    "Workspace".into(),
+                    None,
+                ),
+                instance,
+            ],
+        };
+        let mut pending = PendingImportFields {
+            service: "Workspace".into(),
+            settings_id: Some("part".into()),
+            class_name: "Part".into(),
+            path_segments: vec!["Workspace".into(), "Part".into()],
+            path_ordinals: vec![1, 1],
+            properties: Map::from_iter([("FutureSavedField".into(), requested)]),
+        };
+        let path = service_settings_path(Path::new("src/Workspace"));
+        for wrong in [false, true] {
+            if wrong {
+                pending
+                    .properties
+                    .insert("FutureSavedField".into(), json!("another requested value"));
+            }
+            let mut observed = desired.clone();
+            observed.instances[1]
+                .properties
+                .insert("FutureSavedField".into(), json!("not written"));
+            observed.instances[1]
+                .properties
+                .insert("Unreported".into(), json!("changed"));
+            mask_reported_pending_fields(
+                &path,
+                &desired,
+                &mut observed,
+                std::slice::from_ref(&pending),
+            )?;
+            assert_eq!(
+                observed.instances[1].properties["FutureSavedField"],
+                if wrong {
+                    json!("not written")
+                } else {
+                    saved.clone()
+                }
+            );
+            assert_eq!(observed.instances[1].properties["Unreported"], "changed");
         }
     }
     Ok(())

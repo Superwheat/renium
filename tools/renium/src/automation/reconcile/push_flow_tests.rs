@@ -495,6 +495,112 @@ fn both_live_coordinator_paths_remove_undo_on_an_uncommitted_refusal() -> Result
 }
 
 #[test]
+fn reconcile_keeps_pending_deferred_fields_and_retries_against_the_actual_baseline() -> Result<()> {
+    for remote_edit in [false, true] {
+        for unreported in [false, true] {
+            let mut fixture = Fixture::new()?;
+            fixture.context.experience.clone_from(&fixture.context.root);
+            let root = Path::new(&fixture.context.root);
+            let store = fixture
+                .desired
+                .entries
+                .keys()
+                .find(|path| path.extension().is_some_and(|ext| ext == "renium"))
+                .unwrap()
+                .clone();
+            let mut document = decode_settings_bytecode(&fs::read(root.join(&store))?)?;
+            let mut part =
+                SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), Some(0));
+            part.properties = serde_json::from_value(
+                json!({"Transparency":0.0,"Anchored":false,"CanCollide":false}),
+            )?;
+            document.instances.push(part);
+            let snapshot = |doc: &SettingsBytecode| -> Result<ProjectSnapshot> {
+                let mut snapshot = fixture.desired.clone();
+                // Reconcile captures services, not their containing source root.
+                snapshot.entries.remove(Path::new("src"));
+                snapshot.entries.remove(Path::new("instances"));
+                snapshot.entries.insert(
+                    store.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(doc)?),
+                );
+                Ok(snapshot)
+            };
+            let baseline = snapshot(&document)?;
+            let mut before = document.clone();
+            before.instances[2]
+                .properties
+                .insert("CanCollide".into(), json!(remote_edit));
+            let mut desired = document.clone();
+            desired.instances[2]
+                .properties
+                .insert("Transparency".into(), json!(0.75));
+            desired.instances[2]
+                .properties
+                .insert("Anchored".into(), json!(true));
+            fs::write(root.join(&store), encode_settings_bytecode(&desired)?)?;
+            let mut actual = before.clone();
+            actual.instances[2]
+                .properties
+                .insert("Anchored".into(), json!(!unreported));
+            let actual = snapshot(&actual)?;
+            replace_capture(snapshot(&before)?);
+            let captured = actual.clone();
+            CAPTURES.with(|slot| slot.borrow_mut().push_back(Box::new(move |_| Ok(captured))));
+            let bridge = fixture.bridge.as_ref().unwrap();
+            let coordinator = Coordinator::default();
+            let mut setup = coordinator.prepare(
+                &fixture.context,
+                bridge,
+                PairConfiguration {
+                    mode: PairMode::Reconcile,
+                    conflict_preference: ConflictPreference::Editor,
+                    resolution_preference: Some(ConflictPreference::Editor),
+                    decisions: Default::default(),
+                    runtime_settings: Map::new(),
+                },
+            )?;
+            let mut record = load_record(&fixture.context, &setup.key)?.unwrap();
+            record.baseline = Some(StoredSnapshot::write(root, &setup.key, &baseline)?);
+            write_record(&fixture.context, &setup.key, &record)?;
+            MUTATION.with(|slot| *slot.borrow_mut() = Some(Box::new(|_, _| {
+                let mut committed = summary(false);
+                committed.insert("supplementalImportPendingWrites".into(), json!(1));
+                committed.insert("supplementalImportPendingFields".into(), json!([{
+                    "service":"ReplicatedStorage","settingsId":"part","className":"Part",
+                    "pathSegments":["ReplicatedStorage","Part"],"pathOrdinals":[1,1],"properties":{"Transparency":0.75}
+                }]));
+                Ok(StagedPushResult { generated: ProjectSnapshot::default(), summary: committed })
+            })));
+            let result = coordinator.reconcile_with_gate_held(&fixture.context, bridge, &mut setup);
+            if unreported {
+                assert!(result.is_err(), "unreported loss was hidden");
+                continue;
+            }
+            result.with_context(|| format!("pending reconcile remote_edit={remote_edit}"))?;
+            assert!(setup.error.as_ref().is_some_and(|message| message.contains("pending") && message.contains("Retry")));
+            assert!(setup.unsynced_paths.contains(&store));
+            let files = decode_settings_bytecode(&fs::read(root.join(&store))?)?;
+            assert_eq!(files.instances[2].properties["Transparency"], 0.75);
+            assert_eq!(files.instances[2].properties["CanCollide"], remote_edit);
+            let record = load_record(&fixture.context, &setup.key)?.unwrap();
+            let saved = record.baseline.unwrap().load(root, &setup.key)?;
+            assert!(
+                snapshot_path_differences(&saved, &actual, &HashSet::from([store.clone()]))?
+                    .is_empty()
+            );
+            let undo = root.join(".renium/editor-history/sync");
+            assert!(
+                fs::read_dir(undo)?
+                    .filter_map(std::result::Result::ok)
+                    .any(|entry| entry.path().join("sync.rmp").is_file())
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn incomplete_offline_reopen_retains_undo_and_does_not_read_the_retired_runtime() -> Result<()> {
     let fixture = Fixture::new()?;
     MUTATION.with(|slot| {

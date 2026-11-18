@@ -526,7 +526,6 @@ pub(crate) fn push_project(
     #[cfg(any(windows, target_os = "macos"))]
     if let Some(proof) = can_settle_in_background
         .then_some(())
-        .filter(|_| pending_fields.is_empty())
         .filter(|_| replacement.is_none())
         .and_then(|()| committed_import_proof(context, &pushed.summary, &mutation_paths, services))
         // A Studio that changed since the commit gets the full readback below
@@ -611,8 +610,7 @@ pub(crate) fn push_project(
     // Native replacement validates the loader receipt, retained settings,
     // supplemental writes and script buffers before committing. Re-export only
     // services outside that contract, transformed outputs or newer file edits.
-    if pending_fields.is_empty()
-        && !settle_native_import
+    if !settle_native_import
         && !requires_stage
         && replacement.is_none()
         && stage
@@ -639,10 +637,9 @@ pub(crate) fn push_project(
                 || !entries_equivalent(path, project.entries.get(path), current.entries.get(path))
         });
     }
-    if pending_fields.is_empty()
-        && (verification_paths.is_empty()
-            || (pushed.generated.entries.is_empty()
-                && exact_source_push_verified(&pushed.summary, &verification_paths)))
+    if verification_paths.is_empty()
+        || (pushed.generated.entries.is_empty()
+            && exact_source_push_verified(&pushed.summary, &verification_paths))
     {
         if project == current && !requires_stage && replacement.is_none() {
             tracking_release.proof = pushed.summary.remove("verifiedPushProof");
