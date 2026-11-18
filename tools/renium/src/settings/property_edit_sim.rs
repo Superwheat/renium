@@ -258,3 +258,53 @@ fn property_edit_decoder_retains_group_overwrite_and_error_rules() {
         }
     }
 }
+
+/// A column can hold values the row decoder keeps compact beside values it
+/// decodes as the ordinary decoder does (a payload held once beside a short
+/// one, a number beside one that is not finite). In a store large enough to
+/// be applied in parallel, each value still goes to its own row.
+#[test]
+fn rows_of_a_large_store_hold_the_values_of_a_column_decoded_two_ways() {
+    let mut instances = vec![SettingsBytecodeInstance::new(
+        "root".into(),
+        "Workspace".into(),
+        "Workspace".into(),
+        None,
+    )];
+    for index in 0..3 * SETTINGS_BINARY_PARALLEL_CHUNK_SIZE {
+        let mut instance = SettingsBytecodeInstance::new(
+            format!("id-{index}"),
+            format!("Part{index}"),
+            "Part".into(),
+            Some(0),
+        );
+        if index % 5 != 0 {
+            let payload = if index % 3 == 0 {
+                String::new()
+            } else {
+                format!("payload-{}", index % 11)
+            };
+            instance.properties.insert(
+                "PhysicalConfigData".into(),
+                json!({"_type": "SharedString", "base64": base64::encode(payload)}),
+            );
+        }
+        instance
+            .properties
+            .insert("Transparency".into(), json!(index as f64 / 8.0));
+        instances.push(instance);
+    }
+    let whole = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances,
+    };
+    let bytes = encode_settings_bytecode(&whole).unwrap();
+    let whole = decode_settings_bytecode(&bytes).unwrap();
+    for step in [1, 2, 7, 1000] {
+        let rows = (1..whole.instances.len()).step_by(step).collect::<Vec<_>>();
+        let (read, _) = decode_rows(&bytes, &rows).unwrap();
+        for (row, read) in rows.iter().zip(&read) {
+            assert_eq!(*read, whole.instances[*row], "row {row} of every {step}");
+        }
+    }
+}

@@ -131,6 +131,9 @@ pub(crate) fn decode_rows(
                         ));
                     }
                 }
+                // The values of a group go to their rows in the order of
+                // the instances, as the ordinary decoder gives them.
+                decoded.sort_unstable_by_key(DecodedGroupEntry::instance_index);
                 return Ok(decoded);
             }
             let mut decoded = decode_property_group_body(body, name, kind, count, scope)?;
