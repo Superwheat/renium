@@ -162,20 +162,35 @@ pub(super) fn changed_document_rows(
     };
     let lookup = build_settings_binary_instance_lookup(state, &records);
     let (stored_rows, captured_rows) = rayon::join(
-        || crate::settings::bytecode::property_edit::row_digests(stored, now.viewport_camera),
+        || {
+            crate::settings::bytecode::property_edit::row_digests(stored, |stored| {
+                // The stored camera is the one that stands where the state's
+                // does.
+                let moved = Moved::between(stored, &records)?;
+                let camera = match (now.viewport_camera, moved) {
+                    (Some(camera), Some(moved)) => Some(moved.in_store(camera)?),
+                    (camera, _) => camera,
+                };
+                Some((camera, moved))
+            })
+        },
         || document_row_digests(state, &records, &lookup, stored.len()),
     );
-    let (stored_rows, captured_rows) = (stored_rows?, captured_rows?);
-    if stored_rows.digests.len() != captured_rows.len() {
+    let (Some(stored_rows), captured_rows) = (stored_rows?, captured_rows?) else {
         return Ok(None);
-    }
+    };
+    let moved = stored_rows.moved;
     let mut changed = Vec::new();
     let mut renamed = false;
     for (index, (values, unique_id)) in captured_rows.iter().enumerate() {
         if now.viewport_camera == Some(index) {
             continue;
         }
-        if stored_rows.digests[index] != *values {
+        // An instance the store does not hold yet has nothing to differ from.
+        let Some(stored_index) = moved.map_or(Some(index), |moved| moved.in_store(index)) else {
+            continue;
+        };
+        if stored_rows.digests[stored_index] != *values {
             // A root that differs can name another viewport camera than the
             // one left out here, which only the whole documents show.
             if changed.len() == MAX_CHANGED_ROWS || records[index].parent_index.is_none() {
@@ -183,7 +198,7 @@ pub(super) fn changed_document_rows(
             }
             changed.push(index);
         } else {
-            renamed |= stored_rows.unique_ids[index] != *unique_id;
+            renamed |= stored_rows.unique_ids[stored_index] != *unique_id;
         }
     }
     let stored = StoredRows {
@@ -197,6 +212,7 @@ pub(super) fn changed_document_rows(
                 .map(|(_, unique_id)| unique_id)
                 .collect(),
             renamed,
+            moved,
         }),
     };
     Ok(
@@ -225,6 +241,179 @@ struct ReadStore {
     /// Whether an instance with the stored values holds another UniqueId
     /// than the stored one.
     renamed: bool,
+    /// How the stored instances stand in the state, where it holds one run
+    /// of instances more than the store, or one less.
+    moved: Option<Moved>,
+}
+
+/// How the instances of a stored file stand in a state that holds one run of
+/// instances the file does not hold, or lacks one run the file holds: the
+/// run starts at `at` and is `by` long.
+#[derive(Clone, Copy)]
+pub(crate) struct Moved {
+    at: usize,
+    by: usize,
+    added: bool,
+}
+
+impl Moved {
+    /// How the stored instances stand among the state's: `Some(None)` where
+    /// the two hold as many, `None` where they differ by more than one run.
+    /// The run starts where a name, class or parent first differs, as the
+    /// alignment takes it, and every instance past it stands under the name,
+    /// class and parent of the stored one it is taken for.
+    pub(super) fn between(
+        stored: &[SettingsBytecodeInstance],
+        records: &[SettingsBinaryInstance<'_>],
+    ) -> Option<Option<Self>> {
+        if stored.len() == records.len() {
+            return Some(None);
+        }
+        let common = stored.len().min(records.len());
+        let at = (0..common)
+            .find(|&index| {
+                let (stored, record) = (&stored[index], &records[index]);
+                stored.name != record.name
+                    || stored.class_name != record.class_name
+                    || stored.parent_index != record.parent_index
+            })
+            .unwrap_or(common);
+        let moved = Self {
+            at,
+            by: stored.len().abs_diff(records.len()),
+            added: records.len() > stored.len(),
+        };
+        (at..common)
+            .all(|position| {
+                let (stored_index, index) = if moved.added {
+                    (position, position + moved.by)
+                } else {
+                    (position + moved.by, position)
+                };
+                let (stored, record) = (&stored[stored_index], &records[index]);
+                stored.name == record.name
+                    && stored.class_name == record.class_name
+                    && match record.parent_index {
+                        None => stored.parent_index.is_none(),
+                        Some(parent) => moved
+                            .in_store(parent)
+                            .is_some_and(|parent| stored.parent_index == Some(parent)),
+                    }
+            })
+            .then_some(Some(moved))
+    }
+
+    /// Which stored instance the state's instance at `index` is.
+    pub(super) fn in_store(self, index: usize) -> Option<usize> {
+        match (self.added, index < self.at) {
+            (_, true) => Some(index),
+            (true, false) => index.checked_sub(self.by).filter(|index| *index >= self.at),
+            (false, false) => Some(index + self.by),
+        }
+    }
+
+    /// Where the stored instance at `index` stands in the state.
+    fn in_state(self, index: usize) -> Option<usize> {
+        match (self.added, index < self.at) {
+            (_, true) => Some(index),
+            (true, false) => Some(index + self.by),
+            (false, false) => index.checked_sub(self.by).filter(|index| *index >= self.at),
+        }
+    }
+
+    /// The parent of a stored instance as the position it has in the state.
+    /// A parent the state lacks is no position of the state's.
+    pub(super) fn parent_in_state(self, instance: &mut SettingsBytecodeInstance) {
+        instance.parent_index = instance
+            .parent_index
+            .map(|parent| self.in_state(parent).unwrap_or(usize::MAX - 1));
+    }
+
+    /// A stored value with every reference by position at the position its
+    /// instance has in the state: `None` where it holds none.
+    pub(super) fn value_in_state(self, value: &Value) -> Option<Value> {
+        fn refers(value: &Value) -> bool {
+            match value {
+                Value::Object(map) => map.contains_key("instanceIndex") || map.values().any(refers),
+                Value::Array(values) => values.iter().any(refers),
+                _ => false,
+            }
+        }
+        fn place(moved: Moved, value: &mut Value) {
+            match value {
+                Value::Object(map) => {
+                    if map.get("_type").and_then(Value::as_str) == Some("Ref")
+                        && let Some(index) = map.get("instanceIndex").and_then(Value::as_u64)
+                    {
+                        // A reference to an instance the state lacks points
+                        // at no instance.
+                        let index = (index as usize)
+                            .checked_sub(1)
+                            .and_then(|index| moved.in_state(index))
+                            .map_or(0, |index| index + 1);
+                        map.insert("instanceIndex".into(), json!(index));
+                    }
+                    map.values_mut().for_each(|value| place(moved, value));
+                }
+                Value::Array(values) => values.iter_mut().for_each(|value| place(moved, value)),
+                _ => {}
+            }
+        }
+        refers(value).then(|| {
+            let mut value = value.clone();
+            place(self, &mut value);
+            value
+        })
+    }
+
+    /// The same for the values of a map.
+    pub(super) fn values_in_state(self, values: &Map<String, Value>) -> Option<Map<String, Value>> {
+        let placed = values
+            .iter()
+            .filter_map(|(name, value)| Some((name, self.value_in_state(value)?)))
+            .collect::<Vec<_>>();
+        (!placed.is_empty()).then(|| {
+            let mut values = values.clone();
+            for (name, value) in placed {
+                values.insert(name.clone(), value);
+            }
+            values
+        })
+    }
+
+    /// A stored instance read whole, as it stands in the state.
+    fn in_state_whole(self, instance: &mut SettingsBytecodeInstance) {
+        self.parent_in_state(instance);
+        if let Some(properties) = self.values_in_state(&instance.properties) {
+            instance.properties = properties;
+        }
+        if let Some(attributes) = self.values_in_state(&instance.attributes) {
+            instance.attributes = attributes;
+        }
+    }
+
+    /// The ids the state's instances are written under: each the id its
+    /// stored instance has, and an instance the store does not hold yet its
+    /// own, unless the store or an earlier new instance holds that one.
+    fn written_ids(self, own: &[String], stored: &[String]) -> Vec<String> {
+        let reserved = stored.iter().map(String::as_str).collect::<AHashSet<_>>();
+        let mut used = AHashSet::new();
+        let mut generated = 0_usize;
+        own.iter()
+            .enumerate()
+            .map(|(index, id)| match self.in_store(index) {
+                Some(stored_index) => stored[stored_index].clone(),
+                None if !reserved.contains(id.as_str()) && used.insert(id.clone()) => id.clone(),
+                None => loop {
+                    let candidate = format!("reconcile:{generated:x}");
+                    generated += 1;
+                    if !reserved.contains(candidate.as_str()) && used.insert(candidate.clone()) {
+                        break candidate;
+                    }
+                },
+            })
+            .collect()
+    }
 }
 
 /// The instances each thread holds as a document while it digests them: few,
@@ -351,6 +540,7 @@ fn changed_rows<'a>(
         Some(mut read) => (read.viewport_camera.take(), Some(read)),
         None => (None, None),
     };
+    let moved = read.as_ref().and_then(|read| read.moved);
     // The camera is the last row where the state has one.
     let mut rows = changed.to_vec();
     if camera.is_none() {
@@ -358,18 +548,34 @@ fn changed_rows<'a>(
     }
     let (mut stored_rows, ids) = match &mut read {
         Some(read) if rows.is_empty() => (Vec::new(), std::mem::take(&mut read.ids)),
-        _ => decode_rows(stored.file, &rows)?,
+        _ => {
+            let Some(stored_at) = rows
+                .iter()
+                .map(|row| moved.map_or(Some(*row), |moved| moved.in_store(*row)))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Ok(None);
+            };
+            decode_rows(stored.file, &stored_at)?
+        }
     };
+    if let Some(moved) = moved {
+        for stored in &mut stored_rows {
+            moved.in_state_whole(stored);
+        }
+    }
     if let (Some(camera), Some(row)) = (camera, now.viewport_camera) {
         rows.push(row);
         stored_rows.push(camera);
     }
     // A pull leaves each instance the id its store holds it under.
-    let own_ids = places.ids == ids;
+    let written_ids = moved.map(|moved| moved.written_ids(&places.ids, &ids));
+    let written_ids = written_ids.as_ref().unwrap_or(&ids);
+    let own_ids = places.ids == *written_ids;
     let records = if own_ids {
         records
     } else {
-        under_stored_ids(records, &ids)
+        under_stored_ids(records, written_ids)
     };
     let lookup = build_settings_binary_instance_lookup(state, &records);
     let scope = ConversionScope {
@@ -438,7 +644,40 @@ fn changed_rows<'a>(
         || pairs().any(|(stored, captured)| {
             stored.properties.get(UNIQUE_ID) != captured.properties.get(UNIQUE_ID)
         });
-    let kept = if own_ids {
+    let stored_at = |index: usize| moved.map_or(Some(index), |moved| moved.in_store(index));
+    let camera_holds_a_reference = now.viewport_camera.is_some()
+        && stored_rows.last().is_some_and(|stored| {
+            stored
+                .properties
+                .values()
+                .chain(stored.attributes.values())
+                .any(holds_reference)
+        });
+    let kept = if moved.is_some() {
+        // A state with one run of instances more or less than the store: the
+        // alignment takes every instance beside the run for the stored one
+        // where each holds the stored values as a pull counts them, the
+        // viewport camera too. Where one does not, it matches each instance
+        // by what tells it alone, and gives a new one the id it came with.
+        // Nothing may say an instance is another stored one, and the stored
+        // camera goes back as the store holds it, which a reference by
+        // position does not survive.
+        let camera_alike = match (stored_rows.last(), captured_rows.last()) {
+            (Some(stored), Some(captured)) if now.viewport_camera.is_some() => {
+                match pulled_instance_values_unchanged(stored, captured, root_service)? {
+                    Some((as_held, _)) => as_held,
+                    None => return Ok(None),
+                }
+            }
+            _ => true,
+        };
+        !camera_holds_a_reference
+            && read.as_ref().is_some_and(|read| {
+                places.stored_identities_stand(&ids, read, stored_at)
+                    && (camera_alike && same_values.iter().all(|same| *same)
+                        || places.matched_alone(&ids, read, now.viewport_camera, stored_at))
+            })
+    } else if own_ids {
         // An instance that took another UniqueId under its id became another
         // instance, which the alignment matches.
         !renamed && places.kept_under_their_ids()
@@ -449,7 +688,7 @@ fn changed_rows<'a>(
         // side, or holds the stored values as a pull counts them. Past that
         // it tells each instance by itself, which takes the stored UniqueIds.
         let stand_as_stored = read.as_ref().is_some_and(|read| {
-            places.stored_identities_stand(&ids, read)
+            places.stored_identities_stand(&ids, read, stored_at)
                 && namesakes(&records).is_some_and(|namesakes| {
                     pairs().zip(changed).zip(&same_values).all(
                         |(((stored, captured), row), same)| {
@@ -475,18 +714,14 @@ fn changed_rows<'a>(
     // once it matched the instances, and puts a stored camera that holds a
     // reference back in another form than it compares: that one it decides.
     if !own_ids
-        && now.viewport_camera.is_some()
+        && camera_holds_a_reference
         && let (Some(stored), Some(captured)) = (stored_rows.last(), captured_rows.last())
         && (stored.properties != captured.properties || stored.attributes != captured.attributes)
-        && stored
-            .properties
-            .values()
-            .chain(stored.attributes.values())
-            .any(holds_reference)
     {
         return Ok(None);
     }
-    if !renamed && same_values.iter().all(|same| *same) {
+    // A store with other instances than the state is written.
+    if moved.is_none() && !renamed && same_values.iter().all(|same| *same) {
         return Ok(Some(SettingsAlignment::Equivalent));
     }
     // A pull keeps the stored viewport camera whatever the captured one says.
@@ -595,43 +830,79 @@ impl Places {
             })
     }
 
-    /// Whether nothing an instance is told by says it is another stored
-    /// instance than the one at its place: no UniqueId that one instance of
-    /// the state holds is the one of a single stored instance elsewhere, and
-    /// no id a store gave stands for another stored instance.
-    fn stored_identities_stand(&self, stored_ids: &[String], read: &ReadStore) -> bool {
-        use crate::settings::equivalence::is_store_identity;
-
-        let places = |digests: &[[u8; 16]]| {
-            let mut places = AHashMap::with_capacity(digests.len());
-            for (index, digest) in digests.iter().enumerate() {
-                if *digest != [0; 16] {
-                    places
-                        .entry(*digest)
-                        .and_modify(|at| *at = None)
-                        .or_insert(Some(index));
-                }
-            }
-            places
-        };
-        let (stored, captured) = (places(&read.unique_ids), places(&read.captured_unique_ids));
-        let unique_ids_stand = captured.iter().all(|(digest, at)| {
-            let (Some(at), Some(Some(stored_at))) = (at, stored.get(digest)) else {
+    /// Whether the alignment, matching instance by instance, takes each for
+    /// the stored one `stored_at` gives: the viewport camera, a sole root, an
+    /// instance whose own UniqueId is the stored one's and no other stored
+    /// instance's, and any instance the store holds under an id that is not
+    /// Studio's, which it is matched by once it carries that id.
+    fn matched_alone(
+        &self,
+        stored_ids: &[String],
+        read: &ReadStore,
+        viewport_camera: Option<usize>,
+        stored_at: impl Fn(usize) -> Option<usize>,
+    ) -> bool {
+        let stored_places = unique_id_places(&read.unique_ids);
+        (0..self.ids.len()).all(|index| {
+            let Some(stored) = stored_at(index) else {
                 return true;
             };
-            at == stored_at
+            viewport_camera == Some(index)
+                || self.sole_root == Some(index)
+                || !stored_ids[stored].starts_with("debug:")
+                || self.told_alone[index]
+                    && stored_places.get(&read.captured_unique_ids[index]) == Some(&Some(stored))
+        })
+    }
+
+    /// Whether nothing an instance is told by says it is another stored
+    /// instance than the one `stored_at` takes it for: no UniqueId that one
+    /// instance of the state holds is the one of a single stored instance
+    /// elsewhere, and no id a store gave stands for another stored instance.
+    fn stored_identities_stand(
+        &self,
+        stored_ids: &[String],
+        read: &ReadStore,
+        stored_at: impl Fn(usize) -> Option<usize>,
+    ) -> bool {
+        use crate::settings::equivalence::is_store_identity;
+
+        let (stored, captured) = (
+            unique_id_places(&read.unique_ids),
+            unique_id_places(&read.captured_unique_ids),
+        );
+        let unique_ids_stand = captured.iter().all(|(digest, at)| {
+            let (Some(at), Some(Some(stored_place))) = (at, stored.get(digest)) else {
+                return true;
+            };
+            stored_at(*at) == Some(*stored_place)
         });
         unique_ids_stand && {
             let mut known = None;
-            self.ids.iter().zip(stored_ids).all(|(id, stored)| {
+            self.ids.iter().enumerate().all(|(index, id)| {
                 !is_store_identity(id)
-                    || id == stored
+                    || stored_at(index).is_some_and(|stored| stored_ids[stored] == *id)
                     || !known
                         .get_or_insert_with(|| stored_ids.iter().collect::<AHashSet<_>>())
                         .contains(id)
             })
         }
     }
+}
+
+/// Where each UniqueId stands, by its digest: `None` for one that more than
+/// one instance holds. An instance without one has none.
+fn unique_id_places(digests: &[[u8; 16]]) -> AHashMap<[u8; 16], Option<usize>> {
+    let mut places = AHashMap::with_capacity(digests.len());
+    for (index, digest) in digests.iter().enumerate() {
+        if *digest != [0; 16] {
+            places
+                .entry(*digest)
+                .and_modify(|at| *at = None)
+                .or_insert(Some(index));
+        }
+    }
+    places
 }
 
 /// For each instance, whether it or an instance above it has a sibling of

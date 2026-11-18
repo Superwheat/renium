@@ -161,6 +161,8 @@ pub(crate) struct StoreRows {
     pub(crate) kept: Option<SettingsBytecodeInstance>,
     /// The id of each instance.
     pub(crate) ids: Vec<String>,
+    /// How the instances stand in the state they were digested for.
+    pub(crate) moved: Option<super::captured::Moved>,
 }
 
 /// One value of a store, by the instance that holds it, its property's
@@ -181,9 +183,16 @@ const WHOLE_VALUE_COLUMNS_AT_ONCE: usize = 2;
 
 /// The digest `captured::document_row_digest` gives each instance of a store
 /// file's document, taken column by column: the document is never whole in
-/// memory. The instance at `kept` comes whole with them, where the store has
-/// one there.
-pub(crate) fn row_digests(bytes: &[u8], kept: Option<usize>) -> Result<StoreRows> {
+/// memory. `plan` sees the instances without their values and says which of
+/// them comes whole with the digests, and how they stand in the state they
+/// are digested for: a parent and a reference by position are digested as
+/// the position they have there. `None` where it says nothing.
+pub(crate) fn row_digests(
+    bytes: &[u8],
+    plan: impl FnOnce(
+        &[SettingsBytecodeInstance],
+    ) -> Option<(Option<usize>, Option<super::captured::Moved>)>,
+) -> Result<Option<StoreRows>> {
     use super::captured::{UNIQUE_ID, attributes_digest, row_digest, value_digest};
 
     let _span = crate::app::profile::span("store instance digests");
@@ -197,6 +206,9 @@ pub(crate) fn row_digests(bytes: &[u8], kept: Option<usize>) -> Result<StoreRows
         instance_count,
     } = decode_settings_payload_header(&mut reader, &budget)?;
     let specs = read_settings_property_groups(&mut reader, &properties)?;
+    let Some((kept, moved)) = plan(&instances) else {
+        return Ok(None);
+    };
     // A store too short to hold that instance gives none.
     let kept = kept.filter(|kept| *kept < instance_count);
     let mut occurrences = AHashMap::<&str, usize>::new();
@@ -210,6 +222,16 @@ pub(crate) fn row_digests(bytes: &[u8], kept: Option<usize>) -> Result<StoreRows
         strings: &strings,
         instance_count,
         budget: &budget,
+    };
+    let value_digest = |value: &Value| match moved.and_then(|moved| moved.value_in_state(value)) {
+        Some(value) => value_digest(&value),
+        None => value_digest(value),
+    };
+    let attributes_digest = |attributes: &Map<String, Value>| match moved
+        .and_then(|moved| moved.values_in_state(attributes))
+    {
+        Some(attributes) => attributes_digest(&attributes),
+        None => attributes_digest(attributes),
     };
     // The cells of one group, and what the kept instance holds of it.
     let digested = |group: usize| -> Result<(Vec<Cell>, Vec<DecodedGroupEntry>)> {
@@ -294,6 +316,11 @@ pub(crate) fn row_digests(bytes: &[u8], kept: Option<usize>) -> Result<StoreRows
     }
     apply_decoded_property_groups(&mut instances, &specs, held);
     cells.par_sort_unstable_by_key(|cell| (cell.row, cell.name, cell.group));
+    if let Some(moved) = moved {
+        for instance in &mut instances {
+            moved.parent_in_state(instance);
+        }
+    }
     let empty = attributes_digest(&Map::new());
     let unique_id = names
         .binary_search(&UNIQUE_ID)
@@ -334,12 +361,13 @@ pub(crate) fn row_digests(bytes: &[u8], kept: Option<usize>) -> Result<StoreRows
         ));
     }
     let kept = kept.map(|kept| instances[kept].clone());
-    Ok(StoreRows {
+    Ok(Some(StoreRows {
         digests: rows,
         unique_ids,
         kept,
         ids: ids_of(instances),
-    })
+        moved,
+    }))
 }
 
 fn decode_compact_column(

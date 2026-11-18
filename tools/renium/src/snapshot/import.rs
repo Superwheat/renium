@@ -2544,6 +2544,109 @@ mod projection_tests {
         Ok(())
     }
 
+    /// A Workspace whose parts stand under a folder and point at one
+    /// another, under ids of Studio's and without UniqueIds: nothing tells
+    /// its instances apart but where they stand. With `new`, one more part
+    /// stands before the folder.
+    fn grouped_state(new: bool) -> Result<ServiceState> {
+        let shift = usize::from(new);
+        let mut instances = vec![
+            SnapshotInstance {
+                name: "Workspace".into(),
+                class_name: "Workspace".into(),
+                instance_index: Some(1),
+                properties: Map::from_iter([(
+                    "CurrentCamera".into(),
+                    json!({"_type":"Ref","instanceIndex":2}),
+                )]),
+                ..Default::default()
+            },
+            SnapshotInstance {
+                name: "Camera".into(),
+                class_name: "Camera".into(),
+                instance_index: Some(2),
+                parent_index: Some(1),
+                debug_id: Some("0_902".into()),
+                properties: Map::from_iter([("FieldOfView".to_string(), json!(70.0))]),
+                ..Default::default()
+            },
+        ];
+        if new {
+            instances.push(SnapshotInstance {
+                name: "New".into(),
+                class_name: "Part".into(),
+                instance_index: Some(3),
+                parent_index: Some(1),
+                debug_id: Some("0_990".into()),
+                ..Default::default()
+            });
+        }
+        let folder = 3 + shift;
+        instances.push(SnapshotInstance {
+            name: "Group".into(),
+            class_name: "Folder".into(),
+            instance_index: Some(folder),
+            parent_index: Some(1),
+            debug_id: Some("0_903".into()),
+            ..Default::default()
+        });
+        for index in 0..12 {
+            instances.push(SnapshotInstance {
+                name: format!("Part{index}"),
+                class_name: "Part".into(),
+                instance_index: Some(folder + 1 + index),
+                parent_index: Some(folder),
+                debug_id: Some(format!("0_{}", 910 + index)),
+                properties: Map::from_iter([
+                    ("Transparency".to_string(), json!(0.5)),
+                    (
+                        "Target".to_string(),
+                        json!({"_type":"Ref","instanceIndex": folder + 1 + (index + 1) % 12}),
+                    ),
+                ]),
+                ..Default::default()
+            });
+        }
+        build_service_state_from_instances("Workspace", None, instances, HashMap::new(), true)
+    }
+
+    /// A new instance is pulled without aligning the whole store: every
+    /// instance past it keeps the id it is stored under, whatever place it
+    /// and the instances it points at moved to.
+    #[test]
+    fn a_new_instance_is_pulled_without_aligning_the_whole_store() -> Result<()> {
+        let parent = std::env::temp_dir().join("renium-new-instance-tests");
+        fs::create_dir_all(&parent)?;
+        let root = crate::system::files::create_unique_directory(&parent, "grown-")?;
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let source = root.join("src");
+        let store = service_settings_path(&source.join("Workspace"));
+        import_service_tree(&grouped_state(false)?, &root, &source, None, "Workspace")?;
+        let first = decode_settings_bytecode(&fs::read(&store)?)?;
+        import_service_tree(&grouped_state(true)?, &root, &source, None, "Workspace")?;
+        let grown = decode_settings_bytecode(&fs::read(&store)?)?;
+        assert_eq!(grown.instances.len(), first.instances.len() + 1);
+        assert_eq!(grown.instances[2].name, "New");
+        for (index, stored) in first.instances.iter().enumerate() {
+            let now = &grown.instances[index + usize::from(index >= 2)];
+            assert_eq!(
+                (&now.settings_id, &now.name),
+                (&stored.settings_id, &stored.name)
+            );
+        }
+        assert_eq!(
+            grown.instances[4].properties["Target"],
+            json!({"_type":"Ref","instanceIndex":6})
+        );
+        // And gone again, the store is the first one.
+        import_service_tree(&grouped_state(false)?, &root, &source, None, "Workspace")?;
+        assert!(decode_settings_bytecode(&fs::read(&store)?)?.instances == first.instances);
+        assert!(!WHOLLY_ALIGNED.lock_recover().contains(&store));
+        Ok(())
+    }
+
     /// A capture compared with the project is the project's own file while
     /// Studio holds what a pull left there, whatever its camera does, and the
     /// state's encoding once a value changed.

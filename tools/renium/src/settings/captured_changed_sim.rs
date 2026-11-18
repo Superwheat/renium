@@ -585,6 +585,7 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
     let by_instance = AtomicUsize::new(0);
     let (renumbered, renumbered_from_memory) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let (renamed, renamed_and_changed) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let (grown, shrunk) = (AtomicUsize::new(0), AtomicUsize::new(0));
     run_seeds(1_200, |seed, steps| {
         let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         let native = seed % 2 == 0;
@@ -673,6 +674,14 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
                 if values_changed && matches!(answer, SettingsAlignment::Changed(_)) {
                     renamed_and_changed.fetch_add(1, Ordering::Relaxed);
                 }
+            }
+            // The state holds an instance more than the file, or one less.
+            if unremembered.is_some() {
+                match observed.instances.len().cmp(&reference.instances.len()) {
+                    std::cmp::Ordering::Greater => grown.fetch_add(1, Ordering::Relaxed),
+                    std::cmp::Ordering::Less => shrunk.fetch_add(1, Ordering::Relaxed),
+                    std::cmp::Ordering::Equal => 0,
+                };
             }
             if other_ids {
                 if unremembered.is_some() {
@@ -789,12 +798,16 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
                 && renumbered.load(Ordering::Relaxed) >= 150
                 && renumbered_from_memory.load(Ordering::Relaxed) >= 25
                 && renamed.load(Ordering::Relaxed) >= 25
-                && renamed_and_changed.load(Ordering::Relaxed) >= 10,
-            "kept {kept}, written {written}, by the whole alignment {whole}, under other ids {} and {} of them from memory, under other UniqueIds {} and {} of them with other values",
+                && renamed_and_changed.load(Ordering::Relaxed) >= 10
+                && grown.load(Ordering::Relaxed) >= 40
+                && shrunk.load(Ordering::Relaxed) >= 10,
+            "kept {kept}, written {written}, by the whole alignment {whole}, under other ids {} and {} of them from memory, under other UniqueIds {} and {} of them with other values, with an instance more {} and less {}",
             renumbered.load(Ordering::Relaxed),
             renumbered_from_memory.load(Ordering::Relaxed),
             renamed.load(Ordering::Relaxed),
             renamed_and_changed.load(Ordering::Relaxed),
+            grown.load(Ordering::Relaxed),
+            shrunk.load(Ordering::Relaxed),
         );
     }
 }
@@ -989,6 +1002,226 @@ fn instances_nothing_tells_apart_take_the_whole_alignment_under_other_ids() {
     assert_eq!(stored_ids(&written), stored_ids(&file));
 }
 
+/// A state with one run of instances more than a store, or less, is told by
+/// where the run starts and that every instance past it stands under the
+/// stored one's name, class and parent; a state that differs otherwise is
+/// none.
+#[test]
+fn a_run_of_instances_more_or_less_is_told_from_names_and_parents() {
+    let stored = twins_with_leaves(1, [0.25, 0.75]);
+    let moved = |document: &SettingsBytecode| {
+        let state = captured(document, false);
+        captured::Moved::between(
+            &stored.instances,
+            &collect_service_settings_binary_instances(&state),
+        )
+    };
+    assert!(matches!(moved(&stored), Some(None)));
+    // A folder comes between the root and the first twin.
+    let mut grown = stored.clone();
+    grown.instances.insert(
+        1,
+        SettingsBytecodeInstance::new("new".into(), "New".into(), "Folder".into(), Some(0)),
+    );
+    for row in grown.instances.iter_mut().skip(2) {
+        row.parent_index = row
+            .parent_index
+            .map(|parent| parent + usize::from(parent > 0));
+    }
+    let run = moved(&grown).flatten().expect("one run more");
+    assert_eq!(
+        (0..6).map(|index| run.in_store(index)).collect::<Vec<_>>(),
+        [Some(0), None, Some(1), Some(2), Some(3), Some(4)]
+    );
+    // The last leaf goes.
+    let mut shrunk = stored.clone();
+    shrunk.instances.pop();
+    let run = moved(&shrunk).flatten().expect("one run less");
+    assert_eq!(
+        (0..4).map(|index| run.in_store(index)).collect::<Vec<_>>(),
+        [Some(0), Some(1), Some(2), Some(3)]
+    );
+    // An instance past the run under another name, or another parent.
+    let mut renamed = grown.clone();
+    renamed.instances[4].name = "Other".into();
+    assert!(moved(&renamed).is_none());
+    let mut reparented = grown;
+    reparented.instances[5].parent_index = Some(2);
+    assert!(moved(&reparented).is_none());
+}
+
+/// Instances that nothing tells apart but what they hold are the alignment's
+/// to match where a place Studio opened again also holds a new instance and
+/// two of them traded their values: a UniqueId that is not the stored one
+/// tells nothing.
+#[test]
+fn namesakes_beside_a_new_instance_take_the_whole_alignment() {
+    let file =
+        encode_service_settings_binary(&captured(&twins(1, true, [0.25, 0.75]), false)).unwrap();
+    let with_new = |held: [f64; 2]| {
+        let mut document = twins(2, true, held);
+        document.instances.push(SettingsBytecodeInstance::new(
+            "debug:0_299".into(),
+            "New".into(),
+            "Folder".into(),
+            Some(0),
+        ));
+        captured(&document, false)
+    };
+    let traded = with_new([0.75, 0.25]);
+    let now = pulled_digest_from_service_state(&traded).unwrap();
+    assert!(
+        pull_changed_document_rows(&traded, &now.rows, &file)
+            .unwrap()
+            .is_none()
+    );
+    // With the values they had, each is the stored one at its place.
+    let grown = with_new([0.25, 0.75]);
+    let now = pulled_digest_from_service_state(&grown).unwrap();
+    let (answer, _) = pull_changed_document_rows(&grown, &now.rows, &file)
+        .unwrap()
+        .expect("a new instance beside instances that hold the stored values");
+    let SettingsAlignment::Changed(written) = answer else {
+        panic!("a store with a new instance is written");
+    };
+    let mut ids = stored_ids(&file);
+    ids.push("debug:0_299".into());
+    assert_eq!(stored_ids(&written), ids);
+}
+
+/// A stored viewport camera goes back into a store as the store holds it.
+/// Where it points at an instance by position and the state holds another
+/// run of instances than the store, that position is another instance's, or
+/// none: the alignment says what becomes of it.
+#[test]
+fn a_stored_camera_that_points_at_an_instance_takes_the_whole_alignment_beside_a_run() {
+    let workspace = |subject: bool| {
+        let mut root =
+            SettingsBytecodeInstance::new("1".into(), "Workspace".into(), "Workspace".into(), None);
+        root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type": "Ref", "instanceIndex": 2}),
+        );
+        let mut camera = SettingsBytecodeInstance::new(
+            "debug:0_101".into(),
+            "Camera".into(),
+            "Camera".into(),
+            Some(0),
+        );
+        camera.properties.insert(
+            "FieldOfView".into(),
+            json!(if subject { 70.0 } else { 40.0 }),
+        );
+        let mut instances = vec![root, camera];
+        if subject {
+            instances[1].properties.insert(
+                "CameraSubject".into(),
+                json!({"_type": "Ref", "instanceIndex": 3}),
+            );
+            instances.push(SettingsBytecodeInstance::new(
+                "debug:0_102".into(),
+                "Subject".into(),
+                "Part".into(),
+                Some(0),
+            ));
+        }
+        SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances,
+        }
+    };
+    let file = encode_service_settings_binary(&captured(&workspace(true), false)).unwrap();
+    let state = captured(&workspace(false), false);
+    let now = pulled_digest_from_service_state(&state).unwrap();
+    assert!(
+        pull_changed_document_rows(&state, &now.rows, &file)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A UniqueId tells an instance only where one stored instance holds it.
+/// Where two do and one of them went, what is left is the stored one it
+/// holds the values of, which the alignment finds by those values.
+#[test]
+fn a_unique_id_two_stored_instances_hold_tells_none_of_them() {
+    let mut stored = twins(1, true, [0.5, 0.25]);
+    let shared = stored.instances[1].properties["UniqueId"].clone();
+    stored.instances[2]
+        .properties
+        .insert("UniqueId".into(), shared.clone());
+    let file = encode_settings_bytecode(&stored).unwrap();
+    // The first of them went; the one that stays holds the second's values.
+    let mut left = twins(2, true, [0.25, 0.25]);
+    left.instances.pop();
+    left.instances[1]
+        .properties
+        .insert("UniqueId".into(), shared);
+    let state = captured(&left, false);
+    let now = pulled_digest_from_service_state(&state).unwrap();
+    assert!(
+        pull_changed_document_rows(&state, &now.rows, &file)
+            .unwrap()
+            .is_none()
+    );
+    let aligned = align_pulled_settings_documents_to_reference(
+        decode_settings_bytecode(&file).unwrap(),
+        settings_bytecode_from_service_state(&state).unwrap(),
+        &|| encode_service_settings_binary(&state),
+        std::time::Instant::now(),
+    )
+    .unwrap();
+    let SettingsAlignment::Changed(written) = aligned.alignment else {
+        panic!("the alignment keeps the store");
+    };
+    assert_eq!(stored_ids(&written)[1], stored_ids(&file)[2]);
+}
+
+/// A new instance keeps the id it came with unless the store holds an
+/// instance under that id, or a new instance before it took it: Studio
+/// gives out again the numbers of an earlier session.
+#[test]
+fn a_new_instance_under_an_id_the_store_holds_takes_another() {
+    let file =
+        encode_service_settings_binary(&captured(&twins(1, true, [0.25, 0.75]), false)).unwrap();
+    let before = stored_ids(&file);
+    let mut grown = twins(2, true, [0.25, 0.75]);
+    for id in [&before[1], &before[2]] {
+        grown.instances.push(SettingsBytecodeInstance::new(
+            id.clone(),
+            "New".into(),
+            "Folder".into(),
+            Some(0),
+        ));
+    }
+    let state = captured(&grown, false);
+    let now = pulled_digest_from_service_state(&state).unwrap();
+    let (answer, _) = pull_changed_document_rows(&state, &now.rows, &file)
+        .unwrap()
+        .expect("new instances beside instances that hold the stored values");
+    let SettingsAlignment::Changed(written) = answer else {
+        panic!("a store with new instances is written");
+    };
+    assert_eq!(
+        stored_ids(&written),
+        [
+            &before[0],
+            &before[1],
+            &before[2],
+            "reconcile:0",
+            "reconcile:1"
+        ]
+    );
+    let aligned = align_pulled_settings_documents_to_reference(
+        decode_settings_bytecode(&file).unwrap(),
+        settings_bytecode_from_service_state(&state).unwrap(),
+        &|| encode_service_settings_binary(&state),
+        std::time::Instant::now(),
+    )
+    .unwrap();
+    assert!(matches!(aligned.alignment, SettingsAlignment::Changed(bytes) if bytes == written));
+}
+
 /// A root is told by being the only one, unless a store holds another
 /// instance under the root's id: the alignment then takes the root for that
 /// one.
@@ -1103,7 +1336,10 @@ fn rows_read_alone_are_the_rows_of_the_whole_store() {
             unique_ids,
             kept: alone,
             ids,
-        } = property_edit::row_digests(&bytes, kept).map_err(|error| format!("{error:#}"))?;
+            ..
+        } = property_edit::row_digests(&bytes, |_| Some((kept, None)))
+            .map_err(|error| format!("{error:#}"))?
+            .ok_or("no digests")?;
         if alone.as_ref() != kept.map(|kept| &whole.instances[kept]) {
             return Err("the row kept with the digests is not the store's".into());
         }
