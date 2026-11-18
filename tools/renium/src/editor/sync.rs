@@ -4098,6 +4098,9 @@ fn push_with_reader_platform(
             rerouted_fields,
             &mut place_values.borrow_mut(),
         );
+        // Approval and transaction preparation are the only consumers. Release
+        // the DOM before snapshot publication parses the place again.
+        drop(place_values);
         let offline_route = offline_route
             && (!pending.writes.is_empty() || !changes.deferred_native_rows.is_empty());
         let mut protected = prepare_protected_writes(

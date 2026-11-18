@@ -59,6 +59,12 @@ pub(crate) struct NativeTerrain {
     bindings: Vec<u8>,
 }
 
+impl NativeTerrain {
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.property.instance_id
+    }
+}
+
 pub(crate) fn prepare_terrain(
     pid: u32,
     title: &str,

@@ -6387,7 +6387,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		return false
 	end
 
-	local function describeNativeRootTargets(session, indices)
+	local function describeNativeRootTargets(session, indices, includeIdentities)
 		local dense = denseArrayLength(indices)
 		if not dense then
 			error("Native target preparation requires a dense index list")
@@ -6421,7 +6421,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				error("Native target moved or left the place; retry the push")
 			end
 			targets[#targets + 1] = { index = index, className = write.instance.ClassName,
-				pathSegments = segments, pathOrdinals = ordinals }
+				pathSegments = segments, pathOrdinals = ordinals,
+				debugId = if includeIdentities then BridgeIdentity.getDebugId(write.instance) else nil }
 		end
 		assertTransactionLease(session)
 		if studioGenerationsChanged(generations) then
@@ -6462,7 +6463,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					error("Native target preparation requires an active undo recording")
 				end
 				return { transactionId = transactionId, state = state,
-					nativeRootTargets = describeNativeRootTargets(session, params.describeNativeRootWrites) }
+					nativeRootTargets = describeNativeRootTargets(session, params.describeNativeRootWrites, params.nativeRootTargetIds == true) }
 			end
 			local needsMeshCook: boolean? = nil
 			if params.nativeRootWrite ~= nil then

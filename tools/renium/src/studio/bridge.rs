@@ -474,6 +474,8 @@ pub(crate) struct BridgeInfoPayload {
     pub(crate) registration_ack: bool,
     /// Optional additive protocol: old plugins keep per-write target lookup.
     pub(crate) native_root_target_batch: bool,
+    /// Batch rows include the queued instance's engine debug identity.
+    pub(crate) native_root_target_ids: bool,
 }
 
 /// One Studio registers once per bridge channel; a registration made before

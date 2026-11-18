@@ -447,6 +447,9 @@ struct PreparedRootTarget {
     class_name: String,
     path_segments: Vec<String>,
     path_ordinals: Vec<usize>,
+    #[cfg(any(target_os = "macos", test))]
+    #[serde(default)]
+    debug_id: Option<String>,
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -492,6 +495,8 @@ struct PreparedRootWrites {
     positions: HashMap<usize, usize>,
     #[cfg(windows)]
     properties: Option<crate::studio::native::serializer::NativePropertyBatch>,
+    #[cfg(target_os = "macos")]
+    identities: Vec<String>,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -525,6 +530,8 @@ impl PreparedRootWrites {
                 None,
             )?)
         };
+        #[cfg(target_os = "macos")]
+        let identities = capture_target_identities(pid, &title, &targets)?;
         Ok(Self {
             runtime_id: info.runtime_id,
             pid,
@@ -533,8 +540,75 @@ impl PreparedRootWrites {
             positions,
             #[cfg(windows)]
             properties,
+            #[cfg(target_os = "macos")]
+            identities,
         })
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn check_prepared_identity(expected: &str, actual: &str) -> Result<()> {
+    ensure!(
+        !expected.is_empty() && expected == actual,
+        "Native target identity changed after batch preparation; retry the push after Studio settles"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn capture_target_identities(
+    pid: u32,
+    title: &str,
+    targets: &[PreparedRootTarget],
+) -> Result<Vec<String>> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let services = targets
+            .iter()
+            .map(|target| target.path_segments[0].clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let identities = crate::studio::native::serializer::capture_identities(
+            pid, title, &services, std::time::Duration::from_secs(30))?
+            .context("Cannot bind native targets to their engine identities; update Renium or reopen the selected place")?;
+        bind_target_identities(targets, &identities)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (pid, title);
+        anyhow::bail!(
+            "Native target identity capture is unavailable on this architecture; use per-write target lookup"
+        )
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn bind_target_identities(
+    targets: &[PreparedRootTarget],
+    identities: &HashMap<String, rbx_dom_weak::types::UniqueId>,
+) -> Result<Vec<String>> {
+    targets.iter().map(|target| {
+        let id = target.debug_id.as_deref().filter(|id| !id.is_empty())
+            .and_then(|id| identities.get(id))
+            .context("A queued native target has no matching engine identity; retry the push after Studio settles")?;
+        ensure!(!id.is_nil(), "A queued native target has an empty engine identity; retry after Studio settles");
+        // The native getter returns four LE words in display order, the same
+        // wire convention decoded by macos_identity_rows. No object offset is used.
+        Ok([(id.random() as u64 >> 32) as u32, id.random() as u32, id.time(), id.index()]
+            .into_iter().flat_map(u32::to_le_bytes).map(|byte| format!("{byte:02x}")).collect())
+    }).collect()
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn supports_target_batch(
+    info: &crate::studio::bridge::BridgeInfoPayload,
+    needs_identity: bool,
+) -> bool {
+    info.native_root_target_batch && (!needs_identity || info.native_root_target_ids)
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -544,12 +618,29 @@ fn describe_root_batch(
     transaction_id: &str,
     writes: &[RootWrite],
 ) -> Result<Vec<PreparedRootTarget>> {
-    if writes.is_empty() || !info.native_root_target_batch {
+    if writes.is_empty() || !supports_target_batch(info, cfg!(target_os = "macos")) {
         return Ok(Vec::new());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let database = rbx_reflection_database::get()?;
+        // The native identity capture is service-scoped. Ordinary top-level
+        // instances and older macOS helpers retain the released per-write path.
+        if !cfg!(target_arch = "aarch64")
+            || writes.iter().any(|write| {
+                !write
+                    .path_segments
+                    .first()
+                    .and_then(|name| database.classes.get(name))
+                    .is_some_and(|class| class.tags.contains(&rbx_reflection::ClassTag::Service))
+            })
+        {
+            return Ok(Vec::new());
+        }
     }
     let response = bridge.call_for_runtime_with_timeout(
         "getEditorTransactionState",
-        serde_json::json!({"transactionId":transaction_id, "describeNativeRootWrites":writes.iter().map(|write| write.index).collect::<Vec<_>>()}),
+        serde_json::json!({"transactionId":transaction_id, "describeNativeRootWrites":writes.iter().map(|write| write.index).collect::<Vec<_>>(), "nativeRootTargetIds":cfg!(target_os = "macos")}),
         crate::studio::bridge::BridgeTarget::Edit,
         &info.runtime_id,
         Some(std::time::Duration::from_secs(30)),
@@ -747,6 +838,18 @@ fn apply_write(
         })?)
     };
     let discovered = std::time::Instant::now();
+    #[cfg(target_os = "macos")]
+    if let Some(position) = position {
+        let actual = if let Some(property) = &property {
+            &property.instance_id
+        } else {
+            terrain
+                .as_ref()
+                .context("Native Terrain target is missing")?
+                .instance_id()
+        };
+        check_prepared_identity(&prepared.identities[position], actual)?;
+    }
     if let Some(property) = &property {
         ensure!(
             property.class_name == write.class_name,
@@ -962,6 +1065,47 @@ fn apply_write(_: &BridgeServer, _: &str, _: &RootWrite, _: &str) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_lookup_cannot_write_a_same_named_sibling() {
+        assert!(check_prepared_identity("original-instance", "original-instance").is_ok());
+        assert!(check_prepared_identity("original-instance", "shifted-sibling").is_err());
+        assert!(check_prepared_identity("", "").is_err());
+    }
+
+    #[test]
+    fn target_identity_batch_binds_plugin_instances_and_negotiates_old_plugins() -> Result<()> {
+        use crate::studio::bridge::BridgeInfoPayload;
+        use rbx_dom_weak::types::UniqueId;
+        let mut info = BridgeInfoPayload {
+            native_root_target_batch: true,
+            ..Default::default()
+        };
+        assert!(supports_target_batch(&info, false));
+        assert!(!supports_target_batch(&info, true));
+        info.native_root_target_ids = true;
+        assert!(supports_target_batch(&info, true));
+        let target = |id: Value| -> PreparedRootTarget {
+            serde_json::from_value(json!({"index":1,"className":"Part","pathSegments":["Workspace","same"],"pathOrdinals":[1,2],"debugId":id})).unwrap()
+        };
+        let identities = HashMap::from([(
+            "queued-instance".into(),
+            UniqueId::new(20, 10, 0x1234567887654321),
+        )]);
+        let tokens = bind_target_identities(&[target(json!("queued-instance"))], &identities)?;
+        assert_eq!(tokens, ["78563412214365870a00000014000000"]);
+        for id in [Value::Null, json!(""), json!("shifted-sibling")] {
+            assert!(bind_target_identities(&[target(id)], &identities).is_err());
+        }
+        assert!(
+            bind_target_identities(
+                &[target(json!("nil"))],
+                &HashMap::from([("nil".into(), UniqueId::new(0, 0, 0))])
+            )
+            .is_err()
+        );
+        Ok(())
+    }
     use serde_json::json;
 
     #[test]

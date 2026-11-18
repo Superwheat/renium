@@ -250,13 +250,13 @@ fn resolve_paths(
         .roots
         .iter()
         .map(|entry| {
-            let class = read_instance_class(memory, entry.instance, model.layout)
-                .context("Native root class became unavailable; retry the push")?;
-            let name = read_instance_name(memory, entry.instance, model.layout)
-                .context("Native root name became unavailable; retry the push")?;
-            Ok((*entry, class, name))
+            // Unreadable unrelated roots never participate in a path match.
+            // A requested root still has to resolve uniquely below.
+            let class = read_instance_class(memory, entry.instance, model.layout);
+            let name = read_instance_name(memory, entry.instance, model.layout);
+            (*entry, class, name)
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
     let database = rbx_reflection_database::get()?;
     resolve_indexed(
         paths,
@@ -266,17 +266,7 @@ fn resolve_paths(
                 .classes
                 .get(name)
                 .is_some_and(|class| class.tags.contains(&rbx_reflection::ClassTag::Service));
-            Ok(roots
-                .iter()
-                .filter(|(_, class, label)| {
-                    if service {
-                        class == name
-                    } else {
-                        label == name
-                    }
-                })
-                .map(|(entry, _, _)| *entry)
-                .collect())
+            Ok(matching_root_labels(&roots, name, service))
         },
         |parent| {
             read_children(memory, parent, model.layout)
@@ -290,6 +280,18 @@ fn resolve_paths(
                 .collect()
         },
     )
+}
+
+fn matching_root_labels(
+    roots: &[(SharedEntry, Option<String>, Option<String>)],
+    name: &str,
+    service: bool,
+) -> Vec<SharedEntry> {
+    roots
+        .iter()
+        .filter(|(_, class, label)| (if service { class } else { label }).as_deref() == Some(name))
+        .map(|(entry, _, _)| *entry)
+        .collect()
 }
 
 fn resolve_indexed(
@@ -343,6 +345,50 @@ fn resolve_indexed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn root_lookup_ignores_unreadable_unrelated_labels() -> Result<()> {
+        let roots = [
+            (
+                SharedEntry {
+                    instance: 1,
+                    owner: 101,
+                },
+                None,
+                None,
+            ),
+            (
+                SharedEntry {
+                    instance: 2,
+                    owner: 102,
+                },
+                Some("Workspace".into()),
+                None,
+            ),
+            (
+                SharedEntry {
+                    instance: 3,
+                    owner: 103,
+                },
+                None,
+                Some("ordinary".into()),
+            ),
+        ];
+        for (name, expected) in [("Workspace", 2), ("ordinary", 3)] {
+            let names = vec![name.to_string()];
+            let found = resolve_indexed(
+                &[NativePropertyPath {
+                    segments: &names,
+                    ordinals: &[1],
+                }],
+                Instant::now() + Duration::from_secs(1),
+                |label| Ok(matching_root_labels(&roots, label, label == "Workspace")),
+                |_| panic!("root path has no child lookup"),
+            )?;
+            assert_eq!(found[0][0].instance, expected);
+        }
+        assert!(matching_root_labels(&roots, "missing", false).is_empty());
+        Ok(())
+    }
     #[test]
     fn batch_paths_scan_shared_ancestors_once_and_require_exact_ordinals() -> Result<()> {
         let names = vec!["Workspace".into(), "same".into(), "leaf".into()];

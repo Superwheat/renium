@@ -3318,6 +3318,7 @@ function BridgePluginRuntime.start(context)
 			bridgeRole = Config.bridgeRole,
 			exportAllProperties = EXPORT_ALL_PROPERTIES,
 			nativeRootTargetBatch = true,
+			nativeRootTargetIds = true,
 		}
 	end
 

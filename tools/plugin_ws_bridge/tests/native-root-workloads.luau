@@ -175,6 +175,7 @@ local describe = extract("\tlocal function captureStudioGenerations(", "\tfuncti
 	end end },
 	BridgeIdentity = {
 		newPathSnapshot = function() return {} end, newChildIndex = function() return {} end,
+		getDebugId = function(instance) assert(instance == lighting); return "queued-lighting" end,
 		getRefPathParts = function(instance, snapshot)
 			assert(instance == lighting and snapshot ~= nil)
 			return { "Lighting" }, { 1 }
@@ -245,12 +246,14 @@ call(true, false)
 assert(not session.nativeRootWrites[1].token.active, "No-op/failed writes must not mask later edits")
 fresh()
 session.serviceNames = { "Lighting" }
-local function describeAll(indices)
-	return api.getTransactionState({ transactionId = "test", describeNativeRootWrites = indices })
+local function describeAll(indices, identities)
+	return api.getTransactionState({ transactionId = "test", describeNativeRootWrites = indices, nativeRootTargetIds = identities })
 end
 for index = 2, 3 do session.nativeRootWrites[index] = table.clone(session.nativeRootWrites[1]) end
-local batch = describeAll({ 3, 1, 2 })
+local batch = describeAll({ 3, 1, 2 }, true)
 assert(#batch.nativeRootTargets == 3 and batch.nativeRootTargets[1].index == 3)
+assert(batch.nativeRootTargets[1].debugId == "queued-lighting")
+assert(describeAll({ 1 }).nativeRootTargets[1].debugId == nil, "Identity capture is negotiated separately")
 assert(operations == 0 and session.pendingNativeRootWrite == nil, "Preparing all targets grants no write fence")
 session.nativeRootWrites[2], session.nativeRootWrites[3] = nil, nil
 preparationGeneration += 1

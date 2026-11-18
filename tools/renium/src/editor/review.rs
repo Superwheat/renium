@@ -1932,14 +1932,31 @@ pub(crate) fn apply_protected_writes_offline(
         } else {
             &snapshot
         };
-        receipt["nextStep"] = json!(format!(
-            "The Studio transaction committed. Keep the project files and recover its snapshot at {}. Reconnect that place with rbx so {} before retrying the push. The previous place is retained at {} if the backup step completed.",
-            recovery.display(),
-            format!("{recovery:?}"),
-            backup.display()
+        receipt["nextStep"] = json!(offline_recovery_advice(
+            receipt["phase"].as_str().unwrap_or_default(),
+            pid,
+            recovery,
+            &backup,
         ));
     }
     Ok(receipt)
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn offline_recovery_advice(phase: &str, pid: u32, recovery: &Path, backup: &Path) -> String {
+    let close = if phase == "closing Studio" {
+        format!(
+            "Studio process {pid} could not be closed and may still contain the committed changes. Close that selected Studio before reopening the recovery snapshot. "
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "The Studio transaction committed. Keep the project files. {close}Recover the snapshot at {} with rbx so \"{}\" before retrying the push. The previous place is retained at {} if the backup step completed.",
+        recovery.display(),
+        recovery.display(),
+        backup.display()
+    )
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -1955,6 +1972,25 @@ pub(crate) fn apply_protected_writes_offline(
 #[cfg(test)]
 mod root_write_evidence_tests {
     use super::*;
+
+    #[test]
+    fn committed_recovery_advice_keeps_paths_readable_and_closes_the_old_studio_first() {
+        let path = Path::new(r"C:\scratch place\import.rbxl");
+        let backup = Path::new(r"C:\scratch place\backup.rbxl");
+        let advice = offline_recovery_advice("closing Studio", 42, path, backup);
+        assert!(advice.contains("Studio process 42 could not be closed"));
+        assert!(advice.contains("Close that selected Studio before reopening"));
+        assert!(advice.contains(r#"rbx so "C:\scratch place\import.rbxl""#));
+        assert!(!advice.contains(r"C:\\scratch"));
+        let waiting = offline_recovery_advice(
+            "waiting for the replacement Studio connection",
+            42,
+            path,
+            backup,
+        );
+        assert!(!waiting.contains("could not be closed"));
+        assert!(waiting.contains(r#"rbx so "C:\scratch place\import.rbxl""#));
+    }
 
     #[test]
     fn terrain_voxels_are_authored_data_despite_hidden_property_tags() {

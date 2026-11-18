@@ -357,6 +357,36 @@ mod compatibility_tests {
     }
 
     #[test]
+    fn history_field_range_and_alignment_fail_during_discovery() -> Result<()> {
+        for (field, invalid) in [
+            (0x88u32, 0x78u32),
+            (0x88, 0x800),
+            (0x88, 0x89),
+            (0x90, 0x78),
+            (0x90, 0x800),
+            (0x90, 0x91),
+            (0x80, 0x78),
+            (0x80, 0x800),
+        ] {
+            let mut bytes = fixture()?;
+            let positions = bytes[0x1000..0x1100]
+                .windows(4)
+                .enumerate()
+                .filter_map(|(at, word)| (word == field.to_le_bytes()).then_some(at + 0x1000))
+                .collect::<Vec<_>>();
+            assert!(!positions.is_empty());
+            for at in positions {
+                bytes[at..at + 4].copy_from_slice(&invalid.to_le_bytes());
+            }
+            let error = discover(&image(&bytes))
+                .err()
+                .context("accepted invalid history field")?;
+            assert!(format!("{error:#}").contains("--slow-import"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn missing_source_and_ambiguous_history_keep_rtti_diagnostic() -> Result<()> {
         for duplicate in [false, true] {
             let mut bytes = fixture()?;
