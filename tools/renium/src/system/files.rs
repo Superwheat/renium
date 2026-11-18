@@ -356,14 +356,32 @@ pub(crate) fn write_bytes_if_changed_in_existing_dir(path: &Path, content: &[u8]
     publish_sibling_temp_with_permissions(&temp_path, path, was_readonly)
 }
 
+/// Removes the temporary files a process that no longer runs left in the
+/// directory of `path`. The directory is listed once for all of its files: a
+/// pull writes hundreds of scripts into one directory, and listing it again
+/// for each of them made the work grow with the square of its files.
 pub(crate) fn cleanup_stale_sibling_temps(path: &Path) {
+    static LISTED: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, std::time::Instant>>> =
+        std::sync::LazyLock::new(Default::default);
+    const LISTED_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+
     let Some(parent) = path.parent() else {
         return;
     };
-    let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
-        return;
-    };
-    let prefix = format!("{file_name}.");
+    {
+        let mut listed = LISTED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        if listed
+            .get(parent)
+            .is_some_and(|at| now.duration_since(*at) < LISTED_FOR)
+        {
+            return;
+        }
+        listed.retain(|_, at| now.duration_since(*at) < LISTED_FOR);
+        listed.insert(parent.to_path_buf(), now);
+    }
     let Ok(entries) = fs::read_dir(parent) else {
         return;
     };
@@ -373,9 +391,10 @@ pub(crate) fn cleanup_stale_sibling_temps(path: &Path) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        let Some(owner) = name
-            .strip_prefix(&prefix)
-            .and_then(|value| value.strip_suffix(".renium-tmp"))
+        // `<file>.<pid>-<sequence>.renium-tmp`, as `sibling_temp_path` names it.
+        let Some((_, owner)) = name
+            .strip_suffix(".renium-tmp")
+            .and_then(|rest| rest.rsplit_once('.'))
         else {
             continue;
         };
