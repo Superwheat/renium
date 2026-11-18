@@ -8319,6 +8319,8 @@ mod saved_field_review_tests {
         }
     }
 
+    // On macOS a push resolves its native targets in a running Studio.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn offline_approval_does_not_restart_studio_when_nothing_remains_to_write() {
         push_reviewed_offline_import("apply", false, 0, false);
@@ -8355,6 +8357,8 @@ mod saved_field_review_tests {
         plugin.join().unwrap();
     }
 
+    // On macOS a push resolves its native targets in a running Studio.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn offline_reconnect_failure_keeps_committed_settings_and_receipt() {
         push_reviewed_offline_import("apply", false, 33, true);
@@ -8365,6 +8369,8 @@ mod saved_field_review_tests {
         push_reviewed_offline_import("skip", false, 33, false);
     }
 
+    // On macOS a push resolves its native targets in a running Studio.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn declining_optional_offline_writes_commits_the_rest_and_keeps_pending() {
         let root = project_with_threshold_zero("decline-optional-offline");
@@ -8463,17 +8469,23 @@ mod saved_field_review_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    // On macOS a push resolves its native targets in a running Studio.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn offline_approval_carries_import_rows_and_snapshot_failure_rolls_back_the_push() {
         push_reviewed_offline_import("apply", false, 33, false);
         push_reviewed_offline_import("apply", true, 33, false);
     }
 
+    // On macOS a push resolves its native targets in a running Studio.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn opted_in_push_counts_successful_individual_writes_and_keeps_both_batch_proofs() {
         push_individual_fields(false);
     }
 
+    // On macOS a push resolves its native targets in a running Studio.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn deferred_field_failure_preserves_the_committed_push_and_lists_pending_fields() {
         push_individual_fields(true);
