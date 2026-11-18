@@ -446,7 +446,7 @@ pub(crate) struct NativeProperty {
     pub(crate) class_name: String,
     pub(crate) instance_id: String,
     property: String,
-    memory: ProcessMemory,
+    memory: std::rc::Rc<ProcessMemory>,
     parameters: Vec<u8>,
     entrypoint: usize,
     deadline: Instant,
@@ -1699,12 +1699,7 @@ pub(super) fn identity_binding(
     Ok((binding, getter))
 }
 
-pub(super) fn resolve_path(
-    memory: &ProcessMemory,
-    model: &ActiveDataModel,
-    segments: &[String],
-    ordinals: &[usize],
-) -> Result<Vec<SharedEntry>> {
+fn validate_property_path(segments: &[String], ordinals: &[usize]) -> Result<()> {
     if segments.is_empty()
         || segments.len() > 64
         || segments.iter().any(String::is_empty)
@@ -1713,6 +1708,20 @@ pub(super) fn resolve_path(
     {
         bail!("Property target needs 1-64 nonempty path segments and matching positive ordinals");
     }
+    Ok(())
+}
+
+#[path = "windows_property_batch.rs"]
+mod batch;
+pub(crate) use batch::{NativePropertyBatch, NativePropertyPath};
+
+pub(super) fn resolve_path(
+    memory: &ProcessMemory,
+    model: &ActiveDataModel,
+    segments: &[String],
+    ordinals: &[usize],
+) -> Result<Vec<SharedEntry>> {
+    validate_property_path(segments, ordinals)?;
     let mut children = model.roots.clone();
     let mut ancestors = Vec::with_capacity(segments.len());
     for (index, name) in segments.iter().enumerate() {
@@ -1880,129 +1889,18 @@ fn prepare(
     read_class: Option<&str>,
     model_path: Option<&[String]>,
 ) -> Result<(NativeProperty, String)> {
-    let started = Instant::now();
     let deadline = Instant::now() + timeout;
-    let current_modules = modules(pid)?;
-    let studio = current_modules
-        .iter()
-        .find(|m| m.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
-        .context("Roblox Studio module was not found")?;
-    let layout = package_layout(&studio.path)?;
-    let memory = ProcessMemory::open(pid)?;
-    verify_loaded_image(&memory, studio, layout.image_stamp)?;
-    let model = active_data_model_for_path(pid, &memory, studio, layout.data, title, model_path)?;
-    let model_instance = model.outer + model.layout.data_model_instance;
-    // active_data_model binds the selected PID and document window. game.Name
-    // can differ from that caption; the native invocation validates the model
-    // owner, target identity and ancestry instead of equating those two names.
-    let ancestors = resolve_path(&memory, &model, segments, ordinals)?;
-    let entry = *ancestors.last().expect("path validated above");
-    let class_name = read_instance_class(&memory, entry.instance, model.layout)
-        .context("Property target class is unavailable")?;
-    anyhow::ensure!(
-        read_class.is_none_or(|expected| class_name == expected),
-        "Native snapshot target changed class"
-    );
-    let descriptor = find_class_member_descriptor(&memory, entry.instance, model.layout, property)?;
-    let descriptor_found = Instant::now();
-    let (getter, setter) = reflection_functions(&memory, studio, &layout, descriptor)?;
-    let reflected = Instant::now();
-    let (binding, identity_getter) =
-        identity_binding(&memory, studio, &layout, &model, entry.instance)?;
-    let mut parameters = vec![0; SIZE];
-    for (offset, value) in [
-        (
-            0,
-            data_model_task_context(&memory, studio, &layout, &model)?,
-        ),
-        (8, studio.base + layout.submit_task),
-        (16, entry.instance),
-        (24, entry.owner),
-        (32, model.owner),
-        (40, descriptor),
-        (48, getter),
-        (
-            56,
-            memory.read_u64(entry.instance + model.layout.class_descriptor)? as usize,
-        ),
-        (64, memory.read_u64(descriptor)? as usize),
-        (72, model.layout.class_descriptor),
-        (65888, binding),
-        (65896, identity_getter),
-        (65904, setter),
-        (131488, parent_offset(&memory, &model)?),
-        (132024, model.layout.self_pointer),
-    ] {
-        put_u64(&mut parameters, offset, value);
-    }
-    put_u32(&mut parameters, 131496, ancestors.len() as u32 + 1);
-    for (index, entry) in ancestors.iter().rev().enumerate() {
-        put_u64(&mut parameters, 131504 + index * 8, entry.instance);
-    }
-    put_u64(
-        &mut parameters,
-        131504 + ancestors.len() * 8,
-        model_instance,
-    );
+    let mut batch = NativePropertyBatch::new(
+        pid,
+        title,
+        &[NativePropertyPath { segments, ordinals }],
+        timeout,
+        model_path,
+    )?;
     let remaining = deadline
         .checked_duration_since(Instant::now())
-        .context("Protected property discovery exceeded its deadline")?;
-    memory.authorize(NativeOperation::DescriptorBinding, title)?;
-    let helper = ensure_helper_loaded_with_timeout(
-        pid,
-        &memory,
-        &current_modules,
-        remaining.as_millis().clamp(1, 3000) as u32,
-    )?;
-    let mut prepared = NativeProperty {
-        class_name,
-        property: property.into(),
-        instance_id: String::new(),
-        memory,
-        parameters,
-        entrypoint: helper + helper_export_rva("ReniumReadProperty")?,
-        deadline,
-    };
-    let dispatched = Instant::now();
-    prepared.invoke(if read_class.is_some() { 3 } else { 0 })?;
-    for (phase, from, to) in [
-        ("target and descriptor discovery", started, descriptor_found),
-        (
-            "reflection getter and setter discovery",
-            descriptor_found,
-            reflected,
-        ),
-        (
-            "identity binding and dispatch preparation",
-            reflected,
-            dispatched,
-        ),
-        ("Studio property task", dispatched, Instant::now()),
-    ] {
-        crate::app::profile::record_between(&format!("{property}: {phase}"), from, to);
-    }
-    crate::app::output::log_global(
-        5,
-        format_args!(
-            "[renium] native property preparation: property={property} target_ms={:.3} reflection_ms={:.3} identity_and_dispatch_ms={:.3} task_ms={:.3}",
-            descriptor_found.duration_since(started).as_secs_f64() * 1000.0,
-            reflected.duration_since(descriptor_found).as_secs_f64() * 1000.0,
-            dispatched.duration_since(reflected).as_secs_f64() * 1000.0,
-            dispatched.elapsed().as_secs_f64() * 1000.0,
-        ),
-    );
-    let identity: [u8; 16] = prepared.parameters[IDENTITY..IDENTITY + 16].try_into()?;
-    if identity == [0; 16] {
-        bail!("Studio target has no stable instance identity");
-    }
-    prepared.instance_id = identity.iter().map(|byte| format!("{byte:02x}")).collect();
-    prepared.parameters[EXPECTED_IDENTITY..EXPECTED_IDENTITY + 16].copy_from_slice(&identity);
-    let value = if read_class.is_some() {
-        prepared.value()?
-    } else {
-        String::new()
-    };
-    Ok((prepared, value))
+        .context("Protected property discovery exceeded its deadline; retry the operation")?;
+    batch.prepare_read(0, property, remaining, read_class)
 }
 
 #[cfg(test)]

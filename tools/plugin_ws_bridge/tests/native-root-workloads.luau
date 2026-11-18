@@ -160,8 +160,33 @@ local leaseActive = true
 local operations = 0
 local target = lighting
 local function cancel(_, token) if token then token.active = false end end
+local preparationGeneration = 1
+local onPrepareYield
+local describe = extract("\tlocal function captureStudioGenerations(", "\tfunction api.getTransactionState(", {
+	ctx = { studioChangeGeneration = function() return preparationGeneration end },
+	assertTransactionLease = function() assert(leaseActive, "cancelled lease") end,
+	isNativeRootProperty = predicate,
+	denseArrayLength = extract("local function denseArrayLength(", "local PATH_SEPARATOR", {}, "denseArrayLength"),
+	BridgeParallel = { newWorkBudget = function() return function()
+		local callback = onPrepareYield
+		onPrepareYield = nil
+		if callback then callback(); return true end
+		return false
+	end end },
+	BridgeIdentity = {
+		newPathSnapshot = function() return {} end, newChildIndex = function() return {} end,
+		getRefPathParts = function(instance, snapshot)
+			assert(instance == lighting and snapshot ~= nil)
+			return { "Lighting" }, { 1 }
+		end,
+		resolvePathSegments = function() return target end,
+	},
+}, "describeNativeRootTargets")
 local api = extract("\tfunction api.getTransactionState(", "\tfunction api.cancelRequestLease(", {
 	api = {}, editorTransactions = sessions,
+	describeNativeRootTargets = describe,
+	armSessionExpiry = function() end,
+	studioGenerationsChanged = function(generations) return generations.Lighting ~= preparationGeneration end,
 	nativeWorkPending = extract("local function nativeWorkPending(", "local function expireSession(", {}, "nativeWorkPending"),
 	transactionOutcomes = { get = function() return nil end },
 	assertTransactionLease = function() assert(leaseActive, "cancelled lease") end,
@@ -200,6 +225,7 @@ local function fresh()
 	write.finished = nil
 	write.token = nil
 	session.expireRequested = nil
+	session.nativeRootPreparation = nil
 	sessions.test = session
 end
 fresh()
@@ -217,6 +243,38 @@ fresh()
 call(false)
 call(true, false)
 assert(not session.nativeRootWrites[1].token.active, "No-op/failed writes must not mask later edits")
+fresh()
+session.serviceNames = { "Lighting" }
+local function describeAll(indices)
+	return api.getTransactionState({ transactionId = "test", describeNativeRootWrites = indices })
+end
+for index = 2, 3 do session.nativeRootWrites[index] = table.clone(session.nativeRootWrites[1]) end
+local batch = describeAll({ 3, 1, 2 })
+assert(#batch.nativeRootTargets == 3 and batch.nativeRootTargets[1].index == 3)
+assert(operations == 0 and session.pendingNativeRootWrite == nil, "Preparing all targets grants no write fence")
+session.nativeRootWrites[2], session.nativeRootWrites[3] = nil, nil
+preparationGeneration += 1
+assert(not pcall(call, false) and operations == 0, "Reject a hierarchy changed during host lookup")
+fresh()
+describeAll({ 1 })
+call(false)
+assert(session.nativeRootPreparation == nil and operations == 1)
+preparationGeneration += 1
+call(true, false)
+assert(operations == 0, "Batch preparation preserves one write per fence")
+fresh()
+for _, indices in { false, { named = 1 }, { 1, 1 }, { 0 }, { 2 } } do
+	assert(not pcall(describeAll, indices))
+end
+onPrepareYield = function() preparationGeneration += 1 end
+assert(not pcall(describeAll, { 1 }), "Reject an edit while preparing paths")
+onPrepareYield = function() leaseActive = false end
+assert(not pcall(describeAll, { 1 }), "Recheck the lease after yielding")
+leaseActive = true
+target = { ClassName = "Lighting" }
+assert(not pcall(describeAll, { 1 }), "Reject a target that no longer resolves to its queued instance")
+target = lighting
+fresh()
 print("Native roots: exact targets, undo requirement, no-op routing, lease/identity checks, deferred events and abandoned-operation cleanup")
 
 local attributes = { added = 29, changed = "after" }

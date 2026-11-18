@@ -439,6 +439,105 @@ impl NativeRootVerification {
     }
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreparedRootTarget {
+    index: usize,
+    class_name: String,
+    path_segments: Vec<String>,
+    path_ordinals: Vec<usize>,
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn prepared_targets(response: Value, writes: &[RootWrite]) -> Result<Vec<PreparedRootTarget>> {
+    let targets: Vec<PreparedRootTarget> = serde_json::from_value(response["nativeRootTargets"].clone())
+        .context("Studio did not return the native target batch; update the Renium plugin and reopen the selected place")?;
+    ensure!(
+        targets.len() == writes.len(),
+        "Studio returned an incomplete native target batch; retry the push"
+    );
+    let mut by_index = HashMap::new();
+    for target in targets {
+        ensure!(
+            by_index.insert(target.index, target).is_none(),
+            "Studio returned a duplicate native target; retry the push"
+        );
+    }
+    writes
+        .iter()
+        .map(|write| {
+            let target = by_index
+                .remove(&write.index)
+                .context("Studio omitted a queued native target; retry the push")?;
+            ensure!(
+                target.class_name == write.class_name
+                    && !target.path_segments.is_empty()
+                    && target.path_segments.len() == target.path_ordinals.len()
+                    && target.path_segments.iter().all(|name| !name.is_empty())
+                    && target.path_ordinals.iter().all(|ordinal| *ordinal > 0),
+                "Studio returned a changed or invalid native target; retry the push"
+            );
+            Ok(target)
+        })
+        .collect()
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+struct PreparedRootWrites {
+    runtime_id: String,
+    pid: u32,
+    title: String,
+    targets: Vec<PreparedRootTarget>,
+    positions: HashMap<usize, usize>,
+    #[cfg(windows)]
+    properties: crate::studio::native::serializer::NativePropertyBatch,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl PreparedRootWrites {
+    fn new(bridge: &BridgeServer, transaction_id: &str, writes: &[RootWrite]) -> Result<Self> {
+        use crate::studio::{bridge::BridgeTarget, native::serializer};
+        let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
+        let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
+        let title = serializer::target_name(pid, &info.place_name)?;
+        let response = bridge.call_for_runtime_with_timeout(
+            "getEditorTransactionState",
+            serde_json::json!({"transactionId": transaction_id, "describeNativeRootWrites": writes.iter().map(|write| write.index).collect::<Vec<_>>()}),
+            BridgeTarget::Edit, &info.runtime_id, Some(std::time::Duration::from_secs(30)),
+        )?;
+        let targets = prepared_targets(response, writes)?;
+        let positions = targets
+            .iter()
+            .enumerate()
+            .map(|(index, target)| (target.index, index))
+            .collect();
+        #[cfg(windows)]
+        let properties = serializer::NativePropertyBatch::new(
+            pid,
+            &title,
+            &targets
+                .iter()
+                .map(|target| serializer::NativePropertyPath {
+                    segments: &target.path_segments,
+                    ordinals: &target.path_ordinals,
+                })
+                .collect::<Vec<_>>(),
+            std::time::Duration::from_secs(30),
+            None,
+        )?;
+        Ok(Self {
+            runtime_id: info.runtime_id,
+            pid,
+            title,
+            targets,
+            positions,
+            #[cfg(windows)]
+            properties,
+        })
+    }
+}
+
 pub(crate) fn apply(
     bridge: &BridgeServer,
     summary: &mut Map<String, Value>,
@@ -451,13 +550,39 @@ pub(crate) fn apply(
     let writes: Vec<RootWrite> =
         serde_json::from_value(rows).context("Invalid native root writes")?;
     let transaction_id = transaction_id.context("Native root writes require a transaction")?;
-    for write in writes {
-        let text = write.text()?;
+    let texts = writes
+        .iter()
+        .map(RootWrite::text)
+        .collect::<Result<Vec<_>>>()?;
+    #[cfg(test)]
+    let mocked = RECORDED_WRITES.with_borrow(Option::is_some);
+    #[cfg(not(test))]
+    let mocked = false;
+    #[cfg(any(windows, target_os = "macos"))]
+    let mut prepared = if writes.is_empty() || mocked {
+        None
+    } else {
+        Some(PreparedRootWrites::new(bridge, transaction_id, &writes)?)
+    };
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let _ = mocked;
+    for (write, text) in writes.into_iter().zip(texts) {
         #[cfg(test)]
         if record_test_write(&write) {
             verified.record(write);
             continue;
         }
+        #[cfg(any(windows, target_os = "macos"))]
+        apply_write(
+            bridge,
+            transaction_id,
+            &write,
+            &text,
+            prepared
+                .as_mut()
+                .context("Native target batch is unavailable; retry the push")?,
+        )?;
+        #[cfg(not(any(windows, target_os = "macos")))]
         apply_write(bridge, transaction_id, &write, &text)?;
         // Keep exact native readback local to this transaction and requested
         // values. Terrain also rechecks both grids at the native commit boundary.
@@ -472,12 +597,20 @@ fn apply_write(
     transaction_id: &str,
     write: &RootWrite,
     text: &str,
+    prepared: &mut PreparedRootWrites,
 ) -> Result<()> {
     use crate::studio::bridge::BridgeTarget;
     let started = std::time::Instant::now();
-    let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
-    let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
-    let title = crate::studio::native::serializer::target_name(pid, &info.place_name)?;
+    let pid = prepared.pid;
+    let title = &prepared.title;
+    let runtime_id = &prepared.runtime_id;
+    let position = *prepared
+        .positions
+        .get(&write.index)
+        .context("Native target is missing from its batch; retry the push")?;
+    let target = &prepared.targets[position];
+    let path_segments = target.path_segments.clone();
+    let path_ordinals = target.path_ordinals.clone();
     let property_name = match (write.class_name.as_str(), write.name.as_str()) {
         ("MeshPart", "MeshContent") => "MeshId",
         ("MeshPart", "MeshSize") => "InitialSize",
@@ -485,27 +618,6 @@ fn apply_write(
         _ => &write.name,
     };
     let is_terrain = write.class_name == "Terrain" && write.name == "SmoothGrid";
-    // The plan's ordinals can be stale once earlier changes in the batch have
-    // landed; Studio reports where the queued instance actually sits now.
-    let described = bridge.call_for_runtime_with_timeout(
-        "getEditorTransactionState",
-        serde_json::json!({"transactionId": transaction_id, "nativeRootWrite": write.index, "describeNativeRootWrite": true}),
-        BridgeTarget::Edit,
-        &info.runtime_id,
-        Some(std::time::Duration::from_secs(2)),
-    )?;
-    let live_segments: Option<Vec<String>> =
-        serde_json::from_value(described["pathSegments"].clone()).ok();
-    let live_ordinals: Option<Vec<usize>> =
-        serde_json::from_value(described["pathOrdinals"].clone()).ok();
-    let (path_segments, path_ordinals) = match (live_segments, live_ordinals) {
-        (Some(segments), Some(ordinals))
-            if !segments.is_empty() && segments.len() == ordinals.len() =>
-        {
-            (segments, ordinals)
-        }
-        _ => (write.path_segments.clone(), write.path_ordinals.clone()),
-    };
     let grid = |name: &str| -> Result<Option<Vec<u8>>> {
         write
             .value
@@ -541,7 +653,7 @@ fn apply_write(
     let mut terrain = if is_terrain {
         Some(crate::studio::native::serializer::prepare_terrain(
             pid,
-            &title,
+            title,
             &path_segments,
             &path_ordinals,
             std::time::Duration::from_secs(3),
@@ -552,23 +664,27 @@ fn apply_write(
     let mut property = if is_terrain {
         None
     } else {
-        Some(
-            crate::studio::native::serializer::prepare_property(
-                pid,
-                &title,
-                &path_segments,
-                &path_ordinals,
-                property_name,
-                std::time::Duration::from_secs(2),
+        #[cfg(windows)]
+        let property =
+            prepared
+                .properties
+                .prepare(position, property_name, std::time::Duration::from_secs(2));
+        #[cfg(target_os = "macos")]
+        let property = crate::studio::native::serializer::prepare_property(
+            pid,
+            title,
+            &path_segments,
+            &path_ordinals,
+            property_name,
+            std::time::Duration::from_secs(2),
+        );
+        Some(property.with_context(|| {
+            format!(
+                "Preparing native sync of {}.{}",
+                path_segments.join("."),
+                write.name
             )
-            .with_context(|| {
-                format!(
-                    "Preparing native sync of {}.{}",
-                    path_segments.join("."),
-                    write.name
-                )
-            })?,
-        )
+        })?)
     };
     let discovered = std::time::Instant::now();
     if let Some(property) = &property {
@@ -582,7 +698,7 @@ fn apply_write(
         bridge.call_for_runtime_with_timeout(
         "getEditorTransactionState",
         serde_json::json!({"transactionId":transaction_id, "nativeRootWrite":write.index, "finishNativeRootWrite":finish, "nativeRootChanged":changed, "nativeTerrainBaseline":terrain_baseline}),
-        BridgeTarget::Edit, &info.runtime_id, Some(std::time::Duration::from_secs(2)),
+        BridgeTarget::Edit, runtime_id, Some(std::time::Duration::from_secs(2)),
     )
     };
     let begin = state(false, false, None)?;
@@ -598,7 +714,7 @@ fn apply_write(
             .context("Studio omitted the native write recording")?;
         // A native import can start a new recording after its insertion phase.
         crate::studio::native::serializer::register_history_if_available(
-            pid, &title, token, is_terrain,
+            pid, title, token, is_terrain,
         )?;
         if let Some(terrain) = &mut terrain {
             terrain.expect(
@@ -644,7 +760,7 @@ fn apply_write(
             skipped += 1;
             *property = crate::studio::native::serializer::prepare_property(
                 pid,
-                &title,
+                title,
                 &path_segments,
                 &path_ordinals,
                 property_name,
@@ -703,7 +819,7 @@ fn apply_write(
             "getEditorTransactionState",
             serde_json::json!({"transactionId": transaction_id, "nativeRootWrite": write.index, "cookNativeRootWrite": true}),
             BridgeTarget::Edit,
-            &info.runtime_id,
+            runtime_id,
             Some(std::time::Duration::from_secs(90)),
         )?;
         ensure!(
@@ -787,6 +903,26 @@ fn apply_write(_: &BridgeServer, _: &str, _: &RootWrite, _: &str) -> Result<()> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn batch_targets_bind_every_queued_index_and_class() {
+        let write: RootWrite = serde_json::from_value(json!({"index":7,"className":"SurfaceAppearance","pathSegments":["Workspace","material"],"pathOrdinals":[1,1],"name":"TexturePack","value":"saved"})).unwrap();
+        let row = json!({"index":7,"className":"SurfaceAppearance","pathSegments":["Workspace","renamed"],"pathOrdinals":[1,2]});
+        let writes = [write];
+        let valid = prepared_targets(json!({"nativeRootTargets":[row.clone()]}), &writes).unwrap();
+        assert_eq!(valid[0].path_segments[1], "renamed");
+        assert_eq!(valid[0].path_ordinals, [1, 2]);
+        for bad in [
+            Value::Null,
+            json!([]),
+            json!([row.clone(), row.clone()]),
+            json!([{"index":8,"className":"SurfaceAppearance","pathSegments":["Workspace","x"],"pathOrdinals":[1,1]}]),
+            json!([{"index":7,"className":"Part","pathSegments":["Workspace","x"],"pathOrdinals":[1,1]}]),
+            json!([{"index":7,"className":"SurfaceAppearance","pathSegments":["Workspace","x"],"pathOrdinals":[1,0]}]),
+        ] {
+            assert!(prepared_targets(json!({"nativeRootTargets":bad}), &writes).is_err());
+        }
+    }
 
     #[test]
     fn early_and_late_native_proofs_keep_exact_targets_and_values() {

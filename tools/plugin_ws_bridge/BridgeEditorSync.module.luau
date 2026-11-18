@@ -6370,6 +6370,69 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end)
 	end
 
+	local function captureStudioGenerations(serviceNames: { string }): { [string]: number }
+		local generations = {}
+		for _, serviceName in ipairs(serviceNames) do
+			generations[serviceName] = ctx.studioChangeGeneration(serviceName)
+		end
+		return generations
+	end
+
+	local function studioGenerationsChanged(generations: { [string]: number }): boolean
+		for serviceName, generation in pairs(generations) do
+			if ctx.studioChangeGeneration(serviceName) ~= generation then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function describeNativeRootTargets(session, indices)
+		local dense = denseArrayLength(indices)
+		if not dense then
+			error("Native target preparation requires a dense index list")
+		end
+		assertTransactionLease(session)
+		if session.pendingNativeRootWrite ~= nil then
+			error("Finish the current native write before preparing targets")
+		end
+		local generations = captureStudioGenerations(session.serviceNames)
+		local snapshot = BridgeIdentity.newPathSnapshot()
+		local childIndex = BridgeIdentity.newChildIndex()
+		local resolveCache = {}
+		local budget = BridgeParallel.newWorkBudget()
+		local seen = {}
+		local targets = table.create(#indices)
+		for _, index in ipairs(indices) do
+			if budget() then
+				assertTransactionLease(session)
+				if studioGenerationsChanged(generations) then
+					error("Studio changed during native target preparation; retry the push")
+				end
+			end
+			local write = if session.nativeRootWrites then session.nativeRootWrites[index] else nil
+			if type(index) ~= "number" or index % 1 ~= 0 or index < 1 or seen[index]
+				or write == nil or write.finished or not isNativeRootProperty(write.instance, write.name) then
+				error("Native target index is invalid or no longer queued; retry the push")
+			end
+			seen[index] = true
+			local segments, ordinals = BridgeIdentity.getRefPathParts(write.instance, snapshot)
+			if segments == nil or BridgeIdentity.resolvePathSegments(segments, resolveCache, ordinals, childIndex) ~= write.instance then
+				error("Native target moved or left the place; retry the push")
+			end
+			targets[#targets + 1] = { index = index, className = write.instance.ClassName,
+				pathSegments = segments, pathOrdinals = ordinals }
+		end
+		assertTransactionLease(session)
+		if studioGenerationsChanged(generations) then
+			error("Studio changed during native target preparation; retry the push")
+		end
+		-- The first individual fence confirms that the host's shared lookup saw
+		-- the same hierarchy. Later fences still validate their queued instance.
+		session.nativeRootPreparation = generations
+		return targets
+	end
+
 	function api.getTransactionState(params: { [string]: any }): { [string]: any }
 		local transactionId = tostring(params.transactionId or "")
 		if transactionId == "" then
@@ -6393,6 +6456,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					or (params.nativeRootWrite ~= nil and params.finishNativeRootWrite ~= true) then
 					error("Invalid Terrain transaction baseline")
 				end
+			end
+			if params.describeNativeRootWrites ~= nil then
+				if state ~= "open" and state ~= "prepared" or session.historyRecording == nil then
+					error("Native target preparation requires an active undo recording")
+				end
+				return { transactionId = transactionId, state = state,
+					nativeRootTargets = describeNativeRootTargets(session, params.describeNativeRootWrites) }
 			end
 			local needsMeshCook: boolean? = nil
 			if params.nativeRootWrite ~= nil then
@@ -6428,6 +6498,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						pathSegments = livePathSegments,
 						pathOrdinals = livePathOrdinals,
 					}
+				end
+				if params.finishNativeRootWrite ~= true and params.cookNativeRootWrite ~= true
+					and session.nativeRootPreparation ~= nil then
+					if studioGenerationsChanged(session.nativeRootPreparation) then
+						error("Studio changed while native targets were resolved; retry the push")
+					end
+					session.nativeRootPreparation = nil
 				end
 				if params.nativeTerrainBaseline ~= nil and (write.instance ~= game:GetService("Workspace").Terrain or write.name ~= "SmoothGrid") then
 					error("Terrain baseline does not match the native root write")
@@ -7325,23 +7402,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 		end
 		return filtered
-	end
-
-	local function captureStudioGenerations(serviceNames: { string }): { [string]: number }
-		local generations = {}
-		for _, serviceName in ipairs(serviceNames) do
-			generations[serviceName] = ctx.studioChangeGeneration(serviceName)
-		end
-		return generations
-	end
-
-	local function studioGenerationsChanged(generations: { [string]: number }): boolean
-		for serviceName, generation in pairs(generations) do
-			if ctx.studioChangeGeneration(serviceName) ~= generation then
-				return true
-			end
-		end
-		return false
 	end
 
 	function api.beginTransaction(params: { [string]: any }): { [string]: any }
