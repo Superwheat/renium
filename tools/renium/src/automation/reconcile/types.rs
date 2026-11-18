@@ -260,7 +260,10 @@ pub(crate) struct PreparedEditorSettingsChange {
 
 pub(crate) struct PreparedPushVerification {
     pub(crate) previous: SettingsBytecode,
-    pub(crate) desired: Arc<SettingsBytecode>,
+    /// The files' document the push was made from. `None` for one that left
+    /// instances in its store file, once the import has carried them to
+    /// Studio: a verification reads that file.
+    pub(crate) desired: Option<Arc<SettingsBytecode>>,
 }
 
 #[derive(Default)]

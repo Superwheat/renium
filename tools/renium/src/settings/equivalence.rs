@@ -650,6 +650,61 @@ pub(crate) fn stabilize_settings_reference_ids(document: &mut SettingsBytecode) 
     stabilize_settings_reference_ids_with_remap(document, None, false);
 }
 
+/// `stabilize_settings_reference_ids` for the instances at `rows` of a
+/// document that holds its instances under `ids`.
+pub(crate) fn stabilize_rows(
+    document: &mut SettingsBytecode,
+    rows: std::ops::Range<usize>,
+    ids: &[String],
+) {
+    document.instances[rows]
+        .par_iter_mut()
+        .for_each(|instance| {
+            stabilize_record_references(&mut instance.properties, ids);
+            stabilize_record_references(&mut instance.attributes, ids);
+        });
+}
+
+/// Gives the references of the instances at `rows` the ids `remap` gives
+/// the instances they name, as an alignment by position does for a store of
+/// `service` whose instances took those ids (`remap_positional_ids`).
+pub(crate) fn remap_rows(
+    document: &mut SettingsBytecode,
+    rows: std::ops::Range<usize>,
+    remap: &HashMap<String, String>,
+    service: &str,
+) {
+    document.instances[rows]
+        .par_iter_mut()
+        .for_each(|instance| {
+            remap_record_reference_ids(&mut instance.properties, remap, Some(service));
+            remap_record_reference_ids(&mut instance.attributes, remap, Some(service));
+        });
+}
+
+/// Whether the instances of two copies of a store stand at the same places
+/// and may be told by them: the two hold the same names, classes and
+/// parents in the same order, the viewport camera at the same place, and no
+/// identity that says an instance stands elsewhere in the other copy. These
+/// are the conditions under which `align_settings_ids_to_reference` gives
+/// the observed instances the reference's ids by position, apart from the
+/// values of instances that have a namesake, which the caller compares.
+pub(crate) fn instances_stand_alike(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+) -> bool {
+    settings_topology_matches(reference, observed)
+        && match (
+            workspace_current_camera_index(reference),
+            workspace_current_camera_index(observed),
+        ) {
+            (Some(reference), Some(observed)) => reference == observed,
+            _ => true,
+        }
+        && persistent_identities_follow_mapping(reference, observed, Some)
+        && store_identities_follow_mapping(reference, observed, Some)
+}
+
 fn stabilize_settings_reference_ids_with_remap(
     document: &mut SettingsBytecode,
     remap: Option<&HashMap<String, String>>,
@@ -2582,14 +2637,125 @@ fn canonicalize_content_uri_alias(instance: &mut SettingsBytecodeInstance) -> Re
     Ok(())
 }
 
+/// Whether a document left instances in its store file: each stands there
+/// with its UniqueId alone (`held::stand_unchanged`) until it is read.
+pub(crate) fn holds_unread_instances(document: &SettingsBytecode) -> bool {
+    document
+        .instances
+        .iter()
+        .any(|instance| crate::settings::held::stands_unchanged(&instance.properties))
+}
+
+const STORE_CHANGED: &str = "A store changed while its push was being prepared; retry the sync";
+
+/// Reads every instance a document left in its store file: afterwards it is
+/// the document a whole decode of that file gives, with the instances that
+/// were read before as they stand.
+pub(crate) fn read_unread_instances(document: &mut SettingsBytecode, store: &[u8]) -> Result<()> {
+    if !holds_unread_instances(document) {
+        return Ok(());
+    }
+    let mut whole = crate::settings::bytecode::decode_settings_bytecode_holding(store)?;
+    stabilize_settings_reference_ids(&mut whole);
+    canonicalize_settings_property_names(&mut whole)?;
+    let same_places = whole.instances.len() == document.instances.len()
+        && whole
+            .instances
+            .iter()
+            .zip(&document.instances)
+            .all(|(read, held)| {
+                read.settings_id == held.settings_id
+                    && read.name == held.name
+                    && read.class_name == held.class_name
+                    && read.parent_index == held.parent_index
+            });
+    anyhow::ensure!(same_places, STORE_CHANGED);
+    for (instance, read) in document.instances.iter_mut().zip(whole.instances) {
+        if crate::settings::held::stands_unchanged(&instance.properties) {
+            *instance = read;
+        }
+    }
+    Ok(())
+}
+
+/// The document of a store file with only some of its instances read: the
+/// ones `document` has read, and the ones at `rows`, each as a whole decode
+/// of the file gives it. Every other instance holds no value.
+pub(crate) fn read_instances(
+    document: &SettingsBytecode,
+    store: &[u8],
+    rows: &[usize],
+) -> Result<SettingsBytecode> {
+    let unread = |instance: &SettingsBytecodeInstance| {
+        crate::settings::held::stands_unchanged(&instance.properties)
+    };
+    let rows = rows
+        .iter()
+        .copied()
+        .filter(|row| document.instances.get(*row).is_some_and(unread))
+        .collect::<Vec<_>>();
+    let (read, ids) = crate::settings::bytecode::property_edit::decode_rows(store, &rows)?;
+    anyhow::ensure!(
+        ids.len() == document.instances.len()
+            && ids
+                .iter()
+                .zip(&document.instances)
+                .all(|(id, instance)| *id == instance.settings_id),
+        STORE_CHANGED
+    );
+    let mut partly = SettingsBytecode {
+        version: document.version,
+        instances: document
+            .instances
+            .iter()
+            .map(|instance| {
+                if unread(instance) {
+                    SettingsBytecodeInstance::new(
+                        instance.settings_id.clone(),
+                        instance.name.clone(),
+                        instance.class_name.clone(),
+                        instance.parent_index,
+                    )
+                } else {
+                    instance.clone()
+                }
+            })
+            .collect(),
+    };
+    for (index, mut row) in rows.iter().zip(read) {
+        let held = &partly.instances[*index];
+        anyhow::ensure!(
+            row.name == held.name
+                && row.class_name == held.class_name
+                && row.parent_index == held.parent_index,
+            STORE_CHANGED
+        );
+        for value in row.properties.values_mut() {
+            *value = crate::settings::held::held(std::mem::take(value));
+        }
+        partly.instances[*index] = row;
+    }
+    for &index in &rows {
+        stabilize_rows(&mut partly, index..index + 1, &ids);
+        canonicalize_instances(std::slice::from_mut(&mut partly.instances[index]))?;
+    }
+    Ok(partly)
+}
+
 pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsBytecode) -> Result<()> {
-    let database = rbx_reflection_database::get()?;
     // A dominant service must not serialize canonicalization after decoding.
     // Bounded chunks retain a small class/name cache without a shared lock.
     document
         .instances
         .par_chunks_mut(4096)
-        .try_for_each(|instances| {
+        .try_for_each(canonicalize_instances)
+}
+
+/// `canonicalize_settings_property_names` for some instances of a document.
+pub(crate) fn canonicalize_instances(instances: &mut [SettingsBytecodeInstance]) -> Result<()> {
+    let database = rbx_reflection_database::get()?;
+    {
+        {
             let mut names_by_class = AHashMap::<&str, AHashMap<String, Option<&str>>>::new();
             let mut migrations_by_class = AHashMap::<&str, AHashMap<String, bool>>::new();
             for instance in instances {
@@ -2665,7 +2831,8 @@ pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsByteco
                 instance.properties = canonical;
             }
             Ok(())
-        })
+        }
+    }
 }
 
 fn legacy_property_migration<'db>(

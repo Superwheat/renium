@@ -110,6 +110,24 @@ fn stores_read_of(
     }
 }
 
+/// The import carried the instances these documents left in their store
+/// files to Studio, and what verifies it reads those files. A document read
+/// by its changed instances beside Studio's copy read the same way stays: it
+/// is the proof that every other instance is the one Studio held.
+fn leave_unread_documents(prepared: &mut HashMap<PathBuf, PreparedPushVerification>) {
+    use crate::settings::equivalence::holds_unread_instances;
+    for verified in prepared.values_mut() {
+        if verified
+            .desired
+            .as_deref()
+            .is_some_and(holds_unread_instances)
+            && !holds_unread_instances(&verified.previous)
+        {
+            verified.desired = None;
+        }
+    }
+}
+
 /// The plan as it is carried out: one made from the changed instances of
 /// both copies that creates, removes or imports an instance is made again
 /// from the files' whole copies of its stores.
@@ -522,7 +540,7 @@ pub(crate) fn push_project(
             path,
             PreparedPushVerification {
                 previous: change.previous,
-                desired,
+                desired: Some(desired),
             },
         );
     }
@@ -548,6 +566,7 @@ pub(crate) fn push_project(
         // record or read back; the summary carries the hold and its next step.
         return Ok(pushed.summary);
     }
+    leave_unread_documents(&mut prepared_verification);
     pushed.summary.insert(
         "historyId".into(),
         Value::String(history.commit(&project, &pushed.generated)?),
@@ -723,7 +742,7 @@ pub(crate) fn push_project(
                 prepared_verification
                     .into_par_iter()
                     .for_each(|(_, verified)| {
-                        if let Some(desired) = Arc::into_inner(verified.desired) {
+                        if let Some(desired) = verified.desired.and_then(Arc::into_inner) {
                             drop_settings_documents(verified.previous, desired);
                         } else {
                             drop_settings_document(verified.previous);

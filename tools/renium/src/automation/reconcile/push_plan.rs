@@ -208,8 +208,7 @@ pub(crate) fn push_staged_project(
         },
         |changes| {
             amend_reconciled_changes(changes, plan)?;
-            stage_native_bootstrap_services(changes, &initial_documents);
-            Ok(())
+            stage_native_bootstrap_services(changes, &initial_documents)
         },
         |changes| {
             generated = redirect_staged_settings_writes(
@@ -236,7 +235,7 @@ pub(crate) fn push_staged_project(
 pub(crate) fn stage_native_bootstrap_services(
     changes: &mut EditorChangeSet,
     documents: &HashMap<String, Arc<SettingsBytecode>>,
-) {
+) -> Result<()> {
     changes
         .instance_changes
         .retain(|change| !documents.contains_key(&change.service));
@@ -250,9 +249,16 @@ pub(crate) fn stage_native_bootstrap_services(
                 preserve_instances: Vec::new(),
             });
         } else {
+            // Only the import of a whole service reads the instances a
+            // document left in its store file.
+            anyhow::ensure!(
+                !crate::settings::equivalence::holds_unread_instances(document),
+                "The store of {service} was prepared for an import that does not take place; retry the push"
+            );
             crate::editor::diff::append_editor_instance_reconcile(changes, document, service);
         }
     }
+    Ok(())
 }
 
 pub(crate) fn redirect_staged_settings_writes(

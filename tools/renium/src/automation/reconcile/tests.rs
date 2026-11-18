@@ -665,7 +665,7 @@ fn native_bootstrap_does_not_replace_nonempty_service_deltas() {
     }
     let empty = HashMap::new();
     let before = serde_json::to_value(&changes.instance_changes).unwrap();
-    stage_native_bootstrap_services(&mut changes, &empty);
+    stage_native_bootstrap_services(&mut changes, &empty).unwrap();
     assert_eq!(
         serde_json::to_value(&changes.instance_changes).unwrap(),
         before
@@ -673,7 +673,8 @@ fn native_bootstrap_does_not_replace_nonempty_service_deltas() {
     stage_native_bootstrap_services(
         &mut changes,
         &HashMap::from([("Workspace".into(), Arc::clone(&document))]),
-    );
+    )
+    .unwrap();
     assert_eq!(changes.instance_changes.len(), 3);
     assert_eq!(changes.instance_changes[0].service, "TestService");
     assert_eq!(changes.instance_changes[0].mode, "deleteInstances");
@@ -4384,7 +4385,7 @@ fn native_import_settlement_keeps_checked_values_and_rejects_failed_captures() -
                     instances: Vec::new(),
                 },
             ),
-            desired: Arc::new(desired.clone()),
+            desired: Some(Arc::new(desired.clone())),
         },
     )]);
     let (failures, _) = verify_and_settle_native_import(
@@ -6601,6 +6602,116 @@ fn changed_instances_store(rng: &mut crate::tests::support::SimRng) -> SettingsB
     }
 }
 
+fn plan_text(plan: &ReconcilePushPlan) -> String {
+    fn sorted(items: impl Iterator<Item = String>) -> String {
+        let mut items = items.collect::<Vec<_>>();
+        items.sort();
+        items.join(" | ")
+    }
+    let pair = |(service, id): &(String, String)| format!("{service}/{id}");
+    [
+        sorted(plan.initial_native_services.iter().cloned()),
+        sorted(
+            plan.changed_paths
+                .iter()
+                .map(|path| path.display().to_string()),
+        ),
+        plan.target_settings_ids.join(" | "),
+        sorted(plan.recreated_settings_ids.iter().cloned()),
+        sorted(plan.recreated_instances.iter().map(pair)),
+        sorted(
+            plan.previous_class_names
+                .iter()
+                .map(|(key, class)| format!("{}={class}", pair(key))),
+        ),
+        sorted(plan.previous_paths.iter().map(|(key, path)| {
+            format!(
+                "{}={:?}{:?}",
+                pair(key),
+                path.path_segments,
+                path.path_ordinals
+            )
+        })),
+        sorted(
+            plan.previous_identities
+                .iter()
+                .map(|(key, id)| format!("{}={id}", pair(key))),
+        ),
+        // The planner lists the instances of one removal in no fixed order.
+        sorted(plan.instance_deletes.iter().map(|change| {
+            let mut change = serde_json::to_value(change).unwrap();
+            if let Some(instances) = change["instances"].as_array_mut() {
+                instances.sort_by_key(Value::to_string);
+            }
+            change.to_string()
+        })),
+        sorted(
+            plan.property_removals
+                .iter()
+                .map(|change| serde_json::to_string(change).unwrap()),
+        ),
+        sorted(
+            plan.geometry_properties
+                .iter()
+                .map(|(key, names)| format!("{}={names:?}", pair(key))),
+        ),
+        sorted(plan.attribute_only_instances.iter().map(pair)),
+        sorted(plan.in_place_instances.iter().map(pair)),
+        sorted(
+            plan.unchanged_native_root_properties
+                .iter()
+                .map(|(key, names)| {
+                    let mut names = names.clone();
+                    names.sort();
+                    format!("{}={names:?}", pair(key))
+                }),
+        ),
+    ]
+    .join("\n")
+}
+
+/// What the write step sends for a change set, as text.
+fn request_text(changes: &crate::editor::types::EditorChangeSet) -> Result<String, String> {
+    let mut lists = [
+        serde_json::to_value(&changes.source_changes),
+        serde_json::to_value(&changes.instance_changes),
+        serde_json::to_value(&changes.property_changes),
+    ]
+    .map(|list| list.map_err(|error| error.to_string()));
+    let mut out = Vec::new();
+    for list in &mut lists {
+        let list = list.as_mut().map_err(|error| error.clone())?;
+        if let Some(items) = list.as_array_mut() {
+            // The planner lists the instances of one removal in no fixed
+            // order.
+            for item in items.iter_mut() {
+                if let Some(instances) = item["instances"].as_array_mut() {
+                    instances.sort_by_key(Value::to_string);
+                }
+            }
+            items.sort_by_key(Value::to_string);
+        }
+        // A request states payloads, never a handle or an instance that
+        // stands for another.
+        out.push(
+            serde_json::to_string(&crate::settings::held::AsPayloads(list))
+                .map_err(|error| format!("request: {error}"))?,
+        );
+    }
+    Ok(format!(
+        "{}\nwhole instances {:?}",
+        out.join("\n"),
+        changes
+            .whole_instances
+            .iter()
+            .map(|(service, path)| format!(
+                "{service}{:?}{:?}",
+                path.path_segments, path.path_ordinals
+            ))
+            .collect::<Vec<_>>()
+    ))
+}
+
 /// One change of a store, most of them of a value of one instance.
 fn change_an_instance(rng: &mut crate::tests::support::SimRng, document: &mut SettingsBytecode) {
     let count = document.instances.len();
@@ -6721,74 +6832,6 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
     use crate::tests::support::{SimRng, run_seeds};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn plan_text(plan: &ReconcilePushPlan) -> String {
-        fn sorted(items: impl Iterator<Item = String>) -> String {
-            let mut items = items.collect::<Vec<_>>();
-            items.sort();
-            items.join(" | ")
-        }
-        let pair = |(service, id): &(String, String)| format!("{service}/{id}");
-        [
-            sorted(plan.initial_native_services.iter().cloned()),
-            sorted(
-                plan.changed_paths
-                    .iter()
-                    .map(|path| path.display().to_string()),
-            ),
-            plan.target_settings_ids.join(" | "),
-            sorted(plan.recreated_settings_ids.iter().cloned()),
-            sorted(plan.recreated_instances.iter().map(pair)),
-            sorted(
-                plan.previous_class_names
-                    .iter()
-                    .map(|(key, class)| format!("{}={class}", pair(key))),
-            ),
-            sorted(plan.previous_paths.iter().map(|(key, path)| {
-                format!(
-                    "{}={:?}{:?}",
-                    pair(key),
-                    path.path_segments,
-                    path.path_ordinals
-                )
-            })),
-            sorted(
-                plan.previous_identities
-                    .iter()
-                    .map(|(key, id)| format!("{}={id}", pair(key))),
-            ),
-            // The planner lists the instances of one removal in no fixed order.
-            sorted(plan.instance_deletes.iter().map(|change| {
-                let mut change = serde_json::to_value(change).unwrap();
-                if let Some(instances) = change["instances"].as_array_mut() {
-                    instances.sort_by_key(Value::to_string);
-                }
-                change.to_string()
-            })),
-            sorted(
-                plan.property_removals
-                    .iter()
-                    .map(|change| serde_json::to_string(change).unwrap()),
-            ),
-            sorted(
-                plan.geometry_properties
-                    .iter()
-                    .map(|(key, names)| format!("{}={names:?}", pair(key))),
-            ),
-            sorted(plan.attribute_only_instances.iter().map(pair)),
-            sorted(plan.in_place_instances.iter().map(pair)),
-            sorted(
-                plan.unchanged_native_root_properties
-                    .iter()
-                    .map(|(key, names)| {
-                        let mut names = names.clone();
-                        names.sort();
-                        format!("{}={names:?}", pair(key))
-                    }),
-            ),
-        ]
-        .join("\n")
-    }
-
     let (from_changed, whole, planned, unchanged_stores) = (
         AtomicUsize::new(0),
         AtomicUsize::new(0),
@@ -6871,53 +6914,15 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
                 .map(|change| ("Workspace".to_string(), Arc::new(change.current)))
                 .into_iter()
                 .collect();
-            let mut changes =
-                crate::editor::sync::collect_prepared_editor_changes(&args, documents)
-                    .map_err(|error| format!("collect: {error:#}"))?;
+            let mut changes = crate::editor::sync::collect_prepared_editor_changes(
+                &args,
+                documents,
+                HashSet::new(),
+            )
+            .map_err(|error| format!("collect: {error:#}"))?;
             super::push_plan::amend_reconciled_changes(&mut changes, plan)
                 .map_err(|error| format!("amend: {error:#}"))?;
-            let mut lists = [
-                serde_json::to_value(&changes.source_changes),
-                serde_json::to_value(&changes.instance_changes),
-                serde_json::to_value(&changes.property_changes),
-            ]
-            .map(|list| list.map_err(|error| error.to_string()));
-            let mut out = Vec::new();
-            for list in &mut lists {
-                let list = list.as_mut().map_err(|error| error.clone())?;
-                if let Some(items) = list.as_array_mut() {
-                    // The planner lists the instances of one removal in no
-                    // fixed order.
-                    for item in items.iter_mut() {
-                        if let Some(instances) = item["instances"].as_array_mut() {
-                            instances.sort_by_key(Value::to_string);
-                        }
-                    }
-                    items.sort_by_key(Value::to_string);
-                }
-                // A request states payloads, never a handle or an instance
-                // that stands for another.
-                out.push(
-                    serde_json::to_string(&crate::settings::held::AsPayloads(list))
-                        .map_err(|error| format!("request: {error}"))?,
-                );
-            }
-            Ok(format!(
-                "{}
-whole instances {:?}",
-                out.join(
-                    "
-"
-                ),
-                changes
-                    .whole_instances
-                    .iter()
-                    .map(|(service, path)| format!(
-                        "{service}{:?}{:?}",
-                        path.path_segments, path.path_ordinals
-                    ))
-                    .collect::<Vec<_>>()
-            ))
+            request_text(&changes)
         };
         let pushed = |read: StoresRead| -> Result<(Vec<String>, bool, bool), String> {
             let prepare = || {
@@ -7003,7 +7008,7 @@ whole instances {:?}",
                     .remove(&path)
                     .map(|change| PreparedPushVerification {
                         previous: change.previous,
-                        desired: Arc::new(change.current),
+                        desired: Some(Arc::new(change.current)),
                     });
                 said.push(format!(
                     "verified {:?}",
@@ -7240,4 +7245,826 @@ fn the_ancestors_of_a_changed_instance_are_read_wherever_they_stand() {
             [false, false, false, false, true]
         );
     }
+}
+
+/// A store of which Studio holds nothing but what stays in a service is
+/// pushed whole: the import carries its instances from the store file, and
+/// the push reads only the ones it handles beside the import. Prepared so,
+/// the push says and sends what the push prepared from the whole documents
+/// says and sends, and the instances it left in the file, read afterwards,
+/// give the whole documents' copy.
+#[test]
+fn a_bare_store_prepared_from_the_instances_its_push_reads_is_pushed_as_the_whole_documents_push_it()
+ {
+    use crate::tests::support::{SimRng, run_seeds};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (in_part, whole, with_containers, emptied) = (
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    );
+    let with_one_kept = AtomicUsize::new(0);
+    run_seeds(300, |seed, _| {
+        let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let mut files = changed_instances_store(&mut rng);
+        let camera = files
+            .instances
+            .iter()
+            .position(|instance| instance.class_name == "Camera");
+        // What a place holds beside its parts: the terrain, scripts with
+        // their text in the store or beside it, a second camera, and
+        // instances named or classed as the ones Studio keeps.
+        let count = files.instances.len();
+        if rng.below(2) == 0 {
+            let mut terrain = SettingsBytecodeInstance::new(
+                if rng.below(2) == 0 {
+                    "terrain".into()
+                } else {
+                    "debug:0_3".into()
+                },
+                "Terrain".into(),
+                "Terrain".into(),
+                Some(0),
+            );
+            terrain
+                .properties
+                .insert("WaterTransparency".into(), json!(rng.below(4) as f64 / 4.0));
+            files.instances.push(terrain);
+        }
+        for index in 0..rng.below(4) {
+            let parent = rng.below(count);
+            let class = ["Script", "ModuleScript", "Camera", "Terrain", "Folder"][rng.below(5)];
+            let name = ["Camera", "Terrain", "Main", "Twin", "Workspace"][rng.below(5)];
+            let mut instance = SettingsBytecodeInstance::new(
+                format!("extra-{index}"),
+                name.into(),
+                class.into(),
+                Some(parent),
+            );
+            if class.ends_with("Script") {
+                instance.properties.insert(
+                    "Source".into(),
+                    if rng.below(2) == 0 {
+                        json!(format!("return {index}"))
+                    } else {
+                        json!(crate::settings::EXTERNAL_SOURCE_MARKER)
+                    },
+                );
+            }
+            if class == "Camera" {
+                instance
+                    .properties
+                    .insert("FieldOfView".into(), json!(40.0));
+            }
+            if rng.below(2) == 0 {
+                instance.properties.insert(
+                    "UniqueId".into(),
+                    json!({"_type": "UniqueId", "value": format!("{:024x}{:08x}", 9, index + 1)}),
+                );
+            }
+            files.instances.push(instance);
+        }
+        // A store written before a root named its camera.
+        if rng.below(4) == 0 {
+            files.instances[0].properties.remove("CurrentCamera");
+        }
+        // Studio: an empty place of its own, or no store at all.
+        let empty = rng.below(12) == 0;
+        let mut studio = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: Vec::new(),
+        };
+        if !empty {
+            let mut root = SettingsBytecodeInstance::new(
+                if rng.below(2) == 0 {
+                    "1".into()
+                } else {
+                    "debug:0_1".into()
+                },
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            );
+            root.properties
+                .insert("Gravity".into(), json!([196.2, 50.0][rng.below(2)]));
+            studio.instances.push(root);
+            if rng.below(3) != 0 {
+                // The viewport camera stands under the root, or in a folder
+                // somebody made for it.
+                let folder = (rng.below(5) == 0).then(|| {
+                    studio.instances.push(SettingsBytecodeInstance::new(
+                        "debug:0_60".into(),
+                        "Cams".into(),
+                        "Folder".into(),
+                        Some(0),
+                    ));
+                    studio.instances.len() - 1
+                });
+                let position = studio.instances.len();
+                let mut own = SettingsBytecodeInstance::new(
+                    match (rng.below(3), camera) {
+                        (0, Some(camera)) => files.instances[camera].settings_id.clone(),
+                        (1, _) => "item-2".into(),
+                        _ => "debug:0_77".into(),
+                    },
+                    "Camera".into(),
+                    "Camera".into(),
+                    Some(folder.unwrap_or(0)),
+                );
+                own.properties
+                    .insert("FieldOfView".into(), json!([70.0, 55.0][rng.below(2)]));
+                if let (0, Some(camera)) = (rng.below(2), camera)
+                    && let Some(unique) = files.instances[camera].properties.get("UniqueId")
+                {
+                    own.properties.insert("UniqueId".into(), unique.clone());
+                }
+                studio.instances.push(own);
+                if rng.below(4) != 0 {
+                    studio.instances[0].properties.insert(
+                        "CurrentCamera".into(),
+                        json!({"_type": "Ref", "instanceIndex": position + 1}),
+                    );
+                }
+            }
+            if rng.below(2) == 0 {
+                let mut terrain = SettingsBytecodeInstance::new(
+                    if rng.below(2) == 0 {
+                        "terrain".into()
+                    } else {
+                        "debug:0_3".into()
+                    },
+                    "Terrain".into(),
+                    "Terrain".into(),
+                    Some(0),
+                );
+                terrain
+                    .properties
+                    .insert("WaterTransparency".into(), json!(rng.below(4) as f64 / 4.0));
+                studio.instances.push(terrain);
+            }
+        }
+        // Studio holds a little of its own beside that: an instance the
+        // files know nothing of, the namesake of one of theirs, one of
+        // theirs under another id, or one of theirs as it is.
+        let mut kept = false;
+        if !studio.instances.is_empty() && rng.below(3) == 0 {
+            for index in 0..1 + rng.below(2) {
+                let theirs = &files.instances[1 + rng.below(files.instances.len() - 1)];
+                let mut own = match rng.below(4) {
+                    0 => SettingsBytecodeInstance::new(
+                        format!("debug:0_{}", 900 + index),
+                        "Marker".into(),
+                        "Folder".into(),
+                        Some(0),
+                    ),
+                    1 => {
+                        let mut own = SettingsBytecodeInstance::new(
+                            format!("debug:0_{}", 900 + index),
+                            theirs.name.clone(),
+                            theirs.class_name.clone(),
+                            Some(0),
+                        );
+                        own.properties.insert("Transparency".into(), json!(0.125));
+                        own
+                    }
+                    2 => {
+                        let mut own = theirs.clone();
+                        own.settings_id = format!("debug:0_{}", 900 + index);
+                        own.parent_index = Some(0);
+                        own
+                    }
+                    _ => {
+                        kept |= theirs.parent_index == Some(0);
+                        let mut own = theirs.clone();
+                        own.parent_index = Some(0);
+                        own
+                    }
+                };
+                own.properties
+                    .retain(|_, value| value.get("_type").and_then(Value::as_str) != Some("Ref"));
+                studio.instances.push(own);
+            }
+        }
+        let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        let snapshot = |document: &SettingsBytecode| {
+            Ok::<_, String>(ProjectSnapshot {
+                entries: BTreeMap::from([(
+                    path.clone(),
+                    SnapshotEntry::File(
+                        encode_settings_bytecode(document).map_err(|error| format!("{error:#}"))?,
+                    ),
+                )]),
+            })
+        };
+        let (Ok(desired), Ok(observed)) = (snapshot(&files), snapshot(&studio)) else {
+            return Ok(());
+        };
+        let paths = project_replacement_paths(&desired, &observed);
+        let project_root = crate::tests::support::temp_dir(&format!("bare-store-{seed}"));
+        let store = project_root.join(&path);
+        std::fs::create_dir_all(store.parent().unwrap()).map_err(|error| error.to_string())?;
+        if let Some(SnapshotEntry::File(bytes)) = desired.entries.get(&path) {
+            std::fs::write(&store, bytes).map_err(|error| error.to_string())?;
+        }
+        type Pushed = (Vec<String>, Option<PreparedEditorSettingsChange>, bool);
+        let pushed = |read: StoresRead| -> Result<Pushed, String> {
+            let prepare = || {
+                let mut prepared = HashMap::new();
+                let unchanged = prepare_project_replacement_from(
+                    &desired,
+                    &observed,
+                    &paths,
+                    &mut prepared,
+                    read,
+                )
+                .map_err(|error| format!("prepare: {error:#}"))?;
+                Ok::<_, String>((prepared, unchanged))
+            };
+            let (prepared, unchanged) = prepare()?;
+            let mut said = vec![format!("unchanged {}", unchanged.contains(&path))];
+            let unread =
+                prepared.get(&path).is_some_and(|change| {
+                    change.current.instances.iter().any(|instance| {
+                        crate::settings::held::stands_unchanged(&instance.properties)
+                    })
+                });
+            if let Some(change) = prepared.get(&path) {
+                said.push(format!(
+                    "native {} equivalent {} managed {} saved {:?}",
+                    service_has_only_native_containers(&change.previous),
+                    settings_documents_equivalent(&change.current, &change.previous),
+                    super::verify::differs_only_in_externally_managed_fields(
+                        &change.current,
+                        &change.previous
+                    ),
+                    crate::settings::equivalence::saved_field_differences(
+                        &change.current,
+                        &change.previous
+                    ),
+                ));
+            }
+            let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+                &observed, &desired, &paths, &prepared, true, false,
+            );
+            said.push(match &plan {
+                Ok(plan) => plan_text(plan),
+                Err(error) => format!("no plan: {error:#}"),
+            });
+            if let Ok(plan) = plan
+                && !plan.is_empty()
+            {
+                let (mut prepared, _) = prepare()?;
+                let mut args = crate::cli::PushEditorChangesArgs::new(
+                    crate::cli::ProjectSourceArgs {
+                        project_root: project_root.clone(),
+                        src_root: PathBuf::from("src"),
+                    },
+                    crate::cli::BridgeConnectionArgs::local(0.1),
+                );
+                args.changed_paths.clone_from(&plan.changed_paths);
+                args.target_settings_ids
+                    .clone_from(&plan.target_settings_ids);
+                args.exact_target_ids = true;
+                args.targets_extend_paths = true;
+                args.override_packages = true;
+                let documents = prepared
+                    .remove(&path)
+                    .map(|change| ("Workspace".to_string(), Arc::new(change.current)))
+                    .into_iter()
+                    .collect::<HashMap<_, _>>();
+                let initial = documents
+                    .iter()
+                    .filter(|(service, _)| plan.initial_native_services.contains(*service))
+                    .map(|(service, document)| (service.clone(), Arc::clone(document)))
+                    .collect::<HashMap<_, _>>();
+                said.push(
+                    match crate::editor::sync::collect_prepared_editor_changes(
+                        &args,
+                        documents,
+                        plan.initial_native_services.clone(),
+                    )
+                    .map_err(|error| format!("collect: {error:#}"))
+                    .and_then(|mut changes| {
+                        super::push_plan::amend_reconciled_changes(&mut changes, plan)
+                            .map_err(|error| format!("amend: {error:#}"))?;
+                        super::push_plan::stage_native_bootstrap_services(&mut changes, &initial)
+                            .map_err(|error| format!("stage: {error:#}"))?;
+                        Ok(format!(
+                            "{}\nnative {:?}",
+                            request_text(&changes)?,
+                            changes.native_property_documents.keys().collect::<Vec<_>>()
+                        ))
+                    }) {
+                        Ok(sent) => sent,
+                        Err(error) => format!("not sent: {error}"),
+                    },
+                );
+            }
+            let mut change = prepared.into_iter().next().map(|(_, change)| change);
+            if let (Some(change), Some(SnapshotEntry::File(bytes))) =
+                (&mut change, desired.entries.get(&path))
+            {
+                // Some of them first, as the fields beside an import are read.
+                let some = (0..change.current.instances.len())
+                    .filter(|index| index % 3 == seed as usize % 3)
+                    .collect::<Vec<_>>();
+                let partly =
+                    crate::settings::equivalence::read_instances(&change.current, bytes, &some)
+                        .map_err(|error| format!("read some: {error:#}"))?;
+                for index in some {
+                    change.current.instances[index] = partly.instances[index].clone();
+                }
+                crate::settings::equivalence::read_unread_instances(&mut change.current, bytes)
+                    .map_err(|error| format!("read: {error:#}"))?;
+            }
+            Ok((said, change, unread))
+        };
+        let (expected, expected_change, _) = pushed(StoresRead::Whole)?;
+        let (said, change, unread) = pushed(StoresRead::Changed)?;
+        let _ = std::fs::remove_dir_all(&project_root);
+        if said != expected {
+            return Err(format!(
+                "from the instances the push reads ({unread}):\n{}\nfrom the whole documents:\n{}",
+                said.join("\n"),
+                expected.join("\n")
+            ));
+        }
+        match (&change, &expected_change) {
+            (Some(change), Some(expected)) => {
+                if change.previous != expected.previous {
+                    return Err("Studio's copy is another".to_string());
+                }
+                if let Some(index) = (0..expected.current.instances.len()).find(|&index| {
+                    change.current.instances.get(index) != expected.current.instances.get(index)
+                }) {
+                    return Err(format!(
+                        "read afterwards, instance {index} is\n{:?}\nand whole it is\n{:?}",
+                        change.current.instances.get(index),
+                        expected.current.instances[index]
+                    ));
+                }
+                if change.current.instances.len() != expected.current.instances.len() {
+                    return Err("read afterwards the files' copy has other instances".to_string());
+                }
+            }
+            (None, None) => {}
+            _ => return Err("only one of the two prepared a change".to_string()),
+        }
+        if kept {
+            with_one_kept.fetch_add(1, Ordering::Relaxed);
+        }
+        if unread {
+            in_part.fetch_add(1, Ordering::Relaxed);
+            if studio.instances.len() > 1 {
+                with_containers.fetch_add(1, Ordering::Relaxed);
+            }
+            if empty {
+                emptied.fetch_add(1, Ordering::Relaxed);
+            }
+        } else {
+            whole.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    });
+    if std::env::var_os("RENIUM_SIM_SEED").is_none() {
+        let counts = [&in_part, &whole, &with_containers, &emptied]
+            .map(|count| count.load(Ordering::Relaxed));
+        assert!(
+            counts[0] >= 100 && counts[2] >= 50 && counts[3] >= 5,
+            "prepared in part {} ({} of them with containers in Studio, {} with an empty Studio), whole {}",
+            counts[0],
+            counts[2],
+            counts[3],
+            counts[1]
+        );
+    }
+}
+
+/// A large store is verified a range of rows at a time, with neither copy
+/// whole in memory. Whatever Studio holds afterwards, that verification says
+/// what the whole documents say, and the store it settles holds what theirs
+/// holds: every instance under the files' id, with Studio's values, the
+/// files' value of a field the push left pending, and the files' viewport
+/// camera.
+#[test]
+fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify_it() {
+    use crate::editor::types::PendingImportFields;
+    use crate::tests::support::{SimRng, run_seeds};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (verified, refused, with_pending, with_camera, settled) = (
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    );
+    run_seeds(300, |seed, _| {
+        let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let mut files = changed_instances_store(&mut rng);
+        // A reference by an id alone, as a store holds one whose path nobody
+        // recorded.
+        if rng.below(3) == 0 {
+            for instance in &mut files.instances {
+                if let Some(pointer) = instance
+                    .properties
+                    .get_mut("Pointer")
+                    .and_then(Value::as_object_mut)
+                {
+                    pointer.remove("pathSegments");
+                    pointer.remove("pathOrdinals");
+                }
+            }
+        }
+        let files = files;
+        // Studio before the push: a place of its own, or the files' store
+        // with a few other values.
+        let mut before = files.clone();
+        if rng.below(2) == 0 {
+            before
+                .instances
+                .truncate(1 + usize::from(files.instances[1].class_name == "Camera"));
+            before.instances[0]
+                .properties
+                .insert("Gravity".into(), json!(50.0));
+        } else {
+            for _ in 0..1 + rng.below(3) {
+                change_an_instance(&mut rng, &mut before);
+            }
+        }
+        // Studio after the push: the files' instances under ids and
+        // UniqueIds of its own.
+        let mut after = files.clone();
+        let own_ids = rng.below(4) != 0;
+        let renamed = after
+            .instances
+            .iter()
+            .enumerate()
+            .map(|(index, instance)| {
+                let id = if own_ids && instance.settings_id.starts_with("debug:") {
+                    format!("debug:9_{}", 300 + index)
+                } else {
+                    instance.settings_id.clone()
+                };
+                (instance.settings_id.clone(), id)
+            })
+            .collect::<HashMap<_, _>>();
+        let placed = after
+            .instances
+            .iter()
+            .map(|instance| renamed[&instance.settings_id].clone())
+            .collect::<Vec<_>>();
+        for (index, instance) in after.instances.iter_mut().enumerate() {
+            instance
+                .settings_id
+                .clone_from(&renamed[&instance.settings_id]);
+            // Studio states by an id a reference the files state by the
+            // place of its instance.
+            if rng.below(5) == 0
+                && let Some(place) = instance
+                    .properties
+                    .get("Target")
+                    .and_then(|target| target.get("instanceIndex"))
+                    .and_then(Value::as_u64)
+                && let Some(id) = placed.get(place as usize - 1)
+            {
+                instance
+                    .properties
+                    .insert("Target".into(), json!({"_type": "Ref", "settingsId": id}));
+            }
+            if instance.properties.contains_key("UniqueId") && rng.below(3) != 0 {
+                instance.properties.insert(
+                    "UniqueId".into(),
+                    json!({"_type": "UniqueId", "value": format!("{:024x}{:08x}", 11, index + 1)}),
+                );
+            }
+            // A reference by an id names the instance under Studio's id.
+            if let Some(pointer) = instance.properties.get_mut("Pointer")
+                && let Some(id) = pointer.get("settingsId").and_then(Value::as_str)
+                && let Some(own) = renamed.get(id)
+            {
+                pointer["settingsId"] = json!(own);
+            }
+        }
+        let mut pending = Vec::new();
+        let kind = rng.below(10);
+        let last = after.instances.len() - 1;
+        match kind {
+            // One value is another.
+            0 => {
+                after.instances[1 + rng.below(last)]
+                    .properties
+                    .insert("Transparency".into(), json!(0.875));
+            }
+            // A field the push reported pending is not there yet.
+            1 | 2 | 8 => {
+                let index = 1 + rng.below(last);
+                let unique = files
+                    .instances
+                    .iter()
+                    .filter(|other| {
+                        other.parent_index == files.instances[index].parent_index
+                            && other.name == files.instances[index].name
+                    })
+                    .count()
+                    == 1;
+                if unique
+                    && files.instances[index].parent_index == Some(0)
+                    && let Some(value) = after.instances[index].properties.remove("Transparency")
+                {
+                    pending.push(PendingImportFields {
+                        service: "Workspace".into(),
+                        settings_id: (kind == 1)
+                            .then(|| files.instances[index].settings_id.clone()),
+                        class_name: files.instances[index].class_name.clone(),
+                        path_segments: vec![
+                            "Workspace".into(),
+                            files.instances[index].name.clone(),
+                        ],
+                        path_ordinals: vec![1, 1],
+                        properties: Map::from_iter([("Transparency".to_string(), value)]),
+                    });
+                }
+            }
+            // An instance is missing.
+            3 => {
+                let removed = after.instances.len() - 1;
+                if after
+                    .instances
+                    .iter()
+                    .all(|instance| instance.parent_index != Some(removed))
+                {
+                    after.instances.pop();
+                }
+            }
+            // The viewport camera holds what Studio shows.
+            4 | 5 => {
+                if let Some(camera) = after
+                    .instances
+                    .iter_mut()
+                    .find(|instance| instance.class_name == "Camera")
+                {
+                    camera.properties.insert("FieldOfView".into(), json!(33.0));
+                }
+            }
+            // Studio still holds a value the files no longer state.
+            7 => {
+                let index = 1 + rng.below(last);
+                if let Some(held) = before.instances.iter_mut().find(|instance| {
+                    instance.settings_id == files.instances[index].settings_id
+                        && instance.properties.contains_key("Anchored")
+                }) {
+                    held.properties.insert("Reflectance".into(), json!(0.5));
+                    after.instances[index]
+                        .properties
+                        .insert("Reflectance".into(), json!(0.5));
+                }
+            }
+            // Two instances hold each other's values.
+            6 => {
+                let (left, right) = (1 + rng.below(last), 1 + rng.below(last));
+                if left != right {
+                    let (left_values, right_values) = (
+                        after.instances[left].properties.clone(),
+                        after.instances[right].properties.clone(),
+                    );
+                    after.instances[left].properties = right_values;
+                    after.instances[right].properties = left_values;
+                }
+            }
+            _ => {}
+        }
+        let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        let entry = |document: &SettingsBytecode| {
+            encode_settings_bytecode(document)
+                .map(SnapshotEntry::File)
+                .map_err(|error| format!("{error:#}"))
+        };
+        let (Ok(desired), Ok(observed), Ok(studio)) =
+            (entry(&files), entry(&after), entry(&before))
+        else {
+            return Ok(());
+        };
+        let snapshot = |entry: &SnapshotEntry| ProjectSnapshot {
+            entries: BTreeMap::from([(path.clone(), entry.clone())]),
+        };
+        let (project, held) = (snapshot(&desired), snapshot(&studio));
+        let paths = project_replacement_paths(&project, &held);
+        let prepared = || {
+            let mut prepared = HashMap::new();
+            prepare_project_replacement_from(
+                &project,
+                &held,
+                &paths,
+                &mut prepared,
+                StoresRead::Whole,
+            )
+            .map_err(|error| format!("prepare: {error:#}"))?;
+            Ok::<_, String>(
+                prepared
+                    .remove(&path)
+                    .map(|change| PreparedPushVerification {
+                        previous: change.previous,
+                        desired: (seed % 2 == 0).then(|| Arc::new(change.current)),
+                    }),
+            )
+        };
+        let settle = rng.below(4) != 0;
+        let outcome = |whole_documents: bool| {
+            let Some(prepared) = prepared()? else {
+                return Ok(None);
+            };
+            super::verify::settings_delta_outcome(
+                &path,
+                (&studio, &desired, &observed),
+                prepared,
+                &pending,
+                (settle, whole_documents),
+            )
+            .map(Some)
+            .map_err(|error| format!("{error:#}"))
+        };
+        let (by_rows, whole) = (outcome(false), outcome(true));
+        let (by_rows, whole) = match (by_rows, whole) {
+            (Ok(Some(by_rows)), Ok(Some(whole))) => (by_rows, whole),
+            (Ok(None), Ok(None)) => return Ok(()),
+            (Err(by_rows), Err(whole)) if by_rows == whole => return Ok(()),
+            (by_rows, whole) => {
+                return Err(format!(
+                    "by rows {:?}, whole {:?}",
+                    by_rows.map(|outcome| outcome.map(|outcome| outcome.0)),
+                    whole.map(|outcome| outcome.map(|outcome| outcome.0))
+                ));
+            }
+        };
+        if by_rows.0 != whole.0 {
+            return Err(format!(
+                "by rows the store says {:?}, whole it says {:?}",
+                by_rows.0, whole.0
+            ));
+        }
+        if whole.0.is_some() {
+            refused.fetch_add(1, Ordering::Relaxed);
+        } else {
+            verified.fetch_add(1, Ordering::Relaxed);
+            if !pending.is_empty() {
+                with_pending.fetch_add(1, Ordering::Relaxed);
+            }
+            if matches!(kind, 4 | 5) {
+                with_camera.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        match (by_rows.1, whole.1) {
+            (Some(by_rows), Some(whole)) => {
+                let document = |bytes: Vec<u8>| {
+                    settings_document(Some(&SnapshotEntry::File(bytes)))
+                        .map_err(|error| format!("{error:#}"))
+                };
+                let (by_rows, whole) = (document(by_rows)?, document(whole)?);
+                if let Some(index) = (0..whole.instances.len().max(by_rows.instances.len()))
+                    .find(|&index| by_rows.instances.get(index) != whole.instances.get(index))
+                {
+                    return Err(format!(
+                        "settled by rows, instance {index} is\n{:?}\nand settled whole it is\n{:?}",
+                        by_rows.instances.get(index),
+                        whole.instances.get(index)
+                    ));
+                }
+                settled.fetch_add(1, Ordering::Relaxed);
+            }
+            (None, None) => {}
+            (by_rows, whole) => {
+                return Err(format!(
+                    "by rows a store is settled: {}, whole: {}",
+                    by_rows.is_some(),
+                    whole.is_some()
+                ));
+            }
+        }
+        Ok(())
+    });
+    if std::env::var_os("RENIUM_SIM_SEED").is_none() {
+        let counts = [&verified, &refused, &with_pending, &with_camera, &settled]
+            .map(|count| count.load(Ordering::Relaxed));
+        assert!(
+            counts[0] >= 80
+                && counts[1] >= 20
+                && counts[2] >= 3
+                && counts[3] >= 10
+                && counts[4] >= 60,
+            "verified {} ({} with a pending field, {} with another viewport camera, {} settled), refused {}",
+            counts[0],
+            counts[2],
+            counts[3],
+            counts[4],
+            counts[1]
+        );
+    }
+}
+
+/// A script file the store knows nothing of adds its instance to the store,
+/// and an edited store is written whole: the instances a document left in
+/// its store file are read before the edit, and the import takes the edited
+/// document.
+#[test]
+fn a_new_script_in_a_store_read_in_part_is_written_with_every_instance() {
+    let mut instances = vec![SettingsBytecodeInstance::new(
+        "1".into(),
+        "Workspace".into(),
+        "Workspace".into(),
+        None,
+    )];
+    for index in 0..16 {
+        let mut part = SettingsBytecodeInstance::new(
+            format!("part-{index}"),
+            format!("Part{index}"),
+            "Part".into(),
+            Some(0),
+        );
+        part.properties
+            .insert("Transparency".into(), json!(index as f64 / 16.0));
+        instances.push(part);
+    }
+    let files = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances,
+    };
+    let studio = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![SettingsBytecodeInstance::new(
+            "debug:0_1".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        )],
+    };
+    let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+    let snapshot = |document: &SettingsBytecode| ProjectSnapshot {
+        entries: BTreeMap::from([(
+            path.clone(),
+            SnapshotEntry::File(encode_settings_bytecode(document).unwrap()),
+        )]),
+    };
+    let (desired, observed) = (snapshot(&files), snapshot(&studio));
+    let paths = project_replacement_paths(&desired, &observed);
+    let mut prepared = HashMap::new();
+    prepare_project_replacement_from(
+        &desired,
+        &observed,
+        &paths,
+        &mut prepared,
+        StoresRead::Changed,
+    )
+    .unwrap();
+    let current = prepared.remove(&path).unwrap().current;
+    assert!(crate::settings::equivalence::holds_unread_instances(
+        &current
+    ));
+    let project_root = crate::tests::support::temp_dir("new-script-in-a-store-read-in-part");
+    let store = project_root.join(&path);
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    let SnapshotEntry::File(bytes) = &desired.entries[&path] else {
+        unreachable!()
+    };
+    std::fs::write(&store, bytes).unwrap();
+    let script = PathBuf::from("src/Workspace/Fresh.server.luau");
+    std::fs::write(project_root.join(&script), "print(1)\n").unwrap();
+    let mut args = crate::cli::PushEditorChangesArgs::new(
+        crate::cli::ProjectSourceArgs {
+            project_root: project_root.clone(),
+            src_root: PathBuf::from("src"),
+        },
+        crate::cli::BridgeConnectionArgs::local(0.1),
+    );
+    args.changed_paths = vec![path.clone(), script];
+    args.override_packages = true;
+    let changes = crate::editor::sync::collect_prepared_editor_changes(
+        &args,
+        HashMap::from([("Workspace".to_string(), Arc::new(current))]),
+        HashSet::from(["Workspace".to_string()]),
+    )
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&project_root);
+    let written = &changes
+        .settings_writes
+        .first()
+        .expect("the store with the new script is written")
+        .document;
+    assert_eq!(written.instances.len(), files.instances.len() + 1);
+    assert!(!crate::settings::equivalence::holds_unread_instances(
+        written
+    ));
+    for (index, instance) in files.instances.iter().enumerate().skip(1) {
+        assert_eq!(
+            written.instances[index].properties.get("Transparency"),
+            instance.properties.get("Transparency")
+        );
+    }
+    let imported = &changes.native_property_documents["Workspace"];
+    assert!(!crate::settings::equivalence::holds_unread_instances(
+        imported
+    ));
+    assert_eq!(imported.instances.len(), files.instances.len() + 1);
 }

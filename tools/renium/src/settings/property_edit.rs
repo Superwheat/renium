@@ -29,7 +29,9 @@ pub(crate) fn read_for_property_edit(
     read_settings_file(path, decode_for_property_edit)
 }
 
-fn decode_for_property_edit(bytes: &[u8]) -> Result<(SettingsBytecode, RetainedPropertyColumns)> {
+pub(crate) fn decode_for_property_edit(
+    bytes: &[u8],
+) -> Result<(SettingsBytecode, RetainedPropertyColumns)> {
     let (version, payload) = decode_settings_bytecode_container(bytes)?;
     let budget = DecodeBudget::for_file(bytes.len());
     let mut reader = BytecodeReader::new(&payload);

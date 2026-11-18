@@ -73,15 +73,24 @@ pub(crate) fn prepare_project_replacement_from(
                 }
                 ChangedInstances::Whole(current) => current,
             };
-            let (current, previous) = rayon::join(
-                || match decoded {
-                    Some(current) => Ok(current),
-                    None => settings_document(desired.entries.get(path)),
-                },
-                || settings_document(observed.entries.get(path)),
-            );
+            let bare = if read != StoresRead::Whole && decoded.is_none() {
+                replaced_store_alone(desired.entries.get(path), observed.entries.get(path))?
+            } else {
+                None
+            };
+            let (current, previous) = match bare {
+                Some((current, previous)) => (anyhow::Ok(current), anyhow::Ok(previous)),
+                None => rayon::join(
+                    || match decoded {
+                        Some(current) => Ok(current),
+                        None => settings_document(desired.entries.get(path)),
+                    },
+                    || settings_document(observed.entries.get(path)),
+                ),
+            };
             let mut current = current?;
             let previous = previous?;
+            let stated = states_viewport(&current);
             let instances = current.instances.len().max(previous.instances.len());
             let step = |name: &str, started: std::time::Instant| {
                 if instances >= 4_096 {
@@ -112,6 +121,7 @@ pub(crate) fn prepare_project_replacement_from(
                         path.display()
                     );
                 }
+                read_where_paired(&mut current, &retained, desired.entries.get(path))?;
                 crate::settings::equivalence::inherit_workspace_viewport_reference(
                     &mut current,
                     &retained,
@@ -126,6 +136,7 @@ pub(crate) fn prepare_project_replacement_from(
                         path.display()
                     );
                 }
+                read_where_paired(&mut current, &previous, desired.entries.get(path))?;
                 let step_started = step("identity matching", step_started);
                 crate::settings::equivalence::inherit_workspace_viewport_reference(
                     &mut current,
@@ -169,6 +180,18 @@ pub(crate) fn prepare_project_replacement_from(
                     retained
                 }
             };
+            // Instances stay in their store file only for the import of a
+            // whole service, which reads that file: every other push creates
+            // the files' instances one by one from what each holds, and a
+            // store that took its viewport camera from Studio is another
+            // document than its file gives.
+            if crate::settings::equivalence::holds_unread_instances(&current)
+                && (!service_has_only_native_containers(&previous)
+                    || !stated && states_viewport(&current))
+                && let Some(SnapshotEntry::File(bytes)) = desired.entries.get(path)
+            {
+                crate::settings::equivalence::read_unread_instances(&mut current, bytes)?;
+            }
             Ok((
                 path.clone(),
                 Some(PreparedEditorSettingsChange { previous, current }),
@@ -184,6 +207,15 @@ pub(crate) fn prepare_project_replacement_from(
         }
     }
     Ok(unchanged)
+}
+
+/// Whether a Workspace store names the camera of its viewport.
+fn states_viewport(document: &SettingsBytecode) -> bool {
+    document.instances.iter().any(|instance| {
+        instance.parent_index.is_none()
+            && instance.class_name == "Workspace"
+            && instance.properties.contains_key("CurrentCamera")
+    })
 }
 
 /// Whether a plan sends nothing but values of instances both copies hold:
@@ -451,6 +483,175 @@ fn changed_instances_alone(
     Ok(ChangedInstances::Prepared(Box::new(
         PreparedEditorSettingsChange { previous, current },
     )))
+}
+
+/// The two copies of a large store of which Studio holds little: Studio's
+/// whole, and the files' with only the instances a push reads beside the
+/// import that carries every other one from the store file to Studio. Those
+/// are the roots, the instances Studio's can be matched with (by an id, a
+/// UniqueId, or a name and class), the engine's containers, the cameras and
+/// the scripts, with the instances on their paths and the namesakes of all
+/// of them, and the models. Every other instance stands for its row of the store file
+/// (`held::stand_unchanged`) with its UniqueId alone, until
+/// `equivalence::read_unread_instances` or `read_instances` reads it. `None`
+/// where the whole documents are prepared.
+fn replaced_store_alone(
+    desired: Option<&SnapshotEntry>,
+    observed: Option<&SnapshotEntry>,
+) -> Result<Option<(SettingsBytecode, SettingsBytecode)>> {
+    use crate::settings::bytecode::property_edit::{decode_for_row_chunks, decode_rows};
+    use crate::settings::equivalence::stabilize_settings_reference_ids;
+
+    let Some(SnapshotEntry::File(desired_bytes)) = desired else {
+        return Ok(None);
+    };
+    let observed_bytes = match observed {
+        Some(SnapshotEntry::File(bytes)) => bytes.len(),
+        None => 0,
+        Some(_) => return Ok(None),
+    };
+    if desired_bytes.len() < CHANGED_INSTANCES_MIN_BYTES
+        || !cfg!(test) && observed_bytes.saturating_mul(4) >= desired_bytes.len()
+    {
+        return Ok(None);
+    }
+    // Every instance with its UniqueId alone, which says where Studio's
+    // stand among them. A store this reader refuses is the whole decode's to
+    // refuse.
+    let Ok((structure, columns)) = decode_for_row_chunks(desired_bytes) else {
+        return Ok(None);
+    };
+    let mut current = structure;
+    if columns
+        .project_properties(
+            &mut current,
+            |name| name == "UniqueId",
+            |_, _, value| Some(value),
+        )
+        .is_err()
+    {
+        return Ok(None);
+    }
+    drop(columns);
+    let skeleton = &current.instances;
+    let count = skeleton.len();
+    let previous = settings_document(observed)?;
+    // The identities of a store this much smaller are matched with the
+    // instances of the files that share an id or a name and class with one
+    // of them, or its UniqueId.
+    if previous.instances.len() >= count / 4 {
+        return Ok(None);
+    }
+    let ids = previous
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.as_str())
+        .collect::<HashSet<_>>();
+    let named = previous
+        .instances
+        .iter()
+        .map(|instance| (instance.name.as_str(), instance.class_name.as_str()))
+        .collect::<HashSet<_>>();
+    let unique_ids = previous
+        .instances
+        .iter()
+        .filter_map(|instance| instance.properties.get("UniqueId"))
+        .collect::<Vec<_>>();
+    let mut read = skeleton
+        .iter()
+        .map(|instance| {
+            let Some(parent) = instance.parent_index else {
+                return true;
+            };
+            ids.contains(instance.settings_id.as_str())
+                || named.contains(&(instance.name.as_str(), instance.class_name.as_str()))
+                || instance
+                    .properties
+                    .get("UniqueId")
+                    .is_some_and(|unique_id| unique_ids.contains(&unique_id))
+                || instance.class_name == "Camera"
+                || crate::editor::sync::is_lua_source_class(&instance.class_name)
+                || skeleton.get(parent).is_some_and(|parent| {
+                    parent.parent_index.is_none()
+                        && crate::roblox::services::is_engine_managed_container(
+                            &parent.class_name,
+                            &instance.class_name,
+                        )
+                })
+        })
+        .collect::<Vec<_>>();
+    for index in 0..count {
+        if !read[index] {
+            continue;
+        }
+        let mut parent = skeleton[index].parent_index;
+        let mut steps = 0;
+        while let Some(at) = parent.filter(|at| *at < count && !read[*at]) {
+            read[at] = true;
+            parent = skeleton[at].parent_index;
+            steps += 1;
+            if steps > count {
+                break;
+            }
+        }
+    }
+    let namesakes = (0..count)
+        .filter(|&index| read[index])
+        .map(|index| (skeleton[index].parent_index, skeleton[index].name.as_str()))
+        .collect::<HashSet<_>>();
+    // A model's pivot is written after the import, from what its row holds.
+    let read = (0..count)
+        .filter(|&index| {
+            namesakes.contains(&(skeleton[index].parent_index, skeleton[index].name.as_str()))
+                || skeleton[index].class_name == "Model"
+        })
+        .collect::<Vec<_>>();
+    drop(namesakes);
+    if read.len() == count {
+        return Ok(None);
+    }
+    let Ok((rows, _)) = decode_rows(desired_bytes, &read) else {
+        return Ok(None);
+    };
+    for instance in &mut current.instances {
+        crate::settings::held::stand_unchanged(&mut instance.properties);
+    }
+    for (index, mut row) in read.iter().zip(rows) {
+        for value in row.properties.values_mut() {
+            *value = crate::settings::held::held(std::mem::take(value));
+        }
+        current.instances[*index] = row;
+    }
+    stabilize_settings_reference_ids(&mut current);
+    canonicalize_settings_property_names(&mut current)?;
+    Ok(Some((current, previous)))
+}
+
+/// Reads the instances the files' copy left in its store file where one of
+/// them shares its id with an instance of Studio's copy: the two are
+/// compared, and an instance that stands for its row compares equal to
+/// anything.
+fn read_where_paired(
+    current: &mut SettingsBytecode,
+    previous: &SettingsBytecode,
+    store: Option<&SnapshotEntry>,
+) -> Result<()> {
+    let unread = current
+        .instances
+        .iter()
+        .filter(|instance| crate::settings::held::stands_unchanged(&instance.properties))
+        .map(|instance| instance.settings_id.as_str())
+        .collect::<HashSet<_>>();
+    let paired = !unread.is_empty()
+        && previous
+            .instances
+            .iter()
+            .any(|instance| unread.contains(instance.settings_id.as_str()));
+    drop(unread);
+    if paired && let Some(SnapshotEntry::File(bytes)) = store {
+        crate::settings::equivalence::read_unread_instances(current, bytes)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn snapshot_differences_prepared(

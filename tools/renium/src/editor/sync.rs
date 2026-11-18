@@ -71,7 +71,10 @@ use crate::studio::bridge::{
 use crate::studio::native::editor::{
     property_change_needs_post_native_apply, send_editor_change_batches,
 };
-use crate::studio::native::import::{build_editor_binary_import, select_editor_binary_import};
+use crate::studio::native::import::{
+    BinaryImportSelection, build_editor_binary_import, build_editor_binary_import_with_documents,
+    select_editor_binary_import,
+};
 use crate::system::files::{
     absolutize_under, canonical_path, fnv1a_hex, is_service_settings_file_name, path_key,
     service_settings_path, strip_extended_prefix, validate_filesystem_instance_name,
@@ -2019,6 +2022,7 @@ where
         || files_to_studio_filter_rules(&args.project.project_root)?.is_some()
     {
         prepared_documents.native_services.clear();
+        read_prepared_documents_whole(&args, &mut prepared_documents)?;
     }
     let no_selection = args.changed_paths.is_empty()
         && args.changed_paths_files.is_empty()
@@ -3940,14 +3944,16 @@ fn push_with_reader_platform(
         let mut projected_args = args.clone();
         projected_args.project.project_root = projection.root().to_path_buf();
         projected_args.project.src_root = PathBuf::from(".");
-        build_editor_binary_import(&projected_args, &changes, bridge, selection)?
+        build_native_import(&projected_args, &changes, bridge, selection)?
     } else {
-        build_editor_binary_import(&args, &changes, bridge, selection)?
+        build_native_import(&args, &changes, bridge, selection)?
     };
     let stores_root = match projection.filter(|stage| stage.is_temporary()) {
         Some(projection) => projection.root().to_path_buf(),
         None => absolutize_under(&args.project.project_root, &args.project.src_root),
     };
+    let supplemental = supplemental_documents(&changes, binary_import.as_ref(), &stores_root)?;
+    changes.native_property_documents.extend(supplemental);
     materialize_native_property_changes(
         &mut changes,
         binary_import.as_ref(),
@@ -4350,6 +4356,10 @@ fn individual_writes_fit_before_build(changes: &EditorChangeSet) -> bool {
     // A stored spelling may be an alias. Count every stored property until
     // materialization has resolved it to its logical name.
     for store in changes.native_property_documents.values() {
+        // A store that left instances in its file is far past any budget.
+        if crate::settings::equivalence::holds_unread_instances(store) {
+            return false;
+        }
         for instance in &store.instances {
             if instance.parent_index.is_some() {
                 let Some(left) = budget.checked_sub(instance.properties.len()) else {
@@ -6199,6 +6209,181 @@ fn outside_reference_paths<'a>(
     })
 }
 
+/// The binary import of a change set. A document that left instances in its
+/// store file is not handed to the builder, which then reads that service
+/// from the file, a few instances at a time.
+fn build_native_import(
+    args: &PushEditorChangesArgs,
+    changes: &EditorChangeSet,
+    bridge: &BridgeServer,
+    selection: Option<BinaryImportSelection>,
+) -> Result<Option<EditorBinaryImport>> {
+    let unread = |document: &Arc<SettingsBytecode>| {
+        crate::settings::equivalence::holds_unread_instances(document)
+    };
+    if !changes.native_property_documents.values().any(unread) {
+        return build_editor_binary_import(args, changes, bridge, selection);
+    }
+    let Some(selection) = selection else {
+        return Ok(None);
+    };
+    let documents = changes
+        .native_property_documents
+        .iter()
+        .filter(|(_, document)| !unread(document))
+        .map(|(service, document)| {
+            (
+                service.clone(),
+                crate::rbx::model::RbxPlaceDocument::Shared(Arc::clone(document)),
+            )
+        })
+        .chain(changes.settings_writes.iter().filter_map(|write| {
+            let service = crate::editor::paths::service_from_changed_path(
+                &args.project.project_root.join(&args.project.src_root),
+                &write.path,
+            )?;
+            Some((
+                service,
+                crate::rbx::model::RbxPlaceDocument::Borrowed(&write.document),
+            ))
+        }))
+        .collect::<HashMap<_, _>>();
+    build_editor_binary_import_with_documents(args, changes, bridge, selection, documents)
+}
+
+/// Reads the instances a document left in its store file before the
+/// document is edited: an edited store is written whole.
+fn read_whole_for_edit(
+    document: Option<&mut Arc<SettingsBytecode>>,
+    src_root: &Path,
+    service: &str,
+) -> Result<()> {
+    if let Some(document) = document
+        && crate::settings::equivalence::holds_unread_instances(document)
+    {
+        crate::settings::equivalence::read_unread_instances(
+            Arc::make_mut(document),
+            &store_bytes(src_root, service)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn store_bytes(stores_root: &Path, service: &str) -> Result<Vec<u8>> {
+    let path = service_settings_path(&stores_root.join(service));
+    std::fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))
+}
+
+/// A push that hands its services to no binary import reads their documents
+/// whole.
+fn read_prepared_documents_whole(
+    args: &PushEditorChangesArgs,
+    prepared: &mut PreparedEditorDocuments,
+) -> Result<()> {
+    let (_, src_root) = editor_project_roots(args)?;
+    for (service, document) in &mut prepared.documents {
+        if crate::settings::equivalence::holds_unread_instances(document) {
+            crate::settings::equivalence::read_unread_instances(
+                Arc::make_mut(document),
+                &store_bytes(&src_root, service)?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// For each document that left instances in its store file, the document
+/// the fields a push writes beside the import are made of: with the
+/// instances of a class or at a path the import names, and the models, whose
+/// pivot is written after it. A service the import does not take whole is
+/// read whole.
+fn supplemental_documents(
+    changes: &EditorChangeSet,
+    import: Option<&EditorBinaryImport>,
+    stores_root: &Path,
+) -> Result<HashMap<String, Arc<SettingsBytecode>>> {
+    use crate::settings::equivalence::{
+        holds_unread_instances, read_instances, read_unread_instances,
+    };
+
+    changes
+        .native_property_documents
+        .par_iter()
+        .filter(|(_, document)| holds_unread_instances(document))
+        .map(|(service, document)| {
+            let started = Instant::now();
+            let Some(import) = import.filter(|import| import.imports_service(service)) else {
+                let mut whole = SettingsBytecode::clone(document);
+                read_unread_instances(&mut whole, &store_bytes(stores_root, service)?)?;
+                return Ok((service.clone(), Arc::new(whole)));
+            };
+            let unread = |instance: &crate::settings::bytecode::SettingsBytecodeInstance| {
+                crate::settings::held::stands_unchanged(&instance.properties)
+            };
+            let mut rows = document
+                .instances
+                .iter()
+                .enumerate()
+                .filter(|(_, instance)| {
+                    unread(instance)
+                        && (instance.class_name == "Model"
+                            || import
+                                .post_apply_properties_by_class
+                                .contains_key(&instance.class_name))
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if !import.post_apply_properties_by_path.is_empty() {
+                let chosen = rows.iter().copied().collect::<HashSet<_>>();
+                let others = document
+                    .instances
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, instance)| unread(instance) && !chosen.contains(index))
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                let paths = crate::editor::paths::build_editor_instance_paths_for_indices(
+                    document, service, &others,
+                );
+                rows.extend(paths.into_iter().filter_map(|(index, path)| {
+                    import
+                        .post_apply_properties_by_path
+                        .contains_key(&crate::bytecode::edit::instance_path_parts_key(
+                            &path.path_segments,
+                            &path.path_ordinals,
+                        ))
+                        .then_some(index)
+                }));
+                rows.sort_unstable();
+            }
+            // The models were read with the document; mostly nothing is left.
+            if rows.is_empty() {
+                return Ok((service.clone(), Arc::clone(document)));
+            }
+            if global_log_enabled(5) {
+                let mut classes = rows
+                    .iter()
+                    .map(|index| document.instances[*index].class_name.as_str())
+                    .collect::<Vec<_>>();
+                classes.sort_unstable();
+                classes.dedup();
+                log_global(
+                    5,
+                    format_args!(
+                        "[renium] native supplemental rows of {service}: {} of {classes:?}, by class {:?}, by path {}",
+                        rows.len(),
+                        import.post_apply_properties_by_class,
+                        import.post_apply_properties_by_path.len()
+                    ),
+                );
+            }
+            let read = read_instances(document, &store_bytes(stores_root, service)?, &rows)?;
+            log_editor_collection_timing("native supplemental rows", started);
+            Ok((service.clone(), Arc::new(read)))
+        })
+        .collect()
+}
+
 fn materialize_native_property_changes(
     changes: &mut EditorChangeSet,
     import: Option<&EditorBinaryImport>,
@@ -6267,6 +6452,7 @@ fn collect_settings_file_change(
 pub(crate) fn collect_prepared_editor_changes(
     args: &PushEditorChangesArgs,
     documents: HashMap<String, Arc<SettingsBytecode>>,
+    native_services: HashSet<String>,
 ) -> Result<EditorChangeSet> {
     let (project_root, src_root) = editor_project_roots(args)?;
     collect_editor_changes_with_link_enforcement_and_documents(
@@ -6276,6 +6462,7 @@ pub(crate) fn collect_prepared_editor_changes(
         &LinkEnforcement::default(),
         &mut PreparedEditorDocuments {
             documents,
+            native_services,
             ..PreparedEditorDocuments::default()
         },
     )
@@ -6528,6 +6715,8 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             && exists_as_file
             && let Some(spec) = inferred_spec.as_ref()
         {
+            let held = documents.get_mut(&service).and_then(Option::as_mut);
+            read_whole_for_edit(held, src_root, &service)?;
             let settings_before = documents
                 .get(&service)
                 .and_then(Option::as_ref)
@@ -6627,6 +6816,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                     )
                     .is_none()
             {
+                read_whole_for_edit(Some(&mut *document), src_root, &service)?;
                 let document = Arc::make_mut(document);
                 let original_class = document.instances[index].class_name.clone();
                 if is_lua_source_class(&original_class) {

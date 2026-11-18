@@ -125,6 +125,15 @@ fn release_now() {
     collect_thread_heap();
 }
 
+/// Returns the memory a finished phase of a command freed to the system
+/// before its next phase allocates as much again: the allocator keeps freed
+/// pages for reuse, and what one phase freed across many threads is not
+/// where the next one allocates.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn release_between_phases() {
+    release_now();
+}
+
 fn collect_thread_heap() {
     unsafe { libmimalloc_sys::mi_collect(true) };
 }

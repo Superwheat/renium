@@ -1,10 +1,50 @@
 use super::*;
 use crate::editor::types::PendingImportFields;
 
+mod rows;
+
 #[derive(Clone, Copy, Default)]
 struct Verification<'a> {
     settle: bool,
     pending: &'a [PendingImportFields],
+    /// Compare the whole documents, as a store too small to be read a range
+    /// of rows at a time is compared.
+    #[cfg(test)]
+    whole_documents: bool,
+}
+
+impl Verification<'_> {
+    fn by_rows(&self) -> bool {
+        #[cfg(test)]
+        return !self.whole_documents;
+        #[cfg(not(test))]
+        true
+    }
+}
+
+/// What the verification of one store says, and the store it settles:
+/// from a range of rows at a time where it can, or from the whole documents.
+#[cfg(test)]
+pub(crate) fn settings_delta_outcome(
+    path: &Path,
+    (before, desired, observed): (&SnapshotEntry, &SnapshotEntry, &SnapshotEntry),
+    prepared: PreparedPushVerification,
+    pending: &[PendingImportFields],
+    (settle, whole_documents): (bool, bool),
+) -> Result<(Option<String>, Option<Vec<u8>>)> {
+    let verified = settings_delta_verification(
+        path,
+        Some(before),
+        Some(desired),
+        Some(observed),
+        Some(prepared),
+        Verification {
+            settle,
+            pending,
+            whole_documents,
+        },
+    )?;
+    Ok((verified.mismatch, verified.accepted))
 }
 
 pub(crate) fn verify_committed_push_readback(
@@ -32,6 +72,8 @@ pub(crate) fn verify_committed_push_readback(
         Verification {
             settle: false,
             pending,
+            #[cfg(test)]
+            whole_documents: false,
         },
     )?;
     Ok((result.mismatches, result.detail))
@@ -139,7 +181,9 @@ pub(crate) fn verify_and_settle_native_import(
         prepared,
         Verification {
             settle: true,
-            ..Default::default()
+            pending: &[],
+            #[cfg(test)]
+            whole_documents: false,
         },
     )?;
     if result.mismatches.is_empty() {
@@ -265,12 +309,46 @@ fn settings_delta_verification(
 ) -> Result<SettingsVerification> {
     let entries = (before, desired, observed);
     let before_aligned = prepared.is_some();
+    use crate::settings::equivalence::{holds_unread_instances, read_unread_instances};
+    let mut prepared = prepared;
+    if let (
+        Some(prepared),
+        Some(SnapshotEntry::File(desired_bytes)),
+        Some(SnapshotEntry::File(observed_bytes)),
+    ) = (&mut prepared, desired, observed)
+        && !holds_unread_instances(&prepared.previous)
+        && policy.by_rows()
+    {
+        // A large store is verified a range of rows at a time.
+        if let Some(verified) = rows::verified_by_rows(
+            path,
+            &prepared.previous,
+            desired_bytes,
+            observed_bytes,
+            policy,
+        )? {
+            return Ok(verified);
+        }
+        // The whole documents compare every instance, so the ones the files'
+        // copy left in its store file are read.
+        if let Some(desired) = &mut prepared.desired
+            && holds_unread_instances(desired)
+        {
+            read_unread_instances(Arc::make_mut(desired), desired_bytes)?;
+        }
+    }
     // The three stores decode side by side: on a large service each takes a
     // good part of a second.
     let (requested, observed) = rayon::join(
         || -> Result<_> {
             Ok(match prepared {
-                Some(prepared) => (prepared.previous, prepared.desired),
+                Some(prepared) => (
+                    prepared.previous,
+                    match prepared.desired {
+                        Some(desired) => desired,
+                        None => Arc::new(settings_document(desired)?),
+                    },
+                ),
                 None => {
                     let (before, desired) =
                         rayon::join(|| settings_document(before), || settings_document(desired));
@@ -465,14 +543,9 @@ fn mask_reported_pending_fields(
         return Ok(());
     }
     let service = settings_service_name(path, desired, observed)?;
-    let rows = pending
-        .iter()
-        .filter(|row| row.service == service)
-        .collect::<Vec<_>>();
-    if rows.is_empty() {
+    let Some(pending) = pending_fields(&service, desired, pending) else {
         return Ok(());
-    }
-    let paths = crate::editor::paths::build_editor_instance_paths(desired, &service);
+    };
     let ids = crate::editor::review::EditorReferenceIds::new(
         desired
             .instances
@@ -480,6 +553,50 @@ fn mask_reported_pending_fields(
             .map(|instance| instance.settings_id.as_str()),
     )
     .in_service(&service);
+    let observed_by_id = observed
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| (instance.settings_id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    for (index, row) in &pending.rows {
+        let expected = &desired.instances[*index];
+        let Some(&actual_index) = observed_by_id.get(&expected.settings_id) else {
+            continue;
+        };
+        mask_pending_fields(
+            &pending.paths,
+            &ids,
+            row,
+            expected,
+            &mut observed.instances[actual_index],
+        );
+    }
+    Ok(())
+}
+
+/// The fields a push reported pending for one store, each with the place of
+/// its instance in the files' copy, in the order of those places.
+struct PendingFields<'a> {
+    rows: Vec<(usize, &'a PendingImportFields)>,
+    paths: Vec<Option<crate::editor::types::EditorInstancePath>>,
+}
+
+/// The pending fields of `service` whose instance the files' copy holds
+/// under the reported path, class and id. `None` where there is none.
+fn pending_fields<'a>(
+    service: &str,
+    desired: &SettingsBytecode,
+    pending: &'a [PendingImportFields],
+) -> Option<PendingFields<'a>> {
+    let reported = pending
+        .iter()
+        .filter(|row| row.service == service)
+        .collect::<Vec<_>>();
+    if reported.is_empty() {
+        return None;
+    }
+    let paths = crate::editor::paths::build_editor_instance_paths(desired, service);
     let by_path = paths
         .iter()
         .enumerate()
@@ -492,50 +609,59 @@ fn mask_reported_pending_fields(
             })
         })
         .collect::<HashMap<_, _>>();
-    let observed_by_id = observed
-        .instances
-        .iter()
-        .enumerate()
-        .map(|(index, instance)| (instance.settings_id.clone(), index))
-        .collect::<HashMap<_, _>>();
-    for row in rows {
-        let Some(&index) =
-            by_path.get(&(row.path_segments.as_slice(), row.path_ordinals.as_slice()))
-        else {
-            continue;
-        };
-        let expected = &desired.instances[index];
-        if expected.class_name != row.class_name
-            || row
-                .settings_id
-                .as_ref()
-                .is_some_and(|id| id != &expected.settings_id)
-        {
-            continue;
-        }
-        let Some(&actual_index) = observed_by_id.get(&expected.settings_id) else {
-            continue;
-        };
-        let actual = &mut observed.instances[actual_index];
-        if actual.class_name != row.class_name {
-            continue;
-        }
-        for (name, value) in &row.properties {
-            if let Some(saved) = verification_value(&expected.properties, name, true) {
-                let normalized =
-                    crate::editor::review::normalize_editor_bridge_value(saved, None, &paths, &ids);
-                if reconciliation_property_values_equal(
-                    &row.class_name,
-                    name,
-                    Some(&normalized),
-                    Some(value),
-                ) {
-                    actual.properties.insert(name.clone(), saved.clone());
-                }
+    let mut rows = reported
+        .into_iter()
+        .filter_map(|row| {
+            let index =
+                *by_path.get(&(row.path_segments.as_slice(), row.path_ordinals.as_slice()))?;
+            let expected = &desired.instances[index];
+            (expected.class_name == row.class_name
+                && row
+                    .settings_id
+                    .as_ref()
+                    .is_none_or(|id| id == &expected.settings_id))
+            .then_some((index, row))
+        })
+        .collect::<Vec<_>>();
+    drop(by_path);
+    // Reports of one instance keep their order.
+    rows.sort_by_key(|(index, _)| *index);
+    Some(PendingFields { rows, paths })
+}
+
+/// Gives Studio's instance the files' value of each field a push reported
+/// pending for it, where the reported value is the one the push sent for
+/// that saved value. Says whether it gave one.
+fn mask_pending_fields(
+    paths: &[Option<crate::editor::types::EditorInstancePath>],
+    ids: &crate::editor::review::EditorReferenceIds<'_>,
+    row: &PendingImportFields,
+    expected: &SettingsBytecodeInstance,
+    actual: &mut SettingsBytecodeInstance,
+) -> bool {
+    // An instance that stands for the files' holds their values already.
+    if actual.class_name != row.class_name
+        || crate::settings::held::stands_unchanged(&actual.properties)
+    {
+        return false;
+    }
+    let mut given = false;
+    for (name, value) in &row.properties {
+        if let Some(saved) = verification_value(&expected.properties, name, true) {
+            let normalized =
+                crate::editor::review::normalize_editor_bridge_value(saved, None, paths, ids);
+            if reconciliation_property_values_equal(
+                &row.class_name,
+                name,
+                Some(&normalized),
+                Some(value),
+            ) {
+                actual.properties.insert(name.clone(), saved.clone());
+                given = true;
             }
         }
     }
-    Ok(())
+    given
 }
 
 #[cfg(test)]

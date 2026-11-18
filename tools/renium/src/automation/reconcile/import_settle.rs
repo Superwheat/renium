@@ -408,10 +408,12 @@ pub(super) fn settle(
         // Leave those files alone; the next push reconciles the newer work.
         return Ok((None, work.summary));
     }
+    crate::daemon::memory::release_between_phases();
     let phase = Instant::now();
     let mut stage = ExportProjectStage::create(root, &source, services)?;
     let mut readback = capture_studio_services_in_memory(context, bridge, services, &stage, true)?;
     log_reconcile_timing("full push readback", phase);
+    crate::daemon::memory::release_between_phases();
     let phase = Instant::now();
     let (mismatches, details) = verify_and_settle_native_import(
         &work.before,
