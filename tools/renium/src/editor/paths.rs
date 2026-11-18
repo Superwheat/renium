@@ -19,6 +19,33 @@ use crate::system::files::{
     normalized_child_stem_key, path_key, sanitize_name, strip_extended_prefix,
 };
 
+pub(crate) const SOURCE_PATH_CONTEXT_PROPERTY: &str = "RunContext";
+
+#[derive(Clone, Copy, PartialEq)]
+enum SourceContext {
+    Client,
+    Plugin,
+    Other,
+}
+
+fn source_context(name: Option<&str>) -> SourceContext {
+    match name {
+        Some(name) if name.eq_ignore_ascii_case("Client") => SourceContext::Client,
+        Some(name) if name.eq_ignore_ascii_case("Plugin") => SourceContext::Plugin,
+        _ => SourceContext::Other,
+    }
+}
+
+/// Only these facts affect a source file's suffix. The original value is still
+/// decoded separately for export; this projection never becomes a saved field.
+pub(crate) fn source_path_context_fact(value: &Value) -> Option<Value> {
+    match source_context(run_context_name(value)) {
+        SourceContext::Client => Some(json!("Client")),
+        SourceContext::Plugin => Some(json!("Plugin")),
+        SourceContext::Other => None,
+    }
+}
+
 pub(crate) fn script_file_names(class_name: &str) -> Option<(&'static str, &'static str)> {
     script_file_names_for_run_context(class_name, None)
 }
@@ -51,14 +78,14 @@ fn project_script_suffix(
     if !is_lua_source_class(class_name) {
         return None;
     }
-    let run_context = properties.get("RunContext").and_then(run_context_name);
-    if class_name == "Script"
-        && run_context.is_some_and(|value| value.eq_ignore_ascii_case("Client"))
-    {
+    let run_context = source_context(
+        properties
+            .get(SOURCE_PATH_CONTEXT_PROPERTY)
+            .and_then(run_context_name),
+    );
+    if class_name == "Script" && run_context == SourceContext::Client {
         Some(naming.client_run_context_suffix)
-    } else if class_name == "Script"
-        && run_context.is_some_and(|value| value.eq_ignore_ascii_case("Plugin"))
-    {
+    } else if class_name == "Script" && run_context == SourceContext::Plugin {
         Some(naming.plugin_suffix)
     } else {
         match class_name {

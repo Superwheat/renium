@@ -374,36 +374,43 @@ pub(crate) fn synthesized_mesh_initial_size_for_rbx_export_class(
     triangle_mesh_part: bool,
 ) -> Option<RbxVector3> {
     let instance = document.instances.get(index)?;
+    synthesized_mesh_initial_size_from_values(&instance.properties, triangle_mesh_part, || {
+        cumulative_ancestor_model_scale(document, index)
+    })
+}
+
+pub(crate) fn synthesized_mesh_initial_size_from_values(
+    properties: &Map<String, Value>,
+    triangle_mesh_part: bool,
+    ancestor_scale: impl FnOnce() -> Option<f32>,
+) -> Option<RbxVector3> {
     if !triangle_mesh_part {
         return None;
     }
-    if instance
-        .properties
+    if properties
         .get(MESH_INITIAL_SIZE_PROPERTY)
-        .or_else(|| instance.properties.get("initialSize"))
+        .or_else(|| properties.get("initialSize"))
         .and_then(json_to_rbx_vector3)
         .is_some_and(|value| rbx_vector3_is_non_zero(&value))
     {
         return None;
     }
 
-    if let Some(mesh_size) = instance
-        .properties
+    if let Some(mesh_size) = properties
         .get(MESH_SIZE_TRANSPORT_PROPERTY)
-        .or_else(|| instance.properties.get("meshSize"))
+        .or_else(|| properties.get("meshSize"))
         .and_then(json_to_rbx_vector3)
         .filter(rbx_vector3_is_non_zero)
     {
         return Some(mesh_size);
     }
 
-    let size = instance
-        .properties
+    let size = properties
         .get("Size")
-        .or_else(|| instance.properties.get("size"))
+        .or_else(|| properties.get("size"))
         .and_then(json_to_rbx_vector3)
         .filter(rbx_vector3_is_non_zero)?;
-    let scale = cumulative_ancestor_model_scale(document, index).unwrap_or(1.0);
+    let scale = ancestor_scale().unwrap_or(1.0);
     if scale.is_finite() && scale.abs() > f32::EPSILON && (scale - 1.0).abs() > 1.0e-6 {
         return Some(RbxVector3::new(
             size.x / scale,
@@ -424,7 +431,26 @@ fn rbx_vector3_is_non_zero(value: &RbxVector3) -> bool {
             || value.z.abs() > f32::EPSILON)
 }
 
-fn cumulative_ancestor_model_scale(document: &SettingsBytecode, index: usize) -> Option<f32> {
+// Existing logical name and stored alias, in the same precedence as before.
+pub(crate) const ANCESTOR_MODEL_SCALE_PROPERTIES: [&str; 2] = ["Scale", "ScaleFactor"];
+
+pub(crate) fn ancestor_scale_fact(
+    instance: &SettingsBytecodeInstance,
+    value: &Value,
+) -> Option<Value> {
+    matches!(instance.class_name.as_str(), "Model" | "WorldModel").then(|| {
+        // Preserve presence even for an invalid Scale: it must still win over
+        // ScaleFactor, exactly as the ordinary geometry conversion does.
+        json_f32(value)
+            .filter(|value| value.is_finite())
+            .map_or(Value::Null, |value| json!(value))
+    })
+}
+
+pub(crate) fn cumulative_ancestor_model_scale(
+    document: &SettingsBytecode,
+    index: usize,
+) -> Option<f32> {
     let mut scale = 1.0_f32;
     let mut parent_index = document.instances.get(index)?.parent_index;
     let mut remaining = document.instances.len();
@@ -436,10 +462,9 @@ fn cumulative_ancestor_model_scale(document: &SettingsBytecode, index: usize) ->
         remaining -= 1;
         let instance = &document.instances[parent];
         if matches!(instance.class_name.as_str(), "Model" | "WorldModel")
-            && let Some(value) = instance
-                .properties
-                .get("Scale")
-                .or_else(|| instance.properties.get("ScaleFactor"))
+            && let Some(value) = ANCESTOR_MODEL_SCALE_PROPERTIES
+                .iter()
+                .find_map(|name| instance.properties.get(*name))
                 .and_then(json_f32)
                 .filter(|value| value.is_finite())
         {

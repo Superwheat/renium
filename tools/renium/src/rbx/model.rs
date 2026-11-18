@@ -1475,6 +1475,39 @@ struct PlaceRowValues {
     initial_size: Option<rbx_dom_weak::types::Vector3>,
 }
 
+fn take_place_chunk_values(
+    document: &mut SettingsBytecode,
+    rows: std::ops::Range<usize>,
+    ancestor_scales: &[Option<f32>],
+    database: &rbx_reflection::ReflectionDatabase<'_>,
+) -> Vec<(usize, Option<PlaceRowValues>)> {
+    let mut classes = AHashMap::new();
+    rows.map(|index| {
+        let row = &mut document.instances[index];
+        let mesh = *classes.entry(row.class_name.clone()).or_insert_with(|| {
+            crate::rbx::decode::rbx_reflection_class_is_a(
+                database,
+                &row.class_name,
+                "TriangleMeshPart",
+            )
+        });
+        let initial_size = crate::rbx::encode::synthesized_mesh_initial_size_from_values(
+            &row.properties,
+            mesh,
+            || ancestor_scales[index],
+        );
+        (
+            index,
+            Some(PlaceRowValues {
+                properties: std::mem::take(&mut row.properties),
+                attributes: std::mem::take(&mut row.attributes),
+                initial_size,
+            }),
+        )
+    })
+    .collect()
+}
+
 fn take_place_row_values(
     document: &mut RbxPlaceDocument<'_>,
     database: &rbx_reflection::ReflectionDatabase<'_>,
@@ -1545,10 +1578,32 @@ pub(crate) fn build_rbx_place(
 pub(crate) fn build_rbx_place_with_documents(
     src_root: &Path,
     services: Vec<String>,
+    documents: HashMap<String, RbxPlaceDocument<'_>>,
+    allow_unrepresentable_properties: bool,
+    capture_logical_properties: bool,
+    merge_source_files: bool,
+) -> Result<RbxPlaceBuild> {
+    build_rbx_place_with_row_chunks(
+        src_root,
+        services,
+        documents,
+        allow_unrepresentable_properties,
+        capture_logical_properties,
+        merge_source_files,
+        std::num::NonZeroUsize::new(4096).unwrap(),
+    )
+}
+
+/// The row limit is only a working-set choice. It never partitions identity,
+/// hierarchy, reference resolution, or the final binary's class columns.
+pub(crate) fn build_rbx_place_with_row_chunks(
+    src_root: &Path,
+    services: Vec<String>,
     mut documents: HashMap<String, RbxPlaceDocument<'_>>,
     allow_unrepresentable_properties: bool,
     capture_logical_properties: bool,
     merge_source_files: bool,
+    row_limit: std::num::NonZeroUsize,
 ) -> Result<RbxPlaceBuild> {
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let phase_started = Instant::now();
@@ -1761,8 +1816,7 @@ pub(crate) fn build_rbx_place_with_documents(
     let global_path_segment_refs = Arc::new(global_path_segment_refs);
     log_timing("native editor place reference indexes", phase_started);
     struct ServiceBuild {
-        root_ref: RbxRef,
-        instances: Vec<(Option<RbxRef>, rbx_dom_weak::Instance)>,
+        instances: Vec<(usize, Option<RbxRef>, rbx_dom_weak::Instance)>,
         omitted_properties_by_class: HashMap<String, HashSet<String>>,
         logical_properties_by_ref: HashMap<RbxRef, HashMap<rbx_dom_weak::Ustr, RbxVariant>>,
         unresolved_reference_properties_by_ref: HashMap<RbxRef, HashSet<rbx_dom_weak::Ustr>>,
@@ -1781,26 +1835,56 @@ pub(crate) fn build_rbx_place_with_documents(
     ) in export_inputs.into_iter().zip(per_service_refs)
     {
         let service_started = Instant::now();
-        let from_file = matches!(document, RbxPlaceDocument::File { .. });
-        let mut document = document.load()?.into_consumable();
-        if from_file {
+        let (mut document, mut columns) = match document {
+            RbxPlaceDocument::File {
+                structure,
+                path,
+                bytes,
+            } => {
+                drop(structure);
+                let (mut document, columns) = crate::settings::bytecode::property_edit::decode_for_row_chunks(&bytes)
+                    .with_context(|| format!("Failed to decode {}; repair or refresh this store before retrying the import", path.display()))?;
+                columns.project_properties(
+                    &mut document,
+                    |name| {
+                        name == crate::editor::paths::SOURCE_PATH_CONTEXT_PROPERTY
+                            || crate::rbx::encode::ANCESTOR_MODEL_SCALE_PROPERTIES.contains(&name)
+                    },
+                    |instance, name, value| {
+                        if name == crate::editor::paths::SOURCE_PATH_CONTEXT_PROPERTY {
+                            crate::editor::paths::source_path_context_fact(&value)
+                        } else {
+                            crate::rbx::encode::ancestor_scale_fact(instance, &value)
+                        }
+                    },
+                )?;
+                (RbxPlaceDocument::Owned(document), Some(columns))
+            }
+            other => (other.into_consumable(), None),
+        };
+        let ancestor_scales = if columns.is_some() {
             source_paths = build_editor_source_paths_by_index_with_children(
                 &document,
                 &service,
                 &service_dir,
                 &children,
             );
-        }
+            let scales = (0..document.instances.len())
+                .map(|index| crate::rbx::encode::cumulative_ancestor_model_scale(&document, index))
+                .collect::<Vec<_>>();
+            // These maps contain only projected context. Real values, including
+            // their original spelling and invalid forms, come from materialize.
+            for row in &mut document.to_mut().instances {
+                row.properties.clear();
+            }
+            scales
+        } else {
+            Vec::new()
+        };
         has_package_links |= document
             .instances
             .iter()
             .any(|node| node.class_name == "PackageLink");
-        let mut values = take_place_row_values(&mut document, database);
-        let rows = subtree
-            .iter()
-            .map(|&index| (index, values.as_mut().and_then(|rows| rows[index].take())))
-            .collect::<Vec<_>>();
-        drop(values);
         let refs = BytecodeModelExportRefs {
             service: Some(service.as_str()),
             by_index,
@@ -1813,96 +1897,136 @@ pub(crate) fn build_rbx_place_with_documents(
         // One very large service must not serialize all conversion work
         // onto one worker. Indexed chunks preserve the original order;
         // each encoder owns its metadata and only reads shared refs.
-        let chunk_size = rows
-            .len()
-            .div_ceil(rayon::current_num_threads())
-            .clamp(64, 4096);
-        let service_chunks = rows
-            .into_par_iter()
-            .chunks(chunk_size)
-            .map(|chunk| {
-                let mut instances = Vec::with_capacity(chunk.len());
-                let mut omitted_properties_by_class = HashMap::new();
-                let mut logical_properties_by_ref = HashMap::new();
-                let mut unresolved_reference_properties_by_ref = HashMap::new();
-                let mut metadata = BytecodeExportMetadata::new();
-                let mut encoder =
-                    BytecodeRbxEncoder::new(&document, database, &mut metadata, &refs);
-                for (index, values) in chunk {
-                    let parent_ref = if index == root_index {
-                        None
-                    } else {
-                        let parent_index =
-                            document.instances[index].parent_index.ok_or_else(|| {
-                                anyhow::anyhow!("Export subtree contains a detached child")
-                            })?;
-                        Some(*refs.by_index.get(&parent_index).ok_or_else(|| {
-                            anyhow::anyhow!("Export subtree is missing parent referent")
-                        })?)
-                    };
-                    let mut logical_properties = HashMap::new();
-                    let mut unresolved_reference_properties = HashSet::new();
-                    let builder = encoder.build_with_values(
-                        index,
-                        values
-                            .as_ref()
-                            .map(|values| crate::rbx::encode::BytecodeRbxValues {
-                                properties: &values.properties,
-                                attributes: &values.attributes,
-                                initial_size: values.initial_size,
-                            }),
-                        BytecodeRbxBuildOptions {
-                            source_path: source_paths.get(index).and_then(Option::as_deref),
-                            omitted_properties_by_class: allow_unrepresentable_properties
-                                .then_some(&mut omitted_properties_by_class),
-                            logical_omitted_properties: capture_logical_properties
-                                .then_some(&mut logical_properties),
-                            unresolved_reference_properties: capture_logical_properties
-                                .then_some(&mut unresolved_reference_properties),
-                        },
-                    )?;
-                    if !logical_properties.is_empty() {
-                        logical_properties_by_ref.insert(
-                            *refs
-                                .by_index
-                                .get(&index)
-                                .context("Export instance referent is missing")?,
-                            logical_properties,
-                        );
+        let convert = |document: &SettingsBytecode, rows: Vec<(usize, Option<PlaceRowValues>)>| {
+            let _span = crate::app::profile::span("place row chunk conversion");
+            let chunk_size = rows
+                .len()
+                .div_ceil(rayon::current_num_threads())
+                .clamp(64, 4096);
+            rows.into_par_iter()
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    let mut instances = Vec::with_capacity(chunk.len());
+                    let mut omitted_properties_by_class = HashMap::new();
+                    let mut logical_properties_by_ref = HashMap::new();
+                    let mut unresolved_reference_properties_by_ref = HashMap::new();
+                    let mut metadata = BytecodeExportMetadata::new();
+                    let mut encoder =
+                        BytecodeRbxEncoder::new(document, database, &mut metadata, &refs);
+                    for (index, values) in chunk {
+                        let parent_ref = if index == root_index {
+                            None
+                        } else {
+                            let parent_index =
+                                document.instances[index].parent_index.ok_or_else(|| {
+                                    anyhow::anyhow!("Export subtree contains a detached child")
+                                })?;
+                            Some(*refs.by_index.get(&parent_index).ok_or_else(|| {
+                                anyhow::anyhow!("Export subtree is missing parent referent")
+                            })?)
+                        };
+                        let mut logical_properties = HashMap::new();
+                        let mut unresolved_reference_properties = HashSet::new();
+                        let builder = encoder.build_with_values(
+                            index,
+                            values
+                                .as_ref()
+                                .map(|values| crate::rbx::encode::BytecodeRbxValues {
+                                    properties: &values.properties,
+                                    attributes: &values.attributes,
+                                    initial_size: values.initial_size,
+                                }),
+                            BytecodeRbxBuildOptions {
+                                source_path: source_paths.get(index).and_then(Option::as_deref),
+                                omitted_properties_by_class: allow_unrepresentable_properties
+                                    .then_some(&mut omitted_properties_by_class),
+                                logical_omitted_properties: capture_logical_properties
+                                    .then_some(&mut logical_properties),
+                                unresolved_reference_properties: capture_logical_properties
+                                    .then_some(&mut unresolved_reference_properties),
+                            },
+                        )?;
+                        if !logical_properties.is_empty() {
+                            logical_properties_by_ref.insert(
+                                *refs
+                                    .by_index
+                                    .get(&index)
+                                    .context("Export instance referent is missing")?,
+                                logical_properties,
+                            );
+                        }
+                        if !unresolved_reference_properties.is_empty() {
+                            unresolved_reference_properties_by_ref.insert(
+                                *refs
+                                    .by_index
+                                    .get(&index)
+                                    .context("Export instance referent is missing")?,
+                                unresolved_reference_properties,
+                            );
+                        }
+                        instances.push((
+                            index,
+                            parent_ref,
+                            builder.build_leaf(children[index].len()),
+                        ));
                     }
-                    if !unresolved_reference_properties.is_empty() {
-                        unresolved_reference_properties_by_ref.insert(
-                            *refs
-                                .by_index
-                                .get(&index)
-                                .context("Export instance referent is missing")?,
-                            unresolved_reference_properties,
-                        );
-                    }
-                    instances.push((parent_ref, builder.build_leaf(children[index].len())));
-                }
-                Ok(ServiceBuild {
-                    root_ref: *refs
-                        .by_index
-                        .get(&root_index)
-                        .ok_or_else(|| anyhow::anyhow!("Export root referent missing"))?,
-                    instances,
-                    omitted_properties_by_class,
-                    logical_properties_by_ref,
-                    unresolved_reference_properties_by_ref,
+                    Ok(ServiceBuild {
+                        instances,
+                        omitted_properties_by_class,
+                        logical_properties_by_ref,
+                        unresolved_reference_properties_by_ref,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()
+        };
+        let mut service_chunks = Vec::new();
+        if let Some(columns) = columns.as_mut() {
+            for start in (0..document.instances.len()).step_by(row_limit.get()) {
+                let end = start
+                    .saturating_add(row_limit.get())
+                    .min(document.instances.len());
+                columns.materialize(document.to_mut(), start..end).with_context(|| format!(
+                    "Failed to decode {service} store rows {start}..{end}; repair or refresh this store before retrying the import"
+                ))?;
+                let rows = take_place_chunk_values(
+                    document.to_mut(),
+                    start..end,
+                    &ancestor_scales,
+                    database,
+                );
+                let rows = rows
+                    .into_iter()
+                    .filter(|(index, _)| refs.by_index.contains_key(index))
+                    .collect();
+                service_chunks.extend(convert(&document, rows)?);
+            }
+        } else {
+            let mut values = take_place_row_values(&mut document, database);
+            let rows = subtree
+                .iter()
+                .map(|&index| (index, values.as_mut().and_then(|rows| rows[index].take())))
+                .collect();
+            drop(values);
+            service_chunks = convert(&document, rows)?;
+        }
+        if let Some(columns) = columns {
+            columns.finish()?;
+        }
+        let root_ref = *refs
+            .by_index
+            .get(&root_index)
+            .context("Export root referent missing")?;
+        let mut order = vec![usize::MAX; document.instances.len()];
+        for (rank, &index) in subtree.iter().enumerate() {
+            order[index] = rank;
+        }
         // Encoders and their borrowed metadata have ended. Only the converted
         // rows and the owned reference index are needed for DOM assembly.
         document.release();
         drop(source_paths);
         drop(children);
         drop(subtree);
-        let root_ref = service_chunks
-            .first()
-            .context("Export service has no root")?
-            .root_ref;
+        let mut instances = Vec::with_capacity(order.len());
         for service in service_chunks {
             for (class_name, names) in service.omitted_properties_by_class {
                 omitted_properties_by_class
@@ -1913,10 +2037,14 @@ pub(crate) fn build_rbx_place_with_documents(
             logical_properties_by_ref.extend(service.logical_properties_by_ref);
             unresolved_reference_properties_by_ref
                 .extend(service.unresolved_reference_properties_by_ref);
-            for (parent_ref, builder) in service.instances {
-                let parent_ref = parent_ref.unwrap_or_else(|| dom.root_ref());
-                dom.insert_leaf(parent_ref, builder);
-            }
+            instances.extend(service.instances);
+        }
+        // File columns follow row order, which need not be hierarchy order.
+        // Preserve the same preorder used by prepared and ordinary exports.
+        instances.sort_unstable_by_key(|(index, _, _)| order[*index]);
+        for (_, parent_ref, builder) in instances {
+            let parent_ref = parent_ref.unwrap_or_else(|| dom.root_ref());
+            dom.insert_leaf(parent_ref, builder);
         }
         drop(refs);
         log_timing(

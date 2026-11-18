@@ -2,6 +2,7 @@ use super::*;
 use crate::tests::support::{SimRng, run_seeds};
 
 pub(crate) fn check_codec_document(bytes: &[u8]) -> Result<()> {
+    check_row_chunks(bytes)?;
     for mode in 0..4 {
         let mut oracle = decode_settings_bytecode(bytes)?;
         let (mut document, mut numeric) = decode_for_property_edit(bytes)?;
@@ -34,6 +35,30 @@ pub(crate) fn check_codec_document(bytes: &[u8]) -> Result<()> {
             numeric.encode(&document)?,
             encode_settings_bytecode(&oracle)?
         );
+    }
+    Ok(())
+}
+
+fn check_row_chunks(bytes: &[u8]) -> Result<()> {
+    let oracle = decode_settings_bytecode_holding(bytes)?;
+    for size in [1, 7, 4096] {
+        let (mut document, mut columns) = decode_for_row_chunks(bytes)?;
+        for start in (0..document.instances.len()).step_by(size) {
+            let end = (start + size).min(document.instances.len());
+            columns.materialize(&mut document, start..end)?;
+            for index in start..end {
+                assert_eq!(document.instances[index], oracle.instances[index]);
+                document.instances[index].properties.clear();
+                document.instances[index].attributes.clear();
+            }
+            assert!(
+                document
+                    .instances
+                    .iter()
+                    .all(|row| row.properties.is_empty() && row.attributes.is_empty())
+            );
+        }
+        columns.finish()?;
     }
     Ok(())
 }
@@ -237,6 +262,13 @@ fn property_edit_decoder_retains_group_overwrite_and_error_rules() {
             payload.extend(body);
         }
         let bytes = wrap_settings_bytecode_payload(&payload).unwrap();
+        match (
+            decode_settings_bytecode_holding(&bytes),
+            check_row_chunks(&bytes),
+        ) {
+            (Ok(_), Ok(())) | (Err(_), Err(_)) => {}
+            _ => panic!("chunk decoder validation differs from ordinary decode"),
+        }
         match (
             decode_settings_bytecode(&bytes),
             decode_for_property_edit(&bytes),

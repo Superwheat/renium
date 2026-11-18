@@ -1184,36 +1184,51 @@ fn decode_property_group_body(
         if instance_index >= instance_count {
             bail!("Invalid property instance index {instance_index}");
         }
-        if property_name == "Attributes" && kind == 8 {
-            entries.push(DecodedGroupEntry::Attributes(
-                instance_index,
-                decode_attributes_payload(&mut reader, scope)?,
-            ));
-        } else {
-            let value = if kind == 17 {
-                decode_resolved_ref_group_payload(
-                    &mut reader,
-                    instance_count,
-                    &mut previous_ref_target_index,
-                )?
-            } else {
-                match &cframe_group_decoder {
-                    CFrameGroupDecoder::Inline => {
-                        decode_raw_value_payload(&mut reader, kind, scope, 0)?
-                    }
-                    CFrameGroupDecoder::RotationTable(rotations) => {
-                        decode_cframe_rotation_table_payload(&mut reader, rotations)?
-                    }
-                }
-            };
-            entries.push(DecodedGroupEntry::Property(
-                instance_index,
-                scope.budget.property(value),
-            ));
-        }
+        entries.push(decode_property_group_entry(
+            &mut reader,
+            property_name,
+            kind,
+            instance_index,
+            scope,
+            &cframe_group_decoder,
+            &mut previous_ref_target_index,
+        )?);
     }
     reader.finish()?;
     Ok(entries)
+}
+
+// The shared value decoder for eager columns and bounded row materialization.
+// Delta state and CFrame tables belong to the group, not to a row chunk.
+fn decode_property_group_entry(
+    reader: &mut BytecodeReader<'_>,
+    property_name: &str,
+    kind: u8,
+    instance_index: usize,
+    scope: ValueScope<'_>,
+    cframe: &CFrameGroupDecoder,
+    previous_ref_target: &mut usize,
+) -> Result<DecodedGroupEntry> {
+    if property_name == "Attributes" && kind == 8 {
+        return Ok(DecodedGroupEntry::Attributes(
+            instance_index,
+            decode_attributes_payload(reader, scope)?,
+        ));
+    }
+    let value = if kind == 17 {
+        decode_resolved_ref_group_payload(reader, scope.instance_count, previous_ref_target)?
+    } else {
+        match cframe {
+            CFrameGroupDecoder::Inline => decode_raw_value_payload(reader, kind, scope, 0)?,
+            CFrameGroupDecoder::RotationTable(rotations) => {
+                decode_cframe_rotation_table_payload(reader, rotations)?
+            }
+        }
+    };
+    Ok(DecodedGroupEntry::Property(
+        instance_index,
+        scope.budget.property(value),
+    ))
 }
 
 /// The instance of a group's next value. A group holds one value per

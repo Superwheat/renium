@@ -314,3 +314,120 @@ fn import_document_lifetime_probe() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn native_import_file_chunks_preserve_all_cross_row_facts() -> Result<()> {
+    use crate::rbx::model::{RbxPlaceDocument, build_rbx_place_with_row_chunks};
+    let root =
+        std::env::temp_dir().join(format!("renium-import-row-chunks-{}", std::process::id()));
+    let service_dir = root.join("Workspace");
+    std::fs::create_dir_all(&service_dir)?;
+    let mut document = fixture("Workspace");
+    let parent = document.instances.len() + 8201;
+    for index in document.instances.len()..parent {
+        let class = match index % 3 {
+            0 => "UnionOperation",
+            1 => "MeshPart",
+            _ => "ObjectValue",
+        };
+        let mut row = SettingsBytecodeInstance::new(
+            format!("row:{index}"),
+            "Same".into(),
+            class.into(),
+            Some(parent),
+        );
+        if class == "ObjectValue" {
+            row.properties.insert(
+                "Value".into(),
+                if index % 5 == 0 {
+                    json!({"_type":"Ref"})
+                } else {
+                    json!({"_type":"Ref", "instanceIndex":index - 1})
+                },
+            );
+        } else {
+            row.properties.insert(
+                "Size".into(),
+                json!({"_type":"Vector3", "x":2, "y":4, "z":6}),
+            );
+            row.properties.insert(
+                "CFrame".into(),
+                json!({"_type":"CFrame", "components":[index,0,0,1,0,0,0,1,0,0,0,1]}),
+            );
+            let key = if class == "MeshPart" {
+                "TexturePack"
+            } else {
+                "ChildData2"
+            };
+            row.properties.insert(key.into(), json!({"_type":"SharedString", "base64":base64::encode([b"payload held across chunks".repeat(20), (index % 5).to_le_bytes().to_vec()].concat())}));
+        }
+        row.attributes.insert("AcrossChunks".into(), json!(index));
+        document.instances.push(row);
+    }
+    let mut model = SettingsBytecodeInstance::new(
+        "late-parent".into(),
+        "Model".into(),
+        "Model".into(),
+        Some(0),
+    );
+    model.properties.insert("Scale".into(), json!(0.25));
+    document.instances.push(model);
+    // Source filenames depend on a property column, not only the hierarchy.
+    document.instances[5].class_name = "Script".into();
+    document.instances[5].properties.insert(
+        "RunContext".into(),
+        json!({"_type":"EnumItem", "enumType":"RunContext", "name":"Client", "value":2}),
+    );
+    let source_paths = crate::editor::paths::build_editor_source_paths_by_index(
+        &document,
+        "Workspace",
+        &service_dir,
+    );
+    let source = source_paths[5].as_ref().unwrap();
+    std::fs::create_dir_all(source.parent().unwrap())?;
+    std::fs::write(source, "print('source selected by RunContext')\n")?;
+    let path = service_settings_path(&service_dir);
+    document.write_file(&path)?;
+    // Compare the same encoded store, including wire normalization, through
+    // every route; the small golden separately pins the original main bytes.
+    let document =
+        crate::settings::bytecode::decode_settings_bytecode_holding(&std::fs::read(path)?)?;
+    let expected = fixture_bytes(build_rbx_place(
+        &root,
+        vec!["Workspace".into()],
+        Some(&HashMap::from([("Workspace".into(), &document)])),
+        true,
+        true,
+        false,
+    )?)?;
+    for size in [1, 7, 4096, usize::MAX] {
+        for mode in ["file", "owned", "shared"] {
+            let inputs = match mode {
+                "owned" => HashMap::from([(
+                    "Workspace".into(),
+                    RbxPlaceDocument::Owned(document.clone()),
+                )]),
+                "shared" => HashMap::from([(
+                    "Workspace".into(),
+                    RbxPlaceDocument::Shared(std::sync::Arc::new(document.clone())),
+                )]),
+                _ => HashMap::new(),
+            };
+            let build = build_rbx_place_with_row_chunks(
+                &root,
+                vec!["Workspace".into()],
+                inputs,
+                true,
+                true,
+                false,
+                std::num::NonZeroUsize::new(size).unwrap(),
+            )?;
+            assert!(
+                fixture_bytes(build)? == expected,
+                "{mode}, chunk size {size}: payload bytes changed"
+            );
+        }
+    }
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}

@@ -1,5 +1,9 @@
 use super::*;
 
+#[path = "row_chunks.rs"]
+mod row_chunks;
+pub(crate) use row_chunks::decode_for_row_chunks;
+
 #[cfg(test)]
 #[path = "property_edit_sim.rs"]
 pub(crate) mod sim;
