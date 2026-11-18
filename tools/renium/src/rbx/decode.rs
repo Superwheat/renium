@@ -1521,7 +1521,7 @@ pub(crate) fn json_number_f64(value: f64) -> Value {
     nonfinite_float_json(value)
 }
 
-fn nonfinite_float_json(value: f64) -> Value {
+pub(crate) fn nonfinite_float_json(value: f64) -> Value {
     let text = if value.is_nan() {
         "nan"
     } else if value > 0.0 {

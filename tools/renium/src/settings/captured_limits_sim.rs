@@ -150,8 +150,10 @@ fn captured_conversion_preserves_size_dependent_memory_budget() {
     );
 }
 
+/// One of Studio's ids that came along as text, and a typed float that is no
+/// number, are written from a captured state as from its document.
 #[test]
-fn captured_and_document_encoders_keep_their_distinct_wire_forms() {
+fn a_captured_state_is_written_as_its_document_is() {
     let pools = pools();
     for numeric_id in [false, true] {
         let mut state = plain_state(2);
@@ -169,7 +171,7 @@ fn captured_and_document_encoders_keep_their_distinct_wire_forms() {
         let captured = encode_service_settings_binary(&state).unwrap();
         let document = settings_bytecode_from_service_state(&state).unwrap();
         let stored = encode_settings_bytecode(&document).unwrap();
-        assert_ne!(captured, stored);
+        assert!(captured == stored);
         assert!(crate::settings::codec_sim::same_document(
             &decode_settings_bytecode(&captured).unwrap(),
             &decode_settings_bytecode(&stored).unwrap(),
@@ -246,7 +248,10 @@ fn generated_captures_record_service_and_document_wire_differences() {
             let expected = decode_settings_bytecode(&wire).unwrap();
             let document_wire = encode_settings_bytecode(&expected).unwrap();
             if native {
-                assert_ne!(wire, document_wire, "native NaN retains its wire kind");
+                assert_ne!(
+                    wire, document_wire,
+                    "a property a typed row holds twice is written twice"
+                );
             }
             for pool in &pools {
                 pool.install(|| {

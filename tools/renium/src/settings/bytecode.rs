@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::rbx::decode::{json_number_f64, nonfinite_float_from_json};
+use crate::rbx::decode::{json_number_f64, nonfinite_float_from_json, nonfinite_float_json};
 use crate::roblox::schema::MESH_SIZE_TRANSPORT_PROPERTY;
 use crate::snapshot::types::{NativeSettingsValue, ServiceState, SnapshotInstance};
 use crate::system::LockRecover;
@@ -2253,7 +2253,23 @@ fn visit_settings_binary_properties<'a>(
                 }
                 continue;
             }
-            let source = SettingsBinaryValueSource::Native(&property.value);
+            // A decoder discards the record's own fields, and reads a float
+            // that is no number back as the value that names it: both are
+            // written as the encoder of documents writes them.
+            if SETTINGS_RECORD_FIELDS.contains(&property_name) {
+                continue;
+            }
+            let no_number = match &property.value {
+                NativeSettingsValue::Float32(value) if !value.is_finite() => {
+                    Some(f64::from(*value))
+                }
+                NativeSettingsValue::Float64(value) if !value.is_finite() => Some(*value),
+                _ => None,
+            };
+            let source = match no_number {
+                Some(value) => SettingsBinaryValueSource::Settled(nonfinite_float_json(value)),
+                None => SettingsBinaryValueSource::Native(&property.value),
+            };
             let kind = binary_source_value_kind(&source, lookup)?;
             visit(property_name, kind, source)?;
         }
@@ -2522,7 +2538,11 @@ fn settings_binary_id(source_index: usize, instance: &SnapshotInstance) -> Setti
         .as_deref()
         .filter(|value| !value.is_empty())
     {
-        return SettingsBinaryId::Text(Cow::Borrowed(settings_id));
+        // One of Studio's ids that came along as text is the number it names.
+        return match parse_numeric_debug_settings_id(settings_id) {
+            Some(value) => SettingsBinaryId::NumericDebug(value),
+            None => SettingsBinaryId::Text(Cow::Borrowed(settings_id)),
+        };
     }
     if let Some(debug_id) = instance
         .debug_id
