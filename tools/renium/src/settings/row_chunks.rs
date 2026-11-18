@@ -142,14 +142,42 @@ impl RetainedRowColumns {
         document: &mut SettingsBytecode,
         rows: Range<usize>,
     ) -> Result<()> {
-        let _span = crate::app::profile::span("store row chunk materialize");
         anyhow::ensure!(
-            document.instances.len() == self.instance_count
-                && rows.start == self.next_row
-                && rows.end <= self.instance_count
-                && rows.end > rows.start,
+            document.instances.len() == self.instance_count,
+            "Store structure changed during row decoding; restart the store read"
+        );
+        self.check_range(&rows)?;
+        self.materialize_into(&mut document.instances[rows.clone()], rows)
+    }
+
+    /// The same decoder without borrowing structural rows. A consumer can
+    /// convert the preceding range while this materializes the next one.
+    pub(crate) fn materialize_values(
+        &mut self,
+        rows: Range<usize>,
+    ) -> Result<Vec<DecodedRowValues>> {
+        self.check_range(&rows)?;
+        let mut values = (0..rows.len())
+            .map(|_| DecodedRowValues::default())
+            .collect::<Vec<_>>();
+        self.materialize_into(&mut values, rows)?;
+        Ok(values)
+    }
+
+    fn check_range(&self, rows: &Range<usize>) -> Result<()> {
+        anyhow::ensure!(
+            rows.start == self.next_row && rows.end <= self.instance_count && rows.end > rows.start,
             "Store row chunks must be consecutive and within its structure; restart the store read"
         );
+        Ok(())
+    }
+
+    fn materialize_into<T: DecodedPropertyTarget>(
+        &mut self,
+        instances: &mut [T],
+        rows: Range<usize>,
+    ) -> Result<()> {
+        let _span = crate::app::profile::span("store row chunk materialize");
         let scope = ValueScope {
             strings: &self.strings,
             instance_count: self.instance_count,
@@ -180,7 +208,9 @@ impl RetainedRowColumns {
                 )
             })
             .collect::<Vec<_>>();
-        apply_decoded_property_groups(&mut document.instances, &specs, groups);
+        // Schedule only this range, with enough partitions for a bounded range
+        // to use the worker pool. Group order still decides repeated values.
+        apply_decoded_property_groups_in_range(instances, rows.start, &specs, groups, 512);
         self.next_row = rows.end;
         Ok(())
     }

@@ -935,7 +935,46 @@ impl DecodedGroupEntry {
 fn apply_decoded_property_groups(
     instances: &mut [SettingsBytecodeInstance],
     specs: &[(&String, u8, usize, &[u8])],
+    decoded_groups: Vec<Vec<DecodedGroupEntry>>,
+) {
+    apply_decoded_property_groups_in_range(
+        instances,
+        0,
+        specs,
+        decoded_groups,
+        SETTINGS_BINARY_PARALLEL_CHUNK_SIZE,
+    );
+}
+
+/// A bounded row's values, independent of the retained structural index.
+#[derive(Default)]
+pub(crate) struct DecodedRowValues {
+    pub(crate) properties: Map<String, Value>,
+    pub(crate) attributes: Map<String, Value>,
+}
+
+trait DecodedPropertyTarget: Send {
+    fn maps(&mut self) -> (&mut Map<String, Value>, &mut Map<String, Value>);
+}
+
+impl DecodedPropertyTarget for SettingsBytecodeInstance {
+    fn maps(&mut self) -> (&mut Map<String, Value>, &mut Map<String, Value>) {
+        (&mut self.properties, &mut self.attributes)
+    }
+}
+
+impl DecodedPropertyTarget for DecodedRowValues {
+    fn maps(&mut self) -> (&mut Map<String, Value>, &mut Map<String, Value>) {
+        (&mut self.properties, &mut self.attributes)
+    }
+}
+
+fn apply_decoded_property_groups_in_range<T: DecodedPropertyTarget>(
+    instances: &mut [T],
+    first: usize,
+    specs: &[(&String, u8, usize, &[u8])],
     mut decoded_groups: Vec<Vec<DecodedGroupEntry>>,
+    chunk_size: usize,
 ) {
     let _span = crate::app::profile::span("store property columns apply");
     if instances.len() < SETTINGS_BINARY_PARALLEL_MIN_INSTANCES || rayon::current_num_threads() <= 1
@@ -944,12 +983,13 @@ fn apply_decoded_property_groups(
             for entry in entries {
                 match entry {
                     DecodedGroupEntry::Property(instance_index, value) => {
-                        instances[instance_index]
-                            .properties
+                        instances[instance_index - first]
+                            .maps()
+                            .0
                             .insert((*property_name).clone(), value);
                     }
                     DecodedGroupEntry::Attributes(instance_index, attributes) => {
-                        instances[instance_index].attributes = attributes;
+                        *instances[instance_index - first].maps().1 = attributes;
                     }
                 }
             }
@@ -957,18 +997,16 @@ fn apply_decoded_property_groups(
         return;
     }
 
-    let chunk_count = instances
-        .len()
-        .div_ceil(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE);
+    let chunk_count = instances.len().div_ceil(chunk_size);
     let mut by_chunk = (0..chunk_count).map(|_| Vec::new()).collect::<Vec<_>>();
     for (property_index, entries) in decoded_groups.iter_mut().enumerate() {
         let mut remaining = entries.as_mut_slice();
         // Both decoders validate strictly increasing indices within a group.
         // Slice those ranges without copying every value through a serial queue;
         // group order still decides which value wins across repeated groups.
-        while let Some(first) = remaining.first() {
-            let chunk_index = first.instance_index() / SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
-            let end = (chunk_index + 1) * SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
+        while let Some(entry) = remaining.first() {
+            let chunk_index = (entry.instance_index() - first) / chunk_size;
+            let end = first + (chunk_index + 1) * chunk_size;
             let count = remaining.partition_point(|entry| entry.instance_index() < end);
             let (chunk, tail) = remaining.split_at_mut(count);
             by_chunk[chunk_index].push((property_index, chunk));
@@ -976,20 +1014,21 @@ fn apply_decoded_property_groups(
         }
     }
     instances
-        .par_chunks_mut(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE)
+        .par_chunks_mut(chunk_size)
         .zip(by_chunk.into_par_iter())
         .for_each(|(instances, groups)| {
             for (property_index, entries) in groups {
                 for entry in entries {
-                    let index = entry.instance_index() % SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
+                    let index = (entry.instance_index() - first) % chunk_size;
                     match entry {
                         DecodedGroupEntry::Property(_, value) => {
                             instances[index]
-                                .properties
+                                .maps()
+                                .0
                                 .insert(specs[property_index].0.clone(), std::mem::take(value));
                         }
                         DecodedGroupEntry::Attributes(_, attributes) => {
-                            instances[index].attributes = std::mem::take(attributes);
+                            *instances[index].maps().1 = std::mem::take(attributes);
                         }
                     }
                 }

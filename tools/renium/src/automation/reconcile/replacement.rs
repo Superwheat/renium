@@ -598,11 +598,10 @@ fn replaced_store_alone(
         .filter(|&index| read[index])
         .map(|index| (skeleton[index].parent_index, skeleton[index].name.as_str()))
         .collect::<HashSet<_>>();
-    // A model's pivot is written after the import, from what its row holds.
+    // The import returns the rows for all post-import fields, including pivots.
     let read = (0..count)
         .filter(|&index| {
             namesakes.contains(&(skeleton[index].parent_index, skeleton[index].name.as_str()))
-                || skeleton[index].class_name == "Model"
         })
         .collect::<Vec<_>>();
     drop(namesakes);

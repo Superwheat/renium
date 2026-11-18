@@ -56,6 +56,7 @@ pub(super) mod geometry_tests;
 
 #[derive(Default)]
 pub(crate) struct BytecodeRbxBuildOptions<'a> {
+    pub omitted_properties: Option<&'a mut HashSet<String>>,
     pub source_path: Option<&'a Path>,
     pub omitted_properties_by_class: Option<&'a mut HashMap<String, HashSet<String>>>,
     pub logical_omitted_properties: Option<&'a mut HashMap<rbx_dom_weak::Ustr, RbxVariant>>,
@@ -277,7 +278,15 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                         instance.class_name
                     );
                 }
-                if let Some(omitted) = options.omitted_properties_by_class.as_deref_mut() {
+                if let Some(omitted) = options.omitted_properties.as_deref_mut() {
+                    omitted.insert(name.clone());
+                }
+                // A value-specific conversion failure belongs only to this
+                // instance. Broadcasting it to its class would also request
+                // fields that the payload already carries on other instances.
+                if let Some(omitted) = options.omitted_properties_by_class.as_deref_mut()
+                    && (unsupported && !unknown_number || options.omitted_properties.is_none())
+                {
                     omitted
                         .entry(instance.class_name.clone())
                         .or_default()
@@ -711,7 +720,7 @@ fn rbx_serialized_property_descriptor<'db>(
 /// nothing and Studio then refuses the place ("Failed to read StyleRule
 /// properties: Unexpected end of file"). Ordinary attribute maps accept both.
 pub(crate) fn normalize_export_dom(dom: &mut RbxWeakDom, database: &ReflectionDatabase<'_>) {
-    let mut by_class: HashMap<rbx_dom_weak::Ustr, Vec<RbxRef>> = HashMap::new();
+    let mut by_class: AHashMap<rbx_dom_weak::Ustr, Vec<RbxRef>> = AHashMap::new();
     for instance in dom.descendants() {
         by_class
             .entry(instance.class)
@@ -738,7 +747,10 @@ pub(crate) fn normalize_export_dom(dom: &mut RbxWeakDom, database: &ReflectionDa
     }
     for (class_name, referents) in by_class {
         let class = database.classes.get(class_name.as_str());
-        let mut presence: HashMap<rbx_dom_weak::Ustr, ExportPresence> = HashMap::new();
+        // A reflected default already supplies every missing value. Avoid
+        // counting and cloning values that can never contribute a fill, and
+        // resolve that fact once per class member rather than once per row.
+        let mut presence: AHashMap<rbx_dom_weak::Ustr, Option<ExportPresence>> = AHashMap::new();
         for referent in &referents {
             let Some(instance) = dom.get_by_ref_mut(*referent) else {
                 continue;
@@ -747,21 +759,30 @@ pub(crate) fn normalize_export_dom(dom: &mut RbxWeakDom, database: &ReflectionDa
                 !is_empty_unscriptable_blob(database, class_name.as_str(), name.as_str(), value)
             });
             for (name, value) in &instance.properties {
-                presence.entry(*name).or_default().record(value);
-            }
-        }
-        for (name, values) in presence {
-            if values.present >= referents.len()
-                || class.is_some_and(|class| {
-                    database
-                        .find_default_property(class, name.as_str())
-                        .is_some()
-                        || rbx_logical_property_name(database, class_name.as_str(), name.as_str())
+                let values = presence.entry(*name).or_insert_with(|| {
+                    let has_default = class.is_some_and(|class| {
+                        database
+                            .find_default_property(class, name.as_str())
+                            .is_some()
+                            || rbx_logical_property_name(
+                                database,
+                                class_name.as_str(),
+                                name.as_str(),
+                            )
                             .is_some_and(|logical| {
                                 database.find_default_property(class, logical).is_some()
                             })
-                })
-            {
+                    });
+                    (!has_default).then(ExportPresence::default)
+                });
+                if let Some(values) = values {
+                    values.record(value);
+                }
+            }
+        }
+        for (name, values) in presence {
+            let Some(values) = values else { continue };
+            if values.present >= referents.len() {
                 continue;
             }
             let Some(fill) = values.fill() else {
@@ -2434,6 +2455,35 @@ fn model_export_ref_by_path_segments_key(
         })
 }
 
+fn model_export_ref_by_path(
+    refs: &BytecodeModelExportRefs,
+    segments: &[String],
+    ordinals: Option<&[usize]>,
+) -> Option<RbxRef> {
+    let local = if let Some(ordinals) = ordinals {
+        (!refs.by_path_key.is_empty())
+            .then(|| instance_path_parts_key(segments, ordinals))
+            .and_then(|key| refs.by_path_key.get(&key).copied())
+    } else {
+        (!refs.by_path_segments_key.is_empty())
+            .then(|| instance_path_key(segments))
+            .and_then(|key| refs.by_path_segments_key.get(&key).copied().flatten())
+    };
+    local
+        .or_else(|| {
+            refs.global_paths
+                .as_ref()
+                .and_then(|paths| paths.resolve(segments, ordinals))
+        })
+        .or_else(|| {
+            if let Some(ordinals) = ordinals {
+                model_export_ref_by_path_key(refs, &instance_path_parts_key(segments, ordinals))
+            } else {
+                model_export_ref_by_path_segments_key(refs, &instance_path_key(segments))
+            }
+        })
+}
+
 fn strict_model_export_ref(
     object: &Map<String, Value>,
     refs: &BytecodeModelExportRefs,
@@ -2458,11 +2508,7 @@ fn strict_model_export_ref(
     }
     if let Some((segments, ordinals)) = strict_reference_path(object)? {
         has_stable_selector = true;
-        let candidate = if let Some(ordinals) = ordinals {
-            model_export_ref_by_path_key(refs, &instance_path_parts_key(&segments, &ordinals))
-        } else {
-            model_export_ref_by_path_segments_key(refs, &instance_path_key(&segments))
-        };
+        let candidate = model_export_ref_by_path(refs, &segments, ordinals.as_deref());
         if candidate.is_some() {
             return Ok(candidate);
         }
@@ -2639,10 +2685,10 @@ fn json_to_rbx_ref(value: &Value, refs: &BytecodeModelExportRefs) -> RbxRef {
                 .and_then(path_ordinals_from_value)
             {
                 return (segments.len() == ordinals.len())
-                    .then(|| instance_path_parts_key(&segments, &ordinals))
-                    .and_then(|key| model_export_ref_by_path_key(refs, &key));
+                    .then(|| model_export_ref_by_path(refs, &segments, Some(&ordinals)))
+                    .flatten();
             }
-            model_export_ref_by_path_segments_key(refs, &instance_path_key(&segments))
+            model_export_ref_by_path(refs, &segments, None)
         })
         .or_else(|| {
             object

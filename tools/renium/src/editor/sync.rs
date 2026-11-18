@@ -3938,7 +3938,7 @@ fn push_with_reader_platform(
     {
         return Ok(summary);
     }
-    let binary_import = if prepared_binary_import.is_some() {
+    let mut binary_import = if prepared_binary_import.is_some() {
         prepared_binary_import
     } else if let Some(projection) = projection.filter(|stage| stage.is_temporary()) {
         let mut projected_args = args.clone();
@@ -3952,7 +3952,7 @@ fn push_with_reader_platform(
         Some(projection) => projection.root().to_path_buf(),
         None => absolutize_under(&args.project.project_root, &args.project.src_root),
     };
-    let supplemental = supplemental_documents(&changes, binary_import.as_ref(), &stores_root)?;
+    let supplemental = supplemental_documents(&changes, binary_import.as_mut(), &stores_root)?;
     changes.native_property_documents.extend(supplemental);
     materialize_native_property_changes(
         &mut changes,
@@ -6299,85 +6299,31 @@ fn read_prepared_documents_whole(
 /// read whole.
 fn supplemental_documents(
     changes: &EditorChangeSet,
-    import: Option<&EditorBinaryImport>,
+    import: Option<&mut EditorBinaryImport>,
     stores_root: &Path,
 ) -> Result<HashMap<String, Arc<SettingsBytecode>>> {
-    use crate::settings::equivalence::{
-        holds_unread_instances, read_instances, read_unread_instances,
-    };
-
+    use crate::settings::equivalence::{holds_unread_instances, read_instances};
+    let mut rows = import
+        .map(|import| std::mem::take(&mut import.kept_rows))
+        .unwrap_or_default();
     changes
         .native_property_documents
-        .par_iter()
+        .iter()
         .filter(|(_, document)| holds_unread_instances(document))
-        .map(|(service, document)| {
+        .map(|(service, document)| (service, document, rows.remove(service)))
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|(service, document, rows)| {
             let started = Instant::now();
-            let Some(import) = import.filter(|import| import.imports_service(service)) else {
-                let mut whole = SettingsBytecode::clone(document);
-                read_unread_instances(&mut whole, &store_bytes(stores_root, service)?)?;
-                return Ok((service.clone(), Arc::new(whole)));
+            let read = if let Some(rows) = rows {
+                rows.materialize(document)?
+            } else {
+                read_instances(
+                    document,
+                    &store_bytes(stores_root, service)?,
+                    &(0..document.instances.len()).collect::<Vec<_>>(),
+                )?
             };
-            let unread = |instance: &crate::settings::bytecode::SettingsBytecodeInstance| {
-                crate::settings::held::stands_unchanged(&instance.properties)
-            };
-            let mut rows = document
-                .instances
-                .iter()
-                .enumerate()
-                .filter(|(_, instance)| {
-                    unread(instance)
-                        && (instance.class_name == "Model"
-                            || import
-                                .post_apply_properties_by_class
-                                .contains_key(&instance.class_name))
-                })
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            if !import.post_apply_properties_by_path.is_empty() {
-                let chosen = rows.iter().copied().collect::<HashSet<_>>();
-                let others = document
-                    .instances
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, instance)| unread(instance) && !chosen.contains(index))
-                    .map(|(index, _)| index)
-                    .collect::<Vec<_>>();
-                let paths = crate::editor::paths::build_editor_instance_paths_for_indices(
-                    document, service, &others,
-                );
-                rows.extend(paths.into_iter().filter_map(|(index, path)| {
-                    import
-                        .post_apply_properties_by_path
-                        .contains_key(&crate::bytecode::edit::instance_path_parts_key(
-                            &path.path_segments,
-                            &path.path_ordinals,
-                        ))
-                        .then_some(index)
-                }));
-                rows.sort_unstable();
-            }
-            // The models were read with the document; mostly nothing is left.
-            if rows.is_empty() {
-                return Ok((service.clone(), Arc::clone(document)));
-            }
-            if global_log_enabled(5) {
-                let mut classes = rows
-                    .iter()
-                    .map(|index| document.instances[*index].class_name.as_str())
-                    .collect::<Vec<_>>();
-                classes.sort_unstable();
-                classes.dedup();
-                log_global(
-                    5,
-                    format_args!(
-                        "[renium] native supplemental rows of {service}: {} of {classes:?}, by class {:?}, by path {}",
-                        rows.len(),
-                        import.post_apply_properties_by_class,
-                        import.post_apply_properties_by_path.len()
-                    ),
-                );
-            }
-            let read = read_instances(document, &store_bytes(stores_root, service)?, &rows)?;
             log_editor_collection_timing("native supplemental rows", started);
             Ok((service.clone(), Arc::new(read)))
         })
@@ -7148,9 +7094,99 @@ mod sync_tests {
         }
     }
 
+    #[test]
+    fn supplemental_documents_use_retained_originals_without_the_store() -> Result<()> {
+        use crate::rbx::import_rows::{ImportRowCandidates, identity};
+        use crate::settings::bytecode::SettingsBytecodeInstance;
+        let mut document = SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "root".into(),
+                    "ReplicatedStorage".into(),
+                    "ReplicatedStorage".into(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new(
+                    "model".into(),
+                    "Model".into(),
+                    "Model".into(),
+                    Some(0),
+                ),
+                SettingsBytecodeInstance::new("part".into(), "Part".into(), "Part".into(), Some(1)),
+            ],
+        };
+        document.instances[1].properties.insert(
+            "PrimaryPart".into(),
+            json!({"_type":"Ref", "instanceIndex":2}),
+        );
+        document.instances[1].properties.insert(
+            "WorldPivotData".into(),
+            json!({
+                "_type":"CFrame", "components":[1,2,3,1,0,0,0,1,0,0,0,1]
+            }),
+        );
+        document.instances[1].properties.insert("FuturePayload".into(), json!({
+            "_type":"SharedString", "base64":base64::encode(b"whole original retained payload".repeat(64))
+        }));
+        document.instances[1]
+            .attributes
+            .insert("WholeRow".into(), json!(true));
+        let bytes = crate::settings::bytecode::encode_settings_bytecode(&document)?;
+        let document = crate::settings::bytecode::decode_settings_bytecode_holding(&bytes)?;
+        let candidates = || {
+            ImportRowCandidates {
+                services: HashMap::from([(
+                    "ReplicatedStorage".into(),
+                    (
+                        identity(&document),
+                        vec![(
+                            rbx_dom_weak::types::Ref::new(),
+                            1,
+                            document.instances[1].clone(),
+                        )],
+                    ),
+                )]),
+            }
+            .finish(&HashMap::new(), &HashMap::new(), &HashMap::new())
+        };
+        let mut sparse = document.clone();
+        for row in sparse.instances.iter_mut().skip(1) {
+            row.properties.clear();
+            row.attributes.clear();
+            crate::settings::held::stand_unchanged(&mut row.properties);
+        }
+        let expected = crate::settings::equivalence::read_instances(&sparse, &bytes, &[1])?;
+        let mut changes = EditorChangeSet::default();
+        changes
+            .native_property_documents
+            .insert("ReplicatedStorage".into(), Arc::new(sparse.clone()));
+        let mut import = replacement_fixture();
+        import.kept_rows = candidates()?;
+        // An empty private directory has no store to reread. A regression to
+        // file materialization must fail here, before comparing any values.
+        let root = crate::tests::support::temp_dir("import-retained-supplemental");
+        let actual = supplemental_documents(&changes, Some(&mut import), &root)?;
+        assert_eq!(actual["ReplicatedStorage"].as_ref(), &expected);
+        assert!(import.kept_rows.is_empty());
+        for changed in [0, 1] {
+            let mut invalid = sparse.clone();
+            if changed == 0 {
+                invalid.instances[2].settings_id.push_str(":changed");
+            } else {
+                invalid.instances[1].parent_index = Some(2);
+            }
+            let kept = candidates()?.remove("ReplicatedStorage").unwrap();
+            assert!(kept.materialize(&invalid).is_err());
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     pub(super) fn replacement_fixture() -> EditorBinaryImport {
         use crate::editor::types::EditorBinaryImportGroup;
         EditorBinaryImport {
+            kept_rows: HashMap::new(),
             bytes: Vec::new(),
             native_replacement: None,
             fallback_reason: None,

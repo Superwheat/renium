@@ -616,7 +616,8 @@ fn append_editor_property_changes_with_paths(
                 continue;
             }
             if import.is_some()
-                && !(instance.class_name == "Model" && logical_name == "WorldPivot")
+                && (instance.class_name.as_str(), logical_name)
+                    != crate::editor::types::IMPORT_MODEL_PIVOT
                 && (retained_payload
                     || !(class_names.is_some_and(|names| names.contains(logical_name))
                         || path_names.is_some_and(|names| names.contains(logical_name))))
@@ -773,7 +774,7 @@ fn native_target_path_indices(
                 .get(&instance.class_name)
         });
         if !retained
-            && instance.class_name != "Model"
+            && instance.class_name != crate::editor::types::IMPORT_MODEL_PIVOT.0
             && path_names.is_empty()
             && class_names.is_none_or(HashSet::is_empty)
         {
@@ -790,7 +791,8 @@ fn native_target_path_indices(
                 !name.eq_ignore_ascii_case("Source")
                     && filter.includes_property(logical)
                     && (retained
-                        || instance.class_name == "Model" && logical == "WorldPivot"
+                        || (instance.class_name.as_str(), logical)
+                            == crate::editor::types::IMPORT_MODEL_PIVOT
                         || class_names.is_some_and(|names| names.contains(logical))
                         || path_names.contains(logical))
             });
@@ -1192,6 +1194,7 @@ mod native_property_tests {
             rbx_logical_property_name(rbx_reflection_database::get().unwrap(), "Frame", "Sink")
                 .unwrap_or("Sink");
         EditorBinaryImport {
+            kept_rows: HashMap::new(),
             bytes: Vec::new(),
             native_replacement: None,
             fallback_reason: None,
@@ -1513,6 +1516,7 @@ mod native_property_tests {
 
         let segments = vec!["Workspace".into(), "Same".into()];
         let mut import = EditorBinaryImport {
+            kept_rows: HashMap::new(),
             bytes: Vec::new(),
             native_replacement: None,
             fallback_reason: None,

@@ -666,7 +666,32 @@ impl ServiceReaderFallback {
     }
 }
 
+/// The existing post-import pivot rule, shared by selection and row retention.
+pub(crate) const IMPORT_MODEL_PIVOT: (&str, &str) = ("Model", "WorldPivot");
+
+pub(crate) fn import_property_omissions(
+    mut omitted: HashMap<String, HashSet<String>>,
+    native_reader: bool,
+) -> HashMap<String, HashSet<String>> {
+    omitted
+        .entry(IMPORT_MODEL_PIVOT.0.into())
+        .or_default()
+        .insert(IMPORT_MODEL_PIVOT.1.into());
+    // Plugin deserialization omits RobloxSecurity texture packs. The native
+    // full-place reader carries them in its payload, without per-instance
+    // protected setters after the bulk import. Keep genuine encoder omissions.
+    if !native_reader {
+        omitted
+            .entry("SurfaceAppearance".into())
+            .or_default()
+            .insert(crate::roblox::schema::TEXTURE_PACK_PROPERTY.into());
+    }
+    omitted
+}
+
 pub(crate) struct EditorBinaryImport {
+    /// Host-only decoded rows. The explicit wire payload never includes them.
+    pub(crate) kept_rows: HashMap<String, crate::rbx::import_rows::KeptImportRows>,
     pub(crate) bytes: Vec<u8>,
     pub(crate) groups: Vec<EditorBinaryImportGroup>,
     pub(crate) native_replacement: Option<EditorNativeReplacement>,

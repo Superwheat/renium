@@ -399,6 +399,7 @@ pub(crate) struct BytecodeModelExportRefs<'a> {
     pub(crate) global_by_path_key: Option<Arc<HashMap<String, RbxRef>>>,
     pub(crate) by_path_segments_key: HashMap<String, Option<RbxRef>>,
     pub(crate) global_by_path_segments_key: Option<Arc<HashMap<String, Option<RbxRef>>>>,
+    pub(crate) global_paths: Option<Arc<crate::rbx::place_paths::PlaceReferencePaths>>,
 }
 
 #[derive(Clone, Copy)]
@@ -912,6 +913,8 @@ pub(crate) struct BytecodeModelImportOutcome {
 }
 
 pub(crate) struct RbxPlaceBuild {
+    pub(crate) import_rows: crate::rbx::import_rows::ImportRowCandidates,
+    pub(crate) omitted_properties_by_ref: HashMap<RbxRef, HashSet<String>>,
     pub(crate) dom: RbxWeakDom,
     pub(crate) settings_ids_by_ref: HashMap<RbxRef, String>,
     pub(crate) service_roots: Vec<(String, RbxRef)>,
@@ -1395,7 +1398,7 @@ pub(crate) enum RbxPlaceDocument<'a> {
     File {
         structure: SettingsBytecode,
         path: PathBuf,
-        bytes: Vec<u8>,
+        columns: crate::settings::bytecode::property_edit::RetainedRowColumns,
     },
 }
 
@@ -1413,6 +1416,23 @@ impl std::ops::Deref for RbxPlaceDocument<'_> {
 }
 
 impl RbxPlaceDocument<'_> {
+    pub(crate) fn from_file_bytes(path: PathBuf, bytes: &[u8]) -> Result<Self> {
+        let (structure, columns) = crate::settings::bytecode::property_edit::decode_for_row_chunks(
+            bytes,
+        )
+        .with_context(|| {
+            format!(
+                "Failed to decode {}; repair or refresh this store before retrying the import",
+                path.display()
+            )
+        })?;
+        Ok(Self::File {
+            structure,
+            path,
+            columns,
+        })
+    }
+
     fn into_consumable(self) -> Self {
         match self {
             Self::Shared(document) => match Arc::try_unwrap(document) {
@@ -1436,24 +1456,25 @@ impl RbxPlaceDocument<'_> {
 
     fn load(self) -> Result<Self> {
         let Self::File {
-            structure,
+            mut structure,
             path,
-            bytes,
+            mut columns,
         } = self
         else {
             return Ok(self);
         };
-        crate::settings::equivalence::drop_settings_document(structure);
-        // Decode the same captured bytes as the structural index, even if a
-        // store is replaced on disk while another service is being converted.
-        let document = crate::settings::bytecode::decode_settings_bytecode_holding(&bytes)
-            .with_context(|| {
+        // The structure and columns came from one captured file snapshot.
+        let count = structure.instances.len();
+        if count != 0 {
+            columns.materialize(&mut structure, 0..count).with_context(|| {
                 format!(
                     "Failed to decode {}; repair or refresh this store before retrying the import",
                     path.display()
                 )
             })?;
-        Ok(Self::Owned(document))
+        }
+        columns.finish()?;
+        Ok(Self::Owned(structure))
     }
 
     fn release(self) {
@@ -1475,37 +1496,41 @@ struct PlaceRowValues {
     initial_size: Option<rbx_dom_weak::types::Vector3>,
 }
 
-fn take_place_chunk_values(
-    document: &mut SettingsBytecode,
+fn read_place_chunk_values(
+    document: &SettingsBytecode,
+    columns: &mut crate::settings::bytecode::property_edit::RetainedRowColumns,
     rows: std::ops::Range<usize>,
     ancestor_scales: &[Option<f32>],
     database: &rbx_reflection::ReflectionDatabase<'_>,
-) -> Vec<(usize, Option<PlaceRowValues>)> {
+) -> Result<Vec<(usize, Option<PlaceRowValues>)>> {
     let mut classes = AHashMap::new();
-    rows.map(|index| {
-        let row = &mut document.instances[index];
-        let mesh = *classes.entry(row.class_name.clone()).or_insert_with(|| {
-            crate::rbx::decode::rbx_reflection_class_is_a(
-                database,
-                &row.class_name,
-                "TriangleMeshPart",
+    let values = columns.materialize_values(rows.clone())?;
+    Ok(rows
+        .zip(values)
+        .map(|(index, values)| {
+            let row = &document.instances[index];
+            let mesh = *classes.entry(row.class_name.as_str()).or_insert_with(|| {
+                crate::rbx::decode::rbx_reflection_class_is_a(
+                    database,
+                    &row.class_name,
+                    "TriangleMeshPart",
+                )
+            });
+            let initial_size = crate::rbx::encode::synthesized_mesh_initial_size_from_values(
+                &values.properties,
+                mesh,
+                || ancestor_scales[index],
+            );
+            (
+                index,
+                Some(PlaceRowValues {
+                    properties: values.properties,
+                    attributes: values.attributes,
+                    initial_size,
+                }),
             )
-        });
-        let initial_size = crate::rbx::encode::synthesized_mesh_initial_size_from_values(
-            &row.properties,
-            mesh,
-            || ancestor_scales[index],
-        );
-        (
-            index,
-            Some(PlaceRowValues {
-                properties: std::mem::take(&mut row.properties),
-                attributes: std::mem::take(&mut row.attributes),
-                initial_size,
-            }),
-        )
-    })
-    .collect()
+        })
+        .collect())
 }
 
 fn take_place_row_values(
@@ -1583,27 +1608,45 @@ pub(crate) fn build_rbx_place_with_documents(
     capture_logical_properties: bool,
     merge_source_files: bool,
 ) -> Result<RbxPlaceBuild> {
-    build_rbx_place_with_row_chunks(
+    build_rbx_place_with_tuning(
         src_root,
         services,
         documents,
         allow_unrepresentable_properties,
         capture_logical_properties,
         merge_source_files,
-        std::num::NonZeroUsize::new(4096).unwrap(),
+        PlaceBuildTuning::default(),
     )
+}
+
+/// Scheduling choices only; references and final hierarchy order span all work.
+#[derive(Clone, Copy)]
+pub(crate) struct PlaceBuildTuning {
+    pub(crate) rows: std::num::NonZeroUsize,
+    pub(crate) services: std::num::NonZeroUsize,
+    pub(crate) prefetch: bool,
+}
+
+impl Default for PlaceBuildTuning {
+    fn default() -> Self {
+        Self {
+            rows: std::num::NonZeroUsize::new(8192).unwrap(),
+            services: std::num::NonZeroUsize::new(2).unwrap(),
+            prefetch: true,
+        }
+    }
 }
 
 /// The row limit is only a working-set choice. It never partitions identity,
 /// hierarchy, reference resolution, or the final binary's class columns.
-pub(crate) fn build_rbx_place_with_row_chunks(
+pub(crate) fn build_rbx_place_with_tuning(
     src_root: &Path,
     services: Vec<String>,
     mut documents: HashMap<String, RbxPlaceDocument<'_>>,
     allow_unrepresentable_properties: bool,
     capture_logical_properties: bool,
     merge_source_files: bool,
-    row_limit: std::num::NonZeroUsize,
+    tuning: PlaceBuildTuning,
 ) -> Result<RbxPlaceBuild> {
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let phase_started = Instant::now();
@@ -1647,12 +1690,7 @@ pub(crate) fn build_rbx_place_with_row_chunks(
             } else {
                 let bytes = fs::read(&settings_file)
                     .with_context(|| format!("Failed to read {}", settings_file.display()))?;
-                RbxPlaceDocument::File {
-                    structure: SettingsBytecode::decode_structure(&bytes)
-                        .with_context(|| format!("Failed to read {}", settings_file.display()))?,
-                    path: settings_file.clone(),
-                    bytes,
-                }
+                RbxPlaceDocument::from_file_bytes(settings_file.clone(), &bytes)?
             };
             if merge_source_files {
                 document = document.load()?;
@@ -1785,7 +1823,25 @@ pub(crate) fn build_rbx_place_with_row_chunks(
             });
     let mut global_path_refs = HashMap::new();
     let mut global_path_segment_refs = HashMap::new();
-    if needs_paths {
+    let mut compact_paths = crate::rbx::place_paths::PlaceReferencePaths::default();
+    // Preserve the original separator-key behavior for names containing its
+    // separators. Normal names need only the parent/name relation once.
+    let legacy_path_keys = export_inputs.iter().any(|(_, _, _, document, ..)| {
+        document
+            .instances
+            .iter()
+            .any(|row| row.name.contains(['\0', '\u{1}']))
+    });
+    if needs_paths && !legacy_path_keys {
+        for ((service, _, _, document, _, _, root, subtree, _), refs) in
+            export_inputs.iter().zip(&per_service_refs)
+        {
+            if editor_service_root_index(document, service) == Some(*root) {
+                compact_paths.add_service(document, *root, subtree, refs);
+            }
+        }
+    }
+    if needs_paths && legacy_path_keys {
         global_path_refs.reserve(total_instances);
         global_path_segment_refs.reserve(total_instances);
         for (service_index, (service, _, _, document, _, children, _, subtree, _)) in
@@ -1814,9 +1870,12 @@ pub(crate) fn build_rbx_place_with_row_chunks(
     let global_unique_settings_refs = Arc::new(global_unique_settings_refs);
     let global_path_refs = Arc::new(global_path_refs);
     let global_path_segment_refs = Arc::new(global_path_segment_refs);
+    let compact_paths = Arc::new(compact_paths);
     log_timing("native editor place reference indexes", phase_started);
     struct ServiceBuild {
         instances: Vec<(usize, Option<RbxRef>, rbx_dom_weak::Instance)>,
+        rows: Vec<(RbxRef, usize, SettingsBytecodeInstance)>,
+        omitted_properties_by_ref: HashMap<RbxRef, HashSet<String>>,
         omitted_properties_by_class: HashMap<String, HashSet<String>>,
         logical_properties_by_ref: HashMap<RbxRef, HashMap<rbx_dom_weak::Ustr, RbxVariant>>,
         unresolved_reference_properties_by_ref: HashMap<RbxRef, HashSet<rbx_dom_weak::Ustr>>,
@@ -1824,26 +1883,42 @@ pub(crate) fn build_rbx_place_with_row_chunks(
     let phase_started = Instant::now();
     let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
     dom.reserve(total_instances);
+    let mut import_rows = crate::rbx::import_rows::ImportRowCandidates::default();
+    let mut omitted_properties_by_ref = HashMap::new();
+    let extra_omissions = crate::editor::types::import_property_omissions(HashMap::new(), false);
     let mut omitted_properties_by_class = HashMap::new();
     let mut logical_properties_by_ref = HashMap::new();
     let mut unresolved_reference_properties_by_ref = HashMap::new();
     let mut service_roots = Vec::with_capacity(export_inputs.len());
     let mut has_package_links = false;
-    for (
-        (service, _, service_dir, document, mut source_paths, children, root_index, subtree, _),
-        by_index,
-    ) in export_inputs.into_iter().zip(per_service_refs)
-    {
+    let mut inputs = export_inputs
+        .into_iter()
+        .zip(per_service_refs)
+        .enumerate()
+        .collect::<Vec<_>>();
+    // Overlap the dominant services; keep their original rank for assembly.
+    inputs.sort_by_key(|(_, (input, _))| std::cmp::Reverse(input.7.len()));
+    let mut inputs = inputs.into_iter();
+    let mut converted = Vec::with_capacity(service_roots.capacity());
+    loop {
+        let batch = inputs
+            .by_ref()
+            .take(tuning.services.get())
+            .collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
+        let completed = batch.into_par_iter().map(|(rank, (
+            (service, _, service_dir, document, mut source_paths, children, root_index, subtree, _),
+            by_index,
+        ))| {
         let service_started = Instant::now();
         let (mut document, mut columns) = match document {
             RbxPlaceDocument::File {
-                structure,
-                path,
-                bytes,
+                structure: mut document,
+                columns,
+                ..
             } => {
-                drop(structure);
-                let (mut document, columns) = crate::settings::bytecode::property_edit::decode_for_row_chunks(&bytes)
-                    .with_context(|| format!("Failed to decode {}; repair or refresh this store before retrying the import", path.display()))?;
                 columns.project_properties(
                     &mut document,
                     |name| {
@@ -1862,6 +1937,7 @@ pub(crate) fn build_rbx_place_with_row_chunks(
             }
             other => (other.into_consumable(), None),
         };
+        let identity = capture_logical_properties.then(|| crate::rbx::import_rows::identity(&document));
         let ancestor_scales = if columns.is_some() {
             source_paths = build_editor_source_paths_by_index_with_children(
                 &document,
@@ -1881,7 +1957,7 @@ pub(crate) fn build_rbx_place_with_row_chunks(
         } else {
             Vec::new()
         };
-        has_package_links |= document
+        let has_package_links = document
             .instances
             .iter()
             .any(|node| node.class_name == "PackageLink");
@@ -1892,6 +1968,7 @@ pub(crate) fn build_rbx_place_with_row_chunks(
             global_by_settings_id: Some(Arc::clone(&global_unique_settings_refs)),
             global_by_path_key: Some(Arc::clone(&global_path_refs)),
             global_by_path_segments_key: Some(Arc::clone(&global_path_segment_refs)),
+            global_paths: Some(Arc::clone(&compact_paths)),
             ..Default::default()
         };
         // One very large service must not serialize all conversion work
@@ -1907,6 +1984,8 @@ pub(crate) fn build_rbx_place_with_row_chunks(
                 .chunks(chunk_size)
                 .map(|chunk| {
                     let mut instances = Vec::with_capacity(chunk.len());
+                    let mut rows = Vec::new();
+                    let mut omitted_properties_by_ref = HashMap::new();
                     let mut omitted_properties_by_class = HashMap::new();
                     let mut logical_properties_by_ref = HashMap::new();
                     let mut unresolved_reference_properties_by_ref = HashMap::new();
@@ -1925,6 +2004,7 @@ pub(crate) fn build_rbx_place_with_row_chunks(
                                 anyhow::anyhow!("Export subtree is missing parent referent")
                             })?)
                         };
+                        let mut omitted_properties = HashSet::new();
                         let mut logical_properties = HashMap::new();
                         let mut unresolved_reference_properties = HashSet::new();
                         let builder = encoder.build_with_values(
@@ -1937,6 +2017,7 @@ pub(crate) fn build_rbx_place_with_row_chunks(
                                     initial_size: values.initial_size,
                                 }),
                             BytecodeRbxBuildOptions {
+                                omitted_properties: capture_logical_properties.then_some(&mut omitted_properties),
                                 source_path: source_paths.get(index).and_then(Option::as_deref),
                                 omitted_properties_by_class: allow_unrepresentable_properties
                                     .then_some(&mut omitted_properties_by_class),
@@ -1946,6 +2027,31 @@ pub(crate) fn build_rbx_place_with_row_chunks(
                                     .then_some(&mut unresolved_reference_properties),
                             },
                         )?;
+                        let referent = refs.by_index[&index];
+                        let built = builder.build_leaf(children[index].len());
+                        let instance = &document.instances[index];
+                        let properties = values.as_ref().map_or(&instance.properties, |row| &row.properties);
+                        let keep = capture_logical_properties && (
+                            instance.class_name == crate::editor::types::IMPORT_MODEL_PIVOT.0
+                            || !omitted_properties.is_empty()
+                            || !unresolved_reference_properties.is_empty()
+                            || built.properties.values().chain(logical_properties.values()).any(|value| matches!(value, RbxVariant::Ref(_)))
+                            || extra_omissions.get(&instance.class_name).is_some_and(|names| properties.keys().any(|name| names.contains(name)))
+                        );
+                        if keep {
+                            let mut row = SettingsBytecodeInstance::new(instance.settings_id.clone(), instance.name.clone(), instance.class_name.clone(), instance.parent_index);
+                            if let Some(values) = values {
+                                row.properties = values.properties;
+                                row.attributes = values.attributes;
+                            } else {
+                                row.properties = instance.properties.clone();
+                                row.attributes = instance.attributes.clone();
+                            }
+                            rows.push((referent, index, row));
+                        }
+                        if !omitted_properties.is_empty() {
+                            omitted_properties_by_ref.insert(referent, omitted_properties);
+                        }
                         if !logical_properties.is_empty() {
                             logical_properties_by_ref.insert(
                                 *refs
@@ -1967,11 +2073,13 @@ pub(crate) fn build_rbx_place_with_row_chunks(
                         instances.push((
                             index,
                             parent_ref,
-                            builder.build_leaf(children[index].len()),
+                            built,
                         ));
                     }
                     Ok(ServiceBuild {
                         instances,
+                        rows,
+                        omitted_properties_by_ref,
                         omitted_properties_by_class,
                         logical_properties_by_ref,
                         unresolved_reference_properties_by_ref,
@@ -1981,24 +2089,36 @@ pub(crate) fn build_rbx_place_with_row_chunks(
         };
         let mut service_chunks = Vec::new();
         if let Some(columns) = columns.as_mut() {
-            for start in (0..document.instances.len()).step_by(row_limit.get()) {
+            let read = |columns: &mut crate::settings::bytecode::property_edit::RetainedRowColumns, start: usize| {
                 let end = start
-                    .saturating_add(row_limit.get())
+                    .saturating_add(tuning.rows.get())
                     .min(document.instances.len());
-                columns.materialize(document.to_mut(), start..end).with_context(|| format!(
+                let rows = read_place_chunk_values(&document, columns, start..end, &ancestor_scales, database).with_context(|| format!(
                     "Failed to decode {service} store rows {start}..{end}; repair or refresh this store before retrying the import"
                 ))?;
-                let rows = take_place_chunk_values(
-                    document.to_mut(),
-                    start..end,
-                    &ancestor_scales,
-                    database,
-                );
-                let rows = rows
+                anyhow::Ok(rows
                     .into_iter()
                     .filter(|(index, _)| refs.by_index.contains_key(index))
-                    .collect();
-                service_chunks.extend(convert(&document, rows)?);
+                    .collect::<Vec<_>>())
+            };
+            let mut starts = (0..document.instances.len()).step_by(tuning.rows.get());
+            if tuning.prefetch {
+                if let Some(first) = starts.next() {
+                    let mut pending = read(columns, first)?;
+                    for start in starts {
+                        let (completed, next) = rayon::join(
+                            || convert(&document, pending),
+                            || read(columns, start),
+                        );
+                        service_chunks.extend(completed?);
+                        pending = next?;
+                    }
+                    service_chunks.extend(convert(&document, pending)?);
+                }
+            } else {
+                for start in starts {
+                    service_chunks.extend(convert(&document, read(columns, start)?)?);
+                }
             }
         } else {
             let mut values = take_place_row_values(&mut document, database);
@@ -2026,6 +2146,20 @@ pub(crate) fn build_rbx_place_with_row_chunks(
         drop(source_paths);
         drop(children);
         drop(subtree);
+        drop(refs);
+        log_timing(
+            &format!("native editor place {service} converted and released"),
+            service_started,
+        );
+        anyhow::Ok((rank, service, root_ref, has_package_links, order, service_chunks, identity))
+        }).collect::<Result<Vec<_>>>()?;
+        converted.extend(completed);
+    }
+    converted.sort_by_key(|(rank, ..)| *rank);
+    let join_span = crate::app::profile::span("place converted tree join");
+    for (_, service, root_ref, packages, order, service_chunks, identity) in converted {
+        let mut kept = Vec::new();
+        has_package_links |= packages;
         let mut instances = Vec::with_capacity(order.len());
         for service in service_chunks {
             for (class_name, names) in service.omitted_properties_by_class {
@@ -2038,23 +2172,26 @@ pub(crate) fn build_rbx_place_with_row_chunks(
             unresolved_reference_properties_by_ref
                 .extend(service.unresolved_reference_properties_by_ref);
             instances.extend(service.instances);
+            kept.extend(service.rows);
+            omitted_properties_by_ref.extend(service.omitted_properties_by_ref);
         }
-        // File columns follow row order, which need not be hierarchy order.
-        // Preserve the same preorder used by prepared and ordinary exports.
+        // Completion order and row ranges never change hierarchy preorder.
         instances.sort_unstable_by_key(|(index, _, _)| order[*index]);
         for (_, parent_ref, builder) in instances {
-            let parent_ref = parent_ref.unwrap_or_else(|| dom.root_ref());
-            dom.insert_leaf(parent_ref, builder);
+            dom.insert_leaf(parent_ref.unwrap_or_else(|| dom.root_ref()), builder);
         }
-        drop(refs);
-        log_timing(
-            &format!("native editor place {service} converted and released"),
-            service_started,
-        );
+        if let Some(identity) = identity {
+            import_rows
+                .services
+                .insert(service.clone(), (identity, kept));
+        }
         service_roots.push((service, root_ref));
     }
 
+    drop(join_span);
+    let normalize_span = crate::app::profile::span("place default normalization");
     crate::rbx::encode::normalize_export_dom(&mut dom, database);
+    drop(normalize_span);
     log_timing("native editor place DOM assembly", phase_started);
     // Reimports need the source identities as well as logical properties.
     // Reuse the already prepared index; ordinary file builds need no copy.
@@ -2068,6 +2205,8 @@ pub(crate) fn build_rbx_place_with_row_chunks(
         HashMap::new()
     };
     Ok(RbxPlaceBuild {
+        import_rows,
+        omitted_properties_by_ref,
         dom,
         settings_ids_by_ref,
         service_roots,

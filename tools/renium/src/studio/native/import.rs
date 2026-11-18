@@ -14,6 +14,7 @@ use crate::cli::PushEditorChangesArgs;
 use crate::editor::types::{
     EditorBinaryExport, EditorBinaryImport, EditorBinaryImportGroup, EditorBinaryPackageRoot,
     EditorBinaryRetainedRoot, EditorBinaryRootPath, EditorChangeSet, ServiceReaderFallback,
+    import_property_omissions,
 };
 use crate::rbx::decode::{
     NativeOverlayRequest, NativePropertyFilter, RbxSettingsConversionOptions,
@@ -3133,6 +3134,13 @@ fn build_editor_binary_import_for_services(
         &build.unresolved_reference_properties_by_ref,
         viewport_ref,
     );
+    for (referent, names) in std::mem::take(&mut build.omitted_properties_by_ref) {
+        let (segments, ordinals) = rbx_dom_instance_path_parts(&build.dom, referent);
+        post_apply_properties_by_path
+            .entry(instance_path_parts_key(&segments, &ordinals))
+            .or_default()
+            .extend(names);
+    }
     log_timing("native editor import group preparation", phase_started);
     let replacement_groups = pending_groups
         .iter()
@@ -3253,6 +3261,7 @@ fn build_editor_binary_import_for_services(
             }
         }
     }
+    let row_paths = build.import_rows.paths(&build.dom);
     let phase_started = Instant::now();
     let identities = crate::app::profile::span("native import clear regenerated engine identities");
     clear_import_engine_identities(&mut build.dom);
@@ -3279,16 +3288,21 @@ fn build_editor_binary_import_for_services(
             })
             .sum();
         log_timing("native editor import service encode", phase_started);
+        let post_apply_properties_by_class =
+            import_property_omissions(build.omitted_properties_by_class, true);
+        let kept_rows = build.import_rows.finish(
+            &row_paths,
+            &post_apply_properties_by_class,
+            &post_apply_properties_by_path,
+        )?;
         return Ok(Some(EditorBinaryImport {
+            kept_rows,
             bytes,
             groups,
             native_replacement: Some(native_replacement),
             fallback_reason: None,
             instance_count,
-            post_apply_properties_by_class: import_property_omissions(
-                build.omitted_properties_by_class,
-                true,
-            ),
+            post_apply_properties_by_class,
             post_apply_properties_by_path,
             external_references_post_applied: true,
             viewport_references_post_applied,
@@ -3389,40 +3403,25 @@ fn build_editor_binary_import_for_services(
     rbx_binary::to_writer(&mut bytes, &build.dom, &top_level_refs)
         .context("Failed to encode native Studio import")?;
     log_timing("native editor import binary encode", phase_started);
+    let post_apply_properties_by_class =
+        import_property_omissions(build.omitted_properties_by_class, false);
+    let kept_rows = build.import_rows.finish(
+        &row_paths,
+        &post_apply_properties_by_class,
+        &post_apply_properties_by_path,
+    )?;
     Ok(Some(EditorBinaryImport {
+        kept_rows,
         bytes,
         groups,
         native_replacement: None,
         fallback_reason,
         instance_count,
-        post_apply_properties_by_class: import_property_omissions(
-            build.omitted_properties_by_class,
-            false,
-        ),
+        post_apply_properties_by_class,
         post_apply_properties_by_path,
         external_references_post_applied: true,
         viewport_references_post_applied,
     }))
-}
-
-fn import_property_omissions(
-    mut omitted: HashMap<String, HashSet<String>>,
-    native_reader: bool,
-) -> HashMap<String, HashSet<String>> {
-    omitted
-        .entry("Model".into())
-        .or_default()
-        .insert("WorldPivot".into());
-    // Plugin deserialization omits RobloxSecurity texture packs. The native
-    // full-place reader carries them in its payload, without per-instance
-    // protected setters after the bulk import. Keep genuine encoder omissions.
-    if !native_reader {
-        omitted
-            .entry("SurfaceAppearance".into())
-            .or_default()
-            .insert(crate::roblox::schema::TEXTURE_PACK_PROPERTY.into());
-    }
-    omitted
 }
 
 #[test]

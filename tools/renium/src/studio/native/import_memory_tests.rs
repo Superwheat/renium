@@ -125,7 +125,21 @@ fn native_import_payload_matches_main_ad5_bytes() -> Result<()> {
     Ok(())
 }
 
-fn fixture_bytes(mut build: crate::rbx::model::RbxPlaceBuild) -> Result<Vec<u8>> {
+fn fixture_bytes(build: crate::rbx::model::RbxPlaceBuild) -> Result<Vec<u8>> {
+    Ok(fixture_payload_and_rows(build)?.0)
+}
+
+type FixtureRows = HashMap<String, Vec<(usize, SettingsBytecodeInstance)>>;
+
+fn fixture_payload_and_rows(
+    mut build: crate::rbx::model::RbxPlaceBuild,
+) -> Result<(Vec<u8>, FixtureRows)> {
+    let paths = build.import_rows.paths(&build.dom);
+    let mut omitted_paths = HashMap::new();
+    for (referent, names) in std::mem::take(&mut build.omitted_properties_by_ref) {
+        let (segments, ordinals) = rbx_dom_instance_path_parts(&build.dom, referent);
+        omitted_paths.insert(instance_path_parts_key(&segments, &ordinals), names);
+    }
     let groups = pending_editor_binary_groups(&build.dom, &build.service_roots)?;
     let plans = groups
         .iter()
@@ -143,9 +157,19 @@ fn fixture_bytes(mut build: crate::rbx::model::RbxPlaceBuild) -> Result<Vec<u8>>
         &build.settings_ids_by_ref,
         groups,
         plans,
-        &mut HashMap::new(),
+        &mut omitted_paths,
     )?;
-    Ok(bytes)
+    let rows = build
+        .import_rows
+        .finish(
+            &paths,
+            &import_property_omissions(build.omitted_properties_by_class, true),
+            &omitted_paths,
+        )?
+        .into_iter()
+        .map(|(service, rows)| (service, rows.rows))
+        .collect();
+    Ok((bytes, rows))
 }
 
 #[test]
@@ -222,20 +246,13 @@ fn native_import_file_values_come_from_the_indexed_snapshot() -> Result<()> {
     let document = fixture("Workspace");
     document.write_file(&path)?;
     let bytes = std::fs::read(&path)?;
-    let structure = SettingsBytecode::decode_structure(&bytes)?;
+    let input = RbxPlaceDocument::from_file_bytes(path.clone(), &bytes)?;
     // Replacing even the entire file must not change the already indexed input.
     std::fs::write(&path, b"subsequent edit, not a valid store")?;
     let actual = build_rbx_place_with_documents(
         &root,
         vec!["Workspace".into()],
-        HashMap::from([(
-            "Workspace".into(),
-            RbxPlaceDocument::File {
-                structure,
-                path,
-                bytes,
-            },
-        )]),
+        HashMap::from([("Workspace".into(), input)]),
         true,
         true,
         false,
@@ -317,7 +334,7 @@ fn import_document_lifetime_probe() -> Result<()> {
 
 #[test]
 fn native_import_file_chunks_preserve_all_cross_row_facts() -> Result<()> {
-    use crate::rbx::model::{RbxPlaceDocument, build_rbx_place_with_row_chunks};
+    use crate::rbx::model::{PlaceBuildTuning, RbxPlaceDocument, build_rbx_place_with_tuning};
     let root =
         std::env::temp_dir().join(format!("renium-import-row-chunks-{}", std::process::id()));
     let service_dir = root.join("Workspace");
@@ -392,39 +409,81 @@ fn native_import_file_chunks_preserve_all_cross_row_facts() -> Result<()> {
     // every route; the small golden separately pins the original main bytes.
     let document =
         crate::settings::bytecode::decode_settings_bytecode_holding(&std::fs::read(path)?)?;
-    let expected = fixture_bytes(build_rbx_place(
+    let second_dir = root.join("ReplicatedStorage");
+    std::fs::create_dir_all(&second_dir)?;
+    let mut second = fixture("ReplicatedStorage");
+    // Force cross-service path resolution, including the second same-named
+    // ancestor, without an identity or row-index shortcut.
+    second.instances[4].properties.insert(
+        "Value".into(),
+        json!({
+            "_type":"Ref", "pathSegments":["Workspace", "Same", "Geometry"],
+            "pathOrdinals":[1,2,1]
+        }),
+    );
+    let second_path = service_settings_path(&second_dir);
+    second.write_file(&second_path)?;
+    let second =
+        crate::settings::bytecode::decode_settings_bytecode_holding(&std::fs::read(second_path)?)?;
+    let documents = HashMap::from([
+        ("Workspace".to_string(), document),
+        ("ReplicatedStorage".to_string(), second),
+    ]);
+    let services = vec!["Workspace".to_string(), "ReplicatedStorage".to_string()];
+    let expected = fixture_payload_and_rows(build_rbx_place(
         &root,
-        vec!["Workspace".into()],
-        Some(&HashMap::from([("Workspace".into(), &document)])),
+        services.clone(),
+        Some(
+            &documents
+                .iter()
+                .map(|(name, document)| (name.clone(), document))
+                .collect(),
+        ),
         true,
         true,
         false,
     )?)?;
-    for size in [1, 7, 4096, usize::MAX] {
+    for (size, parallel_services, workers) in
+        [(1, 1, 1), (7, 2, 4), (4096, 4, 4), (usize::MAX, 1, 4)]
+    {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()?;
         for mode in ["file", "owned", "shared"] {
-            let inputs = match mode {
-                "owned" => HashMap::from([(
-                    "Workspace".into(),
-                    RbxPlaceDocument::Owned(document.clone()),
-                )]),
-                "shared" => HashMap::from([(
-                    "Workspace".into(),
-                    RbxPlaceDocument::Shared(std::sync::Arc::new(document.clone())),
-                )]),
-                _ => HashMap::new(),
-            };
-            let build = build_rbx_place_with_row_chunks(
-                &root,
-                vec!["Workspace".into()],
-                inputs,
-                true,
-                true,
-                false,
-                std::num::NonZeroUsize::new(size).unwrap(),
-            )?;
+            let inputs = documents
+                .iter()
+                .filter_map(|(name, document)| match mode {
+                    "owned" => Some((name.clone(), RbxPlaceDocument::Owned(document.clone()))),
+                    "shared" => Some((
+                        name.clone(),
+                        RbxPlaceDocument::Shared(std::sync::Arc::new(document.clone())),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            let build = pool.install(|| {
+                build_rbx_place_with_tuning(
+                    &root,
+                    services.clone(),
+                    inputs,
+                    true,
+                    true,
+                    false,
+                    PlaceBuildTuning {
+                        rows: std::num::NonZeroUsize::new(size).unwrap(),
+                        services: std::num::NonZeroUsize::new(parallel_services).unwrap(),
+                        prefetch: parallel_services != 1,
+                    },
+                )
+            })?;
+            let actual = fixture_payload_and_rows(build)?;
             assert!(
-                fixture_bytes(build)? == expected,
-                "{mode}, chunk size {size}: payload bytes changed"
+                actual.0 == expected.0,
+                "{mode}, chunk size {size}, services {parallel_services}, workers {workers}: payload bytes changed"
+            );
+            assert_eq!(
+                actual.1, expected.1,
+                "{mode}, chunk size {size}: retained original rows changed"
             );
         }
     }

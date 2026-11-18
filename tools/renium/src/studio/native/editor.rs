@@ -4125,6 +4125,8 @@ fn write_editor_place_snapshot(
         has_package_links |= instance.class.as_str() == "PackageLink";
     }
     let mut build = RbxPlaceBuild {
+        import_rows: Default::default(),
+        omitted_properties_by_ref: HashMap::new(),
         dom,
         settings_ids_by_ref: HashMap::new(),
         service_roots,
@@ -5741,6 +5743,7 @@ mod source_change_tests {
             });
         }
         let import = EditorBinaryImport {
+            kept_rows: HashMap::new(),
             bytes: vec![],
             groups,
             fallback_reason: None,
