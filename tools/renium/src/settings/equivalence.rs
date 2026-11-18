@@ -524,10 +524,7 @@ impl AlignmentPhases {
 /// additionally need the same topology and either exact persistent matches
 /// or unchanged duplicate subtrees with consistent incoming references.
 /// A moved persistent ID or viewport role invalidates either proof.
-pub(crate) fn identities_already_aligned(
-    reference: &SettingsBytecode,
-    observed: &SettingsBytecode,
-) -> bool {
+fn identities_already_aligned(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
     let mut seen = AHashSet::with_capacity(reference.instances.len());
     let mut all_store_ids = true;
     if reference.instances.len() != observed.instances.len()
@@ -1820,6 +1817,36 @@ pub(crate) fn align_settings_ids_to_reference(
         return true;
     }
     align_settings_ids_by_matching(reference, observed)
+}
+
+/// `align_settings_ids_to_reference` where it leaves every instance at its
+/// place: the identities are aligned as they stand, or the observed instances
+/// take the ids of the reference by position. `false` where it would match
+/// the instances by what tells them apart, with `observed` as it was. The
+/// conditions are those of `align_settings_ids_to_reference` and of the
+/// start of `align_settings_ids_by_matching`.
+pub(crate) fn align_settings_ids_by_place(
+    reference: &SettingsBytecode,
+    observed: &mut SettingsBytecode,
+) -> bool {
+    if !settings_topology_matches(reference, observed) {
+        return false;
+    }
+    if identities_already_aligned(reference, observed) {
+        return true;
+    }
+    let camera_positions_match = match (
+        workspace_current_camera_index(reference),
+        workspace_current_camera_index(observed),
+    ) {
+        (Some(reference), Some(observed)) => reference == observed,
+        _ => true,
+    };
+    if camera_positions_match && positional_identity_preserved(reference, observed) {
+        remap_positional_ids(reference, observed);
+        return true;
+    }
+    false
 }
 
 fn align_settings_ids_by_matching(

@@ -6568,6 +6568,20 @@ fn changed_instances_store(rng: &mut crate::tests::support::SimRng) -> SettingsB
                 json!({"_type": "Ref", "instanceIndex": 1 + rng.below(position)}),
             );
         }
+        // A reference by an id and a path, as a capture gives one it could
+        // not place.
+        if position > 2 && rng.below(8) == 0 {
+            let target = &instances[1 + rng.below(position - 1)];
+            instance.properties.insert(
+                "Pointer".into(),
+                json!({
+                    "_type": "Ref",
+                    "settingsId": target.settings_id,
+                    "pathSegments": ["Workspace", target.name],
+                    "pathOrdinals": [1, 1],
+                }),
+            );
+        }
         if rng.below(4) == 0 {
             instance
                 .attributes
@@ -6781,10 +6795,33 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
         AtomicUsize::new(0),
         AtomicUsize::new(0),
     );
+    let under_other_ids = AtomicUsize::new(0);
     run_seeds(1_500, |seed, _| {
         let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-        let studio = changed_instances_store(&mut rng);
+        let mut studio = changed_instances_store(&mut rng);
         let mut files = studio.clone();
+        // Studio opened the place again since the files were written: it
+        // gave every instance another id of its own and another UniqueId.
+        let reopened = rng.below(3) == 0;
+        if reopened {
+            for (index, instance) in studio.instances.iter_mut().enumerate() {
+                // Studio numbers anew from where it did before, so an id of
+                // its own can be the one the files hold for another instance.
+                if instance.settings_id.starts_with("debug:") {
+                    instance.settings_id = if seed % 2 == 0 {
+                        format!("debug:0_{}", 500 + index)
+                    } else {
+                        format!("debug:0_{}", 100 + index)
+                    };
+                }
+                if instance.properties.contains_key("UniqueId") {
+                    instance.properties.insert(
+                        "UniqueId".into(),
+                        json!({"_type": "UniqueId", "value": format!("{:024x}{:08x}", 5, index + 1)}),
+                    );
+                }
+            }
+        }
         for _ in 0..rng.below(5) + usize::from(seed % 16 != 0) {
             change_an_instance(&mut rng, &mut files);
         }
@@ -6895,6 +6932,9 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
         }
         if stands {
             from_changed.fetch_add(1, Ordering::Relaxed);
+            if reopened {
+                under_other_ids.fetch_add(1, Ordering::Relaxed);
+            }
         } else {
             whole.fetch_add(1, Ordering::Relaxed);
         }
@@ -6906,12 +6946,23 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
         Ok(())
     });
     if std::env::var_os("RENIUM_SIM_SEED").is_none() {
-        let counts = [&from_changed, &whole, &planned, &unchanged_stores]
-            .map(|count| count.load(Ordering::Relaxed));
+        let counts = [
+            &from_changed,
+            &whole,
+            &planned,
+            &unchanged_stores,
+            &under_other_ids,
+        ]
+        .map(|count| count.load(Ordering::Relaxed));
         assert!(
-            counts[0] >= 350 && counts[1] >= 100 && counts[2] >= 500 && counts[3] >= 50,
-            "prepared from the changed instances {}, from whole documents {}, with a plan {}, unchanged {}",
+            counts[0] >= 200
+                && counts[1] >= 100
+                && counts[2] >= 400
+                && counts[3] >= 50
+                && counts[4] >= 40,
+            "prepared from the changed instances {} ({} of them under other ids), from whole documents {}, with a plan {}, unchanged {}",
             counts[0],
+            counts[4],
             counts[1],
             counts[2],
             counts[3]

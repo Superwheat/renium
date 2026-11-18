@@ -159,10 +159,13 @@ pub(crate) struct StoreRows {
     pub(crate) unique_ids: Vec<[u8; 16]>,
     /// The instance asked for whole, where the store has one there.
     pub(crate) kept: Option<SettingsBytecodeInstance>,
-    /// The id of each instance.
+    /// The id of each instance, from `row_digests`.
     pub(crate) ids: Vec<String>,
     /// How the instances stand in the state they were digested for.
     pub(crate) moved: Option<super::captured::Moved>,
+    /// From `whole_row_digests`: every instance without its values but its
+    /// UniqueId.
+    pub(crate) instances: Vec<SettingsBytecodeInstance>,
 }
 
 /// One value of a store, by the instance that holds it, its property's
@@ -259,6 +262,8 @@ fn row_digests_of(
     let digested = |group: usize| -> Result<(Vec<Cell>, Vec<DecodedGroupEntry>)> {
         let (name, kind, count, body) = specs[group];
         let place = names.binary_search(&name.as_str()).unwrap_or_default() as u32;
+        // Every instance keeps its UniqueId where the instances come back.
+        let kept_of_all = whole && name.as_str() == UNIQUE_ID;
         let cell = |row: usize, name: u32, digest: [u8; 16]| Cell {
             row: row as u32,
             name,
@@ -273,7 +278,7 @@ fn row_digests_of(
                     cell(*row, ATTRIBUTES_CELL, attributes_digest(attributes))
                 }
             };
-            if kept == Some(entry.instance_index()) {
+            if kept_of_all || kept == Some(entry.instance_index()) {
                 held.push(entry);
             }
             cell
@@ -295,7 +300,7 @@ fn row_digests_of(
                     value => {
                         let value = materialized_value(value, kind)?;
                         let digest = value_digest(&value);
-                        if kept == Some(*row) {
+                        if kept_of_all || kept == Some(*row) {
                             held.push(DecodedGroupEntry::Property(*row, value));
                         }
                         digest
@@ -387,12 +392,19 @@ fn row_digests_of(
         ));
     }
     let kept = kept.map(|kept| instances[kept].clone());
+    // The instances carry their ids where they come back themselves.
+    let (ids, instances) = if whole {
+        (Vec::new(), instances)
+    } else {
+        (ids_of(instances), Vec::new())
+    };
     Ok(Some(StoreRows {
         digests: rows,
         unique_ids,
         kept,
-        ids: ids_of(instances),
+        ids,
         moved,
+        instances,
     }))
 }
 
