@@ -1746,7 +1746,7 @@ mod native_identity_tests {
     }
 
     #[test]
-    fn native_conversion_shares_enum_values_without_changing_the_store() -> Result<()> {
+    fn native_conversion_shares_value_envelopes_without_changing_the_store() -> Result<()> {
         let bridge = crate::studio::bridge::routing_tests::fixture();
         let database = rbx_reflection_database::get()?;
         let dependencies = NativeServiceFinishDependencies {
@@ -1788,7 +1788,14 @@ mod native_identity_tests {
                 } else if index == 0 {
                     Map::new()
                 } else {
-                    Map::from_iter([("FutureProperty".into(), enum_value.clone())])
+                    Map::from_iter([
+                        ("FutureProperty".into(), enum_value.clone()),
+                        ("FutureFloat".into(), json!({"_type":"Float","value":"inf"})),
+                        (
+                            "FutureContent".into(),
+                            json!({"_type":"Content","value":"rbxassetid://123"}),
+                        ),
+                    ])
                 },
                 attributes: Map::new(),
             })
@@ -1806,18 +1813,20 @@ mod native_identity_tests {
             crate::snapshot::export::exported_parts_to_service_state("Workspace", output.parts)?;
         assert_eq!(state.instances[0].properties["RootEnum"], enum_value);
         assert_eq!(state.instances[3].properties["RunContext"], run_context);
-        assert!(!state.instances[1].properties.contains_key("FutureProperty"));
-        let shared = |index: usize| {
+        let shared = |index: usize, name: &str| {
             let row = state.native_properties_by_instance.as_ref().unwrap()[index]
                 .iter()
-                .find(|row| row.name == "FutureProperty")
+                .find(|row| row.name == name)
                 .unwrap();
             match &row.value {
                 NativeSettingsValue::Shared(value) => value,
-                _ => panic!("shared enum"),
+                _ => panic!("shared value"),
             }
         };
-        assert!(Arc::ptr_eq(shared(1), shared(2)));
+        for name in ["FutureProperty", "FutureFloat", "FutureContent"] {
+            assert!(!state.instances[1].properties.contains_key(name));
+            assert!(Arc::ptr_eq(shared(1, name), shared(2, name)));
+        }
         let mut json_state = state.clone();
         for (instance, rows) in json_state
             .instances
@@ -2773,7 +2782,7 @@ fn convert_native_service_output(
     };
     drop(prepare);
     let conversion_started = Instant::now();
-    let enum_values = crate::snapshot::native_enums::NativeEnums::default();
+    let shared_values = crate::snapshot::native_values::NativeValuePool::default();
     let (instances, native_properties_by_instance): (Vec<SnapshotInstance>, Vec<Vec<NativeSettingsProperty>>) = native_instances
         .into_par_iter()
         .zip(overlay_by_index.into_par_iter())
@@ -2882,7 +2891,7 @@ fn convert_native_service_output(
                     properties.insert("Archivable".to_string(), Value::Bool(false));
                 }
                 if index != 0 {
-                    enum_values.compact(&mut properties, &mut native_properties, |name| {
+                    shared_values.compact(&mut properties, &mut native_properties, |name| {
                         crate::rbx::decode::native_property_keeps_json(
                             rbx_instance.class.as_str(), name, native_filter,
                         )

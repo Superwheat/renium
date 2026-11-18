@@ -68,6 +68,7 @@ pub(super) fn measure(service: &str, state: &ServiceState) {
     let mut properties = 0;
     let mut attributes = 0;
     let mut property_count = 0;
+    let mut property_kinds = BTreeMap::<String, (usize, usize)>::new();
     let mut key_heap = 0;
     let mut value_heap = 0;
     let mut enums = 0;
@@ -87,7 +88,22 @@ pub(super) fn measure(service: &str, state: &ServiceState) {
         property_count += instance.properties.len();
         for (key, value) in &instance.properties {
             key_heap += key.capacity();
-            value_heap += measure_drop(value.clone()) + spare_value(value);
+            let heap = measure_drop(value.clone()) + spare_value(value);
+            value_heap += heap;
+            let kind = value
+                .get("_type")
+                .and_then(Value::as_str)
+                .unwrap_or(match value {
+                    Value::String(_) => "string",
+                    Value::Object(_) => "object",
+                    Value::Array(_) => "array",
+                    Value::Number(_) => "number",
+                    Value::Bool(_) => "bool",
+                    Value::Null => "null",
+                });
+            let total = property_kinds.entry(kind.into()).or_default();
+            total.0 += 1;
+            total.1 += heap;
             if value.get("_type").and_then(Value::as_str) == Some("EnumItem") {
                 enums += 1;
                 enum_heap += measure_drop(value.clone()) + spare_value(value);
@@ -157,6 +173,7 @@ pub(super) fn measure(service: &str, state: &ServiceState) {
         "service": service, "instances": state.instances.len(),
         "instanceRecords": state.instances.capacity() * size_of::<SnapshotInstance>(),
         "propertiesHeap": properties, "propertyCount": property_count, "propertyKeyHeap": key_heap,
+        "propertyKinds": property_kinds,
         "propertyValueHeap": value_heap, "propertyMapNodes": properties - key_heap - value_heap,
         "flatPropertySlots": property_count * size_of::<(String, Value)>(),
         "enumCount": enums, "enumHeap": enum_heap,

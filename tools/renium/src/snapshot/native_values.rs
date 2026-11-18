@@ -6,12 +6,12 @@ use serde_json::{Map, Value};
 use super::types::{NativeSettingsProperty, NativeSettingsValue};
 use crate::system::LockRecover;
 
-/// The complete serialized enum value is shared, including its type and numeric
-/// value when present. This pool lives only as long as one service conversion.
+/// Complete value envelopes are shared without changing their serialized form.
+/// This pool lives only as long as one service conversion.
 #[derive(Default)]
-pub(crate) struct NativeEnums(Mutex<HashSet<Arc<Value>>>);
+pub(crate) struct NativeValuePool(Mutex<HashSet<Arc<Value>>>);
 
-impl NativeEnums {
+impl NativeValuePool {
     pub(crate) fn compact(
         &self,
         properties: &mut Map<String, Value>,
@@ -19,7 +19,7 @@ impl NativeEnums {
         keep_json: impl Fn(&str) -> bool,
     ) {
         properties.retain(|name, value| {
-            if keep_json(name) || !shareable_enum(value) {
+            if keep_json(name) || !shareable_value(value) {
                 return true;
             }
             let shared = {
@@ -44,18 +44,28 @@ impl NativeEnums {
     }
 }
 
-fn shareable_enum(value: &Value) -> bool {
+fn shareable_value(value: &Value) -> bool {
     let Some(object) = value.as_object() else {
         return false;
     };
-    object.get("_type").and_then(Value::as_str) == Some("EnumItem")
-        && object.iter().all(|(key, value)| match key.as_str() {
+    // These are Renium's value-envelope keys, not engine property names.
+    // Unknown envelopes and content references retain their JSON path.
+    match object.get("_type").and_then(Value::as_str) {
+        Some("EnumItem") => object.iter().all(|(key, value)| match key.as_str() {
             "_type" | "name" | "enumType" => value.is_string(),
             "value" => value.is_number(),
-            // These are Renium's value-envelope keys, not engine property
-            // names. A future envelope keeps its original JSON representation.
             _ => false,
-        })
+        }),
+        Some("Float") => {
+            object.len() == 2
+                && matches!(
+                    object.get("value").and_then(Value::as_str),
+                    Some("nan" | "inf" | "-inf")
+                )
+        }
+        Some("Content") => object.len() == 2 && object.get("value").is_some_and(Value::is_string),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -65,7 +75,7 @@ mod tests {
 
     #[test]
     fn enum_sharing_keeps_the_entire_value_and_unknown_envelopes() {
-        let pool = NativeEnums::default();
+        let pool = NativeValuePool::default();
         let value = json!({"_type":"EnumItem","enumType":"Enum.Future","name":"Chosen","value":7});
         let mut rows = Vec::new();
         for value in [
@@ -110,5 +120,60 @@ mod tests {
         pool.compact(&mut properties, &mut native, |_| false);
         assert_eq!(native.len(), 1);
         assert!(matches!(&native[0].value, NativeSettingsValue::Shared(_)));
+    }
+
+    #[test]
+    fn scalar_envelopes_keep_their_values_and_reject_unknown_shapes() {
+        let pool = NativeValuePool::default();
+        let values = [
+            json!({"_type":"Float","value":"nan"}),
+            json!({"_type":"Float","value":"inf"}),
+            json!({"_type":"Float","value":"-inf"}),
+            json!({"_type":"Content","value":""}),
+            json!({"_type":"Content","value":"rbxassetid://123"}),
+            json!({"_type":"Content","value":"inf"}),
+        ];
+        let mut shared = Vec::new();
+        for value in values {
+            let mut rows = Vec::new();
+            for _ in 0..2 {
+                let mut properties = Map::from_iter([("FutureProperty".into(), value.clone())]);
+                pool.compact(&mut properties, &mut rows, |_| false);
+                assert!(properties.is_empty());
+                // Each row belongs to another instance.
+                let NativeSettingsValue::Shared(held) = rows.pop().unwrap().value else {
+                    panic!("shared value")
+                };
+                assert_eq!(held.as_ref(), &value);
+                shared.push(held);
+            }
+            let end = shared.len();
+            assert!(Arc::ptr_eq(&shared[end - 2], &shared[end - 1]));
+        }
+        for (index, value) in shared.iter().step_by(2).enumerate() {
+            assert!(
+                shared
+                    .iter()
+                    .step_by(2)
+                    .skip(index + 1)
+                    .all(|other| !Arc::ptr_eq(value, other))
+            );
+        }
+        for value in [
+            json!({"_type":"Float","value":7}),
+            json!({"_type":"Float","value":"future"}),
+            json!({"_type":"Float","value":"inf","future":true}),
+            json!({"_type":"Content"}),
+            json!({"_type":"Content","value":7}),
+            json!({"_type":"Content","value":"","future":true}),
+            json!({"_type":"Content","value":{"_type":"Ref","instanceIndex":2}}),
+        ] {
+            let mut properties = Map::from_iter([("FutureProperty".into(), value)]);
+            let before = properties.clone();
+            let mut rows = Vec::new();
+            pool.compact(&mut properties, &mut rows, |_| false);
+            assert_eq!(properties, before);
+            assert!(rows.is_empty());
+        }
     }
 }
