@@ -3558,7 +3558,7 @@ fn targeted_service_root_properties_survive_descendant_only_upsert_selection() {
 #[test]
 fn a_write_clears_the_stale_temporary_files_of_its_directory() {
     let root = temp_dir("stale-sibling-temps");
-    let stale = root.join("other.luau.4294967000-3.renium-tmp");
+    let stale = root.join("other.luau.2000000000-3.renium-tmp");
     let own = root.join(format!(
         "other.luau.{}-900000.renium-tmp",
         std::process::id()
