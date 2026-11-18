@@ -1587,6 +1587,44 @@ fn compression_workers() -> u32 {
 }
 
 fn compress_store_payload(payload: &[u8], workers: u32) -> Result<Vec<u8>> {
+    use zstd::zstd_safe::{CCtx, CParameter, InBuffer, OutBuffer, zstd_sys::ZSTD_EndDirective};
+    if payload.len() < LARGE_STORE_PAYLOAD_BYTES {
+        return Ok(zstd::bulk::compress(payload, STORE_COMPRESSION_LEVEL)?);
+    }
+    // The frame leaves the compressor a piece at a time: one call with room
+    // for the whole of it reserves as many bytes as the payload has, several
+    // times what a store compresses to.
+    let failed = |code| anyhow::anyhow!("{}", zstd::zstd_safe::get_error_name(code));
+    let mut context = CCtx::create();
+    for parameter in [
+        CParameter::CompressionLevel(STORE_COMPRESSION_LEVEL),
+        CParameter::EnableLongDistanceMatching(true),
+        CParameter::WindowLog(STORE_WINDOW_LOG),
+        CParameter::NbWorkers(workers.max(1)),
+    ] {
+        context.set_parameter(parameter).map_err(failed)?;
+    }
+    context
+        .set_pledged_src_size(Some(payload.len() as u64))
+        .map_err(failed)?;
+    let mut input = InBuffer::around(payload);
+    let mut piece = vec![0_u8; 1 << 20];
+    let mut compressed = Vec::with_capacity(payload.len() / 4);
+    loop {
+        let mut output = OutBuffer::around(&mut piece[..]);
+        let left = context
+            .compress_stream2(&mut output, &mut input, ZSTD_EndDirective::ZSTD_e_end)
+            .map_err(failed)?;
+        compressed.extend_from_slice(output.as_slice());
+        if left == 0 {
+            return Ok(compressed);
+        }
+    }
+}
+
+/// `compress_store_payload` as one call with room for the whole frame.
+#[cfg(test)]
+fn compress_store_payload_at_once(payload: &[u8], workers: u32) -> Result<Vec<u8>> {
     use zstd::zstd_safe::CParameter;
     let mut compressor = zstd::bulk::Compressor::new(STORE_COMPRESSION_LEVEL)?;
     if payload.len() >= LARGE_STORE_PAYLOAD_BYTES {
@@ -2662,10 +2700,25 @@ pub(crate) fn encode_service_settings_binary(state: &ServiceState) -> Result<Vec
     let lookup = build_settings_binary_instance_lookup(state, &instances);
     let collected = collect_settings_binary_data(state, &lookup, &instances, None)?;
 
-    encode_prepared_service_settings(&instances, &lookup, collected)
+    // What the payload was made from is freed before the payload is
+    // compressed.
+    let payload = encode_prepared_service_payload(&instances, &lookup, collected)?;
+    drop(lookup);
+    drop(instances);
+    wrap_settings_bytecode_payload(&payload)
 }
 
 fn encode_prepared_service_settings(
+    instances: &[SettingsBinaryInstance<'_>],
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    collected: SettingsBinaryCollection<'_>,
+) -> Result<Vec<u8>> {
+    let payload = encode_prepared_service_payload(instances, lookup, collected)?;
+    wrap_settings_bytecode_payload(&payload)
+}
+
+/// The payload of a captured store before it is compressed.
+fn encode_prepared_service_payload(
     instances: &[SettingsBinaryInstance<'_>],
     lookup: &SettingsBinaryInstanceLookup<'_>,
     collected: SettingsBinaryCollection<'_>,
@@ -2732,9 +2785,7 @@ fn encode_prepared_service_settings(
         &string_ids,
         lookup,
     )?;
-
-    let writer = wrap_settings_bytecode_payload(&payload)?;
-    Ok(writer)
+    Ok(payload)
 }
 
 fn collect_service_settings_binary_instances(
@@ -3115,8 +3166,8 @@ fn write_settings_binary_header<W: Write + ?Sized>(
     write_var_u64(writer, instance_count as u64)
 }
 
-fn write_settings_binary_property_groups<W: Write + ?Sized>(
-    writer: &mut W,
+fn write_settings_binary_property_groups(
+    writer: &mut Vec<u8>,
     groups: &[((&str, u8), Vec<SettingsBinaryValue<'_>>)],
     property_ids: &SettingsStringIdMap<'_>,
     string_ids: &SettingsStringIdMap<'_>,
@@ -3132,6 +3183,9 @@ fn write_settings_binary_property_groups<W: Write + ?Sized>(
             Ok(body)
         })
         .collect::<Result<Vec<_>>>()?;
+    // The payload takes its room once: growing by doubling held the columns
+    // of a large store twice over while they were copied in.
+    writer.reserve_exact(bodies.iter().map(|body| body.len() + 32).sum::<usize>());
     for (((property_name, kind), values), body) in groups.iter().zip(bodies) {
         write_lookup_id(writer, property_ids, property_name, "property")?;
         writer.write_all(&[*kind])?;
@@ -5186,6 +5240,9 @@ mod tests {
             }
         }
         let one = compress_store_payload(&payload, 1).unwrap();
+        // A frame taken a piece at a time is the frame one call gives, so a
+        // store written by an older Renium compresses to the same bytes.
+        assert!(one == compress_store_payload_at_once(&payload, 1).unwrap());
         for workers in [2, 8, 32] {
             assert!(
                 one == compress_store_payload(&payload, workers).unwrap(),
