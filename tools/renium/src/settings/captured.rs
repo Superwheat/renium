@@ -107,18 +107,17 @@ pub(super) fn changed_values(
         }
     }
     let records = collect_service_settings_binary_instances(state);
-    if changed.is_empty()
-        || !written_where_they_stand(&records, now)
-        || !instances_keep_their_places(state, now, &records, stored.len())?
-    {
+    if changed.is_empty() || !written_where_they_stand(&records, now) {
         return Ok(None);
     }
-    let lookup = build_settings_binary_instance_lookup(state, &records);
+    let Some(places) = Places::of(state, now, &records, stored.len())? else {
+        return Ok(None);
+    };
     let stored = StoredRows {
         file: stored,
-        viewport_camera: None,
+        read: None,
     };
-    changed_rows(state, now, (&records, &lookup), &changed, stored)
+    changed_rows(state, now, (records, &places), &changed, stored)
 }
 
 /// What is written for a store compared by its instances is the state's own
@@ -155,45 +154,77 @@ pub(super) fn changed_document_rows(
     }
     let records = collect_service_settings_binary_instances(state);
     // What the state alone can say comes before the two documents are read.
-    if !written_where_they_stand(&records, now)
-        || !instances_keep_their_places(state, now, &records, stored.len())?
-    {
+    if !written_where_they_stand(&records, now) {
         return Ok(None);
     }
+    let Some(places) = Places::of(state, now, &records, stored.len())? else {
+        return Ok(None);
+    };
     let lookup = build_settings_binary_instance_lookup(state, &records);
     let (stored_rows, captured_rows) = rayon::join(
         || crate::settings::bytecode::property_edit::row_digests(stored, now.viewport_camera),
         || document_row_digests(state, &records, &lookup, stored.len()),
     );
-    let ((stored_rows, stored_camera), captured_rows) = (stored_rows?, captured_rows?);
-    if stored_rows.len() != captured_rows.len() {
+    let (stored_rows, captured_rows) = (stored_rows?, captured_rows?);
+    if stored_rows.digests.len() != captured_rows.len() {
         return Ok(None);
     }
     let mut changed = Vec::new();
-    for (index, (stored, captured)) in stored_rows.iter().zip(&captured_rows).enumerate() {
-        if stored != captured && now.viewport_camera != Some(index) {
+    let mut renamed = false;
+    for (index, (values, unique_id)) in captured_rows.iter().enumerate() {
+        if now.viewport_camera == Some(index) {
+            continue;
+        }
+        if stored_rows.digests[index] != *values {
             // A root that differs can name another viewport camera than the
             // one left out here, which only the whole documents show.
             if changed.len() == MAX_CHANGED_ROWS || records[index].parent_index.is_none() {
                 return Ok(None);
             }
             changed.push(index);
+        } else {
+            renamed |= stored_rows.unique_ids[index] != *unique_id;
         }
     }
     let stored = StoredRows {
         file: stored,
-        viewport_camera: stored_camera,
+        read: Some(ReadStore {
+            viewport_camera: stored_rows.kept,
+            ids: stored_rows.ids,
+            unique_ids: stored_rows.unique_ids,
+            captured_unique_ids: captured_rows
+                .into_iter()
+                .map(|(_, unique_id)| unique_id)
+                .collect(),
+            renamed,
+        }),
     };
     Ok(
-        changed_rows(state, now, (&records, &lookup), &changed, stored)?
-            .map(|alignment| (alignment, changed.is_empty())),
+        changed_rows(state, now, (records, &places), &changed, stored)?
+            .map(|alignment| (alignment, changed.is_empty() && !renamed)),
     )
 }
 
-/// A stored file, and its viewport camera where a caller read it already.
+/// A stored file and, where a caller read the two documents already, what
+/// it read of them.
 struct StoredRows<'a> {
     file: &'a [u8],
+    read: Option<ReadStore>,
+}
+
+/// What the digests of two documents say beside which instances differ.
+struct ReadStore {
+    /// The stored viewport camera, where the store has one at that place.
     viewport_camera: Option<SettingsBytecodeInstance>,
+    /// The id of each stored instance.
+    ids: Vec<String>,
+    /// The digest of the UniqueId of each stored instance, and of each
+    /// captured one: all zero for an instance without one.
+    unique_ids: Vec<[u8; 16]>,
+    captured_unique_ids: Vec<[u8; 16]>,
+    /// Whether an instance with the stored values holds another UniqueId
+    /// than the stored one.
+    renamed: bool,
 }
 
 /// The instances each thread holds as a document while it digests them: few,
@@ -207,7 +238,7 @@ fn document_row_digests(
     records: &[SettingsBinaryInstance<'_>],
     lookup: &SettingsBinaryInstanceLookup<'_>,
     stored_len: usize,
-) -> Result<Vec<[u8; 16]>> {
+) -> Result<Vec<([u8; 16], [u8; 16])>> {
     let _span = crate::app::profile::span("captured store instance digests");
     let budget = DecodeBudget::for_file(stored_len);
     let scope = ConversionScope {
@@ -229,18 +260,31 @@ fn document_row_digests(
     Ok(chunks.into_iter().flatten().collect())
 }
 
-/// The digest of one instance of a document: its id, name, class and parent,
-/// and every value it holds.
-pub(super) fn document_row_digest(instance: &SettingsBytecodeInstance) -> [u8; 16] {
-    row_digest(
-        instance,
+/// The digest of one instance of a document: its name, class and parent, and
+/// every value it holds but its UniqueId, whose digest comes beside it (all
+/// zero where the instance has none). The id is no part of either, and the
+/// UniqueId stands apart, because Studio gives the instances of a place new
+/// ones each time it opens the place.
+pub(super) fn document_row_digest(instance: &SettingsBytecodeInstance) -> ([u8; 16], [u8; 16]) {
+    (
+        row_digest(
+            instance,
+            instance
+                .properties
+                .iter()
+                .filter(|(name, _)| name.as_str() != UNIQUE_ID)
+                .map(|(name, value)| (name.as_str(), value_digest(value))),
+            attributes_digest(&instance.attributes),
+        ),
         instance
             .properties
-            .iter()
-            .map(|(name, value)| (name.as_str(), value_digest(value))),
-        attributes_digest(&instance.attributes),
+            .get(UNIQUE_ID)
+            .map_or([0; 16], value_digest),
     )
 }
+
+/// The property that says which instance a stored one is.
+pub(super) const UNIQUE_ID: &str = "UniqueId";
 
 /// The digest of an instance from the digests of its values, by property
 /// name in the order a document holds them.
@@ -252,7 +296,6 @@ pub(super) fn row_digest<'a>(
     use crate::settings::equivalence::digest_text;
 
     let mut digest = Sha256::new();
-    digest_text(&mut digest, &instance.settings_id);
     digest_text(&mut digest, &instance.name);
     digest_text(&mut digest, &instance.class_name);
     digest.update(
@@ -290,128 +333,69 @@ fn half_digest(digest: Sha256) -> [u8; 16] {
 
 /// The answer for a store whose instances are the stored ones but for
 /// `changed`, which hold other values, and for the viewport camera.
-fn changed_rows(
-    state: &ServiceState,
+fn changed_rows<'a>(
+    state: &'a ServiceState,
     now: &PulledRows,
-    (records, lookup): (
-        &[SettingsBinaryInstance<'_>],
-        &SettingsBinaryInstanceLookup<'_>,
-    ),
+    (records, places): (Vec<SettingsBinaryInstance<'a>>, &Places),
     changed: &[usize],
     stored: StoredRows<'_>,
 ) -> Result<Option<SettingsAlignment>> {
+    use crate::settings::bytecode::property_edit::decode_rows;
+    use crate::settings::equivalence::{
+        instance_lacks_enum_types, pulled_instance_values_unchanged,
+        reconciliation_value_contains_reference as holds_reference,
+    };
+
     let budget = DecodeBudget::for_file(stored.file.len());
+    let (camera, mut read) = match stored.read {
+        Some(mut read) => (read.viewport_camera.take(), Some(read)),
+        None => (None, None),
+    };
     // The camera is the last row where the state has one.
     let mut rows = changed.to_vec();
-    let mut stored_rows = match (&stored.viewport_camera, now.viewport_camera) {
-        (None, Some(camera)) => {
-            rows.push(camera);
-            crate::settings::bytecode::property_edit::decode_rows(stored.file, &rows)?
-        }
-        _ if changed.is_empty() => Vec::new(),
-        _ => crate::settings::bytecode::property_edit::decode_rows(stored.file, changed)?,
+    if camera.is_none() {
+        rows.extend(now.viewport_camera);
+    }
+    let (mut stored_rows, ids) = match &mut read {
+        Some(read) if rows.is_empty() => (Vec::new(), std::mem::take(&mut read.ids)),
+        _ => decode_rows(stored.file, &rows)?,
     };
-    if let (Some(camera), Some(row)) = (stored.viewport_camera, now.viewport_camera) {
+    if let (Some(camera), Some(row)) = (camera, now.viewport_camera) {
         rows.push(row);
         stored_rows.push(camera);
     }
-    changed_rows_answer(
-        state,
-        now,
-        (records, lookup),
-        (changed, &rows),
-        stored_rows,
-        &budget,
-    )
-}
-
-/// Whether the alignment keeps every instance of the state where it stands:
-/// under unique ids that a store gave, or under any other unique ids where
-/// each instance is told by a UniqueId of its own, or by an id that is not
-/// Studio's. Past that it matches instances by what they hold, which takes
-/// the whole documents.
-fn instances_keep_their_places(
-    state: &ServiceState,
-    now: &PulledRows,
-    records: &[SettingsBinaryInstance<'_>],
-    stored_len: usize,
-) -> Result<bool> {
-    use crate::settings::equivalence::{is_store_identity, persistent_identity_of};
-
-    let budget = DecodeBudget::for_file(stored_len);
-    let ids = records
-        .iter()
-        .map(|record| Ok(bare_instance(record, &budget)?.settings_id))
-        .collect::<Result<Vec<_>>>()?;
-    if ids.iter().collect::<AHashSet<_>>().len() != ids.len() {
-        return Ok(false);
-    }
-    Ok(ids.iter().all(|id| is_store_identity(id)) || {
-        let mut unique = AHashMap::with_capacity(records.len());
-        for (index, instance) in state.instances.iter().enumerate() {
-            if let Some(id) = persistent_identity_of(&instance.properties) {
-                unique
-                    .entry(id)
-                    .and_modify(|at| *at = None)
-                    .or_insert(Some(index));
-            }
-        }
-        let sole_root = records
-            .iter()
-            .filter(|record| record.parent_index.is_none())
-            .count()
-            == 1;
-        records.iter().enumerate().all(|(index, record)| {
-            now.viewport_camera == Some(index)
-                || persistent_identity_of(&state.instances[index].properties)
-                    .is_some_and(|id| unique[id] == Some(index))
-                || !ids[index].starts_with("debug:")
-                || sole_root && record.parent_index.is_none()
-        })
-    })
-}
-
-/// The answer from the stored rows at `rows`: the changed ones, then the
-/// viewport camera where the state has one.
-fn changed_rows_answer(
-    state: &ServiceState,
-    now: &PulledRows,
-    (records, lookup): (
-        &[SettingsBinaryInstance<'_>],
-        &SettingsBinaryInstanceLookup<'_>,
-    ),
-    (changed, rows): (&[usize], &[usize]),
-    stored_rows: Vec<SettingsBytecodeInstance>,
-    budget: &DecodeBudget,
-) -> Result<Option<SettingsAlignment>> {
-    use crate::settings::equivalence::{instance_lacks_enum_types, pulled_instance_unchanged};
-
+    // A pull leaves each instance the id its store holds it under.
+    let own_ids = places.ids == ids;
+    let records = if own_ids {
+        records
+    } else {
+        under_stored_ids(records, &ids)
+    };
+    let lookup = build_settings_binary_instance_lookup(state, &records);
     let scope = ConversionScope {
-        lookup,
+        lookup: &lookup,
         instance_count: records.len(),
-        budget,
+        budget: &budget,
         string_ids: &SettingsStringIdMap::default(),
         wire_bytes: None,
     };
     let mut captured_rows = Vec::with_capacity(rows.len());
-    for &row in rows {
+    for &row in &rows {
         captured_rows.extend(convert_chunk(
             state,
             std::slice::from_ref(&records[row]),
             scope,
         )?);
     }
-    // Each pair is one instance in one place, told by the same UniqueId: an
-    // instance that became another one is matched by the alignment.
+    // Each pair is one instance in one place: an instance under another
+    // name, class or parent is matched by the alignment.
     if stored_rows
         .iter()
         .zip(&captured_rows)
         .any(|(stored, captured)| {
-            stored.settings_id != captured.settings_id
-                || stored.name != captured.name
+            stored.name != captured.name
                 || stored.class_name != captured.class_name
                 || stored.parent_index != captured.parent_index
-                || stored.properties.get("UniqueId") != captured.properties.get("UniqueId")
         })
     {
         return Ok(None);
@@ -430,14 +414,79 @@ fn changed_rows_answer(
     }) {
         return Ok(None);
     }
-    let mut unchanged = true;
-    for (stored, captured) in stored_rows.iter().zip(&captured_rows).take(changed.len()) {
-        match pulled_instance_unchanged(stored, captured, root_service)? {
-            Some(same) => unchanged &= same,
+    // What each changed instance says: whether its values are the stored
+    // ones as a pull counts them, and whether its UniqueId is.
+    let pairs = || stored_rows.iter().zip(&captured_rows).take(changed.len());
+    let mut same_values = Vec::with_capacity(changed.len());
+    let mut same_under_todays_names = true;
+    for (stored, captured) in pairs() {
+        match pulled_instance_values_unchanged(stored, captured, root_service)? {
+            Some((as_held, as_named)) => {
+                same_values.push(as_held);
+                same_under_todays_names &= as_named;
+            }
             None => return Ok(None),
         }
     }
-    if unchanged {
+    // The alignment compares instances at their places as they hold their
+    // values, and what it aligned under the names of today: where the two
+    // say different things, which of them counts is its to say.
+    if same_values.iter().all(|same| *same) != same_under_todays_names {
+        return Ok(None);
+    }
+    let renamed = read.as_ref().is_some_and(|read| read.renamed)
+        || pairs().any(|(stored, captured)| {
+            stored.properties.get(UNIQUE_ID) != captured.properties.get(UNIQUE_ID)
+        });
+    let kept = if own_ids {
+        // An instance that took another UniqueId under its id became another
+        // instance, which the alignment matches.
+        !renamed && places.kept_under_their_ids()
+    } else {
+        // The alignment first takes every instance for the stored one at its
+        // place where nothing says otherwise: each changed instance either
+        // has no namesake under its parent and holds no reference on either
+        // side, or holds the stored values as a pull counts them. Past that
+        // it tells each instance by itself, which takes the stored UniqueIds.
+        let stand_as_stored = read.as_ref().is_some_and(|read| {
+            places.stored_identities_stand(&ids, read)
+                && namesakes(&records).is_some_and(|namesakes| {
+                    pairs().zip(changed).zip(&same_values).all(
+                        |(((stored, captured), row), same)| {
+                            *same
+                                || !namesakes[*row]
+                                    && ![stored, captured].iter().any(|instance| {
+                                        instance
+                                            .properties
+                                            .values()
+                                            .chain(instance.attributes.values())
+                                            .any(holds_reference)
+                                    })
+                        },
+                    )
+                })
+        });
+        stand_as_stored || !renamed && places.kept_under_other_ids(&ids)
+    };
+    if !kept {
+        return Ok(None);
+    }
+    // Under other ids than the state's the alignment knows the camera only
+    // once it matched the instances, and puts a stored camera that holds a
+    // reference back in another form than it compares: that one it decides.
+    if !own_ids
+        && now.viewport_camera.is_some()
+        && let (Some(stored), Some(captured)) = (stored_rows.last(), captured_rows.last())
+        && (stored.properties != captured.properties || stored.attributes != captured.attributes)
+        && stored
+            .properties
+            .values()
+            .chain(stored.attributes.values())
+            .any(holds_reference)
+    {
+        return Ok(None);
+    }
+    if !renamed && same_values.iter().all(|same| *same) {
         return Ok(Some(SettingsAlignment::Equivalent));
     }
     // A pull keeps the stored viewport camera whatever the captured one says.
@@ -450,10 +499,182 @@ fn changed_rows_answer(
                 instance: stored,
             })
     });
-    let collected = collect_settings_binary_data(state, lookup, records, kept_camera)?;
+    let collected = collect_settings_binary_data(state, &lookup, &records, kept_camera)?;
     Ok(Some(SettingsAlignment::Changed(
-        encode_prepared_service_settings(records, lookup, collected)?,
+        encode_prepared_service_settings(&records, &lookup, collected)?,
     )))
+}
+
+/// Where the alignment leaves the instances of a state, as far as the state
+/// alone says: the id of each, whether the alignment tells each by itself
+/// whatever its id is, as it does the viewport camera and an instance with a
+/// UniqueId of its own, and the root where the state has one root only.
+struct Places {
+    ids: Vec<String>,
+    told_alone: Vec<bool>,
+    sole_root: Option<usize>,
+}
+
+impl Places {
+    /// `None` where two instances carry one id: those the alignment matches
+    /// by what they hold, which takes the whole documents.
+    fn of(
+        state: &ServiceState,
+        now: &PulledRows,
+        records: &[SettingsBinaryInstance<'_>],
+        stored_len: usize,
+    ) -> Result<Option<Self>> {
+        use crate::settings::equivalence::persistent_identity_of;
+
+        let budget = DecodeBudget::for_file(stored_len);
+        let ids = records
+            .iter()
+            .map(|record| Ok(bare_instance(record, &budget)?.settings_id))
+            .collect::<Result<Vec<_>>>()?;
+        if ids.iter().collect::<AHashSet<_>>().len() != ids.len() {
+            return Ok(None);
+        }
+        let mut unique = AHashMap::with_capacity(records.len());
+        for (index, instance) in state.instances.iter().enumerate() {
+            if let Some(id) = persistent_identity_of(&instance.properties) {
+                unique
+                    .entry(id)
+                    .and_modify(|at| *at = None)
+                    .or_insert(Some(index));
+            }
+        }
+        let mut roots = records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.parent_index.is_none())
+            .map(|(index, _)| index);
+        let sole_root = roots.next().filter(|_| roots.next().is_none());
+        let told_alone = (0..records.len())
+            .map(|index| {
+                now.viewport_camera == Some(index)
+                    || persistent_identity_of(&state.instances[index].properties)
+                        .is_some_and(|id| unique[id] == Some(index))
+            })
+            .collect();
+        Ok(Some(Self {
+            ids,
+            told_alone,
+            sole_root,
+        }))
+    }
+
+    /// Whether the alignment keeps every instance where it stands against a
+    /// store that holds them under the state's own ids: where a store gave
+    /// every id, or where each instance is told by itself, is the sole root,
+    /// or carries an id that is not Studio's. Past that the alignment matches
+    /// instances by what they hold.
+    fn kept_under_their_ids(&self) -> bool {
+        use crate::settings::equivalence::is_store_identity;
+
+        self.ids.iter().all(|id| is_store_identity(id))
+            || self
+                .told_alone
+                .iter()
+                .zip(&self.ids)
+                .enumerate()
+                .all(|(index, (alone, id))| {
+                    *alone || self.sole_root == Some(index) || !id.starts_with("debug:")
+                })
+    }
+
+    /// The same against a store that holds them under the ids `stored`, which
+    /// is a place Studio opened again and numbered anew: where each instance
+    /// is told by itself, but for a sole root that is stored under its id.
+    fn kept_under_other_ids(&self, stored: &[String]) -> bool {
+        self.told_alone
+            .iter()
+            .zip(self.ids.iter().zip(stored))
+            .enumerate()
+            .all(|(index, (alone, (id, stored)))| {
+                *alone || self.sole_root == Some(index) && id == stored
+            })
+    }
+
+    /// Whether nothing an instance is told by says it is another stored
+    /// instance than the one at its place: no UniqueId that one instance of
+    /// the state holds is the one of a single stored instance elsewhere, and
+    /// no id a store gave stands for another stored instance.
+    fn stored_identities_stand(&self, stored_ids: &[String], read: &ReadStore) -> bool {
+        use crate::settings::equivalence::is_store_identity;
+
+        let places = |digests: &[[u8; 16]]| {
+            let mut places = AHashMap::with_capacity(digests.len());
+            for (index, digest) in digests.iter().enumerate() {
+                if *digest != [0; 16] {
+                    places
+                        .entry(*digest)
+                        .and_modify(|at| *at = None)
+                        .or_insert(Some(index));
+                }
+            }
+            places
+        };
+        let (stored, captured) = (places(&read.unique_ids), places(&read.captured_unique_ids));
+        let unique_ids_stand = captured.iter().all(|(digest, at)| {
+            let (Some(at), Some(Some(stored_at))) = (at, stored.get(digest)) else {
+                return true;
+            };
+            at == stored_at
+        });
+        unique_ids_stand && {
+            let mut known = None;
+            self.ids.iter().zip(stored_ids).all(|(id, stored)| {
+                !is_store_identity(id)
+                    || id == stored
+                    || !known
+                        .get_or_insert_with(|| stored_ids.iter().collect::<AHashSet<_>>())
+                        .contains(id)
+            })
+        }
+    }
+}
+
+/// For each instance, whether it or an instance above it has a sibling of
+/// its name and class. `None` where an instance stands before its parent,
+/// which the alignment takes for no order at all.
+fn namesakes(records: &[SettingsBinaryInstance<'_>]) -> Option<Vec<bool>> {
+    let mut first = AHashMap::with_capacity(records.len());
+    let mut namesakes = vec![false; records.len()];
+    for (index, record) in records.iter().enumerate() {
+        if let Some(earlier) =
+            first.insert((record.parent_index, record.name, record.class_name), index)
+        {
+            namesakes[earlier] = true;
+            namesakes[index] = true;
+        }
+    }
+    if namesakes.iter().any(|namesake| *namesake) {
+        for (index, record) in records.iter().enumerate() {
+            if let Some(parent) = record.parent_index {
+                if parent >= index {
+                    return None;
+                }
+                namesakes[index] |= namesakes[parent];
+            }
+        }
+    }
+    Some(namesakes)
+}
+
+/// The records of a state under the ids a store holds its instances under,
+/// each written as the encoder of documents writes that id.
+fn under_stored_ids<'a>(
+    records: Vec<SettingsBinaryInstance<'a>>,
+    stored: &[String],
+) -> Vec<SettingsBinaryInstance<'a>> {
+    records
+        .into_iter()
+        .zip(stored)
+        .map(|(record, id)| SettingsBinaryInstance {
+            settings_id: settings_binary_id_of(id),
+            ..record
+        })
+        .collect()
 }
 
 /// The state's document without its values: every instance with its id, name,

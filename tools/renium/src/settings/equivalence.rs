@@ -203,24 +203,19 @@ pub(crate) struct PulledAlignment {
     pub(crate) stored_as_observed: bool,
 }
 
-/// Whether a pull holds the observed instance for unchanged against the
-/// stored one, for two instances that stand at one position under one id,
-/// name, class and parent. `None` where that takes the whole documents to
-/// say: an enum item that gains its type, or a property under an older name.
-pub(crate) fn pulled_instance_unchanged(
+/// Whether a pull holds the values of the observed instance for the stored
+/// one's, for two instances that stand at one position under one id, name,
+/// class and parent: first as the two hold them, which is how the alignment
+/// compares instances by their places, then under the names their
+/// properties go by today, which is how it compares what it aligned. Their
+/// UniqueIds are the caller's to compare. `None` where an enum item gains
+/// its type, which takes the whole documents to say.
+pub(crate) fn pulled_instance_values_unchanged(
     reference: &SettingsBytecodeInstance,
     observed: &SettingsBytecodeInstance,
     service: Option<&str>,
-) -> Result<Option<bool>> {
+) -> Result<Option<(bool, bool)>> {
     if instance_adds_enum_types(reference, observed) {
-        return Ok(None);
-    }
-    let mut named = SettingsBytecode {
-        version: super::bytecode::SETTINGS_BINARY_VERSION,
-        instances: vec![reference.clone(), observed.clone()],
-    };
-    canonicalize_settings_property_names(&mut named)?;
-    if named.instances[0] != *reference || named.instances[1] != *observed {
         return Ok(None);
     }
     let no_ids = AHashMap::new();
@@ -229,20 +224,31 @@ pub(crate) fn pulled_instance_unchanged(
         left: &no_ids,
         right: &no_ids,
     };
-    Ok(Some(
-        reference.properties.get("UniqueId") == observed.properties.get("UniqueId")
-            && (reference.class_name == "PackageLink"
-                || reconciliation_maps_equal_with_ids(
-                    &reference.class_name,
-                    &reference.properties,
-                    &observed.properties,
-                    ids,
-                ) && reconciliation_values_map_equal_with_ids(
-                    &reference.attributes,
-                    &observed.attributes,
-                    ids,
-                )),
-    ))
+    let unchanged = |reference: &SettingsBytecodeInstance, observed: &SettingsBytecodeInstance| {
+        reference.class_name == "PackageLink"
+            || reconciliation_maps_equal_with_ids(
+                &reference.class_name,
+                &reference.properties,
+                &observed.properties,
+                ids,
+            ) && reconciliation_values_map_equal_with_ids(
+                &reference.attributes,
+                &observed.attributes,
+                ids,
+            )
+    };
+    let as_held = unchanged(reference, observed);
+    let mut named = SettingsBytecode {
+        version: super::bytecode::SETTINGS_BINARY_VERSION,
+        instances: vec![reference.clone(), observed.clone()],
+    };
+    canonicalize_settings_property_names(&mut named)?;
+    let as_named = if named.instances[0] == *reference && named.instances[1] == *observed {
+        as_held
+    } else {
+        unchanged(&named.instances[0], &named.instances[1])
+    };
+    Ok(Some((as_held, as_named)))
 }
 
 pub(super) fn digest_text(digest: &mut Sha256, text: &str) {
@@ -3542,7 +3548,7 @@ fn identity_value_is_stable(name: &str, value: &Value, ignore_transient_properti
         && !reconciliation_value_contains_reference(value)
 }
 
-fn reconciliation_value_contains_reference(value: &Value) -> bool {
+pub(crate) fn reconciliation_value_contains_reference(value: &Value) -> bool {
     match value {
         Value::Array(values) => values.iter().any(reconciliation_value_contains_reference),
         Value::Object(object) => {

@@ -80,9 +80,13 @@ fn decode_for_property_edit(bytes: &[u8]) -> Result<(SettingsBytecode, RetainedP
 }
 
 /// The instances at `rows` of a store file, each as decoding the whole file
-/// gives it. The values of every other row are dropped column by column, so
-/// the document is never whole in memory.
-pub(crate) fn decode_rows(bytes: &[u8], rows: &[usize]) -> Result<Vec<SettingsBytecodeInstance>> {
+/// gives it, and the id of every instance of the file. The values of every
+/// other row are dropped column by column, so the document is never whole in
+/// memory.
+pub(crate) fn decode_rows(
+    bytes: &[u8],
+    rows: &[usize],
+) -> Result<(Vec<SettingsBytecodeInstance>, Vec<String>)> {
     let _span = crate::app::profile::span("store rows decode");
     let (_, payload) = decode_settings_bytecode_container(bytes)?;
     let budget = DecodeBudget::for_file(bytes.len());
@@ -136,7 +140,27 @@ pub(crate) fn decode_rows(bytes: &[u8], rows: &[usize]) -> Result<Vec<SettingsBy
         .collect::<Result<Vec<_>>>()?;
     reader.finish()?;
     apply_decoded_property_groups(&mut instances, &specs, groups);
-    Ok(rows.iter().map(|&row| instances[row].clone()).collect())
+    let read = rows.iter().map(|&row| instances[row].clone()).collect();
+    Ok((read, ids_of(instances)))
+}
+
+fn ids_of(instances: Vec<SettingsBytecodeInstance>) -> Vec<String> {
+    instances
+        .into_iter()
+        .map(|instance| instance.settings_id)
+        .collect()
+}
+
+/// What `row_digests` reads of a store file.
+pub(crate) struct StoreRows {
+    /// The digest of each instance.
+    pub(crate) digests: Vec<[u8; 16]>,
+    /// The digest of the UniqueId of each instance, all zero without one.
+    pub(crate) unique_ids: Vec<[u8; 16]>,
+    /// The instance asked for whole, where the store has one there.
+    pub(crate) kept: Option<SettingsBytecodeInstance>,
+    /// The id of each instance.
+    pub(crate) ids: Vec<String>,
 }
 
 /// One value of a store, by the instance that holds it, its property's
@@ -159,11 +183,8 @@ const WHOLE_VALUE_COLUMNS_AT_ONCE: usize = 2;
 /// file's document, taken column by column: the document is never whole in
 /// memory. The instance at `kept` comes whole with them, where the store has
 /// one there.
-pub(crate) fn row_digests(
-    bytes: &[u8],
-    kept: Option<usize>,
-) -> Result<(Vec<[u8; 16]>, Option<SettingsBytecodeInstance>)> {
-    use super::captured::{attributes_digest, row_digest, value_digest};
+pub(crate) fn row_digests(bytes: &[u8], kept: Option<usize>) -> Result<StoreRows> {
+    use super::captured::{UNIQUE_ID, attributes_digest, row_digest, value_digest};
 
     let _span = crate::app::profile::span("store instance digests");
     let (_, payload) = decode_settings_bytecode_container(bytes)?;
@@ -274,7 +295,12 @@ pub(crate) fn row_digests(
     apply_decoded_property_groups(&mut instances, &specs, held);
     cells.par_sort_unstable_by_key(|cell| (cell.row, cell.name, cell.group));
     let empty = attributes_digest(&Map::new());
+    let unique_id = names
+        .binary_search(&UNIQUE_ID)
+        .ok()
+        .map(|place| place as u32);
     let mut rows = Vec::with_capacity(instance_count);
+    let mut unique_ids = Vec::with_capacity(instance_count);
     let mut at = 0;
     for (row, instance) in instances.iter().enumerate() {
         let start = at;
@@ -295,14 +321,25 @@ pub(crate) fn row_digests(
             .clone()
             .find(|cell| cell.name == ATTRIBUTES_CELL)
             .map_or(empty, |cell| cell.digest);
+        unique_ids.push(
+            held.clone()
+                .find(|cell| Some(cell.name) == unique_id)
+                .map_or([0; 16], |cell| cell.digest),
+        );
         rows.push(row_digest(
             instance,
-            held.filter(|cell| cell.name != ATTRIBUTES_CELL)
+            held.filter(|cell| cell.name != ATTRIBUTES_CELL && Some(cell.name) != unique_id)
                 .map(|cell| (names[cell.name as usize], cell.digest)),
             attributes,
         ));
     }
-    Ok((rows, kept.map(|kept| instances.swap_remove(kept))))
+    let kept = kept.map(|kept| instances[kept].clone());
+    Ok(StoreRows {
+        digests: rows,
+        unique_ids,
+        kept,
+        ids: ids_of(instances),
+    })
 }
 
 fn decode_compact_column(

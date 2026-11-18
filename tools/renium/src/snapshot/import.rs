@@ -1510,21 +1510,25 @@ fn write_service_settings_file(
                 if !unchanged_again && !pull_aligns_whole_documents() =>
             {
                 let _comparing = profile::span(&format!("{service}: changed values"));
-                match remembered
+                // What the pull remembers of the file says which instances
+                // changed where Studio still numbers them as it did; a file
+                // it remembers nothing of, or a place Studio opened again,
+                // is read for it.
+                remembered
                     .as_ref()
                     .and_then(|remembered| remembered.rows.clone())
-                {
-                    Some(before) => {
+                    .and_then(|before| {
                         pull_changed_values(state_to_write, &before, &pulled.rows, bytes)
                             .ok()
                             .flatten()
                             .map(|alignment| (alignment, Some(before)))
-                    }
-                    None => pull_changed_document_rows(state_to_write, &pulled.rows, bytes)
-                        .ok()
-                        .flatten()
-                        .map(|(alignment, same)| (alignment, same.then(|| pulled.rows.clone()))),
-                }
+                    })
+                    .or_else(|| {
+                        pull_changed_document_rows(state_to_write, &pulled.rows, bytes)
+                            .ok()
+                            .flatten()
+                            .map(|(alignment, same)| (alignment, same.then(|| pulled.rows.clone())))
+                    })
             }
             _ => None,
         };
@@ -2417,6 +2421,125 @@ mod projection_tests {
             assert!(remembered.rows.is_some());
         }
         assert!(first != fs::read(&store)?);
+        assert!(!WHOLLY_ALIGNED.lock_recover().contains(&store));
+        Ok(())
+    }
+
+    /// A Workspace as one Studio session holds it: the session numbers the
+    /// instances and gives each its UniqueId.
+    fn session_state(
+        session: usize,
+        field_of_view: f64,
+        transparency: f64,
+    ) -> Result<ServiceState> {
+        let unique_id = |index: usize| json!({"_type": "UniqueId", "value": format!("{session:024x}{index:08x}")});
+        let mut instances = vec![
+            SnapshotInstance {
+                name: "Workspace".into(),
+                class_name: "Workspace".into(),
+                instance_index: Some(1),
+                properties: Map::from_iter([(
+                    "CurrentCamera".into(),
+                    json!({"_type":"Ref","instanceIndex":2}),
+                )]),
+                ..Default::default()
+            },
+            SnapshotInstance {
+                name: "Camera".into(),
+                class_name: "Camera".into(),
+                instance_index: Some(2),
+                parent_index: Some(1),
+                debug_id: Some(format!("0_{}", session * 1_000 + 2)),
+                properties: Map::from_iter([
+                    ("FieldOfView".to_string(), json!(field_of_view)),
+                    ("UniqueId".to_string(), unique_id(2)),
+                ]),
+                ..Default::default()
+            },
+        ];
+        for index in 0..24 {
+            instances.push(SnapshotInstance {
+                // Half of them are namesakes of one another.
+                name: if index % 2 == 0 {
+                    "Part".into()
+                } else {
+                    format!("Part{index}")
+                },
+                class_name: "Part".into(),
+                instance_index: Some(index + 3),
+                parent_index: Some(1),
+                debug_id: Some(format!("0_{}", session * 1_000 + index + 3)),
+                properties: Map::from_iter([
+                    (
+                        "Transparency".to_string(),
+                        json!(if index == 7 { transparency } else { 0.5 }),
+                    ),
+                    ("UniqueId".to_string(), unique_id(index + 3)),
+                ]),
+                ..Default::default()
+            });
+        }
+        build_service_state_from_instances("Workspace", None, instances, HashMap::new(), true)
+    }
+
+    /// A place Studio opened again carries other ids and other UniqueIds than
+    /// its store. The pull reads the instances that differ and no whole
+    /// document: the store keeps the ids it holds its instances under and
+    /// its camera, takes the new UniqueIds and values, and is the stored file
+    /// to a comparison with the project from then on.
+    #[test]
+    fn a_place_studio_opened_again_is_pulled_without_aligning_the_whole_store() -> Result<()> {
+        let parent = std::env::temp_dir().join("renium-reopened-place-tests");
+        fs::create_dir_all(&parent)?;
+        let root = crate::system::files::create_unique_directory(&parent, "reopened-")?;
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let source = root.join("src");
+        let store = service_settings_path(&source.join("Workspace"));
+        import_service_tree(
+            &session_state(1, 70.0, 0.5)?,
+            &root,
+            &source,
+            None,
+            "Workspace",
+        )?;
+        let first = decode_settings_bytecode(&fs::read(&store)?)?;
+        let ids = |document: &SettingsBytecode| {
+            document
+                .instances
+                .iter()
+                .map(|instance| instance.settings_id.clone())
+                .collect::<Vec<_>>()
+        };
+        // The same place in a second session, its camera moved; then a value
+        // changes in that session; then nothing does.
+        for (round, transparency) in [0.5, 0.125, 0.125].into_iter().enumerate() {
+            let before = fs::read(&store)?;
+            let state = session_state(2, 40.0, transparency)?;
+            import_service_tree(&state, &root, &source, None, "Workspace")?;
+            let written = fs::read(&store)?;
+            assert_eq!(written != before, round < 2, "round {round}");
+            let document = decode_settings_bytecode(&written)?;
+            assert_eq!(ids(&document), ids(&first), "round {round}");
+            assert_eq!(
+                document.instances[1].properties,
+                first.instances[1].properties
+            );
+            assert_eq!(
+                document.instances[9].properties["Transparency"],
+                json!(transparency)
+            );
+            assert_eq!(
+                document.instances[9].properties["UniqueId"]["value"],
+                json!(format!("{:024x}{:08x}", 2, 10))
+            );
+            let projected = service_projection_in_memory(&state, &source, None, "Workspace")?
+                .remove(&store)
+                .flatten()
+                .expect("the projection holds the store");
+            assert!(projected == written, "round {round}");
+        }
         assert!(!WHOLLY_ALIGNED.lock_recover().contains(&store));
         Ok(())
     }

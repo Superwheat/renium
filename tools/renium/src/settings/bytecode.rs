@@ -2693,6 +2693,15 @@ fn parse_numeric_debug_settings_id(text: &str) -> Option<u64> {
     parse_numeric_debug_id(text.strip_prefix("debug:")?)
 }
 
+/// An id a store holds, as the encoder of documents writes it: one of
+/// Studio's ids is the number it names.
+fn settings_binary_id_of<'a>(id: &str) -> SettingsBinaryId<'a> {
+    match parse_numeric_debug_settings_id(id) {
+        Some(value) => SettingsBinaryId::NumericDebug(value),
+        None => SettingsBinaryId::Text(Cow::Owned(id.to_string())),
+    }
+}
+
 fn settings_binary_id(source_index: usize, instance: &SnapshotInstance) -> SettingsBinaryId<'_> {
     if instance.instance_index == Some(1) && instance.parent_index.is_none() {
         return SettingsBinaryId::Text(Cow::Borrowed("1"));

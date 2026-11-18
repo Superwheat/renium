@@ -72,6 +72,13 @@ fn store(rng: &mut SimRng, ids: usize, unique: usize, workspace: bool) -> Settin
             row.properties
                 .insert("Target".into(), reference(rng, service, count));
         }
+        // A part's size, at times under the name it once went by.
+        if class == "Part" && rng.below(5) == 0 {
+            row.properties.insert(
+                if rng.below(2) == 0 { "size" } else { "Size" }.into(),
+                size(1 + rng.below(4)),
+            );
+        }
         if rng.below(4) == 0 {
             row.properties
                 .insert("Items".into(), enum_items(rng.below(2) == 0));
@@ -94,6 +101,10 @@ fn store(rng: &mut SimRng, ids: usize, unique: usize, workspace: bool) -> Settin
         version: SETTINGS_BINARY_VERSION,
         instances,
     }
+}
+
+fn size(x: usize) -> Value {
+    json!({"_type": "Vector3", "x": x as f64, "y": 1.0, "z": 2.0})
 }
 
 /// A reference as a capture gives it: mostly by position, at times by an id
@@ -289,6 +300,39 @@ fn shift_references(document: &mut SettingsBytecode, at: usize, added: bool) {
     }
 }
 
+/// A new Studio session numbers its debug ids anew, at times with numbers
+/// the session before gave to other instances, and gives every instance a
+/// new UniqueId when it opens the place from its file.
+fn new_session(rng: &mut SimRng, document: &mut SettingsBytecode) {
+    let offset = if rng.below(2) == 0 {
+        1 + rng.below(3)
+    } else {
+        1_000 + rng.below(1_000)
+    };
+    let session = (rng.below(2) == 0).then(|| 1 + rng.below(1 << 20));
+    for row in &mut document.instances {
+        if let Some(number) = row
+            .settings_id
+            .strip_prefix("debug:0_")
+            .and_then(|number| number.parse::<usize>().ok())
+        {
+            row.settings_id = format!("debug:0_{}", number + offset);
+        }
+        if let (Some(session), Some(serial)) = (
+            session,
+            row.properties
+                .get("UniqueId")
+                .and_then(|unique| unique["value"].as_str())
+                .map(|serial| serial[24..].to_string()),
+        ) {
+            row.properties.insert(
+                "UniqueId".into(),
+                json!({"_type": "UniqueId", "value": format!("{session:024x}{serial}")}),
+            );
+        }
+    }
+}
+
 /// One change a Studio session makes between two pulls. Most leave every
 /// instance where it stands; the others a pull has to align whole.
 fn edit(rng: &mut SimRng, document: &mut SettingsBytecode) {
@@ -373,19 +417,7 @@ fn edit(rng: &mut SimRng, document: &mut SettingsBytecode) {
                 enum_items(rng.below(2) == 0)["items"][0].clone(),
             );
         }
-        // A new Studio session numbers its debug ids anew.
-        32 => {
-            let offset = 1_000 + rng.below(1_000);
-            for row in &mut document.instances {
-                if let Some(number) = row
-                    .settings_id
-                    .strip_prefix("debug:0_")
-                    .and_then(|number| number.parse::<usize>().ok())
-                {
-                    row.settings_id = format!("debug:0_{}", number + offset);
-                }
-            }
-        }
+        32 | 54 | 55 => new_session(rng, document),
         33..=35 => {
             let at = 2 + rng.below(count - 1);
             shift_references(document, at, true);
@@ -475,9 +507,24 @@ fn edit(rng: &mut SimRng, document: &mut SettingsBytecode) {
                 row.attributes.insert("Level".into(), json!(rng.below(9)));
             }
         }
-        47 | 48 => {
+        47 => {
             row.attributes
                 .insert("RBX_Marker".into(), json!(rng.below(4)));
+        }
+        // A part's size changes, or goes by its other name.
+        48 | 56 => {
+            if row.class_name == "Part" {
+                let held = ["size", "Size"]
+                    .into_iter()
+                    .find_map(|name| row.properties.remove(name));
+                row.properties.insert(
+                    if rng.below(2) == 0 { "size" } else { "Size" }.into(),
+                    match held {
+                        Some(held) if rng.below(2) == 0 => held,
+                        _ => size(1 + rng.below(4)),
+                    },
+                );
+            }
         }
         49 => {
             document.instances[1].properties.insert(
@@ -536,6 +583,8 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
         AtomicUsize::new(0),
     );
     let by_instance = AtomicUsize::new(0);
+    let (renumbered, renumbered_from_memory) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let (renamed, renamed_and_changed) = (AtomicUsize::new(0), AtomicUsize::new(0));
     run_seeds(1_200, |seed, steps| {
         let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         let native = seed % 2 == 0;
@@ -555,6 +604,11 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
         };
         let mut rows = Some(first.rows);
         for round in 0..6 {
+            // Every few pulls Studio opened the place again before whatever
+            // else changed in it.
+            if rng.below(5) == 0 {
+                new_session(&mut rng, &mut document);
+            }
             for _ in 0..1 + rng.below(3) {
                 edit(&mut rng, &mut document);
             }
@@ -583,6 +637,51 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
             // A file compared with no memory of it answers the same.
             let unremembered = pull_changed_document_rows(&state, &now.rows, &file)
                 .map_err(|error| format!("round {round}: {error:#}"))?;
+            // Studio numbered the instances anew since the file was written.
+            let other_ids = !reference
+                .instances
+                .iter()
+                .map(|instance| &instance.settings_id)
+                .eq(observed
+                    .instances
+                    .iter()
+                    .map(|instance| &instance.settings_id));
+            // It also gave most of them another UniqueId.
+            let other_unique_ids = reference.instances.len() == observed.instances.len()
+                && reference
+                    .instances
+                    .iter()
+                    .zip(&observed.instances)
+                    .filter(|(stored, captured)| {
+                        stored.properties.get("UniqueId") != captured.properties.get("UniqueId")
+                    })
+                    .count()
+                    * 2
+                    > observed.instances.len();
+            if other_unique_ids && let Some((answer, _)) = &unremembered {
+                renamed.fetch_add(1, Ordering::Relaxed);
+                let values_changed = reference.instances.iter().zip(&observed.instances).any(
+                    |(stored, captured)| {
+                        let without = |row: &SettingsBytecodeInstance| {
+                            let mut properties = row.properties.clone();
+                            properties.remove("UniqueId");
+                            (properties, row.attributes.clone())
+                        };
+                        without(stored) != without(captured)
+                    },
+                );
+                if values_changed && matches!(answer, SettingsAlignment::Changed(_)) {
+                    renamed_and_changed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if other_ids {
+                if unremembered.is_some() {
+                    renumbered.fetch_add(1, Ordering::Relaxed);
+                }
+                if answered.is_some() {
+                    renumbered_from_memory.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             let aligned = align_pulled_settings_documents_to_reference(
                 reference,
                 observed,
@@ -661,10 +760,12 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
                 }
             ));
             // What the pull remembers for the next one.
-            rows = match (&aligned.alignment, answered.is_some()) {
-                (SettingsAlignment::Equivalent, true) => rows,
-                (_, true) => Some(now.rows),
-                (_, false) => aligned.stored_as_observed.then_some(now.rows),
+            rows = match (&aligned.alignment, answered.is_some(), &unremembered) {
+                (SettingsAlignment::Equivalent, true, _) => rows,
+                (_, true, _) => Some(now.rows),
+                (SettingsAlignment::Equivalent, false, Some((_, same))) => same.then_some(now.rows),
+                (SettingsAlignment::Changed(_), false, Some(_)) => Some(now.rows),
+                (_, false, None) => aligned.stored_as_observed.then_some(now.rows),
             };
             if let SettingsAlignment::Changed(bytes) = aligned.alignment {
                 file = bytes;
@@ -684,10 +785,278 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
             kept >= 100
                 && written >= 400
                 && whole >= 500
-                && by_instance.load(Ordering::Relaxed) >= 1_000,
-            "kept {kept}, written {written}, by the whole alignment {whole}"
+                && by_instance.load(Ordering::Relaxed) >= 1_000
+                && renumbered.load(Ordering::Relaxed) >= 150
+                && renumbered_from_memory.load(Ordering::Relaxed) >= 25
+                && renamed.load(Ordering::Relaxed) >= 25
+                && renamed_and_changed.load(Ordering::Relaxed) >= 10,
+            "kept {kept}, written {written}, by the whole alignment {whole}, under other ids {} and {} of them from memory, under other UniqueIds {} and {} of them with other values",
+            renumbered.load(Ordering::Relaxed),
+            renumbered_from_memory.load(Ordering::Relaxed),
+            renamed.load(Ordering::Relaxed),
+            renamed_and_changed.load(Ordering::Relaxed),
         );
     }
+}
+
+/// Two parts of one name under one parent, in the session that numbers its
+/// instances from `session`, each with what `held` gives it.
+fn twins(session: usize, unique_ids: bool, held: [f64; 2]) -> SettingsBytecode {
+    let root = SettingsBytecodeInstance::new(
+        "1".into(),
+        "ReplicatedStorage".into(),
+        "ReplicatedStorage".into(),
+        None,
+    );
+    let mut instances = vec![root];
+    for (index, transparency) in held.into_iter().enumerate() {
+        let mut twin = SettingsBytecodeInstance::new(
+            format!("debug:0_{}", session * 100 + index),
+            "Twin".into(),
+            "Part".into(),
+            Some(0),
+        );
+        twin.properties
+            .insert("Transparency".into(), json!(transparency));
+        if unique_ids {
+            twin.properties.insert(
+                "UniqueId".into(),
+                json!({"_type": "UniqueId", "value": format!("{session:024x}{:08x}", index + 1)}),
+            );
+        }
+        instances.push(twin);
+    }
+    SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances,
+    }
+}
+
+/// The same twins, each with a part under it that holds what `held` gives.
+fn twins_with_leaves(session: usize, held: [f64; 2]) -> SettingsBytecode {
+    let mut document = twins(session, true, [0.5, 0.5]);
+    for (index, transparency) in held.into_iter().enumerate() {
+        let mut leaf = SettingsBytecodeInstance::new(
+            format!("debug:0_{}", session * 100 + 10 + index),
+            "Leaf".into(),
+            "Part".into(),
+            Some(index + 1),
+        );
+        leaf.properties
+            .insert("Transparency".into(), json!(transparency));
+        leaf.properties.insert(
+            "UniqueId".into(),
+            json!({"_type": "UniqueId", "value": format!("{session:024x}{:08x}", index + 11)}),
+        );
+        document.instances.push(leaf);
+    }
+    document
+}
+
+/// The ids a written store holds its instances under.
+fn stored_ids(file: &[u8]) -> Vec<String> {
+    decode_settings_bytecode(file)
+        .unwrap()
+        .instances
+        .into_iter()
+        .map(|instance| instance.settings_id)
+        .collect()
+}
+
+/// Same-named siblings that hold each other's values in a place Studio
+/// opened again are each other, as far as anything says: the alignment
+/// gives each the id of the stored one it holds the values of, which a
+/// comparison of the instances at their places cannot know.
+#[test]
+fn namesakes_that_traded_their_values_take_the_whole_alignment() {
+    let file =
+        encode_service_settings_binary(&captured(&twins(1, true, [0.25, 0.75]), false)).unwrap();
+    let state = captured(&twins(2, true, [0.75, 0.25]), false);
+    let now = pulled_digest_from_service_state(&state).unwrap();
+    assert!(
+        pull_changed_document_rows(&state, &now.rows, &file)
+            .unwrap()
+            .is_none()
+    );
+    let aligned = align_pulled_settings_documents_to_reference(
+        decode_settings_bytecode(&file).unwrap(),
+        settings_bytecode_from_service_state(&state).unwrap(),
+        &|| encode_service_settings_binary(&state),
+        std::time::Instant::now(),
+    )
+    .unwrap();
+    let SettingsAlignment::Changed(written) = aligned.alignment else {
+        panic!("the alignment keeps the store");
+    };
+    let (before, after) = (stored_ids(&file), stored_ids(&written));
+    assert_eq!((&after[1], &after[2]), (&before[2], &before[1]));
+    // Siblings that only took other values stand where they stood.
+    let state = captured(&twins(2, true, [0.25, 0.75]), false);
+    let now = pulled_digest_from_service_state(&state).unwrap();
+    let (answer, same) = pull_changed_document_rows(&state, &now.rows, &file)
+        .unwrap()
+        .expect("instances that hold the stored values are compared at their places");
+    assert!(!same);
+    let SettingsAlignment::Changed(written) = answer else {
+        panic!("other UniqueIds are written");
+    };
+    assert_eq!(stored_ids(&written), before);
+}
+
+/// What stands under same-named siblings is told apart no better than they
+/// are: where two such parts hold each other's values in a place Studio
+/// opened again, the alignment takes each sibling, with what stands under
+/// it, for the stored one its part holds the values of.
+#[test]
+fn instances_under_namesakes_take_the_whole_alignment() {
+    let file =
+        encode_service_settings_binary(&captured(&twins_with_leaves(1, [0.25, 0.75]), false))
+            .unwrap();
+    let state = captured(&twins_with_leaves(2, [0.75, 0.25]), false);
+    let now = pulled_digest_from_service_state(&state).unwrap();
+    assert!(
+        pull_changed_document_rows(&state, &now.rows, &file)
+            .unwrap()
+            .is_none()
+    );
+    let aligned = align_pulled_settings_documents_to_reference(
+        decode_settings_bytecode(&file).unwrap(),
+        settings_bytecode_from_service_state(&state).unwrap(),
+        &|| encode_service_settings_binary(&state),
+        std::time::Instant::now(),
+    )
+    .unwrap();
+    let SettingsAlignment::Changed(written) = aligned.alignment else {
+        panic!("the alignment keeps the store");
+    };
+    let (before, after) = (stored_ids(&file), stored_ids(&written));
+    assert_eq!(
+        (&after[1], &after[2], &after[3], &after[4]),
+        (&before[2], &before[1], &before[4], &before[3])
+    );
+}
+
+/// Under other ids than the store's, instances that nothing tells apart
+/// but what they hold are the alignment's to match once one of them holds
+/// other values, also where a pull remembers the store.
+#[test]
+fn instances_nothing_tells_apart_take_the_whole_alignment_under_other_ids() {
+    let file =
+        encode_service_settings_binary(&captured(&twins(1, false, [0.25, 0.75]), false)).unwrap();
+    // The place opened again: nothing changed but the ids.
+    let reopened = captured(&twins(2, false, [0.25, 0.75]), false);
+    let before = pulled_digest_from_service_state(&reopened).unwrap();
+    let (answer, same) = pull_changed_document_rows(&reopened, &before.rows, &file)
+        .unwrap()
+        .expect("a store that differs in its ids alone is compared by its instances");
+    assert!(matches!(answer, SettingsAlignment::Equivalent) && same);
+    // Then the two traded their values.
+    let traded = captured(&twins(2, false, [0.75, 0.25]), false);
+    let now = pulled_digest_from_service_state(&traded).unwrap();
+    assert!(
+        pull_changed_values(&traded, &before.rows, &now.rows, &file)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        pull_changed_document_rows(&traded, &now.rows, &file)
+            .unwrap()
+            .is_none()
+    );
+    // With a UniqueId of its own each is told by itself.
+    let file =
+        encode_service_settings_binary(&captured(&twins(1, true, [0.25, 0.75]), false)).unwrap();
+    let mut reopened = twins(2, true, [0.25, 0.75]);
+    let mut changed = twins(2, true, [0.25, 0.5]);
+    for document in [&mut reopened, &mut changed] {
+        for (index, twin) in document.instances.iter_mut().enumerate().skip(1) {
+            twin.properties.insert(
+                "UniqueId".into(),
+                json!({"_type": "UniqueId", "value": format!("{:024x}{index:08x}", 1)}),
+            );
+        }
+    }
+    let reopened = captured(&reopened, false);
+    let before = pulled_digest_from_service_state(&reopened).unwrap();
+    let changed = captured(&changed, false);
+    let now = pulled_digest_from_service_state(&changed).unwrap();
+    let answer = pull_changed_values(&changed, &before.rows, &now.rows, &file)
+        .unwrap()
+        .expect("instances with a UniqueId of their own are compared from memory");
+    let SettingsAlignment::Changed(written) = answer else {
+        panic!("another value is written");
+    };
+    assert_eq!(stored_ids(&written), stored_ids(&file));
+}
+
+/// A root is told by being the only one, unless a store holds another
+/// instance under the root's id: the alignment then takes the root for that
+/// one.
+#[test]
+fn a_root_stored_under_another_id_takes_the_whole_alignment() {
+    let mut stored = twins(1, true, [0.25, 0.75]);
+    stored.instances[0].settings_id = "root".into();
+    stored.instances[1].settings_id = "1".into();
+    let file = encode_settings_bytecode(&stored).unwrap();
+    // The same UniqueIds under other ids, and the twins traded their values.
+    let mut traded = twins(2, true, [0.75, 0.25]);
+    for (index, twin) in traded.instances.iter_mut().enumerate().skip(1) {
+        twin.properties.insert(
+            "UniqueId".into(),
+            stored.instances[index].properties["UniqueId"].clone(),
+        );
+    }
+    let state = captured(&traded, false);
+    let now = pulled_digest_from_service_state(&state).unwrap();
+    assert!(
+        pull_changed_document_rows(&state, &now.rows, &file)
+            .unwrap()
+            .is_none()
+    );
+    // Stored under the root's own id it is the root, and the twins are told
+    // by their UniqueIds.
+    stored.instances[0].settings_id = "1".into();
+    stored.instances[1].settings_id = "debug:0_100".into();
+    let file = encode_settings_bytecode(&stored).unwrap();
+    let (answer, _) = pull_changed_document_rows(&state, &now.rows, &file)
+        .unwrap()
+        .expect("a sole root under its id and instances with their UniqueIds stand");
+    let SettingsAlignment::Changed(written) = answer else {
+        panic!("other values are written");
+    };
+    assert_eq!(stored_ids(&written), stored_ids(&file));
+}
+
+/// A property under the name it once went by is the same value under the
+/// name of today, and another one as the two instances hold it.
+#[test]
+fn an_instance_is_compared_as_held_and_under_todays_names() {
+    let part = |name: &str, x: usize| {
+        let mut part =
+            SettingsBytecodeInstance::new("a".into(), "Part".into(), "Part".into(), Some(0));
+        part.properties.insert(name.into(), size(x));
+        part
+    };
+    let compared = |stored: &SettingsBytecodeInstance, captured: &SettingsBytecodeInstance| {
+        crate::settings::equivalence::pulled_instance_values_unchanged(stored, captured, None)
+            .unwrap()
+    };
+    assert_eq!(
+        compared(&part("Size", 4), &part("Size", 4)),
+        Some((true, true))
+    );
+    assert_eq!(
+        compared(&part("Size", 4), &part("Size", 3)),
+        Some((false, false))
+    );
+    assert_eq!(
+        compared(&part("size", 4), &part("Size", 4)),
+        Some((false, true))
+    );
+    assert_eq!(
+        compared(&part("size", 4), &part("size", 3)),
+        Some((false, false))
+    );
 }
 
 /// The rows of a store file read alone are the rows its whole decoding gives.
@@ -709,24 +1078,39 @@ fn rows_read_alone_are_the_rows_of_the_whole_store() {
             .filter(|_| rng.below(3) == 0)
             .collect::<Vec<_>>();
         rng.shuffle(&mut rows);
-        let alone =
+        let (alone, ids) =
             property_edit::decode_rows(&bytes, &rows).map_err(|error| format!("{error:#}"))?;
         for (row, instance) in rows.iter().zip(&alone) {
             if *instance != whole.instances[*row] {
                 return Err(format!("row {row} differs"));
             }
         }
+        let stored_ids = whole
+            .instances
+            .iter()
+            .map(|instance| instance.settings_id.clone())
+            .collect::<Vec<_>>();
+        if ids != stored_ids {
+            return Err("the ids read with the rows are not the store's".into());
+        }
         if property_edit::decode_rows(&bytes, &[whole.instances.len()]).is_ok() {
             return Err("a row past the end was read".into());
         }
         // The digests taken column by column are the digests of the rows.
         let kept = (!whole.instances.is_empty()).then(|| rng.below(whole.instances.len()));
-        let (digests, alone) =
-            property_edit::row_digests(&bytes, kept).map_err(|error| format!("{error:#}"))?;
+        let property_edit::StoreRows {
+            digests,
+            unique_ids,
+            kept: alone,
+            ids,
+        } = property_edit::row_digests(&bytes, kept).map_err(|error| format!("{error:#}"))?;
         if alone.as_ref() != kept.map(|kept| &whole.instances[kept]) {
             return Err("the row kept with the digests is not the store's".into());
         }
-        if digests
+        if ids != stored_ids {
+            return Err("the ids read with the digests are not the store's".into());
+        }
+        if digests.into_iter().zip(unique_ids).collect::<Vec<_>>()
             != whole
                 .instances
                 .iter()
