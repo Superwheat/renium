@@ -379,6 +379,14 @@ fn native_import_file_chunks_preserve_all_cross_row_facts() -> Result<()> {
             row.properties.insert(key.into(), json!({"_type":"SharedString", "base64":base64::encode([b"payload held across chunks".repeat(20), (index % 5).to_le_bytes().to_vec()].concat())}));
         }
         row.attributes.insert("AcrossChunks".into(), json!(index));
+        if index % 4 != 0 {
+            row.properties
+                .insert("FutureUnreflectedFlag".into(), json!(index % 5 < 2));
+            row.properties.insert(
+                "FutureUnreflectedText".into(),
+                json!(format!("value:{}", index % 71)),
+            );
+        }
         document.instances.push(row);
     }
     let mut model = SettingsBytecodeInstance::new(

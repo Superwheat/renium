@@ -181,7 +181,24 @@ fn import_builder_returns_exact_original_rows_for_the_supplemental_pass() -> Res
             Some(0),
             json!({"WorldPivot":{"_type":"CFrame", "components":[1,2,3,1,0,0,0,1,0,0,0,1]}}),
         ),
-        ("Carried", "Part", Some(0), json!({"Transparency":0.25})),
+        (
+            "Carried",
+            "Part",
+            Some(0),
+            json!({"Transparency":0.25, "Material":{"_type":"EnumItem", "enumType":"Material", "name":"Wood", "value":512}}),
+        ),
+        (
+            "FutureEnum",
+            "Part",
+            Some(0),
+            json!({"Material":{"_type":"EnumItem", "enumType":"Material", "name":"ReniumFixtureFutureMaterial"}}),
+        ),
+        (
+            "Aliased",
+            "SurfaceAppearance",
+            Some(0),
+            json!({"TexturePackContent":{"_type":"Content", "value":"rbxassetid://123"}}),
+        ),
     ] {
         let mut row = SettingsBytecodeInstance::new(
             format!("row:{}", document.instances.len()),
@@ -276,6 +293,20 @@ fn import_builder_returns_exact_original_rows_for_the_supplemental_pass() -> Res
                 !actual.contains("row:2"),
                 "the same-named sibling carried by the payload needs no setter"
             );
+            assert!(
+                actual.contains("row:6"),
+                "the value-specific omission needs its original row"
+            );
+            assert!(
+                !actual.contains("row:5"),
+                "one unrepresentable value must not retain every row of its class"
+            );
+            if !native {
+                assert!(
+                    actual.contains("row:7"),
+                    "content aliases must be selected as the supplemental pass sees them"
+                );
+            }
             for (index, row) in &kept.rows {
                 assert_eq!(row, &document.instances[*index]);
             }

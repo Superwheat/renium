@@ -54,19 +54,28 @@ impl ImportRowCandidates {
         omitted_paths: &HashMap<String, HashSet<String>>,
     ) -> Result<HashMap<String, KeptImportRows>> {
         let database = rbx_reflection_database::get()?;
-        Ok(self
-            .services
+        self.services
             .into_iter()
             .map(|(service, (identity, rows))| {
                 let mut rows = rows
                     .into_iter()
-                    .filter_map(|(referent, index, row)| {
+                    .map(|(referent, index, row)| {
                         let class = classes.get(&row.class_name);
                         let path = paths
                             .get(&referent)
                             .and_then(|path| omitted_paths.get(path));
-                        let selected = row.class_name == IMPORT_MODEL_PIVOT.0
-                            || row.properties.keys().any(|name| {
+                        let selected = if row.class_name == IMPORT_MODEL_PIVOT.0 {
+                            true
+                        } else if class.is_none() && path.is_none() {
+                            false
+                        } else {
+                            // Match the caller's whole-row alias and migration
+                            // rules without changing the returned original.
+                            let mut canonical = row.clone();
+                            crate::settings::equivalence::canonicalize_instances(
+                                std::slice::from_mut(&mut canonical),
+                            )?;
+                            canonical.properties.keys().any(|name| {
                                 let logical = crate::rbx::encode::rbx_logical_property_name(
                                     database,
                                     &row.class_name,
@@ -75,14 +84,18 @@ impl ImportRowCandidates {
                                 .unwrap_or(name);
                                 class.is_some_and(|names| names.contains(logical))
                                     || path.is_some_and(|names| names.contains(logical))
-                            });
-                        selected.then_some((index, row))
+                            })
+                        };
+                        Ok(selected.then_some((index, row)))
                     })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
                     .collect::<Vec<_>>();
                 rows.sort_unstable_by_key(|(index, _)| *index);
-                (service, KeptImportRows { identity, rows })
+                Ok((service, KeptImportRows { identity, rows }))
             })
-            .collect())
+            .collect()
     }
 }
 

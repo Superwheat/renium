@@ -1630,8 +1630,8 @@ pub(crate) struct PlaceBuildTuning {
 impl Default for PlaceBuildTuning {
     fn default() -> Self {
         Self {
-            rows: std::num::NonZeroUsize::new(8192).unwrap(),
-            services: std::num::NonZeroUsize::new(2).unwrap(),
+            rows: std::num::NonZeroUsize::new(16384).unwrap(),
+            services: std::num::NonZeroUsize::new(4).unwrap(),
             prefetch: true,
         }
     }
@@ -2030,13 +2030,12 @@ pub(crate) fn build_rbx_place_with_tuning(
                         let referent = refs.by_index[&index];
                         let built = builder.build_leaf(children[index].len());
                         let instance = &document.instances[index];
-                        let properties = values.as_ref().map_or(&instance.properties, |row| &row.properties);
                         let keep = capture_logical_properties && (
                             instance.class_name == crate::editor::types::IMPORT_MODEL_PIVOT.0
                             || !omitted_properties.is_empty()
                             || !unresolved_reference_properties.is_empty()
                             || built.properties.values().chain(logical_properties.values()).any(|value| matches!(value, RbxVariant::Ref(_)))
-                            || extra_omissions.get(&instance.class_name).is_some_and(|names| properties.keys().any(|name| names.contains(name)))
+                            || extra_omissions.contains_key(&instance.class_name)
                         );
                         if keep {
                             let mut row = SettingsBytecodeInstance::new(instance.settings_id.clone(), instance.name.clone(), instance.class_name.clone(), instance.parent_index);

@@ -4,6 +4,7 @@ use std::path::Path;
 
 use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use rbx_dom_weak::types::{
     Attributes as RbxAttributes, Axes as RbxAxes, BinaryString as RbxBinaryString,
     BrickColor as RbxBrickColor, CFrame as RbxCFrame, Color3 as RbxColor3,
@@ -745,43 +746,42 @@ pub(crate) fn normalize_export_dom(dom: &mut RbxWeakDom, database: &ReflectionDa
             }
         }
     }
-    for (class_name, referents) in by_class {
-        let class = database.classes.get(class_name.as_str());
-        // A reflected default already supplies every missing value. Avoid
-        // counting and cloning values that can never contribute a fill, and
-        // resolve that fact once per class member rather than once per row.
-        let mut presence: AHashMap<rbx_dom_weak::Ustr, Option<ExportPresence>> = AHashMap::new();
-        for referent in &referents {
-            let Some(instance) = dom.get_by_ref_mut(*referent) else {
-                continue;
-            };
-            instance.properties.retain(|name, value| {
-                !is_empty_unscriptable_blob(database, class_name.as_str(), name.as_str(), value)
-            });
-            for (name, value) in &instance.properties {
-                let values = presence.entry(*name).or_insert_with(|| {
-                    let has_default = class.is_some_and(|class| {
-                        database
-                            .find_default_property(class, name.as_str())
-                            .is_some()
-                            || rbx_logical_property_name(
-                                database,
-                                class_name.as_str(),
-                                name.as_str(),
-                            )
-                            .is_some_and(|logical| {
-                                database.find_default_property(class, logical).is_some()
-                            })
-                    });
-                    (!has_default).then(ExportPresence::default)
-                });
-                if let Some(values) = values {
-                    values.record(value);
+    let scanned = by_class
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|(class_name, referents)| {
+            // Indexed collection and merging in traversal order preserve the
+            // original first-seen tie breaker, independently of worker scheduling.
+            let mut presence = AHashMap::<rbx_dom_weak::Ustr, ExportPresence>::new();
+            let mut empty = Vec::new();
+            // Keep only a worker batch of samples, even if unknown members
+            // contain large strings in a service with millions of instances.
+            let batch_rows = 2048usize.saturating_mul(rayon::current_num_threads());
+            for batch in referents.chunks(batch_rows) {
+                let chunks = batch
+                    .par_chunks(2048)
+                    .map(|chunk| scan_export_presence(dom, database, class_name, chunk))
+                    .collect::<Vec<_>>();
+                for chunk in chunks {
+                    empty.extend(chunk.empty);
+                    for (name, values) in chunk.presence {
+                        if let Some(values) = values {
+                            presence.entry(name).or_default().merge(values);
+                        }
+                    }
                 }
+            }
+            (referents, presence, empty)
+        })
+        .collect::<Vec<_>>();
+    for (referents, presence, empty) in scanned {
+        for (referent, name) in empty {
+            if let Some(instance) = dom.get_by_ref_mut(referent) {
+                instance.properties.remove(&name);
             }
         }
         for (name, values) in presence {
-            let Some(values) = values else { continue };
             if values.present >= referents.len() {
                 continue;
             }
@@ -800,6 +800,51 @@ pub(crate) fn normalize_export_dom(dom: &mut RbxWeakDom, database: &ReflectionDa
     }
 }
 
+#[derive(Default)]
+struct ExportPresenceScan {
+    presence: AHashMap<rbx_dom_weak::Ustr, Option<ExportPresence>>,
+    empty: Vec<(RbxRef, rbx_dom_weak::Ustr)>,
+}
+
+fn scan_export_presence(
+    dom: &RbxWeakDom,
+    database: &ReflectionDatabase<'_>,
+    class_name: rbx_dom_weak::Ustr,
+    referents: &[RbxRef],
+) -> ExportPresenceScan {
+    let class = database.classes.get(class_name.as_str());
+    let mut scan = ExportPresenceScan::default();
+    for referent in referents {
+        let Some(instance) = dom.get_by_ref(*referent) else {
+            continue;
+        };
+        for (name, value) in &instance.properties {
+            if is_empty_unscriptable_blob(database, class_name.as_str(), name.as_str(), value) {
+                scan.empty.push((*referent, *name));
+                continue;
+            }
+            // Reflected defaults already supply missing values. Resolve that
+            // once per class member, and never clone values for unused counts.
+            let values = scan.presence.entry(*name).or_insert_with(|| {
+                let has_default = class.is_some_and(|class| {
+                    database
+                        .find_default_property(class, name.as_str())
+                        .is_some()
+                        || rbx_logical_property_name(database, class_name.as_str(), name.as_str())
+                            .is_some_and(|logical| {
+                                database.find_default_property(class, logical).is_some()
+                            })
+                });
+                (!has_default).then(ExportPresence::default)
+            });
+            if let Some(values) = values {
+                values.record(value);
+            }
+        }
+    }
+    scan
+}
+
 const EXPORT_FILL_DISTINCT_LIMIT: usize = 64;
 
 #[derive(Default)]
@@ -810,6 +855,20 @@ struct ExportPresence {
 }
 
 impl ExportPresence {
+    fn merge(&mut self, other: Self) {
+        self.present += other.present;
+        self.overflowed |= other.overflowed;
+        for (value, occurrences) in other.distinct {
+            if let Some((_, count)) = self.distinct.iter_mut().find(|(seen, _)| *seen == value) {
+                *count += occurrences;
+            } else if self.distinct.len() < EXPORT_FILL_DISTINCT_LIMIT {
+                self.distinct.push((value, occurrences));
+            } else {
+                self.overflowed = true;
+            }
+        }
+    }
+
     fn record(&mut self, value: &RbxVariant) {
         self.present += 1;
         if let Some((_, count)) = self.distinct.iter_mut().find(|(seen, _)| seen == value) {

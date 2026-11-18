@@ -1,5 +1,41 @@
 use super::*;
 
+#[test]
+fn parallel_default_presence_keeps_sequential_counts_and_ties() {
+    for distinct in [2, 17, 64, 65, 137] {
+        let values = (0..5000)
+            .map(|index| RbxVariant::Int32(index % distinct))
+            .collect::<Vec<_>>();
+        let mut expected = ExportPresence::default();
+        for value in &values {
+            expected.record(value);
+        }
+        for size in [1, 7, 2048, usize::MAX] {
+            let chunks = values
+                .par_chunks(size)
+                .map(|chunk| {
+                    let mut presence = ExportPresence::default();
+                    for value in chunk {
+                        presence.record(value);
+                    }
+                    presence
+                })
+                .collect::<Vec<_>>();
+            let mut actual = ExportPresence::default();
+            for chunk in chunks {
+                actual.merge(chunk);
+            }
+            assert_eq!(actual.present, expected.present);
+            assert_eq!(actual.overflowed, expected.overflowed);
+            assert_eq!(
+                actual.fill(),
+                expected.fill(),
+                "{distinct} distinct, {size} rows"
+            );
+        }
+    }
+}
+
 pub(crate) fn fill_engine_geometry_slow(dom: &mut RbxWeakDom, base: &RbxWeakDom) {
     let mut by_path: HashMap<(Vec<String>, Vec<usize>), (GeometrySources, GeometryValues)> =
         HashMap::new();
