@@ -222,15 +222,76 @@ impl SourcemapInstance for SnapshotInstance {
     }
 }
 
+/// For each instance, whether it or an instance below it is a script: only
+/// those have files, so only their parents need the names files are written
+/// under.
+fn scripts_at_or_below<I: SourcemapInstance>(
+    instances: &[I],
+    children_by_parent: &[Vec<usize>],
+    root: usize,
+) -> Vec<bool> {
+    let mut order = Vec::with_capacity(instances.len());
+    let mut seen = vec![false; instances.len()];
+    let mut stack = vec![root];
+    while let Some(index) = stack.pop() {
+        if index >= instances.len() || std::mem::replace(&mut seen[index], true) {
+            continue;
+        }
+        order.push(index);
+        if let Some(children) = children_by_parent.get(index) {
+            stack.extend(children.iter().copied());
+        }
+    }
+    let mut below = vec![false; instances.len()];
+    for &index in order.iter().rev() {
+        below[index] = crate::editor::sync::is_lua_source_class(instances[index].class_name())
+            || children_by_parent
+                .get(index)
+                .is_some_and(|children| children.iter().any(|&child| below[child]));
+    }
+    below
+}
+
+/// The nodes of instances none of which is a script or holds one: no file
+/// stands for any of them.
+fn build_plain_sourcemap_children<I: SourcemapInstance + Sync>(
+    instances: &[I],
+    children_by_parent: &[Vec<usize>],
+    child_indices: &[usize],
+) -> Vec<SourcemapNode> {
+    let build = |&index: &usize| {
+        let instance = &instances[index];
+        SourcemapNode {
+            name: instance.name().to_string(),
+            class_name: instance.class_name().to_string(),
+            file_paths: Vec::new(),
+            children: build_plain_sourcemap_children(
+                instances,
+                children_by_parent,
+                children_by_parent.get(index).map_or(&[][..], Vec::as_slice),
+            ),
+        }
+    };
+    if child_indices.len() >= 512 && rayon::current_num_threads() > 1 {
+        child_indices.par_iter().map(build).collect()
+    } else {
+        child_indices.iter().map(build).collect()
+    }
+}
+
 fn build_full_sourcemap_children<I: SourcemapInstance + Sync>(
     instances: &[I],
     children_by_parent: &[Vec<usize>],
     child_indices: &[usize],
     project_root: &Path,
     parent_dir: &Path,
+    scripts_below: &[bool],
 ) -> Vec<SourcemapNode> {
     if child_indices.is_empty() {
         return Vec::new();
+    }
+    if !child_indices.iter().any(|&index| scripts_below[index]) {
+        return build_plain_sourcemap_children(instances, children_by_parent, child_indices);
     }
     let mut used_stem_keys = std::collections::HashSet::new();
     let mut next_suffix_by_base = HashMap::new();
@@ -251,6 +312,18 @@ fn build_full_sourcemap_children<I: SourcemapInstance + Sync>(
         let child_indices = children_by_parent
             .get(*index)
             .map_or(&[][..], Vec::as_slice);
+        if !scripts_below[*index] {
+            return SourcemapNode {
+                name: instance.name().to_string(),
+                class_name: instance.class_name().to_string(),
+                file_paths: Vec::new(),
+                children: build_plain_sourcemap_children(
+                    instances,
+                    children_by_parent,
+                    child_indices,
+                ),
+            };
+        }
         let source_path = project_script_path(
             parent_dir,
             fs_stem,
@@ -275,6 +348,7 @@ fn build_full_sourcemap_children<I: SourcemapInstance + Sync>(
                     child_indices,
                     project_root,
                     &parent_dir.join(fs_stem),
+                    scripts_below,
                 )
             },
         }
@@ -307,6 +381,7 @@ fn build_full_service_sourcemap<I: SourcemapInstance + Sync>(
             child_indices,
             project_root,
             service_dir,
+            &scripts_at_or_below(instances, children_by_parent, service_root_index),
         ),
     }
 }
@@ -784,5 +859,178 @@ fn wait_for_sourcemap_change(
             }
         }
         return Ok(());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::support::{SimRng, run_seeds, temp_dir};
+
+    /// The sourcemap of a service as every instance gives it: a file name and
+    /// a file lookup for each, whether or not a script stands at or below it.
+    fn every_instance(
+        instances: &[SettingsBytecodeInstance],
+        children_by_parent: &[Vec<usize>],
+        child_indices: &[usize],
+        project_root: &Path,
+        parent_dir: &Path,
+    ) -> Vec<SourcemapNode> {
+        let mut used_stem_keys = std::collections::HashSet::new();
+        let mut next_suffix_by_base = HashMap::new();
+        child_indices
+            .iter()
+            .map(|&index| {
+                let instance = &instances[index];
+                let fs_stem = unique_child_stem(
+                    &instance.name,
+                    &mut used_stem_keys,
+                    &mut next_suffix_by_base,
+                );
+                let children = children_by_parent.get(index).map_or(&[][..], Vec::as_slice);
+                let source_path = project_script_path(
+                    parent_dir,
+                    &fs_stem,
+                    !children.is_empty(),
+                    &instance.class_name,
+                    &instance.properties,
+                )
+                .filter(|path| path.is_file());
+                SourcemapNode {
+                    name: instance.name.clone(),
+                    class_name: instance.class_name.clone(),
+                    file_paths: source_path
+                        .as_deref()
+                        .map(|path| vec![path_to_sourcemap_relative(project_root, path)])
+                        .unwrap_or_default(),
+                    children: every_instance(
+                        instances,
+                        children_by_parent,
+                        children,
+                        project_root,
+                        &parent_dir.join(&fs_stem),
+                    ),
+                }
+            })
+            .collect()
+    }
+
+    /// Only an instance with a script at or below it is given a file name
+    /// and looked up on disk. The sourcemap is the one every instance gives.
+    #[test]
+    fn a_sourcemap_names_files_only_where_scripts_stand() {
+        run_seeds(120, |seed, _| {
+            let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let project_root = temp_dir(&format!("sourcemap-scripts-{seed}"));
+            let service_dir = project_root.join("src").join("Workspace");
+            let mut instances = vec![SettingsBytecodeInstance::new(
+                "root".into(),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            )];
+            for index in 0..6 + rng.below(40) {
+                let class = [
+                    "Folder",
+                    "Part",
+                    "Model",
+                    "Script",
+                    "LocalScript",
+                    "ModuleScript",
+                ][rng.below(6)];
+                let name = ["A", "B", "Twin", "Main", "a"][rng.below(5)];
+                let parent = rng.below(instances.len());
+                let mut instance = SettingsBytecodeInstance::new(
+                    format!("id-{index}"),
+                    name.into(),
+                    class.into(),
+                    Some(parent),
+                );
+                if class == "Script" && rng.below(3) == 0 {
+                    instance
+                        .properties
+                        .insert("RunContext".into(), serde_json::json!("Client"));
+                }
+                instances.push(instance);
+            }
+            let document = SettingsBytecode {
+                version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+                instances,
+            };
+            let children_by_parent = settings_children_by_parent(&document);
+            let expected = |project_root: &Path| {
+                every_instance(
+                    &document.instances,
+                    &children_by_parent,
+                    &children_by_parent[0],
+                    project_root,
+                    &service_dir,
+                )
+            };
+            // The files of some scripts exist, where the names say they stand.
+            fn script_paths(
+                instances: &[SettingsBytecodeInstance],
+                children_by_parent: &[Vec<usize>],
+                child_indices: &[usize],
+                parent_dir: &Path,
+                out: &mut Vec<PathBuf>,
+            ) {
+                let mut used = std::collections::HashSet::new();
+                let mut next = HashMap::new();
+                for &index in child_indices {
+                    let instance = &instances[index];
+                    let stem = unique_child_stem(&instance.name, &mut used, &mut next);
+                    let children = children_by_parent.get(index).map_or(&[][..], Vec::as_slice);
+                    if let Some(path) = project_script_path(
+                        parent_dir,
+                        &stem,
+                        !children.is_empty(),
+                        &instance.class_name,
+                        &instance.properties,
+                    ) {
+                        out.push(path);
+                    }
+                    script_paths(
+                        instances,
+                        children_by_parent,
+                        children,
+                        &parent_dir.join(&stem),
+                        out,
+                    );
+                }
+            }
+            let mut paths = Vec::new();
+            script_paths(
+                &document.instances,
+                &children_by_parent,
+                &children_by_parent[0],
+                &service_dir,
+                &mut paths,
+            );
+            for path in paths {
+                if rng.below(3) != 0 {
+                    std::fs::create_dir_all(path.parent().unwrap())
+                        .map_err(|error| error.to_string())?;
+                    std::fs::write(&path, "return 1\n").map_err(|error| error.to_string())?;
+                }
+            }
+            let built = build_full_service_sourcemap(
+                &document.instances,
+                &children_by_parent,
+                0,
+                &project_root,
+                &service_dir,
+            );
+            let expected = expected(&project_root);
+            let _ = std::fs::remove_dir_all(&project_root);
+            if built.children != expected {
+                return Err(format!(
+                    "built\n{}\nand every instance gives\n{}",
+                    serde_json::to_string(&built.children).unwrap(),
+                    serde_json::to_string(&expected).unwrap()
+                ));
+            }
+            Ok(())
+        });
     }
 }
