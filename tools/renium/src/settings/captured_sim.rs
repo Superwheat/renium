@@ -81,6 +81,9 @@ fn native_value(value: &Value) -> Option<NativeSettingsValue> {
             .map(NativeSettingsValue::Int)
             .or_else(|| value.as_f64().map(NativeSettingsValue::Float64)),
         Value::Object(fields) => match fields.get("_type")?.as_str()? {
+            "UniqueId" => Some(NativeSettingsValue::UniqueId(
+                fields.get("value")?.as_str()?.into(),
+            )),
             // A payload the capture holds once for every instance that has it.
             "SharedString" | "BinaryString" => Some(NativeSettingsValue::Shared(
                 std::sync::Arc::new(value.clone()),
@@ -223,6 +226,7 @@ fn native_values(seed: u64, count: usize) -> Vec<NativeSettingsValue> {
         NativeSettingsValue::Float64(f64::NEG_INFINITY),
         NativeSettingsValue::Float64(0.1),
         NativeSettingsValue::String("text \u{2603}\0".into()),
+        NativeSettingsValue::UniqueId(format!("{seed:032x}")),
         NativeSettingsValue::Enum("FutureEnum.Item".into()),
         NativeSettingsValue::Ref(rng.below(count)),
         NativeSettingsValue::Vector2([number, -0.0]),
@@ -990,6 +994,8 @@ fn a_captured_digest_tells_typed_values_apart() {
         NativeSettingsValue::Enum("b".into()),
         shared("a"),
         shared("b"),
+        NativeSettingsValue::UniqueId("a".into()),
+        NativeSettingsValue::UniqueId("b".into()),
     ];
     let digest = |value: &NativeSettingsValue| {
         let mut state = digested_state(true);

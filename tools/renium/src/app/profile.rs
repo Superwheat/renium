@@ -108,6 +108,20 @@ static LIVE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 static MOST_LIVE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(feature = "count-live-memory")]
+thread_local! {
+    static MEASURE_FREED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Heap allocations released by this thread alone. Used with one cloned field
+/// at a time; concurrent capture workers cannot contaminate the measurement.
+#[cfg(feature = "count-live-memory")]
+pub(crate) fn measure_drop<T>(value: T) -> usize {
+    MEASURE_FREED.with(|count| assert!(count.replace(Some(0)).is_none()));
+    drop(value);
+    MEASURE_FREED.with(|count| count.take().unwrap())
+}
+
+#[cfg(feature = "count-live-memory")]
 fn count_allocated(size: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     let live = LIVE_BYTES.fetch_add(size, Relaxed) + size;
@@ -130,6 +144,11 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
         LIVE_BYTES.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        let _ = MEASURE_FREED.try_with(|count| {
+            if let Some(freed) = count.get() {
+                count.set(Some(freed + layout.size()));
+            }
+        });
         unsafe { mimalloc::MiMalloc.dealloc(pointer, layout) }
     }
 

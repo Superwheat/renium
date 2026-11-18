@@ -2128,6 +2128,8 @@ pub(crate) fn exported_parts_to_service_state(
         }
         state.native_properties_by_instance = Some(native_properties);
     }
+    #[cfg(feature = "count-live-memory")]
+    super::memory::measure(service, &state);
     Ok(state)
 }
 
@@ -2489,6 +2491,7 @@ fn decompress_bridge_text(
     let expected_len = uncompressed_bytes.context("Compressed bridge payload omitted its size")?;
     let compressed =
         base64::decode(text.as_bytes()).context("Compressed bridge payload is not valid base64")?;
+    drop(text);
     let decoded = zstd::bulk::decompress(&compressed, expected_len)
         .context("Compressed bridge payload has invalid zstd data")?;
     if decoded.len() != expected_len {

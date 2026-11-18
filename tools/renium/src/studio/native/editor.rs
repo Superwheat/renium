@@ -1657,18 +1657,24 @@ mod native_identity_tests {
             })
             .collect::<Vec<_>>();
         let decode = || {
-            decode_native_serialization_batch(&bytes, &batch, &groups, Arc::default(), Some(&rows))
-                .unwrap()
+            decode_native_serialization_batch(
+                bytes.clone(),
+                &batch,
+                &groups,
+                Arc::default(),
+                Some(rows.clone()),
+            )
+            .unwrap()
         };
         let mut missing_managed_instance = groups.clone();
         missing_managed_instance[0].instance_count += 1;
         let extra_rows = [rows.clone(), capture_row(8, 0, "engine-only").to_vec()].concat();
         let error = decode_native_serialization_batch(
-            &bytes,
+            bytes.clone(),
             &batch,
             &missing_managed_instance,
             Arc::default(),
-            Some(&extra_rows),
+            Some(extra_rows),
         )
         .err()
         .expect("An extra native identity cannot replace a missing managed instance");
@@ -2054,11 +2060,11 @@ fn decode_native_service_dom(
 }
 
 fn decode_native_serialization_batch(
-    bytes: &[u8],
+    bytes: Vec<u8>,
     batch: &EditorBinarySerializationBatch,
     service_groups: &[EditorBinaryExportGroup],
     property_filter: Arc<HashMap<String, HashSet<String>>>,
-    identity_rows: Option<&[u8]>,
+    identity_rows: Option<Vec<u8>>,
 ) -> Result<HashMap<String, NativeServiceDom>> {
     let _profile = crate::app::profile::span(&format!(
         "{}: decode and partition {} bytes",
@@ -2112,7 +2118,7 @@ fn decode_native_serialization_batch(
         )
         .retain_defaults_for_classes(groups.iter().map(|group| group.service.clone()).collect())
         .flat_property_filter(property_filter)
-        .deserialize_flat(std::io::Cursor::new(bytes))
+        .deserialize_flat(std::io::Cursor::new(bytes.as_slice()))
     {
         Ok(flat) => flat,
         Err(error) => bail!(
@@ -2125,6 +2131,10 @@ fn decode_native_serialization_batch(
         &format!("{}: native binary decode", batch.id),
         decode_started,
     );
+    // The flat decoder owns its values. Release the serialized copy before
+    // identity joins and partition allocation overlap the overlay workers.
+    drop(bytes);
+    let captured = identity_rows.is_some();
     if flat.root_indices.len() != expected_roots {
         bail!(
             "Studio native serialization batch {} contains {} roots; expected {}: Studio changed the place during native export; retry the sync",
@@ -2143,8 +2153,10 @@ fn decode_native_serialization_batch(
     }
     let identities = crate::app::profile::span("native capture validate every identity");
     let captured_debug_ids = identity_rows
+        .as_deref()
         .map(|rows| native_capture_debug_ids(&flat.instances, rows))
         .transpose()?;
+    drop(identity_rows);
     drop(identities);
     let references =
         crate::app::profile::span("native capture partition bounds and cross-service references");
@@ -2153,7 +2165,7 @@ fn decode_native_serialization_batch(
     let mut expected_start = 0;
     for group in &groups {
         let root_end = root_offset
-            + if identity_rows.is_some() {
+            + if captured {
                 1
             } else {
                 native_serialized_root_count(group)?
@@ -2175,7 +2187,7 @@ fn decode_native_serialization_batch(
                 group.service
             );
         }
-        let serialized_instance_count = if identity_rows.is_some() {
+        let serialized_instance_count = if captured {
             group.instance_count
         } else {
             native_serialized_instance_count(group)?
@@ -2191,16 +2203,16 @@ fn decode_native_serialization_batch(
         let marker = &flat.instances[start];
         if marker.parent_index.is_some()
             || marker.class.as_str()
-                != if identity_rows.is_some() {
+                != if captured {
                     group.service.as_str()
                 } else {
                     "Folder"
                 }
-            || identity_rows.is_none() && marker.name != group.service
+            || !captured && marker.name != group.service
         {
             bail!("Studio native {} batch marker is invalid", group.service);
         }
-        if identity_rows.is_some() {
+        if captured {
             flat.instances[start].name.clone_from(&group.service);
         }
         spans.push((start, end, root_offset, root_end));
@@ -2275,6 +2287,9 @@ fn decode_native_serialization_batch(
     }
     let path_segments_by_ref = Arc::new(path_segments_by_ref);
     let path_ordinals_by_ref = Arc::new(path_ordinals_by_ref);
+    drop(global_index_by_dense_ref);
+    drop(owner_by_dense_ref);
+    drop(ordinal_by_global_index);
     drop(references);
     let root_indices = flat.root_indices;
     let mut source_instances = flat.instances.into_iter();
@@ -2348,7 +2363,7 @@ fn decode_native_serialization_batch(
             )
         };
         let mut captured_root_properties = Map::new();
-        if identity_rows.is_some() {
+        if captured {
             let database = rbx_reflection_database::get()?;
             for &name in crate::editor::native_roots::capture_properties(&group.service) {
                 let saved_name = crate::rbx::encode::rbx_serialized_property_name_for_logical(
@@ -2658,7 +2673,7 @@ fn convert_native_service_output(
     };
     drop(prepare);
     let conversion_started = Instant::now();
-    let converted = native_instances
+    let (instances, native_properties_by_instance): (Vec<SnapshotInstance>, Vec<Vec<NativeSettingsProperty>>) = native_instances
         .into_par_iter()
         .zip(overlay_by_index.into_par_iter())
         .zip(debug_ids.into_par_iter())
@@ -2781,11 +2796,7 @@ fn convert_native_service_output(
                 ))
             },
         )
-        .collect::<Result<Vec<_>>>()?;
-    let (instances, native_properties_by_instance): (
-        Vec<SnapshotInstance>,
-        Vec<Vec<NativeSettingsProperty>>,
-    ) = converted.into_iter().unzip();
+        .collect::<Result<_>>()?;
     log_timing(
         &format!("{}: native instance conversion", group.service),
         conversion_started,
@@ -3219,7 +3230,7 @@ fn editor_binary_export_parts_once<'a>(
                                                         Some(serialization_complete_signal),
                                                     )?;
                                                     decode_native_serialization_batch(
-                                                        &bytes,
+                                                        bytes,
                                                         batch,
                                                         service_groups,
                                                         Arc::clone(native_decode_filter),
@@ -3523,16 +3534,13 @@ fn capture_native_export(
         services,
     };
     let decoded = decode_native_serialization_batch(
-        &captured.bytes,
+        captured.bytes,
         &batch,
         groups,
         filter,
-        Some(&captured.identities),
+        Some(captured.identities),
     );
     let capture_attempts = captured.attempts;
-    let release = crate::app::profile::span("native capture release serialized buffers");
-    drop(captured);
-    drop(release);
     decoded
         .map(Mutex::new)
         .map_err(|error| capture_join_error(pid, capture_attempts, error))

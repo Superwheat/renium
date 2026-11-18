@@ -653,11 +653,12 @@ pub(crate) fn parse_native_overlay_class_groups(
             if std::mem::replace(&mut seen_offsets[offset - 1], true) {
                 bail!("Native overlay item offset {offset} is duplicated");
             }
-            let attributes = decode_compact_v5_attributes(fields[1].clone(), strings)?;
-            let properties = if fields.len() == 4 {
+            let mut fields = fields.into_iter().skip(1);
+            let attributes = decode_compact_v5_attributes(fields.next().unwrap(), strings)?;
+            let properties = if let Some(mask) = fields.next() {
                 compact_properties_mask_take_v5_with_schema(
-                    &fields[2],
-                    fields[3].clone(),
+                    &mask,
+                    fields.next().unwrap(),
                     class_name,
                     property_schema.map(Vec::as_slice),
                     strings,

@@ -2468,6 +2468,17 @@ fn visit_settings_binary_properties<'a>(
                 continue;
             }
             let property_name = property.name.as_str();
+            if !state.properties_default_elided
+                && let NativeSettingsValue::UniqueId(value) = &property.value
+                && should_skip_binary_property(
+                    state,
+                    instance,
+                    property_name,
+                    &serde_json::json!({"_type": "UniqueId", "value": value}),
+                )
+            {
+                continue;
+            }
             // A shared value is the JSON value it stands for, to every reader.
             if let NativeSettingsValue::Shared(value) = &property.value {
                 if should_skip_binary_property(state, instance, property_name, value) {
@@ -3185,6 +3196,7 @@ fn native_value_kind(value: &NativeSettingsValue) -> u8 {
         NativeSettingsValue::Float64(value) if exact_f32(*value).is_some() => 20,
         NativeSettingsValue::Float64(_) => 5,
         NativeSettingsValue::String(_) => 6,
+        NativeSettingsValue::UniqueId(_) => 8,
         NativeSettingsValue::Ref(_) => 17,
         NativeSettingsValue::Vector2(_) => 11,
         NativeSettingsValue::Vector3(_) => 12,
@@ -3205,6 +3217,11 @@ fn collect_native_value_strings<'a>(
 ) {
     if let NativeSettingsValue::String(value) | NativeSettingsValue::Enum(value) = value {
         add_count(out, value);
+    }
+    if let NativeSettingsValue::UniqueId(value) = value {
+        for text in ["_type", "UniqueId", "value", value.as_str()] {
+            add_count(out, text);
+        }
     }
 }
 
@@ -3235,6 +3252,15 @@ fn write_native_value_payload<W: Write + ?Sized>(
         NativeSettingsValue::Float64(value) => writer.write_all(&value.to_le_bytes())?,
         NativeSettingsValue::String(value) | NativeSettingsValue::Enum(value) => {
             write_binary_string_id(writer, string_ids, value)?;
+        }
+        NativeSettingsValue::UniqueId(value) => {
+            // Exactly the existing JSON object's wire form, including key order.
+            write_var_u64(writer, 2)?;
+            for (key, text) in [("_type", "UniqueId"), ("value", value.as_str())] {
+                write_binary_string_id(writer, string_ids, key)?;
+                writer.write_all(&[6])?;
+                write_binary_string_id(writer, string_ids, text)?;
+            }
         }
         NativeSettingsValue::Ref(index) => write_var_u64(writer, *index as u64)?,
         NativeSettingsValue::Vector2(_)

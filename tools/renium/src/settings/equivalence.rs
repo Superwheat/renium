@@ -1131,6 +1131,10 @@ pub(crate) fn persistent_identity_of(properties: &Map<String, Value>) -> Option<
         return None;
     }
     let id = value.get("value")?.as_str()?;
+    persistent_identity_text(id)
+}
+
+pub(crate) fn persistent_identity_text(id: &str) -> Option<&str> {
     (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) && id.bytes().any(|b| b != b'0'))
         .then_some(id)
 }

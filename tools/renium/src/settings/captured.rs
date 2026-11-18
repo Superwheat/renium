@@ -816,6 +816,28 @@ struct Places {
     sole_root: Option<usize>,
 }
 
+fn captured_persistent_identity(state: &ServiceState, index: usize) -> Option<&str> {
+    use crate::settings::equivalence::{persistent_identity_of, persistent_identity_text};
+    let properties = &state.instances[index].properties;
+    if properties.contains_key(UNIQUE_ID) {
+        return persistent_identity_of(properties);
+    }
+    let mut matches = state
+        .native_properties_by_instance
+        .as_ref()?
+        .get(index)?
+        .iter()
+        .filter(|property| property.name == UNIQUE_ID);
+    let property = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    match &property.value {
+        NativeSettingsValue::UniqueId(id) => persistent_identity_text(id),
+        _ => None,
+    }
+}
+
 impl Places {
     /// `None` where two instances carry one id: those the alignment matches
     /// by what they hold, which takes the whole documents.
@@ -825,8 +847,6 @@ impl Places {
         records: &[SettingsBinaryInstance<'_>],
         stored_len: usize,
     ) -> Result<Option<Self>> {
-        use crate::settings::equivalence::persistent_identity_of;
-
         let budget = DecodeBudget::for_file(stored_len);
         let ids = records
             .iter()
@@ -836,8 +856,8 @@ impl Places {
             return Ok(None);
         }
         let mut unique = AHashMap::with_capacity(records.len());
-        for (index, instance) in state.instances.iter().enumerate() {
-            if let Some(id) = persistent_identity_of(&instance.properties) {
+        for index in 0..state.instances.len() {
+            if let Some(id) = captured_persistent_identity(state, index) {
                 unique
                     .entry(id)
                     .and_modify(|at| *at = None)
@@ -853,7 +873,7 @@ impl Places {
         let told_alone = (0..records.len())
             .map(|index| {
                 now.viewport_camera == Some(index)
-                    || persistent_identity_of(&state.instances[index].properties)
+                    || captured_persistent_identity(state, index)
                         .is_some_and(|id| unique[id] == Some(index))
             })
             .collect();
@@ -1307,6 +1327,10 @@ fn digest_native_value(
             digest.update([5]);
             crate::settings::equivalence::digest_text(digest, value);
         }
+        NativeSettingsValue::UniqueId(value) => {
+            digest.update([16]);
+            crate::settings::equivalence::digest_text(digest, value);
+        }
         NativeSettingsValue::Ref(index) => {
             digest.update([6]);
             digest.update((*index as u64).to_le_bytes());
@@ -1591,6 +1615,9 @@ fn normalize_source(
     scratch: &mut Vec<u8>,
 ) -> Result<Value> {
     match source {
+        SettingsBinaryValueSource::Native(NativeSettingsValue::UniqueId(_)) => {
+            normalize_complex(source, kind, false, scope, scratch)
+        }
         SettingsBinaryValueSource::Native(value) => native_value(value, scope),
         SettingsBinaryValueSource::Property(value) => {
             property_value(value, source, kind, scope, scratch)
@@ -1683,6 +1710,9 @@ fn native_value(value: &NativeSettingsValue, scope: ConversionScope<'_, '_>) -> 
         NativeSettingsValue::Float64(value) => Ok(json_number_f64(*value)),
         NativeSettingsValue::String(value) => {
             Ok(Value::String(checked_string(value, scope.budget)?))
+        }
+        NativeSettingsValue::UniqueId(_) => {
+            bail!("A native identity is normalized through the object codec")
         }
         NativeSettingsValue::Enum(value) => Ok(typed_object(
             "EnumItem",

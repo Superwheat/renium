@@ -769,6 +769,9 @@ impl RetainedPropertyColumns {
 fn materialized_value(value: &NativeSettingsValue, kind: u8) -> Result<Value> {
     match value {
         NativeSettingsValue::String(value) => return Ok(json!(value)),
+        NativeSettingsValue::UniqueId(value) => {
+            return Ok(typed_object("UniqueId", [("value", json!(value))]));
+        }
         NativeSettingsValue::Shared(value) => return Ok(Value::clone(value)),
         NativeSettingsValue::Enum(value) => {
             return Ok(typed_object("EnumItem", [("name", json!(value))]));

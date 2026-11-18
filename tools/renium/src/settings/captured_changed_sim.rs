@@ -989,17 +989,19 @@ fn instances_nothing_tells_apart_take_the_whole_alignment_under_other_ids() {
             );
         }
     }
-    let reopened = captured(&reopened, false);
-    let before = pulled_digest_from_service_state(&reopened).unwrap();
-    let changed = captured(&changed, false);
-    let now = pulled_digest_from_service_state(&changed).unwrap();
-    let answer = pull_changed_values(&changed, &before.rows, &now.rows, &file)
-        .unwrap()
-        .expect("instances with a UniqueId of their own are compared from memory");
-    let SettingsAlignment::Changed(written) = answer else {
-        panic!("another value is written");
-    };
-    assert_eq!(stored_ids(&written), stored_ids(&file));
+    for native in [false, true] {
+        let reopened = captured(&reopened, native);
+        let before = pulled_digest_from_service_state(&reopened).unwrap();
+        let changed = captured(&changed, native);
+        let now = pulled_digest_from_service_state(&changed).unwrap();
+        let answer = pull_changed_values(&changed, &before.rows, &now.rows, &file)
+            .unwrap()
+            .expect("instances with a UniqueId of their own are compared from memory");
+        let SettingsAlignment::Changed(written) = answer else {
+            panic!("another value is written");
+        };
+        assert_eq!(stored_ids(&written), stored_ids(&file));
+    }
 }
 
 /// A state with one run of instances more than a store, or less, is told by

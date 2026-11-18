@@ -31,6 +31,71 @@ fn pools() -> [rayon::ThreadPool; 3] {
     })
 }
 
+#[test]
+fn native_identities_keep_the_json_wire_format_and_conversion_limits() {
+    let pools = pools();
+    let ids = ["0".repeat(32), "0123456789abcdef0123456789abcdef".into()];
+    let mut json_state = plain_state(ids.len());
+    for (row, id) in json_state.instances.iter_mut().zip(&ids) {
+        row.properties
+            .insert("UniqueId".into(), json!({"_type": "UniqueId", "value": id}));
+    }
+    let expected = encode_service_settings_binary(&json_state).unwrap();
+    let mut native = json_state.clone();
+    native.native_properties_by_instance = Some(
+        ids.into_iter()
+            .map(|id| {
+                vec![NativeSettingsProperty {
+                    name: "UniqueId".into(),
+                    value: NativeSettingsValue::UniqueId(id),
+                }]
+            })
+            .collect(),
+    );
+    for row in &mut native.instances {
+        row.properties.clear();
+    }
+    assert_eq!(encode_service_settings_binary(&native).unwrap(), expected);
+    assert!(oracle(&native, &pools).unwrap());
+    for elided in [false, true] {
+        for state in [&mut native, &mut json_state] {
+            state.properties_default_elided = elided;
+            state.class_defaults_by_class.insert(
+                "Folder".into(),
+                Map::from_iter([(
+                    "UniqueId".into(),
+                    json!({"_type": "UniqueId", "value": "0".repeat(32)}),
+                )]),
+            );
+        }
+        assert_eq!(
+            encode_service_settings_binary(&native).unwrap(),
+            encode_service_settings_binary(&json_state).unwrap()
+        );
+        assert!(oracle(&native, &pools).unwrap());
+    }
+    // The reported JSON value still wins when both representations are present.
+    native.instances[1]
+        .properties
+        .clone_from(&json_state.instances[0].properties);
+    json_state.instances[1]
+        .properties
+        .clone_from(&native.instances[1].properties);
+    assert_eq!(
+        encode_service_settings_binary(&native).unwrap(),
+        encode_service_settings_binary(&json_state).unwrap()
+    );
+    assert!(oracle(&native, &pools).unwrap());
+    native.instances[1].properties.clear();
+    native.native_properties_by_instance.as_mut().unwrap()[1][0].value =
+        NativeSettingsValue::UniqueId("x".repeat(MAX_SETTINGS_STRING_BYTES + 1));
+    rejected(
+        &native,
+        "Settings string exceeds safe size limit of 33554432 bytes",
+        &pools,
+    );
+}
+
 fn rejected(state: &ServiceState, message: &str, pools: &[rayon::ThreadPool]) {
     let error = pools[0].install(|| {
         encode_service_settings_binary(state)

@@ -98,6 +98,8 @@ pub(crate) enum NativeSettingsValue {
     Float32(f32),
     Float64(f64),
     String(String),
+    /// The binary file codec's identity, retained without a JSON object per row.
+    UniqueId(String),
     Ref(usize),
     Vector2([f32; 2]),
     Vector3([f32; 3]),

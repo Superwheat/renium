@@ -488,6 +488,25 @@ mod tests {
     use crate::roblox::schema::{PropertySchemaEntry, TYPE_ID_CFRAME};
 
     #[test]
+    fn native_capture_keeps_file_identities_without_json_objects() {
+        let id = rbx_dom_weak::types::UniqueId::new(23, 17, 11);
+        let properties = [("UniqueId".into(), RbxVariant::UniqueId(id))];
+        let (native, json, _, _) = rbx_properties_to_native_settings_records(
+            "Folder",
+            properties.iter().map(|(name, value)| (name, value)),
+            rbx_reflection_database::get().unwrap(),
+            &BytecodeModelImportRefs::default(),
+            None,
+        );
+        assert!(!json.contains_key("UniqueId"));
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].name, "UniqueId");
+        assert!(
+            matches!(&native[0].value, NativeSettingsValue::UniqueId(value) if value == &id.to_string())
+        );
+    }
+
+    #[test]
     fn model_world_pivot_uses_the_live_overlay() {
         let database = rbx_reflection_database::get().unwrap();
         let schemas = PropertySchemaMap::from([(
@@ -783,6 +802,7 @@ fn fetch_native_overlay_batch_once(
     } else {
         Vec::new()
     };
+    drop(batch.debug_id_buffer);
     let settings_ids = if request.include_debug_ids {
         let mut ids =
             decode_batch_settings_ids(batch.settings_ids, take_count, "Native overlay settings id")
@@ -915,6 +935,7 @@ fn rbx_variant_to_native_settings_value(
             Some(NativeSettingsValue::Float64(*value))
         }
         RbxVariant::String(value) => Some(NativeSettingsValue::String(value.clone())),
+        RbxVariant::UniqueId(value) => Some(NativeSettingsValue::UniqueId(value.to_string())),
         RbxVariant::ContentId(value) => {
             Some(NativeSettingsValue::String(value.as_str().to_string()))
         }
