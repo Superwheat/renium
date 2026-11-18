@@ -2386,9 +2386,11 @@ pub(crate) fn select_editor_binary_import(
     let fallback_reason = reader_fallback(cfg!(windows), disabled, || {
         #[cfg(windows)]
         {
-            let _span = crate::app::profile::span("native service reader preflight");
-            let pid = crate::editor::review::studio_pid_for_bridge(bridge)?;
-            crate::studio::native::serializer::prepare_service_reader(pid)
+            let started = Instant::now();
+            let result = crate::editor::review::studio_pid_for_bridge(bridge)
+                .and_then(crate::studio::native::serializer::prepare_service_reader);
+            log_timing("native service reader preflight", started);
+            result
         }
         #[cfg(not(windows))]
         {
