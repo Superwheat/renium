@@ -34,7 +34,7 @@ impl NativeValuePool {
             };
             // JSON is authoritative over a same-named native row. Preserve
             // that rule when its value moves into the native representation.
-            native.retain(|property| property.name != *name);
+            native.retain(|property| property.name.as_str() != name.as_str());
             native.push(NativeSettingsProperty {
                 name: name.as_str().into(),
                 value: NativeSettingsValue::Shared(shared),

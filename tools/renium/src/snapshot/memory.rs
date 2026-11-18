@@ -79,6 +79,7 @@ pub(super) fn measure(service: &str, state: &ServiceState) {
     let mut native = 0;
     let mut native_slots = 0;
     let mut native_occupied = 0;
+    let mut native_names = HashSet::new();
     let mut cframes = 0;
     let mut shared = 0;
     let mut shared_seen = HashSet::new();
@@ -143,7 +144,9 @@ pub(super) fn measure(service: &str, state: &ServiceState) {
             native_occupied += row.len();
             native += row.capacity() * size_of::<NativeSettingsProperty>();
             for property in row {
-                native += property.name.capacity();
+                // PropertyName borrows the process's interned text. Count its
+                // distinct bytes separately, never as an owned per-row heap.
+                native_names.insert(property.name.as_str());
                 match &property.value {
                     NativeSettingsValue::CFrame(value) => {
                         cframes += 1;
@@ -182,6 +185,8 @@ pub(super) fn measure(service: &str, state: &ServiceState) {
         "nativeRows": native, "nativeSharedValues": shared,
         "nativeSlots": native_slots, "nativePropertySize": size_of::<NativeSettingsProperty>(),
         "nativeOccupied": native_occupied,
+        "nativePropertyNames": native_names.len(),
+        "nativePropertyNameUtf8": native_names.iter().map(|name| name.len()).sum::<usize>(),
         "cframeCount": cframes,
         "children": state.children_by_index.capacity() * size_of::<Vec<usize>>()
             + state.children_by_index.iter().map(|c| c.capacity()*size_of::<usize>()).sum::<usize>(),

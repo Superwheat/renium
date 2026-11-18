@@ -500,7 +500,7 @@ mod tests {
         );
         assert!(!json.contains_key("UniqueId"));
         assert_eq!(native.len(), 1);
-        assert_eq!(native[0].name, "UniqueId");
+        assert_eq!(native[0].name.as_str(), "UniqueId");
         assert!(
             matches!(&native[0].value, NativeSettingsValue::UniqueId(value) if value == &id.to_string())
         );

@@ -2416,7 +2416,7 @@ mod projection_tests {
         })?;
         for (before_value, after_value, forget) in [(1, 2, false), (2, 3, true)] {
             let before = fs::read(&store)?;
-            decode_settings_bytecode(&before)?;
+            crate::settings::bytecode::decode_settings_bytecode(&before)?;
             let digest = <[u8; 32]>::from(Sha256::digest(&before));
             thread::scope(|scope| -> Result<()> {
                 let held = blocked.store_gate.lock_recover();

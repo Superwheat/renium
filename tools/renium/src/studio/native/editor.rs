@@ -1837,7 +1837,7 @@ mod native_identity_tests {
                 if let NativeSettingsValue::Shared(value) = &row.value {
                     instance
                         .properties
-                        .insert(row.name.clone(), value.as_ref().clone());
+                        .insert(row.name.as_str().to_owned(), value.as_ref().clone());
                     false
                 } else {
                     true
