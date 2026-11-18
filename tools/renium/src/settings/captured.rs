@@ -76,6 +76,16 @@ pub(super) fn pulled_digest(state: &ServiceState) -> Result<PulledDigest> {
     })
 }
 
+/// No answer from the instances alone: the pull aligns the whole documents,
+/// and the trace log says why.
+fn whole<T>(why: &str) -> Result<Option<T>> {
+    crate::app::output::log_global(
+        4,
+        format_args!("[renium] store compared as whole documents: {why}"),
+    );
+    Ok(None)
+}
+
 /// The most changed instances a pull compares one by one; past that it
 /// aligns the whole documents.
 const MAX_CHANGED_ROWS: usize = 2_048;
@@ -92,26 +102,28 @@ pub(super) fn changed_values(
         || before.viewport_camera != now.viewport_camera
         || !comparable_by_instance(state, now)
     {
-        return Ok(None);
+        return whole("the state is not comparable with what the pull remembers");
     }
     let mut changed = Vec::new();
     for (index, (before, now)) in before.rows.iter().zip(&now.rows).enumerate() {
         if before.placed != now.placed {
-            return Ok(None);
+            return whole("an instance stands elsewhere than the pull remembers");
         }
         if before.values != now.values {
             if changed.len() == MAX_CHANGED_ROWS {
-                return Ok(None);
+                return whole("more instances changed than are compared one by one");
             }
             changed.push(index);
         }
     }
     let records = collect_service_settings_binary_instances(state);
     if changed.is_empty() || !written_where_they_stand(&records, now) {
-        return Ok(None);
+        return whole(
+            "nothing changed that the pull remembers, or the state is not written in its order",
+        );
     }
     let Some(places) = Places::of(state, now, &records, stored.len())? else {
-        return Ok(None);
+        return whole("two instances of the state carry one id");
     };
     let stored = StoredRows {
         file: stored,
@@ -150,15 +162,15 @@ pub(super) fn changed_document_rows(
 ) -> Result<Option<(SettingsAlignment, bool)>> {
     let _span = crate::app::profile::span("captured store compared by instance");
     if !comparable_by_instance(state, now) {
-        return Ok(None);
+        return whole("the state is written another way than its document");
     }
     let records = collect_service_settings_binary_instances(state);
     // What the state alone can say comes before the two documents are read.
     if !written_where_they_stand(&records, now) {
-        return Ok(None);
+        return whole("the state is not written in its order");
     }
     let Some(places) = Places::of(state, now, &records, stored.len())? else {
-        return Ok(None);
+        return whole("two instances of the state carry one id");
     };
     let lookup = build_settings_binary_instance_lookup(state, &records);
     let (stored_rows, captured_rows) = rayon::join(
@@ -177,7 +189,7 @@ pub(super) fn changed_document_rows(
         || document_row_digests(state, &records, &lookup, stored.len()),
     );
     let (Some(stored_rows), captured_rows) = (stored_rows?, captured_rows?) else {
-        return Ok(None);
+        return whole("the store differs from the state by more than one run of instances");
     };
     let moved = stored_rows.moved;
     let mut changed = Vec::new();
@@ -193,13 +205,19 @@ pub(super) fn changed_document_rows(
         if stored_rows.digests[stored_index] != *values {
             // A root that differs can name another viewport camera than the
             // one left out here, which only the whole documents show.
-            if changed.len() == MAX_CHANGED_ROWS || records[index].parent_index.is_none() {
-                return Ok(None);
+            if records[index].parent_index.is_none() {
+                return whole("a root differs");
             }
             changed.push(index);
         } else {
             renamed |= stored_rows.unique_ids[stored_index] != *unique_id;
         }
+    }
+    if changed.len() > MAX_CHANGED_ROWS {
+        return whole(&format!(
+            "{} instances differ, more than are compared one by one",
+            changed.len()
+        ));
     }
     let stored = StoredRows {
         file: stored,
@@ -554,7 +572,7 @@ fn changed_rows<'a>(
                 .map(|row| moved.map_or(Some(*row), |moved| moved.in_store(*row)))
                 .collect::<Option<Vec<_>>>()
             else {
-                return Ok(None);
+                return whole("a changed instance is none the store holds");
             };
             decode_rows(stored.file, &stored_at)?
         }
@@ -604,12 +622,12 @@ fn changed_rows<'a>(
                 || stored.parent_index != captured.parent_index
         })
     {
-        return Ok(None);
+        return whole("an instance stands under another name, class or parent than the stored one");
     }
     // A stored camera whose enum items can gain their types makes the answer
     // follow the captured camera, which no digest covers.
     if now.viewport_camera.is_some() && stored_rows.last().is_some_and(instance_lacks_enum_types) {
-        return Ok(None);
+        return whole("the stored viewport camera holds an enum item without its type");
     }
     // A stored instance the encoder of documents would write another way
     // (an older store's) is compared and kept by the alignment.
@@ -618,7 +636,7 @@ fn changed_rows<'a>(
         crate::settings::equivalence::forced_property_differs(&stored.properties)
             || !values_encode_alike(&stored.properties, &stored.attributes, root_service)
     }) {
-        return Ok(None);
+        return whole("a stored instance is written another way than documents are today");
     }
     // What each changed instance says: whether its values are the stored
     // ones as a pull counts them, and whether its UniqueId is.
@@ -631,14 +649,14 @@ fn changed_rows<'a>(
                 same_values.push(as_held);
                 same_under_todays_names &= as_named;
             }
-            None => return Ok(None),
+            None => return whole("an enum item of a changed instance gains its type"),
         }
     }
     // The alignment compares instances at their places as they hold their
     // values, and what it aligned under the names of today: where the two
     // say different things, which of them counts is its to say.
     if same_values.iter().all(|same| *same) != same_under_todays_names {
-        return Ok(None);
+        return whole("a changed instance compares otherwise under the names of today");
     }
     let renamed = read.as_ref().is_some_and(|read| read.renamed)
         || pairs().any(|(stored, captured)| {
@@ -666,7 +684,7 @@ fn changed_rows<'a>(
             (Some(stored), Some(captured)) if now.viewport_camera.is_some() => {
                 match pulled_instance_values_unchanged(stored, captured, root_service)? {
                     Some((as_held, _)) => as_held,
-                    None => return Ok(None),
+                    None => return whole("an enum item of the viewport camera gains its type"),
                 }
             }
             _ => true,
@@ -708,7 +726,7 @@ fn changed_rows<'a>(
         stand_as_stored || !renamed && places.kept_under_other_ids(&ids)
     };
     if !kept {
-        return Ok(None);
+        return whole("nothing tells every instance for the stored one at its place");
     }
     // Under other ids than the state's the alignment knows the camera only
     // once it matched the instances, and puts a stored camera that holds a
@@ -718,7 +736,7 @@ fn changed_rows<'a>(
         && let (Some(stored), Some(captured)) = (stored_rows.last(), captured_rows.last())
         && (stored.properties != captured.properties || stored.attributes != captured.attributes)
     {
-        return Ok(None);
+        return whole("the stored viewport camera holds a reference and differs");
     }
     // A store with other instances than the state is written.
     if moved.is_none() && !renamed && same_values.iter().all(|same| *same) {
