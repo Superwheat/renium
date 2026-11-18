@@ -1137,14 +1137,17 @@ fn native_value(value: &NativeSettingsValue, scope: ConversionScope<'_, '_>) -> 
         | NativeSettingsValue::Color3(_)
         | NativeSettingsValue::Rect(_)
         | NativeSettingsValue::CFrame(_) => {
-            let kind = fixed_numeric_kind_from_tag(native_value_kind(value))
-                .context("Expected fixed native value")?;
-            Ok(fixed_value(
-                kind,
-                native_fixed_components(value).context("Expected native components")?,
-            ))
+            fixed_native_value(value).context("Expected fixed native value")
         }
     }
+}
+
+/// A typed value of several floats as a document holds it.
+pub(super) fn fixed_native_value(value: &NativeSettingsValue) -> Option<Value> {
+    Some(fixed_value(
+        fixed_numeric_kind_from_tag(native_value_kind(value))?,
+        native_fixed_components(value)?,
+    ))
 }
 
 fn fixed_fields(kind: FixedNumericKind) -> (&'static str, &'static [&'static str]) {

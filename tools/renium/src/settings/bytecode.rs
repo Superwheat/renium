@@ -2407,19 +2407,29 @@ fn visit_settings_binary_properties<'a>(
             }
             // A decoder discards the record's own fields, and reads a float
             // that is no number back as the value that names it: both are
-            // written as the encoder of documents writes them.
+            // written as the encoder of documents writes them. So is a value
+            // of several floats of which one is no number: a store holds that
+            // one in one form, whatever bits Studio gave it.
             if SETTINGS_RECORD_FIELDS.contains(&property_name) {
                 continue;
             }
             let no_number = match &property.value {
                 NativeSettingsValue::Float32(value) if !value.is_finite() => {
-                    Some(f64::from(*value))
+                    Some(nonfinite_float_json(f64::from(*value)))
                 }
-                NativeSettingsValue::Float64(value) if !value.is_finite() => Some(*value),
+                NativeSettingsValue::Float64(value) if !value.is_finite() => {
+                    Some(nonfinite_float_json(*value))
+                }
+                value
+                    if native_fixed_components(value)
+                        .is_some_and(|floats| floats.iter().any(|float| float.is_nan())) =>
+                {
+                    captured::fixed_native_value(value)
+                }
                 _ => None,
             };
             let source = match no_number {
-                Some(value) => SettingsBinaryValueSource::Settled(nonfinite_float_json(value)),
+                Some(value) => SettingsBinaryValueSource::Settled(value),
                 None => SettingsBinaryValueSource::Native(&property.value),
             };
             let kind = binary_source_value_kind(&source, lookup)?;

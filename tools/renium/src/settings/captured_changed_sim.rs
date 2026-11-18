@@ -233,6 +233,22 @@ fn captured(document: &SettingsBytecode, native: bool) -> ServiceState {
                     value: NativeSettingsValue::String(row.name.clone()),
                 });
             }
+            // Studio hands over what is no number with whatever bits it has.
+            let no_number = f32::from_bits(0xffc0_0000);
+            if index % 5 == 3 {
+                typed.push(NativeSettingsProperty {
+                    name: "Velocity".into(),
+                    value: NativeSettingsValue::Vector3([no_number, 1.0, f32::NAN]),
+                });
+            }
+            if index % 5 == 4 {
+                let mut frame = [no_number; 12];
+                frame[..3].copy_from_slice(&[1.0, 2.0, 3.0]);
+                typed.push(NativeSettingsProperty {
+                    name: "Pivot".into(),
+                    value: NativeSettingsValue::CFrame(frame),
+                });
+            }
         }
     }
     state.native_properties_by_instance = typed;
