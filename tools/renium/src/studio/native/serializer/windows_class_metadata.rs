@@ -196,14 +196,18 @@ struct ClassImage<'a, 'b> {
     image: &'a PeImage<'b>,
     class_table: usize,
     evidence: Evidence,
-    remaining_analyses: usize,
+    remaining_repeats: usize,
 }
 
 impl Image for ClassImage<'_, '_> {
     fn code(&mut self, address: usize) -> Option<Vec<u8>> {
-        self.remaining_analyses = self.remaining_analyses.checked_sub(1)?;
         let bytes = function(self.image, address)?;
-        if !self.evidence.code.contains(&address) {
+        if self.evidence.code.contains(&address) {
+            self.remaining_repeats = self.remaining_repeats.checked_sub(1)?;
+        } else {
+            if self.evidence.code.len() >= 32 {
+                return None;
+            }
             self.evidence.code.push(address);
         }
         Some(bytes.to_vec())
@@ -246,7 +250,7 @@ pub(super) fn source(image: &PeImage<'_>, entry: usize, class_table: usize) -> O
         image,
         class_table,
         evidence: Evidence::default(),
-        remaining_analyses: 32,
+        remaining_repeats: 256,
     };
     follows_name(&mut probe, entry, State::default(), 0).then_some(probe.evidence)
 }
@@ -254,6 +258,51 @@ pub(super) fn source(image: &PeImage<'_>, entry: usize, class_table: usize) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_function_visits_have_a_separate_budget() {
+        let mut bytes = vec![0xc3; 0x1000];
+        for index in 0..33u32 {
+            let at = 0x800 + index as usize * 12;
+            bytes[at..at + 4].copy_from_slice(&(index + 0x100).to_le_bytes());
+            bytes[at + 4..at + 8].copy_from_slice(&(index + 0x101).to_le_bytes());
+        }
+        let image = PeImage {
+            bytes: &bytes,
+            image_base: 0,
+            image_stamp: [0; 3],
+            sections: [
+                (*b".text\0\0\0", 0x100, 33, 0x20000000),
+                (*b".pdata\0\0", 0x800, 33 * 12, 0),
+            ]
+            .into_iter()
+            .map(|(name, start, size, characteristics)| PeSection {
+                name,
+                virtual_size: size,
+                virtual_address: start,
+                raw_size: size,
+                raw_offset: start,
+                characteristics,
+            })
+            .collect(),
+        };
+        let mut probe = ClassImage {
+            image: &image,
+            class_table: 0,
+            evidence: Evidence::default(),
+            remaining_repeats: 256,
+        };
+        assert!(probe.code(0x100).is_some());
+        for _ in 0..256 {
+            assert!(probe.code(0x100).is_some());
+        }
+        assert!(probe.code(0x100).is_none());
+        for at in 0x101..0x120 {
+            assert!(probe.code(at).is_some());
+        }
+        assert!(probe.code(0x120).is_none());
+        assert_eq!(probe.evidence.code.len(), 32);
+    }
     struct Fixture {
         code: Vec<u8>,
         field: usize,

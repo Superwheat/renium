@@ -179,7 +179,7 @@ fn insertion(
 pub(super) fn discover(image: &PeImage<'_>) -> Result<Discovery> {
     let class_table =
         undo_selection::descriptor_vtable(image, b".?AVClassDescriptor@Reflection@RBX@@\0")
-            .context("Cannot validate reflection ClassDescriptor RTTI for the service reader")?;
+            .context("Cannot validate reflection ClassDescriptor RTTI for the service reader");
     let rdata = image.section(b".rdata")?;
     let data = &image.bytes[rdata.raw_offset..rdata.raw_offset + rdata.raw_size];
     let mut found = Vec::new();
@@ -226,7 +226,7 @@ pub(super) fn discover(image: &PeImage<'_>) -> Result<Discovery> {
                 }
                 for (index, &method) in methods.iter().enumerate() {
                     if let Some((record, pending, playback, metadata)) =
-                        insertion(image, method, Some(class_table))
+                        insertion(image, method, class_table.as_ref().ok().copied())
                     {
                         let mut code = metadata.code.clone();
                         code.push(method);
@@ -249,8 +249,130 @@ pub(super) fn discover(image: &PeImage<'_>) -> Result<Discovery> {
     }
     anyhow::ensure!(
         found.len() == 1,
-        "Studio history insertion check found {} validated callbacks; the service reader requires exactly one",
-        found.len()
+        "Studio history insertion check found {} validated callbacks; the service reader requires exactly one{}. Update Renium's finder or use --slow-import",
+        found.len(),
+        class_table
+            .err()
+            .map(|error| format!("; {error:#}"))
+            .unwrap_or_default()
     );
     Ok(found.remove(0))
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    // Synthetic image, not bytes copied from an installed Studio. The history
+    // complete-object locator and direct source-name reference are independent
+    // of whether ClassDescriptor RTTI is present.
+    fn fixture() -> Result<Vec<u8>> {
+        let mut bytes = vec![0; 0x4000];
+        let name = b".?AVChangeHistoryService@RBX@@\0";
+        bytes[0x3010..0x3010 + name.len()].copy_from_slice(name);
+        bytes[0x3100..0x3100 + SOURCE_CLASS_NAME.len()].copy_from_slice(SOURCE_CLASS_NAME);
+        for (at, value) in [
+            (0x3200, 1u32),
+            (0x320c, 0x3000),
+            (0x3214, 0x3200),
+            (0x3800, 0x1000),
+            (0x3804, 0x1100),
+            (0x380c, 0x1200),
+            (0x3810, 0x1210),
+            (0x3818, 0x1300),
+            (0x381c, 0x1301),
+        ] {
+            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (at, value) in [(0x3300, 0x3200u64), (0x3308, 0x1000)] {
+            bytes[at..at + 8].copy_from_slice(&(0x140000000 + value).to_le_bytes());
+        }
+        let mut code =
+            hex("33C03881800000007400488B998800000048399990000000488BB190000000480F45DE488B12")?;
+        for index in 0..9 {
+            let target = if index == 5 { 0x1200i32 } else { 0x1300 };
+            let next = 0x1000 + code.len() as i32 + 5;
+            code.push(0xe8);
+            code.extend_from_slice(&(target - next).to_le_bytes());
+            if index == 5 {
+                code.extend(hex("0FB74B100FB750102BCA0FB740123BC87700")?);
+            }
+        }
+        code.push(0xc3);
+        bytes[0x1000..0x1100].fill(0x90);
+        bytes[0x1000..0x1000 + code.len()].copy_from_slice(&code);
+        bytes[0x1200..0x1203].copy_from_slice(&[0x4c, 0x8d, 0x05]);
+        bytes[0x1203..0x1207].copy_from_slice(&(0x3100i32 - 0x1207).to_le_bytes());
+        bytes[0x1207..0x1210].fill(0x90);
+        bytes[0x1300] = 0xc3;
+        Ok(bytes)
+    }
+
+    fn image(bytes: &[u8]) -> PeImage<'_> {
+        PeImage {
+            bytes,
+            image_base: 0x140000000,
+            image_stamp: [0; 3],
+            sections: [
+                (*b".text\0\0\0", 0x1000, 0x1000, 0x20000000),
+                (*b".rdata\0\0", 0x3000, 0x800, 0),
+                (*b".pdata\0\0", 0x3800, 36, 0),
+            ]
+            .into_iter()
+            .map(|(name, start, size, characteristics)| PeSection {
+                name,
+                virtual_size: size,
+                virtual_address: start,
+                raw_size: size,
+                raw_offset: start,
+                characteristics,
+            })
+            .collect(),
+        }
+    }
+
+    #[test]
+    fn direct_source_history_does_not_require_class_descriptor_rtti() -> Result<()> {
+        let bytes = fixture()?;
+        let image = image(&bytes);
+        assert!(
+            undo_selection::descriptor_vtable(&image, b".?AVClassDescriptor@Reflection@RBX@@\0")
+                .is_err()
+        );
+        let found = discover(&image)?;
+        assert_eq!(
+            (
+                found.trace.record,
+                found.trace.pending,
+                found.trace.playback
+            ),
+            (0x88, 0x90, 0x80)
+        );
+        assert_eq!(found.trace.table, 0x3308);
+        assert_eq!(
+            found.metadata.names.into_iter().collect::<Vec<_>>(),
+            [0x3100]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_source_and_ambiguous_history_keep_rtti_diagnostic() -> Result<()> {
+        for duplicate in [false, true] {
+            let mut bytes = fixture()?;
+            if duplicate {
+                bytes[0x3310..0x3318].copy_from_slice(&0x140001000u64.to_le_bytes());
+            } else {
+                bytes[0x3100] = b'X';
+            }
+            let error = discover(&image(&bytes))
+                .err()
+                .context("accepted invalid callback")?;
+            let message = format!("{error:#}");
+            assert!(message.contains("validated callbacks"), "{message}");
+            assert!(message.contains("ClassDescriptor RTTI"), "{message}");
+            assert!(message.contains("--slow-import"), "{message}");
+        }
+        Ok(())
+    }
 }
