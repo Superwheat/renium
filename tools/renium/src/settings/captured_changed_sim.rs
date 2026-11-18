@@ -1318,6 +1318,39 @@ fn a_value_under_an_old_name_takes_the_whole_alignment_under_other_ids() {
     );
 }
 
+/// What the engine alone sets is no part of what an instance holds to a
+/// pull: a place whose instances differ from the store in that alone is the
+/// store's, and none of them is read to find that out.
+#[test]
+fn what_the_engine_sets_makes_no_instance_differ() {
+    let with_engine_state = |migrated: bool, group: usize| {
+        let mut document = twins(1, true, [0.25, 0.75]);
+        for twin in document.instances.iter_mut().skip(1) {
+            twin.properties
+                .insert("InertiaMigrated".into(), json!(migrated));
+            twin.properties
+                .insert("CollisionGroupId".into(), json!(group));
+        }
+        document
+    };
+    let file =
+        encode_service_settings_binary(&captured(&with_engine_state(false, 0), false)).unwrap();
+    let state = captured(&with_engine_state(true, 3), false);
+    let now = pulled_digest_from_service_state(&state).unwrap();
+    let (answer, same) = pull_changed_document_rows(&state, &now.rows, &file)
+        .unwrap()
+        .expect("instances at their places under their ids");
+    assert!(matches!(answer, SettingsAlignment::Equivalent) && same);
+    let aligned = align_pulled_settings_documents_to_reference(
+        decode_settings_bytecode(&file).unwrap(),
+        settings_bytecode_from_service_state(&state).unwrap(),
+        &|| encode_service_settings_binary(&state),
+        std::time::Instant::now(),
+    )
+    .unwrap();
+    assert!(matches!(aligned.alignment, SettingsAlignment::Equivalent));
+}
+
 /// A root is told by being the only one, unless a store holds another
 /// instance under the root's id: the alignment then takes the root for that
 /// one.

@@ -468,10 +468,10 @@ fn document_row_digests(
 }
 
 /// The digest of one instance of a document: its name, class and parent, and
-/// every value it holds but its UniqueId, whose digest comes beside it (all
-/// zero where the instance has none). The id is no part of either, and the
-/// UniqueId stands apart, because Studio gives the instances of a place new
-/// ones each time it opens the place.
+/// every value it holds that a comparison looks at, but its UniqueId, whose
+/// digest comes beside it (all zero where the instance has none). The id is
+/// no part of either, and the UniqueId stands apart, because Studio gives
+/// the instances of a place new ones each time it opens the place.
 pub(super) fn document_row_digest(instance: &SettingsBytecodeInstance) -> ([u8; 16], [u8; 16]) {
     (
         row_digest(
@@ -479,7 +479,7 @@ pub(super) fn document_row_digest(instance: &SettingsBytecodeInstance) -> ([u8; 
             instance
                 .properties
                 .iter()
-                .filter(|(name, _)| name.as_str() != UNIQUE_ID)
+                .filter(|(name, _)| is_digested(&instance.class_name, name))
                 .map(|(name, value)| (name.as_str(), value_digest(value))),
             attributes_digest(&instance.attributes),
         ),
@@ -488,6 +488,18 @@ pub(super) fn document_row_digest(instance: &SettingsBytecodeInstance) -> ([u8; 
             .get(UNIQUE_ID)
             .map_or([0; 16], value_digest),
     )
+}
+
+/// Whether a property is part of its instance's digest: not the UniqueId,
+/// and not what the engine alone sets, which Studio computes anew whenever
+/// it loads the instance and no comparison looks at.
+pub(super) fn is_digested(class_name: &str, name: &str) -> bool {
+    name != UNIQUE_ID
+        && !crate::settings::equivalence::reconciliation_property_is_always_engine_state(
+            rbx_reflection_database::get().ok(),
+            class_name,
+            name,
+        )
 }
 
 /// The property that says which instance a stored one is.

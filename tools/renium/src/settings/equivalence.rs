@@ -3976,9 +3976,21 @@ pub(crate) fn reconciliation_property_is_engine_state(
     name: &str,
     value: &Value,
 ) -> bool {
+    reconciliation_property_is_metadata(name, value)
+        || reconciliation_property_is_always_engine_state(database, class_name, name)
+}
+
+/// The same for a property that is engine state whatever it holds. No
+/// comparison ever looks at one, so a digest of what an instance holds
+/// leaves it out.
+pub(crate) fn reconciliation_property_is_always_engine_state(
+    database: Option<&rbx_reflection::ReflectionDatabase<'_>>,
+    class_name: &str,
+    name: &str,
+) -> bool {
     name == "ScriptGuid"
+        || name == "HistoryId"
         || reconciliation_property_is_derived(name)
-        || reconciliation_property_is_metadata(name, value)
         // The engine sets a WeldConstraint's State from whether its parts are
         // currently joined; a recreated weld settles to another value.
         || class_name == "WeldConstraint" && name == "State"
