@@ -260,6 +260,14 @@ preparationGeneration += 1
 assert(not pcall(call, false) and operations == 0, "Reject a hierarchy changed during host lookup")
 fresh()
 describeAll({ 1 })
+preparationGeneration += 1
+assert(api.getTransactionState({ transactionId = "test", nativeRootWrite = 1, describeNativeRootWrite = true }).nativeRootWrite == 1)
+assert(session.nativeRootPreparation == nil, "A target described alone does not wait on the shared lookup")
+call(false)
+assert(operations == 1, "A host that fell back to single lookups still writes after the place changed")
+call(true, false)
+fresh()
+describeAll({ 1 })
 call(false)
 assert(session.nativeRootPreparation == nil and operations == 1)
 preparationGeneration += 1

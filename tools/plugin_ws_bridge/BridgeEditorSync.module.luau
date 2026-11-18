@@ -6492,6 +6492,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					error(`Native root write target moved: {write.instance:GetFullName()} resolves to {resolved and resolved:GetFullName() or "nothing"}`)
 				end
 				if params.describeNativeRootWrite == true then
+					-- A target described alone was just resolved against the place as
+					-- it stands, so the shared lookup no longer has to hold for it.
+					session.nativeRootPreparation = nil
 					return {
 						transactionId = transactionId,
 						state = state,
