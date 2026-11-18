@@ -453,6 +453,11 @@ pub(crate) fn apply(
     let transaction_id = transaction_id.context("Native root writes require a transaction")?;
     for write in writes {
         let text = write.text()?;
+        #[cfg(test)]
+        if record_test_write(&write) {
+            verified.record(write);
+            continue;
+        }
         apply_write(bridge, transaction_id, &write, &text)?;
         // Keep exact native readback local to this transaction and requested
         // values. Terrain also rechecks both grids at the native commit boundary.
@@ -753,27 +758,28 @@ fn studio_skipped_native_task(error: &anyhow::Error) -> bool {
         .any(|cause| cause.to_string().contains("0xE40F"))
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 thread_local! {
     pub(crate) static RECORDED_WRITES: std::cell::RefCell<Option<Vec<serde_json::Value>>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
-fn apply_write(_: &BridgeServer, _: &str, _write: &RootWrite, _: &str) -> Result<()> {
-    #[cfg(all(test, target_os = "linux"))]
-    if RECORDED_WRITES.with_borrow_mut(|writes| {
+#[cfg(test)]
+fn record_test_write(write: &RootWrite) -> bool {
+    RECORDED_WRITES.with_borrow_mut(|writes| {
         if let Some(writes) = writes {
             writes.push(serde_json::json!([
-                _write.path_segments,
-                _write.name,
-                _write.value
+                write.path_segments,
+                write.name,
+                write.value
             ]));
             return true;
         }
         false
-    }) {
-        return Ok(());
-    }
+    })
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn apply_write(_: &BridgeServer, _: &str, _: &RootWrite, _: &str) -> Result<()> {
     anyhow::bail!("Native root property sync requires Windows or macOS")
 }
 

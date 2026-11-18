@@ -659,6 +659,9 @@ fn compact_push_summary(
         "sourceVerifyErrors",
         "protectedWrites",
         "protectedApplied",
+        "protectedPending",
+        "protectedOfflineApply",
+        "supplementalImportPendingWrites",
         "unsupportedProperties",
         "savedFieldsApplied",
         "packageModified",
@@ -691,6 +694,22 @@ fn compact_push_summary(
         result.insert("supplementalImportOfflineWrites".into(), json!(count));
     }
     let counts = push_counts(summary);
+    if summary
+        .get("protectedOfflineApply")
+        .is_some_and(|receipt| receipt["recoveryPending"] == true)
+        || ["protectedPending", "supplementalImportPendingWrites"]
+            .iter()
+            .any(|key| {
+                summary
+                    .get(*key)
+                    .and_then(Value::as_u64)
+                    .is_some_and(|count| count > 0)
+            })
+    {
+        result.extend(counts);
+        result.insert("verified".into(), Value::Bool(false));
+        return result;
+    }
     let changed = !counts.is_empty()
         || ["protectedApplied", "savedFieldsApplied", "packageModified"]
             .iter()
@@ -730,6 +749,27 @@ fn automation_value_is_non_empty(value: &Value) -> bool {
         Value::String(value) => !value.is_empty(),
         Value::Array(value) => !value.is_empty(),
         Value::Object(value) => !value.is_empty(),
+    }
+}
+
+#[test]
+fn compact_committed_push_keeps_recovery_receipt_and_pending_fields() {
+    for pending in [
+        json!({"protectedOfflineApply":{"committed":true,"recoveryPending":true,
+        "error":"Studio did not reconnect in 90 s","nextStep":"Reconnect the local place"}}),
+        json!({"supplementalImportPendingWrites":33}),
+        json!({"protectedPending":1}),
+    ] {
+        let mut summary = pending.as_object().unwrap().clone();
+        summary.insert("historyId".into(), json!("retained-undo"));
+        summary.insert("sourceVerified".into(), json!(1));
+        let result = compact_push_summary(&summary, &json!({}), true);
+        assert_eq!(result["verified"], false);
+        assert!(!result.contains_key("unchanged"));
+        assert_eq!(result["historyId"], "retained-undo");
+        for (key, value) in pending.as_object().unwrap() {
+            assert_eq!(result[key], *value);
+        }
     }
 }
 

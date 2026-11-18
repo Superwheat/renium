@@ -388,6 +388,41 @@ fn both_live_coordinator_paths_remove_undo_on_an_uncommitted_refusal() -> Result
 }
 
 #[test]
+fn incomplete_offline_reopen_retains_undo_and_does_not_read_the_retired_runtime() -> Result<()> {
+    let fixture = Fixture::new()?;
+    MUTATION.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(|_, _| {
+            let mut summary = summary(false);
+            summary.insert(
+                "protectedOfflineApply".into(),
+                json!({
+                    "committed":true, "recoveryPending":true, "published":true,
+                    "reopenedPath":"local.rbxl", "error":"Studio did not reconnect in 90 s",
+                    "nextStep":"Reconnect the published local place and retry the push",
+                }),
+            );
+            Ok(StagedPushResult {
+                generated: ProjectSnapshot::default(),
+                summary,
+            })
+        }));
+    });
+    CAPTURES.with(|slot| {
+        slot.borrow_mut()
+            .push_back(Box::new(|_| panic!("readback used the retired runtime")))
+    });
+    let summary = fixture.run()?;
+    assert!(summary["historyId"].is_string());
+    assert_eq!(summary["verified"], false);
+    assert_eq!(summary["protectedOfflineApply"]["recoveryPending"], true);
+    assert_eq!(
+        fs::read_dir(Path::new(&fixture.context.root).join(".renium/editor-history/sync"))?.count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
 fn offline_commit_keeps_undo_receipt_and_reopened_readback_when_saved_fields_are_busy() -> Result<()>
 {
     let fixture = Fixture::for_service("Workspace")?;

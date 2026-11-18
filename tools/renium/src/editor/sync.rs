@@ -395,7 +395,8 @@ mod transaction_recovery_tests {
         };
         args.yes = true;
         let protected =
-            prepare_protected_writes(&args, &bridge, pending, false, &HashSet::new()).unwrap();
+            prepare_protected_writes(&args, &bridge, pending, false, &HashSet::new(), false)
+                .unwrap();
         assert!(protected.apply_offline);
         let snapshot = crate::editor::review::patch_place_protected_writes(
             &root.join("missing.rbxl"),
@@ -1042,49 +1043,55 @@ impl<'a> EditorTransaction<'a> {
                     })
             })
         {
-            let token = result
-                .get("historyRecording")
-                .and_then(Value::as_str)
-                .context("Studio plugin needs updating for safe Terrain history")?;
-            let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
-            let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
-            let title = crate::studio::native::serializer::target_name(pid, &info.place_name)?;
-            let terrain_write = changes.property_changes.iter().any(|change| {
-                change.class_name == "Terrain"
-                    && change
-                        .properties
-                        .keys()
-                        .chain(change.reset_properties.iter())
-                        .any(|name| matches!(name.as_str(), "SmoothGrid" | "PhysicsGrid"))
-            });
-            crate::studio::native::serializer::register_history_if_available(
-                pid,
-                &title,
-                token,
-                terrain_write && native_properties_available,
-            )?;
-            for change in changes
-                .property_changes
-                .iter()
-                .filter(|_| native_properties_available)
-            {
-                if change.class_name == "Terrain"
-                    && change
-                        .properties
-                        .keys()
-                        .chain(change.reset_properties.iter())
-                        .any(|name| matches!(name.as_str(), "SmoothGrid" | "PhysicsGrid"))
+            #[cfg(test)]
+            let mocked = crate::editor::native_roots::RECORDED_WRITES.with_borrow(Option::is_some);
+            #[cfg(not(test))]
+            let mocked = false;
+            if !mocked {
+                let token = result
+                    .get("historyRecording")
+                    .and_then(Value::as_str)
+                    .context("Studio plugin needs updating for safe Terrain history")?;
+                let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
+                let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
+                let title = crate::studio::native::serializer::target_name(pid, &info.place_name)?;
+                let terrain_write = changes.property_changes.iter().any(|change| {
+                    change.class_name == "Terrain"
+                        && change
+                            .properties
+                            .keys()
+                            .chain(change.reset_properties.iter())
+                            .any(|name| matches!(name.as_str(), "SmoothGrid" | "PhysicsGrid"))
+                });
+                crate::studio::native::serializer::register_history_if_available(
+                    pid,
+                    &title,
+                    token,
+                    terrain_write && native_properties_available,
+                )?;
+                for change in changes
+                    .property_changes
+                    .iter()
+                    .filter(|_| native_properties_available)
                 {
-                    let mut terrain = crate::studio::native::serializer::prepare_terrain(
-                        pid,
-                        &title,
-                        &change.path_segments,
-                        &change.path_ordinals,
-                        Duration::from_secs(3),
-                    )?;
-                    terrain.write(token, None, None)?;
-                    bridge.call_for_runtime_with_timeout("getEditorTransactionState", json!({"transactionId":transaction.id,"nativeTerrainBaseline":terrain.fingerprint()}), BridgeTarget::Edit, &info.runtime_id, Some(Duration::from_secs(2)))?;
-                    break;
+                    if change.class_name == "Terrain"
+                        && change
+                            .properties
+                            .keys()
+                            .chain(change.reset_properties.iter())
+                            .any(|name| matches!(name.as_str(), "SmoothGrid" | "PhysicsGrid"))
+                    {
+                        let mut terrain = crate::studio::native::serializer::prepare_terrain(
+                            pid,
+                            &title,
+                            &change.path_segments,
+                            &change.path_ordinals,
+                            Duration::from_secs(3),
+                        )?;
+                        terrain.write(token, None, None)?;
+                        bridge.call_for_runtime_with_timeout("getEditorTransactionState", json!({"transactionId":transaction.id,"nativeTerrainBaseline":terrain.fingerprint()}), BridgeTarget::Edit, &info.runtime_id, Some(Duration::from_secs(2)))?;
+                        break;
+                    }
                 }
             }
         }
@@ -3652,6 +3659,7 @@ fn prepare_protected_writes(
     pending: PendingProtectedWrites,
     offline_route: bool,
     approved: &HashSet<Value>,
+    offline_declined: bool,
 ) -> Result<ProtectedWritePlan> {
     let PendingProtectedWrites {
         writes,
@@ -3706,6 +3714,7 @@ fn prepare_protected_writes(
     } else {
         !writes.is_empty()
             && !args.no_review
+            && !offline_declined
             && (!needs_approval || request_protected_write_review(bridge, &writes)?)
     };
     if crate::app::output::global_log_enabled(5) && !writes.is_empty() {
@@ -3939,15 +3948,21 @@ fn push_with_root_availability(
         return Ok(summary);
     }
     let needs_approval = !args.no_review && !args.yes && !global_yes();
-    let offline_route = requires_offline || (needs_approval && !pending_before.is_empty());
+    let mut offline_route = requires_offline || (needs_approval && !pending_before.is_empty());
+    let mut offline_declined = false;
     let mut approved = HashSet::new();
     if offline_route && needs_approval {
         let mut rows = Vec::clone(&pending_before);
         rows.extend(protected_write_rows(&changes.deferred_native_rows));
         if !request_protected_write_review(bridge, &rows)? {
-            return Ok(skipped_editor_summary(&changes));
+            if requires_offline {
+                return Ok(skipped_editor_summary(&changes));
+            }
+            offline_route = false;
+            offline_declined = true;
+        } else {
+            approved.extend(rows.iter().map(protected_write_intent));
         }
-        approved.extend(rows.iter().map(protected_write_intent));
     }
     drop(pending_before);
     let unstaged_replacements = changes
@@ -4033,8 +4048,14 @@ fn push_with_root_availability(
             pre_routed_protected_writes,
             rerouted_fields,
         );
-        let mut protected =
-            prepare_protected_writes(&args, bridge, pending, offline_route, &approved)?;
+        let mut protected = prepare_protected_writes(
+            &args,
+            bridge,
+            pending,
+            offline_route,
+            &approved,
+            offline_declined,
+        )?;
         if protected.apply_offline && !changes.deferred_native_rows.is_empty() {
             // The offline apply reopens Studio after the commit, so the
             // follow-up transaction has no runtime to run in; the saved place
@@ -4061,7 +4082,7 @@ fn push_with_root_availability(
                 finalize_settings(&mut changes)?;
             }
         }
-        let settings_transaction = EditorSettingsTransaction::apply(&changes)?;
+        let mut settings_transaction = Some(EditorSettingsTransaction::apply(&changes)?);
         if let Some(history_transaction) = history_transaction.as_mut() {
             history_transaction.publish()?;
         }
@@ -4076,14 +4097,35 @@ fn push_with_root_availability(
             transaction.prepare_snapshot()?;
             let result = (place.apply)(bridge, &args, &protected.writes, &mut || {
                 commit_status = Some(transaction.commit()?);
+                if let Some(settings) = settings_transaction.take() {
+                    settings.commit();
+                }
+                if let Some(history) = history_transaction.take() {
+                    history.commit();
+                }
                 Ok(())
-            })?;
+            });
+            let result = match result {
+                Ok(receipt) => receipt,
+                Err(error) if commit_status.is_some() => json!({
+                    "committed": true, "recoveryPending": true,
+                    "error": format!("{error:#}"),
+                    "nextStep": "Studio committed the push. Recover the prepared local snapshot and reconnect Studio before retrying the pending fields.",
+                }),
+                Err(error) => return Err(error),
+            };
+            let recovered = result.get("recoveryPending").and_then(Value::as_bool) != Some(true);
             offline_receipt = Some(result);
-            summary.insert(
-                "protectedApplied".to_string(),
-                json!(protected.writes.len() as u64),
-            );
-            summary.remove("protectedPending");
+            if recovered {
+                summary.insert(
+                    "protectedApplied".to_string(),
+                    json!(protected.writes.len() as u64),
+                );
+                summary.remove("protectedPending");
+            } else {
+                summary.insert("protectedPending".into(), json!(protected.writes.len()));
+                summary.insert("verified".into(), json!(false));
+            }
         } else if let Some(transaction) = transaction.as_mut() {
             match transaction.commit() {
                 Ok(status) => commit_status = Some(status),
@@ -4113,7 +4155,9 @@ fn push_with_root_availability(
             summary.remove("fieldVerifiedServices");
         }
         log_timing("native editor transaction commit", phase_started);
-        settings_transaction.commit();
+        if let Some(settings) = settings_transaction.take() {
+            settings.commit();
+        }
         if let Some(history_transaction) = history_transaction {
             history_transaction.commit();
         }
@@ -4134,7 +4178,7 @@ fn push_with_root_availability(
                 guard,
                 &changes.deferred_native_rows,
                 &mut summary,
-            )?;
+            );
             log_timing("native editor imported engine fields", phase_started);
         }
         if binary_import.is_some() {
@@ -4411,7 +4455,7 @@ fn apply_deferred_native_rows(
     guard: Option<&StudioChangeGuard>,
     rows: &[EditorPropertyChange],
     summary: &mut Map<String, Value>,
-) -> Result<usize> {
+) -> usize {
     let fields = rows.iter().map(|row| row.properties.len()).sum::<usize>();
     let changes = EditorChangeSet {
         property_changes: rows.to_vec(),
@@ -4465,11 +4509,26 @@ fn apply_deferred_native_rows(
         summary.insert("propertyUpdated".into(), json!(previous + updated));
         Ok(applied.individual_dispatches)
     })();
-    EditorTransaction::finish(transaction.as_mut(), result).with_context(|| {
-        format!(
-            "Studio applied the import and the files record it, but {fields} engine-set field(s) of imported instances were not written afterwards; push the store again to write them"
-        )
-    })
+    match EditorTransaction::finish(transaction.as_mut(), result) {
+        Ok(count) => count,
+        Err(error) => {
+            summary.remove("verifiedPushProof");
+            for key in ["fieldVerifiedServices", "nativeVerifiedServices"] {
+                if let Some(Value::Array(services)) = summary.get_mut(key) {
+                    services.retain(|service| {
+                        !rows
+                            .iter()
+                            .any(|row| service.as_str() == Some(&row.service))
+                    });
+                }
+            }
+            record_unsupported_properties(summary, rows.iter().flat_map(|row| row.properties.keys().map(|name| {
+                format!("{}.{} ({error:#}; the import committed, retry the push to write this field)", row.path_segments.join("."), name)
+            })));
+            summary.insert("supplementalImportPendingWrites".into(), json!(fields));
+            0
+        }
+    }
 }
 
 fn apply_editor_change_with_warm_bridge(
@@ -7793,6 +7852,14 @@ mod saved_field_review_tests {
                     "requestEditorPushReview" => {
                         json!({ "required": true, "reviewId": "studio-1" })
                     }
+                    "applyEditorChanges"
+                        if decision == "write-fails"
+                            && request["params"]["propertyChanges"]
+                                .as_array()
+                                .is_some_and(|rows| !rows.is_empty()) =>
+                    {
+                        json!({"ok":false,"errors":1,"error":"simulated imported field setter failure"})
+                    }
                     "applyEditorChanges" if decision == "count" => {
                         let params = &request["params"];
                         let mut writes = Vec::new();
@@ -7813,6 +7880,15 @@ mod saved_field_review_tests {
                         }
                     }
                     "requestProtectedWriteReview" => json!({"required":true,"reviewId":"offline"}),
+                    "applyEditorChanges" if request["params"]["verifyOnly"] == true => {
+                        let count: usize = request["params"]["propertyChanges"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .map(|row| row["properties"].as_object().map_or(0, Map::len))
+                            .sum();
+                        json!({"ok":true,"verifyOnly":true,"errors":0,"verified":count,"verifyMismatches":[]})
+                    }
                     "getEditorPushReviewDecision" => {
                         json!({ "decided": true, "decision": if request["params"]["reviewId"] == "offline" {offline} else {decision} })
                     }
@@ -7969,10 +8045,19 @@ mod saved_field_review_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    fn push_reviewed_offline_import(decision: &'static str, snapshot_fails: bool, count: usize) {
+    fn push_reviewed_offline_import(
+        decision: &'static str,
+        snapshot_fails: bool,
+        count: usize,
+        after_commit_fails: bool,
+    ) {
         let root = project_with_threshold_zero("review-offline-before-import");
         let path = root.join("local.rbxlx");
         fs::write(&path, r#"<roblox version="4"></roblox>"#).unwrap();
+        crate::editor::native_roots::RECORDED_WRITES.replace(Some(Vec::new()));
+        let _native = crate::system::files::OnDrop::new(|| {
+            crate::editor::native_roots::RECORDED_WRITES.replace(None);
+        });
         let (bridge, calls, plugin) = reviewing_bridge_with_offline("apply", decision);
         let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut args = PushEditorChangesArgs::new(
@@ -8006,7 +8091,20 @@ mod saved_field_review_tests {
             properties: Map::from_iter([("TexturePack".into(), json!("requested"))]),
             ..Default::default()
         });
+        let settings_path = root.join("publication.renium");
+        fs::write(&settings_path, b"previous settings").unwrap();
+        let document = SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: Vec::new(),
+        };
+        let expected_settings =
+            crate::settings::bytecode::encode_settings_bytecode(&document).unwrap();
         let changes = EditorChangeSet {
+            settings_writes: vec![EditorSettingsWrite {
+                expected_hash: settings_file_hash(&settings_path).unwrap(),
+                path: settings_path.clone(),
+                document,
+            }],
             property_changes: properties,
             instance_changes: vec![EditorInstanceChange {
                 service: service.into(),
@@ -8052,6 +8150,9 @@ mod saved_field_review_tests {
                         bail!("snapshot writer unavailable")
                     }
                     commit()?;
+                    if after_commit_fails {
+                        bail!("Studio did not reconnect in 90 s");
+                    }
                     Ok(json!({"successor":"reopened"}))
                 },
             },
@@ -8104,9 +8205,23 @@ mod saved_field_review_tests {
                 assert!(!started.load(std::sync::atomic::Ordering::Acquire));
             } else {
                 let summary = result.unwrap();
-                assert_eq!(summary["supplementalImportWrites"], 0);
-                assert_eq!(summary["supplementalImportOfflineWrites"], count);
-                assert_eq!(summary["protectedOfflineApply"]["successor"], "reopened");
+                assert_eq!(fs::read(&settings_path).unwrap(), expected_settings);
+                if after_commit_fails {
+                    assert_eq!(summary["protectedOfflineApply"]["recoveryPending"], true);
+                    assert!(
+                        summary["protectedOfflineApply"]["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains("90 s")
+                    );
+                    assert!(summary["protectedOfflineApply"]["nextStep"].is_string());
+                    assert_eq!(summary["verified"], false);
+                    assert!(!methods.contains(&"rollbackEditorTransaction"));
+                } else {
+                    assert_eq!(summary["supplementalImportWrites"], 0);
+                    assert_eq!(summary["supplementalImportOfflineWrites"], count);
+                    assert_eq!(summary["protectedOfflineApply"]["successor"], "reopened");
+                }
             }
         }
         drop(bridge);
@@ -8115,22 +8230,115 @@ mod saved_field_review_tests {
     }
 
     #[test]
-    fn declining_reviewed_offline_import_leaves_studio_untouched() {
-        push_reviewed_offline_import("skip", false, 33);
-        push_reviewed_offline_import("skip", false, 1);
+    fn offline_reconnect_failure_keeps_committed_settings_and_receipt() {
+        push_reviewed_offline_import("apply", false, 33, true);
     }
 
-    // On Linux the transaction uses just the bridge; its place-file I/O is supplied above.
-    #[cfg(target_os = "linux")]
+    #[test]
+    fn declining_reviewed_offline_import_leaves_studio_untouched() {
+        push_reviewed_offline_import("skip", false, 33, false);
+    }
+
+    #[test]
+    fn declining_optional_offline_writes_commits_the_rest_and_keeps_pending() {
+        let root = project_with_threshold_zero("decline-optional-offline");
+        let path = root.join("local.rbxlx");
+        fs::write(&path, r#"<roblox version="4"></roblox>"#).unwrap();
+        let (bridge, calls, plugin) = reviewing_bridge_with_offline("apply", "skip");
+        let args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: "src".into(),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        let properties = [
+            ("Part", "Transparency", json!(0.5)),
+            ("MaterialVariant", "TexturePack", json!("requested")),
+        ]
+        .into_iter()
+        .map(|(class, name, value)| EditorPropertyChange {
+            service: "Workspace".into(),
+            path_segments: vec!["Workspace".into(), class.into()],
+            class_name: class.into(),
+            properties: Map::from_iter([(name.into(), value)]),
+            ..Default::default()
+        })
+        .collect();
+        let result = push_with_root_availability(
+            args,
+            &bridge,
+            EditorChangeSet {
+                property_changes: properties,
+                ..Default::default()
+            },
+            CollectedPushOptions {
+                started: Instant::now(),
+                projection: None,
+                prepared_binary_import: None,
+                guard: None,
+                validate_project: None,
+                finalize_settings: None,
+            },
+            |_| Ok(true),
+            PlaceFileAccess {
+                path: &|_| Some(path.clone()),
+                pending: &|bridge, summary, rows, suffix| {
+                    pending_protected_writes(bridge, summary, rows, suffix, &|_| Some(path.clone()))
+                },
+                apply: &|_, _, _, _| panic!("declined offline write was applied"),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["protectedPending"], 1);
+        assert!(!result.contains_key("skippedByReview"));
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|r| r["method"] == "requestProtectedWriteReview")
+                .count(),
+            1
+        );
+        assert!(calls.iter().any(|r| {
+            r["method"] == "applyEditorChanges"
+                && r["params"]["propertyChanges"]
+                    .as_array()
+                    .is_some_and(|rows| rows.iter().any(|r| r["properties"]["Transparency"] == 0.5))
+        }));
+        assert!(
+            calls
+                .iter()
+                .any(|r| r["method"] == "commitEditorTransaction")
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|r| r["method"] == "rollbackEditorTransaction")
+        );
+        drop(calls);
+        drop(bridge);
+        plugin.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn offline_approval_carries_import_rows_and_snapshot_failure_rolls_back_the_push() {
-        push_reviewed_offline_import("apply", false, 33);
-        push_reviewed_offline_import("apply", true, 33);
+        push_reviewed_offline_import("apply", false, 33, false);
+        push_reviewed_offline_import("apply", true, 33, false);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn opted_in_push_counts_successful_individual_writes_and_keeps_both_batch_proofs() {
+        push_individual_fields(false);
+    }
+
+    #[test]
+    fn deferred_field_failure_preserves_the_committed_push_and_lists_pending_fields() {
+        push_individual_fields(true);
+    }
+
+    fn push_individual_fields(fail: bool) {
         use crate::editor::native_roots::RECORDED_WRITES;
         let root = project_with_threshold_zero("count-individual-writes");
         let _cleanup = crate::system::files::OnDrop::new(|| {
@@ -8138,7 +8346,7 @@ mod saved_field_review_tests {
             let _ = fs::remove_dir_all(&root);
         });
         RECORDED_WRITES.replace(Some(Vec::new()));
-        let (bridge, calls, plugin) = reviewing_bridge("count");
+        let (bridge, calls, plugin) = reviewing_bridge(if fail { "write-fails" } else { "count" });
         let mut args = PushEditorChangesArgs::new(
             ProjectSourceArgs {
                 project_root: root.clone(),
@@ -8192,6 +8400,39 @@ mod saved_field_review_tests {
             PLACE_FILE,
         )
         .unwrap();
+        if fail {
+            assert_eq!(summary["supplementalImportPendingWrites"], 33);
+            assert_eq!(
+                summary["unsupportedProperties"].as_array().unwrap().len(),
+                33
+            );
+            assert!(!summary.contains_key("verifiedPushProof"));
+            let methods = calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r["method"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            let commit = methods
+                .iter()
+                .position(|m| m == "commitEditorTransaction")
+                .unwrap();
+            let rollback = methods
+                .iter()
+                .position(|m| m == "rollbackEditorTransaction")
+                .unwrap();
+            assert!(commit < rollback);
+            assert_eq!(
+                methods
+                    .iter()
+                    .filter(|m| *m == "commitEditorTransaction")
+                    .count(),
+                1
+            );
+            drop(bridge);
+            plugin.join().unwrap();
+            return;
+        }
         assert_eq!(summary["supplementalImportWrites"], 33);
         assert!(summary.get("supplementalImportOfflineWrites").is_none());
         let writes = RECORDED_WRITES.replace(Some(vec![])).unwrap();

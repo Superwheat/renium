@@ -489,6 +489,17 @@ pub(crate) fn push_project(
     );
     log_reconcile_timing("full push mutation", phase);
 
+    if pushed
+        .summary
+        .get("protectedOfflineApply")
+        .is_some_and(|receipt| receipt["recoveryPending"] == true)
+    {
+        // The committed snapshot and undo record survive a disconnected
+        // successor. Reading the retired runtime cannot verify this push.
+        pushed.summary.insert("verified".into(), Value::Bool(false));
+        return Ok(pushed.summary);
+    }
+
     let replacement = reopened_push_context(context, &pushed.summary)?;
     let _replacement_selection = replacement.as_ref().map(bound_context::select);
     let context = replacement.as_ref().unwrap_or(context);

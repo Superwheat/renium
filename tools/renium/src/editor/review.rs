@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 #[cfg(any(windows, target_os = "macos"))]
 use std::fs;
-#[cfg(any(windows, target_os = "macos"))]
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 #[cfg(any(windows, target_os = "macos"))]
@@ -1805,7 +1803,6 @@ pub(crate) fn apply_protected_writes_offline(
         return Err(error)
             .context("Studio changed before its protected snapshot could be published");
     }
-    input_inject::terminate_studio_process(pid)?;
     let file_name = original_path
         .file_name()
         .and_then(|value| value.to_str())
@@ -1815,80 +1812,62 @@ pub(crate) fn apply_protected_writes_offline(
         pid,
         current_millis()
     ));
-    if let Err(error) = fs::rename(&original_path, &backup) {
-        let _ = reopen_protected_write_studio(&target, &original_path);
-        return Err(error).with_context(|| {
-            format!(
-                "Failed to prepare {} for protected snapshot replacement",
-                original_path.display()
-            )
-        });
-    }
-    if let Err(error) = fs::rename(&snapshot, &original_path) {
-        let restore = fs::rename(&backup, &original_path);
-        if restore.is_ok() {
-            let _ = reopen_protected_write_studio(&target, &original_path);
-        }
-        if let Err(restore_error) = restore {
+    let mut receipt = json!({
+        "ok": true, "committed": true, "applied": 0, "preparedWrites": applied,
+        "exportedInstances": exported_instances, "reopenedPath": original_path,
+        "previousRuntimeId": previous_runtime_id, "localFile": true,
+        "cloudSaved": false, "nativeSnapshot": true, "snapshotPath": snapshot,
+        "backupPath": backup, "published": false,
+    });
+    let result = (|| -> Result<()> {
+        receipt["phase"] = json!("closing Studio");
+        input_inject::terminate_studio_process(pid)?;
+        receipt["phase"] = json!("preserving the previous place file");
+        fs::rename(&original_path, &backup)?;
+        receipt["phase"] = json!("publishing the committed snapshot");
+        if let Err(error) = fs::rename(&snapshot, &original_path) {
+            let restore = fs::rename(&backup, &original_path);
             return Err(error).with_context(|| {
                 format!(
-                    "Failed to replace {} and failed to restore {}: {restore_error}",
-                    original_path.display(),
-                    backup.display()
+                    "Original file restoration: {}",
+                    restore.map_or_else(|error| error.to_string(), |_| "complete".into())
                 )
             });
         }
-        return Err(error).with_context(|| {
-            format!(
-                "Failed to replace {} with protected snapshot",
-                original_path.display()
-            )
-        });
-    }
-    if let Err(error) = reopen_protected_write_studio(&target, &original_path) {
-        let preserve = fs::rename(&original_path, &snapshot);
-        let restore = preserve
-            .as_ref()
-            .map_err(|value| io::Error::other(format!("not attempted: {value}")))
-            .and_then(|_| fs::rename(&backup, &original_path));
-        if restore.is_ok() && preserve.is_ok() {
-            let _ = reopen_protected_write_studio(&target, &original_path);
+        receipt["published"] = json!(true);
+        receipt["applied"] = json!(applied);
+        receipt["phase"] = json!("reopening Studio");
+        reopen_protected_write_studio(&target, &original_path)?;
+        receipt["phase"] = json!("waiting for the replacement Studio connection");
+        receipt["reopenedRuntimeId"] = json!(wait_for_reopened_local_studio(
+            bridge,
+            &original_path,
+            &previous_runtime_id,
+            args.bridge.wait_seconds.max(90.0),
+        )?);
+        if let Err(error) = fs::remove_file(&backup) {
+            receipt["cleanupWarning"] =
+                json!(format!("Backup retained at {}: {error}", backup.display()));
         }
-        return Err(error).with_context(|| {
-                format!(
-                    "Failed to reopen Studio; replacement preservation: {}; original restoration: {}; backup: {}",
-                    preserve
-                        .as_ref().map_or_else(std::string::ToString::to_string, |_| "ok".to_string()),
-                    restore
-                        .as_ref().map_or_else(std::string::ToString::to_string, |_| "ok".to_string()),
-                    backup.display()
-                )
-            });
-    }
-    let reopened_runtime_id = wait_for_reopened_local_studio(
-        bridge,
-        &original_path,
-        &previous_runtime_id,
-        args.bridge.wait_seconds.max(90.0),
-    )?;
-    if let Err(error) = fs::remove_file(&backup) {
-        eprintln!(
-            "[renium] warning: could not remove protected-write backup {}: {error}",
+        receipt.as_object_mut().unwrap().remove("phase");
+        Ok(())
+    })();
+    if let Err(error) = result {
+        receipt["recoveryPending"] = json!(true);
+        receipt["error"] = json!(format!("{error:#}"));
+        let recovery = if receipt["published"] == true {
+            &original_path
+        } else {
+            &snapshot
+        };
+        receipt["nextStep"] = json!(format!(
+            "The Studio transaction committed. Keep the project files and recover its snapshot at {}. Reconnect that place with rbx so {} before retrying the push. The previous place is retained at {} if the backup step completed.",
+            recovery.display(),
+            format!("{recovery:?}"),
             backup.display()
-        );
+        ));
     }
-    let reopen_path = original_path;
-    Ok(json!({
-        "ok": true,
-        "applied": applied,
-        "exportedInstances": exported_instances,
-        "reopenedPath": reopen_path,
-        "reopenedRuntimeId": reopened_runtime_id,
-        "previousRuntimeId": previous_runtime_id,
-        "localFile": true,
-        "cloudSaved": false,
-        "nativeSnapshot": true,
-    }))
+    Ok(receipt)
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
