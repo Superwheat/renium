@@ -31,7 +31,7 @@ pub(crate) fn captured_state(document: &SettingsBytecode, native: bool) -> Servi
                         }
                         native_value(value).map(|value| {
                             crate::snapshot::types::NativeSettingsProperty {
-                                name: name.clone(),
+                                name: name.as_str().into(),
                                 value,
                             }
                         })
@@ -41,7 +41,7 @@ pub(crate) fn captured_state(document: &SettingsBytecode, native: bool) -> Servi
                 Vec::new()
             };
             for property in &native_values {
-                properties.remove(&property.name);
+                properties.remove(property.name.as_str());
             }
             native_rows.push(native_values);
             SnapshotInstance {
@@ -371,7 +371,7 @@ fn add_native_properties(state: &mut ServiceState, seed: u64) {
             .into_iter()
             .enumerate()
             .map(|(at, value)| NativeSettingsProperty {
-                name: format!("Native{at}"),
+                name: format!("Native{at}").into(),
                 value,
             }),
     );

@@ -39,8 +39,56 @@ pub(crate) struct SnapshotInstance {
 
 #[derive(Clone)]
 pub(crate) struct NativeSettingsProperty {
-    pub(crate) name: String,
+    pub(crate) name: PropertyName,
     pub(crate) value: NativeSettingsValue,
+}
+
+/// The name of a property, held once for every instance that has it: a place
+/// has a few hundred names and millions of values.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PropertyName(&'static str);
+
+impl PropertyName {
+    /// A name that is held for good already.
+    pub(crate) const fn held(name: &'static str) -> Self {
+        Self(name)
+    }
+
+    pub(crate) const fn as_str(&self) -> &'static str {
+        self.0
+    }
+}
+
+impl std::ops::Deref for PropertyName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.0
+    }
+}
+
+impl From<&str> for PropertyName {
+    fn from(name: &str) -> Self {
+        Self(rbx_dom_weak::Ustr::from(name).as_str())
+    }
+}
+
+impl From<String> for PropertyName {
+    fn from(name: String) -> Self {
+        Self::from(name.as_str())
+    }
+}
+
+impl PartialEq<str> for PropertyName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for PropertyName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
 }
 
 #[derive(Clone)]

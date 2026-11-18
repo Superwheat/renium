@@ -34,7 +34,7 @@ use crate::snapshot::codec::{
 use crate::snapshot::export::{fetch_typed_payload_with_size_cached, is_supported_bridge_codec};
 use crate::snapshot::types::{
     NativeOverlayFetch, NativeOverlayItem, NativeOverlayPayload, NativeSettingsProperty,
-    NativeSettingsValue, SnapshotInstance,
+    NativeSettingsValue, PropertyName, SnapshotInstance,
 };
 use crate::studio::bridge::{BridgeServer, DEFAULT_EXPORT_CHUNK_SIZE};
 use crate::studio::native::editor::rbx_variant_referent;
@@ -1135,9 +1135,14 @@ fn native_settings_records<'a>(
             continue;
         }
         let descriptor = enum_property_descriptor(variant, database, class_name, property_name);
-        let output_name = native_filter
-            .and_then(|filter| filter.renamed.get(property_name))
-            .map_or(property_name, String::as_str);
+        let renamed = native_filter.and_then(|filter| filter.renamed.get(property_name));
+        let output_name = renamed.map_or(property_name, String::as_str);
+        // The name rbx-dom gave is held for good; only another name is looked
+        // up among the names held.
+        let native_name = || match renamed {
+            Some(renamed) => PropertyName::from(renamed.as_str()),
+            None => PropertyName::held(property_name),
+        };
         let keep_json = class_name == "Script" && output_name == "RunContext"
             || native_filter.is_some_and(|filter| {
                 filter.reconstruct_decal_color_map && output_name == "TextureContent"
@@ -1169,7 +1174,7 @@ fn native_settings_records<'a>(
                 rbx_variant_to_native_settings_value(variant, descriptor, database, refs)
         {
             native_properties.push(NativeSettingsProperty {
-                name: output_name.to_string(),
+                name: native_name(),
                 value,
             });
         } else if share_payloads
@@ -1180,7 +1185,7 @@ fn native_settings_records<'a>(
             })
         {
             native_properties.push(NativeSettingsProperty {
-                name: output_name.to_string(),
+                name: native_name(),
                 value: NativeSettingsValue::Shared(value),
             });
         } else if let Some(value) =

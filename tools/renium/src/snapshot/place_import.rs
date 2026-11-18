@@ -483,7 +483,7 @@ fn convert_service(
                 .as_i64()
                 .context("WeldConstraint.State was not an integer")?;
             native_properties.push(NativeSettingsProperty {
-                name: "State".to_string(),
+                name: "State".into(),
                 value: NativeSettingsValue::Int(state),
             });
             if state == 0 {
