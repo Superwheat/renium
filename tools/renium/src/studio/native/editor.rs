@@ -2789,8 +2789,9 @@ fn convert_native_service_output(
         .zip(debug_ids.into_par_iter())
         .zip(settings_id_by_index.into_par_iter())
         .enumerate()
-        .map(
-            |(index, (((rbx_instance, overlay), debug_id), transported_settings_id))| -> Result<_> {
+        .map_init(
+            || shared_values.local(),
+            |shared_values, (index, (((rbx_instance, overlay), debug_id), transported_settings_id))| -> Result<_> {
                 let parent_index = rbx_instance.parent_index.map(|parent| parent + 1);
                 let native_filter = dependencies.native_filters.get(rbx_instance.class.as_str());
                 let unscriptable_root_fields = if index == 0 {

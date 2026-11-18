@@ -1123,15 +1123,21 @@ fn state_digests(state: &ServiceState, viewport_camera: Option<usize>) -> ([u8; 
     let (rows, alike): (Vec<_>, Vec<_>) = instances
         .par_iter()
         .enumerate()
-        .map(|(index, instance)| {
-            let native = native_properties_by_instance
-                .as_ref()
-                .and_then(|rows| rows.get(index));
-            (
-                instance_state_digest(instance, native, viewport_camera == Some(index), &shared),
-                instance_encodes_as_its_document(instance, native, root_service),
-            )
-        })
+        .map_init(
+            || SharedValueCache {
+                shared: &shared,
+                local: AHashMap::new(),
+            },
+            |cache, (index, instance)| {
+                let native = native_properties_by_instance
+                    .as_ref()
+                    .and_then(|rows| rows.get(index));
+                (
+                    instance_state_digest(instance, native, viewport_camera == Some(index), cache),
+                    instance_encodes_as_its_document(instance, native, root_service),
+                )
+            },
+        )
         .unzip();
     let count = |digest: &mut Sha256, count: usize| digest.update((count as u64).to_le_bytes());
     let mut digest = Sha256::new();
@@ -1220,11 +1226,38 @@ fn instance_encodes_as_its_document(
 /// held: one is digested once however many instances hold it.
 type SharedValueDigests = Mutex<AHashMap<usize, [u8; 32]>>;
 
+/// A task reuses its recent digests without a shared lock. Misses still
+/// consult the invocation's shared cache before hashing a potentially large
+/// payload; neither cache survives the immutable state being digested.
+struct SharedValueCache<'a> {
+    shared: &'a SharedValueDigests,
+    local: AHashMap<usize, [u8; 32]>,
+}
+
+impl SharedValueCache<'_> {
+    fn digest(&mut self, value: &Arc<Value>) -> [u8; 32] {
+        let held_at = Arc::as_ptr(value) as usize;
+        if let Some(known) = self.local.get(&held_at) {
+            return *known;
+        }
+        let known = self.shared.lock_recover().get(&held_at).copied();
+        let known = known.unwrap_or_else(|| {
+            let mut of_value = Sha256::new();
+            crate::settings::equivalence::digest_value(&mut of_value, value);
+            let of_value = <[u8; 32]>::from(of_value.finalize());
+            self.shared.lock_recover().insert(held_at, of_value);
+            of_value
+        });
+        self.local.insert(held_at, known);
+        known
+    }
+}
+
 fn instance_state_digest(
     instance: &SnapshotInstance,
     native: Option<&Vec<NativeSettingsProperty>>,
     viewport_camera: bool,
-    shared: &SharedValueDigests,
+    shared: &mut SharedValueCache<'_>,
 ) -> PulledRow {
     use crate::settings::equivalence::{digest_map, digest_text};
 
@@ -1328,7 +1361,7 @@ fn instance_state_digest(
 fn digest_native_value(
     digest: &mut Sha256,
     value: &NativeSettingsValue,
-    shared: &SharedValueDigests,
+    shared: &mut SharedValueCache<'_>,
 ) {
     let floats = |digest: &mut Sha256, kind: u8, values: &[f32]| {
         digest.update([kind]);
@@ -1372,15 +1405,7 @@ fn digest_native_value(
         }
         NativeSettingsValue::Shared(value) => {
             digest.update([15]);
-            let held_at = Arc::as_ptr(value) as usize;
-            let known = shared.lock_recover().get(&held_at).copied();
-            digest.update(known.unwrap_or_else(|| {
-                let mut of_value = Sha256::new();
-                crate::settings::equivalence::digest_value(&mut of_value, value);
-                let of_value = <[u8; 32]>::from(of_value.finalize());
-                shared.lock_recover().insert(held_at, of_value);
-                of_value
-            }));
+            digest.update(shared.digest(value));
         }
     }
 }

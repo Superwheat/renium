@@ -12,8 +12,24 @@ use crate::system::LockRecover;
 pub(crate) struct NativeValuePool(Mutex<HashSet<Arc<Value>>>);
 
 impl NativeValuePool {
+    pub(crate) fn local(&self) -> NativeValueCache<'_> {
+        NativeValueCache {
+            pool: self,
+            values: HashSet::new(),
+        }
+    }
+}
+
+/// Repeated values in a Rayon task need no shared lock. A local miss still
+/// uses the service pool, so different tasks retain the same allocation.
+pub(crate) struct NativeValueCache<'a> {
+    pool: &'a NativeValuePool,
+    values: HashSet<Arc<Value>>,
+}
+
+impl NativeValueCache<'_> {
     pub(crate) fn compact(
-        &self,
+        &mut self,
         properties: &mut Map<String, Value>,
         native: &mut Vec<NativeSettingsProperty>,
         keep_json: impl Fn(&str) -> bool,
@@ -22,15 +38,21 @@ impl NativeValuePool {
             if keep_json(name) || !shareable_value(value) {
                 return true;
             }
-            let shared = {
-                let mut values = self.0.lock_recover();
-                if let Some(value) = values.get(value) {
-                    Arc::clone(value)
-                } else {
-                    let value = Arc::new(std::mem::take(value));
-                    values.insert(Arc::clone(&value));
-                    value
-                }
+            let shared = if let Some(value) = self.values.get(value) {
+                Arc::clone(value)
+            } else {
+                let shared = {
+                    let mut values = self.pool.0.lock_recover();
+                    if let Some(value) = values.get(value) {
+                        Arc::clone(value)
+                    } else {
+                        let value = Arc::new(std::mem::take(value));
+                        values.insert(Arc::clone(&value));
+                        value
+                    }
+                };
+                self.values.insert(Arc::clone(&shared));
+                shared
             };
             // JSON is authoritative over a same-named native row. Preserve
             // that rule when its value moves into the native representation.
@@ -76,6 +98,7 @@ mod tests {
     #[test]
     fn enum_sharing_keeps_the_entire_value_and_unknown_envelopes() {
         let pool = NativeValuePool::default();
+        let mut cache = pool.local();
         let value = json!({"_type":"EnumItem","enumType":"Enum.Future","name":"Chosen","value":7});
         let mut rows = Vec::new();
         for value in [
@@ -85,7 +108,7 @@ mod tests {
         ] {
             let mut properties = Map::from_iter([("FutureProperty".into(), value)]);
             let mut instance_rows = Vec::new();
-            pool.compact(&mut properties, &mut instance_rows, |_| false);
+            cache.compact(&mut properties, &mut instance_rows, |_| false);
             rows.extend(instance_rows);
             assert!(properties.is_empty());
         }
@@ -104,12 +127,12 @@ mod tests {
         ] {
             let mut properties = Map::from_iter([("FutureProperty".into(), value)]);
             let before = properties.clone();
-            pool.compact(&mut properties, &mut rows, |_| false);
+            cache.compact(&mut properties, &mut rows, |_| false);
             assert_eq!(properties, before);
         }
         let mut properties = Map::from_iter([("RunContext".into(), value)]);
         let before = properties.clone();
-        pool.compact(&mut properties, &mut rows, |_| true);
+        cache.compact(&mut properties, &mut rows, |_| true);
         assert_eq!(properties, before);
         assert_eq!(rows.len(), 3);
         let mut properties = before;
@@ -117,7 +140,7 @@ mod tests {
             name: "RunContext".into(),
             value: NativeSettingsValue::Int(99),
         }];
-        pool.compact(&mut properties, &mut native, |_| false);
+        cache.compact(&mut properties, &mut native, |_| false);
         assert_eq!(native.len(), 1);
         assert!(matches!(&native[0].value, NativeSettingsValue::Shared(_)));
     }
@@ -125,6 +148,7 @@ mod tests {
     #[test]
     fn scalar_envelopes_keep_their_values_and_reject_unknown_shapes() {
         let pool = NativeValuePool::default();
+        let mut cache = pool.local();
         let values = [
             json!({"_type":"Float","value":"nan"}),
             json!({"_type":"Float","value":"inf"}),
@@ -136,9 +160,15 @@ mod tests {
         let mut shared = Vec::new();
         for value in values {
             let mut rows = Vec::new();
-            for _ in 0..2 {
+            for copy in 0..3 {
                 let mut properties = Map::from_iter([("FutureProperty".into(), value.clone())]);
-                pool.compact(&mut properties, &mut rows, |_| false);
+                // A repeat in one task and a hit from another task must both
+                // retain the complete value and the same pooled allocation.
+                if copy == 2 {
+                    pool.local().compact(&mut properties, &mut rows, |_| false);
+                } else {
+                    cache.compact(&mut properties, &mut rows, |_| false);
+                }
                 assert!(properties.is_empty());
                 // Each row belongs to another instance.
                 let NativeSettingsValue::Shared(held) = rows.pop().unwrap().value else {
@@ -149,12 +179,13 @@ mod tests {
             }
             let end = shared.len();
             assert!(Arc::ptr_eq(&shared[end - 2], &shared[end - 1]));
+            assert!(Arc::ptr_eq(&shared[end - 3], &shared[end - 1]));
         }
-        for (index, value) in shared.iter().step_by(2).enumerate() {
+        for (index, value) in shared.iter().step_by(3).enumerate() {
             assert!(
                 shared
                     .iter()
-                    .step_by(2)
+                    .step_by(3)
                     .skip(index + 1)
                     .all(|other| !Arc::ptr_eq(value, other))
             );
@@ -171,7 +202,7 @@ mod tests {
             let mut properties = Map::from_iter([("FutureProperty".into(), value)]);
             let before = properties.clone();
             let mut rows = Vec::new();
-            pool.compact(&mut properties, &mut rows, |_| false);
+            cache.compact(&mut properties, &mut rows, |_| false);
             assert_eq!(properties, before);
             assert!(rows.is_empty());
         }

@@ -786,6 +786,50 @@ fn a_captured_digest_tells_two_shared_values_of_one_state_apart() {
     assert!(holding("a", "b") != holding("b", "a"));
 }
 
+#[test]
+fn shared_digest_caches_preserve_values_across_tasks_and_invocations() {
+    let mut state = generated_state(41, 4096);
+    let values = [
+        Arc::new(json!({"_type":"EnumItem","name":"First","value":1})),
+        Arc::new(json!({"_type":"EnumItem","name":"Second","value":2})),
+        Arc::new(json!({"_type":"SharedString","base64":"payload".repeat(512)})),
+    ];
+    state.native_properties_by_instance = Some(
+        (0..state.instances.len())
+            .map(|index| {
+                vec![NativeSettingsProperty {
+                    name: "Typed".into(),
+                    value: NativeSettingsValue::Shared(Arc::clone(&values[index % values.len()])),
+                }]
+            })
+            .collect(),
+    );
+    let digest = |state: &ServiceState, threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| captured::state_digest(state, None))
+    };
+    let expected = digest(&state, 1);
+    assert_eq!(digest(&state, 8), expected);
+    // Equal content in distinct allocations must give the same digest.
+    for rows in state.native_properties_by_instance.as_mut().unwrap() {
+        let NativeSettingsValue::Shared(value) = &mut rows[0].value else {
+            unreachable!();
+        };
+        *value = Arc::new(value.as_ref().clone());
+    }
+    assert_eq!(digest(&state, 8), expected);
+    // A later invocation cannot reuse a stale digest of an edited allocation.
+    let value = &mut state.native_properties_by_instance.as_mut().unwrap()[2048][0].value;
+    let NativeSettingsValue::Shared(value) = value else {
+        unreachable!();
+    };
+    Arc::make_mut(value)["name"] = json!("Edited");
+    assert_ne!(digest(&state, 8), expected);
+}
+
 /// Which instance a child stands under is part of the digest, not only the
 /// children in their order.
 #[test]
