@@ -120,16 +120,11 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
             .by_index
             .get(&index)
             .ok_or_else(|| anyhow::anyhow!("Missing export referent"))?;
-        let mut builder = RbxInstanceBuilder::with_referent_and_property_capacity(
-            instance.class_name.as_str(),
-            referent,
-            properties.len() + usize::from(!attributes.is_empty()),
-        )
-        .with_name(instance.name.clone());
         let class_metadata = self
             .metadata
             .entry(instance.class_name.as_str())
             .or_insert_with(|| BytecodeExportClassMetadata {
+                name: rbx_dom_weak::Ustr::from(instance.class_name.as_str()),
                 triangle_mesh_part: rbx_reflection_class_is_a(
                     self.database,
                     &instance.class_name,
@@ -139,6 +134,12 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                 decal: rbx_reflection_class_is_a(self.database, &instance.class_name, "Decal"),
                 properties: AHashMap::new(),
             });
+        let mut builder = RbxInstanceBuilder::with_referent_and_property_capacity(
+            class_metadata.name,
+            referent,
+            properties.len() + usize::from(!attributes.is_empty()),
+        )
+        .with_name(instance.name.clone());
         let synthesized_initial_size = values.map_or_else(
             || {
                 synthesized_mesh_initial_size_for_rbx_export_class(
@@ -194,7 +195,7 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                     let metadata = BytecodeExportPropertyMetadata {
                         property,
                         descriptor,
-                        serialized_name,
+                        serialized_name: rbx_dom_weak::Ustr::from(serialized_name.unwrap_or(name)),
                         native_setter_property: class_metadata.triangle_mesh_part
                             && name == "CollisionFidelity",
                         skipped: model_property_name_is_skipped(name)
@@ -241,7 +242,7 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                 );
             }
             let property = property_metadata.property;
-            let serialized_name = property_metadata.serialized_name.unwrap_or(name);
+            let serialized_name = property_metadata.serialized_name;
             let descriptor = property_metadata.descriptor;
             // A bare number for a member the reflection database does not know
             // (Camera.OrthographicSize before the database knew Studio 0.742)

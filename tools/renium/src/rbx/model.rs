@@ -406,12 +406,13 @@ pub(crate) struct BytecodeModelExportRefs<'a> {
 pub(crate) struct BytecodeExportPropertyMetadata<'db> {
     pub(crate) property: Option<&'db RbxPropertyDescriptor<'db>>,
     pub(crate) descriptor: Option<&'db RbxPropertyDescriptor<'db>>,
-    pub(crate) serialized_name: Option<&'static str>,
+    pub(crate) serialized_name: rbx_dom_weak::Ustr,
     pub(crate) native_setter_property: bool,
     pub(crate) skipped: bool,
 }
 
 pub(crate) struct BytecodeExportClassMetadata<'db> {
+    pub(crate) name: rbx_dom_weak::Ustr,
     pub(crate) triangle_mesh_part: bool,
     pub(crate) model: bool,
     pub(crate) decal: bool,
@@ -1946,6 +1947,7 @@ pub(crate) fn build_rbx_place_with_tuning(
                 &children,
             );
             let scales = (0..document.instances.len())
+                .into_par_iter()
                 .map(|index| crate::rbx::encode::cumulative_ancestor_model_scale(&document, index))
                 .collect::<Vec<_>>();
             // These maps contain only projected context. Real values, including
