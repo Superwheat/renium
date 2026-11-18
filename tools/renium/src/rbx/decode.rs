@@ -1046,8 +1046,8 @@ pub(crate) fn rbx_properties_to_native_settings_records<'a>(
     )
 }
 
-/// The same records with every shared string as JSON of its own, for a
-/// caller that goes on to edit the JSON values.
+/// The same records with shared strings and UniqueIds as editable JSON,
+/// for callers that filter or rewrite those envelopes after conversion.
 pub(crate) fn rbx_properties_to_unshared_native_settings_records<'a>(
     class_name: &str,
     property_entries: impl IntoIterator<Item = (&'a rbx_dom_weak::Ustr, &'a RbxVariant)>,
@@ -1125,7 +1125,7 @@ fn native_settings_records<'a>(
     database: &ReflectionDatabase<'_>,
     refs: &BytecodeModelImportRefs,
     native_filter: Option<&NativePropertyFilter>,
-    share_payloads: bool,
+    compact_values: bool,
 ) -> NativeSettingsRecords {
     let mut native_properties = Vec::new();
     let mut properties = Map::new();
@@ -1178,7 +1178,10 @@ fn native_settings_records<'a>(
             Some(renamed) => PropertyName::from(renamed.as_str()),
             None => PropertyName::held(property_name),
         };
-        let keep_json = native_property_keeps_json(class_name, output_name, native_filter);
+        // Offline import applies its engine-managed-property policy to JSON.
+        // Only capture may move identity envelopes into the typed sidecar.
+        let keep_json = native_property_keeps_json(class_name, output_name, native_filter)
+            || !compact_values && matches!(variant, RbxVariant::UniqueId(_));
         // A number or a content value for a member the reflection database
         // does not know keeps its engine type in the store, so a later build
         // writes it as the engine declared it: a number is not left out and a
@@ -1208,7 +1211,7 @@ fn native_settings_records<'a>(
                 name: native_name(),
                 value,
             });
-        } else if share_payloads
+        } else if compact_values
             && let RbxVariant::SharedString(shared) = variant
             && shared.data().len() >= SHARED_PAYLOAD_MIN_BYTES
             && let Some(value) = shared_payload_value(shared, || {
