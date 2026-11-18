@@ -211,19 +211,21 @@ pub(super) fn verified_by_rows(
         for index in written {
             settled.insert(index, observed.instances[index].clone());
         }
-        // The roots stay: they say which camera is the viewport's.
-        let release = |instances: &mut [SettingsBytecodeInstance]| {
-            instances.par_iter_mut().for_each(|instance| {
-                if instance.parent_index.is_some() {
-                    instance.properties = Map::new();
-                    instance.attributes = Map::new();
-                }
-            });
-        };
-        rayon::join(
-            || release(&mut desired.instances[rows.clone()]),
-            || release(&mut observed.instances[rows.clone()]),
-        );
+        // The roots stay: they say which camera is the viewport's. The
+        // values of the others are freed beside the next range's read.
+        let released = [&mut desired, &mut observed].map(|document| {
+            document.instances[rows.clone()]
+                .iter_mut()
+                .filter(|instance| instance.parent_index.is_some())
+                .map(|instance| {
+                    (
+                        std::mem::take(&mut instance.properties),
+                        std::mem::take(&mut instance.attributes),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        rayon::spawn(move || released.into_par_iter().for_each(drop));
         start = rows.end;
     }
     if desired_rows.finish().is_err() || observed_rows.finish().is_err() {
@@ -266,5 +268,7 @@ fn settled_store(
         instance.properties.clone_from(&verified.properties);
         instance.attributes.clone_from(&verified.attributes);
     }
-    retained.encode(&document)
+    let store = retained.encode(&document);
+    rayon::spawn(move || drop((document, retained)));
+    store
 }

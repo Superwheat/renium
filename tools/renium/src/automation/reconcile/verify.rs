@@ -1024,6 +1024,11 @@ pub(crate) fn expected_map_mismatch(
 ) -> Option<String> {
     let class_name = &instance.class_name;
     expected.iter().find_map(|(name, value)| {
+        // A value Studio holds as the files spell it is retained, whatever
+        // the rules below say of its property.
+        if actual.get(name) == Some(value) {
+            return None;
+        }
         if properties
             && name == "PhysicsGrid"
             && crate::settings::equivalence::terrain_physics_caches_match(
