@@ -75,7 +75,7 @@ fn engine_managed_property(class_name: &str, name: &str, value: &Value) -> bool 
 /// hull Studio has not computed; saved, it turns the part into a solid box.
 /// It is reported, where a computed hull is engine state and is not.
 fn is_block_physics_placeholder_json(value: &Value) -> bool {
-    value
+    crate::settings::held::resolve(value)
         .get("base64")
         .and_then(Value::as_str)
         .and_then(|encoded| base64::decode(encoded).ok())

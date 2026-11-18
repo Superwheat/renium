@@ -882,7 +882,9 @@ pub(crate) fn entries_equivalent(
 
 pub(crate) fn decoded_settings_document(entry: Option<&SnapshotEntry>) -> Result<SettingsBytecode> {
     let mut document = match entry {
-        Some(SnapshotEntry::File(bytes)) => decode_settings_bytecode(bytes),
+        Some(SnapshotEntry::File(bytes)) => {
+            crate::settings::bytecode::decode_settings_bytecode_holding(bytes)
+        }
         None => Ok(SettingsBytecode {
             version: SETTINGS_BINARY_VERSION,
             instances: Vec::new(),
@@ -914,7 +916,10 @@ pub(crate) fn missing_store_message(path: &Path) -> String {
 }
 
 pub(crate) fn short_reconciliation_value(value: Option<&Value>) -> String {
-    let text = value.map_or_else(|| "<absent>".to_string(), Value::to_string);
+    let text = value.map_or_else(
+        || "<absent>".to_string(),
+        |value| crate::settings::held::resolve(value).to_string(),
+    );
     if text.len() <= 96 {
         text
     } else {

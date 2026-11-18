@@ -432,6 +432,9 @@ pub(crate) fn normalize_editor_bridge_value(
     paths_by_index: &[Option<EditorInstancePath>],
     settings_ids_by_index: &EditorReferenceIds<'_>,
 ) -> Value {
+    // Studio gets the payload a handle stands for.
+    let held = crate::settings::held::resolve(value);
+    let value: &Value = &held;
     match value {
         Value::Array(items) => Value::Array(
             items
@@ -657,6 +660,8 @@ fn normalize_editor_color3_value(value: Option<&Value>) -> Value {
 }
 
 fn editor_review_value(value: &Value) -> Value {
+    let held = crate::settings::held::resolve(value);
+    let value: &Value = &held;
     let encoded_len = serde_json::to_vec(value).map_or(0, |encoded| encoded.len());
     if encoded_len <= 512 {
         return value.clone();

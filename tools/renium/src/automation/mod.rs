@@ -214,7 +214,9 @@ pub struct Response {
 }
 
 impl Response {
-    pub fn success(id: u64, started: Instant, result: Value) -> Self {
+    pub fn success(id: u64, started: Instant, mut result: Value) -> Self {
+        // A result holds the payload a handle stands for.
+        crate::settings::held::resolve_all(&mut result);
         Self {
             v: PROTOCOL_VERSION,
             id,

@@ -308,9 +308,13 @@ impl Conflict {
             .filter(|(_, value)| value.is_none())
             .map(|(name, _)| name.to_string())
             .collect();
-        self.held = digest_of(
-            [base, files, studio].map(|value| value.map(|value| value.to_string().into_bytes())),
-        );
+        self.held = digest_of([base, files, studio].map(|value| {
+            value.map(|value| {
+                crate::settings::held::resolve(value)
+                    .to_string()
+                    .into_bytes()
+            })
+        }));
         self
     }
 
@@ -460,6 +464,8 @@ fn cut_characters(text: &str) -> Option<String> {
 /// A value as a conflict shows it: whole, or, past 2,000 characters, as its
 /// start with its full length.
 pub(crate) fn shown_value(value: &Value) -> Value {
+    let held = crate::settings::held::resolve(value);
+    let value: &Value = &held;
     let text = value.to_string();
     match cut_characters(&text) {
         Some(cut) => Value::String(cut),
@@ -520,7 +526,7 @@ pub(crate) fn quoted_value(value: Option<&Value>) -> String {
     };
     let text = match value {
         Value::String(text) => format!("{text:?}"),
-        other => other.to_string(),
+        other => crate::settings::held::resolve(other).to_string(),
     };
     if text.chars().count() > 60 {
         format!("{}…", text.chars().take(59).collect::<String>())
@@ -1132,5 +1138,39 @@ mod tests {
             conflict_message(&conflicts[..1]),
             "Sync needs review: Workspace/Door: property A"
         );
+    }
+}
+
+#[cfg(test)]
+mod held_payload_tests {
+    use super::*;
+
+    /// A document of a pull or a push holds a shared payload by a handle
+    /// only its process knows. A record, its id and a sentence state the
+    /// payload, as they do for a document that holds it outright.
+    #[test]
+    fn a_record_states_the_payload_a_handle_stands_for() {
+        for len in [40, 8_000] {
+            let payload = serde_json::json!({"_type": "SharedString", "base64": "Q".repeat(len)});
+            let handle = crate::settings::held::held(payload.clone());
+            assert_ne!(handle, payload);
+            assert_eq!(shown_value(&handle), shown_value(&payload));
+            assert_eq!(quoted_value(Some(&handle)), quoted_value(Some(&payload)));
+            assert_eq!(
+                crate::automation::reconcile::short_reconciliation_value(Some(&handle)),
+                crate::automation::reconcile::short_reconciliation_value(Some(&payload))
+            );
+            let record =
+                |value: &Value| {
+                    Conflict::new(ConflictKind::File, Path::new("a.renium"), "differs".into())
+                        .values(None, Some(value), Some(&payload))
+                };
+            let (held, plain) = (record(&handle), record(&payload));
+            assert_eq!(held.held, plain.held);
+            assert_eq!(
+                serde_json::to_value(&held).unwrap(),
+                serde_json::to_value(&plain).unwrap()
+            );
+        }
     }
 }

@@ -533,10 +533,14 @@ pub(super) fn row_digest<'a>(
     half_digest(digest)
 }
 
+/// A payload held once is digested once for the process.
 pub(super) fn value_digest(value: &Value) -> [u8; 16] {
-    let mut digest = Sha256::new();
-    crate::settings::equivalence::digest_value(&mut digest, value);
-    half_digest(digest)
+    let of = |value: &Value| {
+        let mut digest = Sha256::new();
+        crate::settings::equivalence::digest_value(&mut digest, value);
+        half_digest(digest)
+    };
+    crate::settings::held::digest_once(value, of).unwrap_or_else(|| of(value))
 }
 
 pub(super) fn attributes_digest(attributes: &Map<String, Value>) -> [u8; 16] {
@@ -1527,7 +1531,9 @@ fn convert_chunk<'a>(
                 instance.attributes = attributes;
             } else {
                 let value = normalize_source(&source, kind, scope, &mut scratch)?;
-                instance.properties.insert(name.to_string(), value);
+                instance
+                    .properties
+                    .insert(name.to_string(), crate::settings::held::held(value));
             }
         }
         instances.push(instance);
@@ -1669,7 +1675,7 @@ fn native_value(value: &NativeSettingsValue, scope: ConversionScope<'_, '_>) -> 
             [("name", Value::String(checked_string(value, scope.budget)?))],
         )),
         NativeSettingsValue::Ref(index) => decoded_reference(*index, scope.instance_count),
-        NativeSettingsValue::Shared(value) => Ok(Value::clone(value)),
+        NativeSettingsValue::Shared(value) => Ok(crate::settings::held::held_copy(value)),
         NativeSettingsValue::Vector2(_)
         | NativeSettingsValue::Vector3(_)
         | NativeSettingsValue::UDim(_)

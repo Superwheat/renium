@@ -3308,6 +3308,8 @@ fn push_package_fingerprint_json(
     refs: &PackageFingerprintRefs,
     out: &mut String,
 ) -> Result<()> {
+    let held = crate::settings::held::resolve(value);
+    let value: &Value = &held;
     match value {
         Value::Object(map) => push_package_fingerprint_map(map, refs, out)?,
         Value::Array(items) => {

@@ -877,6 +877,7 @@ const BOX_COLLISION_HULL: &[u8] = b"CSGPHS\0\0\0\0BLOCK";
 /// fidelity gets the enum back from here, so a part recreated through the
 /// plugin cooks at the fidelity it was saved with.
 pub(crate) fn collision_fidelity_from_hull(value: &Value) -> Option<Value> {
+    let value = crate::settings::held::resolve(value);
     let bytes = base64::decode(value.get("base64")?.as_str()?).ok()?;
     if bytes.len() < 12 || !bytes.starts_with(b"CSGPHS") {
         return None;
@@ -1302,7 +1303,8 @@ pub(crate) fn binary_payload_json(kind: &str, bytes: &[u8]) -> Value {
 }
 
 fn json_binary_payload(value: &Value, kind: &str) -> Option<Vec<u8>> {
-    let object = value.as_object()?;
+    let held = crate::settings::held::resolve(value);
+    let object = held.as_object()?;
     if object.get("_type").and_then(Value::as_str) != Some(kind) {
         return None;
     }

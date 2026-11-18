@@ -819,6 +819,7 @@ fn apply_write(
             .value
             .get(name)
             .map(|value| {
+                let value = crate::settings::held::resolve(value);
                 ensure!(
                     value["_type"] == "BinaryString",
                     "Terrain grid requires a BinaryString"

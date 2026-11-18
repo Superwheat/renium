@@ -262,7 +262,7 @@ pub(crate) struct SettingsBytecode {
     pub(crate) instances: Vec<SettingsBytecodeInstance>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SettingsBytecodeInstance {
     pub(crate) settings_id: String,
@@ -270,8 +270,22 @@ pub(crate) struct SettingsBytecodeInstance {
     pub(crate) class_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) parent_index: Option<usize>,
+    /// A binary payload of some size is held once for the process, and the
+    /// property holds its handle (see `settings::held`).
+    #[serde(serialize_with = "crate::settings::held::serialize_properties")]
     pub(crate) properties: Map<String, Value>,
     pub(crate) attributes: Map<String, Value>,
+}
+
+impl PartialEq for SettingsBytecodeInstance {
+    fn eq(&self, other: &Self) -> bool {
+        self.settings_id == other.settings_id
+            && self.name == other.name
+            && self.class_name == other.class_name
+            && self.parent_index == other.parent_index
+            && crate::settings::held::same_properties(&self.properties, &other.properties)
+            && self.attributes == other.attributes
+    }
 }
 
 impl SettingsBytecodeInstance {
@@ -606,6 +620,21 @@ pub(crate) fn decode_settings_bytecode(bytes: &[u8]) -> Result<SettingsBytecode>
     let _span = crate::app::profile::span("store decode");
     let (version, decoded) = decode_settings_bytecode_container(bytes)?;
     decode_settings_bytecode_document(version, &decoded, &DecodeBudget::for_file(bytes.len()))
+}
+
+/// The document of a store for a pull or a push to compare, plan from and
+/// write: it holds each binary payload of some size once, by its handle
+/// (see `settings::held`), where a store's instances share the text of one
+/// payload thousands of times. Whatever writes one of its values out
+/// resolves the handle.
+pub(crate) fn decode_settings_bytecode_holding(bytes: &[u8]) -> Result<SettingsBytecode> {
+    let _span = crate::app::profile::span("store decode");
+    let (version, decoded) = decode_settings_bytecode_container(bytes)?;
+    decode_settings_bytecode_document(
+        version,
+        &decoded,
+        &DecodeBudget::for_file(bytes.len()).holding_payloads(),
+    )
 }
 
 fn decode_settings_bytecode_if_contains_any_string_set(
@@ -974,12 +1003,30 @@ impl ValueScope<'_> {
 /// decode in parallel.
 struct DecodeBudget {
     remaining: AtomicUsize,
+    /// Whether the document holds each payload of some size once, by its
+    /// handle (see `settings::held`).
+    holds_payloads: bool,
 }
 
 impl DecodeBudget {
     fn new(bytes: usize) -> Self {
         Self {
             remaining: AtomicUsize::new(bytes),
+            holds_payloads: false,
+        }
+    }
+
+    fn holding_payloads(mut self) -> Self {
+        self.holds_payloads = true;
+        self
+    }
+
+    /// A property's value as its document holds it.
+    fn property(&self, value: Value) -> Value {
+        if self.holds_payloads {
+            crate::settings::held::held(value)
+        } else {
+            value
         }
     }
 
@@ -1101,7 +1148,10 @@ fn decode_property_group_body(
                         decode_cframe_rotation_table_payload(&mut reader, rotations)?
                     }
                 };
-                Ok(DecodedGroupEntry::Property(index, value))
+                Ok(DecodedGroupEntry::Property(
+                    index,
+                    scope.budget.property(value),
+                ))
             })
             .collect();
     }
@@ -1140,7 +1190,10 @@ fn decode_property_group_body(
                     }
                 }
             };
-            entries.push(DecodedGroupEntry::Property(instance_index, value));
+            entries.push(DecodedGroupEntry::Property(
+                instance_index,
+                scope.budget.property(value),
+            ));
         }
     }
     reader.finish()?;
@@ -1918,6 +1971,10 @@ fn decode_object_payload(
         let key = scope.string(reader, "object key string id")?;
         let value = decode_raw_value_at_depth(reader, scope, depth + 1)?;
         out.insert(key, value);
+    }
+    // A handle stands for a payload this process holds; a file has none.
+    if crate::settings::held::is_handle(&out) {
+        bail!("Settings bytecode holds the handle of a payload in place of the payload");
     }
     Ok(Value::Object(out))
 }
@@ -3479,6 +3536,15 @@ fn write_f32_bits<W: Write + ?Sized>(bits: u32, writer: &mut W) -> Result<()> {
 }
 
 fn binary_raw_value_kind(value: &Value, lookup: &SettingsBinaryInstanceLookup<'_>) -> Result<u8> {
+    let held = crate::settings::held::resolve(value);
+    let value: &Value = &held;
+    // A handle this process holds no payload for is never written.
+    if value
+        .as_object()
+        .is_some_and(crate::settings::held::is_handle)
+    {
+        bail!("A value is the handle of a payload this process does not hold");
+    }
     Ok(match value {
         Value::Null => 0,
         Value::Bool(false) => 1,
@@ -3844,6 +3910,17 @@ fn collect_raw_value_strings<'a>(
     lookup: &SettingsBinaryInstanceLookup<'_>,
     out: &mut SettingsStringCounts<'a>,
 ) -> Result<()> {
+    let held = crate::settings::held::resolve(value);
+    if matches!(held, crate::settings::held::Resolved::Held(_)) {
+        // The payload is kept only while this runs: its strings are counted
+        // as copies, as a settled value's are.
+        let mut counts = SettingsStringCounts::default();
+        collect_raw_value_strings(&held, lookup, &mut counts)?;
+        for (text, count) in counts {
+            add_count_key(out, Cow::Owned(text.into_owned()), count);
+        }
+        return Ok(());
+    }
     match binary_raw_value_kind(value, lookup)? {
         0 | 1 | 2 | 3 | 4 | 5 | 9 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 20 | 21 => {}
         6 | 19 => {
@@ -4056,6 +4133,8 @@ fn write_raw_value_payload<W: Write + ?Sized>(
     lookup: &SettingsBinaryInstanceLookup<'_>,
     writer: &mut W,
 ) -> Result<()> {
+    let held = crate::settings::held::resolve(value);
+    let value: &Value = &held;
     match kind {
         0..=2 => {}
         3..=5 => write_number_payload(

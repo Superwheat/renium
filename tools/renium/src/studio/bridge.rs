@@ -4480,7 +4480,7 @@ impl BridgeServer {
             #[serde(skip_serializing_if = "Option::is_none")]
             lease_id: Option<&'a str>,
             method: &'a str,
-            params: &'a Value,
+            params: crate::settings::held::AsPayloads<'a>,
             #[serde(skip_serializing_if = "Option::is_none")]
             profile: Option<bool>,
         }
@@ -4490,7 +4490,8 @@ impl BridgeServer {
             session_id: &bridge_socket.request_session_id,
             lease_id,
             method,
-            params,
+            // Studio gets the payload a handle stands for.
+            params: crate::settings::held::AsPayloads(params),
             profile: crate::app::profile::enabled().then_some(true),
         })?;
         if payload.len() > MAX_BRIDGE_REQUEST_BYTES {

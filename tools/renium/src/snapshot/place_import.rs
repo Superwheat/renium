@@ -731,7 +731,7 @@ mod tests {
                 .unwrap();
             for name in ["name", "parent", "rootMotion"] {
                 assert_eq!(
-                    rig.properties[name],
+                    *crate::settings::held::resolve(&rig.properties[name]),
                     json!({"_type":"BinaryString", "base64":base64::encode(&binary)}),
                     "{name}, xml={xml}"
                 );

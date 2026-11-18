@@ -623,6 +623,16 @@ Hint: ",
 }
 
 pub(crate) fn print_json_output(value: &Value, pretty: bool) -> Result<()> {
+    // An output holds the payload a handle stands for.
+    let resolved;
+    let value = if crate::settings::held::holds_a_handle(value) {
+        let mut owned = value.clone();
+        crate::settings::held::resolve_all(&mut owned);
+        resolved = owned;
+        &resolved
+    } else {
+        value
+    };
     let captured = CAPTURED_OUTPUT.with_borrow_mut(|output| match output {
         Ok(output) => {
             *output = Some(if CAPTURE_MODE.get() == CaptureMode::Text {

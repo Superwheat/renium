@@ -143,8 +143,8 @@ fn align_settings_bytes(
         >= SETTINGS_PARALLEL_DECODE_MIN_BYTES
     {
         rayon::join(
-            || decode_settings_bytecode(reference_bytes),
-            || decode_settings_bytecode(observed_bytes),
+            || crate::settings::bytecode::decode_settings_bytecode_holding(reference_bytes),
+            || crate::settings::bytecode::decode_settings_bytecode_holding(observed_bytes),
         )
     } else {
         (
@@ -265,7 +265,7 @@ pub(super) fn digest_map(digest: &mut Sha256, map: &Map<String, Value>) {
 }
 
 pub(super) fn digest_value(digest: &mut Sha256, value: &Value) {
-    match value {
+    match &*crate::settings::held::resolve(value) {
         Value::Null => digest.update([0]),
         Value::Bool(value) => digest.update([1, u8::from(*value)]),
         Value::Number(number) => {
@@ -3058,6 +3058,7 @@ pub(crate) fn terrain_physics_caches_match(
     right: &Map<String, Value>,
 ) -> bool {
     let binary = |value: &Value| {
+        let value = crate::settings::held::resolve(value);
         value.get("_type").and_then(Value::as_str) == Some("BinaryString")
             && value.get("base64").is_some_and(Value::is_string)
     };
@@ -3075,6 +3076,7 @@ pub(crate) fn terrain_physics_caches_match(
 /// two hulls that encode one fidelity compare as equal and a pull keeps the
 /// bytes the files have; hulls without a readable code compare by bytes.
 pub(crate) fn hull_fidelity_code(value: &Value) -> Option<u8> {
+    let value = crate::settings::held::resolve(value);
     let bytes = base64::decode(value.get("base64")?.as_str()?).ok()?;
     if !bytes.starts_with(b"CSGPHS") || bytes.len() < 10 {
         return None;
@@ -3348,6 +3350,7 @@ fn hull_fidelity(value: &Value) -> Option<u8> {
 }
 
 fn is_cooked_hull(value: &Value) -> bool {
+    let value = crate::settings::held::resolve(value);
     value.get("_type").and_then(Value::as_str) == Some("CollisionHullFidelity")
         || value
             .get("base64")
@@ -3397,7 +3400,7 @@ fn geometry_sources_equal(
 }
 
 fn hull_is_placeholder(value: &Value) -> bool {
-    value
+    crate::settings::held::resolve(value)
         .get("base64")
         .and_then(Value::as_str)
         .and_then(|text| base64::decode(text).ok())
@@ -3637,6 +3640,16 @@ fn reconciliation_values_equal_with_ids(
     approximate: bool,
     ids: Option<PairedStoreIds<'_>>,
 ) -> bool {
+    // Two handles of one payload hold one value; any other pair compares
+    // as the payloads they stand for.
+    let held = (
+        crate::settings::held::resolve(left),
+        crate::settings::held::resolve(right),
+    );
+    if held.0.same_payload(&held.1) {
+        return true;
+    }
+    let (left, right): (&Value, &Value) = (&held.0, &held.1);
     let (left, right) = (typed_scalar(left), typed_scalar(right));
     let canonical = (
         canonical_wrapped_value(left),

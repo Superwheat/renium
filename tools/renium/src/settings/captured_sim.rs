@@ -514,7 +514,13 @@ fn a_shared_value_is_stored_as_the_json_value_it_holds() {
         &decode_settings_bytecode(&bytes).unwrap()
     ));
     for part in &converted.instances[1..] {
-        assert_eq!(part.properties["PhysicalConfigData"], payload);
+        // The document holds the payload once, and each part its handle.
+        let held = &part.properties["PhysicalConfigData"];
+        assert!(
+            held.as_object()
+                .is_some_and(crate::settings::held::is_handle)
+        );
+        assert_eq!(*crate::settings::held::resolve(held), payload);
     }
 }
 

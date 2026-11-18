@@ -1514,6 +1514,12 @@ impl Doc {
 
 /// Exact equality: integers and floats differ, and floats compare by bits.
 fn same(left: &Value, right: &Value) -> bool {
+    // A decoded document holds a payload of some size by its handle.
+    let held = (
+        crate::settings::held::resolve(left),
+        crate::settings::held::resolve(right),
+    );
+    let (left, right): (&Value, &Value) = (&held.0, &held.1);
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => {
             if left.is_f64() || right.is_f64() {
@@ -1720,6 +1726,16 @@ fn reencoded(bytes: &[u8], d1: &SettingsBytecode) -> Result<(), String> {
         .map_err(|error| format!("law 3: the second encoding does not decode: {error:#}"))?;
     if !same_document(&d2, d1) {
         return Err("law 3: the second round trip changed the document".into());
+    }
+    // The document a pull or a push decodes holds its payloads by handle:
+    // it is the same document, and it encodes to the same bytes.
+    let held = crate::settings::bytecode::decode_settings_bytecode_holding(bytes)
+        .map_err(|error| format!("law 3: the encoding does not decode by handle: {error:#}"))?;
+    if !same_document(&held, d1) || held != *d1 {
+        return Err("law 3: the document that holds its payloads by handle is another".into());
+    }
+    if encode_settings_bytecode(&held).ok().as_deref() != Some(bytes) {
+        return Err("law 3: a document that holds its payloads by handle encodes otherwise".into());
     }
     Ok(())
 }

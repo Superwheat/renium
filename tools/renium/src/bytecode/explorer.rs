@@ -387,7 +387,9 @@ fn bytecode_batch_instance_index(
 fn hidden_by_default(name: &str, value: &Value) -> bool {
     crate::settings::equivalence::reconciliation_property_is_derived(name)
         || matches!(name, "UniqueId" | "HistoryId" | "MeshSize")
-        || value.get("base64").is_some_and(Value::is_string)
+        || crate::settings::held::resolve(value)
+            .get("base64")
+            .is_some_and(Value::is_string)
 }
 
 /// Compact output prints a path as one dotted string with `[n]` after any

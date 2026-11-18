@@ -26,7 +26,7 @@ use crate::roblox::services::DEFAULT_SYNC_SERVICES;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     PulledDigest, PulledRows, SettingsBytecode, child_indices_for_instance,
-    decode_settings_bytecode, encode_service_settings_binary, pull_changed_document_rows,
+    decode_settings_bytecode_holding, encode_service_settings_binary, pull_changed_document_rows,
     pull_changed_values, pulled_digest_from_service_state, settings_bytecode_from_service_state,
     write_fresh_service_settings_binary_file,
 };
@@ -1674,7 +1674,7 @@ struct StoredSettings {
 }
 
 fn decode_stored_settings(settings_path: &Path, bytes: &[u8]) -> Result<SettingsBytecode> {
-    decode_settings_bytecode(bytes)
+    decode_settings_bytecode_holding(bytes)
         .with_context(|| format!("Failed to align {}", settings_path.display()))
 }
 
@@ -2409,7 +2409,7 @@ mod projection_tests {
             import_service_tree(&state, &root, &source, None, "Workspace")?;
             let written = fs::read(&store)?;
             assert_eq!(written != before, round < 2, "round {round}");
-            let document = decode_settings_bytecode(&written)?;
+            let document = crate::settings::bytecode::decode_settings_bytecode(&written)?;
             assert_eq!(
                 document.instances[9].properties["Transparency"],
                 json!(transparency)
@@ -2504,7 +2504,7 @@ mod projection_tests {
             None,
             "Workspace",
         )?;
-        let first = decode_settings_bytecode(&fs::read(&store)?)?;
+        let first = crate::settings::bytecode::decode_settings_bytecode(&fs::read(&store)?)?;
         let ids = |document: &SettingsBytecode| {
             document
                 .instances
@@ -2520,7 +2520,7 @@ mod projection_tests {
             import_service_tree(&state, &root, &source, None, "Workspace")?;
             let written = fs::read(&store)?;
             assert_eq!(written != before, round < 2, "round {round}");
-            let document = decode_settings_bytecode(&written)?;
+            let document = crate::settings::bytecode::decode_settings_bytecode(&written)?;
             assert_eq!(ids(&document), ids(&first), "round {round}");
             assert_eq!(
                 document.instances[1].properties,
@@ -2624,9 +2624,9 @@ mod projection_tests {
         let source = root.join("src");
         let store = service_settings_path(&source.join("Workspace"));
         import_service_tree(&grouped_state(false)?, &root, &source, None, "Workspace")?;
-        let first = decode_settings_bytecode(&fs::read(&store)?)?;
+        let first = crate::settings::bytecode::decode_settings_bytecode(&fs::read(&store)?)?;
         import_service_tree(&grouped_state(true)?, &root, &source, None, "Workspace")?;
-        let grown = decode_settings_bytecode(&fs::read(&store)?)?;
+        let grown = crate::settings::bytecode::decode_settings_bytecode(&fs::read(&store)?)?;
         assert_eq!(grown.instances.len(), first.instances.len() + 1);
         assert_eq!(grown.instances[2].name, "New");
         for (index, stored) in first.instances.iter().enumerate() {
@@ -2642,7 +2642,10 @@ mod projection_tests {
         );
         // And gone again, the store is the first one.
         import_service_tree(&grouped_state(false)?, &root, &source, None, "Workspace")?;
-        assert!(decode_settings_bytecode(&fs::read(&store)?)?.instances == first.instances);
+        assert!(
+            crate::settings::bytecode::decode_settings_bytecode(&fs::read(&store)?)?.instances
+                == first.instances
+        );
         assert!(!WHOLLY_ALIGNED.lock_recover().contains(&store));
         Ok(())
     }
@@ -2813,7 +2816,7 @@ mod projection_tests {
         assert!(
             remembered_pull(&Sha256::digest(&bytes).into()).is_none_or(|pull| pull.rows.is_none())
         );
-        let written = decode_settings_bytecode(&bytes)?;
+        let written = crate::settings::bytecode::decode_settings_bytecode(&bytes)?;
         assert_eq!(written.instances[5].properties["TextWrapped"], json!(true));
         assert_eq!(
             written.instances[9].properties["Transparency"],

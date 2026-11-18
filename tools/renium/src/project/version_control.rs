@@ -779,7 +779,7 @@ fn vc_render_short(value: Option<&Value>) -> String {
     match value {
         None => "<absent>".to_string(),
         Some(value) => {
-            let text = value.to_string();
+            let text = crate::settings::held::resolve(value).to_string();
             if text.len() > 80 {
                 format!(
                     "{}... ({} bytes)",

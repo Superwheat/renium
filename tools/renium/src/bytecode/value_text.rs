@@ -91,6 +91,11 @@ fn typed_text(object: &Map<String, Value>, place: Place) -> Option<String> {
 /// A typed object that only wraps one scalar prints as that scalar, and one
 /// that only carries a binary payload as `<Type N bytes>`.
 fn wrapped_text(kind: &str, object: &Map<String, Value>, place: Place) -> Option<String> {
+    let held = crate::settings::held::payload_object(object);
+    let object = held
+        .as_ref()
+        .and_then(|held| held.as_object())
+        .unwrap_or(object);
     if object.len() != 2 {
         return None;
     }
