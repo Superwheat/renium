@@ -82,6 +82,12 @@ fn store(rng: &mut SimRng, ids: usize, unique: usize, workspace: bool) -> Settin
         if rng.below(60) == 0 {
             row.attributes.insert("Look".into(), wrapped(rng));
         }
+        if rng.below(8) == 0 {
+            row.properties.insert(
+                "MaxForce".into(),
+                json!({"_type": "Float", "value": (["inf", "-inf", "nan"][rng.below(3)])}),
+            );
+        }
         instances.push(row);
     }
     SettingsBytecode {
@@ -126,7 +132,12 @@ fn reference(rng: &mut SimRng, service: &str, count: usize) -> Value {
 /// An attribute in one of the forms Studio's plugin hands over without a
 /// type, and one with it.
 fn wrapped(rng: &mut SimRng) -> Value {
-    match rng.below(5) {
+    match rng.below(6) {
+        5 => json!({"Font": {
+            "family": "rbxasset://fonts/families/Arial.json",
+            "weight": 400,
+            "style": "Normal",
+        }}),
         0 => json!({"BrickColor": 21}),
         1 => json!({"NumberSequence": {"keypoints": [
             {"time": 0, "value": 1, "envelope": 0},
@@ -185,16 +196,46 @@ fn captured_as(document: &SettingsBytecode, native: bool, sparse: bool) -> Servi
 
 fn captured(document: &SettingsBytecode, native: bool) -> ServiceState {
     let mut state = captured_state(document, native);
-    for row in &mut state.instances {
-        if let Some(debug) = row
-            .transported_settings_id
-            .as_deref()
-            .and_then(|id| id.strip_prefix("debug:"))
+    let mut typed = state.native_properties_by_instance.take();
+    for (index, row) in state.instances.iter_mut().enumerate() {
+        // Every third of Studio's ids comes along as text, the way a place
+        // read from a file carries a pulled store's.
+        if index % 3 != 0
+            && let Some(debug) = row
+                .transported_settings_id
+                .as_deref()
+                .and_then(|id| id.strip_prefix("debug:"))
         {
             row.debug_id = Some(debug.to_string());
             row.transported_settings_id = None;
         }
+        // A typed capture holds a force without limit as the float it is, and
+        // at times the record's own name among the typed values.
+        if let Some(typed) = typed.as_mut().and_then(|typed| typed.get_mut(index)) {
+            if let Some(force) = row
+                .properties
+                .get("MaxForce")
+                .and_then(crate::rbx::decode::nonfinite_float_from_json)
+            {
+                row.properties.remove("MaxForce");
+                typed.push(NativeSettingsProperty {
+                    name: "MaxForce".into(),
+                    value: if index % 2 == 0 {
+                        NativeSettingsValue::Float32(force as f32)
+                    } else {
+                        NativeSettingsValue::Float64(force)
+                    },
+                });
+            }
+            if index % 7 == 5 {
+                typed.push(NativeSettingsProperty {
+                    name: "Name".into(),
+                    value: NativeSettingsValue::String(row.name.clone()),
+                });
+            }
+        }
     }
+    state.native_properties_by_instance = typed;
     state
 }
 
@@ -244,7 +285,7 @@ fn edit(rng: &mut SimRng, document: &mut SettingsBytecode) {
         .cloned();
     let service = document.instances[0].name.clone();
     let row = &mut document.instances[at];
-    match rng.below(56) {
+    match rng.below(60) {
         0..=6 => {
             row.properties
                 .insert("Transparency".into(), json!(rng.below(64) as f64 / 64.0));
@@ -431,6 +472,31 @@ fn edit(rng: &mut SimRng, document: &mut SettingsBytecode) {
         50 => {
             row.attributes.remove("Look");
         }
+        // The viewport goes to another camera, or to none.
+        51..=53 => {
+            let spare = (2..count).find(|&index| document.instances[index].class_name == "Camera");
+            let root = &mut document.instances[0];
+            match spare.filter(|_| rng.below(4) != 0) {
+                Some(spare) if root.class_name == "Workspace" => {
+                    let current = root
+                        .properties
+                        .get("CurrentCamera")
+                        .and_then(|camera| camera.get("instanceIndex")?.as_u64());
+                    let target = if current == Some(spare as u64 + 1) {
+                        2
+                    } else {
+                        spare + 1
+                    };
+                    root.properties.insert(
+                        "CurrentCamera".into(),
+                        json!({"_type": "Ref", "instanceIndex": target}),
+                    );
+                }
+                _ => {
+                    root.properties.remove("CurrentCamera");
+                }
+            }
+        }
         _ => {
             if row.class_name == "Camera" {
                 row.properties
@@ -453,6 +519,7 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
         AtomicUsize::new(0),
         AtomicUsize::new(0),
     );
+    let by_instance = AtomicUsize::new(0);
     run_seeds(1_200, |seed, steps| {
         let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         let native = seed % 2 == 0;
@@ -488,12 +555,47 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
                     .map_err(|error| format!("round {round}: {error:#}"))?,
                 None => None,
             };
+            // Where a state says the two encoders write it alike, they do.
+            if now.rows.encodes_as_its_document()
+                && encode_service_settings_binary(&state).ok()
+                    != encode_settings_bytecode(&observed).ok()
+            {
+                return Err(format!(
+                    "round {round}: the state's encoding is not its document's"
+                ));
+            }
+            // A file compared with no memory of it answers the same.
+            let unremembered = pull_changed_document_rows(&state, &now.rows, &file)
+                .map_err(|error| format!("round {round}: {error:#}"))?;
             let aligned = align_pulled_settings_documents_to_reference(
                 reference,
                 observed,
                 &|| encode_service_settings_binary(&state),
                 std::time::Instant::now(),
             );
+            match (&unremembered, &aligned) {
+                (None, _) => {}
+                (Some(_), Err(error)) => {
+                    return Err(format!(
+                        "round {round}: compared by instance where the alignment fails: {error:#}"
+                    ));
+                }
+                (Some((answer, _)), Ok(aligned)) => {
+                    let same = match (answer, &aligned.alignment) {
+                        (SettingsAlignment::Equivalent, SettingsAlignment::Equivalent) => true,
+                        (SettingsAlignment::Changed(left), SettingsAlignment::Changed(right)) => {
+                            left == right
+                        }
+                        _ => false,
+                    };
+                    if !same {
+                        return Err(format!(
+                            "round {round}: compared by instance, another answer than the alignment's"
+                        ));
+                    }
+                    by_instance.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             let aligned = match aligned {
                 Ok(aligned) => aligned,
                 Err(error) if answered.is_none() => {
@@ -563,7 +665,10 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
             whole.load(Ordering::Relaxed),
         );
         assert!(
-            kept >= 100 && written >= 400 && whole >= 500,
+            kept >= 100
+                && written >= 400
+                && whole >= 500
+                && by_instance.load(Ordering::Relaxed) >= 1_000,
             "kept {kept}, written {written}, by the whole alignment {whole}"
         );
     }
@@ -597,6 +702,22 @@ fn rows_read_alone_are_the_rows_of_the_whole_store() {
         }
         if property_edit::decode_rows(&bytes, &[whole.instances.len()]).is_ok() {
             return Err("a row past the end was read".into());
+        }
+        // The digests taken column by column are the digests of the rows.
+        let kept = (!whole.instances.is_empty()).then(|| rng.below(whole.instances.len()));
+        let (digests, alone) =
+            property_edit::row_digests(&bytes, kept).map_err(|error| format!("{error:#}"))?;
+        if alone.as_ref() != kept.map(|kept| &whole.instances[kept]) {
+            return Err("the row kept with the digests is not the store's".into());
+        }
+        if digests
+            != whole
+                .instances
+                .iter()
+                .map(captured::document_row_digest)
+                .collect::<Vec<_>>()
+        {
+            return Err("the digests of the columns are not the digests of the rows".into());
         }
         Ok(())
     });

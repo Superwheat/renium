@@ -252,6 +252,12 @@ fn generated_captures_record_service_and_document_wire_differences() {
                     wire, document_wire,
                     "a property a typed row holds twice is written twice"
                 );
+                assert!(
+                    !pulled_digest_from_service_state(&state)
+                        .unwrap()
+                        .rows
+                        .encodes_as_its_document()
+                );
             }
             for pool in &pools {
                 pool.install(|| {

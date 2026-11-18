@@ -121,7 +121,12 @@ fn values_encode_alike(
     }
     !properties.contains_key("Attributes")
         && attributes.values().all(|value| {
-            canonical_attribute_value(value).is_none()
+            // An object without a type is one of the wrapped forms, whether
+            // the encoder of documents knows it or not.
+            value
+                .as_object()
+                .is_none_or(|object| object.contains_key("_type"))
+                && canonical_attribute_value(value).is_none()
                 && collect_attribute_value_strings(value, &mut SettingsStringCounts::default())
                     .is_ok()
         })
@@ -142,6 +147,17 @@ pub(crate) fn pull_changed_values(
     stored: &[u8],
 ) -> Result<Option<crate::settings::equivalence::SettingsAlignment>> {
     captured::changed_values(state, before, now, stored)
+}
+
+/// The same for a stored file no pull remembers, by comparing the two
+/// documents instance by instance. The answer comes with whether every
+/// instance but the viewport camera is the same in both.
+pub(crate) fn pull_changed_document_rows(
+    state: &ServiceState,
+    now: &PulledRows,
+    stored: &[u8],
+) -> Result<Option<(crate::settings::equivalence::SettingsAlignment, bool)>> {
+    captured::changed_document_rows(state, now, stored)
 }
 
 /// The `PulledDigest` of this state, without holding its document.

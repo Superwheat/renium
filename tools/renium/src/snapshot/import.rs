@@ -26,8 +26,8 @@ use crate::roblox::services::DEFAULT_SYNC_SERVICES;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     PulledDigest, PulledRows, SettingsBytecode, child_indices_for_instance,
-    decode_settings_bytecode, encode_service_settings_binary, pull_changed_values,
-    pulled_digest_from_service_state, settings_bytecode_from_service_state,
+    decode_settings_bytecode, encode_service_settings_binary, pull_changed_document_rows,
+    pull_changed_values, pulled_digest_from_service_state, settings_bytecode_from_service_state,
     write_fresh_service_settings_binary_file,
 };
 use crate::settings::equivalence::{
@@ -1493,26 +1493,38 @@ fn write_service_settings_file(
         })();
         // A digest of the captured state says whether it is the state a pull
         // left this file alone with before. While nothing changed, no document
-        // of the captured store is built. A file no pull remembers is aligned
-        // whatever the digest says, which is then taken beside the documents.
-        let mut pulled = matches!(&stored_file, Ok(Some((_, _, Some(_)))))
+        // of the captured store is built.
+        let pulled = matches!(&stored_file, Ok(Some(_)))
             .then(|| pulled_digest_from_service_state(state_to_write).ok())
             .flatten();
         let unchanged_again = matches!(
             (&stored_file, &pulled),
             (Ok(Some((_, _, Some(remembered)))), Some(pulled)) if remembered.digest == pulled.digest
         );
+        // Where values changed since a pull left the file as a state's own
+        // document, and where no pull remembers the file, the instances that
+        // differ are compared alone. With the answer come the rows the file
+        // goes on to hold, where it stays.
         let changed_values = match (&stored_file, &pulled) {
-            (Ok(Some((bytes, _, Some(remembered)))), Some(pulled))
+            (Ok(Some((bytes, _, remembered))), Some(pulled))
                 if !unchanged_again && !pull_aligns_whole_documents() =>
             {
-                remembered.rows.as_ref().and_then(|before| {
-                    let _comparing = profile::span(&format!("{service}: changed values"));
-                    pull_changed_values(state_to_write, before, &pulled.rows, bytes)
+                let _comparing = profile::span(&format!("{service}: changed values"));
+                match remembered
+                    .as_ref()
+                    .and_then(|remembered| remembered.rows.clone())
+                {
+                    Some(before) => {
+                        pull_changed_values(state_to_write, &before, &pulled.rows, bytes)
+                            .ok()
+                            .flatten()
+                            .map(|alignment| (alignment, Some(before)))
+                    }
+                    None => pull_changed_document_rows(state_to_write, &pulled.rows, bytes)
                         .ok()
                         .flatten()
-                        .map(|alignment| (alignment, before.clone()))
-                })
+                        .map(|(alignment, same)| (alignment, same.then(|| pulled.rows.clone()))),
+                }
             }
             _ => None,
         };
@@ -1520,41 +1532,26 @@ fn write_service_settings_file(
             Ok(Some((_, digest, _))) => Some(*digest),
             _ => None,
         };
-        let digest_beside = pulled.is_none() && stored_digest.is_some();
         let (stored, observed) = if unchanged_again || changed_values.is_some() {
             (Ok(None), Ok(None))
         } else {
-            let (documents, digest) = rayon::join(
-                || {
-                    rayon::join(
-                        || -> Result<Option<StoredSettings>> {
-                            let Some((bytes, digest, _)) = stored_file? else {
-                                return Ok(None);
-                            };
-                            Ok(Some(StoredSettings {
-                                digest,
-                                document: decode_stored_settings(&settings_path, &bytes)?,
-                            }))
-                        },
-                        || {
-                            let _converting =
-                                profile::span(&format!("{service}: captured store document"));
-                            Ok::<_, anyhow::Error>(Some(settings_bytecode_from_service_state(
-                                state_to_write,
-                            )?))
-                        },
-                    )
+            rayon::join(
+                || -> Result<Option<StoredSettings>> {
+                    let Some((bytes, digest, _)) = stored_file? else {
+                        return Ok(None);
+                    };
+                    Ok(Some(StoredSettings {
+                        digest,
+                        document: decode_stored_settings(&settings_path, &bytes)?,
+                    }))
                 },
                 || {
-                    digest_beside
-                        .then(|| pulled_digest_from_service_state(state_to_write).ok())
-                        .flatten()
+                    let _converting = profile::span(&format!("{service}: captured store document"));
+                    Ok::<_, anyhow::Error>(Some(settings_bytecode_from_service_state(
+                        state_to_write,
+                    )?))
                 },
-            );
-            if digest_beside {
-                pulled = digest;
-            }
-            documents
+            )
         };
         let aligned = (|| -> Result<Option<Vec<u8>>> {
             if unchanged_again {
@@ -1564,13 +1561,12 @@ fn write_service_settings_file(
                 );
                 return Ok(None);
             }
-            if let (Some((alignment, before)), Some(stored), Some(pulled)) =
+            if let (Some((alignment, rows)), Some(stored), Some(pulled)) =
                 (changed_values, stored_digest, &pulled)
             {
                 return Ok(match alignment {
-                    // The file still holds the earlier state's document.
                     SettingsAlignment::Equivalent => {
-                        remember_pull(stored, pulled.digest, Some(before));
+                        remember_pull(stored, pulled.digest, rows);
                         None
                     }
                     SettingsAlignment::Changed(written) => {
@@ -2597,6 +2593,58 @@ mod projection_tests {
             written.instances[9].properties["Transparency"],
             json!(0.875)
         );
+        assert!(WHOLLY_ALIGNED.lock_recover().contains(&store));
+        Ok(())
+    }
+
+    /// Studio's viewport moved to another camera of a store no pull
+    /// remembers: the root names it, so the whole store is aligned and the
+    /// file is rewritten, as a pull from bytes rewrites it.
+    #[test]
+    fn a_viewport_that_moved_to_another_camera_is_aligned_whole() -> Result<()> {
+        let parent = std::env::temp_dir().join("renium-viewport-tests");
+        fs::create_dir_all(&parent)?;
+        let root = crate::system::files::create_unique_directory(&parent, "viewport-")?;
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let source = root.join("src");
+        let state = |current: usize, field_of_view: f64| {
+            let camera = |name: &str, index: usize, field_of_view: f64| SnapshotInstance {
+                name: name.into(),
+                class_name: "Camera".into(),
+                instance_index: Some(index),
+                parent_index: Some(1),
+                properties: Map::from_iter([("FieldOfView".into(), json!(field_of_view))]),
+                ..Default::default()
+            };
+            build_service_state_from_instances(
+                "Workspace",
+                None,
+                vec![
+                    SnapshotInstance {
+                        name: "Workspace".into(),
+                        class_name: "Workspace".into(),
+                        instance_index: Some(1),
+                        properties: Map::from_iter([(
+                            "CurrentCamera".into(),
+                            json!({"_type":"Ref","instanceIndex":current}),
+                        )]),
+                        ..Default::default()
+                    },
+                    camera("Camera", 2, 73.0),
+                    camera("Other", 3, field_of_view),
+                ],
+                HashMap::new(),
+                true,
+            )
+        };
+        import_service_tree(&state(2, 53.0)?, &root, &source, None, "Workspace")?;
+        let store = service_settings_path(&source.join("Workspace"));
+        let stored = fs::read(&store)?;
+        forget_pull(&Sha256::digest(&stored).into());
+        import_service_tree(&state(3, 47.0)?, &root, &source, None, "Workspace")?;
+        assert!(fs::read(&store)? != stored);
         assert!(WHOLLY_ALIGNED.lock_recover().contains(&store));
         Ok(())
     }

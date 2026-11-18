@@ -139,6 +139,172 @@ pub(crate) fn decode_rows(bytes: &[u8], rows: &[usize]) -> Result<Vec<SettingsBy
     Ok(rows.iter().map(|&row| instances[row].clone()).collect())
 }
 
+/// One value of a store, by the instance that holds it, its property's
+/// place among the names, and its group's place in the file.
+struct Cell {
+    row: u32,
+    name: u32,
+    group: u32,
+    digest: [u8; 16],
+}
+
+/// The cell of an instance's attributes, after every property.
+const ATTRIBUTES_CELL: u32 = u32::MAX;
+
+/// The columns whose values are decoded as JSON values, of which few are
+/// held at one time; a column of typed values takes a fraction of that.
+const WHOLE_VALUE_COLUMNS_AT_ONCE: usize = 2;
+
+/// The digest `captured::document_row_digest` gives each instance of a store
+/// file's document, taken column by column: the document is never whole in
+/// memory. The instance at `kept` comes whole with them, where the store has
+/// one there.
+pub(crate) fn row_digests(
+    bytes: &[u8],
+    kept: Option<usize>,
+) -> Result<(Vec<[u8; 16]>, Option<SettingsBytecodeInstance>)> {
+    use super::captured::{attributes_digest, row_digest, value_digest};
+
+    let _span = crate::app::profile::span("store instance digests");
+    let (_, payload) = decode_settings_bytecode_container(bytes)?;
+    let budget = DecodeBudget::for_file(bytes.len());
+    let mut reader = BytecodeReader::new(&payload);
+    let SettingsPayloadHeader {
+        strings,
+        properties,
+        mut instances,
+        instance_count,
+    } = decode_settings_payload_header(&mut reader, &budget)?;
+    let specs = read_settings_property_groups(&mut reader, &properties)?;
+    // A store too short to hold that instance gives none.
+    let kept = kept.filter(|kept| *kept < instance_count);
+    let mut occurrences = AHashMap::<&str, usize>::new();
+    for (name, ..) in &specs {
+        *occurrences.entry(name.as_str()).or_default() += 1;
+    }
+    // A document holds an instance's properties by name.
+    let mut names = occurrences.keys().copied().collect::<Vec<_>>();
+    names.sort_unstable();
+    let scope = ValueScope {
+        strings: &strings,
+        instance_count,
+        budget: &budget,
+    };
+    // The cells of one group, and what the kept instance holds of it.
+    let digested = |group: usize| -> Result<(Vec<Cell>, Vec<DecodedGroupEntry>)> {
+        let (name, kind, count, body) = specs[group];
+        let place = names.binary_search(&name.as_str()).unwrap_or_default() as u32;
+        let cell = |row: usize, name: u32, digest: [u8; 16]| Cell {
+            row: row as u32,
+            name,
+            group: group as u32,
+            digest,
+        };
+        let mut held = Vec::new();
+        let mut entry = |entry: DecodedGroupEntry| {
+            let cell = match &entry {
+                DecodedGroupEntry::Property(row, value) => cell(*row, place, value_digest(value)),
+                DecodedGroupEntry::Attributes(row, attributes) => {
+                    cell(*row, ATTRIBUTES_CELL, attributes_digest(attributes))
+                }
+            };
+            if kept == Some(entry.instance_index()) {
+                held.push(entry);
+            }
+            cell
+        };
+        // Groups of one property can overwrite a row in their order, which
+        // the ordinary decoder's entries keep.
+        if occurrences[name.as_str()] == 1
+            && let Some((column, decoded)) = decode_compact_column(body, name, kind, count, scope)?
+        {
+            let mut cells = decoded.into_iter().map(&mut entry).collect::<Vec<_>>();
+            cells.reserve(column.values.len());
+            // A payload many rows hold is digested once.
+            let mut shared = AHashMap::<usize, [u8; 16]>::new();
+            for (row, value) in &column.values {
+                let digest = match value {
+                    NativeSettingsValue::Shared(held) if kept != Some(*row) => *shared
+                        .entry(std::sync::Arc::as_ptr(held) as usize)
+                        .or_insert_with(|| value_digest(held)),
+                    value => {
+                        let value = materialized_value(value, kind)?;
+                        let digest = value_digest(&value);
+                        if kept == Some(*row) {
+                            held.push(DecodedGroupEntry::Property(*row, value));
+                        }
+                        digest
+                    }
+                };
+                cells.push(cell(*row, place, digest));
+            }
+            return Ok((cells, held));
+        }
+        let cells = decode_property_group_body(body, name, kind, count, scope)?
+            .into_iter()
+            .map(&mut entry)
+            .collect();
+        Ok((cells, held))
+    };
+    let typed = |group: &usize| {
+        let (name, kind, ..) = specs[*group];
+        occurrences[name.as_str()] == 1 && matches!(kind, 1..=3 | 5 | 6 | 11..=20)
+    };
+    let (typed_groups, whole_groups): (Vec<_>, Vec<_>) = (0..specs.len()).partition(typed);
+    let mut groups = typed_groups
+        .par_iter()
+        .map(|group| Ok((*group, digested(*group)?)))
+        .collect::<Result<Vec<_>>>()?;
+    for few in whole_groups.chunks(WHOLE_VALUE_COLUMNS_AT_ONCE) {
+        groups.extend(
+            few.par_iter()
+                .map(|group| Ok((*group, digested(*group)?)))
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    reader.finish()?;
+    // The kept instance takes its values in the groups' order.
+    groups.sort_unstable_by_key(|(group, _)| *group);
+    let mut cells = Vec::with_capacity(groups.iter().map(|(_, (cells, _))| cells.len()).sum());
+    let mut held = Vec::with_capacity(specs.len());
+    for (_, (group_cells, group_held)) in groups {
+        cells.extend(group_cells);
+        held.push(group_held);
+    }
+    apply_decoded_property_groups(&mut instances, &specs, held);
+    cells.par_sort_unstable_by_key(|cell| (cell.row, cell.name, cell.group));
+    let empty = attributes_digest(&Map::new());
+    let mut rows = Vec::with_capacity(instance_count);
+    let mut at = 0;
+    for (row, instance) in instances.iter().enumerate() {
+        let start = at;
+        while cells.get(at).is_some_and(|cell| cell.row as usize == row) {
+            at += 1;
+        }
+        // The last group to write a value is the one the document holds.
+        let held = cells[start..at]
+            .iter()
+            .enumerate()
+            .filter(|(index, cell)| {
+                cells[start..at]
+                    .get(index + 1)
+                    .is_none_or(|next| next.name != cell.name)
+            })
+            .map(|(_, cell)| cell);
+        let attributes = held
+            .clone()
+            .find(|cell| cell.name == ATTRIBUTES_CELL)
+            .map_or(empty, |cell| cell.digest);
+        rows.push(row_digest(
+            instance,
+            held.filter(|cell| cell.name != ATTRIBUTES_CELL)
+                .map(|cell| (names[cell.name as usize], cell.digest)),
+            attributes,
+        ));
+    }
+    Ok((rows, kept.map(|kept| instances.swap_remove(kept))))
+}
+
 fn decode_compact_column(
     body: &[u8],
     name: &str,
