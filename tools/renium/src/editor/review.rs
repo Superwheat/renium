@@ -1265,13 +1265,85 @@ fn protected_enum_values_equal(previous: &Value, requested: &Value) -> bool {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn protected_write_rows_with_previous_values(
     path: &Path,
     rows: &[Value],
 ) -> Result<Vec<Value>> {
-    let dom = RbxPlaceFormat::from_path(path)?.read(path)?;
+    ProtectedPlaceCache::default().enrich(path, rows)
+}
+
+/// One push owns this cache. File changes invalidate it before any values are
+/// reused for approval or transaction planning.
+#[derive(Default)]
+pub(crate) struct ProtectedPlaceCache {
+    loaded: Option<(PathBuf, u64, std::time::SystemTime, rbx_dom_weak::WeakDom)>,
+    #[cfg(test)]
+    pub(crate) reads: usize,
+}
+
+#[test]
+fn protected_place_cache_reuses_only_the_same_file_size_and_time() -> Result<()> {
+    let root = crate::tests::support::temp_dir("protected-place-cache");
+    let _cleanup = crate::system::files::OnDrop::new(|| {
+        let _ = std::fs::remove_dir_all(&root);
+    });
+    let path = root.join("place.rbxlx");
+    let xml = r#"<roblox version="4"><Item class="Part" referent="part"><Properties><string name="Name">Part</string><bool name="Anchored">false</bool></Properties></Item></roblox>"#;
+    std::fs::write(&path, xml)?;
+    let rows = [json!({"pathSegments":["Part"],"name":"Anchored","value":true})];
+    let mut cache = ProtectedPlaceCache::default();
+    assert_eq!(cache.enrich(&path, &rows)?[0]["oldValue"], false);
+    assert_eq!(cache.enrich(&path, &rows)?[0]["oldValue"], false);
+    assert_eq!(cache.reads, 1);
+    let modified = std::fs::metadata(&path)?.modified()?;
+    std::fs::write(&path, xml.replace("false", "true"))?;
+    std::fs::File::options()
+        .write(true)
+        .open(&path)?
+        .set_modified(modified)?;
+    assert_eq!(cache.enrich(&path, &rows)?[0]["oldValue"], true);
+    assert_eq!(cache.reads, 2);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)?
+        .set_modified(modified + std::time::Duration::from_secs(10))?;
+    cache.enrich(&path, &rows)?;
+    assert_eq!(cache.reads, 3);
+    Ok(())
+}
+
+impl ProtectedPlaceCache {
+    pub(crate) fn enrich(&mut self, path: &Path, rows: &[Value]) -> Result<Vec<Value>> {
+        let metadata = std::fs::metadata(path)?;
+        let stamp = (metadata.len(), metadata.modified()?);
+        if !self
+            .loaded
+            .as_ref()
+            .is_some_and(|(cached, len, modified, _)| cached == path && (*len, *modified) == stamp)
+        {
+            let dom = RbxPlaceFormat::from_path(path)?.read(path)?;
+            let after = std::fs::metadata(path)?;
+            anyhow::ensure!(
+                (after.len(), after.modified()?) == stamp,
+                "Local place changed while protected values were read; retry the push"
+            );
+            self.loaded = Some((path.into(), stamp.0, stamp.1, dom));
+            #[cfg(test)]
+            {
+                self.reads += 1;
+            }
+        }
+        protected_write_rows_from_dom(&self.loaded.as_ref().unwrap().3, rows)
+    }
+}
+
+fn protected_write_rows_from_dom(
+    dom: &rbx_dom_weak::WeakDom,
+    rows: &[Value],
+) -> Result<Vec<Value>> {
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-    let refs = rbx_dom_path_import_refs(&dom, true);
+    let refs = rbx_dom_path_import_refs(dom, true);
     let attributes_key = rbx_dom_weak::Ustr::from("Attributes");
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -1292,7 +1364,7 @@ pub(crate) fn protected_write_rows_with_previous_values(
             out.push(row);
             continue;
         };
-        let Ok(referent) = rbx_dom_instance_by_path_unique(&dom, &path_segments, &path_ordinals)
+        let Ok(referent) = rbx_dom_instance_by_path_unique(dom, &path_segments, &path_ordinals)
         else {
             out.push(row);
             continue;

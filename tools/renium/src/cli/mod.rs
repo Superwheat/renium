@@ -41,20 +41,6 @@ pub(crate) fn command() -> clap::Command {
     )
 }
 
-/// The explicit restore-and-push switch disambiguates rv from a panel decision.
-pub(crate) fn invocation_command(arguments: &[std::ffi::OsString]) -> clap::Command {
-    let command = command();
-    if arguments.iter().any(|arg| arg == "rv")
-        && arguments.iter().any(|arg| arg == "--apply-studio")
-    {
-        command
-            .mut_subcommand("rv", |cmd| cmd.name("review-decision"))
-            .mut_subcommand("rev", |cmd| cmd.alias("rv"))
-    } else {
-        command
-    }
-}
-
 #[derive(Parser)]
 #[command(author, version, disable_help_subcommand = true)]
 pub(super) struct Cli {

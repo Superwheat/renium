@@ -3718,7 +3718,7 @@ fn live_failure_message(error: &anyhow::Error) -> String {
     if error.is::<super::reconcile::SkippedPushReview>() {
         return format!("[review_skipped] {error:#}");
     }
-    format!("{error:#}")
+    automation_failure_ref(error).0.m
 }
 
 fn is_concurrent_edit_failure(error: &anyhow::Error) -> bool {
@@ -3743,6 +3743,21 @@ pub(crate) fn is_concurrent_edit_message(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_live_failures_keep_classified_help_and_source_messages() {
+        let error =
+            anyhow::anyhow!("bad input\nFor more information, try --help\nretry with a path");
+        assert_eq!(live_failure_message(&error), "bad input\nretry with a path");
+        let error = anyhow::Error::new(crate::editor::sync::EditorSourceVerificationError {
+            details: vec!["Module source mismatch".into()],
+        })
+        .context("irrelevant outer context");
+        assert_eq!(
+            live_failure_message(&error),
+            "Studio source verification failed for 1 script(s): Module source mismatch"
+        );
+    }
 
     #[test]
     fn review_refusals_keep_their_code_and_scope_when_a_diagnostic_mentions_a_race() {

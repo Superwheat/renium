@@ -36,13 +36,13 @@ use crate::editor::paths::{
     infer_source_script, service_from_changed_path,
 };
 use crate::editor::review::{
-    EditorReviewOutcome, OutsideReferencePaths, apply_protected_writes_offline,
-    editor_review_payload, is_externally_managed_editor_property,
+    EditorReviewOutcome, OutsideReferencePaths, ProtectedPlaceCache,
+    apply_protected_writes_offline, editor_review_payload, is_externally_managed_editor_property,
     is_externally_managed_protected_write, is_user_facing_protected_write,
     local_place_path_for_bridge, normalize_editor_bridge_value,
     protected_root_write_rows_with_live_values, protected_write_matches_previous,
-    protected_write_rows_with_previous_values, request_editor_push_review,
-    request_editor_push_review_payload, request_protected_write_review, studio_pid_for_bridge,
+    request_editor_push_review, request_editor_push_review_payload, request_protected_write_review,
+    studio_pid_for_bridge,
 };
 use crate::editor::types::{
     EditorBinaryImport, EditorChangeSet, EditorHistoryEntry, EditorInstanceChange,
@@ -1726,7 +1726,7 @@ fn push_editor_changes_via(
     let warning = match advertised {
         Some(true) => None,
         Some(false) => Some(format!(
-            "The selected daemon is older and ignores {options}. Restart that daemon with this CLI build to use the requested options."
+            "The selected daemon did not advertise support for {options}. Restart that daemon with this CLI build to confirm support for the requested options."
         )),
         None => Some(format!(
             "The capability check timed out. An older daemon may ignore {options}. Restart that daemon with this CLI build to confirm support."
@@ -3537,12 +3537,31 @@ struct PendingProtectedWrites {
     supplemental: usize,
 }
 
+#[cfg(test)]
 fn pending_protected_writes(
     bridge: &BridgeServer,
     summary: &mut Map<String, Value>,
     pre_routed: Vec<Value>,
     imported_suffix: usize,
     local_place: &dyn Fn(&BridgeServer) -> Option<PathBuf>,
+) -> PendingProtectedWrites {
+    pending_protected_writes_cached(
+        bridge,
+        summary,
+        pre_routed,
+        imported_suffix,
+        local_place,
+        &mut ProtectedPlaceCache::default(),
+    )
+}
+
+fn pending_protected_writes_cached(
+    bridge: &BridgeServer,
+    summary: &mut Map<String, Value>,
+    pre_routed: Vec<Value>,
+    imported_suffix: usize,
+    local_place: &dyn Fn(&BridgeServer) -> Option<PathBuf>,
+    cache: &mut ProtectedPlaceCache,
 ) -> PendingProtectedWrites {
     let mut reported = summary
         .get("protectedWrites")
@@ -3594,9 +3613,7 @@ fn pending_protected_writes(
         applicable_rows
     } else {
         local_place(bridge)
-            .and_then(|path| {
-                protected_write_rows_with_previous_values(&path, &applicable_rows).ok()
-            })
+            .and_then(|path| cache.enrich(&path, &applicable_rows).ok())
             .unwrap_or(applicable_rows)
     };
     let enriched = applicable
@@ -3705,9 +3722,7 @@ fn prepare_protected_writes(
                 .cloned()
                 .collect::<Vec<_>>();
             if !request_protected_write_review(bridge, &additional)? {
-                bail!(
-                    "Studio reported additional protected writes and their offline application was declined"
-                );
+                return Err(crate::automation::reconcile::SkippedPushReview.into());
             }
         }
         true
@@ -3773,7 +3788,13 @@ type ApplyPlaceFile<'a> = dyn Fn(
     ) -> Result<Value>
     + 'a;
 type PlacePath<'a> = dyn Fn(&BridgeServer) -> Option<PathBuf> + 'a;
-type ReadPending<'a> = dyn Fn(&BridgeServer, &mut Map<String, Value>, Vec<Value>, usize) -> PendingProtectedWrites
+type ReadPending<'a> = dyn Fn(
+        &BridgeServer,
+        &mut Map<String, Value>,
+        Vec<Value>,
+        usize,
+        &mut ProtectedPlaceCache,
+    ) -> PendingProtectedWrites
     + 'a;
 
 struct PlaceFileAccess<'a> {
@@ -3784,8 +3805,15 @@ struct PlaceFileAccess<'a> {
 
 const PLACE_FILE: PlaceFileAccess<'static> = PlaceFileAccess {
     path: &local_place_path_for_bridge,
-    pending: &|bridge, summary, rows, suffix| {
-        pending_protected_writes(bridge, summary, rows, suffix, &local_place_path_for_bridge)
+    pending: &|bridge, summary, rows, suffix, cache| {
+        pending_protected_writes_cached(
+            bridge,
+            summary,
+            rows,
+            suffix,
+            &local_place_path_for_bridge,
+            cache,
+        )
     },
     apply: &|bridge, args, rows, commit| apply_protected_writes_offline(bridge, args, rows, commit),
 };
@@ -3793,10 +3821,30 @@ const PLACE_FILE: PlaceFileAccess<'static> = PlaceFileAccess {
 fn push_with_root_availability(
     args: PushEditorChangesArgs,
     bridge: &BridgeServer,
+    changes: EditorChangeSet,
+    options: CollectedPushOptions<'_>,
+    root_writes_available: impl FnOnce(&BridgeServer) -> Result<bool>,
+    place: PlaceFileAccess<'_>,
+) -> Result<serde_json::Map<String, Value>> {
+    push_with_reader_platform(
+        args,
+        bridge,
+        changes,
+        options,
+        root_writes_available,
+        place,
+        cfg!(windows),
+    )
+}
+
+fn push_with_reader_platform(
+    args: PushEditorChangesArgs,
+    bridge: &BridgeServer,
     mut changes: EditorChangeSet,
     options: CollectedPushOptions<'_>,
     root_writes_available: impl FnOnce(&BridgeServer) -> Result<bool>,
     place: PlaceFileAccess<'_>,
+    windows_reader: bool,
 ) -> Result<serde_json::Map<String, Value>> {
     let CollectedPushOptions {
         started,
@@ -3862,7 +3910,7 @@ fn push_with_root_availability(
     // A review can return immediately when its outcome cannot depend on the reader.
     if (args.slow_import
         || (prepared_binary_import.is_none()
-            && (!cfg!(windows) || crate::studio::native::import::service_reader_disabled(&args)))
+            && (!windows_reader || crate::studio::native::import::service_reader_disabled(&args)))
         || (review_payload_present && individual_writes_fit_before_build(&changes)))
         && let Some(summary) = review(args.review_report)?
     {
@@ -3923,10 +3971,10 @@ fn push_with_root_availability(
     let fallback = binary_import
         .as_ref()
         .and_then(|import| import.fallback_reason.as_ref());
+    let local_place = (place.path)(bridge).filter(|path| path.is_file());
+    let place_values = std::cell::RefCell::new(ProtectedPlaceCache::default());
     let pending_before = std::cell::LazyCell::new(|| {
-        if pre_routed_protected_writes.is_empty()
-            || !(place.path)(bridge).is_some_and(|path| path.is_file())
-        {
+        if pre_routed_protected_writes.is_empty() || local_place.is_none() {
             return Vec::new();
         }
         (place.pending)(
@@ -3934,6 +3982,7 @@ fn push_with_root_availability(
             &mut Map::new(),
             pre_routed_protected_writes.clone(),
             rerouted_fields,
+            &mut place_values.borrow_mut(),
         )
         .writes
     });
@@ -3941,7 +3990,7 @@ fn push_with_root_availability(
         &changes.deferred_native_rows,
         fallback,
         args.slow_import,
-        !args.no_review,
+        !args.no_review && local_place.is_some(),
         || !pending_before.is_empty(),
     )?;
     if let Some(summary) = review(args.review_report && !requires_offline)? {
@@ -4047,7 +4096,10 @@ fn push_with_root_availability(
             &mut summary,
             pre_routed_protected_writes,
             rerouted_fields,
+            &mut place_values.borrow_mut(),
         );
+        let offline_route = offline_route
+            && (!pending.writes.is_empty() || !changes.deferred_native_rows.is_empty());
         let mut protected = prepare_protected_writes(
             &args,
             bridge,
@@ -4330,7 +4382,7 @@ impl std::fmt::Display for SlowImportRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} Add --slow-import to the original push arguments to allow individual writes.",
+            "{} Retry the pending project changes with rbx ps --slow-import; pass store paths to limit that push.",
             self.message
         )
     }
@@ -4371,14 +4423,13 @@ fn check_import_route(
         .map(|((class, name), n)| format!("{class}.{name} ({n})"))
         .collect::<Vec<_>>()
         .join(", ");
-    let route = if offline_allowed {
-        "Studio may report additional protected writes during import. The final route and duration are unknown.".into()
-    } else {
-        format!(
-            "Individual writes would take about {:.1} s at 31 ms per field.",
-            count as f64 * 0.031
-        )
-    };
+    let mut route = format!(
+        "Individual writes would take about {:.1} s at 31 ms per field.",
+        count as f64 * 0.031
+    );
+    if offline_allowed {
+        route.push_str(" If Studio reports additional protected writes, an approved local snapshot can replace the individual-write route.");
+    }
     let target = rows
         .iter()
         .find_map(|row| {
@@ -6851,9 +6902,14 @@ mod sync_tests {
         let unknown = check_import_route(&rows, Some(&failed), false, true, || false).unwrap_err();
         assert!(unknown.is::<SlowImportRequired>());
         let unknown = unknown.to_string();
-        assert!(unknown.contains("Studio may report additional protected writes"));
-        assert!(!unknown.contains("31 ms"));
-        assert!(unknown.contains("Add --slow-import"));
+        assert!(unknown.contains("If Studio reports additional protected writes"));
+        assert!(unknown.contains("31 ms"));
+        assert!(unknown.contains("rbx ps --slow-import"));
+        assert!(
+            crate::cli::command()
+                .try_get_matches_from(["rbx", "ps", "--slow-import"])
+                .is_ok()
+        );
         let individual =
             check_import_route(&rows, Some(&failed), false, false, || panic!()).unwrap_err();
         assert!(individual.to_string().contains("1.0 s at 31 ms"));
@@ -8130,7 +8186,7 @@ mod saved_field_review_tests {
             |_| Ok(true),
             PlaceFileAccess {
                 path: &|_| Some(path.clone()),
-                pending: &|bridge, summary, rows, suffix| {
+                pending: &|bridge, summary, rows, suffix, cache| {
                     if started.load(std::sync::atomic::Ordering::Acquire) && !snapshot_fails {
                         // The first protected value now agrees, but the supplemental rows still need the approved snapshot.
                         assert_eq!(rows.len(), 1);
@@ -8139,12 +8195,18 @@ mod saved_field_review_tests {
                             supplemental: 0,
                         }
                     } else {
-                        pending_protected_writes(bridge, summary, rows, suffix, &|_| {
-                            Some(path.clone())
-                        })
+                        pending_protected_writes_cached(
+                            bridge,
+                            summary,
+                            rows,
+                            suffix,
+                            &|_| Some(path.clone()),
+                            cache,
+                        )
                     }
                 },
                 apply: &|_, _, rows, commit| {
+                    assert!(count > 0, "zero writes must not restart Studio");
                     assert_eq!(rows.len(), count + usize::from(snapshot_fails));
                     if snapshot_fails {
                         bail!("snapshot writer unavailable")
@@ -8206,27 +8268,79 @@ mod saved_field_review_tests {
             } else {
                 let summary = result.unwrap();
                 assert_eq!(fs::read(&settings_path).unwrap(), expected_settings);
-                if after_commit_fails {
-                    assert_eq!(summary["protectedOfflineApply"]["recoveryPending"], true);
-                    assert!(
-                        summary["protectedOfflineApply"]["error"]
-                            .as_str()
-                            .unwrap()
-                            .contains("90 s")
-                    );
-                    assert!(summary["protectedOfflineApply"]["nextStep"].is_string());
-                    assert_eq!(summary["verified"], false);
-                    assert!(!methods.contains(&"rollbackEditorTransaction"));
-                } else {
-                    assert_eq!(summary["supplementalImportWrites"], 0);
-                    assert_eq!(summary["supplementalImportOfflineWrites"], count);
-                    assert_eq!(summary["protectedOfflineApply"]["successor"], "reopened");
-                }
+                assert_offline_result(&summary, &calls, count, after_commit_fails);
             }
         }
         drop(bridge);
         plugin.join().unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn assert_offline_result(
+        summary: &Map<String, Value>,
+        calls: &[Value],
+        count: usize,
+        after_commit_fails: bool,
+    ) {
+        if count == 0 {
+            assert!(!summary.contains_key("protectedOfflineApply"));
+            assert!(!calls.iter().any(|r| r["params"]["prepareOnly"] == true));
+        } else if after_commit_fails {
+            assert_eq!(summary["protectedOfflineApply"]["recoveryPending"], true);
+            assert!(
+                summary["protectedOfflineApply"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("90 s")
+            );
+            assert!(summary["protectedOfflineApply"]["nextStep"].is_string());
+            assert_eq!(summary["verified"], false);
+            assert!(
+                !calls
+                    .iter()
+                    .any(|r| r["method"] == "rollbackEditorTransaction")
+            );
+        } else {
+            assert_eq!(summary["supplementalImportWrites"], 0);
+            assert_eq!(summary["supplementalImportOfflineWrites"], count);
+            assert_eq!(summary["protectedOfflineApply"]["successor"], "reopened");
+        }
+    }
+
+    #[test]
+    fn offline_approval_does_not_restart_studio_when_nothing_remains_to_write() {
+        push_reviewed_offline_import("apply", false, 0, false);
+    }
+
+    #[test]
+    fn declining_additional_offline_rows_returns_review_skipped() {
+        let (bridge, _, plugin) = reviewing_bridge("skip");
+        let args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: PathBuf::from("."),
+                src_root: "src".into(),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        let result = prepare_protected_writes(
+            &args,
+            &bridge,
+            PendingProtectedWrites {
+                writes: vec![json!({"name":"newly-reported","value":true})],
+                supplemental: 0,
+            },
+            true,
+            &HashSet::new(),
+            false,
+        );
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .is::<crate::automation::reconcile::SkippedPushReview>()
+        );
+        drop(bridge);
+        plugin.join().unwrap();
     }
 
     #[test]
@@ -8265,6 +8379,7 @@ mod saved_field_review_tests {
             ..Default::default()
         })
         .collect();
+        let parses = std::cell::Cell::new(0);
         let result = push_with_root_availability(
             args,
             &bridge,
@@ -8283,14 +8398,28 @@ mod saved_field_review_tests {
             |_| Ok(true),
             PlaceFileAccess {
                 path: &|_| Some(path.clone()),
-                pending: &|bridge, summary, rows, suffix| {
-                    pending_protected_writes(bridge, summary, rows, suffix, &|_| Some(path.clone()))
+                pending: &|bridge, summary, rows, suffix, cache| {
+                    let pending = pending_protected_writes_cached(
+                        bridge,
+                        summary,
+                        rows,
+                        suffix,
+                        &|_| Some(path.clone()),
+                        cache,
+                    );
+                    parses.set(cache.reads);
+                    pending
                 },
                 apply: &|_, _, _, _| panic!("declined offline write was applied"),
             },
         )
         .unwrap();
         assert_eq!(result["protectedPending"], 1);
+        assert_eq!(
+            parses.get(),
+            1,
+            "preflight and transaction must share the parsed place"
+        );
         assert!(!result.contains_key("skippedByReview"));
         let calls = calls.lock().unwrap();
         assert_eq!(
@@ -8524,7 +8653,7 @@ mod saved_field_review_tests {
                 ..Default::default()
             };
             // There is no store to encode. The review must still return the hold.
-            let result = push_with_root_availability(
+            let result = push_with_reader_platform(
                 args,
                 &bridge,
                 changes,
@@ -8538,6 +8667,7 @@ mod saved_field_review_tests {
                 },
                 |_| panic!("unexpected individual write preparation"),
                 PLACE_FILE,
+                true,
             )
             .unwrap();
             assert_eq!(result["heldForReview"], true);
@@ -8681,7 +8811,7 @@ mod saved_field_review_tests {
         use clap::{FromArgMatches, Parser};
         for (command, args, push) in [
             ("imp", vec!["script.luau"], "--push"),
-            ("rv", vec!["--sync", "latest"], "--apply-studio"),
+            ("rev", vec!["--sync", "latest"], "--apply-studio"),
             ("bs", vec!["Workspace", "-p", "Name=target"], "--push"),
         ] {
             let argv = ["rbx", command]
@@ -8694,9 +8824,7 @@ mod saved_field_review_tests {
                 .chain([push, "--slow-import"])
                 .map(std::ffi::OsString::from)
                 .collect::<Vec<_>>();
-            let matches = crate::cli::invocation_command(&argv)
-                .try_get_matches_from(&argv)
-                .unwrap();
+            let matches = crate::cli::command().try_get_matches_from(&argv).unwrap();
             let parsed = Cli::from_arg_matches(&matches).unwrap();
             assert!(match parsed.command {
                 Commands::ImportPath(args) => args.slow_import,
@@ -8705,19 +8833,43 @@ mod saved_field_review_tests {
                 _ => unreachable!(),
             });
         }
+        let argv = ["rbx", "rv", "apply"];
+        let matches = crate::cli::command().try_get_matches_from(argv).unwrap();
+        assert!(matches!(
+            Cli::from_arg_matches(&matches).unwrap().command,
+            Commands::EditorReviewDecision(_)
+        ));
+        assert!(
+            crate::cli::command()
+                .try_get_matches_from([
+                    "rbx",
+                    "rv",
+                    "--sync",
+                    "latest",
+                    "--apply-studio",
+                    "--slow-import"
+                ])
+                .is_err()
+        );
     }
 
     #[test]
     fn push_negotiates_import_options_and_sends_once_even_on_capability_timeout() {
         let root = project_with_threshold_zero("push-capabilities");
         for (slow, disable, support, ack, error_text) in [
-            (true, false, Some(false), false, Some("daemon is older")),
+            (
+                true,
+                false,
+                Some(false),
+                false,
+                Some("did not advertise support"),
+            ),
             (
                 false,
                 true,
                 Some(false),
                 false,
-                Some("ignores RENIUM_NATIVE_SERVICE_IMPORT=0"),
+                Some("did not advertise support for RENIUM_NATIVE_SERVICE_IMPORT=0"),
             ),
             (true, true, None, false, Some("capability check timed out")),
             (true, false, None, true, None),

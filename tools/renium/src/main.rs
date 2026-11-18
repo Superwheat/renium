@@ -236,7 +236,7 @@ fn ensure_leading_root(root: &Path, arguments: &[std::ffi::OsString]) -> Result<
 fn run_cli() -> Result<()> {
     app::crash::install_hook();
     let arguments = arguments_after_leading_root()?;
-    let matches = cli::invocation_command(&arguments).get_matches_from(arguments);
+    let matches = cli::command().get_matches_from(arguments);
     if let Ok(cwd) = std::env::current_dir() {
         let long = system::files::expand_short_names(cwd.clone());
         if long != cwd {
