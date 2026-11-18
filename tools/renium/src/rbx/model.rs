@@ -1412,6 +1412,13 @@ pub(crate) fn build_rbx_place(
             let mut document = if let Some(document) =
                 document_overrides.and_then(|documents| documents.get(&service))
             {
+                // A document read by its changed instances is no place.
+                anyhow::ensure!(
+                    !document.instances.iter().any(|instance| {
+                        crate::settings::held::stands_unchanged(&instance.properties)
+                    }),
+                    "A document whose instances stand for unchanged counterparts is not imported"
+                );
                 // Native push already owns the exact prepared document. Only
                 // source-structure merging needs a mutable copy of that tree.
                 Cow::Borrowed(*document)

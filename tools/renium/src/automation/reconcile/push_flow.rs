@@ -87,6 +87,61 @@ fn reuse_verified_full_push(
     Ok(VerifiedFullPushReuse::Continue(candidate))
 }
 
+/// How a push reads its stores. Where no package is enforced and nothing
+/// but stores differs between the project and Studio, it reads each store
+/// by its changed instances, and its plan says whether that holds
+/// (`plan_reads_changed_alone`).
+fn stores_read_of(
+    unenforced: bool,
+    paths: &HashSet<PathBuf>,
+    project: &ProjectSnapshot,
+    studio: &ProjectSnapshot,
+) -> StoresRead {
+    let only_stores_differ = paths.iter().all(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_service_settings_file_name)
+            || project.entries.get(path) == studio.entries.get(path)
+    });
+    if unenforced && only_stores_differ {
+        StoresRead::ChangedOfBoth
+    } else {
+        StoresRead::Changed
+    }
+}
+
+/// The plan as it is carried out: one made from the changed instances of
+/// both copies that creates, removes or imports an instance is made again
+/// from the files' whole copies of its stores.
+fn plan_from_whole_stores(
+    (stores_read, plan): (StoresRead, ReconcilePushPlan),
+    (project, studio): (&ProjectSnapshot, &ProjectSnapshot),
+    (differences, promoted_services): (&HashSet<PathBuf>, &HashSet<String>),
+    prepared_settings: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
+) -> Result<ReconcilePushPlan> {
+    if stores_read != StoresRead::ChangedOfBoth || plan_reads_changed_alone(&plan) {
+        return Ok(plan);
+    }
+    let paths = prepared_settings.keys().cloned().collect::<HashSet<_>>();
+    let mut whole = HashMap::new();
+    prepare_project_replacement_from(project, studio, &paths, &mut whole, StoresRead::Changed)?;
+    anyhow::ensure!(
+        whole.len() == prepared_settings.len(),
+        "The stores of this push differ another way when read whole; retry the push"
+    );
+    *prepared_settings = whole;
+    let mut plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+        studio,
+        project,
+        differences,
+        prepared_settings,
+        true,
+        false,
+    )?;
+    extend_replaced_service_references(project, prepared_settings, promoted_services, &mut plan)?;
+    Ok(plan)
+}
+
 pub(crate) fn push_project(
     context: &BoundContext,
     bridge: &BridgeServer,
@@ -257,12 +312,22 @@ pub(crate) fn push_project(
     let phase = Instant::now();
     let mut prepared_settings = HashMap::new();
     let mut promoted_services = HashSet::new();
+    let mut stores_read = StoresRead::Changed;
     let differences = if replace {
         let paths = project_replacement_paths(&project, &studio);
+        stores_read = stores_read_of(link_enforcement.is_none(), &paths, &project, &studio);
         // Replacement writes the complete captured snapshot. Its private staging
         // files do not depend on decoding or matching retained Studio objects.
         let (prepared, staged) = rayon::join(
-            || prepare_project_replacement(&project, &studio, &paths, &mut prepared_settings),
+            || {
+                prepare_project_replacement_from(
+                    &project,
+                    &studio,
+                    &paths,
+                    &mut prepared_settings,
+                    stores_read,
+                )
+            },
             || stage_snapshot_paths(&stage.project_root, &paths, &project),
         );
         let unchanged_settings = prepared?;
@@ -392,6 +457,12 @@ pub(crate) fn push_project(
         &prepared_settings,
         &promoted_services,
         &mut plan,
+    )?;
+    let plan = plan_from_whole_stores(
+        (stores_read, plan),
+        (&project, &studio),
+        (&differences, &promoted_services),
+        &mut prepared_settings,
     )?;
     log_reconcile_timing("full push plan", phase);
     if crate::app::output::global_log_enabled(5) {
@@ -1353,5 +1424,42 @@ mod review_hold_tests {
         assert!(!push_applied_nothing(&summary(
             json!({ "ok": true, "heldForReview": false })
         )));
+    }
+}
+
+#[cfg(test)]
+mod stores_read_tests {
+    use super::*;
+
+    /// A push reads its stores by their changed instances only where no
+    /// package is enforced and nothing but stores differs.
+    #[test]
+    fn only_a_push_of_stores_reads_them_by_their_changed_instances() {
+        let store = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        let script = PathBuf::from("src/Workspace/Main.server.luau");
+        let snapshot = |store_bytes: &[u8], source: &[u8]| ProjectSnapshot {
+            entries: BTreeMap::from([
+                (store.clone(), SnapshotEntry::File(store_bytes.to_vec())),
+                (script.clone(), SnapshotEntry::File(source.to_vec())),
+            ]),
+        };
+        let project = snapshot(b"files", b"print(1)");
+        let paths = HashSet::from([store.clone(), script.clone()]);
+        for (studio, unenforced, expected) in [
+            (
+                snapshot(b"studio", b"print(1)"),
+                true,
+                StoresRead::ChangedOfBoth,
+            ),
+            (snapshot(b"studio", b"print(1)"), false, StoresRead::Changed),
+            (snapshot(b"studio", b"print(2)"), true, StoresRead::Changed),
+            (snapshot(b"files", b"print(2)"), true, StoresRead::Changed),
+        ] {
+            assert!(stores_read_of(unenforced, &paths, &project, &studio) == expected);
+        }
+        // A script only one side holds differs.
+        let mut studio = snapshot(b"studio", b"print(1)");
+        studio.entries.remove(&script);
+        assert!(stores_read_of(true, &paths, &project, &studio) == StoresRead::Changed);
     }
 }

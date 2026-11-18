@@ -322,6 +322,9 @@ impl serde::Serialize for AsPayloads<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match &*resolve(self.0) {
             Value::Array(items) => serializer.collect_seq(items.iter().map(AsPayloads)),
+            Value::Object(object) if stands_unchanged(object) => Err(serde::ser::Error::custom(
+                "an instance that stands for its unchanged counterpart is not written",
+            )),
             Value::Object(object) if is_handle(object) => Err(serde::ser::Error::custom(
                 "a value is the handle of a payload that is no longer held",
             )),

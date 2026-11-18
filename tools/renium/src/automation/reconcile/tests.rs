@@ -6796,6 +6796,8 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
         AtomicUsize::new(0),
     );
     let under_other_ids = AtomicUsize::new(0);
+    let from_both = AtomicUsize::new(0);
+    let sent_from_both = AtomicUsize::new(0);
     run_seeds(1_500, |seed, _| {
         let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         let mut studio = changed_instances_store(&mut rng);
@@ -6840,7 +6842,84 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
             return Ok(());
         };
         let paths = project_replacement_paths(&desired, &observed);
-        let pushed = |whole_documents: bool| -> Result<(Vec<String>, bool), String> {
+        // What the write step sends to Studio for a plan, made from the
+        // documents the push prepared.
+        let project_root = crate::tests::support::temp_dir(&format!("changed-instances-{seed}"));
+        let store = project_root.join(&path);
+        std::fs::create_dir_all(store.parent().unwrap()).map_err(|error| error.to_string())?;
+        if let Some(SnapshotEntry::File(bytes)) = desired.entries.get(&path) {
+            std::fs::write(&store, bytes).map_err(|error| error.to_string())?;
+        }
+        let sent = |prepared: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
+                    plan: ReconcilePushPlan|
+         -> Result<String, String> {
+            let mut args = crate::cli::PushEditorChangesArgs::new(
+                crate::cli::ProjectSourceArgs {
+                    project_root: project_root.clone(),
+                    src_root: PathBuf::from("src"),
+                },
+                crate::cli::BridgeConnectionArgs::local(0.1),
+            );
+            args.changed_paths.clone_from(&plan.changed_paths);
+            args.target_settings_ids
+                .clone_from(&plan.target_settings_ids);
+            args.exact_target_ids = true;
+            args.targets_extend_paths = true;
+            args.override_packages = true;
+            let documents = prepared
+                .remove(&path)
+                .map(|change| ("Workspace".to_string(), Arc::new(change.current)))
+                .into_iter()
+                .collect();
+            let mut changes =
+                crate::editor::sync::collect_prepared_editor_changes(&args, documents)
+                    .map_err(|error| format!("collect: {error:#}"))?;
+            super::push_plan::amend_reconciled_changes(&mut changes, plan)
+                .map_err(|error| format!("amend: {error:#}"))?;
+            let mut lists = [
+                serde_json::to_value(&changes.source_changes),
+                serde_json::to_value(&changes.instance_changes),
+                serde_json::to_value(&changes.property_changes),
+            ]
+            .map(|list| list.map_err(|error| error.to_string()));
+            let mut out = Vec::new();
+            for list in &mut lists {
+                let list = list.as_mut().map_err(|error| error.clone())?;
+                if let Some(items) = list.as_array_mut() {
+                    // The planner lists the instances of one removal in no
+                    // fixed order.
+                    for item in items.iter_mut() {
+                        if let Some(instances) = item["instances"].as_array_mut() {
+                            instances.sort_by_key(Value::to_string);
+                        }
+                    }
+                    items.sort_by_key(Value::to_string);
+                }
+                // A request states payloads, never a handle or an instance
+                // that stands for another.
+                out.push(
+                    serde_json::to_string(&crate::settings::held::AsPayloads(list))
+                        .map_err(|error| format!("request: {error}"))?,
+                );
+            }
+            Ok(format!(
+                "{}
+whole instances {:?}",
+                out.join(
+                    "
+"
+                ),
+                changes
+                    .whole_instances
+                    .iter()
+                    .map(|(service, path)| format!(
+                        "{service}{:?}{:?}",
+                        path.path_segments, path.path_ordinals
+                    ))
+                    .collect::<Vec<_>>()
+            ))
+        };
+        let pushed = |read: StoresRead| -> Result<(Vec<String>, bool, bool), String> {
             let prepare = || {
                 let mut prepared = HashMap::new();
                 let unchanged = prepare_project_replacement_from(
@@ -6848,7 +6927,7 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
                     &observed,
                     &paths,
                     &mut prepared,
-                    whole_documents,
+                    read,
                 )
                 .map_err(|error| format!("prepare: {error:#}"))?;
                 Ok::<_, String>((prepared, unchanged))
@@ -6861,14 +6940,33 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
                     })
                 });
             let mut said = vec![format!("unchanged {}", unchanged.contains(&path))];
-            said.push(
-                match reconciliation_push_plan_for_paths_with_prepared_settings(
-                    &observed, &desired, &paths, &prepared, false, false,
-                ) {
-                    Ok(plan) => plan_text(&plan),
-                    Err(error) => format!("no plan: {error:#}"),
-                },
+            let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+                &observed, &desired, &paths, &prepared, false, false,
             );
+            let alone = plan.as_ref().is_ok_and(plan_reads_changed_alone);
+            let planned = plan
+                .as_ref()
+                .is_ok_and(|plan| !plan.target_settings_ids.is_empty());
+            said.push(match plan {
+                Ok(plan) => plan_text(&plan),
+                Err(error) => format!("no plan: {error:#}"),
+            });
+            // The write step, where the plan gives it something to send.
+            if planned {
+                let (mut prepared, _) = prepare()?;
+                let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+                    &observed, &desired, &paths, &prepared, false, false,
+                )
+                .map_err(|error| format!("{error:#}"))?;
+                // A plan that reads more than the changed instances is
+                // carried out from the files' whole copy.
+                if read != StoresRead::ChangedOfBoth || plan_reads_changed_alone(&plan) {
+                    said.push(match sent(&mut prepared, plan) {
+                        Ok(sent) => sent,
+                        Err(error) => format!("not sent: {error}"),
+                    });
+                }
+            }
             if let Some(change) = prepared.get(&path) {
                 said.push(format!(
                     "equivalent {} managed {} saved {:?}",
@@ -6919,10 +7017,47 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
                     .map_err(|error| format!("{error:#}"))
                 ));
             }
-            Ok((said, stands))
+            Ok((said, stands, alone))
         };
-        let (expected, _) = pushed(true)?;
-        let (said, stands) = pushed(false)?;
+        let (expected, _, expected_alone) = pushed(StoresRead::Whole)?;
+        let (said, stands, _) = pushed(StoresRead::Changed)?;
+        // Of both copies the changed instances alone: the plan made from
+        // them says whether it may be carried out from them, as the plan
+        // made from the whole copies says, and where it may, the push is the
+        // same push.
+        let (of_both, both_stand, alone) = pushed(StoresRead::ChangedOfBoth)?;
+        if alone != expected_alone {
+            return Err(format!(
+                "read by the changed instances of both copies the plan reads them alone: {alone}, read whole: {expected_alone}"
+            ));
+        }
+        let _ = std::fs::remove_dir_all(&project_root);
+        if alone && of_both != expected {
+            return Err(format!(
+                "from the changed instances of both copies ({both_stand}):
+{}
+from the whole documents:
+{}",
+                of_both.join(
+                    "
+"
+                ),
+                expected.join(
+                    "
+"
+                )
+            ));
+        }
+        if alone && both_stand {
+            from_both.fetch_add(1, Ordering::Relaxed);
+            // The write step made a request from them, and it named values.
+            if of_both
+                .iter()
+                .any(|said| said.contains("whole instances") && said.contains("\"properties\":{\""))
+            {
+                sent_from_both.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if said != expected {
             return Err(format!(
                 "from the changed instances ({stands}):\n{}\nfrom the whole documents:\n{}",
@@ -6952,6 +7087,8 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
             &planned,
             &unchanged_stores,
             &under_other_ids,
+            &from_both,
+            &sent_from_both,
         ]
         .map(|count| count.load(Ordering::Relaxed));
         assert!(
@@ -6959,10 +7096,14 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
                 && counts[1] >= 100
                 && counts[2] >= 400
                 && counts[3] >= 50
-                && counts[4] >= 40,
-            "prepared from the changed instances {} ({} of them under other ids), from whole documents {}, with a plan {}, unchanged {}",
+                && counts[4] >= 40
+                && counts[5] >= 150
+                && counts[6] >= 100,
+            "prepared from the changed instances {} ({} of them under other ids, {} with both copies read so, {} of those with values sent), from whole documents {}, with a plan {}, unchanged {}",
             counts[0],
             counts[4],
+            counts[5],
+            counts[6],
             counts[1],
             counts[2],
             counts[3]
@@ -7015,15 +7156,13 @@ fn the_namesake_of_a_union_cut_anew_is_read_from_the_store_studio_holds() {
     let (desired, observed) = (snapshot(&files), snapshot(&studio));
     let paths = project_replacement_paths(&desired, &observed);
     let removals = |whole_documents: bool| {
+        let read = if whole_documents {
+            StoresRead::Whole
+        } else {
+            StoresRead::Changed
+        };
         let mut prepared = HashMap::new();
-        prepare_project_replacement_from(
-            &desired,
-            &observed,
-            &paths,
-            &mut prepared,
-            whole_documents,
-        )
-        .unwrap();
+        prepare_project_replacement_from(&desired, &observed, &paths, &mut prepared, read).unwrap();
         let previous = &prepared[&path].previous;
         // The floor stands unchanged; neither wall does.
         assert_eq!(
@@ -7043,4 +7182,62 @@ fn the_namesake_of_a_union_cut_anew_is_read_from_the_store_studio_holds() {
     let request = removals(false);
     assert!(request.contains("\"wall-a\"") && request.contains("CastShadow"));
     assert_eq!(request, removals(true));
+}
+
+/// A store can hold a parent after its child. A request names an instance
+/// by its path and tells each instance on that path from its namesakes, so
+/// the path of an instance that differs is read to its root wherever its
+/// ancestors stand, and their namesakes with them.
+#[test]
+fn the_ancestors_of_a_changed_instance_are_read_wherever_they_stand() {
+    let instance = |id: &str, name: &str, class: &str, parent: Option<usize>| {
+        SettingsBytecodeInstance::new(id.into(), name.into(), class.into(), parent)
+    };
+    let mut part = instance("p", "P", "Part", Some(2));
+    part.properties.insert("Transparency".into(), json!(0.25));
+    let mut other = instance("o", "Other", "Part", Some(0));
+    other.properties.insert("Transparency".into(), json!(0.5));
+    let studio = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![
+            instance("1", "Workspace", "Workspace", None),
+            part,
+            instance("car", "Car", "Model", Some(0)),
+            instance("car-2", "Car", "Folder", Some(0)),
+            other,
+        ],
+    };
+    let mut files = studio.clone();
+    files.instances[1]
+        .properties
+        .insert("Transparency".into(), json!(0.75));
+    let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+    let snapshot = |document: &SettingsBytecode| ProjectSnapshot {
+        entries: BTreeMap::from([(
+            path.clone(),
+            SnapshotEntry::File(encode_settings_bytecode(document).unwrap()),
+        )]),
+    };
+    let (desired, observed) = (snapshot(&files), snapshot(&studio));
+    let paths = project_replacement_paths(&desired, &observed);
+    let mut prepared = HashMap::new();
+    prepare_project_replacement_from(
+        &desired,
+        &observed,
+        &paths,
+        &mut prepared,
+        StoresRead::ChangedOfBoth,
+    )
+    .unwrap();
+    let change = &prepared[&path];
+    for document in [&change.current, &change.previous] {
+        assert_eq!(
+            document
+                .instances
+                .iter()
+                .map(|instance| crate::settings::held::stands_unchanged(&instance.properties))
+                .collect::<Vec<_>>(),
+            [false, false, false, false, true]
+        );
+    }
 }

@@ -6261,6 +6261,26 @@ fn collect_settings_file_change(
     true
 }
 
+/// What a push of a plain folder sends, made from documents a reconcile
+/// prepared instead of the stores on disk.
+#[cfg(test)]
+pub(crate) fn collect_prepared_editor_changes(
+    args: &PushEditorChangesArgs,
+    documents: HashMap<String, Arc<SettingsBytecode>>,
+) -> Result<EditorChangeSet> {
+    let (project_root, src_root) = editor_project_roots(args)?;
+    collect_editor_changes_with_link_enforcement_and_documents(
+        args,
+        &project_root,
+        &src_root,
+        &LinkEnforcement::default(),
+        &mut PreparedEditorDocuments {
+            documents,
+            ..PreparedEditorDocuments::default()
+        },
+    )
+}
+
 fn collect_editor_changes_with_link_enforcement(
     args: &PushEditorChangesArgs,
     project_root: &Path,

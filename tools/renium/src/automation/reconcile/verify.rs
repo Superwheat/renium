@@ -263,6 +263,7 @@ fn settings_delta_verification(
     prepared: Option<PreparedPushVerification>,
     policy: Verification<'_>,
 ) -> Result<SettingsVerification> {
+    let entries = (before, desired, observed);
     let before_aligned = prepared.is_some();
     // The three stores decode side by side: on a large service each takes a
     // good part of a second.
@@ -281,6 +282,20 @@ fn settings_delta_verification(
     );
     let (mut before, desired) = requested?;
     let mut observed = observed?;
+    // Documents read by their changed instances verify a push that left
+    // every instance at its place. Where Studio's instances have to be
+    // matched with the files' by what tells them apart, the whole documents
+    // are read.
+    if desired
+        .instances
+        .iter()
+        .any(|instance| crate::settings::held::stands_unchanged(&instance.properties))
+        && !observed.instances.is_empty()
+        && !crate::settings::equivalence::align_settings_ids_by_place(&desired, &mut observed)
+    {
+        drop((before, desired, observed));
+        return settings_delta_verification(path, entries.0, entries.1, entries.2, None, policy);
+    }
     let viewport = policy
         .settle
         .then(|| crate::settings::equivalence::reference_viewport_camera(&desired))

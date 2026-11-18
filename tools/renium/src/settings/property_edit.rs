@@ -166,6 +166,10 @@ pub(crate) struct StoreRows {
     /// From `whole_row_digests`: every instance without its values but its
     /// UniqueId.
     pub(crate) instances: Vec<SettingsBytecodeInstance>,
+    /// From `whole_row_digests`: the instances that name another instance by
+    /// an id. Which instance that is depends on the ids of the copy that
+    /// holds it, which no digest shows.
+    pub(crate) named: Vec<usize>,
 }
 
 /// One value of a store, by the instance that holds it, its property's
@@ -258,6 +262,7 @@ fn row_digests_of(
         Some(attributes) => attributes_digest(&attributes),
         None => attributes_digest(attributes),
     };
+    let named = std::sync::Mutex::new(Vec::new());
     // The cells of one group, and what the kept instance holds of it.
     let digested = |group: usize| -> Result<(Vec<Cell>, Vec<DecodedGroupEntry>)> {
         let (name, kind, count, body) = specs[group];
@@ -273,8 +278,22 @@ fn row_digests_of(
         let mut held = Vec::new();
         let mut entry = |entry: DecodedGroupEntry| {
             let cell = match &entry {
-                DecodedGroupEntry::Property(row, value) => cell(*row, place, value_digest(value)),
+                DecodedGroupEntry::Property(row, value) => {
+                    if whole && names_an_instance_by_id(value) {
+                        named
+                            .lock()
+                            .unwrap_or_else(|held| held.into_inner())
+                            .push(*row);
+                    }
+                    cell(*row, place, value_digest(value))
+                }
                 DecodedGroupEntry::Attributes(row, attributes) => {
+                    if whole && attributes.values().any(names_an_instance_by_id) {
+                        named
+                            .lock()
+                            .unwrap_or_else(|held| held.into_inner())
+                            .push(*row);
+                    }
                     cell(*row, ATTRIBUTES_CELL, attributes_digest(attributes))
                 }
             };
@@ -411,6 +430,9 @@ fn row_digests_of(
     } else {
         (ids_of(instances), Vec::new())
     };
+    let mut named = named.into_inner().unwrap_or_else(|held| held.into_inner());
+    named.sort_unstable();
+    named.dedup();
     Ok(Some(StoreRows {
         digests: rows,
         unique_ids,
@@ -418,7 +440,23 @@ fn row_digests_of(
         ids,
         moved,
         instances,
+        named,
     }))
+}
+
+/// Whether a value names an instance by an id, at any depth: whatever an
+/// alignment that renames ids would rewrite.
+pub(crate) fn names_an_instance_by_id(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(names_an_instance_by_id),
+        Value::Object(object) => {
+            ["settingsId", "instanceId", "debugId"]
+                .iter()
+                .any(|name| object.contains_key(*name))
+                || object.values().any(names_an_instance_by_id)
+        }
+        _ => false,
+    }
 }
 
 /// What tells one typed value of a column from another: its kind and its
