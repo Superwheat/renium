@@ -86,9 +86,9 @@ fn whole<T>(why: &str) -> Result<Option<T>> {
     Ok(None)
 }
 
-/// The most changed instances a pull compares one by one; past that it
-/// aligns the whole documents.
-const MAX_CHANGED_ROWS: usize = 2_048;
+/// The most changed instances a pull compares one by one, each held whole on
+/// both sides while it is compared; past that it aligns the whole documents.
+const MAX_CHANGED_ROWS: usize = 65_536;
 
 pub(super) fn changed_values(
     state: &ServiceState,
@@ -603,14 +603,13 @@ fn changed_rows<'a>(
         string_ids: &SettingsStringIdMap::default(),
         wire_bytes: None,
     };
-    let mut captured_rows = Vec::with_capacity(rows.len());
-    for &row in &rows {
-        captured_rows.extend(convert_chunk(
-            state,
-            std::slice::from_ref(&records[row]),
-            scope,
-        )?);
-    }
+    let captured_rows = rows
+        .par_iter()
+        .map(|row| convert_chunk(state, std::slice::from_ref(&records[*row]), scope))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     // Each pair is one instance in one place: an instance under another
     // name, class or parent is matched by the alignment.
     if stored_rows
@@ -641,10 +640,16 @@ fn changed_rows<'a>(
     // What each changed instance says: whether its values are the stored
     // ones as a pull counts them, and whether its UniqueId is.
     let pairs = || stored_rows.iter().zip(&captured_rows).take(changed.len());
+    let compared = stored_rows
+        .par_iter()
+        .zip(captured_rows.par_iter())
+        .take(changed.len())
+        .map(|(stored, captured)| pulled_instance_values_unchanged(stored, captured, root_service))
+        .collect::<Result<Vec<_>>>()?;
     let mut same_values = Vec::with_capacity(changed.len());
     let mut same_under_todays_names = true;
-    for (stored, captured) in pairs() {
-        match pulled_instance_values_unchanged(stored, captured, root_service)? {
+    for compared in compared {
+        match compared {
             Some((as_held, as_named)) => {
                 same_values.push(as_held);
                 same_under_todays_names &= as_named;
