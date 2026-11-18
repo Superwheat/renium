@@ -6474,3 +6474,522 @@ fn equivalent_store_files_are_remembered_by_their_bytes() {
     assert!(!equivalent(&files, &changed));
     assert!(!remembered(&files, &changed));
 }
+
+/// A store for `a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_push_it`:
+/// a Workspace with a camera and parts of a few classes, some of them
+/// namesakes, most with a UniqueId, some holding a shared payload, a
+/// reference or an attribute.
+fn changed_instances_store(rng: &mut crate::tests::support::SimRng) -> SettingsBytecode {
+    let mut root =
+        SettingsBytecodeInstance::new("1".into(), "Workspace".into(), "Workspace".into(), None);
+    root.properties.insert("Gravity".into(), json!(196.2));
+    let with_camera = rng.below(4) != 0;
+    let mut instances = vec![root];
+    if with_camera {
+        instances[0].properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type": "Ref", "instanceIndex": 2}),
+        );
+        let mut camera = SettingsBytecodeInstance::new(
+            "debug:0_9".into(),
+            "Camera".into(),
+            "Camera".into(),
+            Some(0),
+        );
+        camera.properties.insert("FieldOfView".into(), json!(70.0));
+        instances.push(camera);
+    }
+    let count = 4 + rng.below(20);
+    for index in 0..count {
+        let position = instances.len();
+        let class = ["Part", "MeshPart", "Folder", "Model", "UnionOperation"][rng.below(5)];
+        let name = if rng.below(4) == 0 {
+            "Twin".to_string()
+        } else {
+            format!("Item{index}")
+        };
+        // An instance without a UniqueId mostly has an id the store gave it,
+        // which tells it as well.
+        let unique = rng.below(8) != 0;
+        let id = if rng.below(3) == 0 || !unique && rng.below(12) != 0 {
+            format!("item-{index}")
+        } else {
+            format!("debug:0_{}", 100 + index)
+        };
+        let parent = if position > 2 && rng.below(3) == 0 {
+            1 + usize::from(with_camera) + rng.below(position - 1 - usize::from(with_camera))
+        } else {
+            0
+        };
+        let mut instance = SettingsBytecodeInstance::new(id, name, class.into(), Some(parent));
+        if unique {
+            instance.properties.insert(
+                "UniqueId".into(),
+                json!({"_type": "UniqueId", "value": format!("{:024x}{:08x}", 7, index + 1)}),
+            );
+        }
+        if class != "Folder" && class != "Model" {
+            instance
+                .properties
+                .insert("Transparency".into(), json!(rng.below(4) as f64 / 4.0));
+            instance
+                .properties
+                .insert("Anchored".into(), json!(rng.below(2) == 0));
+            instance.properties.insert(
+                "Size".into(),
+                json!({"_type": "Vector3", "x": 1.0 + rng.below(3) as f64, "y": 1.0, "z": 2.0}),
+            );
+            instance.properties.insert(
+                "Material".into(),
+                json!({"_type": "EnumItem", "name": (["Plastic", "Wood", "Neon"][rng.below(3)])}),
+            );
+        }
+        if class == "UnionOperation" {
+            for name in ["MeshData2", "ChildData2"] {
+                instance.properties.insert(
+                    name.into(),
+                    json!({"_type": "SharedString", "base64": base64::encode(format!("{name}-{}", rng.below(3)))}),
+                );
+            }
+        }
+        if class == "MeshPart" || class == "UnionOperation" {
+            instance.properties.insert(
+                "PhysicalConfigData".into(),
+                json!({"_type": "SharedString", "base64": base64::encode(format!("CSGPHS-hull-{}", rng.below(3)))}),
+            );
+            instance.properties.insert(
+                "MeshId".into(),
+                json!(format!("rbxassetid://{}", 100 + rng.below(3))),
+            );
+        }
+        if position > 1 && rng.below(5) == 0 {
+            instance.properties.insert(
+                "Target".into(),
+                json!({"_type": "Ref", "instanceIndex": 1 + rng.below(position)}),
+            );
+        }
+        if rng.below(4) == 0 {
+            instance
+                .attributes
+                .insert("Level".into(), json!(rng.below(5)));
+        }
+        if rng.below(6) == 0 {
+            instance.properties.insert(
+                "HistoryId".into(),
+                json!(format!("history-{}", rng.below(9))),
+            );
+        }
+        instances.push(instance);
+    }
+    SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances,
+    }
+}
+
+/// One change of a store, most of them of a value of one instance.
+fn change_an_instance(rng: &mut crate::tests::support::SimRng, document: &mut SettingsBytecode) {
+    let count = document.instances.len();
+    let index = rng.below(count);
+    // Two instances trade their UniqueIds: each is now told for the other.
+    if rng.below(12) == 0 {
+        let other = rng.below(count);
+        let take = |document: &mut SettingsBytecode, at: usize| {
+            document.instances[at].properties.remove("UniqueId")
+        };
+        let (first, second) = (take(document, index), take(document, other));
+        for (at, unique_id) in [(index, second), (other, first)] {
+            if let Some(unique_id) = unique_id {
+                document.instances[at]
+                    .properties
+                    .insert("UniqueId".into(), unique_id);
+            }
+        }
+        return;
+    }
+    let instance = &mut document.instances[index];
+    match rng.below(15) {
+        // The mesh of a union is cut anew.
+        14 => {
+            if instance.class_name == "UnionOperation" {
+                instance.properties.insert(
+                    "MeshData2".into(),
+                    json!({"_type": "SharedString", "base64": base64::encode(format!("recut-{}", rng.below(3)))}),
+                );
+            }
+        }
+        0 | 1 => {
+            instance
+                .properties
+                .insert("Transparency".into(), json!(rng.below(8) as f64 / 8.0));
+        }
+        2 => {
+            instance.properties.insert(
+                "Size".into(),
+                json!({"_type": "Vector3", "x": 4.0 + rng.below(3) as f64, "y": 1.0, "z": 2.0}),
+            );
+        }
+        3 => {
+            instance.properties.insert(
+                "PhysicalConfigData".into(),
+                json!({"_type": "SharedString", "base64": base64::encode(format!("CSGPHS-other-{}", rng.below(3)))}),
+            );
+        }
+        4 => {
+            instance.properties.remove("Anchored");
+        }
+        5 => {
+            instance
+                .attributes
+                .insert("Level".into(), json!(rng.below(9)));
+        }
+        6 => {
+            instance.attributes.remove("Level");
+        }
+        7 => {
+            instance.properties.insert(
+                "Target".into(),
+                json!({"_type": "Ref", "instanceIndex": 1 + rng.below(count)}),
+            );
+        }
+        8 => {
+            instance.properties.insert(
+                "UniqueId".into(),
+                json!({"_type": "UniqueId", "value": format!("{:024x}{:08x}", 9, rng.below(40) + 1)}),
+            );
+        }
+        // What the engine alone sets.
+        9 => {
+            instance.properties.insert(
+                "HistoryId".into(),
+                json!(format!("history-{}", rng.below(9))),
+            );
+        }
+        10 => {
+            instance
+                .properties
+                .insert("Gravity".into(), json!(50.0 + rng.below(3) as f64));
+        }
+        11 => {
+            instance.properties.insert(
+                "Material".into(),
+                json!({"_type": "EnumItem", "name": (["Plastic", "Wood", "Neon"][rng.below(3)])}),
+            );
+        }
+        // Another instance, or one less: the two copies no longer stand
+        // instance for instance.
+        12 => {
+            if index > 0 {
+                instance.name = format!("Renamed{}", rng.below(3));
+            }
+        }
+        _ => {
+            if rng.below(3) == 0 {
+                let parent = rng.below(count);
+                document.instances.push(SettingsBytecodeInstance::new(
+                    format!("added-{count}"),
+                    "Added".into(),
+                    "Folder".into(),
+                    Some(parent),
+                ));
+            }
+        }
+    }
+}
+
+/// A store whose two copies differ in a few instances is prepared from
+/// those instances alone, without the whole document of the copy Studio
+/// holds. What a push makes of it is what it makes of the two whole
+/// documents: the same stores unchanged, the same plan, the same saved-field
+/// differences and the same verdict on what Studio holds afterwards.
+#[test]
+fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_push_it() {
+    use crate::tests::support::{SimRng, run_seeds};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn plan_text(plan: &ReconcilePushPlan) -> String {
+        fn sorted(items: impl Iterator<Item = String>) -> String {
+            let mut items = items.collect::<Vec<_>>();
+            items.sort();
+            items.join(" | ")
+        }
+        let pair = |(service, id): &(String, String)| format!("{service}/{id}");
+        [
+            sorted(plan.initial_native_services.iter().cloned()),
+            sorted(
+                plan.changed_paths
+                    .iter()
+                    .map(|path| path.display().to_string()),
+            ),
+            plan.target_settings_ids.join(" | "),
+            sorted(plan.recreated_settings_ids.iter().cloned()),
+            sorted(plan.recreated_instances.iter().map(pair)),
+            sorted(
+                plan.previous_class_names
+                    .iter()
+                    .map(|(key, class)| format!("{}={class}", pair(key))),
+            ),
+            sorted(plan.previous_paths.iter().map(|(key, path)| {
+                format!(
+                    "{}={:?}{:?}",
+                    pair(key),
+                    path.path_segments,
+                    path.path_ordinals
+                )
+            })),
+            sorted(
+                plan.previous_identities
+                    .iter()
+                    .map(|(key, id)| format!("{}={id}", pair(key))),
+            ),
+            // The planner lists the instances of one removal in no fixed order.
+            sorted(plan.instance_deletes.iter().map(|change| {
+                let mut change = serde_json::to_value(change).unwrap();
+                if let Some(instances) = change["instances"].as_array_mut() {
+                    instances.sort_by_key(Value::to_string);
+                }
+                change.to_string()
+            })),
+            sorted(
+                plan.property_removals
+                    .iter()
+                    .map(|change| serde_json::to_string(change).unwrap()),
+            ),
+            sorted(
+                plan.geometry_properties
+                    .iter()
+                    .map(|(key, names)| format!("{}={names:?}", pair(key))),
+            ),
+            sorted(plan.attribute_only_instances.iter().map(pair)),
+            sorted(plan.in_place_instances.iter().map(pair)),
+            sorted(
+                plan.unchanged_native_root_properties
+                    .iter()
+                    .map(|(key, names)| {
+                        let mut names = names.clone();
+                        names.sort();
+                        format!("{}={names:?}", pair(key))
+                    }),
+            ),
+        ]
+        .join("\n")
+    }
+
+    let (from_changed, whole, planned, unchanged_stores) = (
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    );
+    run_seeds(1_500, |seed, _| {
+        let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let studio = changed_instances_store(&mut rng);
+        let mut files = studio.clone();
+        for _ in 0..rng.below(5) + usize::from(seed % 16 != 0) {
+            change_an_instance(&mut rng, &mut files);
+        }
+        let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        let snapshot = |document: &SettingsBytecode| {
+            Ok::<_, String>(ProjectSnapshot {
+                entries: BTreeMap::from([(
+                    path.clone(),
+                    SnapshotEntry::File(
+                        encode_settings_bytecode(document).map_err(|error| format!("{error:#}"))?,
+                    ),
+                )]),
+            })
+        };
+        let (Ok(desired), Ok(observed)) = (snapshot(&files), snapshot(&studio)) else {
+            return Ok(());
+        };
+        let paths = project_replacement_paths(&desired, &observed);
+        let pushed = |whole_documents: bool| -> Result<(Vec<String>, bool), String> {
+            let prepare = || {
+                let mut prepared = HashMap::new();
+                let unchanged = prepare_project_replacement_from(
+                    &desired,
+                    &observed,
+                    &paths,
+                    &mut prepared,
+                    whole_documents,
+                )
+                .map_err(|error| format!("prepare: {error:#}"))?;
+                Ok::<_, String>((prepared, unchanged))
+            };
+            let (prepared, unchanged) = prepare()?;
+            let stands =
+                prepared.get(&path).is_some_and(|change| {
+                    change.previous.instances.iter().any(|instance| {
+                        crate::settings::held::stands_unchanged(&instance.properties)
+                    })
+                });
+            let mut said = vec![format!("unchanged {}", unchanged.contains(&path))];
+            said.push(
+                match reconciliation_push_plan_for_paths_with_prepared_settings(
+                    &observed, &desired, &paths, &prepared, false, false,
+                ) {
+                    Ok(plan) => plan_text(&plan),
+                    Err(error) => format!("no plan: {error:#}"),
+                },
+            );
+            if let Some(change) = prepared.get(&path) {
+                said.push(format!(
+                    "equivalent {} managed {} saved {:?}",
+                    settings_documents_equivalent(&change.current, &change.previous),
+                    super::verify::differs_only_in_externally_managed_fields(
+                        &change.current,
+                        &change.previous
+                    ),
+                    crate::settings::equivalence::saved_field_differences(
+                        &change.current,
+                        &change.previous
+                    )
+                    .len(),
+                ));
+            }
+            // Studio afterwards: what the files hold, what it held before,
+            // and the files with one value of its own.
+            let mut partly = files.clone();
+            if let Some(instance) = partly.instances.last_mut() {
+                instance
+                    .properties
+                    .insert("Transparency".into(), json!(0.875));
+            }
+            for after in [
+                Some(&desired),
+                Some(&observed),
+                snapshot(&partly).ok().as_ref(),
+            ] {
+                let Some(after) = after else {
+                    continue;
+                };
+                let (mut prepared, _) = prepare()?;
+                let verification = prepared
+                    .remove(&path)
+                    .map(|change| PreparedPushVerification {
+                        previous: change.previous,
+                        desired: Arc::new(change.current),
+                    });
+                said.push(format!(
+                    "verified {:?}",
+                    super::verify::settings_delta_mismatch(
+                        &path,
+                        observed.entries.get(&path),
+                        desired.entries.get(&path),
+                        after.entries.get(&path),
+                        verification,
+                    )
+                    .map_err(|error| format!("{error:#}"))
+                ));
+            }
+            Ok((said, stands))
+        };
+        let (expected, _) = pushed(true)?;
+        let (said, stands) = pushed(false)?;
+        if said != expected {
+            return Err(format!(
+                "from the changed instances ({stands}):\n{}\nfrom the whole documents:\n{}",
+                said.join("\n"),
+                expected.join("\n")
+            ));
+        }
+        if stands {
+            from_changed.fetch_add(1, Ordering::Relaxed);
+        } else {
+            whole.fetch_add(1, Ordering::Relaxed);
+        }
+        if expected[0] == "unchanged true" {
+            unchanged_stores.fetch_add(1, Ordering::Relaxed);
+        } else if !expected[1].lines().nth(2).unwrap_or_default().is_empty() {
+            planned.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    });
+    if std::env::var_os("RENIUM_SIM_SEED").is_none() {
+        let counts = [&from_changed, &whole, &planned, &unchanged_stores]
+            .map(|count| count.load(Ordering::Relaxed));
+        assert!(
+            counts[0] >= 350 && counts[1] >= 100 && counts[2] >= 500 && counts[3] >= 50,
+            "prepared from the changed instances {}, from whole documents {}, with a plan {}, unchanged {}",
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3]
+        );
+    }
+}
+
+/// A union cut anew is removed from Studio and imported again, and the
+/// request that removes it tells it from its namesakes by what each of them
+/// holds: a field only its twin states goes into the request with its
+/// default. The twin differs in nothing, so the copy Studio holds is read
+/// for it all the same, and the request is the one the whole documents give.
+#[test]
+fn the_namesake_of_a_union_cut_anew_is_read_from_the_store_studio_holds() {
+    let root =
+        SettingsBytecodeInstance::new("1".into(), "Workspace".into(), "Workspace".into(), None);
+    let walls =
+        SettingsBytecodeInstance::new("walls".into(), "Walls".into(), "Folder".into(), Some(0));
+    let wall = |id: &str, asset: u64| {
+        let mut wall = SettingsBytecodeInstance::new(
+            id.into(),
+            "Wall".into(),
+            "UnionOperation".into(),
+            Some(1),
+        );
+        wall.properties.insert("AssetId".into(), json!(asset));
+        wall.properties.insert("Anchored".into(), json!(true));
+        wall
+    };
+    let mut twin = wall("wall-b", 7);
+    twin.properties.insert("CastShadow".into(), json!(false));
+    let mut other =
+        SettingsBytecodeInstance::new("floor".into(), "Floor".into(), "Part".into(), Some(0));
+    other.properties.insert("Anchored".into(), json!(true));
+    let studio = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![root, walls, wall("wall-a", 7), twin, other],
+    };
+    let mut files = studio.clone();
+    files.instances[2]
+        .properties
+        .insert("AssetId".into(), json!(8));
+    let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+    let snapshot = |document: &SettingsBytecode| ProjectSnapshot {
+        entries: BTreeMap::from([(
+            path.clone(),
+            SnapshotEntry::File(encode_settings_bytecode(document).unwrap()),
+        )]),
+    };
+    let (desired, observed) = (snapshot(&files), snapshot(&studio));
+    let paths = project_replacement_paths(&desired, &observed);
+    let removals = |whole_documents: bool| {
+        let mut prepared = HashMap::new();
+        prepare_project_replacement_from(
+            &desired,
+            &observed,
+            &paths,
+            &mut prepared,
+            whole_documents,
+        )
+        .unwrap();
+        let previous = &prepared[&path].previous;
+        // The floor stands unchanged; neither wall does.
+        assert_eq!(
+            previous
+                .instances
+                .iter()
+                .map(|instance| crate::settings::held::stands_unchanged(&instance.properties))
+                .collect::<Vec<_>>(),
+            [false, !whole_documents, false, false, !whole_documents]
+        );
+        let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+            &observed, &desired, &paths, &prepared, false, false,
+        )
+        .unwrap();
+        serde_json::to_string(&plan.instance_deletes).unwrap()
+    };
+    let request = removals(false);
+    assert!(request.contains("\"wall-a\"") && request.contains("CastShadow"));
+    assert_eq!(request, removals(true));
+}

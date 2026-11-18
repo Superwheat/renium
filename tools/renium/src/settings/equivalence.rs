@@ -524,7 +524,10 @@ impl AlignmentPhases {
 /// additionally need the same topology and either exact persistent matches
 /// or unchanged duplicate subtrees with consistent incoming references.
 /// A moved persistent ID or viewport role invalidates either proof.
-fn identities_already_aligned(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
+pub(crate) fn identities_already_aligned(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+) -> bool {
     let mut seen = AHashSet::with_capacity(reference.instances.len());
     let mut all_store_ids = true;
     if reference.instances.len() != observed.instances.len()
@@ -2132,6 +2135,13 @@ fn positional_values_equivalent(
         usize,
         (&SettingsBytecodeInstance, &SettingsBytecodeInstance),
     )| {
+        // An instance that stands for its unchanged counterpart holds what
+        // the counterpart holds.
+        if crate::settings::held::stands_unchanged(&reference_instance.properties)
+            || crate::settings::held::stands_unchanged(&observed_instance.properties)
+        {
+            return true;
+        }
         if !preserve_viewport
             && reference_instance.properties.get("UniqueId")
                 != observed_instance.properties.get("UniqueId")
@@ -2752,6 +2762,13 @@ fn settings_documents_match(
                 return false;
             };
             let right_instance = &right.instances[right_index];
+            // An instance that stands for its unchanged counterpart holds what
+            // the counterpart holds.
+            if crate::settings::held::stands_unchanged(&left_instance.properties)
+                || crate::settings::held::stands_unchanged(&right_instance.properties)
+            {
+                return true;
+            }
             left_instance.name == right_instance.name
                 && (preserve_viewport
                     || left_instance.properties.get("UniqueId")
@@ -4302,6 +4319,9 @@ pub(crate) fn saved_field_differences(
         let Some(observed) = studio_by_id.get(instance.settings_id.as_str()) else {
             continue;
         };
+        if crate::settings::held::stands_unchanged(&observed.properties) {
+            continue;
+        }
         let class_name = &instance.class_name;
         let mut path = None;
         for (name, value) in &instance.properties {

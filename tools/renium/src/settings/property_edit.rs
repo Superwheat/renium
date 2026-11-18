@@ -193,6 +193,28 @@ pub(crate) fn row_digests(
         &[SettingsBytecodeInstance],
     ) -> Option<(Option<usize>, Option<super::captured::Moved>)>,
 ) -> Result<Option<StoreRows>> {
+    row_digests_of(bytes, false, plan)
+}
+
+/// `row_digests` over every value an instance holds, what the engine alone
+/// sets included: two instances with one digest and one UniqueId digest hold
+/// the same values, whatever a comparison looks at.
+pub(crate) fn whole_row_digests(
+    bytes: &[u8],
+    plan: impl FnOnce(
+        &[SettingsBytecodeInstance],
+    ) -> Option<(Option<usize>, Option<super::captured::Moved>)>,
+) -> Result<Option<StoreRows>> {
+    row_digests_of(bytes, true, plan)
+}
+
+fn row_digests_of(
+    bytes: &[u8],
+    whole: bool,
+    plan: impl FnOnce(
+        &[SettingsBytecodeInstance],
+    ) -> Option<(Option<usize>, Option<super::captured::Moved>)>,
+) -> Result<Option<StoreRows>> {
     use super::captured::{UNIQUE_ID, attributes_digest, is_digested, row_digest, value_digest};
 
     let _span = crate::app::profile::span("store instance digests");
@@ -357,7 +379,8 @@ pub(crate) fn row_digests(
             instance,
             held.filter(|cell| {
                 cell.name != ATTRIBUTES_CELL
-                    && is_digested(&instance.class_name, names[cell.name as usize])
+                    && (whole && names[cell.name as usize] != UNIQUE_ID
+                        || is_digested(&instance.class_name, names[cell.name as usize]))
             })
             .map(|cell| (names[cell.name as usize], cell.digest)),
             attributes,

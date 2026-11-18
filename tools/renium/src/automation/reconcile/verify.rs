@@ -644,6 +644,10 @@ pub(crate) fn changed_instance_mismatch(
     let before_instance = &before.instances[before_index];
     let desired_instance = &desired.instances[desired_index];
     let observed_instance = &observed.instances[observed_index];
+    // The push asked nothing of an instance the files hold as Studio held it.
+    if crate::settings::held::stands_unchanged(&before_instance.properties) {
+        return None;
+    }
     for (label, previous, expected, actual) in [
         (
             "Name",

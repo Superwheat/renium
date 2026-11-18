@@ -1197,6 +1197,13 @@ fn store_instances_equal(
 ) -> bool {
     let left_instance = &left.instances[left_index];
     let right_instance = &right.instances[right_index];
+    // An instance that stands for its unchanged counterpart holds what
+    // the counterpart holds.
+    if crate::settings::held::stands_unchanged(&left_instance.properties)
+        || crate::settings::held::stands_unchanged(&right_instance.properties)
+    {
+        return true;
+    }
     left_instance.name == right_instance.name
         && left_instance.class_name == right_instance.class_name
         && settings_parent_id(left, left_index) == settings_parent_id(right, right_index)

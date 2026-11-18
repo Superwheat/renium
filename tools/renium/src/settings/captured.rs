@@ -473,13 +473,27 @@ fn document_row_digests(
 /// no part of either, and the UniqueId stands apart, because Studio gives
 /// the instances of a place new ones each time it opens the place.
 pub(super) fn document_row_digest(instance: &SettingsBytecodeInstance) -> ([u8; 16], [u8; 16]) {
+    instance_digest(instance, false)
+}
+
+/// `document_row_digest` over every value the instance holds, what the
+/// engine alone sets included (see `property_edit::whole_row_digests`).
+pub(super) fn whole_document_row_digest(
+    instance: &SettingsBytecodeInstance,
+) -> ([u8; 16], [u8; 16]) {
+    instance_digest(instance, true)
+}
+
+fn instance_digest(instance: &SettingsBytecodeInstance, whole: bool) -> ([u8; 16], [u8; 16]) {
     (
         row_digest(
             instance,
             instance
                 .properties
                 .iter()
-                .filter(|(name, _)| is_digested(&instance.class_name, name))
+                .filter(|(name, _)| {
+                    whole && name.as_str() != UNIQUE_ID || is_digested(&instance.class_name, name)
+                })
                 .map(|(name, value)| (name.as_str(), value_digest(value))),
             attributes_digest(&instance.attributes),
         ),

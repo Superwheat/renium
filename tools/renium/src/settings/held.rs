@@ -79,6 +79,24 @@ static KEY: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// The property of an instance that stands for its unchanged counterpart
+/// (see `stand_unchanged`), which only this process knows.
+static UNCHANGED: LazyLock<String> = LazyLock::new(|| format!("unchanged:{}", &KEY[5..]));
+
+/// A push that changes a few instances of a large store reads the store
+/// Studio holds only where it differs from the files: every other instance
+/// of that document stands for the instance of the files at its place, which
+/// it equals value for value, and holds none of its values. A comparison
+/// takes such an instance for equal to its counterpart, and nothing writes
+/// one.
+pub(crate) fn stand_unchanged(properties: &mut Map<String, Value>) {
+    properties.insert(UNCHANGED.clone(), Value::Bool(true));
+}
+
+pub(crate) fn stands_unchanged(properties: &Map<String, Value>) -> bool {
+    properties.contains_key(UNCHANGED.as_str())
+}
+
 fn now() -> u64 {
     STARTED.elapsed().as_secs() + 1
 }
@@ -321,6 +339,11 @@ pub(crate) fn serialize_properties<S: serde::Serializer>(
     properties: &Map<String, Value>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
+    if stands_unchanged(properties) {
+        return Err(serde::ser::Error::custom(
+            "an instance that stands for its unchanged counterpart is not written",
+        ));
+    }
     serializer.collect_map(
         properties
             .iter()

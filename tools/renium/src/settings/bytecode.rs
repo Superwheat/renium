@@ -160,6 +160,17 @@ pub(crate) fn pull_changed_document_rows(
     captured::changed_document_rows(state, now, stored)
 }
 
+/// The digest and the UniqueId digest `property_edit::whole_row_digests`
+/// gives each instance of the file a document was decoded from, taken from
+/// the document as it was decoded.
+pub(crate) fn whole_instance_digests(document: &SettingsBytecode) -> Vec<([u8; 16], [u8; 16])> {
+    document
+        .instances
+        .par_iter()
+        .map(captured::whole_document_row_digest)
+        .collect()
+}
+
 /// The `PulledDigest` of this state, without holding its document.
 pub(crate) fn pulled_digest_from_service_state(state: &ServiceState) -> Result<PulledDigest> {
     captured::pulled_digest(state)
@@ -1228,6 +1239,13 @@ fn encode_settings_bytecode_with_reference_lookup(
     let _span = crate::app::profile::span("store encode");
     validate_settings_hierarchy(&document.instances)?;
     validate_settings_record_properties(&document.instances)?;
+    if document
+        .instances
+        .iter()
+        .any(|instance| crate::settings::held::stands_unchanged(&instance.properties))
+    {
+        bail!("A document whose instances stand for unchanged counterparts is not written");
+    }
     let canonical = canonical_attribute_document(document);
     let document = canonical.as_ref().unwrap_or(document);
     let settled = forced_properties_settled_document(document);

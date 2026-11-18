@@ -20,6 +20,18 @@ pub(crate) fn prepare_project_replacement(
     paths: &HashSet<PathBuf>,
     prepared: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
 ) -> Result<HashSet<PathBuf>> {
+    prepare_project_replacement_from(desired, observed, paths, prepared, false)
+}
+
+/// `whole_documents` reads both copies of every store whole, as a store
+/// whose copies differ in more than a few instances is read.
+pub(crate) fn prepare_project_replacement_from(
+    desired: &ProjectSnapshot,
+    observed: &ProjectSnapshot,
+    paths: &HashSet<PathBuf>,
+    prepared: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
+    whole_documents: bool,
+) -> Result<HashSet<PathBuf>> {
     let documents = paths
         .par_iter()
         .filter(|path| {
@@ -33,8 +45,23 @@ pub(crate) fn prepare_project_replacement(
                 return Ok((path.clone(), None));
             }
             let step_started = std::time::Instant::now();
+            let changed = if whole_documents {
+                ChangedInstances::Whole(None)
+            } else {
+                changed_instances_alone(desired.entries.get(path), observed.entries.get(path))?
+            };
+            let decoded = match changed {
+                ChangedInstances::None => return Ok((path.clone(), None)),
+                ChangedInstances::Prepared(change) => {
+                    return Ok((path.clone(), Some(*change)));
+                }
+                ChangedInstances::Whole(current) => current,
+            };
             let (current, previous) = rayon::join(
-                || settings_document(desired.entries.get(path)),
+                || match decoded {
+                    Some(current) => Ok(current),
+                    None => settings_document(desired.entries.get(path)),
+                },
                 || settings_document(observed.entries.get(path)),
             );
             let mut current = current?;
@@ -141,6 +168,181 @@ pub(crate) fn prepare_project_replacement(
         }
     }
     Ok(unchanged)
+}
+
+/// What `changed_instances_alone` makes of two copies of a store.
+enum ChangedInstances {
+    /// The two hold the same.
+    None,
+    Prepared(Box<PreparedEditorSettingsChange>),
+    /// The whole documents have to say, with the files' where it is decoded.
+    Whole(Option<SettingsBytecode>),
+}
+
+/// A store file smaller than this is read whole: two documents of it are
+/// small.
+const CHANGED_INSTANCES_MIN_BYTES: usize = if cfg!(test) { 1 } else { 256 * 1024 };
+
+/// The most instances read from the store Studio holds; past that the whole
+/// documents are compared.
+const MAX_CHANGED_INSTANCES: usize = 16_384;
+
+/// The change of a store whose two copies differ in the values of a few
+/// instances, without the whole document of the store Studio holds: the
+/// digests of the two files say which instances differ, and those alone, the
+/// roots and the cameras are read from Studio's. Every other instance of
+/// that document stands for the files' instance at its place
+/// (`held::stand_unchanged`) and keeps its UniqueId alone. This is taken only
+/// where the two copies hold the same instances under the same ids at the
+/// same places and their identities are aligned as they stand, so that the
+/// alignment of the whole documents would change nothing.
+fn changed_instances_alone(
+    desired: Option<&SnapshotEntry>,
+    observed: Option<&SnapshotEntry>,
+) -> Result<ChangedInstances> {
+    use crate::settings::bytecode::property_edit::{decode_rows, whole_row_digests};
+    use crate::settings::equivalence::{
+        identities_already_aligned, inherit_workspace_viewport_reference,
+        stabilize_settings_reference_ids,
+    };
+
+    let (Some(SnapshotEntry::File(desired_bytes)), Some(SnapshotEntry::File(observed_bytes))) =
+        (desired, observed)
+    else {
+        return Ok(ChangedInstances::Whole(None));
+    };
+    // A store Studio holds nearly empty is replaced, not compared.
+    if desired_bytes.len() < CHANGED_INSTANCES_MIN_BYTES
+        || observed_bytes.len().saturating_mul(4) < desired_bytes.len()
+        || desired_bytes.len().saturating_mul(4) < observed_bytes.len()
+    {
+        return Ok(ChangedInstances::Whole(None));
+    }
+    let skeleton = Mutex::new(None);
+    let (observed_rows, current) = rayon::join(
+        || {
+            whole_row_digests(observed_bytes, |instances| {
+                *skeleton.lock().unwrap_or_else(|held| held.into_inner()) =
+                    Some(instances.to_vec());
+                Some((None, None))
+            })
+        },
+        // The files' copy as `settings_document` gives it, with the digests
+        // of its instances taken as they were decoded.
+        || -> Result<_> {
+            let mut current =
+                crate::settings::bytecode::decode_settings_bytecode_holding(desired_bytes)?;
+            let digests = crate::settings::bytecode::whole_instance_digests(&current);
+            stabilize_settings_reference_ids(&mut current);
+            canonicalize_settings_property_names(&mut current)?;
+            Ok((current, digests))
+        },
+    );
+    let (mut current, desired_rows) = current?;
+    let skeleton = skeleton
+        .into_inner()
+        .unwrap_or_else(|held| held.into_inner());
+    // A store the digests cannot read is the whole decode's to refuse.
+    let (Some(observed_rows), Some(skeleton)) = (observed_rows.ok().flatten(), skeleton) else {
+        return Ok(ChangedInstances::Whole(Some(current)));
+    };
+    let count = current.instances.len();
+    let same_places = skeleton.len() == count
+        && desired_rows.len() == count
+        && observed_rows.digests.len() == count
+        && current
+            .instances
+            .iter()
+            .zip(&skeleton)
+            .all(|(files, studio)| {
+                files.settings_id == studio.settings_id
+                    && files.name == studio.name
+                    && files.class_name == studio.class_name
+                    && files.parent_index == studio.parent_index
+            });
+    if !same_places {
+        return Ok(ChangedInstances::Whole(Some(current)));
+    }
+    // Read whole: what differs, and what a comparison reads of an instance
+    // whatever it holds, the roots and the cameras.
+    let differs = (0..count)
+        .filter(|&index| {
+            desired_rows[index]
+                != (
+                    observed_rows.digests[index],
+                    observed_rows.unique_ids[index],
+                )
+                || skeleton[index].parent_index.is_none()
+                || skeleton[index].class_name == "Camera"
+        })
+        .collect::<Vec<_>>();
+    // A request that names one of several namesakes tells it from the others
+    // by what each holds, so the namesakes of an instance that differs are
+    // read with it.
+    let namesakes = differs
+        .iter()
+        .map(|&index| (skeleton[index].parent_index, skeleton[index].name.as_str()))
+        .collect::<HashSet<_>>();
+    let read = (0..count)
+        .filter(|&index| {
+            namesakes.contains(&(skeleton[index].parent_index, skeleton[index].name.as_str()))
+        })
+        .collect::<Vec<_>>();
+    if read.len() > MAX_CHANGED_INSTANCES || read.len() == count {
+        return Ok(ChangedInstances::Whole(Some(current)));
+    }
+    let Ok((rows, _)) = decode_rows(observed_bytes, &read) else {
+        return Ok(ChangedInstances::Whole(Some(current)));
+    };
+    let mut previous = SettingsBytecode {
+        version: current.version,
+        instances: skeleton,
+    };
+    for (instance, files) in previous.instances.iter_mut().zip(&current.instances) {
+        if let Some(unique_id) = files.properties.get("UniqueId") {
+            instance
+                .properties
+                .insert("UniqueId".to_string(), unique_id.clone());
+        }
+        crate::settings::held::stand_unchanged(&mut instance.properties);
+    }
+    for (index, mut row) in read.iter().zip(rows) {
+        for value in row.properties.values_mut() {
+            *value = crate::settings::held::held(std::mem::take(value));
+        }
+        previous.instances[*index] = row;
+    }
+    stabilize_settings_reference_ids(&mut previous);
+    canonicalize_settings_property_names(&mut previous)?;
+    let reusable = previous
+        .instances
+        .iter()
+        .enumerate()
+        .any(|(index, instance)| {
+            instance.parent_index.is_some()
+                && crate::settings::held::stands_unchanged(&instance.properties)
+                && !is_protected_engine_container(&previous, index)
+        });
+    if !reusable
+        || !identities_already_aligned(&current, &previous)
+        || service_has_only_native_containers(&previous)
+    {
+        return Ok(ChangedInstances::Whole(Some(current)));
+    }
+    if settings_documents_positionally_equivalent(&current, &previous) {
+        return Ok(ChangedInstances::None);
+    }
+    inherit_workspace_viewport_reference(&mut current, &previous);
+    if settings_documents_equivalent(&current, &previous) {
+        return Ok(ChangedInstances::None);
+    }
+    // A delta heavy enough to replace the service retains what Studio holds.
+    if delta_weight(&current, &previous).heavy() {
+        return Ok(ChangedInstances::Whole(Some(current)));
+    }
+    Ok(ChangedInstances::Prepared(Box::new(
+        PreparedEditorSettingsChange { previous, current },
+    )))
 }
 
 pub(crate) fn snapshot_differences_prepared(
@@ -507,6 +709,9 @@ fn delta_weight(current: &SettingsBytecode, previous: &SettingsBytecode) -> Delt
             continue;
         };
         let other = &previous.instances[other];
+        if crate::settings::held::stands_unchanged(&other.properties) {
+            continue;
+        }
         // The same rules as the comparison: an asset id in another spelling, a
         // hull that encodes the same fidelity or a field the capture cannot
         // know is no write. A saved override that the files dropped is reset
