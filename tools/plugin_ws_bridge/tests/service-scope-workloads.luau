@@ -138,6 +138,46 @@ end
 print("Structural receipts: 100 class/name/parent/presence checks reject incomplete upserts; skipped containers remain unverified")
 
 do
+	-- The children listed for the previous-place pass are stale after a yield
+	-- and belong to that pass alone.
+	local outer, seen, yields = {}, {}, 0
+	local ctx = { resolveChildIndex = outer }
+	ctx.yieldForBudget = function()
+		assert(ctx.resolveChildIndex == outer, "A yield must not show the pass's child index to other work")
+		yields += 1
+		return yields == 3
+	end
+	local function upsert(resolve)
+		return extract("local function applyInstanceUpserts(", "local function applyInstanceDeletes(", {
+			validatedChangeService = function() return "Workspace", services.Workspace end,
+			sortedInstanceEntries = function(change) return change.instances end,
+			liveHydrateEnabled = function() return false end,
+			syncDesiredEntry = function() assert(ctx.resolveChildIndex == outer, "The pass kept its child index") end,
+			resolveEntryParent = function() return nil end,
+			rememberEntryResolution = function() end,
+			describeUnresolvedPrevious = function() return "gone" end,
+			resolveEntryInstance = resolve,
+		}, "applyInstanceUpserts")
+	end
+	local entries = {}
+	for index = 1, 3 do
+		entries[index] = { key = index, pathSegments = { "Workspace", "Rail" }, previousPathSegments = { "Workspace", "Rail" } }
+	end
+	local stats = { instanceCreated = 0, instanceReplaced = 0, propertyUpdated = 0, noops = 0 }
+	upsert(function(entry)
+		assert(ctx.resolveChildIndex ~= outer, "The pass resolves through its own child index")
+		seen[entry.key] = next(ctx.resolveChildIndex) ~= nil
+		ctx.resolveChildIndex.listed = true
+		return node("Part")
+	end)({ instances = entries }, ctx, stats, {})
+	assert(not seen[1] and seen[2] and not seen[3], "A yield must drop the children listed before it")
+	assert(ctx.resolveChildIndex == outer, "The caller's child index must be back after the pass")
+	local ok = pcall(upsert(function() return nil end), { instances = entries }, ctx, stats, {})
+	assert(not ok and ctx.resolveChildIndex == outer, "A failed pass must give the caller's child index back")
+end
+print("Previous-place pass: its child index is dropped at a yield and never outlives the pass")
+
+do
 	local Identity = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeIdentity.module.luau"), {
 		environment = { game = {} },
 	})()

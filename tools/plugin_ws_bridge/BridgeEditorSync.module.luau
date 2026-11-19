@@ -1629,9 +1629,23 @@ local function resolveEntryInstance(
 	local parent = resolveEntryParent(entry, resolvedEntries)
 	-- A matched duplicate ancestor can have a different live ordinal. Resolve
 	-- its child inside that actual parent, not the old absolute ancestor path.
-	local pathInstance = if parent ~= nil and #entry.pathSegments > 1
-		then resolveOrdinalChild(parent, entry.pathSegments[#entry.pathSegments], entry.pathOrdinals[#entry.pathSegments] or 1)
-		else resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals)
+	-- Read only where no identity names the instance: finding the Nth of many
+	-- same-named siblings walks them all.
+	local atPath, atPathRead = nil, false
+	local function instanceAtPath(): Instance?
+		if not atPathRead then
+			atPathRead = true
+			atPath = if parent ~= nil and #entry.pathSegments > 1
+				then resolveOrdinalChild(
+					parent,
+					entry.pathSegments[#entry.pathSegments],
+					entry.pathOrdinals[#entry.pathSegments] or 1,
+					ctx.resolveChildIndex
+				)
+				else resolvePathSegments(entry.pathSegments, nil, entry.pathOrdinals, ctx.resolveChildIndex)
+		end
+		return atPath
+	end
 	local persistent = matchedSettingsInstance(serviceName, entry.settingsId, ctx)
 	if persistent ~= nil and not claimedInstances[persistent]
 		and (not entry.anchorOnly or classCompatible(persistent)) then
@@ -1647,7 +1661,7 @@ local function resolveEntryInstance(
 	end
 
 	local previousPathInstance = if #entry.previousPathSegments > 0
-		then resolvePathSegments(entry.previousPathSegments, nil, entry.previousPathOrdinals)
+		then resolvePathSegments(entry.previousPathSegments, nil, entry.previousPathOrdinals, ctx.resolveChildIndex)
 		else nil
 	if
 		previousPathInstance ~= nil
@@ -1659,22 +1673,22 @@ local function resolveEntryInstance(
 	-- Lookup-only ancestors still carry the reconciler's established identity.
 	-- Check it before falling back to a desired path that may have moved.
 	if entry.anchorOnly and not entry.ambiguousSiblings then
-		if pathInstance ~= nil and not claimedInstances[pathInstance] and classCompatible(pathInstance) then
-			return pathInstance
+		if instanceAtPath() ~= nil and not claimedInstances[instanceAtPath()] and classCompatible(instanceAtPath()) then
+			return instanceAtPath()
 		end
 		return nil
 	end
 	if
 		entry.exactPathIdentity
-		and pathInstance ~= nil
-		and not claimedInstances[pathInstance]
-		and classCompatible(pathInstance)
+		and instanceAtPath() ~= nil
+		and not claimedInstances[instanceAtPath()]
+		and classCompatible(instanceAtPath())
 	then
-		return pathInstance
+		return instanceAtPath()
 	end
 	if not entry.ambiguousSiblings then
-		if pathInstance ~= nil and not claimedInstances[pathInstance] and classCompatible(pathInstance) then
-			return pathInstance
+		if instanceAtPath() ~= nil and not claimedInstances[instanceAtPath()] and classCompatible(instanceAtPath()) then
+			return instanceAtPath()
 		end
 		return nil
 	end
@@ -1695,7 +1709,7 @@ local function resolveEntryInstance(
 		included[candidate] = true
 		candidates[#candidates + 1] = candidate
 	end
-	include(pathInstance)
+	include(instanceAtPath())
 	if parent ~= nil then
 		local byClass = candidateBucketsForParent(parent, ctx)[expectedName]
 		if byClass ~= nil then
@@ -1736,10 +1750,10 @@ local function resolveEntryInstance(
 			return okRead and okDecode and exactValuesEqual(current, decoded)
 		end
 	)
-	if chosen == nil and pathInstance ~= nil and included[pathInstance] then
+	if chosen == nil and instanceAtPath() ~= nil and included[instanceAtPath()] then
 		-- Identical duplicate siblings have no semantic discriminator. Their exact
 		-- pulled ordinal is the only stable local identity and is safe as a tie-break.
-		chosen = pathInstance
+		chosen = instanceAtPath()
 	end
 	if chosen == nil and #candidates == 1 then
 		-- Earlier duplicate matches may consume this entry's original ordinal.
@@ -1777,7 +1791,7 @@ local function resolveEntryInstance(
 			`Could not uniquely identify {table.concat(entry.pathSegments, ".")} ({#candidates} unmatched siblings: {table.concat(details, "; ")}); reconcile before retrying`
 		)
 	end
-	if chosen == nil and pathInstance ~= nil and not classCompatible(pathInstance) then
+	if chosen == nil and instanceAtPath() ~= nil and not classCompatible(instanceAtPath()) then
 		error(`Ambiguous class replacement at {entry.key}; reconcile before replacing it`)
 	end
 	return chosen
@@ -2763,20 +2777,37 @@ local function applyInstanceUpserts(
 	local claimedInstances = {}
 	local createMissing = liveHydrateEnabled(ctx)
 	local verified = 0
-	for _, entry in ipairs(entries) do
-		if ctx.yieldForBudget then
-			ctx.yieldForBudget()
-		end
-		if #entry.previousPathSegments > 0 then
-			local instance = resolveEntryInstance(entry, serviceName, ctx, resolvedEntries, claimedInstances)
-			if instance == nil then
-				error(
-					`Could not identify the previous instance at {entry.key} ({describeUnresolvedPrevious(entry, claimedInstances)}); Studio was not changed`
-				)
+	-- This pass changes nothing in the hierarchy, so the children of a parent
+	-- are listed once between two yields, not once for each of its entries.
+	-- Whatever runs during a yield sees the caller's index, not this one.
+	local childIndex = {}
+	local outerChildIndex = ctx.resolveChildIndex
+	ctx.resolveChildIndex = childIndex
+	local okResolve, resolveError = pcall(function()
+		for _, entry in ipairs(entries) do
+			if ctx.yieldForBudget then
+				ctx.resolveChildIndex = outerChildIndex
+				local yielded = ctx.yieldForBudget()
+				ctx.resolveChildIndex = childIndex
+				if yielded then
+					table.clear(childIndex)
+				end
 			end
-			resolvedEntries[entry.key] = instance
-			rememberEntryResolution(entry, serviceName, instance, claimedInstances, ctx)
+			if #entry.previousPathSegments > 0 then
+				local instance = resolveEntryInstance(entry, serviceName, ctx, resolvedEntries, claimedInstances)
+				if instance == nil then
+					error(
+						`Could not identify the previous instance at {entry.key} ({describeUnresolvedPrevious(entry, claimedInstances)}); Studio was not changed`
+					)
+				end
+				resolvedEntries[entry.key] = instance
+				rememberEntryResolution(entry, serviceName, instance, claimedInstances, ctx)
+			end
 		end
+	end)
+	ctx.resolveChildIndex = outerChildIndex
+	if not okResolve then
+		error(resolveError, 0)
 	end
 	for _, entry in ipairs(entries) do
 		if ctx.yieldForBudget then
