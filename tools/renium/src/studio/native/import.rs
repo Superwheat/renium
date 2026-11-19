@@ -2895,7 +2895,13 @@ fn additive_references_stay_inside(
     let stays_inside = |refs: &BytecodeModelExportRefs| -> Result<bool> {
         for &index in &selected[1..] {
             let row = &document.instances[index];
-            for value in row.properties.values().chain(row.attributes.values()) {
+            for value in row
+                .properties
+                .iter()
+                .filter(|(name, _)| !crate::rbx::encode::model_property_value_is_skipped(name))
+                .map(|(_, value)| value)
+                .chain(row.attributes.values())
+            {
                 if !model_references_stay_in_selection(value, refs).with_context(|| {
                     format!(
                         "Cannot resolve an additive reference in {service}.{}",
@@ -3026,7 +3032,7 @@ fn additive_document_from_file(
 ) -> Result<RbxPlaceDocument<'static>> {
     crate::settings::bytecode::property_edit::read_row_chunks_with(
         &path,
-        |mut document, mut columns| {
+        |mut document, mut columns, bytes| {
             #[cfg(test)]
             {
                 ADDITIVE_STORE_READS
@@ -3056,25 +3062,21 @@ fn additive_document_from_file(
                 crate::app::output::log_global(
                     5,
                     format_args!(
-                        "[renium] additive {service} has outside or ambiguous references; decoding the complete store from the retained columns"
+                        "[renium] additive {service} has outside or ambiguous references; streaming the complete store"
                     ),
                 );
-                wanted.fill(true);
-                if let Some(selected) = &selected {
-                    for &index in selected {
-                        document.instances[index].properties.clear();
-                        document.instances[index].attributes.clear();
-                    }
-                }
-                columns.rewind_references();
+                drop(columns);
+            } else {
+                columns.materialize_selected(&mut document, &wanted)?;
             }
-            // Completed reference columns already hold this subtree's full values.
-            columns.materialize_selected(&mut document, &wanted)?;
             #[cfg(test)]
             {
                 let mut counts = ADDITIVE_STORE_READS.lock().unwrap();
                 let counts = counts.get_mut(&path).unwrap();
-                counts.1 += wanted.iter().filter(|&&wanted| wanted).count();
+                counts.1 += wanted
+                    .iter()
+                    .filter(|&&wanted| wanted && independent)
+                    .count();
                 counts.2 = !independent;
             }
             Ok(Ok(if independent {
@@ -3085,7 +3087,8 @@ fn additive_document_from_file(
                     service_dir,
                 )
             } else {
-                RbxPlaceDocument::Owned(document)
+                drop(document);
+                RbxPlaceDocument::from_file_bytes(path.clone(), bytes.to_vec())?
             }))
         },
     )?
@@ -3818,6 +3821,29 @@ fn independent_additions_keep_internal_references_and_ignore_service_values() {
         selected.instances[2].attributes,
         document.instances[3].attributes
     );
+    for name in [
+        "Name",
+        "ClassName",
+        "Parent",
+        "Attributes",
+        "AttributesSerialize",
+        "Source",
+        "source",
+    ] {
+        for reference in [
+            json!({"_type":"Ref", "settingsId":""}),
+            json!({"_type":"Ref", "settingsId":"old"}),
+        ] {
+            document.instances[2]
+                .properties
+                .insert(name.into(), reference);
+            assert!(
+                additive_references_stay_inside(&document, "ServerStorage", &indices).unwrap(),
+                "{name}"
+            );
+        }
+    }
+    document.instances[2].properties.clear();
     document.instances[2].properties.insert(
         "PrimaryPart".into(),
         json!({"_type":"Ref", "settingsId":"child"}),

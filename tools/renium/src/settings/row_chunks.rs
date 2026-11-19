@@ -414,15 +414,6 @@ impl RetainedRowColumns {
         Ok(())
     }
 
-    /// The full-document fallback also needs unselected rows of these columns.
-    /// Rewind only their decoding accounting; structural validation stays paid.
-    pub(crate) fn rewind_references(&mut self) {
-        if let Some((budget, _)) = self.reference_budget.take() {
-            self.budget.remaining.store(budget, Ordering::Relaxed);
-            self.cursors = self.groups.iter().map(GroupCursor::beginning).collect();
-        }
-    }
-
     /// Gives the rows marked in `wanted` their maps, all in one pass over the
     /// columns, with the values of every other row dropped as they are
     /// decoded. No range may have been read before.

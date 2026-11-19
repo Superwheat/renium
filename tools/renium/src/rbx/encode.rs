@@ -198,8 +198,7 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                         serialized_name: rbx_dom_weak::Ustr::from(serialized_name.unwrap_or(name)),
                         native_setter_property: class_metadata.triangle_mesh_part
                             && name == "CollisionFidelity",
-                        skipped: model_property_name_is_skipped(name)
-                            || name.eq_ignore_ascii_case("Source"),
+                        skipped: model_property_value_is_skipped(name),
                     };
                     class_metadata.properties.insert(name.clone(), metadata);
                     metadata
@@ -520,6 +519,10 @@ fn bytecode_export_script_source_values(
             .with_context(|| format!("Failed to read source {}", path.display()));
     }
     Ok(stored_source.unwrap_or("").to_string())
+}
+
+pub(crate) fn model_property_value_is_skipped(name: &str) -> bool {
+    model_property_name_is_skipped(name) || name.eq_ignore_ascii_case("Source")
 }
 
 pub(crate) fn model_property_name_is_skipped(name: &str) -> bool {

@@ -10,6 +10,12 @@ fn check_scoped_additive_route(absent: bool, external: bool, prepared: bool) -> 
     let _cleanup = crate::system::files::OnDrop::new(|| {
         let _ = std::fs::remove_dir_all(&root);
     });
+    std::fs::create_dir_all(root.join("src"))?;
+    std::fs::write(
+        root.join("renium.project.jsonc"),
+        r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+    )?;
+    crate::project::config::try_load_project(None, Some(&root))?.context("project not loaded")?;
     let mut args = PushEditorChangesArgs::new(
         ProjectSourceArgs {
             project_root: root.clone(),
@@ -30,6 +36,7 @@ fn check_scoped_additive_route(absent: bool, external: bool, prepared: bool) -> 
         ("new", "Incoming", "Model", Some(0)),
         ("part", "Part", "Part", Some(2)),
         ("value", "Target", "ObjectValue", Some(2)),
+        ("script", "Main", "Script", Some(2)),
     ] {
         document.instances.push(SettingsBytecodeInstance::new(
             id.into(),
@@ -53,6 +60,13 @@ fn check_scoped_additive_route(absent: bool, external: bool, prepared: bool) -> 
             json!({"_type":"Ref","instanceIndex":4})
         },
     );
+    document.instances[5].properties.insert(
+        "Source".into(),
+        json!(crate::settings::EXTERNAL_SOURCE_MARKER),
+    );
+    let source = root.join("src/Workspace/Incoming/Main.server.luau");
+    std::fs::create_dir_all(source.parent().unwrap())?;
+    std::fs::write(source, "print('actual source folder')\n")?;
     for index in 0..256 {
         let mut row = SettingsBytecodeInstance::new(
             format!("unrelated:{index}"),
@@ -65,6 +79,7 @@ fn check_scoped_additive_route(absent: bool, external: bool, prepared: bool) -> 
         document.instances.push(row);
     }
     let path = service_settings_path(&root.join("src").join(service));
+    assert_eq!(path, root.join("instances/Workspace.renium"));
     std::fs::create_dir_all(path.parent().unwrap())?;
     document.write_file(&path)?;
     let mut changes = EditorChangeSet {
@@ -127,22 +142,19 @@ fn check_scoped_additive_route(absent: bool, external: bool, prepared: bool) -> 
             if prepared {
                 (0, 0, false)
             } else {
-                (
-                    1,
-                    if external {
-                        document.instances.len()
-                    } else {
-                        3
-                    },
-                    external,
-                )
+                (1, if external { 0 } else { 4 }, external)
             },
-            "selected rows or one complete decode from the retained columns"
+            "selected rows or a compressed-file streaming fallback"
         );
         let import = import.context("absent root was not imported")?;
         assert_eq!(import.groups.len(), 1);
         assert_eq!(import.groups[0].change_generation, Some(7));
         let dom = rbx_binary::from_reader(import.bytes.as_slice())?;
+        let script = dom.descendants().find(|row| row.name == "Main").unwrap();
+        assert_eq!(
+            script.properties[&"Source".into()],
+            RbxVariant::String("print('actual source folder')\n".into())
+        );
         let part = dom.descendants().find(|row| row.name == "Part").unwrap();
         assert_eq!(
             part.properties[&"Transparency".into()],
@@ -765,7 +777,7 @@ fn check_additive_source_layout(
     )?);
     let mut expected = None;
     for input in [
-        RbxPlaceDocument::Borrowed(&document),
+        RbxPlaceDocument::from_file_bytes(path.clone(), std::fs::read(&path)?)?,
         independent_additive_document(&document, service, &selected, &dir),
         additive_document_from_file(path.clone(), service, &roots, &dir)?,
     ] {
@@ -841,7 +853,7 @@ fn check_additive_legacy_fallbacks(
     path: &std::path::Path,
     dir: &std::path::Path,
 ) -> Result<()> {
-    // Ambiguous legacy selectors must use the complete decoded store once.
+    // Ambiguous legacy selectors must use the complete file-backed stream.
     for duplicate in [false, true] {
         let mut ambiguous = (*document).clone();
         if duplicate {
@@ -871,11 +883,11 @@ fn check_additive_legacy_fallbacks(
             ambiguous.write_file(path)?;
             assert!(matches!(
                 additive_document_from_file(path.to_path_buf(), service, roots, dir)?,
-                RbxPlaceDocument::Owned(_)
+                RbxPlaceDocument::File { .. }
             ));
             assert_eq!(
                 ADDITIVE_STORE_READS.lock().unwrap().remove(path).unwrap(),
-                (1, ambiguous.instances.len(), true)
+                (1, 0, true)
             );
         }
     }
