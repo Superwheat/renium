@@ -1539,7 +1539,11 @@ function BridgePluginRuntime.start(context)
 			local typeId = schemaEntry[2]
 			local enumType = if type(schemaEntry[3]) == "string" then schemaEntry[3] else nil
 			local got, value = tryRead(probe, propertyName)
-			if got and value ~= nil then
+			-- Roblox changes which collision fidelity a new mesh part holds from
+			-- one Studio to the next, so a record that left it out would say
+			-- another thing after an update: every capture states it.
+			local alwaysStated = className == "MeshPart" and propertyName == "CollisionFidelity"
+			if got and value ~= nil and not alwaysStated then
 				local comparable = encodeSchemaComparableValue(typeId, enumType, value, nil)
 				if comparable ~= nil then
 					defaults[propertyName] = comparable

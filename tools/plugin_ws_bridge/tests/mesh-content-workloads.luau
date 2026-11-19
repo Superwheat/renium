@@ -116,3 +116,21 @@ for _, failure in { false, true } do
 	assert(ok ~= failure and cancelled == (if failure then 9 else 0))
 	assert(target.Size == "original size" and target.TextureContent == "original texture")
 end
+
+do
+	local runtime = fs.readFile("tools/plugin_ws_bridge/BridgePluginRuntime.module.luau")
+	local begin = assert(runtime:find("local function getDefaultTransportProperties(", 1, true))
+	local finish = assert(runtime:find("local function getDefaultTransportFastCompareProperties(", begin, true))
+	local defaultsOf = luau.load(runtime:sub(begin, finish - 1) .. "\nreturn getDefaultTransportProperties", { environment = {
+		Instance = { new = function() return { CollisionFidelity = "Default", Transparency = 0, Destroy = function() end } end },
+		DEFAULT_TRANSPORT_PROPERTY_CACHE = {}, DEFAULT_TRANSPORT_FAST_COMPARE_CACHE = {}, NO_DEFAULTS = {},
+		COMPACT_TYPE_IDS = { EnumItem = 1 },
+		getClassPropertySchema = function() return { { "CollisionFidelity", 1 }, { "Transparency", 2 } } end,
+		tryRead = function(instance, name) return true, instance[name] end,
+		encodeSchemaComparableValue = function(_, _, value) return value end,
+		pcall = pcall, ipairs = ipairs, type = type, typeof = typeof,
+	} })()
+	local mesh, union = defaultsOf("MeshPart"), defaultsOf("UnionOperation")
+	assert(mesh.Transparency == 0 and union.CollisionFidelity == "Default")
+	assert(mesh.CollisionFidelity == nil, "a capture must state the collision fidelity of every mesh part")
+end
