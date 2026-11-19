@@ -7,9 +7,65 @@ struct RowGroup {
     name: String,
     kind: u8,
     count: usize,
-    bytes: Range<usize>,
+    bytes: Vec<u8>,
     first_value: usize,
     rotations: CFrameGroupDecoder,
+}
+
+#[test]
+fn consumed_columns_release_their_bytes_without_resetting_deltas() -> Result<()> {
+    let document = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: (0..2000)
+            .map(|index| {
+                let mut row = SettingsBytecodeInstance::new(
+                    format!("id-{index}"),
+                    format!("row-{index}"),
+                    "Folder".into(),
+                    (index > 0).then_some(0),
+                );
+                row.properties.insert("Value".into(), json!(index));
+                row.properties.insert(
+                    "Target".into(),
+                    json!({"_type":"Ref", "instanceIndex":2000-index}),
+                );
+                row
+            })
+            .collect(),
+    };
+    let bytes = encode_settings_bytecode(&document)?;
+    let expected = decode_settings_bytecode_holding(&bytes)?;
+    let (mut actual, mut columns) = decode_for_row_chunks(&bytes)?;
+    let initial = columns
+        .groups
+        .iter()
+        .map(|group| group.bytes.len())
+        .sum::<usize>();
+    for range in [0..100, 100..1600, 1600..2000] {
+        columns.materialize(&mut actual, range.clone())?;
+        assert_eq!(
+            actual.instances[range.clone()],
+            expected.instances[range.clone()]
+        );
+        if range.end == 1600 {
+            let remaining = columns
+                .groups
+                .iter()
+                .map(|group| group.bytes.len())
+                .sum::<usize>();
+            assert!(
+                remaining < initial / 2,
+                "consumed column bytes stayed alive"
+            );
+        }
+    }
+    assert!(columns.groups.iter().all(|group| group.bytes.is_empty()));
+    assert!(
+        columns
+            .project_properties(&mut actual, |_| true, |_, _, value| Some(value))
+            .is_err()
+    );
+    columns.finish()
 }
 
 #[derive(Default)]
@@ -31,12 +87,11 @@ impl GroupCursor {
     fn visit_until(
         &mut self,
         group: &RowGroup,
-        payload: &[u8],
         end: usize,
         scope: ValueScope<'_>,
         mut visit: impl FnMut(DecodedGroupEntry) -> Result<()>,
     ) -> Result<()> {
-        let body = &payload[group.bytes.clone()];
+        let body = &group.bytes;
         let mut reader = BytecodeReader::new(&body[self.byte..]);
         while self.value < group.count {
             let before = reader.position();
@@ -73,7 +128,6 @@ impl GroupCursor {
 }
 
 pub(crate) struct RetainedRowColumns {
-    payload: Vec<u8>,
     strings: Vec<String>,
     groups: Vec<RowGroup>,
     cursors: Vec<GroupCursor>,
@@ -105,13 +159,13 @@ pub(crate) fn decode_for_row_chunks(
             budget.property_group(count, name, kind)?;
             let mut values = BytecodeReader::new(body);
             let rotations = decode_cframe_group_header(kind, &mut values)?;
-            // These slices come from this payload's checked group reader.
-            let start = body.as_ptr().addr() - payload.as_ptr().addr();
             Ok(RowGroup {
                 name: name.clone(),
                 kind,
                 count,
-                bytes: start..start + body.len(),
+                // The header's strings and structural rows are already owned.
+                // Keeping the container would retain a second copy of them.
+                bytes: body.to_vec(),
                 first_value: values.position(),
                 rotations,
             })
@@ -122,7 +176,6 @@ pub(crate) fn decode_for_row_chunks(
     Ok((
         SettingsBytecode { version, instances },
         RetainedRowColumns {
-            payload,
             strings,
             groups,
             cursors,
@@ -185,28 +238,30 @@ impl RetainedRowColumns {
         };
         let groups = self
             .groups
-            .par_iter()
+            .par_iter_mut()
             .zip(self.cursors.par_iter_mut())
             .map(|(group, cursor)| {
                 let mut entries = Vec::with_capacity(rows.len().min(group.count));
-                cursor.visit_until(group, &self.payload, rows.end, scope, |entry| {
+                cursor.visit_until(group, rows.end, scope, |entry| {
                     entries.push(entry);
                     Ok(())
                 })?;
+                // Release consumed prefixes geometrically. The total bytes
+                // moved are bounded by twice the original column size,
+                // independent of the row chunk size.
+                // Cursor deltas and CFrame state survive the buffer movement.
+                if cursor.byte >= group.bytes.len().div_ceil(2) {
+                    group.bytes.drain(..cursor.byte);
+                    group.bytes.shrink_to_fit();
+                    cursor.byte = 0;
+                }
                 Ok(entries)
             })
             .collect::<Result<Vec<_>>>()?;
         let specs = self
             .groups
             .iter()
-            .map(|group| {
-                (
-                    &group.name,
-                    group.kind,
-                    group.count,
-                    &self.payload[group.bytes.clone()],
-                )
-            })
+            .map(|group| (&group.name, group.kind, group.count, group.bytes.as_slice()))
             .collect::<Vec<_>>();
         // Schedule only this range, with enough partitions for a bounded range
         // to use the worker pool. Group order still decides repeated values.
@@ -223,6 +278,10 @@ impl RetainedRowColumns {
         names: impl Fn(&str) -> bool,
         project: impl Fn(&SettingsBytecodeInstance, &str, Value) -> Option<Value>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            self.next_row == 0,
+            "Store context must be projected before reading rows; restart the import before writing to Studio"
+        );
         let budget = DecodeBudget::for_file(self.file_bytes).holding_payloads();
         let scope = ValueScope {
             strings: &self.strings,
@@ -232,7 +291,7 @@ impl RetainedRowColumns {
         for group in self.groups.iter().filter(|group| names(&group.name)) {
             budget.property_group(group.count, &group.name, group.kind)?;
             let mut cursor = GroupCursor::beginning(group);
-            cursor.visit_until(group, &self.payload, self.instance_count, scope, |entry| {
+            cursor.visit_until(group, self.instance_count, scope, |entry| {
                 let DecodedGroupEntry::Property(index, value) = entry else {
                     return Ok(());
                 };
@@ -275,7 +334,7 @@ impl RetainedRowColumns {
             .zip(self.cursors.par_iter_mut())
             .map(|(group, cursor)| {
                 let mut entries = Vec::new();
-                cursor.visit_until(group, &self.payload, self.instance_count, scope, |entry| {
+                cursor.visit_until(group, self.instance_count, scope, |entry| {
                     if wanted[entry.instance_index()] {
                         entries.push(entry);
                     }
@@ -287,14 +346,7 @@ impl RetainedRowColumns {
         let specs = self
             .groups
             .iter()
-            .map(|group| {
-                (
-                    &group.name,
-                    group.kind,
-                    group.count,
-                    &self.payload[group.bytes.clone()],
-                )
-            })
+            .map(|group| (&group.name, group.kind, group.count, group.bytes.as_slice()))
             .collect::<Vec<_>>();
         apply_decoded_property_groups(&mut document.instances, &specs, groups);
         Ok(())
@@ -318,7 +370,7 @@ impl RetainedRowColumns {
         // Also validate empty groups in an empty document, where no row range
         // caused materialize to visit their bodies.
         for (cursor, group) in self.cursors.iter_mut().zip(&self.groups) {
-            cursor.visit_until(group, &self.payload, self.instance_count, scope, |_| {
+            cursor.visit_until(group, self.instance_count, scope, |_| {
                 bail!("Store rows were not completely read; restart the import before writing to Studio")
             })?;
         }
