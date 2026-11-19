@@ -1674,6 +1674,11 @@ impl PlaceImportProperties {
     }
 }
 
+#[cfg(test)]
+pub(crate) static CONVERSION_VISITS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, Vec<String>>>,
+> = std::sync::LazyLock::new(Default::default);
+
 /// Scheduling choices only; references and final hierarchy order span all work.
 #[derive(Clone, Copy)]
 pub(crate) struct PlaceBuildTuning {
@@ -1700,14 +1705,33 @@ impl Default for PlaceBuildTuning {
 pub(crate) fn build_rbx_place_with_tuning(
     src_root: &Path,
     services: Vec<String>,
-    mut documents: HashMap<String, RbxPlaceDocument<'_>>,
+    documents: HashMap<String, RbxPlaceDocument<'_>>,
     allow_unrepresentable_properties: bool,
     import_properties: impl Into<PlaceImportProperties>,
     merge_source_files: bool,
     tuning: PlaceBuildTuning,
 ) -> Result<RbxPlaceBuild> {
-    let import_properties = import_properties.into();
-    let capture_logical_properties = import_properties.capture_logical;
+    prepare_rbx_place(
+        src_root,
+        services,
+        documents,
+        allow_unrepresentable_properties,
+        merge_source_files,
+        tuning,
+    )?(import_properties.into())
+}
+
+/// Reading and reference indexing need no live policy. Conversion is returned
+/// to the caller, so it can overlap preparation with preflight without blocking
+/// a Rayon worker on another job in the same pool.
+pub(crate) fn prepare_rbx_place<'a>(
+    src_root: &Path,
+    services: Vec<String>,
+    mut documents: HashMap<String, RbxPlaceDocument<'a>>,
+    allow_unrepresentable_properties: bool,
+    merge_source_files: bool,
+    tuning: PlaceBuildTuning,
+) -> Result<impl FnOnce(PlaceImportProperties) -> Result<RbxPlaceBuild> + Send + use<'a>> {
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let phase_started = Instant::now();
     let link_enforcement = if merge_source_files {
@@ -1950,47 +1974,58 @@ pub(crate) fn build_rbx_place_with_tuning(
     let global_path_segment_refs = Arc::new(global_path_segment_refs);
     let compact_paths = Arc::new(compact_paths);
     log_timing("native editor place reference indexes", phase_started);
-    struct ServiceBuild {
-        instances: Vec<(usize, Option<RbxRef>, rbx_dom_weak::Instance)>,
-        rows: Vec<(RbxRef, usize, SettingsBytecodeInstance)>,
-        omitted_properties_by_ref: HashMap<RbxRef, HashSet<String>>,
-        omitted_properties_by_class: HashMap<String, HashSet<String>>,
-        logical_properties_by_ref: HashMap<RbxRef, HashMap<rbx_dom_weak::Ustr, RbxVariant>>,
-        unresolved_reference_properties_by_ref: HashMap<RbxRef, HashSet<rbx_dom_weak::Ustr>>,
-    }
-    let phase_started = Instant::now();
-    let mut import_rows = crate::rbx::import_rows::ImportRowCandidates::default();
-    let mut omitted_properties_by_ref = HashMap::new();
-    let extra_omissions = crate::editor::types::import_property_omissions(
-        HashMap::new(),
-        import_properties.native_reader,
-    );
-    let mut omitted_properties_by_class = HashMap::new();
-    let mut logical_properties_by_ref = HashMap::new();
-    let mut unresolved_reference_properties_by_ref = HashMap::new();
-    let mut service_roots = Vec::with_capacity(export_inputs.len());
-    let mut has_package_links = false;
-    let mut inputs = export_inputs
-        .into_iter()
-        .zip(per_service_refs)
-        .enumerate()
-        .collect::<Vec<_>>();
-    // Overlap dominant services, but return failures in original service order.
-    inputs.sort_by_key(|(_, (input, _))| std::cmp::Reverse(input.7.len()));
-    let mut inputs = inputs.into_iter();
-    let mut converted = Vec::with_capacity(service_roots.capacity());
-    loop {
-        let batch = inputs
-            .by_ref()
-            .take(tuning.services.get())
-            .collect::<Vec<_>>();
-        if batch.is_empty() {
-            break;
+    #[cfg(test)]
+    let conversion_root = src_root.to_path_buf();
+    Ok(move |import_properties: PlaceImportProperties| {
+        let capture_logical_properties = import_properties.capture_logical;
+        struct ServiceBuild {
+            instances: Vec<(usize, Option<RbxRef>, rbx_dom_weak::Instance)>,
+            rows: Vec<(RbxRef, usize, SettingsBytecodeInstance)>,
+            omitted_properties_by_ref: HashMap<RbxRef, HashSet<String>>,
+            omitted_properties_by_class: HashMap<String, HashSet<String>>,
+            logical_properties_by_ref: HashMap<RbxRef, HashMap<rbx_dom_weak::Ustr, RbxVariant>>,
+            unresolved_reference_properties_by_ref: HashMap<RbxRef, HashSet<rbx_dom_weak::Ustr>>,
         }
-        let completed = batch.into_par_iter().map(|(rank, (
+        let phase_started = Instant::now();
+        let mut import_rows = crate::rbx::import_rows::ImportRowCandidates::default();
+        let mut omitted_properties_by_ref = HashMap::new();
+        let extra_omissions = crate::editor::types::import_property_omissions(
+            HashMap::new(),
+            import_properties.native_reader,
+        );
+        let mut omitted_properties_by_class = HashMap::new();
+        let mut logical_properties_by_ref = HashMap::new();
+        let mut unresolved_reference_properties_by_ref = HashMap::new();
+        let mut service_roots = Vec::with_capacity(export_inputs.len());
+        let mut has_package_links = false;
+        let mut inputs = export_inputs
+            .into_iter()
+            .zip(per_service_refs)
+            .enumerate()
+            .collect::<Vec<_>>();
+        // Overlap dominant services, but return failures in original service order.
+        inputs.sort_by_key(|(_, (input, _))| std::cmp::Reverse(input.7.len()));
+        let mut inputs = inputs.into_iter();
+        let mut converted = Vec::with_capacity(service_roots.capacity());
+        let first_failure = std::sync::atomic::AtomicUsize::new(usize::MAX);
+        loop {
+            let batch = inputs
+                .by_ref()
+                .take(tuning.services.get())
+                .collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
+            }
+            let completed = batch.into_par_iter().filter_map(|(rank, (
             (service, _, service_dir, document, mut source_paths, children, root_index, subtree, _),
             by_index,
         ))| {
+        if rank > first_failure.load(std::sync::atomic::Ordering::Relaxed) {
+            document.release();
+            return None;
+        }
+        #[cfg(test)]
+        if let Some(visits) = CONVERSION_VISITS.lock().unwrap().get_mut(&conversion_root) { visits.push(service.clone()); }
         let result = (|| {
         let service_started = Instant::now();
         let (mut document, mut columns) = match document {
@@ -2261,79 +2296,81 @@ pub(crate) fn build_rbx_place_with_tuning(
         );
         anyhow::Ok((service, root_ref, has_package_links, order, service_chunks, identity))
         })();
-        (rank, result)
+        if result.is_err() { first_failure.fetch_min(rank, std::sync::atomic::Ordering::Relaxed); }
+        Some((rank, result))
         }).collect::<Vec<_>>();
-        converted.extend(completed);
-    }
-    converted.sort_by_key(|(rank, ..)| *rank);
-    // Conversion has released every encoder. These indexes have no reader in
-    // DOM assembly; release them before allocating the final instance table.
-    drop(global_unique_settings_refs);
-    drop(global_path_refs);
-    drop(global_path_segment_refs);
-    drop(compact_paths);
-    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
-    dom.reserve(total_instances);
-    let join_span = crate::app::profile::span("place converted tree join");
-    for (_, result) in converted {
-        let (service, root_ref, packages, order, service_chunks, identity) = result?;
-        let mut kept = Vec::new();
-        has_package_links |= packages;
-        let mut instances = Vec::with_capacity(order.len());
-        for service in service_chunks {
-            for (class_name, names) in service.omitted_properties_by_class {
-                omitted_properties_by_class
-                    .entry(class_name)
-                    .or_insert_with(HashSet::new)
-                    .extend(names);
+            converted.extend(completed);
+        }
+        converted.sort_by_key(|(rank, ..)| *rank);
+        // Conversion has released every encoder. These indexes have no reader in
+        // DOM assembly; release them before allocating the final instance table.
+        drop(global_unique_settings_refs);
+        drop(global_path_refs);
+        drop(global_path_segment_refs);
+        drop(compact_paths);
+        let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        dom.reserve(total_instances);
+        let join_span = crate::app::profile::span("place converted tree join");
+        for (_, result) in converted {
+            let (service, root_ref, packages, order, service_chunks, identity) = result?;
+            let mut kept = Vec::new();
+            has_package_links |= packages;
+            let mut instances = Vec::with_capacity(order.len());
+            for service in service_chunks {
+                for (class_name, names) in service.omitted_properties_by_class {
+                    omitted_properties_by_class
+                        .entry(class_name)
+                        .or_insert_with(HashSet::new)
+                        .extend(names);
+                }
+                logical_properties_by_ref.extend(service.logical_properties_by_ref);
+                unresolved_reference_properties_by_ref
+                    .extend(service.unresolved_reference_properties_by_ref);
+                instances.extend(service.instances);
+                kept.extend(service.rows);
+                omitted_properties_by_ref.extend(service.omitted_properties_by_ref);
             }
-            logical_properties_by_ref.extend(service.logical_properties_by_ref);
-            unresolved_reference_properties_by_ref
-                .extend(service.unresolved_reference_properties_by_ref);
-            instances.extend(service.instances);
-            kept.extend(service.rows);
-            omitted_properties_by_ref.extend(service.omitted_properties_by_ref);
+            // Completion order and row ranges never change hierarchy preorder.
+            instances.sort_unstable_by_key(|(index, _, _)| order[*index]);
+            for (_, parent_ref, builder) in instances {
+                dom.insert_leaf(parent_ref.unwrap_or_else(|| dom.root_ref()), builder);
+            }
+            if let Some(identity) = identity {
+                import_rows
+                    .services
+                    .insert(service.clone(), (identity, kept));
+            }
+            service_roots.push((service, root_ref));
         }
-        // Completion order and row ranges never change hierarchy preorder.
-        instances.sort_unstable_by_key(|(index, _, _)| order[*index]);
-        for (_, parent_ref, builder) in instances {
-            dom.insert_leaf(parent_ref.unwrap_or_else(|| dom.root_ref()), builder);
-        }
-        if let Some(identity) = identity {
-            import_rows
-                .services
-                .insert(service.clone(), (identity, kept));
-        }
-        service_roots.push((service, root_ref));
-    }
 
-    drop(join_span);
-    let normalize_span = crate::app::profile::span("place default normalization");
-    crate::rbx::encode::normalize_export_dom(&mut dom, database);
-    drop(normalize_span);
-    log_timing("native editor place DOM assembly", phase_started);
-    // Reimports need the source identities as well as logical properties.
-    // Reuse the already prepared index; ordinary file builds need no copy.
-    let settings_ids_by_ref = if capture_logical_properties {
-        Arc::try_unwrap(settings_ids_by_service)
-            .expect("all service reference indexes were released")
-            .into_values()
-            .flat_map(|ids| ids.into_iter().map(|(id, referent)| (referent, id)))
-            .collect()
-    } else {
-        HashMap::new()
-    };
-    Ok(RbxPlaceBuild {
-        import_rows,
-        omitted_properties_by_ref,
-        dom,
-        settings_ids_by_ref,
-        service_roots,
-        total_instances,
-        has_package_links,
-        omitted_properties_by_class,
-        logical_properties_by_ref,
-        unresolved_reference_properties_by_ref,
+        drop(join_span);
+        let normalize_span = crate::app::profile::span("place default normalization");
+        crate::rbx::encode::normalize_export_dom(&mut dom, database);
+        drop(normalize_span);
+        log_timing("native editor place DOM assembly", phase_started);
+        // Reimports need the source identities as well as logical properties.
+        // Reuse the already prepared index; ordinary file builds need no copy.
+        let settings_ids_by_ref = if capture_logical_properties {
+            Arc::try_unwrap(settings_ids_by_service)
+                .expect("all service reference indexes were released")
+                .into_values()
+                .flat_map(|ids| ids.into_iter().map(|(id, referent)| (referent, id)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        Ok(RbxPlaceBuild {
+            import_rows,
+            omitted_properties_by_ref,
+            dom,
+            settings_ids_by_ref,
+            service_roots,
+            total_instances,
+            has_package_links,
+            omitted_properties_by_class,
+            logical_properties_by_ref,
+            unresolved_reference_properties_by_ref,
+        })
     })
 }
 

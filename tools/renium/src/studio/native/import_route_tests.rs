@@ -1,6 +1,7 @@
 use super::*;
 use crate::cli::{BridgeConnectionArgs, ProjectSourceArgs};
 use crate::editor::types::EditorInstanceChange;
+use crate::rbx::model::build_rbx_place_with_documents;
 use crate::studio::bridge::routing_tests::{connect, edit_info, fixture};
 use tungstenite::{Message, WebSocket, protocol::Role};
 
@@ -298,30 +299,54 @@ fn additive_existence_errors_do_not_take_the_older_plugin_route() {
     }
 }
 
-/// The captured service has one root with a PackageLink and two identity slots.
-/// Its package is absent from the desired project and must survive replacement.
-fn package_capture() -> Result<Vec<u8>> {
-    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
-    let root = dom.root_ref();
-    dom.insert(root, RbxInstanceBuilder::new("Folder").with_name("Marker"));
-    dom.insert(
-        root,
-        RbxInstanceBuilder::new("Folder")
-            .with_name("Linked")
-            .with_child(RbxInstanceBuilder::new("PackageLink")),
-    );
-    dom.insert(
-        root,
-        RbxInstanceBuilder::new("Folder").with_name("Identity1"),
+fn preflight_peer(
+    bridge: &BridgeServer,
+    service: &'static str,
+    package: bool,
+) -> Result<std::thread::JoinHandle<()>> {
+    let stream = connect(bridge, 0, edit_info("builder-fixture", 21));
+    // Marker, retained package and its identity carrier, in export order.
+    let dom = RbxWeakDom::new(
+        RbxInstanceBuilder::new("DataModel").with_children([
+            RbxInstanceBuilder::new("Folder").with_name("Marker"),
+            RbxInstanceBuilder::new("Folder")
+                .with_name("Linked")
+                .with_child(RbxInstanceBuilder::new("PackageLink")),
+            RbxInstanceBuilder::new("Folder").with_name("Identity1"),
+        ]),
     );
     let mut bytes = Vec::new();
     rbx_binary::to_writer(&mut bytes, &dom, dom.root().children())?;
-    Ok(bytes)
+    Ok(std::thread::spawn(move || {
+        let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
+        while let Ok(Message::Text(text)) = socket.read() {
+            let req: Value = serde_json::from_str(&text).unwrap();
+            let result = match req["method"].as_str().unwrap() {
+                "getEditorServiceChangeGenerations" => {
+                    json!({"generations":{(service):0},"hasPackageLinks":{(service):package},"absentRoots":{(service):["Clouds","Terrain"]}})
+                }
+                "beginEditorBinaryExport" => {
+                    json!({"groups":[{"service":service,"targetPath":[service],"count":1,"instanceCount":3,"classNames":["Folder","PackageLink"],"identityCarrierClass":"Folder","identityCarrierPrefix":"Identity","identityCarrierSlots":["A","B"],"identityCarrierCount":1}],"propertySchemaByClass":{"Folder":[["Archivable",1]]}})
+                }
+                "readEditorBinaryExport" => {
+                    json!({"start":1,"nextStart":bytes.len()+1,"total":bytes.len(),"chunk":base64::encode(&bytes)})
+                }
+                "finishEditorBinaryExport" => json!({"found":true}),
+                other => panic!("unexpected preflight request {other}"),
+            };
+            socket
+                .send(Message::Text(
+                    json!({"id":req["id"], "ok":true, "result":result})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+        }
+    }))
 }
 
 #[test]
-fn import_builder_preserves_planned_and_failed_reader_routes_and_live_packages() -> Result<()> {
-    let service = "ReplicatedStorage";
+fn import_builder_preserves_reader_routes_packages_and_additive_identity() -> Result<()> {
     let root = crate::tests::support::temp_dir("import-builder-route");
     let _cleanup = crate::system::files::OnDrop::new(|| {
         let _ = std::fs::remove_dir_all(&root);
@@ -333,102 +358,233 @@ fn import_builder_preserves_planned_and_failed_reader_routes_and_live_packages()
         },
         BridgeConnectionArgs::local(0.1),
     );
-    std::fs::create_dir_all(root.join("src").join(service))?;
+    for service in ["Workspace", "ReplicatedStorage"] {
+        std::fs::create_dir_all(root.join("src").join(service))?;
+    }
     args.disable_service_reader = true;
-    let changes = EditorChangeSet {
+    let mut document = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: Vec::new(),
+    };
+    for (id, name, class, parent) in [
+        ("root", "Workspace", "Workspace", None),
+        ("terrain", "Terrain", "Terrain", Some(0)),
+        ("nested", "Clouds", "Clouds", Some(1)),
+        ("new", "Clouds", "Model", Some(0)),
+        ("folder", "Terrain", "Folder", Some(0)),
+        ("part", "External", "Part", Some(0)),
+        ("twin", "Clouds", "Model", Some(0)),
+    ] {
+        document.instances.push(SettingsBytecodeInstance::new(
+            id.into(),
+            name.into(),
+            class.into(),
+            parent,
+        ));
+    }
+    document.instances[3].properties.insert(
+        "PrimaryPart".into(),
+        json!({"_type":"Ref", "settingsId":"part"}),
+    );
+    let mut sparse = document.clone();
+    for row in &mut sparse.instances {
+        row.properties.clear();
+        crate::settings::held::stand_unchanged(&mut row.properties);
+    }
+    let mut changes = EditorChangeSet {
         instance_changes: vec![EditorInstanceChange {
-            service: service.into(),
-            mode: "reconcileService".into(),
-            allow_deletes: true,
-            instances: vec![],
-            preserve_instances: vec![],
+            service: "Workspace".into(),
+            mode: "upsertInstances".into(),
+            instances: [6, 3, 4]
+                .map(|index| crate::editor::types::EditorInstanceDescriptor {
+                    settings_id: document.instances[index].settings_id.clone(),
+                    path_segments: vec!["Workspace".into(), document.instances[index].name.clone()],
+                    path_ordinals: vec![1, if index == 3 { 1 } else { 2 }],
+                    class_name: document.instances[index].class_name.clone(),
+                    ..Default::default()
+                })
+                .into(),
+            allow_deletes: false,
+            preserve_instances: Vec::new(),
         }],
-        native_property_documents: HashMap::from([(
-            service.into(),
-            std::sync::Arc::new(SettingsBytecode {
-                version: SETTINGS_BINARY_VERSION,
-                instances: vec![
-                    SettingsBytecodeInstance::new(
-                        "root".into(),
-                        service.into(),
-                        service.into(),
-                        None,
-                    ),
-                    SettingsBytecodeInstance::new(
-                        "part".into(),
-                        "New".into(),
-                        "Folder".into(),
-                        Some(0),
-                    ),
-                ],
-            }),
-        )]),
         ..Default::default()
     };
-    for (package, failed) in [(false, false), (false, true), (true, false), (true, true)] {
+    for (package, failed, additive) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (true, true, false),
+        (false, false, true),
+    ] {
+        let service = if additive {
+            "Workspace"
+        } else {
+            "ReplicatedStorage"
+        };
+        document.instances[0].name = service.into();
+        document.instances[0].class_name = service.into();
+        changes.instance_changes[0].service = service.into();
+        changes.instance_changes[0].allow_deletes = !additive;
+        let (mode, desired) = if additive {
+            ("upsertInstances", &sparse)
+        } else {
+            ("reconcileService", &document)
+        };
+        changes.instance_changes[0].mode = mode.into();
+        changes
+            .native_property_documents
+            .insert(service.into(), std::sync::Arc::new(desired.clone()));
         let bridge = fixture();
-        let stream = connect(&bridge, 0, edit_info("builder-fixture", 21));
-        let bytes = package_capture()?;
-        let peer = std::thread::spawn(move || {
-            let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
-            let mut generation_requests = 0;
-            while let Ok(Message::Text(text)) = socket.read() {
-                let req: Value = serde_json::from_str(&text).unwrap();
-                let result = match req["method"].as_str().unwrap() {
-                    "getEditorServiceChangeGenerations" => {
-                        generation_requests += 1;
-                        json!({"generations":{(service):0},"hasPackageLinks":{(service):package}})
-                    }
-                    "beginEditorBinaryExport" => {
-                        json!({"groups":[{"service":service,"targetPath":[service],"count":1,"instanceCount":3,"classNames":["Folder","PackageLink"],"identityCarrierClass":"Folder","identityCarrierPrefix":"Identity","identityCarrierSlots":["A","B"],"identityCarrierCount":1}],"propertySchemaByClass":{"Folder":[["Archivable",1]]}})
-                    }
-                    "readEditorBinaryExport" => {
-                        json!({"start":1,"nextStart":bytes.len()+1,"total":bytes.len(),"chunk":base64::encode(&bytes)})
-                    }
-                    "finishEditorBinaryExport" => json!({"found":true}),
-                    other => panic!("unexpected preflight request {other}"),
-                };
-                socket
-                    .send(Message::Text(
-                        json!({"id":req["id"], "ok":true, "result":result})
-                            .to_string()
-                            .into(),
-                    ))
-                    .unwrap();
-            }
-            if !package {
-                assert_eq!(generation_requests, 1);
-            }
-        });
+        let peer = preflight_peer(&bridge, service, package)?;
         let mut selected = select_editor_binary_import(&args, &changes, &bridge)?.unwrap();
         if failed {
             selected.fallback_reason = Some(ServiceReaderFallback::DiscoveryFailed(
                 "missing reader".into(),
             ));
         }
-        let import = build_editor_binary_import(&args, &changes, &bridge, Some(selected))?
-            .context("import missing")?;
-        let reason = import.fallback_reason.unwrap();
-        if package {
-            assert!(matches!(reason, ServiceReaderFallback::PackageRoots));
-            assert_eq!(import.groups[0].package_roots.len(), 1);
+        if additive {
+            // Reconciliation removes stale Studio identities before upserting files.
+            for mode in ["replaceInstances", "deleteInstances"] {
+                let mut removed = changes.instance_changes[0].clone();
+                removed.mode = mode.into();
+                removed.instances.truncate(1);
+                removed.instances[0].settings_id = "not-in-store".into();
+                changes.instance_changes.insert(0, removed);
+            }
             assert_eq!(
-                import.groups[0].package_roots[0].path_segments,
-                [service, "Linked"]
+                additive_root_ids(&changes, &selected.additive_roots)[service]["Clouds"],
+                ["twin", "new"]
             );
-        } else if failed {
+            let mut missing = EditorChangeSet {
+                instance_changes: changes.instance_changes.clone(),
+                native_property_documents: changes.native_property_documents.clone(),
+                ..Default::default()
+            };
+            missing.instance_changes[2].instances[1].settings_id = "missing".into();
+            let missing_selection = select_editor_binary_import(&args, &missing, &bridge)?.unwrap();
             assert!(
-                matches!(reason,ServiceReaderFallback::DiscoveryFailed(message) if message=="missing reader")
+                build_editor_binary_import_with_documents(
+                    &args,
+                    &missing,
+                    &bridge,
+                    missing_selection,
+                    HashMap::from([(service.into(), RbxPlaceDocument::Borrowed(&document))]),
+                )?
+                .is_none(),
+                "unknown identity must take the ordinary route"
             );
-        } else if cfg!(windows) {
-            assert!(matches!(reason, ServiceReaderFallback::Disabled));
-        } else {
-            assert!(matches!(reason, ServiceReaderFallback::Platform));
+        }
+        let import = build_editor_binary_import_with_documents(
+            &args,
+            &changes,
+            &bridge,
+            selected,
+            HashMap::from([(service.into(), RbxPlaceDocument::Borrowed(&document))]),
+        )?
+        .context("import missing")?;
+        if additive {
+            assert!(
+                import.kept_rows.is_empty(),
+                "additive services have no supplemental reader"
+            );
+            assert_eq!(import.groups.len(), 1);
+            assert_eq!(import.groups[0].target_path, [service]);
+            assert_eq!(
+                import.groups[0].root_settings_ids,
+                ["new", "folder", "twin"]
+            );
+        }
+        match (import.fallback_reason.unwrap(), package, failed) {
+            (ServiceReaderFallback::PackageRoots, true, _) => {
+                assert_eq!(import.groups[0].package_roots.len(), 1);
+                assert_eq!(
+                    import.groups[0].package_roots[0].path_segments,
+                    [service, "Linked"]
+                );
+            }
+            (ServiceReaderFallback::DiscoveryFailed(message), false, true) => {
+                assert_eq!(message, "missing reader")
+            }
+            (ServiceReaderFallback::Disabled, false, false) if cfg!(windows) => {}
+            (ServiceReaderFallback::Platform, false, false) if !cfg!(windows) => {}
+            other => panic!("unexpected route {other:?}"),
         }
         assert!(import.native_replacement.is_none() && !import.bytes.is_empty());
         drop(bridge);
         peer.join().unwrap();
     }
+    Ok(())
+}
+
+#[test]
+fn failed_unread_preparation_stops_before_snapshot_export() -> Result<()> {
+    let root = crate::tests::support::temp_dir("failed-import-preparation");
+    let _cleanup = crate::system::files::OnDrop::new(|| {
+        let _ = std::fs::remove_dir_all(&root);
+    });
+    let service = "ReplicatedStorage";
+    let dir = root.join("src").join(service);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(service_settings_path(&dir), b"invalid store")?;
+    let mut row =
+        SettingsBytecodeInstance::new("root".into(), service.into(), service.into(), None);
+    crate::settings::held::stand_unchanged(&mut row.properties);
+    let changes = EditorChangeSet {
+        native_property_documents: HashMap::from([(
+            service.into(),
+            std::sync::Arc::new(SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances: vec![row],
+            }),
+        )]),
+        ..Default::default()
+    };
+    let args = PushEditorChangesArgs::new(
+        ProjectSourceArgs {
+            project_root: root.clone(),
+            src_root: "src".into(),
+        },
+        BridgeConnectionArgs::local(0.1),
+    );
+    let bridge = fixture();
+    let stream = connect(&bridge, 0, edit_info("failed-preparation", 21));
+    let peer = std::thread::spawn(move || {
+        let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
+        let mut requests = 0;
+        while let Ok(Message::Text(text)) = socket.read() {
+            let req: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                req["method"], "getEditorServiceChangeGenerations",
+                "preparation failure must prevent export"
+            );
+            requests += 1;
+            socket
+                .send(Message::Text(
+                    json!({"id":req["id"],"ok":true,"result":{
+                        "generations":{(service):0},"hasPackageLinks":{(service):true}
+                    }})
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+        }
+        assert_eq!(requests, 1);
+    });
+    let result = build_editor_binary_import_with_documents(
+        &args,
+        &changes,
+        &bridge,
+        BinaryImportSelection {
+            services: HashSet::from([service.into()]),
+            additive_roots: HashMap::new(),
+            fallback_reason: Some(ServiceReaderFallback::Disabled),
+            first_generation: None,
+        },
+        HashMap::new(),
+    );
+    drop(bridge);
+    peer.join().unwrap();
+    assert!(format!("{:#}", result.err().context("invalid store accepted")?).contains("decode"));
     Ok(())
 }
 

@@ -25,8 +25,8 @@ use crate::rbx::encode::{collect_rbx_subtree_preorder, rbx_property_descriptor};
 #[cfg(test)]
 use crate::rbx::model::build_rbx_place;
 use crate::rbx::model::{
-    BytecodeModelImportRefs, RbxPlaceDocument, build_rbx_place_with_documents,
-    rbx_dom_instance_by_path_unique, rbx_dom_instance_path_parts, rbx_dom_path_import_refs,
+    BytecodeModelImportRefs, RbxPlaceDocument, rbx_dom_instance_by_path_unique,
+    rbx_dom_instance_path_parts, rbx_dom_path_import_refs,
 };
 use crate::roblox::schema::PropertySchemaMap;
 use crate::roblox::services::{explorer_service_order, is_engine_managed_container};
@@ -2538,13 +2538,7 @@ pub(crate) fn build_editor_binary_import_with_documents(
     selection: BinaryImportSelection,
     document_overrides: HashMap<String, RbxPlaceDocument<'_>>,
 ) -> Result<Option<EditorBinaryImport>> {
-    let BinaryImportSelection {
-        services,
-        additive_roots,
-        fallback_reason,
-        first_generation,
-    } = selection;
-    let root_ids = additive_root_ids(changes, &additive_roots);
+    let root_ids = additive_root_ids(changes, &selection.additive_roots);
     let written_services = changes
         .settings_writes
         .iter()
@@ -2559,7 +2553,7 @@ pub(crate) fn build_editor_binary_import_with_documents(
         .native_property_documents
         .iter()
         .filter(|(service, document)| {
-            !additive_roots.contains_key(*service)
+            !selection.additive_roots.contains_key(*service)
                 && crate::settings::equivalence::holds_unread_instances(document)
                 && !written_services.contains(*service)
         })
@@ -2575,16 +2569,11 @@ pub(crate) fn build_editor_binary_import_with_documents(
     properties.unread_rows = unread_rows;
     build_editor_binary_import_for_services(
         args,
-        services,
-        ImportDocuments {
-            overrides: document_overrides,
-            properties,
-            first_generation,
-        },
-        &additive_roots,
+        selection,
+        document_overrides,
+        properties,
         &root_ids,
         bridge,
-        fallback_reason,
     )
 }
 
@@ -2598,7 +2587,8 @@ fn additive_root_ids(
             continue;
         };
         for instance in &change.instances {
-            if let [_, name] = instance.path_segments.as_slice()
+            if additive_root_is_new(change, instance) == Some(true)
+                && let name = &instance.path_segments[1]
                 && names.contains(name)
             {
                 ids.entry(change.service.clone())
@@ -2612,6 +2602,21 @@ fn additive_root_ids(
     ids
 }
 
+fn additive_root_is_new(
+    change: &crate::editor::types::EditorInstanceChange,
+    instance: &crate::editor::types::EditorInstanceDescriptor,
+) -> Option<bool> {
+    (change.mode == "upsertInstances"
+        && instance.path_segments.len() == 2
+        && instance.path_ordinals.len() == 2)
+        .then(|| {
+            instance.previous_path_segments.is_empty()
+                && instance.previous_class_name.is_none()
+                && !instance.anchor_only
+                && !is_engine_managed_container(&change.service, &instance.class_name)
+        })
+}
+
 fn additive_native_roots(
     changes: &EditorChangeSet,
     replaced: &HashSet<String>,
@@ -2623,21 +2628,17 @@ fn additive_native_roots(
     // Same-named siblings share one root name: the live preflight later proves
     // the name absent from Studio, so every sibling is a fresh insertion.
     for change in &changes.instance_changes {
-        if change.mode != "upsertInstances" || replaced.contains(&change.service) {
+        if replaced.contains(&change.service) {
             continue;
         }
         let mut rejected = HashSet::new();
         let mut candidates = HashSet::new();
         for instance in &change.instances {
-            if instance.path_segments.len() != 2 || instance.path_ordinals.len() != 2 {
+            let Some(new) = additive_root_is_new(change, instance) else {
                 continue;
-            }
+            };
             let name = &instance.path_segments[1];
-            if instance.previous_path_segments.is_empty()
-                && instance.previous_class_name.is_none()
-                && !instance.anchor_only
-                && !is_engine_managed_container(&change.service, &instance.class_name)
-            {
+            if new {
                 candidates.insert(name.clone());
             } else {
                 rejected.insert(name.clone());
@@ -3161,29 +3162,79 @@ fn import_allocates_new_engine_identities_without_losing_saved_content() {
     );
 }
 
-struct ImportDocuments<'a> {
-    overrides: HashMap<String, RbxPlaceDocument<'a>>,
-    properties: crate::rbx::model::PlaceImportProperties,
-    first_generation: Option<EditorServiceChangeGenerations>,
+fn prepare_import_groups(
+    build: &mut crate::rbx::model::RbxPlaceBuild,
+    additive_roots: &HashMap<String, HashSet<String>>,
+    additive_root_ids: &AdditiveRootIds,
+) -> Result<Vec<PendingEditorBinaryGroup>> {
+    // Preserve the viewport's logical reference when serialization omits it.
+    for (service, root) in &build.service_roots {
+        if service == "Workspace"
+            && let Some(camera) = build
+                .logical_properties_by_ref
+                .get(root)
+                .and_then(|properties| properties.get(&rbx_dom_weak::Ustr::from("CurrentCamera")))
+        {
+            build
+                .dom
+                .get_by_ref_mut(*root)
+                .context("Export Workspace root is missing")?
+                .properties
+                .insert("CurrentCamera".into(), camera.clone());
+        }
+    }
+    let mut pending_groups = pending_editor_binary_groups(&build.dom, &build.service_roots)?;
+    pending_groups.retain(|group| {
+        !additive_roots.contains_key(&group.service) || group.target_path.len() == 1
+    });
+    for service in additive_roots.keys() {
+        let Some(group) = pending_groups
+            .iter_mut()
+            .find(|group| group.service == *service)
+        else {
+            return Ok(Vec::new());
+        };
+        group.additive = true;
+        group.viewport_camera = None;
+        let ids = additive_root_ids
+            .get(service)
+            .into_iter()
+            .flat_map(|ids| ids.iter())
+            .flat_map(|(name, ids)| ids.iter().map(move |id| (name, id)))
+            .collect::<HashSet<_>>();
+        (group.roots, group.root_settings_ids) = std::mem::take(&mut group.roots)
+            .into_iter()
+            .filter_map(|root| {
+                let instance = build.dom.get_by_ref(root)?;
+                let id = build.settings_ids_by_ref.get(&root)?;
+                ids.contains(&(&instance.name, id))
+                    .then(|| (root, id.clone()))
+            })
+            .unzip();
+        if group.roots.len() != ids.len() || ids.is_empty() {
+            return Ok(Vec::new());
+        }
+    }
+    Ok(pending_groups)
 }
 
 fn build_editor_binary_import_for_services(
     args: &PushEditorChangesArgs,
-    services: HashSet<String>,
-    documents: ImportDocuments<'_>,
-    additive_roots: &HashMap<String, HashSet<String>>,
+    selection: BinaryImportSelection,
+    mut document_overrides: HashMap<String, RbxPlaceDocument<'_>>,
+    mut properties: crate::rbx::model::PlaceImportProperties,
     additive_root_ids: &AdditiveRootIds,
     bridge: &BridgeServer,
-    fallback_reason: Option<ServiceReaderFallback>,
 ) -> Result<Option<EditorBinaryImport>> {
-    let ImportDocuments {
-        overrides: mut document_overrides,
-        mut properties,
-        mut first_generation,
-    } = documents;
+    let BinaryImportSelection {
+        services,
+        additive_roots,
+        fallback_reason,
+        first_generation,
+    } = selection;
+    let additive_roots = &additive_roots;
     let project_root = resolve_project_root_if_present(&args.project.project_root)?;
     let src_root = absolutize_under(&project_root, &args.project.src_root);
-    let service_count = services.len();
     let mut ordered_services = services.into_iter().collect::<Vec<_>>();
     ordered_services.sort_by(|a, b| {
         explorer_service_order(a)
@@ -3191,8 +3242,57 @@ fn build_editor_binary_import_for_services(
             .cmp(&explorer_service_order(b).unwrap_or(usize::MAX))
             .then_with(|| a.cmp(b))
     });
-    let build_services = ordered_services.clone();
-    let mut capture_preflight = || {
+    let prepare = || {
+        let started = Instant::now();
+        for (service, roots) in additive_roots {
+            if let Some(document) = document_overrides.get(service) {
+                if let Some(indices) = additive_subtree(document, service, roots)
+                    && additive_references_stay_inside(document, service, &indices)?
+                {
+                    document_overrides.insert(
+                        service.clone(),
+                        independent_additive_document(
+                            document,
+                            service,
+                            &indices,
+                            &src_root.join(service),
+                        ),
+                    );
+                } else {
+                    crate::app::output::log_global(
+                        5,
+                        format_args!(
+                            "[renium] additive {service} needs the complete reference index; keeping its prepared document"
+                        ),
+                    );
+                }
+            } else {
+                let path = service_settings_path(&src_root.join(service));
+                if path.is_file() {
+                    document_overrides.insert(
+                        service.clone(),
+                        additive_document_from_file(path, service, roots, &src_root.join(service))?,
+                    );
+                }
+            }
+        }
+        let prepared = crate::rbx::model::prepare_rbx_place(
+            &src_root,
+            ordered_services.clone(),
+            document_overrides,
+            true,
+            false,
+            crate::rbx::model::PlaceBuildTuning::default(),
+        )?;
+        let elapsed = started.elapsed();
+        anyhow::Ok(move |properties| {
+            let started = Instant::now() - elapsed;
+            let build = prepared(properties);
+            log_timing("native editor import place build", started);
+            build
+        })
+    };
+    let capture = |first| {
         capture_editor_package_preflight_live(
             bridge,
             &ordered_services,
@@ -3200,148 +3300,41 @@ fn build_editor_binary_import_for_services(
             false,
             Some(additive_roots),
             Some(additive_root_ids),
-            PackagePreflightAttempt {
-                number: 0,
-                first: first_generation.take(),
-            },
+            PackagePreflightAttempt { number: 0, first },
         )
     };
-    // Original rows have a reader only for partly read whole services. Learn
-    // whether references can cross retained identities before keeping them.
-    let prepared_preflight = (!properties.retain_rows.is_empty())
-        .then(&mut capture_preflight)
-        .transpose()?;
-    if prepared_preflight
-        .as_ref()
-        .is_some_and(|preflight| preflight.dom.is_none())
-    {
-        properties.reference_subtree_limit = Some(payload::NATIVE_IMPORT_BATCH_INSTANCES);
-        properties.native_reader = fallback_reason.is_none();
-    }
-    let (build, live_preflight) = rayon::join(
-        || {
-            let started = Instant::now();
-            for (service, roots) in additive_roots {
-                if let Some(document) = document_overrides.get(service) {
-                    if let Some(indices) = additive_subtree(document, service, roots)
-                        && additive_references_stay_inside(document, service, &indices)?
-                    {
-                        document_overrides.insert(
-                            service.clone(),
-                            independent_additive_document(
-                                document,
-                                service,
-                                &indices,
-                                &src_root.join(service),
-                            ),
-                        );
-                    } else {
-                        crate::app::output::log_global(
-                            5,
-                            format_args!(
-                                "[renium] additive {service} needs the complete reference index; keeping its prepared document"
-                            ),
-                        );
-                    }
-                } else {
-                    let path = service_settings_path(&src_root.join(service));
-                    if path.is_file() {
-                        document_overrides.insert(
-                            service.clone(),
-                            additive_document_from_file(
-                                path,
-                                service,
-                                roots,
-                                &src_root.join(service),
-                            )?,
-                        );
-                    }
-                }
-            }
-            let result = build_rbx_place_with_documents(
-                &src_root,
-                build_services,
-                document_overrides,
-                true,
-                properties,
-                false,
-            );
-            log_timing("native editor import place build", started);
-            result.and_then(|mut build| {
-                // CurrentCamera is role metadata, not a property to apply.
-                // Preserve its logical reference for payload partitioning even
-                // when Roblox's binary serializer omits the property.
-                for (service, root) in &build.service_roots {
-                    if service == "Workspace"
-                        && let Some(camera) =
-                            build
-                                .logical_properties_by_ref
-                                .get(root)
-                                .and_then(|properties| {
-                                    properties.get(&rbx_dom_weak::Ustr::from("CurrentCamera"))
-                                })
-                    {
-                        build
-                            .dom
-                            .get_by_ref_mut(*root)
-                            .context("Export Workspace root is missing")?
-                            .properties
-                            .insert("CurrentCamera".into(), camera.clone());
-                    }
-                }
-                let mut pending_groups =
-                    pending_editor_binary_groups(&build.dom, &build.service_roots)?;
-                for group in &mut pending_groups {
-                    if let Some(roots) = additive_roots.get(&group.service) {
-                        group.additive = true;
-                        group.viewport_camera = None;
-                        group.roots.retain(|root| {
-                            let (segments, _) = rbx_dom_instance_path_parts(&build.dom, *root);
-                            roots.contains(&segments[1])
-                        });
-                        let mut next_by_name: HashMap<&str, usize> = HashMap::new();
-                        group.root_settings_ids = group
-                            .roots
-                            .iter()
-                            .map(|root| {
-                                let name = build
-                                    .dom
-                                    .get_by_ref(*root)
-                                    .map_or("", |instance| instance.name.as_str());
-                                let slot = next_by_name.entry(name).or_insert(0);
-                                let id = additive_root_ids
-                                    .get(&group.service)
-                                    .and_then(|ids| ids.get(name))
-                                    .and_then(|ids| ids.get(*slot))
-                                    .cloned()
-                                    .unwrap_or_default();
-                                *slot += 1;
-                                id
-                            })
-                            .collect();
-                    }
-                }
-                pending_groups.retain(|group| !group.additive || !group.roots.is_empty());
-                for (service, roots) in additive_roots {
-                    let found = pending_groups
-                        .iter()
-                        .filter(|group| group.service == *service)
-                        .flat_map(|group| &group.roots)
-                        .filter_map(|root| build.dom.get_by_ref(*root))
-                        .map(|instance| instance.name.as_str())
-                        .collect::<HashSet<_>>();
-                    anyhow::ensure!(
-                        found.len() == roots.len(),
-                        "New native roots were not found in {service}"
-                    );
-                }
-                Ok((build, pending_groups))
-            })
-        },
-        || prepared_preflight.map_or_else(capture_preflight, Ok),
-    );
-    let (mut build, mut pending_groups) = build?;
+    let (build, live_preflight) = if properties.unread_rows.is_empty() {
+        // Without supplemental readers, no conversion policy depends on Studio.
+        rayon::join(|| prepare()?(properties), || capture(first_generation))
+    } else {
+        let (prepared, first) = rayon::join(prepare, || {
+            first_generation.map_or_else(
+                || {
+                    editor_service_change_generations(
+                        bridge,
+                        &ordered_services,
+                        Some(additive_roots),
+                        Some(additive_root_ids),
+                    )
+                },
+                Ok,
+            )
+        });
+        let prepared = prepared?;
+        let first = first?;
+        if first
+            .has_package_links
+            .as_ref()
+            .is_some_and(|states| !states.values().any(|has| *has))
+        {
+            properties.reference_subtree_limit = Some(payload::NATIVE_IMPORT_BATCH_INSTANCES);
+            properties.native_reader = fallback_reason.is_none();
+        }
+        rayon::join(|| prepared(properties), || capture(Some(first)))
+    };
+    let mut build = build?;
     let mut live_preflight = live_preflight?;
+    let mut pending_groups = prepare_import_groups(&mut build, additive_roots, additive_root_ids)?;
     crate::app::output::log_global(
         5,
         format_args!(
@@ -3351,37 +3344,28 @@ fn build_editor_binary_import_for_services(
     );
     for group in &mut pending_groups {
         if group.additive {
-            let mut kept_ids = Vec::new();
-            let ids = std::mem::take(&mut group.root_settings_ids);
-            let mut index = 0;
-            group.roots.retain(|root| {
-                let keep = live_preflight
-                    .absent_roots
-                    .get(&group.service)
-                    .is_some_and(|absent| {
-                        build
-                            .dom
-                            .get_by_ref(*root)
-                            .is_some_and(|instance| absent.contains(&instance.name))
-                    });
-                if keep && let Some(id) = ids.get(index) {
-                    kept_ids.push(id.clone());
-                }
-                index += 1;
-                keep
-            });
-            group.root_settings_ids = if kept_ids.len() == group.roots.len() {
-                kept_ids
-            } else {
-                Vec::new()
-            };
+            (group.roots, group.root_settings_ids) = std::mem::take(&mut group.roots)
+                .into_iter()
+                .zip(std::mem::take(&mut group.root_settings_ids))
+                .filter(|(root, _)| {
+                    live_preflight
+                        .absent_roots
+                        .get(&group.service)
+                        .is_some_and(|absent| {
+                            build
+                                .dom
+                                .get_by_ref(*root)
+                                .is_some_and(|instance| absent.contains(&instance.name))
+                        })
+                })
+                .unzip();
         }
     }
     pending_groups.retain(|group| !group.additive || !group.roots.is_empty());
     if pending_groups.is_empty() {
         return Ok(None);
     }
-    if build.service_roots.len() != service_count {
+    if build.service_roots.len() != ordered_services.len() {
         return Ok(None);
     }
     let phase_started = Instant::now();

@@ -274,32 +274,43 @@ fn native_import_file_values_come_from_the_indexed_snapshot() -> Result<()> {
 fn parallel_import_reports_the_first_service_error_in_input_order() -> Result<()> {
     use crate::rbx::model::{PlaceBuildTuning, RbxPlaceDocument, build_rbx_place_with_tuning};
     let root = crate::tests::support::temp_dir("import-error-order");
-    let services = vec!["ReplicatedStorage".to_string(), "Workspace".to_string()];
+    let services = vec![
+        "ReplicatedStorage".to_string(),
+        "Workspace".to_string(),
+        "Lighting".to_string(),
+    ];
     for service in &services {
         std::fs::create_dir_all(root.join(service))?;
     }
-    let mut first = fixture(&services[0]);
-    first.instances[4].name = "FirstBadReference".into();
-    first.instances[4]
-        .properties
-        .insert("Value".into(), json!({"_type":"Ref", "settingsId":9}));
-    let mut second = fixture(&services[1]);
-    second.instances[4].name = "SecondBadReference".into();
-    second.instances[4]
-        .properties
-        .insert("Value".into(), json!({"_type":"Ref", "settingsId":9}));
-    // The old size-sorted scheduling visits this service first at degree one.
-    second.instances.push(SettingsBytecodeInstance::new(
+    let mut documents = services
+        .iter()
+        .map(|service| fixture(service))
+        .collect::<Vec<_>>();
+    for (document, name) in documents
+        .iter_mut()
+        .zip(["FirstBadReference", "SecondBadReference"])
+    {
+        document.instances[4].name = name.into();
+        document.instances[4]
+            .properties
+            .insert("Value".into(), json!({"_type":"Ref", "settingsId":9}));
+    }
+    documents[1].instances.push(SettingsBytecodeInstance::new(
         "extra".into(),
         "Extra".into(),
         "Folder".into(),
         Some(0),
     ));
     for degree in [1, 2] {
-        let inputs = HashMap::from([
-            (services[0].clone(), RbxPlaceDocument::Borrowed(&first)),
-            (services[1].clone(), RbxPlaceDocument::Borrowed(&second)),
-        ]);
+        crate::rbx::model::CONVERSION_VISITS
+            .lock()
+            .unwrap()
+            .insert(root.clone(), Vec::new());
+        let inputs = services
+            .iter()
+            .zip(&documents)
+            .map(|(service, document)| (service.clone(), RbxPlaceDocument::Borrowed(document)))
+            .collect();
         let result = build_rbx_place_with_tuning(
             &root,
             services.clone(),
@@ -311,6 +322,23 @@ fn parallel_import_reports_the_first_service_error_in_input_order() -> Result<()
                 services: std::num::NonZeroUsize::new(degree).unwrap(),
                 ..Default::default()
             },
+        );
+        let visits = crate::rbx::model::CONVERSION_VISITS
+            .lock()
+            .unwrap()
+            .remove(&root)
+            .unwrap();
+        // A parallel batch may cancel the second failure before it starts.
+        let required = if degree == 1 { 2 } else { 1 };
+        assert!(
+            services[..required]
+                .iter()
+                .all(|service| visits.contains(service)),
+            "failing services were not converted: {visits:?}"
+        );
+        assert!(
+            !visits.contains(&services[2]),
+            "later-ranked service was converted: {visits:?}"
         );
         let error = result.err().context("invalid reference was accepted")?;
         assert!(
