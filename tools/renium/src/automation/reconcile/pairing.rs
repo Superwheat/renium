@@ -1205,19 +1205,25 @@ fn store_instances_equal(
         return true;
     }
     left_instance.name == right_instance.name
-        && left_instance.class_name == right_instance.class_name
         && settings_parent_id(left, left_index) == settings_parent_id(right, right_index)
+        && instance_values_equal(service, left_instance, right_instance)
+}
+
+/// Whether two instances are of one class and hold the same, wherever they
+/// stand.
+pub(crate) fn instance_values_equal(
+    service: Option<&str>,
+    left: &SettingsBytecodeInstance,
+    right: &SettingsBytecodeInstance,
+) -> bool {
+    left.class_name == right.class_name
         && reconciliation_store_maps_equal(
             service,
-            &left_instance.class_name,
-            &comparison_properties(left_instance),
-            &comparison_properties(right_instance),
+            &left.class_name,
+            &comparison_properties(left),
+            &comparison_properties(right),
         )
-        && reconciliation_store_values_map_equal(
-            service,
-            &left_instance.attributes,
-            &right_instance.attributes,
-        )
+        && reconciliation_store_values_map_equal(service, &left.attributes, &right.attributes)
 }
 
 /// The properties the first comparison judges: a collision hull whose

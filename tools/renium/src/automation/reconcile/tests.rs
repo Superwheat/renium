@@ -7380,6 +7380,134 @@ fn the_ancestors_of_a_changed_instance_are_read_wherever_they_stand() {
     }
 }
 
+/// A store whose copies differ in more instances than a push sends one by
+/// one is imported anew: it is prepared and planned as a store of which
+/// Studio holds nothing but what stays in a service, where the whole
+/// documents would send its instances one by one. Rows written another way
+/// that hold the same count for nothing.
+#[test]
+fn a_store_most_of_whose_instances_differ_is_imported_anew() {
+    type Stated = Option<(&'static str, Value)>;
+    let store = |class: &str, stated: &dyn Fn(usize) -> Vec<Stated>| {
+        let instance = |id: String, name: String, class: &str, parent| {
+            SettingsBytecodeInstance::new(id, name, class.into(), parent)
+        };
+        let mut root = instance("1".into(), "Workspace".into(), "Workspace", None);
+        root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type": "Ref", "instanceIndex": 2}),
+        );
+        let mut camera = instance("debug:0_2".into(), "Camera".into(), "Camera", Some(0));
+        camera.properties.insert("FieldOfView".into(), json!(70.0));
+        let mut terrain = instance("debug:0_3".into(), "Terrain".into(), "Terrain", Some(0));
+        terrain
+            .properties
+            .insert("WaterTransparency".into(), json!(0.25));
+        let mut instances = vec![root, camera, terrain];
+        for index in 0..17_300 {
+            let id = format!("debug:0_{}", 10 + index);
+            let mut part = instance(id, format!("Item{index}"), class, Some(0));
+            part.properties.insert("Anchored".into(), json!(true));
+            for (name, value) in stated(index).into_iter().flatten() {
+                part.properties.insert(name.into(), value);
+            }
+            instances.push(part);
+        }
+        SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances,
+        }
+    };
+    let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+    let snapshot = |document: &SettingsBytecode| ProjectSnapshot {
+        entries: BTreeMap::from([(
+            path.clone(),
+            SnapshotEntry::File(encode_settings_bytecode(document).unwrap()),
+        )]),
+    };
+    // Whether the store is imported anew, the plan, and what the push takes
+    // Studio to hold.
+    let pushed = |files: &SettingsBytecode, studio: &SettingsBytecode, read: StoresRead| {
+        let (desired, observed) = (snapshot(files), snapshot(studio));
+        let paths = project_replacement_paths(&desired, &observed);
+        let (mut prepared, imported) = (HashMap::new(), ImportedStores::default());
+        prepare_project_replacement_importing(
+            &desired,
+            &observed,
+            &paths,
+            &mut prepared,
+            read,
+            (read != StoresRead::Whole).then_some(&imported),
+        )
+        .unwrap();
+        let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+            &observed, &desired, &paths, &prepared, true, false,
+        )
+        .unwrap();
+        // The plan is carried out from the documents it was made from.
+        let plan = super::push_flow::plan_from_whole_stores(
+            (read, plan),
+            (&desired, &observed),
+            &paths,
+            &mut prepared,
+        )
+        .unwrap();
+        let previous = prepared.remove(&path).map(|change| {
+            let said = |instance: &SettingsBytecodeInstance| {
+                format!("{} {:?}", instance.settings_id, instance.properties)
+            };
+            change.previous.instances.iter().map(said).collect()
+        });
+        (
+            imported.into_inner().unwrap().contains(&path),
+            plan_text(&plan),
+            previous.unwrap_or_else(Vec::new),
+        )
+    };
+    let transparent = || Some(("Transparency", json!(0.5)));
+
+    // All but 300 of the parts differ.
+    let studio = store("Part", &|_| vec![]);
+    let files = store("Part", &|index| {
+        vec![(index < 17_000).then(transparent).flatten()]
+    });
+    let mut bare = studio.clone();
+    bare.instances.truncate(3);
+    let (imported, expected, kept) = pushed(&files, &bare, StoresRead::ChangedOfBoth);
+    assert!(
+        !imported && expected.starts_with("Workspace\n"),
+        "{expected}"
+    );
+    assert_eq!(kept.len(), 3);
+    for read in [StoresRead::ChangedOfBoth, StoresRead::Changed] {
+        let (imported, plan, previous) = pushed(&files, &studio, read);
+        assert!(imported);
+        assert_eq!((plan, previous), (expected.clone(), kept.clone()));
+    }
+    let (_, whole, held) = pushed(&files, &studio, StoresRead::Whole);
+    assert!(!whole.starts_with("Workspace\n") && held.len() > 17_000);
+
+    // Every row differs, and half of them in what they hold: fewer than a
+    // push sends one by one.
+    let spelled = || {
+        Some((
+            "CollisionFidelity",
+            json!({"_type": "EnumItem", "name": "Default"}),
+        ))
+    };
+    let studio = store("MeshPart", &|_| vec![]);
+    let half = store("MeshPart", &|index| {
+        vec![spelled(), (index % 2 == 0).then(transparent).flatten()]
+    });
+    let (imported, plan, _) = pushed(&half, &studio, StoresRead::ChangedOfBoth);
+    assert!(!imported);
+    assert_eq!(plan, pushed(&half, &studio, StoresRead::Whole).1);
+
+    // Every row differs, and all of them in what they hold.
+    let all = store("MeshPart", &|_| vec![spelled(), transparent()]);
+    assert!(pushed(&all, &studio, StoresRead::ChangedOfBoth).0);
+}
+
 /// A store of which Studio holds nothing but what stays in a service is
 /// pushed whole: the import carries its instances from the store file, and
 /// the push reads only the ones it handles beside the import. Prepared so,

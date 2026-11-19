@@ -45,6 +45,40 @@ pub(crate) fn prepare_project_replacement_from(
     prepared: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
     read: StoresRead,
 ) -> Result<HashSet<PathBuf>> {
+    prepare_project_replacement_importing(desired, observed, paths, prepared, read, None)
+}
+
+/// The stores a push imports anew although Studio holds their instances
+/// (`heavily_changed_store`).
+pub(crate) type ImportedStores = std::sync::Mutex<HashSet<PathBuf>>;
+
+/// The services of the stores a push imports anew. Every instance of such a
+/// service is a new object, as in one `promote_heavy_deltas_to_replacement`
+/// replaces.
+pub(crate) fn imported_services(
+    imported: ImportedStores,
+    prepared: &HashMap<PathBuf, PreparedEditorSettingsChange>,
+) -> Result<HashSet<String>> {
+    imported
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter_map(|path| Some((path, prepared.get(path)?)))
+        .map(|(path, change)| settings_service_name(path, &change.current, &change.previous))
+        .collect()
+}
+
+/// `prepare_project_replacement_from` for a project whose stores may be
+/// imported anew where most of their instances differ: `imported` takes the
+/// paths of those.
+pub(crate) fn prepare_project_replacement_importing(
+    desired: &ProjectSnapshot,
+    observed: &ProjectSnapshot,
+    paths: &HashSet<PathBuf>,
+    prepared: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
+    read: StoresRead,
+    imported: Option<&ImportedStores>,
+) -> Result<HashSet<PathBuf>> {
     let documents = paths
         .par_iter()
         .filter(|path| {
@@ -65,19 +99,28 @@ pub(crate) fn prepare_project_replacement_from(
                     desired.entries.get(path),
                     observed.entries.get(path),
                     read == StoresRead::ChangedOfBoth,
+                    imported.is_some(),
                 )?
             };
-            let decoded = match changed {
+            let (decoded, bare) = match changed {
                 ChangedInstances::None => return Ok((path.clone(), None)),
                 ChangedInstances::Prepared(change) => {
                     return Ok((path.clone(), Some(*change)));
                 }
-                ChangedInstances::Whole(current) => current,
-            };
-            let bare = if read != StoresRead::Whole && decoded.is_none() {
-                replaced_store_alone(desired.entries.get(path), observed.entries.get(path))?
-            } else {
-                None
+                ChangedInstances::Whole(None) if read != StoresRead::Whole => (
+                    None,
+                    replaced_store_alone(desired.entries.get(path), observed.entries.get(path))?,
+                ),
+                ChangedInstances::Whole(current) => (current, None),
+                ChangedInstances::Imported(copies) => {
+                    if let Some(imported) = imported {
+                        imported
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(path.clone());
+                    }
+                    (None, Some(*copies))
+                }
             };
             let (current, previous) = match bare {
                 Some((current, previous)) => (anyhow::Ok(current), anyhow::Ok(previous)),
@@ -238,6 +281,9 @@ enum ChangedInstances {
     Prepared(Box<PreparedEditorSettingsChange>),
     /// The whole documents have to say, with the files' where it is decoded.
     Whole(Option<SettingsBytecode>),
+    /// The store is imported anew (`heavily_changed_store`): the files' copy
+    /// beside what Studio keeps of its own.
+    Imported(Box<(SettingsBytecode, SettingsBytecode)>),
 }
 
 /// A store file smaller than this is read whole: two documents of it are
@@ -245,8 +291,119 @@ enum ChangedInstances {
 const CHANGED_INSTANCES_MIN_BYTES: usize = if cfg!(test) { 1 } else { 256 * 1024 };
 
 /// The most instances read from the store Studio holds; past that the whole
-/// documents are compared.
+/// documents are compared, or the store is imported anew.
 const MAX_CHANGED_INSTANCES: usize = 16_384;
+
+/// The most instances `heavily_changed_store` compares.
+const HEAVY_SAMPLE: usize = 4_096;
+
+/// A copy of a store read by some of its instances: every other one bare
+/// and standing for its counterpart of the other copy.
+fn sparse_document(
+    instances: Vec<SettingsBytecodeInstance>,
+    read: &[usize],
+    rows: Vec<SettingsBytecodeInstance>,
+    version: u8,
+) -> Result<SettingsBytecode> {
+    let mut document = SettingsBytecode { version, instances };
+    for instance in &mut document.instances {
+        crate::settings::held::stand_unchanged(&mut instance.properties);
+    }
+    for (index, mut row) in read.iter().zip(rows) {
+        for value in row.properties.values_mut() {
+            *value = crate::settings::held::held(std::mem::take(value));
+        }
+        document.instances[*index] = row;
+    }
+    crate::settings::equivalence::stabilize_settings_reference_ids(&mut document);
+    canonicalize_settings_property_names(&mut document)?;
+    Ok(document)
+}
+
+/// How many of `differing`, the instances whose rows differ in two copies
+/// of a store, differ in what they hold: rows written another way can hold
+/// the same, so a sample of them is compared value by value. The sample
+/// takes one instance of every run of them, at a place that varies from run
+/// to run, so that no regular order of the instances misleads it.
+fn truly_differing(
+    (desired_bytes, observed_bytes): (&[u8], &[u8]),
+    differing: &[usize],
+) -> Result<usize> {
+    use crate::settings::bytecode::property_edit::decode_rows;
+    use crate::settings::equivalence::canonicalize_instances;
+
+    let run = differing.len().div_ceil(HEAVY_SAMPLE).max(1);
+    let sample = differing
+        .chunks(run)
+        .enumerate()
+        .map(|(at, run)| {
+            run[((at as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32) as usize % run.len()]
+        })
+        .collect::<Vec<_>>();
+    let (Ok((mut files, _)), Ok((mut studio, _))) = rayon::join(
+        || decode_rows(desired_bytes, &sample),
+        || decode_rows(observed_bytes, &sample),
+    ) else {
+        return Ok(0);
+    };
+    canonicalize_instances(&mut files)?;
+    canonicalize_instances(&mut studio)?;
+    let differ = files
+        .par_iter()
+        .zip(&studio)
+        .filter(|(files, studio)| !instance_values_equal(None, files, studio))
+        .count();
+    Ok(differing.len() * differ / sample.len().max(1))
+}
+
+/// The two copies of a store that holds the same instances at the same
+/// places where more than `MAX_CHANGED_INSTANCES` of them differ in what
+/// they hold. Sending that many instances one by one costs Studio and the
+/// daemon far more than one import of the store, so the store is prepared
+/// as one Studio holds nothing of: the files' copy as `replaced_store_alone`
+/// reads it, beside the instances of Studio's copy that an import keeps.
+/// `studio` are the instances of that copy, bare. `None` where the import
+/// cannot place a camera or a package root, as
+/// `promote_heavy_deltas_to_replacement` asks.
+fn imported_store(
+    (desired_bytes, observed_bytes): (&[u8], &[u8]),
+    studio: Vec<SettingsBytecodeInstance>,
+) -> Result<Option<(SettingsBytecode, SettingsBytecode)>> {
+    // What an import keeps of Studio's copy: its roots, the engine's
+    // containers under them and the camera of the viewport.
+    let kept = (0..studio.len())
+        .filter(|&index| {
+            studio[index].parent_index.is_none_or(|parent| {
+                studio.get(parent).is_some_and(|parent| {
+                    parent.parent_index.is_none()
+                        && (studio[index].class_name == "Camera"
+                            || crate::roblox::services::is_engine_managed_container(
+                                &parent.class_name,
+                                &studio[index].class_name,
+                            ))
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let Ok((rows, _)) =
+        crate::settings::bytecode::property_edit::decode_rows(observed_bytes, &kept)
+    else {
+        return Ok(None);
+    };
+    let studio = sparse_document(studio, &kept, rows, SETTINGS_BINARY_VERSION)?;
+    let retained = retained_settings_document(&studio);
+    if !service_has_only_native_containers(&retained)
+        || same_named_roots_share_a_package(&studio)
+        || retained
+            .instances
+            .iter()
+            .any(|instance| crate::settings::held::stands_unchanged(&instance.properties))
+    {
+        return Ok(None);
+    }
+    drop(studio);
+    replaced_store_beside(desired_bytes, retained)
+}
 
 /// The change of a store whose two copies differ in the values of a few
 /// instances, without the whole document of the store Studio holds: the
@@ -264,6 +421,7 @@ fn changed_instances_alone(
     desired: Option<&SnapshotEntry>,
     observed: Option<&SnapshotEntry>,
     files_too: bool,
+    imports_heavy: bool,
 ) -> Result<ChangedInstances> {
     use crate::settings::bytecode::property_edit::{
         StoreRows, decode_rows, names_an_instance_by_id, whole_row_digests,
@@ -421,32 +579,43 @@ fn changed_instances_alone(
         })
         .collect::<Vec<_>>();
     drop(namesakes);
+    if read.len() > MAX_CHANGED_INSTANCES && imports_heavy {
+        let mut names = files_named;
+        for index in &observed_rows.named {
+            if let Some(names) = names.get_mut(*index) {
+                *names = true;
+            }
+        }
+        let differing = (0..count)
+            .filter(|&index| files_digests[index] != observed_rows.digests[index] && !names[index])
+            .collect::<Vec<_>>();
+        if differing.len() > MAX_CHANGED_INSTANCES
+            && truly_differing((desired_bytes, observed_bytes), &differing)? > MAX_CHANGED_INSTANCES
+        {
+            // Neither copy is whole beside the ones the import reads.
+            drop(files);
+            let copies = imported_store((desired_bytes, observed_bytes), skeleton)?;
+            if copies.is_some() {
+                crate::app::output::log_global(
+                    3,
+                    format_args!(
+                        "[renium] push imports a store of {count} instances anew: {} of them differ",
+                        differing.len()
+                    ),
+                );
+            }
+            return Ok(copies.map_or(ChangedInstances::Whole(None), |copies| {
+                ChangedInstances::Imported(Box::new(copies))
+            }));
+        }
+    }
     if read.len() > MAX_CHANGED_INSTANCES || read.len() == count {
         return hand_over(files);
     }
     let Ok((rows, _)) = decode_rows(observed_bytes, &read) else {
         return hand_over(files);
     };
-    // A copy read by its changed instances: the instances bare, each
-    // standing for its counterpart, with the read ones in their places.
-    let sparse = |instances: Vec<SettingsBytecodeInstance>,
-                  rows: Vec<SettingsBytecodeInstance>,
-                  version: u8|
-     -> Result<SettingsBytecode> {
-        let mut document = SettingsBytecode { version, instances };
-        for instance in &mut document.instances {
-            crate::settings::held::stand_unchanged(&mut instance.properties);
-        }
-        for (index, mut row) in read.iter().zip(rows) {
-            for value in row.properties.values_mut() {
-                *value = crate::settings::held::held(std::mem::take(value));
-            }
-            document.instances[*index] = row;
-        }
-        stabilize_settings_reference_ids(&mut document);
-        canonicalize_settings_property_names(&mut document)?;
-        Ok(document)
-    };
+    let sparse = |instances, rows, version| sparse_document(instances, &read, rows, version);
     let mut current = match files {
         Files::Whole(current, ..) => current,
         Files::Rows(files) => {
@@ -504,9 +673,6 @@ fn replaced_store_alone(
     desired: Option<&SnapshotEntry>,
     observed: Option<&SnapshotEntry>,
 ) -> Result<Option<(SettingsBytecode, SettingsBytecode)>> {
-    use crate::settings::bytecode::property_edit::decode_for_row_chunks;
-    use crate::settings::equivalence::stabilize_settings_reference_ids;
-
     let Some(SnapshotEntry::File(desired_bytes)) = desired else {
         return Ok(None);
     };
@@ -520,6 +686,18 @@ fn replaced_store_alone(
     {
         return Ok(None);
     }
+    replaced_store_beside(desired_bytes, settings_document(observed)?)
+}
+
+/// `replaced_store_alone` for the files' store beside what Studio holds, or
+/// keeps, of its own.
+fn replaced_store_beside(
+    desired_bytes: &[u8],
+    previous: SettingsBytecode,
+) -> Result<Option<(SettingsBytecode, SettingsBytecode)>> {
+    use crate::settings::bytecode::property_edit::decode_for_row_chunks;
+    use crate::settings::equivalence::stabilize_settings_reference_ids;
+
     // Every instance with its UniqueId alone, which says where Studio's
     // stand among them. A store this reader refuses is the whole decode's to
     // refuse.
@@ -539,7 +717,6 @@ fn replaced_store_alone(
     }
     let skeleton = &current.instances;
     let count = skeleton.len();
-    let previous = settings_document(observed)?;
     // The identities of a store this much smaller are matched with the
     // instances of the files that share an id or a name and class with one
     // of them, or its UniqueId.

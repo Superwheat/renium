@@ -131,33 +131,39 @@ fn leave_unread_documents(prepared: &mut HashMap<PathBuf, PreparedPushVerificati
 /// The plan as it is carried out: one made from the changed instances of
 /// both copies that creates, removes or imports an instance is made again
 /// from the files' whole copies of its stores.
-fn plan_from_whole_stores(
+pub(super) fn plan_from_whole_stores(
     (stores_read, plan): (StoresRead, ReconcilePushPlan),
     (project, studio): (&ProjectSnapshot, &ProjectSnapshot),
-    (differences, promoted_services): (&HashSet<PathBuf>, &HashSet<String>),
+    differences: &HashSet<PathBuf>,
     prepared_settings: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
 ) -> Result<ReconcilePushPlan> {
     if stores_read != StoresRead::ChangedOfBoth || plan_reads_changed_alone(&plan) {
         return Ok(plan);
     }
-    let paths = prepared_settings.keys().cloned().collect::<HashSet<_>>();
+    // A store that is imported is prepared the same way either time.
+    let paths = prepared_settings
+        .iter()
+        .filter(|(_, change)| !service_has_only_native_containers(&change.previous))
+        .map(|(path, _)| path.clone())
+        .collect::<HashSet<_>>();
+    if paths.is_empty() {
+        return Ok(plan);
+    }
     let mut whole = HashMap::new();
     prepare_project_replacement_from(project, studio, &paths, &mut whole, StoresRead::Changed)?;
     anyhow::ensure!(
-        whole.len() == prepared_settings.len(),
+        whole.len() == paths.len(),
         "The stores of this push differ another way when read whole; retry the push"
     );
-    *prepared_settings = whole;
-    let mut plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+    prepared_settings.extend(whole);
+    reconciliation_push_plan_for_paths_with_prepared_settings(
         studio,
         project,
         differences,
         prepared_settings,
         true,
         false,
-    )?;
-    extend_replaced_service_references(project, prepared_settings, promoted_services, &mut plan)?;
-    Ok(plan)
+    )
 }
 
 pub(crate) fn push_project(
@@ -329,21 +335,27 @@ pub(crate) fn push_project(
     log_reconcile_timing("full push capture", phase);
     let phase = Instant::now();
     let mut prepared_settings = HashMap::new();
-    let mut promoted_services = HashSet::new();
+    let promoted_services;
     let mut stores_read = StoresRead::Changed;
     let differences = if replace {
         let paths = project_replacement_paths(&project, &studio);
         stores_read = stores_read_of(link_enforcement.is_none(), &paths, &project, &studio);
+        let imported = ImportedStores::default();
+        // A push that replaces has no filter rules, no instances Studio
+        // keeps unknown to the files and no temporary stage; a linked project
+        // keeps the packages an import would replace.
+        let imports_heavy = !root.join("renium-link.json").exists();
         // Replacement writes the complete captured snapshot. Its private staging
         // files do not depend on decoding or matching retained Studio objects.
         let (prepared, staged) = rayon::join(
             || {
-                prepare_project_replacement_from(
+                prepare_project_replacement_importing(
                     &project,
                     &studio,
                     &paths,
                     &mut prepared_settings,
                     stores_read,
+                    imports_heavy.then_some(&imported),
                 )
             },
             || stage_snapshot_paths(&stage.project_root, &paths, &project),
@@ -383,6 +395,7 @@ pub(crate) fn push_project(
             })
             .collect::<HashSet<_>>();
         prepared_settings.retain(|path, _| paths.contains(path));
+        promoted_services = imported_services(imported, &prepared_settings)?;
         paths
     } else {
         let mut differences =
@@ -462,7 +475,7 @@ pub(crate) fn push_project(
         return Ok(Map::from_iter([("ok".to_string(), Value::Bool(true))]));
     }
     let phase = Instant::now();
-    let mut plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+    let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
         &studio,
         &project,
         &differences,
@@ -470,17 +483,17 @@ pub(crate) fn push_project(
         true,
         false,
     )?;
+    let mut plan = plan_from_whole_stores(
+        (stores_read, plan),
+        (&project, &studio),
+        &differences,
+        &mut prepared_settings,
+    )?;
     extend_replaced_service_references(
         &project,
         &prepared_settings,
         &promoted_services,
         &mut plan,
-    )?;
-    let plan = plan_from_whole_stores(
-        (stores_read, plan),
-        (&project, &studio),
-        (&differences, &promoted_services),
-        &mut prepared_settings,
     )?;
     log_reconcile_timing("full push plan", phase);
     if crate::app::output::global_log_enabled(5) {
