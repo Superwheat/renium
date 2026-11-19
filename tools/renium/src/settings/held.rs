@@ -99,6 +99,19 @@ pub(crate) fn stands_unchanged(properties: &Map<String, Value>) -> bool {
     properties.contains_key(UNCHANGED.as_str())
 }
 
+/// Whether `value` holds, at any depth, the mark of an instance that stands
+/// for its unread counterpart: something read such an instance for its
+/// values.
+pub(crate) fn names_unchanged(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.contains_key(UNCHANGED.as_str()) || object.values().any(names_unchanged)
+        }
+        Value::Array(items) => items.iter().any(names_unchanged),
+        _ => false,
+    }
+}
+
 fn now() -> u64 {
     STARTED.elapsed().as_secs() + 1
 }

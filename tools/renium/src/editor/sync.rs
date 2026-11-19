@@ -1868,7 +1868,7 @@ pub(crate) fn push_editor_changes_with_warm_bridge_guarded(
     if native_editor_full_push_eligible(&args)? {
         bail!("A full push must use the managed replacement path; Studio was not changed");
     }
-    let (changes, projection) = collect_project_editor_changes(&args)?;
+    let (changes, projection) = collect_pushed_editor_changes(&args)?;
     validate_source_verification_selection(&args, &changes)?;
     let mut args = args;
     // A push of a few scripts reads them back so the result's `verified`
@@ -2084,6 +2084,184 @@ pub(super) fn collect_project_editor_changes(
     args: &PushEditorChangesArgs,
 ) -> Result<(EditorChangeSet, Option<config::ProjectionStage>)> {
     collect_project_editor_changes_with_documents(args, PreparedEditorDocuments::default())
+}
+
+/// A store with fewer bytes is read whole for a push of chosen instances:
+/// its document is small and stays cached.
+const TARGETED_STORE_MIN_BYTES: usize = if cfg!(test) { 1 } else { 256 * 1024 };
+
+/// The most instances a push of chosen instances reads of one store before
+/// it reads the store whole.
+const MAX_TARGETED_INSTANCES: usize = 16_384;
+
+/// The stores a push of chosen instances names, each read for those
+/// instances and for what the collection reads beside them: what stands
+/// under them where the push takes it along, their ancestors, the namesakes
+/// that tell each of these from its siblings, and the roots. Every other
+/// instance of such a document stands unread (`held::stand_unchanged`), so
+/// the cost of the push follows what it pushes and not the store it is in.
+/// Empty where the collection may read past those instances; it then reads
+/// each store whole.
+fn documents_of_targets(args: &PushEditorChangesArgs) -> Result<PreparedEditorDocuments> {
+    let whole = PreparedEditorDocuments::default;
+    if args.target_settings_ids.is_empty()
+        || !args.target_settings_id_files.is_empty()
+        || args.targets_extend_paths
+        || args.changed_paths.is_empty()
+        || !args.changed_paths_files.is_empty()
+        || (!args.override_packages && args.project.project_root.join("renium-link.json").exists())
+        || files_to_studio_filter_rules(&args.project.project_root)?.is_some()
+    {
+        return Ok(whole());
+    }
+    let (project_root, src_root) = editor_project_roots(args)?;
+    let mut prepared = whole();
+    for path in &args.changed_paths {
+        let path = canonical_editor_changed_path(&project_root, path);
+        // A script or a folder beside the store is read with its instance.
+        let names_a_store = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(crate::system::files::is_service_settings_file_name);
+        let Some(service) = service_from_changed_path(&src_root, &path).filter(|_| names_a_store)
+        else {
+            return Ok(whole());
+        };
+        let Ok(bytes) = fs::read(service_settings_path(&src_root.join(&service))) else {
+            return Ok(whole());
+        };
+        if bytes.len() < TARGETED_STORE_MIN_BYTES {
+            continue;
+        }
+        let Ok(Some(document)) =
+            document_of_targets(&bytes, &args.target_settings_ids, args.exact_target_ids)
+        else {
+            return Ok(whole());
+        };
+        prepared.documents.insert(service, Arc::new(document));
+    }
+    Ok(prepared)
+}
+
+/// One store read for the instances `ids` name (see `documents_of_targets`).
+/// `None` where the store holds none of them, or where so many instances are
+/// read that the whole store is as well.
+fn document_of_targets(
+    bytes: &[u8],
+    ids: &[String],
+    exact: bool,
+) -> Result<Option<SettingsBytecode>> {
+    use crate::settings::bytecode::property_edit::decode_rows;
+
+    let mut document = SettingsBytecode::decode_structure(bytes)?;
+    let count = document.instances.len();
+    let ids = ids.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut read = document
+        .instances
+        .iter()
+        .map(|instance| ids.contains(instance.settings_id.as_str()))
+        .collect::<Vec<_>>();
+    if !read.contains(&true) {
+        return Ok(None);
+    }
+    let parent = |index: usize| {
+        document.instances[index]
+            .parent_index
+            .filter(|at| *at < count)
+    };
+    if !exact {
+        // What stands under a chosen instance goes with it. A store can hold
+        // a parent after its child, so the pass repeats until nothing joins.
+        loop {
+            let mut joined = false;
+            for index in 0..count {
+                if !read[index] && parent(index).is_some_and(|at| read[at]) {
+                    read[index] = true;
+                    joined = true;
+                }
+            }
+            if !joined {
+                break;
+            }
+        }
+    }
+    // A request names an instance by its path, so each one on that path.
+    for index in (0..count).filter(|&index| read[index]).collect::<Vec<_>>() {
+        let mut at = parent(index);
+        let mut steps = 0;
+        while let Some(ancestor) = at.filter(|ancestor| !read[*ancestor]) {
+            read[ancestor] = true;
+            at = parent(ancestor);
+            steps += 1;
+            if steps > count {
+                break;
+            }
+        }
+    }
+    for (instance, read) in document.instances.iter().zip(&mut read) {
+        *read |= instance.parent_index.is_none();
+    }
+    // An instance on a path is told from its namesakes by what each holds.
+    let namesakes = (0..count)
+        .filter(|&index| read[index])
+        .map(|index| {
+            let instance = &document.instances[index];
+            (instance.parent_index, instance.name.as_str())
+        })
+        .collect::<HashSet<_>>();
+    let rows = (0..count)
+        .filter(|&index| {
+            let instance = &document.instances[index];
+            namesakes.contains(&(instance.parent_index, instance.name.as_str()))
+        })
+        .collect::<Vec<_>>();
+    drop(namesakes);
+    if rows.len() > MAX_TARGETED_INSTANCES || rows.len() == count {
+        return Ok(None);
+    }
+    let (decoded, _) = decode_rows(bytes, &rows)?;
+    for instance in &mut document.instances {
+        crate::settings::held::stand_unchanged(&mut instance.properties);
+    }
+    for (index, row) in rows.into_iter().zip(decoded) {
+        document.instances[index] = row;
+    }
+    Ok(Some(document))
+}
+
+/// Whether a collection read an unread instance of a document for its
+/// values: what it sends would then carry that instance's mark.
+fn changes_name_an_unread_instance(changes: &EditorChangeSet) -> bool {
+    [
+        serde_json::to_value(&changes.property_changes),
+        serde_json::to_value(&changes.instance_changes),
+        serde_json::to_value(&changes.deferred_native_rows),
+    ]
+    .iter()
+    .any(|value| {
+        value
+            .as_ref()
+            .map_or(true, crate::settings::held::names_unchanged)
+    })
+}
+
+/// The changes of a push, with the stores a push of chosen instances names
+/// read for those instances alone where that reads all the collection uses.
+fn collect_pushed_editor_changes(
+    args: &PushEditorChangesArgs,
+) -> Result<(EditorChangeSet, Option<config::ProjectionStage>)> {
+    let prepared = documents_of_targets(args)?;
+    if prepared.documents.is_empty() {
+        return collect_project_editor_changes(args);
+    }
+    let collected = collect_project_editor_changes_with_documents(args, prepared);
+    match collected {
+        Ok((changes, projection)) if !changes_name_an_unread_instance(&changes) => {
+            Ok((changes, projection))
+        }
+        // Whatever the stores read whole say, an error included.
+        _ => collect_project_editor_changes(args),
+    }
 }
 
 fn collect_project_editor_changes_with_documents(
@@ -7474,6 +7652,144 @@ mod sync_tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A push of chosen instances reads its store for those instances and
+    /// what tells them from their siblings. Whatever the store holds and
+    /// whichever instances are chosen, it sends what the push that reads the
+    /// whole store sends.
+    #[test]
+    fn a_push_of_chosen_instances_reads_them_alone_and_sends_what_the_whole_store_sends() {
+        use crate::cli::ProjectSourceArgs;
+        use crate::settings::bytecode::SettingsBytecodeInstance;
+        use crate::tests::support::{SimRng, run_seeds};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (read_in_part, sent_something) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        run_seeds(200, |seed, _| {
+            let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let service = ["Workspace", "ReplicatedStorage"][rng.below(2)];
+            let mut instances = vec![SettingsBytecodeInstance::new(
+                "root".into(),
+                service.into(),
+                service.into(),
+                None,
+            )];
+            let count = 12 + rng.below(40);
+            for index in 1..count {
+                let class = ["Folder", "Part", "ObjectValue", "Camera"][rng.below(4)];
+                let mut instance = SettingsBytecodeInstance::new(
+                    format!("id{index}"),
+                    ["Crate", "Door", "Lamp", "Spawn"][rng.below(4)].into(),
+                    class.into(),
+                    Some(rng.below(index)),
+                );
+                match class {
+                    "Part" => {
+                        instance
+                            .properties
+                            .insert("Transparency".into(), json!(rng.below(5) as f64 / 4.0));
+                        instance
+                            .properties
+                            .insert("Anchored".into(), json!(rng.below(2) == 0));
+                    }
+                    "ObjectValue" => {
+                        instance.properties.insert(
+                            "Value".into(),
+                            json!({"_type": "Ref", "settingsId": format!("id{}", 1 + rng.below(count - 1))}),
+                        );
+                    }
+                    _ => {}
+                }
+                if rng.below(3) == 0 {
+                    instance
+                        .attributes
+                        .insert("Tier".into(), json!(rng.below(4)));
+                }
+                instances.push(instance);
+            }
+            if service == "Workspace"
+                && let Some(camera) = instances.iter().position(|row| row.class_name == "Camera")
+            {
+                let id = instances[camera].settings_id.clone();
+                instances[0].properties.insert(
+                    "CurrentCamera".into(),
+                    json!({"_type": "Ref", "settingsId": id}),
+                );
+            }
+            let document = SettingsBytecode {
+                version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+                instances,
+            };
+            let root = crate::tests::support::temp_dir(&format!("chosen-instances-{seed}"));
+            let store = root.join(format!("instances/{service}.renium"));
+            fs::create_dir_all(root.join("src")).map_err(|error| error.to_string())?;
+            fs::write(root.join("renium.project.jsonc"), r#"{"schemaVersion":1}"#)
+                .map_err(|error| error.to_string())?;
+            document
+                .write_file(&store)
+                .map_err(|error| format!("{error:#}"))?;
+            let mut args = PushEditorChangesArgs::new(
+                ProjectSourceArgs {
+                    project_root: root.clone(),
+                    src_root: PathBuf::from("src"),
+                },
+                BridgeConnectionArgs::local(0.1),
+            );
+            args.changed_paths.push(store);
+            for _ in 0..1 + rng.below(3) {
+                args.target_settings_ids
+                    .push(format!("id{}", 1 + rng.below(count - 1)));
+            }
+            args.exact_target_ids = rng.below(2) == 0;
+            let sent = |changes: &EditorChangeSet| {
+                json!({
+                    "properties": &changes.property_changes,
+                    "instances": &changes.instance_changes,
+                    "sources": &changes.source_changes,
+                    "deferred": &changes.deferred_native_rows,
+                    "whole": changes.whole_instances.len(),
+                })
+            };
+            let prepared = documents_of_targets(&args).map_err(|error| format!("{error:#}"))?;
+            let partly = !prepared.documents.is_empty();
+            let in_part = collect_project_editor_changes_with_documents(&args, prepared)
+                .map(|(changes, _)| sent(&changes))
+                .map_err(|error| format!("{error:#}"));
+            let whole = collect_project_editor_changes(&args)
+                .map(|(changes, _)| sent(&changes))
+                .map_err(|error| format!("{error:#}"));
+            let _ = fs::remove_dir_all(&root);
+            if in_part != whole {
+                return Err(format!(
+                    "read for its chosen instances the push sends\n{in_part:?}\nand read whole\n{whole:?}"
+                ));
+            }
+            if partly {
+                read_in_part.fetch_add(1, Ordering::Relaxed);
+                if whole.is_ok_and(|sent| {
+                    sent["properties"]
+                        .as_array()
+                        .is_some_and(|rows| !rows.is_empty())
+                        || sent["instances"]
+                            .as_array()
+                            .is_some_and(|rows| !rows.is_empty())
+                }) {
+                    sent_something.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Ok(())
+        });
+        if std::env::var_os("RENIUM_SIM_SEED").is_none() {
+            let (partly, sending) = (
+                read_in_part.load(Ordering::Relaxed),
+                sent_something.load(Ordering::Relaxed),
+            );
+            assert!(
+                partly >= 100 && sending >= 80,
+                "{partly} pushes read a store in part, {sending} of them sent something"
+            );
+        }
     }
 
     #[test]
