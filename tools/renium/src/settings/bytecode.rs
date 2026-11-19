@@ -255,7 +255,9 @@ fn checked_cframe_rotation_count(count: usize) -> Result<usize> {
     checked_settings_collection_len(count, "CFrame rotation table count")
 }
 // One document per service store; memory is bounded by the instance and byte
-// limits below, so a project's whole set of small stores stays cached.
+// limits below, so a project's whole set of small stores stays cached. A
+// store that passes a limit by itself is decoded for its caller and not kept:
+// its document is gigabytes, and the next edit of the store changes its bytes.
 const MAX_CACHED_SETTINGS_DOCUMENTS: usize = 64;
 const MAX_CACHED_SETTINGS_INSTANCES: usize = 80_000;
 const MAX_CACHED_SETTINGS_BYTES: usize = 8 * 1024 * 1024;
@@ -391,6 +393,11 @@ fn cached_settings_document(bytes: &[u8]) -> Result<Arc<SettingsBytecode>> {
     }
 
     let document = Arc::new(decode_settings_bytecode(bytes)?);
+    if bytes.len() > MAX_CACHED_SETTINGS_BYTES
+        || document.instances.len() > MAX_CACHED_SETTINGS_INSTANCES
+    {
+        return Ok(document);
+    }
     let mut evicted = Vec::new();
     let mut cache = cache.lock_recover();
     if let Some(index) = cache
@@ -412,10 +419,9 @@ fn cached_settings_document(bytes: &[u8]) -> Result<Arc<SettingsBytecode>> {
         source: bytes.to_vec().into_boxed_slice(),
         document: Arc::clone(&document),
     });
-    while cache.entries.len() > 1
-        && (cache.entries.len() > MAX_CACHED_SETTINGS_DOCUMENTS
-            || cache.source_bytes > MAX_CACHED_SETTINGS_BYTES
-            || cache.instances > MAX_CACHED_SETTINGS_INSTANCES)
+    while cache.entries.len() > MAX_CACHED_SETTINGS_DOCUMENTS
+        || cache.source_bytes > MAX_CACHED_SETTINGS_BYTES
+        || cache.instances > MAX_CACHED_SETTINGS_INSTANCES
     {
         let entry = cache
             .entries
@@ -426,7 +432,11 @@ fn cached_settings_document(bytes: &[u8]) -> Result<Arc<SettingsBytecode>> {
         evicted.push(entry);
     }
     drop(cache);
-    drop(evicted);
+    for entry in evicted {
+        if let Ok(document) = Arc::try_unwrap(entry.document) {
+            crate::settings::equivalence::drop_settings_document(document);
+        }
+    }
     Ok(document)
 }
 
@@ -5262,6 +5272,36 @@ fn encode_parent_index(parent_index: Option<usize>, instance_index: usize) -> Re
 
 #[cfg(test)]
 mod tests {
+    /// A store over the cache's own limit is decoded for its caller and not
+    /// kept: the cache held such a document, gigabytes of it, until another
+    /// store was read.
+    #[test]
+    fn a_store_over_the_cache_limit_is_not_kept() {
+        let document = |count: usize, name: &str| SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: (0..count)
+                .map(|index| {
+                    SettingsBytecodeInstance::new(
+                        format!("{name}{index}"),
+                        name.into(),
+                        "Folder".into(),
+                        (index > 0).then_some(0),
+                    )
+                })
+                .collect(),
+        };
+        let large =
+            encode_settings_bytecode(&document(MAX_CACHED_SETTINGS_INSTANCES + 1, "L")).unwrap();
+        let decoded = cached_settings_document(&large).unwrap();
+        assert_eq!(Arc::strong_count(&decoded), 1);
+        let small = encode_settings_bytecode(&document(3, "CacheLimitProbe")).unwrap();
+        let first = cached_settings_document(&small).unwrap();
+        assert!(Arc::ptr_eq(
+            &first,
+            &cached_settings_document(&small).unwrap()
+        ));
+    }
+
     use serde_json::json;
 
     use super::*;
