@@ -395,8 +395,25 @@ pub(crate) fn amend_reconciled_changes(
                 .unchanged_native_root_properties
                 .get(&(change.service.clone(), id.clone()))
         {
+            use crate::editor::native_geometry::is_mesh_geometry_property as generated;
+            use crate::editor::native_roots::is_property as cooks;
             for name in names {
-                change.properties.remove(name);
+                if !generated(&change.class_name, name) {
+                    change.properties.remove(name);
+                }
+            }
+            // A value that cooks the mesh writes the generated fields anew,
+            // so the saved ones follow it; with none they are Studio's already.
+            let class = &change.class_name;
+            if !change.properties.keys().any(|name| cooks(class, name))
+                && !change
+                    .reset_properties
+                    .iter()
+                    .any(|name| cooks(class, name))
+            {
+                for name in names {
+                    change.properties.remove(name);
+                }
             }
         }
     }
@@ -898,11 +915,17 @@ pub(crate) fn append_aligned_settings_push_plan(
             .in_place_instances
             .contains(&(service.clone(), instance.settings_id.clone()))
         {
-            let unchanged = instance
+            // Studio's plugin cannot read these, so it writes each one it is
+            // sent through the engine: the comparison is made here.
+            let mut unchanged = instance
                 .properties
                 .iter()
                 .filter(|(name, value)| {
-                    crate::editor::native_roots::is_property(&instance.class_name, name)
+                    (crate::editor::native_roots::is_property(&instance.class_name, name)
+                        || crate::editor::native_geometry::is_mesh_geometry_property(
+                            &instance.class_name,
+                            name,
+                        ))
                         && reconciliation_property_values_equal(
                             &instance.class_name,
                             name,
@@ -912,6 +935,14 @@ pub(crate) fn append_aligned_settings_push_plan(
                 })
                 .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>();
+            // A record that states no fidelity holds the one its hull was
+            // cooked at, which the push sends for it.
+            let fidelity = crate::rbx::encode::stated_collision_fidelity;
+            if !unchanged.iter().any(|name| name == "CollisionFidelity")
+                && fidelity(&instance.properties) == fidelity(&observed_instance.properties)
+            {
+                unchanged.push("CollisionFidelity".to_string());
+            }
             if !unchanged.is_empty() {
                 plan.unchanged_native_root_properties
                     .insert((service.clone(), instance.settings_id.clone()), unchanged);

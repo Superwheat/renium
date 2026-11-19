@@ -924,6 +924,120 @@ fn default_collision_fidelity_and_unchanged_native_values_are_not_pushed() {
 }
 
 #[test]
+fn a_mesh_part_pushed_in_place_sends_no_engine_written_value_studio_holds() {
+    // Hulls of version 8 cooked as Default and as Hull.
+    let (as_default, as_hull) = ("Q1NHUEhTCAAAAAIAaHVsbA==", "Q1NHUEhTCAAAAAEAaHVsbA==");
+    let hull = |cooked: &str| json!({"_type": "SharedString", "base64": cooked});
+    let fidelity = |name: &str| json!({"_type": "EnumItem", "name": name});
+    let mut files = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![SettingsBytecodeInstance::new(
+            "root".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        )],
+    };
+    for name in ["plain", "spelled", "cooked"] {
+        let mut part =
+            SettingsBytecodeInstance::new(name.into(), name.into(), "MeshPart".into(), Some(0));
+        for (property, value) in [
+            ("MeshId", json!("rbxassetid://123")),
+            ("PhysicalConfigData", hull(as_default)),
+            ("UnscaledVolume", json!(7.0)),
+            ("Transparency", json!(0.0)),
+        ] {
+            part.properties.insert(property.into(), value);
+        }
+        files.instances.push(part);
+    }
+    // A push that leaves an instance as it is edits the others in place.
+    files.instances.push(SettingsBytecodeInstance::new(
+        "kept".into(),
+        "kept".into(),
+        "Folder".into(),
+        Some(0),
+    ));
+    let mut studio = files.clone();
+    // Studio holds the last part cooked as a hull.
+    for (property, value) in [
+        ("CollisionFidelity", fidelity("Hull")),
+        ("PhysicalConfigData", hull(as_hull)),
+    ] {
+        studio.instances[3]
+            .properties
+            .insert(property.into(), value);
+    }
+    // An older store spells out the fidelity a capture leaves out today.
+    files.instances[2]
+        .properties
+        .insert("CollisionFidelity".into(), fidelity("Default"));
+    for part in &mut files.instances[1..4] {
+        part.properties.insert("Transparency".into(), json!(0.5));
+    }
+    let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+    let snapshot = |document: &SettingsBytecode| ProjectSnapshot {
+        entries: BTreeMap::from([(
+            path.clone(),
+            SnapshotEntry::File(encode_settings_bytecode(document).unwrap()),
+        )]),
+    };
+    let (desired, observed) = (snapshot(&files), snapshot(&studio));
+    let project_root = crate::tests::support::temp_dir("mesh-part-in-place");
+    std::fs::create_dir_all(project_root.join(&path).parent().unwrap()).unwrap();
+    if let Some(SnapshotEntry::File(bytes)) = desired.entries.get(&path) {
+        std::fs::write(project_root.join(&path), bytes).unwrap();
+    }
+    let paths = project_replacement_paths(&desired, &observed);
+    let mut prepared = HashMap::new();
+    prepare_project_replacement(&desired, &observed, &paths, &mut prepared).unwrap();
+    let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+        &observed, &desired, &paths, &prepared, false, false,
+    )
+    .unwrap();
+    let mut args = crate::cli::PushEditorChangesArgs::new(
+        crate::cli::ProjectSourceArgs {
+            project_root,
+            src_root: PathBuf::from("src"),
+        },
+        crate::cli::BridgeConnectionArgs::local(0.1),
+    );
+    args.changed_paths.clone_from(&plan.changed_paths);
+    args.target_settings_ids
+        .clone_from(&plan.target_settings_ids);
+    args.exact_target_ids = true;
+    args.targets_extend_paths = true;
+    let documents = prepared
+        .remove(&path)
+        .map(|change| ("Workspace".to_string(), Arc::new(change.current)))
+        .into_iter()
+        .collect();
+    let mut changes =
+        crate::editor::sync::collect_prepared_editor_changes(&args, documents, HashSet::new())
+            .unwrap();
+    amend_reconciled_changes(&mut changes, plan).unwrap();
+    let sent = |id: &str| {
+        let change = changes
+            .property_changes
+            .iter()
+            .find(|change| change.settings_id.as_deref() == Some(id))
+            .unwrap();
+        let mut names = change.properties.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        (names, change.properties.get("CollisionFidelity").cloned())
+    };
+    assert_eq!(sent("plain"), (vec!["Transparency".to_string()], None));
+    assert_eq!(sent("spelled"), (vec!["Transparency".to_string()], None));
+    // A fidelity that differs cooks the part, and the saved mass follows it.
+    let (names, written) = sent("cooked");
+    assert_eq!(
+        names,
+        ["CollisionFidelity", "Transparency", "UnscaledVolume"]
+    );
+    assert_eq!(written.unwrap()["name"], "Default");
+}
+
+#[test]
 fn full_push_reuses_populated_instances_and_plans_only_the_delta() {
     let root = SettingsBytecodeInstance::new(
         "root".into(),

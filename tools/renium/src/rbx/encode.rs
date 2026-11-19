@@ -1025,9 +1025,10 @@ const BOX_COLLISION_HULL: &[u8] = b"CSGPHS\0\0\0\0BLOCK";
 
 /// Roblox serializes a MeshPart's CollisionFidelity only inside its cooked
 /// hull: a version-8 `CSGPHS` blob carries the fidelity in byte 10 (1 Hull,
-/// 2 Box, 3 PreciseConvexDecomposition). A record that has the hull but no
-/// fidelity gets the enum back from here, so a part recreated through the
-/// plugin cooks at the fidelity it was saved with.
+/// 2 Default, 3 PreciseConvexDecomposition; a Box part holds the `BLOCK`
+/// hull, which an uncooked part holds too). A record that has the hull but
+/// no fidelity gets the enum back from here, so a part recreated through
+/// the plugin cooks at the fidelity it was saved with.
 pub(crate) fn collision_fidelity_from_hull(value: &Value) -> Option<Value> {
     let value = crate::settings::held::resolve(value);
     let bytes = base64::decode(value.get("base64")?.as_str()?).ok()?;
@@ -1038,18 +1039,30 @@ pub(crate) fn collision_fidelity_from_hull(value: &Value) -> Option<Value> {
     if version < 8 {
         return None;
     }
-    let name = match bytes[10] {
-        1 => "Hull",
-        2 => "Box",
-        3 => "PreciseConvexDecomposition",
+    let (name, value) = match bytes[10] {
+        1 => ("Hull", 1),
+        2 => ("Default", 0),
+        3 => ("PreciseConvexDecomposition", 3),
         _ => return None,
     };
     Some(serde_json::json!({
         "_type": "EnumItem",
         "enumType": "CollisionFidelity",
         "name": name,
-        "value": bytes[10],
+        "value": value,
     }))
+}
+
+/// The CollisionFidelity a record states: its own value, or the one its
+/// hull was cooked at.
+pub(crate) fn stated_collision_fidelity(properties: &Map<String, Value>) -> Option<String> {
+    let name = |value: &Value| Some(value.get("name")?.as_str()?.to_string());
+    match properties.get("CollisionFidelity") {
+        Some(value) => name(value),
+        None => name(&collision_fidelity_from_hull(
+            properties.get(COLLISION_HULL_PROPERTY)?,
+        )?),
+    }
 }
 
 const COLLISION_FIDELITY_BOX: u32 = 2;
@@ -3835,8 +3848,8 @@ mod hull_fidelity_tests {
             "Hull"
         );
         assert_eq!(
-            collision_fidelity_from_hull(&hull(b"CSGPHS\x08\0\0\0\x02\0(hull bytes)")).unwrap()["name"],
-            "Box"
+            collision_fidelity_from_hull(&hull(b"CSGPHS\x08\0\0\0\x02\0(hull bytes)")).unwrap(),
+            serde_json::json!({"_type": "EnumItem", "enumType": "CollisionFidelity", "name": "Default", "value": 0})
         );
         assert_eq!(
             collision_fidelity_from_hull(&hull(b"CSGPHS\x08\0\0\0\x03\0(hull bytes)")).unwrap()["value"],
