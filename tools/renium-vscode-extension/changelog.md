@@ -1,9 +1,18 @@
 # Changelog
 
-## 0.6.5 - 2026-11-17
+## 0.6.5 - 2026-11-19
 
 ### Improvements
 
+- On a large place Renium's background process stays under 2 GB of memory in every pull and push. Measured on a place of 202,000 instances: a push of the whole project used 2.7 GB and the check that follows it 3.8 GB, and they now use 1.7 GB and 1.8 GB; a pull of one changed property used 1.7 GB and now uses 1.5 GB; the first pull of the place used 1.5 GB and now uses 1.3 GB. A pull or a push reads the instances that differ instead of every instance of a store, and a store pushed whole goes to Studio from its file and is checked a few thousand instances at a time.
+- Pulls are faster on a large place. On that place a pull that finds nothing changed takes 2.0 s where it took 2.6 s, a pull of one changed property 3.3 s where it took 4.0 s, and the pull after a push of the whole project 3.4 s where it took 4.7 s.
+- The background process gives a command's memory back to the system when the command ends. It held that memory for two seconds, so commands sent one after another stacked their memory on each other.
+- When the files and Studio both edited one script while Live Sync was off, the two are merged line by line: edits to different lines are both kept. Where both changed the same lines the script is a conflict, or the lines of the preferred side stand when a side is preferred and the rest still merges.
+- Every sync conflict has an id and carries the last synced value and the values of both sides, or both diffs for a script. `rbx lon --resolve ID=studio|editor` decides one conflict and `--prefer` decides all of them, so an agent can settle each conflict from what it reads.
+- Store files are about a sixth smaller: they are compressed harder in the same time. Older versions read them.
+- A push answers once Studio holds the change and Renium has checked it; the files are brought up to date right after the answer. A command sent in that moment waits for it, and a step that was interrupted is finished by the next command.
+- A push that would fall back to writing protected fields one at a time stops before it changes Studio and says how many fields, which ones and how long they would take; the same `rbx ps` with `--slow-import` allows it for that push.
+- With the trace log on, the background process prints where the time of each command went as a tree of its timed steps, and with a memory-counting build how much memory each step held.
 - A queue of commands in one `rbx` tool call (`steps`) goes on after a failed search or read (`sg`, `ss`, `sr`, `tr`, `in`, `f`, `bg`, `q`, `co`, `ui` and the like), which leaves nothing behind for the steps after it; in measured agent runs most steps lost behind a failure were other reads behind a mistyped name. Any other failed step still stops the queue, and the answer now ends with `step N failed; the K after it did not run`. The agent guide tells agents to queue an edit with its whole test in one call.
 - A click in `rbx inp` that follows another action waits up to 2 seconds for its target to exist, show and be uncovered, asking again every 150 ms, so a panel that the click before it opens needs no `wait` in between. A target that does not appear fails as before, with what can be clicked instead. The first action of a call does not wait, and neither does a click while a key or button is held.
 - `rbx inp -p 1 --shot FILE` and `rbx inp -p 1 --result 'LUAU'` work without actions, to look at a client without touching it. They failed with "required arguments were not provided".
@@ -23,6 +32,10 @@
 
 ### Bug fixes
 
+- A push no longer treats a store as changed when it differs from Studio only in the player capacity, which Roblox takes from Game Settings and no push writes. Such a push answers `unchanged`.
+- A push runs as usual, with a notice, when an earlier push's result could no longer be written to the files because Studio had moved on. It failed until the next pull.
+- A script both sides edited no longer comes out with a line written twice or a repeated line missing when each side moved the same line to another place. Such a script is a conflict.
+- A pull right after a push no longer rewrites a store that holds a value that is not a number (NaN) inside a vector or a CFrame. Studio's capture and the files wrote that value in two forms.
 - In a project whose `tree` maps folders (`"$path": "src/shared"`), `rbx ps FILE` no longer takes instances out of a store that a pull had just written. The push reused a copy of the project made before the pull and wrote that copy's store back over `instances/SERVICE.renium`, so a folder built in Studio and pulled was gone from the files after a push of one unchanged script, with no message. The copy now notices every source that changed on disk since it was made.
 - In such a project, `rbx ps FOLDER` pushes the instance the folder maps to and what it holds. It pushed the whole service around it, which removed instances that existed only in Studio anywhere in that service.
 - `rbx ps PATH` with a path that does not exist and that no script goes by fails with "is not a file or a folder, and no script goes by that name; nothing was pushed". In a project that maps folders, a mistyped path pushed the whole service it pointed into and removed instances that existed only in Studio; elsewhere it answered `unchanged`. A deleted script is still pushed by its file name.
