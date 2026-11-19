@@ -4,21 +4,194 @@ use crate::editor::types::PendingImportFields;
 mod rows;
 
 #[derive(Clone, Copy, Default)]
-struct Verification<'a> {
+pub(crate) struct Verification<'a> {
     settle: bool,
     pending: &'a [PendingImportFields],
+    new_instance_values: Option<&'a NewInstanceValues<'a>>,
     /// Compare the whole documents, as a store too small to be read a range
     /// of rows at a time is compared.
     #[cfg(test)]
     whole_documents: bool,
 }
 
-impl Verification<'_> {
+impl<'a> Verification<'a> {
+    pub(crate) fn of(
+        settle: bool,
+        pending: &'a [PendingImportFields],
+        new_instance_values: &'a NewInstanceValues<'a>,
+    ) -> Self {
+        Self {
+            settle,
+            pending,
+            new_instance_values: Some(new_instance_values),
+            #[cfg(test)]
+            whole_documents: false,
+        }
+    }
+
     fn by_rows(&self) -> bool {
         #[cfg(test)]
         return !self.whole_documents;
         #[cfg(not(test))]
         true
+    }
+}
+
+/// What a new instance of a class holds in Studio. A capture leaves a value
+/// the plugin reads out of an instance that holds what a new instance holds,
+/// and which value that is only that Studio can say: the reflection database
+/// knows none for a property that does not serialize, and Roblox changes
+/// them. Where the files spell out a value the capture left out, the two
+/// compare with the capture's instance holding this one.
+#[derive(Default)]
+pub(crate) struct NewInstanceValues<'a> {
+    /// The bridge and the Studio window the capture came from.
+    studio: Option<(&'a BridgeServer, &'a str)>,
+    known: Mutex<KnownNewInstanceValues>,
+}
+
+#[derive(Default)]
+struct KnownNewInstanceValues {
+    values: HashMap<(String, String), Option<Value>>,
+    /// Studio did not answer, and is asked nothing more.
+    silent: bool,
+}
+
+const NEW_INSTANCE_VALUES_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl<'a> NewInstanceValues<'a> {
+    pub(crate) fn of(bridge: &'a BridgeServer, runtime_id: Option<&'a str>) -> Self {
+        Self {
+            studio: runtime_id.map(|runtime_id| (bridge, runtime_id)),
+            known: Mutex::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn knowing(class_name: &str, name: &str, value: Value) -> Self {
+        let key = (class_name.to_string(), name.to_string());
+        Self {
+            studio: None,
+            known: Mutex::new(KnownNewInstanceValues {
+                values: HashMap::from([(key, Some(value))]),
+                silent: false,
+            }),
+        }
+    }
+
+    /// What a new instance of the class holds for each of `names` that has
+    /// such a value. Studio is asked once for a name, and in one request for
+    /// all the names nobody asked of it before.
+    fn values(&self, class_name: &str, names: &[&String]) -> Vec<(String, Value)> {
+        let key = |name: &String| (class_name.to_string(), name.clone());
+        let mut known = self.known.lock_recover();
+        let unknown = names
+            .iter()
+            .filter(|name| !known.values.contains_key(&key(name)))
+            .copied()
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            let mut answer = match self.read(class_name, &unknown, known.silent) {
+                Ok(answer) => answer,
+                Err(_) => {
+                    known.silent = true;
+                    None
+                }
+            };
+            for name in unknown {
+                let value = answer.as_mut().and_then(|values| values.remove(name));
+                known.values.insert(key(name), value);
+            }
+        }
+        names
+            .iter()
+            .filter_map(|name| Some(((*name).clone(), known.values.get(&key(name))?.clone()?)))
+            .collect()
+    }
+
+    /// Nothing for a value the capture takes from the bytes Studio
+    /// serialized, which no capture leaves out for being a new instance's,
+    /// and nothing from a plugin that cannot say.
+    fn read(
+        &self,
+        class_name: &str,
+        names: &[&String],
+        silent: bool,
+    ) -> Result<Option<Map<String, Value>>> {
+        let (Some((bridge, runtime_id)), false) = (self.studio, silent) else {
+            return Ok(None);
+        };
+        let database = rbx_reflection_database::get()?;
+        let native = crate::rbx::decode::native_property_filter(database, class_name);
+        let names = names
+            .iter()
+            .filter(|name| {
+                crate::rbx::decode::plugin_reads_captured_property(
+                    database,
+                    class_name,
+                    name,
+                    false,
+                    Some(&native.output_names),
+                )
+            })
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return Ok(None);
+        }
+        let mut answer = bridge.call_for_runtime_with_timeout(
+            "getEditorNewInstanceValues",
+            json!({"className": class_name, "properties": names}),
+            BridgeTarget::Edit,
+            runtime_id,
+            Some(NEW_INSTANCE_VALUES_TIMEOUT),
+        )?;
+        Ok(match answer.get_mut("values").map(Value::take) {
+            Some(Value::Object(values)) => Some(values),
+            _ => None,
+        })
+    }
+
+    /// What differs between an instance of the files and Studio's once the
+    /// capture's instance holds the values left out of it. The instance is
+    /// left as it was captured.
+    pub(super) fn mismatch(
+        &self,
+        before: Option<(&SettingsBytecode, usize)>,
+        (desired, desired_index): (&SettingsBytecode, usize),
+        (observed, observed_index): (&mut SettingsBytecode, usize),
+    ) -> Option<String> {
+        let wanted = &desired.instances[desired_index];
+        let held = &mut observed.instances[observed_index];
+        let left_out = wanted
+            .properties
+            .keys()
+            .filter(|name| !held.properties.contains_key(*name))
+            .collect::<Vec<_>>();
+        // The capture left values out against the class of its own instance.
+        let restored = if left_out.is_empty() || wanted.class_name != held.class_name {
+            Vec::new()
+        } else {
+            self.values(&wanted.class_name, &left_out)
+        };
+        for (name, value) in &restored {
+            held.properties.insert(name.clone(), value.clone());
+        }
+        let mismatch = match before {
+            Some((before, before_index)) => changed_instance_mismatch(
+                before,
+                before_index,
+                desired,
+                desired_index,
+                observed,
+                observed_index,
+            ),
+            None => added_instance_mismatch(desired, desired_index, observed, observed_index),
+        };
+        let held = &mut observed.instances[observed_index].properties;
+        for (name, _) in restored.iter().rev() {
+            held.remove(name);
+        }
+        mismatch
     }
 }
 
@@ -29,7 +202,7 @@ pub(crate) fn settings_delta_outcome(
     path: &Path,
     (before, desired, observed): (&SnapshotEntry, &SnapshotEntry, &SnapshotEntry),
     prepared: PreparedPushVerification,
-    pending: &[PendingImportFields],
+    (pending, new_instance_values): (&[PendingImportFields], Option<&NewInstanceValues<'_>>),
     (settle, whole_documents): (bool, bool),
 ) -> Result<(Option<String>, Option<Vec<u8>>)> {
     let verified = settings_delta_verification(
@@ -41,6 +214,7 @@ pub(crate) fn settings_delta_outcome(
         Verification {
             settle,
             pending,
+            new_instance_values,
             whole_documents,
         },
     )?;
@@ -53,29 +227,23 @@ pub(crate) fn verify_committed_push_readback(
     observed: &mut ProjectSnapshot,
     paths: &HashSet<PathBuf>,
     prepared: &mut HashMap<PathBuf, PreparedPushVerification>,
-    pending: &[PendingImportFields],
-    settle: bool,
+    policy: Verification<'_>,
 ) -> Result<(Vec<PathBuf>, Option<String>)> {
-    if pending.is_empty() {
-        return if settle {
-            verify_and_settle_native_import(before, desired, observed, paths, prepared)
-        } else {
-            snapshot_intended_delta_mismatches(before, desired, observed, paths, prepared)
-        };
+    if policy.pending.is_empty() && policy.settle {
+        return verify_and_settle_native_import(
+            before,
+            desired,
+            observed,
+            paths,
+            prepared,
+            policy.new_instance_values,
+        );
     }
-    let result = verify_snapshot_delta(
-        before,
-        desired,
-        observed,
-        paths,
-        prepared,
-        Verification {
-            settle: false,
-            pending,
-            #[cfg(test)]
-            whole_documents: false,
-        },
-    )?;
+    let policy = Verification {
+        settle: false,
+        ..policy
+    };
+    let result = verify_snapshot_delta(before, desired, observed, paths, prepared, policy)?;
     Ok((result.mismatches, result.detail))
 }
 
@@ -145,6 +313,7 @@ pub(crate) fn reconciled_path_differences(
     Ok(differences)
 }
 
+#[cfg(test)]
 pub(crate) fn snapshot_intended_delta_mismatches(
     before: &ProjectSnapshot,
     desired: &ProjectSnapshot,
@@ -172,6 +341,7 @@ pub(crate) fn verify_and_settle_native_import(
     observed: &mut ProjectSnapshot,
     paths: &HashSet<PathBuf>,
     prepared: &mut HashMap<PathBuf, PreparedPushVerification>,
+    new_instance_values: Option<&NewInstanceValues<'_>>,
 ) -> Result<(Vec<PathBuf>, Option<String>)> {
     let result = verify_snapshot_delta(
         before,
@@ -182,6 +352,7 @@ pub(crate) fn verify_and_settle_native_import(
         Verification {
             settle: true,
             pending: &[],
+            new_instance_values,
             #[cfg(test)]
             whole_documents: false,
         },
@@ -506,14 +677,42 @@ fn settings_delta_verification(
     };
     // Read-only comparisons are independent once all three identity maps exist.
     // Keep the same first error regardless of which worker finishes first.
-    let mismatch = if settings_ids.len() >= 1_024 {
+    let mut mismatch = if settings_ids.len() >= 1_024 {
         settings_ids.par_iter().find_map_first(|id| compare(id))
     } else {
         settings_ids.iter().find_map(|id| compare(id))
     };
+    // What each instance that differs says, and where it stands in the three
+    // documents when the files and Studio both hold it.
+    let unlike = (mismatch.is_some() && policy.new_instance_values.is_some()).then(|| {
+        settings_ids
+            .par_iter()
+            .filter_map(|id| {
+                let places = desired_by_id.get(id).zip(observed_by_id.get(id));
+                let places =
+                    places.map(|(wanted, held)| (before_by_id.get(id).copied(), *wanted, *held));
+                Some((compare(id)?, places))
+            })
+            .collect::<Vec<_>>()
+    });
     drop(before_by_id);
     drop(desired_by_id);
     drop(observed_by_id);
+    if let (Some(values), Some(unlike)) = (policy.new_instance_values, unlike) {
+        mismatch = unlike.into_iter().find_map(|(detail, places)| {
+            let Some((previous, wanted, held)) = places else {
+                return Some(detail);
+            };
+            let name = &desired.instances[wanted].name;
+            values
+                .mismatch(
+                    previous.map(|index| (&before, index)),
+                    (&desired, wanted),
+                    (&mut observed, held),
+                )
+                .map(|detail| format!("{name}.{detail}"))
+        });
+    }
     let accepted = if policy.settle && mismatch.is_none() {
         if let Some(camera) = viewport {
             crate::settings::equivalence::keep_reference_viewport_camera(&camera, &mut observed);

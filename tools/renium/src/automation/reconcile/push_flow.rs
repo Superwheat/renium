@@ -802,8 +802,11 @@ pub(crate) fn push_project(
         &mut readback,
         &verification_paths,
         &mut prepared_verification,
-        &pending_fields,
-        settle_verified_capture,
+        verify::Verification::of(
+            settle_verified_capture,
+            &pending_fields,
+            &verify::NewInstanceValues::of(bridge, context.runtime_id.as_deref()),
+        ),
     )?;
     log_reconcile_timing("full push verification", phase);
     if !mismatches.is_empty() {

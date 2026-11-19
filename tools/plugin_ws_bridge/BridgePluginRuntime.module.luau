@@ -1953,6 +1953,10 @@ function BridgePluginRuntime.start(context)
 		return out
 	end
 
+	function Config.neverEncodesProperty(className: string, propertyName: string): boolean
+		return className == "Texture" and propertyName == "Rotation"
+	end
+
 	function Config.getHotPropertySchema(state: ServiceState, className: string): { [string]: any }
 		local cachedByClass = state.hotPropertySchemaByClass
 		if cachedByClass == nil then
@@ -2027,7 +2031,7 @@ function BridgePluginRuntime.start(context)
 			end
 			compareFns[i] = Config.compareDefaultValueV5ByTypeId[typeId] or false
 			encodeFns[i] = Config.encodeValueV5ByTypeId[typeId] or false
-			skipEncode[i] = className == "Texture" and propertyName == "Rotation"
+			skipEncode[i] = Config.neverEncodesProperty(className, propertyName)
 		end
 
 		local hotSchema = {
@@ -4365,6 +4369,30 @@ function BridgePluginRuntime.start(context)
 		assert(instance ~= nil and instance.ClassName == p.className, "Property sample target changed")
 		Config.studioChanges.samplePropertyChange(instance, p.property)
 		return { ok = true }
+	end
+
+	-- A capture leaves out of an instance the values a new instance of its
+	-- class holds. These are those values, for a comparison with files that
+	-- spell one out: only of the properties a capture compares that way.
+	Config.bridgeMethodHandlers.getEditorNewInstanceValues = function(p)
+		assert(type(p.className) == "string" and type(p.properties) == "table", "Invalid new instance request")
+		local values = {}
+		local compared = getDefaultTransportProperties(p.className)
+		local ok, probe = pcall(Instance.new, p.className)
+		if compared and ok and probe then
+			for _, name in ipairs(p.properties) do
+				if compared[name] ~= nil and not Config.neverEncodesProperty(p.className, name) then
+					local got, value = tryRead(probe, name)
+					if got and value ~= nil then
+						values[name] = serializeValue(value, nil)
+					end
+				end
+			end
+		end
+		if ok and probe then
+			probe:Destroy()
+		end
+		return { values = values }
 	end
 
 	Config.bridgeMethodHandlers.getStudioChangeState = function(p, _sessionGeneration, leaseId)

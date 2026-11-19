@@ -4394,6 +4394,7 @@ fn native_import_settlement_keeps_checked_values_and_rejects_failed_captures() -
         &mut readback,
         &paths,
         &mut prepared,
+        None,
     )?;
     assert!(failures.is_empty());
     let settled = settings_document(readback.entries.get(&path))?;
@@ -4424,6 +4425,7 @@ fn native_import_settlement_keeps_checked_values_and_rejects_failed_captures() -
         &mut rejected,
         &paths,
         &mut HashMap::new(),
+        None,
     )?;
     assert_eq!(failures, vec![path]);
     assert!(
@@ -7642,6 +7644,56 @@ fn a_bare_store_prepared_from_the_instances_its_push_reads_is_pushed_as_the_whol
     }
 }
 
+/// A capture leaves out the value a new instance of the class holds, which
+/// the files may spell out. Only Studio's word for that value makes the two
+/// one, for a value the plugin reads, and the captured instance stays as it
+/// was captured.
+#[test]
+fn a_value_a_capture_left_out_compares_as_what_a_new_instance_holds() {
+    let store = |fidelity: Option<&str>| {
+        let root =
+            SettingsBytecodeInstance::new("1".into(), "Workspace".into(), "Workspace".into(), None);
+        let mut mesh =
+            SettingsBytecodeInstance::new("2".into(), "Mesh".into(), "MeshPart".into(), Some(0));
+        if let Some(name) = fidelity {
+            let value = json!({"_type": "EnumItem", "name": name});
+            mesh.properties.insert("CollisionFidelity".into(), value);
+        }
+        SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![root, mesh],
+        }
+    };
+    let (desired, mut observed) = (store(Some("Default")), store(None));
+    let studio_says = |name: &str| {
+        let value = json!({"_type": "EnumItem", "enumType": "CollisionFidelity", "name": name});
+        NewInstanceValues::knowing("MeshPart", "CollisionFidelity", value)
+    };
+    let mut differs = |values: NewInstanceValues<'_>| {
+        values
+            .mismatch(None, (&desired, 1), (&mut observed, 1))
+            .is_some()
+    };
+    assert!(!differs(studio_says("Default")));
+    assert!(differs(studio_says("Box")));
+    assert!(differs(NewInstanceValues::default()));
+    assert!(observed.instances[1].properties.is_empty());
+
+    let database = rbx_reflection_database::get().unwrap();
+    let plugin_reads = |class_name: &str, name: &str| {
+        let native = crate::rbx::decode::native_property_filter(database, class_name);
+        crate::rbx::decode::plugin_reads_captured_property(
+            database,
+            class_name,
+            name,
+            false,
+            Some(&native.output_names),
+        )
+    };
+    assert!(plugin_reads("MeshPart", "CollisionFidelity"));
+    assert!(!plugin_reads("Part", "Transparency"));
+}
+
 /// A large store is verified a range of rows at a time, with neither copy
 /// whole in memory. Whatever Studio holds afterwards, that verification says
 /// what the whole documents say, and the store it settles holds what theirs
@@ -7654,7 +7706,17 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
     use crate::tests::support::{SimRng, run_seeds};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let (verified, refused, with_pending, with_camera, settled) = (
+    let (
+        verified,
+        refused,
+        with_pending,
+        with_camera,
+        settled,
+        left_out_verified,
+        left_out_refused,
+    ) = (
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
         AtomicUsize::new(0),
         AtomicUsize::new(0),
         AtomicUsize::new(0),
@@ -7749,9 +7811,22 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
             }
         }
         let mut pending = Vec::new();
+        let mut left_out = None;
         let kind = rng.below(10);
         let last = after.instances.len() - 1;
         match kind {
+            // The capture left out a value the files spell out: the one a
+            // new instance of the class holds, or another.
+            9 => {
+                let index = 1 + rng.below(last);
+                if let Some(value) = after.instances[index].properties.remove("Transparency") {
+                    let same = rng.below(3) != 0;
+                    let held = if same { value } else { json!(0.0625) };
+                    let class_name = &files.instances[index].class_name;
+                    let values = NewInstanceValues::knowing(class_name, "Transparency", held);
+                    left_out = Some((values, same));
+                }
+            }
             // One value is another.
             0 => {
                 after.instances[1 + rng.below(last)]
@@ -7880,7 +7955,7 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
                 &path,
                 (&studio, &desired, &observed),
                 prepared,
-                &pending,
+                (&pending, left_out.as_ref().map(|(values, _)| values)),
                 (settle, whole_documents),
             )
             .map(Some)
@@ -7905,6 +7980,11 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
                 by_rows.0, whole.0
             ));
         }
+        match (&left_out, whole.0.is_some()) {
+            (Some((_, true)), false) => left_out_verified.fetch_add(1, Ordering::Relaxed),
+            (Some((_, false)), true) => left_out_refused.fetch_add(1, Ordering::Relaxed),
+            _ => 0,
+        };
         if whole.0.is_some() {
             refused.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -7946,20 +8026,32 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
         Ok(())
     });
     if std::env::var_os("RENIUM_SIM_SEED").is_none() {
-        let counts = [&verified, &refused, &with_pending, &with_camera, &settled]
-            .map(|count| count.load(Ordering::Relaxed));
+        let counts = [
+            &verified,
+            &refused,
+            &with_pending,
+            &with_camera,
+            &settled,
+            &left_out_verified,
+            &left_out_refused,
+        ]
+        .map(|count| count.load(Ordering::Relaxed));
         assert!(
             counts[0] >= 80
                 && counts[1] >= 20
                 && counts[2] >= 3
                 && counts[3] >= 10
-                && counts[4] >= 60,
-            "verified {} ({} with a pending field, {} with another viewport camera, {} settled), refused {}",
+                && counts[4] >= 60
+                && counts[5] >= 1
+                && counts[6] >= 1,
+            "verified {} ({} with a pending field, {} with another viewport camera, {} settled, {} with a value the capture left out), refused {} ({} for a value the capture left out)",
             counts[0],
             counts[2],
             counts[3],
             counts[4],
-            counts[1]
+            counts[5],
+            counts[1],
+            counts[6]
         );
     }
 }

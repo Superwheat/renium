@@ -183,29 +183,45 @@ pub(super) fn verified_by_rows(
                 written.push(camera);
             }
         }
-        let compare = |index: usize| {
+        let previous = |index: usize| {
+            before_by_id
+                .get(desired.instances[index].settings_id.as_str())
+                .copied()
+        };
+        let compare = |observed: &SettingsBytecode, index: usize| {
             if protected == Some(index) {
                 return None;
             }
             let instance = &desired.instances[index];
-            match before_by_id.get(instance.settings_id.as_str()) {
-                Some(&previous)
+            match previous(index) {
+                Some(previous)
                     if before.instances[previous].class_name == "PackageLink"
                         && instance.class_name == "PackageLink" =>
                 {
                     None
                 }
-                Some(&previous) => {
-                    changed_instance_mismatch(before, previous, &desired, index, &observed, index)
+                Some(previous) => {
+                    changed_instance_mismatch(before, previous, &desired, index, observed, index)
                 }
-                None => added_instance_mismatch(&desired, index, &observed, index),
+                None => added_instance_mismatch(&desired, index, observed, index),
             }
         };
-        if rows
+        let unlike = rows
             .clone()
             .into_par_iter()
-            .any(|index| compare(index).is_some())
-        {
+            .filter(|index| compare(&observed, *index).is_some())
+            .collect::<Vec<_>>();
+        let differs = |index: usize| match policy.new_instance_values {
+            Some(values) => values
+                .mismatch(
+                    previous(index).map(|previous| (before, previous)),
+                    (&desired, index),
+                    (&mut observed, index),
+                )
+                .is_some(),
+            None => true,
+        };
+        if unlike.into_iter().any(differs) {
             return Ok(None);
         }
         for index in written {

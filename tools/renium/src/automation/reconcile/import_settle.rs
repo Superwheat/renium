@@ -421,6 +421,10 @@ pub(super) fn settle(
         &mut readback,
         &work.verification_paths,
         &mut work.prepared,
+        Some(&NewInstanceValues::of(
+            bridge,
+            context.runtime_id.as_deref(),
+        )),
     )?;
     log_reconcile_timing("full push verification", phase);
     if !mismatches.is_empty() {
@@ -900,6 +904,7 @@ mod tests {
                 &mut observed,
                 &HashSet::from(["src/A.luau".into()]),
                 &mut HashMap::new(),
+                None,
             )?;
             assert!(!mismatches.is_empty());
             let error = retention_failure("pushed project changes", &mismatches, detail.as_deref());

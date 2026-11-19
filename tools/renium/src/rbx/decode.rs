@@ -414,6 +414,35 @@ fn native_overlay_property_is_reconstructed(
     false
 }
 
+/// Whether a native capture takes a property's value from the plugin's
+/// reading of it and not from the bytes Studio serialized: a property those
+/// bytes do not carry, and every reference. The plugin leaves a value out of
+/// an instance that holds what a new instance of its class holds.
+pub(crate) fn plugin_reads_captured_property(
+    database: &ReflectionDatabase<'_>,
+    class_name: &str,
+    name: &str,
+    reference: bool,
+    native_outputs: Option<&HashSet<String>>,
+) -> bool {
+    let Some(descriptor) = rbx_property_descriptor(database, class_name, name) else {
+        return true;
+    };
+    match &descriptor.kind {
+        RbxPropertyKind::Alias { .. }
+        | RbxPropertyKind::Canonical {
+            serialization: RbxPropertySerialization::Migrate(_),
+        } => false,
+        RbxPropertyKind::Canonical {
+            serialization: RbxPropertySerialization::DoesNotSerialize,
+        } => !native_overlay_property_is_reconstructed(database, class_name, name),
+        RbxPropertyKind::Canonical { .. } => {
+            reference || native_outputs.is_none_or(|outputs| !outputs.contains(name))
+        }
+        _ => true,
+    }
+}
+
 pub(crate) fn native_overlay_property_schemas(
     database: &ReflectionDatabase<'_>,
     property_schema_by_class: &PropertySchemaMap,
@@ -428,30 +457,13 @@ pub(crate) fn native_overlay_property_schemas(
             let overlay = entries
                 .iter()
                 .filter(|entry| {
-                    let Some(descriptor) =
-                        rbx_property_descriptor(database, class_name, &entry.name)
-                    else {
-                        return true;
-                    };
-                    match &descriptor.kind {
-                        RbxPropertyKind::Alias { .. }
-                        | RbxPropertyKind::Canonical {
-                            serialization: RbxPropertySerialization::Migrate(_),
-                        } => false,
-                        RbxPropertyKind::Canonical {
-                            serialization: RbxPropertySerialization::DoesNotSerialize,
-                        } => !native_overlay_property_is_reconstructed(
-                            database,
-                            class_name,
-                            &entry.name,
-                        ),
-                        RbxPropertyKind::Canonical { .. } => {
-                            entry.type_id == TYPE_ID_REF
-                                || native_outputs
-                                    .is_none_or(|outputs| !outputs.contains(&entry.name))
-                        }
-                        _ => true,
-                    }
+                    plugin_reads_captured_property(
+                        database,
+                        class_name,
+                        &entry.name,
+                        entry.type_id == TYPE_ID_REF,
+                        native_outputs,
+                    )
                 })
                 .cloned()
                 .collect::<Vec<_>>();
