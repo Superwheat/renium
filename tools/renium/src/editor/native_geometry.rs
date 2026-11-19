@@ -82,6 +82,9 @@ pub(crate) fn capture_generated(
     }
     for (service, targets) in services {
         let path = crate::system::files::service_settings_path(&src_root.join(&service));
+        // A store no other write of this push holds is edited by the rows of
+        // its meshes: the file is never whole in memory.
+        let mut rows = None;
         let index = if let Some(index) = changes
             .settings_writes
             .iter()
@@ -89,31 +92,46 @@ pub(crate) fn capture_generated(
         {
             index
         } else {
-            let document = super::document::read_editor_service_settings(src_root, &service)?
-                .context("Mesh settings document disappeared during sync")?;
-            let index = changes.settings_writes.len();
+            let expected_hash = super::sync::settings_file_hash(&path)?;
+            let (document, columns) =
+                crate::settings::bytecode::property_edit::read_for_property_edit(&path)
+                    .context("Mesh settings document disappeared during sync")?;
+            rows = Some(columns);
             changes.settings_writes.push(EditorSettingsWrite {
-                expected_hash: super::sync::settings_file_hash(&path)?,
+                expected_hash,
                 path,
                 document,
+                encoded: None,
             });
-            index
+            changes.settings_writes.len() - 1
         };
-        let document = &mut changes.settings_writes[index].document;
+        let write = &mut changes.settings_writes[index];
+        let document = &mut write.document;
         let by_id = document
             .instances
             .iter()
             .enumerate()
-            .map(|(index, instance)| (instance.settings_id.clone(), index))
+            .map(|(index, instance)| (instance.settings_id.as_str(), index))
             .collect::<std::collections::HashMap<_, _>>();
-        for target in targets {
-            let index = *by_id
-                .get(&target.settings_id)
-                .context("Mesh identity disappeared during sync")?;
-            ensure!(
-                document.instances[index].class_name == "MeshPart",
-                "Mesh identity changed class"
-            );
+        let targets = targets
+            .into_iter()
+            .map(|target| {
+                let index = *by_id
+                    .get(target.settings_id.as_str())
+                    .context("Mesh identity disappeared during sync")?;
+                ensure!(
+                    document.instances[index].class_name == "MeshPart",
+                    "Mesh identity changed class"
+                );
+                Ok((index, target))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        drop(by_id);
+        if let Some(rows) = &mut rows {
+            let read = targets.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+            rows.materialize(document, &read)?;
+        }
+        for (index, target) in targets {
             let state = bridge.call_for_runtime_with_timeout(
                 "getEditorTransactionState",
                 serde_json::json!({"transactionId": transaction_id, "meshGeometry": target}),
@@ -130,6 +148,9 @@ pub(crate) fn capture_generated(
                 &target.properties,
                 &bytes,
             )?;
+        }
+        if let Some(rows) = rows {
+            write.encoded = Some(rows.encode(document)?);
         }
     }
     Ok(())

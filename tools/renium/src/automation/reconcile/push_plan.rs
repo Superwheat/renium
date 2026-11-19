@@ -301,7 +301,7 @@ pub(crate) fn redirect_staged_settings_writes(
         write.expected_hash = expected_hash;
         generated.entries.insert(
             relative,
-            SnapshotEntry::File(encode_settings_bytecode(&write.document)?),
+            SnapshotEntry::File(write.store_bytes()?.into_owned()),
         );
     }
     Ok(generated)

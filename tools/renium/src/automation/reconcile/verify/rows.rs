@@ -23,6 +23,10 @@ const MIN_ROWS: usize = if cfg!(test) { 2 } else { 16_384 };
 /// compare the two. With `policy.settle` the store to publish is Studio's
 /// copy as it was captured, under the files' ids (`settled_store`).
 ///
+/// A push that read Studio's copy by the instances it changed (`before`
+/// holds every other one bare) asked nothing of the others: those instances
+/// alone are read of either copy, in one pass.
+///
 /// `None` where the whole documents have to say: the two copies hold other
 /// instances, the store is small, or an instance does not hold what the
 /// files hold for it. The whole documents then name what differs, or match
@@ -123,6 +127,89 @@ pub(super) fn verified_by_rows(
             !root.properties.contains_key("CurrentCamera")
                 || workspace_current_camera_index(&desired) == protected
         });
+    // Whether an instance at one of `rows` does not hold what the push asked
+    // of it.
+    let differ = |desired: &SettingsBytecode, observed: &mut SettingsBytecode, rows: &[usize]| {
+        let previous = |index: usize| {
+            before_by_id
+                .get(desired.instances[index].settings_id.as_str())
+                .copied()
+        };
+        let compare = |observed: &SettingsBytecode, index: usize| {
+            if protected == Some(index) {
+                return None;
+            }
+            let instance = &desired.instances[index];
+            match previous(index) {
+                Some(previous)
+                    if before.instances[previous].class_name == "PackageLink"
+                        && instance.class_name == "PackageLink" =>
+                {
+                    None
+                }
+                Some(previous) => {
+                    changed_instance_mismatch(before, previous, desired, index, observed, index)
+                }
+                None => added_instance_mismatch(desired, index, observed, index),
+            }
+        };
+        let unlike = {
+            let observed = &*observed;
+            rows.par_iter()
+                .copied()
+                .filter(|index| compare(observed, *index).is_some())
+                .collect::<Vec<_>>()
+        };
+        unlike
+            .into_iter()
+            .any(|index| match policy.new_instance_values {
+                Some(values) => values
+                    .mismatch(
+                        previous(index).map(|previous| (before, previous)),
+                        (desired, index),
+                        (observed, index),
+                    )
+                    .is_some(),
+                None => true,
+            })
+    };
+    if crate::settings::equivalence::holds_unread_instances(before) {
+        if policy.settle || pending.is_some() {
+            return Ok(None);
+        }
+        let changed = desired
+            .instances
+            .iter()
+            .map(|instance| {
+                before_by_id
+                    .get(instance.settings_id.as_str())
+                    .is_none_or(|previous| {
+                        !crate::settings::held::stands_unchanged(
+                            &before.instances[*previous].properties,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        let (read_desired, read_observed) = rayon::join(
+            || desired_rows.materialize_selected(&mut desired, &changed),
+            || observed_rows.materialize_selected(&mut observed, &changed),
+        );
+        if read_desired.is_err() || read_observed.is_err() {
+            return Ok(None);
+        }
+        let rows = (0..count)
+            .filter(|index| changed[*index])
+            .collect::<Vec<_>>();
+        for &row in &rows {
+            let row = row..row + 1;
+            stabilize_rows(&mut desired, row.clone(), &desired_ids);
+            stabilize_rows(&mut observed, row.clone(), &studio_ids);
+            remap_rows(&mut observed, row.clone(), &remap, &service);
+            canonicalize_instances(&mut desired.instances[row.clone()])?;
+            canonicalize_instances(&mut observed.instances[row])?;
+        }
+        return Ok((!differ(&desired, &mut observed, &rows)).then(SettingsVerification::default));
+    }
     // The instances a settle writes otherwise than Studio's capture holds
     // them.
     let mut settled = BTreeMap::new();
@@ -183,45 +270,7 @@ pub(super) fn verified_by_rows(
                 written.push(camera);
             }
         }
-        let previous = |index: usize| {
-            before_by_id
-                .get(desired.instances[index].settings_id.as_str())
-                .copied()
-        };
-        let compare = |observed: &SettingsBytecode, index: usize| {
-            if protected == Some(index) {
-                return None;
-            }
-            let instance = &desired.instances[index];
-            match previous(index) {
-                Some(previous)
-                    if before.instances[previous].class_name == "PackageLink"
-                        && instance.class_name == "PackageLink" =>
-                {
-                    None
-                }
-                Some(previous) => {
-                    changed_instance_mismatch(before, previous, &desired, index, observed, index)
-                }
-                None => added_instance_mismatch(&desired, index, observed, index),
-            }
-        };
-        let unlike = rows
-            .clone()
-            .into_par_iter()
-            .filter(|index| compare(&observed, *index).is_some())
-            .collect::<Vec<_>>();
-        let differs = |index: usize| match policy.new_instance_values {
-            Some(values) => values
-                .mismatch(
-                    previous(index).map(|previous| (before, previous)),
-                    (&desired, index),
-                    (&mut observed, index),
-                )
-                .is_some(),
-            None => true,
-        };
-        if unlike.into_iter().any(differs) {
+        if differ(&desired, &mut observed, &rows.clone().collect::<Vec<_>>()) {
             return Ok(None);
         }
         for index in written {

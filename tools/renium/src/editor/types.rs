@@ -818,6 +818,22 @@ pub(crate) struct EditorSettingsWrite {
     pub(crate) path: PathBuf,
     pub(crate) expected_hash: Option<[u8; 32]>,
     pub(crate) document: SettingsBytecode,
+    /// The store as it is written, where the write changed values of a few
+    /// instances of the file: `document` then holds those instances whole
+    /// and every other one bare.
+    pub(crate) encoded: Option<Vec<u8>>,
+}
+
+impl EditorSettingsWrite {
+    /// The bytes of the store this write publishes.
+    pub(crate) fn store_bytes(&self) -> anyhow::Result<std::borrow::Cow<'_, [u8]>> {
+        Ok(match &self.encoded {
+            Some(bytes) => std::borrow::Cow::Borrowed(bytes),
+            None => std::borrow::Cow::Owned(crate::settings::bytecode::encode_settings_bytecode(
+                &self.document,
+            )?),
+        })
+    }
 }
 
 pub(crate) struct EditorHistoryEntry {

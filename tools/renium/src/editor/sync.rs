@@ -2450,6 +2450,7 @@ fn collect_project_editor_changes_with_documents(
             expected_hash: settings_file_hash(&path)?,
             path,
             document: crate::settings::bytecode::decode_settings_bytecode(&bytes)?,
+            encoded: None,
         });
     }
     Ok((changes, Some(projection)))
@@ -5816,7 +5817,11 @@ impl EditorSettingsTransaction {
                     std::process::id()
                 ));
                 let _ = fs::remove_file(&temporary);
-                write.document.write_file(&temporary)?;
+                match &write.encoded {
+                    Some(bytes) => fs::write(&temporary, bytes)
+                        .with_context(|| format!("Failed to write {}", temporary.display()))?,
+                    None => write.document.write_file(&temporary)?,
+                }
                 transaction.temporary.push(temporary);
             }
             for (index, write) in changes.settings_writes.iter().enumerate() {
@@ -6339,6 +6344,7 @@ fn finish_editor_change_collection(
                 expected_hash: settings_file_hash(&path)?,
                 path,
                 document: document.as_ref().clone(),
+                encoded: None,
             });
         }
     }
@@ -8886,6 +8892,7 @@ mod saved_field_review_tests {
                 expected_hash: settings_file_hash(&settings_path).unwrap(),
                 path: settings_path.clone(),
                 document,
+                encoded: None,
             }],
             property_changes: properties,
             instance_changes: vec![EditorInstanceChange {

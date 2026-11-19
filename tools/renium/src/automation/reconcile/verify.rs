@@ -487,22 +487,24 @@ fn settings_delta_verification(
         Some(SnapshotEntry::File(desired_bytes)),
         Some(SnapshotEntry::File(observed_bytes)),
     ) = (&mut prepared, desired, observed)
-        && !holds_unread_instances(&prepared.previous)
-        && policy.by_rows()
     {
         // A large store is verified a range of rows at a time.
-        if let Some(verified) = rows::verified_by_rows(
-            path,
-            &prepared.previous,
-            desired_bytes,
-            observed_bytes,
-            policy,
-        )? {
+        if policy.by_rows()
+            && let Some(verified) = rows::verified_by_rows(
+                path,
+                &prepared.previous,
+                desired_bytes,
+                observed_bytes,
+                policy,
+            )?
+        {
             return Ok(verified);
         }
         // The whole documents compare every instance, so the ones the files'
-        // copy left in its store file are read.
-        if let Some(desired) = &mut prepared.desired
+        // copy left in its store file are read. Beside a copy of Studio's
+        // read by the instances that changed, they stand for what it held.
+        if !holds_unread_instances(&prepared.previous)
+            && let Some(desired) = &mut prepared.desired
             && holds_unread_instances(desired)
         {
             read_unread_instances(Arc::make_mut(desired), desired_bytes)?;

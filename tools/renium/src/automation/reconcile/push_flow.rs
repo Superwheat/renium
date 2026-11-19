@@ -806,8 +806,17 @@ pub(crate) fn push_project(
     // These documents were already aligned to the exact requested file bytes.
     // Generated values or a later file edit invalidate that proof, not merely
     // the observed Studio snapshot (which is always read and aligned anew).
-    prepared_verification.retain(|path, _| {
-        entries_equivalent(path, project.entries.get(path), current.entries.get(path))
+    // The values this push wrote to a store itself, from what Studio generated,
+    // left every instance at its place: Studio's copy from before still says
+    // what changed, and the files' is read as it stands now.
+    prepared_verification.retain(|path, verified| {
+        let now = current.entries.get(path);
+        if entries_equivalent(path, project.entries.get(path), now) {
+            return true;
+        }
+        let generated = pushed.generated.entries.get(path);
+        verified.desired = None;
+        generated.is_some() && generated == now
     });
     let (mismatches, details) = verify::verify_committed_push_readback(
         &studio,

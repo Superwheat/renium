@@ -1315,6 +1315,7 @@ fn staged_settings_redirect_uses_original_project_not_merged_stage() {
             path: staged_path.clone(),
             expected_hash: settings_file_hash(&staged_path).unwrap(),
             document: document("aligned-id"),
+            encoded: None,
         }],
         ..Default::default()
     };
@@ -1371,6 +1372,7 @@ fn staged_settings_redirect_keeps_concurrent_write_protection() {
                         path: stage.join(relative),
                         expected_hash: hash,
                         document: document.clone(),
+                        encoded: None,
                     }],
                     ..Default::default()
                 };
@@ -7965,6 +7967,7 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
     use crate::tests::support::{SimRng, run_seeds};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    let by_changed = AtomicUsize::new(0);
     let (
         verified,
         refused,
@@ -8186,16 +8189,17 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
         };
         let (project, held) = (snapshot(&desired), snapshot(&studio));
         let paths = project_replacement_paths(&project, &held);
+        // Studio's copy from before whole, or read by the instances the
+        // push changed.
+        let read = if seed % 3 == 0 {
+            StoresRead::ChangedOfBoth
+        } else {
+            StoresRead::Whole
+        };
         let prepared = || {
             let mut prepared = HashMap::new();
-            prepare_project_replacement_from(
-                &project,
-                &held,
-                &paths,
-                &mut prepared,
-                StoresRead::Whole,
-            )
-            .map_err(|error| format!("prepare: {error:#}"))?;
+            prepare_project_replacement_from(&project, &held, &paths, &mut prepared, read)
+                .map_err(|error| format!("prepare: {error:#}"))?;
             Ok::<_, String>(
                 prepared
                     .remove(&path)
@@ -8205,7 +8209,12 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
                     }),
             )
         };
-        let settle = rng.below(4) != 0;
+        let settle = rng.below(4) != 0 && read == StoresRead::Whole;
+        let changed_alone = !settle
+            && pending.is_empty()
+            && prepared()?.is_some_and(|prepared| {
+                crate::settings::equivalence::holds_unread_instances(&prepared.previous)
+            });
         let outcome = |whole_documents: bool| {
             let Some(prepared) = prepared()? else {
                 return Ok(None);
@@ -8244,6 +8253,9 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
             (Some((_, false)), true) => left_out_refused.fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
+        if changed_alone {
+            by_changed.fetch_add(1, Ordering::Relaxed);
+        }
         if whole.0.is_some() {
             refused.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -8293,6 +8305,7 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
             &settled,
             &left_out_verified,
             &left_out_refused,
+            &by_changed,
         ]
         .map(|count| count.load(Ordering::Relaxed));
         assert!(
@@ -8302,8 +8315,10 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
                 && counts[3] >= 10
                 && counts[4] >= 60
                 && counts[5] >= 1
-                && counts[6] >= 1,
-            "verified {} ({} with a pending field, {} with another viewport camera, {} settled, {} with a value the capture left out), refused {} ({} for a value the capture left out)",
+                && counts[6] >= 1
+                && counts[7] >= 8,
+            "{} judged from the instances the push changed, verified {} ({} with a pending field, {} with another viewport camera, {} settled, {} with a value the capture left out), refused {} ({} for a value the capture left out)",
+            counts[7],
             counts[0],
             counts[2],
             counts[3],
