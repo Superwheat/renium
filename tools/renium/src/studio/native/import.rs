@@ -2958,6 +2958,7 @@ fn build_editor_binary_import_for_services(
         .is_some_and(|preflight| preflight.dom.is_none())
     {
         properties.reference_subtree_limit = Some(payload::NATIVE_IMPORT_BATCH_INSTANCES);
+        properties.native_reader = fallback_reason.is_none();
     }
     let (build, live_preflight) = rayon::join(
         || {

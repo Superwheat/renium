@@ -68,8 +68,12 @@ pub(crate) fn has_selected_property(
     let database = rbx_reflection_database::get()?;
     let selected = |properties: &serde_json::Map<String, serde_json::Value>| {
         properties.keys().any(|name| {
-            let logical = crate::rbx::encode::rbx_logical_property_name(database, class, name)
-                .unwrap_or(name);
+            let logical =
+                crate::settings::equivalence::serialized_only_logical_name(database, class, name)
+                    .or_else(|| {
+                        crate::rbx::encode::rbx_logical_property_name(database, class, name)
+                    })
+                    .unwrap_or(name);
             names.contains(logical)
         })
     };

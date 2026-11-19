@@ -446,6 +446,25 @@ fn ordinary_payload_receipt_preserves_complete_preorder_and_keeps_special_classe
     assert!(expected_structure(&dom, dom.root_ref()).unwrap().is_none());
 }
 
+fn record_cross_batch_properties(
+    dom: &RbxWeakDom,
+    fields: impl Iterator<Item = (RbxRef, rbx_dom_weak::Ustr)>,
+    post_apply: &mut HashMap<String, HashSet<String>>,
+    database: &ReflectionDatabase<'_>,
+) {
+    let mut paths = crate::rbx::model::RbxDomPaths::new(dom);
+    for (referent, name) in fields {
+        let (segments, ordinals) = paths.parts(referent);
+        let class = dom.get_by_ref(referent).unwrap().class.as_str();
+        let logical =
+            rbx_logical_property_name(database, class, name.as_str()).unwrap_or(name.as_str());
+        post_apply
+            .entry(instance_path_parts_key(&segments, &ordinals))
+            .or_default()
+            .insert(logical.to_string());
+    }
+}
+
 pub(super) fn encode_services(
     dom: &mut RbxWeakDom,
     service_roots: &[(String, RbxRef)],
@@ -596,18 +615,18 @@ pub(super) fn encode_services(
         .collect::<Result<Vec<_>>>()?;
     // Every worker reads the same DOM. Remove cross-batch properties only after
     // all selections are complete, then encode against one shared schema.
+    record_cross_batch_properties(
+        dom,
+        batch_references
+            .iter()
+            .flat_map(|(_, crossing)| crossing.iter().copied()),
+        post_apply,
+        database,
+    );
     let mut repeated = HashSet::new();
     for (anchors, crossing) in batch_references {
         repeated.extend(anchors);
         for (referent, name) in crossing {
-            let (segments, ordinals) = rbx_dom_instance_path_parts(dom, referent);
-            let class = dom.get_by_ref(referent).unwrap().class.as_str();
-            let logical =
-                rbx_logical_property_name(database, class, name.as_str()).unwrap_or(name.as_str());
-            post_apply
-                .entry(instance_path_parts_key(&segments, &ordinals))
-                .or_default()
-                .insert(logical.to_string());
             dom.get_by_ref_mut(referent)
                 .unwrap()
                 .properties

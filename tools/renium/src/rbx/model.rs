@@ -1641,6 +1641,9 @@ pub(crate) struct PlaceImportProperties {
     /// Only set after the live preflight proved there are no retained packages.
     /// This is the actual payload's subtree bound, not a second batch policy.
     pub(crate) reference_subtree_limit: Option<usize>,
+    /// The selected reader is known after preflight; its existing supplemental
+    /// policy decides whether serializer-only exceptions need original rows.
+    pub(crate) native_reader: bool,
 }
 
 impl From<bool> for PlaceImportProperties {
@@ -1650,6 +1653,7 @@ impl From<bool> for PlaceImportProperties {
             retain_rows: HashSet::new(),
             unread_rows: HashMap::new(),
             reference_subtree_limit: None,
+            native_reader: false,
         }
     }
 }
@@ -1661,6 +1665,7 @@ impl PlaceImportProperties {
             retain_rows: services,
             unread_rows: HashMap::new(),
             reference_subtree_limit: None,
+            native_reader: false,
         }
     }
 }
@@ -1676,8 +1681,11 @@ pub(crate) struct PlaceBuildTuning {
 impl Default for PlaceBuildTuning {
     fn default() -> Self {
         Self {
-            rows: std::num::NonZeroUsize::new(16384).unwrap(),
-            services: std::num::NonZeroUsize::new(4).unwrap(),
+            // One active column set and two bounded row ranges. Parallelize
+            // decoding/conversion within them, rather than retaining another
+            // service's string table beside all completed output and originals.
+            rows: std::num::NonZeroUsize::new(4096).unwrap(),
+            services: std::num::NonZeroUsize::new(1).unwrap(),
             prefetch: true,
         }
     }
@@ -1933,7 +1941,10 @@ pub(crate) fn build_rbx_place_with_tuning(
     let phase_started = Instant::now();
     let mut import_rows = crate::rbx::import_rows::ImportRowCandidates::default();
     let mut omitted_properties_by_ref = HashMap::new();
-    let extra_omissions = crate::editor::types::import_property_omissions(HashMap::new(), false);
+    let extra_omissions = crate::editor::types::import_property_omissions(
+        HashMap::new(),
+        import_properties.native_reader,
+    );
     let mut omitted_properties_by_class = HashMap::new();
     let mut logical_properties_by_ref = HashMap::new();
     let mut unresolved_reference_properties_by_ref = HashMap::new();

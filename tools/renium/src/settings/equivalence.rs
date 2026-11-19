@@ -2572,7 +2572,7 @@ fn settings_parent_id(document: &SettingsBytecode, index: usize) -> Option<&str>
 // Reflection lists these file-only fields as properties of their own, so a
 // record decoded from a model or place file carries them under the serialized
 // name while Studio and pulls report the logical one.
-fn serialized_only_logical_name(
+pub(crate) fn serialized_only_logical_name(
     database: &rbx_reflection::ReflectionDatabase<'_>,
     class_name: &str,
     name: &str,
