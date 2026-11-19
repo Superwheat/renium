@@ -195,18 +195,7 @@ pub(crate) fn decode_for_row_chunks(
     let _span = crate::app::profile::span("store retained row columns");
     if super::super::blocks::is_block_store(bytes) {
         let (structure, blocks) = super::super::blocks::RowBlocks::decode(bytes)?;
-        let columns = RetainedRowColumns {
-            strings: Vec::new(),
-            groups: Vec::new(),
-            cursors: Vec::new(),
-            budget: DecodeBudget::for_file(bytes.len()),
-            file_bytes: bytes.len(),
-            instance_count: structure.instances.len(),
-            next_row: 0,
-            reference_budget: None,
-            blocks: Some(blocks),
-        };
-        return Ok((structure, columns));
+        return Ok((structure, RetainedRowColumns::of_blocks(bytes, blocks)));
     }
     let (version, payload) = decode_settings_bytecode_container(bytes)?;
     let budget = DecodeBudget::for_file(bytes.len()).holding_payloads();
@@ -254,7 +243,31 @@ pub(crate) fn decode_for_row_chunks(
     ))
 }
 
+/// The retained value columns of a store whose structure the caller holds.
+pub(crate) fn retained_row_columns(bytes: &[u8]) -> Result<RetainedRowColumns> {
+    if super::super::blocks::is_block_store(bytes) {
+        let _span = crate::app::profile::span("store retained row columns");
+        let blocks = super::super::blocks::RowBlocks::open(bytes)?;
+        return Ok(RetainedRowColumns::of_blocks(bytes, blocks));
+    }
+    Ok(decode_for_row_chunks(bytes)?.1)
+}
+
 impl RetainedRowColumns {
+    fn of_blocks(bytes: &[u8], blocks: super::super::blocks::RowBlocks) -> Self {
+        Self {
+            strings: Vec::new(),
+            groups: Vec::new(),
+            cursors: Vec::new(),
+            budget: DecodeBudget::for_file(bytes.len()),
+            file_bytes: bytes.len(),
+            instance_count: blocks.rows(),
+            next_row: 0,
+            reference_budget: None,
+            blocks: Some(blocks),
+        }
+    }
+
     /// Only the requested range receives maps. The caller may consume those
     /// maps before the next range; structural row order must remain unchanged.
     pub(crate) fn materialize(

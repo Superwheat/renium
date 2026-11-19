@@ -2,7 +2,7 @@ use super::*;
 
 #[path = "row_chunks.rs"]
 mod row_chunks;
-pub(crate) use row_chunks::{RetainedRowColumns, decode_for_row_chunks};
+pub(crate) use row_chunks::{RetainedRowColumns, decode_for_row_chunks, retained_row_columns};
 
 #[cfg(test)]
 #[path = "property_edit_sim.rs"]

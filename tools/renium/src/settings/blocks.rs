@@ -1904,16 +1904,21 @@ pub(crate) struct RowBlocks {
 
 impl RowBlocks {
     pub(crate) fn decode(bytes: &[u8]) -> Result<(SettingsBytecode, Self)> {
-        let store = BlockStore::open(bytes.to_vec())?.holding();
-        let structure = store.structure()?;
-        Ok((
-            structure,
-            Self {
-                store,
-                read: VecDeque::new(),
-                held_back: Vec::new(),
-            },
-        ))
+        let blocks = Self::open(bytes)?;
+        Ok((blocks.store.structure()?, blocks))
+    }
+
+    /// The blocks alone, for a reader that holds the store's structure.
+    pub(crate) fn open(bytes: &[u8]) -> Result<Self> {
+        Ok(Self {
+            store: BlockStore::open(bytes.to_vec())?.holding(),
+            read: VecDeque::new(),
+            held_back: Vec::new(),
+        })
+    }
+
+    pub(crate) fn rows(&self) -> usize {
+        self.store.rows
     }
 
     /// `RetainedRowColumns::materialize_references` of this store: the rows

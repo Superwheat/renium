@@ -1476,8 +1476,7 @@ impl RbxPlaceDocument<'_> {
         else {
             return Ok(self);
         };
-        let (_, mut columns) =
-            crate::settings::bytecode::property_edit::decode_for_row_chunks(&bytes)?;
+        let mut columns = crate::settings::bytecode::property_edit::retained_row_columns(&bytes)?;
         drop(bytes);
         // The structure and columns came from one captured file snapshot.
         let count = structure.instances.len();
@@ -2034,7 +2033,7 @@ pub(crate) fn prepare_rbx_place<'a>(
                 bytes,
                 ..
             } => {
-                let (_, columns) = crate::settings::bytecode::property_edit::decode_for_row_chunks(&bytes)
+                let columns = crate::settings::bytecode::property_edit::retained_row_columns(&bytes)
                     .with_context(|| format!("Failed to decode {service}; repair or refresh this store before retrying the import"))?;
                 drop(bytes);
                 columns.project_properties(
