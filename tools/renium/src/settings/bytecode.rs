@@ -2407,6 +2407,10 @@ struct SettingsBinaryValue<'a> {
     source: SettingsBinaryValueSource<'a>,
 }
 
+// A store of 200,000 instances collects millions of these before it is
+// written, so each stays three words: the rare settled value is boxed.
+const _: () = assert!(std::mem::size_of::<SettingsBinaryValue<'static>>() <= 24);
+
 struct CFrameRotationTable {
     rotations: Vec<[u32; 9]>,
     values: Vec<CFrameTableValue>,
@@ -2428,14 +2432,16 @@ struct SettingsBinaryCollection<'a> {
 enum SettingsBinaryValueSource<'a> {
     Property(&'a Value),
     /// A property value as `settled_property_value` gives it.
-    Settled(Value),
+    Settled(Box<Value>),
     Native(&'a NativeSettingsValue),
     Attributes(&'a Map<String, Value>),
 }
 
 impl<'a> SettingsBinaryValueSource<'a> {
     fn of_property(value: &'a Value) -> Self {
-        settled_property_value(value).map_or(Self::Property(value), Self::Settled)
+        settled_property_value(value).map_or(Self::Property(value), |settled| {
+            Self::Settled(Box::new(settled))
+        })
     }
 }
 
@@ -2614,7 +2620,7 @@ fn visit_settings_binary_properties<'a>(
                 _ => None,
             };
             let source = match no_number {
-                Some(value) => SettingsBinaryValueSource::Settled(value),
+                Some(value) => SettingsBinaryValueSource::Settled(Box::new(value)),
                 None => SettingsBinaryValueSource::Native(&property.value),
             };
             let kind = binary_source_value_kind(&source, lookup)?;
@@ -3573,7 +3579,7 @@ fn write_resolved_ref_group_payload<W: Write + ?Sized>(
             bail!("Expected resolved Ref property group")
         }
         SettingsBinaryValueSource::Property(value) => *value,
-        SettingsBinaryValueSource::Settled(value) => value,
+        SettingsBinaryValueSource::Settled(value) => value.as_ref(),
     };
     let ref_value = ref_payload_object(value).context("Expected Ref binary settings value")?;
     let target_index = resolve_ref_index(ref_value, lookup)?
