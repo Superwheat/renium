@@ -2382,23 +2382,21 @@ pub(crate) fn select_editor_binary_import(
     // existence decides whether there is any binary import work at all.
     let first_generation = if only_additive {
         let ids = additive_root_ids(changes, &additive_roots);
-        let mut first = match editor_service_change_generations(
+        let mut first = editor_service_change_generations(
             bridge,
             &services.iter().cloned().collect::<Vec<_>>(),
             Some(&additive_roots),
             Some(&ids),
-        ) {
-            Ok(first) => first,
-            Err(error) => {
-                crate::app::output::log_global(
-                    5,
-                    format_args!(
-                        "[renium] additive root existence is unavailable; using ordinary upserts: {error:#}"
-                    ),
-                );
-                return Ok(None);
-            }
-        };
+        )
+        .map_err(|error| {
+            crate::app::output::log_global(
+                2,
+                format_args!(
+                    "[renium] Cannot check additive root existence; retry the sync: {error:#}"
+                ),
+            );
+            error.context("Cannot check additive root existence; retry the sync")
+        })?;
         additive_roots.retain(|service, names| {
             names.retain(|name| {
                 first
@@ -2847,19 +2845,15 @@ fn additive_subtree(
     Some(selected)
 }
 
-fn independent_additive_document(
+fn additive_references_stay_inside(
     document: &SettingsBytecode,
     service: &str,
     selected: &[usize],
-) -> Result<Option<SettingsBytecode>> {
+) -> Result<bool> {
     use crate::rbx::encode::model_references_stay_in_selection;
     use crate::rbx::model::BytecodeModelExportRefs;
     let root = selected[0];
-    let remap = selected
-        .iter()
-        .enumerate()
-        .map(|(next, &old)| (old, next))
-        .collect::<HashMap<_, _>>();
+    let selected_set = selected.iter().copied().collect::<HashSet<_>>();
     let stays_inside = |refs: &BytecodeModelExportRefs| -> Result<bool> {
         for &index in &selected[1..] {
             let row = &document.instances[index];
@@ -2889,11 +2883,11 @@ fn independent_additive_document(
             .iter()
             .any(|row| row.name.contains(['\0', '\u{1}']))
         {
-            return Ok(None);
+            return Ok(false);
         }
         let outside = RbxRef::new();
         for (index, row) in document.instances.iter().enumerate() {
-            let target = if index != root && remap.contains_key(&index) {
+            let target = if index != root && selected_set.contains(&index) {
                 RbxRef::none()
             } else {
                 outside
@@ -2904,7 +2898,7 @@ fn independent_additive_document(
                 .insert(&row.settings_id, target)
                 .is_some_and(|old| old != target)
             {
-                return Ok(None);
+                return Ok(false);
             }
         }
         let mut paths = crate::rbx::place_paths::PlaceReferencePaths::default();
@@ -2916,38 +2910,68 @@ fn independent_additive_document(
         );
         refs.global_paths = Some(std::sync::Arc::new(paths));
         if !stays_inside(&refs)? {
-            return Ok(None);
+            return Ok(false);
         }
     }
-    Ok(Some(SettingsBytecode {
-        version: document.version,
-        instances: selected
-            .iter()
-            .map(|&index| {
-                let mut row = document.instances[index].clone();
-                if index == root {
-                    // This is a structural anchor, not an imported instance.
-                    row.properties.clear();
-                    row.attributes.clear();
-                    row.parent_index = None;
-                } else {
-                    row.parent_index = row.parent_index.map(|parent| remap[&parent]);
-                    for record in [&mut row.properties, &mut row.attributes] {
-                        crate::settings::bytecode::visit_reference_objects_mut(record, |object| {
-                            if let Some(next) = object
-                                .get("instanceIndex")
-                                .and_then(crate::settings::bytecode::settings_reference_index)
-                                .and_then(|index| remap.get(&index))
-                            {
-                                object.insert("instanceIndex".into(), json!(next + 1));
-                            }
-                        });
+    Ok(true)
+}
+
+fn independent_additive_document(
+    document: &SettingsBytecode,
+    service: &str,
+    selected: &[usize],
+    service_dir: &std::path::Path,
+) -> RbxPlaceDocument<'static> {
+    // File stems belong to the full sibling list, even when only one root is imported.
+    let source_paths = crate::editor::paths::selected_editor_source_paths(
+        document,
+        service,
+        service_dir,
+        selected,
+    );
+    let root = selected[0];
+    let remap = selected
+        .iter()
+        .enumerate()
+        .map(|(next, &old)| (old, next))
+        .collect::<HashMap<_, _>>();
+    RbxPlaceDocument::Selected {
+        source_paths,
+        document: SettingsBytecode {
+            version: document.version,
+            instances: selected
+                .iter()
+                .map(|&index| {
+                    let mut row = document.instances[index].clone();
+                    if index == root {
+                        // This is a structural anchor, not an imported instance.
+                        row.properties.clear();
+                        row.attributes.clear();
+                        row.parent_index = None;
+                    } else {
+                        row.parent_index = row.parent_index.map(|parent| remap[&parent]);
+                        for record in [&mut row.properties, &mut row.attributes] {
+                            crate::settings::bytecode::visit_reference_objects_mut(
+                                record,
+                                |object| {
+                                    if let Some(next) = object
+                                        .get("instanceIndex")
+                                        .and_then(
+                                            crate::settings::bytecode::settings_reference_index,
+                                        )
+                                        .and_then(|index| remap.get(&index))
+                                    {
+                                        object.insert("instanceIndex".into(), json!(next + 1));
+                                    }
+                                },
+                            );
+                        }
                     }
-                }
-                row
-            })
-            .collect(),
-    }))
+                    row
+                })
+                .collect(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -2961,54 +2985,64 @@ fn additive_document_from_file(
     service: &str,
     roots: &HashSet<String>,
 ) -> Result<RbxPlaceDocument<'static>> {
-    let bytes =
-        std::fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
-    #[cfg(test)]
-    {
-        ADDITIVE_STORE_READS
-            .lock()
-            .unwrap()
-            .entry(path.clone())
-            .or_default()
-            .0 += 1;
-    }
-    let (mut document, columns) =
-        crate::settings::bytecode::property_edit::decode_for_row_chunks(&bytes)?;
-    if let Some(selected) = additive_subtree(&document, service, roots) {
-        let mut wanted = vec![false; document.instances.len()];
-        for &index in &selected[1..] {
-            wanted[index] = true;
-        }
-        columns.materialize_selected(&mut document, &wanted)?;
-        #[cfg(test)]
-        {
-            ADDITIVE_STORE_READS
-                .lock()
-                .unwrap()
-                .get_mut(&path)
-                .unwrap()
-                .1 += selected.len() - 1;
-        }
-        if let Some(selected) = independent_additive_document(&document, service, &selected)? {
-            return Ok(RbxPlaceDocument::Owned(selected));
-        }
-    }
-    crate::app::output::log_global(
-        5,
-        format_args!(
-            "[renium] additive {service} needs the complete reference index; using the ordinary file import"
-        ),
-    );
-    #[cfg(test)]
-    {
-        ADDITIVE_STORE_READS
-            .lock()
-            .unwrap()
-            .get_mut(&path)
-            .unwrap()
-            .2 = true;
-    }
-    RbxPlaceDocument::from_file_bytes(path, bytes)
+    crate::settings::bytecode::property_edit::read_row_chunks_with(
+        &path,
+        |mut document, columns| {
+            #[cfg(test)]
+            {
+                ADDITIVE_STORE_READS
+                    .lock()
+                    .unwrap()
+                    .entry(path.clone())
+                    .or_default()
+                    .0 += 1;
+            }
+            let selected = additive_subtree(&document, service, roots);
+            let mut wanted = vec![false; document.instances.len()];
+            let independent = if let Some(selected) = &selected {
+                for &index in &selected[1..] {
+                    wanted[index] = true;
+                }
+                columns.project_references(&mut document, &wanted)?;
+                let independent = additive_references_stay_inside(&document, service, selected)?;
+                for &index in &selected[1..] {
+                    document.instances[index].properties.clear();
+                    document.instances[index].attributes.clear();
+                }
+                independent
+            } else {
+                false
+            };
+            if !independent {
+                crate::app::output::log_global(
+                    5,
+                    format_args!(
+                        "[renium] additive {service} has outside or ambiguous references; decoding the complete store from the retained columns"
+                    ),
+                );
+                wanted.fill(true);
+            }
+            // Either route decodes the values once, under the ordinary store-read retry.
+            columns.materialize_selected(&mut document, &wanted)?;
+            #[cfg(test)]
+            {
+                let mut counts = ADDITIVE_STORE_READS.lock().unwrap();
+                let counts = counts.get_mut(&path).unwrap();
+                counts.1 += wanted.iter().filter(|&&wanted| wanted).count();
+                counts.2 = !independent;
+            }
+            Ok(if independent {
+                independent_additive_document(
+                    &document,
+                    service,
+                    selected.as_ref().unwrap(),
+                    path.parent().unwrap(),
+                )
+            } else {
+                RbxPlaceDocument::Owned(document)
+            })
+        },
+    )
 }
 
 fn clear_import_engine_identities(dom: &mut RbxWeakDom) {
@@ -3141,11 +3175,17 @@ fn build_editor_binary_import_for_services(
             for (service, roots) in additive_roots {
                 if let Some(document) = document_overrides.get(service) {
                     if let Some(indices) = additive_subtree(document, service, roots)
-                        && let Some(selected) =
-                            independent_additive_document(document, service, &indices)?
+                        && additive_references_stay_inside(document, service, &indices)?
                     {
-                        document_overrides
-                            .insert(service.clone(), RbxPlaceDocument::Owned(selected));
+                        document_overrides.insert(
+                            service.clone(),
+                            independent_additive_document(
+                                document,
+                                service,
+                                &indices,
+                                &src_root.join(service),
+                            ),
+                        );
                     } else {
                         crate::app::output::log_global(
                             5,
@@ -3709,9 +3749,13 @@ fn independent_additions_keep_internal_references_and_ignore_service_values() {
         .insert("Keep".into(), json!(false));
     let roots = HashSet::from(["Incoming".into()]);
     let indices = additive_subtree(&document, "ServerStorage", &roots).unwrap();
-    let selected = independent_additive_document(&document, "ServerStorage", &indices)
-        .unwrap()
-        .unwrap();
+    assert!(additive_references_stay_inside(&document, "ServerStorage", &indices).unwrap());
+    let selected = independent_additive_document(
+        &document,
+        "ServerStorage",
+        &indices,
+        std::path::Path::new("ServerStorage"),
+    );
     assert_eq!(selected.instances.len(), 3);
     assert_eq!(selected.instances[1].settings_id, "new");
     assert_eq!(selected.instances[2].parent_index, Some(1));
@@ -3727,29 +3771,24 @@ fn independent_additions_keep_internal_references_and_ignore_service_values() {
         "PrimaryPart".into(),
         json!({"_type":"Ref", "settingsId":"child"}),
     );
-    assert!(
-        independent_additive_document(&document, "ServerStorage", &indices)
-            .unwrap()
-            .is_some()
-    );
+    assert!(additive_references_stay_inside(&document, "ServerStorage", &indices).unwrap());
     document.instances[2].properties.insert(
         "PrimaryPart".into(),
         json!({"_type":"Ref", "settingsId":"old"}),
     );
-    assert!(
-        independent_additive_document(&document, "ServerStorage", &indices)
-            .unwrap()
-            .is_none()
-    );
+    assert!(!additive_references_stay_inside(&document, "ServerStorage", &indices).unwrap());
     document.instances[2].properties.clear();
     document.instances[0]
         .properties
         .insert("Target".into(), json!({"_type":"Ref", "settingsId":"old"}));
     assert!(
-        independent_additive_document(&document, "ServerStorage", &indices)
-            .unwrap()
-            .unwrap()
-            .instances[0]
+        independent_additive_document(
+            &document,
+            "ServerStorage",
+            &indices,
+            std::path::Path::new("ServerStorage")
+        )
+        .instances[0]
             .properties
             .is_empty()
     );

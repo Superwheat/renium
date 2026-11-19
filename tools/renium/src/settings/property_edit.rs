@@ -29,6 +29,17 @@ pub(crate) fn read_for_property_edit(
     read_settings_file(path, decode_for_property_edit)
 }
 
+/// Keep the ordinary store retry around both column parsing and the selected decode.
+pub(crate) fn read_row_chunks_with<T>(
+    path: &Path,
+    mut decode: impl FnMut(SettingsBytecode, RetainedRowColumns) -> Result<T>,
+) -> Result<T> {
+    read_settings_file(path, |bytes| {
+        let (document, columns) = decode_for_row_chunks(bytes)?;
+        decode(document, columns)
+    })
+}
+
 pub(crate) fn decode_for_property_edit(
     bytes: &[u8],
 ) -> Result<(SettingsBytecode, RetainedPropertyColumns)> {

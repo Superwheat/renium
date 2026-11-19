@@ -1407,6 +1407,10 @@ pub(crate) enum RbxPlaceDocument<'a> {
     Borrowed(&'a SettingsBytecode),
     Owned(SettingsBytecode),
     Shared(Arc<SettingsBytecode>),
+    Selected {
+        document: SettingsBytecode,
+        source_paths: Vec<Option<PathBuf>>,
+    },
     File {
         structure: SettingsBytecode,
         path: PathBuf,
@@ -1420,7 +1424,7 @@ impl std::ops::Deref for RbxPlaceDocument<'_> {
     fn deref(&self) -> &Self::Target {
         match self {
             Self::Borrowed(document) => document,
-            Self::Owned(document) => document,
+            Self::Owned(document) | Self::Selected { document, .. } => document,
             Self::Shared(document) => document,
             Self::File { structure, .. } => structure,
         }
@@ -1459,7 +1463,7 @@ impl RbxPlaceDocument<'_> {
         match self {
             Self::Owned(document) => document,
             Self::Shared(document) => Arc::make_mut(document),
-            Self::Borrowed(_) | Self::File { .. } => unreachable!(),
+            Self::Borrowed(_) | Self::File { .. } | Self::Selected { .. } => unreachable!(),
         }
     }
 
@@ -1491,7 +1495,7 @@ impl RbxPlaceDocument<'_> {
 
     fn release(self) {
         let document = match self {
-            Self::Owned(document) => Some(document),
+            Self::Owned(document) | Self::Selected { document, .. } => Some(document),
             Self::Shared(document) => Arc::into_inner(document),
             Self::Borrowed(_) => None,
             Self::File { structure, .. } => Some(structure),
@@ -1748,6 +1752,16 @@ pub(crate) fn build_rbx_place_with_tuning(
                     .with_context(|| format!("Failed to read {}", settings_file.display()))?;
                 RbxPlaceDocument::from_file_bytes(settings_file.clone(), bytes)?
             };
+            let selected_sources = if let RbxPlaceDocument::Selected {
+                document: selected,
+                source_paths,
+            } = document
+            {
+                document = RbxPlaceDocument::Owned(selected);
+                Some(source_paths)
+            } else {
+                None
+            };
             if merge_source_files {
                 document = document.load()?;
             }
@@ -1769,7 +1783,13 @@ pub(crate) fn build_rbx_place_with_tuning(
             let children_by_parent = settings_children_by_parent(&document);
             let mut subtree = Vec::new();
             collect_settings_subtree_preorder(&children_by_parent, root_index, &mut subtree);
-            let mut source_paths = if matches!(document, RbxPlaceDocument::File { .. }) {
+            let mut source_paths = if let Some(paths) = selected_sources {
+                anyhow::ensure!(
+                    paths.len() == document.instances.len(),
+                    "Selected source structure changed; rebuild the import before retrying"
+                );
+                paths
+            } else if matches!(document, RbxPlaceDocument::File { .. }) {
                 Vec::new()
             } else {
                 build_editor_source_paths_by_index_with_children(

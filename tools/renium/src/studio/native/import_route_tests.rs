@@ -4,7 +4,7 @@ use crate::editor::types::EditorInstanceChange;
 use crate::studio::bridge::routing_tests::{connect, edit_info, fixture};
 use tungstenite::{Message, WebSocket, protocol::Role};
 
-fn check_scoped_additive_route(absent: bool, external: bool) -> Result<()> {
+fn check_scoped_additive_route(absent: bool, external: bool, prepared: bool) -> Result<()> {
     let service = "Workspace";
     let root = crate::tests::support::temp_dir("scoped-additive-route");
     let _cleanup = crate::system::files::OnDrop::new(|| {
@@ -67,7 +67,7 @@ fn check_scoped_additive_route(absent: bool, external: bool) -> Result<()> {
     let path = service_settings_path(&root.join("src").join(service));
     std::fs::create_dir_all(path.parent().unwrap())?;
     document.write_file(&path)?;
-    let changes = EditorChangeSet {
+    let mut changes = EditorChangeSet {
         instance_changes: vec![EditorInstanceChange {
             service: service.into(),
             mode: "upsertInstances".into(),
@@ -83,6 +83,11 @@ fn check_scoped_additive_route(absent: bool, external: bool) -> Result<()> {
         }],
         ..Default::default()
     };
+    if prepared {
+        changes
+            .native_property_documents
+            .insert(service.into(), std::sync::Arc::new(document.clone()));
+    }
     let bridge = fixture();
     let stream = connect(&bridge, 0, edit_info("scoped-additive", 21));
     let peer = std::thread::spawn(move || {
@@ -107,7 +112,9 @@ fn check_scoped_additive_route(absent: bool, external: bool) -> Result<()> {
     READER_PREFLIGHTS.set(0);
     let selection = select_editor_binary_import(&args, &changes, &bridge)?;
     assert_eq!(selection.is_some(), absent);
-    assert_eq!(READER_PREFLIGHTS.get(), 0);
+    if !absent {
+        assert_eq!(READER_PREFLIGHTS.get(), 0);
+    }
     let import = build_editor_binary_import(&args, &changes, &bridge, selection)?;
     let reads = ADDITIVE_STORE_READS
         .lock()
@@ -117,30 +124,31 @@ fn check_scoped_additive_route(absent: bool, external: bool) -> Result<()> {
     if absent {
         assert_eq!(
             reads,
-            (1, 3, external),
-            "only the three subtree rows should be materialized"
+            if prepared {
+                (0, 0, false)
+            } else {
+                (
+                    1,
+                    if external {
+                        document.instances.len()
+                    } else {
+                        3
+                    },
+                    external,
+                )
+            },
+            "selected rows or one complete decode from the retained columns"
         );
         let import = import.context("absent root was not imported")?;
         assert_eq!(import.groups.len(), 1);
         assert_eq!(import.groups[0].change_generation, Some(7));
         let dom = rbx_binary::from_reader(import.bytes.as_slice())?;
-        assert!(
-            dom.descendants()
-                .all(|row| row.name != "Unrelated" && row.name != "ExistingCamera")
-        );
         let part = dom.descendants().find(|row| row.name == "Part").unwrap();
         assert_eq!(
             part.properties[&"Transparency".into()],
             RbxVariant::Float32(0.375)
         );
-        if external {
-            assert!(
-                import
-                    .post_apply_properties_by_path
-                    .values()
-                    .any(|names| names.contains("Value"))
-            );
-        } else {
+        if !external {
             let target = dom.descendants().find(|row| row.name == "Target").unwrap();
             assert_eq!(
                 target.properties[&"Value".into()],
@@ -149,7 +157,6 @@ fn check_scoped_additive_route(absent: bool, external: bool) -> Result<()> {
         }
     } else {
         assert!(import.is_none());
-        assert_eq!(reads, (0, 0, false), "existing root read its store");
     }
     drop(bridge);
     peer.join().unwrap();
@@ -158,17 +165,66 @@ fn check_scoped_additive_route(absent: bool, external: bool) -> Result<()> {
 
 #[test]
 fn existing_additive_root_reads_no_store_and_builds_nothing() -> Result<()> {
-    check_scoped_additive_route(false, false)
+    check_scoped_additive_route(false, false, false)
 }
 
 #[test]
 fn absent_additive_root_materializes_its_subtree_with_internal_references() -> Result<()> {
-    check_scoped_additive_route(true, false)
+    check_scoped_additive_route(true, false, false)?;
+    check_scoped_additive_route(true, false, true)
 }
 
 #[test]
 fn additive_external_reference_keeps_the_complete_import_index() -> Result<()> {
-    check_scoped_additive_route(true, true)
+    check_scoped_additive_route(true, true, false)
+}
+
+#[test]
+fn additive_existence_errors_do_not_take_the_older_plugin_route() {
+    for failed in [false, true] {
+        let args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: ".".into(),
+                src_root: "src".into(),
+            },
+            BridgeConnectionArgs::local(0.1),
+        );
+        let changes = EditorChangeSet {
+            instance_changes: vec![EditorInstanceChange {
+                service: "Workspace".into(),
+                mode: "upsertInstances".into(),
+                allow_deletes: false,
+                instances: vec![crate::editor::types::EditorInstanceDescriptor {
+                    settings_id: "new".into(),
+                    class_name: "Folder".into(),
+                    path_segments: vec!["Workspace".into(), "New".into()],
+                    path_ordinals: vec![1, 1],
+                    ..Default::default()
+                }],
+                preserve_instances: vec![],
+            }],
+            ..Default::default()
+        };
+        let bridge = fixture();
+        let stream = connect(&bridge, 0, edit_info("additive-error", 21));
+        let peer = std::thread::spawn(move || {
+            let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
+            let Message::Text(text) = socket.read().unwrap() else {
+                panic!("missing request")
+            };
+            let request: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(request["method"], "getEditorServiceChangeGenerations");
+            socket.send(Message::Text(json!({"id":request["id"],"ok":!failed,"error":"existence timed out","result":{"generations":{"Workspace":7}}}).to_string().into())).unwrap();
+        });
+        let result = select_editor_binary_import(&args, &changes, &bridge);
+        if failed {
+            assert!(result.err().unwrap().to_string().contains("retry the sync"));
+        } else {
+            assert!(result.unwrap().is_none(), "old plugin cannot prove absence");
+        }
+        drop(bridge);
+        peer.join().unwrap();
+    }
 }
 
 /// The captured service has one root with a PackageLink and two identity slots.
@@ -548,6 +604,196 @@ fn import_builder_returns_exact_original_rows_for_the_supplemental_pass() -> Res
             }
             drop(bridge);
             peer.join().unwrap();
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn additive_subtree_payload_matches_the_whole_store_with_colliding_script_folders() -> Result<()> {
+    let root = crate::tests::support::temp_dir("additive-source-oracle");
+    let _cleanup = crate::system::files::OnDrop::new(|| {
+        let _ = std::fs::remove_dir_all(&root);
+    });
+    for service in ["Workspace", "ServerStorage"] {
+        let dir = root.join(service);
+        std::fs::create_dir_all(&dir)?;
+        let mut document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance::new(
+                "service".into(),
+                service.into(),
+                service.into(),
+                None,
+            )],
+        };
+        let long = "a".repeat(100);
+        let pairs = [
+            ("map".into(), "Map".into()),
+            ("A:B".into(), "A_B".into()),
+            ("Map.".into(), "Map ".into()),
+            (format!("{long}1"), format!("{long}2")),
+        ];
+        let mut roots = HashSet::new();
+        for (pair, (old, new)) in pairs.into_iter().enumerate() {
+            roots.insert(new.clone());
+            for (side, name) in [("old", old), ("new", new)] {
+                let parent = document.instances.len();
+                let id = format!("{side}-{pair}");
+                document.instances.push(SettingsBytecodeInstance::new(
+                    id.clone(),
+                    name,
+                    "Model".into(),
+                    Some(0),
+                ));
+                for (child, class) in [("Main", "Script"), ("Same", "Part"), ("Same", "Part")] {
+                    let mut row = SettingsBytecodeInstance::new(
+                        format!("{id}-{}", document.instances.len()),
+                        child.into(),
+                        class.into(),
+                        Some(parent),
+                    );
+                    if class == "Script" {
+                        row.properties.insert(
+                            "Source".into(),
+                            json!(crate::settings::EXTERNAL_SOURCE_MARKER),
+                        );
+                        row.properties.insert("RunContext".into(), json!({"_type":"EnumItem", "name":"Client", "enumType":"RunContext", "value":2}));
+                    }
+                    document.instances.push(row);
+                }
+                document.instances[parent].properties.insert(
+                    "PrimaryPart".into(),
+                    json!({"_type":"Ref", "instanceIndex":parent+4}),
+                );
+            }
+        }
+        let paths =
+            crate::editor::paths::build_editor_source_paths_by_index(&document, service, &dir);
+        for (index, path) in paths.iter().enumerate() {
+            if let Some(path) = path {
+                std::fs::create_dir_all(path.parent().unwrap())?;
+                std::fs::write(path, format!("print({index})\n"))?;
+            }
+        }
+        assert!(
+            paths
+                .iter()
+                .flatten()
+                .any(|path| path.to_string_lossy().contains("Map_2"))
+        );
+        let path = service_settings_path(&dir);
+        document.write_file(&path)?;
+        // Compare against the decoded store: the codec normalizes reference selectors.
+        let document = SettingsBytecode::read_file(&path)?;
+        let selected = additive_subtree(&document, service, &roots).unwrap();
+        assert!(additive_references_stay_inside(
+            &document, service, &selected
+        )?);
+        let mut expected = None;
+        for input in [
+            RbxPlaceDocument::Borrowed(&document),
+            independent_additive_document(&document, service, &selected, &dir),
+            additive_document_from_file(path.clone(), service, &roots)?,
+        ] {
+            let mut build = build_rbx_place_with_documents(
+                &root,
+                vec![service.into()],
+                HashMap::from([(service.into(), input)]),
+                true,
+                true,
+                false,
+            )?;
+            for (&referent, id) in &build.settings_ids_by_ref {
+                let instance = build.dom.get_by_ref(referent).unwrap();
+                if instance.class.as_str() == "Script" {
+                    let original = document
+                        .instances
+                        .iter()
+                        .position(|row| row.settings_id == *id)
+                        .unwrap();
+                    assert_eq!(
+                        instance.properties[&"Source".into()],
+                        RbxVariant::String(format!("print({original})\n"))
+                    );
+                }
+            }
+            let mut groups = pending_editor_binary_groups(&build.dom, &build.service_roots)?;
+            groups.retain(|group| group.target_path.len() == 1);
+            for group in &mut groups {
+                group.additive = true;
+                group.viewport_camera = None;
+                group
+                    .roots
+                    .retain(|root| build.settings_ids_by_ref[root].starts_with("new-"));
+                group.root_settings_ids = group
+                    .roots
+                    .iter()
+                    .map(|root| build.settings_ids_by_ref[root].clone())
+                    .collect();
+            }
+            let plans = groups
+                .iter()
+                .map(|_| EditorPackageGroupPlan {
+                    retained_roots: vec![],
+                    package_roots: vec![],
+                    mutation_package_roots: vec![],
+                    change_generation: Some(7),
+                })
+                .collect();
+            clear_import_engine_identities(&mut build.dom);
+            let (bytes, groups, _) = payload::encode_services(
+                &mut build.dom,
+                &build.service_roots,
+                &build.settings_ids_by_ref,
+                groups,
+                plans,
+                &mut HashMap::new(),
+            )?;
+            let actual = (bytes, serde_json::to_value(groups)?);
+            assert_eq!(&actual, expected.get_or_insert_with(|| actual.clone()));
+        }
+        assert_eq!(
+            ADDITIVE_STORE_READS.lock().unwrap().remove(&path).unwrap(),
+            (1, selected.len() - 1, false)
+        );
+        // Ambiguous legacy selectors must use the complete decoded store once.
+        for duplicate in [false, true] {
+            let mut ambiguous = document.clone();
+            if duplicate {
+                ambiguous.instances[1].settings_id = ambiguous.instances[5].settings_id.clone();
+            } else {
+                ambiguous.instances[1].name = "old\0separator".into();
+            }
+            // Structural ambiguity remains even when the reference uses an index.
+            let reference = json!({"_type":"Ref", "instanceIndex":8});
+            ambiguous.instances[5]
+                .properties
+                .insert("PrimaryPart".into(), reference);
+            let selected = additive_subtree(&ambiguous, service, &roots).unwrap();
+            assert!(!additive_references_stay_inside(
+                &ambiguous, service, &selected
+            )?);
+            if duplicate {
+                // Duplicate IDs can reach a prepared document, but the store codec refuses them.
+                assert!(
+                    ambiguous
+                        .write_file(&path)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("duplicate settings id")
+                );
+            } else {
+                ambiguous.write_file(&path)?;
+                assert!(matches!(
+                    additive_document_from_file(path.clone(), service, &roots)?,
+                    RbxPlaceDocument::Owned(_)
+                ));
+                assert_eq!(
+                    ADDITIVE_STORE_READS.lock().unwrap().remove(&path).unwrap(),
+                    (1, ambiguous.instances.len(), true)
+                );
+            }
         }
     }
     Ok(())

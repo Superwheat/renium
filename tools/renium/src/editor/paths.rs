@@ -565,9 +565,49 @@ pub(crate) fn build_editor_source_paths_by_index_with_children(
     service_dir: &Path,
     children_by_parent: &[Vec<usize>],
 ) -> Vec<Option<PathBuf>> {
+    source_paths_for_rows(
+        document,
+        service,
+        service_dir,
+        children_by_parent,
+        0..document.instances.len(),
+    )
+}
+
+/// Full sibling context; results follow selected row order. Only scripts need paths.
+pub(crate) fn selected_editor_source_paths(
+    document: &SettingsBytecode,
+    service: &str,
+    service_dir: &Path,
+    selected: &[usize],
+) -> Vec<Option<PathBuf>> {
+    if !selected
+        .iter()
+        .any(|&index| is_lua_source_class(&document.instances[index].class_name))
+    {
+        return vec![None; selected.len()];
+    }
+    let mut paths = source_paths_for_rows(
+        document,
+        service,
+        service_dir,
+        &settings_children_by_parent(document),
+        selected.iter().copied(),
+    );
+    selected.iter().map(|&index| paths[index].take()).collect()
+}
+
+fn source_paths_for_rows(
+    document: &SettingsBytecode,
+    service: &str,
+    service_dir: &Path,
+    children_by_parent: &[Vec<usize>],
+    selected: impl IntoIterator<Item = usize>,
+) -> Vec<Option<PathBuf>> {
     let mut out = vec![None; document.instances.len()];
     let mut contains_source = vec![false; document.instances.len()];
-    for (index, instance) in document.instances.iter().enumerate() {
+    for index in selected {
+        let instance = &document.instances[index];
         if !is_lua_source_class(&instance.class_name) {
             continue;
         }

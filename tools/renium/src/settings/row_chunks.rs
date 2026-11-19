@@ -308,6 +308,100 @@ impl RetainedRowColumns {
         Ok(())
     }
 
+    /// Read only columns that can carry references. Include their other kinds
+    /// too, so a later scalar group still replaces an earlier reference.
+    /// Main cursors remain untouched for the chosen full or selected decode.
+    pub(crate) fn project_references(
+        &self,
+        document: &mut SettingsBytecode,
+        wanted: &[bool],
+    ) -> Result<()> {
+        fn references(value: Value, found: &mut Vec<Value>) {
+            if ref_payload_object(&value).is_some() {
+                found.push(value);
+                return;
+            }
+            match value {
+                Value::Array(values) => {
+                    for value in values {
+                        references(value, found);
+                    }
+                }
+                Value::Object(values) => {
+                    for value in values.into_values() {
+                        references(value, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        anyhow::ensure!(
+            wanted.len() == self.instance_count
+                && document.instances.len() == self.instance_count
+                && self.next_row == 0,
+            "Reference projection requires the original store structure; restart the store read"
+        );
+        // These are the store codec's array, object and reference tags, not engine types.
+        let names = self
+            .groups
+            .iter()
+            .filter(|group| matches!(group.kind, 7 | 8 | 10 | 17))
+            .map(|group| &group.name)
+            .collect::<std::collections::HashSet<_>>();
+        let budget = DecodeBudget::for_file(self.file_bytes).holding_payloads();
+        let scope = ValueScope {
+            strings: &self.strings,
+            instance_count: self.instance_count,
+            budget: &budget,
+        };
+        let groups = self
+            .groups
+            .iter()
+            .filter(|group| names.contains(&group.name))
+            .collect::<Vec<_>>();
+        let values = groups
+            .iter()
+            .map(|group| {
+                budget.property_group(group.count, &group.name, group.kind)?;
+                let mut entries = Vec::new();
+                GroupCursor::beginning(group).visit_until(
+                    group,
+                    self.instance_count,
+                    scope,
+                    |entry| {
+                        if !wanted[entry.instance_index()] {
+                            return Ok(());
+                        }
+                        entries.push(match entry {
+                            DecodedGroupEntry::Property(index, value) => {
+                                let mut found = Vec::new();
+                                references(value, &mut found);
+                                DecodedGroupEntry::Property(index, Value::Array(found))
+                            }
+                            DecodedGroupEntry::Attributes(index, values) => {
+                                let mut projected = Map::new();
+                                for (name, value) in values {
+                                    let mut found = Vec::new();
+                                    references(value, &mut found);
+                                    projected.insert(name, Value::Array(found));
+                                }
+                                DecodedGroupEntry::Attributes(index, projected)
+                            }
+                        });
+                        Ok(())
+                    },
+                )?;
+                Ok(entries)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let specs = groups
+            .iter()
+            .map(|group| (&group.name, group.kind, group.count, group.bytes.as_slice()))
+            .collect::<Vec<_>>();
+        apply_decoded_property_groups(&mut document.instances, &specs, values);
+        Ok(())
+    }
+
     /// Gives the rows marked in `wanted` their maps, all in one pass over the
     /// columns, with the values of every other row dropped as they are
     /// decoded. No range may have been read before.
