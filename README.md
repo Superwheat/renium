@@ -38,14 +38,29 @@ Renium's Git setup they still show and merge as text.
 
 ### It stays fast on a big place
 
-On that 202,000-instance place:
+On that 202,000-instance place, with the most memory Renium used at each step:
 
-| | Time |
-|---|---|
-| Send the whole project to an empty Studio place | 11 s |
-| Bring one property changed in Studio into the files | 4.5 s |
+| | Time | Memory |
+|---|---|---|
+| Bring the whole place from Studio into an empty project | 4 s | 1.3 GB |
+| Check Studio when nothing changed | 2 s | 1.0 GB |
+| Bring one property changed in Studio into the files | 3.3 s | 1.5 GB |
+| Send one changed script to Studio | 2.5 s | 1.1 GB |
+| Send one changed property to Studio | 5 s | 1.8 GB |
+| Send the whole project to an empty Studio place | 13 s | 1.8 GB |
 
-Times are from version 0.6.5 on a Windows desktop.
+No step needs 2 GB.
+
+The same two directions with Argon 2.0.29:
+
+| | Renium | Argon |
+|---|---|---|
+| Studio to files, 202,000 instances | 4 s | stopped with an error after 55 s |
+| Files to Studio, 202,000 instances | 13 s | stopped out of memory at 6.9 GB |
+| Studio to files, 20,000 instances of that place | 0.9 s | 31 s |
+| Files to Studio, the same 20,000 instances | 3.3 s | 27 s |
+
+Measured with version 0.6.5 on a Windows desktop.
 
 ### Both sides can change
 
