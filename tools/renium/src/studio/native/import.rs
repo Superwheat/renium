@@ -2337,11 +2337,79 @@ pub(crate) struct BinaryImportSelection {
     first_generation: Option<EditorServiceChangeGenerations>,
 }
 
+fn read_additive_generation(
+    changes: &EditorChangeSet,
+    bridge: &BridgeServer,
+    services: &mut HashSet<String>,
+    additive_roots: &mut HashMap<String, HashSet<String>>,
+) -> Result<EditorServiceChangeGenerations> {
+    let ids = additive_root_ids(changes, additive_roots);
+    let mut first = editor_service_change_generations(
+        bridge,
+        &services.iter().cloned().collect::<Vec<_>>(),
+        Some(additive_roots),
+        Some(&ids),
+    )
+    .map_err(|error| {
+        crate::app::output::log_global(
+            2,
+            format_args!(
+                "[renium] Cannot check additive root existence; retry the sync: {error:#}"
+            ),
+        );
+        error.context("Cannot check additive root existence; retry the sync")
+    })?;
+    additive_roots.retain(|service, names| {
+        names.retain(|name| {
+            first
+                .absent_roots
+                .get(service)
+                .is_some_and(|absent| absent.contains(name))
+        });
+        !names.is_empty()
+    });
+    services.retain(|service| additive_roots.contains_key(service));
+    first
+        .generations
+        .retain(|service, _| services.contains(service));
+    if let Some(packages) = &mut first.has_package_links {
+        packages.retain(|service, _| services.contains(service));
+    }
+    Ok(first)
+}
+
+/// A shown review can invalidate the reused existence/fence reply. Reader
+/// discovery and whole-service plans have no such reply to repeat.
+pub(crate) fn refresh_import_after_review(
+    selection: &mut Option<BinaryImportSelection>,
+    changes: &EditorChangeSet,
+    bridge: &BridgeServer,
+) -> Result<()> {
+    if let Some(plan) = selection.as_mut()
+        && plan.first_generation.is_some()
+    {
+        plan.first_generation = Some(read_additive_generation(
+            changes,
+            bridge,
+            &mut plan.services,
+            &mut plan.additive_roots,
+        )?);
+        if plan.services.is_empty() {
+            *selection = None;
+        }
+    }
+    Ok(())
+}
+
 fn reader_fallback(
     windows: bool,
     disabled: bool,
     probe: impl FnOnce() -> Result<()>,
 ) -> Option<ServiceReaderFallback> {
+    #[cfg(test)]
+    if READER_AVAILABLE.get() {
+        return None;
+    }
     if !windows {
         return Some(ServiceReaderFallback::Platform);
     }
@@ -2355,6 +2423,7 @@ fn reader_fallback(
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static READER_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static SELECTION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static READER_PREFLIGHTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -2381,32 +2450,7 @@ pub(crate) fn select_editor_binary_import(
     // A root upsert is also used for edits to an existing instance. Its live
     // existence decides whether there is any binary import work at all.
     let first_generation = if only_additive {
-        let ids = additive_root_ids(changes, &additive_roots);
-        let mut first = editor_service_change_generations(
-            bridge,
-            &services.iter().cloned().collect::<Vec<_>>(),
-            Some(&additive_roots),
-            Some(&ids),
-        )
-        .map_err(|error| {
-            crate::app::output::log_global(
-                2,
-                format_args!(
-                    "[renium] Cannot check additive root existence; retry the sync: {error:#}"
-                ),
-            );
-            error.context("Cannot check additive root existence; retry the sync")
-        })?;
-        additive_roots.retain(|service, names| {
-            names.retain(|name| {
-                first
-                    .absent_roots
-                    .get(service)
-                    .is_some_and(|absent| absent.contains(name))
-            });
-            !names.is_empty()
-        });
-        services.retain(|service| additive_roots.contains_key(service));
+        let first = read_additive_generation(changes, bridge, &mut services, &mut additive_roots)?;
         if services.is_empty() {
             crate::app::output::log_global(
                 5,
@@ -2415,12 +2459,6 @@ pub(crate) fn select_editor_binary_import(
                 ),
             );
             return Ok(None);
-        }
-        first
-            .generations
-            .retain(|service, _| services.contains(service));
-        if let Some(packages) = &mut first.has_package_links {
-            packages.retain(|service, _| services.contains(service));
         }
         Some(first)
     } else {
@@ -2984,10 +3022,11 @@ fn additive_document_from_file(
     path: std::path::PathBuf,
     service: &str,
     roots: &HashSet<String>,
+    service_dir: &std::path::Path,
 ) -> Result<RbxPlaceDocument<'static>> {
     crate::settings::bytecode::property_edit::read_row_chunks_with(
         &path,
-        |mut document, columns| {
+        |mut document, mut columns| {
             #[cfg(test)]
             {
                 ADDITIVE_STORE_READS
@@ -3003,13 +3042,13 @@ fn additive_document_from_file(
                 for &index in &selected[1..] {
                     wanted[index] = true;
                 }
-                columns.project_references(&mut document, &wanted)?;
-                let independent = additive_references_stay_inside(&document, service, selected)?;
-                for &index in &selected[1..] {
-                    document.instances[index].properties.clear();
-                    document.instances[index].attributes.clear();
+                columns.materialize_references(&mut document, &wanted)?;
+                // Invalid selectors are application errors, not a concurrent
+                // file rewrite. Return them outside the decoder's retry.
+                match additive_references_stay_inside(&document, service, selected) {
+                    Ok(independent) => independent,
+                    Err(error) => return Ok(Err(error)),
                 }
-                independent
             } else {
                 false
             };
@@ -3021,8 +3060,15 @@ fn additive_document_from_file(
                     ),
                 );
                 wanted.fill(true);
+                if let Some(selected) = &selected {
+                    for &index in selected {
+                        document.instances[index].properties.clear();
+                        document.instances[index].attributes.clear();
+                    }
+                }
+                columns.rewind_references();
             }
-            // Either route decodes the values once, under the ordinary store-read retry.
+            // Completed reference columns already hold this subtree's full values.
             columns.materialize_selected(&mut document, &wanted)?;
             #[cfg(test)]
             {
@@ -3031,18 +3077,18 @@ fn additive_document_from_file(
                 counts.1 += wanted.iter().filter(|&&wanted| wanted).count();
                 counts.2 = !independent;
             }
-            Ok(if independent {
+            Ok(Ok(if independent {
                 independent_additive_document(
                     &document,
                     service,
                     selected.as_ref().unwrap(),
-                    path.parent().unwrap(),
+                    service_dir,
                 )
             } else {
                 RbxPlaceDocument::Owned(document)
-            })
+            }))
         },
-    )
+    )?
 }
 
 fn clear_import_engine_identities(dom: &mut RbxWeakDom) {
@@ -3199,7 +3245,12 @@ fn build_editor_binary_import_for_services(
                     if path.is_file() {
                         document_overrides.insert(
                             service.clone(),
-                            additive_document_from_file(path, service, roots)?,
+                            additive_document_from_file(
+                                path,
+                                service,
+                                roots,
+                                &src_root.join(service),
+                            )?,
                         );
                     }
                 }

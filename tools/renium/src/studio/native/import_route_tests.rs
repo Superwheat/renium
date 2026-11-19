@@ -148,7 +148,22 @@ fn check_scoped_additive_route(absent: bool, external: bool, prepared: bool) -> 
             part.properties[&"Transparency".into()],
             RbxVariant::Float32(0.375)
         );
-        if !external {
+        assert!(
+            !dom.descendants()
+                .any(|row| matches!(row.name.as_str(), "Unrelated" | "ExistingCamera"))
+        );
+        if external {
+            assert!(
+                import
+                    .post_apply_properties_by_path
+                    .get(&instance_path_parts_key(
+                        &[service.into(), "Incoming".into(), "Target".into()],
+                        &[1, 1, 1]
+                    ))
+                    .is_some_and(|names| names.contains("Value")),
+                "outside reference must be applied after import"
+            );
+        } else {
             let target = dom.descendants().find(|row| row.name == "Target").unwrap();
             assert_eq!(
                 target.properties[&"Value".into()],
@@ -177,6 +192,50 @@ fn absent_additive_root_materializes_its_subtree_with_internal_references() -> R
 #[test]
 fn additive_external_reference_keeps_the_complete_import_index() -> Result<()> {
     check_scoped_additive_route(true, true, false)
+}
+
+#[test]
+fn additive_invalid_reference_is_not_retried_as_a_store_decode() -> Result<()> {
+    let root = crate::tests::support::temp_dir("additive-invalid-reference");
+    let _cleanup = crate::system::files::OnDrop::new(|| {
+        let _ = std::fs::remove_dir_all(&root);
+    });
+    let service = "Workspace";
+    let dir = root.join(service);
+    std::fs::create_dir_all(&dir)?;
+    let path = service_settings_path(&dir);
+    let mut document = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![
+            SettingsBytecodeInstance::new("service".into(), service.into(), service.into(), None),
+            SettingsBytecodeInstance::new("new".into(), "New".into(), "Folder".into(), Some(0)),
+        ],
+    };
+    document.instances[1].properties.insert(
+        "Nested".into(),
+        json!([{"ref":{"_type":"Ref", "settingsId":""}}]),
+    );
+    document.write_file(&path)?;
+    let error =
+        additive_document_from_file(path.clone(), service, &HashSet::from(["New".into()]), &dir)
+            .err()
+            .context("invalid reference accepted")?;
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("Ref settingsId must be a non-empty string"),
+        "{message}"
+    );
+    assert!(!message.contains("Failed to decode"), "{message}");
+    assert_eq!(
+        ADDITIVE_STORE_READS
+            .lock()
+            .unwrap()
+            .remove(&path)
+            .unwrap()
+            .0,
+        1
+    );
+    Ok(())
 }
 
 #[test]
@@ -609,191 +668,230 @@ fn import_builder_returns_exact_original_rows_for_the_supplemental_pass() -> Res
     Ok(())
 }
 
+fn check_additive_source_layout(
+    root: &std::path::Path,
+    service: &str,
+    separated: bool,
+) -> Result<()> {
+    let project = root.join(if separated { "project" } else { "legacy" });
+    let src = project.join("src");
+    std::fs::create_dir_all(&src)?;
+    if separated {
+        std::fs::write(
+            project.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+        )?;
+        crate::project::config::try_load_project(None, Some(&project))?
+            .context("project not loaded")?;
+    }
+
+    let dir = src.join(service);
+    std::fs::create_dir_all(&dir)?;
+    let mut document = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![SettingsBytecodeInstance::new(
+            "service".into(),
+            service.into(),
+            service.into(),
+            None,
+        )],
+    };
+    let long = "a".repeat(100);
+    let pairs = [
+        ("map".into(), "Map".into()),
+        ("A:B".into(), "A_B".into()),
+        ("Map.".into(), "Map ".into()),
+        (format!("{long}1"), format!("{long}2")),
+    ];
+    let mut roots = HashSet::new();
+    for (pair, (old, new)) in pairs.into_iter().enumerate() {
+        roots.insert(new.clone());
+        for (side, name) in [("old", old), ("new", new)] {
+            let parent = document.instances.len();
+            let id = format!("{side}-{pair}");
+            document.instances.push(SettingsBytecodeInstance::new(
+                id.clone(),
+                name,
+                "Model".into(),
+                Some(0),
+            ));
+            for (child, class) in [("Main", "Script"), ("Same", "Part"), ("Same", "Part")] {
+                let mut row = SettingsBytecodeInstance::new(
+                    format!("{id}-{}", document.instances.len()),
+                    child.into(),
+                    class.into(),
+                    Some(parent),
+                );
+                if class == "Script" {
+                    row.properties.insert(
+                        "Source".into(),
+                        json!(crate::settings::EXTERNAL_SOURCE_MARKER),
+                    );
+                    row.properties.insert("RunContext".into(), json!({"_type":"EnumItem", "name":"Client", "enumType":"RunContext", "value":2}));
+                }
+                document.instances.push(row);
+            }
+            document.instances[parent].properties.insert(
+                "PrimaryPart".into(),
+                json!({"_type":"Ref", "instanceIndex":parent+4}),
+            );
+        }
+    }
+    let paths = crate::editor::paths::build_editor_source_paths_by_index(&document, service, &dir);
+    for (index, path) in paths.iter().enumerate() {
+        if let Some(path) = path {
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(path, format!("print({index})\n"))?;
+        }
+    }
+    assert!(
+        paths
+            .iter()
+            .flatten()
+            .any(|path| path.to_string_lossy().contains("Map_2"))
+    );
+    let path = service_settings_path(&dir);
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    assert_eq!(
+        path.parent() == Some(project.join("instances").as_path()),
+        separated
+    );
+    document.write_file(&path)?;
+    // Compare against the decoded store: the codec normalizes reference selectors.
+    let document = SettingsBytecode::read_file(&path)?;
+    let selected = additive_subtree(&document, service, &roots).unwrap();
+    assert!(additive_references_stay_inside(
+        &document, service, &selected
+    )?);
+    let mut expected = None;
+    for input in [
+        RbxPlaceDocument::Borrowed(&document),
+        independent_additive_document(&document, service, &selected, &dir),
+        additive_document_from_file(path.clone(), service, &roots, &dir)?,
+    ] {
+        let mut build = build_rbx_place_with_documents(
+            &src,
+            vec![service.into()],
+            HashMap::from([(service.into(), input)]),
+            true,
+            true,
+            false,
+        )?;
+        for (&referent, id) in &build.settings_ids_by_ref {
+            let instance = build.dom.get_by_ref(referent).unwrap();
+            if instance.class.as_str() == "Script" {
+                let original = document
+                    .instances
+                    .iter()
+                    .position(|row| row.settings_id == *id)
+                    .unwrap();
+                assert_eq!(
+                    instance.properties[&"Source".into()],
+                    RbxVariant::String(format!("print({original})\n"))
+                );
+            }
+        }
+        let mut groups = pending_editor_binary_groups(&build.dom, &build.service_roots)?;
+        groups.retain(|group| group.target_path.len() == 1);
+        for group in &mut groups {
+            group.additive = true;
+            group.viewport_camera = None;
+            group
+                .roots
+                .retain(|root| build.settings_ids_by_ref[root].starts_with("new-"));
+            group.root_settings_ids = group
+                .roots
+                .iter()
+                .map(|root| build.settings_ids_by_ref[root].clone())
+                .collect();
+        }
+        let plans = groups
+            .iter()
+            .map(|_| EditorPackageGroupPlan {
+                retained_roots: vec![],
+                package_roots: vec![],
+                mutation_package_roots: vec![],
+                change_generation: Some(7),
+            })
+            .collect();
+        clear_import_engine_identities(&mut build.dom);
+        let (bytes, groups, _) = payload::encode_services(
+            &mut build.dom,
+            &build.service_roots,
+            &build.settings_ids_by_ref,
+            groups,
+            plans,
+            &mut HashMap::new(),
+        )?;
+        let actual = (bytes, serde_json::to_value(groups)?);
+        assert_eq!(&actual, expected.get_or_insert_with(|| actual.clone()));
+    }
+    assert_eq!(
+        ADDITIVE_STORE_READS.lock().unwrap().remove(&path).unwrap(),
+        (1, selected.len() - 1, false)
+    );
+    check_additive_legacy_fallbacks(&document, service, &roots, &path, &dir)?;
+    Ok(())
+}
+
+fn check_additive_legacy_fallbacks(
+    document: &SettingsBytecode,
+    service: &str,
+    roots: &HashSet<String>,
+    path: &std::path::Path,
+    dir: &std::path::Path,
+) -> Result<()> {
+    // Ambiguous legacy selectors must use the complete decoded store once.
+    for duplicate in [false, true] {
+        let mut ambiguous = (*document).clone();
+        if duplicate {
+            ambiguous.instances[1].settings_id = ambiguous.instances[5].settings_id.clone();
+        } else {
+            ambiguous.instances[1].name = "old\0separator".into();
+        }
+        // Structural ambiguity remains even when the reference uses an index.
+        let reference = json!({"_type":"Ref", "instanceIndex":8});
+        ambiguous.instances[5]
+            .properties
+            .insert("PrimaryPart".into(), reference);
+        let selected = additive_subtree(&ambiguous, service, roots).unwrap();
+        assert!(!additive_references_stay_inside(
+            &ambiguous, service, &selected
+        )?);
+        if duplicate {
+            // Duplicate IDs can reach a prepared document, but the store codec refuses them.
+            assert!(
+                ambiguous
+                    .write_file(path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("duplicate settings id")
+            );
+        } else {
+            ambiguous.write_file(path)?;
+            assert!(matches!(
+                additive_document_from_file(path.to_path_buf(), service, roots, dir)?,
+                RbxPlaceDocument::Owned(_)
+            ));
+            assert_eq!(
+                ADDITIVE_STORE_READS.lock().unwrap().remove(path).unwrap(),
+                (1, ambiguous.instances.len(), true)
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[test]
 fn additive_subtree_payload_matches_the_whole_store_with_colliding_script_folders() -> Result<()> {
     let root = crate::tests::support::temp_dir("additive-source-oracle");
     let _cleanup = crate::system::files::OnDrop::new(|| {
         let _ = std::fs::remove_dir_all(&root);
     });
-    for service in ["Workspace", "ServerStorage"] {
-        let dir = root.join(service);
-        std::fs::create_dir_all(&dir)?;
-        let mut document = SettingsBytecode {
-            version: SETTINGS_BINARY_VERSION,
-            instances: vec![SettingsBytecodeInstance::new(
-                "service".into(),
-                service.into(),
-                service.into(),
-                None,
-            )],
-        };
-        let long = "a".repeat(100);
-        let pairs = [
-            ("map".into(), "Map".into()),
-            ("A:B".into(), "A_B".into()),
-            ("Map.".into(), "Map ".into()),
-            (format!("{long}1"), format!("{long}2")),
-        ];
-        let mut roots = HashSet::new();
-        for (pair, (old, new)) in pairs.into_iter().enumerate() {
-            roots.insert(new.clone());
-            for (side, name) in [("old", old), ("new", new)] {
-                let parent = document.instances.len();
-                let id = format!("{side}-{pair}");
-                document.instances.push(SettingsBytecodeInstance::new(
-                    id.clone(),
-                    name,
-                    "Model".into(),
-                    Some(0),
-                ));
-                for (child, class) in [("Main", "Script"), ("Same", "Part"), ("Same", "Part")] {
-                    let mut row = SettingsBytecodeInstance::new(
-                        format!("{id}-{}", document.instances.len()),
-                        child.into(),
-                        class.into(),
-                        Some(parent),
-                    );
-                    if class == "Script" {
-                        row.properties.insert(
-                            "Source".into(),
-                            json!(crate::settings::EXTERNAL_SOURCE_MARKER),
-                        );
-                        row.properties.insert("RunContext".into(), json!({"_type":"EnumItem", "name":"Client", "enumType":"RunContext", "value":2}));
-                    }
-                    document.instances.push(row);
-                }
-                document.instances[parent].properties.insert(
-                    "PrimaryPart".into(),
-                    json!({"_type":"Ref", "instanceIndex":parent+4}),
-                );
-            }
-        }
-        let paths =
-            crate::editor::paths::build_editor_source_paths_by_index(&document, service, &dir);
-        for (index, path) in paths.iter().enumerate() {
-            if let Some(path) = path {
-                std::fs::create_dir_all(path.parent().unwrap())?;
-                std::fs::write(path, format!("print({index})\n"))?;
-            }
-        }
-        assert!(
-            paths
-                .iter()
-                .flatten()
-                .any(|path| path.to_string_lossy().contains("Map_2"))
-        );
-        let path = service_settings_path(&dir);
-        document.write_file(&path)?;
-        // Compare against the decoded store: the codec normalizes reference selectors.
-        let document = SettingsBytecode::read_file(&path)?;
-        let selected = additive_subtree(&document, service, &roots).unwrap();
-        assert!(additive_references_stay_inside(
-            &document, service, &selected
-        )?);
-        let mut expected = None;
-        for input in [
-            RbxPlaceDocument::Borrowed(&document),
-            independent_additive_document(&document, service, &selected, &dir),
-            additive_document_from_file(path.clone(), service, &roots)?,
-        ] {
-            let mut build = build_rbx_place_with_documents(
-                &root,
-                vec![service.into()],
-                HashMap::from([(service.into(), input)]),
-                true,
-                true,
-                false,
-            )?;
-            for (&referent, id) in &build.settings_ids_by_ref {
-                let instance = build.dom.get_by_ref(referent).unwrap();
-                if instance.class.as_str() == "Script" {
-                    let original = document
-                        .instances
-                        .iter()
-                        .position(|row| row.settings_id == *id)
-                        .unwrap();
-                    assert_eq!(
-                        instance.properties[&"Source".into()],
-                        RbxVariant::String(format!("print({original})\n"))
-                    );
-                }
-            }
-            let mut groups = pending_editor_binary_groups(&build.dom, &build.service_roots)?;
-            groups.retain(|group| group.target_path.len() == 1);
-            for group in &mut groups {
-                group.additive = true;
-                group.viewport_camera = None;
-                group
-                    .roots
-                    .retain(|root| build.settings_ids_by_ref[root].starts_with("new-"));
-                group.root_settings_ids = group
-                    .roots
-                    .iter()
-                    .map(|root| build.settings_ids_by_ref[root].clone())
-                    .collect();
-            }
-            let plans = groups
-                .iter()
-                .map(|_| EditorPackageGroupPlan {
-                    retained_roots: vec![],
-                    package_roots: vec![],
-                    mutation_package_roots: vec![],
-                    change_generation: Some(7),
-                })
-                .collect();
-            clear_import_engine_identities(&mut build.dom);
-            let (bytes, groups, _) = payload::encode_services(
-                &mut build.dom,
-                &build.service_roots,
-                &build.settings_ids_by_ref,
-                groups,
-                plans,
-                &mut HashMap::new(),
-            )?;
-            let actual = (bytes, serde_json::to_value(groups)?);
-            assert_eq!(&actual, expected.get_or_insert_with(|| actual.clone()));
-        }
-        assert_eq!(
-            ADDITIVE_STORE_READS.lock().unwrap().remove(&path).unwrap(),
-            (1, selected.len() - 1, false)
-        );
-        // Ambiguous legacy selectors must use the complete decoded store once.
-        for duplicate in [false, true] {
-            let mut ambiguous = document.clone();
-            if duplicate {
-                ambiguous.instances[1].settings_id = ambiguous.instances[5].settings_id.clone();
-            } else {
-                ambiguous.instances[1].name = "old\0separator".into();
-            }
-            // Structural ambiguity remains even when the reference uses an index.
-            let reference = json!({"_type":"Ref", "instanceIndex":8});
-            ambiguous.instances[5]
-                .properties
-                .insert("PrimaryPart".into(), reference);
-            let selected = additive_subtree(&ambiguous, service, &roots).unwrap();
-            assert!(!additive_references_stay_inside(
-                &ambiguous, service, &selected
-            )?);
-            if duplicate {
-                // Duplicate IDs can reach a prepared document, but the store codec refuses them.
-                assert!(
-                    ambiguous
-                        .write_file(&path)
-                        .unwrap_err()
-                        .to_string()
-                        .contains("duplicate settings id")
-                );
-            } else {
-                ambiguous.write_file(&path)?;
-                assert!(matches!(
-                    additive_document_from_file(path.clone(), service, &roots)?,
-                    RbxPlaceDocument::Owned(_)
-                ));
-                assert_eq!(
-                    ADDITIVE_STORE_READS.lock().unwrap().remove(&path).unwrap(),
-                    (1, ambiguous.instances.len(), true)
-                );
-            }
+    for separated in [false, true] {
+        for service in ["Workspace", "ServerStorage"] {
+            check_additive_source_layout(&root, service, separated)?;
         }
     }
     Ok(())

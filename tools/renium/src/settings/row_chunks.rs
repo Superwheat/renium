@@ -68,6 +68,49 @@ fn consumed_columns_release_their_bytes_without_resetting_deltas() -> Result<()>
     columns.finish()
 }
 
+#[test]
+fn selected_reference_columns_are_not_decoded_again() -> Result<()> {
+    let mut document = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: (0..3)
+            .map(|i| {
+                SettingsBytecodeInstance::new(
+                    i.to_string(),
+                    i.to_string(),
+                    "Folder".into(),
+                    (i > 0).then_some(0),
+                )
+            })
+            .collect(),
+    };
+    for (index, row) in document.instances.iter_mut().enumerate() {
+        row.properties.insert(
+            "Nested".into(),
+            json!({"values":[index, {"_type":"Ref", "instanceIndex":2}]}),
+        );
+        row.properties.insert("Scalar".into(), json!(index));
+        row.attributes
+            .insert("Text".into(), json!(format!("row {index}")));
+    }
+    let bytes = encode_settings_bytecode(&document)?;
+    let expected = decode_settings_bytecode_holding(&bytes)?;
+    let (mut actual, mut columns) = decode_for_row_chunks(&bytes)?;
+    columns.materialize_references(&mut actual, &[false, true, false])?;
+    let mut completed = 0;
+    for (group, cursor) in columns.groups.iter_mut().zip(&columns.cursors) {
+        if cursor.value == group.count {
+            completed += 1;
+            // The values are already retained. A second decode must fail.
+            group.bytes.fill(255);
+        }
+    }
+    assert!(completed > 0);
+    columns.materialize_selected(&mut actual, &[false, true, false])?;
+    assert_eq!(actual.instances[1], expected.instances[1]);
+    assert!(actual.instances[0].properties.is_empty() && actual.instances[2].properties.is_empty());
+    Ok(())
+}
+
 #[derive(Default)]
 struct GroupCursor {
     byte: usize,
@@ -135,6 +178,7 @@ pub(crate) struct RetainedRowColumns {
     file_bytes: usize,
     instance_count: usize,
     next_row: usize,
+    reference_budget: Option<(usize, Vec<bool>)>,
 }
 
 /// Read structure and retain the encoded value columns. The normal decoder's
@@ -183,6 +227,7 @@ pub(crate) fn decode_for_row_chunks(
             file_bytes: bytes.len(),
             instance_count,
             next_row: 0,
+            reference_budget: None,
         },
     ))
 }
@@ -195,6 +240,10 @@ impl RetainedRowColumns {
         document: &mut SettingsBytecode,
         rows: Range<usize>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            self.reference_budget.is_none(),
+            "Selected reference columns require the same selected rows; restart the store read"
+        );
         anyhow::ensure!(
             document.instances.len() == self.instance_count,
             "Store structure changed during row decoding; restart the store read"
@@ -308,98 +357,70 @@ impl RetainedRowColumns {
         Ok(())
     }
 
-    /// Read only columns that can carry references. Include their other kinds
-    /// too, so a later scalar group still replaces an earlier reference.
-    /// Main cursors remain untouched for the chosen full or selected decode.
-    pub(crate) fn project_references(
-        &self,
+    /// Decode reference-capable columns once, retaining the selected rows' full
+    /// values for the following materialize_selected call. Include every group
+    /// with the same property name so last-group-wins remains unchanged.
+    pub(crate) fn materialize_references(
+        &mut self,
         document: &mut SettingsBytecode,
         wanted: &[bool],
     ) -> Result<()> {
-        fn references(value: Value, found: &mut Vec<Value>) {
-            if ref_payload_object(&value).is_some() {
-                found.push(value);
-                return;
-            }
-            match value {
-                Value::Array(values) => {
-                    for value in values {
-                        references(value, found);
-                    }
-                }
-                Value::Object(values) => {
-                    for value in values.into_values() {
-                        references(value, found);
-                    }
-                }
-                _ => {}
-            }
-        }
         anyhow::ensure!(
             wanted.len() == self.instance_count
                 && document.instances.len() == self.instance_count
-                && self.next_row == 0,
-            "Reference projection requires the original store structure; restart the store read"
+                && self.next_row == 0
+                && self.reference_budget.is_none(),
+            "Reference selection requires unread store columns; restart the store read"
         );
-        // These are the store codec's array, object and reference tags, not engine types.
+        self.reference_budget = Some((
+            self.budget.remaining.load(Ordering::Relaxed),
+            wanted.to_vec(),
+        ));
+        // Store codec tags, not an engine class or property list.
         let names = self
             .groups
             .iter()
             .filter(|group| matches!(group.kind, 7 | 8 | 10 | 17))
             .map(|group| &group.name)
             .collect::<std::collections::HashSet<_>>();
-        let budget = DecodeBudget::for_file(self.file_bytes).holding_payloads();
         let scope = ValueScope {
             strings: &self.strings,
             instance_count: self.instance_count,
-            budget: &budget,
+            budget: &self.budget,
         };
         let groups = self
             .groups
-            .iter()
-            .filter(|group| names.contains(&group.name))
-            .collect::<Vec<_>>();
-        let values = groups
-            .iter()
-            .map(|group| {
-                budget.property_group(group.count, &group.name, group.kind)?;
+            .par_iter()
+            .zip(self.cursors.par_iter_mut())
+            .map(|(group, cursor)| {
                 let mut entries = Vec::new();
-                GroupCursor::beginning(group).visit_until(
-                    group,
-                    self.instance_count,
-                    scope,
-                    |entry| {
-                        if !wanted[entry.instance_index()] {
-                            return Ok(());
+                if names.contains(&group.name) {
+                    cursor.visit_until(group, self.instance_count, scope, |entry| {
+                        if wanted[entry.instance_index()] {
+                            entries.push(entry);
                         }
-                        entries.push(match entry {
-                            DecodedGroupEntry::Property(index, value) => {
-                                let mut found = Vec::new();
-                                references(value, &mut found);
-                                DecodedGroupEntry::Property(index, Value::Array(found))
-                            }
-                            DecodedGroupEntry::Attributes(index, values) => {
-                                let mut projected = Map::new();
-                                for (name, value) in values {
-                                    let mut found = Vec::new();
-                                    references(value, &mut found);
-                                    projected.insert(name, Value::Array(found));
-                                }
-                                DecodedGroupEntry::Attributes(index, projected)
-                            }
-                        });
                         Ok(())
-                    },
-                )?;
+                    })?;
+                }
                 Ok(entries)
             })
             .collect::<Result<Vec<_>>>()?;
-        let specs = groups
+        let specs = self
+            .groups
             .iter()
-            .map(|group| (&group.name, group.kind, group.count, group.bytes.as_slice()))
+            .map(|g| (&g.name, g.kind, g.count, g.bytes.as_slice()))
             .collect::<Vec<_>>();
-        apply_decoded_property_groups(&mut document.instances, &specs, values);
+        apply_decoded_property_groups(&mut document.instances, &specs, groups);
         Ok(())
+    }
+
+    /// The full-document fallback also needs unselected rows of these columns.
+    /// Rewind only their decoding accounting; structural validation stays paid.
+    pub(crate) fn rewind_references(&mut self) {
+        if let Some((budget, _)) = self.reference_budget.take() {
+            self.budget.remaining.store(budget, Ordering::Relaxed);
+            self.cursors = self.groups.iter().map(GroupCursor::beginning).collect();
+        }
     }
 
     /// Gives the rows marked in `wanted` their maps, all in one pass over the
@@ -414,7 +435,11 @@ impl RetainedRowColumns {
         anyhow::ensure!(
             document.instances.len() == self.instance_count
                 && wanted.len() == self.instance_count
-                && self.next_row == 0,
+                && self.next_row == 0
+                && self
+                    .reference_budget
+                    .as_ref()
+                    .is_none_or(|(_, rows)| rows == wanted),
             "Store rows are selected from a store nothing was read of; restart the store read"
         );
         let scope = ValueScope {

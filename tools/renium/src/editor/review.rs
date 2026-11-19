@@ -1086,16 +1086,18 @@ pub(crate) fn request_editor_push_review(
     report: bool,
 ) -> Result<EditorReviewOutcome> {
     request_editor_push_review_payload(bridge, editor_review_payload(changes), project_root, report)
+        .map(|(outcome, _)| outcome)
 }
 
+/// Return the decision and whether Studio required an interactive review.
 pub(crate) fn request_editor_push_review_payload(
     bridge: &BridgeServer,
     (change_count, rows): (u64, Vec<Value>),
     project_root: Option<&Path>,
     report: bool,
-) -> Result<EditorReviewOutcome> {
+) -> Result<(EditorReviewOutcome, bool)> {
     if change_count == 0 {
-        return Ok(EditorReviewOutcome::Proceed);
+        return Ok((EditorReviewOutcome::Proceed, false));
     }
     let row_count = rows.len();
     let changes_threshold = configured_changes_threshold(project_root);
@@ -1170,23 +1172,28 @@ pub(crate) fn request_editor_push_review_payload(
     };
     if let Some((digest, more_rows)) = digest {
         if response.get("required").and_then(Value::as_bool) != Some(true) {
-            return Ok(EditorReviewOutcome::Proceed);
+            return Ok((EditorReviewOutcome::Proceed, false));
         }
-        return Ok(EditorReviewOutcome::Held(held_editor_summary(
-            change_count,
-            digest,
-            more_rows,
-            &response,
-        )));
+        return Ok((
+            EditorReviewOutcome::Held(held_editor_summary(
+                change_count,
+                digest,
+                more_rows,
+                &response,
+            )),
+            false,
+        ));
     }
+    let shown = response.get("required").and_then(Value::as_bool) == Some(true);
     notify_editor_review_hold(&response, "editor push", change_count);
-    Ok(
+    Ok((
         if wait_for_editor_review_decision(bridge, response, change_count, "editor push")? {
             EditorReviewOutcome::Proceed
         } else {
             EditorReviewOutcome::Skipped
         },
-    )
+        shown,
+    ))
 }
 
 pub(crate) fn snapshot_replacement_runtime<'a>(

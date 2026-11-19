@@ -4072,24 +4072,23 @@ fn push_with_reader_platform(
         )
     });
     let review_payload_present = review_payload.is_some();
-    let reviews_run = std::cell::Cell::new(0);
+    let reviews_shown = std::cell::Cell::new(0);
     let mut review = |report| -> Result<Option<Map<String, Value>>> {
         let Some((payload, skipped)) = review_payload.take() else {
             return Ok(None);
         };
-        reviews_run.set(reviews_run.get() + 1);
-        Ok(
-            match request_editor_push_review_payload(
-                bridge,
-                payload,
-                Some(review_project_root(&args)),
-                report,
-            )? {
-                EditorReviewOutcome::Proceed => None,
-                EditorReviewOutcome::Skipped => Some(skipped),
-                EditorReviewOutcome::Held(held) => Some(held),
-            },
-        )
+        let (outcome, shown) = request_editor_push_review_payload(
+            bridge,
+            payload,
+            Some(review_project_root(&args)),
+            report,
+        )?;
+        reviews_shown.set(reviews_shown.get() + usize::from(shown));
+        Ok(match outcome {
+            EditorReviewOutcome::Proceed => None,
+            EditorReviewOutcome::Skipped => Some(skipped),
+            EditorReviewOutcome::Held(held) => Some(held),
+        })
     };
     // A review can return immediately when its outcome cannot depend on the reader.
     if (args.slow_import
@@ -4105,7 +4104,7 @@ fn push_with_reader_platform(
     } else {
         None
     };
-    let selected_after_review = reviews_run.get();
+    let selected_after_review = reviews_shown.get();
     let fallback = prepared_binary_import
         .as_ref()
         .and_then(|import| import.fallback_reason.as_ref())
@@ -4119,9 +4118,12 @@ fn push_with_reader_platform(
     {
         return Ok(summary);
     }
-    if prepared_binary_import.is_none() && reviews_run.get() != selected_after_review {
-        // A review can stay open while Studio changes. Recheck existence and its fence.
-        selection = select_editor_binary_import(&args, &changes, bridge)?;
+    if prepared_binary_import.is_none() && reviews_shown.get() != selected_after_review {
+        crate::studio::native::import::refresh_import_after_review(
+            &mut selection,
+            &changes,
+            bridge,
+        )?;
     }
     let mut binary_import = if prepared_binary_import.is_some() {
         prepared_binary_import
@@ -9367,98 +9369,131 @@ mod saved_field_review_tests {
     }
 
     #[test]
-    fn additive_existence_is_read_again_after_the_review() {
-        let root = project_with_threshold_zero("additive-review-generation");
-        let bridge = fixture();
-        let stream = connect(&bridge, 0, edit_info("additive-review", 21));
-        let plugin = thread::spawn(move || {
-            let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
-            let mut reviewed = false;
-            let mut generations = 0;
-            while let Ok(Message::Text(text)) = socket.read() {
-                let request: Value = serde_json::from_str(&text).unwrap();
-                let result = match request["method"].as_str().unwrap() {
-                    "getEditorMutationPackages" => json!({"packages":[]}),
-                    "requestEditorPushReview" => json!({"required":true,"reviewId":"changing"}),
-                    "getEditorPushReviewDecision" => {
-                        reviewed = true;
-                        json!({"decided":true,"decision":"apply"})
-                    }
-                    "getEditorServiceChangeGenerations" => {
-                        generations += 1;
-                        assert_eq!(reviewed, generations == 2);
-                        if reviewed {
-                            // Stop at the new read, before any build or mutation.
-                            socket.send(Message::Text(json!({"id":request["id"],"ok":false,"error":"fresh generation unavailable"}).to_string().into())).unwrap();
-                            continue;
+    fn only_a_shown_review_refreshes_a_reused_additive_reply() {
+        use crate::studio::native::import::{READER_AVAILABLE, SELECTION_CALLS};
+        READER_AVAILABLE.set(true);
+        let _reader = crate::system::files::OnDrop::new(|| READER_AVAILABLE.set(false));
+        for (whole, shown) in [(false, false), (false, true), (true, true)] {
+            let selections = SELECTION_CALLS.get();
+            let root = project_with_threshold_zero("additive-review-generation");
+            crate::project::config::try_load_project(None, Some(&root)).unwrap();
+            let store = service_settings_path(&root.join("src/Workspace"));
+            fs::create_dir_all(store.parent().unwrap()).unwrap();
+            // Stop the unchanged-reply case at decoding, before any mutation.
+            fs::write(&store, b"invalid store fixture").unwrap();
+            let bridge = fixture();
+            let stream = connect(&bridge, 0, edit_info("additive-review", 21));
+            let plugin = thread::spawn(move || {
+                let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
+                let mut reviewed = false;
+                let mut generations = 0;
+                while let Ok(Message::Text(text)) = socket.read() {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    let result = match request["method"].as_str().unwrap() {
+                        "getEditorMutationPackages" => json!({"packages":[]}),
+                        "requestEditorPushReview" => {
+                            json!({"required":shown,"reviewId":"changing"})
                         }
-                        json!({"generations":{"Workspace":7},"hasPackageLinks":{"Workspace":false},"absentRoots":{"Workspace":[]}})
-                    }
-                    other => panic!("unexpected request before a fresh existence reply: {other}"),
-                };
-                socket
-                    .send(Message::Text(
-                        json!({"id":request["id"],"ok":true,"result":result})
-                            .to_string()
-                            .into(),
-                    ))
-                    .unwrap();
-            }
-            assert_eq!(generations, 2);
-        });
-        let args = PushEditorChangesArgs::new(
-            ProjectSourceArgs {
-                project_root: root.clone(),
-                src_root: "src".into(),
-            },
-            BridgeConnectionArgs::local(0.1),
-        );
-        let changes = EditorChangeSet {
-            instance_changes: vec![EditorInstanceChange {
-                service: "Workspace".into(),
-                mode: "upsertInstances".into(),
-                allow_deletes: false,
-                instances: vec![EditorInstanceDescriptor {
-                    settings_id: "new".into(),
-                    class_name: "Model".into(),
-                    path_segments: vec!["Workspace".into(), "New".into()],
-                    path_ordinals: vec![1, 1],
-                    ..Default::default()
-                }],
-                preserve_instances: vec![],
-            }],
-            property_changes: vec![
-                EditorPropertyChange {
+                        "getEditorPushReviewDecision" => {
+                            reviewed = true;
+                            json!({"decided":true,"decision":"apply"})
+                        }
+                        "getEditorServiceChangeGenerations" => {
+                            generations += 1;
+                            assert_eq!(reviewed, whole || generations == 2);
+                            if reviewed {
+                                // Stop at the new read, before any build or mutation.
+                                socket.send(Message::Text(json!({"id":request["id"],"ok":false,"error":"fresh generation unavailable"}).to_string().into())).unwrap();
+                                continue;
+                            }
+                            json!({"generations":{"Workspace":7},"hasPackageLinks":{"Workspace":false},"absentRoots":{"Workspace":["New"]}})
+                        }
+                        other => {
+                            panic!("unexpected request before a fresh existence reply: {other}")
+                        }
+                    };
+                    socket
+                        .send(Message::Text(
+                            json!({"id":request["id"],"ok":true,"result":result})
+                                .to_string()
+                                .into(),
+                        ))
+                        .unwrap();
+                }
+                assert_eq!(generations, if shown && !whole { 2 } else { 1 });
+            });
+            let args = PushEditorChangesArgs::new(
+                ProjectSourceArgs {
+                    project_root: root.clone(),
+                    src_root: "src".into(),
+                },
+                BridgeConnectionArgs::local(0.1),
+            );
+            let changes = EditorChangeSet {
+                instance_changes: vec![EditorInstanceChange {
                     service: "Workspace".into(),
-                    class_name: "SurfaceAppearance".into(),
-                    path_segments: vec!["Workspace".into(), "New".into()],
-                    properties: Map::from_iter([("TexturePack".into(), json!("uri"))]),
-                    ..Default::default()
-                };
-                MAX_INDIVIDUAL_IMPORT_WRITES + 1
-            ],
-            ..Default::default()
-        };
-        let result = push_with_reader_platform(
-            args,
-            &bridge,
-            changes,
-            CollectedPushOptions {
-                started: Instant::now(),
-                projection: None,
-                prepared_binary_import: None,
-                guard: None,
-                validate_project: None,
-                finalize_settings: None,
-            },
-            |_| panic!("unexpected preparation"),
-            PLACE_FILE,
-            true,
-        );
-        assert!(format!("{:#}", result.unwrap_err()).contains("fresh generation unavailable"));
-        drop(bridge);
-        plugin.join().unwrap();
-        fs::remove_dir_all(root).unwrap();
+                    mode: if whole {
+                        "reconcileService"
+                    } else {
+                        "upsertInstances"
+                    }
+                    .into(),
+                    allow_deletes: whole,
+                    instances: vec![EditorInstanceDescriptor {
+                        settings_id: "new".into(),
+                        class_name: "Model".into(),
+                        path_segments: vec!["Workspace".into(), "New".into()],
+                        path_ordinals: vec![1, 1],
+                        ..Default::default()
+                    }],
+                    preserve_instances: vec![],
+                }],
+                property_changes: vec![
+                    EditorPropertyChange {
+                        service: "Workspace".into(),
+                        class_name: "SurfaceAppearance".into(),
+                        path_segments: vec!["Workspace".into(), "New".into()],
+                        properties: Map::from_iter([("TexturePack".into(), json!("uri"))]),
+                        ..Default::default()
+                    };
+                    MAX_INDIVIDUAL_IMPORT_WRITES + 1
+                ],
+                ..Default::default()
+            };
+            let result = push_with_reader_platform(
+                args,
+                &bridge,
+                changes,
+                CollectedPushOptions {
+                    started: Instant::now(),
+                    projection: None,
+                    prepared_binary_import: None,
+                    guard: None,
+                    validate_project: None,
+                    finalize_settings: None,
+                },
+                |_| panic!("unexpected preparation"),
+                PLACE_FILE,
+                true,
+            );
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.contains(if shown && !whole {
+                    "fresh generation unavailable"
+                } else {
+                    "Failed to decode"
+                }),
+                "{error}"
+            );
+            assert_eq!(
+                SELECTION_CALLS.get(),
+                selections + 1,
+                "reader selection must not repeat"
+            );
+            drop(bridge);
+            plugin.join().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
