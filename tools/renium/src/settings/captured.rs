@@ -94,9 +94,22 @@ fn whole<T>(why: &str) -> Result<Option<T>> {
 /// encoders share (`read_gate`).
 pub(super) const GATED_STORE_BYTES: usize = 1 << 20;
 
-/// The most changed instances a pull compares one by one, each held whole on
-/// both sides while it is compared; past that it aligns the whole documents.
-const MAX_CHANGED_ROWS: usize = 65_536;
+/// The changed instances a pull holds whole on both sides at one time while
+/// it compares them one by one: what each pair says is kept, and the pair
+/// is dropped before the next ones are read.
+const COMPARED_AT_ONCE: usize = if cfg!(test) { 3 } else { 4_096 };
+
+/// What a changed instance and the stored one at its place say of each
+/// other.
+struct ComparedPair {
+    /// The two stand under one name, class and parent.
+    placed: bool,
+    /// The stored one is written as documents are today.
+    written_as_today: bool,
+    same_unique_id: bool,
+    /// One of the two holds a reference.
+    holds_reference: bool,
+}
 
 pub(super) fn changed_values(
     state: &ServiceState,
@@ -119,9 +132,6 @@ pub(super) fn changed_values(
             return whole("an instance stands elsewhere than the pull remembers");
         }
         if before.values != now.values {
-            if changed.len() == MAX_CHANGED_ROWS {
-                return whole("more instances changed than are compared one by one");
-            }
             changed.push(index);
         }
     }
@@ -240,12 +250,6 @@ pub(super) fn changed_document_rows(
         } else {
             renamed |= stored_rows.unique_ids[stored_index] != *unique_id;
         }
-    }
-    if changed.len() > MAX_CHANGED_ROWS {
-        return whole(&format!(
-            "{} instances differ, more than are compared one by one",
-            changed.len()
-        ));
     }
     let stored = StoredRows {
         file: stored,
@@ -633,28 +637,30 @@ fn changed_rows<'a>(
     if camera.is_none() {
         rows.extend(now.viewport_camera);
     }
-    let (mut stored_rows, ids) = match &mut read {
-        Some(read) if rows.is_empty() => (Vec::new(), std::mem::take(&mut read.ids)),
-        _ => {
-            let Some(stored_at) = rows
-                .iter()
-                .map(|row| moved.map_or(Some(*row), |moved| moved.in_store(*row)))
-                .collect::<Option<Vec<_>>>()
-            else {
-                return whole("a changed instance is none the store holds");
-            };
-            decode_rows(file, &stored_at)?
-        }
+    let Some(stored_at) = rows
+        .iter()
+        .map(|row| moved.map_or(Some(*row), |moved| moved.in_store(*row)))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return whole("a changed instance is none the store holds");
     };
-    if let Some(moved) = moved {
-        for stored in &mut stored_rows {
-            moved.in_state_whole(stored);
+    let stored_batch = |stored_at: &[usize]| {
+        let (mut stored_rows, ids) = decode_rows(file, stored_at)?;
+        if let Some(moved) = moved {
+            for stored in &mut stored_rows {
+                moved.in_state_whole(stored);
+            }
         }
-    }
-    if let (Some(camera), Some(row)) = (camera, now.viewport_camera) {
-        rows.push(row);
-        stored_rows.push(camera);
-    }
+        anyhow::Ok((stored_rows, ids))
+    };
+    let mut batches = rows
+        .chunks(COMPARED_AT_ONCE)
+        .zip(stored_at.chunks(COMPARED_AT_ONCE));
+    let first = batches.next();
+    let (first_stored, ids) = match (&mut read, first) {
+        (Some(read), None) => (Vec::new(), std::mem::take(&mut read.ids)),
+        (_, first) => stored_batch(first.map_or(&[], |(_, stored_at)| stored_at))?,
+    };
     // A pull leaves each instance the id its store holds it under.
     let written_ids = moved.map(|moved| moved.written_ids(&places.ids, &ids));
     let written_ids = written_ids.as_ref().unwrap_or(&ids);
@@ -672,49 +678,87 @@ fn changed_rows<'a>(
         string_ids: &SettingsStringIdMap::default(),
         wire_bytes: None,
     };
-    let captured_rows = rows
-        .par_iter()
-        .map(|row| convert_chunk(state, std::slice::from_ref(&records[*row]), scope))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    let root_service = lookup.root_service.as_deref();
+    let holds_a_reference = |instance: &SettingsBytecodeInstance| {
+        instance
+            .properties
+            .values()
+            .chain(instance.attributes.values())
+            .any(holds_reference)
+    };
+    // What each pair says, the camera's last where the state has one, and
+    // for each changed instance whether its values are the stored ones as a
+    // pull counts them.
+    let mut pairs = Vec::with_capacity(rows.len() + 1);
+    let mut compared = Vec::with_capacity(changed.len());
+    let mut last = None;
+    let mut compare = |rows: &[usize], mut stored_rows: Vec<SettingsBytecodeInstance>| {
+        let mut captured_rows = rows
+            .par_iter()
+            .map(|row| convert_chunk(state, std::slice::from_ref(&records[*row]), scope))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let unchanged = changed.len().saturating_sub(compared.len());
+        let (said, values): (Vec<_>, Vec<_>) = stored_rows
+            .par_iter()
+            .zip(captured_rows.par_iter())
+            .enumerate()
+            .map(|(index, (stored, captured))| {
+                let pair = ComparedPair {
+                    placed: stored.name == captured.name
+                        && stored.class_name == captured.class_name
+                        && stored.parent_index == captured.parent_index,
+                    written_as_today: !crate::settings::equivalence::forced_property_differs(
+                        &stored.properties,
+                    ) && values_encode_alike(
+                        &stored.properties,
+                        &stored.attributes,
+                        root_service,
+                    ),
+                    same_unique_id: stored.properties.get(UNIQUE_ID)
+                        == captured.properties.get(UNIQUE_ID),
+                    holds_reference: holds_a_reference(stored) || holds_a_reference(captured),
+                };
+                let values = (index < unchanged)
+                    .then(|| pulled_instance_values_unchanged(stored, captured, root_service));
+                (pair, values)
+            })
+            .unzip();
+        pairs.extend(said);
+        compared.extend(values.into_iter().flatten());
+        last = stored_rows.pop().zip(captured_rows.pop());
+        anyhow::Ok(())
+    };
+    compare(first.map_or(&[], |(rows, _)| rows), first_stored)?;
+    for (rows, stored_at) in batches {
+        compare(rows, stored_batch(stored_at)?.0)?;
+    }
+    if let (Some(camera), Some(row)) = (camera, now.viewport_camera) {
+        compare(&[row], vec![camera])?;
+    }
+    // The camera's pair alone is held past its comparison.
+    let camera_pair = last.filter(|_| now.viewport_camera.is_some());
     // Each pair is one instance in one place: an instance under another
     // name, class or parent is matched by the alignment.
-    if stored_rows
-        .iter()
-        .zip(&captured_rows)
-        .any(|(stored, captured)| {
-            stored.name != captured.name
-                || stored.class_name != captured.class_name
-                || stored.parent_index != captured.parent_index
-        })
-    {
+    if pairs.iter().any(|pair| !pair.placed) {
         return whole("an instance stands under another name, class or parent than the stored one");
     }
     // A stored camera whose enum items can gain their types makes the answer
     // follow the captured camera, which no digest covers.
-    if now.viewport_camera.is_some() && stored_rows.last().is_some_and(instance_lacks_enum_types) {
+    if camera_pair
+        .as_ref()
+        .is_some_and(|(stored, _)| instance_lacks_enum_types(stored))
+    {
         return whole("the stored viewport camera holds an enum item without its type");
     }
     // A stored instance the encoder of documents would write another way
     // (an older store's) is compared and kept by the alignment.
-    let root_service = lookup.root_service.as_deref();
-    if stored_rows.iter().any(|stored| {
-        crate::settings::equivalence::forced_property_differs(&stored.properties)
-            || !values_encode_alike(&stored.properties, &stored.attributes, root_service)
-    }) {
+    if pairs.iter().any(|pair| !pair.written_as_today) {
         return whole("a stored instance is written another way than documents are today");
     }
-    // What each changed instance says: whether its values are the stored
-    // ones as a pull counts them, and whether its UniqueId is.
-    let pairs = || stored_rows.iter().zip(&captured_rows).take(changed.len());
-    let compared = stored_rows
-        .par_iter()
-        .zip(captured_rows.par_iter())
-        .take(changed.len())
-        .map(|(stored, captured)| pulled_instance_values_unchanged(stored, captured, root_service))
-        .collect::<Result<Vec<_>>>()?;
+    let compared = compared.into_iter().collect::<Result<Vec<_>>>()?;
     let mut same_values = Vec::with_capacity(changed.len());
     let mut same_under_todays_names = true;
     for compared in compared {
@@ -726,19 +770,13 @@ fn changed_rows<'a>(
             None => return whole("an enum item of a changed instance gains its type"),
         }
     }
+    let changed_pairs = || pairs.iter().take(changed.len());
     let renamed = read.as_ref().is_some_and(|read| read.renamed)
-        || pairs().any(|(stored, captured)| {
-            stored.properties.get(UNIQUE_ID) != captured.properties.get(UNIQUE_ID)
-        });
+        || changed_pairs().any(|pair| !pair.same_unique_id);
     let stored_at = |index: usize| moved.map_or(Some(index), |moved| moved.in_store(index));
-    let camera_holds_a_reference = now.viewport_camera.is_some()
-        && stored_rows.last().is_some_and(|stored| {
-            stored
-                .properties
-                .values()
-                .chain(stored.attributes.values())
-                .any(holds_reference)
-        });
+    let camera_holds_a_reference = camera_pair
+        .as_ref()
+        .is_some_and(|(stored, _)| holds_a_reference(stored));
     let kept = if moved.is_some() {
         // A state with one run of instances more or less than the store: the
         // alignment takes every instance beside the run for the stored one
@@ -748,14 +786,14 @@ fn changed_rows<'a>(
         // Nothing may say an instance is another stored one, and the stored
         // camera goes back as the store holds it, which a reference by
         // position does not survive.
-        let camera_alike = match (stored_rows.last(), captured_rows.last()) {
-            (Some(stored), Some(captured)) if now.viewport_camera.is_some() => {
+        let camera_alike = match &camera_pair {
+            Some((stored, captured)) => {
                 match pulled_instance_values_unchanged(stored, captured, root_service)? {
                     Some((as_held, _)) => as_held,
                     None => return whole("an enum item of the viewport camera gains its type"),
                 }
             }
-            _ => true,
+            None => true,
         };
         !camera_holds_a_reference
             && read.as_ref().is_some_and(|read| {
@@ -776,19 +814,12 @@ fn changed_rows<'a>(
         let stand_as_stored = read.as_ref().is_some_and(|read| {
             places.stored_identities_stand(&ids, read, stored_at)
                 && namesakes(&records).is_some_and(|namesakes| {
-                    pairs().zip(changed).zip(&same_values).all(
-                        |(((stored, captured), row), same)| {
-                            *same
-                                || !namesakes[*row]
-                                    && ![stored, captured].iter().any(|instance| {
-                                        instance
-                                            .properties
-                                            .values()
-                                            .chain(instance.attributes.values())
-                                            .any(holds_reference)
-                                    })
-                        },
-                    )
+                    changed_pairs()
+                        .zip(changed)
+                        .zip(&same_values)
+                        .all(|((pair, row), same)| {
+                            *same || !namesakes[*row] && !pair.holds_reference
+                        })
                 })
         });
         stand_as_stored || !renamed && places.kept_under_other_ids(&ids)
@@ -806,7 +837,7 @@ fn changed_rows<'a>(
         .is_none_or(|camera| places.ids[camera] == written_ids[camera]);
     if !camera_by_id
         && camera_holds_a_reference
-        && let (Some(stored), Some(captured)) = (stored_rows.last(), captured_rows.last())
+        && let Some((stored, captured)) = &camera_pair
         && (stored.properties != captured.properties || stored.attributes != captured.attributes)
     {
         return whole("the stored viewport camera holds a reference and differs");
@@ -831,18 +862,13 @@ fn changed_rows<'a>(
     }
     // A pull keeps the stored viewport camera whatever the captured one says.
     let kept_camera_index = now.viewport_camera.filter(|_| {
-        stored_rows
-            .last()
-            .zip(captured_rows.last())
-            .is_some_and(|(stored, captured)| {
-                stored.properties != captured.properties || stored.attributes != captured.attributes
-            })
+        camera_pair.as_ref().is_some_and(|(stored, captured)| {
+            stored.properties != captured.properties || stored.attributes != captured.attributes
+        })
     });
-    let kept_camera = kept_camera_index.zip(stored_rows.pop());
     // Comparison is finished. Only the old camera can participate in the
-    // encoding; do not retain decoded changed rows beside the output columns.
-    drop(stored_rows);
-    drop(captured_rows);
+    // encoding.
+    let kept_camera = kept_camera_index.zip(camera_pair.map(|(stored, _)| stored));
     drop(read);
     let kept_camera = kept_camera.as_ref().map(|(camera, stored)| ReplacedRow {
         source_index: *camera,
