@@ -3192,7 +3192,7 @@ fn prepare_import_groups(
             .iter_mut()
             .find(|group| group.service == *service)
         else {
-            return Ok(Vec::new());
+            continue;
         };
         group.additive = true;
         group.viewport_camera = None;
@@ -3200,8 +3200,9 @@ fn prepare_import_groups(
             .get(service)
             .into_iter()
             .flat_map(|ids| ids.iter())
-            .flat_map(|(name, ids)| ids.iter().map(move |id| (name, id)))
-            .collect::<HashSet<_>>();
+            .flat_map(|(name, ids)| ids.iter().map(move |id| (name, id)));
+        let requested_count = ids.clone().count();
+        let ids = ids.collect::<HashSet<_>>();
         (group.roots, group.root_settings_ids) = std::mem::take(&mut group.roots)
             .into_iter()
             .filter_map(|root| {
@@ -3211,8 +3212,9 @@ fn prepare_import_groups(
                     .then(|| (root, id.clone()))
             })
             .unzip();
-        if group.roots.len() != ids.len() || ids.is_empty() {
-            return Ok(Vec::new());
+        if group.roots.len() != requested_count {
+            group.roots.clear();
+            group.root_settings_ids.clear();
         }
     }
     Ok(pending_groups)

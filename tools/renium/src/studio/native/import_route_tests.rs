@@ -323,7 +323,21 @@ fn preflight_peer(
             let req: Value = serde_json::from_str(&text).unwrap();
             let result = match req["method"].as_str().unwrap() {
                 "getEditorServiceChangeGenerations" => {
-                    json!({"generations":{(service):0},"hasPackageLinks":{(service):package},"absentRoots":{(service):["Clouds","Terrain"]}})
+                    let services = req["params"]["services"].as_array().unwrap();
+                    let generations = services
+                        .iter()
+                        .map(|name| (name.as_str().unwrap().to_string(), json!(0)))
+                        .collect::<Map<_, _>>();
+                    let packages = services
+                        .iter()
+                        .map(|name| {
+                            (
+                                name.as_str().unwrap().to_string(),
+                                json!(package && name == service),
+                            )
+                        })
+                        .collect::<Map<_, _>>();
+                    json!({"generations":generations,"hasPackageLinks":packages,"absentRoots":{(service):["Clouds","Terrain"]}})
                 }
                 "beginEditorBinaryExport" => {
                     json!({"groups":[{"service":service,"targetPath":[service],"count":1,"instanceCount":3,"classNames":["Folder","PackageLink"],"identityCarrierClass":"Folder","identityCarrierPrefix":"Identity","identityCarrierSlots":["A","B"],"identityCarrierCount":1}],"propertySchemaByClass":{"Folder":[["Archivable",1]]}})
@@ -455,24 +469,70 @@ fn import_builder_preserves_reader_routes_packages_and_additive_identity() -> Re
                 additive_root_ids(&changes, &selected.additive_roots)[service]["Clouds"],
                 ["twin", "new"]
             );
-            let mut missing = EditorChangeSet {
-                instance_changes: changes.instance_changes.clone(),
-                native_property_documents: changes.native_property_documents.clone(),
-                ..Default::default()
+            let check_uncertain = |duplicate, whole_service| -> Result<()> {
+                let mut uncertain_document = document.clone();
+                let mut uncertain = EditorChangeSet {
+                    instance_changes: changes.instance_changes.clone(),
+                    ..Default::default()
+                };
+                let id = if duplicate { "twin" } else { "missing" };
+                uncertain.instance_changes[2].instances[1].settings_id = id.into();
+                if duplicate {
+                    // Two new same-named roots really carry the same ID in the store.
+                    uncertain_document.instances[3].settings_id = id.into();
+                }
+                uncertain.native_property_documents.insert(
+                    service.into(),
+                    std::sync::Arc::new(uncertain_document.clone()),
+                );
+                let replacement_service = "ReplicatedStorage";
+                let mut replacement = document.clone();
+                replacement.instances[0].name = replacement_service.into();
+                replacement.instances[0].class_name = replacement_service.into();
+                let mut inputs = HashMap::from([(
+                    service.into(),
+                    RbxPlaceDocument::Borrowed(&uncertain_document),
+                )]);
+                if whole_service {
+                    uncertain.instance_changes.push(EditorInstanceChange {
+                        service: replacement_service.into(),
+                        mode: "reconcileService".into(),
+                        allow_deletes: true,
+                        instances: vec![],
+                        preserve_instances: vec![],
+                    });
+                    uncertain.native_property_documents.insert(
+                        replacement_service.into(),
+                        std::sync::Arc::new(replacement.clone()),
+                    );
+                    inputs.insert(
+                        replacement_service.into(),
+                        RbxPlaceDocument::Borrowed(&replacement),
+                    );
+                }
+                let selection = select_editor_binary_import(&args, &uncertain, &bridge)?.unwrap();
+                let import = build_editor_binary_import_with_documents(
+                    &args, &uncertain, &bridge, selection, inputs,
+                )?;
+                if whole_service {
+                    let import = import
+                        .context("uncertain additive roots discarded the whole-service import")?;
+                    assert_eq!(import.groups.len(), 1);
+                    assert_eq!(import.groups[0].service, replacement_service);
+                    assert!(!import.groups[0].additive && !import.bytes.is_empty());
+                } else {
+                    assert!(
+                        import.is_none(),
+                        "uncertain identities must take the ordinary route (duplicate={duplicate})"
+                    );
+                }
+                Ok(())
             };
-            missing.instance_changes[2].instances[1].settings_id = "missing".into();
-            let missing_selection = select_editor_binary_import(&args, &missing, &bridge)?.unwrap();
-            assert!(
-                build_editor_binary_import_with_documents(
-                    &args,
-                    &missing,
-                    &bridge,
-                    missing_selection,
-                    HashMap::from([(service.into(), RbxPlaceDocument::Borrowed(&document))]),
-                )?
-                .is_none(),
-                "unknown identity must take the ordinary route"
-            );
+            for (duplicate, whole_service) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                check_uncertain(duplicate, whole_service)?;
+            }
         }
         let import = build_editor_binary_import_with_documents(
             &args,
