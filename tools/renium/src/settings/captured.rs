@@ -86,6 +86,10 @@ fn whole<T>(why: &str) -> Result<Option<T>> {
     Ok(None)
 }
 
+/// A stored file of this size or more is read for its digests under the gate
+/// that store encoders share.
+const GATED_STORE_BYTES: usize = if cfg!(test) { 1 } else { 1 << 20 };
+
 /// The most changed instances a pull compares one by one, each held whole on
 /// both sides while it is compared; past that it aligns the whole documents.
 const MAX_CHANGED_ROWS: usize = 65_536;
@@ -166,6 +170,15 @@ pub(super) fn changed_document_rows(
     if !comparable_by_instance(state, now) {
         return whole("the state is written another way than its document");
     }
+    // Reading a large store whole for its digests takes as much memory as
+    // writing one, so two such stores are not read side by side: the most a
+    // pull holds is then that of its largest store, however its services'
+    // work happens to overlap.
+    let reading = (stored.len() >= GATED_STORE_BYTES)
+        .then(|| store_gate.map(LockRecover::lock_recover))
+        .flatten();
+    // The store this comparison writes is built under the gate it holds.
+    let store_gate = if reading.is_some() { None } else { store_gate };
     let records = collect_service_settings_binary_instances(state);
     // What the state alone can say comes before the two documents are read.
     if !written_where_they_stand(&records, now) {

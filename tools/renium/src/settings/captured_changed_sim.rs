@@ -916,6 +916,40 @@ fn namesakes_that_traded_their_values_take_the_whole_alignment() {
     assert_eq!(stored_ids(&written), before);
 }
 
+/// A large store is read for its digests under the gate that store encoders
+/// share. While another store's work holds the gate the comparison waits,
+/// also one that goes on to write nothing; and a comparison that writes its
+/// store builds it under the gate it took for the read.
+#[test]
+fn a_store_read_for_its_digests_waits_for_the_gate() {
+    let file =
+        encode_service_settings_binary(&captured(&twins(1, true, [0.25, 0.75]), false)).unwrap();
+    let gate = std::sync::Mutex::new(());
+    // Namesakes that traded their values: the comparison reads both copies
+    // and leaves the store to the whole alignment.
+    let state = captured(&twins(2, true, [0.75, 0.25]), false);
+    let now = pulled_digest_from_service_state(&state).unwrap();
+    let held = gate.lock().unwrap();
+    std::thread::scope(|scope| {
+        let compared =
+            scope.spawn(|| pull_changed_document_rows(&state, &now.rows, &file, Some(&gate)));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !compared.is_finished(),
+            "a store was read beside the work that held the gate"
+        );
+        drop(held);
+        assert!(compared.join().unwrap().unwrap().is_none());
+    });
+    let state = captured(&twins(2, true, [0.25, 0.75]), false);
+    let now = pulled_digest_from_service_state(&state).unwrap();
+    let (answer, _) = pull_changed_document_rows(&state, &now.rows, &file, Some(&gate))
+        .unwrap()
+        .expect("instances that hold the stored values are compared at their places");
+    assert!(matches!(answer, SettingsAlignment::Changed(_)));
+    assert!(gate.try_lock().is_ok());
+}
+
 /// What stands under same-named siblings is told apart no better than they
 /// are: where two such parts hold each other's values in a place Studio
 /// opened again, the alignment takes each sibling, with what stands under
