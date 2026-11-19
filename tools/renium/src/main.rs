@@ -107,8 +107,29 @@ fn take_allocator_pages_as_they_fill() {
     unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PAGE_COMMIT_ON_DEMAND, 1) };
 }
 
+/// The most threads the shared worker pool gets. Every worker keeps freed
+/// memory of its own, so on a machine of 32 threads a push of one property
+/// held 1.65 GB where it holds 1.3 GB on twelve, in the same time: past a
+/// dozen, the work of a pull or a push waits on Studio and on single stores,
+/// not on a free core. `RAYON_NUM_THREADS` sets another number.
+const MAX_WORKER_THREADS: usize = 12;
+
+fn bound_worker_threads() {
+    if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+        return;
+    }
+    let threads = std::thread::available_parallelism().map_or(MAX_WORKER_THREADS, |threads| {
+        threads.get().min(MAX_WORKER_THREADS)
+    });
+    // A pool that something built already keeps its size.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global();
+}
+
 fn main() -> ExitCode {
     take_allocator_pages_as_they_fill();
+    bound_worker_threads();
     let started = std::time::Instant::now();
     let code = main_result();
     let discarding = app::profile::span("free discarded data");
