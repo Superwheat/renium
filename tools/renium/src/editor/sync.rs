@@ -789,7 +789,7 @@ impl<'a> EditorTransaction<'a> {
                 }
             }
         }
-        let has_instance_changes = !changes.instance_changes.is_empty();
+        let has_instance_changes = changes_instances(&changes.instance_changes);
         let destructive_services = changes
             .instance_changes
             .iter()
@@ -2048,6 +2048,36 @@ where
             finalize_settings: Some(&mut finalize_settings),
         },
     )
+}
+
+/// Whether a change set creates, moves or removes an instance. An upsert
+/// entry that only anchors a lookup does none of that, so values pushed to
+/// instances in place need no structural rollback snapshot of the branches
+/// that hold them. The values they held are then read by path before the
+/// anchors are resolved, which finds the same instances only where each
+/// anchor stands in Studio at the place the files give it.
+fn changes_instances(changes: &[super::types::EditorInstanceChange]) -> bool {
+    let in_place = |instance: &super::types::EditorInstanceDescriptor| {
+        let ordinal = |ordinals: &[usize], at: usize| ordinals.get(at).copied().unwrap_or(1);
+        // An identity of Studio's capture names its instance whatever the
+        // order of its namesakes is by now.
+        instance.anchor_only
+            && instance.previous_settings_id.is_none()
+            && if instance.previous_path_segments.is_empty() {
+                !instance.ambiguous_siblings
+            } else {
+                instance.previous_path_segments == instance.path_segments
+                    && (0..instance.path_segments.len()).all(|at| {
+                        ordinal(&instance.previous_path_ordinals, at)
+                            == ordinal(&instance.path_ordinals, at)
+                    })
+            }
+    };
+    changes.iter().any(|change| {
+        change.mode != "upsertInstances"
+            || change.allow_deletes
+            || !change.instances.iter().all(in_place)
+    })
 }
 
 pub(crate) fn native_editor_full_push_eligible(args: &PushEditorChangesArgs) -> Result<bool> {
@@ -7599,6 +7629,48 @@ mod sync_tests {
         assert!(!instances[1].anchor_only);
         assert_eq!(instances[2].settings_id, "Untouched");
         assert!(instances[2].anchor_only);
+    }
+
+    #[test]
+    fn only_anchors_at_their_studio_place_spare_the_structural_snapshot() {
+        let anchor = || crate::editor::types::EditorInstanceDescriptor {
+            path_segments: vec!["Workspace".into(), "Rail".into()],
+            path_ordinals: vec![1, 2],
+            previous_path_segments: vec!["Workspace".into(), "Rail".into()],
+            previous_path_ordinals: vec![1, 2],
+            anchor_only: true,
+            ..Default::default()
+        };
+        let upsert = |instance: crate::editor::types::EditorInstanceDescriptor| {
+            vec![crate::editor::types::EditorInstanceChange {
+                mode: "upsertInstances".into(),
+                service: "Workspace".into(),
+                allow_deletes: false,
+                instances: vec![anchor(), instance],
+                preserve_instances: Vec::new(),
+            }]
+        };
+        assert!(!changes_instances(&upsert(anchor())));
+        // Studio lists the namesakes in another order: the value read by
+        // path before the push would be another instance's.
+        let mut reordered = anchor();
+        reordered.previous_path_ordinals = vec![1, 1];
+        assert!(changes_instances(&upsert(reordered)));
+        let mut created = anchor();
+        created.anchor_only = false;
+        assert!(changes_instances(&upsert(created)));
+        let mut unplaced = anchor();
+        unplaced.previous_path_segments.clear();
+        unplaced.previous_path_ordinals.clear();
+        assert!(!changes_instances(&upsert(unplaced.clone())));
+        unplaced.ambiguous_siblings = true;
+        assert!(changes_instances(&upsert(unplaced)));
+        let mut identified = anchor();
+        identified.previous_settings_id = Some("debug:0_1".into());
+        assert!(changes_instances(&upsert(identified)));
+        let mut removal = upsert(anchor());
+        removal[0].mode = "deleteInstances".into();
+        assert!(changes_instances(&removal));
     }
 
     use crate::cli::BridgeConnectionArgs;
