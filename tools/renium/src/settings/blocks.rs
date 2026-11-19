@@ -29,9 +29,15 @@
 //! carries zstd's checksum of its content and its length. A frame is read and
 //! copied only where its bytes match their digest, so a damaged frame fails a
 //! read and an edit alike, and a pool entry is read only where its text
-//! matches its hash. The counts are not checked against the blocks, which
-//! only a crafted file could make wrong. A reference to an instance is its
-//! index in the store, as in v11.
+//! matches its hash. A reference to an instance is its index in the store,
+//! as in v11.
+//!
+//! Left as they are, since only a crafted file or text makes them matter:
+//! the counts are not checked against the blocks; a text an edit brings whose
+//! hash a pool entry it reads as a marker already has keeps that entry's
+//! text; and a file that forges the writer's tag has its frames copied as
+//! they stand. A zstd update changes the tag even where it gives the same
+//! bytes, so the first write after one is whole.
 //!
 //! Every store is written in this version, and a document has one file: each
 //! block's bytes come from its own rows, and the pool from the strings the
@@ -1536,9 +1542,10 @@ impl<'a> BlockStore<'a> {
             .filter(|(name, ..)| names(name))
             .collect::<Vec<_>>();
         // A marker is no payload: a store that holds payloads holds them once
-        // the markers of the rows read have their texts.
-        let start = self.budget.remaining.load(Ordering::Relaxed);
-        let marked = (!all).then(|| DecodeBudget::new(start));
+        // the markers of the rows read have their texts. The decode charges
+        // the store's own budget as it goes, so blocks read in parallel
+        // together take no more than it holds.
+        let marked = (!all).then(|| self.budget.not_holding());
         let scope = ValueScope {
             strings: &strings,
             instance_count: self.rows,
@@ -1566,10 +1573,6 @@ impl<'a> BlockStore<'a> {
             groups,
             SETTINGS_BINARY_PARALLEL_CHUNK_SIZE,
         );
-        if let Some(marked) = marked {
-            self.budget
-                .take(start - marked.remaining.load(Ordering::Relaxed))?;
-        }
         if all {
             return Ok(());
         }

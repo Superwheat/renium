@@ -92,12 +92,15 @@ fn edit_store(
     columns.encode(&document)
 }
 
-/// The edit that renames a record, which an edit of values may.
+/// The edit that gives a record another name or id, which an edit of values
+/// may.
 const RECORD_EDIT: usize = 7;
 /// The edit that swaps two rows, which an edit of values refuses.
 const REORDER: usize = 8;
 /// The step that adds or takes out rows, which only a whole write may.
 const ROWS: usize = 9;
+/// The edit that gives a record another parent, which an edit of values may.
+const MOVE: usize = 10;
 
 /// Texts for the pool, but the first, a byte too short for it; one of them
 /// a frame of its own, and enough that many buckets hold several.
@@ -125,7 +128,11 @@ fn long_texts(seed: u64) -> Vec<String> {
 fn document(seed: u64, texts: &[String]) -> SettingsBytecode {
     let mut rng = SimRng(seed ^ 0xb10c);
     let mut document = captured_input(seed);
-    for instance in &mut document.instances {
+    let names = (document.instances.iter())
+        .map(|instance| instance.name.clone())
+        .collect::<Vec<_>>();
+    let root = (document.instances.iter()).position(|instance| instance.parent_index.is_none());
+    for (index, instance) in document.instances.iter_mut().enumerate() {
         let choice = rng.below(8);
         let mut text = || texts[rng.below(texts.len())].clone();
         match choice {
@@ -155,6 +162,10 @@ fn document(seed: u64, texts: &[String]) -> SettingsBytecode {
                 let gone = format!("gone-{}", instance.settings_id.len() % 4);
                 let gone = json!({"_type": "Ref", "settingsId": gone});
                 instance.properties.insert("Dangling".into(), gone);
+                let far = &names[(index + names.len() / 2) % names.len()];
+                let path = json!([names[root.unwrap_or(0)], far]);
+                let lost = json!({"_type": "Ref", "pathSegments": path, "pathOrdinals": [1, 1]});
+                instance.properties.insert("Lost".into(), lost);
             }
             _ => {}
         }
@@ -366,7 +377,9 @@ fn step(
         RECORD_EDIT,
         REORDER,
         ROWS,
-    ][rng.below(12)];
+        MOVE,
+        MOVE,
+    ][rng.below(14)];
     let (by_blocks, changed, rows) = if kind == ROWS || count == 0 {
         let changed = rows_moved(whole, block_rows, texts, rng);
         (over(&changed), changed, Vec::new())
@@ -378,13 +391,22 @@ fn step(
             RECORD_EDIT => new_ids(whole, &mut rows, rng),
             _ => HashMap::new(),
         };
+        let lost = (kind == MOVE).then(|| lost_row(whole)).flatten();
+        if let Some((row, _)) = lost {
+            rows = vec![row];
+        }
         let target = whole.instances[rng.below(count)].settings_id.clone();
         let seed = rng.next();
         let change = |edit: &mut SimRng, instance: &mut SettingsBytecodeInstance| match ids
             .get(&instance.settings_id)
         {
             Some(id) => instance.settings_id.clone_from(id),
-            None => edited(kind, edit, texts, &target, count, instance),
+            None => match lost {
+                Some((row, root)) if whole.instances[row].settings_id == instance.settings_id => {
+                    instance.parent_index = Some(root);
+                }
+                _ => edited(kind, edit, texts, &target, count, instance),
+            },
         };
         let mut edit = SimRng(seed);
         let by_blocks = edit_store(file, &rows, |row| change(&mut edit, row), kind == REORDER);
@@ -483,6 +505,29 @@ fn new_ids(
         (1 | 2, _, Some(dangling)) => HashMap::from([(id, dangling.to_string())]),
         _ => HashMap::from([(id.clone(), format!("{id}~"))]),
     }
+}
+
+/// A row that a reference names by a path under the first root and that
+/// stands elsewhere, and that root: moved under it, the row makes the blocks
+/// of that reference, which finds nothing there, come out otherwise.
+fn lost_row(whole: &SettingsBytecode) -> Option<(usize, usize)> {
+    let root = (whole.instances.iter()).position(|instance| instance.parent_index.is_none())?;
+    let named = (whole.instances.iter())
+        .filter_map(|held| {
+            held.properties
+                .get("Lost")?
+                .get("pathSegments")?
+                .get(1)?
+                .as_str()
+        })
+        .collect::<HashSet<_>>();
+    let row = (0..whole.instances.len()).find(|row| {
+        let instance = &whole.instances[*row];
+        *row != root
+            && instance.parent_index != Some(root)
+            && named.contains(instance.name.as_str())
+    })?;
+    Some((row, root))
 }
 
 /// `file` as another writer writes it: under another revision, every frame
@@ -732,6 +777,33 @@ fn claiming(decoded: usize) -> Section<'static> {
         digest: digest(&[&bytes]),
         bytes: Cow::Owned(bytes),
     }
+}
+
+/// Blocks read in parallel charge the store's one budget as they decode, so
+/// together they take no more than it holds: a block's values are charged
+/// before its read goes on, and a read the budget cannot pay is refused.
+#[test]
+fn block_reads_charge_the_store_budget_as_they_decode() {
+    let text = "b".repeat(POOL_MIN_BYTES - 1);
+    let bytes = in_blocks(&in_rows(256, |_| Some(text.clone())), 32).unwrap();
+    let store = BlockStore::open(&bytes).unwrap().holding();
+    let left = || store.budget.remaining.load(Ordering::Relaxed);
+    store.budget.remaining.store(1 << 30, Ordering::Relaxed);
+    let most = AtomicUsize::new(0);
+    let keep = |_| {
+        most.fetch_max(left(), Ordering::Relaxed);
+        true
+    };
+    store
+        .block_values(1, keep, Texts::Resolved(&|_| true))
+        .unwrap();
+    assert!(most.into_inner() <= (1 << 30) - 32 * text.len());
+    store
+        .budget
+        .remaining
+        .store(((1 << 30) - left()) * 3 / 2, Ordering::Relaxed);
+    let error = (store.rows(&(0..store.rows).collect::<Vec<_>>()).map(drop)).unwrap_err();
+    assert!(format!("{error:#}").contains("more memory than a file of its size may take"));
 }
 
 /// A head with a valid digest may still claim anything: frames whose content

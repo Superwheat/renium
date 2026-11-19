@@ -1102,9 +1102,9 @@ impl ValueScope<'_> {
 }
 
 /// The memory a document may still decode into, shared by the parts that
-/// decode in parallel.
+/// decode in parallel and by every view of it.
 struct DecodeBudget {
-    remaining: AtomicUsize,
+    remaining: Arc<AtomicUsize>,
     /// Whether the document holds each payload of some size once, by its
     /// handle (see `settings::held`).
     holds_payloads: bool,
@@ -1113,7 +1113,7 @@ struct DecodeBudget {
 impl DecodeBudget {
     fn new(bytes: usize) -> Self {
         Self {
-            remaining: AtomicUsize::new(bytes),
+            remaining: Arc::new(AtomicUsize::new(bytes)),
             holds_payloads: false,
         }
     }
@@ -1121,6 +1121,14 @@ impl DecodeBudget {
     fn holding_payloads(mut self) -> Self {
         self.holds_payloads = true;
         self
+    }
+
+    /// This budget, charged as it is, for a decode that holds no payloads.
+    fn not_holding(&self) -> Self {
+        Self {
+            remaining: Arc::clone(&self.remaining),
+            holds_payloads: false,
+        }
     }
 
     /// A property's value as its document holds it.
@@ -1142,7 +1150,7 @@ impl DecodeBudget {
     /// Gives back all a reader of a file of `file_bytes` bytes may take, for
     /// a pass that reads again what an earlier pass of the reader read.
     fn renew(&self, file_bytes: usize) {
-        let fresh = Self::for_file(file_bytes).remaining.into_inner();
+        let fresh = Self::for_file(file_bytes).remaining.load(Ordering::Relaxed);
         self.remaining.store(fresh, Ordering::Relaxed);
     }
 
