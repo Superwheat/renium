@@ -6878,7 +6878,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 				local service = game:GetService(serviceName)
 				local rootIds = if type(params.rootIds) == "table" then params.rootIds[serviceName] else nil
-				local lookup = if type(rootIds) == "table" then settingsIdLookupForService(serviceName, ctx) else nil
+				-- Built for the first root no name finds: it walks the whole service.
+				local lookup = nil
 				local absent = {}
 				for _, name in ipairs(names) do
 					if type(name) ~= "string" then
@@ -6890,10 +6891,18 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					-- is reused once its earlier instance was deleted.
 					if not present and type(rootIds) == "table" and type(rootIds[name]) == "table" then
 						for _, settingsId in ipairs(rootIds[name]) do
-							if matchedSettingsInstance(serviceName, settingsId, ctx) ~= nil
-								or (lookup ~= nil and liveInstance(lookup[tostring(settingsId)]) ~= nil) then
+							if matchedSettingsInstance(serviceName, settingsId, ctx) ~= nil then
 								present = true
 								break
+							end
+						end
+						if not present then
+							lookup = lookup or settingsIdLookupForService(serviceName, ctx)
+							for _, settingsId in ipairs(rootIds[name]) do
+								if liveInstance(lookup[tostring(settingsId)]) ~= nil then
+									present = true
+									break
+								end
 							end
 						end
 					end
