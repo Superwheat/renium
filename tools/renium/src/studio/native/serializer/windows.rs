@@ -624,15 +624,6 @@ impl<'a> PeImage<'a> {
         }
         bail!("Studio call site has no x64 unwind function boundary")
     }
-
-    fn rip_target(&self, offset: usize, instruction_size: usize) -> Result<usize> {
-        let displacement = read_i32(self.bytes, offset + 3)? as isize;
-        let source = self.offset_to_rva(offset + instruction_size)? as isize;
-        let target = source
-            .checked_add(displacement)
-            .context("Studio RIP target overflowed")?;
-        usize::try_from(target).context("Studio RIP target was negative")
-    }
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {

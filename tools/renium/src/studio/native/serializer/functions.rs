@@ -62,6 +62,19 @@ pub(super) fn input(class: &str, name: &str, arguments: &[Value]) -> Result<Func
     Ok(FunctionInput { mode, bytes })
 }
 
+// Internal-only allowlist: DataModel.GetFastFlag for this one package notice.
+// The public `input` entry point above continues to reject DataModel calls.
+#[cfg(windows)]
+pub(super) fn package_flag_input() -> FunctionInput {
+    let flag = b"RemovePackageModificationPopupDialog";
+    let mode = 4u32;
+    let mut bytes = vec![0; 56];
+    bytes[20..24].copy_from_slice(&mode.to_le_bytes());
+    bytes[44..48].copy_from_slice(&(flag.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(flag);
+    FunctionInput { mode, bytes }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +96,14 @@ mod tests {
 
     #[test]
     fn function_arguments_preserve_types_and_restrict_authenticated_destinations() {
+        assert!(
+            input(
+                "DataModel",
+                "GetFastFlag",
+                &[json!("RemovePackageModificationPopupDialog")]
+            )
+            .is_err()
+        );
         for url in [
             "https://roblox.com.evil.test/x",
             "http://apis.roblox.com/x",

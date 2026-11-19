@@ -8,7 +8,7 @@ struct Binding {
     code: Vec<(usize, Vec<u8>)>,
 }
 
-type BindingKey = ([u32; 3], usize, bool);
+type BindingKey = ([u32; 3], usize, bool, Option<usize>);
 static BINDINGS: OnceLock<Mutex<HashMap<BindingKey, Binding>>> = OnceLock::new();
 
 #[path = "windows_functions_yield.rs"]
@@ -28,6 +28,7 @@ enum Value {
     Pointer(Storage, i64),
     Bytes(Storage, i64, usize),
     Instance,
+    InstanceInput(i64),
     Lua,
     Adjustment(i64),
     AdjustedInstance(i64),
@@ -54,6 +55,8 @@ struct State {
     registers: HashMap<Register, Value>,
     stack: BTreeMap<i64, (usize, Value)>,
     lua_callback: bool,
+    zero: Option<bool>,
+    complete_receiver: bool,
 }
 
 impl State {
@@ -122,6 +125,9 @@ impl State {
     }
     fn merge(&mut self, other: &Self) -> bool {
         let before = self.clone();
+        if self.zero != other.zero {
+            self.zero = None;
+        }
         self.registers
             .retain(|key, value| other.registers.get(key) == Some(value));
         self.stack
@@ -149,7 +155,9 @@ impl State {
                 }
             }
         }
-        values.contains(&Value::Instance)
+        values
+            .iter()
+            .any(|v| matches!(v, Value::Instance | Value::InstanceInput(_)))
             && values.iter().any(|value| {
                 matches!(
                     value,
@@ -254,6 +262,34 @@ impl State {
         }
     }
 
+    fn nonnull_test(&self, i: &Instruction) -> bool {
+        self.complete_receiver
+            && i.op0_kind() == OpKind::Register
+            && i.op1_kind() == OpKind::Register
+            && i.op0_register() == i.op1_register()
+            && i.op0_register().size() == 8
+            && matches!(
+                self.register(i.op0_register()),
+                Some(Value::Instance | Value::InstanceInput(_))
+            )
+    }
+
+    fn lea_value(&self, i: &Instruction, width: usize) -> Option<Value> {
+        if width != 8 {
+            return None;
+        }
+        if i.is_ip_rel_memory_operand() {
+            return Some(Value::ImagePointer(i.ip_rel_memory_address()));
+        }
+        if i.memory_index() == Register::None
+            && matches!(self.register(i.memory_base()), Some(Value::InstanceInput(offset)) if offset.checked_add(i.memory_displacement64() as i64) == Some(0))
+        {
+            return Some(Value::Instance);
+        }
+        self.address(i)
+            .map(|(storage, offset)| Value::Pointer(storage, offset))
+    }
+
     fn step(&mut self, i: &Instruction) {
         let dst = i.op0_register().full_register();
         let width = if i.op0_kind() == OpKind::Memory {
@@ -261,7 +297,14 @@ impl State {
         } else {
             i.op0_register().size()
         };
+        if i.rflags_modified() != 0 {
+            self.zero = None;
+        }
         match i.mnemonic() {
+            Mnemonic::Test if self.nonnull_test(i) => {
+                self.zero = Some(false);
+            }
+            Mnemonic::Cmove if self.zero == Some(false) => {}
             Mnemonic::Mov
             | Mnemonic::Movaps
             | Mnemonic::Movups
@@ -273,13 +316,7 @@ impl State {
                 self.move_instruction(i, width, dst);
             }
             Mnemonic::Lea => {
-                let value = if width == 8 && i.is_ip_rel_memory_operand() {
-                    Some(Value::ImagePointer(i.ip_rel_memory_address()))
-                } else {
-                    self.address(i)
-                        .filter(|_| width == 8)
-                        .map(|(storage, offset)| Value::Pointer(storage, offset))
-                };
+                let value = self.lea_value(i, width);
                 self.registers.remove(&dst);
                 if let Some(value) = value {
                     self.registers.insert(dst, value);
@@ -339,6 +376,7 @@ impl State {
             }
             Mnemonic::Pop => self.pop(dst),
             Mnemonic::Call => {
+                self.zero = None;
                 self.invalidate_call_arguments();
                 for reg in [
                     Register::RAX,
@@ -575,16 +613,17 @@ fn dispatch_field_checked(
     lua_callback: bool,
     accept: &mut impl FnMut(usize, &State) -> bool,
 ) -> Option<usize> {
-    dispatch_field_fetch(entry, &mut |at, _| code(at), lua_callback, accept)
+    dispatch_field_fetch(entry, &mut |at, _| code(at), lua_callback, None, accept)
 }
 
 fn dispatch_field_fetch(
     entry: u64,
     code: &mut impl FnMut(u64, bool) -> Option<Vec<u8>>,
     lua_callback: bool,
+    receiver_offset: impl Into<Option<usize>>,
     accept: &mut impl FnMut(usize, &State) -> bool,
 ) -> Option<usize> {
-    let fields = dispatch_analysis(entry, code, lua_callback, accept)?;
+    let fields = dispatch_analysis(entry, code, lua_callback, receiver_offset.into(), accept)?;
     (fields.len() == 1).then(|| *fields.iter().next().unwrap())
 }
 
@@ -592,17 +631,27 @@ fn dispatch_analysis(
     entry: u64,
     code: &mut impl FnMut(u64, bool) -> Option<Vec<u8>>,
     lua_callback: bool,
+    receiver_offset: impl Into<Option<usize>>,
     accept: &mut impl FnMut(usize, &State) -> bool,
 ) -> Option<HashSet<usize>> {
+    let receiver_offset = receiver_offset.into();
     let initial = State {
         registers: HashMap::from([
             (Register::RCX, Value::Pointer(Storage::Descriptor, 0)),
-            (Register::RDX, Value::Instance),
+            (
+                Register::RDX,
+                match receiver_offset {
+                    None | Some(0) => Value::Instance,
+                    Some(offset) => Value::InstanceInput(i64::try_from(offset).ok()?),
+                },
+            ),
             (Register::R8, Value::Lua),
             (Register::RSP, Value::Pointer(Storage::Stack, 0)),
         ]),
         stack: BTreeMap::new(),
         lua_callback,
+        zero: None,
+        complete_receiver: receiver_offset.is_some(),
     };
     dispatch_fields(entry, initial, code, &mut 32768, 0, accept)
 }
@@ -623,6 +672,23 @@ pub(in super::super) fn binding(
     )
 }
 
+pub(in super::super) fn binding_for_receiver(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    descriptor: usize,
+    table: usize,
+    receiver_offset: usize,
+) -> Result<(usize, usize)> {
+    resolve(
+        memory,
+        studio,
+        layout,
+        descriptor,
+        member_field_for(memory, studio, layout, table, false, Some(receiver_offset))?,
+    )
+}
+
 pub(in super::super) fn member_field(
     memory: &ProcessMemory,
     studio: &ModuleEntry,
@@ -630,7 +696,7 @@ pub(in super::super) fn member_field(
     _descriptor: usize,
     table: usize,
 ) -> Result<usize> {
-    member_field_for(memory, studio, layout, table, false)
+    member_field_for(memory, studio, layout, table, false, None)
 }
 
 fn member_field_for(
@@ -639,11 +705,13 @@ fn member_field_for(
     layout: &PackageLayout,
     table: usize,
     lua_callback: bool,
+    receiver_offset: Option<usize>,
 ) -> Result<usize> {
     let key = (
         layout.image_stamp,
         table.wrapping_sub(studio.base),
         lua_callback,
+        receiver_offset,
     );
     let cached = BINDINGS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -689,17 +757,25 @@ fn member_field_for(
                     }
                     Err(message) => {
                         if required {
-                            error = Some(format!("{message:#}"));
+                            error = Some(message);
                         }
                         None
                     }
                 }
             },
             lua_callback,
+            receiver_offset,
             &mut |_, _| true,
         );
         if let Some(error) = error {
-            bail!("Could not verify reflection dispatch: {error}");
+            let message = format!("Could not verify reflection dispatch: {error:#}");
+            if matches!(
+                error.downcast_ref::<properties::NativeError>(),
+                Some(properties::NativeError::Unsupported(_))
+            ) {
+                return Err(properties::NativeError::Unsupported(message).into());
+            }
+            bail!("{message}");
         }
         #[cfg(test)]
         if std::env::var_os("RENIUM_DISPATCH_TRACE").is_some() {
@@ -717,8 +793,10 @@ fn member_field_for(
     }
     anyhow::ensure!(
         terminated && candidates.len() == 1,
-        "Reflection dispatch resolved {} function bindings; no call was executed",
-        candidates.len()
+        properties::NativeError::Unsupported(format!(
+            "Reflection dispatch resolved {} function bindings; no call was executed",
+            candidates.len()
+        ))
     );
     let result = *candidates.iter().next().unwrap();
     let mut cache = BINDINGS.get().unwrap().lock_recover();
@@ -826,7 +904,9 @@ pub(in super::super) fn dispatch_code(
         let length = end - start;
         anyhow::ensure!(
             length <= 65536,
-            "Reflection dispatch exceeds its analysis budget"
+            properties::NativeError::Unsupported(
+                "Reflection dispatch exceeds its analysis budget".into()
+            )
         );
         return verified_code(memory, studio, layout, address, length);
     }
@@ -834,7 +914,9 @@ pub(in super::super) fn dispatch_code(
     if let Some(length) = leaf_dispatch_length(&bytes) {
         return Ok(bytes[..length].to_vec());
     }
-    bail!("Reflection dispatch has no verified function boundary")
+    bail!(properties::NativeError::Unsupported(
+        "Reflection dispatch has no verified function boundary".into()
+    ))
 }
 
 fn resolve(
@@ -847,7 +929,9 @@ fn resolve(
     let function = memory.read_u64(descriptor + field)? as usize;
     anyhow::ensure!(
         memory.read_u32(descriptor + field + 8)? == 0,
-        "Function receiver requires an unsupported adjustment"
+        properties::NativeError::Unsupported(
+            "Function receiver requires an unsupported adjustment".into()
+        )
     );
     verified_code(memory, studio, layout, function, 64)?;
     Ok((field, function))
@@ -950,6 +1034,29 @@ mod tests {
         for field in [8, 0x78, 0x80, 0x2f0, 0x2000] {
             assert_eq!(inline(&scalar(field, field + 8)), Some(field as usize));
             assert_eq!(inline(&vector(field)), Some(field as usize));
+        }
+    }
+
+    #[test]
+    fn complete_receiver_binding_requires_the_selected_instance_conversion() {
+        for offset in [32i32, 160, 640] {
+            let mut code = vec![0x48, 0x85, 0xd2, 0x48, 0x8d, 0x92]; // test rdx,rdx; lea rdx,[rdx-offset]
+            code.extend((-offset).to_le_bytes());
+            code.extend([0x49, 0x0f, 0x44, 0xd0]); // cmove rdx,r8 (known not taken)
+            code.extend(scalar(0x78, 0x80));
+            let check = |bytes: &[u8], selected| {
+                dispatch_field_fetch(
+                    0,
+                    &mut |at, _| (at == 0).then(|| bytes.to_vec()),
+                    false,
+                    selected,
+                    &mut |_, _| true,
+                )
+            };
+            assert_eq!(check(&code, offset as usize), Some(0x78));
+            assert_eq!(check(&code, offset as usize + 8), None);
+            code[2] = 0xc0; // test rax,rax cannot prove the null guard is not taken.
+            assert_eq!(check(&code, offset as usize), None);
         }
     }
 

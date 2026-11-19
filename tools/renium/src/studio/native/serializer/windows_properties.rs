@@ -442,6 +442,34 @@ fn cached_abi(
     }
 }
 
+// Structured native failures preserve the existing public error messages.
+#[derive(Debug)]
+pub(super) enum NativeError {
+    Task(u32, u32, String),
+    Unsupported(String),
+}
+impl std::fmt::Display for NativeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Task(exit, status, message) => write!(
+                f,
+                "Studio protected property call failed (0x{exit:X}/0x{status:X}): {message}"
+            ),
+            Self::Unsupported(message) => f.write_str(message),
+        }
+    }
+}
+impl std::error::Error for NativeError {}
+pub(super) fn task_result(exit: u32, parameters: &[u8]) -> Result<()> {
+    let status = read_u32(parameters, 84)?;
+    if exit != 0 || status != 4 {
+        return Err(
+            NativeError::Task(exit, status, error_text_at(&parameters[..65888], 65632)).into(),
+        );
+    }
+    Ok(())
+}
+
 pub(crate) struct NativeProperty {
     pub(crate) class_name: String,
     pub(crate) instance_id: String,
@@ -460,7 +488,21 @@ impl NativeProperty {
         name: &str,
         arguments: &[serde_json::Value],
     ) -> Result<()> {
-        let mut input = super::super::functions::input(&self.class_name, name, arguments)?;
+        self.prepare_reflected_function(
+            pid,
+            title,
+            name,
+            super::super::functions::input(&self.class_name, name, arguments)?,
+        )
+    }
+
+    fn prepare_reflected_function(
+        &mut self,
+        pid: u32,
+        title: &str,
+        name: &str,
+        mut input: super::super::functions::FunctionInput,
+    ) -> Result<()> {
         let current = modules(pid)?;
         let studio = current
             .iter()
@@ -473,6 +515,33 @@ impl NativeProperty {
             "Function DataModel was replaced"
         );
         let target = read_u64(&self.parameters, 16)? as usize;
+        let receiver_offset = if input.mode == 4 {
+            anyhow::ensure!(
+                model.outer.checked_add(model.layout.data_model_instance) == Some(target),
+                "Package flag target is not the selected DataModel"
+            );
+            input.bytes[52..56]
+                .copy_from_slice(&u32::try_from(model.layout.data_model_instance)?.to_le_bytes());
+            // Reuse the live shared DataModel reference used by discovery; the
+            // engine task checks it again immediately before any flag access.
+            let data = self.memory.read_vec(
+                studio.base + layout.data.virtual_address,
+                layout.data.virtual_size,
+            )?;
+            let reference = data
+                .chunks_exact(8)
+                .enumerate()
+                .find_map(|(i, word)| {
+                    (word == model.outer.to_le_bytes()
+                        && data.get(i * 8 + 8..i * 8 + 16) == Some(&model.owner.to_le_bytes()))
+                    .then_some(studio.base + layout.data.virtual_address + i * 8)
+                })
+                .context("Live DataModel reference is unavailable")?;
+            input.bytes[32..40].copy_from_slice(&reference.to_le_bytes());
+            model.layout.data_model_instance
+        } else {
+            0
+        };
         let descriptor = find_class_member_descriptor(&self.memory, target, model.layout, name)?;
         let signature = read_rtti_type(&self.memory, descriptor, studio.base, studio.size)
             .context("Function descriptor has no RTTI")?;
@@ -489,8 +558,15 @@ impl NativeProperty {
             _ => ("BoundFuncDesc", "V34@@Z$0A@$00@Reflection@RBX@@"),
         };
         anyhow::ensure!(
-            signature == format!(".?AV?${kind}@VHttpRbxApiService@RBX@@$$A6A{string}{tail}"),
-            "Unsupported native function signature: {signature}"
+            signature
+                == if input.mode == 4 {
+                    ".?AV?$BoundFuncDesc@VDataModel@RBX@@$$A6A_NV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z$0A@$00@Reflection@RBX@@".to_string()
+                } else {
+                    format!(".?AV?${kind}@VHttpRbxApiService@RBX@@$$A6A{string}{tail}")
+                },
+            NativeError::Unsupported(format!(
+                "Unsupported native function signature: {signature}"
+            ))
         );
         let table = self.memory.read_u64(descriptor)? as usize;
         let locator = self.memory.read_u64(table - 8)? as usize;
@@ -500,10 +576,22 @@ impl NativeProperty {
                     .base
                     .checked_add(self.memory.read_u32(locator + 20)? as usize)
                     == Some(locator),
-            "Function descriptor is not a complete reflection object"
+            NativeError::Unsupported(
+                "Function descriptor is not a complete reflection object".into()
+            )
         );
-        let (field, function) =
-            functions::binding(&self.memory, studio, &layout, descriptor, table)?;
+        let (field, function) = if input.mode == 4 {
+            functions::binding_for_receiver(
+                &self.memory,
+                studio,
+                &layout,
+                descriptor,
+                table,
+                receiver_offset,
+            )?
+        } else {
+            functions::binding(&self.memory, studio, &layout, descriptor, table)?
+        };
         input.bytes[..8].copy_from_slice(&(descriptor as u64).to_le_bytes());
         input.bytes[8..16].copy_from_slice(&(table as u64).to_le_bytes());
         input.bytes[16..20].copy_from_slice(&(field as u32).to_le_bytes());
@@ -517,6 +605,28 @@ impl NativeProperty {
         self.deadline = Instant::now() + timeout.min(Duration::from_secs(30));
         self.invoke(9)?;
         self.value()
+    }
+
+    pub(super) fn package_flag(&mut self, candidate: Option<usize>) -> Result<bool> {
+        anyhow::ensure!(
+            read_u32(&self.parameters, INPUT + 20)? == 4,
+            NativeError::Unsupported("Package flag getter was not prepared".into())
+        );
+        let size = 56 + read_u32(&self.parameters, INPUT + 44)? as usize;
+        let length = usize::from(candidate.is_some()) * size_of::<usize>();
+        if let Some(value) = candidate {
+            put_u64(&mut self.parameters, INPUT + size, value);
+        }
+        put_u32(&mut self.parameters, INPUT + 48, length as u32);
+        put_u32(&mut self.parameters, 65916, (size + length) as u32);
+        match self.call_function(Duration::from_secs(30))?.as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(NativeError::Unsupported(
+                "GetFastFlag returned a non-boolean response; use the dialog watcher".into(),
+            )
+            .into()),
+        }
     }
 
     pub(crate) fn ensure_writable(&self) -> Result<()> {
@@ -569,14 +679,7 @@ impl NativeProperty {
                 read_u32(&self.parameters, 131500)? as f64 / 1000.0,
             ),
         );
-        let status = read_u32(&self.parameters, 84)?;
-        if exit != 0 || status != 4 {
-            bail!(
-                "Studio protected property call failed (0x{exit:X}/0x{status:X}): {}",
-                error_text_at(&self.parameters[..65888], 65632)
-            );
-        }
-        Ok(())
+        task_result(exit, &self.parameters)
     }
 
     pub(crate) fn read(&mut self) -> Result<String> {
@@ -1902,6 +2005,8 @@ fn prepare(
         .context("Protected property discovery exceeded its deadline; retry the operation")?;
     batch.prepare_read(0, property, remaining, read_class)
 }
+
+pub(super) use batch::prepare_package_flag;
 
 #[cfg(test)]
 mod tests {

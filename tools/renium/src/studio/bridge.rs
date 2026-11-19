@@ -42,6 +42,31 @@ const BRIDGE_DUPLICATE_ROLE_KEY_SEPARATOR: char = '#';
 /// Studios it opens; unset in a CLI process.
 static DAEMON_BRIDGE_PORTS: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
 
+#[cfg(windows)]
+type PackageChannels = Mutex<Vec<Arc<BridgeChannel>>>;
+#[cfg(windows)]
+static PACKAGE_CHANNELS: std::sync::OnceLock<std::sync::Weak<PackageChannels>> =
+    std::sync::OnceLock::new();
+#[cfg(windows)]
+pub(crate) fn package_notice_connected(pid: u32) -> bool {
+    PACKAGE_CHANNELS
+        .get()
+        .and_then(std::sync::Weak::upgrade)
+        .is_some_and(|channels| {
+            let channels = channels.lock_recover().clone();
+            channels.iter().any(|channel| {
+                let connections = channel
+                    .sockets
+                    .lock_recover()
+                    .values()
+                    .filter(|c| c.studio_pid == Some(pid) && c.role == BRIDGE_ROLE_EDIT)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                connections.iter().any(BridgeConnection::is_alive)
+            })
+        })
+}
+
 pub(crate) fn daemon_bridge_ports() -> Option<Vec<u16>> {
     DAEMON_BRIDGE_PORTS.get().cloned()
 }
@@ -630,8 +655,10 @@ impl NativeConnectionPreparation {
         {
             return;
         }
-        // No bridge registry or socket lock is held. The native path only
-        // discovers/validates addresses; it does not read or write properties.
+        #[cfg(windows)]
+        let _ = (self.patch_notices)(pid);
+        // No bridge registry/socket lock is held. This read-only preparation
+        // reads the flag worker's stored answer; the worker alone runs engine tasks.
         let started = Instant::now();
         let result = (self.prepare)(pid, &connection.bridge_info.place_name);
         self.pending.lock_recover().remove(runtime);
@@ -1748,6 +1775,10 @@ impl BridgeServer {
         let performance_manager =
             check_updates_on_connect.then(crate::studio::performance::Manager::load);
         let all_channels = Arc::new(Mutex::new(Vec::with_capacity(ports.len())));
+        #[cfg(windows)]
+        if check_updates_on_connect {
+            let _ = PACKAGE_CHANNELS.set(Arc::downgrade(&all_channels));
+        }
         #[cfg(any(windows, target_os = "macos"))]
         let verified_full_pushes = Default::default();
         #[cfg(any(windows, target_os = "macos"))]
@@ -1996,12 +2027,14 @@ impl BridgeServer {
                                     if socket.role == BRIDGE_ROLE_EDIT
                                         && let Some(preparation) = native_preparation.as_ref()
                                     {
+                                        #[cfg(target_os = "macos")]
                                         let patch = socket.studio_pid
                                             .context("Could not identify Studio for its package notice patch")
                                             .and_then(|pid| (preparation.patch_notices)(pid));
+                                        #[cfg(target_os = "macos")]
                                         if let Err(error) = patch {
                                             crate::app::output::log_global(
-                                                if cfg!(windows) { 2 } else { 4 },
+                                                4,
                                                 format_args!(
                                                     "[renium] Studio package notice patch failed: {error:#}"
                                                 ),

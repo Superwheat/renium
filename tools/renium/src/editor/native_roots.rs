@@ -1095,7 +1095,7 @@ fn write_native_property(
 /// The helper reports 0xE40F when Studio never ran the queued task before its
 /// deadline, as the status of a discarded task or as the wait's own exit code.
 #[cfg(any(windows, target_os = "macos", test))]
-fn studio_skipped_native_task(error: &anyhow::Error) -> bool {
+pub(crate) fn studio_skipped_native_task(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.to_string().contains("0xE40F"))

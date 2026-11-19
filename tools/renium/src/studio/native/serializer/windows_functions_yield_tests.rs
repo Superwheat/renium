@@ -118,6 +118,7 @@ fn optional_constructor_fetch_does_not_poison_a_reflection_binding() {
             None
         },
         false,
+        0,
         &mut |_, _| true,
     );
     assert_eq!(field, Some(0xa8));
@@ -132,6 +133,7 @@ fn continuation_analysis_distinguishes_incomplete_methods_and_interior_aliases()
             0,
             &mut |at, _| (at == 0).then(|| code.clone()),
             false,
+            0,
             &mut |_, _| true,
         )
     };
@@ -170,6 +172,7 @@ fn continuation_analysis_follows_verified_unwind_fragments_and_refuses_missing_o
                     })
                 },
                 false,
+                0,
                 &mut |_, _| true,
             )
         };

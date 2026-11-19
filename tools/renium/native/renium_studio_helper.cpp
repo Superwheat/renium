@@ -1417,7 +1417,7 @@ static void ReadPropertyCore(PropertyReadTask* task)
         reinterpret_cast<IdentityGetter>(p.identityGetter)(
             reinterpret_cast<void*>(p.identityBinding), p.identity,
             reinterpret_cast<void*>(p.target));
-        if (!p.operation)
+        if (!p.operation || p.operation == 10)
         {
             p.status = 4;
             return;
@@ -1515,6 +1515,16 @@ static void ReadPropertyCore(PropertyReadTask* task)
         }
         value->~basic_string();
     }
+    catch (const renium_functions::PackageFlagRefused& error)
+    {
+        p.status = 0xE411;
+        strncpy_s(p.error, error.what(), _TRUNCATE);
+    }
+    catch (const renium_functions::StaleDataModel& error)
+    {
+        p.status = 0xE410;
+        strncpy_s(p.error, error.what(), _TRUNCATE);
+    }
     catch (const std::exception& error)
     {
         p.status = 0xE404;
@@ -1535,19 +1545,28 @@ static void ReadPropertyCaught(PropertyReadTask* task)
 
 static DWORD RunPropertyRead(PropertyReadParams* params)
 {
+    renium_functions::Input function{};
+    if (params && params->operation == 9 && params->inputSize >= sizeof(function))
+        std::memcpy(&function, params->input, sizeof(function));
+    const bool flag = params && (params->operation == 10 || (function.mode == 4
+        && function.firstSize == sizeof("RemovePackageModificationPopupDialog") - 1
+        && params->inputSize >= sizeof(function) + function.firstSize
+        && !std::memcmp(params->input + sizeof(function), "RemovePackageModificationPopupDialog", function.firstSize)));
     if (!params || !params->taskContext || !params->submitTask || !params->target ||
         !params->owner || !params->dataModelOwner || !params->descriptor || !params->getter ||
         !params->classDescriptor || !params->descriptorVtable || params->classOffset > 0x100 ||
-        !params->identityBinding || !params->identityGetter || (params->operation > 3 && params->operation != 6 && params->operation != 7 && params->operation != 8 && params->operation != 9) ||
+        !params->identityBinding || !params->identityGetter || (params->operation > 3 && params->operation != 6 && params->operation != 7 && params->operation != 8 && params->operation != 9 && params->operation != 10) ||
         (params->operation == 2 && !params->setter) || params->inputSize > sizeof(params->input) ||
         params->extraInputSize > 128 * 1024 * 1024 ||
         (params->operation == 7 ? (!params->extraInput || !params->extraInputSize) : params->extraInputSize != 0) ||
-        params->parentOffset > 0x200 || params->selfOffset > 0x80 || params->ancestorCount < 2 || params->ancestorCount > 65 ||
+        params->parentOffset > 0x200 || params->selfOffset > 0x80 || params->ancestorCount < 1 || params->ancestorCount > 65 ||
+        (params->ancestorCount == 1 && (!flag || params->owner != params->dataModelOwner))
+        || (params->operation == 10 && params->ancestorCount != 1) ||
         params->ancestors[0] != params->target ||
         !params->timeoutMs || params->timeoutMs > (params->operation == 9 ? 30000 : 3000))
         return 0xE401;
     auto modelOwner = reinterpret_cast<void*>(params->dataModelOwner);
-    if (!AddOwnerReference(modelOwner)) return 0xE402;
+    if (!AddOwnerReference(modelOwner)) { if (flag) params->status = 0xE410; return 0xE402; }
     auto modelHold = std::shared_ptr<void>(modelOwner, ReleaseOwnerReference);
     auto task = std::make_shared<PropertyReadTask>();
     task->result = *params;

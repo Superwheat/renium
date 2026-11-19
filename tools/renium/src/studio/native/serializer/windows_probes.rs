@@ -1,4 +1,4 @@
-//! External-process probes: no remote allocation, writes, helper loads or calls.
+//! Read-only structural probes and previously confirmed process-scoped answers.
 use super::*;
 use serde_json::{Value, json};
 

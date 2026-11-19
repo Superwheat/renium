@@ -25,6 +25,7 @@ pub(crate) struct NativePropertyBatch {
     model: ActiveDataModel,
     targets: Vec<Vec<SharedEntry>>,
     common: Vec<u8>,
+    package_flag: bool,
     entrypoint: usize,
     classes: HashMap<usize, String>,
     identities: HashMap<usize, (usize, usize)>,
@@ -100,6 +101,7 @@ impl NativePropertyBatch {
             model,
             targets,
             common,
+            package_flag: false,
             entrypoint,
             classes: HashMap::new(),
             identities: HashMap::new(),
@@ -200,7 +202,13 @@ impl NativePropertyBatch {
         ] {
             put_u64(&mut parameters, offset, value);
         }
-        put_u32(&mut parameters, 131496, ancestors.len() as u32 + 1);
+        let root = self.package_flag
+            && entry.instance == self.model.outer + self.model.layout.data_model_instance;
+        put_u32(
+            &mut parameters,
+            131496,
+            ancestors.len() as u32 + u32::from(!root),
+        );
         for (index, ancestor) in ancestors.iter().rev().enumerate() {
             put_u64(&mut parameters, 131504 + index * 8, ancestor.instance);
         }
@@ -218,10 +226,16 @@ impl NativePropertyBatch {
             entrypoint: self.entrypoint,
             deadline: started + timeout,
         };
-        prepared.invoke(if read_class.is_some() { 3 } else { 0 })?;
+        prepared.invoke(if self.package_flag {
+            10
+        } else if read_class.is_some() {
+            3
+        } else {
+            0
+        })?;
         let identity: [u8; 16] = prepared.parameters[IDENTITY..IDENTITY + 16].try_into()?;
         anyhow::ensure!(
-            identity != [0; 16],
+            self.package_flag && root || identity != [0; 16],
             "Studio target has no stable instance identity; retry after Studio settles"
         );
         prepared.instance_id = identity.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -340,6 +354,32 @@ fn resolve_indexed(
         result.push(ancestors);
     }
     Ok(result)
+}
+
+pub(in super::super) fn prepare_package_flag(pid: u32) -> Result<NativeProperty> {
+    let title = crate::studio::input::studio_window_title(pid)?;
+    let mut batch = NativePropertyBatch::new(pid, &title, &[], Duration::from_secs(30), None)?;
+    batch.package_flag = true;
+    batch.targets.push(vec![SharedEntry {
+        instance: batch
+            .model
+            .outer
+            .checked_add(batch.model.layout.data_model_instance)
+            .context("DataModel address overflowed")?,
+        owner: batch.model.owner,
+    }]);
+    let mut prepared = batch.prepare(0, "Name", Duration::from_secs(30))?;
+    anyhow::ensure!(
+        prepared.class_name == "DataModel",
+        "Package flag target is not DataModel"
+    );
+    prepared.prepare_reflected_function(
+        pid,
+        &title,
+        "GetFastFlag",
+        super::super::super::functions::package_flag_input(),
+    )?;
+    Ok(prepared)
 }
 
 #[cfg(test)]
