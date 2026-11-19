@@ -2648,12 +2648,33 @@ fn unresolved_model_export_reference<'a>(
     value: &'a Value,
     refs: &BytecodeModelExportRefs,
 ) -> Result<Option<&'a Map<String, Value>>> {
+    model_export_reference_outside(value, refs, |target| target.is_some())
+}
+
+/// The selection planner maps included rows to the null sentinel and every
+/// other row to a non-null sentinel. Use the encoder's selector precedence and
+/// validation, including Content references, rather than a second resolver.
+pub(crate) fn model_references_stay_in_selection(
+    value: &Value,
+    refs: &BytecodeModelExportRefs,
+) -> Result<bool> {
+    Ok(model_export_reference_outside(value, refs, |target| {
+        target.is_some_and(|target| target.is_none())
+    })?
+    .is_none())
+}
+
+fn model_export_reference_outside<'a>(
+    value: &'a Value,
+    refs: &BytecodeModelExportRefs,
+    accepts: impl Fn(Option<RbxRef>) -> bool + Copy,
+) -> Result<Option<&'a Map<String, Value>>> {
     match value {
         Value::Array(values) => {
             let mut unresolved = None;
             for value in values {
                 if matches!(value, Value::Array(_) | Value::Object(_)) {
-                    let nested = unresolved_model_export_reference(value, refs)?;
+                    let nested = model_export_reference_outside(value, refs, accepts)?;
                     unresolved = unresolved.or(nested);
                 }
             }
@@ -2666,7 +2687,7 @@ fn unresolved_model_export_reference<'a>(
                 object.get("Ref").and_then(Value::as_object)
             };
             if let Some(reference) = reference
-                && strict_model_export_ref(reference, refs)?.is_none()
+                && !accepts(strict_model_export_ref(reference, refs)?)
             {
                 return Ok(Some(reference));
             }
@@ -2676,7 +2697,7 @@ fn unresolved_model_export_reference<'a>(
             let mut unresolved = None;
             for (name, value) in object {
                 if name != "Ref" && matches!(value, Value::Array(_) | Value::Object(_)) {
-                    let nested = unresolved_model_export_reference(value, refs)?;
+                    let nested = model_export_reference_outside(value, refs, accepts)?;
                     unresolved = unresolved.or(nested);
                 }
             }

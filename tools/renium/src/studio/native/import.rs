@@ -34,7 +34,7 @@ use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
 };
 use crate::settings::equivalence::{
-    align_settings_ids_to_reference, drop_settings_document, settings_documents_equivalent,
+    align_settings_ids_to_reference, settings_documents_equivalent,
     stabilize_settings_reference_ids,
 };
 use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
@@ -1486,10 +1486,12 @@ fn editor_service_change_generations(
     root_names: Option<&HashMap<String, HashSet<String>>>,
     root_ids: Option<&AdditiveRootIds>,
 ) -> Result<EditorServiceChangeGenerations> {
+    let started = Instant::now();
     let result = bridge.call(
         "getEditorServiceChangeGenerations",
         json!({ "services": services, "rootNames": root_names, "rootIds": root_ids }),
     )?;
+    log_timing("package preflight generation read", started);
     let values = result
         .get("generations")
         .and_then(Value::as_object)
@@ -1569,6 +1571,12 @@ struct EditorPackagePreflightLive<'a> {
     absent_roots: HashMap<String, HashSet<String>>,
 }
 
+#[derive(Default)]
+struct PackagePreflightAttempt {
+    number: u8,
+    first: Option<EditorServiceChangeGenerations>,
+}
+
 fn capture_editor_package_preflight_live<'a>(
     bridge: &'a BridgeServer,
     service_names: &[String],
@@ -1576,43 +1584,20 @@ fn capture_editor_package_preflight_live<'a>(
     force_full_snapshot: bool,
     root_names: Option<&HashMap<String, HashSet<String>>>,
     root_ids: Option<&AdditiveRootIds>,
+    attempt: PackagePreflightAttempt,
 ) -> Result<EditorPackagePreflightLive<'a>> {
-    capture_editor_package_preflight_live_attempt(
-        bridge,
-        service_names,
-        required_reference_services,
-        force_full_snapshot,
-        root_names,
-        root_ids,
-        0,
-    )
-}
-
-fn capture_editor_package_preflight_live_attempt<'a>(
-    bridge: &'a BridgeServer,
-    service_names: &[String],
-    required_reference_services: Option<&HashSet<String>>,
-    force_full_snapshot: bool,
-    root_names: Option<&HashMap<String, HashSet<String>>>,
-    root_ids: Option<&AdditiveRootIds>,
-    attempt: u8,
-) -> Result<EditorPackagePreflightLive<'a>> {
-    let started = Instant::now();
-    let first = editor_service_change_generations(bridge, service_names, root_names, root_ids)?;
-    log_timing("package preflight generation read", started);
+    let first = match attempt.first {
+        Some(first) => first,
+        None => editor_service_change_generations(bridge, service_names, root_names, root_ids)?,
+    };
     if first
         .has_package_links
         .as_ref()
         .is_some_and(|states| !states.values().any(|has_package_link| *has_package_link))
     {
-        let generations =
-            editor_service_change_generations(bridge, service_names, None, None)?.generations;
-        if generations != first.generations {
-            bail!("Studio changed while Renium checked package state; retry the sync");
-        }
         return Ok(EditorPackagePreflightLive {
             dom: None,
-            generations,
+            generations: first.generations,
             captured_services: HashSet::new(),
             export: None,
             finish_guard: None,
@@ -1683,15 +1668,18 @@ fn capture_editor_package_preflight_live_attempt<'a>(
     });
     if let Some(message) = mismatch {
         finish_guard.finish(false)?;
-        if attempt < 2 {
-            return capture_editor_package_preflight_live_attempt(
+        if attempt.number < 2 {
+            return capture_editor_package_preflight_live(
                 bridge,
                 service_names,
                 required_reference_services,
                 force_full_snapshot,
                 root_names,
                 root_ids,
-                attempt + 1,
+                PackagePreflightAttempt {
+                    number: attempt.number + 1,
+                    first: None,
+                },
             );
         }
         bail!(message);
@@ -2346,6 +2334,7 @@ pub(crate) struct BinaryImportSelection {
     services: HashSet<String>,
     additive_roots: HashMap<String, HashSet<String>>,
     pub(crate) fallback_reason: Option<ServiceReaderFallback>,
+    first_generation: Option<EditorServiceChangeGenerations>,
 }
 
 fn reader_fallback(
@@ -2367,6 +2356,7 @@ fn reader_fallback(
 #[cfg(test)]
 thread_local! {
     pub(crate) static SELECTION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static READER_PREFLIGHTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) fn service_reader_disabled(args: &PushEditorChangesArgs) -> bool {
@@ -2382,13 +2372,66 @@ pub(crate) fn select_editor_binary_import(
     #[cfg(test)]
     SELECTION_CALLS.set(SELECTION_CALLS.get() + 1);
     let mut services = native_import_services(changes);
-    let additive_roots = additive_native_roots(changes, &services);
+    let mut additive_roots = additive_native_roots(changes, &services);
+    let only_additive = services.is_empty();
     services.extend(additive_roots.keys().cloned());
     if services.is_empty() {
         return Ok(None);
     }
+    // A root upsert is also used for edits to an existing instance. Its live
+    // existence decides whether there is any binary import work at all.
+    let first_generation = if only_additive {
+        let ids = additive_root_ids(changes, &additive_roots);
+        let mut first = match editor_service_change_generations(
+            bridge,
+            &services.iter().cloned().collect::<Vec<_>>(),
+            Some(&additive_roots),
+            Some(&ids),
+        ) {
+            Ok(first) => first,
+            Err(error) => {
+                crate::app::output::log_global(
+                    5,
+                    format_args!(
+                        "[renium] additive root existence is unavailable; using ordinary upserts: {error:#}"
+                    ),
+                );
+                return Ok(None);
+            }
+        };
+        additive_roots.retain(|service, names| {
+            names.retain(|name| {
+                first
+                    .absent_roots
+                    .get(service)
+                    .is_some_and(|absent| absent.contains(name))
+            });
+            !names.is_empty()
+        });
+        services.retain(|service| additive_roots.contains_key(service));
+        if services.is_empty() {
+            crate::app::output::log_global(
+                5,
+                format_args!(
+                    "[renium] no additive root is confirmed absent; using ordinary upserts without a place build"
+                ),
+            );
+            return Ok(None);
+        }
+        first
+            .generations
+            .retain(|service, _| services.contains(service));
+        if let Some(packages) = &mut first.has_package_links {
+            packages.retain(|service, _| services.contains(service));
+        }
+        Some(first)
+    } else {
+        None
+    };
     let disabled = service_reader_disabled(args);
     let fallback_reason = reader_fallback(cfg!(windows), disabled, || {
+        #[cfg(test)]
+        READER_PREFLIGHTS.set(READER_PREFLIGHTS.get() + 1);
         #[cfg(windows)]
         {
             let started = Instant::now();
@@ -2416,6 +2459,7 @@ pub(crate) fn select_editor_binary_import(
         services,
         additive_roots,
         fallback_reason,
+        first_generation,
     }))
 }
 
@@ -2462,6 +2506,7 @@ pub(crate) fn build_editor_binary_import_with_documents(
         services,
         additive_roots,
         fallback_reason,
+        first_generation,
     } = selection;
     let root_ids = additive_root_ids(changes, &additive_roots);
     let written_services = changes
@@ -2498,6 +2543,7 @@ pub(crate) fn build_editor_binary_import_with_documents(
         ImportDocuments {
             overrides: document_overrides,
             properties,
+            first_generation,
         },
         &additive_roots,
         &root_ids,
@@ -2772,21 +2818,11 @@ mod additive_import_tests {
     }
 }
 
-fn independent_additive_document(
+fn additive_subtree(
     document: &SettingsBytecode,
     service: &str,
     roots: &HashSet<String>,
-) -> Option<SettingsBytecode> {
-    fn contains_reference(value: &Value) -> bool {
-        match value {
-            Value::Object(object) => {
-                object.get("_type").and_then(Value::as_str) == Some("Ref")
-                    || object.values().any(contains_reference)
-            }
-            Value::Array(values) => values.iter().any(contains_reference),
-            _ => false,
-        }
-    }
+) -> Option<Vec<usize>> {
     let root = editor_service_root_index(document, service)?;
     let children = settings_children_by_parent(document);
     let incoming = children
@@ -2795,51 +2831,184 @@ fn independent_additive_document(
         .copied()
         .filter(|&index| roots.contains(&document.instances[index].name))
         .collect::<Vec<_>>();
-    let incoming_names = incoming
+    if incoming
         .iter()
-        .map(|&index| document.instances[index].name.as_str())
-        .collect::<HashSet<_>>();
-    if incoming_names.len() != roots.len() {
+        .map(|&index| &document.instances[index].name)
+        .collect::<HashSet<_>>()
+        .len()
+        != roots.len()
+    {
         return None;
     }
     let mut selected = vec![root];
     for index in incoming {
         collect_settings_subtree_preorder(&children, index, &mut selected);
     }
-    if selected.len() == document.instances.len()
-        || selected.iter().any(|&index| {
-            let instance = &document.instances[index];
-            instance
-                .properties
-                .values()
-                .chain(instance.attributes.values())
-                .any(contains_reference)
-        })
-    {
-        return None;
-    }
-    // Reference-bearing additions retain the complete index used by native
-    // external-reference repair. Independent trees need only their own data.
+    Some(selected)
+}
+
+fn independent_additive_document(
+    document: &SettingsBytecode,
+    service: &str,
+    selected: &[usize],
+) -> Result<Option<SettingsBytecode>> {
+    use crate::rbx::encode::model_references_stay_in_selection;
+    use crate::rbx::model::BytecodeModelExportRefs;
+    let root = selected[0];
     let remap = selected
         .iter()
         .enumerate()
         .map(|(next, &old)| (old, next))
         .collect::<HashMap<_, _>>();
-    Some(SettingsBytecode {
+    let stays_inside = |refs: &BytecodeModelExportRefs| -> Result<bool> {
+        for &index in &selected[1..] {
+            let row = &document.instances[index];
+            for value in row.properties.values().chain(row.attributes.values()) {
+                if !model_references_stay_in_selection(value, refs).with_context(|| {
+                    format!(
+                        "Cannot resolve an additive reference in {service}.{}",
+                        row.name
+                    )
+                })? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    };
+    let mut refs = BytecodeModelExportRefs {
+        service: Some(service),
+        ..Default::default()
+    };
+    // Most additions contain no references. Only a reference-bearing subtree
+    // needs the store's structural index; no outside row's values are read.
+    if !stays_inside(&refs)? {
+        // These legacy separator collisions use the ordinary full path index.
+        if document
+            .instances
+            .iter()
+            .any(|row| row.name.contains(['\0', '\u{1}']))
+        {
+            return Ok(None);
+        }
+        let outside = RbxRef::new();
+        for (index, row) in document.instances.iter().enumerate() {
+            let target = if index != root && remap.contains_key(&index) {
+                RbxRef::none()
+            } else {
+                outside
+            };
+            refs.by_index.insert(index, target);
+            if refs
+                .by_settings_id
+                .insert(&row.settings_id, target)
+                .is_some_and(|old| old != target)
+            {
+                return Ok(None);
+            }
+        }
+        let mut paths = crate::rbx::place_paths::PlaceReferencePaths::default();
+        paths.add_service(
+            document,
+            root,
+            &(0..document.instances.len()).collect::<Vec<_>>(),
+            &refs.by_index,
+        );
+        refs.global_paths = Some(std::sync::Arc::new(paths));
+        if !stays_inside(&refs)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(SettingsBytecode {
         version: document.version,
         instances: selected
-            .into_iter()
-            .map(|index| {
-                let mut instance = document.instances[index].clone();
-                instance.parent_index = if index == root {
-                    None
+            .iter()
+            .map(|&index| {
+                let mut row = document.instances[index].clone();
+                if index == root {
+                    // This is a structural anchor, not an imported instance.
+                    row.properties.clear();
+                    row.attributes.clear();
+                    row.parent_index = None;
                 } else {
-                    instance.parent_index.map(|parent| remap[&parent])
-                };
-                instance
+                    row.parent_index = row.parent_index.map(|parent| remap[&parent]);
+                    for record in [&mut row.properties, &mut row.attributes] {
+                        crate::settings::bytecode::visit_reference_objects_mut(record, |object| {
+                            if let Some(next) = object
+                                .get("instanceIndex")
+                                .and_then(crate::settings::bytecode::settings_reference_index)
+                                .and_then(|index| remap.get(&index))
+                            {
+                                object.insert("instanceIndex".into(), json!(next + 1));
+                            }
+                        });
+                    }
+                }
+                row
             })
             .collect(),
-    })
+    }))
+}
+
+#[cfg(test)]
+type AdditiveReadCounts = HashMap<std::path::PathBuf, (usize, usize, bool)>;
+#[cfg(test)]
+static ADDITIVE_STORE_READS: std::sync::LazyLock<std::sync::Mutex<AdditiveReadCounts>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn additive_document_from_file(
+    path: std::path::PathBuf,
+    service: &str,
+    roots: &HashSet<String>,
+) -> Result<RbxPlaceDocument<'static>> {
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+    #[cfg(test)]
+    {
+        ADDITIVE_STORE_READS
+            .lock()
+            .unwrap()
+            .entry(path.clone())
+            .or_default()
+            .0 += 1;
+    }
+    let (mut document, columns) =
+        crate::settings::bytecode::property_edit::decode_for_row_chunks(&bytes)?;
+    if let Some(selected) = additive_subtree(&document, service, roots) {
+        let mut wanted = vec![false; document.instances.len()];
+        for &index in &selected[1..] {
+            wanted[index] = true;
+        }
+        columns.materialize_selected(&mut document, &wanted)?;
+        #[cfg(test)]
+        {
+            ADDITIVE_STORE_READS
+                .lock()
+                .unwrap()
+                .get_mut(&path)
+                .unwrap()
+                .1 += selected.len() - 1;
+        }
+        if let Some(selected) = independent_additive_document(&document, service, &selected)? {
+            return Ok(RbxPlaceDocument::Owned(selected));
+        }
+    }
+    crate::app::output::log_global(
+        5,
+        format_args!(
+            "[renium] additive {service} needs the complete reference index; using the ordinary file import"
+        ),
+    );
+    #[cfg(test)]
+    {
+        ADDITIVE_STORE_READS
+            .lock()
+            .unwrap()
+            .get_mut(&path)
+            .unwrap()
+            .2 = true;
+    }
+    RbxPlaceDocument::from_file_bytes(path, bytes)
 }
 
 fn clear_import_engine_identities(dom: &mut RbxWeakDom) {
@@ -2912,6 +3081,7 @@ fn import_allocates_new_engine_identities_without_losing_saved_content() {
 struct ImportDocuments<'a> {
     overrides: HashMap<String, RbxPlaceDocument<'a>>,
     properties: crate::rbx::model::PlaceImportProperties,
+    first_generation: Option<EditorServiceChangeGenerations>,
 }
 
 fn build_editor_binary_import_for_services(
@@ -2926,6 +3096,7 @@ fn build_editor_binary_import_for_services(
     let ImportDocuments {
         overrides: mut document_overrides,
         mut properties,
+        mut first_generation,
     } = documents;
     let project_root = resolve_project_root_if_present(&args.project.project_root)?;
     let src_root = absolutize_under(&project_root, &args.project.src_root);
@@ -2938,7 +3109,7 @@ fn build_editor_binary_import_for_services(
             .then_with(|| a.cmp(b))
     });
     let build_services = ordered_services.clone();
-    let capture_preflight = || {
+    let mut capture_preflight = || {
         capture_editor_package_preflight_live(
             bridge,
             &ordered_services,
@@ -2946,12 +3117,16 @@ fn build_editor_binary_import_for_services(
             false,
             Some(additive_roots),
             Some(additive_root_ids),
+            PackagePreflightAttempt {
+                number: 0,
+                first: first_generation.take(),
+            },
         )
     };
     // Original rows have a reader only for partly read whole services. Learn
     // whether references can cross retained identities before keeping them.
     let prepared_preflight = (!properties.retain_rows.is_empty())
-        .then(capture_preflight)
+        .then(&mut capture_preflight)
         .transpose()?;
     if prepared_preflight
         .as_ref()
@@ -2964,27 +3139,29 @@ fn build_editor_binary_import_for_services(
         || {
             let started = Instant::now();
             for (service, roots) in additive_roots {
-                let selected = if let Some(document) = document_overrides.get(service) {
-                    independent_additive_document(document, service, roots)
+                if let Some(document) = document_overrides.get(service) {
+                    if let Some(indices) = additive_subtree(document, service, roots)
+                        && let Some(selected) =
+                            independent_additive_document(document, service, &indices)?
+                    {
+                        document_overrides
+                            .insert(service.clone(), RbxPlaceDocument::Owned(selected));
+                    } else {
+                        crate::app::output::log_global(
+                            5,
+                            format_args!(
+                                "[renium] additive {service} needs the complete reference index; keeping its prepared document"
+                            ),
+                        );
+                    }
                 } else {
                     let path = service_settings_path(&src_root.join(service));
-                    if !path.is_file() {
-                        continue;
+                    if path.is_file() {
+                        document_overrides.insert(
+                            service.clone(),
+                            additive_document_from_file(path, service, roots)?,
+                        );
                     }
-                    let document = SettingsBytecode::read_file(&path)?;
-                    let selected = independent_additive_document(&document, service, roots);
-                    if selected.is_none() {
-                        // Keep the decoded document for the ordinary reference
-                        // path too, rather than reading and decoding it again.
-                        document_overrides
-                            .insert(service.clone(), RbxPlaceDocument::Owned(document));
-                        continue;
-                    }
-                    drop_settings_document(document);
-                    selected
-                };
-                if let Some(document) = selected {
-                    document_overrides.insert(service.clone(), RbxPlaceDocument::Owned(document));
                 }
             }
             let result = build_rbx_place_with_documents(
@@ -3155,6 +3332,7 @@ fn build_editor_binary_import_for_services(
             force_full_snapshot,
             None,
             None,
+            PackagePreflightAttempt::default(),
         )?;
     }
     // Without live packages, the viewport is the only imported object replaced
@@ -3503,7 +3681,7 @@ fn native_reader_carries_texture_packs_but_keeps_genuine_encoder_omissions() {
 }
 
 #[test]
-fn independent_additions_keep_complete_subtrees_and_reference_additions_keep_the_full_index() {
+fn independent_additions_keep_internal_references_and_ignore_service_values() {
     let mut document = SettingsBytecode {
         version: SETTINGS_BINARY_VERSION,
         instances: vec![
@@ -3530,7 +3708,10 @@ fn independent_additions_keep_complete_subtrees_and_reference_additions_keep_the
         .attributes
         .insert("Keep".into(), json!(false));
     let roots = HashSet::from(["Incoming".into()]);
-    let selected = independent_additive_document(&document, "ServerStorage", &roots).unwrap();
+    let indices = additive_subtree(&document, "ServerStorage", &roots).unwrap();
+    let selected = independent_additive_document(&document, "ServerStorage", &indices)
+        .unwrap()
+        .unwrap();
     assert_eq!(selected.instances.len(), 3);
     assert_eq!(selected.instances[1].settings_id, "new");
     assert_eq!(selected.instances[2].parent_index, Some(1));
@@ -3546,14 +3727,34 @@ fn independent_additions_keep_complete_subtrees_and_reference_additions_keep_the
         "PrimaryPart".into(),
         json!({"_type":"Ref", "settingsId":"child"}),
     );
-    assert!(independent_additive_document(&document, "ServerStorage", &roots).is_none());
+    assert!(
+        independent_additive_document(&document, "ServerStorage", &indices)
+            .unwrap()
+            .is_some()
+    );
+    document.instances[2].properties.insert(
+        "PrimaryPart".into(),
+        json!({"_type":"Ref", "settingsId":"old"}),
+    );
+    assert!(
+        independent_additive_document(&document, "ServerStorage", &indices)
+            .unwrap()
+            .is_none()
+    );
     document.instances[2].properties.clear();
     document.instances[0]
         .properties
         .insert("Target".into(), json!({"_type":"Ref", "settingsId":"old"}));
-    assert!(independent_additive_document(&document, "ServerStorage", &roots).is_none());
     assert!(
-        independent_additive_document(
+        independent_additive_document(&document, "ServerStorage", &indices)
+            .unwrap()
+            .unwrap()
+            .instances[0]
+            .properties
+            .is_empty()
+    );
+    assert!(
+        additive_subtree(
             &document,
             "ServerStorage",
             &HashSet::from(["Missing".into()])
