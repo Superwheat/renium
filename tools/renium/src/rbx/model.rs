@@ -2116,8 +2116,8 @@ pub(crate) fn build_rbx_place_with_tuning(
                             !omitted_properties.is_empty()
                             || !unresolved_reference_properties.is_empty()
                             || built.properties.values().chain(logical_properties.values()).any(|value| {
-                                matches!(value, RbxVariant::Ref(target) if target.is_some()
-                                    && reference_scopes.get(&referent).is_none_or(|scope| reference_scopes.get(target) != Some(scope)))
+                                crate::studio::native::editor::rbx_variant_referent(value).is_some_and(|target| target.is_some()
+                                    && reference_scopes.get(&referent).is_none_or(|scope| reference_scopes.get(&target) != Some(scope)))
                             })
                             || crate::rbx::import_rows::has_selected_property(&instance.class_name,
                                 values.as_ref().map_or(&instance.properties, |values| &values.properties),
@@ -2928,4 +2928,47 @@ fn bytecode_repack_settings_files(args: &BytecodeRepackArgs) -> Result<Vec<PathB
     settings_files.sort();
     settings_files.dedup();
     Ok(settings_files)
+}
+
+/// A content value that names an instance is a reference like any other: the
+/// import leaves it out where its target is outside the payload, so the row
+/// that holds it is kept for the pass that writes it afterwards.
+#[cfg(test)]
+#[test]
+fn a_row_whose_content_names_an_instance_is_kept_for_the_supplemental_pass() -> Result<()> {
+    use serde_json::json;
+    let root = crate::tests::support::temp_dir("import-content-reference-row");
+    std::fs::create_dir_all(root.join("Workspace"))?;
+    let instance = |id: &str, class: &str, parent| {
+        SettingsBytecodeInstance::new(id.into(), id.into(), class.into(), parent)
+    };
+    let mut document = SettingsBytecode {
+        version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+        instances: vec![
+            instance("Workspace", "Workspace", None),
+            instance("Target", "Folder", Some(0)),
+            instance("Plain", "Decal", Some(0)),
+            instance("Named", "Decal", Some(0)),
+        ],
+    };
+    document.instances[3].properties.insert(
+        "TextureContent".into(),
+        json!({"_type": "Content", "value": {"_type": "Ref", "settingsId": "Target"}}),
+    );
+    let build = build_rbx_place(
+        &root,
+        vec!["Workspace".into()],
+        Some(&HashMap::from([("Workspace".into(), &document)])),
+        true,
+        PlaceImportProperties::retaining(HashSet::from(["Workspace".into()])),
+        false,
+    )?;
+    let kept = build.import_rows.services["Workspace"]
+        .1
+        .iter()
+        .map(|(_, index, _)| *index)
+        .collect::<Vec<_>>();
+    assert_eq!(kept, [3]);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
 }

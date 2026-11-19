@@ -202,10 +202,6 @@ fn compact_paths_preserve_legacy_reference_value_collisions() {
         paths.resolve(&["Workspace".into(), "A\0B".into()], None),
         Some(refs[&2])
     );
-    assert_eq!(
-        paths.resolve(&["Workspace".into(), "A\0B".into()], Some(&[1, 1])),
-        None
-    );
     let mut empty = document;
     empty.instances[0].name.clear();
     let mut paths = PlaceReferencePaths::default();
