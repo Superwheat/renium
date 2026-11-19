@@ -2,10 +2,16 @@ use super::*;
 use crate::cli::{BridgeConnectionArgs, ProjectSourceArgs};
 use crate::editor::types::EditorInstanceChange;
 use crate::rbx::model::build_rbx_place_with_documents;
+use crate::settings::bytecode::blocks::sim::{FORMATS, Format};
 use crate::studio::bridge::routing_tests::{connect, edit_info, fixture};
 use tungstenite::{Message, WebSocket, protocol::Role};
 
-fn check_scoped_additive_route(absent: bool, external: bool, prepared: bool) -> Result<()> {
+fn check_scoped_additive_route(
+    format: &Format,
+    absent: bool,
+    external: bool,
+    prepared: bool,
+) -> Result<()> {
     let service = "Workspace";
     let root = crate::tests::support::temp_dir("scoped-additive-route");
     let _cleanup = crate::system::files::OnDrop::new(|| {
@@ -82,7 +88,7 @@ fn check_scoped_additive_route(absent: bool, external: bool, prepared: bool) -> 
     let path = service_settings_path(&root.join("src").join(service));
     assert_eq!(path, root.join("instances/Workspace.renium"));
     std::fs::create_dir_all(path.parent().unwrap())?;
-    document.write_file(&path)?;
+    std::fs::write(&path, (format.encode)(&document)?)?;
     let mut changes = EditorChangeSet {
         instance_changes: vec![EditorInstanceChange {
             service: service.into(),
@@ -193,22 +199,32 @@ fn check_scoped_additive_route(absent: bool, external: bool, prepared: bool) -> 
 
 #[test]
 fn existing_additive_root_reads_no_store_and_builds_nothing() -> Result<()> {
-    check_scoped_additive_route(false, false, false)
+    FORMATS
+        .iter()
+        .try_for_each(|format| check_scoped_additive_route(format, false, false, false))
 }
 
 #[test]
 fn absent_additive_root_materializes_its_subtree_with_internal_references() -> Result<()> {
-    check_scoped_additive_route(true, false, false)?;
-    check_scoped_additive_route(true, false, true)
+    FORMATS.iter().try_for_each(|format| {
+        check_scoped_additive_route(format, true, false, false)?;
+        check_scoped_additive_route(format, true, false, true)
+    })
 }
 
 #[test]
 fn additive_external_reference_keeps_the_complete_import_index() -> Result<()> {
-    check_scoped_additive_route(true, true, false)
+    FORMATS
+        .iter()
+        .try_for_each(|format| check_scoped_additive_route(format, true, true, false))
 }
 
 #[test]
 fn additive_invalid_reference_is_not_retried_as_a_store_decode() -> Result<()> {
+    FORMATS.iter().try_for_each(check_invalid_reference)
+}
+
+fn check_invalid_reference(format: &Format) -> Result<()> {
     let root = crate::tests::support::temp_dir("additive-invalid-reference");
     let _cleanup = crate::system::files::OnDrop::new(|| {
         let _ = std::fs::remove_dir_all(&root);
@@ -228,7 +244,7 @@ fn additive_invalid_reference_is_not_retried_as_a_store_decode() -> Result<()> {
         "Nested".into(),
         json!([{"ref":{"_type":"Ref", "settingsId":""}}]),
     );
-    document.write_file(&path)?;
+    std::fs::write(&path, (format.encode)(&document)?)?;
     let error =
         additive_document_from_file(path.clone(), service, &HashSet::from(["New".into()]), &dir)
             .err()
@@ -650,6 +666,10 @@ fn failed_unread_preparation_stops_before_snapshot_export() -> Result<()> {
 
 #[test]
 fn import_builder_returns_exact_original_rows_for_the_supplemental_pass() -> Result<()> {
+    FORMATS.iter().try_for_each(check_original_rows)
+}
+
+fn check_original_rows(format: &Format) -> Result<()> {
     use crate::editor::diff::{
         EditorPropertyScope, EditorTargetChangeOptions, append_editor_target_changes,
     };
@@ -737,7 +757,7 @@ fn import_builder_returns_exact_original_rows_for_the_supplemental_pass() -> Res
     }
     let path = service_settings_path(&root.join("src").join(service));
     std::fs::create_dir_all(path.parent().unwrap())?;
-    document.write_file(&path)?;
+    std::fs::write(&path, (format.encode)(&document)?)?;
     let bytes = std::fs::read(&path)?;
     let document = crate::settings::bytecode::decode_settings_bytecode_holding(&bytes)?;
     for native in [false, true] {
@@ -897,6 +917,7 @@ fn import_builder_returns_exact_original_rows_for_the_supplemental_pass() -> Res
 }
 
 fn check_additive_source_layout(
+    format: &Format,
     root: &std::path::Path,
     service: &str,
     separated: bool,
@@ -984,7 +1005,7 @@ fn check_additive_source_layout(
         path.parent() == Some(project.join("instances").as_path()),
         separated
     );
-    document.write_file(&path)?;
+    std::fs::write(&path, (format.encode)(&document)?)?;
     // Compare against the decoded store: the codec normalizes reference selectors.
     let document = SettingsBytecode::read_file(&path)?;
     let selected = additive_subtree(&document, service, &roots).unwrap();
@@ -1058,11 +1079,12 @@ fn check_additive_source_layout(
         ADDITIVE_STORE_READS.lock().unwrap().remove(&path).unwrap(),
         (1, selected.len() - 1, false)
     );
-    check_additive_legacy_fallbacks(&document, service, &roots, &path, &dir)?;
+    check_additive_legacy_fallbacks(format, &document, service, &roots, &path, &dir)?;
     Ok(())
 }
 
 fn check_additive_legacy_fallbacks(
+    format: &Format,
     document: &SettingsBytecode,
     service: &str,
     roots: &HashSet<String>,
@@ -1089,14 +1111,13 @@ fn check_additive_legacy_fallbacks(
         if duplicate {
             // Duplicate IDs can reach a prepared document, but the store codec refuses them.
             assert!(
-                ambiguous
-                    .write_file(path)
+                (format.encode)(&ambiguous)
                     .unwrap_err()
                     .to_string()
                     .contains("duplicate settings id")
             );
         } else {
-            ambiguous.write_file(path)?;
+            std::fs::write(path, (format.encode)(&ambiguous)?)?;
             assert!(matches!(
                 additive_document_from_file(path.to_path_buf(), service, roots, dir)?,
                 RbxPlaceDocument::File { .. }
@@ -1113,13 +1134,15 @@ fn check_additive_legacy_fallbacks(
 
 #[test]
 fn additive_subtree_payload_matches_the_whole_store_with_colliding_script_folders() -> Result<()> {
-    let root = crate::tests::support::temp_dir("additive-source-oracle");
-    let _cleanup = crate::system::files::OnDrop::new(|| {
-        let _ = std::fs::remove_dir_all(&root);
-    });
-    for separated in [false, true] {
-        for service in ["Workspace", "ServerStorage"] {
-            check_additive_source_layout(&root, service, separated)?;
+    for format in &FORMATS {
+        let root = crate::tests::support::temp_dir("additive-source-oracle");
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            let _ = std::fs::remove_dir_all(&root);
+        });
+        for separated in [false, true] {
+            for service in ["Workspace", "ServerStorage"] {
+                check_additive_source_layout(format, &root, service, separated)?;
+            }
         }
     }
     Ok(())

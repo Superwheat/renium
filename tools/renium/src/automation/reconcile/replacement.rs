@@ -1,4 +1,5 @@
 use super::*;
+use crate::settings::bytecode::blocks::store_payload_len;
 use crate::settings::tree::settings_children_by_parent;
 
 pub(crate) fn project_replacement_paths(
@@ -278,9 +279,13 @@ fn changed_instances_alone(
         return Ok(ChangedInstances::Whole(None));
     };
     // A store Studio holds nearly empty is replaced, not compared.
+    let (desired_len, observed_len) = (
+        store_payload_len(desired_bytes),
+        store_payload_len(observed_bytes),
+    );
     if desired_bytes.len() < CHANGED_INSTANCES_MIN_BYTES
-        || observed_bytes.len().saturating_mul(4) < desired_bytes.len()
-        || desired_bytes.len().saturating_mul(4) < observed_bytes.len()
+        || observed_len.saturating_mul(4) < desired_len
+        || desired_len.saturating_mul(4) < observed_len
     {
         return Ok(ChangedInstances::Whole(None));
     }
@@ -506,12 +511,12 @@ fn replaced_store_alone(
         return Ok(None);
     };
     let observed_bytes = match observed {
-        Some(SnapshotEntry::File(bytes)) => bytes.len(),
+        Some(SnapshotEntry::File(bytes)) => store_payload_len(bytes),
         None => 0,
         Some(_) => return Ok(None),
     };
     if desired_bytes.len() < CHANGED_INSTANCES_MIN_BYTES
-        || !cfg!(test) && observed_bytes.saturating_mul(4) >= desired_bytes.len()
+        || !cfg!(test) && observed_bytes.saturating_mul(4) >= store_payload_len(desired_bytes)
     {
         return Ok(None);
     }

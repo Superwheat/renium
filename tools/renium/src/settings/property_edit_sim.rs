@@ -1,16 +1,20 @@
 use super::*;
+use crate::settings::bytecode::blocks::sim::{FORMATS, encoded_as};
 use crate::tests::support::{SimRng, run_seeds};
 
+/// The property edit and row chunk laws for a store file of either version:
+/// an edit of selected rows writes the store the encoder writes for the same
+/// edit of the whole document, a v11 file converted to v12 by that write.
 pub(crate) fn check_codec_document(bytes: &[u8]) -> Result<()> {
     check_row_chunks(bytes)?;
     for mode in 0..4 {
         let mut oracle = decode_settings_bytecode(bytes)?;
         let (mut document, mut numeric) = decode_for_property_edit(bytes)?;
         if mode == 0 {
-            assert_eq!(
-                numeric.encode(&document)?,
-                encode_settings_bytecode(&oracle)?
-            );
+            // A v11 store is converted by its first write.
+            let written = numeric.encode(&document)?;
+            assert!(blocks::is_block_store(&written));
+            assert!(written == encoded_as(bytes, &oracle)?);
         }
         for index in 0..oracle.instances.len() {
             assert_eq!(
@@ -31,9 +35,9 @@ pub(crate) fn check_codec_document(bytes: &[u8]) -> Result<()> {
             edit(&mut document.instances[index], mode);
             edit(&mut oracle.instances[index], mode);
         }
-        assert_eq!(
-            numeric.encode(&document)?,
-            encode_settings_bytecode(&oracle)?
+        assert!(
+            numeric.encode(&document)? == encoded_as(bytes, &oracle)?,
+            "mode {mode}: the edit of selected rows writes another store"
         );
     }
     Ok(())
@@ -41,10 +45,70 @@ pub(crate) fn check_codec_document(bytes: &[u8]) -> Result<()> {
 
 fn check_row_chunks(bytes: &[u8]) -> Result<()> {
     let oracle = decode_settings_bytecode_holding(bytes)?;
+    // What a reader projects before any row is read: each named property,
+    // as the projection maps it.
+    let named = |name: &str| name.len().is_multiple_of(2);
+    let (mut projected, columns) = decode_for_row_chunks(bytes)?;
+    columns.project_properties(&mut projected, named, |instance, name, value| {
+        (instance.parent_index.is_some() || name.len().is_multiple_of(4)).then_some(value)
+    })?;
+    for (row, instance) in projected.instances.iter().enumerate() {
+        let mut expected = oracle.instances[row].bare();
+        for (name, value) in &oracle.instances[row].properties {
+            if named(name) && (instance.parent_index.is_some() || name.len().is_multiple_of(4)) {
+                expected.properties.insert(name.clone(), value.clone());
+            }
+        }
+        assert_eq!(*instance, expected, "row {row} projected");
+    }
+    // The rows a reader selects, read in one pass.
+    let (mut selected, columns) = decode_for_row_chunks(bytes)?;
+    let wanted = (0..oracle.instances.len())
+        .map(|row| row % 3 == 1)
+        .collect::<Vec<_>>();
+    columns.materialize_selected(&mut selected, &wanted)?;
+    for (row, instance) in selected.instances.iter().enumerate() {
+        let expected = &oracle.instances[row];
+        if wanted[row] {
+            assert_eq!(instance, expected, "row {row} selected");
+        } else {
+            assert_eq!(*instance, expected.bare(), "row {row} not selected");
+        }
+    }
+    // The same rows read after their reference columns: those columns as
+    // the v11 columns of the same document give them, then the rest.
+    let v11 = encode_settings_bytecode_v11(&decode_settings_bytecode(bytes)?)?;
+    let referenced = |bytes: &[u8]| -> Result<_> {
+        let (mut document, mut columns) = decode_for_row_chunks(bytes)?;
+        columns.materialize_references(&mut document, &wanted)?;
+        Ok((document, columns))
+    };
+    let ((mut read, columns), (expected, _)) = (referenced(bytes)?, referenced(&v11)?);
+    assert_eq!(read.instances, expected.instances, "reference columns");
+    columns.materialize_selected(&mut read, &wanted)?;
+    assert_eq!(
+        read.instances, selected.instances,
+        "rows after their references"
+    );
     for size in [1, 7, 4096] {
         let (mut document, mut columns) = decode_for_row_chunks(bytes)?;
         for start in (0..document.instances.len()).step_by(size) {
             let end = (start + size).min(document.instances.len());
+            // Every other range comes as values apart from the structure.
+            if start / size % 2 == 1 {
+                let values = columns.materialize_values(start..end)?;
+                for (index, values) in (start..end).zip(values) {
+                    let instance = &oracle.instances[index];
+                    assert!(
+                        crate::settings::held::same_properties(
+                            &values.properties,
+                            &instance.properties
+                        ) && values.attributes == instance.attributes,
+                        "row {index} as values"
+                    );
+                }
+                continue;
+            }
             columns.materialize(&mut document, start..end)?;
             for index in start..end {
                 assert_eq!(document.instances[index], oracle.instances[index]);
@@ -78,6 +142,7 @@ fn edit(instance: &mut SettingsBytecodeInstance, mode: usize) {
             );
         }
         2 => {
+            instance.settings_id = format!("renamed {}", instance.settings_id);
             instance.properties.clear();
             instance.attributes.clear();
             instance
@@ -185,11 +250,14 @@ fn property_edits_preserve_eager_encoder_bytes() {
             version: SETTINGS_BINARY_VERSION,
             instances,
         };
-        let mut bytes = encode_settings_bytecode(&document).map_err(|error| error.to_string())?;
-        if seed % 2 == 0 {
-            bytes[SETTINGS_BINARY_MAGIC.len()] = SETTINGS_BINARY_MIN_VERSION;
+        for format in &FORMATS {
+            let mut bytes = (format.encode)(&document).map_err(|error| error.to_string())?;
+            if seed % 2 == 0 && format.version == FORMATS[0].version {
+                bytes[SETTINGS_BINARY_MAGIC.len()] = SETTINGS_BINARY_MIN_VERSION;
+            }
+            check_codec_document(&bytes).map_err(|error| error.to_string())?;
         }
-        check_codec_document(&bytes).map_err(|error| error.to_string())
+        Ok(())
     });
 }
 
@@ -219,7 +287,9 @@ fn payloads_alike_in_length_and_sample_keep_their_own_rows() {
         version: SETTINGS_BINARY_VERSION,
         instances,
     };
-    check_codec_document(&encode_settings_bytecode(&document).unwrap()).unwrap();
+    for format in &FORMATS {
+        check_codec_document(&(format.encode)(&document).unwrap()).unwrap();
+    }
 }
 
 #[test]
@@ -234,7 +304,7 @@ fn property_edit_decoder_retains_group_overwrite_and_error_rules() {
         "Value".into(),
         json!({"_type":"Vector3", "x":1, "y":2, "z":3}),
     );
-    let bytes = encode_settings_bytecode(&document).unwrap();
+    let bytes = encode_settings_bytecode_v11(&document).unwrap();
     let (_, payload) = decode_settings_bytecode_container(&bytes).unwrap();
     let mut reader = BytecodeReader::new(&payload);
     let budget = DecodeBudget::for_file(bytes.len());
@@ -330,13 +400,15 @@ fn rows_of_a_large_store_hold_the_values_of_a_column_decoded_two_ways() {
         version: SETTINGS_BINARY_VERSION,
         instances,
     };
-    let bytes = encode_settings_bytecode(&whole).unwrap();
-    let whole = decode_settings_bytecode(&bytes).unwrap();
-    for step in [1, 2, 7, 1000] {
-        let rows = (1..whole.instances.len()).step_by(step).collect::<Vec<_>>();
-        let (read, _) = decode_rows(&bytes, &rows).unwrap();
-        for (row, read) in rows.iter().zip(&read) {
-            assert_eq!(*read, whole.instances[*row], "row {row} of every {step}");
+    for format in &FORMATS {
+        let bytes = (format.encode)(&whole).unwrap();
+        let whole = decode_settings_bytecode(&bytes).unwrap();
+        for step in [1, 2, 7, 1000] {
+            let rows = (1..whole.instances.len()).step_by(step).collect::<Vec<_>>();
+            let (read, _) = decode_rows(&bytes, &rows).unwrap();
+            for (row, read) in rows.iter().zip(&read) {
+                assert_eq!(*read, whole.instances[*row], "row {row} of every {step}");
+            }
         }
     }
 }

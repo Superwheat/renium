@@ -347,8 +347,13 @@ fn captured_conversion_shares_decoder_budget_charges() {
         if seed.is_multiple_of(2) {
             add_native_properties(&mut state, seed);
         }
-        let bytes = encode_service_settings_binary(&state).map_err(|error| format!("{error:#}"))?;
-        let (version, payload) = decode_settings_bytecode_container(&bytes).unwrap();
+        // The conversion charges what the v11 decoder charges, the decoder
+        // the limits of every store version stand on.
+        let bytes =
+            encode_service_settings_binary_v11(&state).map_err(|error| format!("{error:#}"))?;
+        let (_, payload) = decode_settings_bytecode_container(&bytes).unwrap();
+        // A captured state's document carries the version it is written in.
+        let version = SETTINGS_BINARY_VERSION;
         let budget = DecodeBudget::new(usize::MAX);
         let expected = decode_settings_bytecode_document(version, &payload, &budget).unwrap();
         let charge = usize::MAX - budget.remaining.load(Ordering::Relaxed);

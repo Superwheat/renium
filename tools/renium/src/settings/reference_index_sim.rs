@@ -9,9 +9,7 @@ pub(super) fn encode_oracle(document: &SettingsBytecode) -> Result<Vec<u8>> {
     let settled = forced_properties_settled_document(document);
     let document = settled.as_ref().unwrap_or(document);
     let lookup = build_bytecode_instance_lookup_oracle(document);
-    wrap_settings_bytecode_payload(&encode_settings_bytecode_payload_using_lookup(
-        document, &lookup,
-    )?)
+    blocks::encode_with_lookup(document, &lookup, None, blocks::BLOCK_ROWS)
 }
 
 fn generated(seed: u64) -> SettingsBytecode {

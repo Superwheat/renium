@@ -54,12 +54,14 @@ fn generated(seed: u64, count: usize) -> SettingsBytecode {
 /// bytes answers.
 fn documents_answer_like_bytes(reference: &[u8], observed: &[u8]) {
     let from_bytes = align_settings_bytes(reference, observed, true);
+    let stored = reference;
     let from_documents = decode_settings_bytecode(reference).and_then(|reference| {
         align_pulled_settings_documents_to_reference(
             reference,
             decode_settings_bytecode(observed)?,
             &|| Ok(observed.to_vec()),
             std::time::Instant::now(),
+            stored,
         )
         .map(|pulled| pulled.alignment)
     });
@@ -233,7 +235,7 @@ fn runtime_identity_reuse_retains_legacy_reencoding() {
     reference.instances[0]
         .properties
         .insert("Brightness".into(), json!(3));
-    let mut after = encode_settings_bytecode(&reference).unwrap();
+    let mut after = crate::settings::bytecode::encode_settings_bytecode_v11(&reference).unwrap();
     after[b"RBSSET\0".len()] = 10;
     same_result(&before, &after, true);
 }
@@ -585,12 +587,14 @@ fn an_edit_beside_a_moved_camera_is_written_with_the_stored_camera() {
 #[test]
 fn a_pull_says_whether_the_store_it_leaves_is_the_observed_document() {
     let reference = generated(2, 12);
+    let stored = encode_settings_bytecode(&reference).unwrap();
     let pull = |observed: &SettingsBytecode| {
         align_pulled_settings_documents_to_reference(
             reference.clone(),
             observed.clone(),
-            &|| encode_settings_bytecode(observed),
+            &|| encode_settings_bytecode_over(observed, false, Some(&stored)),
             std::time::Instant::now(),
+            &stored,
         )
         .unwrap()
     };

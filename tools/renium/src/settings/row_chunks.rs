@@ -33,7 +33,7 @@ fn consumed_columns_release_their_bytes_without_resetting_deltas() -> Result<()>
             })
             .collect(),
     };
-    let bytes = encode_settings_bytecode(&document)?;
+    let bytes = encode_settings_bytecode_v11(&document)?;
     let expected = decode_settings_bytecode_holding(&bytes)?;
     let (mut actual, mut columns) = decode_for_row_chunks(&bytes)?;
     let initial = columns
@@ -92,7 +92,7 @@ fn selected_reference_columns_are_not_decoded_again() -> Result<()> {
         row.attributes
             .insert("Text".into(), json!(format!("row {index}")));
     }
-    let bytes = encode_settings_bytecode(&document)?;
+    let bytes = encode_settings_bytecode_v11(&document)?;
     let expected = decode_settings_bytecode_holding(&bytes)?;
     let (mut actual, mut columns) = decode_for_row_chunks(&bytes)?;
     columns.materialize_references(&mut actual, &[false, true, false])?;
@@ -170,6 +170,10 @@ impl GroupCursor {
     }
 }
 
+/// The value kinds that can hold a reference, which a selection reads first.
+/// Store codec tags, not an engine class or property list.
+const REFERENCE_KINDS: [u8; 4] = [7, 8, 10, 17];
+
 pub(crate) struct RetainedRowColumns {
     strings: Vec<String>,
     groups: Vec<RowGroup>,
@@ -179,6 +183,8 @@ pub(crate) struct RetainedRowColumns {
     instance_count: usize,
     next_row: usize,
     reference_budget: Option<(usize, Vec<bool>)>,
+    /// A v12 store keeps no columns: its rows come from its blocks.
+    blocks: Option<super::super::blocks::RowBlocks>,
 }
 
 /// Read structure and retain the encoded value columns. The normal decoder's
@@ -187,6 +193,21 @@ pub(crate) fn decode_for_row_chunks(
     bytes: &[u8],
 ) -> Result<(SettingsBytecode, RetainedRowColumns)> {
     let _span = crate::app::profile::span("store retained row columns");
+    if super::super::blocks::is_block_store(bytes) {
+        let (structure, blocks) = super::super::blocks::RowBlocks::decode(bytes)?;
+        let columns = RetainedRowColumns {
+            strings: Vec::new(),
+            groups: Vec::new(),
+            cursors: Vec::new(),
+            budget: DecodeBudget::for_file(bytes.len()),
+            file_bytes: bytes.len(),
+            instance_count: structure.instances.len(),
+            next_row: 0,
+            reference_budget: None,
+            blocks: Some(blocks),
+        };
+        return Ok((structure, columns));
+    }
     let (version, payload) = decode_settings_bytecode_container(bytes)?;
     let budget = DecodeBudget::for_file(bytes.len()).holding_payloads();
     let mut reader = BytecodeReader::new(&payload);
@@ -228,6 +249,7 @@ pub(crate) fn decode_for_row_chunks(
             instance_count,
             next_row: 0,
             reference_budget: None,
+            blocks: None,
         },
     ))
 }
@@ -315,6 +337,9 @@ impl RetainedRowColumns {
         // Schedule only this range, with enough partitions for a bounded range
         // to use the worker pool. Group order still decides repeated values.
         apply_decoded_property_groups_in_range(instances, rows.start, &specs, groups, 512);
+        if let Some(blocks) = &mut self.blocks {
+            blocks.fill(instances, rows.clone())?;
+        }
         self.next_row = rows.end;
         Ok(())
     }
@@ -324,13 +349,16 @@ impl RetainedRowColumns {
     pub(crate) fn project_properties(
         &self,
         document: &mut SettingsBytecode,
-        names: impl Fn(&str) -> bool,
+        names: impl Fn(&str) -> bool + Sync,
         project: impl Fn(&SettingsBytecodeInstance, &str, Value) -> Option<Value>,
     ) -> Result<()> {
         anyhow::ensure!(
             self.next_row == 0,
             "Store context must be projected before reading rows; restart the import before writing to Studio"
         );
+        if let Some(blocks) = &self.blocks {
+            return blocks.project(document, names, project);
+        }
         let budget = DecodeBudget::for_file(self.file_bytes).holding_payloads();
         let scope = ValueScope {
             strings: &self.strings,
@@ -376,11 +404,13 @@ impl RetainedRowColumns {
             self.budget.remaining.load(Ordering::Relaxed),
             wanted.to_vec(),
         ));
-        // Store codec tags, not an engine class or property list.
+        if let Some(blocks) = &mut self.blocks {
+            return blocks.references(document, wanted, &REFERENCE_KINDS);
+        }
         let names = self
             .groups
             .iter()
-            .filter(|group| matches!(group.kind, 7 | 8 | 10 | 17))
+            .filter(|group| REFERENCE_KINDS.contains(&group.kind))
             .map(|group| &group.name)
             .collect::<std::collections::HashSet<_>>();
         let scope = ValueScope {
@@ -433,6 +463,9 @@ impl RetainedRowColumns {
                     .is_none_or(|(_, rows)| rows == wanted),
             "Store rows are selected from a store nothing was read of; restart the store read"
         );
+        if let Some(blocks) = &mut self.blocks {
+            return blocks.select(document, wanted, self.reference_budget.is_some());
+        }
         let scope = ValueScope {
             strings: &self.strings,
             instance_count: self.instance_count,

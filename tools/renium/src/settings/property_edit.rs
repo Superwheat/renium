@@ -15,6 +15,9 @@ pub(crate) mod sim;
 #[derive(Default)]
 pub(crate) struct RetainedPropertyColumns {
     columns: Vec<PropertyColumn>,
+    /// A v12 store keeps no columns: its edit reads and writes the blocks of
+    /// the instances it makes complete or changes.
+    blocks: Option<super::blocks::EditedStore>,
 }
 
 struct PropertyColumn {
@@ -43,6 +46,14 @@ pub(crate) fn read_row_chunks_with<T>(
 pub(crate) fn decode_for_property_edit(
     bytes: &[u8],
 ) -> Result<(SettingsBytecode, RetainedPropertyColumns)> {
+    if super::blocks::is_block_store(bytes) {
+        let (document, store) = super::blocks::EditedStore::decode(bytes)?;
+        let columns = RetainedPropertyColumns {
+            columns: Vec::new(),
+            blocks: Some(store),
+        };
+        return Ok((document, columns));
+    }
     let (version, payload) = decode_settings_bytecode_container(bytes)?;
     let budget = DecodeBudget::for_file(bytes.len());
     let mut reader = BytecodeReader::new(&payload);
@@ -92,6 +103,7 @@ pub(crate) fn decode_for_property_edit(
         SettingsBytecode { version, instances },
         RetainedPropertyColumns {
             columns: columns.into_iter().flatten().collect(),
+            blocks: None,
         },
     ))
 }
@@ -112,6 +124,9 @@ pub(crate) fn decode_rows(
     #[cfg(test)]
     ROW_DECODE_CALLS.set(ROW_DECODE_CALLS.get() + 1);
     let _span = crate::app::profile::span("store rows decode");
+    if super::blocks::is_block_store(bytes) {
+        return super::blocks::decode_rows(bytes, rows);
+    }
     let (_, payload) = decode_settings_bytecode_container(bytes)?;
     let budget = DecodeBudget::for_file(bytes.len());
     let mut reader = BytecodeReader::new(&payload);
@@ -252,6 +267,11 @@ fn row_digests_of(
     use super::captured::{UNIQUE_ID, attributes_digest, is_digested, row_digest, value_digest};
 
     let _span = crate::app::profile::span("store instance digests");
+    if super::blocks::is_block_store(bytes) {
+        return super::blocks::BlockStore::open(bytes)?
+            .holding()
+            .row_digests(whole, plan);
+    }
     let (_, payload) = decode_settings_bytecode_container(bytes)?;
     let budget = DecodeBudget::for_file(bytes.len());
     let mut reader = BytecodeReader::new(&payload);
@@ -700,6 +720,9 @@ impl RetainedPropertyColumns {
         document: &mut SettingsBytecode,
         indices: &[usize],
     ) -> Result<()> {
+        if let Some(store) = &mut self.blocks {
+            return store.materialize(document, indices);
+        }
         let mut selected = vec![false; document.instances.len()];
         for &index in indices {
             selected[index] = true;
@@ -726,71 +749,31 @@ impl RetainedPropertyColumns {
     }
 
     pub(crate) fn encode(&self, document: &SettingsBytecode) -> Result<Vec<u8>> {
-        validate_settings_hierarchy(&document.instances)?;
-        validate_settings_record_properties(&document.instances)?;
-        let canonical = canonical_attribute_document(document);
-        let document = canonical.as_ref().unwrap_or(document);
-        let settled = forced_properties_settled_document(document);
-        let document = settled.as_ref().unwrap_or(document);
-        let lookup = build_bytecode_instance_lookup(document);
-        let mut collected = collect_settings_bytecode_data(document, &lookup)?;
+        if let Some(store) = &self.blocks {
+            return store.encode(document);
+        }
+        // A v11 store is written whole as v12: each retained value goes back
+        // to its row where the document holds none of that name, a payload
+        // many rows hold by its handle.
+        let mut whole = document.clone();
         for column in &self.columns {
-            let mut values = Vec::with_capacity(column.values.len());
             for (index, value) in &column.values {
-                // Forced properties (TextScaled implies TextWrapped) can replace
-                // an unedited value during normalization too.
-                if document.instances[*index]
-                    .properties
-                    .contains_key(&column.name)
-                {
+                let row = &mut whole
+                    .instances
+                    .get_mut(*index)
+                    .context("An edit of values changed how many instances the store holds")?
+                    .properties;
+                if row.contains_key(&column.name) {
                     continue;
                 }
-                if let NativeSettingsValue::Shared(shared) = value {
-                    // Written as the JSON value it holds, as its row would be.
-                    let source = SettingsBinaryValueSource::of_property(shared);
-                    anyhow::ensure!(
-                        binary_source_value_kind(&source, &lookup)? == column.kind,
-                        "A retained payload of {} changed its wire kind",
-                        column.name
-                    );
-                    collect_binary_source_strings(&source, &lookup, &mut collected.string_counts)?;
-                    values.push(SettingsBinaryValue {
-                        instance_index: *index,
-                        source,
-                    });
-                    continue;
-                }
-                collect_native_value_strings(value, &mut collected.string_counts);
-                values.push(SettingsBinaryValue {
-                    instance_index: *index,
-                    source: SettingsBinaryValueSource::Native(value),
-                });
-            }
-            if !values.is_empty() {
-                add_count_key(
-                    &mut collected.string_counts,
-                    Cow::Borrowed(&column.name),
-                    values.len() as u64,
-                );
-                add_count_key(
-                    &mut collected.property_counts,
-                    Cow::Borrowed(&column.name),
-                    values.len() as u64,
-                );
-                let group = collected
-                    .property_groups
-                    .entry((&column.name, column.kind))
-                    .or_default();
-                if group.is_empty() {
-                    *group = values;
-                } else {
-                    group.append(&mut values);
-                    group.sort_unstable_by_key(|value| value.instance_index);
-                }
+                let value = match value {
+                    NativeSettingsValue::Shared(shared) => crate::settings::held::held_copy(shared),
+                    value => materialized_value(value, column.kind)?,
+                };
+                row.insert(column.name.clone(), value);
             }
         }
-        let payload = encode_settings_bytecode_payload_collected(document, &lookup, collected)?;
-        wrap_settings_bytecode_payload(&payload)
+        encode_settings_bytecode(&whole)
     }
 }
 

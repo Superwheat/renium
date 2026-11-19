@@ -14,10 +14,11 @@ use sha2::{Digest, Sha256};
 
 use super::EXTERNAL_SOURCE_MARKER;
 use super::bytecode::{
-    SettingsBytecode, SettingsBytecodeInstance, decode_settings_bytecode, encode_settings_bytecode,
-    encode_settings_bytecode_with_dense_references, is_known_default_property_value,
-    is_reference_object,
+    SettingsBytecode, SettingsBytecodeInstance, decode_settings_bytecode,
+    encode_settings_bytecode_over, is_known_default_property_value, is_reference_object,
 };
+#[cfg(test)]
+use super::bytecode::{encode_settings_bytecode, encode_settings_bytecode_with_dense_references};
 use crate::app::output::log_global;
 use crate::app::timing::verbose_timing_logs;
 use crate::rbx::decode::{nonfinite_float_from_json, rbx_variant_to_settings_json};
@@ -161,6 +162,7 @@ fn align_settings_bytes(
             cache_key,
             started: decode_started,
             stored_as_observed: None,
+            previous: Some(reference_bytes),
         },
     )
 }
@@ -168,13 +170,14 @@ fn align_settings_bytes(
 /// A pull's alignment for a caller that holds both stores decoded already:
 /// the observed one straight from the captured state, never as bytes. Answers
 /// what `align_pulled_settings_bytes_to_reference` answers for the stored
-/// file and the bytes `observed_bytes` gives, which are only asked for where
-/// the observed store is written as it came in.
+/// file `stored` and the bytes `observed_bytes` gives, which are only asked
+/// for where the observed store is written as it came in.
 pub(crate) fn align_pulled_settings_documents_to_reference(
     reference: SettingsBytecode,
     observed: SettingsBytecode,
     observed_bytes: &dyn Fn() -> Result<Vec<u8>>,
     started: std::time::Instant,
+    stored: &[u8],
 ) -> Result<PulledAlignment> {
     let stored_as_observed = AtomicBool::new(false);
     let alignment = align_settings_documents(
@@ -186,6 +189,7 @@ pub(crate) fn align_pulled_settings_documents_to_reference(
             cache_key: None,
             started,
             stored_as_observed: Some(&stored_as_observed),
+            previous: Some(stored),
         },
     )?;
     Ok(PulledAlignment {
@@ -351,6 +355,9 @@ struct AlignmentInput<'a> {
     /// Set where the store the alignment leaves holds exactly the observed
     /// document, with the viewport camera it kept.
     stored_as_observed: Option<&'a AtomicBool>,
+    /// The file of the store aligned to, which a store written for it is
+    /// written over.
+    previous: Option<&'a [u8]>,
 }
 
 fn same_instances(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
@@ -373,6 +380,7 @@ fn align_settings_documents(
         cache_key,
         started,
         stored_as_observed,
+        previous,
     } = input;
     let mut phases = AlignmentPhases {
         instances: observed.instances.len(),
@@ -407,7 +415,7 @@ fn align_settings_documents(
                 bail!("duplicate instance identity is ambiguous after comparing references");
             }
             keep_camera(&mut observed);
-            let upgraded = encode_settings_bytecode(&observed)?;
+            let upgraded = encode_settings_bytecode_over(&observed, false, previous)?;
             drop_settings_documents(reference, observed);
             return Ok(SettingsAlignment::Changed(upgraded));
         }
@@ -441,7 +449,7 @@ fn align_settings_documents(
             .iter()
             .all(|instance| is_store_identity(&instance.settings_id));
         let aligned = if camera_kept || !keep_encoding {
-            encode_settings_bytecode(&observed)?
+            encode_settings_bytecode_over(&observed, false, previous)?
         } else {
             match observed_bytes {
                 ObservedBytes::Given(bytes) => bytes.to_vec(),
@@ -468,7 +476,7 @@ fn align_settings_documents(
         ContiguousStructuralAlignment::Aligned { ids_kept } => {
             phases.end("structural matching");
             keep_camera(&mut observed);
-            let aligned = encode_settings_bytecode_with_dense_references(&observed)?;
+            let aligned = encode_settings_bytecode_over(&observed, true, previous)?;
             if let Some(stored_as_observed) = stored_as_observed {
                 stored_as_observed.store(ids_kept, Ordering::Relaxed);
             }
@@ -490,7 +498,7 @@ fn align_settings_documents(
     }
     phases.end("identity matching");
     let camera_kept = keep_camera(&mut observed) || camera_kept_early;
-    let aligned = encode_settings_bytecode(&observed)?;
+    let aligned = encode_settings_bytecode_over(&observed, false, previous)?;
     phases.end("encode");
     let result = finish_settings_alignment(reference, observed, aligned, cache_key, camera_kept);
     phases.end("final comparison");

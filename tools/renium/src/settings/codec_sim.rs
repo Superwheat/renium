@@ -26,6 +26,10 @@
 //! 5. Keeping untouched property columns in their compact form while
 //!    editing selected rows produces exactly the eager encoder's bytes.
 //!
+//! Laws 1, 2, 3 and 5 hold for the store written as v11 and as v12 (see
+//! `bytecode::blocks`): each reader gives both files the same answers, and
+//! the documents of a v12 file carry its version.
+//!
 //! The canonical forms, as the codec writes and reads them:
 //!
 //! - A property whose value is null is dropped; inside arrays and objects a
@@ -65,10 +69,11 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Number, Value, json};
 
+use super::bytecode::blocks::sim::{FORMATS, Format};
 use super::bytecode::{
     SETTINGS_BINARY_PARALLEL_CHUNK_SIZE, SETTINGS_BINARY_PARALLEL_MIN_INSTANCES,
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, decode_settings_bytecode,
-    encode_settings_bytecode, encode_settings_bytecode_with_dense_references,
+    encode_settings_bytecode_with_dense_references,
 };
 use crate::tests::support::{SimRng, run_seeds};
 
@@ -1579,13 +1584,14 @@ fn shown(value: &Value) -> String {
     }
 }
 
-/// `decoded` holds the instances of `given`, with the decoded version.
+/// `decoded` holds the instances of `given`, with the version `version`.
 fn records_kept(
     given: &SettingsBytecode,
     decoded: &SettingsBytecode,
     law: &str,
+    version: u8,
 ) -> Result<(), String> {
-    if decoded.version != SETTINGS_BINARY_VERSION {
+    if decoded.version != version {
         return Err(format!("{law}: decoded version {}", decoded.version));
     }
     if decoded.instances.len() != given.instances.len() {
@@ -1678,7 +1684,7 @@ fn values_stated(
     decoded: &SettingsBytecode,
     law: &str,
 ) -> Result<(), String> {
-    records_kept(stated, decoded, law)?;
+    records_kept(stated, decoded, law, stated.version)?;
     for (index, (stated, decoded)) in stated.instances.iter().zip(&decoded.instances).enumerate() {
         for (attribute, stated, decoded) in [
             (false, &stated.properties, &decoded.properties),
@@ -1712,8 +1718,8 @@ fn values_stated(
     Ok(())
 }
 
-fn reencoded(bytes: &[u8], d1: &SettingsBytecode) -> Result<(), String> {
-    let again = encode_settings_bytecode(d1)
+fn reencoded(bytes: &[u8], d1: &SettingsBytecode, format: &Format) -> Result<(), String> {
+    let again = (format.encode)(d1)
         .map_err(|error| format!("law 3: the decoded document does not encode: {error:#}"))?;
     if again != bytes {
         return Err(format!(
@@ -1734,7 +1740,7 @@ fn reencoded(bytes: &[u8], d1: &SettingsBytecode) -> Result<(), String> {
     if !same_document(&held, d1) || held != *d1 {
         return Err("law 3: the document that holds its payloads by handle is another".into());
     }
-    if encode_settings_bytecode(&held).ok().as_deref() != Some(bytes) {
+    if (format.encode)(&held).ok().as_deref() != Some(bytes) {
         return Err("law 3: a document that holds its payloads by handle encodes otherwise".into());
     }
     Ok(())
@@ -1793,8 +1799,8 @@ fn dense_kept(
 
 /// Law 2 for a document with a property no store can give back.
 fn refused(d0: &SettingsBytecode) -> Result<(), String> {
-    if encode_settings_bytecode(d0).is_ok() {
-        return Err("law 2: the encoder took a property named for a record field or an object named Attributes".into());
+    if FORMATS.iter().any(|format| (format.encode)(d0).is_ok()) {
+        return Err("law 2: an encoder took a property named for a record field or an object named Attributes".into());
     }
     if encode_settings_bytecode_with_dense_references(d0).is_ok() {
         return Err("law 4: the dense encoder took a property named for a record field or an object named Attributes".into());
@@ -1807,21 +1813,44 @@ fn laws(doc: &Doc) -> Result<(), String> {
     if doc.refused() {
         return refused(&d0);
     }
-    let bytes = encode_settings_bytecode(&d0)
-        .map_err(|error| format!("law 2: the encoder refused the document: {error:#}"))?;
-    let d1 = decode_settings_bytecode(&bytes)
-        .map_err(|error| format!("law 1: its encoding does not decode: {error:#}"))?;
-    records_kept(&d0, &d1, "law 1")?;
-    structure_kept(&bytes, &d1)?;
-    string_sets_kept(&bytes, &d1)?;
     let plain = doc
         .stated(false)
         .expect("the plain encoder refuses nothing");
-    values_stated(doc, false, &plain, &d1, "law 2")?;
-    reencoded(&bytes, &d1)?;
+    let mut files = Vec::new();
+    for format in &FORMATS {
+        files.push(
+            format_laws(doc, &d0, &plain, format)
+                .map_err(|failure| format!("{failure} (as a v{} store)", format.version))?,
+        );
+    }
+    let (bytes, d1) = &files[1];
+    dense_kept(doc, &d0, d1, bytes, &plain)
+}
+
+/// Laws 1, 2, 3 and 5 for the file `format` writes of `d0`, with `plain`
+/// the document law 2 states: the file and its decode.
+fn format_laws(
+    doc: &Doc,
+    d0: &SettingsBytecode,
+    plain: &SettingsBytecode,
+    format: &Format,
+) -> Result<(Vec<u8>, SettingsBytecode), String> {
+    let bytes = (format.encode)(d0)
+        .map_err(|error| format!("law 2: the encoder refused the document: {error:#}"))?;
+    let d1 = decode_settings_bytecode(&bytes)
+        .map_err(|error| format!("law 1: its encoding does not decode: {error:#}"))?;
+    records_kept(d0, &d1, "law 1", format.version)?;
+    structure_kept(&bytes, &d1)?;
+    string_sets_kept(&bytes, &d1)?;
+    let stated = SettingsBytecode {
+        version: format.version,
+        instances: plain.instances.clone(),
+    };
+    values_stated(doc, false, &stated, &d1, "law 2")?;
+    reencoded(&bytes, &d1, format)?;
     super::bytecode::property_edit::sim::check_codec_document(&bytes)
         .map_err(|error| format!("law 5: selective property edit differs: {error:#}"))?;
-    dense_kept(doc, &d0, &d1, &bytes, &plain)
+    Ok((bytes, d1))
 }
 
 fn breaks(doc: &Doc, law: &str) -> bool {
@@ -2068,12 +2097,18 @@ fn parallel_codec_keeps_serial_bytes_and_documents() {
     });
     run_seeds(16, |seed, _| {
         let document = parallel_document(seed);
-        let bytes = pools[0]
-            .install(|| encode_settings_bytecode(&document))
+        let files = FORMATS
+            .iter()
+            .map(|format| pools[0].install(|| (format.encode)(&document)))
+            .collect::<anyhow::Result<Vec<_>>>()
             .map_err(|error| error.to_string())?;
         let expected = pools[0]
-            .install(|| decode_settings_bytecode(&bytes))
+            .install(|| decode_settings_bytecode(&files[1]))
             .map_err(|error| error.to_string())?;
+        let decoded_as = |version| SettingsBytecode {
+            version,
+            instances: expected.instances.clone(),
+        };
         let mut state =
             super::bytecode::parallel_codec_sim::captured_state(&expected, seed % 3 != 1);
         state.dense_index_topology = seed % 3 != 0;
@@ -2082,10 +2117,22 @@ fn parallel_codec_keeps_serial_bytes_and_documents() {
             .map_err(|error| error.to_string())?;
         for pool in &pools[1..] {
             pool.install(|| -> Result<(), String> {
-                let encoded =
-                    encode_settings_bytecode(&document).map_err(|error| error.to_string())?;
-                if bytes != encoded {
-                    return Err("parallel encoder changed bytes".into());
+                for (format, bytes) in FORMATS.iter().zip(&files) {
+                    let encoded = (format.encode)(&document).map_err(|error| error.to_string())?;
+                    if *bytes != encoded {
+                        return Err(format!(
+                            "parallel v{} encoder changed bytes",
+                            format.version
+                        ));
+                    }
+                    let decoded =
+                        decode_settings_bytecode(bytes).map_err(|error| error.to_string())?;
+                    if !same_document(&decoded, &decoded_as(format.version)) {
+                        return Err(format!(
+                            "parallel v{} decoder changed values",
+                            format.version
+                        ));
+                    }
                 }
                 if service_bytes
                     != super::bytecode::encode_service_settings_binary(&state)
@@ -2093,18 +2140,11 @@ fn parallel_codec_keeps_serial_bytes_and_documents() {
                 {
                     return Err("parallel service encoder changed bytes".into());
                 }
-                let decoded =
-                    decode_settings_bytecode(&bytes).map_err(|error| error.to_string())?;
-                if !same_document(&decoded, &expected) {
-                    return Err("parallel decoder changed values".into());
-                }
-                let mut legacy = bytes.clone();
-                legacy[7] = SETTINGS_BINARY_VERSION - 1;
-                let mut expected_legacy = expected.clone();
-                expected_legacy.version -= 1;
+                let mut legacy = files[0].clone();
+                legacy[7] = FORMATS[0].version - 1;
                 let decoded_legacy =
                     decode_settings_bytecode(&legacy).map_err(|error| error.to_string())?;
-                if !same_document(&decoded_legacy, &expected_legacy) {
+                if !same_document(&decoded_legacy, &decoded_as(FORMATS[0].version - 1)) {
                     return Err("parallel legacy decode changed values".into());
                 }
                 Ok(())

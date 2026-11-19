@@ -621,11 +621,34 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
             ) else {
                 return Ok(());
             };
-            let answered = match &rows {
-                Some(before) => pull_changed_values(&state, before, &now.rows, &file, None)
-                    .map_err(|error| format!("round {round}: {error:#}"))?,
-                None => None,
+            let pulled = |file: &[u8]| -> Result<_, String> {
+                let answered = match &rows {
+                    Some(before) => pull_changed_values(&state, before, &now.rows, file, None)
+                        .map_err(|error| format!("round {round}: {error:#}"))?,
+                    None => None,
+                };
+                let unremembered = pull_changed_document_rows(&state, &now.rows, file, None)
+                    .map_err(|error| format!("round {round}: {error:#}"))?;
+                Ok((answered, unremembered))
             };
+            let (answered, unremembered) = pulled(&file)?;
+            // The stored document written as v11 and as v12 answers alike.
+            if let Some([v11, v12]) = files_of(&reference)? {
+                let ((answered, unremembered), (answered_v12, unremembered_v12)) =
+                    (pulled(&v11)?, pulled(&v12)?);
+                if !same_alignment(answered.as_ref(), answered_v12.as_ref())
+                    || !same_alignment(
+                        unremembered.as_ref().map(|(answer, _)| answer),
+                        unremembered_v12.as_ref().map(|(answer, _)| answer),
+                    )
+                    || unremembered.as_ref().map(|(_, same)| same)
+                        != unremembered_v12.as_ref().map(|(_, same)| same)
+                {
+                    return Err(format!(
+                        "round {round}: the stored document as a v12 store answers otherwise"
+                    ));
+                }
+            }
             // Where a state says the two encoders write it alike, they do.
             if now.rows.encodes_as_its_document()
                 && encode_service_settings_binary(&state).ok()
@@ -636,8 +659,6 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
                 ));
             }
             // A file compared with no memory of it answers the same.
-            let unremembered = pull_changed_document_rows(&state, &now.rows, &file, None)
-                .map_err(|error| format!("round {round}: {error:#}"))?;
             // Studio numbered the instances anew since the file was written.
             let other_ids = !reference
                 .instances
@@ -694,8 +715,9 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
             let aligned = align_pulled_settings_documents_to_reference(
                 reference,
                 observed,
-                &|| encode_service_settings_binary(&state),
+                &|| encode_service_settings_binary_over(&state, Some(&file)),
                 std::time::Instant::now(),
+                &file,
             );
             match (&unremembered, &aligned) {
                 (None, _) => {}
@@ -812,6 +834,19 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
     }
 }
 
+/// Whether two pulls answer alike: both keep the file, or both write the
+/// same store, or neither answers.
+fn same_alignment(left: Option<&SettingsAlignment>, right: Option<&SettingsAlignment>) -> bool {
+    match (left, right) {
+        (None, None)
+        | (Some(SettingsAlignment::Equivalent), Some(SettingsAlignment::Equivalent)) => true,
+        (Some(SettingsAlignment::Changed(left)), Some(SettingsAlignment::Changed(right))) => {
+            left == right
+        }
+        _ => false,
+    }
+}
+
 /// Two parts of one name under one parent, in the session that numbers its
 /// instances from `session`, each with what `held` gives it.
 fn twins(session: usize, unique_ids: bool, held: [f64; 2]) -> SettingsBytecode {
@@ -894,8 +929,9 @@ fn namesakes_that_traded_their_values_take_the_whole_alignment() {
     let aligned = align_pulled_settings_documents_to_reference(
         decode_settings_bytecode(&file).unwrap(),
         settings_bytecode_from_service_state(&state).unwrap(),
-        &|| encode_service_settings_binary(&state),
+        &|| encode_service_settings_binary_over(&state, Some(&file)),
         std::time::Instant::now(),
+        &file,
     )
     .unwrap();
     let SettingsAlignment::Changed(written) = aligned.alignment else {
@@ -1020,8 +1056,9 @@ fn instances_under_namesakes_take_the_whole_alignment() {
     let aligned = align_pulled_settings_documents_to_reference(
         decode_settings_bytecode(&file).unwrap(),
         settings_bytecode_from_service_state(&state).unwrap(),
-        &|| encode_service_settings_binary(&state),
+        &|| encode_service_settings_binary_over(&state, Some(&file)),
         std::time::Instant::now(),
+        &file,
     )
     .unwrap();
     let SettingsAlignment::Changed(written) = aligned.alignment else {
@@ -1254,8 +1291,9 @@ fn a_unique_id_two_stored_instances_hold_tells_none_of_them() {
     let aligned = align_pulled_settings_documents_to_reference(
         decode_settings_bytecode(&file).unwrap(),
         settings_bytecode_from_service_state(&state).unwrap(),
-        &|| encode_service_settings_binary(&state),
+        &|| encode_service_settings_binary_over(&state, Some(&file)),
         std::time::Instant::now(),
+        &file,
     )
     .unwrap();
     let SettingsAlignment::Changed(written) = aligned.alignment else {
@@ -1302,8 +1340,9 @@ fn a_new_instance_under_an_id_the_store_holds_takes_another() {
     let aligned = align_pulled_settings_documents_to_reference(
         decode_settings_bytecode(&file).unwrap(),
         settings_bytecode_from_service_state(&state).unwrap(),
-        &|| encode_service_settings_binary(&state),
+        &|| encode_service_settings_binary_over(&state, Some(&file)),
         std::time::Instant::now(),
+        &file,
     )
     .unwrap();
     assert!(matches!(aligned.alignment, SettingsAlignment::Changed(bytes) if bytes == written));
@@ -1358,8 +1397,9 @@ fn a_renamed_property_beside_a_camera_that_points_at_an_instance_is_written() {
     let aligned = align_pulled_settings_documents_to_reference(
         decode_settings_bytecode(&file).unwrap(),
         settings_bytecode_from_service_state(&state).unwrap(),
-        &|| encode_service_settings_binary(&state),
+        &|| encode_service_settings_binary_over(&state, Some(&file)),
         std::time::Instant::now(),
+        &file,
     )
     .unwrap();
     let (SettingsAlignment::Changed(written), SettingsAlignment::Changed(expected)) =
@@ -1431,8 +1471,9 @@ fn what_the_engine_sets_makes_no_instance_differ() {
     let aligned = align_pulled_settings_documents_to_reference(
         decode_settings_bytecode(&file).unwrap(),
         settings_bytecode_from_service_state(&state).unwrap(),
-        &|| encode_service_settings_binary(&state),
+        &|| encode_service_settings_binary_over(&state, Some(&file)),
         std::time::Instant::now(),
+        &file,
     )
     .unwrap();
     assert!(matches!(aligned.alignment, SettingsAlignment::Equivalent));
@@ -1508,7 +1549,9 @@ fn an_instance_is_compared_as_held_and_under_todays_names() {
     );
 }
 
-/// The rows of a store file read alone are the rows its whole decoding gives.
+/// The rows of a store file read alone are the rows its whole decoding gives,
+/// and so are the digests taken without the whole document. The v11 and v12
+/// files the encoder of documents writes of that document answer alike.
 #[test]
 fn rows_read_alone_are_the_rows_of_the_whole_store() {
     run_seeds(48, |seed, _| {
@@ -1519,6 +1562,13 @@ fn rows_read_alone_are_the_rows_of_the_whole_store() {
             (seed / 4 % 4) as usize,
             seed % 3 != 0,
         );
+        // What the engine alone sets, which only the whole digests cover.
+        let mut document = document;
+        for row in document.instances.iter_mut().skip(1) {
+            if row.class_name == "Part" && rng.below(2) == 0 {
+                row.properties.insert("InertiaMigrated".into(), json!(true));
+            }
+        }
         let Ok(bytes) = encode_service_settings_binary(&captured(&document, seed % 2 == 0)) else {
             return Ok(());
         };
@@ -1527,52 +1577,133 @@ fn rows_read_alone_are_the_rows_of_the_whole_store() {
             .filter(|_| rng.below(3) == 0)
             .collect::<Vec<_>>();
         rng.shuffle(&mut rows);
-        let (alone, ids) =
-            property_edit::decode_rows(&bytes, &rows).map_err(|error| format!("{error:#}"))?;
-        for (row, instance) in rows.iter().zip(&alone) {
-            if *instance != whole.instances[*row] {
-                return Err(format!("row {row} differs"));
-            }
-        }
-        let stored_ids = whole
-            .instances
-            .iter()
-            .map(|instance| instance.settings_id.clone())
-            .collect::<Vec<_>>();
-        if ids != stored_ids {
-            return Err("the ids read with the rows are not the store's".into());
-        }
-        if property_edit::decode_rows(&bytes, &[whole.instances.len()]).is_ok() {
-            return Err("a row past the end was read".into());
-        }
-        // The digests taken column by column are the digests of the rows.
         let kept = (!whole.instances.is_empty()).then(|| rng.below(whole.instances.len()));
-        let property_edit::StoreRows {
-            digests,
-            unique_ids,
-            kept: alone,
-            ids,
-            ..
-        } = property_edit::row_digests(&bytes, |_| Some((kept, None)))
-            .map_err(|error| format!("{error:#}"))?
-            .ok_or("no digests")?;
-        if alone.as_ref() != kept.map(|kept| &whole.instances[kept]) {
-            return Err("the row kept with the digests is not the store's".into());
-        }
-        if ids != stored_ids {
-            return Err("the ids read with the digests are not the store's".into());
-        }
-        if digests.into_iter().zip(unique_ids).collect::<Vec<_>>()
-            != whole
-                .instances
-                .iter()
-                .map(captured::document_row_digest)
-                .collect::<Vec<_>>()
-        {
-            return Err("the digests of the columns are not the digests of the rows".into());
+        rows_alone(&bytes, &whole, &rows, kept)?;
+        let Some(files) = files_of(&whole)? else {
+            return Ok(());
+        };
+        let whole = decode_settings_bytecode(&files[0]).map_err(|error| format!("{error:#}"))?;
+        let answers = files
+            .iter()
+            .map(|bytes| {
+                rows_alone(bytes, &whole, &rows, kept)
+                    .map_err(|failure| format!("{failure} (v{})", bytes[7]))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if answers[0] != answers[1] {
+            return Err("a v12 file gives other digests than the v11 file".into());
         }
         Ok(())
     });
+}
+
+/// The v11 and v12 files the encoder of documents writes of `document`;
+/// none where it refuses an attribute the encoder of captured states wrote,
+/// which it does in either version.
+fn files_of(document: &SettingsBytecode) -> Result<Option<[Vec<u8>; 2]>, String> {
+    match (
+        encode_settings_bytecode_v11(document),
+        encode_settings_bytecode(document),
+    ) {
+        (Ok(v11), Ok(v12)) => Ok(Some([v11, v12])),
+        (Err(_), Err(_)) => Ok(None),
+        _ => Err("one version's encoder refused what the other's took".into()),
+    }
+}
+
+/// What the readers of rows give of `bytes`, a file of `whole`, checked
+/// against `whole`: the digests, UniqueId digests, kept row and ids of
+/// `row_digests`, and the same of `whole_row_digests` with its instances and
+/// the rows that name another instance by an id.
+type RowsAnswer = (
+    Vec<[u8; 16]>,
+    Vec<[u8; 16]>,
+    Option<SettingsBytecodeInstance>,
+    Vec<String>,
+    Vec<[u8; 16]>,
+    Vec<SettingsBytecodeInstance>,
+    Vec<usize>,
+);
+
+fn rows_alone(
+    bytes: &[u8],
+    whole: &SettingsBytecode,
+    rows: &[usize],
+    kept: Option<usize>,
+) -> Result<RowsAnswer, String> {
+    let (alone, ids) =
+        property_edit::decode_rows(bytes, rows).map_err(|error| format!("{error:#}"))?;
+    for (row, instance) in rows.iter().zip(&alone) {
+        if *instance != whole.instances[*row] {
+            return Err(format!("row {row} differs"));
+        }
+    }
+    let stored_ids = whole
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.clone())
+        .collect::<Vec<_>>();
+    if ids != stored_ids {
+        return Err("the ids read with the rows are not the store's".into());
+    }
+    if property_edit::decode_rows(bytes, &[whole.instances.len()]).is_ok() {
+        return Err("a row past the end was read".into());
+    }
+    // The digests taken column by column are the digests of the rows.
+    let digested = |whole_rows: bool| {
+        let read = if whole_rows {
+            property_edit::whole_row_digests(bytes, |_| Some((kept, None)))
+        } else {
+            property_edit::row_digests(bytes, |_| Some((kept, None)))
+        };
+        read.map_err(|error| format!("{error:#}"))?
+            .ok_or_else(|| "no digests".to_string())
+    };
+    let property_edit::StoreRows {
+        digests,
+        unique_ids,
+        kept: alone,
+        ids,
+        ..
+    } = digested(false)?;
+    if alone.as_ref() != kept.map(|kept| &whole.instances[kept]) {
+        return Err("the row kept with the digests is not the store's".into());
+    }
+    if ids != stored_ids {
+        return Err("the ids read with the digests are not the store's".into());
+    }
+    let pairs = |digest: fn(&SettingsBytecodeInstance) -> ([u8; 16], [u8; 16])| {
+        whole.instances.iter().map(digest).collect::<Vec<_>>()
+    };
+    if digests
+        .iter()
+        .copied()
+        .zip(unique_ids.iter().copied())
+        .collect::<Vec<_>>()
+        != pairs(captured::document_row_digest)
+    {
+        return Err("the digests of the columns are not the digests of the rows".into());
+    }
+    let every = digested(true)?;
+    if every
+        .digests
+        .iter()
+        .copied()
+        .zip(every.unique_ids)
+        .collect::<Vec<_>>()
+        != pairs(captured::whole_document_row_digest)
+    {
+        return Err("the whole digests of the columns are not those of the rows".into());
+    }
+    Ok((
+        digests,
+        unique_ids,
+        alone,
+        ids,
+        every.digests,
+        every.instances,
+        every.named,
+    ))
 }
 
 /// A capture numbered by another rule than its order is left to the whole

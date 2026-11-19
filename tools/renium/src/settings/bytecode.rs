@@ -24,6 +24,9 @@ use crate::system::files::write_bytes_if_changed;
 #[path = "property_edit.rs"]
 pub(crate) mod property_edit;
 
+#[path = "blocks.rs"]
+pub(crate) mod blocks;
+
 #[path = "captured.rs"]
 mod captured;
 #[cfg(test)]
@@ -185,7 +188,10 @@ pub(crate) fn pulled_digest_from_service_state(state: &ServiceState) -> Result<P
 
 const SETTINGS_BINARY_MAGIC: &[u8] = b"RBSSET\0";
 const SETTINGS_BINARY_MIN_VERSION: u8 = 10;
-pub(crate) const SETTINGS_BINARY_VERSION: u8 = 11;
+/// The last version of a store in one frame (see `blocks` for the version
+/// every store is written in).
+const SETTINGS_COLUMN_VERSION: u8 = 11;
+pub(crate) const SETTINGS_BINARY_VERSION: u8 = 12;
 pub(crate) const SETTINGS_REFERENCE_SELECTOR_KEYS: [&str; 9] = [
     "instanceIndex",
     "settingsId",
@@ -309,6 +315,16 @@ impl PartialEq for SettingsBytecodeInstance {
 }
 
 impl SettingsBytecodeInstance {
+    /// The instance's record, without its values.
+    pub(crate) fn bare(&self) -> Self {
+        Self::new(
+            self.settings_id.clone(),
+            self.name.clone(),
+            self.class_name.clone(),
+            self.parent_index,
+        )
+    }
+
     pub(crate) fn new(
         settings_id: String,
         name: String,
@@ -646,6 +662,9 @@ pub(crate) fn is_null_reference_value(value: &Value) -> bool {
 
 pub(crate) fn decode_settings_bytecode(bytes: &[u8]) -> Result<SettingsBytecode> {
     let _span = crate::app::profile::span("store decode");
+    if blocks::is_block_store(bytes) {
+        return blocks::BlockStore::open(bytes)?.decode();
+    }
     let (version, decoded) = decode_settings_bytecode_container(bytes)?;
     decode_settings_bytecode_document(version, &decoded, &DecodeBudget::for_file(bytes.len()))
 }
@@ -657,6 +676,9 @@ pub(crate) fn decode_settings_bytecode(bytes: &[u8]) -> Result<SettingsBytecode>
 /// resolves the handle.
 pub(crate) fn decode_settings_bytecode_holding(bytes: &[u8]) -> Result<SettingsBytecode> {
     let _span = crate::app::profile::span("store decode");
+    if blocks::is_block_store(bytes) {
+        return blocks::BlockStore::open(bytes)?.holding().decode();
+    }
     let (version, decoded) = decode_settings_bytecode_container(bytes)?;
     decode_settings_bytecode_document(
         version,
@@ -669,6 +691,9 @@ fn decode_settings_bytecode_if_contains_any_string_set(
     bytes: &[u8],
     required: &[Vec<String>],
 ) -> Result<Option<SettingsBytecode>> {
+    if blocks::is_block_store(bytes) {
+        return blocks::decode_if_contains(bytes, required);
+    }
     let (version, decoded) = decode_settings_bytecode_container(bytes)?;
     if !required.is_empty()
         && !required.iter().any(|needles| {
@@ -694,18 +719,25 @@ fn decode_settings_bytecode_container(bytes: &[u8]) -> Result<(u8, Vec<u8>)> {
     let version = reader
         .read_u8()
         .context("Missing settings bytecode version")?;
-    if !(SETTINGS_BINARY_MIN_VERSION..=SETTINGS_BINARY_VERSION).contains(&version) {
+    if !(SETTINGS_BINARY_MIN_VERSION..=SETTINGS_COLUMN_VERSION).contains(&version) {
         bail!("Unsupported settings bytecode version {version}");
     }
 
-    let decoded_len = reader.read_len("compressed settings bytecode payload length")?;
-    let encoded_len = reader.read_len("compressed settings bytecode byte length")?;
-    check_settings_payload_len(decoded_len, "Decoded")?;
-    check_settings_payload_len(encoded_len, "Compressed")?;
+    let (decoded_len, encoded_len) = read_frame_lengths(&mut reader)?;
     let encoded = reader.read_bytes(encoded_len)?;
     reader.finish()?;
     let decoded = zstd::bulk::decompress(encoded, decoded_len)?;
     Ok((version, decoded))
+}
+
+/// The length of a compressed frame's content and of the frame, each within
+/// what a store may hold.
+fn read_frame_lengths(reader: &mut BytecodeReader<'_>) -> Result<(usize, usize)> {
+    let decoded_len = reader.read_len("compressed settings bytecode payload length")?;
+    let encoded_len = reader.read_len("compressed settings bytecode byte length")?;
+    check_settings_payload_len(decoded_len, "Decoded")?;
+    check_settings_payload_len(encoded_len, "Compressed")?;
+    Ok((decoded_len, encoded_len))
 }
 
 fn decode_settings_bytecode_document(
@@ -720,6 +752,9 @@ fn decode_settings_bytecode_document(
 }
 
 fn decode_settings_bytecode_structure(bytes: &[u8]) -> Result<SettingsBytecode> {
+    if blocks::is_block_store(bytes) {
+        return blocks::BlockStore::open(bytes)?.structure();
+    }
     let (version, decoded) = decode_settings_bytecode_container(bytes)?;
     let mut reader = BytecodeReader::new(&decoded);
     let header = decode_settings_payload_header(&mut reader, &DecodeBudget::for_file(bytes.len()))?;
@@ -1104,6 +1139,13 @@ impl DecodeBudget {
         )
     }
 
+    /// Gives back all a reader of a file of `file_bytes` bytes may take, for
+    /// a pass that reads again what an earlier pass of the reader read.
+    fn renew(&self, file_bytes: usize) {
+        let fresh = Self::for_file(file_bytes).remaining.into_inner();
+        self.remaining.store(fresh, Ordering::Relaxed);
+    }
+
     fn take(&self, bytes: usize) -> Result<()> {
         self.remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
@@ -1294,20 +1336,42 @@ fn next_group_instance(previous: usize, step: usize, position: usize) -> Result<
 }
 
 pub(crate) fn encode_settings_bytecode(document: &SettingsBytecode) -> Result<Vec<u8>> {
-    encode_settings_bytecode_with_reference_lookup(document, true)
+    let _span = crate::app::profile::span("store encode");
+    blocks::encode_document(document, true, None)
 }
 
+#[cfg(test)]
 pub(crate) fn encode_settings_bytecode_with_dense_references(
     document: &SettingsBytecode,
 ) -> Result<Vec<u8>> {
-    encode_settings_bytecode_with_reference_lookup(document, false)
+    let _span = crate::app::profile::span("store encode");
+    blocks::encode_document(document, false, None)
 }
 
-fn encode_settings_bytecode_with_reference_lookup(
+/// `encode_settings_bytecode`, or the dense-references encoder where `dense`
+/// says so, for a store whose file holds `previous`: the same bytes, each
+/// frame that comes out as that file holds it copied from it where the same
+/// writer wrote it.
+pub(crate) fn encode_settings_bytecode_over(
     document: &SettingsBytecode,
-    build_reference_lookup: bool,
+    dense: bool,
+    previous: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let _span = crate::app::profile::span("store encode");
+    blocks::encode_document(document, !dense, previous)
+}
+
+/// The v11 encoder, which the tests keep to write the stores every reader
+/// still reads.
+#[cfg(test)]
+pub(crate) fn encode_settings_bytecode_v11(document: &SettingsBytecode) -> Result<Vec<u8>> {
+    let document = settled_settings_document(document)?;
+    wrap_settings_bytecode_payload(&encode_settings_bytecode_payload(&document)?)
+}
+
+/// `document` as a store holds it: refused where no store can hold it, its
+/// attributes in their typed forms and its forced properties settled.
+fn settled_settings_document(document: &SettingsBytecode) -> Result<Cow<'_, SettingsBytecode>> {
     validate_settings_hierarchy(&document.instances)?;
     validate_settings_record_properties(&document.instances)?;
     if document
@@ -1317,14 +1381,9 @@ fn encode_settings_bytecode_with_reference_lookup(
     {
         bail!("A document whose instances stand for unchanged counterparts is not written");
     }
-    let canonical = canonical_attribute_document(document);
-    let document = canonical.as_ref().unwrap_or(document);
-    let settled = forced_properties_settled_document(document);
-    let document = settled.as_ref().unwrap_or(document);
-    let payload =
-        encode_settings_bytecode_payload_with_reference_lookup(document, build_reference_lookup)?;
-    let encoded = wrap_settings_bytecode_payload(&payload)?;
-    Ok(encoded)
+    let document =
+        canonical_attribute_document(document).map_or(Cow::Borrowed(document), Cow::Owned);
+    Ok(forced_properties_settled_document(&document).map_or(document, Cow::Owned))
 }
 
 /// Refuses a property a store cannot give back: one named for a field of the
@@ -1425,56 +1484,60 @@ fn validate_settings_hierarchy(instances: &[SettingsBytecodeInstance]) -> Result
     Ok(())
 }
 
+#[cfg(test)]
 fn collect_settings_bytecode_chunk<'a>(
     lookup: &SettingsBinaryInstanceLookup<'_>,
     instances: &'a [SettingsBytecodeInstance],
     base_index: usize,
 ) -> Result<SettingsBinaryCollection<'a>> {
     let mut out = SettingsBinaryCollection::default();
-
     for (offset, instance) in instances.iter().enumerate() {
-        let instance_index = base_index + offset;
-        if parse_numeric_debug_settings_id(&instance.settings_id).is_none() {
-            add_count(&mut out.string_counts, instance.settings_id.as_str());
-        }
-        add_count(&mut out.string_counts, instance.name.as_str());
-        add_count(&mut out.string_counts, instance.class_name.as_str());
-        add_count(&mut out.class_counts, instance.class_name.as_str());
-
-        for (property_name, raw_value) in &instance.properties {
-            let source = SettingsBinaryValueSource::of_property(raw_value);
-            let kind = binary_source_value_kind(&source, lookup)?;
-            if kind == 0 {
-                continue;
-            }
-            let property_name = property_name.as_str();
-            push_settings_binary_value(
-                &mut out,
-                lookup,
-                instance_index,
-                property_name,
-                kind,
-                source,
-            )?;
-        }
-
-        if !instance.attributes.is_empty() {
-            let source = SettingsBinaryValueSource::Attributes(&instance.attributes);
-            let kind = binary_source_value_kind(&source, lookup)?;
-            push_settings_binary_value(
-                &mut out,
-                lookup,
-                instance_index,
-                "Attributes",
-                kind,
-                source,
-            )?;
-        }
+        collect_settings_record_strings(&mut out, instance);
+        collect_settings_instance_values(&mut out, lookup, base_index + offset, instance)?;
     }
-
     Ok(out)
 }
 
+/// Counts the strings of an instance's record: its id, name and class.
+fn collect_settings_record_strings<'a>(
+    out: &mut SettingsBinaryCollection<'a>,
+    instance: &'a SettingsBytecodeInstance,
+) {
+    if parse_numeric_debug_settings_id(&instance.settings_id).is_none() {
+        add_count(&mut out.string_counts, instance.settings_id.as_str());
+    }
+    add_count(&mut out.string_counts, instance.name.as_str());
+    add_count(&mut out.string_counts, instance.class_name.as_str());
+    add_count(&mut out.class_counts, instance.class_name.as_str());
+}
+
+/// Collects an instance's properties and attributes as the values of the
+/// row `instance_index`.
+fn collect_settings_instance_values<'a>(
+    out: &mut SettingsBinaryCollection<'a>,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    instance_index: usize,
+    instance: &'a SettingsBytecodeInstance,
+) -> Result<()> {
+    for (property_name, raw_value) in &instance.properties {
+        let source = SettingsBinaryValueSource::of_property(raw_value);
+        let kind = binary_source_value_kind(&source, lookup)?;
+        if kind == 0 {
+            continue;
+        }
+        let property_name = property_name.as_str();
+        push_settings_binary_value(out, lookup, instance_index, property_name, kind, source)?;
+    }
+
+    if !instance.attributes.is_empty() {
+        let source = SettingsBinaryValueSource::Attributes(&instance.attributes);
+        let kind = binary_source_value_kind(&source, lookup)?;
+        push_settings_binary_value(out, lookup, instance_index, "Attributes", kind, source)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn collect_settings_bytecode_data<'a>(
     document: &'a SettingsBytecode,
     lookup: &SettingsBinaryInstanceLookup<'_>,
@@ -1508,32 +1571,27 @@ fn collect_settings_bytecode_data<'a>(
 
 #[cfg(test)]
 fn encode_settings_bytecode_payload(document: &SettingsBytecode) -> Result<Vec<u8>> {
-    encode_settings_bytecode_payload_with_reference_lookup(document, true)
+    let lookup = build_bytecode_instance_lookup(document);
+    let collected = collect_settings_bytecode_data(document, &lookup)?;
+    encode_settings_bytecode_payload_collected(document, &lookup, collected)
 }
 
-fn encode_settings_bytecode_payload_with_reference_lookup(
+/// The lookup that finds the instances references name: by every selector
+/// the document's values use, or by instanceIndex alone where `by_selectors`
+/// says otherwise.
+fn document_reference_lookup(
     document: &SettingsBytecode,
-    build_reference_lookup: bool,
-) -> Result<Vec<u8>> {
-    let lookup = if build_reference_lookup {
-        build_bytecode_instance_lookup(document)
-    } else {
-        SettingsBinaryInstanceLookup {
-            dense_instance_count: document.instances.len(),
-            dense_instances: Some(&document.instances),
-            root_service: document_root_service(document),
-            ..Default::default()
-        }
-    };
-    encode_settings_bytecode_payload_using_lookup(document, &lookup)
-}
-
-fn encode_settings_bytecode_payload_using_lookup(
-    document: &SettingsBytecode,
-    lookup: &SettingsBinaryInstanceLookup<'_>,
-) -> Result<Vec<u8>> {
-    let collected = collect_settings_bytecode_data(document, lookup)?;
-    encode_settings_bytecode_payload_collected(document, lookup, collected)
+    by_selectors: bool,
+) -> SettingsBinaryInstanceLookup<'_> {
+    if by_selectors {
+        return build_bytecode_instance_lookup(document);
+    }
+    SettingsBinaryInstanceLookup {
+        dense_instance_count: document.instances.len(),
+        dense_instances: Some(&document.instances),
+        root_service: document_root_service(document),
+        ..Default::default()
+    }
 }
 
 fn encode_settings_bytecode_payload_collected(
@@ -1633,14 +1691,27 @@ const STORE_WINDOW_LOG: u32 = 27;
 /// the machine: zstd cuts the work by size, not by how many threads take it.
 const LARGE_STORE_PAYLOAD_BYTES: usize = 1 << 20;
 
+#[cfg(test)]
 fn compression_workers() -> u32 {
     thread::available_parallelism().map_or(1, |cores| cores.get().min(8) as u32)
 }
 
+#[cfg(test)]
 fn compress_store_payload(payload: &[u8], workers: u32) -> Result<Vec<u8>> {
+    compress_store_frame(payload, workers, false)
+}
+
+/// `compress_store_payload`, with zstd's checksum of the content in the frame
+/// where `checksum` says so.
+fn compress_store_frame(payload: &[u8], workers: u32, checksum: bool) -> Result<Vec<u8>> {
     use zstd::zstd_safe::{CCtx, CParameter, InBuffer, OutBuffer, zstd_sys::ZSTD_EndDirective};
     if payload.len() < LARGE_STORE_PAYLOAD_BYTES {
-        return Ok(zstd::bulk::compress(payload, STORE_COMPRESSION_LEVEL)?);
+        if !checksum {
+            return Ok(zstd::bulk::compress(payload, STORE_COMPRESSION_LEVEL)?);
+        }
+        let mut compressor = zstd::bulk::Compressor::new(STORE_COMPRESSION_LEVEL)?;
+        compressor.set_parameter(CParameter::ChecksumFlag(true))?;
+        return Ok(compressor.compress(payload)?);
     }
     // The frame leaves the compressor a piece at a time: one call with room
     // for the whole of it reserves as many bytes as the payload has, several
@@ -1652,6 +1723,7 @@ fn compress_store_payload(payload: &[u8], workers: u32) -> Result<Vec<u8>> {
         CParameter::EnableLongDistanceMatching(true),
         CParameter::WindowLog(STORE_WINDOW_LOG),
         CParameter::NbWorkers(workers.max(1)),
+        CParameter::ChecksumFlag(checksum),
     ] {
         context.set_parameter(parameter).map_err(failed)?;
     }
@@ -1686,6 +1758,7 @@ fn compress_store_payload_at_once(payload: &[u8], workers: u32) -> Result<Vec<u8
     Ok(compressor.compress(payload)?)
 }
 
+#[cfg(test)]
 fn wrap_settings_bytecode_payload(payload: &[u8]) -> Result<Vec<u8>> {
     let _span = crate::app::profile::span("store compress");
     check_settings_payload_len(payload.len(), "Decoded")?;
@@ -1699,7 +1772,7 @@ fn wrap_settings_bytecode_payload(payload: &[u8]) -> Result<Vec<u8>> {
             + zstd.len(),
     );
     writer.extend_from_slice(SETTINGS_BINARY_MAGIC);
-    writer.push(SETTINGS_BINARY_VERSION);
+    writer.push(SETTINGS_COLUMN_VERSION);
     write_var_u64(&mut writer, payload.len() as u64)?;
     write_var_u64(&mut writer, zstd.len() as u64)?;
     writer.extend_from_slice(&zstd);
@@ -1725,9 +1798,32 @@ fn document_root_service(document: &SettingsBytecode) -> Option<String> {
 }
 
 fn build_bytecode_instance_lookup(document: &SettingsBytecode) -> SettingsBinaryInstanceLookup<'_> {
-    let _span = crate::app::profile::span("store reference indexes");
     let root_service = document_root_service(document);
     let selectors = settings_document_reference_selectors(document, root_service.as_deref());
+    instance_lookup(document, root_service, selectors)
+}
+
+/// `build_bytecode_instance_lookup` of a document whose values use every
+/// selector. It finds what that lookup finds for each reference that a
+/// document's values hold: a reference that needs a selector makes its
+/// document use it, and a settings id beside an index finds that index or
+/// none either way, the ids being unique.
+fn build_bytecode_instance_lookup_by_every_selector(
+    document: &SettingsBytecode,
+) -> SettingsBinaryInstanceLookup<'_> {
+    let every = SettingsReferenceSelectors {
+        settings_id: true,
+        path: true,
+    };
+    instance_lookup(document, document_root_service(document), every)
+}
+
+fn instance_lookup(
+    document: &SettingsBytecode,
+    root_service: Option<String>,
+    selectors: SettingsReferenceSelectors,
+) -> SettingsBinaryInstanceLookup<'_> {
+    let _span = crate::app::profile::span("store reference indexes");
     let mut lookup = SettingsBinaryInstanceLookup {
         dense_instance_count: document.instances.len(),
         dense_instances: Some(&document.instances),
@@ -2542,26 +2638,49 @@ fn collect_settings_binary_chunk<'a>(
     replaced: Option<ReplacedRow<'a>>,
 ) -> Result<SettingsBinaryCollection<'a>> {
     let mut out = SettingsBinaryCollection::default();
-
     for (offset, record) in instances.iter().enumerate() {
-        let instance_index = base_index + offset;
-        if let SettingsBinaryId::Text(settings_id) = &record.settings_id {
-            add_count(&mut out.string_counts, settings_id.as_ref());
-        }
-        add_count(&mut out.string_counts, record.name);
-        add_count(&mut out.string_counts, record.class_name);
-        add_count(&mut out.class_counts, record.class_name);
-
-        let push = |name, kind, source| {
-            push_settings_binary_value(&mut out, lookup, instance_index, name, kind, source)
-        };
-        match replaced.filter(|row| row.source_index == record.source_index) {
-            Some(row) => visit_replaced_row(row.instance, lookup, push)?,
-            None => visit_settings_binary_properties(state, record, lookup, push)?,
-        }
+        collect_settings_binary_record_strings(&mut out, record);
+        collect_settings_binary_record_values(
+            &mut out,
+            (state, lookup),
+            base_index + offset,
+            record,
+            replaced,
+        )?;
     }
-
     Ok(out)
+}
+
+/// Counts the strings of a captured instance's record: its id, name and
+/// class.
+fn collect_settings_binary_record_strings<'a>(
+    out: &mut SettingsBinaryCollection<'a>,
+    record: &'a SettingsBinaryInstance<'a>,
+) {
+    if let SettingsBinaryId::Text(settings_id) = &record.settings_id {
+        add_count(&mut out.string_counts, settings_id.as_ref());
+    }
+    add_count(&mut out.string_counts, record.name);
+    add_count(&mut out.string_counts, record.class_name);
+    add_count(&mut out.class_counts, record.class_name);
+}
+
+/// Collects a captured instance's values, or those of the row that replaces
+/// it, as the values of the row `instance_index`.
+fn collect_settings_binary_record_values<'a>(
+    out: &mut SettingsBinaryCollection<'a>,
+    (state, lookup): (&'a ServiceState, &SettingsBinaryInstanceLookup<'_>),
+    instance_index: usize,
+    record: &SettingsBinaryInstance<'_>,
+    replaced: Option<ReplacedRow<'a>>,
+) -> Result<()> {
+    let push = |name, kind, source| {
+        push_settings_binary_value(out, lookup, instance_index, name, kind, source)
+    };
+    match replaced.filter(|row| row.source_index == record.source_index) {
+        Some(row) => visit_replaced_row(row.instance, lookup, push),
+        None => visit_settings_binary_properties(state, record, lookup, push),
+    }
 }
 
 fn visit_settings_binary_properties<'a>(
@@ -2752,29 +2871,35 @@ fn write_service_settings_binary_file_inner(
 }
 
 pub(crate) fn encode_service_settings_binary(state: &ServiceState) -> Result<Vec<u8>> {
-    let _span = crate::app::profile::span("captured store encode");
+    encode_service_settings_binary_over(state, None)
+}
+
+/// The v11 encoder of captured states, which the tests keep beside the v11
+/// encoder of documents.
+#[cfg(test)]
+pub(crate) fn encode_service_settings_binary_v11(state: &ServiceState) -> Result<Vec<u8>> {
     let instances = collect_service_settings_binary_instances(state);
     let lookup = build_settings_binary_instance_lookup(state, &instances);
     let collected = collect_settings_binary_data(state, &lookup, &instances, None)?;
-
-    // What the payload was made from is freed before the payload is
-    // compressed.
-    let payload = encode_prepared_service_payload(&instances, &lookup, collected)?;
-    drop(lookup);
-    drop(instances);
-    wrap_settings_bytecode_payload(&payload)
+    wrap_settings_bytecode_payload(&encode_prepared_service_payload(
+        &instances, &lookup, collected,
+    )?)
 }
 
-fn encode_prepared_service_settings(
-    instances: &[SettingsBinaryInstance<'_>],
-    lookup: &SettingsBinaryInstanceLookup<'_>,
-    collected: SettingsBinaryCollection<'_>,
+/// `encode_service_settings_binary` for a store whose file holds `previous`
+/// (see `encode_settings_bytecode_over`).
+pub(crate) fn encode_service_settings_binary_over(
+    state: &ServiceState,
+    previous: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    let payload = encode_prepared_service_payload(instances, lookup, collected)?;
-    wrap_settings_bytecode_payload(&payload)
+    let _span = crate::app::profile::span("captured store encode");
+    let instances = collect_service_settings_binary_instances(state);
+    let lookup = build_settings_binary_instance_lookup(state, &instances);
+    blocks::encode_state(state, (&instances, &lookup), None, previous)
 }
 
-/// The payload of a captured store before it is compressed.
+/// The payload of a captured store before it is compressed: in a v12 store,
+/// its structure, from a collection of the records alone.
 fn encode_prepared_service_payload(
     instances: &[SettingsBinaryInstance<'_>],
     lookup: &SettingsBinaryInstanceLookup<'_>,
@@ -5620,6 +5745,7 @@ mod tests {
     fn settings_bytecode_rejects_oversized_decoded_payload_before_decompression() {
         let mut bytes = SETTINGS_BINARY_MAGIC.to_vec();
         bytes.push(SETTINGS_BINARY_VERSION);
+        bytes.extend([1, 1]);
         write_var_u64(&mut bytes, (MAX_SETTINGS_BYTECODE_BYTES as u64) + 1).unwrap();
         write_var_u64(&mut bytes, 0).unwrap();
 
@@ -5965,7 +6091,10 @@ mod tests {
             })
         );
         let bytes = encode_settings_bytecode(&document(&typed)).unwrap();
-        assert_eq!(decode_settings_bytecode(&bytes).unwrap(), decoded);
+        assert_eq!(
+            decode_settings_bytecode(&bytes).unwrap().instances,
+            decoded.instances
+        );
         assert_eq!(encode_settings_bytecode(&decoded).unwrap(), bytes);
         for (name, value) in typed {
             let untyped = decoded.instances[0].properties[name].clone();

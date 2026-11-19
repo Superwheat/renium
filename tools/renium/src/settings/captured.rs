@@ -32,8 +32,12 @@ pub(super) fn convert(state: &ServiceState) -> Result<SettingsBytecode> {
         Ok(document) => Ok(document),
         Err(_) => {
             let _span = crate::app::profile::span("captured store exact limit check");
-            decode_settings_bytecode(&encode_prepared_service_settings(
-                &records, &lookup, collected,
+            drop(collected);
+            decode_settings_bytecode(&blocks::encode_state(
+                state,
+                (&records, &lookup),
+                None,
+                None,
             )?)
         }
     }
@@ -424,7 +428,7 @@ impl Moved {
     }
 
     /// A stored instance read whole, as it stands in the state.
-    fn in_state_whole(self, instance: &mut SettingsBytecodeInstance) {
+    pub(super) fn in_state_whole(self, instance: &mut SettingsBytecodeInstance) {
         self.parent_in_state(instance);
         if let Some(properties) = self.values_in_state(&instance.properties) {
             instance.properties = properties;
@@ -587,7 +591,7 @@ pub(super) fn attributes_digest(attributes: &Map<String, Value>) -> [u8; 16] {
     half_digest(digest)
 }
 
-fn half_digest(digest: Sha256) -> [u8; 16] {
+pub(super) fn half_digest(digest: Sha256) -> [u8; 16] {
     let whole = <[u8; 32]>::from(digest.finalize());
     <[u8; 16]>::try_from(&whole[..16]).unwrap()
 }
@@ -617,7 +621,8 @@ fn changed_rows<'a>(
         ),
     );
 
-    let budget = DecodeBudget::for_file(stored.file.len());
+    let file = stored.file;
+    let budget = DecodeBudget::for_file(file.len());
     let (camera, mut read) = match stored.read {
         Some(mut read) => (read.viewport_camera.take(), Some(read)),
         None => (None, None),
@@ -638,7 +643,7 @@ fn changed_rows<'a>(
             else {
                 return whole("a changed instance is none the store holds");
             };
-            decode_rows(stored.file, &stored_at)?
+            decode_rows(file, &stored_at)?
         }
     };
     if let Some(moved) = moved {
@@ -846,10 +851,12 @@ fn changed_rows<'a>(
     // Comparisons run in parallel. Only the new store's columns and compressed
     // output share the export's allocation gate with other encoders.
     let _store_guard = store_gate.map(LockRecover::lock_recover);
-    let collected = collect_settings_binary_data(state, &lookup, &records, kept_camera)?;
-    Ok(Some(SettingsAlignment::Changed(
-        encode_prepared_service_settings(&records, &lookup, collected)?,
-    )))
+    Ok(Some(SettingsAlignment::Changed(blocks::encode_state(
+        state,
+        (&records, &lookup),
+        kept_camera,
+        Some(file),
+    )?)))
 }
 
 /// Where the alignment leaves the instances of a state, as far as the state
@@ -1489,24 +1496,38 @@ fn convert_prepared_each<T: Send>(
             .map(&keep)
             .collect())
     };
-    let instances = if records.len() < SETTINGS_BINARY_PARALLEL_MIN_INSTANCES
-        || rayon::current_num_threads() <= 1
-    {
+    // Each chunk is counted as the value block of its rows.
+    let instances = if records.len() <= blocks::BLOCK_ROWS {
         kept_chunk(records)?
     } else {
         records
-            .par_chunks(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE)
+            .par_chunks(blocks::BLOCK_ROWS)
             .map(kept_chunk)
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .flatten()
             .collect()
     };
-    let bound = wire_bytes.load(Ordering::Relaxed);
+    // A v12 store holds the structure, which the header bound covers, the
+    // blocks the chunks counted, and each long string once in its pool.
+    let long = strings
+        .iter()
+        .filter(|text| text.len() >= blocks::POOL_MIN_BYTES);
+    let (long, pooled) = long.fold((0_usize, 0_usize), |(count, bytes), text| {
+        (count + 1, bytes.saturating_add(text.len() + 10))
+    });
+    let bound = wire_bytes.load(Ordering::Relaxed).saturating_add(pooled);
     check_settings_payload_len(bound, "Decoded")?;
-    let compressed = zstd::zstd_safe::compress_bound(bound);
-    check_settings_payload_len(compressed, "Compressed")?;
-    check_settings_file_len(compressed.saturating_add(SETTINGS_BINARY_MAGIC.len() + 1 + 20))?;
+    // Its file: each frame within zstd's bound of its content, which over all
+    // frames is the bound of all content and 64 bytes a frame, with its
+    // checksum, and a head of 46 bytes a frame, 26 a pool entry, and four
+    // varints of ten bytes: the writer's two and the two counts.
+    let frames = 1 + long + records.len().div_ceil(blocks::BLOCK_ROWS);
+    let file = zstd::zstd_safe::compress_bound(bound)
+        .saturating_add(frames.saturating_mul(64 + 4 + 46))
+        .saturating_add(long.saturating_mul(26))
+        .saturating_add(SETTINGS_BINARY_MAGIC.len() + 1 + 4 * 10 + 16);
+    check_settings_file_len(file)?;
     Ok(instances)
 }
 
@@ -1595,6 +1616,7 @@ fn convert_chunk<'a>(
     let mut sources = Vec::new();
     let mut scratch = Vec::new();
     let mut wire = SizeWriter::default();
+    let (mut table, mut groups) = (SettingsStringCounts::default(), AHashSet::new());
     let mut instances = Vec::with_capacity(records.len());
     for record in records {
         let mut instance = bare_instance(record, scope.budget)?;
@@ -1614,6 +1636,9 @@ fn convert_chunk<'a>(
                         &mut wire,
                     )?;
                 }
+                add_count(&mut table, name);
+                collect_binary_source_strings(&source, scope.lookup, &mut table)?;
+                groups.insert((name, kind));
             }
             // A decoder discards these columns, including native capture fields.
             if !SETTINGS_RECORD_FIELDS.contains(&name) {
@@ -1648,6 +1673,16 @@ fn convert_chunk<'a>(
         instances.push(instance);
     }
     if let Some(wire_bytes) = scope.wire_bytes {
+        // The chunk is a value block of the store: its counts, its table with
+        // each short string and the hash of each long one, a property
+        // id and a group head for each group, all varints of ten bytes.
+        let table = (table.keys())
+            .map(|text| match text.len() < blocks::POOL_MIN_BYTES {
+                true => text.len() + 2,
+                false => 17,
+            })
+            .fold(30, usize::saturating_add);
+        wire.0 = (wire.0.saturating_add(table)).saturating_add(groups.len().saturating_mul(42));
         wire_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
                 Some(total.saturating_add(wire.0))

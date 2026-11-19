@@ -920,7 +920,7 @@ fn compare_place_compares_two_files_in_either_format() {
 
 fn workspace_store_text() -> String {
     [
-        "# renium store v11: 9 instances",
+        "# renium store v12: 9 instances",
         "= Workspace [Workspace] id=ws",
         "  Gravity = 120.0",
         "= Workspace/Lobby [Folder] id=lobby",
@@ -980,7 +980,7 @@ fn workspace_store_tree() -> Value {
             "properties": {"Gravity": 120.0},
             "settingsId": "ws",
         }],
-        "version": 11,
+        "version": 12,
     })
 }
 
@@ -1094,7 +1094,7 @@ fn view_and_textconv_render_places_models_empty_and_foreign_files() {
     assert_eq!(place_tree["roots"][2]["name"], json!("ServerScriptService"));
     let place_text = fx.text(&["v", &saved_xml.to_string_lossy()]).stdout;
     assert!(place_text.starts_with(
-        "# renium store v11: 11 instances\n= Workspace [Workspace] id=place:0\n  Gravity = 150.0\n"
+        "# renium store v12: 11 instances\n= Workspace [Workspace] id=place:0\n  Gravity = 150.0\n"
     ));
     assert!(place_text.contains(
         "= Workspace/Lobby/Pad [Part] id=place:3\n= Workspace/Lobby/Pad [Part] id=place:4\n"
@@ -1111,7 +1111,7 @@ fn view_and_textconv_render_places_models_empty_and_foreign_files() {
     assert!(
         fx.text(&["v", &model.to_string_lossy()])
             .stdout
-            .starts_with("# renium store v11: 4 instances\n= Kit [Model] id=editor:0\n")
+            .starts_with("# renium store v12: 4 instances\n= Kit [Model] id=editor:0\n")
     );
     let empty = fx.root.join("empty.renium");
     fs::write(&empty, b"").unwrap();

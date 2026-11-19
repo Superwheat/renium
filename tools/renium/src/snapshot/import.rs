@@ -26,8 +26,9 @@ use crate::roblox::services::DEFAULT_SYNC_SERVICES;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     PulledDigest, PulledRows, SettingsBytecode, child_indices_for_instance,
-    decode_settings_bytecode_holding, encode_service_settings_binary, pull_changed_document_rows,
-    pull_changed_values, pulled_digest_from_service_state, settings_bytecode_from_service_state,
+    decode_settings_bytecode_holding, encode_service_settings_binary,
+    encode_service_settings_binary_over, pull_changed_document_rows, pull_changed_values,
+    pulled_digest_from_service_state, settings_bytecode_from_service_state,
     write_fresh_service_settings_binary_file,
 };
 use crate::settings::equivalence::{
@@ -1599,6 +1600,7 @@ fn write_service_settings_file(
                     Ok(Some(StoredSettings {
                         digest,
                         document: decode_stored_settings(&settings_path, &bytes)?,
+                        bytes,
                     }))
                 },
                 || {
@@ -1650,8 +1652,11 @@ fn write_service_settings_file(
                     let pulled_alignment = align_pulled_settings_documents_to_reference(
                         reference,
                         observed,
-                        &|| encode_service_settings_binary(state_to_write),
+                        &|| {
+                            encode_service_settings_binary_over(state_to_write, Some(&stored.bytes))
+                        },
                         alignment_started,
+                        &stored.bytes,
                     )
                     .with_context(|| format!("Failed to align {}", settings_path.display()))?;
                     // The rows are those of the file only where it holds the
@@ -1719,10 +1724,12 @@ static WHOLLY_ALIGNED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 /// A stored file's bytes, their digest, and what a pull remembers of them.
 type StoredFile = (Vec<u8>, [u8; 32], Option<RememberedPull>);
 
-/// A store file as a pull read it: the digest of its bytes and its document.
+/// A store file as a pull read it: the digest of its bytes, its document and
+/// the bytes, which a store written in its place is written over.
 struct StoredSettings {
     digest: [u8; 32],
     document: SettingsBytecode,
+    bytes: Vec<u8>,
 }
 
 fn decode_stored_settings(settings_path: &Path, bytes: &[u8]) -> Result<SettingsBytecode> {
@@ -1822,9 +1829,9 @@ fn pull_aligns_whole_documents() -> bool {
 /// state the decoder refuses still takes this way, and every pull of a debug
 /// build is checked against it.
 fn pull_from_bytes(state: &ServiceState, settings_path: &Path) -> Result<Option<Vec<u8>>> {
-    let observed = encode_service_settings_binary(state)?;
     Ok(match fs::read(settings_path) {
         Ok(reference) => {
+            let observed = encode_service_settings_binary_over(state, Some(&reference))?;
             match align_pulled_settings_bytes_to_reference(&reference, &observed)
                 .with_context(|| format!("Failed to align {}", settings_path.display()))?
             {
@@ -1832,7 +1839,9 @@ fn pull_from_bytes(state: &ServiceState, settings_path: &Path) -> Result<Option<
                 SettingsAlignment::Changed(aligned) => Some(aligned),
             }
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(observed),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Some(encode_service_settings_binary(state)?)
+        }
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("Failed to read {}", settings_path.display()));
