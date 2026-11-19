@@ -916,35 +916,86 @@ fn namesakes_that_traded_their_values_take_the_whole_alignment() {
     assert_eq!(stored_ids(&written), before);
 }
 
-/// A large store is read for its digests under the gate that store encoders
-/// share. While another store's work holds the gate the comparison waits,
-/// also one that goes on to write nothing; and a comparison that writes its
-/// store builds it under the gate it took for the read.
+/// A large store is read under the gate that store encoders share, for its
+/// digests and for the instances a pull remembers as changed. While another
+/// store's work holds the gate the comparison waits, also one that goes on
+/// to write nothing; a comparison that writes its store takes the gate
+/// once. A small store is read beside whatever holds the gate.
 #[test]
-fn a_store_read_for_its_digests_waits_for_the_gate() {
-    let file =
-        encode_service_settings_binary(&captured(&twins(1, true, [0.25, 0.75]), false)).unwrap();
+fn a_large_store_is_read_under_the_gate_of_store_encoders() {
+    // Text no compression makes small, on the root of both copies.
+    let mut rng = SimRng(0x5eed_0bad_cafe_f00d);
+    let bulk = (0..3 * captured::GATED_STORE_BYTES)
+        .map(|_| char::from(b'!' + rng.below(90) as u8))
+        .collect::<String>();
+    let large = |mut document: SettingsBytecode| {
+        document.instances[0]
+            .attributes
+            .insert("Bulk".into(), json!(bulk));
+        document
+    };
+    let unremembered = |file: &[u8], state: &ServiceState, gate| {
+        let now = pulled_digest_from_service_state(state).unwrap();
+        pull_changed_document_rows(state, &now.rows, file, gate).unwrap()
+    };
+    let waits = |compare: &(dyn Fn() + Sync), gate: &std::sync::Mutex<()>| {
+        let held = gate.lock().unwrap();
+        std::thread::scope(|scope| {
+            let compared = scope.spawn(compare);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let waited = !compared.is_finished();
+            drop(held);
+            compared.join().unwrap();
+            waited
+        })
+    };
     let gate = std::sync::Mutex::new(());
+    let small =
+        encode_service_settings_binary(&captured(&twins(1, true, [0.25, 0.75]), false)).unwrap();
+    let file =
+        encode_service_settings_binary(&captured(&large(twins(1, true, [0.25, 0.75])), false))
+            .unwrap();
+    assert!(small.len() < captured::GATED_STORE_BYTES && file.len() >= captured::GATED_STORE_BYTES);
     // Namesakes that traded their values: the comparison reads both copies
     // and leaves the store to the whole alignment.
-    let state = captured(&twins(2, true, [0.75, 0.25]), false);
+    let traded = captured(&large(twins(2, true, [0.75, 0.25])), false);
+    let small_traded = captured(&twins(2, true, [0.75, 0.25]), false);
+    assert!(
+        !waits(
+            &|| assert!(unremembered(&small, &small_traded, Some(&gate)).is_none()),
+            &gate
+        ),
+        "a small store waited for the gate to be read"
+    );
+    assert!(
+        waits(
+            &|| assert!(unremembered(&file, &traded, Some(&gate)).is_none()),
+            &gate
+        ),
+        "a large store was read for its digests beside the work that held the gate"
+    );
+    // A value the pull remembers otherwise than the store and Studio hold
+    // it: the changed instance is read from the store and found alike.
+    let state = captured(&large(twins(1, true, [0.25, 0.75])), false);
+    let before =
+        pulled_digest_from_service_state(&captured(&large(twins(1, true, [0.5, 0.75])), false))
+            .unwrap();
     let now = pulled_digest_from_service_state(&state).unwrap();
-    let held = gate.lock().unwrap();
-    std::thread::scope(|scope| {
-        let compared =
-            scope.spawn(|| pull_changed_document_rows(&state, &now.rows, &file, Some(&gate)));
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(
-            !compared.is_finished(),
-            "a store was read beside the work that held the gate"
-        );
-        drop(held);
-        assert!(compared.join().unwrap().unwrap().is_none());
-    });
-    let state = captured(&twins(2, true, [0.25, 0.75]), false);
-    let now = pulled_digest_from_service_state(&state).unwrap();
-    let (answer, _) = pull_changed_document_rows(&state, &now.rows, &file, Some(&gate))
-        .unwrap()
+    assert!(
+        waits(
+            &|| {
+                let answer =
+                    pull_changed_values(&state, &before.rows, &now.rows, &file, Some(&gate))
+                        .unwrap();
+                assert!(matches!(answer, Some(SettingsAlignment::Equivalent)));
+            },
+            &gate
+        ),
+        "a large store was read for its changed instances beside the work that held the gate"
+    );
+    // A comparison that writes its store takes the gate once.
+    let renamed = captured(&large(twins(2, true, [0.25, 0.75])), false);
+    let (answer, _) = unremembered(&file, &renamed, Some(&gate))
         .expect("instances that hold the stored values are compared at their places");
     assert!(matches!(answer, SettingsAlignment::Changed(_)));
     assert!(gate.try_lock().is_ok());

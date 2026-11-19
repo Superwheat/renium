@@ -1475,7 +1475,7 @@ fn write_service_settings_file(
     if fresh_stage {
         // A fresh capture encodes every store while other services are still
         // converting. Bound those temporary buffers per export; scripts,
-        // sourcemaps, existing-store comparisons and other places can proceed.
+        // sourcemaps, comparisons of small stores and other places can proceed.
         {
             let _store_guard = store_gate.map(LockRecover::lock_recover);
             write_fresh_service_settings_binary_file(&settings_path, state)?;
@@ -1581,7 +1581,8 @@ fn write_service_settings_file(
             _ => None,
         };
         // Whole-document reconciliation also owns large temporary values. The
-        // ordinary row comparison above takes the gate only if it must encode.
+        // row comparison above takes the gate to encode, and for a large
+        // store also to read it.
         let _store_guard = if !unchanged_again && changed_values.is_none() {
             store_gate.map(LockRecover::lock_recover)
         } else {

@@ -86,9 +86,9 @@ fn whole<T>(why: &str) -> Result<Option<T>> {
     Ok(None)
 }
 
-/// A stored file of this size or more is read for its digests under the gate
-/// that store encoders share.
-const GATED_STORE_BYTES: usize = if cfg!(test) { 1 } else { 1 << 20 };
+/// A stored file of this size or more is read under the gate that store
+/// encoders share (`read_gate`).
+pub(super) const GATED_STORE_BYTES: usize = 1 << 20;
 
 /// The most changed instances a pull compares one by one, each held whole on
 /// both sides while it is compared; past that it aligns the whole documents.
@@ -130,11 +130,28 @@ pub(super) fn changed_values(
     let Some(places) = Places::of(state, now, &records, stored.len())? else {
         return whole("two instances of the state carry one id");
     };
+    let (_reading, store_gate) = read_gate(stored, store_gate);
     let stored = StoredRows {
         file: stored,
         read: None,
     };
     changed_rows(state, now, (records, &places), &changed, stored, store_gate)
+}
+
+/// Reading a large store, for its digests or for the instances that changed,
+/// takes as much memory as writing one, so two such stores are not read side
+/// by side: the comparison of a large store holds the gate that store
+/// encoders share from its read on. With the guard comes the gate the
+/// comparison still has to take to build a store, which is none where it
+/// holds it already.
+fn read_gate<'a>(
+    stored: &[u8],
+    store_gate: Option<&'a Mutex<()>>,
+) -> (Option<std::sync::MutexGuard<'a, ()>>, Option<&'a Mutex<()>>) {
+    match store_gate {
+        Some(gate) if stored.len() >= GATED_STORE_BYTES => (Some(gate.lock_recover()), None),
+        gate => (None, gate),
+    }
 }
 
 /// What is written for a store compared by its instances is the state's own
@@ -170,15 +187,6 @@ pub(super) fn changed_document_rows(
     if !comparable_by_instance(state, now) {
         return whole("the state is written another way than its document");
     }
-    // Reading a large store whole for its digests takes as much memory as
-    // writing one, so two such stores are not read side by side: the most a
-    // pull holds is then that of its largest store, however its services'
-    // work happens to overlap.
-    let reading = (stored.len() >= GATED_STORE_BYTES)
-        .then(|| store_gate.map(LockRecover::lock_recover))
-        .flatten();
-    // The store this comparison writes is built under the gate it holds.
-    let store_gate = if reading.is_some() { None } else { store_gate };
     let records = collect_service_settings_binary_instances(state);
     // What the state alone can say comes before the two documents are read.
     if !written_where_they_stand(&records, now) {
@@ -187,6 +195,7 @@ pub(super) fn changed_document_rows(
     let Some(places) = Places::of(state, now, &records, stored.len())? else {
         return whole("two instances of the state carry one id");
     };
+    let (_reading, store_gate) = read_gate(stored, store_gate);
     let lookup = build_settings_binary_instance_lookup(state, &records);
     let (stored_rows, captured_rows) = rayon::join(
         || {

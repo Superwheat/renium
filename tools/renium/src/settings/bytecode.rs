@@ -140,8 +140,10 @@ fn values_encode_alike(
 /// holds exactly the document of an earlier state with the rows `before`, and
 /// only values changed since, in instances a pull can compare one by one.
 /// `None` where the pull has to align the whole documents.
-/// Import's dedicated settings thread supplies its export's gate to bound
-/// encoding allocations; comparisons do not hold it. Other callers use None.
+/// Import's dedicated settings thread supplies its export's gate, which
+/// bounds what the stores of one export hold in memory at a time: a store is
+/// encoded under it, and a large one is read under it. Other callers use
+/// None.
 pub(crate) fn pull_changed_values(
     state: &ServiceState,
     before: &PulledRows,
