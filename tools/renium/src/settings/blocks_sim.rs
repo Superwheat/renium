@@ -58,8 +58,18 @@ pub(crate) const FORMATS: [Format; 2] = [
 ];
 
 /// `document` as a store in blocks of `block_rows` rows.
-fn in_blocks(document: &SettingsBytecode, block_rows: usize) -> Result<Vec<u8>> {
+pub(crate) fn in_blocks(document: &SettingsBytecode, block_rows: usize) -> Result<Vec<u8>> {
     encode_document_in_blocks(document, true, None, block_rows)
+}
+
+/// How many blocks the store `first` and the store `second` hold byte for
+/// byte, as a comparison of the two takes them.
+pub(crate) fn blocks_of_both(first: &[u8], second: &[u8]) -> usize {
+    let (Ok(first), Ok(second)) = (BlockStore::open(first), BlockStore::open(second)) else {
+        return 0;
+    };
+    let shared = first.blocks_held_by(&second);
+    shared.into_iter().filter(|shared| *shared).count()
 }
 
 /// The whole encode of `document` in the blocks of `file`'s rows, which a
@@ -1042,6 +1052,26 @@ fn an_edit_refuses_a_damaged_block_it_does_not_touch() {
         let error = format!("{:#}", edit(&damaged).unwrap_err());
         assert!(error.contains("does not match its digest"), "{error}");
     }
+}
+
+/// Two copies digested together refuse a damaged pool frame that only the
+/// rows of a block both hold name, as each digested alone refuses it.
+#[test]
+fn copies_digested_together_refuse_a_damaged_pool_frame_of_a_block_both_hold() {
+    let payload = format!("{:>2048}", "").replace(' ', "q");
+    let mut document = in_rows(12, |index| (index == 10).then(|| payload.clone()));
+    let files = in_blocks(&document, 4).unwrap();
+    let edited = &mut document.instances[1].properties;
+    edited.insert("Transparency".into(), json!(0.5));
+    let studio = in_blocks(&document, 4).unwrap();
+    assert_eq!(blocks_of_both(&files, &studio), 3);
+    let digested = |files: &[u8]| super::property_edit::whole_row_digests_of_both(files, &studio).0;
+    assert!(digested(&files).is_ok_and(|rows| rows.is_some()));
+    let frame = BlockStore::open(&files).unwrap().pool[0].frame;
+    let mut damaged = files.clone();
+    damaged[frame.at + frame.len / 2] ^= 1;
+    let error = format!("{:#}", digested(&damaged).err().unwrap());
+    assert!(error.contains("does not match its digest"), "{error}");
 }
 
 /// A root and `count` parts under it, each with the payload `payload` gives

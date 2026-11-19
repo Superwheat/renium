@@ -6843,8 +6843,13 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
     let under_other_ids = AtomicUsize::new(0);
     let from_both = AtomicUsize::new(0);
     let sent_from_both = AtomicUsize::new(0);
+    let from_blocks_of_both = AtomicUsize::new(0);
     run_seeds(300, |seed, _| {
+        use crate::settings::bytecode::blocks::sim::{blocks_of_both, in_blocks};
         let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        // Stores of several blocks: a block both copies hold byte for byte
+        // is not read row by row.
+        let block_rows = [1, 3, 8, 4096][(seed >> 2) as usize % 4];
         let mut studio = changed_instances_store(&mut rng);
         let mut files = studio.clone();
         // Studio opened the place again since the files were written: it
@@ -6878,13 +6883,19 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
                 entries: BTreeMap::from([(
                     path.clone(),
                     SnapshotEntry::File(
-                        encode_settings_bytecode(document).map_err(|error| format!("{error:#}"))?,
+                        in_blocks(document, block_rows).map_err(|error| format!("{error:#}"))?,
                     ),
                 )]),
             })
         };
         let (Ok(desired), Ok(observed)) = (snapshot(&files), snapshot(&studio)) else {
             return Ok(());
+        };
+        let held_by_both = match (desired.entries.get(&path), observed.entries.get(&path)) {
+            (Some(SnapshotEntry::File(files)), Some(SnapshotEntry::File(studio))) => {
+                blocks_of_both(files, studio)
+            }
+            _ => 0,
         };
         let paths = project_replacement_paths(&desired, &observed);
         // What the write step sends to Studio for a plan, made from the
@@ -7057,6 +7068,9 @@ from the whole documents:
         }
         if alone && both_stand {
             from_both.fetch_add(1, Ordering::Relaxed);
+            if held_by_both > 0 {
+                from_blocks_of_both.fetch_add(1, Ordering::Relaxed);
+            }
             // The write step made a request from them, and it named values.
             if of_both
                 .iter()
@@ -7096,6 +7110,7 @@ from the whole documents:
             &under_other_ids,
             &from_both,
             &sent_from_both,
+            &from_blocks_of_both,
         ]
         .map(|count| count.load(Ordering::Relaxed));
         assert!(
@@ -7105,12 +7120,14 @@ from the whole documents:
                 && counts[3] >= 10
                 && counts[4] >= 5
                 && counts[5] >= 12
-                && counts[6] >= 8,
-            "prepared from the changed instances {} ({} of them under other ids, {} with both copies read so, {} of those with values sent), from whole documents {}, with a plan {}, unchanged {}",
+                && counts[6] >= 8
+                && counts[7] >= 8,
+            "prepared from the changed instances {} ({} of them under other ids, {} with both copies read so, {} of those with values sent, {} of them with blocks both hold), from whole documents {}, with a plan {}, unchanged {}",
             counts[0],
             counts[4],
             counts[5],
             counts[6],
+            counts[7],
             counts[1],
             counts[2],
             counts[3]

@@ -267,6 +267,7 @@ fn changed_instances_alone(
 ) -> Result<ChangedInstances> {
     use crate::settings::bytecode::property_edit::{
         StoreRows, decode_rows, names_an_instance_by_id, whole_row_digests,
+        whole_row_digests_of_both,
     };
     use crate::settings::equivalence::{
         align_settings_ids_by_place, inherit_workspace_viewport_reference,
@@ -295,39 +296,38 @@ fn changed_instances_alone(
         Whole(SettingsBytecode, Vec<[u8; 16]>, Vec<bool>),
         Rows(StoreRows),
     }
-    let (observed_rows, files) = rayon::join(
-        || whole_row_digests(observed_bytes, |_| Some((None, None))),
-        || -> Result<Option<Files>> {
-            if files_too {
-                return Ok(whole_row_digests(desired_bytes, |_| Some((None, None)))
-                    .ok()
-                    .flatten()
-                    .map(Files::Rows));
-            }
-            // The files' copy as `settings_document` gives it, with the
-            // digests of its instances taken as they were decoded.
-            let mut current =
-                crate::settings::bytecode::decode_settings_bytecode_holding(desired_bytes)?;
-            let digests = crate::settings::bytecode::whole_instance_digests(&current)
-                .into_iter()
-                .map(|(digest, _)| digest)
-                .collect();
-            let named = current
-                .instances
-                .par_iter()
-                .map(|instance| {
-                    instance
-                        .properties
-                        .values()
-                        .chain(instance.attributes.values())
-                        .any(names_an_instance_by_id)
-                })
-                .collect::<Vec<_>>();
-            stabilize_settings_reference_ids(&mut current);
-            canonicalize_settings_property_names(&mut current)?;
-            Ok(Some(Files::Whole(current, digests, named)))
-        },
-    );
+    let (observed_rows, files) = if files_too {
+        let (files, observed_rows) = whole_row_digests_of_both(desired_bytes, observed_bytes);
+        (observed_rows, Ok(files.ok().flatten().map(Files::Rows)))
+    } else {
+        rayon::join(
+            || whole_row_digests(observed_bytes, |_| Some((None, None))),
+            || -> Result<Option<Files>> {
+                // The files' copy as `settings_document` gives it, with the
+                // digests of its instances taken as they were decoded.
+                let mut current =
+                    crate::settings::bytecode::decode_settings_bytecode_holding(desired_bytes)?;
+                let digests = crate::settings::bytecode::whole_instance_digests(&current)
+                    .into_iter()
+                    .map(|(digest, _)| digest)
+                    .collect();
+                let named = current
+                    .instances
+                    .par_iter()
+                    .map(|instance| {
+                        instance
+                            .properties
+                            .values()
+                            .chain(instance.attributes.values())
+                            .any(names_an_instance_by_id)
+                    })
+                    .collect::<Vec<_>>();
+                stabilize_settings_reference_ids(&mut current);
+                canonicalize_settings_property_names(&mut current)?;
+                Ok(Some(Files::Whole(current, digests, named)))
+            },
+        )
+    };
     let Some(files) = files? else {
         return Ok(ChangedInstances::Whole(None));
     };

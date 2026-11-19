@@ -1145,15 +1145,42 @@ impl<'a> BlockStore<'a> {
         (self.hashes.binary_search(hash).ok()).context("A pool entry the store keeps is missing")
     }
 
+    /// Whether each block of this store is, byte for byte, the block `other`
+    /// holds there, where the structures of the two are the same bytes too:
+    /// an index and an id then name one instance in both, so a row of such a
+    /// block holds in both the same values, the instances they name
+    /// included. No block where the two are of other instances.
+    pub(crate) fn blocks_held_by(&self, other: &BlockStore<'_>) -> Vec<bool> {
+        let same = |mine: Frame, theirs: Frame| {
+            mine.digest == theirs.digest
+                && self.bytes[mine.at..mine.at + mine.len]
+                    == other.bytes[theirs.at..theirs.at + theirs.len]
+        };
+        let alike =
+            self.blocks.len() == other.blocks.len() && same(self.structure, other.structure);
+        (self.blocks.iter().zip(&other.blocks))
+            .map(|(mine, theirs)| {
+                alike && mine.count == theirs.count && same(mine.frame, theirs.frame)
+            })
+            .collect()
+    }
+
     /// `property_edit::row_digests`, or `whole_row_digests` where `whole`
     /// says so, of this store: each block decoded whole, digested and given
-    /// back without its values.
+    /// back without its values. A block `shared` takes is one another store
+    /// holds too (`blocks_held_by`), digested beside that store alone: each
+    /// of its rows has the digest of the block and its place there, which is
+    /// the same in both and no other row's, and none of them is given as
+    /// naming an instance.
     pub(crate) fn row_digests(
         &self,
         whole: bool,
+        shared: &[bool],
         plan: impl FnOnce(&[SettingsBytecodeInstance]) -> Option<(Option<usize>, Option<Moved>)>,
     ) -> Result<Option<StoreRows>> {
-        use super::captured::{UNIQUE_ID, document_row_digest, whole_document_row_digest};
+        use super::captured::{
+            UNIQUE_ID, document_row_digest, value_digest, whole_document_row_digest,
+        };
         let mut instances = self.structure()?.instances;
         let Some((kept, moved)) = plan(&instances) else {
             return Ok(None);
@@ -1164,13 +1191,39 @@ impl<'a> BlockStore<'a> {
         } else {
             document_row_digest
         };
+        // The rows of a shared block are not read, and neither is a pool
+        // frame they alone name: a damaged one fails here as it fails their
+        // read.
+        if shared.contains(&true) {
+            (self.pool.par_iter()).try_for_each(|pool| self.frame_bytes(pool.frame).map(drop))?;
+        }
         let digested = self
             .split(&mut instances)
             .into_par_iter()
             .zip(&self.blocks)
             .enumerate()
             .map(|(index, (rows, block))| {
-                self.block_into(&self.open_block(index)?, rows, |_| true, Texts::All)?;
+                let open = self.open_block(index)?;
+                if whole && kept.is_none() && moved.is_none() && shared.get(index) == Some(&true) {
+                    self.values(
+                        &open,
+                        rows,
+                        |_| true,
+                        |name| name == UNIQUE_ID,
+                        Texts::Marked,
+                    )?;
+                    return Ok((0_u64..)
+                        .zip(rows)
+                        .map(|(place, instance)| {
+                            (
+                                digest(&[&block.frame.digest, &place.to_le_bytes()]),
+                                (instance.properties.get(UNIQUE_ID)).map_or([0; 16], value_digest),
+                                None,
+                            )
+                        })
+                        .collect());
+                }
+                self.block_into(&open, rows, |_| true, Texts::All)?;
                 let mut digests = Vec::with_capacity(rows.len());
                 for (row, instance) in (block.first..).zip(rows) {
                     let named = whole

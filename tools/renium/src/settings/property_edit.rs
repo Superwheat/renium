@@ -257,6 +257,30 @@ pub(crate) fn whole_row_digests(
     row_digests_of(bytes, true, plan)
 }
 
+/// `whole_row_digests` of two copies of one store, for telling the rows of
+/// one from the rows of the other. A block both hold byte for byte is not
+/// digested row by row (`BlockStore::row_digests`).
+pub(crate) fn whole_row_digests_of_both(
+    first: &[u8],
+    second: &[u8],
+) -> (Result<Option<StoreRows>>, Result<Option<StoreRows>>) {
+    use super::blocks::BlockStore;
+    let open = |bytes| BlockStore::open(bytes).map(BlockStore::holding);
+    let shared = match (open(first), open(second)) {
+        (Ok(first), Ok(second)) => first.blocks_held_by(&second),
+        _ => Vec::new(),
+    };
+    let digests = |bytes| {
+        let _span = crate::app::profile::span("store instance digests");
+        if shared.contains(&true) {
+            open(bytes)?.row_digests(true, &shared, |_| Some((None, None)))
+        } else {
+            whole_row_digests(bytes, |_| Some((None, None)))
+        }
+    };
+    rayon::join(|| digests(first), || digests(second))
+}
+
 fn row_digests_of(
     bytes: &[u8],
     whole: bool,
@@ -270,7 +294,7 @@ fn row_digests_of(
     if super::blocks::is_block_store(bytes) {
         return super::blocks::BlockStore::open(bytes)?
             .holding()
-            .row_digests(whole, plan);
+            .row_digests(whole, &[], plan);
     }
     let (_, payload) = decode_settings_bytecode_container(bytes)?;
     let budget = DecodeBudget::for_file(bytes.len());
