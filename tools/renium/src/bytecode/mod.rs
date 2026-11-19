@@ -2395,7 +2395,8 @@ fn finish_set_property(args: BytecodeSetPropertyArgs, mut result: Value) -> Resu
                 args.input.service_or_file.as_deref(),
                 None,
             )?;
-            let document = SettingsBytecode::read_file(&settings_file)?;
+            // The instance is found by where it stands; no value is read.
+            let document = SettingsBytecode::read_structure_file(&settings_file)?;
             let service = bytecode_service_name(&document, &settings_file, &service_hint);
             let resolved = resolve_bytecode_selector_or_service_root(
                 &document,

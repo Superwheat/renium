@@ -339,12 +339,7 @@ pub(crate) fn push_stored_instance_reading(
         scope,
         slow_import,
     )?;
-    let document = SettingsBytecode::read_file(&settings_file)?;
-    let Some(index) = document
-        .instances
-        .iter()
-        .position(|instance| instance.settings_id == settings_id)
-    else {
+    let Some((document, index)) = read_store_for_instance(&settings_file, &settings_id)? else {
         return Ok(());
     };
     let service = bytecode_service_name(&document, &settings_file, "");
@@ -367,6 +362,39 @@ pub(crate) fn push_stored_instance_reading(
         result["studio"] = studio;
     }
     Ok(())
+}
+
+/// A store read for one instance: every instance where it stands, and the
+/// one under `settings_id` with its values. The read-back of an edit reads
+/// the path of its instance and that instance, so it reads no other.
+fn read_store_for_instance(
+    settings_file: &Path,
+    settings_id: &str,
+) -> Result<Option<(SettingsBytecode, usize)>> {
+    let mut document = SettingsBytecode::read_structure_file(settings_file)?;
+    let Some(index) = document
+        .instances
+        .iter()
+        .position(|instance| instance.settings_id == settings_id)
+    else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(settings_file)
+        .with_context(|| format!("Failed to read {}", settings_file.display()))?;
+    let (mut rows, _) = crate::settings::bytecode::property_edit::decode_rows(&bytes, &[index])?;
+    // A store written between the two reads is read whole.
+    match rows.pop() {
+        Some(row) if row.settings_id == settings_id => document.instances[index] = row,
+        _ => {
+            let document = SettingsBytecode::read_file(settings_file)?;
+            let index = document
+                .instances
+                .iter()
+                .position(|instance| instance.settings_id == settings_id);
+            return Ok(index.map(|index| (document, index)));
+        }
+    }
+    Ok(Some((document, index)))
 }
 
 /// Whether a read-back row shows the pushed instance: `Some(true)` when the
@@ -599,7 +627,16 @@ pub(crate) fn stored_instances_push(
     // A scoped push creates the instances from the store; a script's text
     // travels as its file, so the files of the pushed scripts go along.
     let mut changed_paths = vec![settings_file.clone()];
-    if let Ok(document) = SettingsBytecode::read_file(&settings_file) {
+    // Only a script has a file, so the store is read for its values only
+    // where one of the pushed instances is a script.
+    let pushes_a_script =
+        SettingsBytecode::read_structure_file(&settings_file).is_ok_and(|store| {
+            store.instances.iter().any(|instance| {
+                settings_ids.contains(&instance.settings_id)
+                    && crate::editor::sync::is_lua_source_class(&instance.class_name)
+            })
+        });
+    if pushes_a_script && let Ok(document) = SettingsBytecode::read_file(&settings_file) {
         let service = bytecode_service_name(&document, &settings_file, "");
         let service_dir = crate::project::storage::source_directory(&settings_file);
         let source_paths = crate::editor::paths::build_editor_source_paths_by_index(
