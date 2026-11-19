@@ -133,6 +133,20 @@ impl PlaceReferencePaths {
     }
 
     pub(crate) fn resolve(&self, segments: &[String], ordinals: Option<&[usize]>) -> Option<Ref> {
+        // The original path key joined segments with NUL, including an empty
+        // path (the empty root key). Stores can contain path-only references,
+        // so preserve these collisions even when all instance names are plain.
+        let normalized;
+        let segments = if segments.is_empty() || segments.iter().any(|part| part.contains('\0')) {
+            normalized = segments
+                .join("\0")
+                .split('\0')
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            normalized.as_slice()
+        } else {
+            segments
+        };
         if ordinals.is_some_and(|ordinals| {
             ordinals.len() != segments.len() || ordinals.first() != Some(&1)
         }) {
@@ -168,4 +182,33 @@ impl PlaceReferencePaths {
             }
         }
     }
+}
+
+#[test]
+fn compact_paths_preserve_legacy_reference_value_collisions() {
+    use crate::settings::bytecode::{SETTINGS_BINARY_VERSION, SettingsBytecodeInstance};
+    let document = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![
+            SettingsBytecodeInstance::new("0".into(), "Workspace".into(), "Workspace".into(), None),
+            SettingsBytecodeInstance::new("1".into(), "A".into(), "Folder".into(), Some(0)),
+            SettingsBytecodeInstance::new("2".into(), "B".into(), "Part".into(), Some(1)),
+        ],
+    };
+    let refs = (0..3).map(|i| (i, Ref::new())).collect();
+    let mut paths = PlaceReferencePaths::default();
+    paths.add_service(&document, 0, &[0, 1, 2], &refs);
+    assert_eq!(
+        paths.resolve(&["Workspace".into(), "A\0B".into()], None),
+        Some(refs[&2])
+    );
+    assert_eq!(
+        paths.resolve(&["Workspace".into(), "A\0B".into()], Some(&[1, 1])),
+        None
+    );
+    let mut empty = document;
+    empty.instances[0].name.clear();
+    let mut paths = PlaceReferencePaths::default();
+    paths.add_service(&empty, 0, &[0, 1, 2], &refs);
+    assert_eq!(paths.resolve(&[], None), Some(refs[&0]));
 }

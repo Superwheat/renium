@@ -280,14 +280,17 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                         instance.class_name
                     );
                 }
-                if let Some(omitted) = options.omitted_properties.as_deref_mut() {
+                let class_omission = options.omitted_properties_by_class.is_some()
+                    && (unsupported && !unknown_number || options.omitted_properties.is_none());
+                if !class_omission && let Some(omitted) = options.omitted_properties.as_deref_mut()
+                {
                     omitted.insert(name.clone());
                 }
                 // A value-specific conversion failure belongs only to this
                 // instance. Broadcasting it to its class would also request
                 // fields that the payload already carries on other instances.
                 if let Some(omitted) = options.omitted_properties_by_class.as_deref_mut()
-                    && (unsupported && !unknown_number || options.omitted_properties.is_none())
+                    && class_omission
                 {
                     omitted
                         .entry(instance.class_name.clone())

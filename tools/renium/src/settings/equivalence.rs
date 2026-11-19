@@ -2681,6 +2681,7 @@ pub(crate) fn read_unread_instances(document: &mut SettingsBytecode, store: &[u8
 /// The document of a store file with only some of its instances read: the
 /// ones `document` has read, and the ones at `rows`, each as a whole decode
 /// of the file gives it. Every other instance holds no value.
+#[cfg(test)]
 pub(crate) fn read_instances(
     document: &SettingsBytecode,
     store: &[u8],

@@ -246,7 +246,7 @@ fn native_import_file_values_come_from_the_indexed_snapshot() -> Result<()> {
     let document = fixture("Workspace");
     document.write_file(&path)?;
     let bytes = std::fs::read(&path)?;
-    let input = RbxPlaceDocument::from_file_bytes(path.clone(), &bytes)?;
+    let input = RbxPlaceDocument::from_file_bytes(path.clone(), bytes)?;
     // Replacing even the entire file must not change the already indexed input.
     std::fs::write(&path, b"subsequent edit, not a valid store")?;
     let actual = build_rbx_place_with_documents(
@@ -266,6 +266,151 @@ fn native_import_file_values_come_from_the_indexed_snapshot() -> Result<()> {
         false,
     )?;
     assert_eq!(fixture_bytes(actual)?, fixture_bytes(expected)?);
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn parallel_import_reports_the_first_service_error_in_input_order() -> Result<()> {
+    use crate::rbx::model::{PlaceBuildTuning, RbxPlaceDocument, build_rbx_place_with_tuning};
+    let root = crate::tests::support::temp_dir("import-error-order");
+    let services = vec!["ReplicatedStorage".to_string(), "Workspace".to_string()];
+    for service in &services {
+        std::fs::create_dir_all(root.join(service))?;
+    }
+    let mut first = fixture(&services[0]);
+    first.instances[4].name = "FirstBadReference".into();
+    first.instances[4]
+        .properties
+        .insert("Value".into(), json!({"_type":"Ref", "settingsId":9}));
+    let mut second = fixture(&services[1]);
+    second.instances[4].name = "SecondBadReference".into();
+    second.instances[4]
+        .properties
+        .insert("Value".into(), json!({"_type":"Ref", "settingsId":9}));
+    // The old size-sorted scheduling visits this service first at degree one.
+    second.instances.push(SettingsBytecodeInstance::new(
+        "extra".into(),
+        "Extra".into(),
+        "Folder".into(),
+        Some(0),
+    ));
+    for degree in [1, 2] {
+        let inputs = HashMap::from([
+            (services[0].clone(), RbxPlaceDocument::Borrowed(&first)),
+            (services[1].clone(), RbxPlaceDocument::Borrowed(&second)),
+        ]);
+        let result = build_rbx_place_with_tuning(
+            &root,
+            services.clone(),
+            inputs,
+            true,
+            true,
+            false,
+            PlaceBuildTuning {
+                services: std::num::NonZeroUsize::new(degree).unwrap(),
+                ..Default::default()
+            },
+        );
+        let error = result.err().context("invalid reference was accepted")?;
+        assert!(
+            format!("{error:#}").contains("FirstBadReference"),
+            "{error:#}"
+        );
+    }
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn import_retains_no_unused_or_null_reference_rows() -> Result<()> {
+    use crate::rbx::model::PlaceImportProperties;
+    let root = crate::tests::support::temp_dir("import-null-rows");
+    std::fs::create_dir_all(root.join("Workspace"))?;
+    let mut document = fixture("Workspace");
+    // All values are carried; null references cannot become cross-batch or
+    // external references and do not justify retaining their whole rows.
+    document.instances[4]
+        .properties
+        .insert("Value".into(), json!({"_type":"Ref"}));
+    document.instances.push(SettingsBytecodeInstance::new(
+        "no-pivot".into(),
+        "NoPivot".into(),
+        "Model".into(),
+        Some(0),
+    ));
+    for retain in [false, true] {
+        let options = if retain {
+            PlaceImportProperties::retaining(HashSet::from(["Workspace".into()]))
+        } else {
+            true.into()
+        };
+        let build = build_rbx_place(
+            &root,
+            vec!["Workspace".into()],
+            Some(&HashMap::from([("Workspace".into(), &document)])),
+            true,
+            options,
+            false,
+        )?;
+        if retain {
+            assert!(
+                build.import_rows.services["Workspace"].1.is_empty(),
+                "no field needs its original row"
+            );
+        } else {
+            assert!(build.import_rows.services.is_empty());
+        }
+    }
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn imported_references_keep_originals_only_across_payload_or_live_identity_boundaries() -> Result<()>
+{
+    use crate::rbx::model::PlaceImportProperties;
+    let root = crate::tests::support::temp_dir("import-reference-rows");
+    std::fs::create_dir_all(root.join("Workspace"))?;
+    for (parent, limit, viewport, expected) in [
+        (2, NATIVE_IMPORT_BATCH_INSTANCES, false, false),
+        (1, NATIVE_IMPORT_BATCH_INSTANCES, false, true),
+        (2, 1, false, true),
+        (2, NATIVE_IMPORT_BATCH_INSTANCES, true, true),
+    ] {
+        let mut document = fixture("Workspace");
+        document.instances[4].parent_index = Some(parent);
+        if viewport {
+            document.instances[3].class_name = "Camera".into();
+            document.instances[0].properties.insert(
+                "CurrentCamera".into(),
+                json!({"_type":"Ref", "settingsId":"part"}),
+            );
+        }
+        document.write_file(&service_settings_path(&root.join("Workspace")))?;
+        for files in [false, true] {
+            let mut properties =
+                PlaceImportProperties::retaining(HashSet::from(["Workspace".into()]));
+            properties.reference_subtree_limit = Some(limit);
+            let documents = HashMap::from([("Workspace".into(), &document)]);
+            let build = build_rbx_place(
+                &root,
+                vec!["Workspace".into()],
+                (!files).then_some(&documents),
+                true,
+                properties,
+                false,
+            )?;
+            assert_eq!(
+                build.import_rows.services["Workspace"]
+                    .1
+                    .iter()
+                    .any(|(_, index, _)| *index == 4),
+                expected,
+                "parent {parent}, bound {limit}, viewport {viewport}, file {files}"
+            );
+        }
+    }
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -448,7 +593,7 @@ fn native_import_file_chunks_preserve_all_cross_row_facts() -> Result<()> {
                 .collect(),
         ),
         true,
-        true,
+        crate::rbx::model::PlaceImportProperties::retaining(services.iter().cloned().collect()),
         false,
     )?)?;
     for (size, parallel_services, workers) in
@@ -470,12 +615,16 @@ fn native_import_file_chunks_preserve_all_cross_row_facts() -> Result<()> {
                 })
                 .collect();
             let build = pool.install(|| {
+                let mut properties = crate::rbx::model::PlaceImportProperties::retaining(
+                    services.iter().cloned().collect(),
+                );
+                properties.reference_subtree_limit = Some(NATIVE_IMPORT_BATCH_INSTANCES);
                 build_rbx_place_with_tuning(
                     &root,
                     services.clone(),
                     inputs,
                     true,
-                    true,
+                    properties,
                     false,
                     PlaceBuildTuning {
                         rows: std::num::NonZeroUsize::new(size).unwrap(),

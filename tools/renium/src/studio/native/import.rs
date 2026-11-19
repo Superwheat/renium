@@ -94,6 +94,7 @@ fn externalize_imported_references(
 ) -> HashMap<String, HashSet<String>> {
     let mut removed = Vec::new();
     let mut properties_by_path = HashMap::<String, HashSet<String>>::new();
+    let mut paths = crate::rbx::model::RbxDomPaths::new(dom);
     for referent in imported_refs.iter().copied() {
         let Some(instance) = dom.get_by_ref(referent) else {
             continue;
@@ -112,7 +113,7 @@ fn externalize_imported_references(
         if external_names.is_empty() && unresolved_names.is_none() {
             continue;
         }
-        let (segments, ordinals) = rbx_dom_instance_path_parts(dom, referent);
+        let (segments, ordinals) = paths.parts(referent);
         let names = properties_by_path
             .entry(instance_path_parts_key(&segments, &ordinals))
             .or_default();
@@ -122,6 +123,7 @@ fn externalize_imported_references(
         }
         removed.extend(external_names.into_iter().map(|name| (referent, name)));
     }
+    drop(paths);
     for (referent, name) in removed {
         if let Some(instance) = dom.get_by_ref_mut(referent) {
             instance
@@ -2462,10 +2464,41 @@ pub(crate) fn build_editor_binary_import_with_documents(
         fallback_reason,
     } = selection;
     let root_ids = additive_root_ids(changes, &additive_roots);
+    let written_services = changes
+        .settings_writes
+        .iter()
+        .filter_map(|write| {
+            crate::editor::paths::service_from_changed_path(
+                &args.project.project_root.join(&args.project.src_root),
+                &write.path,
+            )
+        })
+        .collect::<HashSet<_>>();
+    let unread_rows = changes
+        .native_property_documents
+        .iter()
+        .filter(|(service, document)| {
+            !additive_roots.contains_key(*service)
+                && crate::settings::equivalence::holds_unread_instances(document)
+                && !written_services.contains(*service)
+        })
+        .map(|(service, document)| {
+            (
+                service.clone(),
+                crate::rbx::import_rows::UnreadRows::new(document),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut properties =
+        crate::rbx::model::PlaceImportProperties::retaining(unread_rows.keys().cloned().collect());
+    properties.unread_rows = unread_rows;
     build_editor_binary_import_for_services(
         args,
         services,
-        document_overrides,
+        ImportDocuments {
+            overrides: document_overrides,
+            properties,
+        },
         &additive_roots,
         &root_ids,
         bridge,
@@ -2876,15 +2909,24 @@ fn import_allocates_new_engine_identities_without_losing_saved_content() {
     );
 }
 
+struct ImportDocuments<'a> {
+    overrides: HashMap<String, RbxPlaceDocument<'a>>,
+    properties: crate::rbx::model::PlaceImportProperties,
+}
+
 fn build_editor_binary_import_for_services(
     args: &PushEditorChangesArgs,
     services: HashSet<String>,
-    mut document_overrides: HashMap<String, RbxPlaceDocument<'_>>,
+    documents: ImportDocuments<'_>,
     additive_roots: &HashMap<String, HashSet<String>>,
     additive_root_ids: &AdditiveRootIds,
     bridge: &BridgeServer,
     fallback_reason: Option<ServiceReaderFallback>,
 ) -> Result<Option<EditorBinaryImport>> {
+    let ImportDocuments {
+        overrides: mut document_overrides,
+        mut properties,
+    } = documents;
     let project_root = resolve_project_root_if_present(&args.project.project_root)?;
     let src_root = absolutize_under(&project_root, &args.project.src_root);
     let service_count = services.len();
@@ -2896,6 +2938,27 @@ fn build_editor_binary_import_for_services(
             .then_with(|| a.cmp(b))
     });
     let build_services = ordered_services.clone();
+    let capture_preflight = || {
+        capture_editor_package_preflight_live(
+            bridge,
+            &ordered_services,
+            None,
+            false,
+            Some(additive_roots),
+            Some(additive_root_ids),
+        )
+    };
+    // Original rows have a reader only for partly read whole services. Learn
+    // whether references can cross retained identities before keeping them.
+    let prepared_preflight = (!properties.retain_rows.is_empty())
+        .then(capture_preflight)
+        .transpose()?;
+    if prepared_preflight
+        .as_ref()
+        .is_some_and(|preflight| preflight.dom.is_none())
+    {
+        properties.reference_subtree_limit = Some(payload::NATIVE_IMPORT_BATCH_INSTANCES);
+    }
     let (build, live_preflight) = rayon::join(
         || {
             let started = Instant::now();
@@ -2928,7 +2991,7 @@ fn build_editor_binary_import_for_services(
                 build_services,
                 document_overrides,
                 true,
-                true,
+                properties,
                 false,
             );
             log_timing("native editor import place build", started);
@@ -3003,16 +3066,7 @@ fn build_editor_binary_import_for_services(
                 Ok((build, pending_groups))
             })
         },
-        || {
-            capture_editor_package_preflight_live(
-                bridge,
-                &ordered_services,
-                None,
-                false,
-                Some(additive_roots),
-                Some(additive_root_ids),
-            )
-        },
+        || prepared_preflight.map_or_else(capture_preflight, Ok),
     );
     let (mut build, mut pending_groups) = build?;
     let mut live_preflight = live_preflight?;
@@ -3134,13 +3188,15 @@ fn build_editor_binary_import_for_services(
         &build.unresolved_reference_properties_by_ref,
         viewport_ref,
     );
+    let mut omitted_paths = crate::rbx::model::RbxDomPaths::new(&build.dom);
     for (referent, names) in std::mem::take(&mut build.omitted_properties_by_ref) {
-        let (segments, ordinals) = rbx_dom_instance_path_parts(&build.dom, referent);
+        let (segments, ordinals) = omitted_paths.parts(referent);
         post_apply_properties_by_path
             .entry(instance_path_parts_key(&segments, &ordinals))
             .or_default()
             .extend(names);
     }
+    drop(omitted_paths);
     log_timing("native editor import group preparation", phase_started);
     let replacement_groups = pending_groups
         .iter()
@@ -3199,6 +3255,7 @@ fn build_editor_binary_import_for_services(
         })
         .collect::<HashSet<_>>();
     if !retained_refs.is_empty() {
+        let mut paths = crate::rbx::model::RbxDomPaths::new(&build.dom);
         for referent in retained_refs.iter().copied() {
             let Some(instance) = build.dom.get_by_ref(referent) else {
                 continue;
@@ -3223,7 +3280,7 @@ fn build_editor_binary_import_for_services(
             if names.is_empty() {
                 continue;
             }
-            let (segments, ordinals) = rbx_dom_instance_path_parts(&build.dom, referent);
+            let (segments, ordinals) = paths.parts(referent);
             post_apply_properties_by_path
                 .entry(instance_path_parts_key(&segments, &ordinals))
                 .or_default()
@@ -3246,13 +3303,14 @@ fn build_editor_binary_import_for_services(
             if names.is_empty() {
                 continue;
             }
-            let (segments, ordinals) = rbx_dom_instance_path_parts(&build.dom, referent);
+            let (segments, ordinals) = paths.parts(referent);
             post_apply_properties_by_path
                 .entry(instance_path_parts_key(&segments, &ordinals))
                 .or_default()
                 .extend(names.iter().cloned());
             retained_reference_properties.extend(names.into_iter().map(|name| (referent, name)));
         }
+        drop(paths);
         for (referent, name) in retained_reference_properties {
             if let Some(instance) = build.dom.get_by_ref_mut(referent) {
                 instance
@@ -3314,19 +3372,20 @@ fn build_editor_binary_import_for_services(
     for (pending, package_plan) in pending_groups.into_iter().zip(package_plans) {
         let group_index = groups.len() + 1;
         let payload_root_name = format!("__ReniumImportGroup_{group_index}");
+        let mut paths = crate::rbx::model::RbxDomPaths::new(&build.dom);
         let root_paths = pending
             .roots
             .iter()
             .copied()
             .map(|referent| {
-                let (path_segments, path_ordinals) =
-                    rbx_dom_instance_path_parts(&build.dom, referent);
+                let (path_segments, path_ordinals) = paths.parts(referent);
                 EditorBinaryRootPath {
                     path_segments,
                     path_ordinals,
                 }
             })
             .collect::<Vec<_>>();
+        drop(paths);
         let payload_root_ref = build.dom.insert(
             build.dom.root_ref(),
             RbxInstanceBuilder::new("Folder").with_name(payload_root_name.as_str()),

@@ -85,6 +85,11 @@ pub(crate) fn decode_for_property_edit(
     ))
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ROW_DECODE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The instances at `rows` of a store file, each as decoding the whole file
 /// gives it, and the id of every instance of the file. The values of every
 /// other row are dropped column by column, so the document is never whole in
@@ -93,6 +98,8 @@ pub(crate) fn decode_rows(
     bytes: &[u8],
     rows: &[usize],
 ) -> Result<(Vec<SettingsBytecodeInstance>, Vec<String>)> {
+    #[cfg(test)]
+    ROW_DECODE_CALLS.set(ROW_DECODE_CALLS.get() + 1);
     let _span = crate::app::profile::span("store rows decode");
     let (_, payload) = decode_settings_bytecode_container(bytes)?;
     let budget = DecodeBudget::for_file(bytes.len());

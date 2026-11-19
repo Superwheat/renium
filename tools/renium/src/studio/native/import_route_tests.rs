@@ -210,6 +210,16 @@ fn import_builder_returns_exact_original_rows_for_the_supplemental_pass() -> Res
         row.attributes.insert("WholeRow".into(), json!("unchanged"));
         document.instances.push(row);
     }
+    for index in 0..256 {
+        let mut row = SettingsBytecodeInstance::new(
+            format!("unknown:{index}"),
+            "Flat".into(),
+            "Part".into(),
+            Some(0),
+        );
+        row.properties.insert("UnknownNumber".into(), json!(0.25));
+        document.instances.push(row);
+    }
     let path = service_settings_path(&root.join("src").join(service));
     std::fs::create_dir_all(path.parent().unwrap())?;
     document.write_file(&path)?;
@@ -217,7 +227,7 @@ fn import_builder_returns_exact_original_rows_for_the_supplemental_pass() -> Res
     let document = crate::settings::bytecode::decode_settings_bytecode_holding(&bytes)?;
     for native in [false, true] {
         let mut expected_payload = None;
-        for files in [false, true] {
+        for (files, retain) in [(false, false), (true, false), (false, true), (true, true)] {
             let bridge = fixture();
             let stream = connect(&bridge, 0, edit_info("kept-rows", 21));
             let peer = std::thread::spawn(move || {
@@ -233,21 +243,70 @@ fn import_builder_returns_exact_original_rows_for_the_supplemental_pass() -> Res
             } else {
                 HashMap::from([(service.into(), RbxPlaceDocument::Borrowed(&document))])
             };
-            let mut import = build_editor_binary_import_for_services(
+            let mut requested = document.clone();
+            if retain {
+                // The caller already has the Humanoid row; only unread rows
+                // need originals returned by the builder.
+                for row in requested.instances.iter_mut().skip(2) {
+                    row.properties.clear();
+                    crate::settings::held::stand_unchanged(&mut row.properties);
+                }
+            }
+            let changes = EditorChangeSet {
+                native_property_documents: HashMap::from([(
+                    service.into(),
+                    std::sync::Arc::new(requested),
+                )]),
+                ..Default::default()
+            };
+            crate::rbx::model::PATH_SIBLING_VISITS.set(0);
+            let mut import = build_editor_binary_import_with_documents(
                 &args,
-                HashSet::from([service.into()]),
-                inputs,
-                &HashMap::new(),
-                &HashMap::new(),
+                &changes,
                 &bridge,
-                (!native).then_some(ServiceReaderFallback::Disabled),
+                BinaryImportSelection {
+                    services: HashSet::from([service.into()]),
+                    additive_roots: HashMap::new(),
+                    fallback_reason: (!native).then_some(ServiceReaderFallback::Disabled),
+                },
+                inputs,
             )?
             .context("import missing")?;
+            assert!(
+                crate::rbx::model::PATH_SIBLING_VISITS.get() < document.instances.len() * 20,
+                "omission paths must index sibling ordinals once, not scan each prefix"
+            );
+            if let Some(expected) = &expected_payload {
+                assert_eq!(
+                    &import.bytes, expected,
+                    "retaining rows changed the payload"
+                );
+            } else {
+                expected_payload = Some(import.bytes.clone());
+            }
+            if !retain {
+                assert!(
+                    import.kept_rows.is_empty(),
+                    "fully read documents have no supplemental reader"
+                );
+                drop(bridge);
+                peer.join().unwrap();
+                continue;
+            }
             assert!(
                 import
                     .post_apply_properties_by_class
                     .get("Humanoid")
                     .is_some_and(|names| names.contains("Health"))
+            );
+            assert!(
+                !import
+                    .post_apply_properties_by_path
+                    .contains_key(&instance_path_parts_key(
+                        &[service.into(), "Actor".into()],
+                        &[1, 1]
+                    )),
+                "class omissions must not duplicate per-instance paths"
             );
             assert!(
                 import
@@ -278,6 +337,7 @@ fn import_builder_returns_exact_original_rows_for_the_supplemental_pass() -> Res
                 .property_changes
                 .iter()
                 .filter_map(|row| row.settings_id.clone())
+                .filter(|id| id != "row:1")
                 .collect::<HashSet<_>>();
             let kept = import
                 .kept_rows
@@ -309,11 +369,6 @@ fn import_builder_returns_exact_original_rows_for_the_supplemental_pass() -> Res
             }
             for (index, row) in &kept.rows {
                 assert_eq!(row, &document.instances[*index]);
-            }
-            if let Some(expected) = &expected_payload {
-                assert_eq!(&import.bytes, expected);
-            } else {
-                expected_payload = Some(import.bytes);
             }
             drop(bridge);
             peer.join().unwrap();

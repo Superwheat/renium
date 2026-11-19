@@ -6302,9 +6302,13 @@ fn supplemental_documents(
     import: Option<&mut EditorBinaryImport>,
     stores_root: &Path,
 ) -> Result<HashMap<String, Arc<SettingsBytecode>>> {
-    use crate::settings::equivalence::{holds_unread_instances, read_instances};
+    use crate::settings::equivalence::{holds_unread_instances, read_unread_instances};
     let mut rows = import
-        .map(|import| std::mem::take(&mut import.kept_rows))
+        .map(|import| {
+            let mut rows = std::mem::take(&mut import.kept_rows);
+            rows.retain(|service, _| import.imports_service(service));
+            rows
+        })
         .unwrap_or_default();
     changes
         .native_property_documents
@@ -6318,11 +6322,9 @@ fn supplemental_documents(
             let read = if let Some(rows) = rows {
                 rows.materialize(document)?
             } else {
-                read_instances(
-                    document,
-                    &store_bytes(stores_root, service)?,
-                    &(0..document.instances.len()).collect::<Vec<_>>(),
-                )?
+                let mut whole = document.as_ref().clone();
+                read_unread_instances(&mut whole, &store_bytes(stores_root, service)?)?;
+                whole
             };
             log_editor_collection_timing("native supplemental rows", started);
             Ok((service.clone(), Arc::new(read)))
@@ -7178,6 +7180,75 @@ mod sync_tests {
             }
             let kept = candidates()?.remove("ReplicatedStorage").unwrap();
             assert!(kept.materialize(&invalid).is_err());
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn supplemental_without_a_whole_import_uses_the_held_whole_reader() -> Result<()> {
+        use crate::settings::bytecode::{SETTINGS_BINARY_VERSION, SettingsBytecodeInstance};
+        let root = crate::tests::support::temp_dir("supplemental-whole-reader");
+        let service = "ReplicatedStorage";
+        let mut document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance::new(
+                "root".into(),
+                service.into(),
+                service.into(),
+                None,
+            )],
+        };
+        for index in 0..64 {
+            let mut row = SettingsBytecodeInstance::new(
+                index.to_string(),
+                "Payload".into(),
+                "MeshPart".into(),
+                Some(0),
+            );
+            row.properties.insert("TexturePack".into(), json!({"_type":"SharedString", "base64":base64::encode(b"repeated whole-reader payload".repeat(256))}));
+            document.instances.push(row);
+        }
+        let path = service_settings_path(&root.join(service));
+        fs::create_dir_all(path.parent().unwrap())?;
+        document.write_file(&path)?;
+        let bytes = fs::read(&path)?;
+        let mut expected = crate::settings::bytecode::decode_settings_bytecode_holding(&bytes)?;
+        crate::settings::equivalence::stabilize_settings_reference_ids(&mut expected);
+        crate::settings::equivalence::canonicalize_settings_property_names(&mut expected)?;
+        let mut sparse = expected.clone();
+        for row in sparse.instances.iter_mut().skip(1) {
+            row.properties.clear();
+            crate::settings::held::stand_unchanged(&mut row.properties);
+        }
+        let changes = EditorChangeSet {
+            native_property_documents: HashMap::from([(service.into(), Arc::new(sparse))]),
+            ..Default::default()
+        };
+        // An additive document can have reduced/re-indexed rows. Its identities
+        // must never be tested against this partly read whole store.
+        let mut additive = replacement_fixture();
+        additive.groups[0].additive = true;
+        additive.kept_rows = crate::rbx::import_rows::ImportRowCandidates {
+            services: HashMap::from([(service.into(), ([99; 32], Vec::new()))]),
+        }
+        .finish(&HashMap::new(), &HashMap::new(), &HashMap::new())?;
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
+        for import in [None, Some(&mut additive)] {
+            pool.install(|| -> Result<()> {
+                use crate::settings::bytecode::property_edit::ROW_DECODE_CALLS;
+                ROW_DECODE_CALLS.set(0);
+                let actual = supplemental_documents(&changes, import, &root)?;
+                assert_eq!(actual[service].as_ref(), &expected);
+                // This is a memory-path regression: decode_rows expands shared
+                // payloads before holding them. Equal values alone cannot catch it.
+                assert_eq!(
+                    ROW_DECODE_CALLS.get(),
+                    0,
+                    "whole fallback must not expand shared payloads row by row"
+                );
+                Ok(())
+            })?;
         }
         fs::remove_dir_all(root)?;
         Ok(())

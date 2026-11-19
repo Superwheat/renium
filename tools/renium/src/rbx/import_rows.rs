@@ -8,6 +8,82 @@ use sha2::{Digest, Sha256};
 use crate::editor::types::IMPORT_MODEL_PIVOT;
 use crate::settings::bytecode::{SettingsBytecode, SettingsBytecodeInstance};
 
+/// A small subtree is indivisible in both payload routes. With no retained live
+/// packages, a reference inside it cannot become a post-import write. The
+/// viewport and service/container anchors are excluded because they stay live.
+pub(crate) fn reference_scopes(
+    document: &SettingsBytecode,
+    service: &str,
+    root: usize,
+    children: &[Vec<usize>],
+    refs: &crate::rbx::model::BytecodeModelExportRefs<'_>,
+    limit: usize,
+    viewport: Option<Ref>,
+) -> HashMap<Ref, usize> {
+    let mut order = Vec::new();
+    crate::bytecode::edit::collect_settings_subtree_preorder(children, root, &mut order);
+    let mut sizes = vec![1usize; document.instances.len()];
+    let mut contains_viewport = vec![false; document.instances.len()];
+    for &index in order.iter().rev() {
+        contains_viewport[index] |= refs.by_index.get(&index).copied() == viewport;
+        if let Some(parent) = document.instances[index].parent_index {
+            sizes[parent] += sizes[index];
+            contains_viewport[parent] |= contains_viewport[index];
+        }
+    }
+    let mut scopes = HashMap::new();
+    let mut by_index = vec![None; document.instances.len()];
+    let mut below_viewport = vec![false; document.instances.len()];
+    for index in order {
+        let row = &document.instances[index];
+        below_viewport[index] = refs.by_index.get(&index).copied() == viewport
+            || row
+                .parent_index
+                .is_some_and(|parent| below_viewport[parent]);
+        if below_viewport[index]
+            || index == root
+            || row.parent_index == Some(root)
+                && crate::roblox::services::is_engine_managed_container(service, &row.class_name)
+        {
+            continue;
+        }
+        let scope = row
+            .parent_index
+            .and_then(|parent| by_index[parent])
+            .or_else(|| (sizes[index] <= limit && !contains_viewport[index]).then_some(index));
+        by_index[index] = scope;
+        if let (Some(scope), Some(referent)) = (scope, refs.by_index.get(&index)) {
+            scopes.insert(*referent, scope);
+        }
+    }
+    scopes
+}
+
+pub(crate) fn has_selected_property(
+    class: &str,
+    properties: &serde_json::Map<String, serde_json::Value>,
+    names: Option<&HashSet<String>>,
+) -> Result<bool> {
+    let Some(names) = names else { return Ok(false) };
+    let database = rbx_reflection_database::get()?;
+    let selected = |properties: &serde_json::Map<String, serde_json::Value>| {
+        properties.keys().any(|name| {
+            let logical = crate::rbx::encode::rbx_logical_property_name(database, class, name)
+                .unwrap_or(name);
+            names.contains(logical)
+        })
+    };
+    if selected(properties) {
+        return Ok(true);
+    }
+    // Migrations and content aliases are owned by the caller's canonicalizer.
+    // Do not duplicate their list here or expand a held payload.
+    let mut row = SettingsBytecodeInstance::new(String::new(), String::new(), class.into(), None);
+    row.properties = properties.clone();
+    crate::settings::equivalence::canonicalize_instances(std::slice::from_mut(&mut row))?;
+    Ok(selected(&row.properties))
+}
+
 pub(crate) fn identity(document: &SettingsBytecode) -> [u8; 32] {
     let mut hash = Sha256::new();
     for instance in &document.instances {
@@ -15,6 +91,36 @@ pub(crate) fn identity(document: &SettingsBytecode) -> [u8; 32] {
         hash.update(instance.settings_id.as_bytes());
     }
     hash.finalize().into()
+}
+
+pub(crate) struct UnreadRows {
+    identity: [u8; 32],
+    unread: Vec<bool>,
+}
+
+impl UnreadRows {
+    pub(crate) fn new(document: &SettingsBytecode) -> Self {
+        Self {
+            identity: identity(document),
+            unread: document
+                .instances
+                .iter()
+                .map(|row| crate::settings::held::stands_unchanged(&row.properties))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn validate(&self, document: &SettingsBytecode) -> Result<()> {
+        anyhow::ensure!(
+            self.identity == identity(document) && self.unread.len() == document.instances.len(),
+            "The store's instance identities changed during import preparation; retry the push from the current files"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn contains(&self, index: usize) -> bool {
+        self.unread[index]
+    }
 }
 
 pub(crate) struct KeptImportRows {
@@ -36,7 +142,6 @@ impl ImportRowCandidates {
         self.services
             .values()
             .flat_map(|(_, rows)| rows)
-            .filter(|(_, _, row)| row.class_name != IMPORT_MODEL_PIVOT.0)
             .map(|(referent, _, _)| {
                 let (segments, ordinals) = paths.parts(*referent);
                 (
@@ -53,7 +158,7 @@ impl ImportRowCandidates {
         classes: &HashMap<String, HashSet<String>>,
         omitted_paths: &HashMap<String, HashSet<String>>,
     ) -> Result<HashMap<String, KeptImportRows>> {
-        let database = rbx_reflection_database::get()?;
+        let pivot = HashSet::from([IMPORT_MODEL_PIVOT.1.to_string()]);
         self.services
             .into_iter()
             .map(|(service, (identity, rows))| {
@@ -64,28 +169,15 @@ impl ImportRowCandidates {
                         let path = paths
                             .get(&referent)
                             .and_then(|path| omitted_paths.get(path));
-                        let selected = if row.class_name == IMPORT_MODEL_PIVOT.0 {
-                            true
-                        } else if class.is_none() && path.is_none() {
-                            false
-                        } else {
-                            // Match the caller's whole-row alias and migration
-                            // rules without changing the returned original.
-                            let mut canonical = row.clone();
-                            crate::settings::equivalence::canonicalize_instances(
-                                std::slice::from_mut(&mut canonical),
-                            )?;
-                            canonical.properties.keys().any(|name| {
-                                let logical = crate::rbx::encode::rbx_logical_property_name(
-                                    database,
-                                    &row.class_name,
-                                    name,
-                                )
-                                .unwrap_or(name);
-                                class.is_some_and(|names| names.contains(logical))
-                                    || path.is_some_and(|names| names.contains(logical))
-                            })
-                        };
+                        let selected =
+                            has_selected_property(&row.class_name, &row.properties, class)?
+                                || has_selected_property(&row.class_name, &row.properties, path)?
+                                || (row.class_name == IMPORT_MODEL_PIVOT.0
+                                    && has_selected_property(
+                                        &row.class_name,
+                                        &row.properties,
+                                        Some(&pivot),
+                                    )?);
                         Ok(selected.then_some((index, row)))
                     })
                     .collect::<Result<Vec<_>>>()?

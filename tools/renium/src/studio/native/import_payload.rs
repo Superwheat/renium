@@ -19,7 +19,7 @@ mod memory_tests;
 // Each engine read finalizes the loaded scene. Hundreds of tiny reads repeat
 // that work over an ever larger place; retain bounded chunks without doing a
 // whole engine load for every small subtree.
-const NATIVE_IMPORT_BATCH_INSTANCES: usize = 32768;
+pub(super) const NATIVE_IMPORT_BATCH_INSTANCES: usize = 32768;
 
 // Fixed-width tree rows avoid repeating full paths for every descendant.
 // Each row is (parent row, sibling/root ordinal, name, class, settings id).

@@ -174,6 +174,11 @@ pub(crate) fn rbx_dom_instance_path_segments(dom: &RbxWeakDom, referent: RbxRef)
     rbx_dom_instance_path_parts(dom, referent).0
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PATH_SIBLING_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn rbx_dom_instance_path_parts(
     dom: &RbxWeakDom,
     referent: RbxRef,
@@ -184,6 +189,10 @@ pub(crate) fn rbx_dom_instance_path_parts(
                 .children()
                 .iter()
                 .take_while(|sibling_ref| **sibling_ref != current)
+                .inspect(|_| {
+                    #[cfg(test)]
+                    PATH_SIBLING_VISITS.set(PATH_SIBLING_VISITS.get() + 1);
+                })
                 .filter(|sibling_ref| {
                     dom.get_by_ref(**sibling_ref)
                         .is_some_and(|sibling| sibling.name == name)
@@ -219,6 +228,8 @@ impl<'a> RbxDomPaths<'a> {
             let mut counts = AHashMap::<&str, usize>::new();
             if let Some(parent) = dom.get_by_ref(parent) {
                 for child in parent.children() {
+                    #[cfg(test)]
+                    PATH_SIBLING_VISITS.set(PATH_SIBLING_VISITS.get() + 1);
                     if let Some(instance) = dom.get_by_ref(*child) {
                         let count = counts.entry(&instance.name).or_default();
                         *count += 1;
@@ -1399,7 +1410,7 @@ pub(crate) enum RbxPlaceDocument<'a> {
     File {
         structure: SettingsBytecode,
         path: PathBuf,
-        columns: crate::settings::bytecode::property_edit::RetainedRowColumns,
+        bytes: Vec<u8>,
     },
 }
 
@@ -1417,11 +1428,8 @@ impl std::ops::Deref for RbxPlaceDocument<'_> {
 }
 
 impl RbxPlaceDocument<'_> {
-    pub(crate) fn from_file_bytes(path: PathBuf, bytes: &[u8]) -> Result<Self> {
-        let (structure, columns) = crate::settings::bytecode::property_edit::decode_for_row_chunks(
-            bytes,
-        )
-        .with_context(|| {
+    pub(crate) fn from_file_bytes(path: PathBuf, bytes: Vec<u8>) -> Result<Self> {
+        let structure = SettingsBytecode::decode_structure(&bytes).with_context(|| {
             format!(
                 "Failed to decode {}; repair or refresh this store before retrying the import",
                 path.display()
@@ -1430,7 +1438,7 @@ impl RbxPlaceDocument<'_> {
         Ok(Self::File {
             structure,
             path,
-            columns,
+            bytes,
         })
     }
 
@@ -1459,11 +1467,14 @@ impl RbxPlaceDocument<'_> {
         let Self::File {
             mut structure,
             path,
-            mut columns,
+            bytes,
         } = self
         else {
             return Ok(self);
         };
+        let (_, mut columns) =
+            crate::settings::bytecode::property_edit::decode_for_row_chunks(&bytes)?;
+        drop(bytes);
         // The structure and columns came from one captured file snapshot.
         let count = structure.instances.len();
         if count != 0 {
@@ -1583,7 +1594,7 @@ pub(crate) fn build_rbx_place(
     services: Vec<String>,
     document_overrides: Option<&HashMap<String, &SettingsBytecode>>,
     allow_unrepresentable_properties: bool,
-    capture_logical_properties: bool,
+    import_properties: impl Into<PlaceImportProperties>,
     merge_source_files: bool,
 ) -> Result<RbxPlaceBuild> {
     let documents = document_overrides
@@ -1596,7 +1607,7 @@ pub(crate) fn build_rbx_place(
         services,
         documents,
         allow_unrepresentable_properties,
-        capture_logical_properties,
+        import_properties,
         merge_source_files,
     )
 }
@@ -1606,7 +1617,7 @@ pub(crate) fn build_rbx_place_with_documents(
     services: Vec<String>,
     documents: HashMap<String, RbxPlaceDocument<'_>>,
     allow_unrepresentable_properties: bool,
-    capture_logical_properties: bool,
+    import_properties: impl Into<PlaceImportProperties>,
     merge_source_files: bool,
 ) -> Result<RbxPlaceBuild> {
     build_rbx_place_with_tuning(
@@ -1614,10 +1625,44 @@ pub(crate) fn build_rbx_place_with_documents(
         services,
         documents,
         allow_unrepresentable_properties,
-        capture_logical_properties,
+        import_properties,
         merge_source_files,
         PlaceBuildTuning::default(),
     )
+}
+
+/// Decoded originals have one reader: the supplemental pass for partly read
+/// whole-service imports. Ordinary exports and fully read documents need none.
+#[derive(Default)]
+pub(crate) struct PlaceImportProperties {
+    capture_logical: bool,
+    pub(crate) retain_rows: HashSet<String>,
+    pub(crate) unread_rows: HashMap<String, crate::rbx::import_rows::UnreadRows>,
+    /// Only set after the live preflight proved there are no retained packages.
+    /// This is the actual payload's subtree bound, not a second batch policy.
+    pub(crate) reference_subtree_limit: Option<usize>,
+}
+
+impl From<bool> for PlaceImportProperties {
+    fn from(capture_logical: bool) -> Self {
+        Self {
+            capture_logical,
+            retain_rows: HashSet::new(),
+            unread_rows: HashMap::new(),
+            reference_subtree_limit: None,
+        }
+    }
+}
+
+impl PlaceImportProperties {
+    pub(crate) fn retaining(services: HashSet<String>) -> Self {
+        Self {
+            capture_logical: true,
+            retain_rows: services,
+            unread_rows: HashMap::new(),
+            reference_subtree_limit: None,
+        }
+    }
 }
 
 /// Scheduling choices only; references and final hierarchy order span all work.
@@ -1645,10 +1690,12 @@ pub(crate) fn build_rbx_place_with_tuning(
     services: Vec<String>,
     mut documents: HashMap<String, RbxPlaceDocument<'_>>,
     allow_unrepresentable_properties: bool,
-    capture_logical_properties: bool,
+    import_properties: impl Into<PlaceImportProperties>,
     merge_source_files: bool,
     tuning: PlaceBuildTuning,
 ) -> Result<RbxPlaceBuild> {
+    let import_properties = import_properties.into();
+    let capture_logical_properties = import_properties.capture_logical;
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let phase_started = Instant::now();
     let link_enforcement = if merge_source_files {
@@ -1691,7 +1738,7 @@ pub(crate) fn build_rbx_place_with_tuning(
             } else {
                 let bytes = fs::read(&settings_file)
                     .with_context(|| format!("Failed to read {}", settings_file.display()))?;
-                RbxPlaceDocument::from_file_bytes(settings_file.clone(), &bytes)?
+                RbxPlaceDocument::from_file_bytes(settings_file.clone(), bytes)?
             };
             if merge_source_files {
                 document = document.load()?;
@@ -1741,6 +1788,8 @@ pub(crate) fn build_rbx_place_with_tuning(
                 source_structure_changed,
             )))
         })
+        .collect::<Vec<_>>()
+        .into_iter()
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
@@ -1882,8 +1931,6 @@ pub(crate) fn build_rbx_place_with_tuning(
         unresolved_reference_properties_by_ref: HashMap<RbxRef, HashSet<rbx_dom_weak::Ustr>>,
     }
     let phase_started = Instant::now();
-    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
-    dom.reserve(total_instances);
     let mut import_rows = crate::rbx::import_rows::ImportRowCandidates::default();
     let mut omitted_properties_by_ref = HashMap::new();
     let extra_omissions = crate::editor::types::import_property_omissions(HashMap::new(), false);
@@ -1897,7 +1944,7 @@ pub(crate) fn build_rbx_place_with_tuning(
         .zip(per_service_refs)
         .enumerate()
         .collect::<Vec<_>>();
-    // Overlap the dominant services; keep their original rank for assembly.
+    // Overlap dominant services, but return failures in original service order.
     inputs.sort_by_key(|(_, (input, _))| std::cmp::Reverse(input.7.len()));
     let mut inputs = inputs.into_iter();
     let mut converted = Vec::with_capacity(service_roots.capacity());
@@ -1913,21 +1960,28 @@ pub(crate) fn build_rbx_place_with_tuning(
             (service, _, service_dir, document, mut source_paths, children, root_index, subtree, _),
             by_index,
         ))| {
+        let result = (|| {
         let service_started = Instant::now();
         let (mut document, mut columns) = match document {
             RbxPlaceDocument::File {
                 structure: mut document,
-                columns,
+                bytes,
                 ..
             } => {
+                let (_, columns) = crate::settings::bytecode::property_edit::decode_for_row_chunks(&bytes)
+                    .with_context(|| format!("Failed to decode {service}; repair or refresh this store before retrying the import"))?;
+                drop(bytes);
                 columns.project_properties(
                     &mut document,
                     |name| {
                         name == crate::editor::paths::SOURCE_PATH_CONTEXT_PROPERTY
                             || crate::rbx::encode::ANCESTOR_MODEL_SCALE_PROPERTIES.contains(&name)
+                            || service == "Workspace" && name == "CurrentCamera"
                     },
                     |instance, name, value| {
-                        if name == crate::editor::paths::SOURCE_PATH_CONTEXT_PROPERTY {
+                        if service == "Workspace" && name == "CurrentCamera" {
+                            Some(value)
+                        } else if name == crate::editor::paths::SOURCE_PATH_CONTEXT_PROPERTY {
                             crate::editor::paths::source_path_context_fact(&value)
                         } else {
                             crate::rbx::encode::ancestor_scale_fact(instance, &value)
@@ -1938,7 +1992,13 @@ pub(crate) fn build_rbx_place_with_tuning(
             }
             other => (other.into_consumable(), None),
         };
-        let identity = capture_logical_properties.then(|| crate::rbx::import_rows::identity(&document));
+        let retain_rows = import_properties.retain_rows.contains(&service);
+        let unread_rows = import_properties.unread_rows.get(&service);
+        if let Some(rows) = unread_rows { rows.validate(&document)?; }
+        let identity = retain_rows.then(|| crate::rbx::import_rows::identity(&document));
+        let viewport = (service == "Workspace")
+            .then(|| document.instances[root_index].properties.get("CurrentCamera").cloned())
+            .flatten();
         let ancestor_scales = if columns.is_some() {
             source_paths = build_editor_source_paths_by_index_with_children(
                 &document,
@@ -1973,6 +2033,15 @@ pub(crate) fn build_rbx_place_with_tuning(
             global_paths: Some(Arc::clone(&compact_paths)),
             ..Default::default()
         };
+        let reference_scopes = import_properties.reference_subtree_limit
+            .filter(|_| retain_rows)
+            .map(|limit| {
+                let viewport = viewport.as_ref().and_then(|value| {
+                    crate::rbx::encode::json_to_rbx_property_variant(value,
+                        crate::rbx::encode::rbx_property_descriptor(database, &service, "CurrentCamera"), database, &refs)
+                }).and_then(|value| match value { RbxVariant::Ref(target) if target.is_some() => Some(target), _ => None });
+                crate::rbx::import_rows::reference_scopes(&document, &service, root_index, &children, &refs, limit, viewport)
+            }).unwrap_or_default();
         // One very large service must not serialize all conversion work
         // onto one worker. Indexed chunks preserve the original order;
         // each encoder owns its metadata and only reads shared refs.
@@ -2032,12 +2101,19 @@ pub(crate) fn build_rbx_place_with_tuning(
                         let referent = refs.by_index[&index];
                         let built = builder.build_leaf(children[index].len());
                         let instance = &document.instances[index];
-                        let keep = capture_logical_properties && (
-                            instance.class_name == crate::editor::types::IMPORT_MODEL_PIVOT.0
-                            || !omitted_properties.is_empty()
+                        let keep = retain_rows && unread_rows.is_none_or(|rows| rows.contains(index)) && (
+                            !omitted_properties.is_empty()
                             || !unresolved_reference_properties.is_empty()
-                            || built.properties.values().chain(logical_properties.values()).any(|value| matches!(value, RbxVariant::Ref(_)))
-                            || extra_omissions.contains_key(&instance.class_name)
+                            || built.properties.values().chain(logical_properties.values()).any(|value| {
+                                matches!(value, RbxVariant::Ref(target) if target.is_some()
+                                    && reference_scopes.get(&referent).is_none_or(|scope| reference_scopes.get(target) != Some(scope)))
+                            })
+                            || crate::rbx::import_rows::has_selected_property(&instance.class_name,
+                                values.as_ref().map_or(&instance.properties, |values| &values.properties),
+                                omitted_properties_by_class.get(&instance.class_name))?
+                            || crate::rbx::import_rows::has_selected_property(&instance.class_name,
+                                values.as_ref().map_or(&instance.properties, |values| &values.properties),
+                                extra_omissions.get(&instance.class_name))?
                         );
                         if keep {
                             let mut row = SettingsBytecodeInstance::new(instance.settings_id.clone(), instance.name.clone(), instance.class_name.clone(), instance.parent_index);
@@ -2152,13 +2228,24 @@ pub(crate) fn build_rbx_place_with_tuning(
             &format!("native editor place {service} converted and released"),
             service_started,
         );
-        anyhow::Ok((rank, service, root_ref, has_package_links, order, service_chunks, identity))
-        }).collect::<Result<Vec<_>>>()?;
+        anyhow::Ok((service, root_ref, has_package_links, order, service_chunks, identity))
+        })();
+        (rank, result)
+        }).collect::<Vec<_>>();
         converted.extend(completed);
     }
     converted.sort_by_key(|(rank, ..)| *rank);
+    // Conversion has released every encoder. These indexes have no reader in
+    // DOM assembly; release them before allocating the final instance table.
+    drop(global_unique_settings_refs);
+    drop(global_path_refs);
+    drop(global_path_segment_refs);
+    drop(compact_paths);
+    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+    dom.reserve(total_instances);
     let join_span = crate::app::profile::span("place converted tree join");
-    for (_, service, root_ref, packages, order, service_chunks, identity) in converted {
+    for (_, result) in converted {
+        let (service, root_ref, packages, order, service_chunks, identity) = result?;
         let mut kept = Vec::new();
         has_package_links |= packages;
         let mut instances = Vec::with_capacity(order.len());
