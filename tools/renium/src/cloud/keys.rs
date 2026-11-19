@@ -426,11 +426,7 @@ mod tests {
     use super::*;
 
     fn scratch_store() -> (PathBuf, PathBuf) {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("renium-keys-{}-{stamp}", std::process::id()));
+        let dir = crate::tests::support::temp_dir("keys");
         (dir.clone(), dir.join("api-keys.json"))
     }
 

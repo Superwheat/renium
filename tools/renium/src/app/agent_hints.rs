@@ -247,14 +247,10 @@ mod tests {
     struct ScratchHome(PathBuf);
 
     impl ScratchHome {
+        /// A folder of its own: two tests that start in the same tick of the
+        /// clock, which is a microsecond on macOS, must not share one.
         fn new() -> Result<Self> {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos();
-            let path = std::env::temp_dir()
-                .join(format!("renium-agent-hints-{}-{stamp}", std::process::id()));
-            fs::create_dir_all(&path)?;
-            Ok(Self(path))
+            Ok(Self(crate::tests::support::temp_dir("agent-hints")))
         }
 
         fn path(&self) -> &Path {
