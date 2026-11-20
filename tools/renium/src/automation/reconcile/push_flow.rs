@@ -88,9 +88,11 @@ fn reuse_verified_full_push(
 }
 
 /// How a push reads its stores. Where no package is enforced and nothing
-/// but stores differs between the project and Studio, it reads each store
-/// by its changed instances, and its plan says whether that holds
-/// (`plan_reads_changed_alone`).
+/// but stores and script files differs between the project and Studio, it
+/// reads each store by its changed instances, and its plan says whether that
+/// holds (`plan_reads_changed_alone`). A script is found among them by its
+/// name and its place, which every instance keeps, and a script file that
+/// adds an instance to its store or takes one away reads that store whole.
 fn stores_read_of(
     unenforced: bool,
     paths: &HashSet<PathBuf>,
@@ -101,6 +103,7 @@ fn stores_read_of(
         path.file_name()
             .and_then(|name| name.to_str())
             .is_some_and(is_service_settings_file_name)
+            || super::merge::is_source_path(path)
             || project.entries.get(path) == studio.entries.get(path)
     });
     if unenforced && only_stores_differ {
@@ -108,6 +111,24 @@ fn stores_read_of(
     } else {
         StoresRead::Changed
     }
+}
+
+/// How a push that replaces nothing reads its stores to compare them: by
+/// their changed instances under the conditions of a push that replaces
+/// (`stores_read_of`), where it takes every instance of a store as the files
+/// hold it.
+fn stores_compared_of(
+    unenforced: bool,
+    (project, studio): (&ProjectSnapshot, &ProjectSnapshot),
+    args: &crate::cli::PushEditorChangesArgs,
+) -> Result<StoresRead> {
+    let paths = project_replacement_paths(project, studio);
+    Ok(match stores_read_of(unenforced, &paths, project, studio) {
+        StoresRead::ChangedOfBoth if crate::editor::sync::project_pushes_stores_as_held(args)? => {
+            StoresRead::ChangedOfBoth
+        }
+        _ => StoresRead::Changed,
+    })
 }
 
 /// The import carried the instances these documents left in their store
@@ -440,9 +461,14 @@ pub(crate) fn push_project(
         promoted_services = imported_services(imported, &prepared_settings)?;
         paths
     } else {
-        stores_read = StoresRead::ChangedOfBoth;
-        let mut differences =
-            snapshot_differences_prepared(&project, &studio, Some(&mut prepared_settings), true)?;
+        stores_read =
+            stores_compared_of(link_enforcement.is_none(), (&project, &studio), &push_args)?;
+        let mut differences = snapshot_differences_prepared(
+            &project,
+            &studio,
+            Some(&mut prepared_settings),
+            stores_read == StoresRead::ChangedOfBoth,
+        )?;
         promoted_services = promote_heavy_deltas_to_replacement(
             context,
             &project,
@@ -1519,11 +1545,11 @@ mod stores_read_tests {
     use super::*;
 
     /// A push reads its stores by their changed instances only where no
-    /// package is enforced and nothing but stores differs.
+    /// package is enforced and nothing but stores and scripts differs.
     #[test]
-    fn only_a_push_of_stores_reads_them_by_their_changed_instances() {
+    fn only_a_push_of_stores_and_scripts_reads_stores_by_their_changed_instances() {
         let store = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
-        let script = PathBuf::from("src/Workspace/Main.server.luau");
+        let script = PathBuf::from("src/Workspace/Terrain.bin");
         let snapshot = |store_bytes: &[u8], source: &[u8]| ProjectSnapshot {
             entries: BTreeMap::from([
                 (store.clone(), SnapshotEntry::File(store_bytes.to_vec())),
@@ -1544,9 +1570,22 @@ mod stores_read_tests {
         ] {
             assert!(stores_read_of(unenforced, &paths, &project, &studio) == expected);
         }
-        // A script only one side holds differs.
+        // A file only one side holds differs.
         let mut studio = snapshot(b"studio", b"print(1)");
         studio.entries.remove(&script);
         assert!(stores_read_of(true, &paths, &project, &studio) == StoresRead::Changed);
+        // A script that differs, or that one side alone holds, does not count.
+        let source = PathBuf::from("src/Workspace/Main.server.luau");
+        let mut project = snapshot(b"files", b"print(1)");
+        let mut studio = snapshot(b"studio", b"print(1)");
+        project
+            .entries
+            .insert(source.clone(), SnapshotEntry::File(b"print(2)".to_vec()));
+        let paths = HashSet::from([store, script, source.clone()]);
+        assert!(stores_read_of(true, &paths, &project, &studio) == StoresRead::ChangedOfBoth);
+        studio
+            .entries
+            .insert(source, SnapshotEntry::File(b"print(3)".to_vec()));
+        assert!(stores_read_of(true, &paths, &project, &studio) == StoresRead::ChangedOfBoth);
     }
 }

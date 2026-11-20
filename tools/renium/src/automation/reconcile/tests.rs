@@ -5302,6 +5302,81 @@ fn incremental_cross_service_recreation_reapplies_target_service_referrers() {
     assert!(plan.target_settings_ids.iter().any(|id| id == "holder"));
 }
 
+/// A store that differs in nothing is read for what refers to a new instance
+/// only where it holds that instance's id, and its referrer is sent then.
+#[test]
+fn an_unchanged_store_that_names_a_new_instance_is_pushed_with_it() {
+    let root = |service: &str| {
+        SettingsBytecodeInstance::new(
+            format!("{service}-root"),
+            service.into(),
+            service.into(),
+            None,
+        )
+    };
+    let instance = |id: &str, class: &str| {
+        SettingsBytecodeInstance::new(id.into(), id.into(), class.into(), Some(0))
+    };
+    let mut holder = instance("holder", "ObjectValue");
+    holder.properties.insert(
+        "Value".into(),
+        json!({
+            "_type": "Ref",
+            "settingsId": "target",
+            "pathSegments": ["ReplicatedStorage", "target"],
+            "pathOrdinals": [1, 1]
+        }),
+    );
+    let store = |service: &str, instances: Vec<SettingsBytecodeInstance>| {
+        let mut all = vec![root(service)];
+        all.extend(instances);
+        (
+            PathBuf::from(format!("src/{service}/__roblox_sync_settings.renium")),
+            SnapshotEntry::File(
+                encode_settings_bytecode(&SettingsBytecode {
+                    version: SETTINGS_BINARY_VERSION,
+                    instances: all,
+                })
+                .unwrap(),
+            ),
+        )
+    };
+    let snapshot = |target: bool| ProjectSnapshot {
+        entries: BTreeMap::from([
+            store(
+                "ReplicatedStorage",
+                if target {
+                    vec![instance("target", "Folder")]
+                } else {
+                    Vec::new()
+                },
+            ),
+            store("ServerStorage", vec![holder.clone()]),
+            store("Lighting", vec![instance("other", "Folder")]),
+        ]),
+    };
+    let (previous, current) = (snapshot(false), snapshot(true));
+    let changed = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
+    let scopes = vec![changed.clone()];
+    let prepared = prepare_editor_settings_changes(&previous, &current, &scopes).unwrap();
+    let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+        &previous,
+        &current,
+        &HashSet::from([changed]),
+        &prepared,
+        false,
+        false,
+    )
+    .unwrap();
+    assert_eq!(plan.target_settings_ids, ["holder", "target"]);
+    assert!(
+        !plan
+            .changed_paths
+            .iter()
+            .any(|path| path.starts_with("src/Lighting"))
+    );
+}
+
 #[test]
 fn incremental_added_target_reapplies_existing_same_service_referrer() {
     let root = SettingsBytecodeInstance {
@@ -6817,8 +6892,19 @@ fn request_text(changes: &crate::editor::types::EditorChangeSet) -> Result<Strin
                 .map_err(|error| format!("request: {error}"))?,
         );
     }
+    // A store the push writes is written with every instance.
+    let written = changes
+        .settings_writes
+        .iter()
+        .map(|write| {
+            (
+                write.document.instances.len(),
+                crate::settings::equivalence::holds_unread_instances(&write.document),
+            )
+        })
+        .collect::<Vec<_>>();
     Ok(format!(
-        "{}\nwhole instances {:?}",
+        "{}\nwhole instances {:?}\nwritten {written:?}",
         out.join("\n"),
         changes
             .whole_instances
@@ -7098,6 +7184,97 @@ fn add_or_remove_a_run(rng: &mut crate::tests::support::SimRng, document: &mut S
     }
 }
 
+/// Script files: of each its name, the files' text and Studio's.
+type ScriptFiles = Vec<(String, Option<String>, Option<String>)>;
+
+/// The files' texts of `scripts`, written beside `store`.
+fn write_script_files(store: &Path, scripts: &ScriptFiles) -> Result<(), String> {
+    for (name, text, _) in scripts {
+        if let Some(text) = text {
+            std::fs::write(store.with_file_name(name), text).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Scripts under the roots of two copies of a store, their sources in files:
+/// each with the text Studio holds or another, held by the files alone, with
+/// its file gone, a file the store knows nothing of, or a file renamed to
+/// run where another kind of script does. Some run on the client or as a
+/// plugin, which their file names say. Gives of each file its name, the
+/// files' text and Studio's, and whether the files alone hold one of the
+/// instances.
+fn scripts_beside(
+    seed: u64,
+    files: &mut SettingsBytecode,
+    studio: &mut SettingsBytecode,
+) -> (ScriptFiles, bool) {
+    let mut rng = crate::tests::support::SimRng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1);
+    let (mut scripts, mut uneven) = (Vec::new(), false);
+    let count = if seed.is_multiple_of(2) {
+        1 + rng.below(4)
+    } else {
+        0
+    };
+    for index in 0..count {
+        let (class, context, suffix) = [
+            ("Script", None, ".server.luau"),
+            ("ModuleScript", None, ".luau"),
+            ("LocalScript", None, ".client.luau"),
+            ("Script", Some("Client"), ".client.luau"),
+            ("Script", Some("Plugin"), ".plugin.luau"),
+        ][rng.below(5)];
+        let name = format!("Code{index}");
+        let script = || {
+            let mut script = SettingsBytecodeInstance::new(
+                format!("code-{index}"),
+                name.clone(),
+                class.into(),
+                Some(0),
+            );
+            if let Some(context) = context {
+                script.properties.insert(
+                    "RunContext".into(),
+                    crate::editor::paths::editor_run_context_value(context),
+                );
+            }
+            script
+        };
+        let kind = rng.below(7);
+        // The file of a script that runs elsewhere, named as a server
+        // script's: Studio holds it under its own name.
+        if kind == 6 && context.is_some() {
+            files.instances.push(script());
+            studio.instances.push(script());
+            scripts.push((
+                format!("{name}.server.luau"),
+                Some("return 1\n".to_string()),
+                None,
+            ));
+            scripts.push((
+                format!("{name}{suffix}"),
+                None,
+                Some("return 1\n".to_string()),
+            ));
+            continue;
+        }
+        let (in_files, in_studio) = (kind != 4, kind != 2 && kind != 4);
+        uneven |= kind == 2;
+        if in_files {
+            files.instances.push(script());
+        }
+        if in_studio {
+            studio.instances.push(script());
+        }
+        scripts.push((
+            format!("{name}{suffix}"),
+            (kind != 3).then(|| format!("return {}\n", 1 + usize::from(kind == 1))),
+            in_studio.then(|| "return 1\n".to_string()),
+        ));
+    }
+    (scripts, uneven)
+}
+
 /// A store whose two copies differ in a few instances is prepared from
 /// those instances alone, without the whole document of the copy Studio
 /// holds. What a push makes of it is what it makes of the two whole
@@ -7122,7 +7299,9 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
     let runs = AtomicUsize::new(0);
     let runs_sent_from_both = AtomicUsize::new(0);
     let compared_by_changed = AtomicUsize::new(0);
+    let (with_scripts, sources_sent) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let told_alone_before = super::replacement::TOLD_ALONE.load(Ordering::Relaxed);
+    let paired_first_before = super::replacement::PAIRED_FIRST.load(Ordering::Relaxed);
     run_seeds(300, |seed, _| {
         use crate::settings::bytecode::blocks::sim::{blocks_of_both, in_blocks};
         let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
@@ -7166,21 +7345,37 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
             move_a_leaf_to_the_end(&mut rng, &mut files);
         }
         let run = files.instances.len() != studio.instances.len();
+        // Scripts beside them, their sources in files: with the text Studio
+        // holds or another, held by the files alone, with its file gone, or
+        // a file the store knows nothing of. Each is its file name, the
+        // files' text and Studio's.
+        let (scripts, uneven) = scripts_beside(seed, &mut files, &mut studio);
+        let scripts_differ = scripts.iter().any(|(_, files, studio)| files != studio);
+        // One run of instances apart, with no script the files alone hold
+        // beside it.
+        let run = run && !uneven;
         if run {
             runs.fetch_add(1, Ordering::Relaxed);
         }
         let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
-        let snapshot = |document: &SettingsBytecode| {
-            Ok::<_, String>(ProjectSnapshot {
-                entries: BTreeMap::from([(
-                    path.clone(),
-                    SnapshotEntry::File(
-                        in_blocks(document, block_rows).map_err(|error| format!("{error:#}"))?,
-                    ),
-                )]),
-            })
+        let snapshot = |document: &SettingsBytecode, of_files: bool| {
+            let mut entries = BTreeMap::from([(
+                path.clone(),
+                SnapshotEntry::File(
+                    in_blocks(document, block_rows).map_err(|error| format!("{error:#}"))?,
+                ),
+            )]);
+            for (name, files, studio) in &scripts {
+                if let Some(text) = if of_files { files } else { studio } {
+                    entries.insert(
+                        PathBuf::from("src/Workspace").join(name),
+                        SnapshotEntry::File(text.clone().into_bytes()),
+                    );
+                }
+            }
+            Ok::<_, String>(ProjectSnapshot { entries })
         };
-        let (Ok(desired), Ok(observed)) = (snapshot(&files), snapshot(&studio)) else {
+        let (Ok(desired), Ok(observed)) = (snapshot(&files, true), snapshot(&studio, false)) else {
             return Ok(());
         };
         let held_by_both = match (desired.entries.get(&path), observed.entries.get(&path)) {
@@ -7198,6 +7393,7 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
         if let Some(SnapshotEntry::File(bytes)) = desired.entries.get(&path) {
             std::fs::write(&store, bytes).map_err(|error| error.to_string())?;
         }
+        write_script_files(&store, &scripts)?;
         let sent = |prepared: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
                     plan: ReconcilePushPlan|
          -> Result<String, String> {
@@ -7254,9 +7450,9 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
                 &observed, &desired, &paths, &prepared, false, false,
             );
             let alone = plan.as_ref().is_ok_and(plan_reads_changed_alone);
-            let planned = plan
-                .as_ref()
-                .is_ok_and(|plan| !plan.target_settings_ids.is_empty());
+            let planned = plan.as_ref().is_ok_and(|plan| {
+                !plan.target_settings_ids.is_empty() || !plan.changed_paths.is_empty()
+            });
             said.push(match plan {
                 Ok(plan) => plan_text(&plan),
                 Err(error) => format!("no plan: {error:#}"),
@@ -7303,7 +7499,7 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
             for after in [
                 Some(&desired),
                 Some(&observed),
-                snapshot(&partly).ok().as_ref(),
+                snapshot(&partly, true).ok().as_ref(),
             ] {
                 let Some(after) = after else {
                     continue;
@@ -7375,7 +7571,7 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
             match plan {
                 Ok(plan) => {
                     said.push(plan_text(&plan));
-                    if !plan.target_settings_ids.is_empty() {
+                    if !plan.target_settings_ids.is_empty() || !plan.changed_paths.is_empty() {
                         said.push(match sent(&mut prepared, plan) {
                             Ok(sent) => sent,
                             Err(error) => format!("not sent: {error}"),
@@ -7414,6 +7610,12 @@ from the whole documents:
 "
                 )
             ));
+        }
+        if alone && both_stand && scripts_differ {
+            with_scripts.fetch_add(1, Ordering::Relaxed);
+            if of_both.iter().any(|said| said.contains("\"source\":\"")) {
+                sources_sent.fetch_add(1, Ordering::Relaxed);
+            }
         }
         if alone && both_stand {
             from_both.fetch_add(1, Ordering::Relaxed);
@@ -7479,10 +7681,23 @@ from the whole documents:
         // copies and were prepared from the ones that differ all the same.
         let told_alone = super::replacement::TOLD_ALONE.load(Ordering::Relaxed) - told_alone_before;
         assert!(told_alone >= 100, "paired each by itself: {told_alone}");
+        // The ones paired so without a comparison by place before: the store
+        // stood apart the last time it was compared.
+        let paired_first =
+            super::replacement::PAIRED_FIRST.load(Ordering::Relaxed) - paired_first_before;
+        assert!(paired_first >= 5, "paired first: {paired_first}");
         let compared = compared_by_changed.load(Ordering::Relaxed);
         assert!(
             compared >= 100,
             "compared by the changed instances: {compared}"
+        );
+        let (with_scripts, sources_sent) = (
+            with_scripts.load(Ordering::Relaxed),
+            sources_sent.load(Ordering::Relaxed),
+        );
+        assert!(
+            with_scripts >= 40 && sources_sent >= 35,
+            "beside scripts that differ: {with_scripts}, {sources_sent} of them with a source sent"
         );
         assert!(
             counts[0] >= 30

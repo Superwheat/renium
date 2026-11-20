@@ -97,6 +97,7 @@ pub(crate) fn prepare_project_replacement_importing(
                 ChangedInstances::Whole(None)
             } else {
                 changed_instances_alone(
+                    path,
                     desired.entries.get(path),
                     observed.entries.get(path),
                     read == StoresRead::ChangedOfBoth,
@@ -488,7 +489,8 @@ fn told_apart(
 /// The instances of a store a push reads whole, of `instances` at the same
 /// places in both copies: the ones that differ or name another by its id,
 /// and what a comparison reads of an instance whatever it holds, the roots
-/// and the cameras.
+/// and the cameras. With `paths_too` the scripts as well: where a script
+/// runs is part of the name of its file.
 fn instances_read(
     instances: &[SettingsBytecodeInstance],
     (differs, named): (&[bool], &[bool]),
@@ -501,6 +503,7 @@ fn instances_read(
                 || named[index]
                 || instances[index].parent_index.is_none()
                 || instances[index].class_name == "Camera"
+                || paths_too && instances[index].class_name == "Script"
         })
         .collect::<Vec<_>>();
     if paths_too {
@@ -681,24 +684,69 @@ fn imported_anew(
 ///
 /// `viewport_first` is the order of a push that replaces: the files take the
 /// camera of the viewport from Studio before the two are compared.
+///
+/// Whether two copies hold the same depends on their bytes alone, so a pair
+/// found to is not read again while neither changes. `path` names the store:
+/// one whose copies stood at other places the last time is paired so first
+/// (`changed_instances_compared`).
 fn changed_instances_alone(
+    path: &Path,
     desired: Option<&SnapshotEntry>,
     observed: Option<&SnapshotEntry>,
     files_too: bool,
     imports_heavy: bool,
     viewport_first: bool,
 ) -> Result<ChangedInstances> {
-    let how = (files_too, imports_heavy, viewport_first);
-    let current = match changed_instances_placed(desired, observed, how, None)? {
-        ChangedInstances::Apart(current) => current,
-        changed => return Ok(changed),
+    use sha2::{Digest, Sha256};
+    type Pairs = Mutex<HashSet<([u8; 32], [u8; 32], bool)>>;
+    static SAME: std::sync::OnceLock<Pairs> = std::sync::OnceLock::new();
+    let pair = match (desired, observed) {
+        (Some(SnapshotEntry::File(files)), Some(SnapshotEntry::File(studio))) => {
+            let (files, studio) = rayon::join(
+                || <[u8; 32]>::from(Sha256::digest(files)),
+                || <[u8; 32]>::from(Sha256::digest(studio)),
+            );
+            Some((files, studio, viewport_first))
+        }
+        _ => None,
     };
-    if files_too
-        && let (Some(SnapshotEntry::File(files)), Some(SnapshotEntry::File(studio))) =
-            (desired, observed)
-        && let Some(told) = told_alone(files, studio)
-    {
-        return Ok(
+    let same = SAME.get_or_init(Default::default);
+    if pair.is_some_and(|pair| same.lock_recover().contains(&pair)) {
+        return Ok(ChangedInstances::None);
+    }
+    let how = (files_too, imports_heavy, viewport_first);
+    let changed = changed_instances_compared(path, desired, observed, how)?;
+    if let (ChangedInstances::None, Some(pair)) = (&changed, pair) {
+        let mut same = same.lock_recover();
+        if same.len() >= 4_096 {
+            same.clear();
+        }
+        same.insert(pair);
+    }
+    Ok(changed)
+}
+
+/// `changed_instances_alone` without what it remembers of equal copies.
+/// Copies are compared place by place first and, where they stand apart,
+/// paired each instance by itself. A store whose copies held as many
+/// instances at other places the last time is paired without the comparison
+/// by place, which could only say so again.
+fn changed_instances_compared(
+    path: &Path,
+    desired: Option<&SnapshotEntry>,
+    observed: Option<&SnapshotEntry>,
+    how: (bool, bool, bool),
+) -> Result<ChangedInstances> {
+    static APART: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    let apart = APART.get_or_init(Default::default);
+    let copies = match (desired, observed) {
+        (Some(SnapshotEntry::File(files)), Some(SnapshotEntry::File(studio))) if how.0 => {
+            Some((files, studio))
+        }
+        _ => None,
+    };
+    let paired = |told| {
+        Ok(
             match changed_instances_placed(desired, observed, how, Some(told))? {
                 ChangedInstances::Apart(current) => ChangedInstances::Whole(current),
                 changed => {
@@ -709,10 +757,42 @@ fn changed_instances_alone(
                     changed
                 }
             },
-        );
+        )
+    };
+    if let Some((files, studio)) = copies
+        && apart.lock_recover().contains(path)
+    {
+        match told_alone(files, studio) {
+            Some((told, true)) => {
+                #[cfg(test)]
+                PAIRED_FIRST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return paired(told);
+            }
+            _ => {
+                apart.lock_recover().remove(path);
+            }
+        }
+    }
+    let current = match changed_instances_placed(desired, observed, how, None)? {
+        ChangedInstances::Apart(current) => current,
+        changed => return Ok(changed),
+    };
+    if let Some((files, studio)) = copies
+        && let Some((told, as_many_apart)) = told_alone(files, studio)
+    {
+        if as_many_apart {
+            apart.lock_recover().insert(path.to_path_buf());
+        }
+        return paired(told);
     }
     Ok(ChangedInstances::Whole(current))
 }
+
+/// The stores paired each instance by itself without a comparison by place
+/// before.
+#[cfg(test)]
+pub(crate) static PAIRED_FIRST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// The stores prepared from instances paired each by itself.
 #[cfg(test)]
@@ -722,8 +802,11 @@ pub(crate) static TOLD_ALONE: std::sync::atomic::AtomicUsize =
 /// How Studio's instances stand among the files', each paired by itself,
 /// and the id the alignment gives each (`settings_ids_told_alone`). Of each
 /// copy only the instances with their UniqueIds, and the camera a root
-/// names, are read. `None` where the whole documents have to say.
-fn told_alone(desired_bytes: &[u8], observed_bytes: &[u8]) -> Option<(Moved, Vec<String>)> {
+/// names, are read. `None` where the whole documents have to say. With it,
+/// whether the copies hold as many instances and one stands under another
+/// name, class or parent than the one at its place: a comparison by place
+/// finds such copies apart.
+fn told_alone(desired_bytes: &[u8], observed_bytes: &[u8]) -> Option<((Moved, Vec<String>), bool)> {
     use crate::settings::bytecode::property_edit::decode_for_row_chunks;
     let _span = crate::app::profile::span("store instances told alone");
     let bare = |bytes: &[u8]| {
@@ -742,7 +825,20 @@ fn told_alone(desired_bytes: &[u8], observed_bytes: &[u8]) -> Option<(Moved, Vec
     let (files, studio) = rayon::join(|| bare(desired_bytes), || bare(observed_bytes));
     let (files, studio) = (files?, studio?);
     let (ids, places) = crate::settings::equivalence::settings_ids_told_alone(&files, &studio)?;
-    Some((Moved::paired(places, files.instances.len()), ids))
+    let as_many_apart = files.instances.len() == studio.instances.len()
+        && files
+            .instances
+            .iter()
+            .zip(&studio.instances)
+            .any(|(files, studio)| {
+                files.name != studio.name
+                    || files.class_name != studio.class_name
+                    || files.parent_index != studio.parent_index
+            });
+    Some((
+        (Moved::paired(places, files.instances.len()), ids),
+        as_many_apart,
+    ))
 }
 
 /// `changed_instances_alone` for copies whose instances stand at the same
@@ -1250,12 +1346,11 @@ fn read_where_paired(
 /// and `prepared` takes one. `None` where the whole documents have to say
 /// (`snapshot_entry_equivalent`).
 fn store_copies_by_changed(
-    left: Option<&SnapshotEntry>,
-    right: Option<&SnapshotEntry>,
+    (path, left, right): (&Path, Option<&SnapshotEntry>, Option<&SnapshotEntry>),
     prepared: Option<&mut Option<PreparedEditorSettingsChange>>,
 ) -> Result<Option<bool>> {
     Ok(
-        match changed_instances_alone(left, right, true, false, false)? {
+        match changed_instances_alone(path, left, right, true, false, false)? {
             ChangedInstances::None => Some(true),
             ChangedInstances::Prepared(mut change) => {
                 if let Some(prepared) = prepared {
@@ -1299,7 +1394,7 @@ pub(crate) fn snapshot_differences_prepared(
                     .and_then(|name| name.to_str())
                     .is_some_and(is_service_settings_file_name);
             let told = if store {
-                store_copies_by_changed(ours, theirs, prepare.then_some(&mut settings))?
+                store_copies_by_changed((&path, ours, theirs), prepare.then_some(&mut settings))?
             } else {
                 None
             };

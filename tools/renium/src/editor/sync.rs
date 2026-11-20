@@ -2101,6 +2101,13 @@ pub(crate) fn native_editor_full_push_eligible(args: &PushEditorChangesArgs) -> 
     {
         return Ok(false);
     }
+    project_pushes_stores_as_held(args)
+}
+
+/// Whether a push takes every instance of a store as the files hold it: the
+/// project keeps no instances Studio alone knows, needs no temporary stage,
+/// enforces no linked package and filters nothing on the way to Studio.
+pub(crate) fn project_pushes_stores_as_held(args: &PushEditorChangesArgs) -> Result<bool> {
     if let Some(project) = config::try_load_project(None, Some(&args.project.project_root))?
         && (project
             .project
