@@ -2572,7 +2572,7 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
         args.input.service_or_file.as_deref(),
         None,
     )?;
-    let document = read_existing_service_store(&settings_file)?;
+    let (mut document, rows) = read_existing_service_store(&settings_file)?;
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let scope = resolve_bytecode_selector_or_service_root(
         &document,
@@ -2580,7 +2580,7 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
         &args.selector,
         "No matching instance",
     )?;
-    let matched = where_matches(&document, &service, scope.index, query)?;
+    let matched = where_matches(&mut document, rows, &service, scope.index, query)?;
     let store_paths = build_editor_instance_paths(&document, &service);
     let path_of = |index: usize| {
         store_paths
@@ -2664,7 +2664,7 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
         } else {
             (set_names, Vec::new())
         };
-        let stored = SettingsBytecode::read_file(&settings_file)?;
+        let (mut stored, mut stored_rows) = SettingsBytecode::read_by_rows(&settings_file)?;
         let stored_paths = build_editor_instance_paths(&stored, &service);
         let stored_by_id = stored
             .instances
@@ -2672,27 +2672,28 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
             .enumerate()
             .map(|(index, instance)| (instance.settings_id.as_str(), index))
             .collect::<HashMap<_, _>>();
-        let (instances, paths): (Vec<_>, Vec<_>) = ids
+        let (indices, paths): (Vec<_>, Vec<_>) = ids
             .iter()
             .filter_map(|id| {
                 let index = *stored_by_id.get(id.as_str())?;
-                Some((&stored.instances[index], stored_paths.get(index)?.clone()?))
+                Some((index, stored_paths.get(index)?.clone()?))
             })
             .unzip();
         if paths.len() > WHERE_READ_BACK_LIMIT {
             result["studioLimit"] = json!(WHERE_READ_BACK_LIMIT);
         }
         let read = &paths[..paths.len().min(WHERE_READ_BACK_LIMIT)];
+        fill_rows(&mut stored, stored_rows.as_mut(), &indices[..read.len()])?;
         if let Ok(studio) =
             crate::bytecode::edit::read_back_many_from_studio(read, &properties, &attributes)
         {
             let rows = studio.as_array().cloned().unwrap_or_default();
             let mut verified = Some(rows.len() == read.len());
-            for ((row, path), instance) in rows.iter().zip(read).zip(instances) {
+            for ((row, path), index) in rows.iter().zip(read).zip(indices) {
                 match crate::bytecode::edit::read_back_verifies(
                     row,
                     &path.path_segments,
-                    instance,
+                    &stored.instances[index],
                     &properties,
                     &attributes,
                 ) {
@@ -2734,7 +2735,7 @@ pub(crate) fn bytecode_rename_where(
     if from.is_empty() {
         bail!("--replace FROM must not be empty");
     }
-    let document = read_existing_service_store(&settings_file)?;
+    let (mut document, rows) = read_existing_service_store(&settings_file)?;
     let service = bytecode_service_name(&document, &settings_file, "");
     let selector = BytecodeInstanceSelectorArgs::by_settings_id(scope_settings_id);
     let scope = resolve_bytecode_selector_or_service_root(
@@ -2743,6 +2744,7 @@ pub(crate) fn bytecode_rename_where(
         &selector,
         "No matching instance",
     )?;
+    let matched = where_matches(&mut document, rows, &service, scope.index, query)?;
     let store_paths = build_editor_instance_paths(&document, &service);
     let path_of = |index: usize| {
         store_paths
@@ -2751,7 +2753,6 @@ pub(crate) fn bytecode_rename_where(
             .map(|path| path.path_segments.join("."))
             .unwrap_or_else(|| document.instances[index].name.clone())
     };
-    let matched = where_matches(&document, &service, scope.index, query)?;
     let links = store_link_enforcement(&settings_file, override_packages)?;
     let mut renames = Vec::new();
     for &index in &matched {
@@ -2840,7 +2841,7 @@ pub(crate) fn bytecode_rename_where(
             crate::bytecode::edit::PushedScope::Subtree,
             false,
         )?;
-        let after = SettingsBytecode::read_file(&settings_file)?;
+        let (mut after, mut after_rows) = SettingsBytecode::read_by_rows(&settings_file)?;
         let after_paths = build_editor_instance_paths(&after, &service);
         let indices = ids
             .iter()
@@ -2860,6 +2861,8 @@ pub(crate) fn bytecode_rename_where(
             result["studioLimit"] = json!(WHERE_READ_BACK_LIMIT);
         }
         let names = ["Name".to_string()];
+        let read_back = &indices[..indices.len().min(read.len())];
+        fill_rows(&mut after, after_rows.as_mut(), read_back)?;
         if let Ok(studio) = crate::bytecode::edit::read_back_many_from_studio(read, &names, &[]) {
             let rows = studio.as_array().cloned().unwrap_or_default();
             let mut verified = Some(rows.len() == read.len());
@@ -2926,18 +2929,21 @@ fn fold_derived_property(
 }
 
 /// The store indices under `scope_index` (every instance when the scope is
-/// the service root) that match a bulk-read query.
+/// the service root) that match a bulk-read query. A store read by its rows
+/// gives each instance the values the query compares while it is matched
+/// (`visit_rows`), and `document` holds after what it held before.
 pub(crate) fn where_matches(
-    document: &SettingsBytecode,
+    document: &mut SettingsBytecode,
+    rows: Option<RowReader>,
     service: &str,
     scope_index: usize,
     query: &str,
 ) -> Result<Vec<usize>> {
-    let groups = crate::bytecode::explorer::explorer_search_groups(query);
+    let groups = explorer_search_groups(query);
     if groups.is_empty() {
         bail!("--where needs a query: words match names, is:Class, tag:Name, Prop=value, Prop>0.5");
     }
-    let (segments, _) = crate::editor::paths::build_editor_instance_path_parts(document, service);
+    let (segments, _) = build_editor_instance_path_parts(document, service);
     let whole_service = editor_service_root_index(document, service) == Some(scope_index);
     let under_scope = |index: usize| {
         let mut cursor = document.instances[index].parent_index;
@@ -2949,14 +2955,25 @@ pub(crate) fn where_matches(
         }
         false
     };
-    Ok((0..document.instances.len())
+    let scoped = (0..document.instances.len())
         .filter(|&index| index != scope_index && (whole_service || under_scope(index)))
-        .filter(|&index| {
-            crate::bytecode::explorer::explorer_search_instance_matches(
-                document, &segments, index, &groups,
-            )
-        })
-        .collect())
+        .collect::<Vec<_>>();
+    let compared = explorer_search_value_names(&groups);
+    let reads = |name: &str| explorer_search_reads(&compared, name);
+    let mut matched = Vec::new();
+    visit_rows(
+        document,
+        rows.as_ref(),
+        &scoped,
+        (!compared.is_empty()).then_some(reads),
+        |document, index| {
+            if explorer_search_instance_matches(document, &segments, index, &groups) {
+                matched.push(index);
+            }
+            true
+        },
+    )?;
+    Ok(matched)
 }
 
 /// A `bs` edit as its result: one `-p NAME` with a value flag, or several
@@ -3031,21 +3048,18 @@ fn set_store_properties(
         BTreeSet::from([settings_file.clone()])
     };
     let _locks = lock_existing_service_stores(locked_stores.iter().map(PathBuf::as_path))?;
-    // Retained columns keep row indices, so other source-path changes need the
-    // complete document. A rename or a move reads the store by its instances,
-    // and value-only edits materialize their selected rows.
-    let keep_columns = !structural
-        && !assigned().any(|(property, _)| {
+    // An edit that may change a script path reads the store by its instances,
+    // each script with what its path depends on; any other edit keeps the
+    // columns of a store of an older version. Either way the edited instances
+    // take their values.
+    let paths_change = structural
+        || assigned().any(|(property, _)| {
             property_affects_source_path(scope, property) || property.eq_ignore_ascii_case("source")
         });
-    let (mut document, mut retained_columns) = if structural {
-        let (document, stored) = read_store_for_structure(&settings_file)?;
-        (document, Some(stored))
-    } else if keep_columns {
-        let (document, numeric) = read_for_property_edit(&settings_file)?;
-        (document, Some(numeric))
+    let (mut document, mut stored) = if paths_change {
+        read_store_for_structure(&settings_file)?
     } else {
-        (SettingsBytecode::read_file(&settings_file)?, None)
+        read_for_property_edit(&settings_file)?
     };
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let indices = edits
@@ -3060,17 +3074,16 @@ fn set_store_properties(
             .map(|resolved| resolved.index)
         })
         .collect::<Result<Vec<_>>>()?;
-    if let Some(numeric) = &mut retained_columns {
-        numeric.materialize(&mut document, &indices)?;
-    }
-    let referring = match &mut retained_columns {
-        Some(stored) if structural => references::read_for_moves(
+    stored.materialize(&mut document, &indices)?;
+    let referring = if structural {
+        references::read_for_moves(
             (&settings_file, &service),
-            (&mut document, stored),
+            (&mut document, &mut stored),
             &indices,
             locked_stores.iter().filter(|path| **path != settings_file),
-        )?,
-        _ => BTreeMap::new(),
+        )?
+    } else {
+        BTreeMap::new()
     };
     let links = store_link_enforcement(&settings_file, args.override_packages)?;
     let mut edit = StorePropertyEdit {
@@ -3080,8 +3093,8 @@ fn set_store_properties(
         scope,
         links: &links,
         document,
-        retained_columns,
-        structural,
+        stored,
+        by_instances: paths_change,
         referring,
         references: references::ReferencedStores::default(),
         before: None,
@@ -3109,10 +3122,12 @@ struct StorePropertyEdit<'a> {
     scope: PropertyScope,
     links: &'a LinkEnforcement,
     document: SettingsBytecode,
-    retained_columns: Option<RetainedPropertyColumns>,
-    /// Whether the edit renames or moves instances, and so read the store by
+    /// The store's file as the edit read it, with the values of the instances
+    /// the document holds without theirs.
+    stored: RetainedPropertyColumns,
+    /// Whether the edit may change a script path, and so read the store by
     /// its instances.
-    structural: bool,
+    by_instances: bool,
     /// The project's other stores as such an edit reads them, by service and
     /// with their files.
     referring: BTreeMap<String, references::ReferringStore>,
@@ -3294,14 +3309,11 @@ impl StorePropertyEdit<'_> {
         }
         if self.store_edited || followed.is_some() {
             let document = followed.as_ref().unwrap_or(&self.document);
-            writes.insert(
-                self.settings_file.to_path_buf(),
-                match &self.retained_columns {
-                    Some(stored) if self.structural => stored.encode_restructured(document)?,
-                    Some(numeric) => numeric.encode(document)?,
-                    None => encode_settings_bytecode(document)?,
-                },
-            );
+            let encoded = match self.by_instances {
+                true => self.stored.encode_restructured(document)?,
+                false => self.stored.encode(document)?,
+            };
+            writes.insert(self.settings_file.to_path_buf(), encoded);
         }
         let mut studio = add_batch::StudioPrep::default();
         if let Some((before_document, _)) = &self.before
@@ -4642,13 +4654,17 @@ pub(super) fn ensure_service_store_exists(settings_file: &Path, service_hint: &s
         .with_context(|| format!("Failed to create {}", settings_file.display()))
 }
 
-/// Reads a store, pulling it first when the project does not have it yet.
-fn read_existing_service_store(settings_file: &Path) -> Result<SettingsBytecode> {
+/// Reads a store for a query that answers for all of it
+/// (`SettingsBytecode::read_whole_by_rows`), pulling it first when the
+/// project does not have it yet.
+fn read_existing_service_store(
+    settings_file: &Path,
+) -> Result<(SettingsBytecode, Option<RowReader>)> {
     pull_missing_service_store(settings_file);
     if !settings_file.exists() {
         return Err(missing_service_store_error(settings_file));
     }
-    SettingsBytecode::read_file(settings_file)
+    SettingsBytecode::read_whole_by_rows(settings_file)
 }
 
 pub(super) fn lock_existing_service_store(settings_file: &Path) -> Result<SettingsFileLock> {

@@ -1777,12 +1777,17 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
     )?;
     let store_files = super::project_store_files(&settings_file)?;
     let locks = super::lock_existing_service_stores(store_files.iter().map(PathBuf::as_path))?;
-    // A query reads the values of every instance under its scope.
-    let (mut document, mut stored) = match args.where_query {
-        Some(_) => (
-            SettingsBytecode::read_file(&settings_file)?,
-            Default::default(),
-        ),
+    // A query reads the values it compares by the rows of the store; a store
+    // of an older version it reads whole, as the edit reads it.
+    let (queried, whole) = match args.where_query {
+        Some(_) => match SettingsBytecode::read_whole_by_rows(&settings_file)? {
+            (document, None) => (None, Some(document)),
+            (_, rows) => (rows, None),
+        },
+        None => (None, None),
+    };
+    let (mut document, mut stored) = match whole {
+        Some(document) => (document, Default::default()),
         None => super::read_store_for_structure(&settings_file)?,
     };
     let before_document = document.clone();
@@ -1798,7 +1803,7 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
             .get(index)
             .and_then(Option::as_ref)
             .map(|path| path.path_segments.clone())
-            .unwrap_or_else(|| vec![document.instances[index].name.clone()])
+            .unwrap_or_else(|| vec![before_document.instances[index].name.clone()])
     };
     let indices = if let Some(query) = args.where_query.as_deref() {
         let scope = super::resolve_bytecode_selector_or_service_root(
@@ -1807,7 +1812,7 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
             &args.selector,
             "No matching instance",
         )?;
-        let matched = super::where_matches(&document, &service, scope.index, query)?;
+        let matched = super::where_matches(&mut document, queried, &service, scope.index, query)?;
         if matched.is_empty() {
             bail!(
                 "No instance under {} matches '{query}'",

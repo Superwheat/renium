@@ -23,11 +23,11 @@ const STEPS: usize = 14;
 pub(super) const SERVICES: [&str; 3] = ["Workspace", "ReplicatedStorage", "ServerStorage"];
 /// Few names, so that siblings share them, and one no generated instance
 /// has, which the references that name nothing use.
-const NAMES: [&str; 6] = ["Model", "Part", "Door", "Value", "Config", "Ghost"];
-const CLASSES: [&str; 5] = ["Folder", "Model", "Part", "ObjectValue", "ModuleScript"];
+pub(super) const NAMES: [&str; 6] = ["Model", "Part", "Door", "Value", "Config", "Ghost"];
+pub(super) const CLASSES: [&str; 5] = ["Folder", "Model", "Part", "ObjectValue", "ModuleScript"];
 /// The first instances of each store, which the commands pick more often
 /// than any other and under which the references to nothing name a child.
-const NEAR: usize = 4;
+pub(super) const NEAR: usize = 4;
 pub(super) const KINDS: [&str; 8] = [
     "add",
     "copy",
@@ -253,7 +253,7 @@ fn model_round_trip(rng: &mut SimRng, oracle: &Fixture, step: usize) -> Option<V
 /// What a command printed, without the stores among the files it changed:
 /// a whole write of a version 11 store changes its file whatever the edit.
 /// An import lists the sources it wrote in no fixed order.
-fn printed(mut outcome: Outcome) -> (Option<String>, Value) {
+pub(super) fn printed(mut outcome: Outcome) -> (Option<String>, Value) {
     if let Some(Value::Array(changed)) = outcome.value.get_mut("changedPaths") {
         changed.retain(|path| !path.as_str().is_some_and(|path| path.ends_with(".renium")));
     }
@@ -309,21 +309,10 @@ fn run_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
         stores.insert(service, tree(&mut rng, service, rows));
     }
     fill(&mut rng, &mut stores);
-    let (oracle, sparse) = (project("edits-whole"), project("edits-blocks"));
     // Now and then another writer wrote the stores, which are then written
     // whole on their first edit.
     let foreign = rng.below(5) == 0;
-    for (service, document) in &stores {
-        let whole = (FORMATS[0].encode)(document).map_err(|error| format!("{error:#}"))?;
-        let mut blocks = in_blocks(document, block_rows).map_err(|error| format!("{error:#}"))?;
-        if foreign {
-            blocks = foreign_file(&blocks);
-        }
-        fs::create_dir_all(oracle.store(service).parent().unwrap()).unwrap();
-        fs::create_dir_all(sparse.store(service).parent().unwrap()).unwrap();
-        fs::write(oracle.store(service), whole).unwrap();
-        fs::write(sparse.store(service), blocks).unwrap();
-    }
+    let (oracle, sparse) = projects(&stores, block_rows, foreign)?;
     log.push(format!("blocks of {block_rows} rows, foreign: {foreign}"));
     for step in 0..STEPS {
         let kind = rng.below(KINDS.len() + 1);
@@ -346,39 +335,74 @@ fn run_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
             went &= whole.0.is_none();
         }
         DONE[kind].fetch_add(usize::from(went), Ordering::Relaxed);
-        if files_of(&oracle) != files_of(&sparse) {
-            return Err(format!("step {step}: the files beside the stores differ"));
+        same_projects(&oracle, &sparse, before).map_err(|error| format!("step {step}: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Two projects of `stores`: one whose stores are of version 11, the oracle,
+/// and one whose stores are in blocks of `block_rows` rows, `foreign` where
+/// another writer wrote them.
+pub(super) fn projects(
+    stores: &BTreeMap<&str, SettingsBytecode>,
+    block_rows: usize,
+    foreign: bool,
+) -> Result<(Fixture, Fixture), String> {
+    let (oracle, sparse) = (project("edits-whole"), project("edits-blocks"));
+    for (service, document) in stores {
+        let whole = (FORMATS[0].encode)(document).map_err(|error| format!("{error:#}"))?;
+        let mut blocks = in_blocks(document, block_rows).map_err(|error| format!("{error:#}"))?;
+        if foreign {
+            blocks = foreign_file(&blocks);
         }
-        for (service, before) in SERVICES.into_iter().zip(before) {
-            let (whole, blocks) = (oracle.store(service), sparse.store(service));
-            if whole.is_file() != blocks.is_file() {
-                return Err(format!("step {step}: only one {service} store is left"));
-            }
-            let (Some(before), true) = (before, whole.is_file()) else {
-                continue;
-            };
-            // A store the oracle's command left alone is of version 11 still.
-            let mut expected = oracle.read_store(service);
-            expected.version = FORMATS[1].version;
-            let written = fs::read(&blocks).unwrap();
-            let read = sparse.read_store(service);
-            if !same_document(&expected, &read) {
-                let difference = difference(&expected, &read);
-                return Err(format!(
-                    "step {step}: the {service} stores differ at {difference}"
-                ));
-            }
-            // A file the command left alone may be another writer's.
-            let encoded = in_blocks(&expected, block_rows_of(&before));
-            if written != before && encoded.map_err(|error| format!("{error:#}"))? != written {
-                return Err(format!(
-                    "step {step}: the {service} store is not the whole encode of its document"
-                ));
-            }
-            // The oracle's next command reads its store whole again.
-            let whole_again = (FORMATS[0].encode)(&expected);
-            fs::write(&whole, whole_again.map_err(|error| format!("{error:#}"))?).unwrap();
+        fs::create_dir_all(oracle.store(service).parent().unwrap()).unwrap();
+        fs::create_dir_all(sparse.store(service).parent().unwrap()).unwrap();
+        fs::write(oracle.store(service), whole).unwrap();
+        fs::write(sparse.store(service), blocks).unwrap();
+    }
+    Ok((oracle, sparse))
+}
+
+/// Holds the project in blocks to the oracle after a command ran on both:
+/// the same files beside the stores, stores of the same documents, and each
+/// store in blocks the whole encode of its document. `before` holds the
+/// stores in blocks as they were. The stores of the oracle are of version
+/// 11 again after it.
+pub(super) fn same_projects(
+    oracle: &Fixture,
+    sparse: &Fixture,
+    before: [Option<Vec<u8>>; SERVICES.len()],
+) -> Result<(), String> {
+    if files_of(oracle) != files_of(sparse) {
+        return Err("the files beside the stores differ".into());
+    }
+    for (service, before) in SERVICES.into_iter().zip(before) {
+        let (whole, blocks) = (oracle.store(service), sparse.store(service));
+        if whole.is_file() != blocks.is_file() {
+            return Err(format!("only one {service} store is left"));
         }
+        let (Some(before), true) = (before, whole.is_file()) else {
+            continue;
+        };
+        // A store the oracle's command left alone is of version 11 still.
+        let mut expected = oracle.read_store(service);
+        expected.version = FORMATS[1].version;
+        let written = fs::read(&blocks).unwrap();
+        let read = sparse.read_store(service);
+        if !same_document(&expected, &read) {
+            let difference = difference(&expected, &read);
+            return Err(format!("the {service} stores differ at {difference}"));
+        }
+        // A file the command left alone may be another writer's.
+        let encoded = in_blocks(&expected, block_rows_of(&before));
+        if written != before && encoded.map_err(|error| format!("{error:#}"))? != written {
+            return Err(format!(
+                "the {service} store is not the whole encode of its document"
+            ));
+        }
+        // The oracle's next command reads its store whole again.
+        let whole_again = (FORMATS[0].encode)(&expected);
+        fs::write(&whole, whole_again.map_err(|error| format!("{error:#}"))?).unwrap();
     }
     Ok(())
 }
