@@ -406,6 +406,10 @@ const IDENTITY: usize = 65920;
 const EXPECTED_IDENTITY: usize = 65936;
 const INPUT: usize = 65952;
 const LIMIT: usize = 65536;
+const STATUS: usize = 84;
+const EXCEPTION_CODE: usize = 92;
+const ERROR_TEXT: usize = 65632;
+const ERROR_END: usize = ERROR_TEXT + 256;
 
 #[derive(Clone)]
 struct AbiCacheEntry {
@@ -461,11 +465,26 @@ impl std::fmt::Display for NativeError {
 }
 impl std::error::Error for NativeError {}
 pub(super) fn task_result(exit: u32, parameters: &[u8]) -> Result<()> {
-    let status = read_u32(parameters, 84)?;
+    let status = read_u32(parameters, STATUS)?;
     if exit != 0 || status != 4 {
-        return Err(
-            NativeError::Task(exit, status, error_text_at(&parameters[..65888], 65632)).into(),
-        );
+        let exception = read_u32(parameters, EXCEPTION_CODE)?;
+        let mut message = error_text_at(&parameters[..ERROR_END], ERROR_TEXT);
+        if exception != 0 {
+            let description = match exception {
+                0xE06D7363 => "C++ exception",
+                0xC0000005 => "access violation (invalid memory access)",
+                0xC0000006 => "in-page error (memory could not be loaded)",
+                0xC000001D => "illegal instruction",
+                0xC0000094 => "integer division by zero",
+                0xC000008E => "floating-point division by zero",
+                0xC00000FD => "stack overflow",
+                0x80000002 => "misaligned memory access",
+                0x80000003 => "breakpoint",
+                _ => "Windows exception",
+            };
+            message = format!("{description} (0x{exception:08X}): {message}");
+        }
+        return Err(NativeError::Task(exit, status, message).into());
     }
     Ok(())
 }
@@ -659,6 +678,7 @@ impl NativeProperty {
         )?;
         put_u32(&mut self.parameters, 80, timeout);
         put_u32(&mut self.parameters, 84, 0);
+        put_u32(&mut self.parameters, EXCEPTION_CODE, 0);
         put_u32(&mut self.parameters, 65912, operation);
         let mut remote = self.memory.allocate(self.parameters.len())?;
         if operation == 7 {
@@ -2010,6 +2030,73 @@ pub(super) use batch::prepare_package_flag;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn property_exception_messages_and_native_result_layout() {
+        let result = crate::system::tools::hidden_command(
+            std::path::Path::new(env!("OUT_DIR")).join("renium-property-exception-test.exe"),
+        )
+        .output()
+        .expect("run isolated property exception regression");
+        assert!(
+            result.status.success(),
+            "native regression: {:?}\n{}",
+            result.status,
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let layout = [SIZE, STATUS, EXCEPTION_CODE, ERROR_TEXT, ERROR_END];
+        for (index, expected) in layout.into_iter().enumerate() {
+            assert_eq!(
+                read_u64(&result.stdout, index * 8).unwrap() as usize,
+                expected
+            );
+        }
+        let results = &result.stdout[layout.len() * 8..];
+        assert_eq!(results.len(), SIZE * 25);
+        for (index, parameters) in results.chunks_exact(SIZE).enumerate() {
+            let status = if index == 0 {
+                4
+            } else if index == 1 {
+                0xE404
+            } else {
+                0xE405
+            };
+            assert_eq!(read_u32(parameters, STATUS).unwrap(), status);
+            let exception = match index {
+                0 | 1 => 0,
+                8 => 0xC0000005,
+                9 => 0xC000001D,
+                _ => 0xE06D7363,
+            };
+            assert_eq!(read_u32(parameters, EXCEPTION_CODE).unwrap(), exception);
+            let outcome = task_result(if index == 0 { 0 } else { status }, parameters);
+            if index == 0 {
+                outcome.unwrap();
+                continue;
+            }
+            let message = outcome.unwrap_err().to_string();
+            let expected = match index {
+                1 => "standard refusal",
+                2 => "literal refusal",
+                3 => "short refusal",
+                4 => "xxxxxxxxxxxxxxxx",
+                5 | 10 => "UnfamiliarException",
+                _ => "Studio raised an exception while reading the property",
+            };
+            assert!(message.contains(expected), "case {index}: {message}");
+            if exception != 0 {
+                assert!(message.contains(&format!("0x{exception:08X}")), "{message}");
+                assert!(
+                    message.contains(match index {
+                        8 => "access violation",
+                        9 => "illegal instruction",
+                        _ => "C++ exception",
+                    }),
+                    "{message}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn scalar_property_flow_follows_guarded_multiple_inheritance_conversion() {
         for outer_adjustment in [-0x1f0i32, -0x288, -0x3a0] {

@@ -606,6 +606,11 @@ fn main() {
                 "batch-pacer",
                 Path::new("native/tests/batch_pacer_windows.cpp"),
             );
+            build_native_test(
+                &out_dir,
+                "property-exception",
+                Path::new("native/tests/property_exception_windows.cpp"),
+            );
         }
         build_native_test(
             &out_dir,

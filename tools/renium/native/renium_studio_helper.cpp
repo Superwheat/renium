@@ -1,4 +1,5 @@
 #include <Windows.h>
+#include <ehdata.h>
 
 #include <atomic>
 #include <cstddef>
@@ -13,6 +14,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <typeinfo>
 #include <vector>
 #include "renium_engine_allocator_windows.h"
 #include "renium_studio_history.h"
@@ -1532,15 +1535,124 @@ static void ReadPropertyCore(PropertyReadTask* task)
     }
 }
 
+// Only the MSVC/Windows ABI is inspected here, never a Studio exception class.
+// Metadata must remain inside the throwing image; payloads may be on the heap.
+static bool ExceptionRange(std::uintptr_t address, std::size_t size, std::uintptr_t image = 0)
+{
+    if (!address || size > UINTPTR_MAX - address) return false;
+    const auto end = address + size;
+    while (address < end) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) ||
+            region.State != MEM_COMMIT || (region.Protect & PAGE_GUARD) ||
+            !(region.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) ||
+            (image && (region.Type != MEM_IMAGE || reinterpret_cast<std::uintptr_t>(region.AllocationBase) != image)))
+            return false;
+        const auto base = reinterpret_cast<std::uintptr_t>(region.BaseAddress);
+        if (region.RegionSize > UINTPTR_MAX - base || base + region.RegionSize <= address) return false;
+        address = (std::min)(end, base + region.RegionSize);
+    }
+    return true;
+}
+
+static bool ReadExceptionMemory(std::uintptr_t address, void* output, std::size_t size, std::uintptr_t image = 0)
+{
+    SIZE_T copied = 0;
+    return ExceptionRange(address, size, image) &&
+        ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), output, size, &copied) && copied == size;
+}
+
+template<class T>
+static bool ReadExceptionRva(std::uintptr_t image, int rva, T& output)
+{
+    return rva > 0 && static_cast<unsigned>(rva) <= UINTPTR_MAX - image &&
+        ReadExceptionMemory(image + rva, &output, sizeof(output), image);
+}
+
+static bool ReadExceptionText(std::uintptr_t address, char (&output)[256], std::uintptr_t image = 0)
+{
+    if (address > UINTPTR_MAX - sizeof(output)) return false;
+    for (std::size_t i = 0; i < sizeof(output) - 1; ++i) {
+        if (!ReadExceptionMemory(address + i, output + i, 1, image)) return false;
+        if (!output[i]) return true;
+    }
+    output[sizeof(output) - 1] = 0;
+    return !image; // Messages may truncate; a type name must match in full.
+}
+
+static bool ReadStringException(std::uintptr_t object, char (&output)[256])
+{
+    // A matching runtime type and size are required by the caller. Use the
+    // toolchain's string accessors, not a copied private string layout. SEH also
+    // covers a page becoming unreadable between validation and these accesses.
+    __try {
+        if (!ExceptionRange(object, sizeof(std::string))) return false;
+        const auto value = reinterpret_cast<const std::string*>(object);
+        if (value->size() > value->capacity()) return false;
+        const auto size = (std::min)(value->size(), sizeof(output) - 1);
+        if (!ReadExceptionMemory(reinterpret_cast<std::uintptr_t>(value->data()), output, size)) return false;
+        output[size] = 0;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static bool ReadCppException(const EXCEPTION_RECORD* record, char (&output)[256])
+{
+#if _EH_RELATIVE_TYPEINFO
+    EHExceptionRecord exception{};
+    if (!ReadExceptionMemory(reinterpret_cast<std::uintptr_t>(record), &exception, sizeof(exception)) ||
+        !PER_IS_MSVC_EH(&exception)) return false;
+    const auto image = reinterpret_cast<std::uintptr_t>(exception.params.pThrowImageBase);
+    std::remove_const_t<ThrowInfo> info{};
+    if (!image || !ReadExceptionMemory(reinterpret_cast<std::uintptr_t>(exception.params.pThrowInfo),
+        &info, sizeof(info), image) || info.pForwardCompat) return false;
+    std::remove_const_t<CatchableTypeArray> types;
+    if (!ReadExceptionRva(image, info.pCatchableTypeArray, types) || types.nCatchableTypes <= 0) return false;
+    // Only the first entry (the actual thrown type) is needed, not base casts.
+    const auto array = image + info.pCatchableTypeArray;
+    constexpr auto first = offsetof(CatchableTypeArray, arrayOfCatchableTypes);
+    int typeRva = 0;
+    if (array > UINTPTR_MAX - first || !ReadExceptionMemory(array + first, &typeRva, sizeof(typeRva), image)) return false;
+    std::remove_const_t<CatchableType> type{};
+    TypeDescriptor descriptor;
+    if (!ReadExceptionRva(image, typeRva, type) || !ReadExceptionRva(image, type.pType, descriptor)) return false;
+    const auto name = image + type.pType;
+    constexpr auto nameOffset = offsetof(TypeDescriptor, name);
+    char typeName[256]{};
+    if (name > UINTPTR_MAX - nameOffset || !ReadExceptionText(name + nameOffset, typeName, image) || !typeName[0]) return false;
+    const auto object = reinterpret_cast<std::uintptr_t>(exception.params.pExceptionObject);
+    const bool direct = !type.thisDisplacement.mdisp && type.thisDisplacement.pdisp == -1 && !type.thisDisplacement.vdisp;
+    if (!std::strcmp(typeName, typeid(const char*).raw_name()) || !std::strcmp(typeName, typeid(char*).raw_name())) {
+        std::uintptr_t text = 0;
+        return direct && type.sizeOrOffset == sizeof(char*) && ReadExceptionMemory(object, &text, sizeof(text)) &&
+            ReadExceptionText(text, output);
+    }
+    if (!std::strcmp(typeName, typeid(std::string).raw_name()))
+        return direct && type.sizeOrOffset == sizeof(std::string) && ReadStringException(object, output);
+    _snprintf_s(output, _TRUNCATE, "C++ exception type %s", typeName);
+    return true;
+#else
+    return false;
+#endif
+}
+
+static int PropertyExceptionFilter(EXCEPTION_POINTERS* exception, PropertyReadParams* result)
+{
+    result->status = 0xE405;
+    result->exceptionCode = exception->ExceptionRecord->ExceptionCode;
+    strncpy_s(result->error, "Studio raised an exception while reading the property", _TRUNCATE);
+    char message[256]{};
+    if (result->exceptionCode == EH_EXCEPTION_NUMBER && ReadCppException(exception->ExceptionRecord, message))
+        strncpy_s(result->error, message, _TRUNCATE);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 static void ReadPropertyCaught(PropertyReadTask* task)
 {
     __try { ReadPropertyCore(task); }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        task->result.status = 0xE405;
-        task->result.exceptionCode = GetExceptionCode();
-        strncpy_s(task->result.error, "Studio raised an exception while reading the property", _TRUNCATE);
-    }
+    __except (PropertyExceptionFilter(GetExceptionInformation(), &task->result)) {}
 }
 
 static DWORD RunPropertyRead(PropertyReadParams* params)
