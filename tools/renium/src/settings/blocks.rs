@@ -1781,32 +1781,54 @@ pub(crate) fn decode_if_contains(
     required: &[Vec<String>],
 ) -> Result<Option<SettingsBytecode>> {
     let store = BlockStore::open(bytes)?;
-    let (structure, opened) = rayon::join(
-        || store.content(store.structure),
-        || store.open_blocks(0..store.blocks.len()),
-    );
-    let (structure, opened) = (structure?, opened?);
-    if !required.is_empty() {
+    let (structure, opened) = store.opened()?;
+    if !required.is_empty() && !store.holds_any(&structure, &opened, required)? {
+        return Ok(None);
+    }
+    store.decode_opened(structure, opened).map(Some)
+}
+
+/// Whether `decode_if_contains` would decode a v12 file for `required`.
+pub(crate) fn holds_any_string_set(bytes: &[u8], required: &[Vec<String>]) -> Result<bool> {
+    let store = BlockStore::open(bytes)?;
+    let (structure, opened) = store.opened()?;
+    store.holds_any(&structure, &opened, required)
+}
+
+impl BlockStore<'_> {
+    /// The content of the structure and every block, opened.
+    fn opened(&self) -> Result<(Vec<u8>, Vec<OpenBlock>)> {
+        let (structure, opened) = rayon::join(
+            || self.content(self.structure),
+            || self.open_blocks(0..self.blocks.len()),
+        );
+        Ok((structure?, opened?))
+    }
+
+    /// Whether the structure, a block or a pool entry a block names holds
+    /// every string of one of the `required` sets.
+    fn holds_any(
+        &self,
+        structure: &[u8],
+        opened: &[OpenBlock],
+        required: &[Vec<String>],
+    ) -> Result<bool> {
         let named = opened
             .iter()
             .flat_map(OpenBlock::pool_entries)
             .collect::<AHashSet<_>>();
-        let read = store.pool_read(named.iter().copied())?;
+        let read = self.pool_read(named.iter().copied())?;
         let holds = |needle: &String| {
-            std::iter::once(&structure)
-                .chain(opened.iter().map(|open| &open.content))
+            std::iter::once(structure)
+                .chain(opened.iter().map(|open| open.content.as_slice()))
                 .any(|content| memmem::find(content, needle.as_bytes()).is_some())
                 || named.iter().any(|entry| {
-                    store
-                        .entry(&read, *entry)
+                    self.entry(&read, *entry)
                         .is_ok_and(|text| text.contains(needle.as_str()))
                 })
         };
-        if !required.iter().any(|needles| needles.iter().all(holds)) {
-            return Ok(None);
-        }
+        Ok(required.iter().any(|needles| needles.iter().all(holds)))
     }
-    store.decode_opened(structure, opened).map(Some)
 }
 
 /// `property_edit::decode_rows` of a v12 file: the instances at `rows`, each

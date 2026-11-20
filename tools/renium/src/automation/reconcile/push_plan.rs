@@ -566,6 +566,14 @@ pub(crate) fn append_recreated_reference_pushes(
     if recreated.is_empty() {
         return Ok(());
     }
+    // A store names another store's instance by its id, which its strings
+    // then hold: one that holds none of a few ids is not decoded for them.
+    let ids = (recreated.len() <= 8).then(|| {
+        recreated
+            .iter()
+            .map(|id| vec![id.clone()])
+            .collect::<Vec<_>>()
+    });
 
     for (path, entry) in &desired.entries {
         if !path
@@ -579,6 +587,11 @@ pub(crate) fn append_recreated_reference_pushes(
         let document = if let Some(prepared) = prepared_settings.get(path) {
             &prepared.current
         } else {
+            if let (Some(ids), SnapshotEntry::File(bytes)) = (&ids, entry)
+                && !crate::settings::bytecode::holds_any_string_set(bytes, ids)
+            {
+                continue;
+            }
             decoded = settings_document(Some(entry))?;
             &decoded
         };
