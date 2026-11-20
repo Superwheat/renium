@@ -33,7 +33,8 @@ use std::time::Instant;
 
 use super::property_edit::{decode_for_property_edit, decode_for_row_chunks};
 use super::*;
-use crate::settings::codec_sim::{captured_input, same_document};
+use crate::settings::codec_sim::captured_input;
+pub(crate) use crate::settings::codec_sim::same_document;
 use crate::tests::support::{SimRng, run_seeds};
 
 /// One seed of each kind of the codec simulation's documents.
@@ -70,6 +71,15 @@ pub(crate) fn blocks_of_both(first: &[u8], second: &[u8]) -> usize {
     };
     let shared = first.blocks_held_by(&second);
     shared.into_iter().filter(|shared| *shared).count()
+}
+
+/// The rows of each block but the last that an edit of `file` writes: the
+/// file's own, where this writer wrote it.
+pub(crate) fn block_rows_of(file: &[u8]) -> usize {
+    let own = BlockStore::open(file)
+        .ok()
+        .filter(|store| store.writer == writer());
+    own.map_or(BLOCK_ROWS, |store| store.block_rows())
 }
 
 /// The whole encode of `document` in the blocks of `file`'s rows, which a
@@ -542,7 +552,7 @@ fn lost_row(whole: &SettingsBytecode) -> Option<(usize, usize)> {
 
 /// `file` as another writer writes it: under another revision, every frame
 /// compressed at another level.
-fn foreign_file(file: &[u8]) -> Vec<u8> {
+pub(crate) fn foreign_file(file: &[u8]) -> Vec<u8> {
     let store = BlockStore::open(file).unwrap();
     let again = |frame: Frame| {
         let content = store.content(frame).unwrap();

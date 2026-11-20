@@ -4,20 +4,25 @@
 
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
-use crate::bytecode::edit::{instance_path_key, instance_path_parts_key};
+use crate::bytecode::edit::{
+    collect_settings_subtree_preorder, instance_path_key, instance_path_parts_key,
+};
 use crate::bytecode::explorer::compact_path_string;
 use crate::editor::paths::{build_editor_instance_paths, build_editor_instance_paths_for_indices};
 use crate::editor::types::EditorInstancePath;
-use crate::settings::bytecode::{
-    SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode, strict_reference_path,
-    visit_reference_objects_mut,
+use crate::settings::bytecode::property_edit::{
+    RetainedPropertyColumns, read_for_structural_edit_if_contains,
 };
-use crate::settings::tree::editor_service_root_index;
+use crate::settings::bytecode::{
+    SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode, SettingsBytecodeInstance,
+    settings_reference_index, strict_reference_path, visit_reference_objects_mut,
+};
+use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
 use crate::system::files::{service_settings_path, validate_filesystem_instance_name};
 
 /// A reference as a command writes it by hand: by settings id alone, or by
@@ -394,7 +399,7 @@ impl ReferencedStores {
                 .context("Service settings path has no service name")?;
             if service != own_service && !self.stores.contains_key(&service) && path.is_file() {
                 self.stores
-                    .insert(service, SettingsBytecode::read_file(&path)?);
+                    .insert(service, SettingsBytecode::read_structure_file(&path)?);
             }
         }
         Ok(())
@@ -562,6 +567,164 @@ impl EarlierTargets<'_> {
                 .flatten(),
         }
     }
+}
+
+/// One of the project's other stores as an edit that renames, moves or
+/// removes instances reads it: by its instances, those whose references the
+/// edit may change with their values.
+pub(crate) struct ReferringStore {
+    pub(crate) file: PathBuf,
+    pub(crate) document: SettingsBytecode,
+    pub(crate) stored: RetainedPropertyColumns,
+}
+
+/// Whether a value names an instance by an id or a path, at any depth: a
+/// reference by position follows its instance wherever it stands.
+fn names_by_selector(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(names_by_selector),
+        Value::Object(object) => {
+            SETTINGS_REFERENCE_SELECTOR_KEYS[1..]
+                .iter()
+                .any(|key| object.contains_key(*key))
+                || object.values().any(names_by_selector)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a value names by its position, at any depth, one of the
+/// instances at `rows`.
+pub(crate) fn names_row_of(value: &Value, rows: &HashSet<usize>) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(|value| names_row_of(value, rows)),
+        Value::Object(object) => {
+            let row = object
+                .get("instanceIndex")
+                .and_then(settings_reference_index);
+            row.is_some_and(|row| rows.contains(&row))
+                || object.values().any(|value| names_row_of(value, rows))
+        }
+        _ => false,
+    }
+}
+
+/// Gives their values to the instances of a store read by its instances
+/// that name an instance by an id or a path, of the blocks that hold one of
+/// `names`: the ones whose references an edit of the instances `names`
+/// stand for may change.
+fn materialize_referrers(
+    document: &mut SettingsBytecode,
+    stored: &mut RetainedPropertyColumns,
+    names: &HashSet<String>,
+) -> Result<()> {
+    let names = names.iter().map(String::as_str).collect();
+    stored.materialize_where(document, Some(&names), names_by_selector)
+}
+
+/// The strings a reference to one of the instances at `rows` holds, which
+/// are of the store at `settings_file`: the names the store goes by, and the
+/// id of each instance.
+pub(crate) fn names_of_moved(
+    (settings_file, service): (&Path, &str),
+    document: &SettingsBytecode,
+    rows: &[usize],
+) -> HashSet<String> {
+    let mut names = HashSet::from([service.to_string()]);
+    names.extend(crate::project::storage::store_service_name(settings_file));
+    for row in rows {
+        let id = &document.instances[*row].settings_id;
+        names.extend(id.strip_prefix("debug:").map(str::to_string));
+        names.insert(id.clone());
+    }
+    names
+}
+
+/// Gives their values to the instances at `rows` of a store read by its
+/// instances, to its root, and to each instance whose references a rename
+/// or a move of the instances `names` stand for may change.
+pub(crate) fn materialize_for_moves(
+    (document, stored): (&mut SettingsBytecode, &mut RetainedPropertyColumns),
+    rows: &[usize],
+    names: &HashSet<String>,
+) -> Result<()> {
+    let root = |instance: &SettingsBytecodeInstance| instance.parent_index.is_none();
+    let mut rows = rows.to_vec();
+    rows.extend(document.instances.iter().position(root));
+    stored.materialize(document, &rows)?;
+    materialize_referrers(document, stored, names)
+}
+
+/// Each store at `files` that holds every string of one of the sets in
+/// `required`, where there are any, by its service and with the values of
+/// the instances that refer to something `names` stands for.
+pub(crate) fn read_referring_stores<'p>(
+    files: impl Iterator<Item = &'p PathBuf>,
+    names: &HashSet<String>,
+    required: &[Vec<String>],
+) -> Result<BTreeMap<String, ReferringStore>> {
+    let mut stores = BTreeMap::new();
+    for file in files {
+        let Some((mut document, mut stored)) =
+            read_for_structural_edit_if_contains(file, required)?
+        else {
+            continue;
+        };
+        materialize_referrers(&mut document, &mut stored, names)?;
+        let service = crate::project::storage::store_service_name(file)
+            .context("Service settings path has no service name")?;
+        let file = file.clone();
+        stores.insert(
+            service,
+            ReferringStore {
+                file,
+                document,
+                stored,
+            },
+        );
+    }
+    Ok(stores)
+}
+
+/// Readies a store read by its instances, `own`, for an edit that renames
+/// or moves the instances at `indices`: they, their descendants, the root
+/// and each instance whose references the edit may change take their
+/// values. Returns the project's other stores, at `others`, read likewise.
+pub(crate) fn read_for_moves<'p>(
+    store: (&Path, &str),
+    own: (&mut SettingsBytecode, &mut RetainedPropertyColumns),
+    indices: &[usize],
+    others: impl Iterator<Item = &'p PathBuf>,
+) -> Result<BTreeMap<String, ReferringStore>> {
+    let children = settings_children_by_parent(own.0);
+    let mut rows = Vec::new();
+    for index in indices {
+        collect_settings_subtree_preorder(&children, *index, &mut rows);
+    }
+    let names = names_of_moved(store, own.0, &rows);
+    materialize_for_moves(own, &rows, &names)?;
+    read_referring_stores(others, &names, &[])
+}
+
+/// Readies a store read by its instances, `own`, for an edit that removes
+/// instances at the paths `removed`. Returns the project's other stores, at
+/// `others`, that hold every name of one of those paths, read by their
+/// instances; where there are any, the instances of `own` whose references
+/// the removal may change take their values, as theirs did.
+pub(crate) fn read_for_removal<'p>(
+    settings_file: &Path,
+    (document, stored): (&mut SettingsBytecode, &mut RetainedPropertyColumns),
+    removed: &[Vec<String>],
+    others: impl Iterator<Item = &'p PathBuf>,
+) -> Result<BTreeMap<String, ReferringStore>> {
+    let names = crate::project::storage::store_service_name(settings_file)
+        .into_iter()
+        .collect();
+    let referring = read_referring_stores(others, &names, removed)?;
+    if !referring.is_empty() {
+        materialize_referrers(document, stored, &names)?;
+    }
+    Ok(referring)
 }
 
 fn names_edited_store(value: &Value, edited: &BTreeMap<String, &SettingsBytecode>) -> bool {

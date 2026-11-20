@@ -2631,8 +2631,10 @@ pub(crate) fn bytecode_import_model(args: BytecodeImportModelArgs) -> Result<()>
     )?;
     ensure_service_store_exists(&settings_file, &service_hint)?;
     let _lock = acquire_settings_file_lock(&settings_file)?;
-    let mut document = SettingsBytecode::read_file(&settings_file)?;
+    let (mut document, mut stored) = crate::bytecode::read_store_for_structure(&settings_file)?;
     let instances_before = document.instances.len();
+    let every = (0..instances_before).collect::<Vec<_>>();
+    stored.give(&mut document, &every, "UniqueId")?;
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let service_dir = crate::project::storage::source_directory(&settings_file);
     let sources_before = SourcePathsBefore::capture(
@@ -2676,7 +2678,10 @@ pub(crate) fn bytecode_import_model(args: BytecodeImportModelArgs) -> Result<()>
         &mut writes,
         &mut removals,
     )?;
-    writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
+    writes.insert(
+        settings_file.clone(),
+        stored.encode_restructured(&document)?,
+    );
     let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
     print_json_output(

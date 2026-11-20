@@ -20,6 +20,7 @@ mod files;
 mod project;
 mod references;
 mod stores;
+mod structure_edits_sim;
 
 /// What one captured command run produced.
 pub(super) struct Outcome {

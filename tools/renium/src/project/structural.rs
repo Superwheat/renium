@@ -13,18 +13,21 @@ use crate::bytecode::edit::{
     path_ordinals_from_value, path_segments_from_value, prune_removed_source_dirs,
     reject_package_link_subtree_mutation,
 };
+use crate::bytecode::references::{
+    materialize_for_moves, names_of_moved, names_row_of, read_referring_stores,
+};
 use crate::bytecode::{
     SourcePathsBefore, apply_file_mutations, collect_source_path_updates, file_mutation_paths,
-    lock_existing_service_stores, preserve_source_path_extension,
+    lock_existing_service_stores, preserve_source_path_extension, read_store_for_structure,
 };
 use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
     build_editor_instance_paths, build_editor_source_paths_by_index, script_file_names,
 };
 use crate::rbx::model::canonicalize_settings_references_for_move;
+use crate::settings::bytecode::property_edit::RetainedPropertyColumns;
 use crate::settings::bytecode::{
-    SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode, encode_settings_bytecode,
-    visit_reference_objects_mut,
+    SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode, visit_reference_objects_mut,
 };
 use crate::settings::instance;
 use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
@@ -223,15 +226,22 @@ fn source_root_for_stores(source_file: &Path, target_file: &Path) -> Result<Path
     Ok(source_root.to_path_buf())
 }
 
+/// The documents of a move between services by service: `source` and
+/// `target` as given, each other store that may refer to a moved instance
+/// read by its instances, with what writes it, and any other by its
+/// instances alone. `names` are the strings a reference to a moved instance
+/// holds.
 fn load_move_reference_documents(
     files: &BTreeMap<String, PathBuf>,
-    source_service: &str,
-    target_service: &str,
-    source: SettingsBytecode,
-    target: SettingsBytecode,
+    (source_service, source): (&str, SettingsBytecode),
+    (target_service, target): (&str, SettingsBytecode),
     moved_indices: &HashSet<usize>,
     old_paths: &[Option<crate::editor::types::EditorInstancePath>],
-) -> Result<BTreeMap<String, SettingsBytecode>> {
+    names: &HashSet<String>,
+) -> Result<(
+    BTreeMap<String, SettingsBytecode>,
+    BTreeMap<String, RetainedPropertyColumns>,
+)> {
     let structures = files
         .par_iter()
         .filter(|(service, _)| {
@@ -281,20 +291,18 @@ fn load_move_reference_documents(
     needles.sort();
     needles.dedup();
 
-    let candidates = files
-        .par_iter()
-        .filter(|(service, _)| {
-            service.as_str() != source_service && service.as_str() != target_service
-        })
-        .map(|(service, path)| {
-            SettingsBytecode::read_file_if_contains_any_string_set(path, &needles)
-                .map(|document| document.map(|document| (service.clone(), document)))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    for (service, document) in candidates.into_iter().flatten() {
-        documents.insert(service, document);
+    let mut stores = BTreeMap::new();
+    for (service, path) in files {
+        if service.as_str() == source_service || service.as_str() == target_service {
+            continue;
+        }
+        let read = read_referring_stores(std::iter::once(path), names, &needles)?;
+        if let Some(store) = read.into_values().next() {
+            documents.insert(service.clone(), store.document);
+            stores.insert(service.clone(), store.stored);
+        }
     }
-    Ok(documents)
+    Ok((documents, stores))
 }
 
 pub(crate) fn move_instance_between_service_stores(
@@ -311,11 +319,11 @@ pub(crate) fn move_instance_between_service_stores(
     let _locks = lock_existing_service_stores(files.values().map(PathBuf::as_path))?;
     let load_started = Instant::now();
     let (source_before, target_before) = rayon::join(
-        || SettingsBytecode::read_file(source_file),
-        || SettingsBytecode::read_file(target_file),
+        || read_store_for_structure(source_file),
+        || read_store_for_structure(target_file),
     );
-    let source_before = source_before?;
-    let target_before = target_before?;
+    let (mut source_before, mut source_stored) = source_before?;
+    let (mut target_before, mut target_stored) = target_before?;
     let source_index = source_before
         .instances
         .iter()
@@ -348,14 +356,21 @@ pub(crate) fn move_instance_between_service_stores(
     reject_package_link_subtree_mutation(&source_before, &subtree, "moved between services")?;
     let moved_indices = subtree.iter().copied().collect::<HashSet<_>>();
     let old_paths = build_editor_instance_paths(&source_before, source_service);
-    let mut documents = load_move_reference_documents(
+    let names = names_of_moved((source_file, source_service), &source_before, &subtree);
+    let source_read = (&mut source_before, &mut source_stored);
+    materialize_for_moves(source_read, &subtree, &names)?;
+    // A reference by position to a moved instance takes its path before
+    // the instance leaves the store.
+    let to_moved = |value: &Value| names_row_of(value, &moved_indices);
+    source_stored.materialize_where(&mut source_before, None, to_moved)?;
+    materialize_for_moves((&mut target_before, &mut target_stored), &[], &names)?;
+    let (mut documents, other_stores) = load_move_reference_documents(
         &files,
-        source_service,
-        target_service,
-        source_before.clone(),
-        target_before,
+        (source_service, source_before.clone()),
+        (target_service, target_before),
         &moved_indices,
         &old_paths,
+        &names,
     )?;
     log_timing("cross-service move load", load_started);
     let original_package_links = documents
@@ -498,8 +513,14 @@ pub(crate) fn move_instance_between_service_stores(
         let path = &files[service];
         if service == source_service && source_store_removed {
             removals.push(path.clone());
+        } else if service == source_service {
+            writes.insert(path.clone(), source_stored.encode_restructured(document)?);
+        } else if service == target_service {
+            writes.insert(path.clone(), target_stored.encode_restructured(document)?);
         } else {
-            writes.insert(path.clone(), encode_settings_bytecode(document)?);
+            let stored = (other_stores.get(service))
+                .context("A store read without its values is not written")?;
+            writes.insert(path.clone(), stored.encode(document)?);
         }
     }
     removals.retain(|path| {

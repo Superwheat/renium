@@ -59,7 +59,9 @@ use crate::rbx::model::{
     canonicalize_settings_references_for_moves, source_structure_settings_document,
 };
 use crate::settings::bytecode::blocks::RowReader;
-use crate::settings::bytecode::property_edit::{RetainedPropertyColumns, read_for_property_edit};
+use crate::settings::bytecode::property_edit::{
+    RetainedPropertyColumns, read_for_property_edit, read_for_structural_edit,
+};
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode,
     stabilize_reference_objects,
@@ -328,6 +330,24 @@ pub(crate) fn read_store(path: &Path) -> Result<(SettingsBytecode, Option<RowRea
         )?;
     }
     Ok((document, rows))
+}
+
+/// A store as a command that adds, removes or moves instances reads it
+/// (`read_for_structural_edit`): a store read by its instances gives each
+/// Script its RunContext, which names its source file.
+pub(crate) fn read_store_for_structure(
+    path: &Path,
+) -> Result<(SettingsBytecode, RetainedPropertyColumns)> {
+    let (mut document, mut stored) = read_for_structural_edit(path)?;
+    let scripts = (0..document.instances.len())
+        .filter(|index| document.instances[*index].class_name == "Script")
+        .collect::<Vec<_>>();
+    stored.give(
+        &mut document,
+        &scripts,
+        crate::editor::paths::SOURCE_PATH_CONTEXT_PROPERTY,
+    )?;
+    Ok((document, stored))
 }
 
 /// Gives the instances at `indices` their stored values where the store is
@@ -2961,27 +2981,6 @@ pub(crate) fn project_store_files(settings_file: &Path) -> Result<BTreeSet<PathB
     Ok(files)
 }
 
-/// Every locked store by service name, with `document` as the content of
-/// `settings_file`.
-fn read_locked_stores(
-    locked_stores: &BTreeSet<PathBuf>,
-    settings_file: &Path,
-    document: &SettingsBytecode,
-) -> Result<BTreeMap<String, SettingsBytecode>> {
-    let mut documents = BTreeMap::new();
-    for path in locked_stores {
-        let service_name = crate::project::storage::store_service_name(path)
-            .context("Service settings path has no service name")?;
-        let candidate = if path == settings_file {
-            document.clone()
-        } else {
-            SettingsBytecode::read_file(path)?
-        };
-        documents.insert(service_name, candidate);
-    }
-    Ok(documents)
-}
-
 /// Applies to each selected instance of one store its assignments and
 /// returns one result per instance and assignment. The instances are
 /// resolved before anything changes and the files are written once, after
@@ -3012,13 +3011,17 @@ fn set_store_properties(
         BTreeSet::from([settings_file.clone()])
     };
     let _locks = lock_existing_service_stores(locked_stores.iter().map(PathBuf::as_path))?;
-    // Retained columns keep row indices, so moves and source-path changes need
-    // the complete document. Value-only edits materialize their selected rows.
+    // Retained columns keep row indices, so other source-path changes need the
+    // complete document. A rename or a move reads the store by its instances,
+    // and value-only edits materialize their selected rows.
     let keep_columns = !structural
         && !assigned().any(|(property, _)| {
             property_affects_source_path(scope, property) || property.eq_ignore_ascii_case("source")
         });
-    let (mut document, mut retained_columns) = if keep_columns {
+    let (mut document, mut retained_columns) = if structural {
+        let (document, stored) = read_store_for_structure(&settings_file)?;
+        (document, Some(stored))
+    } else if keep_columns {
         let (document, numeric) = read_for_property_edit(&settings_file)?;
         (document, Some(numeric))
     } else {
@@ -3040,6 +3043,15 @@ fn set_store_properties(
     if let Some(numeric) = &mut retained_columns {
         numeric.materialize(&mut document, &indices)?;
     }
+    let referring = match &mut retained_columns {
+        Some(stored) if structural => references::read_for_moves(
+            (&settings_file, &service),
+            (&mut document, stored),
+            &indices,
+            locked_stores.iter().filter(|path| **path != settings_file),
+        )?,
+        _ => BTreeMap::new(),
+    };
     let links = store_link_enforcement(&settings_file, args.override_packages)?;
     let mut edit = StorePropertyEdit {
         settings_file: &settings_file,
@@ -3049,6 +3061,8 @@ fn set_store_properties(
         links: &links,
         document,
         retained_columns,
+        structural,
+        referring,
         references: references::ReferencedStores::default(),
         before: None,
         moved: HashSet::new(),
@@ -3064,7 +3078,7 @@ fn set_store_properties(
             .collect::<Result<Vec<_>>>()?;
         applied.push(outcomes);
     }
-    edit.finish(&locked_stores, applied)
+    edit.finish(applied)
 }
 
 /// One store's document while a `bs` call edits it in memory.
@@ -3076,6 +3090,12 @@ struct StorePropertyEdit<'a> {
     links: &'a LinkEnforcement,
     document: SettingsBytecode,
     retained_columns: Option<RetainedPropertyColumns>,
+    /// Whether the edit renames or moves instances, and so read the store by
+    /// its instances.
+    structural: bool,
+    /// The project's other stores as such an edit reads them, by service and
+    /// with their files.
+    referring: BTreeMap<String, references::ReferringStore>,
     /// The stores the written references point into.
     references: references::ReferencedStores,
     /// The document and its script paths before the first assignment that
@@ -3176,7 +3196,6 @@ impl StorePropertyEdit<'_> {
     /// moved instances in one step, then gives each assignment its result.
     fn finish(
         mut self,
-        locked_stores: &BTreeSet<PathBuf>,
         mut applied: Vec<Vec<AppliedAssignment>>,
     ) -> Result<(Vec<Vec<Value>>, add_batch::StudioPrep)> {
         if let Some((before_document, _)) = &self.before
@@ -3221,24 +3240,16 @@ impl StorePropertyEdit<'_> {
             writes.insert(source_path.clone(), source.clone().into_bytes());
             written_sources.insert(*index, source_path);
         }
-        if self.store_edited {
-            writes.insert(
-                self.settings_file.to_path_buf(),
-                match &self.retained_columns {
-                    Some(numeric) => numeric.encode(&self.document)?,
-                    None => encode_settings_bytecode(&self.document)?,
-                },
-            );
-        }
+        let mut followed = None;
         if !self.moved.is_empty() {
-            let mut documents =
-                read_locked_stores(locked_stores, self.settings_file, &self.document)?;
-            let files = locked_stores
-                .iter()
-                .filter_map(|path| Some((crate::project::storage::store_service_name(path)?, path)))
-                .collect::<BTreeMap<_, _>>();
             let own_service = crate::project::storage::store_service_name(self.settings_file)
                 .context("Service settings path has no service name")?;
+            let mut documents = BTreeMap::from([(own_service.clone(), self.document.clone())]);
+            let mut stores = BTreeMap::new();
+            for (service, store) in std::mem::take(&mut self.referring) {
+                documents.insert(service.clone(), store.document);
+                stores.insert(service, (store.file, store.stored));
+            }
             let edited = self
                 .before
                 .iter()
@@ -3252,11 +3263,25 @@ impl StorePropertyEdit<'_> {
                 &self.moved,
             ));
             for changed_service in changed_services {
-                writes.insert(
-                    files[&changed_service].clone(),
-                    encode_settings_bytecode(&documents[&changed_service])?,
-                );
+                match stores.get(&changed_service) {
+                    Some((file, stored)) => {
+                        let document = &documents[&changed_service];
+                        writes.insert(file.clone(), stored.encode(document)?);
+                    }
+                    None => followed = documents.remove(&changed_service),
+                }
             }
+        }
+        if self.store_edited || followed.is_some() {
+            let document = followed.as_ref().unwrap_or(&self.document);
+            writes.insert(
+                self.settings_file.to_path_buf(),
+                match &self.retained_columns {
+                    Some(stored) if self.structural => stored.encode_restructured(document)?,
+                    Some(numeric) => numeric.encode(document)?,
+                    None => encode_settings_bytecode(document)?,
+                },
+            );
         }
         let mut studio = add_batch::StudioPrep::default();
         if let Some((before_document, _)) = &self.before

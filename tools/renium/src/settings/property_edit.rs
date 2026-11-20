@@ -32,6 +32,38 @@ pub(crate) fn read_for_property_edit(
     read_settings_file(path, decode_for_property_edit)
 }
 
+/// A store read for an edit that adds, removes or moves instances: a v12
+/// store by its instances, each given its values as the edit asks for them,
+/// and a store of an older version whole.
+pub(crate) fn read_for_structural_edit(
+    path: &Path,
+) -> Result<(SettingsBytecode, RetainedPropertyColumns)> {
+    read_settings_file(path, |bytes| {
+        if super::blocks::is_block_store(bytes) {
+            return decode_for_property_edit(bytes);
+        }
+        let columns = RetainedPropertyColumns::default();
+        Ok((decode_settings_bytecode(bytes)?, columns))
+    })
+}
+
+/// `read_for_structural_edit` of a store that holds every string of one of
+/// the sets in `required`, or of any store where there are none.
+pub(crate) fn read_for_structural_edit_if_contains(
+    path: &Path,
+    required: &[Vec<String>],
+) -> Result<Option<(SettingsBytecode, RetainedPropertyColumns)>> {
+    read_settings_file(path, |bytes| {
+        if !super::blocks::is_block_store(bytes) {
+            let document = decode_settings_bytecode_if_contains_any_string_set(bytes, required)?;
+            return Ok(document.map(|document| (document, RetainedPropertyColumns::default())));
+        }
+        let held =
+            required.is_empty() || super::blocks::BlockStore::open(bytes)?.holds_any(required)?;
+        held.then(|| decode_for_property_edit(bytes)).transpose()
+    })
+}
+
 /// Keep the ordinary store retry around both column parsing and the selected decode.
 pub(crate) fn read_row_chunks_with<T>(
     path: &Path,
@@ -773,6 +805,44 @@ impl RetainedPropertyColumns {
             result?;
         }
         Ok(())
+    }
+
+    /// Gives the rows at `rows` of a store read by its instances their
+    /// stored value of the property `name`, for an edit that only reads it.
+    pub(crate) fn give(
+        &mut self,
+        document: &mut SettingsBytecode,
+        rows: &[usize],
+        name: &str,
+    ) -> Result<()> {
+        match &mut self.blocks {
+            Some(store) => store.give(document, rows, name),
+            None => Ok(()),
+        }
+    }
+
+    /// `materialize` of each instance of a store read by its instances that
+    /// holds a value `wanted` takes: of the blocks that hold one of
+    /// `strings`, or of every block where there are none.
+    pub(crate) fn materialize_where(
+        &mut self,
+        document: &mut SettingsBytecode,
+        strings: Option<&AHashSet<&str>>,
+        wanted: impl Fn(&Value) -> bool + Sync,
+    ) -> Result<()> {
+        match &mut self.blocks {
+            Some(store) => store.materialize_where(document, strings, wanted),
+            None => Ok(()),
+        }
+    }
+
+    /// `encode` after an edit of `read_for_structural_edit` that added,
+    /// removed or moved instances, each one known by its id.
+    pub(crate) fn encode_restructured(&self, document: &SettingsBytecode) -> Result<Vec<u8>> {
+        match &self.blocks {
+            Some(store) => store.encode_restructured(document),
+            None => encode_settings_bytecode(document),
+        }
     }
 
     pub(crate) fn encode(&self, document: &SettingsBytecode) -> Result<Vec<u8>> {

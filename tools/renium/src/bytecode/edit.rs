@@ -887,7 +887,7 @@ pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value>
     } = request;
     ensure_service_store_exists(&settings_file, &service_hint)?;
     let _lock = acquire_settings_file_lock(&settings_file)?;
-    let mut document = SettingsBytecode::read_file(&settings_file)?;
+    let (mut document, stored) = super::read_store_for_structure(&settings_file)?;
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let service_directory = crate::project::storage::source_directory(&settings_file);
     let service_dir = service_directory.as_path();
@@ -961,7 +961,10 @@ pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value>
         &mut writes,
         &mut removals,
     )?;
-    writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
+    writes.insert(
+        settings_file.clone(),
+        stored.encode_restructured(&document)?,
+    );
     let mut adopted_source = None;
     if is_lua_source_class(&document.instances[added.index].class_name)
         && let Some(Some(source_path)) = source_paths.get(added.index)
@@ -1033,7 +1036,7 @@ pub(crate) fn clone_stored_instance(
     let (settings_file, service_hint) =
         resolve_bytecode_cli_settings_file(Some(settings_file), None, Some(service))?;
     let _lock = lock_existing_service_store(&settings_file)?;
-    let mut document = SettingsBytecode::read_file(&settings_file)?;
+    let (mut document, mut stored) = super::read_store_for_structure(&settings_file)?;
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let index_of = |settings_id: &str| {
         document
@@ -1046,6 +1049,10 @@ pub(crate) fn clone_stored_instance(
         bail!("Service roots cannot be copied");
     }
     let target_parent_index = index_of(parent_id).context("Parent instance was not found")?;
+    let mut copied = Vec::new();
+    let children = settings_children_by_parent(&document);
+    collect_settings_subtree_preorder(&children, source_index, &mut copied);
+    stored.materialize(&mut document, &copied)?;
 
     let service_dir = crate::project::storage::source_directory(&settings_file);
     let source_paths_before = build_editor_source_paths_by_index(&document, &service, &service_dir);
@@ -1101,7 +1108,10 @@ pub(crate) fn clone_stored_instance(
             "to": to,
         }));
     }
-    writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
+    writes.insert(
+        settings_file.clone(),
+        stored.encode_restructured(&document)?,
+    );
     let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
     let root_index = cloned.root_index;
@@ -1767,7 +1777,14 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
     )?;
     let store_files = super::project_store_files(&settings_file)?;
     let locks = super::lock_existing_service_stores(store_files.iter().map(PathBuf::as_path))?;
-    let mut document = SettingsBytecode::read_file(&settings_file)?;
+    // A query reads the values of every instance under its scope.
+    let (mut document, mut stored) = match args.where_query {
+        Some(_) => (
+            SettingsBytecode::read_file(&settings_file)?,
+            Default::default(),
+        ),
+        None => super::read_store_for_structure(&settings_file)?,
+    };
     let before_document = document.clone();
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let source_paths_by_index = build_editor_source_paths_by_index(
@@ -1843,6 +1860,12 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
         .iter()
         .filter_map(|&index| paths_before.get(index).cloned().flatten())
         .collect::<Vec<_>>();
+    let referring = super::references::read_for_removal(
+        &settings_file,
+        (&mut document, &mut stored),
+        &removed_instance_paths,
+        store_files.iter().filter(|path| **path != settings_file),
+    )?;
     let removed =
         instance_api::remove_instances_at_indices(&mut document, &indices, !args.no_recursive)?;
     if args.no_recursive {
@@ -1865,17 +1888,11 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
     let service_dir = service_directory.as_path();
     let mut writes = BTreeMap::new();
     let mut removals = Vec::new();
-    let other_stores = store_files
-        .iter()
-        .filter(|path| **path != settings_file)
-        .cloned()
-        .collect::<Vec<_>>();
     document = clear_references_to_removed(
         &settings_file,
         &before_document,
         document,
-        &other_stores,
-        &removed_instance_paths,
+        referring,
         &mut writes,
     )?;
     collect_source_path_updates(
@@ -1895,7 +1912,10 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
     if removed_settings_file {
         removals.push(settings_file.clone());
     } else {
-        writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
+        writes.insert(
+            settings_file.clone(),
+            stored.encode_restructured(&document)?,
+        );
     }
     let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
@@ -1946,43 +1966,34 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
 /// `after` are the store's document around the removal; `after` is returned
 /// with its own references brought up to date. A reference carries its
 /// target's path, so only the stores that hold every name of a removed path
-/// are read, and those that change are added to `writes`.
+/// are read (`read_for_removal` gives them as `referring`), and those that
+/// change are added to `writes`.
 fn clear_references_to_removed(
     settings_file: &Path,
     before: &SettingsBytecode,
     after: SettingsBytecode,
-    other_stores: &[PathBuf],
-    removed_paths: &[Vec<String>],
+    referring: BTreeMap<String, super::references::ReferringStore>,
     writes: &mut BTreeMap<PathBuf, Vec<u8>>,
 ) -> Result<SettingsBytecode> {
-    let mut files = BTreeMap::new();
-    let mut documents = BTreeMap::new();
-    for path in other_stores {
-        if let Some(document) =
-            SettingsBytecode::read_file_if_contains_any_string_set(path, removed_paths)?
-        {
-            let service = crate::project::storage::store_service_name(path)
-                .context("Service settings path has no service name")?;
-            files.insert(service.clone(), path);
-            documents.insert(service, document);
-        }
-    }
-    if documents.is_empty() {
+    if referring.is_empty() {
         return Ok(after);
     }
     let own_service = crate::project::storage::store_service_name(settings_file)
         .context("Service settings path has no service name")?;
+    let mut stores = BTreeMap::new();
+    let mut documents = BTreeMap::new();
+    for (service, store) in referring {
+        documents.insert(service.clone(), store.document);
+        stores.insert(service, (store.file, store.stored));
+    }
     documents.insert(own_service.clone(), after);
     let changed = super::references::follow_edited_references(
         &BTreeMap::from([(own_service.clone(), before)]),
         &mut documents,
     );
     for service in changed {
-        if let Some(path) = files.get(&service) {
-            writes.insert(
-                (*path).clone(),
-                encode_settings_bytecode(&documents[&service])?,
-            );
+        if let Some((file, stored)) = stores.get(&service) {
+            writes.insert(file.clone(), stored.encode(&documents[&service])?);
         }
     }
     documents

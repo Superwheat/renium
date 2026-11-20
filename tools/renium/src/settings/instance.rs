@@ -351,7 +351,10 @@ fn remap_ref_indices(document: &mut SettingsBytecode, old_to_new: &[Option<usize
     }
 }
 
-fn remap_ref_indices_in_value(value: &mut Value, old_to_new: &[Option<usize>]) {
+/// Brings the references by position in `value` to where their instances
+/// stand now: `old_to_new` gives each earlier position its present one, and
+/// a reference to an instance that is gone names nothing.
+pub(crate) fn remap_ref_indices_in_value(value: &mut Value, old_to_new: &[Option<usize>]) {
     match value {
         Value::Array(items) => {
             for item in items {

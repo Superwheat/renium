@@ -706,7 +706,9 @@ pub(crate) fn decode_settings_bytecode_holding(bytes: &[u8]) -> Result<SettingsB
 /// decode is the one to say why.
 pub(crate) fn holds_any_string_set(bytes: &[u8], required: &[Vec<String>]) -> bool {
     if blocks::is_block_store(bytes) {
-        return blocks::holds_any_string_set(bytes, required).unwrap_or(true);
+        return blocks::BlockStore::open(bytes)
+            .and_then(|store| store.holds_any(required))
+            .unwrap_or(true);
     }
     let Ok((_, decoded)) = decode_settings_bytecode_container(bytes) else {
         return true;

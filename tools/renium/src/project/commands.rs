@@ -102,7 +102,7 @@ fn projected_structural_target(
     if !settings.is_file() {
         bail!("Projected service '{service}' has no Renium store");
     }
-    let document = SettingsBytecode::read_file(&settings)?;
+    let document = SettingsBytecode::read_structure_file(&settings)?;
     let index = crate::bytecode::query::resolve_document_id_or_target(&document, target)
         .with_context(|| format!("Projected service '{service}' has no instance '{target}'"))?;
     let settings_id = document.instances[index].settings_id.clone();
@@ -181,7 +181,7 @@ fn projected_structural_store(
                 }
                 Ok(canonical_id.to_string())
             } else {
-                let document = SettingsBytecode::read_file(&store)?;
+                let document = SettingsBytecode::read_structure_file(&store)?;
                 if document
                     .instances
                     .iter()
@@ -287,7 +287,7 @@ fn metadata_property_change(
 }
 
 fn service_root_settings_id(settings_file: &Path, service: &str) -> Result<String> {
-    let document = SettingsBytecode::read_file(settings_file)?;
+    let document = SettingsBytecode::read_structure_file(settings_file)?;
     let root_index = editor_service_root_index(&document, service)
         .with_context(|| format!("Service '{service}' has no root instance"))?;
     Ok(document.instances[root_index].settings_id.clone())
