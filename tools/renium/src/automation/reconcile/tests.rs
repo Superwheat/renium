@@ -7508,6 +7508,23 @@ fn a_store_most_of_whose_instances_differ_is_imported_anew() {
     // Every row differs, and all of them in what they hold.
     let all = store("MeshPart", &|_| vec![spelled(), transparent()]);
     assert!(pushed(&all, &studio, StoresRead::ChangedOfBoth).0);
+
+    // Every row differs, and five of them in what they hold: those five
+    // alone are read of Studio's copy.
+    let few = store("MeshPart", &|index| {
+        vec![spelled(), (index % 4_000 == 7).then(transparent).flatten()]
+    });
+    let (imported, plan, previous) = pushed(&few, &studio, StoresRead::ChangedOfBoth);
+    assert!(!imported && plan.contains("debug:0_4017"), "{plan}");
+    assert_eq!(plan, pushed(&few, &studio, StoresRead::Whole).1);
+    let read = previous.iter().filter(|row| row.contains("Anchored"));
+    assert_eq!(read.count(), 5);
+
+    // Every row differs, and none in what it holds.
+    let same = store("MeshPart", &|_| vec![spelled()]);
+    let (imported, plan, previous) = pushed(&same, &studio, StoresRead::ChangedOfBoth);
+    assert!(!imported && previous.is_empty());
+    assert_eq!(plan, pushed(&same, &studio, StoresRead::Whole).1);
 }
 
 /// A store of which Studio holds nothing but what stays in a service is

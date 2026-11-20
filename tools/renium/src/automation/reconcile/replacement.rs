@@ -49,7 +49,7 @@ pub(crate) fn prepare_project_replacement_from(
 }
 
 /// The stores a push imports anew although Studio holds their instances
-/// (`heavily_changed_store`).
+/// (`imported_store`).
 pub(crate) type ImportedStores = std::sync::Mutex<HashSet<PathBuf>>;
 
 /// The services of the stores a push imports anew. Every instance of such a
@@ -281,7 +281,7 @@ enum ChangedInstances {
     Prepared(Box<PreparedEditorSettingsChange>),
     /// The whole documents have to say, with the files' where it is decoded.
     Whole(Option<SettingsBytecode>),
-    /// The store is imported anew (`heavily_changed_store`): the files' copy
+    /// The store is imported anew (`imported_store`): the files' copy
     /// beside what Studio keeps of its own.
     Imported(Box<(SettingsBytecode, SettingsBytecode)>),
 }
@@ -294,8 +294,9 @@ const CHANGED_INSTANCES_MIN_BYTES: usize = if cfg!(test) { 1 } else { 256 * 1024
 /// documents are compared, or the store is imported anew.
 const MAX_CHANGED_INSTANCES: usize = 16_384;
 
-/// The most instances `heavily_changed_store` compares.
-const HEAVY_SAMPLE: usize = 4_096;
+/// The instances of each copy `told_apart` holds whole at a time: one can
+/// hold a mesh's cooked data.
+const COMPARED_AT_ONCE: usize = if cfg!(test) { 64 } else { 1_024 };
 
 /// A copy of a store read by some of its instances: every other one bare
 /// and standing for its counterpart of the other copy.
@@ -320,40 +321,127 @@ fn sparse_document(
     Ok(document)
 }
 
-/// How many of `differing`, the instances whose rows differ in two copies
-/// of a store, differ in what they hold: rows written another way can hold
-/// the same, so a sample of them is compared value by value. The sample
-/// takes one instance of every run of them, at a place that varies from run
-/// to run, so that no regular order of the instances misleads it.
-fn truly_differing(
+/// Tells the instances that differ in what they hold from the ones whose
+/// rows two copies of a store only write another way: `differs` keeps each
+/// of `differing` that holds other values, and their count is the answer. A
+/// capture can write a value the other copy leaves out, in every row of a
+/// class. Once more than `MAX_CHANGED_INSTANCES` differ the store is not
+/// compared instance by instance, so the rest are left as they were, and so
+/// are all of a copy that cannot be read by its rows.
+fn told_apart(
     (desired_bytes, observed_bytes): (&[u8], &[u8]),
     differing: &[usize],
+    differs: &mut [bool],
 ) -> Result<usize> {
-    use crate::settings::bytecode::property_edit::decode_rows;
+    use crate::settings::bytecode::property_edit::decode_for_property_edit;
     use crate::settings::equivalence::canonicalize_instances;
 
-    let run = differing.len().div_ceil(HEAVY_SAMPLE).max(1);
-    let sample = differing
-        .chunks(run)
-        .enumerate()
-        .map(|(at, run)| {
-            run[((at as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32) as usize % run.len()]
+    let (Ok((mut files, mut files_rows)), Ok((mut studio, mut studio_rows))) = rayon::join(
+        || decode_for_property_edit(desired_bytes),
+        || decode_for_property_edit(observed_bytes),
+    ) else {
+        return Ok(differing.len());
+    };
+    let whole = |document: &mut SettingsBytecode, rows: &[usize]| {
+        let mut instances = rows
+            .iter()
+            .map(|row| {
+                let instance = &mut document.instances[*row];
+                SettingsBytecodeInstance {
+                    properties: std::mem::take(&mut instance.properties),
+                    attributes: std::mem::take(&mut instance.attributes),
+                    ..instance.bare()
+                }
+            })
+            .collect::<Vec<_>>();
+        canonicalize_instances(&mut instances)?;
+        anyhow::Ok(instances)
+    };
+    let (mut unlike, mut compared) = (0, 0);
+    for rows in differing.chunks(COMPARED_AT_ONCE) {
+        if unlike > MAX_CHANGED_INSTANCES {
+            break;
+        }
+        let (read_files, read_studio) = rayon::join(
+            || files_rows.materialize(&mut files, rows),
+            || studio_rows.materialize(&mut studio, rows),
+        );
+        if read_files.is_err() || read_studio.is_err() {
+            break;
+        }
+        let (of_files, of_studio) = (whole(&mut files, rows)?, whole(&mut studio, rows)?);
+        let differ = of_files
+            .par_iter()
+            .zip(&of_studio)
+            .map(|(files, studio)| !instance_values_equal(None, files, studio))
+            .collect::<Vec<_>>();
+        for (row, differ) in rows.iter().zip(differ) {
+            differs[*row] = differ;
+            unlike += usize::from(differ);
+        }
+        compared += rows.len();
+    }
+    Ok(unlike + differing.len() - compared)
+}
+
+/// The instances of a store a push reads whole, of `instances` at the same
+/// places in both copies: the ones that differ or name another by its id,
+/// and what a comparison reads of an instance whatever it holds, the roots
+/// and the cameras.
+fn instances_read(
+    instances: &[SettingsBytecodeInstance],
+    (differs, named): (&[bool], &[bool]),
+    paths_too: bool,
+) -> Vec<usize> {
+    let count = instances.len();
+    let mut read = (0..count)
+        .map(|index| {
+            differs[index]
+                || named[index]
+                || instances[index].parent_index.is_none()
+                || instances[index].class_name == "Camera"
         })
         .collect::<Vec<_>>();
-    let (Ok((mut files, _)), Ok((mut studio, _))) = rayon::join(
-        || decode_rows(desired_bytes, &sample),
-        || decode_rows(observed_bytes, &sample),
-    ) else {
-        return Ok(0);
-    };
-    canonicalize_instances(&mut files)?;
-    canonicalize_instances(&mut studio)?;
-    let differ = files
-        .par_iter()
-        .zip(&studio)
-        .filter(|(files, studio)| !instance_values_equal(None, files, studio))
-        .count();
-    Ok(differing.len() * differ / sample.len().max(1))
+    if paths_too {
+        // A request names an instance by its path, and each instance on that
+        // path by what tells it from its namesakes. A store can hold a
+        // parent after its child, so each path is walked to its root.
+        for index in 0..count {
+            if !read[index] {
+                continue;
+            }
+            let mut parent = instances[index].parent_index;
+            let mut steps = 0;
+            while let Some(at) = parent.filter(|at| *at < count && !read[*at]) {
+                read[at] = true;
+                parent = instances[at].parent_index;
+                steps += 1;
+                if steps > count {
+                    break;
+                }
+            }
+        }
+    }
+    // A request that names one of several namesakes tells it from the others
+    // by what each holds, so the namesakes of an instance that is read are
+    // read with it.
+    let namesakes = (0..count)
+        .filter(|&index| read[index])
+        .map(|index| {
+            (
+                instances[index].parent_index,
+                instances[index].name.as_str(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    (0..count)
+        .filter(|&index| {
+            namesakes.contains(&(
+                instances[index].parent_index,
+                instances[index].name.as_str(),
+            ))
+        })
+        .collect()
 }
 
 /// The two copies of a store that holds the same instances at the same
@@ -534,73 +622,32 @@ fn changed_instances_alone(
     if !same_places {
         return hand_over(files);
     }
-    // Read whole: what differs, and what a comparison reads of an instance
-    // whatever it holds, the roots and the cameras.
-    let mut read = vec![false; count];
-    for index in 0..count {
-        if files_digests[index] != observed_rows.digests[index]
-            || files_named[index]
-            || skeleton[index].parent_index.is_none()
-            || skeleton[index].class_name == "Camera"
-        {
-            read[index] = true;
-        }
-    }
-    if files_too {
-        // A request names an instance by its path, and each instance on that
-        // path by what tells it from its namesakes. A store can hold a
-        // parent after its child, so each path is walked to its root.
-        for index in 0..count {
-            if !read[index] {
-                continue;
-            }
-            let mut parent = skeleton[index].parent_index;
-            let mut steps = 0;
-            while let Some(at) = parent.filter(|at| *at < count && !read[*at]) {
-                read[at] = true;
-                parent = skeleton[at].parent_index;
-                steps += 1;
-                if steps > count {
-                    break;
-                }
-            }
-        }
-    }
-    // A request that names one of several namesakes tells it from the others
-    // by what each holds, so the namesakes of an instance that is read are
-    // read with it.
-    let namesakes = (0..count)
-        .filter(|&index| read[index])
-        .map(|index| (skeleton[index].parent_index, skeleton[index].name.as_str()))
-        .collect::<HashSet<_>>();
-    let read = (0..count)
-        .filter(|&index| {
-            namesakes.contains(&(skeleton[index].parent_index, skeleton[index].name.as_str()))
-        })
+    let mut differs = (0..count)
+        .map(|index| files_digests[index] != observed_rows.digests[index])
         .collect::<Vec<_>>();
-    drop(namesakes);
-    if read.len() > MAX_CHANGED_INSTANCES && imports_heavy {
-        let mut names = files_named;
+    let mut read = instances_read(&skeleton, (&differs, &files_named), files_too);
+    if read.len() > MAX_CHANGED_INSTANCES {
+        // The rows that only write the same values another way are not read.
+        let mut names = files_named.clone();
         for index in &observed_rows.named {
             if let Some(names) = names.get_mut(*index) {
                 *names = true;
             }
         }
         let differing = (0..count)
-            .filter(|&index| files_digests[index] != observed_rows.digests[index] && !names[index])
+            .filter(|&index| differs[index] && !names[index])
             .collect::<Vec<_>>();
-        if differing.len() > MAX_CHANGED_INSTANCES
-            && truly_differing((desired_bytes, observed_bytes), &differing)? > MAX_CHANGED_INSTANCES
-        {
+        let copies = (desired_bytes.as_slice(), observed_bytes.as_slice());
+        let unlike = told_apart(copies, &differing, &mut differs)?;
+        if unlike > MAX_CHANGED_INSTANCES && imports_heavy {
             // Neither copy is whole beside the ones the import reads.
             drop(files);
-            let copies = imported_store((desired_bytes, observed_bytes), skeleton)?;
+            let copies = imported_store(copies, skeleton)?;
             if copies.is_some() {
                 crate::app::output::log_global(
                     3,
                     format_args!(
-                        "[renium] push imports a store of {count} instances anew: {} of them differ",
-                        differing.len()
+                        "[renium] push imports a store of {count} instances anew: most of them differ"
                     ),
                 );
             }
@@ -608,6 +655,7 @@ fn changed_instances_alone(
                 ChangedInstances::Imported(Box::new(copies))
             }));
         }
+        read = instances_read(&skeleton, (&differs, &files_named), files_too);
     }
     if read.len() > MAX_CHANGED_INSTANCES || read.len() == count {
         return hand_over(files);
