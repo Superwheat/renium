@@ -59,6 +59,19 @@ fn dispatcher(field: i32, buffer: u8, argument: usize) -> Vec<u8> {
 }
 
 #[test]
+fn receiver_binding_does_not_certify_yield_callbacks() {
+    for field in [0x88, 0x300, 0x2000] {
+        let mut bytes = dispatcher(field, 0x40, 5);
+        bytes[34] = 0x40 + 24; // A different callable layout, same receiver.
+        assert_eq!(
+            dispatch_field(0, |at| (at == 0).then(|| bytes.clone())),
+            Some(field as usize)
+        );
+        assert_eq!(checked(&bytes, 0, 5, 0x1000), None);
+    }
+}
+
+#[test]
 fn yield_callback_tracks_stack_arguments_and_relocated_fields() {
     for field in [0x88, 0xa8, 0x300, 0x2000] {
         for buffer in [0x38, 0x40] {

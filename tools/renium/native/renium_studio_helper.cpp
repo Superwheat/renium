@@ -1382,6 +1382,8 @@ struct PropertyReadTask
     std::vector<PropertyReadParams> batch;
     std::string extraInput;
     std::shared_ptr<renium_functions::Completion> function;
+    const char* stage = "preflight";
+    std::uintptr_t entry = 0;
     HANDLE completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     std::uint64_t deadline = 0;
     ~PropertyReadTask() { if (completed) CloseHandle(completed); }
@@ -1390,6 +1392,8 @@ struct PropertyReadTask
 static void ReadPropertyCore(PropertyReadTask* task)
 {
     auto& p = task->result;
+    task->stage = "preflight";
+    task->entry = 0;
     if (!RemainingMilliseconds(task->deadline))
     {
         p.status = 0xE40F;
@@ -1418,9 +1422,13 @@ static void ReadPropertyCore(PropertyReadTask* task)
             throw std::runtime_error("property target was destroyed before execution");
         auto targetHold = std::shared_ptr<void>(owner, ReleaseOwnerReference);
         using IdentityGetter = void*(__fastcall*)(void*, void*, void*);
+        task->stage = "identity";
+        task->entry = p.identityGetter;
         reinterpret_cast<IdentityGetter>(p.identityGetter)(
             reinterpret_cast<void*>(p.identityBinding), p.identity,
             reinterpret_cast<void*>(p.target));
+        task->stage = "operation";
+        task->entry = 0;
         if (!p.operation || p.operation == 10)
         {
             p.status = 4;
@@ -1431,6 +1439,10 @@ static void ReadPropertyCore(PropertyReadTask* task)
         if (p.operation != 3 && memcmp(p.identity, p.expectedIdentity, sizeof(p.identity)))
             throw std::runtime_error("property target was replaced; request access again");
         if (p.operation == 9) {
+            renium_functions::Input input{};
+            if (p.inputSize >= sizeof(input)) std::memcpy(&input, p.input, sizeof(input));
+            task->stage = "function-adapter";
+            task->entry = input.function;
             task->function = renium_functions::Begin(reinterpret_cast<void*>(p.target), targetHold,
                 p.input, p.inputSize, [](std::uintptr_t address, void* output, std::size_t size) {
                     SIZE_T copied = 0;
@@ -1495,6 +1507,8 @@ static void ReadPropertyCore(PropertyReadTask* task)
         {
             const std::string input(p.input, p.inputSize);
             using Setter = bool(__fastcall*)(void*, void*, const std::string*);
+            task->stage = "setter";
+            task->entry = p.setter;
             if (!reinterpret_cast<Setter>(p.setter)(
                     reinterpret_cast<void*>(p.descriptor), reinterpret_cast<void*>(p.target), &input))
                 throw std::runtime_error("Studio rejected this property's text value");
@@ -1503,6 +1517,8 @@ static void ReadPropertyCore(PropertyReadTask* task)
         // The descriptor constructs the returned std::string in that buffer.
         alignas(std::string) unsigned char storage[sizeof(std::string)];
         using Getter = void*(__fastcall*)(void*, void*, void*);
+        task->stage = "getter";
+        task->entry = p.getter;
         reinterpret_cast<Getter>(p.getter)(
             reinterpret_cast<void*>(p.descriptor), storage, reinterpret_cast<void*>(p.target));
         auto value = reinterpret_cast<std::string*>(storage);
@@ -1639,7 +1655,21 @@ static bool ReadCppException(const EXCEPTION_RECORD* record, char (&output)[256]
 #endif
 }
 
-static int PropertyExceptionFilter(EXCEPTION_POINTERS* exception, PropertyReadParams* result)
+static void PropertyAddress(std::uintptr_t address, char (&text)[80])
+{
+    HMODULE module = nullptr;
+    char path[MAX_PATH]{};
+    if (address && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<const char*>(address), &module) && GetModuleFileNameA(module, path, sizeof(path))) {
+        path[sizeof(path) - 1] = 0;
+        const auto name = std::strrchr(path, '\\');
+        _snprintf_s(text, _TRUNCATE, "%.48s+0x%llX", name ? name + 1 : path,
+            static_cast<unsigned long long>(address - reinterpret_cast<std::uintptr_t>(module)));
+    } else _snprintf_s(text, _TRUNCATE, "unmapped@0x%llX", static_cast<unsigned long long>(address));
+}
+
+static int PropertyExceptionFilter(EXCEPTION_POINTERS* exception, PropertyReadParams* result,
+    const char* stage = "preflight", std::uintptr_t entry = 0)
 {
     result->status = 0xE405;
     result->exceptionCode = exception->ExceptionRecord->ExceptionCode;
@@ -1647,13 +1677,20 @@ static int PropertyExceptionFilter(EXCEPTION_POINTERS* exception, PropertyReadPa
     char message[256]{};
     if (result->exceptionCode == EH_EXCEPTION_NUMBER && ReadCppException(exception->ExceptionRecord, message))
         strncpy_s(result->error, message, _TRUNCATE);
+    else if (result->exceptionCode != EH_EXCEPTION_NUMBER) {
+        char fault[80]{}, called[80]{};
+        PropertyAddress(reinterpret_cast<std::uintptr_t>(exception->ExceptionRecord->ExceptionAddress), fault);
+        PropertyAddress(entry, called);
+        _snprintf_s(result->error, _TRUNCATE,
+            "Studio raised an exception while reading the property; fault=%s; stage=%s; entry=%s", fault, stage, called);
+    }
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
 static void ReadPropertyCaught(PropertyReadTask* task)
 {
     __try { ReadPropertyCore(task); }
-    __except (PropertyExceptionFilter(GetExceptionInformation(), &task->result)) {}
+    __except (PropertyExceptionFilter(GetExceptionInformation(), &task->result, task->stage, task->entry)) {}
 }
 
 static bool ValidPropertyRead(const PropertyReadParams* params, bool& flag)
@@ -1693,6 +1730,8 @@ static DWORD RunPropertyRead(PropertyReadParams* params, std::size_t count = 1)
             p.dataModelOwner != params->dataModelOwner ||
             p.ancestors[p.ancestorCount - 1] != params->ancestors[params->ancestorCount - 1]) return 0xE401;
     }
+    if (params->operation == 9)
+        renium_functions::ValidateCallContract(params->input, params->inputSize);
     auto modelOwner = reinterpret_cast<void*>(params->dataModelOwner);
     if (!AddOwnerReference(modelOwner)) { if (flag) params->status = 0xE410; return 0xE402; }
     auto modelHold = std::shared_ptr<void>(modelOwner, ReleaseOwnerReference);

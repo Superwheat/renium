@@ -16,6 +16,18 @@ struct Input {
 };
 static_assert(sizeof(Input) == 56);
 
+// Called on the transport worker before queue submission, and again by Begin.
+// No Studio pointers are read and no callbacks constructed for an unqualified
+// yield ABI. Reflection's public signature and the queue's callable ABI do not
+// establish the member's hidden continuations or required execution context.
+inline void ValidateCallContract(const char* bytes, std::size_t size) {
+    Input input{};
+    if (size < sizeof(input)) throw std::runtime_error("Truncated function request");
+    std::memcpy(&input, bytes, sizeof(input));
+    if (input.mode == 1 || input.mode == 2)
+        throw std::runtime_error("yield-call-contract: hidden success/error continuation ABI, ownership and execution context unverified; no call executed");
+}
+
 #ifdef _WIN32
 // No C++ objects in this frame: /EHsc does not unwind their destructors on SEH.
 // The finally block runs on a refused read, a C++ exception and a hardware fault.
@@ -79,6 +91,7 @@ struct Completion {
 template<class Read>
 std::shared_ptr<Completion> Begin(void* target, std::shared_ptr<void> hold,
     const char* bytes, std::size_t size, Read read) {
+    ValidateCallContract(bytes, size);
     Input input{};
     if (size < sizeof(input)) throw std::runtime_error("Truncated function request");
     std::memcpy(&input, bytes, sizeof(input));
@@ -98,9 +111,6 @@ std::shared_ptr<Completion> Begin(void* target, std::shared_ptr<void> hold,
     const std::string first(bytes + sizeof(input), input.firstSize);
     const std::string second(bytes + sizeof(input) + input.firstSize, input.secondSize);
     auto result = std::make_shared<Completion>();
-    using Callback = std::function<void(std::string)>;
-    Callback success{[result, hold](std::string value) { result->Finish(std::move(value), true); }};
-    Callback failure{[result, hold](std::string error) { result->Finish(std::move(error), false); }};
     if (input.mode == 4) {
         if (first != "RemovePackageModificationPopupDialog"
             || (input.secondSize != 0 && input.secondSize != sizeof(std::uintptr_t)))
@@ -133,12 +143,6 @@ std::shared_ptr<Completion> Begin(void* target, std::shared_ptr<void> hold,
 #endif
         }
         result->Finish(value ? "true" : "false", true);
-    } else if (input.mode == 1) {
-        using Function = void(*)(void*, std::string, int, int, Callback, Callback);
-        reinterpret_cast<Function>(input.function)(target, first, input.enums[0], input.enums[1], std::move(success), std::move(failure));
-    } else if (input.mode == 2) {
-        using Function = void(*)(void*, std::string, std::string, int, int, int, Callback, Callback);
-        reinterpret_cast<Function>(input.function)(target, first, second, input.enums[0], input.enums[1], input.enums[2], std::move(success), std::move(failure));
     } else {
 #ifdef _WIN32
         struct Receiver {};

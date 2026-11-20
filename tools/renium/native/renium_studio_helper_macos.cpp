@@ -1565,6 +1565,8 @@ static bool RunPropertyCall(const std::string& payload, const std::string& title
         (p.operation == 7 ? task->extraInput.empty() : !task->extraInput.empty()) ||
         p.timeoutMs < 1 || p.ancestors[0] != p.instance)
         throw std::runtime_error("Invalid protected-property request");
+    if (p.operation == 9)
+        renium_functions::ValidateCallContract(p.input, p.inputSize);
     task->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(p.timeoutMs);
     struct Submission
     {

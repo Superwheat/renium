@@ -67,6 +67,21 @@ bool package_flag_confirmation() {
 }
 
 int main() {
+    // Refuse even a stale/direct helper request before any engine memory read.
+    for (unsigned mode : {1u, 2u}) {
+        renium_functions::Input input{};
+        input.mode = mode;
+        input.function = 1;
+        unsigned reads = 0;
+        bool refused = false;
+        try {
+            renium_functions::Begin(nullptr, {}, reinterpret_cast<const char*>(&input), sizeof(input),
+                [&](std::uintptr_t, void*, std::size_t) { ++reads; return false; });
+        } catch (const std::runtime_error& error) {
+            refused = std::strstr(error.what(), "yield-call-contract") != nullptr;
+        }
+        if (!refused || reads) return 4;
+    }
     if (!package_flag_confirmation()) return 3;
     Receiver receiver;
     const auto identity = receiver.identity;

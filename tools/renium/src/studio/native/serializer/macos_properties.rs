@@ -1371,14 +1371,18 @@ impl NativeProperty {
                 == format!(
                     "N3RBX10Reflection{kind}INS_17HttpRbxApiServiceEFNSt3__112basic_stringIcNS3_11char_traitsIcEENS3_9allocatorIcEEEE{tail}"
                 ),
-            "Unsupported native function signature: {signature}"
+            "function-signature detector: unsupported native function signature: {signature}"
         );
         let table = self.memory.pointer(descriptor)?;
         anyhow::ensure!(
             self.memory.pointer(table - 16)? == 0,
-            "Function descriptor is not a complete reflection object"
+            "function-descriptor detector: not a complete reflection object"
         );
-        let (field, function) = self.memory.function_binding(descriptor, table)?;
+        let (field, function) = self
+            .memory
+            .function_binding(descriptor, table)
+            .context("function-entrypoint detector")?;
+        input.validate_call_contract(name, "RobloxStudio", function - self.memory.base, field)?;
         input.bytes[..8].copy_from_slice(&descriptor.to_le_bytes());
         input.bytes[8..16].copy_from_slice(&table.to_le_bytes());
         input.bytes[16..20].copy_from_slice(&(field as u32).to_le_bytes());

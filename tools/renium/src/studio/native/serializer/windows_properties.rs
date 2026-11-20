@@ -584,7 +584,7 @@ impl NativeProperty {
                     format!(".?AV?${kind}@VHttpRbxApiService@RBX@@$$A6A{string}{tail}")
                 },
             NativeError::Unsupported(format!(
-                "Unsupported native function signature: {signature}"
+                "function-signature detector: unsupported native function signature: {signature}"
             ))
         );
         let table = self.memory.read_u64(descriptor)? as usize;
@@ -596,7 +596,7 @@ impl NativeProperty {
                     .checked_add(self.memory.read_u32(locator + 20)? as usize)
                     == Some(locator),
             NativeError::Unsupported(
-                "Function descriptor is not a complete reflection object".into()
+                "function-descriptor detector: not a complete reflection object".into()
             )
         );
         let (field, function) = if input.mode == 4 {
@@ -609,8 +609,10 @@ impl NativeProperty {
                 receiver_offset,
             )?
         } else {
-            functions::binding(&self.memory, studio, &layout, descriptor, table)?
+            functions::binding(&self.memory, studio, &layout, descriptor, table)
+                .context("function-entrypoint detector")?
         };
+        input.validate_call_contract(name, &studio.name, (function - studio.base) as u64, field)?;
         input.bytes[..8].copy_from_slice(&(descriptor as u64).to_le_bytes());
         input.bytes[8..16].copy_from_slice(&(table as u64).to_le_bytes());
         input.bytes[16..20].copy_from_slice(&(field as u32).to_le_bytes());
@@ -2103,6 +2105,16 @@ mod tests {
                 _ => "Studio raised an exception while reading the property",
             };
             assert!(message.contains(expected), "case {index}: {message}");
+            if matches!(index, 8 | 9) {
+                assert!(
+                    message.contains("fault=") && message.contains("+0x"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("stage=identity") && message.contains("entry="),
+                    "{message}"
+                );
+            }
             if exception != 0 {
                 assert!(message.contains(&format!("0x{exception:08X}")), "{message}");
                 assert!(

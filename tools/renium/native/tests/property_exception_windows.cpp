@@ -103,6 +103,20 @@ static void BatchReads()
         rows[25].operation = 3; rows[25].taskContext = 2;
         assert(ReniumReadPropertyBatch(wire.data()) == 0xE401 && submissions == 0);
         rows[25].taskContext = 1;
+        // The transport must refuse an unverified yielding member before it
+        // even submits to Studio. Invalid engine pointers are intentional.
+        for (unsigned mode : {1u, 2u}) {
+            auto request = std::make_unique<PropertyReadParams>(rows[0]);
+            request->operation = 9;
+            request->target = request->ancestors[0] = request->owner = request->dataModelOwner = 1;
+            request->status = request->exceptionCode = 0;
+            renium_functions::Input input{};
+            input.mode = mode; input.function = 1;
+            request->inputSize = sizeof(input);
+            std::memcpy(request->input, &input, sizeof(input));
+            assert(ReniumReadProperty(request.get()) == 0xE408 && submissions == 0);
+            assert(request->exceptionCode == 0 && std::strstr(request->error, "yield-call-contract"));
+        }
         wire[0] = 33;
         assert(ReniumReadPropertyBatch(wire.data()) == 0xE401);
         wire[0] = 26;
@@ -144,6 +158,12 @@ int main(int argc, char**)
         task.deadline = GetTickCount64() + 10000;
         ReadPropertyCaught(&task);
         assert(p.status == (failure == 0 ? 4 : failure == 1 ? 0xE404 : 0xE405));
+        if (failure == 8 || failure == 9) {
+            char entry[80]{};
+            PropertyAddress(p.identityGetter, entry);
+            assert(std::strstr(p.error, "fault=") && std::strstr(p.error, "+0x"));
+            assert(std::strstr(p.error, "stage=identity") && std::strstr(p.error, entry));
+        }
         WriteResult(p);
     }
 

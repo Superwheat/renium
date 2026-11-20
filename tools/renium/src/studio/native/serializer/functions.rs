@@ -6,6 +6,27 @@ pub(super) struct FunctionInput {
     pub bytes: Vec<u8>,
 }
 
+impl FunctionInput {
+    // Reflection RTTI describes public arguments, not hidden continuations or
+    // the execution context required by the member. Receiver discovery alone
+    // cannot certify a yielding call. Keep it disabled until those contracts
+    // have runtime validators; the task-submission ABI is a different contract.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    pub(super) fn validate_call_contract(
+        &self,
+        name: &str,
+        module: &str,
+        entry_rva: u64,
+        field: usize,
+    ) -> Result<()> {
+        ensure!(
+            !matches!(self.mode, 1 | 2),
+            "yield-call-contract: HttpRbxApiService.{name}; candidate={module}+0x{entry_rva:X}, descriptor-field=0x{field:X}; hidden success/error continuation ABI, ownership and execution context unverified; no call executed"
+        );
+        Ok(())
+    }
+}
+
 pub(super) fn input(class: &str, name: &str, arguments: &[Value]) -> Result<FunctionInput> {
     ensure!(
         class == "HttpRbxApiService",
@@ -79,6 +100,42 @@ pub(super) fn package_flag_input() -> FunctionInput {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn yielding_calls_require_a_verified_contract_on_every_image() {
+        for name in [
+            "GetAsync",
+            "GetAsyncFullUrl",
+            "PostAsync",
+            "PostAsyncFullUrl",
+        ] {
+            let args = if name.starts_with("Post") {
+                vec![json!("https://apis.roblox.com/x"), json!("{}")]
+            } else {
+                vec![json!("https://apis.roblox.com/x")]
+            };
+            let input = input("HttpRbxApiService", name, &args).unwrap();
+            for (entry, field) in [(0x1234, 16), (0x87654321, 768)] {
+                let error = input
+                    .validate_call_contract(name, "Studio", entry, field)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("yield-call-contract"));
+                assert!(error.contains(name));
+                assert!(error.contains(&format!("Studio+0x{entry:X}")));
+                assert!(error.contains(&format!("descriptor-field=0x{field:X}")));
+                assert!(error.contains("no call executed"));
+            }
+        }
+        input(
+            "HttpRbxApiService",
+            "GetDocumentationUrl",
+            &[json!("reference/engine")],
+        )
+        .unwrap()
+        .validate_call_contract("GetDocumentationUrl", "Studio", 1234, 16)
+        .unwrap();
+    }
 
     #[cfg(windows)]
     #[test]
