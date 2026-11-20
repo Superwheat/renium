@@ -336,6 +336,7 @@ fn told_apart(
     use crate::settings::bytecode::property_edit::decode_for_property_edit;
     use crate::settings::equivalence::canonicalize_instances;
 
+    let _span = crate::app::profile::span("store rows told apart");
     let (Ok((mut files, mut files_rows)), Ok((mut studio, mut studio_rows))) = rayon::join(
         || decode_for_property_edit(desired_bytes),
         || decode_for_property_edit(observed_bytes),
@@ -457,6 +458,7 @@ fn imported_store(
     (desired_bytes, observed_bytes): (&[u8], &[u8]),
     studio: Vec<SettingsBytecodeInstance>,
 ) -> Result<Option<(SettingsBytecode, SettingsBytecode)>> {
+    let _span = crate::app::profile::span("store prepared for import");
     // What an import keeps of Studio's copy: its roots, the engine's
     // containers under them and the camera of the viewport.
     let kept = (0..studio.len())

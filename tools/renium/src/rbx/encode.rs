@@ -1222,11 +1222,12 @@ pub(crate) fn fill_engine_geometry_from(dom: &mut RbxWeakDom, base: &RbxWeakDom)
     }
 }
 
-/// The last step before a place or model is written. A file carries
-/// collision hulls for every part of a class or for none: the writer fills a
-/// missing one with the database default, the BLOCK placeholder, which makes
-/// the part collide as a box. Leaving the whole class without hulls lets
-/// Studio rebuild them from the meshes on load.
+/// The last step before a place or model is written. A part whose
+/// CollisionFidelity is Box takes the hull Studio stores for one. Every other
+/// part keeps the hull it has; one without a hull loads in Studio as a Box
+/// part whatever the file says of it, since Studio reads the fidelity from
+/// the hull alone and cooks none on load, so the parts left that way are
+/// counted in the log.
 pub(crate) fn finish_place_dom(dom: &mut RbxWeakDom) {
     let key = rbx_dom_weak::Ustr::from(COLLISION_HULL_PROPERTY);
     let boxed = dom
@@ -1246,32 +1247,26 @@ pub(crate) fn finish_place_dom(dom: &mut RbxWeakDom) {
             );
         }
     }
-    let mut by_class: HashMap<rbx_dom_weak::Ustr, (Vec<RbxRef>, usize)> = HashMap::new();
+    let mut by_class = std::collections::BTreeMap::<&str, (usize, usize)>::new();
     for instance in dom.descendants() {
         if !carries_collision_hull(instance.class.as_str()) {
             continue;
         }
-        let entry = by_class.entry(instance.class).or_default();
-        entry.0.push(instance.referent());
+        let entry = by_class.entry(instance.class.as_str()).or_default();
+        entry.0 += 1;
         entry.1 += usize::from(has_collision_hull(instance));
     }
-    for (class, (referents, with_hull)) in by_class {
-        if with_hull == referents.len() {
+    for (class, (parts, with_hull)) in by_class {
+        if with_hull == parts {
             continue;
         }
         crate::app::output::log_global(
             3,
             format_args!(
-                "[renium] {} of {} {class} parts have no collision hull in the files or the base; the file carries none for that class (a part without one would get the box placeholder) and Studio rebuilds them on load; rbx q lists such values under `defaulted`",
-                referents.len() - with_hull,
-                referents.len()
+                "[renium] {} of {parts} {class} parts have no collision hull in the files or the base: Studio loads those as Box parts, which collide as their bounding box until their CollisionFidelity is set in Studio; rbx q lists such values under `defaulted`",
+                parts - with_hull
             ),
         );
-        for referent in referents {
-            if let Some(instance) = dom.get_by_ref_mut(referent) {
-                instance.properties.remove(&key);
-            }
-        }
     }
 }
 
@@ -3276,7 +3271,7 @@ mod tests {
     }
 
     #[test]
-    fn export_never_leaves_a_class_with_some_hulls_missing() {
+    fn export_keeps_the_hulls_of_a_class_where_one_part_has_none() {
         let database = rbx_reflection_database::get().unwrap();
         let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
         let workspace = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
@@ -3313,16 +3308,17 @@ mod tests {
             property(&dom, hull),
             Some(RbxVariant::SharedString(_))
         ));
+        let (kept_hull, kept_box) = (property(&dom, hull), property(&dom, boxed));
         let bare = dom.insert(workspace, RbxInstanceBuilder::new("MeshPart"));
         normalize_export_dom(&mut dom, database);
         finish_place_dom(&mut dom);
         assert_eq!(property(&dom, bare), None);
         assert_eq!(
             property(&dom, hull),
-            None,
-            "one part without a hull leaves the whole class for Studio to rebuild"
+            kept_hull,
+            "a part without a hull takes none from the parts that have one"
         );
-        assert_eq!(property(&dom, boxed), None);
+        assert_eq!(property(&dom, boxed), kept_box);
     }
 
     #[test]
@@ -3392,10 +3388,11 @@ mod tests {
         finish_place_dom(&mut dom);
         assert_eq!(
             property(&dom, tent),
-            None,
-            "one part without a hull clears the class"
+            Some(hull.clone()),
+            "the part without a hull leaves the others theirs"
         );
-        assert_eq!(property(&dom, other), None);
+        assert_eq!(property(&dom, other), Some(hull));
+        assert_eq!(property(&dom, rock), None);
     }
 
     #[test]
@@ -3642,7 +3639,7 @@ mod tests {
     }
 
     #[test]
-    fn encoded_models_do_not_fill_missing_hulls_with_boxes() {
+    fn encoded_models_keep_the_hull_of_a_part_beside_one_without() {
         use crate::tests::support::{settings_document, settings_instance};
         let mut document = settings_document(vec![
             settings_instance("root", "Model", "Model", None),
@@ -3655,16 +3652,19 @@ mod tests {
         );
         let bytes = crate::rbx::model::encode_settings_model(&document, true).unwrap();
         let dom = rbx_binary::from_reader(bytes.as_slice()).unwrap();
-        for instance in dom
-            .descendants()
-            .filter(|instance| instance.class.as_str() == "MeshPart")
-        {
-            assert!(
-                !instance
-                    .properties
-                    .contains_key(&rbx_dom_weak::Ustr::from(COLLISION_HULL_PROPERTY))
-            );
-        }
+        let hull = |name: &str| {
+            dom.descendants()
+                .find(|instance| instance.name == name)
+                .and_then(|instance| {
+                    instance
+                        .properties
+                        .get(&rbx_dom_weak::Ustr::from(COLLISION_HULL_PROPERTY))
+                        .cloned()
+                })
+        };
+        let computed = RbxVariant::SharedString(RbxSharedString::new(b"CSGPHS-hull".to_vec()));
+        assert_eq!(hull("Computed"), Some(computed.clone()));
+        assert_ne!(hull("New"), Some(computed));
     }
 
     #[test]
