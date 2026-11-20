@@ -1406,6 +1406,18 @@ struct ScoreInputs<'a, 'b> {
     told_alone: bool,
 }
 
+/// How a matching by order took an observed instance among its namesakes
+/// under one parent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ByOrder {
+    /// Paired, where both copies hold as many of the namesakes.
+    Paired,
+    /// Paired, where one copy holds more of them.
+    BesideMore,
+    /// One of those more: it is no instance of the reference.
+    More,
+}
+
 struct IdentityAssignment<'a> {
     reference: &'a SettingsBytecode,
     observed: &'a SettingsBytecode,
@@ -1422,10 +1434,9 @@ struct IdentityAssignment<'a> {
     shape_keys: Option<(Vec<u64>, Vec<u64>)>,
     /// A matching that stops at what instances hold reached such a group.
     compares_values: bool,
-    /// The observed instances such a matching paired with a namesake by
-    /// their order under one parent, where it pairs them so, and whether
-    /// one copy holds more of those namesakes.
-    by_order: Option<Vec<(usize, bool)>>,
+    /// The observed instances such a matching took by their order among
+    /// their namesakes under one parent, where it pairs them so.
+    by_order: Option<Vec<(usize, ByOrder)>>,
 }
 
 /// Hash of an instance's subtree by names and classes only, so same-named
@@ -1872,12 +1883,22 @@ impl<'a> IdentityAssignment<'a> {
                     self.compares_values = true;
                     return progressed;
                 };
-                let uneven = observed_group.len() != candidates.len();
+                let how = if observed_group.len() == candidates.len() {
+                    ByOrder::Paired
+                } else {
+                    ByOrder::BesideMore
+                };
+                by_order.extend(
+                    observed_group
+                        .iter()
+                        .skip(candidates.len())
+                        .map(|index| (*index, ByOrder::More)),
+                );
                 let pairs = observed_group
                     .into_iter()
                     .zip(candidates)
                     .collect::<Vec<_>>();
-                by_order.extend(pairs.iter().map(|(index, _)| (*index, uneven)));
+                by_order.extend(pairs.iter().map(|(index, _)| (*index, how)));
                 for (index, candidate) in pairs {
                     self.assign(index, candidate);
                 }
@@ -2246,14 +2267,13 @@ pub(crate) fn settings_ids_told_alone(
 
 /// `settings_ids_told_alone` where namesakes under one parent that nothing
 /// else tells apart are paired by their order, and with it the observed
-/// instances paired so, each with whether one copy holds more of its
-/// namesakes. Such a pair is one instance only where both hold the same,
-/// which is the caller's to see.
+/// instances taken so. Such a pair is one instance only where both hold the
+/// same, which is the caller's to see.
 #[allow(clippy::type_complexity)]
 pub(crate) fn settings_ids_told_in_order(
     reference: &SettingsBytecode,
     observed: &SettingsBytecode,
-) -> Option<(Vec<String>, Vec<Option<usize>>, Vec<(usize, bool)>)> {
+) -> Option<(Vec<String>, Vec<Option<usize>>, Vec<(usize, ByOrder)>)> {
     match_settings_ids(reference, observed, true, true)
 }
 
@@ -2292,7 +2312,7 @@ fn match_settings_ids(
     observed: &SettingsBytecode,
     told_alone: bool,
     in_order: bool,
-) -> Option<(Vec<String>, Vec<Option<usize>>, Vec<(usize, bool)>)> {
+) -> Option<(Vec<String>, Vec<Option<usize>>, Vec<(usize, ByOrder)>)> {
     let preparation_started = Instant::now();
     let cameras = (
         workspace_current_camera_index(reference),
@@ -8174,5 +8194,13 @@ fn namesakes_nothing_tells_apart_are_paired_by_their_order_where_asked() {
     let (ids, places, by_order) = settings_ids_told_in_order(&files, &studio).unwrap();
     assert_eq!(places, [Some(0), Some(1), Some(2), Some(4), None]);
     assert_eq!(ids, ["root", "a", "b", "c", "debug:4"]);
-    assert_eq!(by_order, [(1, true), (2, true), (3, true)]);
+    assert_eq!(
+        by_order,
+        [
+            (4, ByOrder::More),
+            (1, ByOrder::BesideMore),
+            (2, ByOrder::BesideMore),
+            (3, ByOrder::BesideMore)
+        ]
+    );
 }

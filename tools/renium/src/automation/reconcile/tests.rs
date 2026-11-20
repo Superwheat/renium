@@ -7280,6 +7280,34 @@ fn scripts_beside(
 /// holds. What a push makes of it is what it makes of the two whole
 /// documents: the same stores unchanged, the same plan, the same saved-field
 /// differences and the same verdict on what Studio holds afterwards.
+/// Gives the namesakes of a class under one parent what the first of them
+/// holds, but for its UniqueId.
+fn twins_alike(document: &mut SettingsBytecode) {
+    let mut first = HashMap::new();
+    for index in 0..document.instances.len() {
+        let instance = &document.instances[index];
+        if instance.name != "Twin" {
+            continue;
+        }
+        let key = (instance.parent_index, instance.class_name.clone());
+        let Some(&model) = first.get(&key) else {
+            first.insert(key, index);
+            continue;
+        };
+        let (mut properties, attributes) = {
+            let model: &SettingsBytecodeInstance = &document.instances[model];
+            (model.properties.clone(), model.attributes.clone())
+        };
+        let instance = &mut document.instances[index];
+        match instance.properties.remove("UniqueId") {
+            Some(unique) => properties.insert("UniqueId".into(), unique),
+            None => properties.remove("UniqueId"),
+        };
+        instance.properties = properties;
+        instance.attributes = attributes;
+    }
+}
+
 /// What came between two copies of a store since the files were written:
 /// Studio's ids, the files' edits. Answers whether Studio opened the place
 /// again, and whether a push imported the service.
@@ -7377,6 +7405,10 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
         // is not read row by row.
         let block_rows = [1, 3, 8, 4096][(seed >> 2) as usize % 4];
         let mut studio = changed_instances_store(&mut rng);
+        // Namesakes that hold the same, as copies of one model do.
+        if seed % 14 == 3 {
+            twins_alike(&mut studio);
+        }
         let mut files = studio.clone();
         let (reopened, imported) = copies_apart(seed, &mut rng, &mut studio, &mut files);
         let run = files.instances.len() != studio.instances.len();

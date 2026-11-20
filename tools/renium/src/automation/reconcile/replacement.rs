@@ -1,6 +1,7 @@
 use super::*;
 use crate::settings::bytecode::blocks::store_payload_len;
 use crate::settings::bytecode::property_edit::Moved;
+use crate::settings::equivalence::ByOrder;
 use crate::settings::tree::settings_children_by_parent;
 
 pub(crate) fn project_replacement_paths(
@@ -813,11 +814,10 @@ struct Told {
     moved: Moved,
     /// The id the alignment gives each of Studio's.
     ids: Vec<String>,
-    /// Studio's instances paired with a namesake by their order under one
-    /// parent: UniqueIds told neither apart, as after an import of the
-    /// service, which gives every instance another. With each, whether one
-    /// copy holds more of those namesakes.
-    by_order: Vec<(usize, bool)>,
+    /// Studio's instances taken by their order among their namesakes under
+    /// one parent: UniqueIds told none of those apart, as after an import
+    /// of the service, which gives every instance another.
+    by_order: Vec<(usize, ByOrder)>,
 }
 
 /// How Studio's instances stand among the files', each paired by itself,
@@ -866,6 +866,108 @@ fn told_alone(desired_bytes: &[u8], observed_bytes: &[u8]) -> Option<(Told, bool
         },
         as_many_apart,
     ))
+}
+
+/// The instance of the other copy an instance of one stands for, if any.
+type Counterpart<'a> = &'a dyn Fn(usize) -> Option<usize>;
+
+/// Studio's instances that a matching took by their order among namesakes
+/// (`Told::by_order`), with the ones that stand under such an instance, where
+/// they are the instances it took them for; `None` where they may not be.
+/// One paired so is its counterpart only where the two and all Studio holds
+/// under them hold the same, as a comparison by place asks of namesakes
+/// (`positional_identity_preserved`). Where one copy holds more of the
+/// namesakes, more could tell which of them an instance is, so none of this
+/// may be there: an instance the files alone hold under a paired one, an
+/// instance the files hold elsewhere under one Studio holds more. `studio`
+/// and `files` are the instances of the two copies, and `differs` says of
+/// each of Studio's whether its row differs from its counterpart's. What
+/// names one of these instances is `names_one_taken_by_order`'s to find.
+fn taken_by_order(
+    by_order: &[(usize, ByOrder)],
+    (studio, files): (&[SettingsBytecodeInstance], &[SettingsBytecodeInstance]),
+    differs: &[bool],
+    (files_of, studio_of): (Counterpart<'_>, Counterpart<'_>),
+) -> Option<Vec<Option<ByOrder>>> {
+    let mut ordered = vec![None; studio.len()];
+    for (index, how) in by_order {
+        ordered[*index] = Some(*how);
+    }
+    for index in 0..studio.len() {
+        let parent = studio[index].parent_index;
+        if parent.is_some_and(|parent| parent >= index) {
+            return None;
+        }
+        let above = parent.and_then(|parent| ordered[parent]);
+        if above == Some(ByOrder::More) {
+            if files_of(index).is_some() {
+                return None;
+            }
+            ordered[index] = above;
+        } else if ordered[index] != Some(ByOrder::More) {
+            ordered[index] = ordered[index].max(above);
+            if ordered[index].is_some() && differs[index] {
+                return None;
+            }
+        }
+    }
+    (0..files.len())
+        .filter(|index| studio_of(*index).is_none())
+        .all(|index| {
+            // The nearest instance above it that Studio holds as well.
+            let mut above = files[index].parent_index;
+            for _ in 0..files.len() {
+                let Some(parent) = above else {
+                    return true;
+                };
+                if let Some(studio) = studio_of(parent) {
+                    return ordered[studio] != Some(ByOrder::BesideMore);
+                }
+                above = files[parent].parent_index;
+            }
+            false
+        })
+        .then_some(ordered)
+}
+
+/// Whether an instance read of either copy refers to one of `taken`
+/// (`taken_by_order`, of Studio's instances): namesakes that hold the same
+/// are told apart by what names them, and a pairing by their order that took
+/// one for the other reads as a reference that changed. `read` and
+/// `read_of_files` are the instances read of Studio's copy and of the files'.
+fn names_one_taken_by_order(
+    taken: &[Option<ByOrder>],
+    (studio, files): (&SettingsBytecode, &SettingsBytecode),
+    (read, read_of_files): (&[usize], &[usize]),
+    studio_of: Counterpart<'_>,
+) -> bool {
+    use crate::settings::bytecode::for_each_reference;
+    let by_id = |document: &'_ SettingsBytecode| {
+        let ids = document.instances.iter().enumerate();
+        ids.map(|(index, instance)| (instance.settings_id.clone(), index))
+            .collect::<HashMap<_, _>>()
+    };
+    let names = |instance: &SettingsBytecodeInstance,
+                 ids: &HashMap<String, usize>,
+                 taken: &dyn Fn(usize) -> bool| {
+        let mut found = false;
+        let values = instance.properties.values();
+        for value in values.chain(instance.attributes.values()) {
+            for_each_reference(value, &mut |reference| {
+                let id = reference.get("settingsId").and_then(Value::as_str);
+                found |= id.and_then(|id| ids.get(id)).is_some_and(|at| taken(*at));
+            });
+        }
+        found
+    };
+    let (studio_ids, files_ids) = rayon::join(|| by_id(studio), || by_id(files));
+    let of_studio = |index: usize| taken[index].is_some();
+    let of_files = |index: usize| studio_of(index).is_some_and(|studio| taken[studio].is_some());
+    read.iter()
+        .any(|index| names(&studio.instances[*index], &studio_ids, &of_studio))
+        || read_of_files
+            .iter()
+            .any(|index| names(&files.instances[*index], &files_ids, &of_files))
 }
 
 /// `changed_instances_alone` for copies whose instances stand at the same
@@ -1053,58 +1155,29 @@ fn changed_instances_placed(
             files_of(index).is_none_or(|files| files_digests[files] != observed_rows.digests[index])
         })
         .collect::<Vec<_>>();
-    // Namesakes paired by their order are the same instances only where
-    // they and all under them hold the same, as a comparison by place asks
-    // of them (`positional_identity_preserved`). Where one copy holds more
-    // of the namesakes, what the files alone hold under one of them could
-    // be what Studio holds under another: nothing may stand there.
+    // Read whatever they hold: the instances that name another by its id.
+    let kept = (0..studio_count)
+        .map(|index| files_of(index).is_some_and(|files| files_named[files]))
+        .collect::<Vec<_>>();
+    let mut taken = None;
     if let Some(by_order) = told.as_ref().map(|told| &told.by_order)
         && !by_order.is_empty()
     {
-        const PAIRED: u8 = 1;
-        const BESIDE_MORE: u8 = 2;
-        let mut ordered = vec![0; studio_count];
-        for (index, uneven) in by_order {
-            ordered[*index] = if *uneven { BESIDE_MORE } else { PAIRED };
-        }
-        let same = (0..studio_count).all(|index| {
-            let parent = skeleton[index].parent_index;
-            if parent.is_some_and(|parent| parent >= index) {
-                return false;
-            }
-            if let Some(parent) = parent {
-                ordered[index] = ordered[index].max(ordered[parent]);
-            }
-            !(ordered[index] != 0 && differs[index])
-        }) && (0..count)
-            .filter(|index| studio_of(*index).is_none())
-            .all(|index| {
-                // The nearest instance above it that Studio holds as well.
-                let mut above = files_instances[index].parent_index;
-                for _ in 0..count {
-                    let Some(parent) = above else {
-                        return true;
-                    };
-                    if let Some(studio) = studio_of(parent) {
-                        return ordered[studio] != BESIDE_MORE;
-                    }
-                    above = files_instances[parent].parent_index;
-                }
-                false
-            });
-        #[cfg(test)]
-        BY_ORDER[usize::from(same)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if !same {
+        taken = taken_by_order(
+            by_order,
+            (&skeleton, files_instances),
+            &differs,
+            (&files_of, &studio_of),
+        );
+        if taken.is_none() {
+            #[cfg(test)]
+            BY_ORDER[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(ChangedInstances::Apart(match files {
                 Files::Whole(current, ..) => Some(current),
                 Files::Rows(_) => None,
             }));
         }
     }
-    // Read whatever they hold: the instances that name another by its id.
-    let kept = (0..studio_count)
-        .map(|index| files_of(index).is_some_and(|files| files_named[files]))
-        .collect::<Vec<_>>();
     let mut read = instances_read(&skeleton, (&differs, &kept), files_too);
     if read.len() > MAX_CHANGED_INSTANCES {
         // The rows that only write the same values another way are not read.
@@ -1181,6 +1254,23 @@ fn changed_instances_placed(
         |current: SettingsBytecode| Ok(ChangedInstances::Whole((!files_too).then_some(current)));
     if settings_documents_positionally_equivalent(&current, &previous) {
         return Ok(ChangedInstances::None);
+    }
+    if let Some(taken) = &taken {
+        let of_files = match &read_of_files {
+            Some(read) => read.clone(),
+            None => {
+                let alone = (0..count).filter(|index| studio_of(*index).is_none());
+                let paired = read.iter().filter_map(|index| files_of(*index));
+                paired.chain(alone).collect()
+            }
+        };
+        let named =
+            names_one_taken_by_order(taken, (&previous, &current), (&read, &of_files), &studio_of);
+        #[cfg(test)]
+        BY_ORDER[usize::from(!named)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if named {
+            return Ok(ChangedInstances::Apart((!files_too).then_some(current)));
+        }
     }
     let aligned = match (told, moved.and_then(Moved::run)) {
         (Some(told), _) => {
