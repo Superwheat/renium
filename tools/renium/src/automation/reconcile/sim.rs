@@ -1795,7 +1795,7 @@ fn run_baseline_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
 const SCOPED_SERVICES: [&str; 3] = ["ReplicatedStorage", "ServerStorage", "Workspace"];
 
 #[cfg(any(windows, target_os = "macos"))]
-const SCOPED_OUTCOMES: [&str; 7] = [
+const SCOPED_OUTCOMES: [&str; 8] = [
     "scoped pull kept a baseline",
     "scoped pull published and kept none",
     "scoped pull fell back to a whole pull",
@@ -1803,26 +1803,47 @@ const SCOPED_OUTCOMES: [&str; 7] = [
     "scope took a store referring into a moved service",
     "pull not scoped: it covers every service",
     "a scoped pull's baseline answered a later pull",
+    "scope left out a store referring into a service moved only in values",
 ];
 
 #[cfg(any(windows, target_os = "macos"))]
-static SCOPED_COUNTS: [std::sync::atomic::AtomicUsize; 7] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 7];
+static SCOPED_COUNTS: [std::sync::atomic::AtomicUsize; 8] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 8];
 
 #[cfg(any(windows, target_os = "macos"))]
 fn scoped_outcome(index: usize) {
     SCOPED_COUNTS[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// What the plugin lays one change to: each service it touched with how
+/// (`values`, `children`, `subtree`, or `whole`), or `None` where no service
+/// answers for it.
+#[cfg(any(windows, target_os = "macos"))]
+type Laid = Option<Vec<(String, &'static str)>>;
+
+/// Removed subtrees by when they left, which an undo brings back with their
+/// identities.
+#[cfg(any(windows, target_os = "macos"))]
+type Removed = Vec<(u64, Vec<(String, Node)>)>;
+
 /// Studio in the scoped-pull model, with what the plugin lays each change
-/// to, by the version the change made: the services it touched, or `None`
-/// where no service answers for it.
+/// to, by the version the change made.
 #[cfg(any(windows, target_os = "macos"))]
 struct ScopedStudio {
     tree: Tree,
-    changes: Vec<Option<BTreeSet<String>>>,
-    /// Removed subtrees, which an undo brings back with their identities.
-    removed: Vec<Vec<(String, Node)>>,
+    changes: Vec<Laid>,
+    removed: Removed,
+    /// When Studio took its latest proof; the plugin lays an instance that
+    /// arrives in a service by it.
+    proof: u64,
+}
+
+/// When the model made an instance: its id carries the counter then.
+#[cfg(any(windows, target_os = "macos"))]
+fn created(id: &str) -> u64 {
+    id.trim_start_matches(|character: char| !character.is_ascii_digit())
+        .parse()
+        .unwrap_or(0)
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -1833,18 +1854,30 @@ impl ScopedStudio {
 
     /// The plugin's answer for the proof taken at `proof`, as it sends it.
     fn answer_since(&self, proof: u64) -> Value {
-        let mut services = BTreeSet::new();
+        let mut kinds = BTreeMap::<String, Vec<&str>>::new();
         for change in &self.changes[proof as usize..] {
             let Some(touched) = change else {
                 return json!({"unknown": "no service answers for a change"});
             };
-            services.extend(touched.iter().cloned());
+            for (service, kind) in touched {
+                kinds.entry(service.clone()).or_default().push(*kind);
+            }
         }
-        let touched = services
+        let touched = kinds
             .iter()
-            .map(|service| (service.clone(), json!("whole")))
+            .map(|(service, kinds)| {
+                let entries = if kinds.contains(&"whole") {
+                    json!("whole")
+                } else {
+                    kinds
+                        .iter()
+                        .map(|kind| json!({"pathSegments": [service], "pathOrdinals": [1], "kind": kind}))
+                        .collect()
+                };
+                (service.clone(), entries)
+            })
             .collect::<Map<_, _>>();
-        json!({"services": services, "touched": touched})
+        json!({"services": kinds.keys().collect::<Vec<_>>(), "touched": touched})
     }
 
     fn edit(&mut self, rng: &mut Rng, counter: &mut u64, log: &mut Vec<String>) {
@@ -1853,9 +1886,19 @@ impl ScopedStudio {
             self.changes.push(None);
             return;
         }
-        let (what, touched) = scoped_edit(&mut self.tree, &mut self.removed, rng, counter);
+        let (what, touched) = scoped_edit(
+            &mut self.tree,
+            (&mut self.removed, self.proof),
+            rng,
+            counter,
+        );
         log.push(format!("Studio: {what}, laid to {touched:?}"));
         self.changes.push(touched);
+    }
+
+    fn take_proof(&mut self, counter: u64) -> u64 {
+        self.proof = counter;
+        self.version()
     }
 }
 
@@ -1905,16 +1948,17 @@ fn add_workspace(tree: &mut Tree, rng: &mut Rng, counter: &mut u64) {
     }
 }
 
-/// One edit of the scoped model, with the services the plugin lays it to.
+/// One edit of the scoped model, with what the plugin lays it to under the
+/// proof taken at `proof`.
 #[cfg(any(windows, target_os = "macos"))]
 fn scoped_edit(
     tree: &mut Tree,
-    removed: &mut Vec<Vec<(String, Node)>>,
+    removed: (&mut Removed, u64),
     rng: &mut Rng,
     counter: &mut u64,
-) -> (String, Option<BTreeSet<String>>) {
+) -> (String, Laid) {
     loop {
-        if let Some(edit) = try_scoped_edit(tree, removed, rng, counter) {
+        if let Some(edit) = try_scoped_edit(tree, (&mut *removed.0, removed.1), rng, counter) {
             return edit;
         }
     }
@@ -1923,10 +1967,10 @@ fn scoped_edit(
 #[cfg(any(windows, target_os = "macos"))]
 fn try_scoped_edit(
     tree: &mut Tree,
-    removed: &mut Vec<Vec<(String, Node)>>,
+    (removed, proof): (&mut Removed, u64),
     rng: &mut Rng,
     counter: &mut u64,
-) -> Option<(String, Option<BTreeSet<String>>)> {
+) -> Option<(String, Laid)> {
     *counter += 1;
     let fresh = *counter;
     let movable = tree
@@ -1936,28 +1980,30 @@ fn try_scoped_edit(
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
     let all = tree.nodes.keys().cloned().collect::<Vec<_>>();
-    let at = |tree: &Tree, id: &str| Some(BTreeSet::from([tree.service_of(id)?.to_string()]));
+    let laid = |tree: &Tree, id: &str, kind: &'static str| {
+        Some(vec![(tree.service_of(id)?.to_string(), kind)])
+    };
     let edit = match rng.below(11) {
         0..=4 => {
             let id = rng.pick(&movable)?;
             let class = tree.nodes[&id].class.clone();
             let node = tree.nodes.get_mut(&id)?;
-            let what = match (rng.below(5), class.as_str()) {
+            let (what, kind) = match (rng.below(5), class.as_str()) {
                 (0, "StringValue") => {
                     node.value = Some(format!("v{fresh}"));
-                    "value"
+                    ("value", "values")
                 }
                 (0, "ObjectValue") => {
                     node.value = rng.pick(&all);
-                    "reference"
+                    ("reference", "values")
                 }
                 (1, "ModuleScript") => {
                     node.source = Some(format!("return {fresh}\n"));
-                    "source"
+                    ("source", "values")
                 }
                 (2, _) => {
                     node.name = format!("R{fresh}");
-                    "rename"
+                    ("rename", "children")
                 }
                 (3, _) => {
                     let key = format!("A{}", rng.below(2));
@@ -1966,7 +2012,7 @@ fn try_scoped_edit(
                     } else {
                         node.attributes.insert(key, format!("a{fresh}"));
                     }
-                    "attribute"
+                    ("attribute", "values")
                 }
                 (4, _) => {
                     // A tag is an attribute here; the first or last use of a
@@ -1982,32 +2028,46 @@ fn try_scoped_edit(
                         .count();
                     let first_or_last =
                         uses == 0 || (uses == 1 && tree.nodes[&id].attributes.contains_key(&key));
-                    let touched = if first_or_last { None } else { at(tree, &id) };
+                    let touched = if first_or_last {
+                        None
+                    } else {
+                        laid(tree, &id, "values")
+                    };
                     return Some((format!("tag {key} of {id}"), touched));
                 }
                 _ => return None,
             };
-            (format!("{what} of {id}"), at(tree, &id))
+            (format!("{what} of {id}"), laid(tree, &id, kind))
         }
         5 => {
             tree.nodes.get_mut("terrain")?.value = Some(format!("voxels{fresh}"));
-            ("Terrain voxels".to_string(), at(tree, "terrain"))
+            (
+                "Terrain voxels".to_string(),
+                laid(tree, "terrain", "values"),
+            )
         }
         6 | 7 => {
+            // A move within a service has no old parent to name.
             let id = rng.pick(&movable)?;
             let parent = rng.pick(&all)?;
             if parent == "terrain" || tree.subtree(&id).contains(&parent) {
                 return None;
             }
-            let mut touched = at(tree, &id)?;
+            let from = tree.service_of(&id)?.to_string();
             Op::Move(id.clone(), parent.clone()).apply(tree);
-            touched.extend(at(tree, &id)?);
+            let to = tree.service_of(&id)?.to_string();
+            let touched = if from == to {
+                vec![(to, "whole")]
+            } else {
+                vec![(from, "children"), (to, "subtree")]
+            };
             (format!("move of {id} into {parent}"), Some(touched))
         }
         8 => {
             let id = rng.pick(&movable)?;
-            let touched = at(tree, &id);
-            removed.push(
+            let touched = laid(tree, &id, "children");
+            removed.push((
+                fresh,
                 tree.subtree(&id)
                     .into_iter()
                     .map(|id| {
@@ -2015,7 +2075,7 @@ fn try_scoped_edit(
                         (id, node)
                     })
                     .collect(),
-            );
+            ));
             Op::Delete(id.clone()).apply(tree);
             (format!("removal of {id}"), touched)
         }
@@ -2027,24 +2087,37 @@ fn try_scoped_edit(
             let class = ["Folder", "StringValue", "ModuleScript", "ObjectValue"][rng.below(4)];
             let node = new_node(class, parent.clone(), fresh, rng.pick(&all));
             tree.nodes.insert(format!("s{fresh}"), node);
-            (format!("new {class} in {parent}"), at(tree, &parent))
+            let touched = if fresh > proof {
+                laid(tree, &parent, "subtree")
+            } else {
+                None
+            };
+            (format!("new {class} in {parent}"), touched)
         }
         _ => {
             // An undo brings a removed subtree back with its identities, so
             // a reference another store held to it while it was away is
-            // written again: no service answers for it.
+            // written again. The plugin lays it to its service only where
+            // it left since the proof, or was made since and so was named
+            // by no store before.
             let index = rng.below(removed.len().max(1));
-            let subtree = removed.get(index)?;
-            let parent = subtree[0].1.parent.as_ref()?;
-            if !tree.nodes.contains_key(parent)
+            let (_, subtree) = removed.get(index)?;
+            let parent = subtree[0].1.parent.clone()?;
+            if !tree.nodes.contains_key(&parent)
                 || subtree.iter().any(|(id, _)| tree.nodes.contains_key(id))
             {
                 return None;
             }
-            let subtree = removed.remove(index);
+            let (left, subtree) = removed.remove(index);
             let what = format!("undo of the removal of {}", subtree[0].0);
+            let placed = left > proof || subtree.iter().all(|(id, _)| created(id) > proof);
             tree.nodes.extend(subtree);
-            (what, None)
+            let touched = if placed {
+                laid(tree, &parent, "subtree")
+            } else {
+                None
+            };
+            (what, touched)
         }
     };
     Some(edit)
@@ -2059,11 +2132,11 @@ fn scoped_whole_pull(
     (counter, log): (&mut u64, &mut Vec<String>),
 ) -> Option<Held> {
     log.push("whole pull".into());
-    let proof = studio.version();
+    let proof = studio.take_proof(*counter);
     *files = studio.tree.clone();
     let settled = settled_of(&files.snapshot(None));
     if rng.below(5) == 0 {
-        let (what, _) = scoped_edit(files, &mut Vec::new(), rng, counter);
+        let (what, _) = scoped_edit(files, (&mut Vec::new(), 0), rng, counter);
         log.push(format!("  then a file edit: {what}"));
     }
     if rng.below(5) == 0 {
@@ -2112,28 +2185,37 @@ fn scoped_pull_step(
             (service.to_string(), store)
         })
         .collect::<BTreeMap<_, _>>();
-    let moved = match ProofScope::parse(&studio.answer_since(held.version)) {
+    let (moved, paths_moved) = match ProofScope::parse(&studio.answer_since(held.version)) {
         ProofScope::Unknown(reason) => {
             log.push(format!("pull not scoped: {reason}"));
             scoped_outcome(3);
             return Ok(scoped_whole_pull(rng, (studio, files), (counter, log)));
         }
-        ProofScope::Services { services, .. } => services,
+        ProofScope::Services { services, touched } => {
+            let paths_moved = paths_moved_in(&services, &touched);
+            (services, paths_moved)
+        }
     };
-    let referring =
-        referring_services(&held.project, &stores, &moved).map_err(|error| format!("{error:#}"))?;
+    let referring = referring_services(&held.project, &stores, &paths_moved)
+        .map_err(|error| format!("{error:#}"))?;
     if !referring.is_empty() {
         scoped_outcome(4);
     }
     let scope = moved.union(&referring).cloned().collect::<BTreeSet<_>>();
+    if !referring_services(&held.project, &stores, &moved)
+        .map_err(|error| format!("{error:#}"))?
+        .is_subset(&scope)
+    {
+        scoped_outcome(7);
+    }
     log.push(format!(
-        "pull scoped to {scope:?}: Studio moved {moved:?}, stores referring to them {referring:?}"
+        "pull scoped to {scope:?}: Studio moved {moved:?}, structure in {paths_moved:?}, stores referring to it {referring:?}"
     ));
     if scope.len() >= SCOPED_SERVICES.len() {
         scoped_outcome(5);
         return Ok(scoped_whole_pull(rng, (studio, files), (counter, log)));
     }
-    let proof = studio.version();
+    let proof = studio.take_proof(*counter);
     let at_proof = studio.tree.snapshot(None);
     if rng.below(4) == 0 {
         log.push("  before the capture:".into());
@@ -2179,7 +2261,7 @@ fn scoped_pull_step(
     }
     *files = Tree::read(&published)?;
     if rng.below(5) == 0 {
-        let (what, _) = scoped_edit(files, &mut Vec::new(), rng, counter);
+        let (what, _) = scoped_edit(files, (&mut Vec::new(), 0), rng, counter);
         log.push(format!("  then a file edit: {what}"));
     }
     let written = under_scope(&files.snapshot(None));
@@ -2222,6 +2304,7 @@ fn run_scoped_pull_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> 
         tree,
         changes: Vec::new(),
         removed: Vec::new(),
+        proof: counter,
     };
     let mut files = studio.tree.clone();
     let mut held = Some(Held {
@@ -2232,7 +2315,8 @@ fn run_scoped_pull_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> 
     for step in 0..40 {
         match rng.below(8) {
             0 => {
-                let (what, _) = scoped_edit(&mut files, &mut Vec::new(), &mut rng, &mut counter);
+                let (what, _) =
+                    scoped_edit(&mut files, (&mut Vec::new(), 0), &mut rng, &mut counter);
                 log.push(format!("file edit: {what}"));
             }
             1..=3 => {
@@ -2247,7 +2331,7 @@ fn run_scoped_pull_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> 
                 from_scope = false;
                 held = Some(Held {
                     project: files.snapshot(None),
-                    version: studio.version(),
+                    version: studio.take_proof(counter),
                 });
             }
             _ => {
@@ -2310,7 +2394,8 @@ fn seeded_baselines_answer_as_captures_do() {
 
 /// A store outside a pull's scope that refers into a service the pull
 /// captures is written from the capture's paths: a change there during the
-/// pull is outside the scope, one in a service it does not refer to is not.
+/// pull is outside the scope, one in a service it does not refer to is not,
+/// and one of values alone moves none of those paths.
 #[cfg(any(windows, target_os = "macos"))]
 #[test]
 fn a_change_a_store_outside_the_scope_refers_to_falsifies_the_premise() {
@@ -2349,6 +2434,39 @@ fn a_change_a_store_outside_the_scope_refers_to_falsifies_the_premise() {
     assert_eq!(premise("ServerStorage"), ScopedPremise::False);
     assert_eq!(premise("ReplicatedStorage"), ScopedPremise::Inside);
     assert_eq!(premise("Workspace"), ScopedPremise::False);
+    // Studio moved only values in a service another store refers into:
+    // that store writes its references as before. A touch of structure, the
+    // whole service, or the session lock's marker moves them.
+    let scope = BTreeSet::from(["ServerStorage".to_string()]);
+    let premise = |touched: Option<(&str, &str)>| {
+        let touched = touched.map(|(name, kind)| {
+            vec![TouchedInstance {
+                path_segments: vec!["ServerStorage".into(), name.into()],
+                path_ordinals: vec![1, 1],
+                kind: kind.into(),
+            }]
+        });
+        let now = ProofScope::Services {
+            services: scope.clone(),
+            touched: BTreeMap::from([("ServerStorage".to_string(), touched)]),
+        };
+        scoped_premise(&now, &scope, &tree.snapshot(None), &stores).unwrap()
+    };
+    assert_eq!(premise(Some(("N1", "values"))), ScopedPremise::Inside);
+    for kind in ["children", "subtree"] {
+        assert_eq!(premise(Some(("N1", kind))), ScopedPremise::False);
+    }
+    assert_eq!(premise(None), ScopedPremise::False);
+    assert_eq!(
+        premise(Some(("__Renium_SessionLock", "values"))),
+        ScopedPremise::False
+    );
+    let unnamed = BTreeMap::from([("ServerStorage".to_string(), Some(Vec::new()))]);
+    assert_eq!(
+        paths_moved_in(&scope, &unnamed),
+        scope,
+        "a service with no instance named moved as a whole"
+    );
 }
 
 /// A push of chosen instances keeps a baseline only where it sends every

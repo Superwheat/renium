@@ -2400,6 +2400,21 @@ do
 	})()
 	local environment = table.clone(trackerEnvironment)
 	environment.script = { Parent = scopedDependencies }
+	-- Studio numbers instances as it creates them; a proof's probe is one.
+	local creations = 0
+	local function numbered(item, scope)
+		creations += 1
+		local id = `{scope or 0}_{creations}`
+		function item:GetDebugId() return id end
+		return item
+	end
+	local function made(class, name, parent)
+		return numbered(instance(class, name, parent))
+	end
+	environment.Instance = { new = function(class)
+		if class == "Folder" then return numbered({}) end
+		return trackerEnvironment.Instance.new(class)
+	end }
 	local scopedModule = luau.load(trackerSource, { environment = environment })()
 	local watched = { "ReplicatedStorage", "Workspace" }
 	local function serviceOf(item)
@@ -2559,6 +2574,43 @@ do
 	assert(named(answer) == "ReplicatedStorage" and touched(answer, "ReplicatedStorage") == "ReplicatedStorage.Box.Crate:subtree,ReplicatedStorage.Box:children",
 		"an instance removed and restored since the proof: " .. touched(answer, "ReplicatedStorage"))
 	context.observer.stop()
+	-- Created since the proof: nothing could refer to it before it existed.
+	local back = made("Folder", "Back", nil)
+	local old = made("Part", "Old", nil)
+	context = start()
+	local fresh = made("Folder", "Fresh", nil)
+	made("Part", "Inside", fresh)
+	relocate(fresh, workspace)
+	workspace.DescendantAdded:Fire(fresh)
+	workspace.DescendantAdded:Fire(fresh.children[1])
+	answer = scope(context)
+	assert(answer.unknown == nil and named(answer) == "Workspace"
+		and touched(answer, "Workspace") == "Workspace.Fresh:subtree,Workspace:children",
+		"an instance created since the proof belongs to its service")
+	relocate(back, workspace)
+	workspace.DescendantAdded:Fire(back)
+	assert(scope(context).unknown ~= nil, "an instance made before the proof has no answer")
+	local wrapper = made("Folder", "Wrapper", nil)
+	relocate(old, wrapper)
+	relocate(wrapper, workspace)
+	workspace.DescendantAdded:Fire(wrapper)
+	workspace.DescendantAdded:Fire(old)
+	assert(scope(context).unknown ~= nil, "an older instance inside a new one has no answer")
+	local foreign = numbered(instance("Folder", "Foreign", nil), 7)
+	relocate(foreign, workspace)
+	workspace.DescendantAdded:Fire(foreign)
+	assert(scope(context).unknown ~= nil, "a number of another scope has no answer")
+	creations += 1000
+	scope(context)
+	creations -= 500
+	scope(context)
+	local late = made("Folder", "Late", nil)
+	creations += 1000
+	relocate(late, workspace)
+	workspace.DescendantAdded:Fire(late)
+	assert(scope(context).unknown ~= nil, "after a probe numbered below an earlier one, no arrival is new")
+	context.observer.stop()
+	for _, item in { fresh, back, wrapper, foreign, late } do relocate(item, nil) end
 	context = start()
 	collection.TagAdded:Fire("Created")
 	assert(scope(context).unknown ~= nil, "a tag created anywhere has no answer")
@@ -2603,6 +2655,94 @@ do
 		observer.stop()
 	end
 	print("Retained hold: an outside change ends it after its handler; a running lease or an unbroken proof keeps tracking")
+
+	-- A proof kept with tracking stopped, as a scoped pull keeps it: a whole
+	-- push or a push of chosen paths continues it on the same relay.
+	for _, push in { "whole", "chosen" } do
+		context = start()
+		local observer = context.observer
+		deferred = {}
+		moving.Transparency = (moving.Transparency or 0) + 0.25
+		testGame.ItemChanged:Fire(moving, "Transparency")
+		flushDeferred()
+		deferred = nil
+		scope(context)
+		observer.getState({ start = false, retainPushProof = context.proof, retainSeconds = 100 })
+		assert(not observer.getState({ start = false }).tracking, "the kept proof restarted tracking")
+		local relays, listeners = #createdRelays, moving.AttributeChanged:Count()
+		local lease = { start = true, services = watched, trackingGuardId = "push", includeGenerations = true,
+			captureLocalPushProof = true, verifyPushProof = context.proof }
+		if push == "whole" then
+			lease.nativeAttributeRelay, lease.deferNativeTracking = true, true
+		else
+			lease.requirePushProof = true
+		end
+		local state = observer.getState(lease)
+		assert(state.pushProofMatches and state.nativeRelayContinued and state.nativeTrackingDeferred == nil,
+			`{push}: the push continues the kept proof ({state.pushProofMismatch})`)
+		assert(state.tracking and #createdRelays == relays, `{push}: tracking restarts on the same relay`)
+		assert(moving.AttributeChanged:Count() == listeners, `{push}: attributes stay with the native relay`)
+		observer.stop()
+	end
+	print("Kept proof: a push continues it with tracking restarted on its relay")
+
+	-- A Renium edit takes a lease that arms no relay and commits a proof of
+	-- its own: the kept proof's relay goes on observing, and the next pull is
+	-- scoped to what changed since that proof, the edit included.
+	local savedGetTags = collection.GetTags
+	local beamTagged = false
+	collection.GetTags = function(_, target) return if target == beam and beamTagged then { "ProofTag" } else {} end
+	for _, lease in { "edit", "live" } do
+		context = start()
+		local observer = context.observer
+		local relays = #createdRelays
+		local state = observer.getState({ start = true, services = watched, includeGenerations = true,
+			trackingGuardId = if lease == "edit" then "edit" else nil })
+		assert(state.tracking and not state.nativeRelayContinued and #createdRelays == relays,
+			`{lease}: the lease keeps the kept proof's relay`)
+		local seq = observer.getState({ start = false }).seq
+		beamTagged = true
+		tagAdded:Fire(beam)
+		assert(observer.getState({ start = false }).seq > seq, `{lease}: the lease tracks tags beside the kept relay`)
+		seq = observer.getState({ start = false }).seq
+		moving.AttributeChanged:Fire("Probe")
+		assert(observer.getState({ start = false }).seq > seq, `{lease}: the lease tracks attributes beside the kept relay`)
+		testGame.ItemChanged:Fire(corner, "TopLeftRadius")
+		assert(observer.capturePushProof(), `{lease}: the edit commits a proof`)
+		local verified = observer.getState({ start = false, verifyPushProof = context.proof })
+		assert(verified.pushProofMismatch == "a later proof followed it", `{lease}: {verified.pushProofMismatch}`)
+		testGame.ItemChanged:Fire(moving, "Transparency")
+		if lease == "edit" then
+			observer.getState({ start = false, releaseTrackingGuardId = "edit", includeGenerations = true })
+		end
+		answer = scope(context)
+		assert(answer.unknown == nil and named(answer) == "ReplicatedStorage", `{lease}: {answer.unknown}`)
+		assert(touched(answer, "ReplicatedStorage") == "ReplicatedStorage.Beam:values,ReplicatedStorage.Corner:values,"
+			.. "ReplicatedStorage.Left.Duplicate:values", `{lease}: ` .. touched(answer, "ReplicatedStorage"))
+		beamTagged = false
+		observer.stop()
+	end
+	-- A tag set while only the kept proof held tracking reached no tracker
+	-- state; the lease restarts tracking, which reads it.
+	context = start()
+	beamTagged = true
+	tagAdded:Fire(beam)
+	context.observer.getState({ start = true, services = watched, trackingGuardId = "edit" })
+	local seq = context.observer.getState({ start = false }).seq
+	beamTagged = false
+	collection.TagRemoved:Fire("ProofTag")
+	assert(context.observer.getState({ start = false }).seq > seq, "the lease missed a tag set during the hold")
+	context.observer.stop()
+	-- A lease that arms a relay of its own and does not continue the proof
+	-- retires it.
+	context = start()
+	context.observer.getState({ start = true, services = watched, trackingGuardId = "pull", nativeAttributeRelay = true,
+		deferNativeTracking = true })
+	local retired = context.observer.getState({ start = false, capturePushProof = true, scopeFrom = context.proof })
+	assert(retired.pushProofScope.unknown == "proof retired", "a new relay retires the kept proof")
+	context.observer.stop()
+	collection.GetTags = savedGetTags
+	print("Edit lease: the kept proof answers across a Renium edit's lease and commit")
 
 	dependencies.BridgeScriptDocuments.capture = savedCapture
 	table.clear(collection)

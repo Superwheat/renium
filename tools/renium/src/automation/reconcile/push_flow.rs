@@ -1085,6 +1085,7 @@ pub(crate) fn push_targeted(
     let entry = VerifiedFullPush {
         connections: bridge.runtime_connection_signature(&release.runtime_id),
         input: std::mem::take(&mut held.input),
+        sourcemap: sourcemap_after_push(&held, &project),
         project,
         paths: std::mem::take(&mut held.paths),
         proof,
@@ -1092,7 +1093,6 @@ pub(crate) fn push_targeted(
             #[cfg(windows)]
             relay.as_ref(),
         ),
-        exact: held.exact,
         #[cfg(windows)]
         relay,
     };

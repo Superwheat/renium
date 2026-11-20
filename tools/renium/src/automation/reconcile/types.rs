@@ -72,10 +72,14 @@ pub(crate) struct VerifiedFullPush {
     pub(crate) paths: Vec<PathBuf>,
     pub(crate) proof: Value,
     pub(crate) expires: Instant,
-    /// Whether the files are what a pull writes from Studio. A whole push
-    /// leaves them only what a push sends: it sends no Game Settings and not
-    /// the viewport's camera, so Studio may hold other values there.
-    pub(crate) exact: bool,
+    /// Where the files are what a pull writes from Studio, the sourcemap as
+    /// the last pull on them left it: a pull answered from the baseline
+    /// writes the services it does not capture into the sourcemap as the
+    /// file holds them. A whole push leaves the files only what a push
+    /// sends: it sends no Game Settings and not the viewport's camera, so
+    /// Studio may hold other values there. A push of chosen paths keeps the
+    /// sourcemap only where it changed script sources alone.
+    pub(crate) sourcemap: Option<Box<SourcemapState>>,
     #[cfg(windows)]
     pub(crate) relay: Option<NativeRelay>,
 }
@@ -335,11 +339,78 @@ pub(crate) fn retain_verified_full_push(
             #[cfg(windows)]
             relay.as_ref(),
         ),
-        exact: false,
+        sourcemap: None,
         #[cfg(windows)]
         relay,
     };
     keep_baseline(bridge, &release.runtime_id, entry, "full push");
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+const SOURCEMAP: &str = "sourcemap.json";
+
+/// What the project's sourcemap path holds, as a publish records it.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) type SourcemapState = BTreeMap<PathBuf, PublishEntryState>;
+
+/// The sourcemap a baseline keeps after `published`: as the publish left
+/// it, or `held` where it did not write one.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn settled_sourcemap(
+    published: &crate::snapshot::export::PublishedProjectChanges,
+    held: Option<Box<SourcemapState>>,
+) -> Option<Box<SourcemapState>> {
+    let sourcemap = Path::new(SOURCEMAP);
+    if !published.publish_paths.iter().any(|path| path == sourcemap) {
+        return held;
+    }
+    Some(Box::new(
+        published
+            .settled
+            .iter()
+            .filter(|(path, _)| *path == sourcemap)
+            .map(|(path, state)| (path.clone(), state.clone()))
+            .collect(),
+    ))
+}
+
+/// The sourcemap a baseline keeps after a push of chosen paths left its
+/// files as `project`. A pull maps stores and file names; a push that
+/// changed only script sources changes neither.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn sourcemap_after_push(
+    held: &VerifiedFullPush,
+    project: &ProjectSnapshot,
+) -> Option<Box<SourcemapState>> {
+    let sources_only = held.project.entries.len() == project.entries.len()
+        && held.project.entries.iter().all(|(path, entry)| {
+            project
+                .entries
+                .get(path)
+                .is_some_and(|now| now == entry || super::merge::is_source_path(path))
+        });
+    if held.sourcemap.is_some() && !sources_only {
+        log_global(
+            5,
+            format_args!(
+                "[renium] baseline: a pull on it captures every service: the push changed more than script sources"
+            ),
+        );
+    }
+    held.sourcemap.clone().filter(|_| sources_only)
+}
+
+/// Whether the project's sourcemap is as `held` says the last pull on it
+/// left it.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn sourcemap_as_left(root: &Path, held: &VerifiedFullPush) -> Result<bool> {
+    let Some(left) = held.sourcemap.as_ref() else {
+        return Ok(false);
+    };
+    Ok(
+        crate::snapshot::export::collect_publish_hashes(root, &[PathBuf::from(SOURCEMAP)])?
+            == **left,
+    )
 }
 
 /// A pull's use of the held baseline.
@@ -420,10 +491,20 @@ pub(crate) fn pull_baseline<'a>(
     let mut held = take_baseline(context, bridge, &input);
     // Only files a pull would write, still as they were, answer a pull.
     let files_unchanged = match held.as_ref() {
-        Some(entry) => {
-            entry.exact && capture_snapshot(&args.project_root, &entry.paths)? == entry.project
+        Some(entry) if entry.sourcemap.is_some() => {
+            if sourcemap_as_left(&args.project_root, entry)? {
+                capture_snapshot(&args.project_root, &entry.paths)? == entry.project
+            } else {
+                log_global(
+                    5,
+                    format_args!(
+                        "[renium] baseline: pull whole: sourcemap.json is not as the last pull left it"
+                    ),
+                );
+                false
+            }
         }
-        None => false,
+        _ => false,
     };
     if files_unchanged {
         let unchanged = match held.as_ref() {
@@ -552,7 +633,7 @@ impl PullLease<'_> {
                 #[cfg(windows)]
                 self.relay.as_ref(),
             ),
-            exact: true,
+            sourcemap: settled_sourcemap(published, None),
             #[cfg(windows)]
             relay: self.relay,
         };
@@ -701,6 +782,11 @@ pub(crate) fn referring_services(
     stores: &BTreeMap<String, PathBuf>,
     moved: &BTreeSet<String>,
 ) -> Result<BTreeSet<String>> {
+    // No store refers to none of them, and a search for no name reads every
+    // store whole.
+    if moved.is_empty() {
+        return Ok(BTreeSet::new());
+    }
     let needles = moved
         .iter()
         .map(|service| vec![service.clone()])
@@ -782,6 +868,38 @@ pub(crate) enum ScopedPremise {
 }
 
 #[cfg(any(windows, target_os = "macos"))]
+/// The services among `services` where Studio may have moved what another
+/// store refers to. A store writes a reference by its target's path, sibling
+/// ordinals, export and identity; values alone (properties but a name, a
+/// parent or Archivable, attributes, tags, script buffers, voxels) move none,
+/// but for the attribute that makes a folder named as the session lock one,
+/// which leaves it out of the export.
+pub(crate) fn paths_moved_in(
+    services: &BTreeSet<String>,
+    touched: &BTreeMap<String, Option<Vec<TouchedInstance>>>,
+) -> BTreeSet<String> {
+    services
+        .iter()
+        .filter(|service| {
+            !touched
+                .get(*service)
+                .and_then(Option::as_ref)
+                .is_some_and(|instances| {
+                    !instances.is_empty()
+                        && instances.iter().all(|instance| {
+                            instance.kind == "values"
+                                && !instance
+                                    .path_segments
+                                    .iter()
+                                    .any(|segment| segment == "__Renium_SessionLock")
+                        })
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 /// The premise of a pull scoped to `scope` once Studio moved as `now`
 /// says since its proof.
 pub(crate) fn scoped_premise(
@@ -790,12 +908,13 @@ pub(crate) fn scoped_premise(
     project: &ProjectSnapshot,
     stores: &BTreeMap<String, PathBuf>,
 ) -> Result<ScopedPremise> {
-    let ProofScope::Services { services, .. } = now else {
+    let ProofScope::Services { services, touched } = now else {
         return Ok(ScopedPremise::False);
     };
     Ok(
         if services.is_subset(scope)
-            && referring_services(project, stores, services)?.is_subset(scope)
+            && referring_services(project, stores, &paths_moved_in(services, touched))?
+                .is_subset(scope)
         {
             ScopedPremise::Inside
         } else {
@@ -864,14 +983,15 @@ fn plan_scoped_pull(
             format_args!("[renium] baseline: pull not scoped: {reason}"),
         );
     };
-    let moved = match ProofScope::parse(&state["pushProofScope"]) {
+    let (moved, paths_moved) = match ProofScope::parse(&state["pushProofScope"]) {
         ProofScope::Unknown(reason) => {
             not_scoped(&reason);
             return Ok(None);
         }
         ProofScope::Services { services, touched } => {
             log_touched(&touched);
-            services
+            let paths_moved = paths_moved_in(&services, &touched);
+            (services, paths_moved)
         }
     };
     let Some(proof) = state
@@ -883,19 +1003,22 @@ fn plan_scoped_pull(
         return Ok(None);
     };
     let stores = project_store_paths(&args.project_root, &args.src_dir)?;
-    let referring = referring_services(&entry.project, &stores, &moved)?;
+    let referring = referring_services(&entry.project, &stores, &paths_moved)?;
     let services = moved.union(&referring).cloned().collect::<BTreeSet<_>>();
     if services.len() >= sync_services().len() {
         not_scoped("it covers every service");
         return Ok(None);
     }
+    let list =
+        |services: &BTreeSet<String>| services.iter().cloned().collect::<Vec<_>>().join(", ");
     log_global(
         5,
         format_args!(
-            "[renium] baseline: pull scoped to [{}]: Studio moved [{}], stores referring to them [{}]",
-            services.iter().cloned().collect::<Vec<_>>().join(", "),
-            moved.iter().cloned().collect::<Vec<_>>().join(", "),
-            referring.iter().cloned().collect::<Vec<_>>().join(", ")
+            "[renium] baseline: pull scoped to [{}]: Studio moved [{}], values only in [{}], stores referring to the rest [{}]",
+            list(&services),
+            list(&moved),
+            list(&moved.difference(&paths_moved).cloned().collect()),
+            list(&referring)
         ),
     );
     Ok(held.take().map(|held| ScopedPull {
@@ -1060,7 +1183,7 @@ impl ScopedPull {
             paths: self.held.paths,
             proof: self.proof,
             expires,
-            exact: true,
+            sourcemap: settled_sourcemap(published, self.held.sourcemap),
             #[cfg(windows)]
             relay: self.held.relay,
         };

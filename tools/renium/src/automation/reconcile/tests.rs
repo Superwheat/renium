@@ -9495,3 +9495,80 @@ fn a_scoped_answer_reads_its_services_their_touched_instances_and_unknowns() {
         ProofScope::Unknown(_)
     ));
 }
+
+/// Values alone moved no path another store names, so no store is read to
+/// look for one: a search for no service would read each of them whole.
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn no_store_is_read_for_what_refers_to_no_service() -> Result<()> {
+    let store = PathBuf::from("instances/Workspace.renium");
+    let project = ProjectSnapshot {
+        entries: BTreeMap::from([(store.clone(), SnapshotEntry::File(b"no store".to_vec()))]),
+    };
+    let stores = BTreeMap::from([("Workspace".to_string(), store)]);
+    assert!(referring_services(&project, &stores, &BTreeSet::new())?.is_empty());
+    let lighting = BTreeSet::from(["Lighting".to_string()]);
+    assert!(referring_services(&project, &stores, &lighting).is_err());
+    Ok(())
+}
+
+/// A pull answered from a baseline writes no sourcemap for the services it
+/// does not capture, so it answers only while the sourcemap is the one the
+/// last pull on the baseline left. A push of script sources keeps that
+/// sourcemap; one of a store or of other files does not.
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn a_baseline_answers_a_pull_only_while_the_sourcemap_is_as_its_pull_left_it() -> Result<()> {
+    let root = crate::tests::support::temp_dir("sourcemap-as-left");
+    let sourcemap = PathBuf::from("sourcemap.json");
+    fs::write(root.join(&sourcemap), b"{\"name\":\"left\"}")?;
+    let mut published = crate::snapshot::export::PublishedProjectChanges::default();
+    let kept = Box::new(BTreeMap::from([(
+        sourcemap.clone(),
+        crate::snapshot::export::file_publish_state(b"{\"name\":\"kept\"}"),
+    )]));
+    assert!(
+        settled_sourcemap(&published, Some(kept.clone())) == Some(kept),
+        "a pull that wrote no sourcemap keeps the record it had"
+    );
+    published.publish_paths = vec![PathBuf::from("src"), sourcemap.clone()];
+    published.settled =
+        crate::snapshot::export::collect_publish_hashes(&root, std::slice::from_ref(&sourcemap))?;
+    let (module, store) = (
+        PathBuf::from("src/ReplicatedStorage/Module.luau"),
+        crate::system::files::service_settings_path(Path::new("src/ReplicatedStorage")),
+    );
+    let project = |module_bytes: &[u8], store_bytes: &[u8]| ProjectSnapshot {
+        entries: BTreeMap::from([
+            (module.clone(), SnapshotEntry::File(module_bytes.to_vec())),
+            (store.clone(), SnapshotEntry::File(store_bytes.to_vec())),
+        ]),
+    };
+    let mut held = VerifiedFullPush {
+        connections: Vec::new(),
+        input: Value::Null,
+        project: project(b"return 1", b"store"),
+        paths: vec![PathBuf::from("src")],
+        proof: Value::Null,
+        expires: Instant::now(),
+        sourcemap: settled_sourcemap(&published, None),
+        #[cfg(windows)]
+        relay: None,
+    };
+    assert!(held.sourcemap.is_some() && sourcemap_as_left(&root, &held)?);
+    assert!(sourcemap_after_push(&held, &project(b"return 2", b"store")) == held.sourcemap);
+    assert!(sourcemap_after_push(&held, &project(b"return 1", b"renamed")).is_none());
+    let mut added = project(b"return 1", b"store");
+    added.entries.insert(
+        PathBuf::from("src/ReplicatedStorage/Other.luau"),
+        SnapshotEntry::File(b"return 3".to_vec()),
+    );
+    assert!(sourcemap_after_push(&held, &added).is_none());
+    fs::write(root.join(&sourcemap), b"{\"name\":\"edited\"}")?;
+    assert!(!sourcemap_as_left(&root, &held)?);
+    fs::remove_file(root.join(&sourcemap))?;
+    assert!(!sourcemap_as_left(&root, &held)?);
+    held.sourcemap = None;
+    assert!(!sourcemap_as_left(&root, &held)?);
+    Ok(())
+}

@@ -397,6 +397,10 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return { id = relay.notify.Name, generation = relay.attributeGeneration }
 	end
 	local verifiedPushProof = nil
+	-- The native proof a daemon last kept. A later proof of the same relay (a
+	-- Renium edit's commit takes one) replaces the current one; this one
+	-- still answers where Studio moved since it.
+	local keptPushProof = nil
 	-- The proof the current lease verified as it began, which the proof it
 	-- retains may continue.
 	local continuedPushProof = nil
@@ -408,7 +412,16 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	-- what no service answers for (an instance entering a service from outside
 	-- every synced one, a tag created or retired). A proof copies the counts,
 	-- so a later one tells which services moved between the two.
-	local proofLedger = { attributes = {}, tags = {}, unplaced = 0 }
+	-- `created` is the highest creation number a proof's probe took.
+	local proofLedger = { attributes = {}, tags = {}, unplaced = 0, created = -1 }
+	-- The engine numbers instances as it creates them: an undo brings one back
+	-- with its number, a clone takes a new one.
+	local function creationNumber(instance: any): (string?, number?)
+		local ok, id = pcall(instance.GetDebugId, instance, 32)
+		if not ok or type(id) ~= "string" then return nil, nil end
+		local scope, number = string.match(id, "^(%d+)_(%d+)$")
+		return scope, tonumber(number)
+	end
 	local function proofServiceOf(instance: Instance): string?
 		local current = instance
 		while current.Parent ~= nil and current.Parent ~= game do
@@ -422,6 +435,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	-- the whole service. One event costs a few table reads and one write.
 	local function noteTouched(proof, serviceName: string?, instance: Instance?, kind: string)
 		if proof == nil or serviceName == nil then return end
+		if proof == verifiedPushProof and keptPushProof ~= nil and keptPushProof ~= proof then
+			noteTouched(keptPushProof, serviceName, instance, kind)
+		end
 		local touched = proof.touched[serviceName]
 		if touched == true then return end
 		if instance == nil then
@@ -442,6 +458,10 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			end
 		end
 		touched.kinds[instance] = if previous == nil then kind else "subtree"
+	end
+	local function proofById(id: any)
+		if verifiedPushProof ~= nil and verifiedPushProof.id == id then return verifiedPushProof end
+		return if keptPushProof ~= nil and keptPushProof.id == id then keptPushProof else nil
 	end
 	local function releaseLocalPushObservation()
 		if localPushObservation == nil then return end
@@ -585,6 +605,17 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		-- arrival from outside.
 		proof.touched = {}
 		proof.departed = setmetatable({}, { __mode = "k" })
+		-- An instance created after this proof numbers above a probe made now.
+		-- The numbers must rise from proof to proof, or no arrival is new.
+		local made, probe = pcall(Instance.new, "Folder")
+		local scope, number = nil, nil
+		if made then
+			scope, number = creationNumber(probe)
+		end
+		if number ~= nil and number > proofLedger.created then
+			proof.createdScope, proof.createdAfter = scope, number
+		end
+		proofLedger.created = math.max(proofLedger.created, number or proofLedger.created)
 		verifiedPushProof = proof
 		return proof.id, nil
 	end
@@ -609,7 +640,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	end
 	function api.verifyPushProof(id: any): (boolean, string?)
 		local proof = verifiedPushProof
-		if proof == nil or proof.id ~= id then return false, "proof retired" end
+		if proof == nil or proof.id ~= id then
+			return false, if proofById(id) ~= nil then "a later proof followed it" else "proof retired"
+		end
 		local matches, reason = matchesPushState(proof)
 		if not matches then return false, reason end
 		local terrain = proofTerrain(proof.terrainRequired)
@@ -732,7 +765,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	end
 	-- An instance entering a service from outside every synced one may be one
 	-- another service's reference named while it was away, which that
-	-- service's store then holds as no value; no service answers for it.
+	-- service's store then holds as no value; no service answers for it. One
+	-- created since the proof cannot be: nothing referred to it before it
+	-- existed, and a reference set since moved its holder's service.
 	local function noteStructure(serviceName: string, instance: Instance, included: boolean?, added: boolean)
 		if included == false then return end
 		local proof = verifiedPushProof
@@ -745,7 +780,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			return
 		end
 		local moved = proof ~= nil and proof.departed[instance] == true
-		if not moved then
+		local new = false
+		if not moved and proof ~= nil and proof.createdAfter ~= nil then
+			local scope, number = creationNumber(instance)
+			new = scope == proof.createdScope and number ~= nil and number > proof.createdAfter
+		end
+		if not moved and not new then
 			proofLedger.unplaced += 1
 		end
 		if proof == nil then return end
@@ -757,7 +797,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			above = above.Parent
 		end
 		noteTouched(proof, serviceName, instance, "subtree")
-		if moved then
+		if moved or new then
 			noteTouched(proof, serviceName, instance.Parent, "children")
 		end
 	end
@@ -783,8 +823,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	-- The services Studio differs from proof `id` in now, read without
 	-- tracking, or why it cannot say.
 	function api.pushProofScope(id: any): { [string]: any }
-		local proof = verifiedPushProof
-		if proof == nil or proof.id ~= id then return { unknown = "proof retired" } end
+		local proof = proofById(id)
+		if proof == nil then return { unknown = "proof retired" } end
 		local differs, laid = proofDifference(proof, proofStateNow(proof))
 		if differs == nil then return { unknown = laid } end
 		return proofScopeAnswer(proof, differs, laid)
@@ -1457,21 +1497,26 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		state.changeEvent:Fire(state.seq)
 	end
 
-	-- Tracking that only retained proofs hold ends at the first outside change
-	-- that breaks the proof, as their guards' expiry would end it, so Studio's
-	-- further edits run untracked. The proof's own observers keep reading.
-	local function releaseRetainedHold()
+	local function heldOnlyByRetainedProofs(): boolean
 		if not state.started or state.persistentTracking or state.changeJournal ~= nil
 			or next(state.trackingGuards) == nil then
-			return
+			return false
 		end
 		local relay, observation = nativeAttributeRelay, localPushObservation
 		for guardId in pairs(state.trackingGuards) do
 			if not (relay ~= nil and relay.cached and relay.retainedGuardId == guardId)
 				and not (observation ~= nil and observation.cached and observation.guardId == guardId) then
-				return
+				return false
 			end
 		end
+		return true
+	end
+
+	-- Tracking that only retained proofs hold ends at the first outside change
+	-- that breaks the proof, as their guards' expiry would end it, so Studio's
+	-- further edits run untracked. The proof's own observers keep reading.
+	local function releaseRetainedHold()
+		if not heldOnlyByRetainedProofs() then return end
 		if verifiedPushProof ~= nil and matchesPushState(verifiedPushProof) then return end
 		table.clear(state.trackingGuards)
 		releaseLocalPushObservation()
@@ -2494,7 +2539,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			proofLedger.tags[proofService] = (proofLedger.tags[proofService] or 0) + 1
 			noteTouched(verifiedPushProof, proofService, instance, "values")
 		end
-		if nativeAttributeRelay and nativeAttributeRelay.cached then return end
+		if nativeAttributeRelay and nativeAttributeRelay.cached and (not state.started or heldOnlyByRetainedProofs()) then
+			return
+		end
 		local fingerprint = tagFingerprint(instance)
 		local previous = state.tagFingerprintByInstance[instance]
 		-- While a transaction holds a natively inserted tree, CollectionService
@@ -3154,7 +3201,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				promoteNativeAttributeConnections()
 				if relay.cached then
 					local retainedGuardId = relay.retainedGuardId
-					verifiedPushProof = nil
+					verifiedPushProof, keptPushProof = nil, nil
 					releaseProofConnections(relay)
 					releaseTagConnections()
 					relay.connection:Disconnect()
@@ -4496,7 +4543,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					pushProofScope = if not pushProofMatches and params.scopePushProof == true
 						then api.pushProofScope(params.verifyPushProof) else nil }
 			end
-			if params.requirePushProof == true and not (pushProofMatches and state.started) then
+			-- A native proof's observers outlive tracking; a local proof ends with it.
+			if params.requirePushProof == true and not (pushProofMatches
+				and (state.started or (nativeAttributeRelay ~= nil and nativeAttributeRelay.cached))) then
 				return { ok = true, pushProofMatches = false, pushProofMismatch = pushProofMismatch or "tracking stopped" }
 			end
 			continuedPushProof = if pushProofMatches then verifiedPushProof else nil
@@ -4513,7 +4562,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				acquireTrackingGuard(localPushObservation.guardId, retainSeconds)
 				localPushObservation.cached = true
 				retainedProofLocal = true
+				keptPushProof = nil
 			else
+				keptPushProof = verifiedPushProof
 				nativeAttributeRelay.cached = true
 				nativeAttributeRelay.notify:SetAttribute("CachedPushProof", true)
 				-- Keep listeners armed while the proof lives so the next push
@@ -4546,11 +4597,30 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		local continuedNativeRelay = false
 		if params.start ~= false and params.stop ~= true and params.releaseTrackingGuardId == nil
-			and nativeAttributeRelay and nativeAttributeRelay.cached and pushProofMatches and wasTracking then
+			and nativeAttributeRelay and nativeAttributeRelay.cached and pushProofMatches then
 			-- The daemon that retained this proof continues the same lease: the
-			-- relay, its native worker and every listener stay armed.
+			-- relay, its native worker and every listener stay armed. Its
+			-- observers outlive tracking, so a proof that still holds covers the
+			-- time Studio ran untracked, and tracking restarts on the relay
+			-- before anything can yield.
 			nativeAttributeRelay.cached = false
+			if not wasTracking then
+				nativeAttributeRelay.ready = not state.persistentTracking
+			end
 			continuedNativeRelay = true
+		elseif params.start ~= false and params.stop ~= true and params.releaseTrackingGuardId == nil
+			and nativeAttributeRelay and nativeAttributeRelay.cached and params.nativeAttributeRelay ~= true then
+			-- A lease that arms no relay of its own (a Renium edit) watches
+			-- attributes with local listeners, and the kept proof's relay goes
+			-- on observing for that proof: the next pull is scoped to what the
+			-- edit touched. Tracking that only the proof held restarts with the
+			-- lease, as it does after a replaced relay below.
+			if heldOnlyByRetainedProofs() then
+				stopTracking()
+			elseif nativeAttributeRelay.ready then
+				promoteNativeAttributeConnections()
+			end
+			wasTracking = state.started
 		elseif params.start ~= false and params.stop ~= true and params.releaseTrackingGuardId == nil
 			and nativeAttributeRelay and nativeAttributeRelay.cached then
 			-- A new tracking lease can follow a daemon restart before the old
@@ -4558,7 +4628,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			-- must never disarm or bypass the new observer. The listeners retained
 			-- for the retired proof end with it so the new lease starts cleanly.
 			local retainedGuardId = nativeAttributeRelay.retainedGuardId
-			verifiedPushProof = nil
+			verifiedPushProof, keptPushProof = nil, nil
 			releaseProofConnections(nativeAttributeRelay)
 			releaseTagConnections()
 			nativeAttributeRelay.connection:Disconnect()
@@ -4575,7 +4645,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		if params.deferNativeTracking == true and params.nativeAttributeRelay == true
 			and params.start ~= false and params.stop ~= true and params.releaseTrackingGuardId == nil
-			and not wasTracking and not state.persistentTracking
+			and not wasTracking and not state.persistentTracking and not continuedNativeRelay
 			and type(params.trackingGuardId) == "string" and params.trackingGuardId ~= ""
 		then
 			local path = prepareNativeAttributeRelay(services)
@@ -4664,11 +4734,11 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if params.capturePushProof == true then
 			-- Taken under one observation with the proof it follows, the new
 			-- proof tells which services moved since the held one.
-			local held = verifiedPushProof
+			local held = proofById(params.scopeFrom)
 			response.verifiedPushProof = api.capturePushProof()
 			if params.scopeFrom ~= nil then
 				local differs, laid = nil, "proof retired"
-				if held == nil or held.id ~= params.scopeFrom then
+				if held == nil then
 					laid = "proof retired"
 				elseif response.verifiedPushProof == nil then
 					laid = "Studio gave no new proof"
@@ -4735,7 +4805,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	end
 
 	function api.stop()
-		verifiedPushProof = nil
+		verifiedPushProof, keptPushProof = nil, nil
 		if nativeAttributeRelay then
 			nativeAttributeRelay.cached = false
 		end
