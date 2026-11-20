@@ -1069,6 +1069,7 @@ pub(crate) fn append_aligned_settings_push_plan(
     let observed_paths =
         build_editor_instance_paths_for_indices(observed, &service, &root_removals);
     let mut descriptors = Vec::with_capacity(root_removals.len());
+    let sibling_counts = editor_sibling_group_counts(observed);
     for index in root_removals {
         if observed.instances[index].class_name == "PackageLink" {
             bail!(
@@ -1083,11 +1084,12 @@ pub(crate) fn append_aligned_settings_push_plan(
             )
         })?;
         descriptors.push(
-            editor_instance_descriptor_for_known_path(
+            editor_instance_descriptor_from_path(
                 observed,
                 index,
                 path_info.path_segments,
                 path_info.path_ordinals,
+                &sibling_counts,
             )
             .context("Failed to describe a reconciled instance removal")?,
         );

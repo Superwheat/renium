@@ -19,7 +19,7 @@ use super::runtime::{acknowledge_pulled_changes, automation_pull_args, automatio
 use crate::app::output::{ensure_plugin_api_ok, global_log_enabled, log_global};
 use crate::app::timing::elapsed_ms;
 use crate::cli::PushEditorChangesArgs;
-use crate::editor::diff::editor_instance_descriptor_for_known_path;
+use crate::editor::diff::{editor_instance_descriptor_from_path, editor_sibling_group_counts};
 use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
     build_editor_instance_paths_for_indices, build_editor_source_paths_by_index,
