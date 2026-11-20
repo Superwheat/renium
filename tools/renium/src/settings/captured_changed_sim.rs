@@ -1145,6 +1145,36 @@ fn instances_under_namesakes_take_the_whole_alignment() {
     );
 }
 
+/// The row comparison leaves the viewport camera out, so a camera Studio
+/// gave another name is not one of its changed instances: the alignment of
+/// the whole documents writes the name.
+#[test]
+fn a_renamed_viewport_camera_takes_the_whole_alignment() {
+    let mut stored = workspace_with_a_subject("Size");
+    stored.instances[1].properties.remove("CameraSubject");
+    let mut renamed = stored.clone();
+    renamed.instances[1].name = "Cam".into();
+    for native in [false, true] {
+        let file = encode_service_settings_binary(&captured(&stored, native)).unwrap();
+        let state = captured(&renamed, native);
+        let now = pulled_digest_from_service_state(&state).unwrap();
+        let answer = pull_changed_document_rows(&state, &now.rows, &file, None).unwrap();
+        let aligned = align_pulled_settings_documents_to_reference(
+            decode_settings_bytecode(&file).unwrap(),
+            settings_bytecode_from_service_state(&state).unwrap(),
+            &|| encode_service_settings_binary_over(&state, Some(&file)),
+            std::time::Instant::now(),
+            &file,
+        )
+        .unwrap();
+        assert!(matches!(aligned.alignment, SettingsAlignment::Changed(_)));
+        assert!(
+            answer
+                .is_none_or(|(answer, _)| same_alignment(Some(&answer), Some(&aligned.alignment)))
+        );
+    }
+}
+
 /// Under other ids than the store's, instances that nothing tells apart
 /// but what they hold are the alignment's to match once one of them holds
 /// other values, also where a pull remembers the store.

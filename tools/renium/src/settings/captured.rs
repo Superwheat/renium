@@ -908,11 +908,13 @@ fn changed_rows<'a>(
     let camera_pair = last.filter(|_| now.viewport_camera.is_some());
     // Each pair is one instance in one place: an instance under another
     // name, class or parent is matched by the alignment.
-    // Paired each by itself, an instance is the stored one under whatever
-    // name and parent.
+    // Paired each by itself, a changed instance is the stored one under
+    // whatever name and parent. The camera's pair is compared for its
+    // values alone, so it has to stand as the stored one does.
     if pairs
         .iter()
-        .any(|pair| !(pair.placed || paired && pair.same_class))
+        .enumerate()
+        .any(|(index, pair)| !(pair.placed || paired && index < changed.len() && pair.same_class))
     {
         return whole("an instance stands under another name, class or parent than the stored one");
     }
