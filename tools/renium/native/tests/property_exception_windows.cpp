@@ -31,11 +31,100 @@ static void WriteResult(const PropertyReadParams& result)
     assert(std::fwrite(&result, sizeof(result), 1, stdout) == 1);
 }
 
-int main()
+static unsigned submissions;
+static std::function<void()> delayed;
+static bool SubmitRead(void*, std::function<void()>* work, std::uint32_t)
+{
+    ++submissions;
+    (*work)();
+    return true;
+}
+static bool DelayRead(void*, std::function<void()>* work, std::uint32_t)
+{
+    delayed = *work;
+    return true;
+}
+static void* ReadIdentity(void*, void* output, void*)
+{
+    std::memset(output, 1, 16);
+    return output;
+}
+static void* ReadValue(void*, void* output, void* target)
+{
+    const auto index = *static_cast<std::uint64_t*>(target);
+    if (index == 1) throw std::runtime_error("standard refusal");
+    if (index == 2) throw static_cast<const char*>("literal refusal");
+    if (index == 3) RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+    return new(output) std::string(std::to_string(index));
+}
+static void BatchReads()
+{
+    renium_continuation::taskAbi.store(renium_continuation::Abi::Msvc);
+    for (unsigned shift : {0u, 8u}) {
+        std::uint64_t owner[]{0, 2}, descriptor = 43, targets[26][12]{};
+        std::vector<std::uint64_t> wire((8 + 26 * sizeof(PropertyReadParams)) / 8);
+        wire[0] = 26;
+        auto rows = reinterpret_cast<PropertyReadParams*>(wire.data() + 1);
+        for (unsigned i = 0; i < 26; ++i) {
+            auto& p = rows[i];
+            p.target = reinterpret_cast<std::uintptr_t>(targets[i]);
+            p.owner = p.dataModelOwner = reinterpret_cast<std::uintptr_t>(owner);
+            p.taskContext = 1; p.submitTask = reinterpret_cast<std::uintptr_t>(&SubmitRead);
+            p.classDescriptor = 42; p.descriptorVtable = descriptor;
+            p.descriptor = reinterpret_cast<std::uintptr_t>(&descriptor);
+            p.classOffset = 16 + shift; p.selfOffset = 32 + shift; p.parentOffset = 64 + shift;
+            targets[i][0] = i; targets[i][p.classOffset / 8] = 42;
+            targets[i][p.selfOffset / 8] = p.target; targets[i][p.selfOffset / 8 + 1] = p.owner;
+            targets[i][p.parentOffset / 8] = 99;
+            p.ancestorCount = 2; p.ancestors[0] = p.target; p.ancestors[1] = 99;
+            p.identityBinding = 1; p.identityGetter = reinterpret_cast<std::uintptr_t>(&ReadIdentity);
+            p.getter = reinterpret_cast<std::uintptr_t>(&ReadValue); p.operation = 3; p.timeoutMs = 2000;
+        }
+        targets[4][rows[4].classOffset / 8] = 0;
+        targets[5][rows[5].parentOffset / 8] = 0;
+        targets[6][rows[6].selfOffset / 8 + 1] = 0;
+        submissions = 0;
+        assert(ReniumReadPropertyBatch(wire.data()) == 0 && submissions == 1);
+        for (unsigned i = 0; i < 26; ++i) {
+            auto single = std::make_unique<PropertyReadParams>(rows[i]);
+            single->status = single->exceptionCode = single->outputSize = 0;
+            std::memset(single->error, 0, sizeof(single->error));
+            const auto exit = ReniumReadProperty(single.get());
+            assert(exit == (rows[i].status == 4 ? 0 : rows[i].status));
+            assert(single->status == rows[i].status && single->exceptionCode == rows[i].exceptionCode);
+            assert(!std::strcmp(single->error, rows[i].error));
+            assert(single->outputSize == rows[i].outputSize);
+            assert(!std::memcmp(single->output, rows[i].output, single->outputSize));
+            assert(!std::memcmp(single->identity, rows[i].identity, sizeof(single->identity)));
+        }
+        submissions = 0;
+        rows[25].operation = 2;
+        assert(ReniumReadPropertyBatch(wire.data()) == 0xE401 && submissions == 0);
+        rows[25].operation = 3; rows[25].taskContext = 2;
+        assert(ReniumReadPropertyBatch(wire.data()) == 0xE401 && submissions == 0);
+        rows[25].taskContext = 1;
+        wire[0] = 33;
+        assert(ReniumReadPropertyBatch(wire.data()) == 0xE401);
+        wire[0] = 26;
+        const auto ownerBeforeTimeout = owner[1];
+        for (unsigned i = 0; i < 26; ++i) {
+            rows[i].submitTask = reinterpret_cast<std::uintptr_t>(&DelayRead);
+            rows[i].timeoutMs = 1;
+        }
+        assert(ReniumReadPropertyBatch(wire.data()) == 0xE40F);
+        wire.clear(); wire.shrink_to_fit(); // The late task owns its input.
+        Sleep(20); // Let the coarse GetTickCount64 deadline expire before delivery.
+        delayed(); delayed = {};
+        assert(owner[1] == ownerBeforeTimeout);
+    }
+}
+
+int main(int argc, char**)
 {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     _set_error_mode(_OUT_TO_STDERR);
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    if (argc > 1) { BatchReads(); return 0; }
     assert(_setmode(_fileno(stdout), _O_BINARY) != -1);
     const std::uint64_t layout[]{sizeof(PropertyReadParams), offsetof(PropertyReadParams, status),
         offsetof(PropertyReadParams, exceptionCode), offsetof(PropertyReadParams, error),

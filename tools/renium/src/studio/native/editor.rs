@@ -5639,6 +5639,47 @@ fn unreadable_property_rows(
 }
 
 #[cfg(any(windows, target_os = "macos"))]
+fn unreadable_property_batch(
+    pid: u32,
+    title: &str,
+    rows: &[EditorPropertyChange],
+    fields: &[(usize, String)],
+) -> Result<Vec<bool>> {
+    #[cfg(windows)]
+    {
+        anyhow::ensure!(fields.len() <= 32, "Supplemental read exceeds batch bound");
+        let paths = fields
+            .iter()
+            .map(|(index, _)| serializer::NativePropertyPath {
+                segments: &rows[*index].path_segments,
+                ordinals: &rows[*index].path_ordinals,
+            })
+            .collect::<Vec<_>>();
+        let names = fields
+            .iter()
+            .map(|(index, name)| (rows[*index].class_name.as_str(), name.as_str()))
+            .collect::<Vec<_>>();
+        let mut batch =
+            serializer::NativePropertyBatch::new(pid, title, &paths, Duration::from_secs(2), None)?;
+        batch
+            .read_many(&names, Duration::from_secs(2), |index, value| {
+                let (row, name) = &fields[index];
+                let row = &rows[*row];
+                value.and_then(|text| {
+                    native_property_matches(&row.class_name, name, &row.properties[name], &text)
+                })
+            })?
+            .into_iter()
+            .collect()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (pid, title, rows, fields);
+        Ok(Vec::new()) // Keep the existing platform reader.
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 fn verify_unreadable_properties(
     bridge: &BridgeServer,
     rows: &[EditorPropertyChange],
@@ -5653,20 +5694,33 @@ fn verify_unreadable_properties(
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
     let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
     let title = serializer::target_name(pid, &info.place_name)?;
+    let mut batched = unreadable_property_batch(pid, &title, rows, &fields)
+        .unwrap_or_else(|error| {
+            crate::app::output::log_global(
+                5,
+                format_args!(
+                    "[renium] native supplemental batch unavailable; using single reads: {error:#}"
+                ),
+            );
+            Vec::new()
+        })
+        .into_iter();
     let mut verified = 0;
     for (index, name) in fields {
         let row = &rows[index];
-        let value = serializer::read_property(
-            pid,
-            &title,
-            &row.path_segments,
-            &row.path_ordinals,
-            &row.class_name,
-            &name,
-            Duration::from_secs(2),
-        )
-        .and_then(|text| {
-            native_property_matches(&row.class_name, &name, &row.properties[&name], &text)
+        let value = batched.next().map(Ok).unwrap_or_else(|| {
+            serializer::read_property(
+                pid,
+                &title,
+                &row.path_segments,
+                &row.path_ordinals,
+                &row.class_name,
+                &name,
+                Duration::from_secs(2),
+            )
+            .and_then(|text| {
+                native_property_matches(&row.class_name, &name, &row.properties[&name], &text)
+            })
         });
         let value = match value {
             Ok(value) => value,

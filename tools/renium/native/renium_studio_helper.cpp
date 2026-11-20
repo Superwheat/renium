@@ -1379,6 +1379,7 @@ static_assert(offsetof(PropertyReadParams, reserved) == 131500);
 struct PropertyReadTask
 {
     PropertyReadParams result{};
+    std::vector<PropertyReadParams> batch;
     std::string extraInput;
     std::shared_ptr<renium_functions::Completion> function;
     HANDLE completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -1655,12 +1656,12 @@ static void ReadPropertyCaught(PropertyReadTask* task)
     __except (PropertyExceptionFilter(GetExceptionInformation(), &task->result)) {}
 }
 
-static DWORD RunPropertyRead(PropertyReadParams* params)
+static bool ValidPropertyRead(const PropertyReadParams* params, bool& flag)
 {
     renium_functions::Input function{};
     if (params && params->operation == 9 && params->inputSize >= sizeof(function))
         std::memcpy(&function, params->input, sizeof(function));
-    const bool flag = params && (params->operation == 10 || (function.mode == 4
+    flag = params && (params->operation == 10 || (function.mode == 4
         && function.firstSize == sizeof("RemovePackageModificationPopupDialog") - 1
         && params->inputSize >= sizeof(function) + function.firstSize
         && !std::memcmp(params->input + sizeof(function), "RemovePackageModificationPopupDialog", function.firstSize)));
@@ -1676,12 +1677,28 @@ static DWORD RunPropertyRead(PropertyReadParams* params)
         || (params->operation == 10 && params->ancestorCount != 1) ||
         params->ancestors[0] != params->target ||
         !params->timeoutMs || params->timeoutMs > (params->operation == 9 ? 30000 : 3000))
-        return 0xE401;
+        return false;
+    return true;
+}
+
+static DWORD RunPropertyRead(PropertyReadParams* params, std::size_t count = 1)
+{
+    bool flag = false;
+    if (!count || count > 32 || !ValidPropertyRead(params, flag)) return 0xE401;
+    for (std::size_t i = 0; count > 1 && i < count; ++i) {
+        bool ignored = false;
+        const auto& p = params[i];
+        if (!ValidPropertyRead(&p, ignored) || p.operation != 3 ||
+            p.taskContext != params->taskContext || p.submitTask != params->submitTask ||
+            p.dataModelOwner != params->dataModelOwner ||
+            p.ancestors[p.ancestorCount - 1] != params->ancestors[params->ancestorCount - 1]) return 0xE401;
+    }
     auto modelOwner = reinterpret_cast<void*>(params->dataModelOwner);
     if (!AddOwnerReference(modelOwner)) { if (flag) params->status = 0xE410; return 0xE402; }
     auto modelHold = std::shared_ptr<void>(modelOwner, ReleaseOwnerReference);
     auto task = std::make_shared<PropertyReadTask>();
     task->result = *params;
+    if (count > 1) task->batch.assign(params, params + count);
     if (params->operation == 7) task->extraInput.assign(reinterpret_cast<const char*>(params->extraInput), static_cast<std::size_t>(params->extraInputSize));
     task->deadline = GetTickCount64() + params->timeoutMs;
     if (!task->completed) return 0xE406;
@@ -1693,9 +1710,17 @@ static DWORD RunPropertyRead(PropertyReadParams* params)
     std::function<void()> readTask{[task, queued, frequency]() {
         LARGE_INTEGER started{};
         QueryPerformanceCounter(&started);
-        task->result.reserved = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        const auto queueMicros = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             ElapsedMicros(queued, started, frequency), UINT32_MAX));
-        ReadPropertyCaught(task.get());
+        if (task->batch.empty()) {
+            task->result.reserved = queueMicros;
+            ReadPropertyCaught(task.get());
+        } else for (auto& row : task->batch) {
+            task->result = row;
+            task->result.reserved = queueMicros;
+            ReadPropertyCaught(task.get()); // A failed field does not skip later fields.
+            row = task->result;
+        }
         SetEvent(task->completed);
     }};
     auto submit = SubmitDataModelTask(params->submitTask);
@@ -1708,13 +1733,17 @@ static DWORD RunPropertyRead(PropertyReadParams* params)
         task->result.outputSize = static_cast<std::uint32_t>(value.size());
         std::memcpy(task->result.output, value.data(), value.size());
     }
+    if (count > 1) {
+        std::copy(task->batch.begin(), task->batch.end(), params);
+        return 0; // Each field retains the single-read status and exception text.
+    }
     *params = task->result;
     return params->status == 4 ? 0 : params->status;
 }
 
-static DWORD PropertyReadBoundary(PropertyReadParams* params)
+static DWORD PropertyReadBoundary(PropertyReadParams* params, std::size_t count = 1)
 {
-    try { return RunPropertyRead(params); }
+    try { return RunPropertyRead(params, count); }
     catch (const std::exception& error)
     {
         if (params) strncpy_s(params->error, error.what(), _TRUNCATE);
@@ -1732,6 +1761,19 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumReadProperty(PropertyReadPar
         strncpy_s(params->error, "Studio target expired before the property task was submitted", _TRUNCATE);
         return 0xE40A;
     }
+}
+
+// Separate export: a helper without this read-only protocol falls back on the host.
+extern "C" __declspec(dllexport) DWORD WINAPI ReniumReadPropertyBatch(std::uint64_t* input)
+{
+    __try {
+        if (!input || !*input || *input > 32) return 0xE401;
+        const auto params = reinterpret_cast<PropertyReadParams*>(input + 1);
+        for (std::size_t i = 0; i < *input; ++i)
+            if (params[i].operation != 3) return 0xE401;
+        return PropertyReadBoundary(params, static_cast<std::size_t>(*input));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0xE40A; }
 }
 
 #include "renium_studio_reader.h"

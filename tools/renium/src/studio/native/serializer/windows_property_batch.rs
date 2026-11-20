@@ -162,6 +162,109 @@ impl NativePropertyBatch {
         read_class: Option<&str>,
     ) -> Result<(NativeProperty, String)> {
         let started = Instant::now();
+        let mut prepared = self.bind(index, property, timeout, read_class)?;
+        prepared.invoke(if self.package_flag {
+            10
+        } else if read_class.is_some() {
+            3
+        } else {
+            0
+        })?;
+        let identity: [u8; 16] = prepared.parameters[IDENTITY..IDENTITY + 16].try_into()?;
+        anyhow::ensure!(
+            self.package_flag
+                && self.targets[index]
+                    .last()
+                    .is_some_and(|entry| entry.instance
+                        == self.model.outer + self.model.layout.data_model_instance)
+                || identity != [0; 16],
+            "Studio target has no stable instance identity; retry after Studio settles"
+        );
+        prepared.instance_id = identity.iter().map(|byte| format!("{byte:02x}")).collect();
+        prepared.parameters[EXPECTED_IDENTITY..EXPECTED_IDENTITY + 16].copy_from_slice(&identity);
+        let value = if read_class.is_some() {
+            prepared.value()?
+        } else {
+            String::new()
+        };
+        crate::app::profile::record_between(
+            "native property binding and identity preparation",
+            started,
+            Instant::now(),
+        );
+        Ok((prepared, value))
+    }
+
+    // Bound remote storage; reuse the single-field host buffer for every result.
+    // All offsets here belong to Renium's ABI, never to a Studio type.
+    pub(crate) fn read_many<T>(
+        &mut self,
+        fields: &[(&str, &str)],
+        timeout: Duration,
+        mut consume: impl FnMut(usize, Result<String>) -> T,
+    ) -> Result<Vec<T>> {
+        anyhow::ensure!(
+            !fields.is_empty() && fields.len() <= 32,
+            "Invalid property batch size"
+        );
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let entry = self.entrypoint - helper_export_rva("ReniumReadProperty")?
+            + helper_export_rva("ReniumReadPropertyBatch")?;
+        let memory = Rc::clone(&self.memory);
+        let mut remote = memory.allocate(8 + SIZE * fields.len())?;
+        memory.write(remote.address, &(fields.len() as u64).to_le_bytes())?;
+        for (index, (class, property)) in fields.iter().enumerate() {
+            let mut prepared = self.bind(index, property, timeout, Some(class))?;
+            put_u32(
+                &mut prepared.parameters,
+                80,
+                timeout.as_millis().clamp(1, 3000) as u32,
+            );
+            put_u32(&mut prepared.parameters, 65912, 3);
+            memory.write(remote.address + 8 + SIZE * index, &prepared.parameters)?;
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .context("Native property batch preparation expired")?;
+        let remaining = remaining.as_millis().clamp(1, 3000) as u32;
+        memory.write(remote.address + 8 + 80, &remaining.to_le_bytes())?;
+        let exit = remote.run(entry, remaining + 500)?;
+        anyhow::ensure!(exit == 0, "Native property batch failed: {exit:#x}");
+        let mut output = Vec::with_capacity(fields.len());
+        // Do not overwrite common: it is also used by subsequent writes.
+        let mut parameters = self.common.clone();
+        for index in 0..fields.len() {
+            memory.read(remote.address + 8 + SIZE * index, &mut parameters)?;
+            let value = task_result(0, &parameters).and_then(|()| {
+                anyhow::ensure!(
+                    parameters[IDENTITY..IDENTITY + 16] != [0; 16],
+                    "Studio target has no stable instance identity; retry after Studio settles"
+                );
+                property_value(&parameters)
+            });
+            output.push(consume(index, value));
+        }
+        crate::app::output::log_global(
+            5,
+            format_args!(
+                "[renium] native property batch read: fields={} tasks=1 total_ms={:.3} queue_ms={:.3}",
+                fields.len(),
+                started.elapsed().as_secs_f64() * 1000.0,
+                read_u32(&parameters, 131500)? as f64 / 1000.0,
+            ),
+        );
+        Ok(output)
+    }
+
+    fn bind(
+        &mut self,
+        index: usize,
+        property: &str,
+        timeout: Duration,
+        read_class: Option<&str>,
+    ) -> Result<NativeProperty> {
+        let started = Instant::now();
         let ancestors = self
             .targets
             .get(index)
@@ -217,7 +320,7 @@ impl NativePropertyBatch {
             131504 + ancestors.len() * 8,
             self.model.outer + self.model.layout.data_model_instance,
         );
-        let mut prepared = NativeProperty {
+        Ok(NativeProperty {
             class_name,
             property: property.into(),
             instance_id: String::new(),
@@ -225,32 +328,7 @@ impl NativePropertyBatch {
             parameters,
             entrypoint: self.entrypoint,
             deadline: started + timeout,
-        };
-        prepared.invoke(if self.package_flag {
-            10
-        } else if read_class.is_some() {
-            3
-        } else {
-            0
-        })?;
-        let identity: [u8; 16] = prepared.parameters[IDENTITY..IDENTITY + 16].try_into()?;
-        anyhow::ensure!(
-            self.package_flag && root || identity != [0; 16],
-            "Studio target has no stable instance identity; retry after Studio settles"
-        );
-        prepared.instance_id = identity.iter().map(|byte| format!("{byte:02x}")).collect();
-        prepared.parameters[EXPECTED_IDENTITY..EXPECTED_IDENTITY + 16].copy_from_slice(&identity);
-        let value = if read_class.is_some() {
-            prepared.value()?
-        } else {
-            String::new()
-        };
-        crate::app::profile::record_between(
-            "native property binding and identity preparation",
-            started,
-            Instant::now(),
-        );
-        Ok((prepared, value))
+        })
     }
 }
 

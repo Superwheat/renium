@@ -741,13 +741,17 @@ impl NativeProperty {
     }
 
     fn value(&self) -> Result<String> {
-        let len = read_u32(&self.parameters, 88)? as usize;
-        if len > LIMIT {
-            bail!("Studio returned an invalid property length");
-        }
-        String::from_utf8(self.parameters[96..96 + len].to_vec())
-            .context("Property is not UTF-8 text; it requires a binary value codec")
+        property_value(&self.parameters)
     }
+}
+
+fn property_value(parameters: &[u8]) -> Result<String> {
+    let len = read_u32(parameters, 88)? as usize;
+    if len > LIMIT {
+        bail!("Studio returned an invalid property length");
+    }
+    String::from_utf8(parameters[96..96 + len].to_vec())
+        .context("Property is not UTF-8 text; it requires a binary value codec")
 }
 
 // Read only the relevant executable bytes, not the whole Studio image on every
@@ -2030,6 +2034,22 @@ pub(super) use batch::prepare_package_flag;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn property_batch_matches_single_reads_and_validates_each_field() {
+        let result = crate::system::tools::hidden_command(
+            std::path::Path::new(env!("OUT_DIR")).join("renium-property-exception-test.exe"),
+        )
+        .arg("--batch")
+        .output()
+        .expect("run isolated property batch regression");
+        assert!(
+            result.status.success(),
+            "native batch regression: {:?}\n{}",
+            result.status,
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
     #[test]
     fn property_exception_messages_and_native_result_layout() {
         let result = crate::system::tools::hidden_command(
