@@ -1530,6 +1530,17 @@ fn sort_post_commit_model_pivots(changes: &mut [EditorPropertyChange]) {
     changes.sort_by_key(|change| change.path_segments.len());
 }
 
+/// The rows that bind parts to one another go after every other row, in
+/// their order. A joint bound while one of its parts still stands where it
+/// was created keeps that offset, and Studio then moves the parts to it.
+fn bind_joints_last(changes: &mut [EditorPropertyChange]) {
+    changes.sort_by_key(|change| {
+        ["Part0", "Part1", "Attachment0", "Attachment1"]
+            .iter()
+            .any(|bound| change.properties.contains_key(*bound))
+    });
+}
+
 impl Drop for EditorTransaction<'_> {
     fn drop(&mut self) {
         if self.active
@@ -4179,6 +4190,7 @@ fn push_with_reader_platform(
         &stores_root,
     )?;
     defer_imported_native_root_rows(&mut changes, binary_import.as_ref());
+    bind_joints_last(&mut changes.property_changes);
     if global_log_enabled(5) {
         log_change_set_composition(&changes, binary_import.as_ref());
     }
@@ -7694,6 +7706,31 @@ mod sync_tests {
             deleted_attributes: Vec::new(),
             attributes_complete: false,
         }
+    }
+
+    #[test]
+    fn rows_that_bind_parts_follow_the_rows_that_place_them() {
+        let row = |name: &str, properties: &[&str]| {
+            let mut row = model_pivot(&["Workspace", "Rig", name]);
+            for property in properties {
+                row.properties.insert((*property).to_string(), json!(1));
+            }
+            row
+        };
+        let mut rows = vec![
+            row("Torso", &["CFrame"]),
+            row("Neck", &["C0", "Part0", "Part1"]),
+            row("Weld", &["Part1"]),
+            row("Head", &["CFrame", "Anchored"]),
+            row("Rigid", &["Attachment0"]),
+            row("Arm", &[]),
+        ];
+        bind_joints_last(&mut rows);
+        let order = rows
+            .iter()
+            .map(|row| row.path_segments[2].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["Torso", "Head", "Arm", "Neck", "Weld", "Rigid"]);
     }
 
     #[test]
