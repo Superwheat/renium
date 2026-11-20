@@ -2477,6 +2477,15 @@ local function syncDesiredEntry(
 		created.Name = tostring(entry.pathSegments[#entry.pathSegments])
 		if ctx.editorTransaction then
 			ctx.editorTransaction.createdInstances[created] = true
+			-- New parts all stand at the origin until their rows place them, and
+			-- Studio pairs up every loose part of such a pile each time one is
+			-- anchored or moved. An anchored part costs none of that: it stays
+			-- anchored until its row has placed it, or until the commit.
+			local heldAnchored = ctx.editorTransaction.heldAnchored
+			if heldAnchored ~= nil and created:IsA("BasePart") then
+				created.Anchored = true
+				heldAnchored[created] = true
+			end
 		end
 		setParentForSync(created, parent, ctx)
 		instance = created
@@ -3476,6 +3485,8 @@ local function applyPropertyChange(
 		return
 	end
 	local properties = change.properties
+	local heldAnchored = if ctx.editorTransaction then ctx.editorTransaction.heldAnchored else nil
+	local placesHeld = heldAnchored ~= nil and heldAnchored[instance] == true
 	if type(properties) == "table" then
 		if instance:IsA("Terrain") and (properties.SmoothGrid ~= nil or properties.PhysicsGrid ~= nil) then
 			queueNativeRootWrite(instance, "SmoothGrid", {
@@ -3483,7 +3494,8 @@ local function applyPropertyChange(
 			}, change, ctx, stats)
 		end
 		for _, propertyName in ipairs(changedPropertyNames(properties)) do
-			if instance:IsA("Terrain") and (propertyName == "SmoothGrid" or propertyName == "PhysicsGrid") then
+			if instance:IsA("Terrain") and (propertyName == "SmoothGrid" or propertyName == "PhysicsGrid")
+				or placesHeld and propertyName == "Anchored" then
 				continue
 			end
 			applyChangedProperty(
@@ -3496,6 +3508,18 @@ local function applyPropertyChange(
 				unreadableNames,
 				serviceName
 			)
+		end
+	end
+	if placesHeld then
+		heldAnchored[instance] = nil
+		if type(properties) == "table" and properties.Anchored ~= nil then
+			applyChangedProperty(instance, "Anchored", properties.Anchored, change, ctx, stats, unreadableNames, serviceName)
+		else
+			-- No row value: the part has the value of a new part again.
+			local okWrite, writeError = writePropertyForSync(instance, "Anchored", false, ctx)
+			if not okWrite then
+				error(`Failed to write Anchored on {instance:GetFullName()}: {writeError}`)
+			end
 		end
 	end
 
@@ -7608,6 +7632,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			changedSourceInstances = changedSourceInstances,
 			instanceReplacements = {},
 			createdInstances = {},
+			heldAnchored = {},
 			nativePropertiesAvailable = params.nativePropertiesAvailable ~= false,
 			snapshot = snapshot,
 			mutated = false,
@@ -7776,6 +7801,17 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		assertCommitActive()
 		setTrackedOperationPhase(operation, "postCommitProperties")
+		if not session.commitPrepared then
+			for instance in pairs(session.heldAnchored) do
+				if instance.Parent ~= nil then
+					local okWrite, writeError = writePropertyForSync(instance, "Anchored", false, ctx)
+					if not okWrite then
+						error(`Failed to write Anchored on {instance:GetFullName()}: {writeError}`)
+					end
+				end
+			end
+			table.clear(session.heldAnchored)
+		end
 		local postCommitPropertyChanges = session.postCommitPropertyChanges
 		if #postCommitPropertyChanges > 0 and not session.commitPrepared then
 			local updated = 0

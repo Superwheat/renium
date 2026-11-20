@@ -587,7 +587,7 @@ local function pending()
 	local value = {
 		historyRecording = "recording", snapshot = {}, instanceReplacements = {},
 		nativeUndo = { replacements = {}, prepared = {} },
-		postCommitPropertyChanges = {}, serviceNames = { "Workspace" },
+		postCommitPropertyChanges = {}, heldAnchored = {}, serviceNames = { "Workspace" },
 		studioGenerations = { Workspace = 0 },
 	}
 	pendingSessions.snapshot = value
