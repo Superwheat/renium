@@ -26,7 +26,9 @@ use crate::{
     types::Type,
 };
 
-use super::{error::InnerError, header::FileHeader, Deserializer, FlatDom, FlatInstance};
+use super::{
+    error::InnerError, header::FileHeader, Deserializer, FlatDom, FlatInstance, SparseDom,
+};
 
 pub(super) struct DeserializerState<'db, R> {
     /// The user-provided configuration that we should use.
@@ -160,6 +162,8 @@ struct Instance {
     /// Document-defined IDs for the children of this instance.
     children: Vec<(i32, usize)>,
     has_name: bool,
+    record_elided_defaults: bool,
+    elided_defaults: Vec<Ustr>,
 }
 
 struct FlatPropChunk {
@@ -295,18 +299,85 @@ fn populate_canonical_property_defaults<'db>(
         .unwrap_or_default();
 }
 
+// PartialEq alone would erase signed zero. Unknown/composite floating types
+// stay explicit; adding a Variant never silently broadens the optimization.
+fn exact_default(value: &Variant, default: &Variant) -> bool {
+    if value != default {
+        return false;
+    }
+    let vector = |v: &Vector3| [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()];
+    let frame = |v: &CFrame| {
+        [
+            vector(&v.position),
+            vector(&v.orientation.x),
+            vector(&v.orientation.y),
+            vector(&v.orientation.z),
+        ]
+    };
+    match (value, default) {
+        (Variant::Float32(a), Variant::Float32(b)) => a.to_bits() == b.to_bits(),
+        (Variant::Float64(a), Variant::Float64(b)) => a.to_bits() == b.to_bits(),
+        (Variant::Vector2(a), Variant::Vector2(b)) => {
+            [a.x.to_bits(), a.y.to_bits()] == [b.x.to_bits(), b.y.to_bits()]
+        }
+        (Variant::Vector3(a), Variant::Vector3(b)) => vector(a) == vector(b),
+        (Variant::Color3(a), Variant::Color3(b)) => {
+            [a.r.to_bits(), a.g.to_bits(), a.b.to_bits()]
+                == [b.r.to_bits(), b.g.to_bits(), b.b.to_bits()]
+        }
+        (Variant::UDim(a), Variant::UDim(b)) => a.scale.to_bits() == b.scale.to_bits(),
+        (Variant::UDim2(a), Variant::UDim2(b)) => {
+            [a.x.scale.to_bits(), a.y.scale.to_bits()] == [b.x.scale.to_bits(), b.y.scale.to_bits()]
+        }
+        (Variant::CFrame(a), Variant::CFrame(b)) => frame(a) == frame(b),
+        (Variant::OptionalCFrame(Some(a)), Variant::OptionalCFrame(Some(b))) => {
+            frame(a) == frame(b)
+        }
+        (Variant::OptionalCFrame(None), _)
+        | (Variant::PhysicalProperties(PhysicalProperties::Default), _) => true,
+        (Variant::Attributes(a), _) => a.is_empty(),
+        (
+            Variant::Axes(_)
+            | Variant::BinaryString(_)
+            | Variant::Bool(_)
+            | Variant::BrickColor(_)
+            | Variant::Color3uint8(_)
+            | Variant::ContentId(_)
+            | Variant::Enum(_)
+            | Variant::Faces(_)
+            | Variant::Int32(_)
+            | Variant::Int64(_)
+            | Variant::Ref(_)
+            | Variant::SharedString(_)
+            | Variant::String(_)
+            | Variant::Tags(_)
+            | Variant::Font(_)
+            | Variant::UniqueId(_)
+            | Variant::MaterialColors(_)
+            | Variant::SecurityCapabilities(_)
+            | Variant::EnumItem(_)
+            | Variant::Content(_)
+            | Variant::NetAssetRef(_)
+            | Variant::Vector2int16(_)
+            | Variant::Vector3int16(_),
+            _,
+        ) => true,
+        _ => false,
+    }
+}
+
 fn add_property(instance: &mut Instance, canonical_property: &CanonicalProperty, value: Variant) {
     if let Some(PropertySerialization::Migrate(migration)) = canonical_property.migration {
         let old_property_name = canonical_property.name;
         match migration.perform(&value) {
             Ok(new_value) => {
                 for &new_property_name in migration.new_property_names() {
-                    if canonical_property
-                        .migration_default_values
-                        .iter()
-                        .any(|(name, value)| {
-                            name.as_str() == new_property_name && *value == &new_value
-                        })
+                    if !instance.record_elided_defaults
+                        && canonical_property.migration_default_values.iter().any(
+                            |(name, value)| {
+                                name.as_str() == new_property_name && *value == &new_value
+                            },
+                        )
                     {
                         continue;
                     }
@@ -327,7 +398,18 @@ fn add_property(instance: &mut Instance, canonical_property: &CanonicalProperty,
             }
         };
     } else {
-        if canonical_property.default_value == Some(&value) {
+        let default = canonical_property.default_value;
+        let elide = if instance.record_elided_defaults {
+            default.is_some_and(|default| default.ty() == canonical_property.ty && exact_default(&value, default))
+                // Repeated columns still obey the ordinary reader's last-write rule.
+                && !instance.builder.has_property(canonical_property.name)
+        } else {
+            default == Some(&value)
+        };
+        if elide {
+            if instance.record_elided_defaults {
+                instance.elided_defaults.push(canonical_property.name);
+            }
             return;
         }
         instance
@@ -472,6 +554,8 @@ impl<'db, R: Read> DeserializerState<'db, R> {
                 builder,
                 children: Vec::new(),
                 has_name: false,
+                record_elided_defaults: self.deserializer.record_elided_defaults,
+                elided_defaults: Vec::new(),
             });
         }
         let end = self.instances.len();
@@ -1918,7 +2002,12 @@ rbx-dom may require changes to fully support this property. Please open an issue
     /// Combines together all the decoded information to build and emplace
     /// instances in our tree.
     #[profiling::function]
-    pub(super) fn finish(mut self) -> WeakDom {
+    pub(super) fn finish(self) -> WeakDom {
+        self.finish_sparse().dom
+    }
+
+    pub(super) fn finish_sparse(mut self) -> SparseDom {
+        let mut elided_defaults = std::collections::HashMap::new();
         log::trace!("Constructing tree from deserialized data");
 
         // Track all the instances we need to construct. Order of construction
@@ -1945,9 +2034,14 @@ rbx-dom may require changes to fully support this property. Please open an issue
                 builder: InstanceBuilder::empty_without_referent().with_class(empty_ustr),
                 children: Vec::new(),
                 has_name: false,
+                record_elided_defaults: false,
+                elided_defaults: Vec::new(),
             };
             let instance = core::mem::replace(&mut self.instances[instance_key], impostor);
             let id = self.tree.insert(parent_ref, instance.builder);
+            if !instance.elided_defaults.is_empty() {
+                elided_defaults.insert(id, instance.elided_defaults);
+            }
 
             Arc::get_mut(&mut self.instance_key_by_ref)
                 .expect("referents cannot be modified while property decoding is active")
@@ -1957,7 +2051,10 @@ rbx-dom may require changes to fully support this property. Please open an issue
             }
         }
 
-        self.tree
+        SparseDom {
+            dom: self.tree,
+            elided_defaults,
+        }
     }
 
     pub(super) fn finish_flat(self) -> FlatDom {
@@ -1975,6 +2072,8 @@ rbx-dom may require changes to fully support this property. Please open an issue
                     builder: InstanceBuilder::empty_without_referent(),
                     children: Vec::new(),
                     has_name: false,
+                    record_elided_defaults: false,
+                    elided_defaults: Vec::new(),
                 });
             let index = instances.len();
             if parent_index.is_none() {

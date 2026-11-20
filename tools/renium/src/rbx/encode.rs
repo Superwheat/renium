@@ -971,6 +971,9 @@ fn asset_identity(value: &RbxVariant) -> Option<String> {
     }
 }
 
+pub(crate) const ENGINE_GEOMETRY_IDENTITY_PROPERTIES: &[&str] =
+    &["MeshContent", "MeshId", "AssetId"];
+
 /// What a part's geometry was computed from: the base's data is reused for
 /// a build part only when both agree. A place read from disk carries no
 /// CollisionFidelity value, so fidelity counts only when both sides have one.
@@ -983,14 +986,12 @@ struct GeometrySources {
 
 impl GeometrySources {
     fn of(instance: &rbx_dom_weak::Instance) -> Self {
-        let identity = ["MeshContent", "MeshId", "AssetId"]
-            .iter()
-            .find_map(|name| {
-                instance
-                    .properties
-                    .get(&rbx_dom_weak::Ustr::from(name))
-                    .and_then(asset_identity)
-            });
+        let identity = ENGINE_GEOMETRY_IDENTITY_PROPERTIES.iter().find_map(|name| {
+            instance
+                .properties
+                .get(&rbx_dom_weak::Ustr::from(name))
+                .and_then(asset_identity)
+        });
         let fidelity = instance
             .properties
             .get(&rbx_dom_weak::Ustr::from("CollisionFidelity"))
@@ -1106,7 +1107,12 @@ fn matching_geometry(
 /// Gives every part the build lacks engine geometry for the data of the part
 /// at the same path in the base when their sources agree, and otherwise the
 /// one value the base holds for that asset, if there is exactly one.
-pub(crate) fn fill_engine_geometry_from(dom: &mut RbxWeakDom, base: &RbxWeakDom) {
+pub(crate) struct EngineGeometry {
+    by_path: HashMap<(Vec<String>, Vec<usize>), (GeometrySources, GeometryValues)>,
+    by_identity: HashMap<(rbx_dom_weak::Ustr, rbx_dom_weak::Ustr, String), GeometryCandidates>,
+}
+
+pub(crate) fn capture_engine_geometry(base: &RbxWeakDom) -> EngineGeometry {
     let mut base_paths = crate::rbx::model::RbxDomPaths::new(base);
     let mut by_path: HashMap<(Vec<String>, Vec<usize>), (GeometrySources, GeometryValues)> =
         HashMap::new();
@@ -1144,6 +1150,20 @@ pub(crate) fn fill_engine_geometry_from(dom: &mut RbxWeakDom, base: &RbxWeakDom)
         let path = base_paths.parts(instance.referent());
         by_path.insert(path, (sources, values));
     }
+    EngineGeometry {
+        by_path,
+        by_identity,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fill_engine_geometry_from(dom: &mut RbxWeakDom, base: &RbxWeakDom) {
+    fill_engine_geometry_from_cache(dom, &capture_engine_geometry(base));
+}
+
+pub(crate) fn fill_engine_geometry_from_cache(dom: &mut RbxWeakDom, geometry: &EngineGeometry) {
+    let by_path = &geometry.by_path;
+    let by_identity = &geometry.by_identity;
     if by_path.is_empty() {
         return;
     }

@@ -38,7 +38,7 @@ use crate::rbx::decode::{
     merge_native_overlay_items, native_overlay_property_schemas, native_property_filter,
     overlay_property_names_value, rbx_properties_to_native_settings_records,
 };
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", test))]
 use crate::rbx::encode::collect_rbx_subtree_preorder;
 use crate::rbx::encode::json_i64;
 #[cfg(any(windows, target_os = "macos", test))]
@@ -52,10 +52,8 @@ use crate::rbx::model::BytecodeModelExportRefs;
 use crate::rbx::model::BytecodeModelImportRefs;
 #[cfg(any(windows, target_os = "macos"))]
 use crate::rbx::model::RbxPlaceFormat;
-#[cfg(any(windows, target_os = "macos", test))]
-use crate::rbx::model::rbx_dom_path_import_refs;
 #[cfg(any(windows, target_os = "macos"))]
-use crate::rbx::model::{RbxPlaceBuild, build_rbx_place, rbx_dom_instance_path_parts};
+use crate::rbx::model::{RbxPlaceBuild, build_rbx_place};
 use crate::roblox::schema::{
     EnumValueNameMap, parse_enum_value_name_map, parse_property_schema_map,
 };
@@ -3690,8 +3688,9 @@ fn rbx_dom_path_export_refs(dom: &RbxWeakDom) -> BytecodeModelExportRefs<'static
     }
     let mut by_path_key = HashMap::with_capacity(refs_preorder.len());
     let mut by_path_segments_key = HashMap::with_capacity(refs_preorder.len());
+    let mut paths = crate::rbx::model::RbxDomPaths::new(dom);
     for referent in refs_preorder {
-        let (segments, ordinals) = rbx_dom_instance_path_parts(dom, referent);
+        let (segments, ordinals) = paths.parts(referent);
         insert_unique_rbx_path(
             &mut by_path_segments_key,
             instance_path_key(&segments),
@@ -3712,7 +3711,38 @@ pub(crate) fn rbx_dom_service_root_property_values(
     service_names: &HashSet<String>,
     database: &ReflectionDatabase<'_>,
 ) -> HashMap<String, Map<String, Value>> {
-    let refs = rbx_dom_path_import_refs(dom, true);
+    // Root settings need paths only for their reference targets, not copies of
+    // every path (and a second indexed copy) in the entire base place.
+    let targets = rbx_model_top_level_refs(dom)
+        .into_iter()
+        .filter_map(|referent| dom.get_by_ref(referent))
+        .filter(|instance| service_names.contains(instance.class.as_str()))
+        .flat_map(|instance| instance.properties.values())
+        .filter_map(|value| match value {
+            RbxVariant::Ref(referent) => Some(*referent),
+            RbxVariant::Content(content) => match content.value() {
+                RbxContentType::Object(referent) => Some(*referent),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut refs = BytecodeModelImportRefs::default();
+    if !targets.is_empty() {
+        let mut preorder = Vec::new();
+        for root in rbx_model_top_level_refs(dom) {
+            collect_rbx_subtree_preorder(dom, root, &mut preorder);
+        }
+        let mut paths = crate::rbx::model::RbxDomPaths::new(dom);
+        for (index, referent) in preorder.into_iter().enumerate() {
+            if targets.contains(&referent) {
+                let (segments, ordinals) = paths.parts(referent);
+                refs.new_index_by_ref.insert(referent, index);
+                Arc::make_mut(&mut refs.path_segments_by_ref).insert(referent, segments);
+                Arc::make_mut(&mut refs.path_ordinals_by_ref).insert(referent, ordinals);
+            }
+        }
+    }
     let mut result = HashMap::new();
     for referent in rbx_model_top_level_refs(dom) {
         let Some(instance) = dom.get_by_ref(referent) else {
@@ -4035,13 +4065,233 @@ fn write_editor_place_snapshot(
             }
         }
     }
+    let receive = crate::app::profile::span("save receive Studio export");
     let export = match runtime_id {
         Some(runtime_id) => receive_editor_binary_export_for_runtime(bridge, runtime_id)?,
         None => receive_editor_binary_export(bridge)?,
     };
-    let mut dom = rbx_binary::from_reader(std::io::Cursor::new(&export.bytes))
-        .context("Studio returned an invalid native place snapshot")?;
-    let plugin_service_roots = serialized_service_roots(&mut dom, &export.groups)?;
+    drop(receive);
+    write_editor_export_snapshot(export, args, output_path, existing_place)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn save_service_roots(
+    dom: &mut RbxWeakDom,
+    groups: &[EditorBinaryExportGroup],
+) -> Result<Vec<(RbxRef, Vec<RbxRef>)>> {
+    let mut services = HashSet::new();
+    anyhow::ensure!(
+        !groups.is_empty()
+            && groups.iter().all(|group| {
+                !group.service.is_empty()
+                    && group.target_path == [group.service.clone()]
+                    && group.instance_count > 0
+                    && services.insert(&group.service)
+            }),
+        "Studio save export has invalid or duplicate service groups; original file was not changed"
+    );
+    let roots = serialized_service_roots(dom, groups)?;
+    for (group, (marker_ref, child_refs)) in groups.iter().zip(&roots) {
+        let marker = dom
+            .get_by_ref(*marker_ref)
+            .context("Studio save marker is missing")?;
+        anyhow::ensure!(
+            marker.class.as_str() == "Folder"
+                && marker.name == group.service
+                && marker.children().is_empty(),
+            "Studio save export marker contract changed; original file was not changed"
+        );
+        let instance_count = child_refs.iter().try_fold(1_usize, |count, child| {
+            count
+                .checked_add(dom.descendants_of(*child).count())
+                .context("Studio save instance count overflowed")
+        })?;
+        anyhow::ensure!(
+            instance_count == group.instance_count,
+            "Studio save export instance count changed: received {instance_count}, expected {}; original file was not changed",
+            group.instance_count
+        );
+    }
+    Ok(roots)
+}
+
+/// Keep roots, markers, carriers and geometry explicit. Ordinary defaults are
+/// represented by the sparse reader's field-presence ledger until writing.
+#[cfg(any(windows, target_os = "macos"))]
+fn save_snapshot_decoder(
+    groups: &[EditorBinaryExportGroup],
+) -> Result<rbx_binary::Deserializer<'static>> {
+    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+    let classes = groups
+        .iter()
+        .flat_map(|group| [group.service.clone(), group.identity_carrier_class.clone()])
+        .chain(std::iter::once("Folder".to_string()))
+        .collect();
+    let properties = database
+        .classes
+        .keys()
+        .flat_map(|class| {
+            crate::rbx::encode::engine_geometry_properties(class)
+                .iter()
+                .copied()
+        })
+        .chain(
+            crate::rbx::encode::ENGINE_GEOMETRY_IDENTITY_PROPERTIES
+                .iter()
+                .copied(),
+        )
+        .chain(["CollisionFidelity"])
+        .map(str::to_string)
+        .collect();
+    Ok(rbx_binary::Deserializer::new()
+        .elide_defaults(true)
+        .retain_defaults_for_classes(classes)
+        .retain_defaults_for_properties(properties))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+struct SaveBase {
+    dom: RbxWeakDom,
+    root_properties: HashMap<String, Map<String, Value>>,
+    geometry: crate::rbx::encode::EngineGeometry,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn read_save_base(
+    path: &Path,
+    groups: &[EditorBinaryExportGroup],
+    database: &ReflectionDatabase<'_>,
+) -> Result<SaveBase> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(fs::File::open(path)?);
+    let format =
+        RbxPlaceFormat::sniff(reader.fill_buf()?).unwrap_or(RbxPlaceFormat::from_path(path)?);
+    let decode = crate::app::profile::span("save decode sparse base");
+    let sparse = match format {
+        RbxPlaceFormat::Binary => save_snapshot_decoder(groups)?
+            .deserialize_sparse(reader)
+            .context("Invalid saved place snapshot")?,
+        RbxPlaceFormat::Xml => rbx_binary::SparseDom {
+            dom: format.read(path)?,
+            elided_defaults: HashMap::new(),
+        },
+    };
+    drop(decode);
+    let prepare = crate::app::profile::span("save retain base roots services and geometry");
+    let mut dom = sparse.dom;
+    let services = groups
+        .iter()
+        .map(|group| group.service.clone())
+        .collect::<HashSet<_>>();
+    let mut replaced = HashSet::new();
+    let mut keep = dom
+        .root()
+        .children()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut prune = Vec::new();
+    for root in dom.root().children() {
+        let class = dom
+            .get_by_ref(*root)
+            .context("Saved place root is missing")?
+            .class;
+        if services.contains(class.as_str()) && replaced.insert(class) {
+            prune.push(*root);
+        } else {
+            keep.extend(
+                dom.descendants_of(*root)
+                    .map(|instance| instance.referent()),
+            );
+        }
+    }
+    // Restore only retained services/roots. This ledger preserves field presence
+    // even when separate INST groups of one class carried different columns.
+    for (referent, names) in sparse.elided_defaults {
+        if !keep.contains(&referent) {
+            continue;
+        }
+        let instance = dom
+            .get_by_ref_mut(referent)
+            .context("Saved default target is missing")?;
+        let class = database
+            .classes
+            .get(instance.class.as_str())
+            .context("Saved default class is missing")?;
+        for name in names {
+            let value = database
+                .find_default_property(class, name.as_str())
+                .context("Saved default schema changed; original file was not changed")?;
+            instance
+                .properties
+                .entry(name)
+                .or_insert_with(|| value.clone());
+        }
+    }
+    let root_properties = rbx_dom_service_root_property_values(&dom, &services, database);
+    let geometry = crate::rbx::encode::capture_engine_geometry(&dom);
+    for root in prune {
+        let children = dom
+            .get_by_ref(root)
+            .context("Saved service root is missing")?
+            .children()
+            .to_vec();
+        for child in children {
+            dom.destroy(child);
+        }
+    }
+    drop(prepare);
+    Ok(SaveBase {
+        dom,
+        root_properties,
+        geometry,
+    })
+}
+
+/// One explicit sample makes the existing writer emit the same class column;
+/// its missing entries use the exact defaults proven by the sparse reader.
+#[cfg(any(windows, target_os = "macos"))]
+fn seed_save_default_columns(
+    dom: &mut RbxWeakDom,
+    elided: HashMap<RbxRef, Vec<rbx_dom_weak::Ustr>>,
+    database: &ReflectionDatabase<'_>,
+) -> Result<()> {
+    let mut columns = HashMap::<_, HashSet<_>>::new();
+    for instance in dom.descendants() {
+        columns
+            .entry(instance.class)
+            .or_default()
+            .extend(instance.properties.keys().copied());
+    }
+    for (referent, names) in elided {
+        let instance = dom
+            .get_by_ref_mut(referent)
+            .context("Studio save lost a default target; original file was not changed")?;
+        let class = database
+            .classes
+            .get(instance.class.as_str())
+            .context("Studio save default class is missing")?;
+        for name in names {
+            if columns.entry(instance.class).or_default().insert(name) {
+                let value = database
+                    .find_default_property(class, name.as_str())
+                    .context("Studio save default schema changed; original file was not changed")?;
+                instance.properties.insert(name, value.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn write_editor_export_snapshot(
+    mut export: EditorBinaryExport,
+    args: Option<&PushEditorChangesArgs>,
+    output_path: &Path,
+    existing_place: Option<&Path>,
+) -> Result<usize> {
+    let _save = crate::app::profile::span("save reconstruct and stream snapshot");
+    let format = RbxPlaceFormat::from_path(existing_place.unwrap_or(output_path))?;
     let service_names = export
         .groups
         .iter()
@@ -4049,11 +4299,39 @@ fn write_editor_place_snapshot(
         .collect::<Vec<_>>();
     let service_name_set = service_names.iter().cloned().collect::<HashSet<_>>();
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-    let mut root_property_values = if let Some(path) = existing_place {
-        read_place_service_root_property_values(path, &service_name_set, database)?
-    } else {
-        HashMap::new()
-    };
+    // Retire the base's replaced instances before allocating the export DOM.
+    let read_base = crate::app::profile::span("save prepare base before export");
+    let mut base = existing_place
+        .map(|path| read_save_base(path, &export.groups, database))
+        .transpose()?;
+    drop(read_base);
+    let decode = crate::app::profile::span("save decode export");
+    let sparse = match format {
+        RbxPlaceFormat::Binary => {
+            save_snapshot_decoder(&export.groups)?.deserialize_sparse(export.bytes.as_slice())
+        }
+        // XML has no class columns to supply omitted per-instance defaults.
+        RbxPlaceFormat::Xml => {
+            rbx_binary::from_reader(export.bytes.as_slice()).map(|dom| rbx_binary::SparseDom {
+                dom,
+                elided_defaults: HashMap::new(),
+            })
+        }
+    }
+    .context("Studio returned an invalid native place snapshot; original file was not changed")?;
+    let mut dom = sparse.dom;
+    drop(std::mem::take(&mut export.bytes));
+    drop(decode);
+    let validate = crate::app::profile::span("save validate export contract and remove carriers");
+    let plugin_service_roots = save_service_roots(&mut dom, &export.groups)?;
+    drop(validate);
+    let columns = crate::app::profile::span("save preserve exported property columns");
+    seed_save_default_columns(&mut dom, sparse.elided_defaults, database)?;
+    drop(columns);
+    let root_settings = crate::app::profile::span("save base root properties");
+    let mut root_property_values = base.as_mut().map_or_else(HashMap::new, |base| {
+        std::mem::take(&mut base.root_properties)
+    });
     if let Some(args) = args {
         let project_root = resolve_project_root_if_present(&args.project.project_root)?;
         let src_root = absolutize_under(&project_root, &args.project.src_root);
@@ -4072,6 +4350,8 @@ fn write_editor_place_snapshot(
             }
         }
     }
+    drop(root_settings);
+    let reconstruct = crate::app::profile::span("save reconstruct service roots");
     let attributes_key = rbx_dom_weak::Ustr::from("Attributes");
     let tags_key = rbx_dom_weak::Ustr::from("Tags");
     let mut service_roots = Vec::with_capacity(export.groups.len());
@@ -4090,7 +4370,11 @@ fn write_editor_place_snapshot(
         service_roots.push((group.service.clone(), marker_ref));
         live_metadata.push((live_attributes, live_tags));
     }
+    drop(reconstruct);
+    let index = crate::app::profile::span("save index root reference paths");
     let target_refs = rbx_dom_path_export_refs(&dom);
+    drop(index);
+    let root_encode = crate::app::profile::span("save encode root properties");
     for ((group, (_, marker_ref)), (live_attributes, live_tags)) in export
         .groups
         .iter()
@@ -4118,6 +4402,10 @@ fn write_editor_place_snapshot(
             .context("Studio native place snapshot lost a service root")?
             .properties = properties;
     }
+    drop(target_refs);
+    drop(root_property_values);
+    drop(root_encode);
+    let prepare = crate::app::profile::span("save prepare merge");
     let mut total_instances = 0;
     let mut has_package_links = false;
     for instance in dom.descendants() {
@@ -4136,22 +4424,37 @@ fn write_editor_place_snapshot(
         logical_properties_by_ref: HashMap::new(),
         unresolved_reference_properties_by_ref: HashMap::new(),
     };
-    let format_path = existing_place.unwrap_or(output_path);
-    let format = RbxPlaceFormat::from_path(format_path)?;
     // Without Studio's own serializer the export carries only the tracked
     // services; the base place supplies the rest and the root fields the
     // plugin cannot read, with Studio's values on top.
-    if let Some(base) = existing_place {
+    drop(prepare);
+    if let Some(base) = base {
+        let merge = crate::app::profile::span("save merge base");
         let exported = std::mem::replace(
             &mut build.dom,
             rbx_dom_weak::WeakDom::new(rbx_dom_weak::InstanceBuilder::new("DataModel")),
         );
-        let (merged, roots) = crate::rbx::model::merge_build_into_base(&build, exported, base)?;
+        let (merged, roots) =
+            crate::rbx::model::merge_build_into_base_dom(&build, exported, base.dom, base.geometry);
+        drop(merge);
+        let write = crate::app::profile::span("save stream encode and flush");
         format.write(output_path, &merged, &roots)?;
-        return Ok(merged.descendants().count());
+        drop(write);
+        let cleanup = crate::app::profile::span("save release snapshot");
+        let count = merged.descendants().count();
+        drop(merged);
+        drop(build);
+        drop(cleanup);
+        return Ok(count);
     }
+    let write = crate::app::profile::span("save stream encode and flush");
     write_rbx_place_build(output_path, &mut build, format)?;
-    Ok(build.total_instances)
+    drop(write);
+    let cleanup = crate::app::profile::span("save release snapshot");
+    let count = build.total_instances;
+    drop(build);
+    drop(cleanup);
+    Ok(count)
 }
 
 pub(crate) fn wait_for_editor_review_decision(
@@ -5992,3 +6295,7 @@ mod export_worker_tests {
         assert_eq!(total, (0..4).map(|index| index * 5).sum::<usize>());
     }
 }
+
+#[cfg(all(test, any(windows, target_os = "macos")))]
+#[path = "save_snapshot_tests.rs"]
+mod save_snapshot_tests;

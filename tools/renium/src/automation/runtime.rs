@@ -916,6 +916,7 @@ fn studio_clients(bridge: &BridgeServer) -> Vec<Value> {
 
 #[cfg(any(windows, target_os = "macos"))]
 fn save_local_studio(studio: &ConnectedStudio, bridge: &BridgeServer) -> Result<()> {
+    let _save = crate::app::profile::span("save local Studio");
     let file = studio
         .target
         .file
@@ -938,6 +939,7 @@ fn save_local_studio(studio: &ConnectedStudio, bridge: &BridgeServer) -> Result<
         let _ = std::fs::remove_file(&staging);
         return Err(error);
     }
+    let _replace = crate::app::profile::span("save replace file with backup");
     if let Err(error) =
         crate::system::files::replace_file_with_backup(&staging, file, "saved Studio place")
     {

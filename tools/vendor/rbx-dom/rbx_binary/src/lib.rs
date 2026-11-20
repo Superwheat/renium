@@ -76,7 +76,7 @@ pub mod text_format {
 }
 
 pub use crate::{
-    deserializer::{Deserializer, Error as DecodeError, FlatDom, FlatInstance},
+    deserializer::{Deserializer, Error as DecodeError, FlatDom, FlatInstance, SparseDom},
     serializer::{
         CompressionType, Error as EncodeError, InstanceBindingMode, SerializedInstanceBinding,
         Serializer,

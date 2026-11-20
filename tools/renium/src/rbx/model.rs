@@ -2458,11 +2458,25 @@ pub(crate) fn recorded_import_base(root: &Path) -> Result<Option<ImportBase>> {
 /// same part in the base.
 pub(crate) fn merge_build_into_base(
     build: &RbxPlaceBuild,
-    mut dom: RbxWeakDom,
+    dom: RbxWeakDom,
     base: &Path,
 ) -> Result<(RbxWeakDom, Vec<RbxRef>)> {
-    let mut base_dom = RbxPlaceFormat::from_path(base)?.read(base)?;
-    crate::rbx::encode::fill_engine_geometry_from(&mut dom, &base_dom);
+    let base_dom = RbxPlaceFormat::from_path(base)?.read(base)?;
+    let geometry = crate::rbx::encode::capture_engine_geometry(&base_dom);
+    Ok(merge_build_into_base_dom(build, dom, base_dom, geometry))
+}
+
+pub(crate) fn merge_build_into_base_dom(
+    build: &RbxPlaceBuild,
+    mut dom: RbxWeakDom,
+    mut base_dom: RbxWeakDom,
+    geometry: crate::rbx::encode::EngineGeometry,
+) -> (RbxWeakDom, Vec<RbxRef>) {
+    let fill = crate::app::profile::span("save merge engine geometry");
+    crate::rbx::encode::fill_engine_geometry_from_cache(&mut dom, &geometry);
+    drop(geometry);
+    drop(fill);
+    let services = crate::app::profile::span("save merge services");
     let base_root = base_dom.root_ref();
     for (service, referent) in &build.service_roots {
         let existing = base_dom.root().children().iter().copied().find(|child| {
@@ -2498,10 +2512,14 @@ pub(crate) fn merge_build_into_base(
         }
         dom.transfer(*referent, &mut base_dom, base_root);
     }
+    drop(services);
+    let finish = crate::app::profile::span("save normalize merged values");
     let top_level_refs = base_dom.root().children().to_vec();
     coerce_numeric_property_widths(&mut base_dom);
     crate::rbx::encode::finish_place_dom(&mut base_dom);
-    Ok((base_dom, top_level_refs))
+    drop(dom);
+    drop(finish);
+    (base_dom, top_level_refs)
 }
 
 pub(crate) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result<()> {

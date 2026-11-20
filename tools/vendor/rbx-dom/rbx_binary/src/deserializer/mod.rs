@@ -38,6 +38,14 @@ pub struct FlatDom {
     pub instances: Vec<FlatInstance>,
 }
 
+/// A sparse document and the exact property names elided from each instance.
+/// Each elided value equals its reflection default, including floating bits.
+#[allow(missing_docs)]
+pub struct SparseDom {
+    pub dom: WeakDom,
+    pub elided_defaults: HashMap<Ref, Vec<Ustr>>,
+}
+
 /// A configurable deserializer for Roblox binary models and places.
 ///
 /// ## Example
@@ -71,9 +79,11 @@ pub struct FlatDom {
 ///
 /// [ReflectionDatabase]: rbx_reflection::ReflectionDatabase
 /// [reflection_database]: Deserializer#method.reflection_database
+#[derive(Clone)]
 pub struct Deserializer<'db> {
     database: &'db ReflectionDatabase<'db>,
     elide_defaults: bool,
+    record_elided_defaults: bool,
     strict_float_types: bool,
     retain_defaults_for_classes: HashSet<String>,
     retain_defaults_for_properties: HashSet<String>,
@@ -86,6 +96,7 @@ impl<'db> Deserializer<'db> {
         Self {
             database: rbx_reflection_database::get().unwrap(),
             elide_defaults: false,
+            record_elided_defaults: false,
             strict_float_types: false,
             retain_defaults_for_classes: HashSet::new(),
             retain_defaults_for_properties: HashSet::new(),
@@ -142,8 +153,43 @@ impl<'db> Deserializer<'db> {
     /// Deserialize a Roblox binary model or place from the given stream using
     /// this deserializer.
     pub fn deserialize<R: Read>(&self, reader: R) -> Result<WeakDom, Error> {
-        profiling::scope!("rbx_binary::deserialize");
+        Ok(self.read_state(reader)?.finish())
+    }
 
+    /// Elide only bit-exact reflection defaults and record their original field
+    /// presence. Restore these fields, or seed their class columns, before writing.
+    pub fn deserialize_sparse<R: Read>(&self, reader: R) -> Result<SparseDom, Error> {
+        let mut options = self.clone();
+        options.elide_defaults = true;
+        options.record_elided_defaults = true;
+        // WeakDom enforces uniqueness while inserting, including for nil IDs.
+        options
+            .retain_defaults_for_properties
+            .insert("UniqueId".into());
+        // A default canonical value must still block a later legacy alias.
+        for class in options.database.classes.values() {
+            for property in class.properties.values() {
+                if let rbx_reflection::PropertyKind::Canonical {
+                    serialization: rbx_reflection::PropertySerialization::Migrate(migration),
+                } = &property.kind
+                {
+                    options
+                        .retain_defaults_for_properties
+                        .insert(property.name.to_string());
+                    options.retain_defaults_for_properties.extend(
+                        migration
+                            .new_property_names()
+                            .iter()
+                            .map(|name| name.to_string()),
+                    );
+                }
+            }
+        }
+        Ok(options.read_state(reader)?.finish_sparse())
+    }
+
+    fn read_state<R: Read>(&self, reader: R) -> Result<DeserializerState<'_, R>, Error> {
+        profiling::scope!("rbx_binary::deserialize");
         let mut deserializer = DeserializerState::new(self, reader, false)?;
 
         loop {
@@ -166,7 +212,7 @@ impl<'db> Deserializer<'db> {
             }
         }
 
-        Ok(deserializer.finish())
+        Ok(deserializer)
     }
 
     #[allow(missing_docs)]
