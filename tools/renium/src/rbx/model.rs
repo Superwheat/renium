@@ -2573,7 +2573,9 @@ pub(crate) fn merge_build_into_read_base(
     let brought =
         |service: &String| (build.service_roots.iter()).any(|(built, _)| built == service);
     if !base.emptied.iter().all(brought) {
-        base = PlaceBase::read(&base.path, &HashSet::new())?;
+        let path = std::mem::take(&mut base.path);
+        drop(base);
+        base = PlaceBase::read(&path, &HashSet::new())?;
     }
     let PlaceBase {
         dom: base_dom,

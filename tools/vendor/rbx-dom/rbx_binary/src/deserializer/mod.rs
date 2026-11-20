@@ -155,8 +155,8 @@ impl<'db> Deserializer<'db> {
     /// Give every instance below the first top-level instance of each of
     /// these classes only these canonical properties and its name.
     /// `deserialize` then reads the values once the file has placed its
-    /// instances, so a caller that drops those instances never holds what
-    /// they hold.
+    /// instances, so a caller that drops those instances never holds their
+    /// decoded values. The file's property chunks are held until then.
     pub fn keep_below(mut self, classes: HashSet<String>, properties: HashSet<String>) -> Self {
         self.keep_below = Some((classes, properties));
         self

@@ -2026,8 +2026,11 @@ rbx-dom may require changes to fully support this property. Please open an issue
                 below.extend(self.instances[key].children.iter().map(|(_, key)| *key));
             }
         }
+        // A damaged file can name an instance as its own descendant.
         while let Some(key) = below.pop() {
-            self.instances[key].bare = true;
+            if std::mem::replace(&mut self.instances[key].bare, true) {
+                continue;
+            }
             below.extend(self.instances[key].children.iter().map(|(_, key)| *key));
         }
     }
