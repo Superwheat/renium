@@ -466,7 +466,7 @@ impl Moved {
     }
 
     /// A stored instance read whole, as it stands in the state.
-    pub(super) fn in_state_whole(self, instance: &mut SettingsBytecodeInstance) {
+    pub(crate) fn in_state_whole(self, instance: &mut SettingsBytecodeInstance) {
         self.parent_in_state(instance);
         if let Some(properties) = self.values_in_state(&instance.properties) {
             instance.properties = properties;

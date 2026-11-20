@@ -333,6 +333,7 @@ fn told_apart(
     (desired_bytes, observed_bytes): (&[u8], &[u8]),
     differing: &[(usize, usize)],
     differs: &mut [bool],
+    moved: Option<crate::settings::bytecode::property_edit::Moved>,
 ) -> Result<usize> {
     use crate::settings::bytecode::property_edit::decode_for_property_edit;
     use crate::settings::equivalence::canonicalize_instances;
@@ -372,10 +373,17 @@ fn told_apart(
         if read_files.is_err() || read_studio.is_err() {
             break;
         }
-        let (of_files, of_studio) = (
+        let (of_files, mut of_studio) = (
             whole(&mut files, &of_files)?,
             whole(&mut studio, &of_studio)?,
         );
+        // A reference by position is compared as the position its instance
+        // has among the files'.
+        if let Some(moved) = moved {
+            for instance in &mut of_studio {
+                moved.in_state_whole(instance);
+            }
+        }
         let differ = of_files
             .par_iter()
             .zip(&of_studio)
@@ -500,6 +508,51 @@ fn imported_store(
     replaced_store_beside(desired_bytes, retained)
 }
 
+/// Whether the run of instances one copy alone holds is the one its place
+/// gives. Where the instance ahead of it is a namesake of its last, the run
+/// could as well start earlier, and only a UniqueId both copies hold for the
+/// instance ahead says it does not. An instance of the run under a UniqueId
+/// the other copy holds was moved, not added.
+fn run_is_told(
+    moved: crate::settings::bytecode::property_edit::Moved,
+    files: &[SettingsBytecodeInstance],
+    studio: &[SettingsBytecodeInstance],
+) -> bool {
+    let (run, of_files) = moved.run();
+    let (longer, shorter) = if of_files {
+        (files, studio)
+    } else {
+        (studio, files)
+    };
+    fn unique(instance: &SettingsBytecodeInstance) -> Option<&str> {
+        instance.properties.get("UniqueId")?.get("value")?.as_str()
+    }
+    let of_run = longer[run.clone()]
+        .iter()
+        .filter_map(unique)
+        .collect::<HashSet<_>>();
+    if !of_run.is_empty()
+        && shorter
+            .iter()
+            .filter_map(unique)
+            .any(|held| of_run.contains(held))
+    {
+        return false;
+    }
+    let (Some(ahead), Some(last)) = (run.start.checked_sub(1), run.end.checked_sub(1)) else {
+        return true;
+    };
+    if longer[ahead].name != longer[last].name
+        || longer[ahead].class_name != longer[last].class_name
+    {
+        return true;
+    }
+    matches!(
+        (unique(&longer[ahead]), shorter.get(ahead).and_then(unique)),
+        (Some(one), Some(other)) if one == other
+    )
+}
+
 /// What `changed_instances_alone` answers for a store it has imported anew
 /// (`imported_store`), said in the log: the whole documents' where the
 /// import cannot take it.
@@ -582,12 +635,19 @@ fn changed_instances_alone(
         (Some(files), Some(studio)) => files == studio,
         _ => true,
     };
+    // The digests place the parents of Studio's instances among the files';
+    // its document holds them where Studio has them.
+    let own_parents = std::sync::OnceLock::new();
     let stand = |studio: &[SettingsBytecodeInstance]| {
         let moved = (!as_many)
             .then(|| decode_for_row_chunks(desired_bytes).ok())
             .flatten()
             .and_then(|(files, _)| Moved::between_copies(studio, &files.instances))
             .flatten();
+        if moved.is_some() {
+            let parents = studio.iter().map(|instance| instance.parent_index);
+            let _ = own_parents.set(parents.collect::<Vec<_>>());
+        }
         Some((None, moved))
     };
     let (observed_rows, files) = if files_too {
@@ -639,7 +699,12 @@ fn changed_instances_alone(
             Files::Rows(_) => None,
         }));
     };
-    let skeleton = observed_rows.instances;
+    let mut skeleton = observed_rows.instances;
+    if let (Some(_), Some(parents)) = (observed_rows.moved, own_parents.get()) {
+        for (instance, parent) in skeleton.iter_mut().zip(parents) {
+            instance.parent_index = *parent;
+        }
+    }
     let (files_instances, files_digests, files_named): (
         &[SettingsBytecodeInstance],
         &[[u8; 16]],
@@ -683,7 +748,7 @@ fn changed_instances_alone(
             Files::Rows(_) => None,
         }))
     };
-    if !same_places {
+    if !same_places || moved.is_some_and(|moved| !run_is_told(moved, files_instances, &skeleton)) {
         return hand_over(files);
     }
     // The files' instance each of Studio's stands for, and Studio's for
@@ -713,7 +778,7 @@ fn changed_instances_alone(
             .filter_map(|index| Some((files_of(index)?, index)))
             .collect::<Vec<_>>();
         let copies = (desired_bytes.as_slice(), observed_bytes.as_slice());
-        let unlike = told_apart(copies, &differing, &mut differs)?
+        let unlike = told_apart(copies, &differing, &mut differs, moved)?
             + moved.map_or(0, |moved| moved.run().0.len());
         if unlike > MAX_CHANGED_INSTANCES && imports_heavy {
             // Neither copy is whole beside the ones the import reads.

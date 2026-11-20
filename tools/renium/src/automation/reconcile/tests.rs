@@ -6986,7 +6986,23 @@ fn add_or_remove_a_run(rng: &mut crate::tests::support::SimRng, document: &mut S
         if leaves.is_empty() {
             return;
         }
-        let gone = leaves[rng.below(leaves.len())];
+        // Half the time the first of two a place alone cannot tell apart.
+        let alike = |first: usize, second: usize| {
+            let (first, second) = (&document.instances[first], &document.instances[second]);
+            first.name == second.name
+                && first.class_name == second.class_name
+                && first.parent_index == second.parent_index
+        };
+        let firsts = leaves
+            .iter()
+            .copied()
+            .filter(|leaf| (leaf + 1..count).any(|other| alike(*leaf, other)))
+            .collect::<Vec<_>>();
+        let gone = if !firsts.is_empty() && rng.below(2) == 0 {
+            firsts[rng.below(firsts.len())]
+        } else {
+            leaves[rng.below(leaves.len())]
+        };
         document.instances.remove(gone);
         place_all(document, &|index| match index.cmp(&gone) {
             std::cmp::Ordering::Less => Some(index),
@@ -6995,19 +7011,25 @@ fn add_or_remove_a_run(rng: &mut crate::tests::support::SimRng, document: &mut S
         });
         return;
     }
-    // Half the time the namesake of another instance under the same parent,
-    // ahead of it or after it.
-    let like = &document.instances[rng.below(count)];
+    // Half the time the namesake of another instance under the same parent
+    // and of its class: right ahead of it, or anywhere under that parent.
+    let like_at = rng.below(count);
+    let like = &document.instances[like_at];
     let twin = rng.below(2) == 0;
-    let (name, parent, at) = match like.parent_index.filter(|_| twin) {
+    let (name, class, parent, at) = match like.parent_index.filter(|_| twin) {
         Some(parent) => (
             like.name.clone(),
+            like.class_name.to_string(),
             parent,
-            parent + 1 + rng.below(count - parent),
+            if rng.below(2) == 0 {
+                like_at
+            } else {
+                parent + 1 + rng.below(count - parent)
+            },
         ),
         None => {
             let at = 1 + rng.below(count);
-            ("Added".to_string(), rng.below(at), at)
+            ("Added".to_string(), "Part".to_string(), rng.below(at), at)
         }
     };
     let with_child = rng.below(3) == 0;
@@ -7015,11 +7037,17 @@ fn add_or_remove_a_run(rng: &mut crate::tests::support::SimRng, document: &mut S
     place_all(document, &|index| {
         Some(if index >= at { index + by } else { index })
     });
-    let mut added =
-        SettingsBytecodeInstance::new(format!("editor:{count}"), name, "Part".into(), Some(parent));
-    added
-        .properties
-        .insert("Transparency".into(), json!(rng.below(8) as f64 / 8.0));
+    let mut added = SettingsBytecodeInstance::new(
+        format!("editor:{count}"),
+        name,
+        class.as_str().into(),
+        Some(parent),
+    );
+    if class != "Folder" && class != "Model" {
+        added
+            .properties
+            .insert("Transparency".into(), json!(rng.below(8) as f64 / 8.0));
+    }
     document.instances.insert(at, added);
     if with_child {
         document.instances.insert(
@@ -7055,6 +7083,7 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
     let sent_from_both = AtomicUsize::new(0);
     let from_blocks_of_both = AtomicUsize::new(0);
     let beside_a_run = AtomicUsize::new(0);
+    let runs = AtomicUsize::new(0);
     run_seeds(300, |seed, _| {
         use crate::settings::bytecode::blocks::sim::{blocks_of_both, in_blocks};
         let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
@@ -7093,6 +7122,9 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
             add_or_remove_a_run(&mut rng, &mut files);
         }
         let run = files.instances.len() != studio.instances.len();
+        if run {
+            runs.fetch_add(1, Ordering::Relaxed);
+        }
         let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
         let snapshot = |document: &SettingsBytecode| {
             Ok::<_, String>(ProjectSnapshot {
@@ -7320,6 +7352,8 @@ from the whole documents:
         }
         Ok(())
     });
+    // The share of the stores with such a run that are prepared so.
+    const RUNS_READ_SO: usize = 38;
     if std::env::var_os("RENIUM_SIM_SEED").is_none() {
         let counts = [
             &from_changed,
@@ -7331,6 +7365,7 @@ from the whole documents:
             &sent_from_both,
             &from_blocks_of_both,
             &beside_a_run,
+            &runs,
         ]
         .map(|count| count.load(Ordering::Relaxed));
         assert!(
@@ -7342,14 +7377,15 @@ from the whole documents:
                 && counts[5] >= 12
                 && counts[6] >= 8
                 && counts[7] >= 8
-                && counts[8] >= 20,
-            "prepared from the changed instances {} ({} of them under other ids, {} with both copies read so, {} of those with values sent, {} of them with blocks both hold, {} beside a run of instances one copy alone holds), from whole documents {}, with a plan {}, unchanged {}",
+                && counts[8] * 100 >= counts[9] * RUNS_READ_SO,
+            "prepared from the changed instances {} ({} of them under other ids, {} with both copies read so, {} of those with values sent, {} of them with blocks both hold, {} beside a run of instances one copy alone holds, of {} such), from whole documents {}, with a plan {}, unchanged {}",
             counts[0],
             counts[4],
             counts[5],
             counts[6],
             counts[7],
             counts[8],
+            counts[9],
             counts[1],
             counts[2],
             counts[3]
@@ -7657,6 +7693,24 @@ fn a_store_most_of_whose_instances_differ_is_imported_anew() {
     assert_eq!(plan, pushed(&few, &studio, StoresRead::Whole).1);
     let read = previous.iter().filter(|row| row.contains("Anchored"));
     assert_eq!(read.count(), 5);
+
+    // Studio holds a folder the files lack, and one part names by its place
+    // another instance in each copy: the same number, said of two instances.
+    let names = || json!({"_type": "Ref", "instanceIndex": 8});
+    let mut beside = studio.clone();
+    let gone =
+        SettingsBytecodeInstance::new("debug:gone".into(), "Gone".into(), "Folder".into(), Some(0));
+    beside.instances.insert(3, gone);
+    beside.instances[4_000]
+        .properties
+        .insert("Target".into(), names());
+    let mut naming = few.clone();
+    naming.instances[3_999]
+        .properties
+        .insert("Target".into(), names());
+    let (imported, plan, _) = pushed(&naming, &beside, StoresRead::ChangedOfBoth);
+    assert!(!imported && plan.contains("debug:0_4006"), "{plan}");
+    assert_eq!(plan, pushed(&naming, &beside, StoresRead::Whole).1);
 
     // Every row differs, and none in what it holds.
     let same = store("MeshPart", &|_| vec![spelled()]);

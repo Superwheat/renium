@@ -2088,7 +2088,17 @@ pub(crate) fn align_settings_ids_beside_run(
         let Some(taken) = take_run(reference, &run) else {
             return false;
         };
-        let aligned = align_settings_ids_by_place(reference, observed);
+        // An identity of the store's own that the other copy holds as well
+        // is no instance this copy alone holds.
+        let held = observed
+            .instances
+            .iter()
+            .map(|instance| instance.settings_id.as_str())
+            .collect::<AHashSet<_>>();
+        let aligned = !taken.iter().any(|instance| {
+            !instance.settings_id.starts_with("debug:")
+                && held.contains(instance.settings_id.as_str())
+        }) && align_settings_ids_by_place(reference, observed);
         put_run(reference, &run, taken);
         return aligned;
     }
@@ -2108,7 +2118,12 @@ pub(crate) fn align_settings_ids_beside_run(
             .clone()
             .filter(|index| reserved.contains(observed.instances[*index].settings_id.as_str()));
         let first = colliding.next();
-        if colliding.next().is_some() {
+        // Studio numbers its instances anew when it opens a place: only an
+        // id of that kind is another instance's by chance.
+        if colliding.next().is_some()
+            || first
+                .is_some_and(|index| !observed.instances[index].settings_id.starts_with("debug:"))
+        {
             return false;
         }
         first.map(|index| {
