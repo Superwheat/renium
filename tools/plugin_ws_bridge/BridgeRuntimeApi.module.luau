@@ -1013,21 +1013,39 @@ end
 		return false, nil
 	end
 
+	-- Where GUI space starts on the screen, and the screen's size.
+	-- AbsolutePosition counts from the corner of the area clear of the top bar
+	-- and of the device's cutouts; input positions count from the screen's own
+	-- corner. GetGuiInset leaves the cutouts out, and a simulated phone in
+	-- landscape has one on the left: every click by path missed by its width.
+	local function guiScreenArea(): (number, number, Vector2)
+		local guiService = game:GetService("GuiService") :: any
+		local okArea, area = pcall(function()
+			return guiService:GetInsetArea(Enum.ScreenInsets.None)
+		end)
+		if okArea and typeof(area) == "Rect" then
+			return -area.Min.X, -area.Min.Y, Vector2.new(area.Width, area.Height)
+		end
+		local insetX, insetY = 0, 0
+		local topLeft = guiService:GetGuiInset()
+		if typeof(topLeft) == "Vector2" then
+			insetX, insetY = topLeft.X, topLeft.Y
+		end
+		local camera = game:GetService("Workspace").CurrentCamera
+		return insetX, insetY, if camera ~= nil then camera.ViewportSize else Vector2.new(math.huge, math.huge)
+	end
+
 	-- Whether the center of `instance` is inside the screen and every ancestor
 	-- that clips it; the second result is the ancestor that clips it away.
-	local function guiCenterOnScreen(instance, insetX, insetY)
+	local function guiCenterOnScreen(instance, insetX, insetY, screen)
 		local absPos = instance.AbsolutePosition
 		local absSize = instance.AbsoluteSize
 		local centerX = absPos.X + absSize.X / 2
 		local centerY = absPos.Y + absSize.Y / 2
-		local camera = game:GetService("Workspace").CurrentCamera
-		if camera ~= nil then
-			local viewport = camera.ViewportSize
-			local viewportX = centerX + insetX
-			local viewportY = centerY + insetY
-			if viewportX < 0 or viewportY < 0 or viewportX > viewport.X or viewportY > viewport.Y then
-				return false, nil
-			end
+		local screenX = centerX + insetX
+		local screenY = centerY + insetY
+		if screenX < 0 or screenY < 0 or screenX > screen.X or screenY > screen.Y then
+			return false, nil
 		end
 		local current = instance.Parent
 		while current ~= nil and not current:IsA("ScreenGui") do
@@ -1113,7 +1131,7 @@ end
 	-- it and its ancestors with Visible=false, its ScreenGui with
 	-- Enabled=false, no ScreenGui around it, an AbsoluteSize without area, or
 	-- a center outside the screen or outside an ancestor that clips it.
-	local function guiNotVisibleReason(instance, root, insetX, insetY): string?
+	local function guiNotVisibleReason(instance, root, insetX, insetY, screen): string?
 		local visible, decider = isEffectivelyVisible(instance)
 		if not visible then
 			if decider == nil then
@@ -1128,19 +1146,18 @@ end
 		if size.X <= 0 or size.Y <= 0 then
 			return ("it has AbsoluteSize %gx%g"):format(size.X, size.Y)
 		end
-		local onScreen, clippedBy = guiCenterOnScreen(instance, insetX, insetY)
+		local onScreen, clippedBy = guiCenterOnScreen(instance, insetX, insetY, screen)
 		if onScreen then
 			return nil
 		elseif clippedBy ~= nil then
 			return `its center is outside {guiOrdinalPath(root, clippedBy)}, which clips its descendants`
 		end
 		local position = instance.AbsolutePosition
-		local viewport = game:GetService("Workspace").CurrentCamera.ViewportSize
 		return ("its center %d,%d is outside the %dx%d screen"):format(
 			math.round(position.X + size.X / 2 + insetX),
 			math.round(position.Y + size.Y / 2 + insetY),
-			viewport.X,
-			viewport.Y
+			screen.X,
+			screen.Y
 		)
 	end
 
@@ -1215,14 +1232,10 @@ end
 		local centerX = absPos.X + absSize.X / 2
 		local centerY = absPos.Y + absSize.Y / 2
 		local hitTest, blockedBy = guiHitTest(current)
-		local insetX, insetY = 0, 0
-		local topLeft = (game:GetService("GuiService") :: any):GetGuiInset()
-		if typeof(topLeft) == "Vector2" then
-			insetX, insetY = topLeft.X, topLeft.Y
-		end
+		local insetX, insetY, screen = guiScreenArea()
 		local camera = game:GetService("Workspace").CurrentCamera
 		local viewport = if camera ~= nil then camera.ViewportSize else Vector2.new(0, 0)
-		local notVisible = guiNotVisibleReason(current, root, insetX, insetY)
+		local notVisible = guiNotVisibleReason(current, root, insetX, insetY, screen)
 		return {
 			ok = true,
 			x = centerX + insetX,
@@ -1232,7 +1245,7 @@ end
 			width = absSize.X,
 			height = absSize.Y,
 			visible = isEffectivelyVisible(current),
-			onScreen = guiCenterOnScreen(current, insetX, insetY),
+			onScreen = guiCenterOnScreen(current, insetX, insetY, screen),
 			notVisible = notVisible,
 			clickable = if notVisible ~= nil or not hitTest then clickableGuiPaths(current) else nil,
 			viewportWidth = viewport.X,
@@ -1416,12 +1429,7 @@ end
 		if playerGui == nil then
 			return { ok = false, error = "PlayerGui is not available" }
 		end
-		local insetX, insetY = 0, 0
-		local topLeft = (game:GetService("GuiService") :: any):GetGuiInset()
-		if typeof(topLeft) == "Vector2" then
-			insetX = topLeft.X
-			insetY = topLeft.Y
-		end
+		local insetX, insetY, screen = guiScreenArea()
 		local visibilityByInstance = { [playerGui] = true }
 		local screenGuiByInstance = { [playerGui] = false }
 		local pathByInstance = { [playerGui] = "" }
@@ -1525,14 +1533,10 @@ end
 			local size = instance.AbsoluteSize
 			local centerX = position.X + size.X / 2
 			local centerY = position.Y + size.Y / 2
-			local camera = workspace.CurrentCamera
-			if camera then
-				local viewport = camera.ViewportSize
-				local viewportX = centerX + offX
-				local viewportY = centerY + offY
-				if viewportX < 0 or viewportY < 0 or viewportX > viewport.X or viewportY > viewport.Y then
-					return false
-				end
+			local screenX = centerX + offX
+			local screenY = centerY + offY
+			if screenX < 0 or screenY < 0 or screenX > screen.X or screenY > screen.Y then
+				return false
 			end
 			local clip = inheritedClip(instance)
 			return not clip
@@ -1655,10 +1659,18 @@ end
 		local point, inFront = camera:WorldToViewportPoint(position)
 		local viewport = camera.ViewportSize
 		local onScreen = inFront and point.X >= 0 and point.Y >= 0 and point.X <= viewport.X and point.Y <= viewport.Y
+		-- The camera's viewport starts behind the device's cutouts as well.
+		local cutoutX, cutoutY = 0, 0
+		pcall(function()
+			local guiService = game:GetService("GuiService") :: any
+			local whole = guiService:GetInsetArea(Enum.ScreenInsets.None)
+			local safe = guiService:GetInsetArea(Enum.ScreenInsets.DeviceSafeInsets)
+			cutoutX, cutoutY = safe.Min.X - whole.Min.X, safe.Min.Y - whole.Min.Y
+		end)
 		return {
 			ok = true,
-			x = point.X,
-			y = point.Y,
+			x = point.X + cutoutX,
+			y = point.Y + cutoutY,
 			depth = point.Z,
 			inFront = inFront,
 			onScreen = onScreen,
@@ -2076,9 +2088,9 @@ updateMouse()
 			return not okProbe and string.find(tostring(probeError), "keyboard focus", 1, true) ~= nil
 		end
 		local function coreGuiObjectsAt(position: Vector2)
-			local inset = GuiService:GetGuiInset()
+			local insetX, insetY = guiScreenArea()
 			local okList, objects =
-				pcall(CoreGui.GetGuiObjectsAtPosition, CoreGui, position.X - inset.X, position.Y - inset.Y)
+				pcall(CoreGui.GetGuiObjectsAtPosition, CoreGui, position.X - insetX, position.Y - insetY)
 			return if okList and type(objects) == "table" then objects else {}
 		end
 		local function buttonLabel(button): string

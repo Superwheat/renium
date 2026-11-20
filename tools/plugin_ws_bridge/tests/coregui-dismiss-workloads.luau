@@ -748,6 +748,17 @@ assert(table.concat(result.clickable, ",") == nearestFirst, table.concat(result.
 local bounds = api.getGuiBounds({ path = "Main.HUD.Cash", scroll = true })
 assert(table.concat(bounds.clickable, ",") == nearestFirst, "a press reads the same list")
 assert(api.getGuiBounds({ path = "Main.Shop.Redeem" }).clickable == nil, "a reachable element carries no list")
+-- A simulated phone's cutout stands left of GUI space; GetGuiInset leaves it out.
+local redeem = api.getGuiBounds({ path = "Main.Shop.Redeem" })
+rawset(guiService, "GetInsetArea", function()
+	return roblox.Rect.new(-62, -INSET.Y, 1218, 720 - INSET.Y)
+end)
+local behindCutout = api.getGuiBounds({ path = "Main.Shop.Redeem" })
+rawset(guiService, "GetInsetArea", nil)
+assert(
+	behindCutout.x == redeem.x + 62 and behindCutout.y == redeem.y and behindCutout.onScreen,
+	`a device cutout moves a click by its width: {redeem.x} -> {behindCutout.x}`
+)
 for index = 1, 20 do
 	local position, size = at(120 + (index - 1) % 10 * 45, 250 + (index - 1) // 10 * 45, 40, 40)
 	new("TextButton", store.panel, { Name = `Item{index}`, AbsolutePosition = position, AbsoluteSize = size })
