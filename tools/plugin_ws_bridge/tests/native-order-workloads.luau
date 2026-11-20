@@ -18,6 +18,7 @@ local indexed, onProperty
 local states = {}
 local config = { studioChanges = {
 	observeExports = function(_, property) onProperty = property end,
+	noteExportChange = function() end,
 	trackedServiceRoot = function() return service end,
 	isTracking = function() return true end,
 	hasNonArchivable = function() return false end,

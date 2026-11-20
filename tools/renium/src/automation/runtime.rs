@@ -799,19 +799,29 @@ fn pull_publication(
     context: &automation::BoundContext,
     bridge: &BridgeServer,
     info: &crate::studio::bridge::BridgeInfoPayload,
-    args: PullArgs,
+    mut args: PullArgs,
 ) -> Result<PublishedProjectChanges> {
     use crate::automation::reconcile::{PullBaseline, pull_baseline};
-    let baseline = pull_baseline(context, bridge, &args).unwrap_or_else(|error| {
-        log_global(
-            5,
-            format_args!("[renium] baseline: none for this pull: {error:#}"),
-        );
-        None
-    });
+    let baseline_of = |args: &PullArgs| {
+        pull_baseline(context, bridge, args).unwrap_or_else(|error| {
+            log_global(
+                5,
+                format_args!("[renium] baseline: none for this pull: {error:#}"),
+            );
+            None
+        })
+    };
+    let mut baseline = baseline_of(&args);
     if let Some(PullBaseline::Unchanged) = baseline {
         crate::snapshot::export::record_bridge_sync_completion(bridge)?;
         return Ok(PublishedProjectChanges::default());
+    }
+    if let Some(PullBaseline::Scoped(scoped)) = baseline {
+        if let Some(published) = scoped.run(context, bridge, info, &mut args)? {
+            return Ok(published);
+        }
+        // The held baseline is gone: this one captures the whole place.
+        baseline = baseline_of(&args);
     }
     let published =
         export_snapshots_with_warm_bridge(args, bridge, info, 0.0, false, ExportPurpose::Pull)?;

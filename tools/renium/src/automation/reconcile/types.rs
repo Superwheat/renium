@@ -347,6 +347,9 @@ pub(crate) fn retain_verified_full_push(
 pub(crate) enum PullBaseline<'a> {
     /// Studio and the files still hold the baseline: the pull writes nothing.
     Unchanged,
+    /// Studio moved since the baseline only in services the pull can capture
+    /// alone; it falls back to a whole pull where that proves false.
+    Scoped(Box<ScopedPull>),
     /// The pull captures under this lease, which may keep a new baseline.
     Capture(Box<PullLease<'a>>),
 }
@@ -415,25 +418,38 @@ pub(crate) fn pull_baseline<'a>(
     };
     let input = plain_push_input(&PushEditorChangesArgs::new(project, args.bridge.clone()))?;
     let mut held = take_baseline(context, bridge, &input);
-    let unchanged = match held.as_ref() {
+    // Only files a pull would write, still as they were, answer a pull.
+    let files_unchanged = match held.as_ref() {
         Some(entry) => {
-            entry.exact
-                && capture_snapshot(&args.project_root, &entry.paths)? == entry.project
-                && verified_full_push_proof_matches(context, bridge, &entry.proof)?
+            entry.exact && capture_snapshot(&args.project_root, &entry.paths)? == entry.project
         }
         None => false,
     };
-    if unchanged && let Some(mut entry) = held.take() {
-        // Studio still holds the proof it held when it and these files were
-        // one, and the files are still those files: a capture would find
-        // nothing to write.
-        entry.renew();
-        log_global(5, format_args!("[renium] baseline: pull unchanged"));
-        bridge
-            .verified_full_pushes
-            .lock_recover()
-            .insert(runtime.to_string(), entry);
-        return Ok(Some(PullBaseline::Unchanged));
+    if files_unchanged {
+        let unchanged = match held.as_ref() {
+            Some(entry) => verified_full_push_proof_matches(context, bridge, &entry.proof)?,
+            None => false,
+        };
+        if unchanged && let Some(mut entry) = held.take() {
+            // Studio still holds the proof it held when it and these files
+            // were one, and the files are still those files: a capture would
+            // find nothing to write.
+            entry.renew();
+            log_global(5, format_args!("[renium] baseline: pull unchanged"));
+            bridge
+                .verified_full_pushes
+                .lock_recover()
+                .insert(runtime.to_string(), entry);
+            return Ok(Some(PullBaseline::Unchanged));
+        }
+        match plan_scoped_pull(context, bridge, args, &mut held) {
+            Ok(Some(scoped)) => return Ok(Some(PullBaseline::Scoped(Box::new(scoped)))),
+            Ok(None) => {}
+            Err(error) => log_global(
+                5,
+                format_args!("[renium] baseline: pull not scoped: {error:#}"),
+            ),
+        }
     }
     let services = sync_services();
     #[cfg(windows)]
@@ -570,6 +586,487 @@ pub(crate) fn publish_settled(
                     }
             })
         })
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+/// What Studio holds against a held proof, as the plugin answers: the
+/// services it moved in, each with the instances touched since the proof,
+/// or why it cannot say.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ProofScope {
+    Unknown(String),
+    Services {
+        services: BTreeSet<String>,
+        touched: BTreeMap<String, Option<Vec<TouchedInstance>>>,
+    },
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+/// An instance touched since a proof, by where it stands now: its `values`,
+/// its `subtree`, or the set of its `children`. The daemon logs these.
+#[derive(Debug, PartialEq)]
+pub(crate) struct TouchedInstance {
+    pub(crate) path_segments: Vec<String>,
+    pub(crate) path_ordinals: Vec<u64>,
+    pub(crate) kind: String,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl ProofScope {
+    pub(crate) fn parse(answer: &Value) -> Self {
+        if let Some(reason) = answer["unknown"].as_str() {
+            return Self::Unknown(reason.to_string());
+        }
+        let Some(services) = answer["services"].as_array().and_then(|services| {
+            services
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()
+        }) else {
+            return Self::Unknown("Studio gave no scoped answer".to_string());
+        };
+        let touched = answer["touched"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(service, entries)| (service.clone(), touched_instances(entries)))
+            .collect();
+        Self::Services {
+            services: services.into_iter().map(str::to_string).collect(),
+            touched,
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+/// A service's touched instances, or `None` for the whole service.
+fn touched_instances(entries: &Value) -> Option<Vec<TouchedInstance>> {
+    entries
+        .as_array()?
+        .iter()
+        .map(|entry| {
+            Some(TouchedInstance {
+                path_segments: serde_json::from_value(entry["pathSegments"].clone()).ok()?,
+                path_ordinals: serde_json::from_value(entry["pathOrdinals"].clone()).ok()?,
+                kind: entry["kind"].as_str()?.to_string(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn log_touched(touched: &BTreeMap<String, Option<Vec<TouchedInstance>>>) {
+    for (service, instances) in touched {
+        let Some(instances) = instances else {
+            log_global(
+                5,
+                format_args!("[renium] baseline: touched {service}: whole"),
+            );
+            continue;
+        };
+        let count = |kind: &str| {
+            instances
+                .iter()
+                .filter(|instance| instance.kind == kind)
+                .count()
+        };
+        log_global(
+            5,
+            format_args!(
+                "[renium] baseline: touched {service}: {} values, {} subtree, {} children",
+                count("values"),
+                count("subtree"),
+                count("children")
+            ),
+        );
+    }
+}
+
+/// The store of each service the project holds, by path from its root.
+#[cfg(any(windows, target_os = "macos"))]
+fn project_store_paths(root: &Path, src_dir: &Path) -> Result<BTreeMap<String, PathBuf>> {
+    crate::project::structural::service_store_paths(&root.join(src_dir))?
+        .into_iter()
+        .map(|(service, path)| Ok((service, path.strip_prefix(root)?.to_path_buf())))
+        .collect()
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+/// The services outside `moved` whose store in `project` refers to an
+/// instance of one of them. A whole pull writes such a reference from where
+/// its target stands now, so a pull scoped to `moved` captures them too. A
+/// reference without a path stays in its own store.
+pub(crate) fn referring_services(
+    project: &ProjectSnapshot,
+    stores: &BTreeMap<String, PathBuf>,
+    moved: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let needles = moved
+        .iter()
+        .map(|service| vec![service.clone()])
+        .collect::<Vec<_>>();
+    let referring = stores
+        .par_iter()
+        .filter(|(service, _)| !moved.contains(*service))
+        .map(|(service, path)| {
+            let Some(SnapshotEntry::File(bytes)) = project.entries.get(path) else {
+                // A store the baseline does not hold cannot be shown not to.
+                return Ok(Some(service.clone()));
+            };
+            let Some(document) =
+                SettingsBytecode::decode_if_contains_any_string_set(bytes, &needles)?
+            else {
+                return Ok(None);
+            };
+            let mut refers = false;
+            for value in document.instances.iter().flat_map(|instance| {
+                instance
+                    .properties
+                    .values()
+                    .chain(instance.attributes.values())
+            }) {
+                crate::settings::bytecode::for_each_reference(value, &mut |reference| {
+                    refers |= reference
+                        .get("pathSegments")
+                        .and_then(Value::as_array)
+                        .and_then(|segments| segments.first())
+                        .and_then(Value::as_str)
+                        .is_some_and(|service| moved.contains(service));
+                });
+                if refers {
+                    return Ok(Some(service.clone()));
+                }
+            }
+            Ok(None)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(referring.into_iter().flatten().collect())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+/// The held files with what a scoped publish left under its paths in place
+/// of what they held there.
+pub(crate) fn scoped_project(
+    held: &ProjectSnapshot,
+    written: &ProjectSnapshot,
+    paths: &[PathBuf],
+) -> ProjectSnapshot {
+    let scope = ScopeSet::new(paths);
+    let mut entries = held
+        .entries
+        .iter()
+        .filter(|(path, _)| !scope.contains(path))
+        .map(|(path, entry)| (path.clone(), entry.clone()))
+        .collect::<BTreeMap<_, _>>();
+    entries.extend(
+        written
+            .entries
+            .iter()
+            .map(|(path, entry)| (path.clone(), entry.clone())),
+    );
+    ProjectSnapshot { entries }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+/// What Studio did since a scoped pull's proof, as its publication sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScopedPremise {
+    /// Studio still holds the proof.
+    Held,
+    /// Studio moved only where the pull captures, references to it
+    /// included: the pull publishes and keeps no baseline.
+    Inside,
+    /// Studio moved elsewhere, or cannot say where: the pull publishes
+    /// nothing and a whole pull runs instead.
+    False,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+/// The premise of a pull scoped to `scope` once Studio moved as `now`
+/// says since its proof.
+pub(crate) fn scoped_premise(
+    now: &ProofScope,
+    scope: &BTreeSet<String>,
+    project: &ProjectSnapshot,
+    stores: &BTreeMap<String, PathBuf>,
+) -> Result<ScopedPremise> {
+    let ProofScope::Services { services, .. } = now else {
+        return Ok(ScopedPremise::False);
+    };
+    Ok(
+        if services.is_subset(scope)
+            && referring_services(project, stores, services)?.is_subset(scope)
+        {
+            ScopedPremise::Inside
+        } else {
+            ScopedPremise::False
+        },
+    )
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+/// The baseline a scoped pull keeps, from the files under its publish paths
+/// as read back: the held files with those in their place. The capture came
+/// after the pull's proof and Studio held that proof until the files were
+/// written, so the scoped services' files hold what Studio holds at it; every
+/// other service's files hold what Studio held at the old proof, which
+/// differs from this one only in the scoped services.
+pub(crate) fn scoped_baseline(
+    held: &ProjectSnapshot,
+    written: &ProjectSnapshot,
+    (paths, settled): (&[PathBuf], &BTreeMap<PathBuf, PublishEntryState>),
+    premise: ScopedPremise,
+) -> std::result::Result<ProjectSnapshot, &'static str> {
+    if premise != ScopedPremise::Held {
+        return Err("Studio changed during the pull");
+    }
+    if !publish_settled(written, settled) {
+        return Err("the files changed after the pull wrote them");
+    }
+    Ok(scoped_project(held, written, paths))
+}
+
+/// A pull of the services Studio moved in since the held baseline, with
+/// those whose stores refer into them.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) struct ScopedPull {
+    held: VerifiedFullPush,
+    /// The proof Studio took under the held one's observation before the
+    /// capture, which the new baseline stands on.
+    proof: Value,
+    services: BTreeSet<String>,
+    stores: BTreeMap<String, PathBuf>,
+}
+
+/// Has Studio take a new proof under the held proof's observation and, where
+/// it can say which services moved between the two, plans a pull of those.
+#[cfg(any(windows, target_os = "macos"))]
+fn plan_scoped_pull(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    args: &crate::cli::PullArgs,
+    held: &mut Option<VerifiedFullPush>,
+) -> Result<Option<ScopedPull>> {
+    let (Some(entry), Some(runtime)) = (held.as_ref(), context.runtime_id.as_deref()) else {
+        return Ok(None);
+    };
+    let state = bridge.call_for_runtime_with_timeout(
+        "getStudioChangeState",
+        json!({"start": false, "capturePushProof": true, "scopeFrom": entry.proof}),
+        BridgeTarget::Edit,
+        runtime,
+        Some(Duration::from_secs(10)),
+    )?;
+    ensure_plugin_api_ok(&state)?;
+    let not_scoped = |reason: &str| {
+        log_global(
+            5,
+            format_args!("[renium] baseline: pull not scoped: {reason}"),
+        );
+    };
+    let moved = match ProofScope::parse(&state["pushProofScope"]) {
+        ProofScope::Unknown(reason) => {
+            not_scoped(&reason);
+            return Ok(None);
+        }
+        ProofScope::Services { services, touched } => {
+            log_touched(&touched);
+            services
+        }
+    };
+    let Some(proof) = state
+        .get("verifiedPushProof")
+        .filter(|value| !value.is_null())
+        .cloned()
+    else {
+        not_scoped("Studio gave no new proof");
+        return Ok(None);
+    };
+    let stores = project_store_paths(&args.project_root, &args.src_dir)?;
+    let referring = referring_services(&entry.project, &stores, &moved)?;
+    let services = moved.union(&referring).cloned().collect::<BTreeSet<_>>();
+    if services.len() >= sync_services().len() {
+        not_scoped("it covers every service");
+        return Ok(None);
+    }
+    log_global(
+        5,
+        format_args!(
+            "[renium] baseline: pull scoped to [{}]: Studio moved [{}], stores referring to them [{}]",
+            services.iter().cloned().collect::<Vec<_>>().join(", "),
+            moved.iter().cloned().collect::<Vec<_>>().join(", "),
+            referring.iter().cloned().collect::<Vec<_>>().join(", ")
+        ),
+    );
+    Ok(held.take().map(|held| ScopedPull {
+        held,
+        proof,
+        services,
+        stores,
+    }))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl ScopedPull {
+    /// Captures and publishes the scoped services, checking before the
+    /// publish that Studio moved nowhere else since the proof; `None`, having
+    /// written nothing, where it did.
+    pub(crate) fn run(
+        self,
+        context: &BoundContext,
+        bridge: &BridgeServer,
+        info: &crate::studio::bridge::BridgeInfoPayload,
+        args: &mut crate::cli::PullArgs,
+    ) -> Result<Option<crate::snapshot::export::PublishedProjectChanges>> {
+        let runtime = context
+            .runtime_id
+            .as_deref()
+            .context("Studio context has no edit-mode runtime")?;
+        let mut premise = ScopedPremise::False;
+        let mut check = || -> Result<()> {
+            let state = bridge.call_for_runtime_with_timeout(
+                "getStudioChangeState",
+                json!({"start": false, "verifyPushProof": self.proof, "scopePushProof": true}),
+                BridgeTarget::Edit,
+                runtime,
+                Some(Duration::from_secs(10)),
+            )?;
+            ensure_plugin_api_ok(&state)?;
+            premise = if state["pushProofMatches"] == true {
+                ScopedPremise::Held
+            } else {
+                scoped_premise(
+                    &ProofScope::parse(&state["pushProofScope"]),
+                    &self.services,
+                    &self.held.project,
+                    &self.stores,
+                )?
+            };
+            if premise == ScopedPremise::False {
+                bail!("Studio moved outside the scoped services during the pull");
+            }
+            Ok(())
+        };
+        let result = if self.services.is_empty() {
+            check().and_then(|()| {
+                crate::snapshot::export::record_bridge_sync_completion(bridge)?;
+                Ok(crate::snapshot::export::PublishedProjectChanges::default())
+            })
+        } else {
+            let whole = std::mem::replace(
+                &mut args.services,
+                self.services.iter().cloned().collect::<Vec<_>>().join(","),
+            );
+            let result =
+                crate::snapshot::export::export_pull_checked(args, bridge, info, &mut check);
+            args.services = whole;
+            result
+        };
+        let published = match result {
+            Err(error) if premise == ScopedPremise::False => {
+                log_global(
+                    5,
+                    format_args!(
+                        "[renium] baseline: scoped pull wrote nothing; a whole pull follows: {error:#}"
+                    ),
+                );
+                return Ok(None);
+            }
+            result => result?,
+        };
+        if let Err(error) = self.keep(bridge, runtime, &args.project_root, &published, premise) {
+            log_global(
+                5,
+                format_args!("[renium] baseline: not kept after scoped pull: {error:#}"),
+            );
+        }
+        Ok(Some(published))
+    }
+
+    /// Keeps the held files with the scoped services' files as the publish
+    /// left them as the baseline, on the proof taken before the capture,
+    /// when Studio still holds that proof.
+    fn keep(
+        self,
+        bridge: &BridgeServer,
+        runtime: &str,
+        root: &Path,
+        published: &crate::snapshot::export::PublishedProjectChanges,
+        premise: ScopedPremise,
+    ) -> Result<()> {
+        let not_kept = |reason: &str| {
+            log_global(
+                5,
+                format_args!("[renium] baseline: not kept after scoped pull: {reason}"),
+            );
+        };
+        if !published.preserved.is_empty()
+            || !published.read_only_links_restored.is_empty()
+            || !published.studio_overrides.is_empty()
+        {
+            not_kept("the pull kept files back");
+            return Ok(());
+        }
+        let held_paths = ScopeSet::new(&self.held.paths);
+        if published
+            .publish_paths
+            .iter()
+            .any(|path| !derived_project_path(path) && !held_paths.contains(path))
+        {
+            not_kept("the pull wrote outside the baseline's paths");
+            return Ok(());
+        }
+        let written = capture_snapshot(root, &published.publish_paths)?;
+        let project = match scoped_baseline(
+            &self.held.project,
+            &written,
+            (&published.publish_paths, &published.settled),
+            premise,
+        ) {
+            Ok(project) => project,
+            Err(reason) => {
+                not_kept(reason);
+                return Ok(());
+            }
+        };
+        let expires = baseline_expiry(
+            #[cfg(windows)]
+            self.held.relay.as_ref(),
+        );
+        let retain = expires
+            .saturating_duration_since(Instant::now())
+            .min(BASELINE_IDLE);
+        let state = bridge.call_for_runtime_with_timeout(
+            "getStudioChangeState",
+            json!({"start": false, "retainPushProof": self.proof, "retainSeconds": retain.as_secs()}),
+            BridgeTarget::Edit,
+            runtime,
+            Some(Duration::from_secs(10)),
+        )?;
+        ensure_plugin_api_ok(&state)?;
+        if state.get("retainedPushProof") != Some(&self.proof) {
+            not_kept("Studio changed during the pull");
+            return Ok(());
+        }
+        #[cfg(windows)]
+        if self.held.relay.is_none() && state["retainedPushProofLocal"] != true {
+            not_kept("no native attribute guard");
+            return Ok(());
+        }
+        let entry = VerifiedFullPush {
+            connections: bridge.runtime_connection_signature(runtime),
+            input: self.held.input,
+            project,
+            paths: self.held.paths,
+            proof: self.proof,
+            expires,
+            exact: true,
+            #[cfg(windows)]
+            relay: self.held.relay,
+        };
+        keep_baseline(bridge, runtime, entry, "scoped pull");
+        Ok(())
+    }
 }
 
 #[derive(Default)]

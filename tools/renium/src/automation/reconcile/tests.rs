@@ -9452,3 +9452,46 @@ fn a_new_script_in_a_store_read_in_part_is_written_with_every_instance() {
     ));
     assert_eq!(imported.instances.len(), files.instances.len() + 1);
 }
+
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn a_scoped_answer_reads_its_services_their_touched_instances_and_unknowns() {
+    let answer = json!({
+        "services": ["ReplicatedStorage", "ServerStorage", "Workspace"],
+        "touched": {
+            "ReplicatedStorage": [
+                {"pathSegments": ["ReplicatedStorage", "Box"], "pathOrdinals": [1, 2], "kind": "children"},
+            ],
+            "ServerStorage": [{"pathSegments": ["ServerStorage"], "pathOrdinals": [1]}],
+            "Workspace": "whole",
+        },
+    });
+    let ProofScope::Services { services, touched } = ProofScope::parse(&answer) else {
+        panic!("a scoped answer read as unknown");
+    };
+    assert_eq!(
+        services,
+        BTreeSet::from(["ReplicatedStorage", "ServerStorage", "Workspace"].map(String::from))
+    );
+    assert_eq!(
+        touched["ReplicatedStorage"],
+        Some(vec![TouchedInstance {
+            path_segments: vec!["ReplicatedStorage".into(), "Box".into()],
+            path_ordinals: vec![1, 2],
+            kind: "children".into(),
+        }])
+    );
+    assert_eq!(
+        touched["ServerStorage"], None,
+        "an entry it cannot read leaves the whole service"
+    );
+    assert_eq!(touched["Workspace"], None);
+    assert_eq!(
+        ProofScope::parse(&json!({"unknown": "proof retired"})),
+        ProofScope::Unknown("proof retired".into())
+    );
+    assert!(matches!(
+        ProofScope::parse(&Value::Null),
+        ProofScope::Unknown(_)
+    ));
+}

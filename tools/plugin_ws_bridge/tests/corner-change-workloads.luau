@@ -2381,3 +2381,231 @@ do
 	observer.stop()
 end
 print("Renamed service: a lone property edit stays pending under the service's class name")
+
+do
+	-- A broken proof's answer: the services Studio moved in since it, each
+	-- with the instances touched, read from the export observers alone.
+	local savedItemChanged, savedTerrain = testGame.ItemChanged, workspace.Terrain
+	local savedCapture = dependencies.BridgeScriptDocuments.capture
+	local collection = services.CollectionService
+	local savedCollection = table.clone(collection)
+	local tagAdded = signal()
+	collection.GetAllTags = function() return { "ProofTag" } end
+	collection.GetTagged = function() return {} end
+	collection.GetInstanceAddedSignal = function() return tagAdded end
+	collection.GetInstanceRemovedSignal = function() return signal() end
+	local scopedDependencies = table.clone(dependencies)
+	scopedDependencies.BridgeIdentity = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeIdentity.module.luau"), {
+		environment = { game = testGame },
+	})()
+	local environment = table.clone(trackerEnvironment)
+	environment.script = { Parent = scopedDependencies }
+	local scopedModule = luau.load(trackerSource, { environment = environment })()
+	local watched = { "ReplicatedStorage", "Workspace" }
+	local function serviceOf(item)
+		while item.Parent ~= testGame do item = item.Parent end
+		return item.ClassName
+	end
+	local function relocate(item, parent)
+		if item.Parent then table.remove(item.Parent.children, assert(table.find(item.Parent.children, item))) end
+		item.Parent = parent
+		if parent then table.insert(parent.children, item) end
+	end
+	-- An observer holding a retained native proof of both services, as a
+	-- pull leaves it. `generations` stand for the export observers' counts.
+	local function start()
+		testGame.ItemChanged = signal()
+		local context = { generations = { ReplicatedStorage = 0, Workspace = 0 }, digest = "voxels", exported = true,
+			documents = { { instance = localScript, source = "original" } } }
+		dependencies.BridgeScriptDocuments.capture = function() return context.documents end
+		local config = table.clone(trackerConfig)
+		config.exportProofGeneration = function(service) return context.generations[service] end
+		config.observeProofDocuments = function() return {} end
+		config.captureTerrainProof = function() return context.digest end
+		local observer = scopedModule.create(config, { ReplicatedStorage = true, Workspace = true })
+		observer.observeExports(function(service)
+			context.generations[service] += 1
+			return true
+		end, function(item, property)
+			if not context.exported then return end
+			local service = serviceOf(item)
+			context.generations[service] += 1
+			observer.noteExportChange(service, item, property)
+		end)
+		observer.configurePropertyCandidates({ Part = { "Transparency" } })
+		observer.getState({ services = watched, trackingGuardId = "first", nativeAttributeRelay = true, deferNativeTracking = true })
+		context.relay = createdRelays[#createdRelays]
+		context.relay.Changed:Fire(context.relay)
+		context.proof = assert(observer.capturePushProof())
+		observer.getState({ start = false, releaseTrackingGuardId = "first", retainPushProof = context.proof, retainSeconds = 100 })
+		context.observer = observer
+		return context
+	end
+	local function scope(context)
+		local state = context.observer.getState({ start = false, capturePushProof = true, scopeFrom = context.proof })
+		context.proof = assert(state.verifiedPushProof, "Studio took no new proof")
+		return state.pushProofScope
+	end
+	local function touched(answer, service)
+		if answer.touched[service] == "whole" then return "whole" end
+		local found = {}
+		for _, entry in answer.touched[service] do
+			assert(#entry.pathSegments == #entry.pathOrdinals)
+			found[#found + 1] = table.concat(entry.pathSegments, ".") .. ":" .. entry.kind
+		end
+		table.sort(found)
+		return table.concat(found, ",")
+	end
+	local function named(answer)
+		return table.concat(answer.services, ",")
+	end
+
+	local context = start()
+	testGame.ItemChanged:Fire(corner, "TopLeftRadius")
+	local answer = scope(context)
+	assert(named(answer) == "ReplicatedStorage" and touched(answer, "ReplicatedStorage") == "ReplicatedStorage.Corner:values",
+		"one property change names its instance")
+	local again = scope(context)
+	assert(again.unknown == nil and #again.services == 0 and next(again.touched) == nil, "a new proof starts empty")
+	testGame.ItemChanged:Fire(moving, "Transparency")
+	assert(touched(scope(context), "ReplicatedStorage") == "ReplicatedStorage.Left.Duplicate:values",
+		"a new proof names only what changed since it")
+	context.observer.stop()
+
+	context = start()
+	workspace.Terrain = instance("Terrain", "Terrain", workspace)
+	testGame.ItemChanged:Fire(corner, "TopLeftRadius")
+	context.relay.Changed:Fire(mesh)
+	tagAdded:Fire(beam)
+	testGame.ItemChanged:Fire(left, "Name")
+	context.documents = { { instance = localScript, source = "typed" } }
+	context.digest = "dug"
+	answer = scope(context)
+	assert(named(answer) == "ReplicatedStorage,Workspace", named(answer))
+	assert(touched(answer, "ReplicatedStorage") == "ReplicatedStorage.Beam:values,ReplicatedStorage.Corner:values,"
+		.. "ReplicatedStorage.LocalScript:values,ReplicatedStorage.Mesh:values,ReplicatedStorage:children",
+		"property, attribute, tag, rename and buffer: " .. touched(answer, "ReplicatedStorage"))
+	assert(touched(answer, "Workspace") == "Workspace.Terrain:values", "voxels belong to Workspace")
+	relocate(workspace.Terrain, nil)
+	workspace.Terrain = savedTerrain
+	context.observer.stop()
+
+	local many = instance("Folder", "Many", storage)
+	for index = 1, 257 do instance("Part", `P{index}`, many) end
+	for _, limit in { 256, 257 } do
+		context = start()
+		for index = 1, limit do testGame.ItemChanged:Fire(many.children[index], "Transparency") end
+		answer = scope(context)
+		assert(if limit == 256 then #answer.touched.ReplicatedStorage == 256 else answer.touched.ReplicatedStorage == "whole",
+			`{limit} touched instances`)
+		context.observer.stop()
+	end
+	for _, part in many.children do instance("Part", "Inner", part) end
+	context = start()
+	storage.DescendantRemoving:Fire(many)
+	for _, part in many.children do
+		storage.DescendantRemoving:Fire(part)
+		storage.DescendantRemoving:Fire(part.children[1])
+	end
+	relocate(many, nil)
+	answer = scope(context)
+	assert(touched(answer, "ReplicatedStorage") == "ReplicatedStorage:children",
+		"a removed subtree counts once: " .. touched(answer, "ReplicatedStorage"))
+	context.observer.stop()
+
+	local box = instance("Folder", "Box", storage)
+	local inner = instance("Part", "Inner", box)
+	context = start()
+	testGame.ItemChanged:Fire(inner, "Transparency")
+	storage.DescendantRemoving:Fire(inner)
+	relocate(inner, nil)
+	answer = scope(context)
+	assert(touched(answer, "ReplicatedStorage") == "ReplicatedStorage.Box:children",
+		"a touched, then removed instance is its parent's children: " .. touched(answer, "ReplicatedStorage"))
+	context.observer.stop()
+
+	local crate = instance("Folder", "Crate", box)
+	instance("Part", "Content", crate)
+	context = start()
+	testGame.ItemChanged:Fire(crate.children[1], "Transparency")
+	storage.DescendantRemoving:Fire(crate)
+	storage.DescendantRemoving:Fire(crate.children[1])
+	relocate(crate, workspace)
+	workspace.DescendantAdded:Fire(crate)
+	workspace.DescendantAdded:Fire(crate.children[1])
+	testGame.ItemChanged:Fire(crate, "Parent")
+	answer = scope(context)
+	assert(named(answer) == "ReplicatedStorage,Workspace", "a move marks both services")
+	assert(touched(answer, "ReplicatedStorage") == "ReplicatedStorage.Box:children")
+	assert(touched(answer, "Workspace") == "Workspace.Crate:subtree,Workspace:children", touched(answer, "Workspace"))
+	context.observer.stop()
+
+	-- Removed before the proof, then back: a reference to it from another
+	-- service's store was written as no value while it was away.
+	relocate(crate, nil)
+	context = start()
+	relocate(crate, box)
+	storage.DescendantAdded:Fire(crate)
+	answer = scope(context)
+	assert(answer.services == nil and answer.unknown ~= nil, "an instance back from outside every service has no answer")
+	context.observer.stop()
+	-- Removed after the proof and back again: its old place is in the files.
+	context = start()
+	storage.DescendantRemoving:Fire(crate)
+	relocate(crate, nil)
+	relocate(crate, box)
+	storage.DescendantAdded:Fire(crate)
+	answer = scope(context)
+	assert(named(answer) == "ReplicatedStorage" and touched(answer, "ReplicatedStorage") == "ReplicatedStorage.Box.Crate:subtree,ReplicatedStorage.Box:children",
+		"an instance removed and restored since the proof: " .. touched(answer, "ReplicatedStorage"))
+	context.observer.stop()
+	context = start()
+	collection.TagAdded:Fire("Created")
+	assert(scope(context).unknown ~= nil, "a tag created anywhere has no answer")
+	context.observer.stop()
+	context = start()
+	testGame.ItemChanged:Fire(box, "Parent")
+	answer = scope(context)
+	assert(touched(answer, "ReplicatedStorage") == "whole", "a move within a service has no old parent to name")
+	context.observer.stop()
+	relocate(box, nil)
+	print("Scoped proof answer: one change, several kinds, the 256 cap, removed and moved instances, a fresh proof and the unanswerable cases")
+
+	-- The first outside change that breaks a retained proof ends the hold.
+	for _, mode in { "release", "lease", "unbroken" } do
+		context = start()
+		local observer = context.observer
+		if mode == "lease" then
+			local lease = observer.getState({ start = true, services = watched, trackingGuardId = "running-pull",
+				verifyPushProof = context.proof })
+			assert(lease.nativeRelayContinued, `the running pull continues the baseline's observation ({lease.pushProofMismatch})`)
+		end
+		context.exported = mode ~= "unbroken"
+		deferred = {}
+		moving.Transparency = (moving.Transparency or 0) + 0.25
+		testGame.ItemChanged:Fire(moving, "Transparency")
+		assert(observer.getState({ start = false }).tracking, "the release waits until the handler returns")
+		flushDeferred()
+		deferred = nil
+		local tracking = observer.getState({ start = false }).tracking
+		assert(tracking == (mode ~= "release"), `{mode}: tracking {tracking}`)
+		if mode == "release" then
+			assert(next(observer.reviewState.connectionServiceByInstance) == nil, "the release kept instance listeners")
+			local seq = observer.getState({ start = false }).seq
+			moving.Transparency += 0.25
+			testGame.ItemChanged:Fire(moving, "Transparency")
+			assert(observer.getState({ start = false }).seq == seq, "a later change cost tracker work")
+			answer = scope(context)
+			assert(named(answer) == "ReplicatedStorage"
+				and touched(answer, "ReplicatedStorage") == "ReplicatedStorage.Left.Duplicate:values",
+				"the answer after the release names the service")
+		end
+		observer.stop()
+	end
+	print("Retained hold: an outside change ends it after its handler; a running lease or an unbroken proof keeps tracking")
+
+	dependencies.BridgeScriptDocuments.capture = savedCapture
+	table.clear(collection)
+	for key, value in pairs(savedCollection) do collection[key] = value end
+	testGame.ItemChanged = savedItemChanged
+end

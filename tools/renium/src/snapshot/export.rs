@@ -1597,22 +1597,34 @@ pub(crate) fn export_snapshots_with_warm_bridge(
     repair_reference_paths: bool,
     purpose: ExportPurpose,
 ) -> Result<PublishedProjectChanges> {
-    let prelude = export_snapshots_prelude(&args)?;
-    println!(
-        "[renium] persistent warm bridge: channels={}/{}, cached_bridge_info={}, per_export_handshake_ms={:.1}",
-        bridge.channel_count(),
-        bridge.expected_channel_count(),
-        bridge_info_refresh_ms == 0.0,
-        bridge_info_refresh_ms
-    );
     export_snapshots_core(
         &args,
-        prelude,
         bridge,
         bridge_info,
         bridge_info_refresh_ms,
         repair_reference_paths,
         purpose,
+        &mut || Ok(()),
+    )
+}
+
+/// A pull's export whose publication waits on `before_publish`: an error
+/// from it leaves the project's files as they were.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn export_pull_checked(
+    args: &PullArgs,
+    bridge: &BridgeServer,
+    bridge_info: &BridgeInfoPayload,
+    before_publish: &mut dyn FnMut() -> Result<()>,
+) -> Result<PublishedProjectChanges> {
+    export_snapshots_core(
+        args,
+        bridge,
+        bridge_info,
+        0.0,
+        false,
+        ExportPurpose::Pull,
+        before_publish,
     )
 }
 
@@ -1925,19 +1937,26 @@ pub(crate) fn finish_export_publication(
 
 fn export_snapshots_core(
     args: &PullArgs,
-    prelude: ExportPrelude,
     bridge: &BridgeServer,
     bridge_info: &BridgeInfoPayload,
     all_channels_connected_to_bridge_info_ms: f64,
     repair_reference_paths: bool,
     purpose: ExportPurpose,
+    before_publish: &mut dyn FnMut() -> Result<()>,
 ) -> Result<PublishedProjectChanges> {
     let ExportPrelude {
         total_started,
         project_root,
         services,
         ..
-    } = prelude;
+    } = export_snapshots_prelude(args)?;
+    println!(
+        "[renium] persistent warm bridge: channels={}/{}, cached_bridge_info={}, per_export_handshake_ms={:.1}",
+        bridge.channel_count(),
+        bridge.expected_channel_count(),
+        all_channels_connected_to_bridge_info_ms == 0.0,
+        all_channels_connected_to_bridge_info_ms
+    );
     let cli_start_to_bridge_listen_ms = log_export_bridge_connection(
         total_started,
         all_channels_connected_to_bridge_info_ms,
@@ -2013,7 +2032,7 @@ fn export_snapshots_core(
             if let Some(mut guard) = native_finish_guard.take() {
                 finish_native_export(&mut guard)?;
             }
-            Ok(())
+            before_publish()
         },
         || record_bridge_sync_completion(bridge),
     )?;

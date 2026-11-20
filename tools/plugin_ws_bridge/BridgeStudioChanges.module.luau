@@ -12,6 +12,8 @@ local MAX_CHANGE_LOGS_PER_SERVICE = 1024
 local MAX_DIRECT_PROPERTY_CHANGES = 2048
 local MAX_DIRECT_PROPERTY_BYTES = 8 * 1024 * 1024
 local TRACKING_GUARD_TTL_SECONDS = 300
+-- Past this many touched instances a service's answer is the whole service.
+local PROOF_TOUCHED_LIMIT = 256
 local FLOAT32_FINGERPRINT_BUFFER = buffer.create(4)
 local CAMERA_FOV_PROPERTIES = { fieldofview = true, diagonalfieldofview = true, maxaxisfieldofview = true }
 -- A Decal's ColorMapContent mirrors TextureContent, so Studio signals both for one write.
@@ -401,6 +403,46 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	local localPushObservation = nil
 	local localPushProofRequested = false
 	local nextPushProof = 0
+	-- What the proof observers lay to the synced service it happened in:
+	-- native attribute and tag changes counted by service, and `unplaced` for
+	-- what no service answers for (an instance entering a service from outside
+	-- every synced one, a tag created or retired). A proof copies the counts,
+	-- so a later one tells which services moved between the two.
+	local proofLedger = { attributes = {}, tags = {}, unplaced = 0 }
+	local function proofServiceOf(instance: Instance): string?
+		local current = instance
+		while current.Parent ~= nil and current.Parent ~= game do
+			current = current.Parent
+		end
+		return if current.Parent == game and allowedServices[current.ClassName] then current.ClassName else nil
+	end
+	-- Records an instance the observers saw change since `proof` was taken:
+	-- `values` (it alone), `subtree` (it and everything below) or `children`
+	-- (the set of its children). No instance, or more than the limit, leaves
+	-- the whole service. One event costs a few table reads and one write.
+	local function noteTouched(proof, serviceName: string?, instance: Instance?, kind: string)
+		if proof == nil or serviceName == nil then return end
+		local touched = proof.touched[serviceName]
+		if touched == true then return end
+		if instance == nil then
+			proof.touched[serviceName] = true
+			return
+		end
+		if touched == nil then
+			touched = { count = 0, kinds = {} }
+			proof.touched[serviceName] = touched
+		end
+		local previous = touched.kinds[instance]
+		if previous == kind or previous == "subtree" then return end
+		if previous == nil then
+			touched.count += 1
+			if touched.count > PROOF_TOUCHED_LIMIT then
+				proof.touched[serviceName] = true
+				return
+			end
+		end
+		touched.kinds[instance] = if previous == nil then kind else "subtree"
+	end
 	local function releaseLocalPushObservation()
 		if localPushObservation == nil then return end
 		state.trackingGuards[localPushObservation.guardId] = nil
@@ -513,6 +555,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 						observation.generation += 1
 						observation.instance = relay.camera
 					end
+					noteTouched(verifiedPushProof, "Workspace", relay.camera, "values")
 					config.invalidateRuntimeExportCache("Workspace")
 				end))
 			end
@@ -526,7 +569,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if documents == nil then return nil, "script editor documents unavailable" end
 		local proof = { attributes = attributes, services = services, generations = generations, documents = documents,
 			tags = rawTagGeneration, documentGeneration = rawDocumentGeneration, terrainRequired = relay.services.Workspace == true,
-			localObservation = localObservation, camera = Workspace.CurrentCamera, cameraGeneration = relay.cameraGeneration }
+			localObservation = localObservation, camera = Workspace.CurrentCamera, cameraGeneration = relay.cameraGeneration,
+			attributeServices = table.clone(proofLedger.attributes), tagServices = table.clone(proofLedger.tags),
+			unplaced = proofLedger.unplaced }
 		proof.terrain = proofTerrain(proof.terrainRequired)
 		-- The serializer yields. All other state must remain unchanged across
 		-- that interval, including open-buffer changes that later cancel out.
@@ -535,6 +580,11 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if not matches then return nil, reason end
 		nextPushProof += 1
 		proof.id = nextPushProof
+		-- The instances touched since this proof, and those that left a synced
+		-- service since it: one entering a service again is a move, not an
+		-- arrival from outside.
+		proof.touched = {}
+		proof.departed = setmetatable({}, { __mode = "k" })
 		verifiedPushProof = proof
 		return proof.id, nil
 	end
@@ -566,6 +616,178 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if terrain == nil then return false, "Terrain unavailable" end
 		if terrain ~= proof.terrain then return false, "Terrain changed" end
 		return matchesPushState(proof)
+	end
+	-- What a later proof of `proof`'s observation would hold, read now. Only
+	-- observers that outlive tracking feed it once tracking stops: export
+	-- generations, the native relay, its tag and buffer listeners, Terrain.
+	local function proofStateNow(proof)
+		local observation = proof.localObservation
+		local current = { attributes = api.nativeAttributeProof(), generations = {}, unplaced = proofLedger.unplaced,
+			attributeServices = proofLedger.attributes, tagServices = proofLedger.tags,
+			documents = proofDocuments(proof.services), camera = Workspace.CurrentCamera }
+		if observation ~= nil then
+			local observing = observation == localPushObservation and state.started and not state.onlyCodeMode
+				and state.syncbackProperties and state.itemChangedAvailable
+			current.localObservation = if observing then observation else false
+			current.cameraGeneration = observation.cameraGeneration
+			current.attributes = {}
+			for service in pairs(proof.attributes) do
+				local now = api.attributeObservation(service)
+				current.attributes[service] = if now then { observation = now, generation = now.generation } else nil
+			end
+		end
+		for _, service in ipairs(proof.services) do
+			current.generations[service] = config.exportProofGeneration(service)
+		end
+		current.terrain = proofTerrain(proof.terrainRequired)
+		return current
+	end
+	-- The services `current`, a later state of the same observation, differs
+	-- from `proof` in, with the instances whose open buffers or voxels differ.
+	-- Nil and why where a part no service answers for changed or the
+	-- observation ended.
+	local function proofDifference(proof, current): (any, any)
+		if proof.unplaced == nil then return nil, "the proof predates service answers" end
+		if current.localObservation ~= proof.localObservation then return nil, "local observation ended" end
+		if current.unplaced ~= proof.unplaced then
+			return nil, "an instance entered a service from outside the synced ones, or a tag was created or retired"
+		end
+		if current.documents == nil then return nil, "script editor documents unavailable" end
+		if current.terrain == nil then return nil, "Terrain unavailable" end
+		local differs, laid = {}, {}
+		if proof.localObservation == nil then
+			if current.attributes == nil or current.attributes.id ~= proof.attributes.id then return nil, "native observation ended" end
+			for service, count in pairs(current.attributeServices) do
+				if proof.attributeServices[service] ~= count then
+					differs[service] = true
+				end
+			end
+		else
+			for service, entry in pairs(proof.attributes) do
+				local now = current.attributes[service]
+				if now == nil or now.observation ~= entry.observation then return nil, `{service} attribute observation ended` end
+				if now.generation ~= entry.generation then
+					differs[service] = true
+				end
+			end
+			if current.camera ~= proof.camera or current.cameraGeneration ~= proof.cameraGeneration then
+				differs.Workspace = true
+			end
+		end
+		for service, count in pairs(current.tagServices) do
+			if proof.tagServices[service] ~= count then
+				differs[service] = true
+			end
+		end
+		for service, generation in pairs(proof.generations) do
+			if current.generations[service] ~= generation then
+				differs[service] = true
+			end
+		end
+		-- A buffer belongs to the service its script stands in; one that left
+		-- every service changed that service's structure as it left.
+		for _, sides in ipairs({ { proof.documents, current.documents }, { current.documents, proof.documents } }) do
+			for instance, source in pairs(sides[1]) do
+				local service = if sides[2][instance] ~= source then proofServiceOf(instance) else nil
+				if service ~= nil then
+					differs[service] = true
+					laid[instance] = service
+				end
+			end
+		end
+		if current.terrain ~= proof.terrain then
+			differs.Workspace = true
+			if Workspace.Terrain ~= nil then
+				laid[Workspace.Terrain] = "Workspace"
+			end
+		end
+		return differs, laid
+	end
+	-- The answer for the services `proof` differs in: each with the instances
+	-- touched since the proof, by where they stand now, or "whole".
+	local function proofScopeAnswer(proof, differs, laid): { [string]: any }
+		for instance, service in pairs(laid) do
+			noteTouched(proof, service, instance, "values")
+		end
+		local services, touched = {}, {}
+		for service in pairs(differs) do
+			services[#services + 1] = service
+			local entries = proof.touched[service]
+			local list = {}
+			for instance, kind in pairs(if type(entries) == "table" then entries.kinds else {}) do
+				-- An instance that left the service since is its old parent's
+				-- `children`, recorded as it left.
+				local segments, ordinals = nil, nil
+				if proofServiceOf(instance) == service then
+					segments, ordinals = BridgeIdentity.getRefPathParts(instance)
+				end
+				if segments ~= nil then
+					list[#list + 1] = { pathSegments = segments, pathOrdinals = ordinals, kind = kind }
+				end
+			end
+			touched[service] = if #list == 0 then "whole" else list
+		end
+		table.sort(services)
+		return { services = services, touched = touched }
+	end
+	-- An instance entering a service from outside every synced one may be one
+	-- another service's reference named while it was away, which that
+	-- service's store then holds as no value; no service answers for it.
+	local function noteStructure(serviceName: string, instance: Instance, included: boolean?, added: boolean)
+		if included == false then return end
+		local proof = verifiedPushProof
+		if not added then
+			if proof == nil then return end
+			if not proof.departed[instance.Parent] then
+				noteTouched(proof, serviceName, instance.Parent, "children")
+			end
+			proof.departed[instance] = true
+			return
+		end
+		local moved = proof ~= nil and proof.departed[instance] == true
+		if not moved then
+			proofLedger.unplaced += 1
+		end
+		if proof == nil then return end
+		proof.departed[instance] = nil
+		local touched = proof.touched[serviceName]
+		local above = instance.Parent
+		while type(touched) == "table" and above ~= nil and above ~= game do
+			if touched.kinds[above] == "subtree" then return end
+			above = above.Parent
+		end
+		noteTouched(proof, serviceName, instance, "subtree")
+		if moved then
+			noteTouched(proof, serviceName, instance.Parent, "children")
+		end
+	end
+	-- The export observers report each export-relevant property change. A
+	-- rename moves the paths below its instance, and Archivable decides
+	-- whether it is exported: both change its parent's children. A Parent
+	-- change within a service has no old parent to name.
+	function api.noteExportChange(serviceName: string, instance: Instance, propertyName: any)
+		local proof = verifiedPushProof
+		if proof == nil then return end
+		local property = string.lower(tostring(propertyName))
+		if property == "parent" then
+			local touched = proof.touched[serviceName]
+			if not (type(touched) == "table" and touched.kinds[instance] == "subtree") then
+				noteTouched(proof, serviceName, nil, "")
+			end
+		elseif (property == "name" or property == "archivable") and instance.Parent ~= game then
+			noteTouched(proof, serviceName, instance.Parent, "children")
+		else
+			noteTouched(proof, serviceName, instance, "values")
+		end
+	end
+	-- The services Studio differs from proof `id` in now, read without
+	-- tracking, or why it cannot say.
+	function api.pushProofScope(id: any): { [string]: any }
+		local proof = verifiedPushProof
+		if proof == nil or proof.id ~= id then return { unknown = "proof retired" } end
+		local differs, laid = proofDifference(proof, proofStateNow(proof))
+		if differs == nil then return { unknown = laid } end
+		return proofScopeAnswer(proof, differs, laid)
 	end
 	local nativeAttributeConnection = { Disconnect = function(_self: any) end }
 	-- Native receipts already retain initial parent identities. Materialize a
@@ -1235,6 +1457,27 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		state.changeEvent:Fire(state.seq)
 	end
 
+	-- Tracking that only retained proofs hold ends at the first outside change
+	-- that breaks the proof, as their guards' expiry would end it, so Studio's
+	-- further edits run untracked. The proof's own observers keep reading.
+	local function releaseRetainedHold()
+		if not state.started or state.persistentTracking or state.changeJournal ~= nil
+			or next(state.trackingGuards) == nil then
+			return
+		end
+		local relay, observation = nativeAttributeRelay, localPushObservation
+		for guardId in pairs(state.trackingGuards) do
+			if not (relay ~= nil and relay.cached and relay.retainedGuardId == guardId)
+				and not (observation ~= nil and observation.cached and observation.guardId == guardId) then
+				return
+			end
+		end
+		if verifiedPushProof ~= nil and matchesPushState(verifiedPushProof) then return end
+		table.clear(state.trackingGuards)
+		releaseLocalPushObservation()
+		stopTracking()
+	end
+
 	local function signalTrackedChange()
 		if state.changeSignalPending then
 			return
@@ -1242,6 +1485,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		state.changeSignalPending = true
 		task.defer(function()
 			state.changeSignalPending = false
+			releaseRetainedHold()
 			if state.started then
 				signalChange()
 			end
@@ -2245,6 +2489,11 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 
 	local function markTagChange(instance: Instance, tag: string, added: boolean)
 		rawTagGeneration += 1
+		local proofService = proofServiceOf(instance)
+		if proofService ~= nil then
+			proofLedger.tags[proofService] = (proofLedger.tags[proofService] or 0) + 1
+			noteTouched(verifiedPushProof, proofService, instance, "values")
+		end
 		if nativeAttributeRelay and nativeAttributeRelay.cached then return end
 		local fingerprint = tagFingerprint(instance)
 		local previous = state.tagFingerprintByInstance[instance]
@@ -2348,10 +2597,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		tagDiscoveryConnections = {
 			CollectionService.TagAdded:Connect(function(tag: string)
 				rawTagGeneration += 1
+				proofLedger.unplaced += 1
 				connectTag(tag, true)
 			end),
 			CollectionService.TagRemoved:Connect(function(tag: string)
 				rawTagGeneration += 1
+				proofLedger.unplaced += 1
 				-- The last membership and the global tag removal may be delivered
 				-- in either order. Record the live fingerprint before retiring the
 				-- membership listeners; duplicate notifications remain no-ops.
@@ -2796,6 +3047,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				observation.generation += 1
 				observation.instance = instance
 				observation.attribute = attributeName
+				noteTouched(verifiedPushProof, serviceName, instance, "values")
 			end
 			if not state.syncbackProperties then
 				return
@@ -2919,6 +3171,11 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				return
 			end
 			relay.attributeGeneration += 1
+			local proofService = proofServiceOf(instance)
+			if proofService ~= nil then
+				proofLedger.attributes[proofService] = (proofLedger.attributes[proofService] or 0) + 1
+				noteTouched(verifiedPushProof, proofService, instance, "values")
+			end
 			if relay.cached then return end
 			local connection = state.instanceConnections[instance]
 			if connection ~= nil and connection ~= nativeAttributeConnection then return end
@@ -3371,6 +3628,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local service = game:GetService(serviceName)
 		signals.connections[1] = service.DescendantAdded:Connect(function(instance)
 			local included = if exportStructureObserver then exportStructureObserver(serviceName, instance) else nil
+			noteStructure(serviceName, instance, included, true)
 			if signals.added then
 				signals.added(instance, included)
 			else
@@ -3378,9 +3636,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			end
 		end)
 		signals.connections[2] = service.DescendantRemoving:Connect(function(instance)
-			if exportStructureObserver then
-				exportStructureObserver(serviceName, instance)
-			end
+			local included = if exportStructureObserver then exportStructureObserver(serviceName, instance) else nil
+			noteStructure(serviceName, instance, included, false)
 			if signals.removing then
 				signals.removing(instance)
 			end
@@ -4235,7 +4492,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					and localPushObservation.cached then
 					acquireTrackingGuard(localPushObservation.guardId, retainSeconds)
 				end
-				return { ok = true, pushProofMatches = pushProofMatches, pushProofMismatch = pushProofMismatch }
+				return { ok = true, pushProofMatches = pushProofMatches, pushProofMismatch = pushProofMismatch,
+					pushProofScope = if not pushProofMatches and params.scopePushProof == true
+						then api.pushProofScope(params.verifyPushProof) else nil }
 			end
 			if params.requirePushProof == true and not (pushProofMatches and state.started) then
 				return { ok = true, pushProofMatches = false, pushProofMismatch = pushProofMismatch or "tracking stopped" }
@@ -4403,7 +4662,21 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		response.pushProofMismatch = pushProofMismatch
 		response.nativeRelayContinued = continuedNativeRelay
 		if params.capturePushProof == true then
+			-- Taken under one observation with the proof it follows, the new
+			-- proof tells which services moved since the held one.
+			local held = verifiedPushProof
 			response.verifiedPushProof = api.capturePushProof()
+			if params.scopeFrom ~= nil then
+				local differs, laid = nil, "proof retired"
+				if held == nil or held.id ~= params.scopeFrom then
+					laid = "proof retired"
+				elseif response.verifiedPushProof == nil then
+					laid = "Studio gave no new proof"
+				else
+					differs, laid = proofDifference(held, verifiedPushProof)
+				end
+				response.pushProofScope = if differs == nil then { unknown = laid } else proofScopeAnswer(held, differs, laid)
+			end
 		end
 		if params.nativeTerrainRelay == true and state.started then
 			response.nativeTerrainRelay = prepareNativeTerrainRelay()

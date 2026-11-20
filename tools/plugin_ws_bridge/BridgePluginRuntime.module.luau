@@ -864,6 +864,7 @@ function BridgePluginRuntime.start(context)
 			end
 			local serviceName = nativeServiceNames[root]
 			if serviceName ~= nil and includeExportInstance(serviceName, instance) then
+				Config.studioChanges.noteExportChange(serviceName, instance, propertyName)
 				nativeLastChangeByService[serviceName] = tostring(propertyName)
 				if string.lower(tostring(propertyName)) == "archivable" then
 					nativeArchivableGenerationByService[serviceName] = (nativeArchivableGenerationByService[serviceName] or 0) + 1
