@@ -1763,7 +1763,10 @@ fn automation_dispatch_operation(
                 IMPORT_REPLY_PARAMETERS.with(|slot| slot.borrow_mut().take());
             });
             bridge.wait_for_all_target(bridge_wait_seconds, BridgeTarget::Main)?;
-            let args = automation_push_args(context, parameters, reviewed)?;
+            let args = {
+                let _span = crate::app::profile::span("push arguments");
+                automation_push_args(context, parameters, reviewed)?
+            };
             if args.verify {
                 let summary = push_editor_changes_with_warm_bridge(args, bridge)?;
                 return Ok(Value::Object(compact_push_summary(
@@ -1776,7 +1779,10 @@ fn automation_dispatch_operation(
                     &summary, parameters, true,
                 )));
             }
-            let delta_services = selected_push_delta_services(context, &args)?;
+            let delta_services = {
+                let _span = crate::app::profile::span("push delta services");
+                selected_push_delta_services(context, &args)?
+            };
             if let Some(services) = delta_services {
                 let summary = push_project_delta(context, bridge, &services, args, None)?;
                 return Ok(Value::Object(compact_push_summary(

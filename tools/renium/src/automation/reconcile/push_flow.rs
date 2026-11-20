@@ -8,6 +8,26 @@ fn push_applied_nothing(summary: &Map<String, Value>) -> bool {
         .any(|key| summary.get(*key) == Some(&Value::Bool(true)))
 }
 
+/// Whether a push created, replaced or removed an instance: Studio then holds
+/// identities the files do not, and the stores no longer stand row for row.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn push_changed_structure(summary: &Map<String, Value>) -> bool {
+    [
+        "instanceCreated",
+        "instanceReplaced",
+        "instanceDeleted",
+        "sourceCreated",
+        "sourceDeleted",
+    ]
+    .iter()
+    .any(|key| {
+        summary
+            .get(*key)
+            .and_then(Value::as_f64)
+            .is_some_and(|count| count > 0.0)
+    })
+}
+
 /// Hands the previous push's native attribute observer over to the fresh
 /// lease: the old one stops only once the proof check inside the lease has
 /// passed, and the new relay starts from the path the state names.
@@ -1002,6 +1022,11 @@ pub(crate) fn push_targeted(
         let _span = crate::app::profile::span("push of the chosen paths");
         push_editor_changes_with_warm_bridge(args, bridge)?
     };
+    if push_changed_structure(&summary) {
+        // No comparison of the stores can keep these files: skip it.
+        not_kept("the push added, replaced or removed instances");
+        return Ok(summary);
+    }
     let _span = crate::app::profile::span("held state: files and lease after the push");
     let after = match capture_snapshot(&root, &held.paths) {
         Ok(after) => after,

@@ -2401,6 +2401,17 @@ fn a_targeted_baseline_holds_only_rows_a_push_sends() {
     ));
     assert!(kept("Script", "Disabled", json!(false), json!(true)));
 
+    assert!(push_changed_structure(
+        json!({"ok": true, "instanceCreated": 1.0})
+            .as_object()
+            .unwrap()
+    ));
+    assert!(!push_changed_structure(
+        json!({"ok": true, "instanceCreated": 0.0, "propertyUpdated": 2.0})
+            .as_object()
+            .unwrap()
+    ));
+
     let decal = |texture: &str, color_map: &str| {
         let mut row =
             SettingsBytecodeInstance::new("row".into(), "Row".into(), "Decal".into(), None);
