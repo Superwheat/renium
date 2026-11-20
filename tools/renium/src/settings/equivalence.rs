@@ -690,27 +690,133 @@ pub(crate) fn remap_rows(
         });
 }
 
-/// Whether the instances of two copies of a store stand at the same places
-/// and may be told by them: the two hold the same names, classes and
-/// parents in the same order, the viewport camera at the same place, and no
-/// identity that says an instance stands elsewhere in the other copy. These
-/// are the conditions under which `align_settings_ids_to_reference` gives
-/// the observed instances the reference's ids by position, apart from the
-/// values of instances that have a namesake, which the caller compares.
-pub(crate) fn instances_stand_alike(
+/// Where each instance of `reference` stands in `observed`, when the two
+/// copies of a store hold the same instances and they may be told by their
+/// places: the two hold the same names, classes and parents in the same
+/// order, or, under a parent, the same children with those of one name and
+/// class in the same order (Studio keeps a camera or a terrain of its own
+/// ahead of what an import brings beside it). The viewport camera is the
+/// same instance in both, and no identity says an instance stands elsewhere
+/// in the other copy. The values of instances that have a namesake are the
+/// caller's to compare.
+///
+/// The second answer marks the instances of copies in another order that
+/// nothing but their order among namesakes tells, with all under them: the
+/// caller takes such a pair for one instance only where the two hold the
+/// same in full.
+pub(crate) fn instance_places(
     reference: &SettingsBytecode,
     observed: &SettingsBytecode,
-) -> bool {
-    settings_topology_matches(reference, observed)
-        && match (
-            workspace_current_camera_index(reference),
-            workspace_current_camera_index(observed),
-        ) {
-            (Some(reference), Some(observed)) => reference == observed,
-            _ => true,
+) -> Option<(Vec<usize>, Vec<bool>)> {
+    let count = reference.instances.len();
+    let (places, by_order) = if settings_topology_matches(reference, observed) {
+        ((0..count).collect::<Vec<_>>(), vec![false; count])
+    } else {
+        places_among_namesakes(reference, observed)?
+    };
+    let mut origins = vec![0; places.len()];
+    for (index, place) in places.iter().enumerate() {
+        origins[*place] = index;
+    }
+    if places
+        .iter()
+        .enumerate()
+        .any(|(index, place)| index != *place)
+    {
+        // An id the store gave, or an import numbered, that both copies hold
+        // names one instance: the whole documents pair the two by it.
+        let ids = reference
+            .instances
+            .iter()
+            .enumerate()
+            .map(|(index, instance)| (instance.settings_id.as_str(), index))
+            .collect::<AHashMap<_, _>>();
+        let follows = observed
+            .instances
+            .iter()
+            .enumerate()
+            .all(|(place, instance)| {
+                let id = instance.settings_id.as_str();
+                id.starts_with("debug:") || ids.get(id).is_none_or(|index| *index == origins[place])
+            });
+        if !follows {
+            return None;
         }
-        && persistent_identities_follow_mapping(reference, observed, Some)
-        && store_identities_follow_mapping(reference, observed, Some)
+    }
+    let origin = |place: usize| Some(origins[place]);
+    let cameras = match (
+        workspace_current_camera_index(reference),
+        workspace_current_camera_index(observed),
+    ) {
+        (Some(reference), Some(observed)) => places[reference] == observed,
+        _ => true,
+    };
+    (cameras
+        && persistent_identities_follow_mapping(reference, observed, origin)
+        && store_identities_follow_mapping(reference, observed, origin))
+    .then_some((places, by_order))
+}
+
+/// Each instance of `reference` with the instance of `observed` that has
+/// its name and class under its parent's counterpart, the namesakes of one
+/// parent in their order, and whether its order among namesakes, or that of
+/// an instance above it, is all that tells it. `None` where the two hold
+/// other instances.
+fn places_among_namesakes(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+) -> Option<(Vec<usize>, Vec<bool>)> {
+    let count = reference.instances.len();
+    if observed.instances.len() != count {
+        return None;
+    }
+    let mut namesakes = AHashMap::<_, (Vec<usize>, usize)>::new();
+    for (index, instance) in observed.instances.iter().enumerate() {
+        let key = (
+            instance.parent_index,
+            instance.name.as_str(),
+            instance.class_name.as_str(),
+        );
+        namesakes.entry(key).or_default().0.push(index);
+    }
+    // The instances by their parents, each parent's in their order: a store
+    // can hold a parent after its child.
+    let mut by_parent = (0..count).collect::<Vec<_>>();
+    by_parent.sort_by_key(|index| reference.instances[*index].parent_index);
+    let children = |parent: Option<usize>| {
+        let start =
+            by_parent.partition_point(|index| reference.instances[*index].parent_index < parent);
+        by_parent[start..]
+            .iter()
+            .copied()
+            .take_while(move |index| reference.instances[*index].parent_index == parent)
+    };
+    let mut places = vec![usize::MAX; count];
+    let mut by_order = vec![false; count];
+    let mut placed = Vec::with_capacity(count);
+    let mut place = |index: usize, under: Option<usize>| {
+        let instance = &reference.instances[index];
+        let (namesakes, next) =
+            namesakes.get_mut(&(under, instance.name.as_str(), instance.class_name.as_str()))?;
+        *next += 1;
+        Some((*namesakes.get(*next - 1)?, namesakes.len() > 1))
+    };
+    for root in children(None) {
+        (places[root], by_order[root]) = place(root, None)?;
+        placed.push(root);
+    }
+    let mut next = 0;
+    while let Some(parent) = placed.get(next).copied() {
+        next += 1;
+        let under = Some(places[parent]);
+        for child in children(Some(parent)) {
+            let (at, among_namesakes) = place(child, under)?;
+            places[child] = at;
+            by_order[child] = among_namesakes || by_order[parent];
+            placed.push(child);
+        }
+    }
+    (placed.len() == count).then_some((places, by_order))
 }
 
 fn stabilize_settings_reference_ids_with_remap(
@@ -4790,6 +4896,87 @@ mod tests {
             "LocalScript",
             "Enabled"
         ));
+    }
+
+    #[test]
+    fn instances_in_another_order_are_placed_among_their_namesakes() {
+        let store = |rows: &[(&str, &str, Option<usize>)]| SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: rows
+                .iter()
+                .enumerate()
+                .map(|(index, (name, class, parent))| {
+                    SettingsBytecodeInstance::new(
+                        format!("debug:{index}"),
+                        (*name).into(),
+                        (*class).into(),
+                        *parent,
+                    )
+                })
+                .collect(),
+        };
+        let files = store(&[
+            ("Workspace", "Workspace", None),
+            ("Twin", "Part", Some(0)),
+            ("Group", "Model", Some(0)),
+            ("Twin", "Part", Some(2)),
+            ("Twin", "Part", Some(0)),
+            ("Terrain", "Terrain", Some(0)),
+        ]);
+        // Studio's terrain stands first, and the group ahead of the parts.
+        let studio = store(&[
+            ("Workspace", "Workspace", None),
+            ("Terrain", "Terrain", Some(0)),
+            ("Group", "Model", Some(0)),
+            ("Twin", "Part", Some(2)),
+            ("Twin", "Part", Some(0)),
+            ("Twin", "Part", Some(0)),
+        ]);
+        // The parts under the service are told by their order alone; the one
+        // in the group has no namesake there.
+        assert_eq!(
+            instance_places(&files, &studio),
+            Some((
+                vec![0, 4, 2, 3, 5, 1],
+                vec![false, true, false, false, true, false]
+            ))
+        );
+        assert_eq!(
+            instance_places(&files, &files),
+            Some(((0..6).collect::<Vec<_>>(), vec![false; 6]))
+        );
+        // An id of the store's that both hold names one instance.
+        let (mut held, mut other) = (files.clone(), studio.clone());
+        held.instances[4].settings_id = "part-b".into();
+        other.instances[5].settings_id = "part-b".into();
+        assert!(instance_places(&held, &other).is_some());
+        other.instances[5].settings_id = "debug:9".into();
+        other.instances[4].settings_id = "part-b".into();
+        assert_eq!(instance_places(&held, &other), None);
+        // Another class, another parent or one instance more is another store.
+        let mut other = studio.clone();
+        other.instances[5].class_name = "MeshPart".into();
+        assert_eq!(instance_places(&files, &other), None);
+        let mut other = studio.clone();
+        other.instances[5].parent_index = Some(2);
+        assert_eq!(instance_places(&files, &other), None);
+        let mut other = studio.clone();
+        other.instances.push(other.instances[5].clone());
+        assert_eq!(instance_places(&files, &other), None);
+        // A UniqueId that says an instance stands elsewhere is believed.
+        let unique = |document: &mut SettingsBytecode, index: usize, id: u32| {
+            document.instances[index].properties.insert(
+                "UniqueId".into(),
+                json!({"_type": "UniqueId", "value": format!("{id:032x}")}),
+            );
+        };
+        let (mut files, mut studio) = (files, studio);
+        unique(&mut files, 1, 7);
+        unique(&mut studio, 4, 7);
+        assert!(instance_places(&files, &studio).is_some());
+        unique(&mut files, 4, 8);
+        unique(&mut studio, 4, 8);
+        assert_eq!(instance_places(&files, &studio), None);
     }
 
     #[test]

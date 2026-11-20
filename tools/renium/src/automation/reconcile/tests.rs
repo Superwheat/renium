@@ -7955,6 +7955,54 @@ fn a_value_a_capture_left_out_compares_as_what_a_new_instance_holds() {
     assert!(!plugin_reads("Part", "Transparency"));
 }
 
+/// Moves the last instance of a store to `ahead`, as Studio holds a terrain
+/// of its own ahead of the service's other children. Only a child of the
+/// root that no other instance shares its name with is moved.
+fn holds_last_child_ahead(store: &mut SettingsBytecode, ahead: usize) -> bool {
+    fn place_references(value: &mut Value, place: &dyn Fn(usize) -> usize) {
+        match value {
+            Value::Object(fields) => {
+                if let Some(index) = fields.get("instanceIndex").and_then(Value::as_u64) {
+                    fields.insert("instanceIndex".into(), json!(place(index as usize - 1) + 1));
+                }
+                for value in fields.values_mut() {
+                    place_references(value, place);
+                }
+            }
+            Value::Array(items) => {
+                for value in items {
+                    place_references(value, place);
+                }
+            }
+            _ => {}
+        }
+    }
+    let last = store.instances.len() - 1;
+    if last <= ahead
+        || store.instances[last].parent_index != Some(0)
+        || store.instances[..last]
+            .iter()
+            .any(|instance| instance.name == store.instances[last].name)
+    {
+        return false;
+    }
+    let place = |index: usize| match index {
+        index if index == last => ahead,
+        index if index >= ahead => index + 1,
+        index => index,
+    };
+    let instance = store.instances.pop().unwrap();
+    store.instances.insert(ahead, instance);
+    for instance in &mut store.instances {
+        instance.parent_index = instance.parent_index.map(place);
+        let values = instance.properties.values_mut();
+        for value in values.chain(instance.attributes.values_mut()) {
+            place_references(value, &place);
+        }
+    }
+    true
+}
+
 /// A large store is verified a range of rows at a time, with neither copy
 /// whole in memory. Whatever Studio holds afterwards, that verification says
 /// what the whole documents say, and the store it settles holds what theirs
@@ -7967,7 +8015,7 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
     use crate::tests::support::{SimRng, run_seeds};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let by_changed = AtomicUsize::new(0);
+    let (by_changed, reordered) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let (
         verified,
         refused,
@@ -8173,6 +8221,8 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
             }
             _ => {}
         }
+        let ahead = 1 + usize::from(files.instances[1].class_name == "Camera");
+        let moved = rng.below(3) == 0 && holds_last_child_ahead(&mut after, ahead);
         let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
         let entry = |document: &SettingsBytecode| {
             encode_settings_bytecode(document)
@@ -8260,6 +8310,9 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
             refused.fetch_add(1, Ordering::Relaxed);
         } else {
             verified.fetch_add(1, Ordering::Relaxed);
+            if moved {
+                reordered.fetch_add(1, Ordering::Relaxed);
+            }
             if !pending.is_empty() {
                 with_pending.fetch_add(1, Ordering::Relaxed);
             }
@@ -8308,6 +8361,8 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
             &by_changed,
         ]
         .map(|count| count.load(Ordering::Relaxed));
+        let reordered = reordered.load(Ordering::Relaxed);
+        assert!(reordered >= 10, "{reordered} verified in another order");
         assert!(
             counts[0] >= 80
                 && counts[1] >= 20
@@ -8328,6 +8383,69 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
             counts[6]
         );
     }
+}
+
+/// Studio holds two namesakes in the other order behind a terrain of its
+/// own, and the value a push asked of one of them did not arrive: read by
+/// its rows, the store is refused as its whole documents refuse it.
+#[test]
+fn a_lost_write_among_reordered_namesakes_is_refused_by_rows() {
+    let store = |rows: &[(&str, &str, f64, f64)]| {
+        let mut instances = vec![SettingsBytecodeInstance::new(
+            "debug:0".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        )];
+        for (index, (name, class, transparency, reflectance)) in rows.iter().enumerate() {
+            let id = format!("debug:{}", index + 1);
+            let mut instance =
+                SettingsBytecodeInstance::new(id, (*name).into(), (*class).into(), Some(0));
+            if *class == "Part" {
+                let values = &mut instance.properties;
+                values.insert("Transparency".into(), json!(transparency));
+                values.insert("Reflectance".into(), json!(reflectance));
+            }
+            instances.push(instance);
+        }
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances,
+        };
+        SnapshotEntry::File(encode_settings_bytecode(&document).unwrap())
+    };
+    let terrain = ("Terrain", "Terrain", 0.0, 0.0);
+    let before = store(&[("A", "Part", 0.0, 0.25), ("A", "Part", 0.5, 0.75), terrain]);
+    let files = store(&[("A", "Part", 0.5, 0.25), ("A", "Part", 0.5, 0.75), terrain]);
+    let after = store(&[terrain, ("A", "Part", 0.5, 0.75), ("A", "Part", 0.0, 0.25)]);
+    let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+    let snapshot = |entry: &SnapshotEntry| ProjectSnapshot {
+        entries: BTreeMap::from([(path.clone(), entry.clone())]),
+    };
+    let (project, held) = (snapshot(&files), snapshot(&before));
+    let paths = project_replacement_paths(&project, &held);
+    let outcome = |whole_documents: bool| {
+        let mut prepared = HashMap::new();
+        prepare_project_replacement_from(&project, &held, &paths, &mut prepared, StoresRead::Whole)
+            .unwrap();
+        let change = prepared.remove(&path).unwrap();
+        let prepared = PreparedPushVerification {
+            previous: change.previous,
+            desired: None,
+        };
+        super::verify::settings_delta_outcome(
+            &path,
+            (&before, &files, &after),
+            prepared,
+            (&[], None),
+            (false, whole_documents),
+        )
+        .unwrap()
+        .0
+    };
+    let (by_rows, whole) = (outcome(false), outcome(true));
+    assert!(whole.is_some(), "the whole documents verify a lost write");
+    assert_eq!(by_rows, whole);
 }
 
 /// A script file the store knows nothing of adds its instance to the store,
