@@ -42,4 +42,18 @@ now += 0.033
 assert(fixed())
 now += 0.031
 assert(not fixed(), "A caller's own slice stays as given")
+-- A request's budget: fast frames leave the 0.25 s floor, a slow frame sets
+-- the next slice, and a 3 s autosave stall still ends the next one at 1 s.
+for _, case in ipairs({ { 0.016, 0.25 }, { 0.6, 0.6 }, { 3, 1 } }) do
+	frame = case[1]
+	local budget, charged = parallel.newRequestBudget(), 0
+	now += 0.25 - 0.001
+	assert(not budget(), "Work shorter than the first slice never yields")
+	now += 0.002
+	assert(budget(function() charged += 1 end) and charged == 1, "A spent slice yields once, charged to its caller")
+	now += case[2] - 0.001
+	assert(not budget(), `After a {case[1]} s wait the work yielded before {case[2]} s`)
+	now += 0.002
+	assert(budget(), `After a {case[1]} s wait the work held Studio past {case[2]} s`)
+end
 print("work budgets retain bounded scheduler cooperation")

@@ -76,14 +76,14 @@ local function pushNewRoot(name, rootSettingsIds, ctx)
 	}
 	local prepared = prepareImport({ groups = { group } }, { payload = payload }, { {} }, ctx)
 	local root = prepared[1].incomingByPayloadIndex[1]
-	identity.rememberRoots(prepared, ctx)
+	identity.rememberRoots(prepared, ctx, nil, function() return false end)
 	assert(identity.captured(root, ctx) == nil, "A staged root is not in the place and has no identity yet")
 	local undo = overlay.prepareRetained(prepared, ctx, true)
 	undo.prepared, undo.generationsByService, undo.guard =
 		prepared, { ReplicatedStorage = 0 }, { connections = {}, attributeCheckpoints = {} }
 	overlay.commitNative(undo, ctx)
 	assert(root.Parent == replicated and root.Name == name)
-	identity.rememberRoots(prepared, ctx)
+	identity.rememberRoots(prepared, ctx, nil, function() return false end)
 	return root
 end
 local function context()

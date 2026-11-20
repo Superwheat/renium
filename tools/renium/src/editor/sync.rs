@@ -665,9 +665,9 @@ pub(crate) fn resolve_editor_package_target(
 }
 
 impl<'a> EditorTransaction<'a> {
-    fn parameters(
-        changes: &EditorChangeSet,
-        binary_import: Option<&EditorBinaryImport>,
+    fn parameters<'c>(
+        changes: &'c EditorChangeSet,
+        binary_import: Option<&'c EditorBinaryImport>,
         id: &str,
         services: Vec<String>,
         guard: Option<&StudioChangeGuard>,
@@ -698,22 +698,30 @@ impl<'a> EditorTransaction<'a> {
                 })
             })
             .collect::<Vec<_>>();
-        let mut mutation_root_keys = BTreeSet::new();
-        let mut mutation_roots = Vec::new();
+        let mut mutation_root_keys = HashSet::new();
+        let mut mutation_root_names = Vec::<(&str, Vec<&str>, Vec<usize>)>::new();
         let retained_by_native_import = |service: &str, path: &[String], ordinals: &[usize]| {
             binary_import.is_some_and(|import| import.retains_path(service, path, ordinals))
         };
-        let mut add_mutation_root = |service: &str, path: &[String], ordinals: &[usize]| {
+        let mut add_mutation_root = |service: &'c str, path: &'c [String], ordinals: &[usize]| {
             if path.len() < 2 {
                 return;
             }
             let ordinal = ordinals.get(1).copied().unwrap_or(1);
-            if mutation_root_keys.insert((service.to_string(), path[1].clone(), ordinal)) {
-                mutation_roots.push(json!({
-                    "service": service,
-                    "pathSegments": [&path[0], &path[1]],
-                    "pathOrdinals": [ordinals.first().copied().unwrap_or(1), ordinal],
-                }));
+            if mutation_root_keys.insert((service, path[1].as_str(), ordinal)) {
+                let position = match mutation_root_names
+                    .iter()
+                    .position(|(name, ..)| *name == service)
+                {
+                    Some(position) => position,
+                    None => {
+                        mutation_root_names.push((service, Vec::new(), Vec::new()));
+                        mutation_root_names.len() - 1
+                    }
+                };
+                let (_, names, ordinals) = &mut mutation_root_names[position];
+                names.push(path[1].as_str());
+                ordinals.push(ordinal);
             }
         };
         for change in &changes.source_changes {
@@ -834,6 +842,19 @@ impl<'a> EditorTransaction<'a> {
                         &change.path_ordinals,
                     )
                 }) || property_change_needs_post_native_apply(change)
+            })
+            .collect::<Vec<_>>();
+        // A descriptor names roots of one service by name and ordinal under it,
+        // at most 1,024 of them so an upload row stays small.
+        let mutation_roots = mutation_root_names
+            .iter()
+            .flat_map(|(service, names, ordinals)| {
+                names
+                    .chunks(1024)
+                    .zip(ordinals.chunks(1024))
+                    .map(move |(names, ordinals)| {
+                        json!({ "service": service, "names": names, "ordinals": ordinals })
+                    })
             })
             .collect::<Vec<_>>();
         json!({
@@ -7324,6 +7345,64 @@ fn log_change_set_composition(
 
 #[cfg(test)]
 mod sync_tests {
+
+    #[test]
+    fn mutation_roots_name_each_root_of_a_service_once_by_name_and_ordinal() {
+        use super::{EditorChangeSet, EditorTransaction};
+        use crate::editor::types::EditorPropertyChange;
+        use serde_json::json;
+        let change = |service: &str, path: &[&str], ordinals: &[usize]| EditorPropertyChange {
+            service: service.into(),
+            path_segments: path.iter().map(|segment| segment.to_string()).collect(),
+            path_ordinals: ordinals.to_vec(),
+            class_name: "Part".into(),
+            ..EditorPropertyChange::default()
+        };
+        let mut changes = EditorChangeSet {
+            property_changes: vec![
+                change("Workspace", &["Workspace", "Model", "Part"], &[1, 2, 1]),
+                change("Lighting", &["Lighting", "Sky"], &[]),
+                change("Workspace", &["Workspace", "Model"], &[1, 2]),
+                change("Workspace", &["Workspace", "Model"], &[1, 1]),
+                change("Workspace", &["Workspace"], &[1]),
+            ],
+            ..EditorChangeSet::default()
+        };
+        for index in 0..1500 {
+            let name = format!("Wide{index}");
+            changes
+                .property_changes
+                .push(change("Workspace", &["Workspace", &name], &[1, 1]));
+        }
+        let parameters = EditorTransaction::parameters(
+            &changes,
+            None,
+            "id",
+            vec!["Lighting".into(), "Workspace".into()],
+            None,
+        );
+        let names = |range: std::ops::Range<usize>| {
+            range
+                .map(|index| match index {
+                    0 | 1 => "Model".to_string(),
+                    index => format!("Wide{}", index - 2),
+                })
+                .collect::<Vec<_>>()
+        };
+        let ordinals = |range: std::ops::Range<usize>| {
+            range
+                .map(|index| if index == 0 { 2 } else { 1 })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            parameters["mutationRoots"],
+            json!([
+                { "service": "Workspace", "names": names(0..1024), "ordinals": ordinals(0..1024) },
+                { "service": "Workspace", "names": names(1024..1502), "ordinals": ordinals(1024..1502) },
+                { "service": "Lighting", "names": ["Sky"], "ordinals": [1] },
+            ])
+        );
+    }
 
     #[test]
     fn a_final_line_break_only_the_file_has_is_an_edit_to_send() {

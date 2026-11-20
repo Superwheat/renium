@@ -124,6 +124,32 @@ fn serialize_bridge_properties<S: serde::Serializer>(
 }
 
 #[cfg(test)]
+mod identity_text_tests {
+    use super::*;
+
+    #[test]
+    fn identity_strings_travel_as_one_joined_text_unless_one_holds_nul() -> Result<()> {
+        #[derive(Serialize)]
+        struct Wire(
+            #[serde(serialize_with = "serialize_identity_text")] Option<EditorBinaryStructure>,
+        );
+        let structure = |strings: &[&str]| EditorBinaryStructure {
+            strings: strings.iter().map(|text| text.to_string()).collect(),
+            nodes: "AAAA".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(Wire(Some(structure(&["", "Part", "editor:1"]))))?,
+            json!({ "stringText": base64::encode("\0Part\0editor:1"), "stringCount": 3, "nodes": "AAAA" })
+        );
+        assert_eq!(
+            serde_json::to_value(Wire(Some(structure(&["Part", "a\0b"]))))?,
+            json!({ "strings": ["Part", "a\0b"], "nodes": "AAAA" })
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod font_transport_tests {
     use super::*;
 
@@ -550,7 +576,10 @@ pub(crate) struct EditorBinaryImportGroup {
     pub(crate) root_paths: Vec<EditorBinaryRootPath>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) root_settings_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_identity_text"
+    )]
     pub(crate) instance_identities: Option<EditorBinaryStructure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) viewport_camera: Option<EditorBinaryRootPath>,
@@ -568,6 +597,27 @@ pub(crate) struct EditorBinaryImportGroup {
 pub(crate) struct EditorBinaryStructure {
     pub(crate) strings: Vec<String>,
     pub(crate) nodes: String,
+}
+
+/// Identity strings travel as one base64 text joined by NUL with their count,
+/// which Studio splits in one call instead of reading a JSON array element by
+/// element. A string that holds NUL keeps the array.
+fn serialize_identity_text<S: serde::Serializer>(
+    identities: &Option<EditorBinaryStructure>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct;
+    let Some(identities) = identities else {
+        return serializer.serialize_none();
+    };
+    if identities.strings.iter().any(|text| text.contains('\0')) {
+        return identities.serialize(serializer);
+    }
+    let mut fields = serializer.serialize_struct("EditorBinaryStructure", 3)?;
+    fields.serialize_field("stringText", &base64::encode(identities.strings.join("\0")))?;
+    fields.serialize_field("stringCount", &identities.strings.len())?;
+    fields.serialize_field("nodes", &identities.nodes)?;
+    fields.end()
 }
 
 #[derive(Clone, Serialize)]

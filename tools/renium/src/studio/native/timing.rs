@@ -73,7 +73,14 @@ fn reply_intervals(
                 return None;
             }
             let mut label = label.to_owned();
-            for key in ["services", "instances", "bytes", "calls", "cacheHit"] {
+            for key in [
+                "services",
+                "instances",
+                "bytes",
+                "calls",
+                "arrived",
+                "cacheHit",
+            ] {
                 let count = &span[3][key];
                 if count.is_u64() || count.is_boolean() {
                     label.push_str(&format!(" {key}={count}"));
@@ -214,12 +221,13 @@ mod tests {
     fn plugin_timing_preserves_nested_measurements_and_bounds_clock_uncertainty() {
         let start = Instant::now();
         let end = start + Duration::from_millis(10);
-        let value = serde_json::json!({"version":1,"elapsedMs":8,"spans":[["handler",1,8],["overlay",2,7,{"instances":20,"bytes":400,"calls":2,"futureField":1}]]});
+        let value = serde_json::json!({"version":1,"elapsedMs":8,"spans":[["handler",1,8],["overlay",2,7,{"instances":20,"bytes":400,"calls":2,"futureField":1}],["identities",3,4,{"instances":9,"calls":1,"arrived":6}]]});
         let (origin, elapsed, spans) = reply_intervals(start, end, &value).unwrap();
         assert_eq!(origin - start, Duration::from_millis(2));
         assert_eq!(elapsed, Duration::from_millis(8));
         assert_eq!(spans[1].2 - spans[1].1, Duration::from_millis(5));
         assert_eq!(spans[1].0, "overlay instances=20 bytes=400 calls=2");
+        assert_eq!(spans[2].0, "identities instances=9 calls=1 arrived=6");
         for invalid in [
             serde_json::json!({"version":2,"elapsedMs":8,"spans":[]}),
             serde_json::json!({"version":1,"elapsedMs":11,"spans":[]}),

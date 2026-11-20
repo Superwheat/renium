@@ -1642,6 +1642,86 @@ do
 end
 print("Detached journals: pre-attachment/removal edits, own overwrites, deferred cleanup, reattachment and finish cleanup passed")
 
+-- A native insertion's old roots leave together, and Studio delivers their
+-- removal events afterwards. Until the journal finishes, an outside edit inside
+-- either tree (a property, a rename, an attribute, a removal) is journaled,
+-- whether the transaction commits or a rollback puts the trees back.
+do
+	local savedItemChanged = testGame.ItemChanged
+	for _, restore in { false, true } do
+		testGame.ItemChanged = signal()
+		local first = instance("Folder", "ImportFirst", storage)
+		local firstChild = instance("Part", "Child", first)
+		local firstLeaf = instance("Part", "Leaf", firstChild)
+		local doomed = instance("Part", "Doomed", firstChild)
+		local second = instance("Folder", "ImportSecond", storage)
+		local secondChild = instance("Part", "Child", second)
+		firstLeaf.Transparency, secondChild.Transparency = 0, 0
+		local attributes = { Mark = "before" }
+		function firstChild:GetAttributes() return table.clone(attributes) end
+		function firstChild:GetAttribute(name) return attributes[name] end
+		local observer = trackerModule.create(trackerConfig, { ReplicatedStorage = true })
+		observer.configurePropertyCandidates({ Part = { "Transparency" } })
+		observer.getState({ services = { "ReplicatedStorage" } })
+		observer.beginSuppress()
+		observer.beginChangeJournal("import", { "ReplicatedStorage" })
+		deferred = {}
+		for _, root in { first, second } do
+			local descendants = root:GetDescendants()
+			local token = observer.expectParentChange(root, nil, nil)
+			table.remove(storage.children, assert(table.find(storage.children, root)))
+			root.Parent = nil
+			table.insert(deferred, function() testGame.ItemChanged:Fire(root, "Parent") end)
+			table.insert(deferred, function() storage.DescendantRemoving:Fire(root) end)
+			for _, descendant in descendants do
+				table.insert(deferred, function() storage.DescendantRemoving:Fire(descendant) end)
+			end
+			if token.complete then token.complete() end
+		end
+		flushDeferred()
+		deferred = nil
+		assert(#observer.drainChangeJournal("import") == 0, "the import's own detach was journaled")
+		for _, item in { firstChild, firstLeaf, doomed, secondChild } do
+			assert(item.Changed:Count() == 1, `{item.Name} lost its observer while detached`)
+		end
+		firstLeaf.Transparency = 0.5
+		firstLeaf.Changed:Fire("Transparency")
+		secondChild.Name = "Renamed"
+		secondChild.Changed:Fire("Name")
+		attributes.Mark = "outside"
+		firstChild.AttributeChanged:Fire("Mark")
+		table.remove(firstChild.children, assert(table.find(firstChild.children, doomed)))
+		doomed.Parent = nil
+		doomed.Changed:Fire("Parent")
+		if restore then
+			for _, root in { first, second } do
+				local token = observer.expectParentChange(root, storage)
+				add(root, storage)
+				testGame.ItemChanged:Fire(root, "Parent")
+				if token.complete then token.complete() end
+			end
+		end
+		local records = observer.finishChangeJournal("import")
+		local byInstance = {}
+		for _, record in records do byInstance[record.instance] = record end
+		local leaf, child, renamed, removed = byInstance[firstLeaf], byInstance[firstChild], byInstance[secondChild], byInstance[doomed]
+		assert(leaf and leaf.properties.Transparency and leaf.properties.Transparency.value == 0.5,
+			"an outside property edit inside a detached old tree went unseen")
+		assert(renamed and renamed.properties.Name and renamed.properties.Name.value == "Renamed",
+			"an outside rename inside a detached old tree went unseen")
+		assert(child and child.attributes and child.attributes.Mark and child.attributes.Mark.value == "outside",
+			"an outside attribute edit inside a detached old tree went unseen")
+		assert(removed ~= nil, "an outside removal inside a detached old tree went unseen")
+		observer.endSuppress(0)
+		observer.stop()
+		for _, root in { first, second } do
+			if root.Parent then remove(root) end
+		end
+	end
+	testGame.ItemChanged = savedItemChanged
+end
+print("Detached old roots: outside property, rename, attribute and removal edits inside them are journaled on commit and on rollback")
+
 do
 	local savedItemChanged = testGame.ItemChanged
 	local savedDescriptor = dependencies.RbxDom.findCanonicalPropertyDescriptor

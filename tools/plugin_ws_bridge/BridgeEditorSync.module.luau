@@ -601,22 +601,38 @@ end
 
 -- Parent indices keep identity metadata linear even for deeply nested imports.
 -- Validate before importing; resolving it later never accepts an approximate path.
-local function validatedImportIdentities(raw: any, rootCount: number): any
+-- The strings arrive as one base64 text joined by NUL, with their count, or
+-- as an array when one of them holds NUL.
+local function validatedImportIdentities(raw: any, rootCount: number, budget: (((number) -> ())?) -> boolean): any
 	if raw == nil then return nil end
 	if type(raw) ~= "table" or type(raw.nodes) ~= "string" then
 		error("Invalid imported instance identities")
 	end
-	local isArray, stringCount = denseArrayLength(raw.strings)
-	if not isArray then
-		error("Imported identity strings must be an array")
-	end
 	local observeWait, finishWork = BridgeConnection.profileWaitObserver(
 		"import identity metadata: scheduler yield", "import identity metadata: validation work")
-	local budget = BridgeParallel.newWorkBudget(nil, observeWait)
-	for _, value in ipairs(raw.strings) do
-		budget()
-		if type(value) ~= "string" then
-			error("Imported identity strings must be strings")
+	local strings, stringCount
+	if type(raw.stringText) == "string" then
+		stringCount = raw.stringCount
+		if type(stringCount) ~= "number" or stringCount < 0 or stringCount % 1 ~= 0 then
+			error("Imported identity string count is invalid")
+		end
+		strings = if stringCount == 0 then {} else string.split(
+			buffer.tostring(EncodingService:Base64Decode(buffer.fromstring(raw.stringText))), "\0")
+		if #strings ~= stringCount then
+			error("Imported identity strings do not match their count")
+		end
+	else
+		local isArray
+		isArray, stringCount = denseArrayLength(raw.strings)
+		if not isArray then
+			error("Imported identity strings must be an array")
+		end
+		strings = raw.strings
+		for _, value in ipairs(strings) do
+			budget(observeWait)
+			if type(value) ~= "string" then
+				error("Imported identity strings must be strings")
+			end
 		end
 	end
 	local nodes = EncodingService:Base64Decode(buffer.fromstring(raw.nodes))
@@ -626,7 +642,7 @@ local function validatedImportIdentities(raw: any, rootCount: number): any
 	end
 	local ids = {}
 	for offset = 0, bytes - 20, 20 do
-		budget()
+		budget(observeWait)
 		local parent, ordinal = buffer.readu32(nodes, offset), buffer.readu32(nodes, offset + 4)
 		if parent >= offset / 20 + 1 or ordinal == 0 or (parent == 0 and ordinal > rootCount) then
 			error("Invalid imported identity parent or ordinal")
@@ -636,7 +652,7 @@ local function validatedImportIdentities(raw: any, rootCount: number): any
 				error("Imported identity string index is out of range")
 			end
 		end
-		local id = raw.strings[buffer.readu32(nodes, offset + 16) + 1]
+		local id = strings[buffer.readu32(nodes, offset + 16) + 1]
 		if id ~= "" then
 			if ids[id] then
 				error("Duplicate imported settings id")
@@ -647,57 +663,93 @@ local function validatedImportIdentities(raw: any, rootCount: number): any
 	if finishWork then
 		finishWork()
 	end
-	return { strings = raw.strings, nodes = nodes }
+	return { strings = strings, nodes = nodes }
 end
 
-local function prepareImportedIdentities(group: any)
+-- A row takes the one addition the import observed under the row's parent
+-- with the row's name when no other row under that parent has the name and
+-- the addition's parent, name and class agree: the creation receipt proved
+-- the import created it. Only Studio's child order tells same-named siblings
+-- apart, so their rows, and any row no single addition answers, are found
+-- among their parent's children. `additions` maps each receipted addition of
+-- the group's service to the parent it arrived under. An empty `byParent` is
+-- first filled with those additions by parent and name (false for a name two
+-- of them share); the service's other groups reuse it.
+local function prepareImportedIdentities(group: any, budget: (((number) -> ())?) -> boolean,
+	additions: { [Instance]: Instance }?, byParent: { [Instance]: { [string]: Instance | false } }?)
 	local identities = group.instanceIdentities
 	if identities == nil then return end
 	local nodes, strings = identities.nodes, identities.strings
-	local instances, childrenByParent, seen = {}, {}, {}
-	-- These walks have no engine writes. Amortize scheduler resumption while
-	-- retaining a bounded interval for other Studio work on large imports.
+	local bytes = buffer.len(nodes)
+	local instances, childrenByParent, seen, repeated = table.create(bytes // 20), {}, {}, {}
+	for offset = 4, bytes - 16, 20 do
+		if buffer.readu32(nodes, offset) > 1 then
+			local parent = buffer.readu32(nodes, offset - 4)
+			local names = repeated[parent] or {}
+			repeated[parent] = names
+			names[buffer.readu32(nodes, offset + 4)] = true
+		end
+	end
 	local started = os.clock()
-	local childCalls = 0
+	local childCalls, arrived = 0, 0
 	local observeWait, finishWork = BridgeConnection.profileWaitObserver(
 		"import live identities: scheduler yield", "import live identities: validation work")
-	local budget = BridgeParallel.newWorkBudget(0.1, observeWait)
-	for offset = 0, buffer.len(nodes) - 20, 20 do
-		budget()
-		local parent, ordinal = buffer.readu32(nodes, offset), buffer.readu32(nodes, offset + 4)
-		local name, class = strings[buffer.readu32(nodes, offset + 8) + 1], strings[buffer.readu32(nodes, offset + 12) + 1]
-		local instance
-		if parent == 0 then
-			instance = group.incomingByPayloadIndex[ordinal]
-		else
-			local byName = childrenByParent[parent]
-			if byName == nil then
-				byName = {}
-				childCalls += 1
-				for _, child in ipairs(instances[parent]:GetChildren()) do
-					budget()
-					local childName = child.Name
-					local siblings = byName[childName]
-					if siblings == nil then
-						byName[childName] = child
-					elseif typeof(siblings) == "Instance" then
-						byName[childName] = { siblings, child }
-					else
-						siblings[#siblings + 1] = child
-					end
-				end
-				childrenByParent[parent] = byName
-			end
-			local siblings = byName[name]
-			instance = if typeof(siblings) == "Instance" then (if ordinal == 1 then siblings else nil)
-				else siblings and siblings[ordinal]
+	if byParent ~= nil and next(byParent) == nil then
+		for addition, parent in pairs(additions or {}) do
+			budget(observeWait)
+			local named = byParent[parent] or {}
+			byParent[parent] = named
+			local additionName = addition.Name
+			named[additionName] = if named[additionName] == nil then addition else false
 		end
-		if instance == nil or instance.Name ~= name or instance.ClassName ~= class or seen[instance]
-			or (parent ~= 0 and instance.Parent ~= instances[parent]) then
-			if #name > 100 then
-				error(`Instance name has {#name} bytes and Studio keeps 100: {string.sub(name, 1, 40)}...`)
+	end
+	for offset = 0, bytes - 20, 20 do
+		budget(observeWait)
+		local parent, ordinal = buffer.readu32(nodes, offset), buffer.readu32(nodes, offset + 4)
+		local nameIndex = buffer.readu32(nodes, offset + 8)
+		local name, class = strings[nameIndex + 1], strings[buffer.readu32(nodes, offset + 12) + 1]
+		local instance = nil
+		local named = if parent ~= 0 and byParent ~= nil and not (repeated[parent] and repeated[parent][nameIndex])
+			then byParent[instances[parent]] else nil
+		local candidate = if named ~= nil then named[name] else nil
+		if candidate and not seen[candidate] and candidate.Name == name and candidate.ClassName == class
+			and candidate.Parent == instances[parent] then
+			instance = candidate
+			arrived += 1
+		end
+		if instance == nil then
+			if parent == 0 then
+				instance = group.incomingByPayloadIndex[ordinal]
+			else
+				local byName = childrenByParent[parent]
+				if byName == nil then
+					byName = {}
+					childCalls += 1
+					for _, child in ipairs(instances[parent]:GetChildren()) do
+						budget(observeWait)
+						local childName = child.Name
+						local siblings = byName[childName]
+						if siblings == nil then
+							byName[childName] = child
+						elseif typeof(siblings) == "Instance" then
+							byName[childName] = { siblings, child }
+						else
+							siblings[#siblings + 1] = child
+						end
+					end
+					childrenByParent[parent] = byName
+				end
+				local siblings = byName[name]
+				instance = if typeof(siblings) == "Instance" then (if ordinal == 1 then siblings else nil)
+					else siblings and siblings[ordinal]
 			end
-			error("Imported instance identity does not match the payload")
+			if instance == nil or instance.Name ~= name or instance.ClassName ~= class or seen[instance]
+				or (parent ~= 0 and instance.Parent ~= instances[parent]) then
+				if #name > 100 then
+					error(`Instance name has {#name} bytes and Studio keeps 100: {string.sub(name, 1, 40)}...`)
+				end
+				error("Imported instance identity does not match the payload")
+			end
 		end
 		seen[instance] = true
 		instances[#instances + 1] = instance
@@ -706,29 +758,77 @@ local function prepareImportedIdentities(group: any)
 	if finishWork then
 		finishWork()
 	end
-	BridgeConnection.profileStep("import live identity traversal", started, { instances = #instances, calls = childCalls })
+	BridgeConnection.profileStep("import live identity traversal", started,
+		{ instances = #instances, calls = childCalls, arrived = arrived })
 end
 
 -- Bind actual imported objects before any later rename/reparent can change a
 -- path. Retention may substitute a live package object for a staged duplicate.
-local function rememberImportedIdentities(prepared: { any }, ctx: { [string]: any }, aliases: { [Instance]: Instance }?)
+-- Imported rows bind their ids here as rememberMatchedSettingsInstance binds
+-- one; an id without surrounding whitespace needs no trimming.
+local function rememberImportedIdentities(prepared: { any }, ctx: { [string]: any }, aliases: { [Instance]: Instance }?,
+	budget: (((number) -> ())?) -> boolean)
 	local observeWait, finishWork = BridgeConnection.profileWaitObserver(
 		"import identity registration: scheduler yield", "import identity registration: binding work")
-	local budget = BridgeParallel.newWorkBudget(0.1, observeWait)
 	for _, group in ipairs(prepared) do
 		for index, settingsId in ipairs(group.rootSettingsIds or {}) do
-			budget()
+			budget(observeWait)
 			local instance = group.incomingByPayloadIndex[index]
 			if settingsId ~= "" and instance ~= nil then
 				rememberMatchedSettingsInstance(group.serviceName, settingsId, if aliases then aliases[instance] or instance else instance, ctx)
 			end
 		end
-		local identities = group.instanceIdentities
-		for index, instance in ipairs(group.importedSettingsInstances or {}) do
-			budget()
-			local settingsId = identities.strings[buffer.readu32(identities.nodes, (index - 1) * 20 + 16) + 1]
-			if settingsId ~= "" then
-				rememberMatchedSettingsInstance(group.serviceName, settingsId, if aliases then aliases[instance] or instance else instance, ctx)
+		local imported = group.importedSettingsInstances
+		if imported == nil or #imported == 0 then
+			continue
+		end
+		-- Other requests may replace these tables while the loop yields.
+		local serviceMatches, byInstance, lookup
+		local function readTables()
+			if type(ctx.matchedSettingsInstancesByService) ~= "table" then
+				ctx.matchedSettingsInstancesByService = {}
+			end
+			serviceMatches = ctx.matchedSettingsInstancesByService[group.serviceName]
+			if type(serviceMatches) ~= "table" then
+				serviceMatches = {}
+				ctx.matchedSettingsInstancesByService[group.serviceName] = serviceMatches
+			end
+			if type(ctx.matchedSettingsIdByInstance) ~= "table" then
+				ctx.matchedSettingsIdByInstance = setmetatable({}, { __mode = "k" })
+			end
+			byInstance = ctx.matchedSettingsIdByInstance
+			local cached = if type(ctx.settingsIdLookupByService) == "table" then ctx.settingsIdLookupByService[group.serviceName] else nil
+			lookup = if type(cached) == "table" and type(cached.lookup) == "table" then cached.lookup else nil
+		end
+		readTables()
+		local nodes, strings = group.instanceIdentities.nodes, group.instanceIdentities.strings
+		for index, instance in ipairs(imported) do
+			if budget(observeWait) then
+				readTables()
+			end
+			local raw = strings[buffer.readu32(nodes, (index - 1) * 20 + 16) + 1]
+			local first, last = string.byte(raw, 1), string.byte(raw, -1)
+			if first == nil then
+				continue
+			end
+			local settingsId = if first ~= 32 and (first < 9 or first > 13) and last ~= 32 and (last < 9 or last > 13)
+				then raw else settingsIdText(raw)
+			local target = if aliases then aliases[instance] or instance else instance
+			if settingsId == nil or liveInstance(target) == nil then
+				continue
+			end
+			local previous = serviceMatches[settingsId]
+			if previous ~= nil and previous ~= target and byInstance[previous] == settingsId and liveInstance(previous) ~= nil then
+				byInstance[previous] = nil
+				ctx.matchedSettingsIdVersion = (tonumber(ctx.matchedSettingsIdVersion) or 0) + 1
+			end
+			serviceMatches[settingsId] = target
+			if settingsId ~= "1" and string.sub(settingsId, 1, 6) ~= "debug:" and byInstance[target] ~= settingsId then
+				byInstance[target] = settingsId
+				ctx.matchedSettingsIdVersion = (tonumber(ctx.matchedSettingsIdVersion) or 0) + 1
+			end
+			if lookup then
+				lookup[settingsId] = target
 			end
 		end
 	end
@@ -6973,35 +7073,92 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 				local service = game:GetService(serviceName)
 				local rootIds = if type(params.rootIds) == "table" then params.rootIds[serviceName] else nil
-				-- Built for the first root no name finds: it walks the whole service.
-				local lookup = nil
-				local absent = {}
-				for _, name in ipairs(names) do
+				local present, wanted = table.create(#names), {}
+				for index, name in ipairs(names) do
 					if type(name) ~= "string" then
 						error("Invalid native root name")
 					end
-					local present = service:FindFirstChild(name) ~= nil
+					present[index] = service:FindFirstChild(name) ~= nil
 					-- A renamed root keeps its identity: it is present under its old name.
 					-- The live match map wins over the cached lookup: a settings id
 					-- is reused once its earlier instance was deleted.
-					if not present and type(rootIds) == "table" and type(rootIds[name]) == "table" then
+					if not present[index] and type(rootIds) == "table" and type(rootIds[name]) == "table" then
 						for _, settingsId in ipairs(rootIds[name]) do
 							if matchedSettingsInstance(serviceName, settingsId, ctx) ~= nil then
-								present = true
+								present[index] = true
 								break
 							end
 						end
-						if not present then
-							lookup = lookup or settingsIdLookupForService(serviceName, ctx)
+						if not present[index] then
 							for _, settingsId in ipairs(rootIds[name]) do
-								if liveInstance(lookup[tostring(settingsId)]) ~= nil then
-									present = true
-									break
-								end
+								wanted[tostring(settingsId)] = false
 							end
 						end
 					end
-					if not present then
+				end
+				-- Each id still wanted is present when settingsIdLookupForService
+				-- holds a live instance under it. A cached lookup answers as it is;
+				-- otherwise only the asked ids are looked for, by each way that
+				-- lookup lists an instance: its position, its state id, its live
+				-- debug id, or the match map.
+				local cached = if type(ctx.settingsIdLookupByService) == "table" then ctx.settingsIdLookupByService[serviceName] else nil
+				if next(wanted) ~= nil and type(cached) == "table" then
+					for settingsId in pairs(wanted) do
+						wanted[settingsId] = liveInstance(cached.lookup[settingsId]) ~= nil
+					end
+				elseif next(wanted) ~= nil then
+					local state = getStateForService(serviceName, ctx)
+					local instances = if state ~= nil and type(state.instances) == "table" then state.instances else {}
+					local stateIds = if state ~= nil and type(state.instanceIdByInstance) == "table" then state.instanceIdByInstance else {}
+					local matches = if type(ctx.matchedSettingsInstancesByService) == "table"
+						then ctx.matchedSettingsInstancesByService[serviceName] else nil
+					local byPosition, byDebugId, debugIdsLeft = {}, {}, 0
+					for settingsId in pairs(wanted) do
+						local index = tonumber(settingsId, 16)
+						if index ~= nil and (index > 2 ^ 52 or string.format("%x", index) ~= settingsId) then
+							index = nil
+						end
+						if type(matches) == "table" and liveInstance(matches[settingsId]) ~= nil
+							or index ~= nil and liveInstance(instances[index]) ~= nil then
+							wanted[settingsId] = true
+						elseif string.sub(settingsId, 1, 6) == "debug:" and #settingsId > 6 then
+							byDebugId[string.sub(settingsId, 7)] = settingsId
+							debugIdsLeft += 1
+						elseif index ~= nil and index >= 1 then
+							byPosition[index] = settingsId
+						end
+					end
+					for instance, stateId in pairs(stateIds) do
+						local settingsId = if type(stateId) == "number" and stateId >= 1 then byPosition[stateId]
+							elseif type(stateId) == "string" and wanted[stateId] == false then stateId else nil
+						if settingsId ~= nil and liveInstance(instance) ~= nil
+							and (instances[stateId] == instance or table.find(instances, instance) ~= nil) then
+							wanted[settingsId] = true
+						end
+					end
+					for _, candidate in ipairs(if debugIdsLeft > 0 then instances else {}) do
+						local debugId = if typeof(candidate) == "Instance" then ctx.identityModule.getDebugId(candidate) else nil
+						local settingsId = if debugId ~= nil then byDebugId[debugId] else nil
+						if settingsId ~= nil and not wanted[settingsId] and liveInstance(candidate) ~= nil then
+							wanted[settingsId] = true
+							debugIdsLeft -= 1
+							if debugIdsLeft == 0 then
+								break
+							end
+						end
+					end
+				end
+				local absent = {}
+				for index, name in ipairs(names) do
+					if not present[index] and type(rootIds) == "table" and type(rootIds[name]) == "table" then
+						for _, settingsId in ipairs(rootIds[name]) do
+							if wanted[tostring(settingsId)] then
+								present[index] = true
+								break
+							end
+						end
+					end
+					if not present[index] then
 						absent[#absent + 1] = name
 					end
 				end
@@ -7433,14 +7590,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local packageSnapshotRoots = {}
 		local explicitPackageRoots = params.packageRoots ~= nil
 		local childIndex = BridgeIdentity.newChildIndex()
-		for index, descriptor in ipairs(params.mutationRoots or {}) do
-			local serviceName = tostring(descriptor.service or "")
-			if not includedServices[serviceName] then
-				error("Invalid editor transaction mutation root service")
-			end
-			validateMutationPath(descriptor, serviceName, `Editor transaction mutation root {index}`, ctx)
-			restrictedServices[serviceName] = true
-			local root = resolvePathSegments(descriptor.pathSegments, nil, descriptor.pathOrdinals, childIndex)
+		local function addRoot(serviceName: string, root: Instance?)
 			if root ~= nil and root.Parent == game:GetService(serviceName) then
 				local serviceRoots = rootsByService[serviceName]
 				if serviceRoots == nil then
@@ -7451,6 +7601,34 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				if not explicitPackageRoots and containsPackageLink(root) then
 					packageSnapshotRoots[root] = true
 				end
+			end
+		end
+		-- A descriptor names one root by its path, or the roots of one service
+		-- by their names and ordinals under it.
+		for index, descriptor in ipairs(params.mutationRoots or {}) do
+			local serviceName = tostring(descriptor.service or "")
+			if not includedServices[serviceName] then
+				error("Invalid editor transaction mutation root service")
+			end
+			if descriptor.names == nil then
+				validateMutationPath(descriptor, serviceName, `Editor transaction mutation root {index}`, ctx)
+				restrictedServices[serviceName] = true
+				addRoot(serviceName, resolvePathSegments(descriptor.pathSegments, nil, descriptor.pathOrdinals, childIndex))
+				continue
+			end
+			local namesAreArray, count = denseArrayLength(descriptor.names)
+			local ordinalsAreArray, ordinalCount = denseArrayLength(descriptor.ordinals)
+			if not namesAreArray or not ordinalsAreArray or count ~= ordinalCount or count == 0 then
+				error(`Editor transaction mutation roots {index} must pair names with ordinals`)
+			end
+			restrictedServices[serviceName] = true
+			local service = game:GetService(serviceName)
+			for position = 1, count do
+				local name, ordinal = descriptor.names[position], descriptor.ordinals[position]
+				if type(name) ~= "string" or #name > 255 or type(ordinal) ~= "number" or ordinal < 1 or ordinal % 1 ~= 0 then
+					error(`Editor transaction mutation roots {index} hold an invalid name or ordinal`)
+				end
+				addRoot(serviceName, resolveOrdinalChild(service, name, ordinal, childIndex))
 			end
 		end
 		if explicitPackageRoots then
@@ -7782,7 +7960,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			-- complete. Commit reparents staged imports; live insertion's objects
 			-- and package aliases are unchanged, so its second walk adds nothing.
 			if session.nativeServiceImport == nil or not session.nativeServiceImport.identitiesRegistered then
-				rememberImportedIdentities(session.nativeUndo.prepared, ctx, session.nativeUndo.packageAliases)
+				rememberImportedIdentities(session.nativeUndo.prepared, ctx, session.nativeUndo.packageAliases,
+					BridgeParallel.newRequestBudget())
 			end
 			for original, replacement in pairs(session.nativeUndo.replacements) do
 				session.instanceReplacements[original] = replacement
@@ -8937,7 +9116,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	local function validatedNativeImportGroup(
 		rawGroup: { [string]: any },
 		payloadRootNames: { [string]: boolean },
-		wholeServices: boolean?
+		wholeServices: boolean?,
+		budget: (((number) -> ())?) -> boolean
 	): { [string]: any }
 		validateObjectTable(rawGroup, "Native import group")
 		local serviceName, service, target, targetPath, targetPathLength = validatedNativeImportTarget(rawGroup)
@@ -8947,7 +9127,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		local rootPaths = validatedNativeImportRootPaths(rawGroup, serviceName, targetPath, targetPathLength, count)
 		local rootSettingsIds = rawGroup.rootSettingsIds
-		local instanceIdentities = validatedImportIdentities(rawGroup.instanceIdentities, count)
+		local instanceIdentities = validatedImportIdentities(rawGroup.instanceIdentities, count, budget)
 		if rootSettingsIds ~= nil then
 			local isArray, idCount = denseArrayLength(rootSettingsIds)
 			if not isArray or idCount ~= #rootPaths then
@@ -9049,9 +9229,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			error("Native import groups must be an array")
 		end
 		local groups = table.create(groupCount)
-		local payloadRootNames = {}
+		local payloadRootNames, budget = {}, BridgeParallel.newRequestBudget()
 		for index, rawGroup in ipairs(rawGroups) do
-			groups[index] = validatedNativeImportGroup(rawGroup, payloadRootNames, wholeServices)
+			groups[index] = validatedNativeImportGroup(rawGroup, payloadRootNames, wholeServices, budget)
 		end
 		return groups
 	end
@@ -9384,10 +9564,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				if length == 0 or length >= 48 or offset + 7 + length > bytes then
 					error("Native creation receipt contains an invalid identity")
 				end
+				-- A wrong id, one holding NUL included, is no object's debug id and
+				-- leaves the object it stands for unreceipted. That refuses the
+				-- commit only while change tracking is started.
 				local id = buffer.readstring(decoded, offset + 7, length)
-				if string.find(id, "\0", 1, true) then
-					error("Native creation receipt identity contains a terminator")
-				end
 				local byteIndex, bit = math.floor(ordinal / 8), bit32.lshift(1, ordinal % 8)
 				local used = buffer.readu8(class.used, byteIndex)
 				if native.createdById[id] ~= nil or bit32.btest(used, bit) then
@@ -9556,7 +9736,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			or not bit32.btest(params.nativeState, 8) then
 			error("Native insertion did not return a complete creation receipt")
 		end
-		local timings = {}
+		local timings, budget, byParentByService = {}, BridgeParallel.newRequestBudget(), {}
 		local phaseStarted = os.clock()
 		local function finishPhase(name: string)
 			local now = os.clock()
@@ -9622,11 +9802,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				error("Native insertion returned unexpected roots")
 			end
 			group.incoming = ordered
-			prepareImportedIdentities(group)
+			local byParent = byParentByService[group.serviceName] or {}
+			byParentByService[group.serviceName] = byParent
+			prepareImportedIdentities(group, budget, additions[group.serviceName], byParent)
 		end
 		finishPhase("identityValidation")
 		transaction.assertOwnership()
-		rememberImportedIdentities(undo.prepared, ctx, undo.packageAliases)
+		rememberImportedIdentities(undo.prepared, ctx, undo.packageAliases, budget)
 		native.identitiesRegistered = true
 		finishPhase("identityRegistration")
 		runWithStudioChangeSuppression(ctx, function()
@@ -9848,8 +10030,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				}
 			end
 			setTrackedOperationPhase(operation, "prepareRetention")
+			local budget = BridgeParallel.newRequestBudget()
 			for _, group in ipairs(prepared) do
-				prepareImportedIdentities(group)
+				prepareImportedIdentities(group, budget)
 			end
 			assertImportActive()
 			ReferenceOverlay.assertNativeGuard(transaction.nativeGuard)

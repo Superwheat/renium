@@ -6,6 +6,8 @@ local PARALLEL_TARGET_ITEMS_PER_WORKER = 256
 local FRAME_SECONDS = 1 / 30
 local MIN_SLICE_SECONDS = 0.008
 local MAX_SLICE_SECONDS = 0.1
+local REQUEST_SLICE_SECONDS = 0.25
+local MAX_REQUEST_SLICE_SECONDS = 1
 
 -- task.spawn runs on the same Luau scheduler: workers must still share frames
 -- with Studio's built-in plugins. Check at item boundaries, keeping small jobs
@@ -34,6 +36,29 @@ function BridgeParallel.newWorkBudget(sliceSeconds: number?, observeWait: ((numb
 			slice = math.clamp(math.max(FRAME_SECONDS - waited, waited), MIN_SLICE_SECONDS, MAX_SLICE_SECONDS)
 		end
 		deadline = os.clock() + slice
+		return true
+	end
+end
+
+-- One budget for all the work of one request, which yields rarely: right
+-- after a large import one wait costs Studio 0.4 s whenever it comes. The
+-- first slice is the shortest; each later one lasts as long as the last wait
+-- did, within those bounds, so the work never holds Studio near the 5 s at
+-- which Studio reports it as not responding. Each check may name the observer
+-- that its wait is charged to, and returns true when it yielded.
+function BridgeParallel.newRequestBudget()
+	local deadline = os.clock() + REQUEST_SLICE_SECONDS
+	return function(observeWait: ((number) -> ())?)
+		if os.clock() < deadline then
+			return false
+		end
+		local started = os.clock()
+		task.wait()
+		local resumed = os.clock()
+		if observeWait then
+			observeWait(started)
+		end
+		deadline = os.clock() + math.clamp(resumed - started, REQUEST_SLICE_SECONDS, MAX_REQUEST_SLICE_SECONDS)
 		return true
 	end
 end

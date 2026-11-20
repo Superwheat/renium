@@ -52,6 +52,96 @@ do
 		assert(not pcall(generations, { services = { "TestService" }, rootNames = roots }))
 	end
 end
+-- A renamed root is present under its old name when an id it held finds a live
+-- instance. The answer for the asked ids alone must equal the whole lookup's.
+do
+	local engineTypeof = typeof
+	local helpers = {
+		liveInstance = function(value) return if type(value) == "table" and value.live then value else nil end,
+		typeof = function(value) return if type(value) == "table" and value.live ~= nil then "Instance" else engineTypeof(value) end,
+	}
+	local function load(first, after, returned)
+		local start = assert(source:find(first, 1, true))
+		helpers[returned] = luau.load(source:sub(start, assert(source:find(after, start, true)) - 1) .. "\nreturn " .. returned,
+			{ environment = table.clone(helpers) })()
+	end
+	load("local function settingsIdText(", "local function strongSettingsId(", "settingsIdText")
+	load("local function matchedSettingsInstance(", "local function rememberMatchedSettingsInstance(", "matchedSettingsInstance")
+	load("local function getStateForService(", "local function parseInstanceIndexId(", "getStateForService")
+	load("local function settingsIdLookupForService(", "local function resolveInstanceBySettingsId(", "settingsIdLookupForService")
+	local service = { FindFirstChildWhichIsA = function() return nil end, FindFirstChild = function() return nil end }
+	local function generationsFor(ctx)
+		local environment = table.clone(helpers)
+		environment.api, environment.ctx = {}, ctx
+		environment.game = { GetService = function() return service end }
+		environment.denseArrayLength = extract("local function denseArrayLength(", "local PATH_SEPARATOR", {}, "denseArrayLength")
+		return extract("\tfunction api.getServiceChangeGenerations(", "\tlocal function hasDirectPackageLink(", environment,
+			"api.getServiceChangeGenerations")
+	end
+	math.randomseed(20261120)
+	local cases, cachedCases = 0, 0
+	for _ = 1, 300 do
+		local instances, stateIds = {}, {}
+		for index = 1, math.random(0, 40) do
+			local item = { live = math.random() < 0.7, debugId = `D{math.random(1, 60)}{index}` }
+			instances[index] = item
+			local kind = math.random(1, 5)
+			stateIds[item] = if kind == 1 then index elseif kind == 2 then math.random(0, 70)
+				elseif kind == 3 then `s{math.random(1, 20)}` elseif kind == 4 then string.format("%x", math.random(1, 70))
+				else false
+		end
+		local outsider = { live = true, debugId = "Doutside" }
+		stateIds[outsider] = 3
+		local matches = {}
+		for _ = 1, math.random(0, 6) do
+			matches[`m{math.random(1, 8)}`] = if math.random() < 0.5 then outsider else instances[math.random(1, math.max(1, #instances))]
+		end
+		local pool = { "0", "01", "1F", "0x1", "zz", "debug:", "debug:Doutside", `s{math.random(1, 20)}`, `m{math.random(1, 8)}` }
+		for _ = 1, 4 do
+			pool[#pool + 1] = string.format("%x", math.random(0, 75))
+			local item = instances[math.random(1, math.max(1, #instances))]
+			pool[#pool + 1] = if item then `debug:{item.debugId}` else "debug:D1"
+		end
+		local names, rootIds = {}, {}
+		for index, id in ipairs(pool) do
+			names[index] = `Root{index}`
+			rootIds[names[index]] = { id }
+		end
+		local state = { instances = instances, instanceIdByInstance = stateIds }
+		local function context()
+			return { allowedServices = { TestService = true }, studioChangeGeneration = function() return 1 end,
+				getState = function() return state end, matchedSettingsInstancesByService = { TestService = table.clone(matches) },
+				identityModule = { getDebugId = function(item) return item.debugId end } }
+		end
+		local cached = math.random() < 0.2
+		local reference = context()
+		local lookup = helpers.settingsIdLookupForService("TestService", reference)
+		local expected = {}
+		for index, name in ipairs(names) do
+			local id = rootIds[name][1]
+			if helpers.matchedSettingsInstance("TestService", id, context()) == nil and helpers.liveInstance(lookup[id]) == nil then
+				expected[#expected + 1] = names[index]
+			end
+		end
+		local ctx = context()
+		if cached then
+			-- A cached lookup answers as it is, even after the state moved on.
+			ctx.settingsIdLookupByService = { TestService = { lookup = lookup, state = state } }
+			instances[#instances + 1] = { live = true, debugId = "Dlate" }
+			cachedCases += 1
+		end
+		local result = generationsFor(ctx)({ services = { "TestService" }, rootNames = { TestService = names },
+			rootIds = { TestService = rootIds } })
+		local absent = result.absentRoots.TestService
+		assert(#absent == #expected, `case {cases}: {#absent} absent roots, the lookup finds {#expected}`)
+		for index, name in ipairs(expected) do
+			assert(absent[index] == name, `case {cases}: {name} must be absent`)
+		end
+		assert(cached or ctx.settingsIdLookupByService == nil, "Answering for the asked ids must not build the whole lookup")
+		cases += 1
+	end
+	assert(cachedCases > 0)
+end
 local lighting = { ClassName = "Lighting" }
 local chat = { ClassName = "TextChatService" }
 local material = { ClassName = "MaterialService" }
@@ -551,6 +641,7 @@ local attached, documents, finished, generation = 0, 0, 0, 0
 local identified = 0
 local commitPhase = nil
 local commitContext = { studioChangeGeneration = function() return generation end }
+local function commitBudget() return false end
 local onFinish = nil
 local commit = extract("local function commitTransactionUnsafe(", "function api.commitTransaction(", {
 	editorTransactions = pendingSessions,
@@ -568,11 +659,13 @@ local commit = extract("local function commitTransactionUnsafe(", "function api.
 		chainReplacements = function() end,
 		commitNative = function() attached += 1 end,
 	},
-	rememberImportedIdentities = function(prepared, ctx)
+	rememberImportedIdentities = function(prepared, ctx, _, budget)
 		assert(attached == identified + 1, "Imported roots are identified once they are in the place")
 		assert(prepared == pendingSessions.snapshot.nativeUndo.prepared and ctx == commitContext)
+		assert(budget == commitBudget, "The commit's registration spends the commit request's budget")
 		identified += 1
 	end,
+	BridgeParallel = { newRequestBudget = function() return commitBudget end },
 	ScriptDocumentState = { apply = function()
 		assert(commitPhase == "scriptDocuments")
 		documents += 1
