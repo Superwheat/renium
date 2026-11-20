@@ -129,6 +129,11 @@ fn writer() -> [u64; 2] {
 
 /// The bytes of a store file that hold its instances and values: past the
 /// head of a v12 store, which grows with its blocks and pool entries.
+/// How many instances a store in blocks holds, from its header alone.
+pub(crate) fn instance_count(bytes: &[u8]) -> Option<usize> {
+    BlockStore::open(bytes).ok().map(|store| store.rows)
+}
+
 pub(crate) fn store_payload_len(bytes: &[u8]) -> usize {
     match BlockStore::open(bytes) {
         Ok(store) => bytes.len() - store.structure.at,

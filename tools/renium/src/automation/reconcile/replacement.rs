@@ -323,14 +323,15 @@ fn sparse_document(
 
 /// Tells the instances that differ in what they hold from the ones whose
 /// rows two copies of a store only write another way: `differs` keeps each
-/// of `differing` that holds other values, and their count is the answer. A
+/// of `differing`, an instance of the files' copy with Studio's, that holds
+/// other values, by where Studio's stands, and their count is the answer. A
 /// capture can write a value the other copy leaves out, in every row of a
 /// class. Once more than `MAX_CHANGED_INSTANCES` differ the store is not
 /// compared instance by instance, so the rest are left as they were, and so
 /// are all of a copy that cannot be read by its rows.
 fn told_apart(
     (desired_bytes, observed_bytes): (&[u8], &[u8]),
-    differing: &[usize],
+    differing: &[(usize, usize)],
     differs: &mut [bool],
 ) -> Result<usize> {
     use crate::settings::bytecode::property_edit::decode_for_property_edit;
@@ -359,28 +360,32 @@ fn told_apart(
         anyhow::Ok(instances)
     };
     let (mut unlike, mut compared) = (0, 0);
-    for rows in differing.chunks(COMPARED_AT_ONCE) {
+    for pairs in differing.chunks(COMPARED_AT_ONCE) {
         if unlike > MAX_CHANGED_INSTANCES {
             break;
         }
+        let (of_files, of_studio): (Vec<usize>, Vec<usize>) = pairs.iter().copied().unzip();
         let (read_files, read_studio) = rayon::join(
-            || files_rows.materialize(&mut files, rows),
-            || studio_rows.materialize(&mut studio, rows),
+            || files_rows.materialize(&mut files, &of_files),
+            || studio_rows.materialize(&mut studio, &of_studio),
         );
         if read_files.is_err() || read_studio.is_err() {
             break;
         }
-        let (of_files, of_studio) = (whole(&mut files, rows)?, whole(&mut studio, rows)?);
+        let (of_files, of_studio) = (
+            whole(&mut files, &of_files)?,
+            whole(&mut studio, &of_studio)?,
+        );
         let differ = of_files
             .par_iter()
             .zip(&of_studio)
             .map(|(files, studio)| !instance_values_equal(None, files, studio))
             .collect::<Vec<_>>();
-        for (row, differ) in rows.iter().zip(differ) {
+        for ((_, row), differ) in pairs.iter().zip(differ) {
             differs[*row] = differ;
             unlike += usize::from(differ);
         }
-        compared += rows.len();
+        compared += pairs.len();
     }
     Ok(unlike + differing.len() - compared)
 }
@@ -495,6 +500,25 @@ fn imported_store(
     replaced_store_beside(desired_bytes, retained)
 }
 
+/// What `changed_instances_alone` answers for a store it has imported anew
+/// (`imported_store`), said in the log: the whole documents' where the
+/// import cannot take it.
+fn imported_anew(
+    copies: (&[u8], &[u8]),
+    studio: Vec<SettingsBytecodeInstance>,
+    why: &str,
+) -> Result<ChangedInstances> {
+    let count = studio.len();
+    let Some(copies) = imported_store(copies, studio)? else {
+        return Ok(ChangedInstances::Whole(None));
+    };
+    log_global(
+        3,
+        format_args!("[renium] push imports a store of {count} instances anew: {why}"),
+    );
+    Ok(ChangedInstances::Imported(Box::new(copies)))
+}
+
 /// The change of a store whose two copies differ in the values of a few
 /// instances, without the whole document of the store Studio holds: the
 /// digests of the two files say which instances differ, and those, their
@@ -503,7 +527,10 @@ fn imported_store(
 /// the files' instance at its place (`held::stand_unchanged`) and keeps its
 /// UniqueId alone. This is taken only where the two copies hold the same
 /// instances at the same places and the alignment of the whole documents
-/// would leave each of them there, whatever ids Studio gave them.
+/// would leave each of them there, whatever ids Studio gave them. One copy
+/// may hold one run of instances the other lacks, an instance a store edit
+/// added or removed with all under it: every other instance then stands for
+/// the one at its place beside the run (`Moved`).
 ///
 /// With `files_too` the files' copy is read the same way: a push that sends
 /// nothing but values of existing instances reads no other instance of it.
@@ -513,13 +540,14 @@ fn changed_instances_alone(
     files_too: bool,
     imports_heavy: bool,
 ) -> Result<ChangedInstances> {
+    use crate::settings::bytecode::blocks::instance_count;
     use crate::settings::bytecode::property_edit::{
-        StoreRows, decode_rows, names_an_instance_by_id, whole_row_digests,
-        whole_row_digests_of_both,
+        Moved, StoreRows, decode_for_row_chunks, decode_rows, names_an_instance_by_id,
+        whole_row_digests, whole_row_digests_of_both,
     };
     use crate::settings::equivalence::{
-        align_settings_ids_by_place, inherit_workspace_viewport_reference,
-        stabilize_settings_reference_ids,
+        align_settings_ids_beside_run, align_settings_ids_by_place,
+        inherit_workspace_viewport_reference, stabilize_settings_reference_ids,
     };
 
     let (Some(SnapshotEntry::File(desired_bytes)), Some(SnapshotEntry::File(observed_bytes))) =
@@ -544,12 +572,37 @@ fn changed_instances_alone(
         Whole(SettingsBytecode, Vec<[u8; 16]>, Vec<bool>),
         Rows(StoreRows),
     }
+    // Copies that hold as many instances are compared place by place.
+    // Where they do not, Studio's instances are digested as they stand among
+    // the files', if one run of instances is all that one holds more.
+    let as_many = match (
+        instance_count(desired_bytes),
+        instance_count(observed_bytes),
+    ) {
+        (Some(files), Some(studio)) => files == studio,
+        _ => true,
+    };
+    let stand = |studio: &[SettingsBytecodeInstance]| {
+        let moved = (!as_many)
+            .then(|| decode_for_row_chunks(desired_bytes).ok())
+            .flatten()
+            .and_then(|(files, _)| Moved::between_copies(studio, &files.instances))
+            .flatten();
+        Some((None, moved))
+    };
     let (observed_rows, files) = if files_too {
-        let (files, observed_rows) = whole_row_digests_of_both(desired_bytes, observed_bytes);
+        let (files, observed_rows) = if as_many {
+            whole_row_digests_of_both(desired_bytes, observed_bytes)
+        } else {
+            rayon::join(
+                || whole_row_digests(desired_bytes, |_| Some((None, None))),
+                || whole_row_digests(observed_bytes, stand),
+            )
+        };
         (observed_rows, Ok(files.ok().flatten().map(Files::Rows)))
     } else {
         rayon::join(
-            || whole_row_digests(observed_bytes, |_| Some((None, None))),
+            || whole_row_digests(observed_bytes, stand),
             || -> Result<Option<Files>> {
                 // The files' copy as `settings_document` gives it, with the
                 // digests of its instances taken as they were decoded.
@@ -604,17 +657,26 @@ fn changed_instances_alone(
         }
     };
     let count = files_instances.len();
-    let same_places = skeleton.len() == count
-        && files_digests.len() == count
-        && observed_rows.digests.len() == count
-        && files_instances
-            .iter()
-            .zip(&skeleton)
-            .all(|(files, studio)| {
-                files.name == studio.name
-                    && files.class_name == studio.class_name
-                    && files.parent_index == studio.parent_index
-            });
+    let studio_count = skeleton.len();
+    let moved = observed_rows.moved;
+    let same_places = files_digests.len() == count
+        && observed_rows.digests.len() == studio_count
+        && match moved {
+            // Each instance beside the run stands under the name, class and
+            // parent of its counterpart (`Moved::between_copies`).
+            Some(moved) => moved.run().0.len() == count.abs_diff(studio_count),
+            None => {
+                studio_count == count
+                    && files_instances
+                        .iter()
+                        .zip(&skeleton)
+                        .all(|(files, studio)| {
+                            files.name == studio.name
+                                && files.class_name == studio.class_name
+                                && files.parent_index == studio.parent_index
+                        })
+            }
+        };
     let hand_over = |files: Files| {
         Ok(ChangedInstances::Whole(match files {
             Files::Whole(current, ..) => Some(current),
@@ -624,64 +686,97 @@ fn changed_instances_alone(
     if !same_places {
         return hand_over(files);
     }
-    let mut differs = (0..count)
-        .map(|index| files_digests[index] != observed_rows.digests[index])
+    // The files' instance each of Studio's stands for, and Studio's for
+    // each of the files': none for an instance of the run.
+    let files_of = |studio: usize| moved.map_or(Some(studio), |moved| moved.in_state(studio));
+    let studio_of = |files: usize| moved.map_or(Some(files), |moved| moved.in_store(files));
+    let mut differs = (0..studio_count)
+        .map(|index| {
+            files_of(index).is_none_or(|files| files_digests[files] != observed_rows.digests[index])
+        })
         .collect::<Vec<_>>();
-    let mut read = instances_read(&skeleton, (&differs, &files_named), files_too);
+    // Read whatever they hold: the instances that name another by its id.
+    let kept = (0..studio_count)
+        .map(|index| files_of(index).is_some_and(|files| files_named[files]))
+        .collect::<Vec<_>>();
+    let mut read = instances_read(&skeleton, (&differs, &kept), files_too);
     if read.len() > MAX_CHANGED_INSTANCES {
         // The rows that only write the same values another way are not read.
-        let mut names = files_named.clone();
+        let mut names = kept.clone();
         for index in &observed_rows.named {
             if let Some(names) = names.get_mut(*index) {
                 *names = true;
             }
         }
-        let differing = (0..count)
+        let differing = (0..studio_count)
             .filter(|&index| differs[index] && !names[index])
+            .filter_map(|index| Some((files_of(index)?, index)))
             .collect::<Vec<_>>();
         let copies = (desired_bytes.as_slice(), observed_bytes.as_slice());
-        let unlike = told_apart(copies, &differing, &mut differs)?;
+        let unlike = told_apart(copies, &differing, &mut differs)?
+            + moved.map_or(0, |moved| moved.run().0.len());
         if unlike > MAX_CHANGED_INSTANCES && imports_heavy {
             // Neither copy is whole beside the ones the import reads.
             drop(files);
-            let copies = imported_store(copies, skeleton)?;
-            if copies.is_some() {
-                crate::app::output::log_global(
-                    3,
-                    format_args!(
-                        "[renium] push imports a store of {count} instances anew: most of them differ"
-                    ),
-                );
-            }
-            return Ok(copies.map_or(ChangedInstances::Whole(None), |copies| {
-                ChangedInstances::Imported(Box::new(copies))
-            }));
+            return imported_anew(copies, skeleton, "most of its instances differ");
         }
-        read = instances_read(&skeleton, (&differs, &files_named), files_too);
+        read = instances_read(&skeleton, (&differs, &kept), files_too);
     }
-    if read.len() > MAX_CHANGED_INSTANCES || read.len() == count {
+    // Of the files' copy read by its instances: the counterparts of those,
+    // and the instances of a run it alone holds with what is read beside
+    // them, whose counterparts are read from Studio's as well.
+    let read_of_files = match (&files, moved) {
+        (Files::Rows(files), Some(_)) => {
+            let mut of_studio = vec![false; studio_count];
+            for index in &read {
+                of_studio[*index] = true;
+            }
+            let wanted = (0..count)
+                .map(|index| studio_of(index).is_none_or(|studio| of_studio[studio]))
+                .collect::<Vec<_>>();
+            let of_files = instances_read(&files.instances, (&wanted, &vec![false; count]), true);
+            let known = read.len();
+            for studio in of_files.iter().filter_map(|index| studio_of(*index)) {
+                if !std::mem::replace(&mut of_studio[studio], true) {
+                    read.push(studio);
+                }
+            }
+            if read.len() != known {
+                read.sort_unstable();
+            }
+            Some(of_files)
+        }
+        _ => None,
+    };
+    if read.len() > MAX_CHANGED_INSTANCES || read.len() == studio_count {
         return hand_over(files);
     }
     let Ok((rows, _)) = decode_rows(observed_bytes, &read) else {
         return hand_over(files);
     };
-    let sparse = |instances, rows, version| sparse_document(instances, &read, rows, version);
     let mut current = match files {
         Files::Whole(current, ..) => current,
         Files::Rows(files) => {
-            let Ok((rows, _)) = decode_rows(desired_bytes, &read) else {
+            let read = read_of_files.as_deref().unwrap_or(&read);
+            let Ok((rows, _)) = decode_rows(desired_bytes, read) else {
                 return Ok(ChangedInstances::Whole(None));
             };
-            sparse(files.instances, rows, SETTINGS_BINARY_VERSION)?
+            sparse_document(files.instances, read, rows, SETTINGS_BINARY_VERSION)?
         }
     };
-    let mut previous = sparse(skeleton, rows, current.version)?;
+    let mut previous = sparse_document(skeleton, &read, rows, current.version)?;
     let hand_over =
         |current: SettingsBytecode| Ok(ChangedInstances::Whole((!files_too).then_some(current)));
     if settings_documents_positionally_equivalent(&current, &previous) {
         return Ok(ChangedInstances::None);
     }
-    if !align_settings_ids_by_place(&current, &mut previous) {
+    let aligned = match moved.map(Moved::run) {
+        None => align_settings_ids_by_place(&current, &mut previous),
+        Some((run, of_files)) => {
+            align_settings_ids_beside_run(&mut current, &mut previous, run, !of_files)
+        }
+    };
+    if !aligned {
         return hand_over(current);
     }
     let reusable = previous
@@ -700,9 +795,25 @@ fn changed_instances_alone(
     if settings_documents_equivalent(&current, &previous) {
         return Ok(ChangedInstances::None);
     }
-    // A delta heavy enough to replace the service retains what Studio holds.
+    // A delta heavy enough to replace the service is one import of the
+    // store, as `promote_heavy_deltas_to_replacement` makes it; where the
+    // push imports none, the whole documents send it.
     if delta_weight(&current, &previous).heavy() {
-        return hand_over(current);
+        if !imports_heavy {
+            return hand_over(current);
+        }
+        drop((current, previous));
+        let Some(studio) = whole_row_digests(observed_bytes, |_| Some((None, None)))
+            .ok()
+            .flatten()
+        else {
+            return Ok(ChangedInstances::Whole(None));
+        };
+        return imported_anew(
+            (desired_bytes, observed_bytes),
+            studio.instances,
+            "it creates more instances than a push sends one by one",
+        );
     }
     Ok(ChangedInstances::Prepared(Box::new(
         PreparedEditorSettingsChange { previous, current },

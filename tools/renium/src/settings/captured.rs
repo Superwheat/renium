@@ -316,22 +316,49 @@ impl Moved {
         stored: &[SettingsBytecodeInstance],
         records: &[SettingsBinaryInstance<'_>],
     ) -> Option<Option<Self>> {
-        if stored.len() == records.len() {
+        Self::between_by(stored, records.len(), |index| {
+            let record = &records[index];
+            (record.name, record.class_name, record.parent_index)
+        })
+    }
+
+    /// `between` for another copy of the store as the state: a push's files
+    /// beside the store Studio holds.
+    pub(crate) fn between_copies(
+        stored: &[SettingsBytecodeInstance],
+        state: &[SettingsBytecodeInstance],
+    ) -> Option<Option<Self>> {
+        Self::between_by(stored, state.len(), |index| {
+            let instance = &state[index];
+            (
+                instance.name.as_str(),
+                instance.class_name.as_str(),
+                instance.parent_index,
+            )
+        })
+    }
+
+    fn between_by<'a>(
+        stored: &[SettingsBytecodeInstance],
+        count: usize,
+        state: impl Fn(usize) -> (&'a str, &'a str, Option<usize>),
+    ) -> Option<Option<Self>> {
+        if stored.len() == count {
             return Some(None);
         }
-        let common = stored.len().min(records.len());
+        let common = stored.len().min(count);
         let at = (0..common)
             .find(|&index| {
-                let (stored, record) = (&stored[index], &records[index]);
-                stored.name != record.name
-                    || stored.class_name != record.class_name
-                    || stored.parent_index != record.parent_index
+                let (stored, (name, class_name, parent_index)) = (&stored[index], state(index));
+                stored.name != name
+                    || stored.class_name != class_name
+                    || stored.parent_index != parent_index
             })
             .unwrap_or(common);
         let moved = Self {
             at,
-            by: stored.len().abs_diff(records.len()),
-            added: records.len() > stored.len(),
+            by: stored.len().abs_diff(count),
+            added: count > stored.len(),
         };
         (at..common)
             .all(|position| {
@@ -340,10 +367,11 @@ impl Moved {
                 } else {
                     (position + moved.by, position)
                 };
-                let (stored, record) = (&stored[stored_index], &records[index]);
-                stored.name == record.name
-                    && stored.class_name == record.class_name
-                    && match record.parent_index {
+                let (stored, (name, class_name, parent_index)) =
+                    (&stored[stored_index], state(index));
+                stored.name == name
+                    && stored.class_name == class_name
+                    && match parent_index {
                         None => stored.parent_index.is_none(),
                         Some(parent) => moved
                             .in_store(parent)
@@ -353,8 +381,14 @@ impl Moved {
             .then_some(Some(moved))
     }
 
+    /// The run of instances one copy holds and the other lacks, as it
+    /// stands in the copy that holds it, and whether that is the state.
+    pub(crate) fn run(self) -> (std::ops::Range<usize>, bool) {
+        (self.at..self.at + self.by, self.added)
+    }
+
     /// Which stored instance the state's instance at `index` is.
-    pub(super) fn in_store(self, index: usize) -> Option<usize> {
+    pub(crate) fn in_store(self, index: usize) -> Option<usize> {
         match (self.added, index < self.at) {
             (_, true) => Some(index),
             (true, false) => index.checked_sub(self.by).filter(|index| *index >= self.at),
@@ -363,7 +397,7 @@ impl Moved {
     }
 
     /// Where the stored instance at `index` stands in the state.
-    fn in_state(self, index: usize) -> Option<usize> {
+    pub(crate) fn in_state(self, index: usize) -> Option<usize> {
         match (self.added, index < self.at) {
             (_, true) => Some(index),
             (true, false) => Some(index + self.by),

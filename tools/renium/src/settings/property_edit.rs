@@ -193,6 +193,8 @@ fn ids_of(instances: Vec<SettingsBytecodeInstance>) -> Vec<String> {
         .collect()
 }
 
+pub(crate) use super::captured::Moved;
+
 /// What `row_digests` reads of a store file.
 pub(crate) struct StoreRows {
     /// The digest of each instance.

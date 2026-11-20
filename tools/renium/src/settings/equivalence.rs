@@ -2022,6 +2022,145 @@ pub(crate) fn align_settings_ids_by_place(
     false
 }
 
+/// Takes the instances at `run` out of a document: the others stand as in
+/// a document that never held them. `None`, with the document as it was,
+/// where an instance beside the run stands under one of them.
+fn take_run(
+    document: &mut SettingsBytecode,
+    run: &std::ops::Range<usize>,
+) -> Option<Vec<SettingsBytecodeInstance>> {
+    if run.end > document.instances.len()
+        || document
+            .instances
+            .iter()
+            .enumerate()
+            .any(|(index, instance)| {
+                !run.contains(&index)
+                    && instance
+                        .parent_index
+                        .is_some_and(|parent| run.contains(&parent))
+            })
+    {
+        return None;
+    }
+    let taken = document.instances.drain(run.clone()).collect();
+    for instance in &mut document.instances {
+        if let Some(parent) = instance.parent_index.as_mut()
+            && *parent >= run.end
+        {
+            *parent -= run.len();
+        }
+    }
+    Some(taken)
+}
+
+/// Puts the instances `take_run` took back where they stood.
+fn put_run(
+    document: &mut SettingsBytecode,
+    run: &std::ops::Range<usize>,
+    taken: Vec<SettingsBytecodeInstance>,
+) {
+    for instance in &mut document.instances {
+        if let Some(parent) = instance.parent_index.as_mut()
+            && *parent >= run.start
+        {
+            *parent += run.len();
+        }
+    }
+    document.instances.splice(run.start..run.start, taken);
+}
+
+/// `align_settings_ids_by_place` for two copies of a store of which one
+/// holds one run of instances the other lacks, every other instance standing
+/// as its counterpart stands. The instances beside the run are aligned by
+/// their places. An instance of a run `observed` holds has no counterpart:
+/// it keeps its id, or takes a new one where the reference holds that id for
+/// another instance, as the matching gives one. `false` where the instances
+/// beside the run are not aligned by place, or more than one instance of the
+/// run needs a new id; `reference` is then as it was.
+pub(crate) fn align_settings_ids_beside_run(
+    reference: &mut SettingsBytecode,
+    observed: &mut SettingsBytecode,
+    run: std::ops::Range<usize>,
+    observed_holds_run: bool,
+) -> bool {
+    if !observed_holds_run {
+        let Some(taken) = take_run(reference, &run) else {
+            return false;
+        };
+        let aligned = align_settings_ids_by_place(reference, observed);
+        put_run(reference, &run, taken);
+        return aligned;
+    }
+    if run.end > observed.instances.len() {
+        return false;
+    }
+    let service = store_service(observed).map(str::to_string);
+    // The id of an instance of the run that the reference holds for another
+    // instance is renamed while every reference to it still says the old one.
+    let renamed = {
+        let reserved = reference
+            .instances
+            .iter()
+            .map(|instance| instance.settings_id.as_str())
+            .collect::<AHashSet<_>>();
+        let mut colliding = run
+            .clone()
+            .filter(|index| reserved.contains(observed.instances[*index].settings_id.as_str()));
+        let first = colliding.next();
+        if colliding.next().is_some() {
+            return false;
+        }
+        first.map(|index| {
+            let held = observed
+                .instances
+                .iter()
+                .map(|instance| instance.settings_id.as_str())
+                .collect::<AHashSet<_>>();
+            let fresh = (0_usize..)
+                .map(|generated| format!("reconcile:{generated:x}"))
+                .find(|candidate| {
+                    !reserved.contains(candidate.as_str()) && !held.contains(candidate.as_str())
+                })
+                .unwrap_or_default();
+            (index, fresh)
+        })
+    };
+    if let Some((index, fresh)) = renamed {
+        let old = std::mem::replace(&mut observed.instances[index].settings_id, fresh.clone());
+        let remap = HashMap::from([(old, fresh)]);
+        for instance in &mut observed.instances {
+            remap_record_reference_ids(&mut instance.properties, &remap, service.as_deref());
+            remap_record_reference_ids(&mut instance.attributes, &remap, service.as_deref());
+        }
+    }
+    let Some(mut taken) = take_run(observed, &run) else {
+        return false;
+    };
+    let before = observed
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.clone())
+        .collect::<Vec<_>>();
+    let aligned = align_settings_ids_by_place(reference, observed);
+    if aligned {
+        let remap = before
+            .into_iter()
+            .zip(&observed.instances)
+            .filter(|(before, instance)| *before != instance.settings_id)
+            .map(|(before, instance)| (before, instance.settings_id.clone()))
+            .collect::<HashMap<_, _>>();
+        if !remap.is_empty() {
+            for instance in &mut taken {
+                remap_record_reference_ids(&mut instance.properties, &remap, service.as_deref());
+                remap_record_reference_ids(&mut instance.attributes, &remap, service.as_deref());
+            }
+        }
+    }
+    put_run(observed, &run, taken);
+    aligned
+}
+
 fn align_settings_ids_by_matching(
     reference: &SettingsBytecode,
     observed: &mut SettingsBytecode,
@@ -4895,6 +5034,115 @@ mod tests {
             database,
             "LocalScript",
             "Enabled"
+        ));
+    }
+
+    #[test]
+    fn ids_are_aligned_beside_a_run_one_copy_alone_holds() {
+        let store = |rows: &[(&str, &str, &str, Option<usize>)]| SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: rows
+                .iter()
+                .map(|(id, name, class, parent)| {
+                    SettingsBytecodeInstance::new(
+                        (*id).into(),
+                        (*name).into(),
+                        (*class).into(),
+                        *parent,
+                    )
+                })
+                .collect(),
+        };
+        let names = |id: &str| json!({"_type": "Ref", "settingsId": id});
+        let ids = |document: &SettingsBytecode| {
+            document
+                .instances
+                .iter()
+                .map(|instance| instance.settings_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut files = store(&[
+            ("debug:0", "Workspace", "Workspace", None),
+            ("debug:1", "A", "Part", Some(0)),
+            ("debug:2", "B", "Part", Some(0)),
+            ("debug:3", "Under", "Folder", Some(2)),
+        ]);
+        // Studio opened the place again. It holds a folder the files lack,
+        // under the id the files hold for another instance.
+        let mut studio = store(&[
+            ("debug:10", "Workspace", "Workspace", None),
+            ("debug:11", "A", "Part", Some(0)),
+            ("debug:2", "Gone", "Folder", Some(1)),
+            ("debug:12", "B", "Part", Some(0)),
+            ("debug:13", "Under", "Folder", Some(3)),
+        ]);
+        studio.instances[1]
+            .properties
+            .insert("Target".into(), names("debug:2"));
+        studio.instances[2]
+            .properties
+            .insert("Target".into(), names("debug:12"));
+        let before = files.instances.clone();
+        assert!(align_settings_ids_beside_run(
+            &mut files,
+            &mut studio,
+            2..3,
+            true
+        ));
+        assert!(files.instances == before);
+        assert_eq!(
+            ids(&studio),
+            ["debug:0", "debug:1", "reconcile:0", "debug:2", "debug:3"]
+        );
+        // Each reference names the instance it named.
+        assert_eq!(
+            studio.instances[1].properties["Target"],
+            names("reconcile:0")
+        );
+        assert_eq!(studio.instances[2].properties["Target"], names("debug:2"));
+        assert_eq!(studio.instances[2].parent_index, Some(1));
+        assert_eq!(studio.instances[4].parent_index, Some(3));
+
+        // The files hold an instance Studio lacks.
+        let mut files = store(&[
+            ("debug:0", "Workspace", "Workspace", None),
+            ("debug:1", "A", "Part", Some(0)),
+            ("editor:1", "New", "Part", Some(1)),
+            ("debug:2", "B", "Part", Some(0)),
+            ("debug:3", "Under", "Folder", Some(3)),
+        ]);
+        let mut studio = store(&[
+            ("debug:10", "Workspace", "Workspace", None),
+            ("debug:11", "A", "Part", Some(0)),
+            ("debug:12", "B", "Part", Some(0)),
+            ("debug:13", "Under", "Folder", Some(2)),
+        ]);
+        let before = files.instances.clone();
+        assert!(align_settings_ids_beside_run(
+            &mut files,
+            &mut studio,
+            2..3,
+            false
+        ));
+        assert!(files.instances == before);
+        assert_eq!(ids(&studio), ["debug:0", "debug:1", "debug:2", "debug:3"]);
+
+        // An instance beside the run stands under one of the run: the run is
+        // no run of instances with all under them.
+        let mut studio = store(&[
+            ("debug:10", "Workspace", "Workspace", None),
+            ("debug:11", "Gone", "Folder", Some(0)),
+            ("debug:12", "A", "Part", Some(1)),
+        ]);
+        let mut files = store(&[
+            ("debug:0", "Workspace", "Workspace", None),
+            ("debug:1", "A", "Part", Some(0)),
+        ]);
+        assert!(!align_settings_ids_beside_run(
+            &mut files,
+            &mut studio,
+            1..2,
+            true
         ));
     }
 
