@@ -26,6 +26,7 @@ pub(crate) fn fixture() -> BridgeServer {
         desired_device_request: Default::default(),
         performance_manager: None,
         team_create: Mutex::new(HashMap::new()),
+        published_versions: Mutex::new(HashMap::new()),
     }
 }
 

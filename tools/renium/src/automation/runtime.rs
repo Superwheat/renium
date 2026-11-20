@@ -1538,11 +1538,8 @@ fn studio_status_result(
                 result[key] = value.clone();
             }
         }
-        if let (Some(team_create), Some(runtime_id)) = (
-            state.get("teamCreate").and_then(Value::as_bool),
-            context.runtime_id.as_deref(),
-        ) {
-            bridge.remember_team_create(runtime_id, team_create);
+        if let Some(runtime_id) = context.runtime_id.as_deref() {
+            bridge.status_of_runtime(runtime_id, &state, &mut result);
         }
         result["studioState"] = state;
     }

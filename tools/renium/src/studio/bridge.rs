@@ -722,6 +722,9 @@ pub(crate) struct BridgeServer {
     /// Team Create state per Edit runtime as Studio last reported it, which
     /// outranks the value the plugin registered with.
     team_create: Mutex<HashMap<String, bool>>,
+    /// The version a publish gave the place of an Edit runtime. Studio keeps
+    /// reporting the version it opened until the place is opened again.
+    published_versions: Mutex<HashMap<String, u64>>,
 }
 
 pub(crate) struct BridgeRequestLease {
@@ -1392,6 +1395,26 @@ impl BridgeServer {
         )
     }
 
+    pub(crate) fn remember_published_version(&self, runtime_id: &str, version: u64) {
+        self.published_versions
+            .lock_recover()
+            .insert(runtime_id.to_string(), version);
+    }
+
+    /// Takes what Studio reported of an Edit runtime into its status: its
+    /// Team Create state is remembered, and its place version is the one
+    /// Studio reports or a later one a publish from this daemon gave it.
+    pub(crate) fn status_of_runtime(&self, runtime_id: &str, state: &Value, status: &mut Value) {
+        if let Some(reported) = state.get("placeVersion").and_then(Value::as_u64) {
+            let published = self.published_versions.lock_recover();
+            let published = published.get(runtime_id).copied().unwrap_or(0);
+            status["placeVersion"] = json!(reported.max(published));
+        }
+        if let Some(team_create) = state.get("teamCreate").and_then(Value::as_bool) {
+            self.remember_team_create(runtime_id, team_create);
+        }
+    }
+
     pub(crate) fn remember_team_create(&self, runtime_id: &str, team_create: bool) {
         self.team_create
             .lock_recover()
@@ -1885,6 +1908,7 @@ impl BridgeServer {
             desired_device_request,
             performance_manager,
             team_create: Mutex::new(HashMap::new()),
+            published_versions: Mutex::new(HashMap::new()),
         };
 
         let required_channels = server.channels.len();
@@ -2886,6 +2910,7 @@ impl BridgeServer {
             drop(cached);
         }
         self.team_create.lock_recover().remove(runtime_id);
+        self.published_versions.lock_recover().remove(runtime_id);
         // Retire before best-effort cleanup: neither a busy channel nor an
         // in-flight handshake may resurrect this runtime.
         self.routing

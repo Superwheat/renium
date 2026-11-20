@@ -312,13 +312,19 @@ pub(crate) fn studio_result(
             Some(Duration::from_secs(PUBLISH_SECONDS)),
         )
         .map_err(studio_failure)?;
-    match crate::app::output::ensure_plugin_api_ok(&result) {
-        Ok(()) => Ok(result),
+    let result = match crate::app::output::ensure_plugin_api_ok(&result) {
+        Ok(()) => result,
         Err(error) if !dry_run && save_place_api_refused(&error.to_string()) => {
-            publish_with_studio_action(context, bridge, runtime, &result)
+            publish_with_studio_action(context, bridge, runtime, &result)?
         }
-        Err(error) => Err(error),
+        Err(error) => return Err(error),
+    };
+    if result["published"] == true
+        && let Some(version) = result["versionNumber"].as_u64()
+    {
+        bridge.remember_published_version(runtime, version);
     }
+    Ok(result)
 }
 
 // AssetService:SavePlaceAsync only works where the Save Place API is enabled.
