@@ -2129,18 +2129,67 @@ pub(crate) fn decode_rows(
     rows: &[usize],
 ) -> Result<(Vec<SettingsBytecodeInstance>, Vec<String>)> {
     let store = BlockStore::open(bytes)?;
-    let structure = store.structure()?;
-    let read = store.rows(rows)?.into_iter().collect::<AHashMap<_, _>>();
-    let instances = rows
-        .iter()
-        .map(|row| SettingsBytecodeInstance {
-            properties: read[row].properties.clone(),
-            attributes: read[row].attributes.clone(),
-            ..structure.instances[*row].bare()
-        })
-        .collect();
-    let ids = structure.instances.into_iter().map(|row| row.settings_id);
+    let structure = store.structure()?.instances;
+    let instances = rows_of(&store, &structure, rows)?;
+    let ids = structure.into_iter().map(|row| row.settings_id);
     Ok((instances, ids.collect()))
+}
+
+/// The instances at `rows` of `store`, whose instances without their values
+/// are `structure`.
+fn rows_of(
+    store: &BlockStore<'_>,
+    structure: &[SettingsBytecodeInstance],
+    rows: &[usize],
+) -> Result<Vec<SettingsBytecodeInstance>> {
+    let read = store.rows(rows)?;
+    let whole = |row: usize, properties, attributes| SettingsBytecodeInstance {
+        properties,
+        attributes,
+        ..structure[row].bare()
+    };
+    // Rows asked in rising order come back as asked.
+    if rows.windows(2).all(|pair| pair[0] < pair[1]) {
+        let read = read.into_iter();
+        return Ok(read
+            .map(|(row, values)| whole(row, values.properties, values.attributes))
+            .collect());
+    }
+    let read = read.into_iter().collect::<AHashMap<_, _>>();
+    let rows = rows.iter();
+    Ok(rows
+        .map(|row| {
+            whole(
+                *row,
+                read[row].properties.clone(),
+                read[row].attributes.clone(),
+            )
+        })
+        .collect())
+}
+
+/// `decode_rows` of one v12 file a batch of rows at a time: its instances
+/// are read once for all the batches, and each batch on a budget of its own.
+pub(crate) struct RowBatches<'a> {
+    bytes: &'a [u8],
+    structure: Vec<SettingsBytecodeInstance>,
+}
+
+impl<'a> RowBatches<'a> {
+    pub(crate) fn open(bytes: &'a [u8]) -> Result<Self> {
+        let structure = BlockStore::open(bytes)?.structure()?.instances;
+        Ok(Self { bytes, structure })
+    }
+
+    /// The id of every instance of the file.
+    pub(crate) fn ids(&self) -> Vec<String> {
+        let rows = self.structure.iter();
+        rows.map(|row| row.settings_id.clone()).collect()
+    }
+
+    pub(crate) fn read(&self, rows: &[usize]) -> Result<Vec<SettingsBytecodeInstance>> {
+        rows_of(&BlockStore::open(self.bytes)?, &self.structure, rows)
+    }
 }
 
 /// A v12 store that an edit reads and writes for `RetainedPropertyColumns`:

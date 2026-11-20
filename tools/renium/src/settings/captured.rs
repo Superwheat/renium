@@ -772,7 +772,7 @@ fn changed_rows<'a>(
     stored: StoredRows<'_>,
     store_gate: Option<&Mutex<()>>,
 ) -> Result<Option<SettingsAlignment>> {
-    use crate::settings::bytecode::property_edit::decode_rows;
+    use crate::settings::bytecode::property_edit::RowBatches;
     use crate::settings::equivalence::{
         instance_lacks_enum_types, pulled_instance_values_unchanged,
         reconciliation_value_contains_reference as holds_reference,
@@ -809,22 +809,25 @@ fn changed_rows<'a>(
     else {
         return whole("a changed instance is none the store holds");
     };
-    let stored_batch = |stored_at: &[usize]| {
-        let (mut stored_rows, ids) = decode_rows(file, stored_at)?;
+    let in_state = |mut stored_rows: Vec<SettingsBytecodeInstance>| {
         if let Some(moved) = moved {
-            for stored in &mut stored_rows {
-                moved.in_state_whole(stored);
-            }
+            (stored_rows.par_iter_mut()).for_each(|stored| moved.in_state_whole(stored));
         }
-        anyhow::Ok((stored_rows, ids))
+        stored_rows
     };
     let mut batches = rows
         .chunks(COMPARED_AT_ONCE)
         .zip(stored_at.chunks(COMPARED_AT_ONCE));
     let first = batches.next();
+    // The store's instances are read once for all the batches.
+    let mut stored_batches = None;
     let (first_stored, ids) = match (&mut read, first) {
         (Some(read), None) => (Vec::new(), std::mem::take(&mut read.ids)),
-        (_, first) => stored_batch(first.map_or(&[], |(_, stored_at)| stored_at))?,
+        (_, first) => {
+            let opened = stored_batches.insert(RowBatches::open(file)?);
+            let (stored_rows, ids) = opened.first(first.map_or(&[], |(_, stored_at)| stored_at))?;
+            (in_state(stored_rows), ids)
+        }
     };
     // A pull leaves each instance the id its store holds it under.
     let written_ids = told_ids.or_else(|| moved.map(|moved| moved.written_ids(&places.ids, &ids)));
@@ -858,6 +861,7 @@ fn changed_rows<'a>(
     let mut compared = Vec::with_capacity(changed.len());
     let mut last = None;
     let mut compare = |rows: &[usize], mut stored_rows: Vec<SettingsBytecodeInstance>| {
+        let converted = crate::app::profile::span("changed rows converted");
         let mut captured_rows = rows
             .par_iter()
             .map(|row| convert_chunk(state, std::slice::from_ref(&records[*row]), scope))
@@ -865,6 +869,8 @@ fn changed_rows<'a>(
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+        drop(converted);
+        let _span = crate::app::profile::span("changed rows compared");
         let unchanged = changed.len().saturating_sub(compared.len());
         let (said, values): (Vec<_>, Vec<_>) = stored_rows
             .par_iter()
@@ -899,7 +905,8 @@ fn changed_rows<'a>(
     };
     compare(first.map_or(&[], |(rows, _)| rows), first_stored)?;
     for (rows, stored_at) in batches {
-        compare(rows, stored_batch(stored_at)?.0)?;
+        let stored_batches = stored_batches.as_ref().context("No store was opened")?;
+        compare(rows, in_state(stored_batches.read(stored_at)?))?;
     }
     if let (Some(camera), Some(row)) = (camera, now.viewport_camera) {
         compare(&[row], vec![camera])?;

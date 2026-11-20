@@ -145,6 +145,47 @@ thread_local! {
     pub(crate) static ROW_DECODE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// `decode_rows` of one store file a batch of rows at a time. A v12 file's
+/// instances are read once for all the batches; an older file is read anew
+/// for each.
+pub(crate) enum RowBatches<'a> {
+    Blocks(super::blocks::RowBatches<'a>),
+    Columns(&'a [u8]),
+}
+
+impl<'a> RowBatches<'a> {
+    pub(crate) fn open(bytes: &'a [u8]) -> Result<Self> {
+        if super::blocks::is_block_store(bytes) {
+            let _span = crate::app::profile::span("store rows decode");
+            return Ok(Self::Blocks(super::blocks::RowBatches::open(bytes)?));
+        }
+        Ok(Self::Columns(bytes))
+    }
+
+    /// The first batch, with the id of every instance of the file.
+    pub(crate) fn first(
+        &self,
+        rows: &[usize],
+    ) -> Result<(Vec<SettingsBytecodeInstance>, Vec<String>)> {
+        match self {
+            Self::Blocks(batches) => Ok((self.read(rows)?, batches.ids())),
+            Self::Columns(bytes) => decode_rows(bytes, rows),
+        }
+    }
+
+    pub(crate) fn read(&self, rows: &[usize]) -> Result<Vec<SettingsBytecodeInstance>> {
+        match self {
+            Self::Blocks(batches) => {
+                #[cfg(test)]
+                ROW_DECODE_CALLS.set(ROW_DECODE_CALLS.get() + 1);
+                let _span = crate::app::profile::span("store rows decode");
+                batches.read(rows)
+            }
+            Self::Columns(bytes) => Ok(decode_rows(bytes, rows)?.0),
+        }
+    }
+}
+
 /// The instances at `rows` of a store file, each as decoding the whole file
 /// gives it, and the id of every instance of the file. The values of every
 /// other row are dropped column by column, so the document is never whole in
