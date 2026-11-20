@@ -26,6 +26,44 @@ impl ScopeSet {
     }
 }
 
+/// How long the native helper observes attributes for a Windows proof: it
+/// refuses a longer lifetime, and a proof ends with its observer.
+#[cfg(windows)]
+pub(crate) const NATIVE_RELAY_LIFETIME: Duration = Duration::from_secs(120);
+
+/// A baseline on a native observer ends this long before the observer, so
+/// Studio stops the tracking it kept for the baseline before the observer's
+/// end would hand every instance to local listeners.
+#[cfg(windows)]
+const NATIVE_RELAY_MARGIN: Duration = Duration::from_secs(5);
+
+/// How long a baseline on local observation lasts unused. Its proof does not
+/// age; the limit only ends the tracking Studio keeps for a daemon that may
+/// have gone, and each use renews it.
+pub(crate) const BASELINE_IDLE: Duration = Duration::from_secs(30 * 60);
+
+/// The native attribute observer a Windows proof stands on, and when the
+/// baseline on it ends.
+#[cfg(windows)]
+pub(crate) struct NativeRelay {
+    _guard: crate::studio::native::serializer::AttributeGuard,
+    pub(crate) ends: Instant,
+}
+
+#[cfg(windows)]
+impl NativeRelay {
+    /// An observer the helper started after `armed`.
+    pub(crate) fn armed(
+        guard: crate::studio::native::serializer::AttributeGuard,
+        armed: Instant,
+    ) -> Self {
+        Self {
+            _guard: guard,
+            ends: armed + NATIVE_RELAY_LIFETIME - NATIVE_RELAY_MARGIN,
+        }
+    }
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) struct VerifiedFullPush {
     pub(crate) connections: Vec<usize>,
@@ -33,16 +71,33 @@ pub(crate) struct VerifiedFullPush {
     pub(crate) project: ProjectSnapshot,
     pub(crate) paths: Vec<PathBuf>,
     pub(crate) proof: Value,
-    pub(crate) created: Instant,
+    pub(crate) expires: Instant,
     #[cfg(windows)]
-    pub(crate) _attributes: Option<crate::studio::native::serializer::AttributeGuard>,
+    pub(crate) relay: Option<NativeRelay>,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
 impl VerifiedFullPush {
     pub(crate) fn expired(&self) -> bool {
-        self.created.elapsed() >= Duration::from_secs(60)
+        Instant::now() >= self.expires
     }
+
+    /// A baseline used again lasts as long as a new one on its observer.
+    pub(crate) fn renew(&mut self) {
+        self.expires = baseline_expiry(
+            #[cfg(windows)]
+            self.relay.as_ref(),
+        );
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn baseline_expiry(#[cfg(windows)] relay: Option<&NativeRelay>) -> Instant {
+    #[cfg(windows)]
+    if let Some(relay) = relay {
+        return relay.ends;
+    }
+    Instant::now() + BASELINE_IDLE
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -58,16 +113,53 @@ pub(crate) fn full_push_cache_input(
         "root": args.project.project_root, "source": args.project.src_root, "services": services,
         "paths": args.paths, "changedPaths": args.changed_paths, "changedPathFiles": args.changed_paths_files,
         "ids": args.target_settings_ids, "idFiles": args.target_settings_id_files, "properties": args.target_properties,
-        "upsert": args.upsert_instances_only, "verify": args.verify_sources,
+        "upsert": args.upsert_instances_only,
         "linkCache": args.link_cache_dir, "overridePackages": args.override_packages,
         "configuration": loaded.as_ref().map(|loaded| &loaded.project),
     }))
+}
+
+/// The input of a whole push of the project `args` reads: a pull and a push
+/// of chosen paths keep and use the baseline of `rbx ps`.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn plain_push_input(args: &PushEditorChangesArgs) -> Result<Value> {
+    let mut plain = PushEditorChangesArgs::new(args.project.clone(), args.bridge.clone());
+    plain.link_cache_dir.clone_from(&args.link_cache_dir);
+    plain.override_packages = args.override_packages;
+    full_push_cache_input(&plain, &sync_services())
 }
 
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) struct VerifiedFullPushCandidate {
     pub(crate) cached: VerifiedFullPush,
     pub(crate) files_unchanged: bool,
+}
+
+/// Takes the runtime's baseline when it still applies to a push of `input`.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn take_baseline(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    input: &Value,
+) -> Option<VerifiedFullPush> {
+    let runtime = context.runtime_id.as_deref()?;
+    // Take ownership before any RPC or native cleanup: another place must not
+    // wait behind this place's verification or an expired observer's teardown.
+    let cached = bridge.verified_full_pushes.lock_recover().remove(runtime)?;
+    let invalidated_by = if cached.expired() {
+        Some("proof expired")
+    } else if cached.connections != bridge.runtime_connection_signature(runtime) {
+        Some("Studio connection changed")
+    } else if cached.input != *input {
+        Some("push configuration changed")
+    } else {
+        None
+    };
+    if let Some(reason) = invalidated_by {
+        log_global(5, format_args!("[renium] full push cache miss: {reason}"));
+        return None;
+    }
+    Some(cached)
 }
 
 // The retained proof says Studio still equals the files of the last verified
@@ -81,28 +173,10 @@ pub(crate) fn take_verified_full_push(
     services: &[String],
     args: &PushEditorChangesArgs,
 ) -> Result<Option<VerifiedFullPushCandidate>> {
-    let Some(runtime) = context.runtime_id.as_deref() else {
+    let input = full_push_cache_input(args, services)?;
+    let Some(cached) = take_baseline(context, bridge, &input) else {
         return Ok(None);
     };
-    // Take ownership before any RPC or native cleanup: another place must not
-    // wait behind this place's verification or an expired observer's teardown.
-    let cached = bridge.verified_full_pushes.lock_recover().remove(runtime);
-    let Some(cached) = cached else {
-        return Ok(None);
-    };
-    let invalidated_by = if cached.expired() {
-        Some("proof expired")
-    } else if cached.connections != bridge.runtime_connection_signature(runtime) {
-        Some("Studio connection changed")
-    } else if cached.input != full_push_cache_input(args, services)? {
-        Some("push configuration changed")
-    } else {
-        None
-    };
-    if let Some(reason) = invalidated_by {
-        log_global(5, format_args!("[renium] full push cache miss: {reason}"));
-        return Ok(None);
-    }
     let files_unchanged =
         cached.project == capture_snapshot(&args.project.project_root, &cached.paths)?;
     Ok(Some(VerifiedFullPushCandidate {
@@ -124,7 +198,7 @@ pub(crate) fn verified_full_push_proof_matches(
     pin_edit_runtime(context, bridge)?;
     let state = bridge.call_for_runtime_with_timeout(
         "getStudioChangeState",
-        json!({"start": false, "verifyPushProof": proof}),
+        json!({"start": false, "verifyPushProof": proof, "retainSeconds": BASELINE_IDLE.as_secs()}),
         BridgeTarget::Edit,
         runtime,
         Some(Duration::from_secs(10)),
@@ -163,6 +237,50 @@ pub(crate) fn capture_push_proof(
         .cloned())
 }
 
+/// Holds `entry` as the runtime's baseline, dropping expired ones and the
+/// oldest past eight.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn keep_baseline(
+    bridge: &BridgeServer,
+    runtime: &str,
+    entry: VerifiedFullPush,
+    after: &str,
+) {
+    log_global(
+        5,
+        format_args!(
+            "[renium] baseline: kept after {after} for {}s",
+            entry
+                .expires
+                .saturating_duration_since(Instant::now())
+                .as_secs()
+        ),
+    );
+    let evicted = {
+        let mut entries = bridge.verified_full_pushes.lock_recover();
+        let expired = entries
+            .iter()
+            .filter(|(_, value)| value.expired())
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let mut evicted = expired
+            .into_iter()
+            .filter_map(|key| entries.remove(&key))
+            .collect::<Vec<_>>();
+        if entries.len() >= 8
+            && let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, value)| value.expires)
+                .map(|(key, _)| key.clone())
+        {
+            evicted.extend(entries.remove(&oldest));
+        }
+        evicted.extend(entries.insert(runtime.to_string(), entry));
+        evicted
+    };
+    drop(evicted);
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn retain_verified_full_push(
     bridge: &BridgeServer,
@@ -170,7 +288,7 @@ pub(crate) fn retain_verified_full_push(
     paths: &[PathBuf],
     project: ProjectSnapshot,
     release: &StudioTrackingGuardRelease<'_>,
-    #[cfg(windows)] attributes: &mut Option<crate::studio::native::serializer::AttributeGuard>,
+    #[cfg(windows)] relay: &mut Option<NativeRelay>,
 ) {
     let (Some(input), Some(proof)) = (input, release.retained_proof.as_ref()) else {
         log_global(
@@ -183,49 +301,268 @@ pub(crate) fn retain_verified_full_push(
         );
         return;
     };
+    if !release.studio_unchanged {
+        log_global(
+            5,
+            format_args!("[renium] full push proof not retained: Studio changed during the push"),
+        );
+        return;
+    }
     #[cfg(windows)]
-    let attributes = attributes.take();
+    let relay = relay.take();
     #[cfg(windows)]
-    if attributes.is_none() && !release.retained_proof_local {
+    if relay.is_none() && !release.retained_proof_local {
         log_global(
             5,
             format_args!("[renium] full push proof not retained: no native attribute guard"),
         );
         return;
     }
-    let cached = VerifiedFullPush {
+    // Studio held the commit's proof at the release, and no tracked change
+    // reached a synced service between the lease and the release: Studio
+    // holds what the push verified, which is these files.
+    let entry = VerifiedFullPush {
         connections: bridge.runtime_connection_signature(&release.runtime_id),
         input: input.clone(),
         project,
         paths: paths.to_vec(),
         proof: proof.clone(),
-        created: Instant::now(),
+        expires: baseline_expiry(
+            #[cfg(windows)]
+            relay.as_ref(),
+        ),
         #[cfg(windows)]
-        _attributes: attributes,
+        relay,
     };
-    let evicted = {
-        let mut entries = bridge.verified_full_pushes.lock_recover();
-        let expired = entries
-            .iter()
-            .filter(|(_, value)| value.created.elapsed() >= Duration::from_secs(60))
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        let mut evicted = expired
-            .into_iter()
-            .filter_map(|key| entries.remove(&key))
-            .collect::<Vec<_>>();
-        if entries.len() >= 8
-            && let Some(oldest) = entries
-                .iter()
-                .min_by_key(|(_, value)| value.created)
-                .map(|(key, _)| key.clone())
-        {
-            evicted.extend(entries.remove(&oldest));
+    keep_baseline(bridge, &release.runtime_id, entry, "full push");
+}
+
+/// A pull's use of the held baseline.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) enum PullBaseline<'a> {
+    /// Studio and the files still hold the baseline: the pull writes nothing.
+    Unchanged,
+    /// The pull captures under this lease, which may keep a new baseline.
+    Capture(Box<PullLease<'a>>),
+}
+
+/// The tracking lease of a capturing pull and the proof it took before the
+/// capture. Its fields drop in order: Lua tracking ends before native
+/// observation.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) struct PullLease<'a> {
+    guard: StudioChangeGuard,
+    release: StudioTrackingGuardRelease<'a>,
+    root: PathBuf,
+    input: Value,
+    #[cfg(windows)]
+    relay: Option<NativeRelay>,
+}
+
+/// Whether a pull writes Studio's whole export as it stands, which only then
+/// is a baseline of `rbx ps`: every synced service, no file kept back, no
+/// layout that transforms the export (adapters, a temporary stage, linked
+/// packages).
+#[cfg(any(windows, target_os = "macos"))]
+fn pull_is_whole(args: &crate::cli::PullArgs) -> Result<bool> {
+    let mut services = crate::snapshot::import::parse_services(&args.services)?;
+    services.sort();
+    let mut synced = sync_services();
+    synced.sort();
+    if services != synced
+        || !args.preserve_paths.is_empty()
+        || args.export_all_properties
+        || args.keep_local_only_scripts
+        || args.layout_src_root.is_some()
+        || args.project_root.join("renium-link.json").exists()
+    {
+        return Ok(false);
+    }
+    Ok(
+        match config::try_load_project(None, Some(&args.project_root))? {
+            Some(loaded) => {
+                loaded.project.adapters.is_empty()
+                    && !config::project_requires_temporary_stage(&loaded)?
+            }
+            None => true,
+        },
+    )
+}
+
+/// How a pull uses the held baseline: it answers from one Studio and the
+/// files still hold, and otherwise takes a lease and a proof before its
+/// capture. `None` where the pull cannot keep one.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn pull_baseline<'a>(
+    context: &BoundContext,
+    bridge: &'a BridgeServer,
+    args: &crate::cli::PullArgs,
+) -> Result<Option<PullBaseline<'a>>> {
+    let Some(runtime) = context.runtime_id.as_deref() else {
+        return Ok(None);
+    };
+    if !pull_is_whole(args)? {
+        return Ok(None);
+    }
+    let project = crate::cli::ProjectSourceArgs {
+        project_root: args.project_root.clone(),
+        src_root: args.src_dir.clone(),
+    };
+    let input = plain_push_input(&PushEditorChangesArgs::new(project, args.bridge.clone()))?;
+    let mut held = take_baseline(context, bridge, &input);
+    let unchanged = match held.as_ref() {
+        Some(entry) => {
+            capture_snapshot(&args.project_root, &entry.paths)? == entry.project
+                && verified_full_push_proof_matches(context, bridge, &entry.proof)?
         }
-        evicted.extend(entries.insert(release.runtime_id.clone(), cached));
-        evicted
+        None => false,
     };
-    drop(evicted);
+    if unchanged && let Some(mut entry) = held.take() {
+        // Studio still holds the proof it held when it and these files were
+        // one, and the files are still those files: a capture would find
+        // nothing to write.
+        entry.renew();
+        log_global(5, format_args!("[renium] baseline: pull unchanged"));
+        bridge
+            .verified_full_pushes
+            .lock_recover()
+            .insert(runtime.to_string(), entry);
+        return Ok(Some(PullBaseline::Unchanged));
+    }
+    let services = sync_services();
+    #[cfg(windows)]
+    let mut previous = held.as_mut().and_then(|entry| entry.relay.take());
+    #[cfg(windows)]
+    let mut relay = None;
+    let (guard, state) = current_studio_change_guard_verifying(
+        context,
+        bridge,
+        Some(services.as_slice()),
+        held.as_ref().map(|entry| &entry.proof),
+        |state| {
+            #[cfg(windows)]
+            super::push_flow::arm_native_attribute_relay(
+                state,
+                bridge,
+                &services,
+                &mut previous,
+                &mut relay,
+            )?;
+            #[cfg(not(windows))]
+            let _ = state;
+            Ok(())
+        },
+    )?;
+    #[cfg(windows)]
+    if state["nativeRelayContinued"] == true {
+        relay = previous.take();
+    }
+    #[cfg(not(windows))]
+    let _ = state;
+    let mut release =
+        StudioTrackingGuardRelease::new(bridge, &guard.runtime_id, guard.tracking_guard_id.clone());
+    #[cfg(windows)]
+    {
+        release.retain_until = relay.as_ref().map(|relay| relay.ends);
+    }
+    release.proof = capture_push_proof(bridge, &guard)?;
+    Ok(Some(PullBaseline::Capture(Box::new(PullLease {
+        guard,
+        release,
+        root: args.project_root.clone(),
+        input,
+        #[cfg(windows)]
+        relay,
+    }))))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl PullLease<'_> {
+    /// Keeps the files `published` wrote as the baseline when Studio held the
+    /// proof from before the capture until now.
+    pub(crate) fn keep(
+        mut self,
+        published: &crate::snapshot::export::PublishedProjectChanges,
+    ) -> Result<()> {
+        let not_kept = |reason: &str| {
+            log_global(
+                5,
+                format_args!("[renium] baseline: not kept after pull: {reason}"),
+            );
+        };
+        let Some(proof) = self.release.proof.clone() else {
+            not_kept("Studio gave no proof");
+            return Ok(());
+        };
+        if !published.preserved.is_empty()
+            || !published.read_only_links_restored.is_empty()
+            || !published.studio_overrides.is_empty()
+        {
+            not_kept("the pull kept files back");
+            return Ok(());
+        }
+        let project = capture_snapshot(&self.root, &published.publish_paths)?;
+        if !publish_settled(&project, &published.settled) {
+            not_kept("the files changed after the pull wrote them");
+            return Ok(());
+        }
+        let bridge = self.release.bridge;
+        release_tracking_lease(bridge, &self.guard, &mut self.release, json!({}))?;
+        if self.release.retained_proof.as_ref() != Some(&proof) || !self.release.studio_unchanged {
+            not_kept("Studio changed during the pull");
+            return Ok(());
+        }
+        #[cfg(windows)]
+        if self.relay.is_none() && !self.release.retained_proof_local {
+            not_kept("no native attribute guard");
+            return Ok(());
+        }
+        // The capture came after the proof, and Studio held that proof with
+        // no tracked change until the files were written and read back as the
+        // publish left them: the files hold what Studio holds at this proof.
+        let entry = VerifiedFullPush {
+            connections: bridge.runtime_connection_signature(&self.release.runtime_id),
+            input: self.input,
+            project,
+            paths: published.publish_paths.clone(),
+            proof,
+            expires: baseline_expiry(
+                #[cfg(windows)]
+                self.relay.as_ref(),
+            ),
+            #[cfg(windows)]
+            relay: self.relay,
+        };
+        keep_baseline(bridge, &self.release.runtime_id, entry, "pull");
+        Ok(())
+    }
+}
+
+/// Whether `files` holds exactly what a publish left at its paths.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn publish_settled(
+    files: &ProjectSnapshot,
+    settled: &BTreeMap<PathBuf, PublishEntryState>,
+) -> bool {
+    let settled = settled
+        .iter()
+        .filter(|(path, _)| !derived_project_path(path))
+        .collect::<Vec<_>>();
+    settled.len() == files.entries.len()
+        && settled.par_iter().all(|(path, state)| {
+            files.entries.get(*path).is_some_and(|entry| {
+                *state
+                    == &match entry {
+                        SnapshotEntry::Directory => PublishEntryState::Directory,
+                        SnapshotEntry::File(bytes) => {
+                            crate::snapshot::export::file_publish_state(bytes)
+                        }
+                        SnapshotEntry::Symlink { target, .. } => {
+                            PublishEntryState::Symlink(target.clone())
+                        }
+                    }
+            })
+        })
 }
 
 #[derive(Default)]

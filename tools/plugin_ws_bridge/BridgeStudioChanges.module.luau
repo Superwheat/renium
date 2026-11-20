@@ -395,6 +395,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return { id = relay.notify.Name, generation = relay.attributeGeneration }
 	end
 	local verifiedPushProof = nil
+	-- The proof the current lease verified as it began, which the proof it
+	-- retains may continue.
+	local continuedPushProof = nil
 	local localPushObservation = nil
 	local localPushProofRequested = false
 	local nextPushProof = 0
@@ -534,6 +537,25 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		proof.id = nextPushProof
 		verifiedPushProof = proof
 		return proof.id, nil
+	end
+	-- A proof continues another when one observation ran under both and what
+	-- no event tracks (Terrain voxels, open script buffers, the viewport
+	-- camera's attributes) is as the other saw it.
+	local function continuesPushProof(previous, proof): boolean
+		if previous.terrain ~= proof.terrain or previous.localObservation ~= proof.localObservation then return false end
+		for instance, source in pairs(previous.documents) do
+			if proof.documents[instance] ~= source then return false end
+		end
+		for instance, source in pairs(proof.documents) do
+			if previous.documents[instance] ~= source then return false end
+		end
+		if proof.localObservation == nil then return previous.attributes.id == proof.attributes.id end
+		if previous.camera ~= proof.camera or previous.cameraGeneration ~= proof.cameraGeneration then return false end
+		for service, entry in pairs(previous.attributes) do
+			local current = proof.attributes[service]
+			if current == nil or current.observation ~= entry.observation then return false end
+		end
+		return true
 	end
 	function api.verifyPushProof(id: any): (boolean, string?)
 		local proof = verifiedPushProof
@@ -2879,7 +2901,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				-- the native subscription is disconnected under the DataModel lock.
 				promoteNativeAttributeConnections()
 				if relay.cached then
-					local retainedGuardId = if verifiedPushProof ~= nil then "push-proof-" .. tostring(verifiedPushProof.id) else nil
+					local retainedGuardId = relay.retainedGuardId
 					verifiedPushProof = nil
 					releaseProofConnections(relay)
 					releaseTagConnections()
@@ -4206,16 +4228,30 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if params.verifyPushProof ~= nil then
 			pushProofMatches, pushProofMismatch = api.verifyPushProof(params.verifyPushProof)
 			if params.start ~= true then
+				-- Each answer from a retained local proof keeps its listeners as
+				-- long again; a native proof lasts as long as its observer.
+				local retainSeconds = tonumber(params.retainSeconds)
+				if pushProofMatches and retainSeconds ~= nil and verifiedPushProof.localObservation ~= nil
+					and localPushObservation.cached then
+					acquireTrackingGuard(localPushObservation.guardId, retainSeconds)
+				end
 				return { ok = true, pushProofMatches = pushProofMatches, pushProofMismatch = pushProofMismatch }
 			end
+			if params.requirePushProof == true and not (pushProofMatches and state.started) then
+				return { ok = true, pushProofMatches = false, pushProofMismatch = pushProofMismatch or "tracking stopped" }
+			end
+			continuedPushProof = if pushProofMatches then verifiedPushProof else nil
 		end
 		if params.start ~= false and params.stop ~= true and params.releaseTrackingGuardId == nil then
 			localPushProofRequested = params.captureLocalPushProof == true
 		end
-		local retainedProof, retainedProofLocal = nil, false
+		local retainedProof, retainedProofLocal, proofContinues = nil, false, false
 		if params.retainPushProof ~= nil and api.verifyPushProof(params.retainPushProof) then
+			local retainSeconds = tonumber(params.retainSeconds) or 60
+			proofContinues = continuedPushProof ~= nil and continuedPushProof.id == params.continuesPushProof
+				and continuesPushProof(continuedPushProof, verifiedPushProof)
 			if verifiedPushProof.localObservation ~= nil then
-				acquireTrackingGuard(localPushObservation.guardId, 60)
+				acquireTrackingGuard(localPushObservation.guardId, retainSeconds)
 				localPushObservation.cached = true
 				retainedProofLocal = true
 			else
@@ -4223,15 +4259,31 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				nativeAttributeRelay.notify:SetAttribute("CachedPushProof", true)
 				-- Keep listeners armed while the proof lives so the next push
 				-- continues this lease instead of reconnecting every instance.
-				acquireTrackingGuard("push-proof-" .. tostring(params.retainPushProof), 60)
+				local guardId = "push-proof-" .. tostring(params.retainPushProof)
+				local previousGuardId = nativeAttributeRelay.retainedGuardId
+				if previousGuardId ~= nil and previousGuardId ~= guardId then
+					state.trackingGuards[previousGuardId] = nil
+				end
+				nativeAttributeRelay.retainedGuardId = guardId
+				acquireTrackingGuard(guardId, retainSeconds)
 			end
 			retainedProof = params.retainPushProof
+		end
+		if params.retainPushProof ~= nil then
+			continuedPushProof = nil
 		end
 		local wasTracking = state.started
 		local services = normalizeServices(params.services, allowedServices)
 		if params.start ~= false and params.stop ~= true and params.releaseTrackingGuardId == nil
 			and localPushObservation ~= nil and localPushObservation.cached then
-			releaseLocalPushObservation()
+			if pushProofMatches and wasTracking and verifiedPushProof ~= nil
+				and verifiedPushProof.localObservation == localPushObservation then
+				-- The lease continues the retained proof's listeners, as a native
+				-- relay is continued below.
+				localPushObservation.cached = false
+			else
+				releaseLocalPushObservation()
+			end
 		end
 		local continuedNativeRelay = false
 		if params.start ~= false and params.stop ~= true and params.releaseTrackingGuardId == nil
@@ -4246,7 +4298,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			-- native worker retires. Give it a distinct relay; late old callbacks
 			-- must never disarm or bypass the new observer. The listeners retained
 			-- for the retired proof end with it so the new lease starts cleanly.
-			local retainedGuardId = if verifiedPushProof ~= nil then "push-proof-" .. tostring(verifiedPushProof.id) else nil
+			local retainedGuardId = nativeAttributeRelay.retainedGuardId
 			verifiedPushProof = nil
 			releaseProofConnections(nativeAttributeRelay)
 			releaseTagConnections()
@@ -4346,6 +4398,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local response = buildStateResponse(responseServices, params.compact == true)
 		response.retainedPushProof = retainedProof
 		response.retainedPushProofLocal = retainedProofLocal
+		response.pushProofContinues = proofContinues
 		response.pushProofMatches = pushProofMatches
 		response.pushProofMismatch = pushProofMismatch
 		response.nativeRelayContinued = continuedNativeRelay

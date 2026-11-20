@@ -792,6 +792,50 @@ pub(super) fn push_is_filtered(parameters: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// A pull's export and publication, answered from the held baseline where
+/// Studio and the files still hold it.
+#[cfg(any(windows, target_os = "macos"))]
+fn pull_publication(
+    context: &automation::BoundContext,
+    bridge: &BridgeServer,
+    info: &crate::studio::bridge::BridgeInfoPayload,
+    args: PullArgs,
+) -> Result<PublishedProjectChanges> {
+    use crate::automation::reconcile::{PullBaseline, pull_baseline};
+    let baseline = pull_baseline(context, bridge, &args).unwrap_or_else(|error| {
+        log_global(
+            5,
+            format_args!("[renium] baseline: none for this pull: {error:#}"),
+        );
+        None
+    });
+    if let Some(PullBaseline::Unchanged) = baseline {
+        crate::snapshot::export::record_bridge_sync_completion(bridge)?;
+        return Ok(PublishedProjectChanges::default());
+    }
+    let published =
+        export_snapshots_with_warm_bridge(args, bridge, info, 0.0, false, ExportPurpose::Pull)?;
+    if let Some(PullBaseline::Capture(lease)) = baseline
+        && let Err(error) = lease.keep(&published)
+    {
+        log_global(
+            5,
+            format_args!("[renium] baseline: not kept after pull: {error:#}"),
+        );
+    }
+    Ok(published)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn pull_publication(
+    _context: &automation::BoundContext,
+    bridge: &BridgeServer,
+    info: &crate::studio::bridge::BridgeInfoPayload,
+    args: PullArgs,
+) -> Result<PublishedProjectChanges> {
+    export_snapshots_with_warm_bridge(args, bridge, info, 0.0, false, ExportPurpose::Pull)
+}
+
 fn automation_pull_operation(
     context: &automation::BoundContext,
     parameters: &Value,
@@ -808,8 +852,7 @@ fn automation_pull_operation(
     let parsed_services = parse_services(&services)?;
     let pending_ack = pending_change_ack(bridge, &parsed_services)?;
     let acknowledged_pending = pending_ack.is_some();
-    let published =
-        export_snapshots_with_warm_bridge(args, bridge, &info, 0.0, false, ExportPurpose::Pull)?;
+    let published = pull_publication(context, bridge, &info, args)?;
     if let Some((seq, runtime_id)) = pending_ack {
         acknowledge_pulled_changes(bridge, &parsed_services, seq, &runtime_id)?;
     }
@@ -1733,6 +1776,9 @@ fn automation_dispatch_operation(
                     &summary, parameters, true,
                 )));
             }
+            #[cfg(any(windows, target_os = "macos"))]
+            let summary = crate::automation::reconcile::push_targeted(context, bridge, args)?;
+            #[cfg(not(any(windows, target_os = "macos")))]
             let summary = push_editor_changes_with_warm_bridge(args, bridge)?;
             Ok(Value::Object(compact_push_summary(
                 &summary, parameters, false,

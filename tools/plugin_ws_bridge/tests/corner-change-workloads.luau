@@ -2221,6 +2221,83 @@ end
 print("Local push proof: existing observers, raw edits, camera, asynchronous Terrain fence, expiry and lease transitions verified")
 
 do
+	local savedItemChanged, savedCamera = testGame.ItemChanged, workspace.CurrentCamera
+	local savedCapture = dependencies.BridgeScriptDocuments.capture
+	local function scheduled(seconds: number): number
+		local count = 0
+		for _, timer in capturedDelays do
+			if timer.seconds == seconds then count += 1 end
+		end
+		return count
+	end
+	local function fire(seconds: number): number
+		for _, timer in capturedDelays do
+			if timer.seconds == seconds then timer.callback() end
+		end
+		return scheduled(seconds)
+	end
+	for _, observation in { "native", "local" } do
+		for _, mode in { "stable", "terrain", "document", "wrong-id", "camera-attribute", "refused" } do
+			if observation == "native" and mode == "camera-attribute" then continue end
+			testGame.ItemChanged = signal()
+			workspace.CurrentCamera = camera
+			capturedDelays = {}
+			local generation, digest = 0, "voxels"
+			local documents = { { instance = localScript, source = "original" } }
+			local config = table.clone(trackerConfig)
+			config.exportProofGeneration = function() return generation end
+			config.observeProofDocuments = function() return {} end
+			config.captureTerrainProof = function() return digest end
+			dependencies.BridgeScriptDocuments.capture = function() return documents end
+			local observer = trackerModule.create(config, { ReplicatedStorage = true, Workspace = true })
+			local watched = { "ReplicatedStorage", "Workspace" }
+			local relay = nil
+			if observation == "native" then
+				observer.getState({ services = watched, trackingGuardId = "first", nativeAttributeRelay = true, deferNativeTracking = true })
+				relay = createdRelays[#createdRelays]
+				relay.Changed:Fire(relay)
+			else
+				observer.getState({ services = watched, trackingGuardId = "first", captureLocalPushProof = true })
+			end
+			local held = assert(observer.capturePushProof())
+			observer.getState({ start = false, releaseTrackingGuardId = "first", retainPushProof = held, retainSeconds = 100 })
+			assert(scheduled(100) == 1, "the retained proof did not take its lifetime")
+			observer.getState({ start = false, verifyPushProof = held, retainSeconds = 200 })
+			assert((scheduled(200) == 1) == (observation == "local"), "a use of a local baseline did not renew its listeners")
+			if mode == "refused" then generation += 1 end
+			local lease = observer.getState({ start = true, services = watched, trackingGuardId = "lease", includeGenerations = true,
+				captureLocalPushProof = true, verifyPushProof = held, requirePushProof = true })
+			if mode == "refused" then
+				assert(lease.pushProofMatches == false and lease.serviceGenerations == nil, "a stale baseline started a lease")
+			else
+				assert(lease.pushProofMatches and lease.serviceGenerations ~= nil,
+					`{observation} {mode}: the lease refused a held baseline ({lease.pushProofMismatch})`)
+				assert(if observation == "native" then lease.nativeRelayContinued else camera.AttributeChanged:Count() == 1,
+					"the lease did not continue the baseline's observation")
+				if mode == "terrain" then digest = "pushed voxels"
+				elseif mode == "document" then documents = { { instance = localScript, source = "typed" } }
+				elseif mode == "camera-attribute" then camera.AttributeChanged:Fire("Probe") end
+				local proof = assert(observer.capturePushProof())
+				local released = observer.getState({ start = false, releaseTrackingGuardId = "lease", retainPushProof = proof,
+					continuesPushProof = if mode == "wrong-id" then held + 1 else held, retainSeconds = 90 })
+				assert(released.retainedPushProof == proof and released.pushProofContinues == (mode == "stable"),
+					`{observation} {mode}: continuation misjudged`)
+				fire(100)
+				assert(observer.getState({ start = false }).tracking, "the replaced proof's guard ended the new one's tracking")
+				assert(fire(90) == 1 and not observer.getState({ start = false }).tracking, "the retained proof outlived its lifetime")
+			end
+			observer.stop()
+			assert(relay == nil or relay.destroyed)
+			assert(moving.AttributeChanged:Count() == 0 and camera.AttributeChanged:Count() == 0)
+		end
+	end
+	capturedDelays = nil
+	dependencies.BridgeScriptDocuments.capture = savedCapture
+	testGame.ItemChanged, workspace.CurrentCamera = savedItemChanged, savedCamera
+end
+print("Baseline continuation: native and local leases continue, renew, refuse stale proofs and judge Terrain, buffer and camera continuity")
+
+do
 	local config = table.clone(trackerConfig)
 	local invalidations = 0
 	config.invalidateTerrainExport = function() invalidations += 1 end

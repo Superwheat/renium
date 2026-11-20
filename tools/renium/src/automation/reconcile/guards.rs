@@ -152,9 +152,38 @@ pub(crate) struct StudioTrackingGuardRelease<'a> {
     pub(crate) proof: Option<Value>,
     pub(crate) retained_proof: Option<Value>,
     pub(crate) retained_proof_local: bool,
+    /// When the observer under the proof ends; without one Studio keeps the
+    /// proof for `BASELINE_IDLE`.
+    pub(crate) retain_until: Option<Instant>,
+    /// The held proof the lease verified, to be continued by the new one.
+    pub(crate) continues: Option<Value>,
+    /// No tracked change reached Studio between the lease and its release.
+    pub(crate) studio_unchanged: bool,
+    /// The new proof stands on the observation of `continues`, with the same
+    /// untracked state (Terrain voxels, open script buffers).
+    pub(crate) proof_continues: bool,
 }
 
-impl StudioTrackingGuardRelease<'_> {
+impl<'a> StudioTrackingGuardRelease<'a> {
+    pub(crate) fn new(
+        bridge: &'a BridgeServer,
+        runtime_id: &str,
+        guard_id: Option<String>,
+    ) -> Self {
+        Self {
+            bridge,
+            runtime_id: runtime_id.to_string(),
+            guard_id,
+            proof: None,
+            retained_proof: None,
+            retained_proof_local: false,
+            retain_until: None,
+            continues: None,
+            studio_unchanged: false,
+            proof_continues: false,
+        }
+    }
+
     pub(crate) fn finish(&mut self) -> Result<()> {
         let Some(guard_id) = self.guard_id.as_ref() else {
             return Ok(());
@@ -187,28 +216,66 @@ pub(crate) fn acknowledge_verified_push(
     guard: &StudioChangeGuard,
     tracking_release: &mut StudioTrackingGuardRelease<'_>,
 ) -> Result<()> {
+    release_tracking_lease(
+        bridge,
+        guard,
+        tracking_release,
+        json!({"services": services, "ackSeq": guard.change_seq, "runtimeId": guard.runtime_id}),
+    )
+}
+
+/// Ends a tracking lease and has Studio keep the proof `release` names while
+/// it still holds. `request` adds what else the call does (an acknowledgment).
+pub(crate) fn release_tracking_lease(
+    bridge: &BridgeServer,
+    guard: &StudioChangeGuard,
+    release: &mut StudioTrackingGuardRelease<'_>,
+    mut request: Value,
+) -> Result<()> {
+    let retain = release.retain_until.map_or(BASELINE_IDLE, |until| {
+        until.saturating_duration_since(Instant::now())
+    });
+    if request.get("services").is_none() {
+        request["services"] = json!(sync_services());
+    }
+    request["start"] = json!(false);
+    request["includeGenerations"] = json!(true);
+    request["releaseTrackingGuardId"] = json!(release.guard_id);
+    request["retainPushProof"] = json!(release.proof);
+    request["continuesPushProof"] = json!(release.continues);
+    request["retainSeconds"] = json!(retain.as_secs());
     let result = bridge.call_for_runtime_with_timeout(
         "getStudioChangeState",
-        json!({
-            "services": services,
-            "start": false,
-            "ackSeq": guard.change_seq,
-            "runtimeId": guard.runtime_id,
-            "releaseTrackingGuardId": tracking_release.guard_id,
-            "retainPushProof": tracking_release.proof,
-        }),
+        request,
         BridgeTarget::Edit,
         &guard.runtime_id,
         Some(Duration::from_secs(10)),
     )?;
     ensure_plugin_api_ok(&result)?;
-    tracking_release.guard_id = None;
-    tracking_release.retained_proof = result
+    release.guard_id = None;
+    release.retained_proof = result
         .get("retainedPushProof")
         .filter(|value| !value.is_null())
         .cloned();
-    tracking_release.retained_proof_local = result["retainedPushProofLocal"] == true;
+    release.retained_proof_local = result["retainedPushProofLocal"] == true;
+    release.proof_continues = result["pushProofContinues"] == true;
+    release.studio_unchanged = generations_held(guard, &result);
     Ok(())
+}
+
+/// Whether no tracked change reached any synced service since `guard` was
+/// taken: an edit outside the services a push wrote moves their generation
+/// all the same, and Studio's own pushes are expected changes that do not.
+fn generations_held(guard: &StudioChangeGuard, state: &Value) -> bool {
+    let Some(now) = state["serviceGenerations"].as_object() else {
+        return false;
+    };
+    sync_services().iter().all(|service| {
+        guard
+            .service_generations
+            .get(service)
+            .is_some_and(|held| now.get(service).and_then(Value::as_u64) == Some(*held))
+    })
 }
 
 pub(crate) fn current_studio_change_guard_with_state(
@@ -255,14 +322,7 @@ pub(crate) fn current_studio_change_guard_verifying(
         runtime_id,
         Some(Duration::from_secs(10)),
     )?;
-    let mut release = StudioTrackingGuardRelease {
-        bridge,
-        runtime_id: runtime_id.to_string(),
-        guard_id: Some(guard_id.clone()),
-        proof: None,
-        retained_proof: None,
-        retained_proof_local: false,
-    };
+    let mut release = StudioTrackingGuardRelease::new(bridge, runtime_id, Some(guard_id.clone()));
     ensure_plugin_api_ok(&state)?;
     let tracking_started = state["trackingStarted"].as_bool() != Some(false);
     arm_native(&state)?;
@@ -282,8 +342,6 @@ pub(crate) fn current_studio_change_guard_verifying(
         // The native handshake starts tracking with attribute observation already
         // armed. If discovery failed, this call starts ordinary local listeners.
         // In either case this is the initial, fully observed generation fence.
-        let proof_matches = state.get("pushProofMatches").cloned();
-        let proof_mismatch = state.get("pushProofMismatch").cloned();
         state = bridge.call_for_runtime_with_timeout(
             "getStudioChangeState",
             json!({"start": true, "trackingGuardId": guard_id, "includeGenerations": true}),
@@ -292,11 +350,11 @@ pub(crate) fn current_studio_change_guard_verifying(
             Some(Duration::from_secs(10)),
         )?;
         ensure_plugin_api_ok(&state)?;
-        if let Some(matches) = proof_matches {
-            state["pushProofMatches"] = matches;
-        }
-        if let Some(mismatch) = proof_mismatch {
-            state["pushProofMismatch"] = mismatch;
+        // Nothing tracked Studio between the two calls, so a proof checked in
+        // the first one says nothing of the fence the second one starts.
+        if verify_push_proof.is_some() {
+            state["pushProofMatches"] = json!(false);
+            state["pushProofMismatch"] = json!("tracking restarted");
         }
     }
     let mut guard = studio_change_guard_from_state(context, &state)?;

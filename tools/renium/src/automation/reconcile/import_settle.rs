@@ -711,14 +711,12 @@ fn recover(
             let _ = state;
             Ok(())
         })?;
-    let mut release = StudioTrackingGuardRelease {
-        bridge,
-        runtime_id: guard.runtime_id.clone(),
-        guard_id: guard.tracking_guard_id.clone(),
-        proof: None,
-        retained_proof: None,
-        retained_proof_local: false,
-    };
+    let mut release =
+        StudioTrackingGuardRelease::new(bridge, &guard.runtime_id, guard.tracking_guard_id.clone());
+    #[cfg(windows)]
+    {
+        release.retain_until = attributes.as_ref().map(|relay: &NativeRelay| relay.ends);
+    }
     let proof = capture_push_proof(bridge, &guard)?
         .context("Studio cannot prove a stable recovery capture; run rbx pl")?;
     let paths = work.paths.clone();

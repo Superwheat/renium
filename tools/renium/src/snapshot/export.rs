@@ -57,7 +57,7 @@ const BRIDGE_CODEC_VERSION: &str = BRIDGE_CODEC_VERSION_SCHEMA9;
 const SUPPORTED_BRIDGE_CODEC_VERSIONS: [&str; 2] =
     [BRIDGE_CODEC_VERSION, BRIDGE_CODEC_VERSION_SCHEMA8];
 
-fn record_bridge_sync_completion(bridge: &BridgeServer) -> Result<()> {
+pub(crate) fn record_bridge_sync_completion(bridge: &BridgeServer) -> Result<()> {
     bridge
         .call("recordSyncCompletion", json!({}))
         .context("Failed to record Studio sync completion after export publication")?;
@@ -919,6 +919,10 @@ impl ExportProjectStage {
                 root: backup_root,
                 container: self.container.clone(),
             }),
+            #[cfg(any(windows, target_os = "macos"))]
+            publish_paths: std::mem::take(&mut self.publish_paths),
+            #[cfg(any(windows, target_os = "macos"))]
+            settled: staged,
         })
     }
 }
@@ -1195,6 +1199,13 @@ pub(crate) struct PublishedProjectChanges {
     pub(crate) previous: Option<PublishBackups>,
     /// The sync history entry a pull recorded for its replaced files.
     pub(crate) history_id: Option<String>,
+    /// The project paths the publish covered.
+    #[cfg(any(windows, target_os = "macos"))]
+    pub(crate) publish_paths: Vec<PathBuf>,
+    /// What each entry under them held once the publish wrote, outside the
+    /// paths it preserved.
+    #[cfg(any(windows, target_os = "macos"))]
+    pub(crate) settled: BTreeMap<PathBuf, PublishEntryState>,
 }
 
 #[derive(Clone, Copy)]
@@ -1263,19 +1274,20 @@ pub(crate) fn collect_publish_hashes(
             let state = match kind {
                 PublishEntryKind::Directory => PublishEntryState::Directory,
                 PublishEntryKind::Symlink => PublishEntryState::Symlink(fs::read_link(path)?),
-                PublishEntryKind::File => {
-                    let bytes = fs::read(path)?;
-                    PublishEntryState::File {
-                        sha256: sha256_hex(&bytes),
-                        length: bytes.len() as u64,
-                        hash: fnv1a(&bytes),
-                    }
-                }
+                PublishEntryKind::File => file_publish_state(&fs::read(path)?),
             };
             Ok((relative, state))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(entries.into_iter().collect())
+}
+
+pub(crate) fn file_publish_state(bytes: &[u8]) -> PublishEntryState {
+    PublishEntryState::File {
+        sha256: sha256_hex(bytes),
+        length: bytes.len() as u64,
+        hash: fnv1a(bytes),
+    }
 }
 
 fn refresh_publish_hashes(

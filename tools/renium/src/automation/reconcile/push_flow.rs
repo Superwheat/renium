@@ -16,8 +16,8 @@ pub(super) fn arm_native_attribute_relay(
     state: &Value,
     bridge: &BridgeServer,
     services: &[String],
-    previous: &mut Option<crate::studio::native::serializer::AttributeGuard>,
-    current: &mut Option<crate::studio::native::serializer::AttributeGuard>,
+    previous: &mut Option<NativeRelay>,
+    current: &mut Option<NativeRelay>,
 ) -> Result<()> {
     if state["nativeRelayContinued"] == true {
         return Ok(());
@@ -32,14 +32,15 @@ pub(super) fn arm_native_attribute_relay(
     let path = serde_json::from_value::<Vec<String>>(path.clone())?;
     let pid = crate::editor::review::studio_pid_for_bridge(bridge)?;
     let title = crate::editor::review::studio_title_for_bridge(bridge, pid)?;
+    let armed = Instant::now();
     match crate::studio::native::serializer::begin_attribute_relay(
         pid,
         &title,
         services,
-        Duration::from_secs(120),
+        NATIVE_RELAY_LIFETIME,
         &path,
     ) {
-        Ok(observation) => *current = Some(observation),
+        Ok(observation) => *current = Some(NativeRelay::armed(observation, armed)),
         Err(error) => log_global(
             5,
             format_args!("[renium] native attribute relay unavailable: {error:#}"),
@@ -70,10 +71,12 @@ fn reuse_verified_full_push(
     } else {
         None
     };
-    if let Some(candidate) = candidate.take_if(|candidate| candidate.files_unchanged)
+    if let Some(mut candidate) = candidate.take_if(|candidate| candidate.files_unchanged)
         && verified_full_push_proof_matches(context, bridge, &candidate.cached.proof)?
     {
+        log_global(5, format_args!("[renium] baseline: full push unchanged"));
         if let Some(runtime) = context.runtime_id.as_deref() {
+            candidate.cached.renew();
             bridge
                 .verified_full_pushes
                 .lock_recover()
@@ -255,7 +258,7 @@ pub(crate) fn push_project(
         .then(|| full_push_cache_input(&push_args, services))
         .transpose()?;
     #[cfg(windows)]
-    let mut _native_attributes = None;
+    let mut native_relay = None;
     let phase = Instant::now();
     // The previous push's native attribute observer must outlive the proof
     // check inside the lease request, yet stop before the new lease arms its
@@ -266,7 +269,7 @@ pub(crate) fn push_project(
         Some(candidate) => {
             let VerifiedFullPushCandidate { cached, .. } = candidate;
             #[cfg(windows)]
-            let previous = cached._attributes;
+            let previous = cached.relay;
             #[cfg(not(windows))]
             let previous = ();
             (Some((cached.proof.clone(), cached.project)), previous)
@@ -298,7 +301,7 @@ pub(crate) fn push_project(
                     bridge,
                     services,
                     &mut previous_attributes,
-                    &mut _native_attributes,
+                    &mut native_relay,
                 )?;
                 #[cfg(not(windows))]
                 let _ = state;
@@ -309,7 +312,7 @@ pub(crate) fn push_project(
     log_reconcile_timing("full push guard", phase);
     #[cfg(windows)]
     if initial_state["nativeRelayContinued"] == true {
-        _native_attributes = previous_attributes.take();
+        native_relay = previous_attributes.take();
     } else {
         drop(previous_attributes.take());
     }
@@ -319,7 +322,13 @@ pub(crate) fn push_project(
     // means every later Studio edit is caught by the transaction's generation
     // checks and the last verified files are a complete baseline.
     let verified_baseline = match candidate_parts {
-        Some((_, project)) if initial_state["pushProofMatches"] == true => Some(project),
+        Some((_, project)) if initial_state["pushProofMatches"] == true => {
+            log_global(
+                5,
+                format_args!("[renium] baseline: full push compared with the held files"),
+            );
+            Some(project)
+        }
         Some(_) => {
             log_global(
                 5,
@@ -338,14 +347,12 @@ pub(crate) fn push_project(
     // Declared before the tracking lease so unwinding releases Lua tracking
     // before native observation. On cancellation the native guard can promote
     // surviving listeners before disconnecting its shared signal.
-    let mut tracking_release = StudioTrackingGuardRelease {
-        bridge,
-        runtime_id: guard.runtime_id.clone(),
-        guard_id: guard.tracking_guard_id.clone(),
-        proof: None,
-        retained_proof: None,
-        retained_proof_local: false,
-    };
+    let mut tracking_release =
+        StudioTrackingGuardRelease::new(bridge, &guard.runtime_id, guard.tracking_guard_id.clone());
+    #[cfg(windows)]
+    {
+        tracking_release.retain_until = native_relay.as_ref().map(|relay| relay.ends);
+    }
     let src_dir = push_args.project.src_root.clone();
     let root = push_args.project.project_root.clone();
     let requires_stage = config::try_load_project(None, Some(&root))?
@@ -539,7 +546,7 @@ pub(crate) fn push_project(
             project,
             &tracking_release,
             #[cfg(windows)]
-            &mut _native_attributes,
+            &mut native_relay,
         );
         return Ok(Map::from_iter([("ok".to_string(), Value::Bool(true))]));
     }
@@ -595,7 +602,7 @@ pub(crate) fn push_project(
             project,
             &tracking_release,
             #[cfg(windows)]
-            &mut _native_attributes,
+            &mut native_relay,
         );
         return Ok(Map::from_iter([("ok".to_string(), Value::Bool(true))]));
     }
@@ -753,7 +760,7 @@ pub(crate) fn push_project(
                 current,
                 &tracking_release,
                 #[cfg(windows)]
-                &mut _native_attributes,
+                &mut native_relay,
             );
         }
         return Ok(summary);
@@ -842,7 +849,7 @@ pub(crate) fn push_project(
             project,
             &tracking_release,
             #[cfg(windows)]
-            &mut _native_attributes,
+            &mut native_relay,
         );
         return Ok(pushed.summary);
     }
@@ -949,9 +956,393 @@ pub(crate) fn push_project(
         current,
         &tracking_release,
         #[cfg(windows)]
-        &mut _native_attributes,
+        &mut native_relay,
     );
     Ok(pushed.summary)
+}
+
+/// A push of chosen paths or instances. With a held baseline it runs under a
+/// lease that continues the baseline's observation, and keeps a baseline of
+/// the files where it can say Studio holds them after the push.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn push_targeted(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    args: PushEditorChangesArgs,
+) -> Result<Map<String, Value>> {
+    use crate::editor::sync::push_editor_changes_with_warm_bridge;
+    let Some(mut held) = take_baseline(context, bridge, &plain_push_input(&args)?) else {
+        return push_editor_changes_with_warm_bridge(args, bridge);
+    };
+    let Some((guard, mut release)) = baseline_lease(context, bridge, &held)? else {
+        return push_editor_changes_with_warm_bridge(args, bridge);
+    };
+    let root = args.project.project_root.clone();
+    let before = capture_snapshot(&root, &held.paths)?;
+    let pushed = TargetedPush::of(&args);
+    let summary = push_editor_changes_with_warm_bridge(args, bridge)?;
+    let not_kept = |reason: &str| {
+        log_global(
+            5,
+            format_args!("[renium] baseline: not kept after targeted push: {reason}"),
+        );
+    };
+    let after = match capture_snapshot(&root, &held.paths) {
+        Ok(after) => after,
+        Err(error) => {
+            not_kept(&format!("{error:#}"));
+            return Ok(summary);
+        }
+    };
+    let service_of = |path: &Path| {
+        crate::editor::paths::service_from_changed_path(
+            Path::new(&context.source),
+            &Path::new(&context.root).join(path),
+        )
+    };
+    let project = match targeted_baseline(
+        &held.project,
+        (&before, &after),
+        &summary,
+        &pushed,
+        service_of,
+    ) {
+        Ok(project) => project,
+        Err(reason) => {
+            not_kept(reason);
+            return Ok(summary);
+        }
+    };
+    let proof = if push_applied_nothing(&summary) {
+        Some(held.proof.clone())
+    } else {
+        summary
+            .get("verifiedPushProof")
+            .filter(|value| !value.is_null())
+            .cloned()
+    };
+    release.proof.clone_from(&proof);
+    if let Err(error) = release_tracking_lease(bridge, &guard, &mut release, json!({})) {
+        not_kept(&format!("{error:#}"));
+        return Ok(summary);
+    }
+    let Some(proof) = proof.filter(|proof| release.retained_proof.as_ref() == Some(proof)) else {
+        not_kept("Studio holds no proof of the push");
+        return Ok(summary);
+    };
+    if !release.studio_unchanged || !release.proof_continues {
+        not_kept("Studio changed during the push");
+        return Ok(summary);
+    }
+    // Studio held the baseline when the lease began, no tracked change but
+    // the push's own reached a synced service until the release, and the
+    // state no event tracks (Terrain voxels, open script buffers) is what the
+    // baseline's proof saw. The push wrote and verified every file that
+    // differs from the baseline, so Studio holds these files.
+    #[cfg(windows)]
+    let relay = held.relay.take();
+    let entry = VerifiedFullPush {
+        connections: bridge.runtime_connection_signature(&release.runtime_id),
+        input: std::mem::take(&mut held.input),
+        project,
+        paths: std::mem::take(&mut held.paths),
+        proof,
+        expires: baseline_expiry(
+            #[cfg(windows)]
+            relay.as_ref(),
+        ),
+        #[cfg(windows)]
+        relay,
+    };
+    keep_baseline(bridge, &release.runtime_id, entry, "targeted push");
+    Ok(summary)
+}
+
+/// A tracking lease that continues the held baseline's observation, which
+/// Studio grants only while the baseline's proof holds and tracking runs.
+#[cfg(any(windows, target_os = "macos"))]
+fn baseline_lease<'a>(
+    context: &BoundContext,
+    bridge: &'a BridgeServer,
+    held: &VerifiedFullPush,
+) -> Result<Option<(StudioChangeGuard, StudioTrackingGuardRelease<'a>)>> {
+    let runtime_id = context
+        .runtime_id
+        .as_deref()
+        .context("Studio context has no edit-mode runtime")?;
+    pin_edit_runtime(context, bridge)?;
+    let guard_id = format!(
+        "push-{}-{}-{}",
+        std::process::id(),
+        runtime_id,
+        crate::app::timing::current_millis()
+    );
+    let state = bridge.call_for_runtime_with_timeout(
+        "getStudioChangeState",
+        json!({
+            "start": true,
+            "trackingGuardId": guard_id,
+            "includeGenerations": true,
+            "services": sync_services(),
+            "captureLocalPushProof": true,
+            "verifyPushProof": held.proof,
+            "requirePushProof": true,
+        }),
+        BridgeTarget::Edit,
+        runtime_id,
+        Some(Duration::from_secs(10)),
+    )?;
+    ensure_plugin_api_ok(&state)?;
+    if state["pushProofMatches"] != true {
+        log_global(
+            5,
+            format_args!(
+                "[renium] full push cache miss: {}",
+                state["pushProofMismatch"]
+                    .as_str()
+                    .unwrap_or("Studio proof unavailable")
+            ),
+        );
+        return Ok(None);
+    }
+    let mut release = StudioTrackingGuardRelease::new(bridge, runtime_id, Some(guard_id.clone()));
+    let mut guard = studio_change_guard_from_state(context, &state)?;
+    guard.tracking_guard_id = Some(guard_id);
+    release.continues = Some(held.proof.clone());
+    #[cfg(windows)]
+    {
+        release.retain_until = held.relay.as_ref().map(|relay| relay.ends);
+    }
+    Ok(Some((guard, release)))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+/// What a push of chosen paths or instances wrote: the project paths it
+/// named, and the store instances it wrote whole.
+pub(crate) struct TargetedPush {
+    pub(crate) paths: HashSet<PathBuf>,
+    pub(crate) ids: HashSet<String>,
+    /// Whether what stands under the chosen instances went with them.
+    pub(crate) exact: bool,
+    /// Whether each instance went whole: no property filter, no instance
+    /// list or path list file, no upsert of instances alone.
+    pub(crate) whole_rows: bool,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl TargetedPush {
+    pub(crate) fn of(args: &PushEditorChangesArgs) -> Self {
+        let root = &args.project.project_root;
+        Self {
+            paths: args
+                .changed_paths
+                .iter()
+                .map(|path| {
+                    let absolute = absolutize_under(root, path);
+                    absolute
+                        .strip_prefix(root)
+                        .map_or_else(|_| absolute.clone(), Path::to_path_buf)
+                })
+                .collect(),
+            ids: args.target_settings_ids.iter().cloned().collect(),
+            exact: args.exact_target_ids,
+            whole_rows: args.target_properties.is_empty()
+                && args.target_settings_id_files.is_empty()
+                && args.changed_paths_files.is_empty()
+                && !args.upsert_instances_only,
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+/// The baseline after a verified push of chosen paths over the files `held`
+/// that Studio held: the files as they stand, where every file that differs
+/// from `held` is one the push named, wrote and verified. A push that applied
+/// nothing leaves `held`. Otherwise says why there is none.
+pub(crate) fn targeted_baseline(
+    held: &ProjectSnapshot,
+    (before, after): (&ProjectSnapshot, &ProjectSnapshot),
+    summary: &Map<String, Value>,
+    pushed: &TargetedPush,
+    service_of: impl Fn(&Path) -> Option<String>,
+) -> std::result::Result<ProjectSnapshot, &'static str> {
+    if !pushed.whole_rows {
+        return Err("the push chose fields or read its selection from a file");
+    }
+    if before != after {
+        return Err("the files changed during the push");
+    }
+    if summary.get("ok") == Some(&Value::Bool(false))
+        || summary.get("verified") == Some(&Value::Bool(false))
+        || [
+            "unsupportedProperties",
+            "protectedPending",
+            "supplementalImportPendingWrites",
+            "protectedOfflineApply",
+        ]
+        .iter()
+        .any(|key| summary.contains_key(*key))
+    {
+        return Err("the push left changes unwritten or unverified");
+    }
+    if push_applied_nothing(summary) {
+        return Ok(held.clone());
+    }
+    let verified = ["nativeVerifiedServices", "fieldVerifiedServices"]
+        .into_iter()
+        .filter_map(|key| summary.get(key).and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let is_store = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_service_settings_file_name)
+    };
+    let scripts = pushed
+        .paths
+        .iter()
+        .filter(|path| {
+            super::merge::is_source_path(path)
+                && matches!(after.entries.get(*path), Some(SnapshotEntry::File(_)))
+        })
+        .count();
+    let scripts_verified = summary.get("sourceVerifyFailed").and_then(Value::as_u64) == Some(0)
+        && summary.get("sourceVerified").and_then(Value::as_u64) == Some(scripts as u64);
+    let paths = held
+        .entries
+        .keys()
+        .chain(after.entries.keys())
+        .collect::<BTreeSet<_>>();
+    for path in paths {
+        let (was, now) = (held.entries.get(path), after.entries.get(path));
+        if was == now {
+            continue;
+        }
+        if !pushed.paths.contains(path) {
+            return Err("files differ from the baseline outside the push");
+        }
+        let carried = match (was, now) {
+            (Some(SnapshotEntry::File(was)), Some(SnapshotEntry::File(now)))
+                if is_store(path.as_path()) =>
+            {
+                service_of(path.as_path()).is_some_and(|service| {
+                    verified
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&service))
+                }) && store_rows_differ_only_at(was, now, &pushed.ids, pushed.exact)
+                    .unwrap_or(false)
+            }
+            (Some(SnapshotEntry::File(_)), Some(SnapshotEntry::File(_))) => {
+                super::merge::is_source_path(path) && scripts_verified
+            }
+            _ => false,
+        };
+        if !carried {
+            return Err("the push did not write and verify every changed file");
+        }
+    }
+    Ok(after.clone())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+/// Whether a verified write of the whole instances `ids` of a store (with
+/// what stands under them unless `exact`) leaves the store `held` held as
+/// `files` holds it. Every other instance must be the same, every instance
+/// at the same place, and a written instance must hold every value it held
+/// before, each one a push writes: a write sets values and resets none.
+pub(crate) fn store_rows_differ_only_at(
+    held: &[u8],
+    files: &[u8],
+    ids: &HashSet<String>,
+    exact: bool,
+) -> Result<bool> {
+    use crate::settings::bytecode::property_edit::{decode_rows, whole_row_digests_of_both};
+    let (was, now) = whole_row_digests_of_both(held, files);
+    let (Some(was), Some(now)) = (was?, now?) else {
+        return Ok(false);
+    };
+    let count = was.instances.len();
+    let same_places = now.instances.len() == count
+        && was.digests.len() == count
+        && now.digests.len() == count
+        && was.unique_ids == now.unique_ids
+        && was.instances.iter().zip(&now.instances).all(|(was, now)| {
+            was.settings_id == now.settings_id
+                && was.name == now.name
+                && was.class_name == now.class_name
+                && was.parent_index == now.parent_index
+        });
+    if !same_places {
+        return Ok(false);
+    }
+    let mut chosen = was
+        .instances
+        .iter()
+        .map(|instance| ids.contains(&instance.settings_id))
+        .collect::<Vec<_>>();
+    // A store can hold a parent after its child, so the pass repeats until
+    // nothing joins.
+    let mut joined = !exact;
+    while joined {
+        joined = false;
+        for index in 0..count {
+            if !chosen[index]
+                && was.instances[index]
+                    .parent_index
+                    .is_some_and(|parent| parent < count && chosen[parent])
+            {
+                chosen[index] = true;
+                joined = true;
+            }
+        }
+    }
+    let differing = (0..count)
+        .filter(|&index| was.digests[index] != now.digests[index])
+        .collect::<Vec<_>>();
+    if differing.iter().any(|&index| !chosen[index]) {
+        return Ok(false);
+    }
+    if differing.is_empty() {
+        return Ok(true);
+    }
+    let Ok(database) = rbx_reflection_database::get() else {
+        return Ok(false);
+    };
+    let (was_rows, _) = decode_rows(held, &differing)?;
+    let (now_rows, _) = decode_rows(files, &differing)?;
+    Ok(was_rows.iter().zip(&now_rows).all(|(was, now)| {
+        was.properties
+            .keys()
+            .all(|name| now.properties.contains_key(name))
+            && now.properties.iter().all(|(name, value)| {
+                was.properties.get(name) == Some(value) || {
+                    let logical = crate::rbx::encode::rbx_logical_property_name(
+                        database,
+                        &now.class_name,
+                        name,
+                    )
+                    .unwrap_or(name);
+                    let root = if now.parent_index.is_none() {
+                        std::slice::from_ref(&now.name)
+                    } else {
+                        &[]
+                    };
+                    !logical.eq_ignore_ascii_case("Source")
+                        && !is_externally_managed_editor_property(
+                            &now.name,
+                            &now.class_name,
+                            root,
+                            logical,
+                        )
+                        && !crate::editor::review::is_engine_managed_editor_property(
+                            &now.class_name,
+                            logical,
+                            database,
+                        )
+                }
+            })
+    }))
 }
 
 #[cfg(any(windows, target_os = "macos"))]

@@ -1497,3 +1497,318 @@ fn run_decision_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
 fn seeded_decisions_by_id_keep_the_laws_of_a_conflict_record() {
     run_seeds(300, run_decision_seed);
 }
+
+/// The files the daemon holds as what Studio holds, at the Studio version
+/// its proof was taken at: every change Studio takes, its own pushes
+/// included, moves the version, as it retires a proof.
+#[cfg(any(windows, target_os = "macos"))]
+struct Held {
+    project: ProjectSnapshot,
+    version: u64,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+static BASELINE_OUTCOMES: [std::sync::atomic::AtomicUsize; 4] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
+
+/// One edit of the kind either side makes: a value set or cleared, an
+/// attribute set or removed, a script's source, or a rename.
+#[cfg(any(windows, target_os = "macos"))]
+fn edit_one(tree: &mut Tree, rng: &mut Rng, counter: &mut u64) -> String {
+    *counter += 1;
+    let ids = tree
+        .nodes
+        .keys()
+        .filter(|id| *id != ROOT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let id = rng.pick(&ids).unwrap();
+    let node = tree.nodes.get_mut(&id).unwrap();
+    let kind = match rng.below(6) {
+        0 if node.class == "StringValue" => {
+            node.value = Some(format!("v{counter}"));
+            "value"
+        }
+        1 if node.class == "StringValue" => {
+            node.value = None;
+            "value cleared"
+        }
+        2 if node.class == "ModuleScript" => {
+            node.source = Some(format!("return {counter}\n"));
+            "source"
+        }
+        3 => {
+            node.attributes.clear();
+            "attributes cleared"
+        }
+        4 if rng.below(3) == 0 => {
+            node.name = format!("R{counter}");
+            "rename"
+        }
+        _ => {
+            node.attributes
+                .insert(format!("A{}", rng.below(3)), format!("a{counter}"));
+            "attribute"
+        }
+    };
+    format!("{kind} of {id}")
+}
+
+/// What a push of chosen instances or scripts writes in Studio: each value
+/// the files' row holds, the whole attribute map, and the named scripts'
+/// sources. It resets no value and moves or renames nothing.
+#[cfg(any(windows, target_os = "macos"))]
+fn push_chosen(studio: &mut Tree, files: &Tree, chosen: &[String], scripts: &[String]) {
+    for id in chosen {
+        let (Some(node), Some(wanted)) = (studio.nodes.get_mut(id), files.nodes.get(id)) else {
+            continue;
+        };
+        if wanted.value.is_some() {
+            node.value.clone_from(&wanted.value);
+        }
+        node.attributes.clone_from(&wanted.attributes);
+    }
+    for id in scripts {
+        if let (Some(node), Some(wanted)) = (studio.nodes.get_mut(id), files.nodes.get(id)) {
+            node.source.clone_from(&wanted.source);
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn settled_of(snapshot: &ProjectSnapshot) -> BTreeMap<PathBuf, PublishEntryState> {
+    snapshot
+        .entries
+        .iter()
+        .map(|(path, entry)| {
+            let state = match entry {
+                SnapshotEntry::Directory => PublishEntryState::Directory,
+                SnapshotEntry::File(bytes) => crate::snapshot::export::file_publish_state(bytes),
+                SnapshotEntry::Symlink { target, .. } => PublishEntryState::Symlink(target.clone()),
+            };
+            (path.clone(), state)
+        })
+        .collect()
+}
+
+/// A targeted push: `bs`/`ba` (instances with their scripts) or `ps FILE`
+/// (scripts alone), under the held baseline when its proof still holds.
+#[cfg(any(windows, target_os = "macos"))]
+fn targeted_step(
+    rng: &mut Rng,
+    (studio, files, version): (&mut Tree, &Tree, &mut u64),
+    held: Option<Held>,
+    log: &mut Vec<String>,
+) -> Option<Held> {
+    let scripts_by_id = script_paths(files);
+    let ids = files
+        .nodes
+        .keys()
+        .filter(|id| *id != ROOT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let store = service_settings_path(&Path::new("src").join(SERVICE));
+    let exact = rng.below(2) == 0;
+    let (targets, scripts) = if rng.below(3) == 0 {
+        let scripts = scripts_by_id.keys().cloned().collect::<Vec<_>>();
+        (
+            Vec::new(),
+            rng.pick(&scripts).into_iter().collect::<Vec<_>>(),
+        )
+    } else {
+        let mut targets = (0..1 + rng.below(2))
+            .filter_map(|_| rng.pick(&ids))
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        let scripts = targets
+            .iter()
+            .filter(|id| scripts_by_id.contains_key(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        (targets, scripts)
+    };
+    let chosen = if exact {
+        targets.clone()
+    } else {
+        targets.iter().flat_map(|id| files.subtree(id)).collect()
+    };
+    let mut paths = scripts
+        .iter()
+        .map(|id| scripts_by_id[id].clone())
+        .collect::<HashSet<_>>();
+    if !targets.is_empty() {
+        paths.insert(store);
+    }
+    let held = held.filter(|held| held.version == *version);
+    let before = files.snapshot(None);
+    push_chosen(studio, files, &chosen, &scripts);
+    *version += 1;
+    let concurrent = rng.below(5) == 0;
+    log.push(format!(
+        "targeted push of {targets:?} exact={exact} scripts={scripts:?} held={} concurrent={concurrent}",
+        held.is_some()
+    ));
+    let held = held?;
+    let mut summary = Map::new();
+    summary.insert("ok".into(), json!(true));
+    summary.insert("sourceVerified".into(), json!(scripts.len()));
+    summary.insert("sourceVerifyFailed".into(), json!(0));
+    if !targets.is_empty() {
+        summary.insert("fieldVerifiedServices".into(), json!([SERVICE]));
+    }
+    let pushed = TargetedPush {
+        paths,
+        ids: targets.into_iter().collect(),
+        exact,
+        whole_rows: true,
+    };
+    let kept = targeted_baseline(&held.project, (&before, &before), &summary, &pushed, |_| {
+        Some(SERVICE.to_string())
+    });
+    BASELINE_OUTCOMES[usize::from(kept.is_ok())].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    log.push(format!("  baseline: {:?}", kept.as_ref().err()));
+    if concurrent {
+        // Studio's generation fence turns the lease down.
+        *version += 1;
+        return None;
+    }
+    kept.ok().map(|project| Held {
+        project,
+        version: *version,
+    })
+}
+
+/// A pull: answered from the baseline, or a capture that keeps one where
+/// the files are still what it wrote and Studio did not change meanwhile.
+#[cfg(any(windows, target_os = "macos"))]
+fn pull_step(
+    rng: &mut Rng,
+    (studio, files, version): (&mut Tree, &mut Tree, &mut u64),
+    held: Option<Held>,
+    (counter, log): (&mut u64, &mut Vec<String>),
+) -> Result<Option<Held>, String> {
+    let current = files.snapshot(None);
+    if let Some(held) = held.filter(|held| held.version == *version && held.project == current) {
+        log.push("pull answered unchanged".into());
+        if let Some(difference) = files.difference(studio) {
+            return Err(format!(
+                "a pull answered unchanged where a capture writes: {difference}"
+            ));
+        }
+        return Ok(Some(held));
+    }
+    let proof = *version;
+    *files = studio.clone();
+    let settled = settled_of(&files.snapshot(None));
+    if rng.below(4) == 0 {
+        let edit = edit_one(files, rng, counter);
+        log.push(format!("pull, then a file edit: {edit}"));
+    }
+    if rng.below(4) == 0 {
+        let edit = edit_one(studio, rng, counter);
+        *version += 1;
+        log.push(format!("pull, with a Studio edit: {edit}"));
+    }
+    let project = files.snapshot(None);
+    let kept = publish_settled(&project, &settled) && proof == *version;
+    BASELINE_OUTCOMES[2 + usize::from(kept)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(kept.then_some(Held {
+        project,
+        version: *version,
+    }))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn run_baseline_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
+    let mut rng = Rng(seed);
+    let mut counter = 0;
+    let mut studio = first_tree(&mut rng, &mut counter);
+    let mut files = studio.clone();
+    let mut version = 0;
+    let mut held = None;
+    for step in 0..40 {
+        match rng.below(6) {
+            0 => {
+                let edit = edit_one(&mut files, &mut rng, &mut counter);
+                log.push(format!("file edit: {edit}"));
+            }
+            1 => {
+                let edit = edit_one(&mut studio, &mut rng, &mut counter);
+                version += 1;
+                log.push(format!("Studio edit: {edit}"));
+            }
+            2 => {
+                held = pull_step(
+                    &mut rng,
+                    (&mut studio, &mut files, &mut version),
+                    held,
+                    (&mut counter, log),
+                )?;
+            }
+            3 => {
+                let current = files.snapshot(None);
+                if held
+                    .as_ref()
+                    .is_some_and(|held: &Held| held.version == version && held.project == current)
+                {
+                    log.push("full push answered unchanged".into());
+                    if let Some(difference) = files.difference(&studio) {
+                        return Err(format!(
+                            "a full push answered unchanged where it writes: {difference}"
+                        ));
+                    }
+                } else {
+                    log.push("full push".into());
+                    studio = files.clone();
+                    version += 1;
+                    held = Some(Held {
+                        project: current,
+                        version,
+                    });
+                }
+            }
+            _ => {
+                held = targeted_step(
+                    &mut rng,
+                    (&mut studio, &files, &mut version),
+                    held.take(),
+                    log,
+                );
+            }
+        }
+        if let Some(held) = held.as_ref().filter(|held| held.version == version) {
+            let tree = Tree::read(&held.project)?;
+            if let Some(difference) = tree.difference(&studio) {
+                return Err(format!(
+                    "step {step}: the held baseline is not what Studio holds: {difference}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every baseline a pull or a push keeps is what Studio holds, and an answer
+/// from one is the answer of a capture: random file and Studio edits, pulls
+/// (some with a file or Studio edit while they write), full pushes and
+/// pushes of chosen instances or scripts (some with a Studio edit meanwhile).
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn seeded_baselines_answer_as_captures_do() {
+    run_seeds(300, run_baseline_seed);
+    for (index, what) in [
+        "targeted push dropped",
+        "targeted push kept",
+        "pull dropped",
+        "pull kept",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(
+            BASELINE_OUTCOMES[index].load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "no seed reached: {what}"
+        );
+    }
+}
