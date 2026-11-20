@@ -913,6 +913,40 @@ last.Transparency = 0.5
 testGame.ItemChanged:Fire(last, "Transparency")
 journal = tracker.drainChangeJournal("wide")
 assert(#journal == 1 and journal[1].pathOrdinals[#journal[1].pathOrdinals] == 2399)
+-- A burst of additions under one parent walks its siblings once at most, and
+-- each child still takes the ordinal of its place among its namesakes.
+siblingScans = 0
+local burst = {}
+for index = 1, 600 do
+	burst[index] = instance("Part", if index % 3 == 0 then "Other" else "Duplicate")
+	add(burst[index], wide)
+end
+local removedFromBurst = burst[2]
+deferred = {}
+remove(removedFromBurst)
+testGame.ItemChanged:Fire(removedFromBurst, "Parent")
+flushDeferred()
+deferred = nil
+local late = instance("Part", "Duplicate")
+add(late, wide)
+journal = tracker.drainChangeJournal("wide")
+local burstOrdinals = {}
+for _, record in journal do
+	if record.structural and record.instance ~= removedFromBurst then
+		burstOrdinals[record.instance] = record.pathOrdinals[#record.pathOrdinals]
+	end
+end
+local namesakes = {}
+for _, child in wide.children do
+	namesakes[child.Name] = (namesakes[child.Name] or 0) + 1
+	if child == late or table.find(burst, child) then
+		assert(burstOrdinals[child] == namesakes[child.Name] or child ~= late and child.Name == "Duplicate"
+			and burstOrdinals[child] == namesakes[child.Name] + 1,
+			`added sibling {namesakes[child.Name]} of {child.Name} recorded ordinal {burstOrdinals[child]}`)
+	end
+end
+assert(burstOrdinals[late] == namesakes.Duplicate, "an addition after a removal must read its siblings anew")
+assert(siblingScans <= 3, `an addition burst rescanned siblings {siblingScans} times`)
 tracker.stop()
 remove(wide)
 remove(deepRoot)

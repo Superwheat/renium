@@ -1625,6 +1625,26 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
+	-- A child given a parent is appended last among its siblings: they keep
+	-- their ordinals and it takes the next one of its name. Rebuilding the
+	-- parent's ordinals for every child of an addition burst (thousands of
+	-- parts made by one script) walked every sibling each time.
+	local function appendSiblingOrdinal(instance: Instance, parent: Instance?)
+		-- Its own children changed unobserved while it was outside the service.
+		state.ordinalCacheByParent[instance] = nil
+		local entry = if parent ~= nil then state.ordinalCacheByParent[parent] else nil
+		if entry == nil then
+			return
+		end
+		if entry.dirtyFrame ~= nil or instance.Parent ~= parent then
+			invalidateSiblingOrdinals(parent)
+		elseif entry.ordinals[instance] == nil then
+			local ordinal = (entry.counts[instance.Name] or 0) + 1
+			entry.counts[instance.Name] = ordinal
+			entry.ordinals[instance] = ordinal
+		end
+	end
+
 	local function rebuildSiblingOrdinals(parent: Instance)
 		local ordinals = setmetatable({}, { __mode = "k" }) :: any
 		local counts = {}
@@ -3500,7 +3520,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				end
 			end
 			if expectation == nil or not expectation.parentUnchanged then
-				invalidateSiblingOrdinals(instance.Parent)
+				appendSiblingOrdinal(instance, instance.Parent)
 			end
 			if
 				included
