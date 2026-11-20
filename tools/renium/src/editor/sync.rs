@@ -1872,7 +1872,7 @@ pub(crate) fn push_editor_changes_with_warm_bridge_guarded(
 ) -> Result<serde_json::Map<String, Value>> {
     let started = Instant::now();
     if args.verify {
-        let (changes, _) = collect_project_editor_changes(&args)?;
+        let (changes, _) = collect_verified_editor_changes(&args)?;
         validate_source_verification_selection(&args, &changes)?;
         return verify_editor_sources_only(bridge, &changes);
     }
@@ -2032,8 +2032,7 @@ where
     if (!args.no_review && !args.yes && !global_yes())
         || files_to_studio_filter_rules(&args.project.project_root)?.is_some()
     {
-        prepared_documents.native_services.clear();
-        read_prepared_documents_whole(&args, &mut prepared_documents)?;
+        read_imported_documents_whole(&args, &mut prepared_documents)?;
     }
     let no_selection = args.changed_paths.is_empty()
         && args.changed_paths_files.is_empty()
@@ -2174,9 +2173,13 @@ fn documents_of_targets(args: &PushEditorChangesArgs) -> Result<PreparedEditorDo
         if bytes.len() < TARGETED_STORE_MIN_BYTES {
             continue;
         }
-        let Ok(Some(document)) =
-            document_of_targets(&bytes, &args.target_settings_ids, args.exact_target_ids)
-        else {
+        let ids = (args.target_settings_ids.iter())
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let chosen = |instance: &crate::settings::bytecode::SettingsBytecodeInstance| {
+            ids.contains(instance.settings_id.as_str())
+        };
+        let Ok(Some(document)) = document_of_targets(&bytes, chosen, args.exact_target_ids) else {
             return Ok(whole());
         };
         prepared.documents.insert(service, Arc::new(document));
@@ -2184,24 +2187,74 @@ fn documents_of_targets(args: &PushEditorChangesArgs) -> Result<PreparedEditorDo
     Ok(prepared)
 }
 
-/// One store read for the instances `ids` name (see `documents_of_targets`).
+/// The stores `ps --verify` reads, each for its scripts and what tells them
+/// from their siblings: the sources alone are compared. A store that cannot
+/// be read so is read whole, and so is every store where the collection may
+/// read past its scripts.
+fn documents_of_scripts(args: &PushEditorChangesArgs) -> Result<PreparedEditorDocuments> {
+    let mut prepared = PreparedEditorDocuments::default();
+    if (!args.override_packages && args.project.project_root.join("renium-link.json").exists())
+        || files_to_studio_filter_rules(&args.project.project_root)?.is_some()
+    {
+        return Ok(prepared);
+    }
+    let (project_root, src_root) = editor_project_roots(args)?;
+    let mut paths = expand_editor_changed_paths(args)?;
+    if paths.is_empty() {
+        paths = collect_editor_full_paths(&src_root)?;
+    }
+    for path in paths {
+        let path = canonical_editor_changed_path(&project_root, &path);
+        let names_a_store = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(crate::system::files::is_service_settings_file_name);
+        let Some(service) = service_from_changed_path(&src_root, &path).filter(|_| names_a_store)
+        else {
+            continue;
+        };
+        let Ok(bytes) = fs::read(service_settings_path(&src_root.join(&service))) else {
+            continue;
+        };
+        if bytes.len() < TARGETED_STORE_MIN_BYTES {
+            continue;
+        }
+        let scripts = |instance: &crate::settings::bytecode::SettingsBytecodeInstance| {
+            is_lua_source_class(&instance.class_name)
+        };
+        if let Ok(Some(document)) = document_of_targets(&bytes, scripts, true) {
+            prepared.documents.insert(service, Arc::new(document));
+        }
+    }
+    Ok(prepared)
+}
+
+/// The changes whose sources `ps --verify` compares with Studio's.
+fn collect_verified_editor_changes(
+    args: &PushEditorChangesArgs,
+) -> Result<(EditorChangeSet, Option<config::ProjectionStage>)> {
+    let prepared = documents_of_scripts(args)?;
+    if !prepared.documents.is_empty()
+        && let Ok(collected) = collect_project_editor_changes_with_documents(args, prepared)
+    {
+        return Ok(collected);
+    }
+    collect_project_editor_changes(args)
+}
+
+/// One store read for the instances `chosen` (see `documents_of_targets`).
 /// `None` where the store holds none of them, or where so many instances are
 /// read that the whole store is as well.
 fn document_of_targets(
     bytes: &[u8],
-    ids: &[String],
+    chosen: impl Fn(&crate::settings::bytecode::SettingsBytecodeInstance) -> bool,
     exact: bool,
 ) -> Result<Option<SettingsBytecode>> {
     use crate::settings::bytecode::property_edit::decode_rows;
 
     let mut document = SettingsBytecode::decode_structure(bytes)?;
     let count = document.instances.len();
-    let ids = ids.iter().map(String::as_str).collect::<HashSet<_>>();
-    let mut read = document
-        .instances
-        .iter()
-        .map(|instance| ids.contains(instance.settings_id.as_str()))
-        .collect::<Vec<_>>();
+    let mut read = document.instances.iter().map(chosen).collect::<Vec<_>>();
     if !read.contains(&true) {
         return Ok(None);
     }
@@ -6509,15 +6562,21 @@ fn store_bytes(stores_root: &Path, service: &str) -> Result<Vec<u8>> {
     std::fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))
 }
 
-/// A push that hands its services to no binary import reads their documents
-/// whole.
-fn read_prepared_documents_whole(
+/// A push that hands its services to no binary import reads the documents
+/// an import would have carried whole: those left the instances the import
+/// takes from the store file in that file. A document of any other service
+/// that holds unread instances was compared by the instances that differ,
+/// and the others are the ones Studio holds.
+fn read_imported_documents_whole(
     args: &PushEditorChangesArgs,
     prepared: &mut PreparedEditorDocuments,
 ) -> Result<()> {
     let (_, src_root) = editor_project_roots(args)?;
+    let imported = std::mem::take(&mut prepared.native_services);
     for (service, document) in &mut prepared.documents {
-        if crate::settings::equivalence::holds_unread_instances(document) {
+        if imported.contains(service)
+            && crate::settings::equivalence::holds_unread_instances(document)
+        {
             crate::settings::equivalence::read_unread_instances(
                 Arc::make_mut(document),
                 &store_bytes(&src_root, service)?,
@@ -7912,6 +7971,109 @@ mod sync_tests {
             assert!(
                 partly >= 100 && sending >= 80,
                 "{partly} pushes read a store in part, {sending} of them sent something"
+            );
+        }
+    }
+
+    /// A verification of sources reads each store for its scripts and what
+    /// tells them from their siblings. Whatever the store holds, it compares
+    /// the sources the collection that reads the whole store gives.
+    #[test]
+    fn a_verification_reads_the_scripts_of_a_store_alone_and_compares_what_the_whole_store_gives() {
+        use crate::cli::ProjectSourceArgs;
+        use crate::settings::bytecode::SettingsBytecodeInstance;
+        use crate::tests::support::{SimRng, run_seeds};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (read_in_part, sources) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        run_seeds(200, |seed, _| {
+            let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let service = ["Workspace", "ReplicatedStorage", "ServerScriptService"][rng.below(3)];
+            let root = crate::tests::support::temp_dir(&format!("verified-scripts-{seed}"));
+            let scripts = root.join("src").join(service);
+            fs::write(root.join("renium.project.jsonc"), r#"{"schemaVersion":1}"#)
+                .map_err(|error| error.to_string())?;
+            // Scripts as files, some in folders, as a pull writes them.
+            let names = ["Crate", "Door", "Main", "Util", "Lamp", "Spawn"];
+            let mut folders = vec![scripts.clone()];
+            for _ in 0..rng.below(4) {
+                let folder = folders[rng.below(folders.len())].join(names[rng.below(6)]);
+                if !folders.contains(&folder) {
+                    folders.push(folder);
+                }
+            }
+            for folder in &folders {
+                fs::create_dir_all(folder).map_err(|error| error.to_string())?;
+            }
+            for _ in 0..3 + rng.below(8) {
+                let file = folders[rng.below(folders.len())].join(format!(
+                    "{}{}",
+                    names[rng.below(6)],
+                    [".luau", ".server.luau", ".client.luau"][rng.below(3)]
+                ));
+                fs::write(file, format!("return {}\n", rng.below(9)))
+                    .map_err(|error| error.to_string())?;
+            }
+            let mut document = crate::rbx::model::source_only_settings_document(&scripts, service)
+                .map_err(|error| format!("{error:#}"))?;
+            // What a place holds beside its scripts, namesakes of them too.
+            for index in 0..8 + rng.below(40) {
+                let mut instance = SettingsBytecodeInstance::new(
+                    format!("id{index}"),
+                    names[rng.below(6)].into(),
+                    ["Folder", "Part", "Model"][rng.below(3)].into(),
+                    Some(rng.below(document.instances.len())),
+                );
+                instance
+                    .properties
+                    .insert("Transparency".into(), json!(rng.below(5) as f64 / 4.0));
+                if rng.below(4) == 0 {
+                    instance
+                        .attributes
+                        .insert("Tier".into(), json!(rng.below(4)));
+                }
+                document.instances.push(instance);
+            }
+            document
+                .write_file(&root.join(format!("instances/{service}.renium")))
+                .map_err(|error| format!("{error:#}"))?;
+            let mut args = PushEditorChangesArgs::new(
+                ProjectSourceArgs {
+                    project_root: root.clone(),
+                    src_root: PathBuf::from("src"),
+                },
+                BridgeConnectionArgs::local(0.1),
+            );
+            args.verify = true;
+            let compared = |changes: &EditorChangeSet| json!(&changes.source_changes);
+            let prepared = documents_of_scripts(&args).map_err(|error| format!("{error:#}"))?;
+            let partly = !prepared.documents.is_empty();
+            let in_part = collect_project_editor_changes_with_documents(&args, prepared)
+                .map(|(changes, _)| compared(&changes))
+                .map_err(|error| format!("{error:#}"));
+            let whole = collect_project_editor_changes(&args)
+                .map(|(changes, _)| compared(&changes))
+                .map_err(|error| format!("{error:#}"));
+            let _ = fs::remove_dir_all(&root);
+            if in_part != whole {
+                return Err(format!(
+                    "read for its scripts the verification compares\n{in_part:?}\nand read whole\n{whole:?}"
+                ));
+            }
+            if partly && let Ok(compared) = whole {
+                read_in_part.fetch_add(1, Ordering::Relaxed);
+                sources.fetch_add(compared.as_array().map_or(0, Vec::len), Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        if std::env::var_os("RENIUM_SIM_SEED").is_none() {
+            let (partly, sources) = (
+                read_in_part.load(Ordering::Relaxed),
+                sources.load(Ordering::Relaxed),
+            );
+            assert!(
+                partly >= 100 && sources >= 1_000,
+                "{partly} verifications read a store in part and compared {sources} sources"
             );
         }
     }
