@@ -9,6 +9,7 @@ local COMMAND_OUTPUT_MESSAGE_BYTE_LIMIT = 64 * 1024
 local CLIENT_RUNNER_NAME = "__ReniumClientRunner"
 local SERVER_RUNNER_NAME = "__ReniumServerRunner"
 local MOUSE_PROBE_NAME = "__ReniumMouseProbe"
+local KEY_OBSERVE_SECONDS = 0.5
 -- Labels of the buttons that close a Roblox prompt without accepting it,
 -- most preferred first.
 local CORE_GUI_DISMISS_LABELS = {
@@ -1746,6 +1747,7 @@ updateMouse()
 			x = x,
 			y = y,
 			heldKeys = tostring(probe:GetAttribute("HeldKeys") or ""),
+			answered = probe:GetAttribute("ResponseSeq") == requestSeq,
 			viewportWidth = viewport.X,
 			viewportHeight = viewport.Y,
 		}
@@ -1912,7 +1914,7 @@ updateMouse()
 		end
 		local function gameHoldsKey(keyCode)
 			local snapshot = api.getMouseLocation({})
-			if snapshot.ok ~= true then
+			if snapshot.ok ~= true or not snapshot.answered then
 				return nil
 			end
 			for name in string.gmatch(snapshot.heldKeys, "[^,]+") do
@@ -1937,12 +1939,14 @@ updateMouse()
 				error(keyboardRefusal(sendError), 0)
 			end
 			heldKeys[keyCode] = if down then true else nil
-			RunService.Heartbeat:Wait()
-			local pressed = gameHoldsKey(keyCode)
-			if pressed ~= nil and pressed ~= down then
+			-- The game takes a key on its next input step, which a busy client
+			-- reaches some frames later.
+			local deadline = os.clock() + KEY_OBSERVE_SECONDS
+			local pressed
+			repeat
 				RunService.Heartbeat:Wait()
 				pressed = gameHoldsKey(keyCode)
-			end
+			until pressed == down or os.clock() >= deadline
 			if pressed ~= nil then
 				keysObserved[keyCode.Name] = pressed == down
 			end
