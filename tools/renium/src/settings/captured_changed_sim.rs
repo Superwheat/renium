@@ -300,6 +300,59 @@ fn shift_references(document: &mut SettingsBytecode, at: usize, added: bool) {
     }
 }
 
+/// A leaf of a stored document at the end of it, where a store edit writes
+/// an instance it adds: the state holds that one among the others.
+fn leaf_at_the_end(document: &mut SettingsBytecode, pick: usize) -> bool {
+    fn place(value: &mut Value, placed: &dyn Fn(usize) -> usize) {
+        match value {
+            Value::Object(map) => {
+                if let Some(index) = map.get("instanceIndex").and_then(Value::as_u64)
+                    && index > 0
+                {
+                    map.insert(
+                        "instanceIndex".into(),
+                        json!(placed(index as usize - 1) + 1),
+                    );
+                }
+                map.values_mut().for_each(|value| place(value, placed));
+            }
+            Value::Array(values) => values.iter_mut().for_each(|value| place(value, placed)),
+            _ => {}
+        }
+    }
+    let count = document.instances.len();
+    let leaves = (1..count - 1)
+        .filter(|index| {
+            !document
+                .instances
+                .iter()
+                .any(|row| row.parent_index == Some(*index))
+        })
+        .collect::<Vec<_>>();
+    if leaves.is_empty() {
+        return false;
+    }
+    let moved = leaves[pick % leaves.len()];
+    let row = document.instances.remove(moved);
+    document.instances.push(row);
+    let placed = |index: usize| match index.cmp(&moved) {
+        std::cmp::Ordering::Less => index,
+        std::cmp::Ordering::Equal => count - 1,
+        std::cmp::Ordering::Greater => index - 1,
+    };
+    for row in &mut document.instances {
+        row.parent_index = row.parent_index.map(placed);
+        for value in row
+            .properties
+            .values_mut()
+            .chain(row.attributes.values_mut())
+        {
+            place(value, &placed);
+        }
+    }
+    true
+}
+
 /// A new Studio session numbers its debug ids anew, at times with numbers
 /// the session before gave to other instances, and gives every instance a
 /// new UniqueId when it opens the place from its file.
@@ -586,6 +639,7 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
     let (renumbered, renumbered_from_memory) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let (renamed, renamed_and_changed) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let (grown, shrunk) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let (displaced, displaced_by_instance) = (AtomicUsize::new(0), AtomicUsize::new(0));
     run_seeds(1_200, |seed, steps| {
         let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         let native = seed % 2 == 0;
@@ -604,6 +658,7 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
             return Ok(());
         };
         let mut rows = Some(first.rows);
+        let mut at_other_places = false;
         for round in 0..6 {
             // Every few pulls Studio opened the place again before whatever
             // else changed in it.
@@ -740,6 +795,9 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
                         ));
                     }
                     by_instance.fetch_add(1, Ordering::Relaxed);
+                    if at_other_places {
+                        displaced_by_instance.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             let aligned = match aligned {
@@ -800,6 +858,19 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
             };
             if let SettingsAlignment::Changed(bytes) = aligned.alignment {
                 file = bytes;
+                at_other_places = false;
+            }
+            // A store edit wrote an instance at the end of the file that the
+            // state holds among the others; no pull remembers that file.
+            if (seed as usize + round).is_multiple_of(5)
+                && let Ok(mut stored) = decode_settings_bytecode(&file)
+                && leaf_at_the_end(&mut stored, seed as usize / 5 + round)
+                && let Ok(bytes) = encode_settings_bytecode(&stored)
+            {
+                file = bytes;
+                rows = None;
+                at_other_places = true;
+                displaced.fetch_add(1, Ordering::Relaxed);
             }
         }
         Ok(())
@@ -822,8 +893,11 @@ fn a_pull_of_changed_values_answers_what_the_whole_alignment_answers() {
                 && renamed.load(Ordering::Relaxed) >= 25
                 && renamed_and_changed.load(Ordering::Relaxed) >= 10
                 && grown.load(Ordering::Relaxed) >= 40
-                && shrunk.load(Ordering::Relaxed) >= 10,
-            "kept {kept}, written {written}, by the whole alignment {whole}, under other ids {} and {} of them from memory, under other UniqueIds {} and {} of them with other values, with an instance more {} and less {}",
+                && shrunk.load(Ordering::Relaxed) >= 10
+                && displaced_by_instance.load(Ordering::Relaxed) >= 300,
+            "of {} stores with an instance at another place {} by instance, kept {kept}, written {written}, by the whole alignment {whole}, under other ids {} and {} of them from memory, under other UniqueIds {} and {} of them with other values, with an instance more {} and less {}",
+            displaced.load(Ordering::Relaxed),
+            displaced_by_instance.load(Ordering::Relaxed),
             renumbered.load(Ordering::Relaxed),
             renumbered_from_memory.load(Ordering::Relaxed),
             renamed.load(Ordering::Relaxed),

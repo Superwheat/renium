@@ -1,5 +1,6 @@
 use super::*;
 use crate::settings::bytecode::blocks::store_payload_len;
+use crate::settings::bytecode::property_edit::Moved;
 use crate::settings::tree::settings_children_by_parent;
 
 pub(crate) fn project_replacement_paths(
@@ -100,6 +101,7 @@ pub(crate) fn prepare_project_replacement_importing(
                     observed.entries.get(path),
                     read == StoresRead::ChangedOfBoth,
                     imported.is_some(),
+                    true,
                 )?
             };
             let (decoded, bare) = match changed {
@@ -111,7 +113,9 @@ pub(crate) fn prepare_project_replacement_importing(
                     None,
                     replaced_store_alone(desired.entries.get(path), observed.entries.get(path))?,
                 ),
-                ChangedInstances::Whole(current) => (current, None),
+                ChangedInstances::Whole(current) | ChangedInstances::Apart(current) => {
+                    (current, None)
+                }
                 ChangedInstances::Imported(copies) => {
                     if let Some(imported) = imported {
                         imported
@@ -262,16 +266,89 @@ fn states_viewport(document: &SettingsBytecode) -> bool {
     })
 }
 
-/// Whether a plan sends nothing but values of instances both copies hold:
-/// nothing is created anew, removed or imported, so no instance beside the
-/// ones that differ, their ancestors and their namesakes is read to carry
-/// it out. Any other plan is made from the files' whole copies.
+/// Whether a plan is carried out from the instances that differ: it sends
+/// values of instances both copies hold, creates instances the files alone
+/// hold and removes instances Studio alone holds, which are read with their
+/// ancestors and their namesakes. An instance of another class, or a solid
+/// cut anew, is created in the place of the one it removes and takes what
+/// stands under that one with it, and an import reads the store: such a plan
+/// is made from the files' whole copies. So is one that moves an instance
+/// to another store, where an instance that differs in nothing refers to it
+/// (`moved_between_stores`).
 pub(crate) fn plan_reads_changed_alone(plan: &ReconcilePushPlan) -> bool {
     plan.initial_native_services.is_empty()
-        && plan.recreated_settings_ids.is_empty()
-        && plan.recreated_instances.is_empty()
         && plan.previous_class_names.is_empty()
-        && plan.instance_deletes.is_empty()
+        && !plan
+            .instance_deletes
+            .iter()
+            .flat_map(|change| &change.instances)
+            .any(|removed| plan.recreated_settings_ids.contains(&removed.settings_id))
+}
+
+/// The ids of the instances a plan removes from one store and creates in
+/// another, where those alone keep it from being carried out from the
+/// instances that differ. What refers to such an instance names it by its
+/// id; of the instances that differ in nothing, only one that does so has
+/// to be read (`unread_instance_refers`).
+pub(crate) fn moved_between_stores(plan: &ReconcilePushPlan) -> Option<HashSet<String>> {
+    if !plan.initial_native_services.is_empty() || !plan.previous_class_names.is_empty() {
+        return None;
+    }
+    let mut moved = HashSet::new();
+    for change in &plan.instance_deletes {
+        for removed in &change.instances {
+            let id = &removed.settings_id;
+            if !plan.recreated_settings_ids.contains(id) {
+                continue;
+            }
+            if plan
+                .recreated_instances
+                .contains(&(change.service.clone(), id.clone()))
+            {
+                return None;
+            }
+            moved.insert(id.clone());
+        }
+    }
+    Some(moved)
+}
+
+/// Whether an instance of a store that `current` holds unread refers to one
+/// of `ids` by its id.
+pub(crate) fn unread_instance_refers(
+    entry: Option<&SnapshotEntry>,
+    current: &SettingsBytecode,
+    ids: &HashSet<String>,
+) -> Result<bool> {
+    use crate::settings::bytecode::property_edit::{decode_rows, whole_row_digests};
+    let Some(SnapshotEntry::File(bytes)) = entry else {
+        return Ok(true);
+    };
+    let Some(rows) = whole_row_digests(bytes, |_| Some((None, None)))? else {
+        return Ok(true);
+    };
+    let mut unread = rows
+        .named
+        .into_iter()
+        .filter(|row| {
+            current.instances.get(*row).is_none_or(|instance| {
+                crate::settings::held::stands_unchanged(&instance.properties)
+            })
+        })
+        .collect::<Vec<_>>();
+    unread.sort_unstable();
+    unread.dedup();
+    if unread.is_empty() {
+        return Ok(false);
+    }
+    let (instances, _) = decode_rows(bytes, &unread)?;
+    Ok(instances.iter().any(|instance| {
+        instance
+            .properties
+            .values()
+            .chain(instance.attributes.values())
+            .any(|value| super::push_plan::value_references_any(value, ids))
+    }))
 }
 
 /// What `changed_instances_alone` makes of two copies of a store.
@@ -284,6 +361,10 @@ enum ChangedInstances {
     /// The store is imported anew (`imported_store`): the files' copy
     /// beside what Studio keeps of its own.
     Imported(Box<(SettingsBytecode, SettingsBytecode)>),
+    /// The two hold their instances at other places, or other instances
+    /// than one run: `changed_instances_alone` then pairs each by itself.
+    /// With the files' copy where it is decoded.
+    Apart(Option<SettingsBytecode>),
 }
 
 /// A store file smaller than this is read whole: two documents of it are
@@ -333,7 +414,7 @@ fn told_apart(
     (desired_bytes, observed_bytes): (&[u8], &[u8]),
     differing: &[(usize, usize)],
     differs: &mut [bool],
-    moved: Option<crate::settings::bytecode::property_edit::Moved>,
+    moved: Option<&Moved>,
 ) -> Result<usize> {
     use crate::settings::bytecode::property_edit::decode_for_property_edit;
     use crate::settings::equivalence::canonicalize_instances;
@@ -384,10 +465,16 @@ fn told_apart(
                 moved.in_state_whole(instance);
             }
         }
+        // Instances paired each by itself can stand under another name or
+        // parent, which a push sends as well.
         let differ = of_files
             .par_iter()
             .zip(&of_studio)
-            .map(|(files, studio)| !instance_values_equal(None, files, studio))
+            .map(|(files, studio)| {
+                files.name != studio.name
+                    || files.parent_index != studio.parent_index
+                    || !instance_values_equal(None, files, studio)
+            })
             .collect::<Vec<_>>();
         for ((_, row), differ) in pairs.iter().zip(differ) {
             differs[*row] = differ;
@@ -514,11 +601,10 @@ fn imported_store(
 /// instance ahead says it does not. An instance of the run under a UniqueId
 /// the other copy holds was moved, not added.
 fn run_is_told(
-    moved: crate::settings::bytecode::property_edit::Moved,
+    (run, of_files): (std::ops::Range<usize>, bool),
     files: &[SettingsBytecodeInstance],
     studio: &[SettingsBytecodeInstance],
 ) -> bool {
-    let (run, of_files) = moved.run();
     let (longer, shorter) = if of_files {
         (files, studio)
     } else {
@@ -587,20 +673,94 @@ fn imported_anew(
 ///
 /// With `files_too` the files' copy is read the same way: a push that sends
 /// nothing but values of existing instances reads no other instance of it.
+///
+/// Copies that hold their instances at other places, as after an instance
+/// was added to the files under a folder and pushed, or more than one run
+/// apart, are read the same way where an id, a UniqueId or its place under
+/// its parent tells every instance by itself (`told_alone`).
+///
+/// `viewport_first` is the order of a push that replaces: the files take the
+/// camera of the viewport from Studio before the two are compared.
 fn changed_instances_alone(
     desired: Option<&SnapshotEntry>,
     observed: Option<&SnapshotEntry>,
     files_too: bool,
     imports_heavy: bool,
+    viewport_first: bool,
+) -> Result<ChangedInstances> {
+    let how = (files_too, imports_heavy, viewport_first);
+    let current = match changed_instances_placed(desired, observed, how, None)? {
+        ChangedInstances::Apart(current) => current,
+        changed => return Ok(changed),
+    };
+    if files_too
+        && let (Some(SnapshotEntry::File(files)), Some(SnapshotEntry::File(studio))) =
+            (desired, observed)
+        && let Some(told) = told_alone(files, studio)
+    {
+        return Ok(
+            match changed_instances_placed(desired, observed, how, Some(told))? {
+                ChangedInstances::Apart(current) => ChangedInstances::Whole(current),
+                changed => {
+                    #[cfg(test)]
+                    if matches!(changed, ChangedInstances::Prepared(_)) {
+                        TOLD_ALONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    changed
+                }
+            },
+        );
+    }
+    Ok(ChangedInstances::Whole(current))
+}
+
+/// The stores prepared from instances paired each by itself.
+#[cfg(test)]
+pub(crate) static TOLD_ALONE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How Studio's instances stand among the files', each paired by itself,
+/// and the id the alignment gives each (`settings_ids_told_alone`). Of each
+/// copy only the instances with their UniqueIds, and the camera a root
+/// names, are read. `None` where the whole documents have to say.
+fn told_alone(desired_bytes: &[u8], observed_bytes: &[u8]) -> Option<(Moved, Vec<String>)> {
+    use crate::settings::bytecode::property_edit::decode_for_row_chunks;
+    let _span = crate::app::profile::span("store instances told alone");
+    let bare = |bytes: &[u8]| {
+        let (mut document, columns) = decode_for_row_chunks(bytes).ok()?;
+        columns
+            .project_properties(
+                &mut document,
+                |name| name == "UniqueId" || name == "CurrentCamera",
+                |instance, name, value| {
+                    (name == "UniqueId" || instance.parent_index.is_none()).then_some(value)
+                },
+            )
+            .ok()?;
+        Some(document)
+    };
+    let (files, studio) = rayon::join(|| bare(desired_bytes), || bare(observed_bytes));
+    let (files, studio) = (files?, studio?);
+    let (ids, places) = crate::settings::equivalence::settings_ids_told_alone(&files, &studio)?;
+    Some((Moved::paired(places, files.instances.len()), ids))
+}
+
+/// `changed_instances_alone` for copies whose instances stand at the same
+/// places, one run apart, or as `told` pairs them.
+fn changed_instances_placed(
+    desired: Option<&SnapshotEntry>,
+    observed: Option<&SnapshotEntry>,
+    (files_too, imports_heavy, viewport_first): (bool, bool, bool),
+    told: Option<(Moved, Vec<String>)>,
 ) -> Result<ChangedInstances> {
     use crate::settings::bytecode::blocks::instance_count;
     use crate::settings::bytecode::property_edit::{
-        Moved, StoreRows, decode_for_row_chunks, decode_rows, names_an_instance_by_id,
-        whole_row_digests, whole_row_digests_of_both,
+        StoreRows, decode_for_row_chunks, decode_rows, names_an_instance_by_id, whole_row_digests,
+        whole_row_digests_of_both,
     };
     use crate::settings::equivalence::{
         align_settings_ids_beside_run, align_settings_ids_by_place,
-        inherit_workspace_viewport_reference, stabilize_settings_reference_ids,
+        inherit_workspace_viewport_reference, stabilize_settings_reference_ids, take_settings_ids,
     };
 
     let (Some(SnapshotEntry::File(desired_bytes)), Some(SnapshotEntry::File(observed_bytes))) =
@@ -639,11 +799,14 @@ fn changed_instances_alone(
     // its document holds them where Studio has them.
     let own_parents = std::sync::OnceLock::new();
     let stand = |studio: &[SettingsBytecodeInstance]| {
-        let moved = (!as_many)
-            .then(|| decode_for_row_chunks(desired_bytes).ok())
-            .flatten()
-            .and_then(|(files, _)| Moved::between_copies(studio, &files.instances))
-            .flatten();
+        let moved = match &told {
+            Some((moved, _)) => Some(moved.clone()),
+            None => (!as_many)
+                .then(|| decode_for_row_chunks(desired_bytes).ok())
+                .flatten()
+                .and_then(|(files, _)| Moved::between_copies(studio, &files.instances))
+                .flatten(),
+        };
         if moved.is_some() {
             let parents = studio.iter().map(|instance| instance.parent_index);
             let _ = own_parents.set(parents.collect::<Vec<_>>());
@@ -651,7 +814,7 @@ fn changed_instances_alone(
         Some((None, moved))
     };
     let (observed_rows, files) = if files_too {
-        let (files, observed_rows) = if as_many {
+        let (files, observed_rows) = if as_many && told.is_none() {
             whole_row_digests_of_both(desired_bytes, observed_bytes)
         } else {
             rayon::join(
@@ -700,7 +863,7 @@ fn changed_instances_alone(
         }));
     };
     let mut skeleton = observed_rows.instances;
-    if let (Some(_), Some(parents)) = (observed_rows.moved, own_parents.get()) {
+    if let (Some(_), Some(parents)) = (&observed_rows.moved, own_parents.get()) {
         for (instance, parent) in skeleton.iter_mut().zip(parents) {
             instance.parent_index = *parent;
         }
@@ -726,10 +889,12 @@ fn changed_instances_alone(
     let moved = observed_rows.moved;
     let same_places = files_digests.len() == count
         && observed_rows.digests.len() == studio_count
-        && match moved {
+        && match moved.as_ref().map(Moved::run) {
             // Each instance beside the run stands under the name, class and
             // parent of its counterpart (`Moved::between_copies`).
-            Some(moved) => moved.run().0.len() == count.abs_diff(studio_count),
+            Some(Some((run, _))) => run.len() == count.abs_diff(studio_count),
+            // Paired each by itself, under whatever name or parent.
+            Some(None) => true,
             None => {
                 studio_count == count
                     && files_instances
@@ -748,9 +913,14 @@ fn changed_instances_alone(
             Files::Rows(_) => None,
         }))
     };
-    if !same_places || moved.is_some_and(|moved| !run_is_told(moved, files_instances, &skeleton)) {
-        return hand_over(files);
+    let run = moved.as_ref().and_then(Moved::run);
+    if !same_places || run.is_some_and(|run| !run_is_told(run, files_instances, &skeleton)) {
+        return Ok(ChangedInstances::Apart(match files {
+            Files::Whole(current, ..) => Some(current),
+            Files::Rows(_) => None,
+        }));
     }
+    let moved = moved.as_ref();
     // The files' instance each of Studio's stands for, and Studio's for
     // each of the files': none for an instance of the run.
     let files_of = |studio: usize| moved.map_or(Some(studio), |moved| moved.in_state(studio));
@@ -778,8 +948,14 @@ fn changed_instances_alone(
             .filter_map(|index| Some((files_of(index)?, index)))
             .collect::<Vec<_>>();
         let copies = (desired_bytes.as_slice(), observed_bytes.as_slice());
+        // With the instances one copy alone holds.
         let unlike = told_apart(copies, &differing, &mut differs, moved)?
-            + moved.map_or(0, |moved| moved.run().0.len());
+            + (0..studio_count)
+                .filter(|&index| files_of(index).is_none())
+                .count()
+            + (0..count)
+                .filter(|&index| studio_of(index).is_none())
+                .count();
         if unlike > MAX_CHANGED_INSTANCES && imports_heavy {
             // Neither copy is whole beside the ones the import reads.
             drop(files);
@@ -835,9 +1011,13 @@ fn changed_instances_alone(
     if settings_documents_positionally_equivalent(&current, &previous) {
         return Ok(ChangedInstances::None);
     }
-    let aligned = match moved.map(Moved::run) {
-        None => align_settings_ids_by_place(&current, &mut previous),
-        Some((run, of_files)) => {
+    let aligned = match (told, moved.and_then(Moved::run)) {
+        (Some((_, ids)), _) => {
+            take_settings_ids(&mut previous, ids);
+            true
+        }
+        (None, None) => align_settings_ids_by_place(&current, &mut previous),
+        (None, Some((run, of_files))) => {
             align_settings_ids_beside_run(&mut current, &mut previous, run, !of_files)
         }
     };
@@ -856,9 +1036,14 @@ fn changed_instances_alone(
     if !reusable || service_has_only_native_containers(&previous) {
         return hand_over(current);
     }
-    inherit_workspace_viewport_reference(&mut current, &previous);
+    if viewport_first {
+        inherit_workspace_viewport_reference(&mut current, &previous);
+    }
     if settings_documents_equivalent(&current, &previous) {
         return Ok(ChangedInstances::None);
+    }
+    if !viewport_first {
+        inherit_workspace_viewport_reference(&mut current, &previous);
     }
     // A delta heavy enough to replace the service is one import of the
     // store, as `promote_heavy_deltas_to_replacement` makes it; where the
@@ -1060,10 +1245,38 @@ fn read_where_paired(
     Ok(())
 }
 
+/// Whether two copies of a store are equivalent, by the instances that
+/// differ (`changed_instances_alone`), with the change where they are not
+/// and `prepared` takes one. `None` where the whole documents have to say
+/// (`snapshot_entry_equivalent`).
+fn store_copies_by_changed(
+    left: Option<&SnapshotEntry>,
+    right: Option<&SnapshotEntry>,
+    prepared: Option<&mut Option<PreparedEditorSettingsChange>>,
+) -> Result<Option<bool>> {
+    Ok(
+        match changed_instances_alone(left, right, true, false, false)? {
+            ChangedInstances::None => Some(true),
+            ChangedInstances::Prepared(mut change) => {
+                if let Some(prepared) = prepared {
+                    align_equivalent_values(&change.current, &mut change.previous);
+                    *prepared = Some(*change);
+                }
+                Some(false)
+            }
+            _ => None,
+        },
+    )
+}
+
+/// The paths at which two snapshots differ, with the change of each store
+/// where `prepared` takes them. With `by_changed` a store is compared by
+/// the instances that differ where that says as much as its whole documents.
 pub(crate) fn snapshot_differences_prepared(
     left: &ProjectSnapshot,
     right: &ProjectSnapshot,
     mut prepared: Option<&mut HashMap<PathBuf, PreparedEditorSettingsChange>>,
+    by_changed: bool,
 ) -> Result<HashSet<PathBuf>> {
     let mut paths = left
         .entries
@@ -1078,12 +1291,27 @@ pub(crate) fn snapshot_differences_prepared(
         .into_par_iter()
         .map(|path| {
             let mut settings = None;
-            let equivalent = snapshot_entry_equivalent(
-                &path,
-                left.entries.get(&path),
-                right.entries.get(&path),
-                prepare.then_some(&mut settings),
-            )?;
+            let (ours, theirs) = (left.entries.get(&path), right.entries.get(&path));
+            let store = by_changed
+                && ours != theirs
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_service_settings_file_name);
+            let told = if store {
+                store_copies_by_changed(ours, theirs, prepare.then_some(&mut settings))?
+            } else {
+                None
+            };
+            let equivalent = match told {
+                Some(equivalent) => equivalent,
+                None => snapshot_entry_equivalent(
+                    &path,
+                    ours,
+                    theirs,
+                    prepare.then_some(&mut settings),
+                )?,
+            };
             Ok((!equivalent).then_some((path, settings)))
         })
         .collect::<Result<Vec<_>>>()?;

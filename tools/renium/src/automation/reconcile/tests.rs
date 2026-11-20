@@ -4407,7 +4407,8 @@ fn prepared_full_push_reuses_the_same_duplicate_and_reference_mapping() {
     let studio = snapshot(&observed);
     let project = snapshot(&desired);
     let mut prepared = HashMap::new();
-    let paths = snapshot_differences_prepared(&project, &studio, Some(&mut prepared)).unwrap();
+    let paths =
+        snapshot_differences_prepared(&project, &studio, Some(&mut prepared), false).unwrap();
     assert_eq!(paths, snapshot_differences(&project, &studio).unwrap());
     assert_eq!(prepared.len(), 1);
     let change = &prepared[&path];
@@ -6940,11 +6941,9 @@ fn change_an_instance(rng: &mut crate::tests::support::SimRng, document: &mut Se
     }
 }
 
-/// One run of instances more in a store, or one less, as a store edit
-/// leaves it: an instance somewhere among the others, at times with a child
-/// and at times the namesake of another, or a leaf gone. Every reference by
-/// position follows the instances.
-fn add_or_remove_a_run(rng: &mut crate::tests::support::SimRng, document: &mut SettingsBytecode) {
+/// Every parent and every reference by position of a store at the place
+/// `placed` gives its instance.
+fn place_instances(document: &mut SettingsBytecode, placed: &dyn Fn(usize) -> Option<usize>) {
     fn place(value: &mut Value, placed: &dyn Fn(usize) -> Option<usize>) {
         match value {
             Value::Object(map) => {
@@ -6961,18 +6960,55 @@ fn add_or_remove_a_run(rng: &mut crate::tests::support::SimRng, document: &mut S
             _ => {}
         }
     }
-    let place_all = |document: &mut SettingsBytecode, placed: &dyn Fn(usize) -> Option<usize>| {
-        for instance in &mut document.instances {
-            instance.parent_index = instance.parent_index.and_then(placed);
-            for value in instance
-                .properties
-                .values_mut()
-                .chain(instance.attributes.values_mut())
-            {
-                place(value, placed);
-            }
+    for instance in &mut document.instances {
+        instance.parent_index = instance.parent_index.and_then(placed);
+        for value in instance
+            .properties
+            .values_mut()
+            .chain(instance.attributes.values_mut())
+        {
+            place(value, placed);
         }
-    };
+    }
+}
+
+/// A leaf goes to the end of its store, where a store edit writes an
+/// instance it adds: Studio holds that one among the others, as the last
+/// child of its parent.
+fn move_a_leaf_to_the_end(
+    rng: &mut crate::tests::support::SimRng,
+    document: &mut SettingsBytecode,
+) {
+    let count = document.instances.len();
+    let leaves = (1..count)
+        .filter(|index| {
+            !document
+                .instances
+                .iter()
+                .any(|instance| instance.parent_index == Some(*index))
+        })
+        .collect::<Vec<_>>();
+    if leaves.is_empty() {
+        return;
+    }
+    let moved = leaves[rng.below(leaves.len())];
+    let instance = document.instances.remove(moved);
+    document.instances.push(instance);
+    place_instances(document, &|index| {
+        Some(match index.cmp(&moved) {
+            std::cmp::Ordering::Less => index,
+            std::cmp::Ordering::Equal => count - 1,
+            std::cmp::Ordering::Greater => index - 1,
+        })
+    });
+}
+
+/// One run of instances more in a store, or one less, as a store edit
+/// leaves it: an instance somewhere among the others, at times with a child
+/// and at times the namesake of another, or a leaf gone. Every reference by
+/// position follows the instances.
+fn add_or_remove_a_run(rng: &mut crate::tests::support::SimRng, document: &mut SettingsBytecode) {
+    let place_all = place_instances;
     let count = document.instances.len();
     if rng.below(2) == 0 {
         let leaves = (1..count)
@@ -7084,6 +7120,9 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
     let from_blocks_of_both = AtomicUsize::new(0);
     let beside_a_run = AtomicUsize::new(0);
     let runs = AtomicUsize::new(0);
+    let runs_sent_from_both = AtomicUsize::new(0);
+    let compared_by_changed = AtomicUsize::new(0);
+    let told_alone_before = super::replacement::TOLD_ALONE.load(Ordering::Relaxed);
     run_seeds(300, |seed, _| {
         use crate::settings::bytecode::blocks::sim::{blocks_of_both, in_blocks};
         let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
@@ -7120,6 +7159,11 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
         // A store edit added an instance to the files, or took one away.
         if seed % 3 == 0 {
             add_or_remove_a_run(&mut rng, &mut files);
+        }
+        // The files hold an instance at the end that Studio holds among
+        // the others.
+        if seed % 5 == 1 && seed % 3 != 0 {
+            move_a_leaf_to_the_end(&mut rng, &mut files);
         }
         let run = files.instances.len() != studio.instances.len();
         if run {
@@ -7297,6 +7341,63 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
                 "read by the changed instances of both copies the plan reads them alone: {alone}, read whole: {expected_alone}"
             ));
         }
+        // A push that replaces nothing compares the two copies the same
+        // way: whether they differ, and the push its plan makes, which a
+        // plan the instances that differ do not carry out makes from the
+        // whole copies.
+        let compared = |by_changed: bool| -> Result<(Vec<String>, bool), String> {
+            let mut prepared = HashMap::new();
+            let differences =
+                snapshot_differences_prepared(&desired, &observed, Some(&mut prepared), by_changed)
+                    .map_err(|error| format!("compare: {error:#}"))?;
+            let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+                &observed,
+                &desired,
+                &differences,
+                &prepared,
+                true,
+                false,
+            );
+            let stands = plan.as_ref().is_ok_and(plan_reads_changed_alone)
+                && prepared.get(&path).is_some_and(|change| {
+                    crate::settings::equivalence::holds_unread_instances(&change.current)
+                });
+            let plan = match plan {
+                Ok(plan) if by_changed => super::push_flow::plan_from_whole_stores(
+                    (StoresRead::ChangedOfBoth, false, plan),
+                    (&desired, &observed),
+                    &differences,
+                    &mut prepared,
+                ),
+                plan => plan,
+            };
+            let mut said = vec![format!("differs {}", differences.contains(&path))];
+            match plan {
+                Ok(plan) => {
+                    said.push(plan_text(&plan));
+                    if !plan.target_settings_ids.is_empty() {
+                        said.push(match sent(&mut prepared, plan) {
+                            Ok(sent) => sent,
+                            Err(error) => format!("not sent: {error}"),
+                        });
+                    }
+                }
+                Err(error) => said.push(format!("no plan: {error:#}")),
+            }
+            Ok((said, stands))
+        };
+        let (whole_compared, _) = compared(false)?;
+        let (by_changed, compared_stand) = compared(true)?;
+        if by_changed != whole_compared {
+            return Err(format!(
+                "compared by the changed instances:\n{}\ncompared whole:\n{}",
+                by_changed.join("\n"),
+                whole_compared.join("\n")
+            ));
+        }
+        if compared_stand {
+            compared_by_changed.fetch_add(1, Ordering::Relaxed);
+        }
         let _ = std::fs::remove_dir_all(&project_root);
         if alone && of_both != expected {
             return Err(format!(
@@ -7325,6 +7426,11 @@ from the whole documents:
                 .any(|said| said.contains("whole instances") && said.contains("\"properties\":{\""))
             {
                 sent_from_both.fetch_add(1, Ordering::Relaxed);
+            }
+            // A plan that creates or removes the instances of a run is
+            // carried out from them as well.
+            if run && of_both.iter().any(|said| said.contains("whole instances")) {
+                runs_sent_from_both.fetch_add(1, Ordering::Relaxed);
             }
         }
         if said != expected {
@@ -7366,8 +7472,18 @@ from the whole documents:
             &from_blocks_of_both,
             &beside_a_run,
             &runs,
+            &runs_sent_from_both,
         ]
         .map(|count| count.load(Ordering::Relaxed));
+        // The stores whose instances stand at other places in the two
+        // copies and were prepared from the ones that differ all the same.
+        let told_alone = super::replacement::TOLD_ALONE.load(Ordering::Relaxed) - told_alone_before;
+        assert!(told_alone >= 100, "paired each by itself: {told_alone}");
+        let compared = compared_by_changed.load(Ordering::Relaxed);
+        assert!(
+            compared >= 100,
+            "compared by the changed instances: {compared}"
+        );
         assert!(
             counts[0] >= 30
                 && counts[1] >= 30
@@ -7377,8 +7493,9 @@ from the whole documents:
                 && counts[5] >= 12
                 && counts[6] >= 8
                 && counts[7] >= 8
-                && counts[8] * 100 >= counts[9] * RUNS_READ_SO,
-            "prepared from the changed instances {} ({} of them under other ids, {} with both copies read so, {} of those with values sent, {} of them with blocks both hold, {} beside a run of instances one copy alone holds, of {} such), from whole documents {}, with a plan {}, unchanged {}",
+                && counts[8] * 100 >= counts[9] * RUNS_READ_SO
+                && counts[10] >= 20,
+            "prepared from the changed instances {} ({} of them under other ids, {} with both copies read so, {} of those with values sent, {} of them with blocks both hold, {} beside a run of instances one copy alone holds, of {} such, {} of them sent from both), from whole documents {}, with a plan {}, unchanged {}",
             counts[0],
             counts[4],
             counts[5],
@@ -7386,6 +7503,7 @@ from the whole documents:
             counts[7],
             counts[8],
             counts[9],
+            counts[10],
             counts[1],
             counts[2],
             counts[3]
@@ -7459,6 +7577,9 @@ fn the_namesake_of_a_union_cut_anew_is_read_from_the_store_studio_holds() {
             &observed, &desired, &paths, &prepared, false, false,
         )
         .unwrap();
+        // What stands under the old union goes to the new one, so the
+        // instances that differ do not carry this plan out.
+        assert!(!plan_reads_changed_alone(&plan));
         serde_json::to_string(&plan.instance_deletes).unwrap()
     };
     let request = removals(false);
@@ -7590,7 +7711,7 @@ fn a_store_most_of_whose_instances_differ_is_imported_anew() {
         .unwrap();
         // The plan is carried out from the documents it was made from.
         let plan = super::push_flow::plan_from_whole_stores(
-            (read, plan),
+            (read, true, plan),
             (&desired, &observed),
             &paths,
             &mut prepared,
@@ -7717,6 +7838,262 @@ fn a_store_most_of_whose_instances_differ_is_imported_anew() {
     let (imported, plan, previous) = pushed(&same, &studio, StoresRead::ChangedOfBoth);
     assert!(!imported && previous.is_empty());
     assert_eq!(plan, pushed(&same, &studio, StoresRead::Whole).1);
+}
+
+/// An instance the files hold in another store than Studio does is removed
+/// from one and created in the other. Prepared from the instances that
+/// differ, with what refers to the moved one, the push says and sends what
+/// the push prepared from the whole documents says and sends.
+#[test]
+fn an_instance_moved_to_another_store_is_pushed_from_the_changed_instances_as_the_whole_documents_push_it()
+ {
+    use crate::settings::bytecode::blocks::sim::in_blocks;
+    use crate::tests::support::{SimRng, run_seeds};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (moved_alone, with_referrers) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let referred_unchanged = AtomicUsize::new(0);
+    run_seeds(200, |seed, _| {
+        let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let block_rows = [1, 3, 8, 4096][(seed >> 2) as usize % 4];
+        let mut studio_a = changed_instances_store(&mut rng);
+        let refers = |instance: &SettingsBytecodeInstance| {
+            let values = format!("{:?}{:?}", instance.properties, instance.attributes);
+            values.contains("instanceIndex") || values.contains("settingsId")
+        };
+        let leaves = (1..studio_a.instances.len())
+            .filter(|index| {
+                let instance = &studio_a.instances[*index];
+                instance.class_name != "Camera"
+                    && !refers(instance)
+                    && !studio_a
+                        .instances
+                        .iter()
+                        .any(|other| other.parent_index == Some(*index))
+            })
+            .collect::<Vec<_>>();
+        if leaves.is_empty() {
+            return Ok(());
+        }
+        let at = leaves[rng.below(leaves.len())];
+        let id = studio_a.instances[at].settings_id.clone();
+        let mut studio_b = SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance::new(
+                "rs".into(),
+                "ReplicatedStorage".into(),
+                "ReplicatedStorage".into(),
+                None,
+            )],
+        };
+        for index in 0..1 + rng.below(6) {
+            let mut instance = SettingsBytecodeInstance::new(
+                format!("b{index}"),
+                ["Shared", "Assets", "Shared", "Kit"][rng.below(4)].into(),
+                ["Folder", "Part"][rng.below(2)].into(),
+                Some(rng.below(index + 1)),
+            );
+            instance
+                .properties
+                .insert("Transparency".into(), json!(rng.below(4) as f64 / 4.0));
+            studio_b.instances.push(instance);
+        }
+        // What refers to the moved instance names it by its place in the
+        // store that holds it and by its id from another store.
+        let by_id = json!({"_type": "Ref", "settingsId": id});
+        let pointer = |store: &str, index: usize, parent: usize, value: Value| {
+            let mut instance = SettingsBytecodeInstance::new(
+                format!("{store}-pointer{index}"),
+                "Pointer".into(),
+                "ObjectValue".into(),
+                Some(parent),
+            );
+            instance.properties.insert("Value".into(), value);
+            instance
+        };
+        let (in_a, in_b) = (rng.below(3), rng.below(3));
+        let mut files_a = studio_a.clone();
+        for index in 0..in_a {
+            let here = json!({"_type": "Ref", "instanceIndex": at + 1});
+            studio_a.instances.push(pointer("a", index, 0, here));
+            files_a
+                .instances
+                .push(pointer("a", index, 0, by_id.clone()));
+        }
+        let moved = files_a.instances.remove(at);
+        place_instances(&mut files_a, &|index| match index.cmp(&at) {
+            std::cmp::Ordering::Less => Some(index),
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some(index - 1),
+        });
+        let mut files_b = studio_b.clone();
+        let parent = rng.below(files_b.instances.len());
+        let there = files_b.instances.len() + in_b;
+        for index in 0..in_b {
+            let parent = rng.below(studio_b.instances.len());
+            studio_b
+                .instances
+                .push(pointer("b", index, parent, by_id.clone()));
+            let here = json!({"_type": "Ref", "instanceIndex": there + 1});
+            files_b.instances.push(pointer("b", index, parent, here));
+        }
+        files_b.instances.push(SettingsBytecodeInstance {
+            parent_index: Some(parent),
+            ..moved
+        });
+        // A third store refers to it by its id in both copies: an instance
+        // that differs in nothing, beside one that does.
+        let mut studio_c = SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance::new(
+                "ss".into(),
+                "ServerStorage".into(),
+                "ServerStorage".into(),
+                None,
+            )],
+        };
+        let in_c = rng.below(3);
+        for index in 0..in_c {
+            studio_c
+                .instances
+                .push(pointer("c", index, 0, by_id.clone()));
+        }
+        for index in 0..2 + rng.below(4) {
+            let mut instance = SettingsBytecodeInstance::new(
+                format!("c{index}"),
+                "Crate".into(),
+                "Part".into(),
+                Some(0),
+            );
+            instance
+                .properties
+                .insert("Transparency".into(), json!(0.25));
+            studio_c.instances.push(instance);
+        }
+        let mut files_c = studio_c.clone();
+        if let Some(instance) = files_c.instances.last_mut() {
+            instance
+                .properties
+                .insert("Transparency".into(), json!(0.5));
+        }
+        let stores = ["Workspace", "ReplicatedStorage", "ServerStorage"]
+            .map(|service| PathBuf::from(format!("src/{service}/__roblox_sync_settings.renium")));
+        let snapshot = |documents: [&SettingsBytecode; 3]| {
+            let mut entries = BTreeMap::new();
+            for (path, document) in stores.iter().zip(documents) {
+                let bytes =
+                    in_blocks(document, block_rows).map_err(|error| format!("{error:#}"))?;
+                entries.insert(path.clone(), SnapshotEntry::File(bytes));
+            }
+            Ok::<_, String>(ProjectSnapshot { entries })
+        };
+        let (Ok(desired), Ok(observed)) = (
+            snapshot([&files_a, &files_b, &files_c]),
+            snapshot([&studio_a, &studio_b, &studio_c]),
+        ) else {
+            return Ok(());
+        };
+        let paths = project_replacement_paths(&desired, &observed);
+        let project_root = crate::tests::support::temp_dir(&format!("moved-instance-{seed}"));
+        for (path, entry) in &desired.entries {
+            let store = project_root.join(path);
+            std::fs::create_dir_all(store.parent().unwrap()).map_err(|error| error.to_string())?;
+            if let SnapshotEntry::File(bytes) = entry {
+                std::fs::write(&store, bytes).map_err(|error| error.to_string())?;
+            }
+        }
+        let pushed = |read: StoresRead| -> Result<(Vec<String>, bool, usize), String> {
+            let mut prepared = HashMap::new();
+            prepare_project_replacement_from(&desired, &observed, &paths, &mut prepared, read)
+                .map_err(|error| format!("prepare: {error:#}"))?;
+            let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+                &observed, &desired, &paths, &prepared, true, false,
+            )
+            .map_err(|error| format!("plan: {error:#}"))?;
+            // The plan as the push carries it out.
+            let plan = super::push_flow::plan_from_whole_stores(
+                (read, true, plan),
+                (&desired, &observed),
+                &paths,
+                &mut prepared,
+            )
+            .map_err(|error| format!("plan from whole stores: {error:#}"))?;
+            // Whether a store is still read for what differs alone.
+            let alone = prepared.values().any(|change| {
+                crate::settings::equivalence::holds_unread_instances(&change.current)
+            });
+            let targets = plan.target_settings_ids.len();
+            let mut said = vec![plan_text(&plan)];
+            let mut args = crate::cli::PushEditorChangesArgs::new(
+                crate::cli::ProjectSourceArgs {
+                    project_root: project_root.clone(),
+                    src_root: PathBuf::from("src"),
+                },
+                crate::cli::BridgeConnectionArgs::local(0.1),
+            );
+            args.changed_paths.clone_from(&plan.changed_paths);
+            args.target_settings_ids
+                .clone_from(&plan.target_settings_ids);
+            args.exact_target_ids = true;
+            args.targets_extend_paths = true;
+            args.override_packages = true;
+            let documents = prepared
+                .into_iter()
+                .map(|(path, change)| {
+                    let service = ["Workspace", "ReplicatedStorage", "ServerStorage"]
+                        [stores.iter().position(|store| *store == path).unwrap_or(0)];
+                    (service.to_string(), Arc::new(change.current))
+                })
+                .collect();
+            let sent = crate::editor::sync::collect_prepared_editor_changes(
+                &args,
+                documents,
+                HashSet::new(),
+            )
+            .map_err(|error| format!("collect: {error:#}"))
+            .and_then(|mut changes| {
+                super::push_plan::amend_reconciled_changes(&mut changes, plan)
+                    .map_err(|error| format!("amend: {error:#}"))?;
+                request_text(&changes)
+            });
+            said.push(sent.unwrap_or_else(|error| format!("not sent: {error}")));
+            Ok((said, alone, targets))
+        };
+        let whole = pushed(StoresRead::Whole);
+        let of_both = pushed(StoresRead::ChangedOfBoth);
+        let _ = std::fs::remove_dir_all(&project_root);
+        let (whole, _, _) = whole?;
+        let (of_both, alone, targets) = of_both?;
+        if of_both != whole {
+            return Err(format!(
+                "from the changed instances of both copies:\n{}\nfrom the whole documents:\n{}",
+                of_both.join("\n"),
+                whole.join("\n")
+            ));
+        }
+        if alone {
+            moved_alone.fetch_add(1, Ordering::Relaxed);
+        }
+        // The moved instance, and each instance that refers to it.
+        if in_a + in_b + in_c > 0 && targets > in_a + in_b + in_c {
+            with_referrers.fetch_add(1, Ordering::Relaxed);
+        }
+        if in_c > 0 {
+            referred_unchanged.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    });
+    if std::env::var_os("RENIUM_SIM_SEED").is_none() {
+        let (moved, referred) = (
+            moved_alone.load(Ordering::Relaxed),
+            with_referrers.load(Ordering::Relaxed),
+        );
+        let unchanged = referred_unchanged.load(Ordering::Relaxed);
+        assert!(
+            moved >= 100 && referred >= 80 && unchanged >= 60,
+            "{moved} moves pushed from what differs, {referred} of them with what refers to the moved one, {unchanged} from an instance that differs in nothing"
+        );
+    }
 }
 
 /// A store of which Studio holds nothing but what stays in a service is

@@ -1237,7 +1237,7 @@ impl<'a> BlockStore<'a> {
                             .values()
                             .chain(instance.attributes.values())
                             .any(names_an_instance_by_id);
-                    let (sum, unique_id) = match moved {
+                    let (sum, unique_id) = match &moved {
                         Some(moved) => {
                             let mut placed = instance.clone();
                             moved.in_state_whole(&mut placed);

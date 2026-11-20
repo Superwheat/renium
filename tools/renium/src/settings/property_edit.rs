@@ -325,11 +325,12 @@ fn row_digests_of(
         instance_count,
         budget: &budget,
     };
-    let value_digest = |value: &Value| match moved.and_then(|moved| moved.value_in_state(value)) {
+    let placed = moved.as_ref();
+    let value_digest = |value: &Value| match placed.and_then(|moved| moved.value_in_state(value)) {
         Some(value) => value_digest(&value),
         None => value_digest(value),
     };
-    let attributes_digest = |attributes: &Map<String, Value>| match moved
+    let attributes_digest = |attributes: &Map<String, Value>| match placed
         .and_then(|moved| moved.values_in_state(attributes))
     {
         Some(attributes) => attributes_digest(&attributes),
@@ -448,7 +449,7 @@ fn row_digests_of(
     }
     apply_decoded_property_groups(&mut instances, &specs, held);
     cells.par_sort_unstable_by_key(|cell| (cell.row, cell.name, cell.group));
-    if let Some(moved) = moved {
+    if let Some(moved) = &moved {
         for instance in &mut instances {
             moved.parent_in_state(instance);
         }

@@ -104,6 +104,7 @@ const COMPARED_AT_ONCE: usize = if cfg!(test) { 3 } else { 4_096 };
 struct ComparedPair {
     /// The two stand under one name, class and parent.
     placed: bool,
+    same_class: bool,
     /// The stored one is written as documents are today.
     written_as_today: bool,
     same_unique_id: bool,
@@ -149,7 +150,8 @@ pub(super) fn changed_values(
         file: stored,
         read: None,
     };
-    changed_rows(state, now, (records, &places), &changed, stored, store_gate)
+    let rows = (records, &places, &(|| false) as &dyn Fn() -> bool);
+    changed_rows(state, now, rows, &changed, stored, store_gate)
 }
 
 /// Reading a large store, for its digests or for the instances that changed,
@@ -186,6 +188,64 @@ fn written_where_they_stand(records: &[SettingsBinaryInstance<'_>], now: &Pulled
             .all(|(index, record)| record.source_index == index)
 }
 
+/// Whether each stored instance stands under the name, class and parent of
+/// the state's instance at its place.
+fn stand_alike(
+    stored: &[SettingsBytecodeInstance],
+    records: &[SettingsBinaryInstance<'_>],
+) -> bool {
+    stored.len() == records.len()
+        && stored.iter().zip(records).all(|(stored, record)| {
+            stored.name == record.name
+                && stored.class_name == record.class_name
+                && stored.parent_index == record.parent_index
+        })
+}
+
+/// How the stored instances stand among the state's, each paired by itself,
+/// and the id the alignment gives each of the state's
+/// (`equivalence::settings_ids_told_alone`). Of the store only the instances
+/// with their UniqueIds, and the camera a root names, are read. `None` where
+/// the whole documents have to say.
+fn told_alone(
+    stored: &[u8],
+    state: &ServiceState,
+    records: &[SettingsBinaryInstance<'_>],
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+) -> Option<(Moved, Vec<String>)> {
+    use crate::settings::bytecode::property_edit::decode_for_row_chunks;
+    let _span = crate::app::profile::span("store instances told alone");
+    let (mut reference, columns) = decode_for_row_chunks(stored).ok()?;
+    columns
+        .project_properties(
+            &mut reference,
+            |name| name == UNIQUE_ID || name == "CurrentCamera",
+            |instance, name, value| {
+                (name == UNIQUE_ID || instance.parent_index.is_none()).then_some(value)
+            },
+        )
+        .ok()?;
+    let mut observed = skeleton(state, records, lookup).ok()?;
+    for (index, instance) in observed.instances.iter_mut().enumerate() {
+        if !instance.properties.contains_key(UNIQUE_ID)
+            && let Some(id) = captured_persistent_identity(state, index)
+        {
+            instance
+                .properties
+                .insert(UNIQUE_ID.into(), json!({"_type": "UniqueId", "value": id}));
+        }
+    }
+    let (ids, in_store) =
+        crate::settings::equivalence::settings_ids_told_alone(&reference, &observed)?;
+    let mut in_state = vec![None; reference.instances.len()];
+    for (index, stored) in in_store.into_iter().enumerate() {
+        if let Some(stored) = stored {
+            in_state[stored] = Some(index);
+        }
+    }
+    Some((Moved::paired(in_state, records.len()), ids))
+}
+
 /// What a pull of `state` leaves of the stored file `stored` where no pull
 /// remembers that file: the digests of the two documents' instances say
 /// which of them differ, and those alone are compared. Whether every
@@ -211,13 +271,24 @@ pub(super) fn changed_document_rows(
     };
     let (_reading, store_gate) = read_gate(stored, store_gate);
     let lookup = build_settings_binary_instance_lookup(state, &records);
+    let mut told_ids = None;
     let (stored_rows, captured_rows) = rayon::join(
         || {
-            crate::settings::bytecode::property_edit::row_digests(stored, |stored| {
+            crate::settings::bytecode::property_edit::row_digests(stored, |instances| {
+                // Instances at other places than the state's, or more than
+                // one run apart, are paired each by itself.
+                let moved = match Moved::between(instances, &records) {
+                    Some(None) if stand_alike(instances, &records) => None,
+                    Some(Some(run)) => Some(run),
+                    _ => {
+                        let (moved, ids) = told_alone(stored, state, &records, &lookup)?;
+                        told_ids = Some(ids);
+                        Some(moved)
+                    }
+                };
                 // The stored camera is the one that stands where the state's
                 // does.
-                let moved = Moved::between(stored, &records)?;
-                let camera = match (now.viewport_camera, moved) {
+                let camera = match (now.viewport_camera, &moved) {
                     (Some(camera), Some(moved)) => Some(moved.in_store(camera)?),
                     (camera, _) => camera,
                 };
@@ -227,9 +298,20 @@ pub(super) fn changed_document_rows(
         || document_row_digests(state, &records, &lookup, stored.len()),
     );
     let (Some(stored_rows), captured_rows) = (stored_rows?, captured_rows?) else {
-        return whole("the store differs from the state by more than one run of instances");
+        return whole("nothing tells every instance of the store by itself among the state's");
     };
     let moved = stored_rows.moved;
+    let paired = told_ids.is_some();
+    // Where the places alone do not say that each instance is the stored
+    // one at its place, the alignment's own matching can.
+    let file = stored;
+    let told_in_place = || {
+        let records = collect_service_settings_binary_instances(state);
+        let lookup = build_settings_binary_instance_lookup(state, &records);
+        told_alone(file, state, &records, &lookup).is_some_and(|(moved, _)| {
+            (0..records.len()).all(|index| moved.in_store(index) == Some(index))
+        })
+    };
     let mut changed = Vec::new();
     let mut renamed = false;
     for (index, (values, unique_id)) in captured_rows.iter().enumerate() {
@@ -237,7 +319,8 @@ pub(super) fn changed_document_rows(
             continue;
         }
         // An instance the store does not hold yet has nothing to differ from.
-        let Some(stored_index) = moved.map_or(Some(index), |moved| moved.in_store(index)) else {
+        let stored_index = (moved.as_ref()).map_or(Some(index), |moved| moved.in_store(index));
+        let Some(stored_index) = stored_index else {
             continue;
         };
         if stored_rows.digests[stored_index] != *values {
@@ -263,11 +346,15 @@ pub(super) fn changed_document_rows(
                 .collect(),
             renamed,
             moved,
+            told_ids,
         }),
     };
+    // A store kept with its instances at other places is not the state's
+    // rows in their order.
+    let rows = (records, &places, &told_in_place as &dyn Fn() -> bool);
     Ok(
-        changed_rows(state, now, (records, &places), &changed, stored, store_gate)?
-            .map(|alignment| (alignment, changed.is_empty() && !renamed)),
+        changed_rows(state, now, rows, &changed, stored, store_gate)?
+            .map(|alignment| (alignment, changed.is_empty() && !renamed && !paired)),
     )
 }
 
@@ -292,18 +379,25 @@ struct ReadStore {
     /// than the stored one.
     renamed: bool,
     /// How the stored instances stand in the state, where it holds one run
-    /// of instances more than the store, or one less.
+    /// of instances more than the store, or one less, or holds them at
+    /// other places.
     moved: Option<Moved>,
+    /// The id the alignment gives each instance of the state, where `moved`
+    /// pairs each by itself.
+    told_ids: Option<Vec<String>>,
 }
 
-/// How the instances of a stored file stand in a state that holds one run of
-/// instances the file does not hold, or lacks one run the file holds: the
-/// run starts at `at` and is `by` long.
-#[derive(Clone, Copy)]
-pub(crate) struct Moved {
-    at: usize,
-    by: usize,
-    added: bool,
+/// How the instances of a stored file stand in a state that holds other
+/// instances than the file, or holds them at other places.
+#[derive(Clone)]
+pub(crate) enum Moved {
+    /// The state holds one run of instances the file does not hold, or
+    /// lacks one run the file holds: the run starts at `at` and is `by` long.
+    Run { at: usize, by: usize, added: bool },
+    /// Each stored instance stands where `in_state` says, and each of the
+    /// state's is the stored one `in_store` says: `u32::MAX` for an instance
+    /// the other does not hold.
+    Paired(std::sync::Arc<(Vec<u32>, Vec<u32>)>),
 }
 
 impl Moved {
@@ -355,17 +449,14 @@ impl Moved {
                     || stored.parent_index != parent_index
             })
             .unwrap_or(common);
-        let moved = Self {
-            at,
-            by: stored.len().abs_diff(count),
-            added: count > stored.len(),
-        };
+        let (by, added) = (stored.len().abs_diff(count), count > stored.len());
+        let moved = Self::Run { at, by, added };
         (at..common)
             .all(|position| {
-                let (stored_index, index) = if moved.added {
-                    (position, position + moved.by)
+                let (stored_index, index) = if added {
+                    (position, position + by)
                 } else {
-                    (position + moved.by, position)
+                    (position + by, position)
                 };
                 let (stored, (name, class_name, parent_index)) =
                     (&stored[stored_index], state(index));
@@ -381,33 +472,65 @@ impl Moved {
             .then_some(Some(moved))
     }
 
+    /// The stored instances as `in_state` places each of them, for a state
+    /// of `count` instances.
+    pub(crate) fn paired(in_state: Vec<Option<usize>>, count: usize) -> Self {
+        let mut in_store = vec![u32::MAX; count];
+        let in_state = (in_state.into_iter().enumerate())
+            .map(
+                |(stored, state)| match state.filter(|state| *state < count) {
+                    Some(state) => {
+                        in_store[state] = stored as u32;
+                        state as u32
+                    }
+                    None => u32::MAX,
+                },
+            )
+            .collect();
+        Self::Paired(std::sync::Arc::new((in_state, in_store)))
+    }
+
     /// The run of instances one copy holds and the other lacks, as it
     /// stands in the copy that holds it, and whether that is the state.
-    pub(crate) fn run(self) -> (std::ops::Range<usize>, bool) {
-        (self.at..self.at + self.by, self.added)
+    /// `None` for instances paired each by itself.
+    pub(crate) fn run(&self) -> Option<(std::ops::Range<usize>, bool)> {
+        match *self {
+            Self::Run { at, by, added } => Some((at..at + by, added)),
+            Self::Paired(_) => None,
+        }
     }
 
     /// Which stored instance the state's instance at `index` is.
-    pub(crate) fn in_store(self, index: usize) -> Option<usize> {
-        match (self.added, index < self.at) {
-            (_, true) => Some(index),
-            (true, false) => index.checked_sub(self.by).filter(|index| *index >= self.at),
-            (false, false) => Some(index + self.by),
+    pub(crate) fn in_store(&self, index: usize) -> Option<usize> {
+        match *self {
+            Self::Run { at, by, added } => match (added, index < at) {
+                (_, true) => Some(index),
+                (true, false) => index.checked_sub(by).filter(|index| *index >= at),
+                (false, false) => Some(index + by),
+            },
+            Self::Paired(ref pairs) => (pairs.1.get(index).copied())
+                .filter(|stored| *stored != u32::MAX)
+                .map(|stored| stored as usize),
         }
     }
 
     /// Where the stored instance at `index` stands in the state.
-    pub(crate) fn in_state(self, index: usize) -> Option<usize> {
-        match (self.added, index < self.at) {
-            (_, true) => Some(index),
-            (true, false) => Some(index + self.by),
-            (false, false) => index.checked_sub(self.by).filter(|index| *index >= self.at),
+    pub(crate) fn in_state(&self, index: usize) -> Option<usize> {
+        match *self {
+            Self::Run { at, by, added } => match (added, index < at) {
+                (_, true) => Some(index),
+                (true, false) => Some(index + by),
+                (false, false) => index.checked_sub(by).filter(|index| *index >= at),
+            },
+            Self::Paired(ref pairs) => (pairs.0.get(index).copied())
+                .filter(|state| *state != u32::MAX)
+                .map(|state| state as usize),
         }
     }
 
     /// The parent of a stored instance as the position it has in the state.
     /// A parent the state lacks is no position of the state's.
-    pub(super) fn parent_in_state(self, instance: &mut SettingsBytecodeInstance) {
+    pub(super) fn parent_in_state(&self, instance: &mut SettingsBytecodeInstance) {
         instance.parent_index = instance
             .parent_index
             .map(|parent| self.in_state(parent).unwrap_or(usize::MAX - 1));
@@ -415,7 +538,7 @@ impl Moved {
 
     /// A stored value with every reference by position at the position its
     /// instance has in the state: `None` where it holds none.
-    pub(super) fn value_in_state(self, value: &Value) -> Option<Value> {
+    pub(super) fn value_in_state(&self, value: &Value) -> Option<Value> {
         fn refers(value: &Value) -> bool {
             match value {
                 Value::Object(map) => map.contains_key("instanceIndex") || map.values().any(refers),
@@ -423,7 +546,7 @@ impl Moved {
                 _ => false,
             }
         }
-        fn place(moved: Moved, value: &mut Value) {
+        fn place(moved: &Moved, value: &mut Value) {
             match value {
                 Value::Object(map) => {
                     if map.get("_type").and_then(Value::as_str) == Some("Ref")
@@ -451,7 +574,10 @@ impl Moved {
     }
 
     /// The same for the values of a map.
-    pub(super) fn values_in_state(self, values: &Map<String, Value>) -> Option<Map<String, Value>> {
+    pub(super) fn values_in_state(
+        &self,
+        values: &Map<String, Value>,
+    ) -> Option<Map<String, Value>> {
         let placed = values
             .iter()
             .filter_map(|(name, value)| Some((name, self.value_in_state(value)?)))
@@ -466,7 +592,7 @@ impl Moved {
     }
 
     /// A stored instance read whole, as it stands in the state.
-    pub(crate) fn in_state_whole(self, instance: &mut SettingsBytecodeInstance) {
+    pub(crate) fn in_state_whole(&self, instance: &mut SettingsBytecodeInstance) {
         self.parent_in_state(instance);
         if let Some(properties) = self.values_in_state(&instance.properties) {
             instance.properties = properties;
@@ -479,7 +605,7 @@ impl Moved {
     /// The ids the state's instances are written under: each the id its
     /// stored instance has, and an instance the store does not hold yet its
     /// own, unless the store or an earlier new instance holds that one.
-    fn written_ids(self, own: &[String], stored: &[String]) -> Vec<String> {
+    fn written_ids(&self, own: &[String], stored: &[String]) -> Vec<String> {
         let reserved = stored.iter().map(String::as_str).collect::<AHashSet<_>>();
         let mut used = AHashSet::new();
         let mut generated = 0_usize;
@@ -636,10 +762,12 @@ pub(super) fn half_digest(digest: Sha256) -> [u8; 16] {
 
 /// The answer for a store whose instances are the stored ones but for
 /// `changed`, which hold other values, and for the viewport camera.
+/// `told_in_place` says whether the alignment's matching takes each instance
+/// for the stored one at its place, and is asked where the places do not.
 fn changed_rows<'a>(
     state: &'a ServiceState,
     now: &PulledRows,
-    (records, places): (Vec<SettingsBinaryInstance<'a>>, &Places),
+    (records, places, told_in_place): (Vec<SettingsBinaryInstance<'a>>, &Places, &dyn Fn() -> bool),
     changed: &[usize],
     stored: StoredRows<'_>,
     store_gate: Option<&Mutex<()>>,
@@ -665,7 +793,10 @@ fn changed_rows<'a>(
         Some(mut read) => (read.viewport_camera.take(), Some(read)),
         None => (None, None),
     };
-    let moved = read.as_ref().and_then(|read| read.moved);
+    let moved = read.as_ref().and_then(|read| read.moved.clone());
+    let moved = moved.as_ref();
+    let told_ids = read.as_mut().and_then(|read| read.told_ids.take());
+    let paired = told_ids.is_some();
     // The camera is the last row where the state has one.
     let mut rows = changed.to_vec();
     if camera.is_none() {
@@ -696,7 +827,7 @@ fn changed_rows<'a>(
         (_, first) => stored_batch(first.map_or(&[], |(_, stored_at)| stored_at))?,
     };
     // A pull leaves each instance the id its store holds it under.
-    let written_ids = moved.map(|moved| moved.written_ids(&places.ids, &ids));
+    let written_ids = told_ids.or_else(|| moved.map(|moved| moved.written_ids(&places.ids, &ids)));
     let written_ids = written_ids.as_ref().unwrap_or(&ids);
     let own_ids = places.ids == *written_ids;
     let records = if own_ids {
@@ -744,6 +875,7 @@ fn changed_rows<'a>(
                     placed: stored.name == captured.name
                         && stored.class_name == captured.class_name
                         && stored.parent_index == captured.parent_index,
+                    same_class: stored.class_name == captured.class_name,
                     written_as_today: !crate::settings::equivalence::forced_property_differs(
                         &stored.properties,
                     ) && values_encode_alike(
@@ -776,7 +908,12 @@ fn changed_rows<'a>(
     let camera_pair = last.filter(|_| now.viewport_camera.is_some());
     // Each pair is one instance in one place: an instance under another
     // name, class or parent is matched by the alignment.
-    if pairs.iter().any(|pair| !pair.placed) {
+    // Paired each by itself, an instance is the stored one under whatever
+    // name and parent.
+    if pairs
+        .iter()
+        .any(|pair| !(pair.placed || paired && pair.same_class))
+    {
         return whole("an instance stands under another name, class or parent than the stored one");
     }
     // A stored camera whose enum items can gain their types makes the answer
@@ -795,11 +932,11 @@ fn changed_rows<'a>(
     let compared = compared.into_iter().collect::<Result<Vec<_>>>()?;
     let mut same_values = Vec::with_capacity(changed.len());
     let mut same_under_todays_names = true;
-    for compared in compared {
+    for (compared, pair) in compared.into_iter().zip(&pairs) {
         match compared {
             Some((as_held, as_named)) => {
-                same_values.push(as_held);
-                same_under_todays_names &= as_named;
+                same_values.push(as_held && pair.placed);
+                same_under_todays_names &= as_named && pair.placed;
             }
             None => return whole("an enum item of a changed instance gains its type"),
         }
@@ -811,7 +948,12 @@ fn changed_rows<'a>(
     let camera_holds_a_reference = camera_pair
         .as_ref()
         .is_some_and(|(stored, _)| holds_a_reference(stored));
-    let kept = if moved.is_some() {
+    let kept = if paired {
+        // Each instance is the stored one the alignment itself takes it
+        // for. The stored camera goes back as the store holds it, which a
+        // reference by position does not survive.
+        !camera_holds_a_reference
+    } else if moved.is_some() {
         // A state with one run of instances more or less than the store: the
         // alignment takes every instance beside the run for the stored one
         // where each holds the stored values as a pull counts them, the
@@ -858,7 +1000,7 @@ fn changed_rows<'a>(
         });
         stand_as_stored || !renamed && places.kept_under_other_ids(&ids)
     };
-    if !kept {
+    if !(kept || moved.is_none() && told_in_place()) {
         return whole("nothing tells every instance for the stored one at its place");
     }
     // The alignment puts the stored camera back before it compares anything
@@ -885,12 +1027,18 @@ fn changed_rows<'a>(
     // comparison is not the comparison of instance with instance made here,
     // so only the second counts. One with other instances is written.
     let same_as_held = same_values.iter().all(|same| *same);
-    if moved.is_none() && !renamed {
+    // Paired each by itself, the two hold the same instances where each of
+    // one is one of the other: those the alignment compares under the names
+    // their properties go by today.
+    let all_paired = paired
+        && ids.len() == records.len()
+        && (0..records.len()).all(|index| stored_at(index).is_some());
+    if (moved.is_none() || all_paired) && !renamed {
         let same_as_named = same_under_todays_names && !camera_holds_a_reference;
-        if same_as_named || own_ids && same_as_held {
+        if same_as_named || !paired && own_ids && same_as_held {
             return Ok(Some(SettingsAlignment::Equivalent));
         }
-        if same_as_held {
+        if !paired && same_as_held {
             return whole("instances that hold the stored values compare otherwise by name");
         }
     }

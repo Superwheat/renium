@@ -1760,7 +1760,7 @@ pub(crate) fn snapshot_differences(
     left: &ProjectSnapshot,
     right: &ProjectSnapshot,
 ) -> Result<HashSet<PathBuf>> {
-    snapshot_differences_prepared(left, right, None)
+    snapshot_differences_prepared(left, right, None, false)
 }
 
 pub(crate) fn retained_settings_document(document: &SettingsBytecode) -> SettingsBytecode {

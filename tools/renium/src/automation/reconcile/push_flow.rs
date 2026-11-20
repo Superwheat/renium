@@ -129,10 +129,13 @@ fn leave_unread_documents(prepared: &mut HashMap<PathBuf, PreparedPushVerificati
 }
 
 /// The plan as it is carried out: one made from the changed instances of
-/// both copies that creates, removes or imports an instance is made again
-/// from the files' whole copies of its stores.
+/// both copies that the instances that differ do not carry out
+/// (`plan_reads_changed_alone`) is made again from the whole copies of its
+/// stores: of each of them, or for a move between stores of the ones where
+/// an unread instance refers to what moved. `replace` says which comparison
+/// prepared them.
 pub(super) fn plan_from_whole_stores(
-    (stores_read, plan): (StoresRead, ReconcilePushPlan),
+    (stores_read, replace, plan): (StoresRead, bool, ReconcilePushPlan),
     (project, studio): (&ProjectSnapshot, &ProjectSnapshot),
     differences: &HashSet<PathBuf>,
     prepared_settings: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
@@ -140,15 +143,54 @@ pub(super) fn plan_from_whole_stores(
     if stores_read != StoresRead::ChangedOfBoth || plan_reads_changed_alone(&plan) {
         return Ok(plan);
     }
-    // A store that is imported is prepared the same way either time.
-    let paths = prepared_settings
-        .iter()
-        .filter(|(_, change)| !service_has_only_native_containers(&change.previous))
-        .map(|(path, _)| path.clone())
-        .collect::<HashSet<_>>();
-    if paths.is_empty() {
+    let moved = super::replacement::moved_between_stores(&plan);
+    let mut read_whole = Vec::new();
+    for (path, change) in prepared_settings.iter() {
+        let unread = crate::settings::equivalence::holds_unread_instances(&change.current);
+        let whole = match &moved {
+            Some(ids) => {
+                unread
+                    && super::replacement::unread_instance_refers(
+                        project.entries.get(path),
+                        &change.current,
+                        ids,
+                    )?
+            }
+            None if replace => !service_has_only_native_containers(&change.previous),
+            None => unread,
+        };
+        if whole {
+            read_whole.push(path.clone());
+        }
+    }
+    if read_whole.is_empty() {
         return Ok(plan);
     }
+    if !replace {
+        for path in read_whole {
+            let mut whole = None;
+            let equivalent = super::verify::snapshot_entry_equivalent(
+                &path,
+                project.entries.get(&path),
+                studio.entries.get(&path),
+                Some(&mut whole),
+            )?;
+            let Some(whole) = whole.filter(|_| !equivalent) else {
+                bail!("The stores of this push differ another way when read whole; retry the push");
+            };
+            prepared_settings.insert(path, whole);
+        }
+        return reconciliation_push_plan_for_paths_with_prepared_settings(
+            studio,
+            project,
+            differences,
+            prepared_settings,
+            true,
+            false,
+        );
+    }
+    // A store that is imported is prepared the same way either time.
+    let paths = read_whole.into_iter().collect::<HashSet<_>>();
     let mut whole = HashMap::new();
     prepare_project_replacement_from(project, studio, &paths, &mut whole, StoresRead::Changed)?;
     anyhow::ensure!(
@@ -336,7 +378,7 @@ pub(crate) fn push_project(
     let phase = Instant::now();
     let mut prepared_settings = HashMap::new();
     let promoted_services;
-    let mut stores_read = StoresRead::Changed;
+    let stores_read;
     let differences = if replace {
         let paths = project_replacement_paths(&project, &studio);
         stores_read = stores_read_of(link_enforcement.is_none(), &paths, &project, &studio);
@@ -398,8 +440,9 @@ pub(crate) fn push_project(
         promoted_services = imported_services(imported, &prepared_settings)?;
         paths
     } else {
+        stores_read = StoresRead::ChangedOfBoth;
         let mut differences =
-            snapshot_differences_prepared(&project, &studio, Some(&mut prepared_settings))?;
+            snapshot_differences_prepared(&project, &studio, Some(&mut prepared_settings), true)?;
         promoted_services = promote_heavy_deltas_to_replacement(
             context,
             &project,
@@ -484,7 +527,7 @@ pub(crate) fn push_project(
         false,
     )?;
     let mut plan = plan_from_whole_stores(
-        (stores_read, plan),
+        (stores_read, replace, plan),
         (&project, &studio),
         &differences,
         &mut prepared_settings,

@@ -1402,6 +1402,8 @@ struct ScoreInputs<'a, 'b> {
     reference_graph: &'b ReferenceGraph,
     observed_graph: &'b ReferenceGraph,
     subtree_keys: Option<&'b (Vec<usize>, Vec<usize>)>,
+    /// The matching stops at instances only what they hold tells apart.
+    told_alone: bool,
 }
 
 struct IdentityAssignment<'a> {
@@ -1418,6 +1420,8 @@ struct IdentityAssignment<'a> {
     generated: usize,
     remaining: usize,
     shape_keys: Option<(Vec<u64>, Vec<u64>)>,
+    /// A matching that stops at what instances hold reached such a group.
+    compares_values: bool,
 }
 
 /// Hash of an instance's subtree by names and classes only, so same-named
@@ -1673,6 +1677,7 @@ impl<'a> IdentityAssignment<'a> {
             generated: 0,
             remaining: observed.instances.len(),
             shape_keys: None,
+            compares_values: false,
         }
     }
 
@@ -1855,6 +1860,10 @@ impl<'a> IdentityAssignment<'a> {
                 continue;
             }
 
+            if inputs.told_alone {
+                self.compares_values = true;
+                return progressed;
+            }
             let group_index = observed_group[0];
             if unchanged_content_groups.get(&group_index).is_some_and(
                 |(previous_observed, previous_candidates)| {
@@ -2180,7 +2189,6 @@ fn align_settings_ids_by_matching(
     reference: &SettingsBytecode,
     observed: &mut SettingsBytecode,
 ) -> bool {
-    let preparation_started = Instant::now();
     let cameras = (
         workspace_current_camera_index(reference),
         workspace_current_camera_index(observed),
@@ -2195,7 +2203,65 @@ fn align_settings_ids_by_matching(
         remap_positional_ids(reference, observed);
         return true;
     }
+    let Some((ids, _)) = match_settings_ids(reference, observed, false) else {
+        return false;
+    };
+    take_settings_ids(observed, ids);
+    true
+}
 
+/// The id `align_settings_ids_to_reference` gives each observed instance of
+/// a store whose instances stand at other places than the reference's, and
+/// the reference instance it takes each for, where an id, a UniqueId or the
+/// place under its parent tells every one of them by itself. `None` where
+/// the alignment compares what two instances hold: that takes the whole
+/// documents. Nothing an instance holds but its UniqueId, and the camera a
+/// root names, is read here.
+pub(crate) fn settings_ids_told_alone(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+) -> Option<(Vec<String>, Vec<Option<usize>>)> {
+    match_settings_ids(reference, observed, true)
+}
+
+/// Gives the observed instances the ids a matching assigned them, in every
+/// reference among them as well.
+pub(crate) fn take_settings_ids(observed: &mut SettingsBytecode, ids: Vec<String>) {
+    let phase = Instant::now();
+    let remap = observed
+        .instances
+        .iter()
+        .map(|instance| instance.settings_id.clone())
+        .zip(ids.iter().cloned())
+        .collect::<HashMap<_, _>>();
+    let service = store_service(observed).map(str::to_string);
+    for (instance, id) in observed.instances.iter_mut().zip(ids) {
+        instance.settings_id = id;
+        remap_record_reference_ids(&mut instance.properties, &remap, service.as_deref());
+        remap_record_reference_ids(&mut instance.attributes, &remap, service.as_deref());
+    }
+    log_global(
+        4,
+        format_args!(
+            "[renium] identity reference remap: {:.1}ms",
+            phase.elapsed().as_secs_f64() * 1000.0
+        ),
+    );
+}
+
+/// The matching of `align_settings_ids_by_matching`: for each observed
+/// instance its id and the reference instance it is. With `told_alone` it
+/// stops where two instances are told apart by what they hold.
+fn match_settings_ids(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+    told_alone: bool,
+) -> Option<(Vec<String>, Vec<Option<usize>>)> {
+    let preparation_started = Instant::now();
+    let cameras = (
+        workspace_current_camera_index(reference),
+        workspace_current_camera_index(observed),
+    );
     // A fresh destination has only its retained containers. Index candidates
     // it can actually match rather than allocating a group for every incoming
     // descendant. Full comparisons keep the direct index construction.
@@ -2292,24 +2358,25 @@ fn align_settings_ids_by_matching(
             .iter()
             .filter_map(|instance| instance.parent_index)
             .collect::<AHashSet<_>>();
-        let subtree_keys = reference_groups
-            .values()
-            .any(|group| group.len() > 1 && group.iter().any(|index| parents.contains(index)))
-            .then(|| {
-                let mut keys = AHashMap::new();
-                (
-                    identity_subtree_keys(
-                        reference,
-                        &mut keys,
-                        state.used_reference.iter().map(|used| !used).collect(),
-                    ),
-                    identity_subtree_keys(
-                        observed,
-                        &mut keys,
-                        state.assigned_ids.iter().map(Option::is_none).collect(),
-                    ),
-                )
-            });
+        let subtree_keys = (!told_alone
+            && reference_groups
+                .values()
+                .any(|group| group.len() > 1 && group.iter().any(|index| parents.contains(index))))
+        .then(|| {
+            let mut keys = AHashMap::new();
+            (
+                identity_subtree_keys(
+                    reference,
+                    &mut keys,
+                    state.used_reference.iter().map(|used| !used).collect(),
+                ),
+                identity_subtree_keys(
+                    observed,
+                    &mut keys,
+                    state.assigned_ids.iter().map(Option::is_none).collect(),
+                ),
+            )
+        });
         log_global(
             4,
             format_args!(
@@ -2323,15 +2390,19 @@ fn align_settings_ids_by_matching(
             reference_graph: &reference_graph,
             observed_graph: &observed_graph,
             subtree_keys: subtree_keys.as_ref(),
+            told_alone,
         };
         let mut unchanged_content_groups = HashMap::new();
         while state.remaining > 0 {
             let mut progressed = state.run_exact(&lookup);
             progressed |= state.run_scored(&inputs, &mut unchanged_content_groups);
-            if progressed || state.run_fallback(&reference_groups) {
+            if state.compares_values {
+                return None;
+            }
+            if progressed || !told_alone && state.run_fallback(&reference_groups) {
                 continue;
             }
-            return false;
+            return None;
         }
         log_global(
             4,
@@ -2341,34 +2412,15 @@ fn align_settings_ids_by_matching(
             ),
         );
     }
-    let phase = Instant::now();
     let IdentityAssignment {
-        old_ids,
         assigned_ids,
+        assigned_reference,
         ..
     } = state;
-    let assigned = assigned_ids
-        .into_iter()
-        .map(Option::unwrap)
-        .collect::<Vec<_>>();
-    let remap = old_ids
-        .into_iter()
-        .zip(assigned.iter().cloned())
-        .collect::<HashMap<_, _>>();
-    let service = store_service(observed).map(str::to_string);
-    for (instance, id) in observed.instances.iter_mut().zip(assigned) {
-        instance.settings_id = id;
-        remap_record_reference_ids(&mut instance.properties, &remap, service.as_deref());
-        remap_record_reference_ids(&mut instance.attributes, &remap, service.as_deref());
-    }
-    log_global(
-        4,
-        format_args!(
-            "[renium] identity reference remap: {:.1}ms",
-            phase.elapsed().as_secs_f64() * 1000.0
-        ),
-    );
-    true
+    Some((
+        assigned_ids.into_iter().map(Option::unwrap).collect(),
+        assigned_reference,
+    ))
 }
 
 fn remap_positional_ids(reference: &SettingsBytecode, observed: &mut SettingsBytecode) {
