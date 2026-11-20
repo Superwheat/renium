@@ -1018,7 +1018,7 @@ pub(crate) fn push_targeted(
     ) {
         Ok(project) => project,
         Err(reason) => {
-            not_kept(reason);
+            not_kept(&reason);
             return Ok(summary);
         }
     };
@@ -1175,12 +1175,12 @@ pub(crate) fn targeted_baseline(
     summary: &Map<String, Value>,
     pushed: &TargetedPush,
     service_of: impl Fn(&Path) -> Option<String>,
-) -> std::result::Result<ProjectSnapshot, &'static str> {
+) -> std::result::Result<ProjectSnapshot, String> {
     if !pushed.whole_rows {
-        return Err("the push chose fields or read its selection from a file");
+        return Err("the push chose fields or read its selection from a file".into());
     }
     if before != after {
-        return Err("the files changed during the push");
+        return Err("the files changed during the push".into());
     }
     if summary.get("ok") == Some(&Value::Bool(false))
         || summary.get("verified") == Some(&Value::Bool(false))
@@ -1193,7 +1193,7 @@ pub(crate) fn targeted_baseline(
         .iter()
         .any(|key| summary.contains_key(*key))
     {
-        return Err("the push left changes unwritten or unverified");
+        return Err("the push left changes unwritten or unverified".into());
     }
     if push_applied_nothing(summary) {
         return Ok(held.clone());
@@ -1230,26 +1230,38 @@ pub(crate) fn targeted_baseline(
             continue;
         }
         if !pushed.paths.contains(path) {
-            return Err("files differ from the baseline outside the push");
+            return Err(format!(
+                "{} differs from the baseline outside the push",
+                path.display()
+            ));
         }
-        let carried = match (was, now) {
+        let refused = match (was, now) {
             (Some(SnapshotEntry::File(was)), Some(SnapshotEntry::File(now)))
                 if is_store(path.as_path()) =>
             {
-                service_of(path.as_path()).is_some_and(|service| {
+                if !service_of(path.as_path()).is_some_and(|service| {
                     verified
                         .iter()
                         .any(|name| name.eq_ignore_ascii_case(&service))
-                }) && store_rows_differ_only_at(was, now, &pushed.ids, pushed.exact)
+                }) {
+                    Some("the push did not verify its service")
+                } else if !store_rows_differ_only_at(was, now, &pushed.ids, pushed.exact)
                     .unwrap_or(false)
+                {
+                    Some("it differs beyond the instances the push wrote")
+                } else {
+                    None
+                }
             }
-            (Some(SnapshotEntry::File(_)), Some(SnapshotEntry::File(_))) => {
-                super::merge::is_source_path(path) && scripts_verified
+            (Some(SnapshotEntry::File(_)), Some(SnapshotEntry::File(_)))
+                if super::merge::is_source_path(path) =>
+            {
+                (!scripts_verified).then_some("the push did not verify its source")
             }
-            _ => false,
+            _ => Some("the push does not write such a change"),
         };
-        if !carried {
-            return Err("the push did not write and verify every changed file");
+        if let Some(reason) = refused {
+            return Err(format!("{}: {reason}", path.display()));
         }
     }
     Ok(after.clone())
@@ -1324,7 +1336,18 @@ pub(crate) fn store_rows_differ_only_at(
     let (was_rows, _) = decode_rows(held, &differing)?;
     let (now_rows, _) = decode_rows(files, &differing)?;
     Ok(was_rows.iter().zip(&now_rows).all(|(was, now)| {
-        !matches!(now.class_name.as_str(), "PackageLink" | "Camera")
+        // Studio holds a Decal's ColorMapContent as its TextureContent.
+        let mirror = "ColorMapContent";
+        let mirrored = !crate::settings::equivalence::reconciliation_property_is_engine_mirror(
+            database,
+            &now.class_name,
+            mirror,
+        ) || now
+            .properties
+            .get(mirror)
+            .is_none_or(|map| now.properties.get("TextureContent") == Some(map));
+        mirrored
+            && !matches!(now.class_name.as_str(), "PackageLink" | "Camera")
             && was
                 .properties
                 .keys()

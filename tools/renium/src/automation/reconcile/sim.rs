@@ -1862,4 +1862,23 @@ fn a_targeted_baseline_holds_only_rows_a_push_sends() {
         json!("Client")
     ));
     assert!(kept("Script", "Disabled", json!(false), json!(true)));
+
+    let decal = |texture: &str, color_map: &str| {
+        let mut row =
+            SettingsBytecodeInstance::new("row".into(), "Row".into(), "Decal".into(), None);
+        row.properties
+            .insert("TextureContent".into(), json!(texture));
+        row.properties
+            .insert("ColorMapContent".into(), json!(color_map));
+        encode_settings_bytecode(&SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![row],
+        })
+        .unwrap()
+    };
+    let held = decal("rbxassetid://1", "rbxassetid://1");
+    let kept = |now: &[u8]| store_rows_differ_only_at(&held, now, &ids, true).unwrap();
+    assert!(kept(&decal("rbxassetid://2", "rbxassetid://2")));
+    assert!(!kept(&decal("rbxassetid://1", "rbxassetid://2")));
+    assert!(!kept(&decal("rbxassetid://2", "rbxassetid://1")));
 }
