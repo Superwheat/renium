@@ -42,11 +42,11 @@ On that 202,000-instance place, with the most memory Renium used at each step:
 
 | | Time | Memory |
 |---|---|---|
+| Check Studio and the files when nothing changed | 0.2 s | 0.5 GB |
+| Send one changed script to Studio | 0.3 s | 0.6 GB |
+| Send one changed property to Studio | 1.4 s | 1.0 GB |
+| Bring one property changed in Studio into the files | 4 s | 1.4 GB |
 | Bring the whole place from Studio into an empty project | 4 s | 1.3 GB |
-| Check Studio when nothing changed | 2 s | 1.0 GB |
-| Bring one property changed in Studio into the files | 3.3 s | 1.5 GB |
-| Send one changed script to Studio | 2.5 s | 1.1 GB |
-| Send one changed property to Studio | 5 s | 1.8 GB |
 | Send the whole project to an empty Studio place | 13 s | 1.8 GB |
 
 No step needs 2 GB.
