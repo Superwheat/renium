@@ -422,11 +422,8 @@ fn resolve_indexed(
                     .map(Vec::as_slice)
                     .unwrap_or_default()
             };
-            let entry = match path.ordinals.get(index) {
-                Some(ordinal) => matches.get(ordinal - 1).copied(),
-                None if matches.len() == 1 => Some(matches[0]),
-                _ => None,
-            }.with_context(|| format!("Native target segment '{name}' has {} matches; retry with the current path and ordinals", matches.len()))?;
+            let entry = exact_ordinal_index(path.ordinals.get(index).copied(), matches.len())
+                .map(|index| matches[index]).with_context(|| format!("Native target segment '{name}' has {} matches; retry with the current path and ordinals", matches.len()))?;
             ancestors.push(entry);
         }
         result.push(ancestors);

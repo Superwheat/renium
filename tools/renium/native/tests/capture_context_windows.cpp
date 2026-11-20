@@ -6,6 +6,7 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include "../renium_capture_roots.h"
 
 static ReniumSerializerParams Fixture(std::uint32_t offset, std::uint64_t mask)
 {
@@ -29,6 +30,33 @@ static void Refuses(ReniumSerializerParams p, const char* reason)
         assert(std::string(error.what()).find(reason) != std::string::npos);
         assert(p.contextRead == 0);
     }
+}
+
+static void SelectedRootTests()
+{
+    int model = 0, parent = 1, leaf = 2, owner = 3;
+    CaptureRootRequest root{};
+    root.depth = 2;
+    root.path[0] = {{&parent, &owner}, 0};
+    root.path[1] = {{&leaf, &owner}, 1};
+    SharedInstance top[] = {{&parent, &owner}};
+    SharedInstance children[] = {{&parent, &owner}, {&leaf, &owner}};
+    auto present = [&] {
+        return CapturePathPresent(root, &model, [&](void* object) {
+            return object == &model ? std::make_pair(top, std::size_t(1))
+                                    : std::make_pair(children, std::size_t(2));
+        }, [&](void* object) { return SharedInstance{object, &owner}; },
+        [&](void* object) -> void* { return object == &parent ? &model : &parent; });
+    };
+    assert(present());
+    root.path[1].sibling = 0; assert(!present());
+    root.path[1].sibling = 1;
+    children[1].owner = nullptr; assert(!present());
+    children[1].owner = &owner;
+    top[0].instance = nullptr; assert(!present()); // no stale descendant dereference
+    top[0].instance = &parent;
+    root.depth = 0; assert(!present());
+    root.depth = 65; assert(!present());
 }
 
 static void UnitTests()
@@ -71,7 +99,7 @@ static void UnitTests()
         p.taskContext = pointer;
         Refuses(p, "Invalid DataModel capture task-context binding");
     }
-    for (auto version : {0u, 1u, 2u, 4u, 0xffffffffu}) {
+    for (auto version : {0u, 1u, 2u, 3u, 5u, 0xffffffffu}) {
         auto p = Fixture(0x48, ~7ull);
         p.protocolVersion = version;
         Refuses(p, "Incompatible native serializer protocol");
@@ -81,7 +109,7 @@ static void UnitTests()
     const char* error = "DataModel task context changed before capture";
     std::memcpy(p.error, error, std::strlen(error));
     auto response = MakeCaptureResponse(p, p.status);
-    assert(response.base.version == 3 && CaptureResponseSize(p) == 440);
+    assert(response.base.version == ReniumSerializerVersion && CaptureResponseSize(p) == 440);
     p.timeline.frequency = 1000;
     p.timeline.ticks[3] = 120;
     p.timeline.ticks[4] = 160;
@@ -117,6 +145,7 @@ static void PrintLayout()
 int main(int argc, char** argv)
 {
     UnitTests();
+    SelectedRootTests();
     if (argc == 1) { PrintLayout(); return 0; }
     assert(argc == 3);
     ReniumSerializerParams p{};

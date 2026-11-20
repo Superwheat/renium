@@ -6,6 +6,12 @@ mod task_context;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use task_context::*;
+#[path = "windows_capture_roots.rs"]
+mod capture_roots;
+#[allow(unused_imports)]
+pub(crate) use capture_roots::{
+    NativeCaptureRoot, NativeCaptureRootResult, capture_live_instances,
+};
 #[path = "windows_probes.rs"]
 mod probes;
 pub(super) use probes::probe_operation;
@@ -79,7 +85,7 @@ use crate::system::LockRecover;
 use crate::system::files::{atomic_write_file, fnv1a};
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/renium-studio-helper.dll"));
-const PARAM_SIZE: usize = 6024;
+const PARAM_SIZE: usize = 6032;
 const PARAM_STATUS: usize = 68;
 const PARAM_OUTPUT_SIZE: usize = 72;
 const PARAM_CONTEXT_MICROS: usize = 80;
@@ -101,7 +107,7 @@ const PARAM_IDENTITY_BINDING: usize = 5840;
 const PARAM_IDENTITY_GETTER: usize = 5848;
 const PARAM_DEBUG_ID_GETTER: usize = 5856;
 const CAPTURE_HEADER_SIZE: usize = 440;
-const CAPTURE_HEADER_MAGIC: u32 = 0x50414352; // RCAP; capture uses version 3.
+const CAPTURE_HEADER_MAGIC: u32 = 0x50414352; // RCAP; capture uses version 4.
 const PARAM_CAPTURE_MODE: usize = 5880;
 const PARAM_PARENT_OFFSET: usize = 5884;
 const PARAM_WINDOW: usize = 5888;
@@ -2748,8 +2754,10 @@ pub(crate) struct NativeCapture {
     /// LE parent row u32, reserved zero u32. Selected roots come first in request
     /// order with parent=u32::MAX; remaining rows are breadth-first, in engine
     /// child order, and every parent precedes its children. These are identities,
-    /// not creation/ownership receipts. Includes services themselves, not Game.
+    /// not creation/ownership receipts. Includes selected roots themselves, not Game.
     pub identities: Vec<u8>,
+    #[allow(dead_code)]
+    pub roots: Vec<NativeCaptureRootResult>,
 }
 
 fn capture_remaining_ms(started: Instant, timeout: Duration) -> Result<u32> {
@@ -2927,7 +2935,7 @@ fn validate_capture_header(header: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn capture_lengths(header: &[u8], root_count: usize, file_size: u64) -> Result<(usize, usize)> {
+fn validate_capture_status(header: &[u8]) -> Result<()> {
     validate_capture_header(header)?;
     let status = read_u32(header, 8)?;
     let exit = read_u32(header, 12)?;
@@ -2939,10 +2947,16 @@ fn capture_lengths(header: &[u8], root_count: usize, file_size: u64) -> Result<(
         }
         .into());
     }
+    Ok(())
+}
+
+fn capture_lengths(header: &[u8], root_count: usize, file_size: u64) -> Result<(usize, usize)> {
+    validate_capture_status(header)?;
     let bytes = usize::try_from(read_u64(header, 16)?)?;
     let identities = usize::try_from(read_u64(header, 24)?)?;
     anyhow::ensure!(
-        (32..=CAPTURE_MAX_BYTES).contains(&bytes)
+        ((32..=CAPTURE_MAX_BYTES).contains(&bytes)
+            || (root_count == 0 && bytes == 0 && identities == 0))
             && identities.is_multiple_of(CAPTURE_ROW_SIZE)
             && (root_count..=CAPTURE_MAX_ROWS).contains(&(identities / CAPTURE_ROW_SIZE))
             && bytes
@@ -2977,7 +2991,9 @@ pub(crate) fn capture_live_services(
     })?;
     let (mut captured, attempts) = retry_capture(
         timeout.saturating_sub(started.elapsed()),
-        |remaining| capture_live_services_once(pid, studio_title, services, remaining, &memory),
+        |remaining| {
+            capture_live_services_once(pid, studio_title, services, remaining, &memory, None)
+        },
         |attempt, result, delay| {
             let outcome = match result {
                 Ok(_) => "succeeded".to_owned(),
@@ -3007,13 +3023,14 @@ fn capture_live_services_once(
     services: &[String],
     timeout: Duration,
     memory: &ProcessMemory,
+    selected: Option<&[NativeCaptureRoot<'_>]>,
 ) -> Result<NativeCapture> {
     let _profile = crate::app::profile::span("native capture host and helper");
     let started = Instant::now();
     let discovery = crate::app::profile::span("native capture structural discovery and bindings");
     capture_remaining_ms(started, timeout)?;
     anyhow::ensure!(
-        !services.is_empty() && services.len() <= MAX_ROOTS,
+        selected.is_some() || (!services.is_empty() && services.len() <= MAX_ROOTS),
         "Native capture requires 1..={MAX_ROOTS} services"
     );
     memory.authorize(NativeOperation::Capture, studio_title)?;
@@ -3045,18 +3062,26 @@ fn capture_live_services_once(
     let (identity_binding, identity_getter) =
         properties::identity_binding(memory, studio, &layout, &model, instance)?;
     let debug_id = properties::debug_id_function(memory, studio, &layout, &model, instance)?;
-    let roots = model
-        .roots
-        .iter()
-        .map(|entry| {
-            Ok((
-                *entry,
-                read_instance_class(memory, entry.instance, model.layout)
-                    .context("Studio service class changed during capture discovery")?,
-            ))
+    let selection = selected
+        .map(|roots| {
+            capture_roots::encode(memory, &model, roots, started + timeout)
+                .context("capture-root-path detector")
         })
-        .collect::<Result<Vec<_>>>()?;
-    model.roots = select_capture_roots(&roots, services)?;
+        .transpose()?;
+    if selected.is_none() {
+        let roots = model
+            .roots
+            .iter()
+            .map(|entry| {
+                Ok((
+                    *entry,
+                    read_instance_class(memory, entry.instance, model.layout)
+                        .context("Studio service class changed during capture discovery")?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        model.roots = select_capture_roots(&roots, services)?;
+    }
     let helper = ensure_helper_loaded_with_timeout(
         pid,
         memory,
@@ -3126,7 +3151,11 @@ fn capture_live_services_once(
     task_context.encode(&mut parameters)?;
     let remaining = capture_remaining_ms(started, timeout)?;
     put_u32(&mut parameters, PARAM_TIMEOUT, remaining.min(15_000));
-    let remote = memory.allocate(parameters.len())?;
+    let remote = memory.allocate(parameters.len() + selection.as_ref().map_or(0, Vec::len))?;
+    if let Some(selection) = &selection {
+        put_u64(&mut parameters, 6024, remote.address + PARAM_SIZE);
+        memory.write(remote.address + PARAM_SIZE, selection)?;
+    }
     memory.write(remote.address, &parameters)?;
     drop(prepare);
     let helper_span = crate::app::profile::span("native capture helper round trip");
@@ -3149,8 +3178,14 @@ fn capture_live_services_once(
         "Native capture response exit disagrees with helper exit"
     );
     task_context.log_helper_reading(pid, &header)?;
-    let (byte_count, identity_count) =
-        capture_lengths(&header, services.len(), transport.metadata()?.len())?;
+    validate_capture_status(&header)?;
+    let receipt_size = selected.map_or(0, |roots| roots.len() * capture_roots::RECEIPT_SIZE);
+    let payload_size = transport
+        .metadata()?
+        .len()
+        .checked_sub(receipt_size as u64)
+        .context("Truncated selected capture receipts")?;
+    let (byte_count, identity_count) = capture_lengths(&header, services.len(), payload_size)?;
     let ticks = (0..10)
         .map(|i| read_u64(&header, 360 + i * 8))
         .collect::<Result<Vec<_>>>()?;
@@ -3162,7 +3197,7 @@ fn capture_live_services_once(
             "task allocation and ownership",
             "DataModel queue wait",
             "target validation",
-            "engine serialize selected services",
+            "engine serialize selected roots",
             "identity and hierarchy walk",
             "open transport",
             "write binary and identities",
@@ -3179,8 +3214,9 @@ fn capture_live_services_once(
     crate::app::output::log_global(
         4,
         format_args!(
-            "[renium] native capture helper: services={} engine_calls=1 bytes={byte_count} instances={} identity_bytes={identity_count} queue_ms={:.3} serialize_ms={:.3} identity_ms={:.3} write_ms={:.3}",
-            services.len(),
+            "[renium] native capture helper: roots={} engine_calls={} bytes={byte_count} instances={} identity_bytes={identity_count} queue_ms={:.3} serialize_ms={:.3} identity_ms={:.3} write_ms={:.3}",
+            selected.map_or(services.len(), |roots| roots.len()),
+            usize::from(byte_count != 0),
             identity_count / CAPTURE_ROW_SIZE,
             read_u64(&header, 32)? as f64 / 1000.0,
             read_u64(&header, 40)? as f64 / 1000.0,
@@ -3202,11 +3238,16 @@ fn capture_live_services_once(
         capture_window(pid, studio_title)? == window,
         "Studio window changed during native capture"
     );
+    let mut receipts = vec![0; receipt_size];
+    transport.read_exact(&mut receipts)?;
+    let roots = capture_roots::decode(&receipts, identity_count / CAPTURE_ROW_SIZE)?;
+    capture_remaining_ms(started, timeout)?;
     drop(receive);
     Ok(NativeCapture {
         attempts: 1,
         bytes,
         identities,
+        roots,
     })
 }
 

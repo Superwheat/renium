@@ -1,6 +1,7 @@
 #include <Windows.h>
 #include <ehdata.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -29,14 +30,8 @@
 
 extern "C" __declspec(dllexport) const std::uint32_t ReniumSerializerAbiVersion = ReniumSerializerVersion;
 
-struct CaptureIdentityRow
-{
-    unsigned char id[16]; // Native UniqueId getter's four LE words, unchanged.
-    char debugId[48];     // GetDebugId(32), NUL terminated and zero padded.
-    std::uint32_t parent; // Earlier row index; UINT32_MAX for selected roots.
-    std::uint32_t reserved;
-};
-static_assert(sizeof(CaptureIdentityRow) == 72);
+#include "renium_capture_roots.h"
+
 static constexpr std::size_t CaptureMaxRows = 2000000;
 static constexpr std::size_t CaptureMaxBytes = 512ull * 1024 * 1024;
 
@@ -213,6 +208,29 @@ static void DestroyDebugString(RunState* state)
     }
 }
 
+static void CaptureIdentity(RunState* state, void* instance, CaptureIdentityRow& row)
+{
+    const auto params = state->params;
+    using IdentityGetter = void*(__fastcall*)(void*, void*, void*);
+    const auto identity = reinterpret_cast<IdentityGetter>(params->identityGetter)(
+        reinterpret_cast<void*>(params->identityBinding), row.id, instance);
+    if (identity != row.id)
+        throw std::runtime_error("Native UniqueId return-buffer ABI changed");
+    using DebugIdGetter = void*(__fastcall*)(void*, void*, std::int32_t);
+    const auto textResult = reinterpret_cast<DebugIdGetter>(params->debugIdGetter)(
+        instance, &state->debugString, 32);
+    state->debugStringBuilt = true;
+    const auto& text = state->debugString;
+    if (textResult != &text || !text.size || text.size >= sizeof(row.debugId) ||
+        text.size > text.capacity)
+        throw std::runtime_error("Native GetDebugId returned an invalid string");
+    const auto data = text.capacity < 16 ? text.storage.inlineBytes : text.storage.heap;
+    if (memchr(data, '\0', text.size) || data[text.size] != '\0')
+        throw std::runtime_error("Native GetDebugId returned invalid text");
+    memcpy(row.debugId, data, text.size);
+    DestroyDebugString(state);
+}
+
 static void CaptureIdentities(RunState* state)
 {
     const auto params = state->params;
@@ -229,7 +247,7 @@ static void CaptureIdentities(RunState* state)
             static_cast<unsigned char*>(root) + params->selfOffset);
         if (self->instance != root || self->owner != params->roots[index].owner)
             throw std::runtime_error("Selected service self identity changed before capture");
-        if (*reinterpret_cast<void**>(static_cast<unsigned char*>(root) + params->parentOffset) !=
+        if (!params->selectedRoots && *reinterpret_cast<void**>(static_cast<unsigned char*>(root) + params->parentOffset) !=
             reinterpret_cast<void*>(params->dataModel + params->dataModelInstanceOffset))
             throw std::runtime_error("Selected service parent changed before capture");
         pending.push_back(root);
@@ -239,24 +257,7 @@ static void CaptureIdentities(RunState* state)
     {
         CheckSerializerDeadline(state);
         auto instance = static_cast<unsigned char*>(pending[index]);
-        using IdentityGetter = void*(__fastcall*)(void*, void*, void*);
-        const auto identity = reinterpret_cast<IdentityGetter>(params->identityGetter)(
-            reinterpret_cast<void*>(params->identityBinding), rows[index].id, instance);
-        if (identity != rows[index].id)
-            throw std::runtime_error("Native UniqueId return-buffer ABI changed");
-        using DebugIdGetter = void*(__fastcall*)(void*, void*, std::int32_t);
-        const auto textResult = reinterpret_cast<DebugIdGetter>(params->debugIdGetter)(
-            instance, &state->debugString, 32);
-        state->debugStringBuilt = true;
-        const auto& text = state->debugString;
-        if (textResult != &text || !text.size || text.size >= sizeof(rows[index].debugId) ||
-            text.size > text.capacity)
-            throw std::runtime_error("Native GetDebugId returned an invalid string");
-        const auto data = text.capacity < 16 ? text.storage.inlineBytes : text.storage.heap;
-        if (memchr(data, '\0', text.size) || data[text.size] != '\0')
-            throw std::runtime_error("Native GetDebugId returned invalid text");
-        memcpy(rows[index].debugId, data, text.size);
-        DestroyDebugString(state);
+        CaptureIdentity(state, instance, rows[index]);
 
         const auto children = *reinterpret_cast<const SharedVector* const*>(instance + params->childrenOffset);
         const auto count = CaptureChildCount(children);
@@ -277,6 +278,60 @@ static void CaptureIdentities(RunState* state)
         }
     }
     params->identitySize = rows.size() * sizeof(CaptureIdentityRow);
+}
+
+static bool SelectedCapturePathPresent(const ReniumSerializerParams& p, const CaptureRootRequest& root)
+{
+    return CapturePathPresent(root, reinterpret_cast<void*>(p.dataModel + p.dataModelInstanceOffset),
+            [&](void* object) {
+                const auto list = *reinterpret_cast<const SharedVector* const*>(
+                    static_cast<unsigned char*>(object) + p.childrenOffset);
+                const auto count = CaptureChildCount(list);
+                return std::make_pair(list ? list->begin : nullptr, count);
+            }, [&](void* object) {
+                return *reinterpret_cast<const SharedInstance*>(
+                    static_cast<unsigned char*>(object) + p.selfOffset);
+            }, [&](void* object) {
+                return *reinterpret_cast<void**>(static_cast<unsigned char*>(object) + p.parentOffset);
+            });
+}
+
+static void SelectCaptureInstances(RunState* state)
+{
+    auto& p = *state->params;
+    auto& selected = *reinterpret_cast<CaptureRoots*>(p.selectedRoots);
+    if (!selected.count || selected.count > 256 || selected.reserved)
+        throw std::runtime_error("capture-root-path detector: invalid root count");
+    p.count = 0;
+    const auto model = reinterpret_cast<void*>(p.dataModel + p.dataModelInstanceOffset);
+    for (std::uint32_t i = 0; i < selected.count; ++i) {
+        CheckSerializerDeadline(state);
+        auto& root = selected.roots[i];
+        if (root.depth > 64 || root.reserved > 1)
+            throw std::runtime_error("capture-root-path detector: invalid path depth or scope");
+        root.receipt = {root.depth ? 2u : 1u, UINT32_MAX, 0, 1, {}};
+        if (!SelectedCapturePathPresent(p, root)) continue;
+        const auto& node = root.path[root.depth - 1];
+        CaptureIdentityRow identity{};
+        CaptureIdentity(state, node.object.instance, identity);
+        if (!root.expectedDebugId[0] || root.expectedDebugId[47] ||
+            std::memcmp(identity.debugId, root.expectedDebugId, 48)) continue;
+        // Reject overlap instead of duplicating rows or silently dropping a root.
+        for (std::uint32_t j = 0; j < i; ++j) {
+            const auto& other = selected.roots[j];
+            if (other.receipt.status) continue;
+            const auto depth = (std::min)(root.depth, other.depth);
+            if (root.path[depth - 1].object.instance == other.path[depth - 1].object.instance)
+                throw std::runtime_error("capture-root-path detector: overlapping roots");
+        }
+        const auto parent = root.depth == 1 ? model : root.path[root.depth - 2].object.instance;
+        CaptureIdentity(state, parent, root.receipt.parent);
+        root.receipt.parent.parent = UINT32_MAX;
+        root.receipt.status = 0;
+        root.receipt.row = p.count;
+        root.receipt.sibling = static_cast<std::uint32_t>(node.sibling);
+        p.roots[p.count++] = node.object;
+    }
 }
 
 static bool WriteSnapshotBytes(RunState* state, const void* bytes, std::size_t size)
@@ -323,7 +378,8 @@ static DWORD RunCore(RunState* state)
     if (!children || !children->begin || children->end < children->begin ||
         children->end - children->begin > 256)
         throw std::runtime_error("DataModel root layout changed before native snapshot");
-    for (std::uint32_t index = 0; index < params->count; ++index)
+    if (params->selectedRoots) SelectCaptureInstances(state);
+    else for (std::uint32_t index = 0; index < params->count; ++index)
     {
         const auto& expected = params->roots[index];
         bool present = false;
@@ -403,7 +459,8 @@ static DWORD RunCore(RunState* state)
     state->streamBuilt = true;
     QueryPerformanceCounter(&started);
     params->timeline.ticks[3] = started.QuadPart;
-    if (params->placeMode)
+    if (params->selectedRoots && !params->count) { /* All roots are stale; no engine call. */ }
+    else if (params->placeMode)
     {
         // Rust already validated this build's layout and captured these roots.
         auto instance = reinterpret_cast<unsigned char*>(params->dataModel) +
@@ -443,9 +500,15 @@ static DWORD RunCore(RunState* state)
     if (params->captureMode)
     {
         const auto size = state->stream->view().size();
-        if (size < 32 || size > CaptureMaxBytes)
+        if ((size < 32 && !(params->selectedRoots && !params->count && !size)) || size > CaptureMaxBytes)
             throw std::runtime_error("Native capture exceeds its byte bound");
         QueryPerformanceCounter(&started);
+        if (params->selectedRoots) {
+            const auto& selected = *reinterpret_cast<const CaptureRoots*>(params->selectedRoots);
+            for (std::uint32_t i = 0; i < selected.count; ++i)
+                if (!selected.roots[i].receipt.status && !SelectedCapturePathPresent(*params, selected.roots[i]))
+                    throw std::runtime_error("capture-root-path detector: ancestry changed during serialization");
+        }
         CaptureIdentities(state);
         QueryPerformanceCounter(&finished);
         params->identityMicros = ElapsedMicros(started, finished, frequency);
@@ -493,6 +556,11 @@ static DWORD RunCore(RunState* state)
     bool wrote = WriteSnapshotBytes(state, payload.data(), payload.size());
     if (wrote && params->captureMode)
         wrote = WriteSnapshotBytes(state, state->identities->data(), params->identitySize);
+    if (wrote && params->selectedRoots) {
+        const auto& selected = *reinterpret_cast<const CaptureRoots*>(params->selectedRoots);
+        for (std::uint32_t i = 0; wrote && i < selected.count; ++i)
+            wrote = WriteSnapshotBytes(state, &selected.roots[i].receipt, sizeof(CaptureRootReceipt));
+    }
     if (wrote && !params->captureMode)
         wrote = FlushFileBuffers(state->file) != FALSE;
     CloseHandle(state->file);
@@ -749,6 +817,7 @@ static DWORD RemainingMilliseconds(std::uint64_t deadline)
 struct SerializerTask
 {
     ReniumSerializerParams result{};
+    std::unique_ptr<CaptureRoots> selected;
     HANDLE completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     bool delivered = false;
     std::atomic<bool> cancelled{false};
@@ -777,6 +846,15 @@ static DWORD QueueSerializer(ReniumSerializerParams* params)
     auto modelHold = std::shared_ptr<void>(owner, ReleaseOwnerReference);
     auto task = std::make_shared<SerializerTask>();
     task->result = *params;
+    if (params->selectedRoots) {
+        if (params->captureMode != 1) throw std::runtime_error("capture-root-path detector: invalid mode");
+        const auto input = reinterpret_cast<const CaptureRoots*>(params->selectedRoots);
+        if (!input->count || input->count > 256 || input->reserved)
+            throw std::runtime_error("capture-root-path detector: invalid request header");
+        task->selected = std::make_unique<CaptureRoots>();
+        std::memcpy(task->selected.get(), input, 8 + input->count * sizeof(CaptureRootRequest));
+        task->result.selectedRoots = reinterpret_cast<std::uint64_t>(task->selected.get());
+    }
     task->result.status = 1;
     task->result.deadlineTick = GetTickCount64() + params->timeoutMs;
     if (!task->completed) throw std::runtime_error("Cannot create native snapshot completion event");
@@ -806,7 +884,9 @@ static DWORD QueueSerializer(ReniumSerializerParams* params)
         task->cancelled.store(true, std::memory_order_release);
         throw std::runtime_error("Native snapshot exceeded its response deadline");
     }
+    const auto selectedInput = params->selectedRoots;
     *params = task->result;
+    params->selectedRoots = selectedInput;
     LARGE_INTEGER completed{};
     QueryPerformanceCounter(&completed);
     params->timeline.ticks[9] = completed.QuadPart;

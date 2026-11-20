@@ -1828,7 +1828,15 @@ pub(super) fn identity_binding(
     Ok((binding, getter))
 }
 
-fn validate_property_path(segments: &[String], ordinals: &[usize]) -> Result<()> {
+pub(super) fn exact_ordinal_index(ordinal: Option<usize>, matches: usize) -> Option<usize> {
+    match ordinal {
+        Some(n) if n > 0 && n <= matches => Some(n - 1),
+        None if matches == 1 => Some(0),
+        _ => None,
+    }
+}
+
+pub(super) fn validate_property_path(segments: &[String], ordinals: &[usize]) -> Result<()> {
     if segments.is_empty()
         || segments.len() > 64
         || segments.iter().any(String::is_empty)

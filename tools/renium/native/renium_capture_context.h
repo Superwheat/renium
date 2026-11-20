@@ -4,7 +4,7 @@
 #include <cstring>
 #include <stdexcept>
 
-static constexpr std::uint32_t ReniumSerializerVersion = 3;
+static constexpr std::uint32_t ReniumSerializerVersion = 4;
 
 // Renium's own wire layout, independent of the engine's objects. QPC is shared
 // across processes; the host pins it to an Instant before invoking the helper.
@@ -74,9 +74,11 @@ struct ReniumSerializerParams
     std::uint32_t contextRead;
     std::uint32_t contextReserved;
     CaptureTimeline timeline;
+    std::uint64_t selectedRoots; // Optional Renium CaptureRoots request, copied before queueing.
 };
 
-static_assert(sizeof(ReniumSerializerParams) == 6024);
+static_assert(sizeof(ReniumSerializerParams) == 6032);
+static_assert(offsetof(ReniumSerializerParams, selectedRoots) == 6024);
 static_assert(offsetof(ReniumSerializerParams, timeline) == 5936);
 static_assert(offsetof(ReniumSerializerParams, status) == 68);
 static_assert(offsetof(ReniumSerializerParams, placeMode) == 136);
