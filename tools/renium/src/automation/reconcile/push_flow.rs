@@ -93,7 +93,7 @@ fn reuse_verified_full_push(
 /// holds (`plan_reads_changed_alone`). A script is found among them by its
 /// name and its place, which every instance keeps, and a script file that
 /// adds an instance to its store or takes one away reads that store whole.
-fn stores_read_of(
+pub(super) fn stores_read_of(
     unenforced: bool,
     paths: &HashSet<PathBuf>,
     project: &ProjectSnapshot,

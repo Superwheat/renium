@@ -5789,6 +5789,8 @@ mod merge_rules;
 
 mod conflict_records;
 
+mod live_store_edits;
+
 #[test]
 fn a_file_identity_reused_for_another_class_is_a_new_instance_not_a_replacement() {
     let instance =

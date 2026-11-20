@@ -1090,7 +1090,11 @@ impl Coordinator {
             return Ok(AppliedEditorChanges::default());
         }
         let root = Path::new(&context.root);
-        let mut inputs = incremental_push_inputs(root, baseline, key, &scopes)?;
+        let mut args = automation_push_args(context, &json!({ "yes": true }), false)?;
+        // The stores are read as a push from the files reads them to compare
+        // (`stores_compared_of`).
+        let by_changed = crate::editor::sync::project_pushes_stores_as_held(&args)?;
+        let mut inputs = incremental_push_inputs(root, baseline, key, &scopes, by_changed)?;
         let mut promoted_services = promote_heavy_deltas_to_replacement(
             context,
             &inputs.current,
@@ -1105,7 +1109,7 @@ impl Coordinator {
             let stage = project_comparison_stage(context, &sync_services())?;
             let full = stage.publish_paths().to_vec();
             drop(stage);
-            inputs = incremental_push_inputs(root, baseline, key, &full)?;
+            inputs = incremental_push_inputs(root, baseline, key, &full, false)?;
             promoted_services = promote_heavy_deltas_to_replacement(
                 context,
                 &inputs.current,
@@ -1117,17 +1121,15 @@ impl Coordinator {
         let IncrementalPushInputs {
             previous,
             current,
-            prepared: prepared_settings,
+            prepared: mut prepared_settings,
             changed,
         } = inputs;
         let phase = Instant::now();
-        let mut plan = reconciliation_push_plan_for_paths_with_prepared_settings(
-            &previous,
-            &current,
+        let mut plan = incremental_push_plan(
+            (&previous, &current, &scopes),
             &changed,
-            &prepared_settings,
+            &mut prepared_settings,
             !promoted_services.is_empty(),
-            false,
         )?;
         extend_replaced_service_references(
             &current,
@@ -1175,7 +1177,6 @@ impl Coordinator {
         apply_snapshot_paths(&stage.project_root, &changed, &current)?;
         log_reconcile_timing("incremental staged write", phase);
         let phase = Instant::now();
-        let mut args = automation_push_args(context, &json!({ "yes": true }), false)?;
         let mut history =
             history::SyncHistory::begin_push(root, &source, &previous, &changed, &mut args)?;
         let StagedPushResult {
@@ -1405,6 +1406,7 @@ fn incremental_push_inputs(
     baseline: &StoredSnapshot,
     key: &str,
     scopes: &[PathBuf],
+    by_changed: bool,
 ) -> Result<IncrementalPushInputs> {
     let phase = Instant::now();
     let previous = baseline.load_scopes(root, key, scopes)?;
@@ -1413,7 +1415,7 @@ fn incremental_push_inputs(
     let current = capture_snapshot(root, scopes)?;
     log_reconcile_timing("incremental project capture", phase);
     let phase = Instant::now();
-    let prepared = prepare_editor_settings_changes(&previous, &current, scopes)?;
+    let prepared = prepare_editor_settings_changes_from(&previous, &current, scopes, by_changed)?;
     log_reconcile_timing("incremental settings preparation", phase);
     let changed = previous
         .entries

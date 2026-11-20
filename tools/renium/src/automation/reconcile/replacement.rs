@@ -382,12 +382,15 @@ const MAX_CHANGED_INSTANCES: usize = 16_384;
 const COMPARED_AT_ONCE: usize = if cfg!(test) { 64 } else { 1_024 };
 
 /// A copy of a store read by some of its instances: every other one bare
-/// and standing for its counterpart of the other copy.
+/// and standing for its counterpart of the other copy. With `as_stored` each
+/// property keeps the name its file states, as `editor_settings_document`
+/// leaves it.
 fn sparse_document(
     instances: Vec<SettingsBytecodeInstance>,
     read: &[usize],
     rows: Vec<SettingsBytecodeInstance>,
     version: u8,
+    as_stored: bool,
 ) -> Result<SettingsBytecode> {
     let mut document = SettingsBytecode { version, instances };
     for instance in &mut document.instances {
@@ -400,7 +403,9 @@ fn sparse_document(
         document.instances[*index] = row;
     }
     crate::settings::equivalence::stabilize_settings_reference_ids(&mut document);
-    canonicalize_settings_property_names(&mut document)?;
+    if !as_stored {
+        canonicalize_settings_property_names(&mut document)?;
+    }
     Ok(document)
 }
 
@@ -584,7 +589,7 @@ fn imported_store(
     else {
         return Ok(None);
     };
-    let studio = sparse_document(studio, &kept, rows, SETTINGS_BINARY_VERSION)?;
+    let studio = sparse_document(studio, &kept, rows, SETTINGS_BINARY_VERSION, false)?;
     let retained = retained_settings_document(&studio);
     if !service_has_only_native_containers(&retained)
         || same_named_roots_share_a_package(&studio)
@@ -715,7 +720,7 @@ fn changed_instances_alone(
     if pair.is_some_and(|pair| same.lock_recover().contains(&pair)) {
         return Ok(ChangedInstances::None);
     }
-    let how = (files_too, imports_heavy, viewport_first);
+    let how = (files_too, imports_heavy, viewport_first, false);
     let changed = changed_instances_compared(path, desired, observed, how)?;
     if let (ChangedInstances::None, Some(pair)) = (&changed, pair) {
         let mut same = same.lock_recover();
@@ -736,7 +741,7 @@ fn changed_instances_compared(
     path: &Path,
     desired: Option<&SnapshotEntry>,
     observed: Option<&SnapshotEntry>,
-    how: (bool, bool, bool),
+    how: (bool, bool, bool, bool),
 ) -> Result<ChangedInstances> {
     static APART: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
     let apart = APART.get_or_init(Default::default);
@@ -971,11 +976,12 @@ fn names_one_taken_by_order(
 }
 
 /// `changed_instances_alone` for copies whose instances stand at the same
-/// places, one run apart, or as `told` pairs them.
+/// places, one run apart, or as `told` pairs them. `as_stored` is for two
+/// copies of the files' own (`edited_store_alone`).
 fn changed_instances_placed(
     desired: Option<&SnapshotEntry>,
     observed: Option<&SnapshotEntry>,
-    (files_too, imports_heavy, viewport_first): (bool, bool, bool),
+    (files_too, imports_heavy, viewport_first, as_stored): (bool, bool, bool, bool),
     told: Option<Told>,
 ) -> Result<ChangedInstances> {
     use crate::settings::bytecode::blocks::instance_count;
@@ -1246,10 +1252,16 @@ fn changed_instances_placed(
             let Ok((rows, _)) = decode_rows(desired_bytes, read) else {
                 return Ok(ChangedInstances::Whole(None));
             };
-            sparse_document(files.instances, read, rows, SETTINGS_BINARY_VERSION)?
+            sparse_document(
+                files.instances,
+                read,
+                rows,
+                SETTINGS_BINARY_VERSION,
+                as_stored,
+            )?
         }
     };
-    let mut previous = sparse_document(skeleton, &read, rows, current.version)?;
+    let mut previous = sparse_document(skeleton, &read, rows, current.version, as_stored)?;
     let hand_over =
         |current: SettingsBytecode| Ok(ChangedInstances::Whole((!files_too).then_some(current)));
     if settings_documents_positionally_equivalent(&current, &previous) {
@@ -1272,6 +1284,11 @@ fn changed_instances_placed(
             return Ok(ChangedInstances::Apart((!files_too).then_some(current)));
         }
     }
+    let stored_ids = as_stored.then(|| {
+        let ids = previous.instances.iter();
+        ids.map(|instance| instance.settings_id.clone())
+            .collect::<Vec<_>>()
+    });
     let aligned = match (told, moved.and_then(Moved::run)) {
         (Some(told), _) => {
             take_settings_ids(&mut previous, told.ids);
@@ -1282,7 +1299,13 @@ fn changed_instances_placed(
             align_settings_ids_beside_run(&mut current, &mut previous, run, !of_files)
         }
     };
-    if !aligned {
+    // Two copies of the files' own share their ids: an alignment that gives
+    // an instance another id took it for one the files hold under that id.
+    let kept = stored_ids.is_none_or(|ids| {
+        let now = previous.instances.iter();
+        ids.iter().eq(now.map(|instance| &instance.settings_id))
+    });
+    if !aligned || !kept {
         return hand_over(current);
     }
     let reusable = previous
@@ -1504,6 +1527,27 @@ fn read_where_paired(
         crate::settings::equivalence::read_unread_instances(current, bytes)?;
     }
     Ok(())
+}
+
+/// The change of a store the files hold edited since Live Sync pushed it
+/// last, from the instances that differ between the two copies
+/// (`changed_instances_alone`, of both). The copies share their ids and Live
+/// Sync aligns neither, so the change is taken only where the alignment
+/// leaves each instance of the earlier copy the id it had, and each instance
+/// read is the one `editor_settings_document` gives. `None` where the whole
+/// documents are prepared: for copies that hold the same, which no instance
+/// read here tells from copies under other ids, and for what this reading
+/// refuses, which is the whole decode's to refuse.
+pub(crate) fn edited_store_alone(
+    path: &Path,
+    current: Option<&SnapshotEntry>,
+    previous: Option<&SnapshotEntry>,
+) -> Option<PreparedEditorSettingsChange> {
+    let how = (true, false, false, true);
+    match changed_instances_compared(path, current, previous, how) {
+        Ok(ChangedInstances::Prepared(change)) => Some(*change),
+        _ => None,
+    }
 }
 
 /// Whether two copies of a store are equivalent, by the instances that

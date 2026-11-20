@@ -340,11 +340,32 @@ pub(crate) fn service_settings_paths(
     paths
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_editor_settings_changes(
     previous: &ProjectSnapshot,
     current: &ProjectSnapshot,
     scopes: &[PathBuf],
 ) -> Result<HashMap<PathBuf, PreparedEditorSettingsChange>> {
+    prepare_editor_settings_changes_from(previous, current, scopes, false)
+}
+
+/// The change of each store the files hold edited since `previous`. With
+/// `by_changed`, which a project that pushes its stores as held gives
+/// (`project_pushes_stores_as_held`), a store is prepared from the instances
+/// that differ (`edited_store_alone`) where nothing but stores and script
+/// files changed (`stores_read_of`). `incremental_push_plan` then says
+/// whether its plan is carried out from them.
+pub(crate) fn prepare_editor_settings_changes_from(
+    previous: &ProjectSnapshot,
+    current: &ProjectSnapshot,
+    scopes: &[PathBuf],
+    by_changed: bool,
+) -> Result<HashMap<PathBuf, PreparedEditorSettingsChange>> {
+    let by_changed = by_changed && {
+        let paths = project_replacement_paths(current, previous);
+        super::push_flow::stores_read_of(true, &paths, current, previous)
+            == StoresRead::ChangedOfBoth
+    };
     service_settings_paths(previous, current, scopes)
         .into_iter()
         .filter(|path| previous.entries.get(path) != current.entries.get(path))
@@ -354,25 +375,67 @@ pub(crate) fn prepare_editor_settings_changes(
             if previous_entry.is_some() && current_entry.is_none() {
                 bail!("{}", missing_store_message(&path));
             }
-            let (previous_document, current_document) = rayon::join(
-                || editor_settings_document(previous_entry),
-                || {
-                    editor_settings_document(current_entry)
-                        .with_context(|| format!("Could not read the store {}", path.display()))
-                },
-            );
-            let mut change = PreparedEditorSettingsChange {
-                previous: previous_document?,
-                current: current_document?,
+            let alone = by_changed
+                .then(|| edited_store_alone(&path, current_entry, previous_entry))
+                .flatten();
+            let change = match alone {
+                Some(change) => change,
+                None => {
+                    let (previous_document, current_document) = rayon::join(
+                        || editor_settings_document(previous_entry),
+                        || {
+                            editor_settings_document(current_entry).with_context(|| {
+                                format!("Could not read the store {}", path.display())
+                            })
+                        },
+                    );
+                    let mut change = PreparedEditorSettingsChange {
+                        previous: previous_document?,
+                        current: current_document?,
+                    };
+                    crate::settings::equivalence::inherit_workspace_viewport_reference(
+                        &mut change.current,
+                        &change.previous,
+                    );
+                    change
+                }
             };
-            crate::settings::equivalence::inherit_workspace_viewport_reference(
-                &mut change.current,
-                &change.previous,
-            );
             validate_package_link_documents(&path, &change.previous, &change.current)?;
             Ok((path, change))
         })
         .collect()
+}
+
+/// The plan of an incremental push from the stores it prepared. One the
+/// instances that differ do not carry out (`plan_reads_changed_alone`) is
+/// made again from the whole documents, which `prepared` then holds. So is
+/// one that creates an instance beside another store: what refers to a new
+/// instance is sent again, and a store is read for what names an id only
+/// where it holds an instance more itself, never for another store's.
+pub(crate) fn incremental_push_plan(
+    (previous, current, scopes): (&ProjectSnapshot, &ProjectSnapshot, &[PathBuf]),
+    changed: &HashSet<PathBuf>,
+    prepared: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
+    bootstrap: bool,
+) -> Result<ReconcilePushPlan> {
+    let planned = |prepared: &HashMap<PathBuf, PreparedEditorSettingsChange>| {
+        reconciliation_push_plan_for_paths_with_prepared_settings(
+            previous, current, changed, prepared, bootstrap, false,
+        )
+    };
+    let plan = planned(prepared);
+    let unread = |change: &PreparedEditorSettingsChange| {
+        crate::settings::equivalence::holds_unread_instances(&change.current)
+    };
+    let carried = plan.as_ref().is_ok_and(|plan| {
+        plan_reads_changed_alone(plan)
+            && (prepared.len() == 1 || plan.recreated_settings_ids.is_empty())
+    });
+    if carried || !prepared.values().any(unread) {
+        return plan;
+    }
+    *prepared = prepare_editor_settings_changes_from(previous, current, scopes, false)?;
+    planned(prepared)
 }
 
 pub(crate) fn validate_package_link_documents(
