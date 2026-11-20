@@ -460,7 +460,10 @@ impl Coordinator {
             publish_paths,
         } = capture_for_reconcile(context, bridge, setup, &record, &studio_state)?;
         let phase = Instant::now();
-        let side_differences = snapshot_differences(&editor, &studio)?;
+        // The files against Studio's capture, as a push compares them: a
+        // store by the instances that differ where that says as much.
+        let side_differences =
+            super::replacement::snapshot_differences_prepared(&editor, &studio, None, true)?;
         log_reconcile_timing("side comparison", phase);
         let phase = Instant::now();
         let comparison = compare_sides(
