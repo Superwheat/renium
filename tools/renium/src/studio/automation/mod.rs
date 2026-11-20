@@ -407,8 +407,46 @@ impl Visitor for LuauLoopCheckpoints {
     }
 }
 
+/// Parses code the Luau compiler has accepted. Luau takes a type suffix after
+/// a parenthesized return list that ends in a variadic, as in
+/// `(boolean, ...any)?`, and full_moon does not. Code it refuses is parsed
+/// once more with each `?` after a closing parenthesis blanked, which moves no
+/// byte and takes nothing but an optional mark from a type.
+pub(crate) fn parse_compiled_luau(code: &str) -> ast::AstResult {
+    let luau = full_moon::LuaVersion::luau();
+    let parsed = full_moon::parse_fallible(code, luau);
+    if parsed.errors().is_empty() {
+        return parsed;
+    }
+    without_optional_marks_after_parentheses(code)
+        .map(|blanked| full_moon::parse_fallible(&blanked, luau))
+        .filter(|retried| retried.errors().is_empty())
+        .unwrap_or(parsed)
+}
+
+fn without_optional_marks_after_parentheses(code: &str) -> Option<String> {
+    use full_moon::tokenizer::{Lexer, LexerResult, Symbol, TokenType};
+    let LexerResult::Ok(tokens) = Lexer::new(code, full_moon::LuaVersion::luau()).collect() else {
+        return None;
+    };
+    let mut blanked = code.as_bytes().to_vec();
+    let mut after_parenthesis = false;
+    for token in &tokens {
+        let is = |symbol| *token.token_type() == TokenType::Symbol { symbol };
+        if token.token_type().is_trivia() {
+            continue;
+        }
+        if after_parenthesis && is(Symbol::QuestionMark) {
+            blanked[token.start_position().bytes()] = b' ';
+        } else {
+            after_parenthesis = is(Symbol::RightParen);
+        }
+    }
+    String::from_utf8(blanked).ok().filter(|text| text != code)
+}
+
 fn instrument_luau(code: &str) -> Result<String> {
-    let parsed = full_moon::parse_fallible(code, full_moon::LuaVersion::luau());
+    let parsed = parse_compiled_luau(code);
     if let Some(error) = parsed.errors().first() {
         let (start, _) = error.range();
         bail!(

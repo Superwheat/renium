@@ -334,6 +334,7 @@ pub fn post_key_state(window: &StudioWindow, key: &KeySpec, down: bool) -> Resul
 pub struct KeySpec {
     #[cfg(windows)]
     platform_code: u16,
+    /// The key's `Enum.KeyCode` name, which the plugin looks the key up by.
     pub name: &'static str,
 }
 
@@ -378,16 +379,16 @@ pub fn resolve_key(name: &str) -> Result<KeySpec> {
             "PAUSE" | "BREAK" => Some((0x13, 113, "Pause")),
             "PRINT" => Some((0x2C, 105, "Print")),
             "CLEAR" => Some((0x0C, 71, "Clear")),
-            "ZERO" => Some((b'0' as u16, 29, "0")),
-            "ONE" => Some((b'1' as u16, 18, "1")),
-            "TWO" => Some((b'2' as u16, 19, "2")),
-            "THREE" => Some((b'3' as u16, 20, "3")),
-            "FOUR" => Some((b'4' as u16, 21, "4")),
-            "FIVE" => Some((b'5' as u16, 23, "5")),
-            "SIX" => Some((b'6' as u16, 22, "6")),
-            "SEVEN" => Some((b'7' as u16, 26, "7")),
-            "EIGHT" => Some((b'8' as u16, 28, "8")),
-            "NINE" => Some((b'9' as u16, 25, "9")),
+            "ZERO" => Some((b'0' as u16, 29, "Zero")),
+            "ONE" => Some((b'1' as u16, 18, "One")),
+            "TWO" => Some((b'2' as u16, 19, "Two")),
+            "THREE" => Some((b'3' as u16, 20, "Three")),
+            "FOUR" => Some((b'4' as u16, 21, "Four")),
+            "FIVE" => Some((b'5' as u16, 23, "Five")),
+            "SIX" => Some((b'6' as u16, 22, "Six")),
+            "SEVEN" => Some((b'7' as u16, 26, "Seven")),
+            "EIGHT" => Some((b'8' as u16, 28, "Eight")),
+            "NINE" => Some((b'9' as u16, 25, "Nine")),
             "MINUS" => Some((0xBD, 27, "Minus")),
             "EQUALS" => Some((0xBB, 24, "Equals")),
             "LEFTBRACKET" => Some((0xDB, 33, "LeftBracket")),
@@ -438,7 +439,9 @@ fn letter_name(ch: u8) -> &'static str {
 }
 
 fn digit_name(ch: u8) -> &'static str {
-    const NAMES: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    const NAMES: [&str; 10] = [
+        "Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine",
+    ];
     NAMES[(ch - b'0') as usize]
 }
 
@@ -453,6 +456,30 @@ fn mac_letter_keycode(ch: u8) -> u16 {
 fn mac_digit_keycode(ch: u8) -> u16 {
     const CODES: [u16; 10] = [29, 18, 19, 20, 21, 23, 22, 26, 28, 25];
     CODES[(ch - b'0') as usize]
+}
+
+#[cfg(test)]
+#[test]
+fn keys_resolve_to_enum_key_code_names() {
+    let key_codes = &rbx_reflection_database::get().unwrap().enums["KeyCode"].items;
+    let digits = [
+        "Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine",
+    ];
+    for (digit, name) in digits.into_iter().enumerate() {
+        for written in [digit.to_string(), name.to_string(), name.to_uppercase()] {
+            assert_eq!(resolve_key(&written).unwrap().name, name, "{written}");
+        }
+    }
+    let letters: Vec<String> = ('a'..='z').map(String::from).collect();
+    let letters = letters.iter().map(String::as_str);
+    let words = "Space Enter Esc Tab Backspace Delete Insert Home End PageUp PageDown Up Down Left \
+        Right Shift RightShift Ctrl RightControl Alt RightAlt LeftMeta RightSuper CapsLock NumLock \
+        ScrollLock Pause Print Clear Minus Equals LeftBracket RightBracket BackSlash Semicolon \
+        Quote Comma Period Slash Backquote F1 F12 F15";
+    for written in letters.chain(digits).chain(words.split(' ')) {
+        let name = resolve_key(written).unwrap().name;
+        assert!(key_codes.contains_key(name), "{written} resolves to {name}");
+    }
 }
 
 #[cfg(windows)]

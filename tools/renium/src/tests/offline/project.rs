@@ -1088,6 +1088,23 @@ fn script_read_resolves_an_instance_path_through_the_script_mapping() {
 }
 
 #[test]
+fn script_grep_scopes_to_an_instance_path_through_the_script_mapping() {
+    let (fx, project) = shop_fixture("script-grep-instances");
+    let grep = |scope: &str| fx.text(&["sg", "return", "--in", scope, "--project", &project]);
+    let config = format!("{SHOP_FILE}\n2-4 buy\n3: return id\n7: return Shop\n");
+    assert_eq!(grep("ReplicatedStorage.Shared.Config").stdout, config);
+    assert_eq!(grep("game.ReplicatedStorage.Shared").stdout, config);
+    assert_eq!(
+        grep("Workspace.Lobby").stdout,
+        "src/Workspace/Lobby/Helper.client.luau\n2: return a\n"
+    );
+    assert_eq!(
+        grep("Workspace.Lobby.Halper").err(),
+        "--in Workspace.Lobby.Halper: the project has no file or folder at that path, no script by that name, no script at or below that instance path and no script path with that word"
+    );
+}
+
+#[test]
 fn script_commands_print_for_agents_in_text_mode_and_keep_their_json() {
     let (fx, project) = shop_fixture("script-text-forms");
     let long = format!(

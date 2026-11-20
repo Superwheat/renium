@@ -43,6 +43,8 @@ rbx oc --anonymous asset search --limit 5 -q query=car -q searchCategoryType=Mod
 
 Pass images use `--file imageFile=PATH`. Asset creation takes metadata/file positionally and requires a creator owner.
 
+`iu` uploads local files through Open Cloud, so it needs an API key (`rbx oc key add NAME`, or `ROBLOX_API_KEY`); without `--user`/`--group` the creator is Studio's signed-in user. A refused upload names the creator and the key it went with.
+
 Creator Store search and Studio insertion/generation:
 
 ```powershell

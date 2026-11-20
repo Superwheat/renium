@@ -258,7 +258,7 @@ fn compiler_error(error: mlua::Error) -> String {
 /// Parses a script and lists its functions in source order, each with the
 /// number of listed functions around it as its depth.
 fn parse_functions(source: &str) -> Result<Vec<LuauFunction>, String> {
-    let parsed = full_moon::parse_fallible(source, full_moon::LuaVersion::luau());
+    let parsed = crate::studio::automation::parse_compiled_luau(source);
     if let Some(error) = parsed.errors().first() {
         return Err(format!(
             "line {}: {}",
@@ -419,6 +419,28 @@ local a, b = function() end,
 \tend
 ";
         assert_eq!(outline(source), ["6-6 a()", "7-8 b()"]);
+    }
+
+    #[test]
+    fn a_type_suffix_after_a_return_list_with_a_variadic_tail_parses() {
+        let source = "\
+local Network = {}
+function Network.Await(name: string, player: Player, timeout: number?, ...): (boolean, ...any)?
+\treturn true
+end
+type Reply = (ok: boolean) -> (boolean, ...any)?
+local function after(value: (number | string)?): (string, ...number)??
+\treturn \"\"
+end
+return Network
+";
+        assert_eq!(
+            outline(source),
+            [
+                "2-4 Network.Await(name, player, timeout, ...)",
+                "6-8 after(value)"
+            ]
+        );
     }
 
     #[test]

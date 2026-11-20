@@ -136,7 +136,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
     ("ai", "Examples:\n  rbx ai 123456789"),
     ("gm", "Examples:\n  rbx gm \"small wooden cabin\""),
     ("js", "Examples:\n  rbx js job-id --wait-seconds 30"),
-    ("iu", "Examples:\n  rbx iu icon.png --user 123456"),
+    (
+        "iu",
+        "Local files upload through Open Cloud and need an API key (`rbx oc key add NAME`, or ROBLOX_API_KEY); the creator is --user or --group, else Studio's signed-in user.\n\nExamples:\n  rbx iu icon.png --user 123456",
+    ),
     ("ss", "Examples:\n  rbx ss DataStore UpdateAsync"),
     (
         "sg",

@@ -467,6 +467,16 @@ fn wait_for_upload(path: &str, auth: &CloudAuth, wait_seconds: f64) -> Result<Va
     }
 }
 
+/// Puts the route, the creator and the credential's name in front of what
+/// Roblox answered: a refusal such as "User is moderated" names none of them.
+fn upload_refusal(mut refusal: Failure, creator: &str, credential: &str) -> Failure {
+    refusal.0.m = format!(
+        "Open Cloud upload for {creator} with {credential}: {}",
+        refusal.0.m
+    );
+    refusal
+}
+
 pub(crate) fn upload(
     root: &Path,
     parameters: &Value,
@@ -504,14 +514,20 @@ pub(crate) fn upload(
             "image-upload",
         ));
     }
-    let creator = if let Some(group_id) = request.group_id.filter(|id| *id > 0) {
-        json!({ "groupId": group_id.to_string() })
+    let (creator, creator_name) = if let Some(group_id) = request.group_id.filter(|id| *id > 0) {
+        (
+            json!({ "groupId": group_id.to_string() }),
+            format!("group {group_id}"),
+        )
     } else {
         let user_id = match request.user_id.filter(|id| *id > 0) {
             Some(id) => id,
             None => studio_user_id(bridge, None, "image-upload")?,
         };
-        json!({ "userId": user_id.to_string() })
+        (
+            json!({ "userId": user_id.to_string() }),
+            format!("user {user_id}"),
+        )
     };
     let auth = CloudAuth::from_env(
         false,
@@ -519,6 +535,7 @@ pub(crate) fn upload(
         request.oauth_env.as_deref(),
         "image-upload",
     )?;
+    let refused = |refusal| upload_refusal(refusal, &creator_name, auth.name());
     let mut results = Vec::with_capacity(request.images.len());
     for (index, source) in request.images.iter().enumerate() {
         let (bytes, label) = load_image(root, source)?;
@@ -557,9 +574,10 @@ pub(crate) fn upload(
                 )
                 .send_bytes(&body),
             "image-upload",
-        )?;
+        )
+        .map_err(refused)?;
         let operation = match operation_path(&created) {
-            Some(path) => wait_for_upload(path, &auth, request.wait_seconds)?,
+            Some(path) => wait_for_upload(path, &auth, request.wait_seconds).map_err(refused)?,
             None => created,
         };
         let asset_id = operation
@@ -597,4 +615,22 @@ pub(crate) fn studio_upload(parameters: &Value) -> bool {
                 source.starts_with("https://") || source.starts_with("http://")
             })
         })
+}
+
+#[cfg(test)]
+#[test]
+fn a_refused_upload_names_its_route_creator_and_key() {
+    let answer =
+        r#"Roblox returned HTTP 403: {"errors":[{"code":0,"message":"User is moderated"}]}"#;
+    let auth = CloudAuth::ApiKey {
+        secret: "rbx-secret".to_string(),
+        name: "the stored default key studio".to_string(),
+    };
+    let refusal = failure("cloud_auth", answer, false, "image-upload");
+    let refusal = upload_refusal(refusal, "user 123456", auth.name()).0;
+    assert_eq!(
+        refusal.m,
+        format!("Open Cloud upload for user 123456 with the stored default key studio: {answer}")
+    );
+    assert_eq!(refusal.c, "cloud_auth");
 }

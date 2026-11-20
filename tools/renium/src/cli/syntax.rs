@@ -442,6 +442,15 @@ mod tests {
     }
 
     #[test]
+    fn loops_beside_a_suffixed_variadic_return_list_are_instrumented() {
+        let source = "local function first(...): (boolean, ...any)?\n\treturn true, ...\nend\nfor index = 1, 3 do first(index) end";
+        let output = crate::studio::automation::cooperative_luau(source).unwrap();
+        assert!(output.contains("): (boolean, ...any)?\n"));
+        assert!(output.ends_with("do __reniumCooperate(); first(index) end"));
+        validate_luau_syntax(&output).unwrap();
+    }
+
+    #[test]
     fn checks_luau_without_execution_and_reports_all_files() {
         let root = crate::tests::support::temp_dir("offline-syntax");
         let valid = root.join("valid.luau");

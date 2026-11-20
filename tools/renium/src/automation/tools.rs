@@ -881,38 +881,49 @@ fn resolve_script(root: &Path, requested: &str, next: &str) -> Result<PathBuf, F
     Ok(path)
 }
 
-/// Adds the files of every instance at the dotted path `rest` below `node` to
-/// `files` and returns the number of those instances. A name may hold dots,
-/// so every child whose name starts the rest of the path is followed.
-fn mapped_files<'a>(node: &'a SourcemapNode, rest: &str, files: &mut Vec<&'a str>) -> usize {
-    let mut instances = 0;
+/// Adds every instance at the dotted path `rest` below `node` to `instances`.
+/// A name may hold dots, so every child whose name starts the rest of the
+/// path is followed.
+fn mapped_instances<'a>(
+    node: &'a SourcemapNode,
+    rest: &str,
+    instances: &mut Vec<&'a SourcemapNode>,
+) {
     for child in &node.children {
         match rest.strip_prefix(child.name.as_str()) {
-            Some("") => {
-                instances += 1;
-                files.extend(child.file_paths.iter().map(String::as_str));
-            }
+            Some("") => instances.push(child),
             Some(tail) => {
                 if let Some(tail) = tail.strip_prefix('.') {
-                    instances += mapped_files(child, tail, files);
+                    mapped_instances(child, tail, instances);
                 }
             }
             None => {}
         }
     }
-    instances
+}
+
+/// Adds the files of an instance and of every instance below it to `files`.
+fn tree_files<'a>(node: &'a SourcemapNode, files: &mut Vec<&'a str>) {
+    files.extend(node.file_paths.iter().map(String::as_str));
+    for child in &node.children {
+        tree_files(child, files);
+    }
 }
 
 /// The file the sourcemap maps the script at an instance path to. A path
 /// that names no instance, an instance without a script file, or several
 /// script files is an error.
 fn mapped_script<'a>(sourcemap: &'a SourcemapNode, requested: &str) -> Result<&'a str, Failure> {
-    let mut files = Vec::new();
+    let mut instances = Vec::new();
     let path = requested.strip_prefix("game.").unwrap_or(requested);
-    let instances = mapped_files(sourcemap, path, &mut files);
+    mapped_instances(sourcemap, path, &mut instances);
+    let files: Vec<&str> = instances
+        .iter()
+        .flat_map(|instance| instance.file_paths.iter().map(String::as_str))
+        .collect();
     let message = match files.as_slice() {
         [file] => return Ok(*file),
-        [] if instances == 0 => format!(
+        [] if instances.is_empty() => format!(
             "No script at {requested}: it is not a file or a script's name, and the project has no instance at that path; rbx ss NAME finds scripts"
         ),
         [] => format!("{requested} has no script file in the project"),
@@ -986,12 +997,31 @@ impl<'a> ScriptMapping<'a> {
         {
             return Ok(file);
         }
-        let built = loaded_once(&self.built, || {
+        mapped_script(self.built()?, requested)
+    }
+
+    fn built(&self) -> Result<&SourcemapNode, Failure> {
+        loaded_once(&self.built, || {
             let loaded = config::try_load_project(None, Some(self.root))?
                 .filter(|loaded| loaded.root == self.root);
             build_project_sourcemap_with_loaded(self.root, loaded.as_ref())
-        })?;
-        mapped_script(built, requested)
+        })
+    }
+
+    /// The script files of the instance at an instance path and of every
+    /// instance below it. They come from the mapping built now: a sourcemap
+    /// on disk can predate a script, and a search that skips one reads as no
+    /// match.
+    fn scripts_below(&self, requested: &str) -> Result<Vec<&str>, Failure> {
+        let path = requested.strip_prefix("game.").unwrap_or(requested);
+        let mut instances = Vec::new();
+        mapped_instances(self.built()?, path, &mut instances);
+        let mut files = Vec::new();
+        for instance in instances {
+            tree_files(instance, &mut files);
+        }
+        files.retain(|file| has_script_extension(Path::new(file)));
+        Ok(files)
     }
 }
 
@@ -1719,11 +1749,13 @@ fn scope_prefix(scope: &str) -> String {
 
 /// The `--in` scopes as path prefixes: a file or folder under the project as
 /// it is given, anything else as the file of the one script that goes by that
-/// name, or else every script whose path holds the word (`--in Honk` for
-/// HonkHandler and HonkClient). A path that is not there matches nothing, as
-/// a folder that may be absent always did; a bare word that no script path
-/// holds is an error, since it was meant to name something.
+/// name, else every script whose path holds the word (`--in Honk` for
+/// HonkHandler and HonkClient), else the scripts at and below an instance
+/// path (`--in ReplicatedStorage.Core.Network`). A path that is not there
+/// matches nothing, as a folder that may be absent always did; a bare word
+/// that names none of these is an error, since it was meant to name something.
 fn scope_prefixes(root: &Path, source: &Path, scopes: &[String]) -> Result<Vec<String>, Failure> {
+    let mapping = ScriptMapping::new(root, source);
     let mut prefixes = Vec::new();
     for scope in scopes {
         let prefix = scope_prefix(scope);
@@ -1745,10 +1777,20 @@ fn scope_prefixes(root: &Path, source: &Path, scopes: &[String]) -> Result<Vec<S
                         .map(|path| relative(root, path))
                         .filter(|path| path.to_lowercase().contains(&word)),
                 );
+                let dotted = prefix.contains('.');
+                if prefixes.len() == before && dotted {
+                    let below = mapping.scripts_below(&prefix)?;
+                    prefixes.extend(below.into_iter().map(scope_prefix));
+                }
                 if prefixes.len() == before {
+                    let instance = if dotted {
+                        ", no script at or below that instance path"
+                    } else {
+                        ""
+                    };
                     return Err(failure(
                         format!(
-                            "--in {scope}: the project has no file or folder at that path, no script by that name and no script path with that word"
+                            "--in {scope}: the project has no file or folder at that path, no script by that name{instance} and no script path with that word"
                         ),
                         "script-grep",
                     ));

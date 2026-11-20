@@ -1796,7 +1796,7 @@ pub(super) struct ScriptGrepArgs {
     )]
     pub(super) regex: bool,
     #[arg(
-        help = "Search only this script file or folder, a path under the project or a script's unique name (DataHandler); repeat for several",
+        help = "Search only this script file or folder: a path under the project, a script's unique name (DataHandler) or an instance path (ReplicatedStorage.Shared); repeat for several",
         long = "in",
         value_name = "PATH"
     )]

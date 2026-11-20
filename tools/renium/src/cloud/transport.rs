@@ -74,8 +74,8 @@ pub(crate) struct CloudResponse {
 
 pub(crate) enum CloudAuth {
     Anonymous,
-    ApiKey(String),
-    OAuth(String),
+    ApiKey { secret: String, name: String },
+    OAuth { token: String, name: String },
 }
 
 impl CloudAuth {
@@ -96,17 +96,30 @@ impl CloudAuth {
         if anonymous {
             Ok(Self::Anonymous)
         } else if let Some(oauth_env) = oauth_env {
-            Ok(Self::OAuth(required_secret(oauth_env, next)?))
+            Ok(Self::OAuth {
+                token: required_secret(oauth_env, next)?,
+                name: format!("the OAuth token in {oauth_env}"),
+            })
         } else {
-            Ok(Self::ApiKey(api_key_secret(key_env, next)?))
+            let (secret, name) = api_key(key_env, next)?;
+            Ok(Self::ApiKey { secret, name })
         }
     }
 
     pub(crate) fn apply(&self, request: ureq::Request) -> ureq::Request {
         match self {
             Self::Anonymous => request,
-            Self::ApiKey(key) => request.set("x-api-key", key),
-            Self::OAuth(token) => request.set("Authorization", &format!("Bearer {token}")),
+            Self::ApiKey { secret, .. } => request.set("x-api-key", secret),
+            Self::OAuth { token, .. } => request.set("Authorization", &format!("Bearer {token}")),
+        }
+    }
+
+    /// What the credential goes by, never its value: a stored key's name or
+    /// the environment variable it was read from.
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Anonymous => "no credential",
+            Self::ApiKey { name, .. } | Self::OAuth { name, .. } => name,
         }
     }
 }
@@ -125,25 +138,31 @@ pub(crate) fn agent() -> &'static ureq::Agent {
     })
 }
 
-/// `--key NAME` wins, then the environment variable, then the stored default
-/// key, so a key added once with `rbx oc key add` works from any shell.
 fn api_key_secret(env_name: &str, next: &str) -> Result<String, Failure> {
+    api_key(env_name, next).map(|(secret, _)| secret)
+}
+
+/// An API key's secret and the name it goes by. `--key NAME` wins, then the
+/// environment variable, then the stored default key, so a key added once
+/// with `rbx oc key add` works from any shell.
+fn api_key(env_name: &str, next: &str) -> Result<(String, String), Failure> {
     let stored = |name: Option<&str>| {
         super::keys::secret(name)
             .map_err(|error| Failure::new("cloud_auth", format!("{error:#}"), false, next))
     };
     if let Some(name) = super::keys::selected() {
-        return stored(Some(name))?.ok_or_else(|| {
+        let (name, secret) = stored(Some(name))?.ok_or_else(|| {
             Failure::new(
                 "cloud_auth",
                 format!("No stored key named {name}"),
                 false,
                 next,
             )
-        });
+        })?;
+        return Ok((secret, format!("the stored key {name}")));
     }
     if let Some(value) = environment_value(env_name).filter(|value| !value.trim().is_empty()) {
-        return Ok(value);
+        return Ok((value, format!("the key in {env_name}")));
     }
     // A caller that names its own variable chose that key; never substitute the
     // stored default, which may reach other experiences.
@@ -155,8 +174,8 @@ fn api_key_secret(env_name: &str, next: &str) -> Result<String, Failure> {
             next,
         ));
     }
-    if let Some(secret) = stored(None)? {
-        return Ok(secret);
+    if let Some((name, secret)) = stored(None)? {
+        return Ok((secret, format!("the stored default key {name}")));
     }
     Err(Failure::new(
         "cloud_auth",
@@ -1312,6 +1331,17 @@ mod tests {
                 .m
                 .contains("RENIUM_TEST_UNSET_SANDBOX_KEY is not set")
         );
+    }
+
+    #[test]
+    fn a_credential_goes_by_where_it_came_from_and_never_by_its_value() {
+        let name = |anonymous, oauth| match CloudAuth::from_env(anonymous, "PATH", oauth, "cloud") {
+            Ok(auth) => auth.name().to_string(),
+            Err(failure) => failure.0.m,
+        };
+        assert_eq!(name(false, None), "the key in PATH");
+        assert_eq!(name(false, Some("PATH")), "the OAuth token in PATH");
+        assert_eq!(name(true, None), "no credential");
     }
 
     use super::*;

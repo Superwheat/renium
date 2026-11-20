@@ -327,8 +327,9 @@ pub(crate) fn list() -> Result<Value> {
     list_in(&store_path()?)
 }
 
-/// The secret for a stored key, or for the default key when no name is given.
-pub(crate) fn secret_in(path: &Path, name: Option<&str>) -> Result<Option<String>> {
+/// The name and the secret of a stored key, or of the default key when no
+/// name is given.
+pub(crate) fn secret_in(path: &Path, name: Option<&str>) -> Result<Option<(String, String)>> {
     let store = read_store(path)?;
     let name = match name {
         Some(name) => validate_name(name)?.to_string(),
@@ -340,10 +341,11 @@ pub(crate) fn secret_in(path: &Path, name: Option<&str>) -> Result<Option<String
     let Some(entry) = store.keys.get(&name) else {
         bail!("No stored key named {name}; `rbx oc key list` shows the stored keys");
     };
-    unprotect(entry, &name).map(Some)
+    let secret = unprotect(entry, &name)?;
+    Ok(Some((name, secret)))
 }
 
-pub(crate) fn secret(name: Option<&str>) -> Result<Option<String>> {
+pub(crate) fn secret(name: Option<&str>) -> Result<Option<(String, String)>> {
     secret_in(&store_path()?, name)
 }
 
@@ -433,14 +435,15 @@ mod tests {
     #[test]
     fn keys_round_trip_without_the_secret_in_the_listing() -> Result<()> {
         let (dir, path) = scratch_store();
+        let key = |name: &str, secret: &str| Some((name.to_string(), secret.to_string()));
         assert!(secret_in(&path, None)?.is_none());
         let added = add_in(&path, "studio", "rbx-secret-1")?;
         assert_eq!(added["default"], "studio");
         add_in(&path, "backup", "rbx-secret-2")?;
-        assert_eq!(secret_in(&path, None)?.as_deref(), Some("rbx-secret-1"));
+        assert_eq!(secret_in(&path, None)?, key("studio", "rbx-secret-1"));
         assert_eq!(
-            secret_in(&path, Some("backup"))?.as_deref(),
-            Some("rbx-secret-2")
+            secret_in(&path, Some("backup"))?,
+            key("backup", "rbx-secret-2")
         );
         let listing = list_in(&path)?;
         assert!(!serde_json::to_string(&listing)?.contains("rbx-secret"));
@@ -450,9 +453,9 @@ mod tests {
             assert!(!raw.contains("rbx-secret"));
         }
         set_default_in(&path, "backup")?;
-        assert_eq!(secret_in(&path, None)?.as_deref(), Some("rbx-secret-2"));
+        assert_eq!(secret_in(&path, None)?, key("backup", "rbx-secret-2"));
         remove_in(&path, "backup")?;
-        assert_eq!(secret_in(&path, None)?.as_deref(), Some("rbx-secret-1"));
+        assert_eq!(secret_in(&path, None)?, key("studio", "rbx-secret-1"));
         assert!(secret_in(&path, Some("backup")).is_err());
         assert!(add_in(&path, "bad name", "x").is_err());
         assert!(add_in(&path, "ok", " ").is_err());
