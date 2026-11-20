@@ -983,9 +983,12 @@ pub(crate) fn push_targeted(
     let root = args.project.project_root.clone();
     // The push itself needs neither the lease nor the files as they stood:
     // without them it runs as it does with no baseline held.
-    let lease = capture_snapshot(&root, &held.paths).and_then(|before| {
-        Ok(baseline_lease(context, bridge, &held)?.map(|lease| (before, lease)))
-    });
+    let lease = {
+        let _span = crate::app::profile::span("held state: files and lease before the push");
+        capture_snapshot(&root, &held.paths).and_then(|before| {
+            Ok(baseline_lease(context, bridge, &held)?.map(|lease| (before, lease)))
+        })
+    };
     let (before, (guard, mut release)) = match lease {
         Ok(Some(lease)) => lease,
         Ok(None) => return push_editor_changes_with_warm_bridge(args, bridge),
@@ -995,7 +998,11 @@ pub(crate) fn push_targeted(
         }
     };
     let pushed = TargetedPush::of(&args);
-    let summary = push_editor_changes_with_warm_bridge(args, bridge)?;
+    let summary = {
+        let _span = crate::app::profile::span("push of the chosen paths");
+        push_editor_changes_with_warm_bridge(args, bridge)?
+    };
+    let _span = crate::app::profile::span("held state: files and lease after the push");
     let after = match capture_snapshot(&root, &held.paths) {
         Ok(after) => after,
         Err(error) => {
