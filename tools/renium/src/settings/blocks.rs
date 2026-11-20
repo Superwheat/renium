@@ -2541,4 +2541,46 @@ impl RowReader {
             Ok(more)
         })
     }
+
+    /// Refuses a store one of whose frames does not match its digest, as its
+    /// whole decode does, before a row of it is read.
+    pub(crate) fn check(&self) -> Result<()> {
+        let store = &self.store;
+        let frames = (store.pool.iter().map(|pool| pool.frame))
+            .chain(store.blocks.iter().map(|block| block.frame))
+            .collect::<Vec<_>>();
+        (frames.par_iter()).try_for_each(|frame| store.frame_bytes(*frame).map(drop))
+    }
+
+    /// Calls `visit` on `rows` in the order given, `at_once` of them at a
+    /// time, each row holding its stored values whole while its turn is
+    /// visited. The blocks of a turn are read together, on a budget of their
+    /// own, and the document holds after what it held before.
+    pub(crate) fn walk_turns(
+        &self,
+        document: &mut SettingsBytecode,
+        rows: &[usize],
+        at_once: usize,
+        mut visit: impl FnMut(&SettingsBytecode, &[usize]) -> Result<()>,
+    ) -> Result<()> {
+        for turn in rows.chunks(at_once.max(1)) {
+            self.store.budget.renew(self.store.bytes.len());
+            let mut held = Vec::with_capacity(turn.len());
+            for (row, values) in self.store.rows(turn)? {
+                let instance = &mut document.instances[row];
+                held.push((
+                    row,
+                    std::mem::replace(&mut instance.properties, values.properties),
+                    std::mem::replace(&mut instance.attributes, values.attributes),
+                ));
+            }
+            let visited = visit(document, turn);
+            for (row, properties, attributes) in held {
+                document.instances[row].properties = properties;
+                document.instances[row].attributes = attributes;
+            }
+            visited?;
+        }
+        Ok(())
+    }
 }

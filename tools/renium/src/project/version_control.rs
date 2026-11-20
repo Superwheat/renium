@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use serde_json::{Map, Value, json};
 
-use crate::app::output::{print_json_output, visible};
+use crate::app::output::{JsonParts, print_json_output, visible};
 use crate::bytecode::edit::next_editor_settings_id_fast;
 use crate::bytecode::stabilize_reference_output;
 use crate::cli::args::{VcInitArgs, VcMergeArgs, VcTextconvArgs, ViewArgs};
@@ -18,6 +18,7 @@ use crate::editor::sync::is_lua_source_class;
 use crate::project::package_links::RENIUM_DIR_GITIGNORE;
 use crate::rbx::model::read_settings_model_document;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
+use crate::settings::bytecode::blocks::RowReader;
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode,
     SettingsBytecodeInstance, for_each_reference, for_each_reference_mut, reference_leads_out_of,
@@ -251,58 +252,90 @@ pub(crate) fn vc_init(args: VcInitArgs) -> Result<()> {
     )
 }
 
-pub(crate) fn settings_doc_to_text(document: &SettingsBytecode) -> String {
-    let mut children: HashMap<Option<usize>, Vec<usize>> = HashMap::new();
-    for (index, instance) in document.instances.iter().enumerate() {
-        children
-            .entry(instance.parent_index)
-            .or_default()
-            .push(index);
-    }
-    let mut out = format!(
-        "# renium store v{}: {} instances\n",
-        document.version,
-        document.instances.len()
-    );
-    let service = document
-        .instances
-        .iter()
-        .find(|instance| instance.parent_index.is_none())
-        .map(|instance| instance.name.as_str())
-        .unwrap_or_default();
-    let (path_segments_by_index, path_ordinals_by_index) =
-        build_editor_instance_path_parts(document, service);
-    let canonical_settings_ids_by_index = document
-        .instances
-        .iter()
-        .map(|instance| Some(instance.settings_id.clone()))
-        .collect::<Vec<_>>();
-    let mut stack: Vec<(usize, String)> = Vec::new();
-    for root in children
-        .get(&None)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .rev()
-    {
-        stack.push((root, String::new()));
-    }
-    let mut rows = Vec::with_capacity(document.instances.len());
-    while let Some((index, parent_path)) = stack.pop() {
-        let instance = &document.instances[index];
-        let path = if parent_path.is_empty() {
-            visible(&instance.name).into_owned()
-        } else {
-            format!("{parent_path}/{}", visible(&instance.name))
-        };
-        if let Some(kids) = children.get(&Some(index)) {
-            for kid in kids.iter().rev() {
-                stack.push((*kid, path.clone()));
-            }
+/// What `settings_doc_to_text` gives of a document before the lines of its
+/// instances, and the instances in the order of their lines, each with its
+/// path. None of it reads a value, so a store read by its rows has it whole.
+struct TextLayout {
+    head: String,
+    path_segments_by_index: Vec<Option<Vec<String>>>,
+    path_ordinals_by_index: Vec<Option<Vec<usize>>>,
+    canonical_settings_ids_by_index: Vec<Option<String>>,
+    rows: Vec<(usize, String)>,
+}
+
+impl TextLayout {
+    fn of(document: &SettingsBytecode) -> Self {
+        let mut children: HashMap<Option<usize>, Vec<usize>> = HashMap::new();
+        for (index, instance) in document.instances.iter().enumerate() {
+            children
+                .entry(instance.parent_index)
+                .or_default()
+                .push(index);
         }
-        rows.push((index, path));
+        let head = format!(
+            "# renium store v{}: {} instances\n",
+            document.version,
+            document.instances.len()
+        );
+        let service = document
+            .instances
+            .iter()
+            .find(|instance| instance.parent_index.is_none())
+            .map(|instance| instance.name.as_str())
+            .unwrap_or_default();
+        let (path_segments_by_index, path_ordinals_by_index) =
+            build_editor_instance_path_parts(document, service);
+        let canonical_settings_ids_by_index = document
+            .instances
+            .iter()
+            .map(|instance| Some(instance.settings_id.clone()))
+            .collect::<Vec<_>>();
+        let mut stack: Vec<(usize, String)> = Vec::new();
+        for root in children
+            .get(&None)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+        {
+            stack.push((root, String::new()));
+        }
+        let mut rows = Vec::with_capacity(document.instances.len());
+        while let Some((index, parent_path)) = stack.pop() {
+            let instance = &document.instances[index];
+            let path = if parent_path.is_empty() {
+                visible(&instance.name).into_owned()
+            } else {
+                format!("{parent_path}/{}", visible(&instance.name))
+            };
+            if let Some(kids) = children.get(&Some(index)) {
+                for kid in kids.iter().rev() {
+                    stack.push((*kid, path.clone()));
+                }
+            }
+            rows.push((index, path));
+        }
+        Self {
+            head,
+            path_segments_by_index,
+            path_ordinals_by_index,
+            canonical_settings_ids_by_index,
+            rows,
+        }
     }
-    let render = |rows: &[(usize, String)]| {
+
+    /// The lines of `rows`, some of the layout's, which hold their values in
+    /// `document`.
+    fn render(&self, document: &SettingsBytecode, rows: &[(usize, String)]) -> String {
+        let stabilize = |record: &mut Map<String, Value>| {
+            stabilize_reference_output(
+                document,
+                &self.path_segments_by_index,
+                &self.path_ordinals_by_index,
+                &self.canonical_settings_ids_by_index,
+                record,
+            )
+        };
         let mut out = String::new();
         for (index, path) in rows {
             let instance = &document.instances[*index];
@@ -312,15 +345,7 @@ pub(crate) fn settings_doc_to_text(document: &SettingsBytecode) -> String {
                 visible(&instance.class_name),
                 visible(&instance.settings_id)
             );
-            let property_record = text_record(&instance.properties, |record| {
-                stabilize_reference_output(
-                    document,
-                    &path_segments_by_index,
-                    &path_ordinals_by_index,
-                    &canonical_settings_ids_by_index,
-                    record,
-                )
-            });
+            let property_record = text_record(&instance.properties, stabilize);
             let mut properties: Vec<(&String, &Value)> = property_record.iter().collect();
             properties.sort_by(|a, b| a.0.cmp(b.0));
             for (key, value) in properties {
@@ -338,15 +363,7 @@ pub(crate) fn settings_doc_to_text(document: &SettingsBytecode) -> String {
                 }
                 let _ = writeln!(out, "  {} = {}", visible(key), visible(&value.to_string()));
             }
-            let attribute_record = text_record(&instance.attributes, |record| {
-                stabilize_reference_output(
-                    document,
-                    &path_segments_by_index,
-                    &path_ordinals_by_index,
-                    &canonical_settings_ids_by_index,
-                    record,
-                )
-            });
+            let attribute_record = text_record(&instance.attributes, stabilize);
             let mut attributes: Vec<(&String, &Value)> = attribute_record.iter().collect();
             attributes.sort_by(|a, b| a.0.cmp(b.0));
             for (key, value) in attributes {
@@ -354,18 +371,120 @@ pub(crate) fn settings_doc_to_text(document: &SettingsBytecode) -> String {
             }
         }
         out
-    };
-    // Indexed chunks preserve the traversal order, regardless of worker order.
-    let blocks = if rows.len() >= 2_048 && rayon::current_num_threads() > 1 {
-        rows.par_chunks(512).map(render).collect::<Vec<_>>()
-    } else {
-        vec![render(&rows)]
-    };
-    out.reserve(blocks.iter().map(String::len).sum());
-    for block in blocks {
-        out.push_str(&block);
+    }
+
+    /// `render` of `rows` in pieces that follow one another.
+    fn pieces(&self, document: &SettingsBytecode, rows: &[(usize, String)]) -> Vec<String> {
+        // Indexed chunks preserve the traversal order, regardless of worker order.
+        let workers = rayon::current_num_threads();
+        if rows.len() >= 2_048 && workers > 1 {
+            (rows.par_chunks(rows.len().div_ceil(workers * 2).clamp(64, 512)))
+                .map(|rows| self.render(document, rows))
+                .collect()
+        } else {
+            vec![self.render(document, rows)]
+        }
+    }
+}
+
+pub(crate) fn settings_doc_to_text(document: &SettingsBytecode) -> String {
+    let layout = TextLayout::of(document);
+    let pieces = layout.pieces(document, &layout.rows);
+    let mut out = layout.head;
+    out.reserve(pieces.iter().map(String::len).sum());
+    for piece in pieces {
+        out.push_str(&piece);
     }
     out
+}
+
+/// The rows a view reads and prints at a time: those of one block of a store.
+const VIEW_ROWS_AT_ONCE: usize = 4_096;
+
+/// What gives the rows of a document their values a turn at a time, as
+/// `RowReader::walk_turns` does: the reader of a store, or the DOM of a place
+/// file.
+pub(super) trait RowTurns {
+    fn turns(
+        &self,
+        document: &mut SettingsBytecode,
+        rows: &[usize],
+        at_once: usize,
+        visit: impl FnMut(&SettingsBytecode, &[usize]) -> Result<()>,
+    ) -> Result<()>;
+}
+
+impl RowTurns for RowReader {
+    fn turns(
+        &self,
+        document: &mut SettingsBytecode,
+        rows: &[usize],
+        at_once: usize,
+        visit: impl FnMut(&SettingsBytecode, &[usize]) -> Result<()>,
+    ) -> Result<()> {
+        self.walk_turns(document, rows, at_once, visit)
+    }
+}
+
+impl RowTurns for super::place_diff::DomRows<'_> {
+    fn turns(
+        &self,
+        document: &mut SettingsBytecode,
+        rows: &[usize],
+        at_once: usize,
+        visit: impl FnMut(&SettingsBytecode, &[usize]) -> Result<()>,
+    ) -> Result<()> {
+        self.walk_turns(document, rows, at_once, visit)
+    }
+}
+
+/// Gives `out`, piece after piece, `settings_doc_to_text` of the document
+/// `values` reads, whose instances `document` holds without their values:
+/// `at_once` rows at a time in the order of their lines, so that neither the
+/// document nor its text is ever whole in memory.
+pub(super) fn text_by_rows(
+    document: &mut SettingsBytecode,
+    values: &impl RowTurns,
+    at_once: usize,
+    mut out: impl FnMut(String),
+) -> Result<()> {
+    let mut layout = TextLayout::of(document);
+    out(std::mem::take(&mut layout.head));
+    let order = (layout.rows.iter().map(|(index, _)| *index)).collect::<Vec<_>>();
+    let mut given = 0;
+    values.turns(document, &order, at_once, |document, turn| {
+        let rows = &layout.rows[given..given + turn.len()];
+        given += turn.len();
+        (layout.pieces(document, rows).into_iter()).for_each(&mut out);
+        Ok(())
+    })
+}
+
+/// Prints `settings_doc_to_text` of a store file.
+fn print_store_text(path: &Path) -> Result<()> {
+    // A process that serves automation prints each `print!` as a line.
+    let (mut document, reader) = if crate::app::context::automation_stdio() {
+        (SettingsBytecode::read_file(path)?, None)
+    } else {
+        SettingsBytecode::read_whole_by_rows(path)?
+    };
+    let Some(reader) = reader else {
+        print!("{}", settings_doc_to_text(&document));
+        return Ok(());
+    };
+    text_by_rows(&mut document, &reader, VIEW_ROWS_AT_ONCE, |piece| {
+        print!("{piece}")
+    })
+}
+
+/// Prints `settings_doc_to_text` of the document of a place file, which is
+/// read from the file's DOM some rows at a time.
+fn print_place_text(path: &Path) -> Result<()> {
+    let dom = super::place_file::place_dom(path)?;
+    let rows = super::place_diff::dom_rows(&dom, "place", None, false)?;
+    text_by_rows(&mut rows.structure(), &rows, VIEW_ROWS_AT_ONCE, |piece| {
+        print!("{piece}")
+    })
 }
 
 fn text_record<'a>(
@@ -395,128 +514,265 @@ pub(crate) fn vc_textconv(args: VcTextconvArgs) -> Result<()> {
         println!("# renium store: empty file");
         return Ok(());
     }
-    let document = SettingsBytecode::read_file(&args.file)?;
-    print!("{}", settings_doc_to_text(&document));
-    Ok(())
+    print_store_text(&args.file)
 }
 
-struct ViewTree<'a> {
-    document: &'a SettingsBytecode,
-    children_by_parent: &'a [Vec<usize>],
-    source_paths: &'a [Option<PathBuf>],
-    path_segments_by_index: &'a [Option<Vec<String>>],
-    path_ordinals_by_index: &'a [Option<Vec<usize>>],
-    canonical_settings_ids_by_index: &'a [Option<String>],
+/// What `settings_doc_to_json_tree` reads of a document beside the values of
+/// its instances, which a store read by its rows has whole once each Script
+/// holds its RunContext.
+struct ViewTree {
+    children_by_parent: Vec<Vec<usize>>,
+    source_paths: Vec<Option<PathBuf>>,
+    path_segments_by_index: Vec<Option<Vec<String>>>,
+    path_ordinals_by_index: Vec<Option<Vec<usize>>>,
+    canonical_settings_ids_by_index: Vec<Option<String>>,
 }
 
-fn build_view_node(tree: &ViewTree<'_>, index: usize, visited: &mut HashSet<usize>) -> Value {
-    let instance = &tree.document.instances[index];
-    let mut node = Map::new();
-    node.insert("name".into(), json!(instance.name));
-    node.insert("className".into(), json!(instance.class_name));
-    node.insert("settingsId".into(), json!(instance.settings_id));
-
-    let mut properties: Vec<(&String, &Value)> = instance
-        .properties
-        .iter()
-        .filter(|(key, _)| key.as_str() != "Source")
-        .collect();
-    properties.sort_by(|a, b| a.0.cmp(b.0));
-    if !properties.is_empty() {
-        let mut properties = properties
-            .into_iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<Map<String, Value>>();
-        stabilize_reference_output(
-            tree.document,
-            tree.path_segments_by_index,
-            tree.path_ordinals_by_index,
-            tree.canonical_settings_ids_by_index,
-            &mut properties,
+impl ViewTree {
+    fn of(document: &SettingsBytecode, file: &Path) -> Self {
+        let children_by_parent = settings_children_by_parent(document);
+        let service = document
+            .instances
+            .iter()
+            .find(|instance| instance.parent_index.is_none())
+            .map(|instance| instance.name.clone())
+            .unwrap_or_default();
+        let (path_segments_by_index, path_ordinals_by_index) =
+            build_editor_instance_path_parts(document, &service);
+        let canonical_settings_ids_by_index = document
+            .instances
+            .iter()
+            .map(|instance| Some(instance.settings_id.clone()))
+            .collect::<Vec<_>>();
+        let source_paths = build_editor_source_paths_by_index(
+            document,
+            &service,
+            &super::storage::source_directory(file),
         );
-        node.insert("properties".into(), Value::Object(properties));
-    }
-    if !instance.attributes.is_empty() {
-        let mut attributes: Vec<(&String, &Value)> = instance.attributes.iter().collect();
-        attributes.sort_by(|a, b| a.0.cmp(b.0));
-        let mut attributes = attributes
-            .into_iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<Map<String, Value>>();
-        stabilize_reference_output(
-            tree.document,
-            tree.path_segments_by_index,
-            tree.path_ordinals_by_index,
-            tree.canonical_settings_ids_by_index,
-            &mut attributes,
-        );
-        node.insert("attributes".into(), Value::Object(attributes));
-    }
-    if is_lua_source_class(&instance.class_name) {
-        if let Some(source) = instance.properties.get("Source").and_then(Value::as_str) {
-            node.insert("source".into(), json!(source));
-        } else if let Some(Some(path)) = tree.source_paths.get(index)
-            && let Ok(source) = fs::read_to_string(path)
-        {
-            node.insert("source".into(), json!(source));
+        Self {
+            children_by_parent,
+            source_paths,
+            path_segments_by_index,
+            path_ordinals_by_index,
+            canonical_settings_ids_by_index,
         }
     }
 
-    let mut children = Vec::new();
-    if let Some(kids) = tree.children_by_parent.get(index) {
-        for &kid in kids {
-            if visited.insert(kid) {
-                children.push(build_view_node(tree, kid, visited));
+    fn roots(document: &SettingsBytecode) -> impl Iterator<Item = usize> + '_ {
+        (0..document.instances.len())
+            .filter(|index| document.instances[*index].parent_index.is_none())
+    }
+
+    /// The node of an instance, which holds its values in `document`, without
+    /// its children.
+    fn node(&self, document: &SettingsBytecode, index: usize) -> Map<String, Value> {
+        let instance = &document.instances[index];
+        let mut node = Map::new();
+        node.insert("name".into(), json!(instance.name));
+        node.insert("className".into(), json!(instance.class_name));
+        node.insert("settingsId".into(), json!(instance.settings_id));
+        let stabilized = |mut record: Map<String, Value>| {
+            stabilize_reference_output(
+                document,
+                &self.path_segments_by_index,
+                &self.path_ordinals_by_index,
+                &self.canonical_settings_ids_by_index,
+                &mut record,
+            );
+            Value::Object(record)
+        };
+        let properties = (instance.properties.iter())
+            .filter(|(key, _)| key.as_str() != "Source")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Map<String, Value>>();
+        if !properties.is_empty() {
+            node.insert("properties".into(), stabilized(properties));
+        }
+        if !instance.attributes.is_empty() {
+            node.insert("attributes".into(), stabilized(instance.attributes.clone()));
+        }
+        if is_lua_source_class(&instance.class_name) {
+            if let Some(source) = instance.properties.get("Source").and_then(Value::as_str) {
+                node.insert("source".into(), json!(source));
+            } else if let Some(Some(path)) = self.source_paths.get(index)
+                && let Ok(source) = fs::read_to_string(path)
+            {
+                node.insert("source".into(), json!(source));
             }
         }
+        node
     }
-    node.insert("childCount".into(), json!(children.len()));
-    if !children.is_empty() {
-        node.insert("children".into(), Value::Array(children));
+
+    fn build(&self, document: &SettingsBytecode, index: usize) -> Value {
+        let mut node = self.node(document, index);
+        let children = (self.children_by_parent[index].iter())
+            .map(|kid| self.build(document, *kid))
+            .collect::<Vec<_>>();
+        node.insert("childCount".into(), json!(children.len()));
+        if !children.is_empty() {
+            node.insert("children".into(), Value::Array(children));
+        }
+        Value::Object(node)
     }
-    Value::Object(node)
 }
 
 pub(crate) fn settings_doc_to_json_tree(document: &SettingsBytecode, file: &Path) -> Value {
-    let children_by_parent = settings_children_by_parent(document);
-    let service = document
-        .instances
-        .iter()
-        .find(|instance| instance.parent_index.is_none())
-        .map(|instance| instance.name.clone())
-        .unwrap_or_default();
-    let (path_segments_by_index, path_ordinals_by_index) =
-        build_editor_instance_path_parts(document, &service);
-    let canonical_settings_ids_by_index = document
-        .instances
-        .iter()
-        .map(|instance| Some(instance.settings_id.clone()))
+    let tree = ViewTree::of(document, file);
+    let roots = ViewTree::roots(document)
+        .map(|root| tree.build(document, root))
         .collect::<Vec<_>>();
-    let source_paths = build_editor_source_paths_by_index(
-        document,
-        &service,
-        &super::storage::source_directory(file),
-    );
-    let tree = ViewTree {
-        document,
-        children_by_parent: &children_by_parent,
-        source_paths: &source_paths,
-        path_segments_by_index: &path_segments_by_index,
-        path_ordinals_by_index: &path_ordinals_by_index,
-        canonical_settings_ids_by_index: &canonical_settings_ids_by_index,
-    };
-    let mut visited: HashSet<usize> = HashSet::new();
-    let mut roots = Vec::new();
-    for (index, instance) in document.instances.iter().enumerate() {
-        if instance.parent_index.is_none() && visited.insert(index) {
-            roots.push(build_view_node(&tree, index, &mut visited));
-        }
-    }
     json!({
         "version": document.version,
         "instanceCount": document.instances.len(),
         "roots": roots,
     })
+}
+
+/// The text of a JSON tree whose nodes are given one at a time, each before
+/// its children: a node is the text before its children and the text after
+/// them, at the depth its first line is indented to where the tree is pretty.
+struct JsonTreeText {
+    pretty: bool,
+    /// The nodes whose children are not all given: the text after them, how
+    /// many are to come, and the node's depth.
+    open: Vec<(String, usize, usize)>,
+    text: String,
+}
+
+impl JsonTreeText {
+    fn line(&mut self, depth: usize) {
+        if self.pretty {
+            self.text.push('\n');
+            self.text.extend(std::iter::repeat_n("  ", depth));
+        }
+    }
+
+    fn put(&mut self, (before, after): (String, String), children: usize, depth: usize) {
+        self.text.push_str(&before);
+        if children > 0 {
+            self.text.push('[');
+            self.line(depth + 2);
+            self.open.push((after, children, depth));
+            return;
+        }
+        while let Some((_, left, depth)) = self.open.last_mut() {
+            *left -= 1;
+            let (left, depth) = (*left, *depth);
+            if left > 0 {
+                self.text.push(',');
+                self.line(depth + 2);
+                break;
+            }
+            self.line(depth + 1);
+            self.text.push(']');
+            let (after, ..) = self.open.pop().unwrap_or_default();
+            self.text.push_str(&after);
+        }
+    }
+}
+
+/// Gives `out`, piece after piece, the line `parts` prints for
+/// `settings_doc_to_json_tree` of the store `reader` reads, whose instances
+/// `document` holds without their values but each Script's RunContext:
+/// `at_once` rows at a time in the order of the tree, so that neither the
+/// document nor the tree is ever whole in memory.
+pub(super) fn store_json_by_rows(
+    document: &mut SettingsBytecode,
+    reader: &RowReader,
+    file: &Path,
+    parts: &JsonParts,
+    at_once: usize,
+    mut out: impl FnMut(String),
+) -> Result<()> {
+    let tree = ViewTree::of(document, file);
+    let roots = ViewTree::roots(document).collect::<Vec<_>>();
+    let mut order = Vec::with_capacity(document.instances.len());
+    let mut pending = (roots.iter().rev().map(|root| (*root, 2))).collect::<Vec<_>>();
+    while let Some((index, depth)) = pending.pop() {
+        order.push((index, depth));
+        let kids = tree.children_by_parent[index].iter().rev();
+        pending.extend(kids.map(|kid| (*kid, depth + 2)));
+    }
+    // No value of a store holds this text, drawn anew by every process, so
+    // it stands in a node's text only where its children go.
+    let children = format!(
+        "\u{1}children:{:016x}",
+        ahash::RandomState::new().hash_one(0_u8)
+    );
+    let children_text = serde_json::to_string(&children)?;
+    let halves = |node: Map<String, Value>, depth: usize| -> Result<(String, String)> {
+        let mut text = parts.text(Value::Object(node))?;
+        if parts.pretty && depth > 0 {
+            text = text.replace('\n', &format!("\n{}", "  ".repeat(depth)));
+        }
+        Ok(match text.split_once(&children_text) {
+            Some((before, after)) => (before.to_string(), after.to_string()),
+            None => (text, String::new()),
+        })
+    };
+    let mut top = Map::new();
+    top.insert("version".into(), json!(document.version));
+    top.insert("instanceCount".into(), json!(document.instances.len()));
+    top.insert(
+        "roots".into(),
+        if roots.is_empty() {
+            json!([])
+        } else {
+            json!(children)
+        },
+    );
+    let mut written = JsonTreeText {
+        pretty: parts.pretty,
+        open: Vec::new(),
+        text: String::new(),
+    };
+    written.put(halves(top, 0)?, roots.len(), 0);
+    let rows = order.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+    let mut given = 0;
+    reader.walk_turns(document, &rows, at_once, |document, turn| {
+        let nodes = &order[given..given + turn.len()];
+        given += turn.len();
+        let texts = (nodes.par_iter())
+            .map(|(index, depth)| {
+                let kids = tree.children_by_parent[*index].len();
+                let mut node = tree.node(document, *index);
+                node.insert("childCount".into(), json!(kids));
+                if kids > 0 {
+                    node.insert("children".into(), json!(children));
+                }
+                halves(node, *depth)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for ((index, depth), halves) in nodes.iter().zip(texts) {
+            written.put(halves, tree.children_by_parent[*index].len(), *depth);
+        }
+        out(std::mem::take(&mut written.text));
+        Ok(())
+    })?;
+    out(written.text + "\n");
+    Ok(())
+}
+
+/// Prints `settings_doc_to_json_tree` of a store file as `print_json_output`
+/// prints it.
+fn print_store_json(path: &Path, pretty: bool) -> Result<()> {
+    let parts = crate::app::output::json_parts(pretty);
+    let (mut document, reader) = if parts.is_some() {
+        crate::bytecode::read_whole_store(path)?
+    } else {
+        (SettingsBytecode::read_file(path)?, None)
+    };
+    let (Some(parts), Some(reader)) = (parts, reader) else {
+        return print_json_output(&settings_doc_to_json_tree(&document, path), pretty);
+    };
+    store_json_by_rows(
+        &mut document,
+        &reader,
+        path,
+        &parts,
+        VIEW_ROWS_AT_ONCE,
+        |piece| print!("{piece}"),
+    )
 }
 
 pub(crate) fn view_command(args: ViewArgs) -> Result<()> {
@@ -537,8 +793,21 @@ pub(crate) fn view_command(args: ViewArgs) -> Result<()> {
         println!("# renium store: empty file");
         return Ok(());
     }
+    if extension.as_deref() == Some("renium") {
+        return if args.json {
+            print_store_json(&args.file, args.pretty)
+        } else {
+            print_store_text(&args.file)
+        };
+    }
+    // A process that serves automation prints each `print!` as a line.
+    if matches!(extension.as_deref(), Some("rbxl" | "rbxlx"))
+        && !args.json
+        && !crate::app::context::automation_stdio()
+    {
+        return print_place_text(&args.file);
+    }
     let document = match extension.as_deref() {
-        Some("renium") => SettingsBytecode::read_file(&args.file)?,
         Some("rbxm" | "rbxmx") => read_settings_model_document(&args.file)?,
         Some("rbxl" | "rbxlx") => super::place_diff::document(
             &super::place_file::place_dom(&args.file)?,

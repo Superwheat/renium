@@ -456,8 +456,8 @@ fn lighting_fixture(state: i32, technology: u32, marker: bool, original: Option<
 fn full_diff_skips_engine_managed_values_and_migration_markers() {
     let services = BTreeSet::from(["Workspace".to_string(), "Lighting".to_string()]);
     let result = compare(
-        &lighting_fixture(1, 4, true, Some(4)),
-        &lighting_fixture(2, 5, true, None),
+        lighting_fixture(1, 4, true, Some(4)),
+        lighting_fixture(2, 5, true, None),
         &services,
         &args(&[]),
     )
@@ -471,8 +471,8 @@ fn full_diff_skips_engine_managed_values_and_migration_markers() {
         1
     );
     let legacy = compare(
-        &lighting_fixture(1, 4, false, None),
-        &lighting_fixture(1, 5, false, None),
+        lighting_fixture(1, 4, false, None),
+        lighting_fixture(1, 5, false, None),
         &services,
         &args(&["--values"]),
     )

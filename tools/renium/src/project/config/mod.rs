@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::editor::paths::infer_source_script;
-use crate::settings::bytecode::SettingsBytecode;
 use crate::system::files::{
     absolutize_for_daemon as absolute_path, atomic_write_file, canonical_path,
     ends_with_ignore_ascii_case, exact_path_key as path_slash, is_windows_reserved_name,
@@ -1817,26 +1816,30 @@ fn explain_staged_filter_candidates(
         if !settings.is_file() {
             continue;
         }
-        let document = SettingsBytecode::read_file(&settings)?;
+        let (mut document, mut rows) = crate::bytecode::read_whole_store(&settings)?;
         let source_paths = crate::editor::paths::build_editor_source_paths_by_index(
             &document,
             &service_name,
             &service,
         );
         let paths = projection_instance_paths(&document);
-        for (index, source_path) in source_paths.into_iter().enumerate() {
+        let named = |(index, source_path): (usize, &Option<PathBuf>)| {
             let source_matches = source_path
                 .as_deref()
                 .is_some_and(|source_path| staged_absolute.contains(&absolute_path(source_path)));
             let transformed_matches = projection
                 .transformed_source_for_target(&paths[index])
                 .is_some_and(|source| absolute_path(source) == requested_absolute);
-            if !source_matches
-                && !transformed_matches
-                && sidecar_target != Some(paths[index].as_slice())
-            {
-                continue;
-            }
+            (source_matches
+                || transformed_matches
+                || sidecar_target == Some(paths[index].as_slice()))
+            .then_some(index)
+        };
+        let named = (source_paths.iter().enumerate())
+            .filter_map(named)
+            .collect::<Vec<_>>();
+        crate::bytecode::fill_rows(&mut document, rows.as_mut(), &named)?;
+        for index in named {
             let instance = &document.instances[index];
             let fields = filter_candidate_fields(&instance.properties, &instance.attributes);
             let candidate_path = filter_path_segments(&paths[index]);

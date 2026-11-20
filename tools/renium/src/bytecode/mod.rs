@@ -318,7 +318,18 @@ fn canonical_stored_property_name(
 /// (`SettingsBytecode::read_by_rows`): a store read by its rows gives each
 /// Script its RunContext, which names its source file.
 pub(crate) fn read_store(path: &Path) -> Result<(SettingsBytecode, Option<RowReader>)> {
-    let (mut document, rows) = SettingsBytecode::read_by_rows(path)?;
+    with_run_contexts(SettingsBytecode::read_by_rows(path)?)
+}
+
+/// `read_store` for a command that answers for the whole store
+/// (`SettingsBytecode::read_whole_by_rows`).
+pub(crate) fn read_whole_store(path: &Path) -> Result<(SettingsBytecode, Option<RowReader>)> {
+    with_run_contexts(SettingsBytecode::read_whole_by_rows(path)?)
+}
+
+fn with_run_contexts(
+    (mut document, rows): (SettingsBytecode, Option<RowReader>),
+) -> Result<(SettingsBytecode, Option<RowReader>)> {
     if let Some(rows) = &rows {
         let scripts = (0..document.instances.len())
             .filter(|index| document.instances[*index].class_name == "Script")

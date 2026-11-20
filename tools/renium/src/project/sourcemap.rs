@@ -584,7 +584,7 @@ fn build_project_sourcemap_from_source(
             let service_path = entry.clone();
             let settings_path = service_settings_path(&service_path);
             let node = if settings_path.is_file() {
-                let document = SettingsBytecode::read_file(&settings_path)?;
+                let (document, _) = crate::bytecode::read_whole_store(&settings_path)?;
                 Some(build_service_sourcemap_from_settings(
                     &document,
                     &service_name,

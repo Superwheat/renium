@@ -10,4 +10,6 @@ pub(crate) mod sourcemap;
 pub(crate) mod storage;
 pub(crate) mod structural;
 pub(crate) mod version_control;
+#[cfg(test)]
+mod view_sim;
 pub(crate) mod workflows;

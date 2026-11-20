@@ -336,7 +336,8 @@ impl RbxPlaceFormat {
         head.trim_start().starts_with('<').then_some(Self::Xml)
     }
 
-    fn read_with_defaults(self, path: &Path, elide_defaults: bool) -> Result<RbxWeakDom> {
+    /// The file opened, and the format its content declares or else this one.
+    fn open(self, path: &Path) -> Result<(Self, BufReader<File>)> {
         let input =
             File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
         let mut reader = BufReader::new(input);
@@ -344,6 +345,29 @@ impl RbxPlaceFormat {
             .ok()
             .and_then(Self::sniff)
             .unwrap_or(self);
+        Ok((format, reader))
+    }
+
+    /// The instances of a binary file in the order of its tree, each with
+    /// its name, its class and, of the properties of a class `kept` names,
+    /// those it lists alone; none for an XML file, which is read whole.
+    pub(crate) fn read_flat(
+        self,
+        path: &Path,
+        kept: HashMap<String, HashSet<String>>,
+    ) -> Result<Option<rbx_binary::FlatDom>> {
+        let (Self::Binary, reader) = self.open(path)? else {
+            return Ok(None);
+        };
+        rbx_binary::Deserializer::new()
+            .flat_property_filter(Arc::new(kept))
+            .deserialize_flat(reader)
+            .with_context(|| format!("Failed to read {}", path.display()))
+            .map(Some)
+    }
+
+    fn read_with_defaults(self, path: &Path, elide_defaults: bool) -> Result<RbxWeakDom> {
+        let (format, reader) = self.open(path)?;
         match format {
             Self::Binary => rbx_binary::Deserializer::new()
                 .elide_defaults(elide_defaults)

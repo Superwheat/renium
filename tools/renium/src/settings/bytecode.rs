@@ -359,11 +359,24 @@ impl SettingsBytecode {
     /// without its values, with the reader that gives a row them, and a
     /// store of an older version whole.
     pub(crate) fn read_by_rows(path: &Path) -> Result<(Self, Option<blocks::RowReader>)> {
+        Self::read_rows(path, false)
+    }
+
+    /// `read_by_rows` for a command that answers for the whole store: a v12
+    /// store with a damaged frame is refused, as `read_file` refuses it.
+    pub(crate) fn read_whole_by_rows(path: &Path) -> Result<(Self, Option<blocks::RowReader>)> {
+        Self::read_rows(path, true)
+    }
+
+    fn read_rows(path: &Path, whole: bool) -> Result<(Self, Option<blocks::RowReader>)> {
         read_settings_file(path, |bytes| {
             if !blocks::is_block_store(bytes) {
                 return Ok((decode_settings_bytecode(bytes)?, None));
             }
             let (document, reader) = blocks::RowReader::decode(bytes)?;
+            if whole {
+                reader.check()?;
+            }
             Ok((document, Some(reader)))
         })
     }

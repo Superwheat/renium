@@ -675,6 +675,40 @@ pub(crate) fn print_json_output(value: &Value, pretty: bool) -> Result<()> {
     Ok(())
 }
 
+/// How `print_json_output` prints a result that goes to stdout as it stands,
+/// for a command that prints a large one a part at a time.
+pub(crate) struct JsonParts {
+    pub(crate) text_mode: bool,
+    pub(crate) pretty: bool,
+}
+
+/// None where `print_json_output` needs its result whole: one that is
+/// captured, projected by `--fields`, or a line of an automation process.
+pub(crate) fn json_parts(pretty: bool) -> Option<JsonParts> {
+    let whole =
+        output_is_captured() || FIELDS.get().is_some() || crate::app::context::automation_stdio();
+    (!whole).then(|| JsonParts {
+        text_mode: MODE.load(Ordering::Relaxed) == 0,
+        pretty: global_pretty_output(pretty) && !STREAM.load(Ordering::Relaxed),
+    })
+}
+
+impl JsonParts {
+    /// The text `print_json_output` prints for `value`, a result that is no
+    /// store edit or held review, or a value within one.
+    pub(crate) fn text(&self, mut value: Value) -> Result<String> {
+        if self.text_mode {
+            value = relativize_project_paths(value);
+            shorten_single_precision_floats(&mut value);
+        }
+        Ok(if self.pretty {
+            serde_json::to_string_pretty(&value)?
+        } else {
+            serde_json::to_string(&value)?
+        })
+    }
+}
+
 /// What the result of a store edit repeats, which its text form leaves out:
 /// the store file that `changedPaths` already names, the store index and the
 /// split path (printed as one dotted `path`), the push summary's own `ok`

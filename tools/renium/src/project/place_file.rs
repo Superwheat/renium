@@ -17,12 +17,13 @@ use crate::rbx::encode::{
     enum_item_name_by_value, rbx_logical_property_name, rbx_property_descriptor, strip_enum_prefix,
 };
 use crate::rbx::model::{
-    BytecodeModelImportRefs, RbxPlaceFormat, build_rbx_place, rbx_dom_instance_path_parts,
+    BytecodeModelImportRefs, RbxPlaceFormat, build_rbx_place, is_service_class,
+    rbx_dom_instance_path_parts,
 };
 use crate::system::text::normalized_source_bytes;
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
-struct ScriptRecord {
+pub(super) struct ScriptRecord {
     class_name: String,
     source: Vec<u8>,
 }
@@ -465,31 +466,105 @@ fn projected_services(root: &Path) -> Result<Vec<String>> {
     Ok(services)
 }
 
-fn script_groups(dom: &RbxWeakDom, services: &BTreeSet<String>) -> ScriptGroups {
-    let mut groups = ScriptGroups::new();
-    for referent in descendants(dom) {
-        let Some(source) = script_source(dom, referent) else {
-            continue;
-        };
-        let (path, _) = rbx_dom_instance_path_parts(dom, referent);
-        if !path
-            .first()
-            .is_some_and(|service| services.contains(service))
-        {
-            continue;
-        }
-        let Some(instance) = dom.get_by_ref(referent) else {
-            continue;
-        };
-        groups.entry(path).or_default().push(ScriptRecord {
-            class_name: instance.class.to_string(),
+/// The scripts of a place, each under the names from its service down to it,
+/// and the names of the place's services.
+pub(super) struct PlaceScripts {
+    pub(super) services: Vec<String>,
+    pub(super) scripts: Vec<(Vec<String>, ScriptRecord)>,
+}
+
+impl PlaceScripts {
+    fn record(class_name: &str, source: &str) -> ScriptRecord {
+        ScriptRecord {
+            class_name: class_name.to_string(),
             source: normalized_source_bytes(source.as_bytes()).collect(),
-        });
+        }
     }
-    for scripts in groups.values_mut() {
-        scripts.sort();
+
+    pub(super) fn of_dom(dom: &RbxWeakDom) -> Self {
+        let services = (dom.root().children().iter())
+            .filter_map(|id| dom.get_by_ref(*id).map(|node| node.name.clone()))
+            .collect();
+        let scripts = descendants(dom)
+            .filter_map(|referent| {
+                let source = script_source(dom, referent)?;
+                let class_name = dom.get_by_ref(referent)?.class.as_str();
+                let (path, _) = rbx_dom_instance_path_parts(dom, referent);
+                Some((path, Self::record(class_name, source)))
+            })
+            .collect();
+        Self { services, scripts }
     }
-    groups
+
+    /// Of a place file, as `of_dom` gives them of its DOM. A binary file is
+    /// read for them alone: every instance by its name and class, and each
+    /// script with its Source.
+    pub(super) fn of_file(path: &Path) -> Result<Self> {
+        if !path.is_file() {
+            bail!("Place file does not exist: {}", path.display());
+        }
+        let database =
+            rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
+        let kept = (database.classes.keys())
+            .map(|class| {
+                let kept = is_lua_source_class(class).then(|| "Source".to_string());
+                (class.to_string(), kept.into_iter().collect())
+            })
+            .collect();
+        let Some(flat) = RbxPlaceFormat::from_path(path)?.read_flat(path, kept)? else {
+            return Ok(Self::of_dom(&place_dom(path)?));
+        };
+        let segment = |index: usize| {
+            let instance = &flat.instances[index];
+            if instance.parent_index.is_none() && is_service_class(instance.class.as_str()) {
+                instance.class.to_string()
+            } else {
+                instance.name.clone()
+            }
+        };
+        let script = |(index, instance): (usize, &rbx_binary::FlatInstance)| {
+            if !is_lua_source_class(instance.class.as_str()) {
+                return None;
+            }
+            let mut saved = instance.properties.iter().rev();
+            let saved = saved.find(|(name, _)| name.as_str() == "Source");
+            let source = match saved {
+                Some((_, RbxVariant::String(source))) => source.as_str(),
+                None => "",
+                _ => return None,
+            };
+            let mut path = vec![segment(index)];
+            let mut parent = instance.parent_index;
+            while let Some(index) = parent {
+                path.push(segment(index));
+                parent = flat.instances[index].parent_index;
+            }
+            path.reverse();
+            Some((path, Self::record(instance.class.as_str(), source)))
+        };
+        Ok(Self {
+            services: (flat.root_indices.iter())
+                .map(|root| flat.instances[*root].name.clone())
+                .collect(),
+            scripts: (flat.instances.iter().enumerate())
+                .filter_map(script)
+                .collect(),
+        })
+    }
+
+    /// The scripts under the services `services` names, by their paths.
+    fn groups(self, services: &BTreeSet<String>) -> ScriptGroups {
+        let mut groups = ScriptGroups::new();
+        for (path, script) in self.scripts {
+            if path.first().is_some_and(|name| services.contains(name)) {
+                groups.entry(path).or_default().push(script);
+            }
+        }
+        for scripts in groups.values_mut() {
+            scripts.sort();
+        }
+        groups
+    }
 }
 
 fn remove_exact_matches(project: &mut Vec<ScriptRecord>, place: &mut Vec<ScriptRecord>) -> usize {
@@ -545,15 +620,12 @@ pub(crate) fn compare_place(mut args: ComparePlaceArgs, project: Option<&Path>) 
     if args.against.is_none() {
         args.against = args.other.take();
     }
-    let read = |path: &Path| {
-        if args.full {
-            // Full comparison already normalizes exact reflection defaults away.
-            // Omit them during decoding instead of allocating then dropping them.
-            RbxPlaceFormat::from_path(path)?.read_for_comparison(path)
-        } else {
-            place_dom(path)
-        }
-    };
+    if !args.full {
+        return compare_scripts(&args, project, started);
+    }
+    // Full comparison already normalizes exact reflection defaults away.
+    // Omit them during decoding instead of allocating then dropping them.
+    let read = |path: &Path| RbxPlaceFormat::from_path(path)?.read_for_comparison(path);
     let (mut place_dom, mut project_dom, project_path, service_set) =
         if let Some(against) = &args.against {
             let (before, target) = rayon::join(|| read(&args.input), || read(against));
@@ -586,62 +658,86 @@ pub(crate) fn compare_place(mut args: ComparePlaceArgs, project: Option<&Path>) 
             started.elapsed().as_secs_f64() * 1000.0
         ),
     );
-    if args.full {
-        let (not_serialized, unsaved_instances, unsaved_service) = if args.against.is_none() {
-            (
-                super::place_diff::project_properties_as_saved(&mut project_dom)?,
-                super::place_diff::omit_unsaved_project_instances(&mut project_dom),
-                super::place_diff::omit_unsaved_service_properties(&mut place_dom)?,
-            )
-        } else {
-            (BTreeMap::new(), 0, BTreeMap::new())
-        };
-        let mut result = super::place_diff::compare(&place_dom, &project_dom, &service_set, &args)?;
-        if !not_serialized.is_empty() {
-            result["notSerializedProjectProperties"] = json!(not_serialized);
-        }
-        if !unsaved_service.is_empty() {
-            result["unsavedServiceProperties"] = json!(unsaved_service);
-        }
-        if unsaved_instances > 0 {
-            result["unsavedProjectInstances"] = json!(unsaved_instances);
-        }
-        if args.against.is_some() {
-            let internal = [&place_dom, &project_dom]
-                .into_iter()
-                .flat_map(|dom| {
-                    dom.root()
-                        .children()
-                        .iter()
-                        .filter_map(|id| dom.get_by_ref(*id))
-                })
-                .map(|node| node.name.as_str())
-                .filter(|name| super::place_diff::is_engine_internal_service(name))
-                .collect::<BTreeSet<_>>();
-            if !internal.is_empty() {
-                result["engineManagedServices"] = json!(internal);
-            }
-        }
-        result["input"] = json!(args.input);
-        result["target"] = json!(project_path);
-        result["targetKind"] = json!(if args.against.is_some() {
-            "place"
-        } else {
-            "project"
-        });
-        let started = std::time::Instant::now();
-        rayon::join(|| drop(place_dom), || drop(project_dom));
-        crate::app::output::log_global(
-            4,
-            format_args!(
-                "[renium] place comparison input release: {:.1}ms",
-                started.elapsed().as_secs_f64() * 1000.0
-            ),
-        );
-        return print_json_output(&result, args.pretty);
+    let (not_serialized, unsaved_instances, unsaved_service) = if args.against.is_none() {
+        (
+            super::place_diff::project_properties_as_saved(&mut project_dom)?,
+            super::place_diff::omit_unsaved_project_instances(&mut project_dom),
+            super::place_diff::omit_unsaved_service_properties(&mut place_dom)?,
+        )
+    } else {
+        (BTreeMap::new(), 0, BTreeMap::new())
+    };
+    let internal = [&place_dom, &project_dom]
+        .into_iter()
+        .filter(|_| args.against.is_some())
+        .flat_map(|dom| {
+            dom.root()
+                .children()
+                .iter()
+                .filter_map(|id| dom.get_by_ref(*id))
+        })
+        .map(|node| node.name.clone())
+        .filter(|name| super::place_diff::is_engine_internal_service(name))
+        .collect::<BTreeSet<_>>();
+    let mut result = super::place_diff::compare(place_dom, project_dom, &service_set, &args)?;
+    if !not_serialized.is_empty() {
+        result["notSerializedProjectProperties"] = json!(not_serialized);
     }
-    let project_scripts = script_groups(&project_dom, &service_set);
-    let place_scripts = script_groups(&place_dom, &service_set);
+    if !unsaved_service.is_empty() {
+        result["unsavedServiceProperties"] = json!(unsaved_service);
+    }
+    if unsaved_instances > 0 {
+        result["unsavedProjectInstances"] = json!(unsaved_instances);
+    }
+    if !internal.is_empty() {
+        result["engineManagedServices"] = json!(internal);
+    }
+    result["input"] = json!(args.input);
+    result["target"] = json!(project_path);
+    result["targetKind"] = json!(if args.against.is_some() {
+        "place"
+    } else {
+        "project"
+    });
+    print_json_output(&result, args.pretty)
+}
+
+/// `compare_place` of the scripts alone, which reads of each place nothing
+/// but them.
+fn compare_scripts(
+    args: &ComparePlaceArgs,
+    project: Option<&Path>,
+    started: std::time::Instant,
+) -> Result<()> {
+    let (place, target, project_path, service_set) = if let Some(against) = &args.against {
+        let (before, target) = rayon::join(
+            || PlaceScripts::of_file(&args.input),
+            || PlaceScripts::of_file(against),
+        );
+        let (before, target) = (before?, target?);
+        let services = (before.services.iter().chain(&target.services))
+            .filter(|name| !super::place_diff::is_engine_internal_service(name))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        (before, target, against.clone(), services)
+    } else {
+        let before = PlaceScripts::of_file(&args.input)?;
+        let loaded = config::load_project(project, None)?;
+        let projection = config::stage_project(&loaded)?;
+        let services = projected_services(projection.root())?;
+        let service_set = services.iter().cloned().collect::<BTreeSet<_>>();
+        let dom = build_rbx_place(projection.root(), services, None, false, false, false)?.dom;
+        (before, PlaceScripts::of_dom(&dom), loaded.path, service_set)
+    };
+    crate::app::output::log_global(
+        4,
+        format_args!(
+            "[renium] place comparison input decoding: {:.1}ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        ),
+    );
+    let project_scripts = target.groups(&service_set);
+    let place_scripts = place.groups(&service_set);
     let project_count = project_scripts.values().map(Vec::len).sum::<usize>();
     let place_count = place_scripts.values().map(Vec::len).sum::<usize>();
 

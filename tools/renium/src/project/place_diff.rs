@@ -29,7 +29,7 @@ use crate::settings::{
         stabilize_settings_reference_ids,
     },
 };
-use crate::snapshot::refs::remap_record_reference_ids;
+use crate::snapshot::refs::{remap_record_reference_ids, stabilize_record_references};
 
 const UNIFIED_LIGHTING_MARKER: &str = "RBX_LightingTechnologyUnifiedMigration";
 const ENGINE_INTERNAL_SERVICES: [&str; 2] = ["ConfigureServerService", "FilteredSelection"];
@@ -291,6 +291,85 @@ pub(super) fn document(
     services: Option<&BTreeSet<String>>,
     elide_defaults: bool,
 ) -> Result<SettingsBytecode> {
+    let rows = dom_rows(dom, prefix, services, elide_defaults)?;
+    let every = (0..rows.refs.len()).collect::<Vec<_>>();
+    let mut document = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: records(&rows, &every)?,
+    };
+    stabilize_settings_reference_ids(&mut document);
+    Ok(document)
+}
+
+/// What `document` reads of a DOM before it converts an instance: the
+/// instances in the order of its document, where each stands there, and how
+/// a reference names one.
+pub(super) struct DomRows<'a> {
+    dom: &'a WeakDom,
+    prefix: &'a str,
+    elide_defaults: bool,
+    database: &'static rbx_reflection::ReflectionDatabase<'static>,
+    refs: Vec<Ref>,
+    indices: HashMap<Ref, usize>,
+    current_camera: Option<Ref>,
+    import_refs: BytecodeModelImportRefs,
+}
+
+impl DomRows<'_> {
+    /// The instances of `document` without their values.
+    pub(super) fn structure(&self) -> SettingsBytecode {
+        let bare = |(index, id): (usize, &Ref)| {
+            let node = self.dom.get_by_ref(*id).unwrap();
+            SettingsBytecodeInstance::new(
+                format!("{}:{index}", self.prefix),
+                node.name.clone(),
+                node.class.to_string(),
+                self.indices.get(&node.parent()).copied(),
+            )
+        };
+        SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: self.refs.iter().enumerate().map(bare).collect(),
+        }
+    }
+
+    /// `RowReader::walk_turns` of `structure`: each row of a turn holds the
+    /// values `document` gives it while its turn is visited.
+    pub(super) fn walk_turns(
+        &self,
+        document: &mut SettingsBytecode,
+        rows: &[usize],
+        at_once: usize,
+        mut visit: impl FnMut(&SettingsBytecode, &[usize]) -> Result<()>,
+    ) -> Result<()> {
+        let ids = (document.instances.iter())
+            .map(|instance| instance.settings_id.clone())
+            .collect::<Vec<_>>();
+        for turn in rows.chunks(at_once.max(1)) {
+            let mut read = records(self, turn)?;
+            read.par_iter_mut().for_each(|record| {
+                stabilize_record_references(&mut record.properties, &ids);
+                stabilize_record_references(&mut record.attributes, &ids);
+            });
+            for (row, record) in turn.iter().zip(read) {
+                document.instances[*row] = record;
+            }
+            let visited = visit(document, turn);
+            for row in turn {
+                document.instances[*row] = document.instances[*row].bare();
+            }
+            visited?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn dom_rows<'a>(
+    dom: &'a WeakDom,
+    prefix: &'a str,
+    services: Option<&BTreeSet<String>>,
+    elide_defaults: bool,
+) -> Result<DomRows<'a>> {
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let mut refs = Vec::new();
     let mut pending = dom
@@ -342,11 +421,35 @@ pub(super) fn document(
                 .insert(node.referent(), ordinals);
         }
     }
+    Ok(DomRows {
+        dom,
+        prefix,
+        elide_defaults,
+        database,
+        refs,
+        indices,
+        current_camera,
+        import_refs,
+    })
+}
+
+/// The instances at `rows` of a DOM's rows, as `document` holds them before
+/// it stabilizes their references.
+fn records(plan: &DomRows<'_>, rows: &[usize]) -> Result<Vec<SettingsBytecodeInstance>> {
+    let &DomRows {
+        dom,
+        prefix,
+        elide_defaults,
+        database,
+        ref refs,
+        ref indices,
+        current_camera,
+        ref import_refs,
+    } = plan;
     // Indexed collection keeps file traversal order while independent records
     // convert in parallel. Each worker reuses its reflection/default metadata.
-    let instances = refs
-        .par_iter()
-        .enumerate()
+    rows.par_iter()
+        .map(|index| (*index, &refs[*index]))
         .map_init(
             HashMap::new,
             |property_metadata, (index, id)| -> Result<_> {
@@ -378,7 +481,7 @@ pub(super) fn document(
                             attributes,
                             elide_defaults,
                             database,
-                            &import_refs,
+                            import_refs,
                             &mut record,
                         )?;
                         continue;
@@ -426,7 +529,7 @@ pub(super) fn document(
                                 };
                             let default = raw_default
                                 .map(|value| {
-                                    variant_value(value, descriptor, database, &import_refs)
+                                    variant_value(value, descriptor, database, import_refs)
                                 })
                                 .transpose()?;
                             entry.insert((canonical.to_string(), descriptor, raw_default, default))
@@ -456,7 +559,7 @@ pub(super) fn document(
                                 normalized_source_bytes(source.as_bytes()).collect()
                             )?),
                             Variant::String(source) => json!(source),
-                            _ => variant_value(value, descriptor, database, &import_refs)?,
+                            _ => variant_value(value, descriptor, database, import_refs)?,
                         }
                     } else if elide_defaults && let Variant::Tags(tags) = value {
                         json!(tags.iter().collect::<BTreeSet<_>>())
@@ -476,16 +579,22 @@ pub(super) fn document(
                             &Variant::Enum(rbx_dom_weak::types::Enum::from_u32(item.value)),
                             None,
                             database,
-                            &import_refs,
+                            import_refs,
                         )?
                     } else {
-                        variant_value(value, descriptor, database, &import_refs)?
+                        variant_value(value, descriptor, database, import_refs)?
                     };
                     if key != crate::rbx::encode::COLLISION_HULL_PROPERTY
                         && default.as_ref() == Some(&value)
                     {
                         continue;
                     }
+                    // A comparison holds a payload its instances share once.
+                    let value = if elide_defaults {
+                        crate::settings::held::held(value)
+                    } else {
+                        value
+                    };
                     let output_name = if elide_defaults {
                         canonical.as_str()
                     } else {
@@ -507,13 +616,7 @@ pub(super) fn document(
                 Ok(record)
             },
         )
-        .collect::<Result<Vec<_>>>()?;
-    let mut document = SettingsBytecode {
-        version: SETTINGS_BINARY_VERSION,
-        instances,
-    };
-    stabilize_settings_reference_ids(&mut document);
-    Ok(document)
+        .collect()
 }
 
 fn collect_attribute_values(
@@ -941,19 +1044,25 @@ fn field_noise(before: Option<&Value>, after: Option<&Value>) -> bool {
     }
 }
 
+/// A DOM given whole is released once its document is read, the first before
+/// the second is converted, so the two documents never stand beside both DOMs.
 pub(super) fn compare(
-    before: &WeakDom,
-    after: &WeakDom,
+    before: impl std::borrow::Borrow<WeakDom>,
+    after: impl std::borrow::Borrow<WeakDom>,
     services: &BTreeSet<String>,
     args: &ComparePlaceArgs,
 ) -> Result<Value> {
     let started = Instant::now();
-    let (before, after) = rayon::join(
-        || document(before, "before", Some(services), true),
-        || document(after, "after", Some(services), true),
-    );
-    let mut before = before?;
-    let mut after = after?;
+    let mut before = {
+        let document = document(before.borrow(), "before", Some(services), true);
+        drop(before);
+        document?
+    };
+    let mut after = {
+        let document = document(after.borrow(), "after", Some(services), true);
+        drop(after);
+        document?
+    };
     let mut engine_managed = omit_engine_managed_properties(&mut before, &args.props);
     for (name, count) in omit_engine_managed_properties(&mut after, &args.props) {
         *engine_managed.entry(name).or_default() += count;
