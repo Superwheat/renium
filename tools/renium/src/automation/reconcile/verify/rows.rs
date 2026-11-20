@@ -32,13 +32,17 @@ const MIN_ROWS: usize = if cfg!(test) { 2 } else { 16_384 };
 /// holds every other one bare) asked nothing of the others: those instances
 /// alone are read of either copy, in one pass.
 ///
+/// Without `before`, for a store the push asked nothing of, every instance
+/// is compared in full as a new one is: Studio holding what the files hold
+/// is more than such a store's whole documents ask.
+///
 /// `None` where the whole documents have to say: the two copies hold other
 /// instances, the store is small, or an instance does not hold what the
 /// files hold for it. The whole documents then name what differs, or match
 /// Studio's instances with the files' another way.
 pub(super) fn verified_by_rows(
     path: &Path,
-    before: &SettingsBytecode,
+    before: Option<&SettingsBytecode>,
     desired_bytes: &[u8],
     observed_bytes: &[u8],
     policy: Verification<'_>,
@@ -54,8 +58,21 @@ pub(super) fn verified_by_rows(
         return Ok(None);
     };
     let count = desired.instances.len();
-    if count < MIN_ROWS || observed.instances.len() != count {
+    if count < MIN_ROWS {
         return Ok(None);
+    }
+    // Why a large store is left to its whole documents, for the log.
+    let whole = |why: &str| {
+        log_global(
+            4,
+            format_args!(
+                "[renium] a store of {count} instances is verified from its whole documents: {why}"
+            ),
+        );
+        Ok(None)
+    };
+    if observed.instances.len() != count {
+        return whole("Studio holds another count of instances");
     }
     // What says where the instances stand, before any of them is read: the
     // UniqueId of each and the camera its root names.
@@ -95,7 +112,7 @@ pub(super) fn verified_by_rows(
     // Where Studio holds each instance of the files, and the files each of
     // Studio's.
     let Some((places, by_order)) = instance_places(&desired, &observed) else {
-        return Ok(None);
+        return whole("nothing says where Studio holds each instance");
     };
     let mut origins = vec![0; count];
     for (index, place) in places.iter().enumerate() {
@@ -129,12 +146,13 @@ pub(super) fn verified_by_rows(
     let pending = pending_fields(&service, &desired, policy.pending);
     let reference_ids =
         EditorReferenceIds::new(desired_ids.iter().map(String::as_str)).in_service(&service);
-    let before_by_id = before
-        .instances
-        .iter()
-        .enumerate()
-        .map(|(index, instance)| (instance.settings_id.as_str(), index))
-        .collect::<AHashMap<_, _>>();
+    let before = before.map(|before| {
+        let ids = before.instances.iter().enumerate();
+        let by_id = ids
+            .map(|(index, instance)| (instance.settings_id.as_str(), index))
+            .collect::<AHashMap<_, _>>();
+        (before, by_id)
+    });
     // The viewport camera Studio holds is never compared, and a settle gives
     // it the values the files hold for it (`keep_reference_viewport_camera`).
     let protected = workspace_current_camera_index(&observed);
@@ -152,12 +170,27 @@ pub(super) fn verified_by_rows(
     // what the push asked of it.
     let differ = |desired: &SettingsBytecode, observed: &mut SettingsBytecode, rows: &[usize]| {
         // An instance its order among namesakes alone tells is Studio's
-        // only where the two hold the same in full, as a new one is compared.
+        // only where the two hold the same in full: compared as a new one
+        // is, and with nothing in Studio's that the files do not state, which
+        // would tell it from a namesake.
+        let holds_more = |observed: &SettingsBytecode, index: usize| {
+            let (wanted, held) = (
+                &desired.instances[index],
+                &observed.instances[places[index]],
+            );
+            let more = |held: &Map<String, Value>, wanted: &Map<String, Value>| {
+                held.keys().any(|name| !wanted.contains_key(name))
+            };
+            by_order[index]
+                && (more(&held.properties, &wanted.properties)
+                    || more(&held.attributes, &wanted.attributes))
+        };
         let previous = |index: usize| {
-            before_by_id
+            let (before, by_id) = before.as_ref()?;
+            by_id
                 .get(desired.instances[index].settings_id.as_str())
-                .copied()
                 .filter(|_| !by_order[index])
+                .map(|previous| (*before, *previous))
         };
         let compare = |observed: &SettingsBytecode, index: usize| {
             let place = places[index];
@@ -166,16 +199,17 @@ pub(super) fn verified_by_rows(
             }
             let instance = &desired.instances[index];
             match previous(index) {
-                Some(previous)
+                Some((before, previous))
                     if before.instances[previous].class_name == "PackageLink"
                         && instance.class_name == "PackageLink" =>
                 {
                     None
                 }
-                Some(previous) => {
+                Some((before, previous)) => {
                     changed_instance_mismatch(before, previous, desired, index, observed, place)
                 }
-                None => added_instance_mismatch(desired, index, observed, place),
+                None => added_instance_mismatch(desired, index, observed, place)
+                    .or_else(|| holds_more(observed, index).then(String::new)),
             }
         };
         let unlike = {
@@ -188,19 +222,20 @@ pub(super) fn verified_by_rows(
         unlike
             .into_iter()
             .any(|index| match policy.new_instance_values {
+                Some(_) if holds_more(observed, index) => true,
                 Some(values) => values
-                    .mismatch(
-                        previous(index).map(|previous| (before, previous)),
-                        (desired, index),
-                        (observed, places[index]),
-                    )
+                    .mismatch(previous(index), (desired, index), (observed, places[index]))
                     .is_some(),
                 None => true,
             })
     };
-    if crate::settings::equivalence::holds_unread_instances(before) {
+    if let Some((before, before_by_id)) = &before
+        && crate::settings::equivalence::holds_unread_instances(before)
+    {
         if policy.settle || pending.is_some() {
-            return Ok(None);
+            return whole(
+                "the push read Studio's copy by its changed instances and settles or left fields pending",
+            );
         }
         let changed = desired
             .instances
@@ -287,7 +322,7 @@ pub(super) fn verified_by_rows(
             .collect::<Vec<_>>();
         waiting = waiting + rows.len() - both.len();
         if waiting > ROWS_AT_A_TIME {
-            return Ok(None);
+            return whole("Studio holds the instances in another order");
         }
         if let Some(pending) = &pending {
             for (index, row) in pending.rows.iter().filter(|(index, _)| read(*index)) {
@@ -314,7 +349,7 @@ pub(super) fn verified_by_rows(
             }
         }
         if differ(&desired, &mut observed, &both) {
-            return Ok(None);
+            return whole("an instance does not hold what the files hold for it");
         }
         for place in written {
             settled.insert(place, observed.instances[place].clone());
@@ -342,6 +377,10 @@ pub(super) fn verified_by_rows(
         return Ok(None);
     }
     drop((desired, observed));
+    #[cfg(test)]
+    if before.is_none() {
+        UNPREPARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let accepted = policy
         .settle
         .then(|| settled_store(observed_bytes, &placed_ids, &settled))
@@ -351,6 +390,11 @@ pub(super) fn verified_by_rows(
         accepted,
     }))
 }
+
+/// The stores verified without a copy from before the push.
+#[cfg(test)]
+pub(crate) static UNPREPARED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// The store a settle publishes: Studio's copy as it was captured, each
 /// instance under the files' id for its place, and the instances of

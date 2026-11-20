@@ -9116,14 +9116,24 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
             && prepared()?.is_some_and(|prepared| {
                 crate::settings::equivalence::holds_unread_instances(&prepared.previous)
             });
+        // A store the push asked nothing of: Studio held it as the files do.
+        let unasked = settle && seed % 5 == 4;
         let outcome = |whole_documents: bool| {
-            let Some(prepared) = prepared()? else {
-                return Ok(None);
+            let prepared = match unasked {
+                true => None,
+                false => match prepared()? {
+                    Some(prepared) => Some(prepared),
+                    None => return Ok(None),
+                },
             };
             super::verify::settings_delta_outcome(
                 &path,
-                (&studio, &desired, &observed),
-                prepared,
+                (
+                    if unasked { &desired } else { &studio },
+                    &desired,
+                    &observed,
+                ),
+                (prepared, !unasked),
                 (&pending, left_out.as_ref().map(|(values, _)| values)),
                 (settle, whole_documents),
             )
@@ -9214,6 +9224,11 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
         .map(|count| count.load(Ordering::Relaxed));
         let reordered = reordered.load(Ordering::Relaxed);
         assert!(reordered >= 10, "{reordered} verified in another order");
+        let unprepared = super::verify::rows::UNPREPARED.load(Ordering::Relaxed);
+        assert!(
+            unprepared >= 10,
+            "{unprepared} verified without a copy from before"
+        );
         assert!(
             counts[0] >= 80
                 && counts[1] >= 20
@@ -9287,7 +9302,7 @@ fn a_lost_write_among_reordered_namesakes_is_refused_by_rows() {
         super::verify::settings_delta_outcome(
             &path,
             (&before, &files, &after),
-            prepared,
+            (Some(prepared), true),
             (&[], None),
             (false, whole_documents),
         )

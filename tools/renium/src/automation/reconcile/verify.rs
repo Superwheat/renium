@@ -1,7 +1,7 @@
 use super::*;
 use crate::editor::types::PendingImportFields;
 
-mod rows;
+pub(super) mod rows;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Verification<'a> {
@@ -201,7 +201,7 @@ impl<'a> NewInstanceValues<'a> {
 pub(crate) fn settings_delta_outcome(
     path: &Path,
     (before, desired, observed): (&SnapshotEntry, &SnapshotEntry, &SnapshotEntry),
-    prepared: PreparedPushVerification,
+    (prepared, asked): (Option<PreparedPushVerification>, bool),
     (pending, new_instance_values): (&[PendingImportFields], Option<&NewInstanceValues<'_>>),
     (settle, whole_documents): (bool, bool),
 ) -> Result<(Option<String>, Option<Vec<u8>>)> {
@@ -210,7 +210,7 @@ pub(crate) fn settings_delta_outcome(
         Some(before),
         Some(desired),
         Some(observed),
-        Some(prepared),
+        (prepared, asked),
         Verification {
             settle,
             pending,
@@ -388,18 +388,20 @@ fn verify_snapshot_delta(
             .and_then(|name| name.to_str())
             .is_some_and(is_service_settings_file_name)
     };
-    let mut jobs = paths
+    // What the push asked something of.
+    let asked = paths
         .iter()
         .filter(|path| {
             !entries_equivalent(path, before.entries.get(*path), desired.entries.get(*path))
         })
         .collect::<HashSet<_>>();
+    let mut jobs = asked.clone();
     if policy.settle {
         jobs.extend(observed.entries.keys().filter(|path| settings_path(path)));
     }
     let jobs = jobs
         .into_iter()
-        .map(|path| (path, prepared.remove(path)))
+        .map(|path| (path, (prepared.remove(path), asked.contains(path))))
         .collect::<Vec<_>>();
     // Services have independent identity graphs. Share the captured snapshots,
     // but give each worker ownership of its already-prepared documents.
@@ -464,7 +466,7 @@ pub(crate) fn settings_delta_mismatch(
         before,
         desired,
         observed,
-        prepared,
+        (prepared, true),
         Verification::default(),
     )?
     .mismatch)
@@ -475,7 +477,7 @@ fn settings_delta_verification(
     before: Option<&SnapshotEntry>,
     desired: Option<&SnapshotEntry>,
     observed: Option<&SnapshotEntry>,
-    prepared: Option<PreparedPushVerification>,
+    (prepared, asked): (Option<PreparedPushVerification>, bool),
     policy: Verification<'_>,
 ) -> Result<SettingsVerification> {
     let entries = (before, desired, observed);
@@ -492,7 +494,7 @@ fn settings_delta_verification(
         if policy.by_rows()
             && let Some(verified) = rows::verified_by_rows(
                 path,
-                &prepared.previous,
+                Some(&prepared.previous),
                 desired_bytes,
                 observed_bytes,
                 policy,
@@ -509,6 +511,19 @@ fn settings_delta_verification(
         {
             read_unread_instances(Arc::make_mut(desired), desired_bytes)?;
         }
+    }
+    // A settle reads every store Studio's capture holds, most of which the
+    // push asked nothing of and prepared no documents for.
+    if !asked
+        && prepared.is_none()
+        && policy.settle
+        && policy.by_rows()
+        && let (Some(SnapshotEntry::File(desired_bytes)), Some(SnapshotEntry::File(observed_bytes))) =
+            (desired, observed)
+        && let Some(verified) =
+            rows::verified_by_rows(path, None, desired_bytes, observed_bytes, policy)?
+    {
+        return Ok(verified);
     }
     // The three stores decode side by side: on a large service each takes a
     // good part of a second.
@@ -545,7 +560,10 @@ fn settings_delta_verification(
         && !crate::settings::equivalence::align_settings_ids_by_place(&desired, &mut observed)
     {
         drop((before, desired, observed));
-        return settings_delta_verification(path, entries.0, entries.1, entries.2, None, policy);
+        let unprepared = (None, asked);
+        return settings_delta_verification(
+            path, entries.0, entries.1, entries.2, unprepared, policy,
+        );
     }
     let viewport = policy
         .settle
