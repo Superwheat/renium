@@ -2172,6 +2172,64 @@ fn base_place_numbers_take_the_declared_width_before_writing() {
     rbx_binary::to_writer(&mut output, &dom, &[workspace]).unwrap();
 }
 
+/// A model exported from a store and imported into it again is other
+/// instances than the ones it was made from: none keeps a UniqueId the store
+/// holds. In another store the instances keep theirs.
+#[test]
+fn a_model_imported_into_its_own_store_keeps_no_unique_id_of_it() {
+    let mut properties = Map::new();
+    properties.insert("Size".to_string(), vector3_json(4.0, 5.0, 6.0));
+    properties.insert(
+        "UniqueId".to_string(),
+        json!({ "_type": "UniqueId", "value": format!("{:032x}", 9) }),
+    );
+    let (project_root, settings_path) =
+        write_mesh_export_fixture("model-own-store", None, properties);
+    let model = project_root.join("model.rbxm");
+    bytecode_export_model(BytecodeExportModelArgs {
+        input: BytecodeFileArgs::settings_file(settings_path.clone()),
+        service: "Workspace".to_string(),
+        selector: BytecodeInstanceSelectorArgs::by_settings_id(Some("model".to_string())),
+        output: model.clone(),
+        format: Some("rbxm".to_string()),
+        pretty: false,
+    })
+    .unwrap();
+    let unique_ids = |document: &SettingsBytecode| {
+        document
+            .instances
+            .iter()
+            .map(|instance| instance.properties.contains_key("UniqueId"))
+            .collect::<Vec<_>>()
+    };
+    let mut own = SettingsBytecode::read_file(&settings_path).unwrap();
+    crate::rbx::model::import_rbx_model_into_document(
+        &mut own,
+        &settings_path,
+        "Workspace",
+        &model,
+        Some(0),
+    )
+    .unwrap();
+    assert_eq!(unique_ids(&own), [false, false, true, false, false]);
+    let mut other = settings_document(vec![settings_instance(
+        "root",
+        "Workspace",
+        "Workspace",
+        None,
+    )]);
+    crate::rbx::model::import_rbx_model_into_document(
+        &mut other,
+        &settings_path,
+        "Workspace",
+        &model,
+        Some(0),
+    )
+    .unwrap();
+    assert_eq!(unique_ids(&other), [false, false, true]);
+    let _ = fs::remove_dir_all(project_root);
+}
+
 #[test]
 fn bytecode_export_uses_size_for_file_created_meshes_in_all_formats() {
     let mut properties = Map::new();
@@ -2321,6 +2379,10 @@ fn clone_instance_rebinds_internal_ref_properties() {
         "ExternalRef".to_string(),
         json!({ "_type": "Ref", "instanceIndex": 6 }),
     );
+    model_properties.insert(
+        "UniqueId".to_string(),
+        json!({ "_type": "UniqueId", "value": format!("{:032x}", 7) }),
+    );
     let mut weld_properties = Map::new();
     weld_properties.insert(
         "Part0".to_string(),
@@ -2385,6 +2447,13 @@ fn clone_instance_rebinds_internal_ref_properties() {
         })
         .unwrap();
 
+    // The copy is another instance than its original.
+    assert!(cloned.instances[1].properties.contains_key("UniqueId"));
+    assert!(
+        !cloned.instances[cloned_model_index]
+            .properties
+            .contains_key("UniqueId")
+    );
     assert_ref_index(
         cloned.instances[cloned_model_index]
             .properties

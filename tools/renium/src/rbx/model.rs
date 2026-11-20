@@ -2812,6 +2812,14 @@ pub(crate) fn import_rbx_model_into_document(
         path_segments_by_index,
         ..Default::default()
     };
+    // A model exported from this store comes back as other instances: none
+    // keeps a UniqueId the store holds already.
+    let held_unique_ids = document
+        .instances
+        .iter()
+        .filter_map(crate::settings::equivalence::persistent_identity)
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
     let mut source_by_index = HashMap::<usize, String>::new();
     for referent in refs_preorder.iter().copied() {
         let new_index = *import_refs
@@ -2821,8 +2829,13 @@ pub(crate) fn import_rbx_model_into_document(
         let rbx_instance = dom
             .get_by_ref(referent)
             .ok_or_else(|| anyhow::anyhow!("Model contains a missing referent"))?;
-        let (properties, attributes, source) =
+        let (mut properties, attributes, source) =
             rbx_instance_to_settings_records(rbx_instance, database, &import_refs, None);
+        if crate::settings::equivalence::persistent_identity_of(&properties)
+            .is_some_and(|id| held_unique_ids.contains(id))
+        {
+            properties.remove("UniqueId");
+        }
         if let Some(instance) = document.instances.get_mut(new_index) {
             instance.properties = properties;
             instance.attributes = attributes;

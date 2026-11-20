@@ -1134,7 +1134,8 @@ pub(crate) struct ClonedSubtree {
 /// Copies the subtree at `source_index` under `parent_index` in memory. The
 /// copy's root takes `name`, or a name unique among its new siblings; every
 /// copy gets a fresh id that is not in `reserved`, scripts drop their stored
-/// source, and references inside the subtree point at the copies.
+/// source, no copy keeps the UniqueId of its original, and references inside
+/// the subtree point at the copies.
 pub(crate) fn clone_store_subtree(
     document: &mut SettingsBytecode,
     service: &str,
@@ -1199,6 +1200,7 @@ pub(crate) fn clone_store_subtree(
         let mut properties = old_instance.properties;
         properties.remove("Source");
         properties.remove("LinkedSource");
+        properties.remove("UniqueId");
         document.instances.push(SettingsBytecodeInstance {
             settings_id,
             name,
