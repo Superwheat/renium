@@ -30,6 +30,7 @@ use crate::snapshot::import::parse_services;
 use crate::snapshot::types::{
     ExportedSnapshotParts, NativeSettingsProperty, NativeSettingsValue, SnapshotInstance,
 };
+use crate::studio::native::editor::rbx_variant_referent;
 use crate::system::files::{resolve_existing_project_root, service_settings_path};
 
 /// Imports a saved place file into the project the same way a pull imports
@@ -44,7 +45,7 @@ pub(crate) fn import_place_file(mut args: ImportPlaceArgs) -> Result<()> {
     let services = parse_services(&args.services)?;
     let mut flat = read_place(&args.input, &services)?;
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-    let paths = PlacePaths::new(&flat);
+    let paths = PlacePaths::referenced(&flat);
     let subtrees = service_subtrees(&flat);
     let ExportExecutionSetup {
         project_stage,
@@ -152,12 +153,15 @@ fn read_place(path: &Path, services: &[String]) -> Result<FlatDom> {
         .deserialize_flat(Cursor::new(bytes))
         .with_context(|| format!("{} is not a valid place file", path.display()))?;
     if let Some(hulls) = xml_hulls {
-        let paths = PlacePaths::new(&flat);
+        let paths = PlacePaths::new(&flat, |instance| {
+            (instance.properties.iter())
+                .any(|(name, _)| name.as_str() == crate::rbx::encode::COLLISION_HULL_PROPERTY)
+        });
         for instance in &mut flat.instances {
-            let path = (
-                paths.segments[&instance.referent].clone(),
-                paths.ordinals[&instance.referent].clone(),
-            );
+            let Some(segments) = paths.segments.get(&instance.referent) else {
+                continue;
+            };
+            let path = (segments.clone(), paths.ordinals[&instance.referent].clone());
             if !hulls.contains(&path) {
                 instance.properties.retain(|(name, _)| {
                     name.as_str() != crate::rbx::encode::COLLISION_HULL_PROPERTY
@@ -187,38 +191,42 @@ fn children_by_index(flat: &FlatDom) -> Vec<Vec<usize>> {
 }
 
 impl PlacePaths {
-    fn new(flat: &FlatDom) -> Self {
-        let children = children_by_index(flat);
-        let mut segments = HashMap::with_capacity(flat.instances.len());
-        let mut ordinals = HashMap::with_capacity(flat.instances.len());
-        let mut stack = flat
-            .root_indices
-            .iter()
-            .rev()
-            .map(|&index| (index, Vec::new(), Vec::new(), 1usize))
-            .collect::<Vec<_>>();
-        while let Some((index, parent_segments, parent_ordinals, ordinal)) = stack.pop() {
-            let instance = &flat.instances[index];
-            let mut path = parent_segments;
-            path.push(
-                if instance.parent_index.is_none() && is_service_class(instance.class.as_str()) {
-                    instance.class.to_string()
-                } else {
-                    instance.name.clone()
-                },
-            );
-            let mut ords = parent_ordinals;
-            ords.push(ordinal);
+    /// The paths of the instances `wanted` takes, each with the place of every
+    /// instance on it among its same-named siblings.
+    fn new(flat: &FlatDom, wanted: impl Fn(&FlatInstance) -> bool) -> Self {
+        let mut ordinal = vec![1; flat.instances.len()];
+        for siblings in children_by_index(flat) {
             let mut counts = HashMap::<&str, usize>::new();
-            let mut ordered = Vec::with_capacity(children[index].len());
-            for &child in &children[index] {
+            for child in siblings {
                 let count = counts
                     .entry(flat.instances[child].name.as_str())
                     .or_default();
                 *count += 1;
-                ordered.push((child, path.clone(), ords.clone(), *count));
+                ordinal[child] = *count;
             }
-            stack.extend(ordered.into_iter().rev());
+        }
+        let mut segments = HashMap::new();
+        let mut ordinals = HashMap::new();
+        for (index, instance) in flat.instances.iter().enumerate() {
+            if !wanted(instance) {
+                continue;
+            }
+            let (mut path, mut ords) = (Vec::new(), Vec::new());
+            let mut above = Some(index);
+            while let Some(at) = above {
+                let node = &flat.instances[at];
+                path.push(
+                    if node.parent_index.is_none() && is_service_class(node.class.as_str()) {
+                        node.class.to_string()
+                    } else {
+                        node.name.clone()
+                    },
+                );
+                ords.push(ordinal[at]);
+                above = node.parent_index;
+            }
+            path.reverse();
+            ords.reverse();
             segments.insert(instance.referent, path);
             ordinals.insert(instance.referent, ords);
         }
@@ -226,6 +234,17 @@ impl PlacePaths {
             segments: Arc::new(segments),
             ordinals: Arc::new(ordinals),
         }
+    }
+
+    /// The paths of the instances a reference in the place points at, the
+    /// only ones a converted value names by path. Copying every instance's
+    /// path for each service took half the time of a 200,000-instance import.
+    fn referenced(flat: &FlatDom) -> Self {
+        let targets = (flat.instances.iter())
+            .flat_map(|instance| &instance.properties)
+            .filter_map(|(_, value)| rbx_variant_referent(value))
+            .collect::<HashSet<_>>();
+        Self::new(flat, |instance| targets.contains(&instance.referent))
     }
 }
 
@@ -473,6 +492,11 @@ fn convert_service(
                 database,
                 &refs,
                 Some(filter),
+                // Below the service nothing filters or rewrites a shared
+                // string, so its payload is held once for all the instances
+                // that carry it, as a capture holds it: a copy for each
+                // instance was most of what an import held.
+                local > 0,
             );
         if filter.reconstruct_decal_color_map {
             let value = properties
@@ -881,6 +905,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A collision mesh many parts share is held once for all of them below
+    /// a service, and the store written from that one copy is the store a
+    /// copy for each part writes. A reference into another service names
+    /// its target by path and by its place among same-named siblings.
+    #[test]
+    fn shared_meshes_write_the_store_of_their_copies_and_references_keep_their_paths() {
+        use rbx_dom_weak::types::SharedString;
+
+        let root = crate::tests::support::temp_dir("import-shared-meshes");
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            let _ = std::fs::remove_dir_all(&root);
+        });
+        let mesh = SharedString::new((0..600).map(|byte| (byte % 251) as u8).collect());
+        let pebble = SharedString::new(vec![3; 40]);
+        let hull = |name: &str, hull: &SharedString| {
+            InstanceBuilder::new("MeshPart")
+                .with_name(name)
+                .with_property("PhysicalConfigData", hull.clone())
+        };
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+        let rocks = dom.insert(workspace, InstanceBuilder::new("Folder").with_name("Rocks"));
+        dom.insert(rocks, hull("Rock", &mesh));
+        dom.insert(rocks, InstanceBuilder::new("Part").with_name("Gap"));
+        let second = dom.insert(rocks, hull("Rock", &mesh));
+        dom.insert(rocks, hull("Pebble", &pebble));
+        let storage = dom.insert(dom.root_ref(), InstanceBuilder::new("ServerStorage"));
+        let kit = dom.insert(storage, InstanceBuilder::new("Model").with_name("Kit"));
+        let base = dom.insert(kit, InstanceBuilder::new("Part").with_name("Base"));
+        dom.get_by_ref_mut(kit)
+            .unwrap()
+            .properties
+            .insert("PrimaryPart".into(), base.into());
+        dom.insert(kit, hull("Rock", &mesh));
+        dom.insert(
+            storage,
+            InstanceBuilder::new("ObjectValue")
+                .with_name("Back")
+                .with_property("Value", second),
+        );
+        dom.insert(
+            workspace,
+            InstanceBuilder::new("ObjectValue")
+                .with_name("Kit")
+                .with_property("Value", kit),
+        );
+        std::fs::write(root.join("renium.project.jsonc"), r#"{"schemaVersion":1}"#).unwrap();
+        RbxPlaceFormat::Binary
+            .write(&root.join("place.rbxl"), &dom, dom.root().children())
+            .unwrap();
+        assert_eq!(run(&root)["ok"], true);
+
+        let stored = |service: &str| {
+            SettingsBytecode::read_file(&root.join(format!("instances/{service}.renium"))).unwrap()
+        };
+        let reference = |service: &str, name: &str| {
+            stored(service)
+                .instances
+                .into_iter()
+                .find(|instance| instance.name == name && instance.class_name == "ObjectValue")
+                .unwrap()
+                .properties["Value"]
+                .clone()
+        };
+        let back = reference("ServerStorage", "Back");
+        assert_eq!(back["pathSegments"], json!(["Workspace", "Rocks", "Rock"]));
+        assert_eq!(back["pathOrdinals"], json!([1, 1, 2]));
+        let kit = reference("Workspace", "Kit");
+        assert_eq!(kit["pathSegments"], json!(["ServerStorage", "Kit"]));
+        assert_eq!(kit["pathOrdinals"], json!([1, 1]));
+
+        // Read as the import reads it, with every default service named.
+        let mut flat = read_place(&root.join("place.rbxl"), &parse_services("").unwrap()).unwrap();
+        let paths = PlacePaths::referenced(&flat);
+        let subtrees = service_subtrees(&flat);
+        let database = rbx_reflection_database::get().unwrap();
+        let mut filters = HashMap::new();
+        for service in ["Workspace", "ServerStorage"] {
+            let parts = convert_service(
+                service,
+                &mut flat.instances,
+                (&subtrees[service], None),
+                &paths,
+                database,
+                &mut filters,
+            )
+            .unwrap();
+            let state =
+                crate::snapshot::export::exported_parts_to_service_state(service, parts).unwrap();
+            let rows = state.native_properties_by_instance.as_ref().unwrap();
+            let meshes = |name: &str| {
+                (state.instances.iter().zip(rows))
+                    .filter(|(instance, _)| instance.name == name)
+                    .map(|(_, row)| {
+                        row.iter()
+                            .find(|property| property.name == "PhysicalConfigData")
+                            .map(|property| &property.value)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let held = (meshes("Rock").into_iter())
+                .map(|value| match value {
+                    Some(NativeSettingsValue::Shared(value)) => Arc::clone(value),
+                    _ => panic!("{service}: a mesh of its own"),
+                })
+                .collect::<Vec<_>>();
+            assert!(!held.is_empty());
+            assert!(held.windows(2).all(|pair| Arc::ptr_eq(&pair[0], &pair[1])));
+            // A mesh too small to share stays a value of its own.
+            for value in meshes("Pebble") {
+                assert!(value.is_none());
+            }
+            let mut unshared = state.clone();
+            let rows = unshared.native_properties_by_instance.as_mut().unwrap();
+            for (instance, row) in unshared.instances.iter_mut().zip(rows) {
+                row.retain(|property| match &property.value {
+                    NativeSettingsValue::Shared(value) => {
+                        let name = property.name.as_str().to_string();
+                        instance.properties.insert(name, Value::clone(value));
+                        false
+                    }
+                    _ => true,
+                });
+            }
+            let encoded = crate::settings::bytecode::encode_service_settings_binary;
+            let written = std::fs::read(root.join(format!("instances/{service}.renium"))).unwrap();
+            assert_eq!(encoded(&state).unwrap(), written, "{service}");
+            assert_eq!(encoded(&unshared).unwrap(), written, "{service}");
+        }
+        let pebble = stored("Workspace")
+            .instances
+            .into_iter()
+            .find(|instance| instance.name == "Pebble")
+            .unwrap();
+        assert_eq!(
+            pebble.properties["PhysicalConfigData"]["_type"],
+            "SharedString"
+        );
+        assert_eq!(run(&root)["changedPaths"], json!([]));
     }
 
     #[test]

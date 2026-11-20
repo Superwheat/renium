@@ -554,7 +554,7 @@ mod tests {
                 )
             } else {
                 rbx_properties_to_unshared_native_settings_records(
-                    "MeshPart", entries, database, &refs, None,
+                    "MeshPart", entries, database, &refs, None, false,
                 )
             }
         };
@@ -1054,18 +1054,20 @@ pub(crate) fn rbx_properties_to_native_settings_records<'a>(
         database,
         refs,
         native_filter,
-        true,
+        (true, true),
     )
 }
 
-/// The same records with shared strings and UniqueIds as editable JSON,
-/// for callers that filter or rewrite those envelopes after conversion.
+/// The same records with UniqueIds as editable JSON, for callers that filter
+/// or rewrite those envelopes after conversion. Shared strings are editable
+/// JSON too unless `share_payloads`, for a caller that keeps them as they are.
 pub(crate) fn rbx_properties_to_unshared_native_settings_records<'a>(
     class_name: &str,
     property_entries: impl IntoIterator<Item = (&'a rbx_dom_weak::Ustr, &'a RbxVariant)>,
     database: &ReflectionDatabase<'_>,
     refs: &BytecodeModelImportRefs,
     native_filter: Option<&NativePropertyFilter>,
+    share_payloads: bool,
 ) -> NativeSettingsRecords {
     native_settings_records(
         class_name,
@@ -1073,7 +1075,7 @@ pub(crate) fn rbx_properties_to_unshared_native_settings_records<'a>(
         database,
         refs,
         native_filter,
-        false,
+        (false, share_payloads),
     )
 }
 
@@ -1137,7 +1139,7 @@ fn native_settings_records<'a>(
     database: &ReflectionDatabase<'_>,
     refs: &BytecodeModelImportRefs,
     native_filter: Option<&NativePropertyFilter>,
-    compact_values: bool,
+    (compact_values, share_payloads): (bool, bool),
 ) -> NativeSettingsRecords {
     let mut native_properties = Vec::new();
     let mut properties = Map::new();
@@ -1223,7 +1225,7 @@ fn native_settings_records<'a>(
                 name: native_name(),
                 value,
             });
-        } else if compact_values
+        } else if share_payloads
             && let RbxVariant::SharedString(shared) = variant
             && shared.data().len() >= SHARED_PAYLOAD_MIN_BYTES
             && let Some(value) = shared_payload_value(shared, || {
