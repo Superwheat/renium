@@ -3870,26 +3870,15 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			local serviceName = tostring(change.service or "")
 			if allowedServices[serviceName] then
 				affectedServices[serviceName] = true
+				local instanceKey = expectedPathKey(serviceName, change.pathSegments, change.pathOrdinals, "")
 				for propertyName, value in pairs(change.properties or {}) do
-					addExpected(
-						state.expectedProperties,
-						expectedPathKey(serviceName, change.pathSegments, change.pathOrdinals, tostring(propertyName)),
-						value
-					)
+					addExpected(state.expectedProperties, instanceKey .. tostring(propertyName), value)
 				end
 				for attributeName, value in pairs(change.attributes or {}) do
-					addExpected(
-						state.expectedAttributes,
-						expectedPathKey(serviceName, change.pathSegments, change.pathOrdinals, tostring(attributeName)),
-						value
-					)
+					addExpected(state.expectedAttributes, instanceKey .. tostring(attributeName), value)
 				end
 				for _, attributeName in ipairs(change.deletedAttributes or {}) do
-					addExpected(
-						state.expectedAttributes,
-						expectedPathKey(serviceName, change.pathSegments, change.pathOrdinals, tostring(attributeName)),
-						nil
-					)
+					addExpected(state.expectedAttributes, instanceKey .. tostring(attributeName), nil)
 				end
 			end
 		end

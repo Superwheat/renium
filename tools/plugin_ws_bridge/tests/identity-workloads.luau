@@ -40,11 +40,14 @@ do
 	local service = { Name = "Workspace" }
 	local parent = { Name = "Folder" }
 	function service:FindFirstChild(name) return if name == parent.Name then parent else nil end
+	function service:GetChildren() return { parent } end
+	local finds = 0
 	function parent:GetChildren()
 		calls += 1
 		return children
 	end
 	function parent:FindFirstChild(name)
+		finds += 1
 		for _, child in children do
 			if child.Name == name then
 				return child
@@ -72,6 +75,18 @@ do
 		assert(resolved == expected[ordinal], `Indexed ordinal {ordinal} resolved a different child`)
 	end
 	assert(calls == 1, `Expected one child scan with an index, got {calls}`)
+	calls, finds = 0, 0
+	local firstChildren = Identity.newChildIndex()
+	for lookup = 1, 40 do
+		local name = if lookup % 2 == 0 then "Other" else "Duplicate"
+		local resolved = Identity.resolvePathSegments({ "Workspace", "Folder", name }, nil, { 1, 1, 1 }, firstChildren)
+		assert(resolved == parent:FindFirstChild(name), `Lookup {lookup} of a first child resolved a different child`)
+		assert(Identity.resolvePathSegments({ "Workspace", "Folder", "Absent" }, nil, nil, firstChildren) == nil)
+		for _, listed in firstChildren do
+			assert(type(listed) == "table", "An index holds listed children alone: its callers read it as their own")
+		end
+	end
+	assert(calls == 1 and finds == 40 + 7, `First children are listed once after a few lookups, got {calls} and {finds}`)
 	mockGame.GetService = nil
 end
 do

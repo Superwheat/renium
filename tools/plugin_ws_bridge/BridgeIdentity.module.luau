@@ -36,8 +36,18 @@ end
 
 export type ChildIndex = { [Instance]: { [string]: { Instance } } }
 
--- Lists each parent's children by name on first use, so resolving many
--- ordinal paths costs one child scan per parent. Discard it before any
+-- FindFirstChild walks a parent's children: a few lookups of a first child
+-- cost less than listing them all, many under one parent cost more.
+local LISTED_AFTER_LOOKUPS = 8
+
+-- How often each parent's first child of a name was asked for through an
+-- index before its children were listed. The index itself holds nothing but
+-- listed children: callers share it with listings of their own.
+local firstChildLookups: { [ChildIndex]: { [Instance]: number } } = setmetatable({}, { __mode = "k" }) :: any
+
+-- Lists each parent's children by name, so resolving many paths costs one
+-- child scan per parent: on the first ordinal path through it, or once its
+-- first child of a name was asked for several times. Discard it before any
 -- instance is added, removed, renamed or reparented.
 function BridgeIdentity.newChildIndex(): ChildIndex
 	return {}
@@ -49,12 +59,25 @@ function BridgeIdentity.resolveOrdinalChild(
 	ordinal: number,
 	childIndex: ChildIndex?
 ): Instance?
-	if ordinal <= 1 then
+	if childIndex == nil and ordinal <= 1 then
 		return parent:FindFirstChild(childName)
 	end
 	if childIndex ~= nil then
 		local childrenByName = childIndex[parent]
 		if childrenByName == nil then
+			if ordinal <= 1 then
+				local lookups = firstChildLookups[childIndex]
+				if lookups == nil then
+					lookups = {}
+					firstChildLookups[childIndex] = lookups
+				end
+				local asked = (lookups[parent] or 0) + 1
+				if asked < LISTED_AFTER_LOOKUPS then
+					lookups[parent] = asked
+					return parent:FindFirstChild(childName)
+				end
+				lookups[parent] = nil
+			end
 			childrenByName = {}
 			for _, child in ipairs(parent:GetChildren()) do
 				local name = child.Name
@@ -68,7 +91,7 @@ function BridgeIdentity.resolveOrdinalChild(
 			childIndex[parent] = childrenByName
 		end
 		local named = childrenByName[childName]
-		return if named ~= nil then named[ordinal] else nil
+		return if named ~= nil then named[math.max(ordinal, 1)] else nil
 	end
 	local seen = 0
 	for _, child in ipairs(parent:GetChildren()) do

@@ -4038,6 +4038,41 @@ local function serializeSnapshotRoots(roots: { Instance }, nonArchivable: { Inst
 	return payload
 end
 
+local TransactionState = {}
+
+-- Calls `visit` for each item, with a pause between items when a frame's
+-- share of work is spent. The paths `visit` resolves list the children of a
+-- parent once between two pauses, and whatever runs during such a pause sees
+-- the caller's index, not this one. `visit` changes nothing in the hierarchy.
+function TransactionState.eachResolving(items: { any }, ctx: { [string]: any }, visit: (any, number) -> ())
+	local budget = BridgeParallel.newWorkBudget()
+	local childIndex = BridgeIdentity.newChildIndex()
+	local outerChildIndex = ctx.resolveChildIndex
+	local ok, visitError = pcall(function()
+		for index, item in ipairs(items) do
+			if budget() then
+				table.clear(childIndex)
+			end
+			ctx.resolveChildIndex = childIndex
+			visit(item, index)
+			ctx.resolveChildIndex = outerChildIndex
+		end
+	end)
+	ctx.resolveChildIndex = outerChildIndex
+	if not ok then
+		error(visitError, 0)
+	end
+end
+
+-- The instance each change names, or false where Studio holds none.
+function TransactionState.resolved(changes: { any }, ctx: { [string]: any }): { any }
+	local instances = table.create(#changes, false)
+	TransactionState.eachResolving(changes, ctx, function(change, index)
+		instances[index] = resolveInstance(change, ctx, true) or false
+	end)
+	return instances
+end
+
 local function mutationNeedsStructuralSnapshot(params: { [string]: any }, ctx: { [string]: any }): boolean
 	if params.skipStructural == true then
 		return false
@@ -4045,23 +4080,24 @@ local function mutationNeedsStructuralSnapshot(params: { [string]: any }, ctx: {
 	if params.forceStructural == true or #(params.instanceChanges or {}) > 0 then
 		return true
 	end
-	for _, change in ipairs(params.sourceChanges or {}) do
-		local instance = resolveInstance(change, ctx, true)
-		if instance == nil and change.deleted ~= true and liveHydrateEnabled(ctx) then
+	local sourceChanges = params.sourceChanges or {}
+	for index, instance in ipairs(TransactionState.resolved(sourceChanges, ctx)) do
+		local change = sourceChanges[index]
+		if not instance and change.deleted ~= true and liveHydrateEnabled(ctx) then
 			return true
 		end
 		if
-			instance ~= nil
+			instance
 			and instance.ClassName == "Folder"
 			and ctx.luaSourceClass[tostring(change.className or "")]
 		then
 			return true
 		end
 	end
-	for _, change in ipairs(params.propertyChanges or {}) do
-		local instance = resolveInstance(change, ctx, true)
-		local className = tostring(change.className or "")
-		if instance ~= nil and className ~= "" and instance.ClassName ~= className then
+	local propertyChanges = params.propertyChanges or {}
+	for index, instance in ipairs(TransactionState.resolved(propertyChanges, ctx)) do
+		local className = tostring(propertyChanges[index].className or "")
+		if instance and className ~= "" and instance.ClassName ~= className then
 			return true
 		end
 	end
@@ -4170,8 +4206,6 @@ local function serializeMutationSnapshot(roots: { Instance }, nonArchivable: { I
 	return serialized
 end
 
-local TransactionState = {}
-
 function TransactionState.captureServiceStates(serviceNames: { string }, groups: { any }, ctx: { [string]: any })
 	local fingerprints = captureMutationFingerprints(groups)
 	local generations = {}
@@ -4205,10 +4239,13 @@ function TransactionState.captureSources(sourceChanges: { any }, ctx: { [string]
 	local sources = {}
 	local sourceKeys = {}
 	local sourceSeen = {}
-	for _, change in ipairs(sourceChanges) do
+	local instances = TransactionState.resolved(sourceChanges, ctx)
+	local yieldForBudget = BridgeParallel.newWorkBudget()
+	for index, change in ipairs(sourceChanges) do
+		yieldForBudget()
 		sourceKeys[pathCacheKey(change.pathSegments, change.pathOrdinals)] = true
-		local instance = resolveInstance(change, ctx, true)
-		if instance ~= nil and ctx.luaSourceClass[instance.ClassName] and not sourceSeen[instance] then
+		local instance = instances[index]
+		if instance and ctx.luaSourceClass[instance.ClassName] and not sourceSeen[instance] then
 			local okRead, source = readScriptSource(instance)
 			if not okRead then
 				error(`Could not snapshot Source for {instance:GetFullName()}: {source}`)
@@ -4277,9 +4314,12 @@ function TransactionState.captureProperties(
 	local properties = {}
 	local propertySeen = {}
 	local unreadablePropertyNames = {}
-	for _, change in ipairs(changes) do
-		local instance = resolveInstance(change, ctx, true)
-		if instance ~= nil then
+	local instances = TransactionState.resolved(changes, ctx)
+	local yieldForBudget = BridgeParallel.newWorkBudget()
+	for index, change in ipairs(changes) do
+		yieldForBudget()
+		local instance = instances[index]
+		if instance then
 			addSnapshotMetadataTarget(metadataTargets, metadataSeen, instance)
 			local seenNames = propertySeen[instance] or {}
 			propertySeen[instance] = seenNames
@@ -7106,11 +7146,11 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 
 	local function activeMutationPackageTargets(params: { [string]: any }): { any }
 		local activePropertyPaths = {}
-		for _, change in ipairs(params.propertyChanges or {}) do
+		TransactionState.eachResolving(params.propertyChanges or {}, ctx, function(change)
 			if propertyChangeWouldMutate(change) then
 				activePropertyPaths[pathCacheKey(change.pathSegments, change.pathOrdinals)] = true
 			end
-		end
+		end)
 		local targets = {}
 		for _, target in ipairs(params.mutationPackageTargets or {}) do
 			if
@@ -7485,6 +7525,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			return { ok = false, studioChanged = true }
 		end
 		validateDestructiveTransactionServices(params, includedServices)
+		-- The steps from here on pause between rows: whatever Studio changes
+		-- during a pause ends the transaction before it begins.
+		local studioGenerations = captureStudioGenerations(serviceNames)
 		local changedSourceKeys, changedSourceInstances =
 			captureChangedSources(params.sourceChanges or {}, includedServices)
 		local nativeImport = params.nativeImport == true
@@ -7532,7 +7575,6 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 			end
 		end
-		local studioGenerations = captureStudioGenerations(serviceNames)
 		BridgeConnection.profileStep("transaction validation, paths and packages", profileStarted)
 		profileStarted = os.clock()
 		local snapshot = TransactionState.captureSnapshot(snapshotServices, {

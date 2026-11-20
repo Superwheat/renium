@@ -102,6 +102,7 @@ fn fallback_serialization_yields_and_rejects_interleaved_edits() -> mlua::Result
         os.clock = function() return now end
         task = {wait = function()
             yields += 1
+            now += 0.03
             if editOnYield then generation += 1 end
         end}
         Config = {
@@ -145,7 +146,7 @@ fn fallback_serialization_yields_and_rejects_interleaved_edits() -> mlua::Result
         assert(#small.items == 2 and yields == 0, "small work stays synchronous")
         table.clear(state.batchCacheByKey)
         local batch = Config.getInstanceBatchCompact("Workspace", 1, 200)
-        assert(yields >= 20 and yields <= 26, "large exports must give Studio a frame every 8ms")
+        assert(yields >= 20 and yields <= 26, "large exports must give a busy Studio a frame every 8ms")
         for index, item in batch.items do assert(item == index, "yielding preserves row order and contents") end
         assert(not acquired)
         table.clear(state.batchCacheByKey)
