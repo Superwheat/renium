@@ -376,6 +376,157 @@ fn preflight_peer(
 }
 
 #[test]
+fn package_preflight_scopes_and_validates_snapshot_services() -> Result<()> {
+    const SERVICE: &str = "ReplicatedStorage";
+    const REFERENCE: &str = "ServerStorage";
+    const UNRELATED: &str = "ReplicatedFirst";
+    for case in [
+        "single",
+        "mixed",
+        "reference",
+        "full",
+        "unknown",
+        "extra",
+        "missing",
+        "duplicate",
+        "count",
+    ] {
+        let services = if matches!(case, "mixed" | "reference" | "missing") {
+            vec![SERVICE.to_string(), REFERENCE.to_string()]
+        } else {
+            vec![SERVICE.to_string()]
+        };
+        let required =
+            matches!(case, "reference" | "missing").then(|| HashSet::from([REFERENCE.to_string()]));
+        let expected_filter = match case {
+            "full" | "unknown" => Value::Null,
+            "reference" | "missing" => json!([SERVICE, REFERENCE]),
+            _ => json!([SERVICE]),
+        };
+        let returned = match case {
+            "full" | "unknown" => vec![SERVICE, REFERENCE, UNRELATED],
+            "reference" | "extra" => vec![SERVICE, REFERENCE],
+            "duplicate" => vec![SERVICE, SERVICE],
+            _ => vec![SERVICE],
+        };
+        let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let mut groups = Vec::new();
+        for service in &returned {
+            for root in [
+                RbxInstanceBuilder::new("Folder"),
+                RbxInstanceBuilder::new("Folder")
+                    .with_child(RbxInstanceBuilder::new("PackageLink")),
+                RbxInstanceBuilder::new("Folder").with_name("Identity1"),
+            ] {
+                dom.insert(dom.root_ref(), root);
+            }
+            groups.push(json!({
+                "service":service,"targetPath":[service],"count":1,
+                "classNames":["Folder","PackageLink"],
+                "instanceCount":if case == "count" { 2 } else { 3 },
+                "identityCarrierClass":"Folder","identityCarrierPrefix":"Identity",
+                "identityCarrierSlots":["A","B"],"identityCarrierCount":1
+            }));
+        }
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, dom.root().children())?;
+        let bridge = fixture();
+        let stream = connect(&bridge, 0, edit_info("preflight-scope", 21));
+        let peer = std::thread::spawn(move || {
+            let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
+            let mut filters = Vec::new();
+            let mut reads = 0;
+            let mut finishes = 0;
+            while let Ok(Message::Text(text)) = socket.read() {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let result = match req["method"].as_str().unwrap() {
+                    "getEditorServiceChangeGenerations" => {
+                        let names = req["params"]["services"].as_array().unwrap();
+                        let generations = names
+                            .iter()
+                            .map(|name| (name.as_str().unwrap().to_string(), json!(7)))
+                            .collect::<Map<_, _>>();
+                        let states = names
+                            .iter()
+                            .map(|name| {
+                                (name.as_str().unwrap().to_string(), json!(name == SERVICE))
+                            })
+                            .collect::<Map<_, _>>();
+                        json!({"generations":generations,"hasPackageLinks":
+                            if case == "unknown" { Value::Null } else { json!(states) }})
+                    }
+                    "beginEditorBinaryExport" => {
+                        filters.push(req["params"]["serviceFilter"].clone());
+                        json!({"groups":groups,"propertySchemaByClass":{"Folder":[["Archivable",1]]}})
+                    }
+                    "readEditorBinaryExport" => {
+                        reads += 1;
+                        json!({"start":1,"nextStart":bytes.len()+1,"total":bytes.len(),"chunk":base64::encode(&bytes)})
+                    }
+                    "finishEditorBinaryExport" => {
+                        finishes += 1;
+                        json!({"found":true})
+                    }
+                    other => panic!("unexpected preflight request {other}"),
+                };
+                socket
+                    .send(Message::Text(
+                        json!({"id":req["id"],"ok":true,"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .unwrap();
+            }
+            (filters, reads, finishes)
+        });
+        let rejected = matches!(case, "extra" | "missing" | "duplicate");
+        match capture_editor_package_preflight_live(
+            &bridge,
+            &services,
+            required.as_ref(),
+            case == "full",
+            None,
+            None,
+            PackagePreflightAttempt::default(),
+        ) {
+            Err(error) => assert!(
+                error.to_string().contains(if rejected {
+                    "different services than requested"
+                } else {
+                    assert_eq!(case, "count", "{error:#}");
+                    "contains 3 instances; expected 2"
+                }),
+                "{case}: {error:#}"
+            ),
+            Ok(live) => {
+                assert!(!rejected && case != "count", "{case} must fail closed");
+                assert_eq!(
+                    live.captured_services,
+                    returned.iter().map(|s| s.to_string()).collect()
+                );
+                assert_eq!(live.generations.len(), services.len());
+                assert_eq!(
+                    live.dom.as_ref().unwrap().root().children().len(),
+                    returned.len()
+                );
+                assert!(
+                    required
+                        .as_ref()
+                        .is_none_or(|r| r.is_subset(&live.captured_services))
+                );
+            }
+        }
+        drop(bridge);
+        let (filters, reads, finishes) = peer.join().unwrap();
+        let captures = if case == "count" { 3 } else { 1 };
+        assert_eq!(filters, vec![expected_filter; captures], "{case}");
+        assert_eq!(finishes, captures, "{case}: export cleanup");
+        assert_eq!(reads, if rejected { 0 } else { captures }, "{case}");
+    }
+    Ok(())
+}
+
+#[test]
 fn import_builder_preserves_reader_routes_packages_and_additive_identity() -> Result<()> {
     let root = crate::tests::support::temp_dir("import-builder-route");
     let _cleanup = crate::system::files::OnDrop::new(|| {

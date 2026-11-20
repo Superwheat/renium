@@ -1607,8 +1607,9 @@ fn capture_editor_package_preflight_live<'a>(
     let service_filter = (!force_full_snapshot)
         .then_some(first.has_package_links.as_ref())
         .flatten()
-        .and_then(|states| {
-            let filtered = service_names
+        .map(|states| {
+            // None exports the whole place, not just the requested services.
+            service_names
                 .iter()
                 .filter(|service| {
                     states.get(*service).copied().unwrap_or(false)
@@ -1616,8 +1617,7 @@ fn capture_editor_package_preflight_live<'a>(
                             .is_some_and(|required| required.contains(*service))
                 })
                 .cloned()
-                .collect::<Vec<_>>();
-            (filtered.len() < service_names.len()).then_some(filtered)
+                .collect::<Vec<_>>()
         });
     let started = Instant::now();
     let export = begin_editor_binary_export(bridge, service_filter.as_deref())?;
@@ -1627,6 +1627,18 @@ fn capture_editor_package_preflight_live<'a>(
         #[cfg(windows)]
         attribute_guard: None,
     };
+    let captured_services = export
+        .groups
+        .iter()
+        .map(|group| group.service.clone())
+        .collect::<HashSet<_>>();
+    anyhow::ensure!(
+        captured_services.len() == export.groups.len()
+            && service_filter
+                .as_ref()
+                .is_none_or(|services| { captured_services == services.iter().cloned().collect() }),
+        "Studio package preflight returned different services than requested; retry with a compatible plugin"
+    );
     let bytes = receive_editor_binary_export_bytes(
         bridge,
         export
@@ -1685,11 +1697,6 @@ fn capture_editor_package_preflight_live<'a>(
         bail!(message);
     }
     log_timing("package preflight plugin snapshot", started);
-    let captured_services = export
-        .groups
-        .iter()
-        .map(|group| group.service.clone())
-        .collect();
     Ok(EditorPackagePreflightLive {
         dom: Some(dom),
         generations: first.generations,
