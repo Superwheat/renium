@@ -1812,3 +1812,54 @@ fn seeded_baselines_answer_as_captures_do() {
         );
     }
 }
+
+/// A push of chosen instances keeps a baseline only where it sends every
+/// value that differs: it sends no PackageLink, not a camera, and a script's
+/// RunContext names its file.
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn a_targeted_baseline_holds_only_rows_a_push_sends() {
+    let store = |class: &str, property: &str, value: Value| {
+        let mut row =
+            SettingsBytecodeInstance::new("row".into(), "Row".into(), class.into(), Some(0));
+        row.properties.insert(property.into(), value);
+        encode_settings_bytecode(&SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "root".into(),
+                    "Workspace".into(),
+                    "Workspace".into(),
+                    None,
+                ),
+                row,
+            ],
+        })
+        .unwrap()
+    };
+    let ids = HashSet::from(["row".to_string()]);
+    let kept = |class: &str, property: &str, was: Value, now: Value| {
+        store_rows_differ_only_at(
+            &store(class, property, was),
+            &store(class, property, now),
+            &ids,
+            true,
+        )
+        .unwrap()
+    };
+    assert!(kept("Part", "Transparency", json!(0.0), json!(0.5)));
+    assert!(!kept("Camera", "FieldOfView", json!(70.0), json!(40.0)));
+    assert!(!kept(
+        "PackageLink",
+        "AutoUpdate",
+        json!(false),
+        json!(true)
+    ));
+    assert!(!kept(
+        "Script",
+        "RunContext",
+        json!("Legacy"),
+        json!("Client")
+    ));
+    assert!(kept("Script", "Disabled", json!(false), json!(true)));
+}

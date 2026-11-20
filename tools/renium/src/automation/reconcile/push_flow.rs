@@ -974,19 +974,28 @@ pub(crate) fn push_targeted(
     let Some(mut held) = take_baseline(context, bridge, &plain_push_input(&args)?) else {
         return push_editor_changes_with_warm_bridge(args, bridge);
     };
-    let Some((guard, mut release)) = baseline_lease(context, bridge, &held)? else {
-        return push_editor_changes_with_warm_bridge(args, bridge);
-    };
-    let root = args.project.project_root.clone();
-    let before = capture_snapshot(&root, &held.paths)?;
-    let pushed = TargetedPush::of(&args);
-    let summary = push_editor_changes_with_warm_bridge(args, bridge)?;
     let not_kept = |reason: &str| {
         log_global(
             5,
             format_args!("[renium] baseline: not kept after targeted push: {reason}"),
         );
     };
+    let root = args.project.project_root.clone();
+    // The push itself needs neither the lease nor the files as they stood:
+    // without them it runs as it does with no baseline held.
+    let lease = capture_snapshot(&root, &held.paths).and_then(|before| {
+        Ok(baseline_lease(context, bridge, &held)?.map(|lease| (before, lease)))
+    });
+    let (before, (guard, mut release)) = match lease {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return push_editor_changes_with_warm_bridge(args, bridge),
+        Err(error) => {
+            not_kept(&format!("{error:#}"));
+            return push_editor_changes_with_warm_bridge(args, bridge);
+        }
+    };
+    let pushed = TargetedPush::of(&args);
+    let summary = push_editor_changes_with_warm_bridge(args, bridge)?;
     let after = match capture_snapshot(&root, &held.paths) {
         Ok(after) => after,
         Err(error) => {
@@ -1051,6 +1060,7 @@ pub(crate) fn push_targeted(
             #[cfg(windows)]
             relay.as_ref(),
         ),
+        exact: held.exact,
         #[cfg(windows)]
         relay,
     };
@@ -1250,7 +1260,9 @@ pub(crate) fn targeted_baseline(
 /// what stands under them unless `exact`) leaves the store `held` held as
 /// `files` holds it. Every other instance must be the same, every instance
 /// at the same place, and a written instance must hold every value it held
-/// before, each one a push writes: a write sets values and resets none.
+/// before, each one a push writes: a write sets values and resets none. A
+/// push sends no PackageLink and not the viewport's camera, and a script's
+/// file is named after its RunContext, so a change there keeps nothing.
 pub(crate) fn store_rows_differ_only_at(
     held: &[u8],
     files: &[u8],
@@ -1312,9 +1324,11 @@ pub(crate) fn store_rows_differ_only_at(
     let (was_rows, _) = decode_rows(held, &differing)?;
     let (now_rows, _) = decode_rows(files, &differing)?;
     Ok(was_rows.iter().zip(&now_rows).all(|(was, now)| {
-        was.properties
-            .keys()
-            .all(|name| now.properties.contains_key(name))
+        !matches!(now.class_name.as_str(), "PackageLink" | "Camera")
+            && was
+                .properties
+                .keys()
+                .all(|name| now.properties.contains_key(name))
             && now.properties.iter().all(|(name, value)| {
                 was.properties.get(name) == Some(value) || {
                     let logical = crate::rbx::encode::rbx_logical_property_name(
@@ -1329,6 +1343,9 @@ pub(crate) fn store_rows_differ_only_at(
                         &[]
                     };
                     !logical.eq_ignore_ascii_case("Source")
+                        && !logical.eq_ignore_ascii_case(
+                            crate::editor::paths::SOURCE_PATH_CONTEXT_PROPERTY,
+                        )
                         && !is_externally_managed_editor_property(
                             &now.name,
                             &now.class_name,

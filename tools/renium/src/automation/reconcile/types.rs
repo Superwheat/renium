@@ -72,6 +72,10 @@ pub(crate) struct VerifiedFullPush {
     pub(crate) paths: Vec<PathBuf>,
     pub(crate) proof: Value,
     pub(crate) expires: Instant,
+    /// Whether the files are what a pull writes from Studio. A whole push
+    /// leaves them only what a push sends: it sends no Game Settings and not
+    /// the viewport's camera, so Studio may hold other values there.
+    pub(crate) exact: bool,
     #[cfg(windows)]
     pub(crate) relay: Option<NativeRelay>,
 }
@@ -331,6 +335,7 @@ pub(crate) fn retain_verified_full_push(
             #[cfg(windows)]
             relay.as_ref(),
         ),
+        exact: false,
         #[cfg(windows)]
         relay,
     };
@@ -412,7 +417,8 @@ pub(crate) fn pull_baseline<'a>(
     let mut held = take_baseline(context, bridge, &input);
     let unchanged = match held.as_ref() {
         Some(entry) => {
-            capture_snapshot(&args.project_root, &entry.paths)? == entry.project
+            entry.exact
+                && capture_snapshot(&args.project_root, &entry.paths)? == entry.project
                 && verified_full_push_proof_matches(context, bridge, &entry.proof)?
         }
         None => false,
@@ -530,6 +536,7 @@ impl PullLease<'_> {
                 #[cfg(windows)]
                 self.relay.as_ref(),
             ),
+            exact: true,
             #[cfg(windows)]
             relay: self.relay,
         };
