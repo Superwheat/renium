@@ -7967,9 +7967,9 @@ fn a_store_most_of_whose_instances_differ_is_imported_anew() {
     let (_, whole, held) = pushed(&files, &studio, StoresRead::Whole);
     assert!(!whole.starts_with("Workspace\n") && held.len() > 17_000);
 
-    // The files hold a model Studio lacks. One of more instances than a push
-    // creates one by one is imported with the store; a smaller one is sent
-    // as the whole documents send it.
+    // The files hold a model Studio lacks. One of a quarter of the service's
+    // instances is imported with the store; a smaller one is sent as the
+    // whole documents send it, instance by instance.
     let with_model = |parts: usize| {
         let mut files = studio.clone();
         let model = (0..=parts).map(|index| {
@@ -7987,17 +7987,22 @@ fn a_store_most_of_whose_instances_differ_is_imported_anew() {
         files.instances.splice(3..3, model);
         files
     };
-    let files = with_model(2_500);
+    let files = with_model(8_000);
     let (_, expected, kept) = pushed(&files, &bare, StoresRead::ChangedOfBoth);
     for read in [StoresRead::ChangedOfBoth, StoresRead::Changed] {
         let (imported, plan, previous) = pushed(&files, &studio, read);
         assert!(imported);
         assert_eq!((plan, previous), (expected.clone(), kept.clone()));
     }
-    let files = with_model(40);
-    let (imported, plan, _) = pushed(&files, &studio, StoresRead::ChangedOfBoth);
-    assert!(!imported && plan.contains("editor:40"), "{plan}");
-    assert_eq!(plan, pushed(&files, &studio, StoresRead::Whole).1);
+    for parts in [2_500, 40] {
+        let files = with_model(parts);
+        let (imported, plan, _) = pushed(&files, &studio, StoresRead::ChangedOfBoth);
+        assert!(
+            !imported && plan.contains(&format!("editor:{parts}")),
+            "{plan}"
+        );
+        assert_eq!(plan, pushed(&files, &studio, StoresRead::Whole).1);
+    }
 
     // Every row differs, and half of them in what they hold: fewer than a
     // push sends one by one.

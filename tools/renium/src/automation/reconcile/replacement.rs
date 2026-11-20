@@ -1482,6 +1482,11 @@ pub(crate) fn stage_snapshot_paths(
 const HEAVY_DELTA_NATIVE_WRITES: usize = 64;
 const HEAVY_DELTA_NEW_INSTANCES: usize = 2000;
 
+// One by one a new instance without such a field costs Studio about four
+// times what the import spends on an instance of the service, so that many
+// new instances are imported only where they are a quarter of it.
+const HEAVY_DELTA_NEW_SERVICE_RATIO: usize = 4;
+
 // A replacement grows with the service: its serialize, import and reference
 // scan touch every instance, so a few dozen writes in a huge service stay
 // incremental unless they are at least this share of it.
@@ -1500,7 +1505,8 @@ struct DeltaWeight {
 
 impl DeltaWeight {
     fn heavy(&self) -> bool {
-        self.new_instances >= HEAVY_DELTA_NEW_INSTANCES
+        (self.new_instances >= HEAVY_DELTA_NEW_INSTANCES
+            && self.new_instances * HEAVY_DELTA_NEW_SERVICE_RATIO >= self.service_instances)
             || (self.native_writes >= HEAVY_DELTA_NATIVE_WRITES
                 && self.native_writes > self.replacement_writes
                 && self.native_writes * HEAVY_DELTA_SERVICE_RATIO >= self.service_instances)
@@ -1912,6 +1918,10 @@ mod heavy_delta_tests {
         let empty = document(0, "Folder");
         assert!(!delta_weight(&document(HEAVY_DELTA_NEW_INSTANCES - 1, "Folder"), &empty).heavy());
         assert!(delta_weight(&document(HEAVY_DELTA_NEW_INSTANCES, "Folder"), &empty).heavy());
+        let large = document(HEAVY_DELTA_NEW_INSTANCES * 4, "Folder");
+        let larger = document(HEAVY_DELTA_NEW_INSTANCES * 5, "Folder");
+        assert!(delta_weight(&larger, &large).new_instances == HEAVY_DELTA_NEW_INSTANCES);
+        assert!(!delta_weight(&larger, &large).heavy());
     }
 
     #[test]
