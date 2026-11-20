@@ -661,7 +661,7 @@ local function prepareImportedIdentities(group: any)
 	local childCalls = 0
 	local observeWait, finishWork = BridgeConnection.profileWaitObserver(
 		"import live identities: scheduler yield", "import live identities: validation work")
-	local budget = BridgeParallel.newWorkBudget(0.032, observeWait)
+	local budget = BridgeParallel.newWorkBudget(0.1, observeWait)
 	for offset = 0, buffer.len(nodes) - 20, 20 do
 		budget()
 		local parent, ordinal = buffer.readu32(nodes, offset), buffer.readu32(nodes, offset + 4)
@@ -714,7 +714,7 @@ end
 local function rememberImportedIdentities(prepared: { any }, ctx: { [string]: any }, aliases: { [Instance]: Instance }?)
 	local observeWait, finishWork = BridgeConnection.profileWaitObserver(
 		"import identity registration: scheduler yield", "import identity registration: binding work")
-	local budget = BridgeParallel.newWorkBudget(0.032, observeWait)
+	local budget = BridgeParallel.newWorkBudget(0.1, observeWait)
 	for _, group in ipairs(prepared) do
 		for index, settingsId in ipairs(group.rootSettingsIds or {}) do
 			budget()

@@ -26,13 +26,13 @@ end)
 assert(not budget() and observed == 0)
 now += 0.009
 assert(budget() and observed == 1)
-for _, case in ipairs({ { 0.003, 0.025 }, { 0.02, 0.0133 }, { 0.2, 0.008 } }) do
+for _, case in ipairs({ { 0.003, 0.0303 }, { 0.02, 0.02 }, { 0.2, 0.1 } }) do
 	frame = case[1]
 	local adaptive = parallel.newWorkBudget()
 	now += 0.009
 	assert(adaptive(), "The first slice is the shortest")
 	now += case[2] - 0.001
-	assert(not adaptive(), "A slice lasts what the frame has left after Studio's own time")
+	assert(not adaptive(), "A slice lasts what the frame has left, or as long as Studio's own time took")
 	now += 0.002
 	assert(adaptive(), "A slice ends when the frame is spent")
 end

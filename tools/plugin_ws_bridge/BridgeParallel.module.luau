@@ -5,14 +5,17 @@ local PARALLEL_TARGET_ITEMS_PER_WORKER = 256
 
 local FRAME_SECONDS = 1 / 30
 local MIN_SLICE_SECONDS = 0.008
-local MAX_SLICE_SECONDS = 0.025
+local MAX_SLICE_SECONDS = 0.1
 
 -- task.spawn runs on the same Luau scheduler: workers must still share frames
 -- with Studio's built-in plugins. Check at item boundaries, keeping small jobs
 -- synchronous and returning whether callers need to invalidate a local cache.
 -- Without a slice of the caller's, each slice is what a frame at 30 a second
--- has left after the time Studio took for its own work during the last wait:
--- an idle Studio gives most of the frame, a busy one the minimum.
+-- has left after the time Studio took for its own work during the last wait,
+-- and never less than that time itself: a Studio whose frames are slow (after
+-- a large import a frame takes 50 to 200 ms) would otherwise leave the work
+-- 8 ms of every frame and stretch a one-second loop to half a minute, while a
+-- frame of its own length more costs it nothing a person notices.
 function BridgeParallel.newWorkBudget(sliceSeconds: number?, observeWait: ((number) -> ())?)
 	local slice = sliceSeconds or MIN_SLICE_SECONDS
 	local deadline = os.clock() + slice
@@ -27,7 +30,8 @@ function BridgeParallel.newWorkBudget(sliceSeconds: number?, observeWait: ((numb
 			observeWait(started)
 		end
 		if sliceSeconds == nil then
-			slice = math.clamp(FRAME_SECONDS - (resumed - started), MIN_SLICE_SECONDS, MAX_SLICE_SECONDS)
+			local waited = resumed - started
+			slice = math.clamp(math.max(FRAME_SECONDS - waited, waited), MIN_SLICE_SECONDS, MAX_SLICE_SECONDS)
 		end
 		deadline = os.clock() + slice
 		return true
