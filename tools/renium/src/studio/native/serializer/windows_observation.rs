@@ -1,7 +1,18 @@
-//! Export-scoped attribute observation. One engine subscription, no Instance walk.
+//! Guard-owned attribute observation. One engine subscription, no Instance walk.
 use super::*;
 // Observation retains its v1 response; capture has a v2 context receipt.
 const OBSERVATION_HEADER_SIZE: usize = 320;
+#[test]
+fn attribute_observation_renews_without_retaining_more_owners() {
+    assert!(
+        crate::system::tools::hidden_command(
+            Path::new(env!("OUT_DIR")).join("renium-attribute-observation-test.exe")
+        )
+        .status()
+        .expect("run attribute observation lifecycle regression")
+        .success()
+    );
+}
 use crate::system::LockRecover;
 use std::io::{self, Seek, SeekFrom};
 use std::sync::Arc;
@@ -135,8 +146,8 @@ impl Drop for Handle {
         }
     }
 }
-fn event() -> Result<Handle> {
-    let handle = unsafe { CreateEventW(null(), 1, 0, null()) };
+fn event(manual_reset: bool) -> Result<Handle> {
+    let handle = unsafe { CreateEventW(null(), i32::from(manual_reset), 0, null()) };
     anyhow::ensure!(
         !handle.is_null(),
         "Cannot create attribute observation event: {}",
@@ -199,6 +210,29 @@ pub(crate) struct AttributeGuard {
     stop: Handle,
     thread: Option<Handle>,
     transport: fs::File,
+    renewal: Option<Box<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>>,
+}
+
+fn renew_while_held(
+    renew: Handle,
+    lifetime: Duration,
+) -> Result<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)> {
+    let (held, released) = std::sync::mpsc::channel();
+    let worker = std::thread::Builder::new()
+        .name("renium-attribute-lease".into())
+        .spawn(move || {
+            let started = Instant::now();
+            while released.recv_timeout(Duration::from_secs(30))
+                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                && started.elapsed() < lifetime
+            {
+                if unsafe { SetEvent(renew.0) } == 0 {
+                    break;
+                }
+            }
+            drop(renew);
+        })?;
+    Ok((held, worker))
 }
 impl AttributeGuard {
     fn header(&mut self) -> Result<[u8; OBSERVATION_HEADER_SIZE]> {
@@ -212,14 +246,20 @@ impl AttributeGuard {
         Ok(header)
     }
     pub(crate) fn finish(&mut self) -> Result<()> {
+        if let Some(renewal) = self.renewal.take() {
+            let (held, worker) = *renewal;
+            drop(held);
+            let _ = worker.join();
+        }
         let Some(thread) = self.thread.take() else {
             return Ok(());
         };
         unsafe {
             SetEvent(self.stop.0);
         }
+        // An in-flight renewal and the final cleanup each have a 2 s queue bound.
         anyhow::ensure!(
-            unsafe { WaitForSingleObject(thread.0, 2500) } == WAIT_OBJECT_0,
+            unsafe { WaitForSingleObject(thread.0, 4500) } == WAIT_OBJECT_0,
             "Studio attribute observation did not finish; export was not accepted"
         );
         let mut exit = 0;
@@ -268,6 +308,10 @@ fn begin_observation(
     lifetime: Duration,
     relay_path: Option<&[String]>,
 ) -> Result<AttributeGuard> {
+    anyhow::ensure!(
+        (1..=1_800_000).contains(&lifetime.as_millis()),
+        "Attribute observation lifetime must be between 1 ms and 30 minutes"
+    );
     let memory = ProcessMemory::open_with_access(pid, PROCESS_DUP_HANDLE)?;
     memory.authorize(NativeOperation::AttributeObservation, title)?;
     let modules = modules(pid)?;
@@ -356,7 +400,7 @@ fn begin_observation(
     model.roots = select_capture_roots(&roots, services)?;
     let (_, serializer, _) = studio_layout(&studio.path)?;
     let helper = ensure_helper_loaded(pid, &memory, &modules)?;
-    let entry = helper + helper_export_rva("ReniumObserveAttributes")?;
+    let entry = helper + helper_export_rva("ReniumObserveAttributesLease")?;
     let mut nonce = [0u8; 16];
     getrandom::fill(&mut nonce)
         .map_err(|error| anyhow::anyhow!("Cannot create observation nonce: {error}"))?;
@@ -373,8 +417,9 @@ fn begin_observation(
         .share_mode(7)
         .custom_flags(0x04000000)
         .open(&path)?;
-    let stop = event()?;
-    let ready = event()?;
+    let stop = event(true)?;
+    let ready = event(true)?;
+    let renew = event(false)?;
     let host = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, std::process::id()) };
     anyhow::ensure!(
         !host.is_null(),
@@ -387,7 +432,7 @@ fn begin_observation(
         values: Vec::new(),
     };
     let mut params = build_parameters(studio.base, serializer, &model, &path, true)?;
-    params.resize(PARAM_SIZE + 112, 0);
+    params.resize(PARAM_SIZE + 120, 0);
     // The bounded field offset occupies the low word of the original slot;
     // its former zero high word now identifies the structurally proven ABI.
     put_u32(
@@ -423,6 +468,7 @@ fn begin_observation(
         (PARAM_SIZE + 56, duplicates.duplicate(&stop)?),
         (PARAM_SIZE + 64, duplicates.duplicate(&ready)?),
         (PARAM_SIZE + 104, duplicates.duplicate(&host)?),
+        (PARAM_SIZE + 112, duplicates.duplicate(&renew)?),
     ] {
         put_u64(&mut params, offset, value);
     }
@@ -443,11 +489,12 @@ fn begin_observation(
         .start_thread(entry, remote.address)
         .context("Cannot start attribute observation")?;
     remote.address = 0;
-    duplicates.values.clear(); // Worker owns both duplicates and its input.
+    duplicates.values.clear(); // Worker owns the duplicates and its input.
     let mut guard = AttributeGuard {
         stop,
         thread: Some(Handle(thread)),
         transport,
+        renewal: None,
     };
     anyhow::ensure!(
         unsafe { WaitForSingleObject(ready.0, 2500) } == WAIT_OBJECT_0,
@@ -459,5 +506,8 @@ fn begin_observation(
         "{}",
         String::from_utf8_lossy(&header[64..]).trim_end_matches('\0')
     );
+    if lifetime > Duration::from_secs(120) {
+        guard.renewal = Some(Box::new(renew_while_held(renew, lifetime)?));
+    }
     Ok(guard)
 }

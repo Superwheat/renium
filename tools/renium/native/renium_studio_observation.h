@@ -1,7 +1,8 @@
-// One temporary native signal subscription replaces per-instance Lua attribute
-// subscriptions during a full export or transient native push. It observes;
+// One leased native signal subscription replaces per-instance Lua attribute
+// subscriptions during export, push, or a retained baseline. It observes;
 // it never suppresses Studio's events or other subscribers.
 #include "renium_signal_append.h"
+#include <algorithm>
 namespace renium_observation {
 struct Params {
     ReniumSerializerParams base;
@@ -11,9 +12,9 @@ struct Params {
     HANDLE stop, ready;
     SharedInstance relay;
     std::uintptr_t relayOffset, fireRelay;
-    HANDLE host;
+    HANDLE host, renew;
 };
-static_assert(sizeof(Params) == sizeof(ReniumSerializerParams) + 112);
+static_assert(sizeof(Params) == sizeof(ReniumSerializerParams) + 120);
 static_assert(offsetof(Params, signalOffset) == sizeof(ReniumSerializerParams));
 static_assert(offsetof(Params, appendAbi) == sizeof(ReniumSerializerParams) + 4);
 
@@ -24,6 +25,7 @@ struct Task {
     bool relayArmed = false;
     std::atomic<bool> cancelled{false};
     std::vector<void*> owners;
+    std::shared_ptr<void> modelHold;
     std::shared_ptr<Task> installed;
     std::string error;
 };
@@ -106,8 +108,10 @@ static void Begin(const std::shared_ptr<Task>& task) {
         if (identity->instance != root.instance || identity->owner != root.owner
             || *reinterpret_cast<void**>(static_cast<unsigned char*>(root.instance) + p.base.parentOffset) != instance)
             throw std::runtime_error("Attribute observation service changed");
-        if (!AddOwnerReference(root.owner)) throw std::runtime_error("Attribute observation service expired");
-        task->owners.push_back(root.owner);
+        if (!task->connection) {
+            if (!AddOwnerReference(root.owner)) throw std::runtime_error("Attribute observation service expired");
+            task->owners.push_back(root.owner);
+        }
     }
     if (p.relay.instance) {
         const auto self = reinterpret_cast<const SharedInstance*>(
@@ -115,9 +119,18 @@ static void Begin(const std::shared_ptr<Task>& task) {
         if (self->instance != p.relay.instance || self->owner != p.relay.owner
             || !p.fireRelay || !p.relayOffset || p.relayOffset >= 0x1000 || p.relayOffset % 8)
             throw std::runtime_error("Native attribute relay changed");
-        if (!AddOwnerReference(p.relay.owner)) throw std::runtime_error("Native attribute relay expired");
-        task->owners.push_back(p.relay.owner);
+        auto parent = p.relay.instance;
+        for (unsigned depth = 0; parent && parent != instance && depth < 4096; ++depth)
+            parent = *reinterpret_cast<void**>(static_cast<unsigned char*>(parent) + p.base.parentOffset);
+        if (parent != instance) throw std::runtime_error("Native attribute relay was detached");
+        if (!task->connection) {
+            if (!AddOwnerReference(p.relay.owner)) throw std::runtime_error("Native attribute relay expired");
+            task->owners.push_back(p.relay.owner);
+        }
     }
+    // Renewal revalidates the existing identities on the model queue. It never
+    // installs another callback or adds another owner reference.
+    if (task->connection) return;
     auto signal = reinterpret_cast<void**>(p.base.dataModel + p.signalOffset);
     reinterpret_cast<void(__fastcall*)(void**)>(p.ensure)(signal);
     auto node = static_cast<unsigned char*>(reinterpret_cast<void*(__fastcall*)(std::size_t)>(p.allocate)(0x48));
@@ -162,14 +175,15 @@ static DWORD Run(Params* input) {
     auto task = std::make_shared<Task>();
     task->params = *input;
     auto p = *input;
-    if (p.appendAbi > 1 || !p.stop || !p.ready || !p.host || !p.base.count || p.base.count > 256
-        || !p.base.timeoutMs || p.base.timeoutMs > 120000
+    if (p.appendAbi > 1 || !p.stop || !p.ready || !p.host || !p.renew || !p.base.count || p.base.count > 256
+        || !p.base.timeoutMs || p.base.timeoutMs > 1800000
         || !p.base.submitTask || !p.base.taskContext || !p.base.dataModelOwner)
         throw std::runtime_error("Invalid attribute observation context");
     auto owner = reinterpret_cast<void*>(p.base.dataModelOwner);
+    task->owners.reserve(p.base.count + 1);
     if (!AddOwnerReference(owner)) throw std::runtime_error("Attribute observation DataModel expired");
-    auto modelHold = std::shared_ptr<void>(owner, ReleaseOwnerReference);
-    task->owners.reserve(p.base.count);
+    // Delayed queue work must keep the model alive until after Finish returns.
+    task->modelHold = std::shared_ptr<void>(owner, ReleaseOwnerReference);
     p.base.status = 1;
     if (!Dispatch(task, true)) {
         p.base.status = 0xE621;
@@ -189,8 +203,18 @@ static DWORD Run(Params* input) {
     if (p.base.status == 2) {
         // A forcibly stopped daemon cannot signal its cancellation event. The
         // process handle also retires its native callback and DataModel owners.
-        HANDLE cancellation[] = { p.stop, p.host };
-        if (WaitForMultipleObjects(2, cancellation, FALSE, p.base.timeoutMs) != WAIT_OBJECT_0) {
+        HANDLE cancellation[] = { p.stop, p.host, p.renew };
+        const auto deadline = GetTickCount64() + p.base.timeoutMs;
+        DWORD result = WAIT_TIMEOUT;
+        for (auto now = GetTickCount64(); now < deadline; now = GetTickCount64()) {
+            const auto remaining = deadline - now;
+            result = WaitForMultipleObjects(3, cancellation, FALSE,
+                static_cast<DWORD>((std::min)(remaining, 120000ull)));
+            if (result != WAIT_OBJECT_0 + 2) break;
+            if (!Dispatch(task, true) || !task->error.empty()) { result = WAIT_FAILED; break; }
+            result = WAIT_TIMEOUT;
+        }
+        if (result != WAIT_OBJECT_0) {
             p.base.status = 0xE623;
             SetError(&p.base, "Attribute observation expired or its host stopped");
         }
@@ -226,7 +250,8 @@ static DWORD ObservationBoundary(renium_observation::Params* params) {
         return PublishCaptureResponse(&params->base, params->base.status);
     }
 }
-extern "C" __declspec(dllexport) DWORD WINAPI ReniumObserveAttributes(renium_observation::Params* params) {
+// Separate entry point: a legacy request has no renewal-handle suffix.
+extern "C" __declspec(dllexport) DWORD WINAPI ReniumObserveAttributesLease(renium_observation::Params* params) {
     if (!params) return 0xE000;
     if (params->base.protocolVersion != ReniumSerializerVersion) {
         // The old request's extension starts earlier: never read its handles
@@ -242,6 +267,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI ReniumObserveAttributes(renium_obs
         if (params->stop) CloseHandle(params->stop);
         if (params->ready) { SetEvent(params->ready); CloseHandle(params->ready); }
         if (params->host) CloseHandle(params->host);
+        if (params->renew) CloseHandle(params->renew);
         VirtualFree(params, 0, MEM_RELEASE);
     }
     return result;

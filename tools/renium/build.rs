@@ -603,6 +603,11 @@ fn main() {
         if target_os == "windows" {
             build_native_test(
                 &out_dir,
+                "attribute-observation",
+                Path::new("native/tests/observation_windows.cpp"),
+            );
+            build_native_test(
+                &out_dir,
                 "batch-pacer",
                 Path::new("native/tests/batch_pacer_windows.cpp"),
             );
