@@ -431,15 +431,10 @@ fn revert_sync_entry_file(args: EditorRevertArgs, file: sync_history::SyncEntryF
             .extension()
             .is_some_and(|extension| extension == "renium")
         {
-            let document = crate::settings::bytecode::decode_settings_bytecode(&file.bytes)
-                .with_context(|| {
-                    format!("Could not decode the saved store {}", file.path.display())
-                })?;
-            print!(
-                "{}",
-                crate::project::version_control::settings_doc_to_text(&document)
+            let text = |piece: String| print!("{piece}");
+            return crate::project::version_control::store_text_of(&file.bytes, text).with_context(
+                || format!("Could not decode the saved store {}", file.path.display()),
             );
-            return Ok(());
         }
         std::io::stdout()
             .write_all(&file.bytes)

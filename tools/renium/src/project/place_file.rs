@@ -57,6 +57,14 @@ pub(super) fn place_dom(path: &Path) -> Result<RbxWeakDom> {
     RbxPlaceFormat::from_path(path)?.read(path)
 }
 
+/// `place_dom` as `RbxPlaceFormat::read_sparse` reads it.
+pub(super) fn sparse_place_dom(path: &Path) -> Result<rbx_binary::SparseDom> {
+    if !path.is_file() {
+        bail!("Place file does not exist: {}", path.display());
+    }
+    RbxPlaceFormat::from_path(path)?.read_sparse(path)
+}
+
 fn descendants(dom: &RbxWeakDom) -> Descendants<'_> {
     Descendants {
         dom,

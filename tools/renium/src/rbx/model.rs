@@ -324,6 +324,22 @@ impl RbxPlaceFormat {
         self.read_with_defaults(path, true, None)
     }
 
+    /// `read` without the values of a binary file that are their reflection
+    /// default bit for bit: those are named by instance instead, so that a
+    /// reader states them again where it needs them. An XML file is read
+    /// whole.
+    pub(crate) fn read_sparse(self, path: &Path) -> Result<rbx_binary::SparseDom> {
+        let (Self::Binary, reader) = self.open(path)? else {
+            return Ok(rbx_binary::SparseDom {
+                dom: self.read(path)?,
+                elided_defaults: HashMap::new(),
+            });
+        };
+        rbx_binary::Deserializer::new()
+            .deserialize_sparse(reader)
+            .with_context(|| format!("Failed to read {}", path.display()))
+    }
+
     /// The format the file's own content declares, when it declares one. A
     /// place saved as XML under an .rbxl name, or the reverse, still opens
     /// in Studio, which reads the content rather than the name.

@@ -21,8 +21,8 @@ use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::blocks::RowReader;
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode,
-    SettingsBytecodeInstance, for_each_reference, for_each_reference_mut, reference_leads_out_of,
-    reindex_store_reference_indices,
+    SettingsBytecodeInstance, decode_settings_bytecode, for_each_reference, for_each_reference_mut,
+    reference_leads_out_of, reindex_store_reference_indices,
 };
 use crate::settings::tree::settings_children_by_parent;
 use crate::snapshot::refs::{
@@ -400,8 +400,9 @@ pub(crate) fn settings_doc_to_text(document: &SettingsBytecode) -> String {
     out
 }
 
-/// The rows a view reads and prints at a time: those of one block of a store.
-const VIEW_ROWS_AT_ONCE: usize = 4_096;
+/// The rows a view or a comparison reads at a time: those of one block of a
+/// store.
+pub(super) const VIEW_ROWS_AT_ONCE: usize = 4_096;
 
 /// What gives the rows of a document their values a turn at a time, as
 /// `RowReader::walk_turns` does: the reader of a store, or the DOM of a place
@@ -462,31 +463,55 @@ pub(super) fn text_by_rows(
     })
 }
 
+/// Gives `out` `settings_doc_to_text` of a store: of the document whole, or
+/// of the one its reader gives the values of some rows at a time.
+fn store_text(
+    (mut document, reader): (SettingsBytecode, Option<RowReader>),
+    mut out: impl FnMut(String),
+) -> Result<()> {
+    let Some(reader) = reader else {
+        out(settings_doc_to_text(&document));
+        return Ok(());
+    };
+    text_by_rows(&mut document, &reader, VIEW_ROWS_AT_ONCE, out)
+}
+
 /// Prints `settings_doc_to_text` of a store file.
 fn print_store_text(path: &Path) -> Result<()> {
     // A process that serves automation prints each `print!` as a line.
-    let (mut document, reader) = if crate::app::context::automation_stdio() {
+    let read = if crate::app::context::automation_stdio() {
         (SettingsBytecode::read_file(path)?, None)
     } else {
         SettingsBytecode::read_whole_by_rows(path)?
     };
-    let Some(reader) = reader else {
-        print!("{}", settings_doc_to_text(&document));
-        return Ok(());
-    };
-    text_by_rows(&mut document, &reader, VIEW_ROWS_AT_ONCE, |piece| {
-        print!("{piece}")
-    })
+    store_text(read, |piece| print!("{piece}"))
 }
 
-/// Prints `settings_doc_to_text` of the document of a place file, which is
-/// read from the file's DOM some rows at a time.
-fn print_place_text(path: &Path) -> Result<()> {
-    let dom = super::place_file::place_dom(path)?;
-    let rows = super::place_diff::dom_rows(&dom, "place", None, false)?;
-    text_by_rows(&mut rows.structure(), &rows, VIEW_ROWS_AT_ONCE, |piece| {
-        print!("{piece}")
-    })
+/// Gives `out` `settings_doc_to_text` of the bytes of a store file, as
+/// `print_store_text` prints it. A store its rows do not give is decoded
+/// whole, which says why.
+pub(crate) fn store_text_of(bytes: &[u8], out: impl FnMut(String)) -> Result<()> {
+    let by_rows = if crate::app::context::automation_stdio() {
+        None
+    } else {
+        SettingsBytecode::decode_whole_by_rows(bytes).ok()
+    };
+    let read = match by_rows {
+        Some(read) => read,
+        None => (decode_settings_bytecode(bytes)?, None),
+    };
+    store_text(read, out)
+}
+
+/// Gives `out` `settings_doc_to_text` of the document of a place file, which
+/// is read from the file's DOM `at_once` rows at a time. The DOM holds no
+/// value of a binary file that is its reflection default: a row states those
+/// again while its turn is converted.
+pub(super) fn place_text(path: &Path, at_once: usize, out: impl FnMut(String)) -> Result<()> {
+    let place = super::place_file::sparse_place_dom(path)?;
+    let mut rows = super::place_diff::dom_rows(&place.dom, "place", None, false)?;
+    rows.left_out = place.elided_defaults;
+    text_by_rows(&mut rows.structure(), &rows, at_once, out)
 }
 
 fn text_record<'a>(
@@ -807,7 +832,7 @@ pub(crate) fn view_command(args: ViewArgs) -> Result<()> {
         && !args.json
         && !crate::app::context::automation_stdio()
     {
-        return print_place_text(&args.file);
+        return place_text(&args.file, VIEW_ROWS_AT_ONCE, |piece| print!("{piece}"));
     }
     let document = match extension.as_deref() {
         Some("rbxm" | "rbxmx") => read_settings_model_document(&args.file)?,

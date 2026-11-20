@@ -369,16 +369,23 @@ impl SettingsBytecode {
     }
 
     fn read_rows(path: &Path, whole: bool) -> Result<(Self, Option<blocks::RowReader>)> {
-        read_settings_file(path, |bytes| {
-            if !blocks::is_block_store(bytes) {
-                return Ok((decode_settings_bytecode(bytes)?, None));
-            }
-            let (document, reader) = blocks::RowReader::decode(bytes)?;
-            if whole {
-                reader.check()?;
-            }
-            Ok((document, Some(reader)))
-        })
+        read_settings_file(path, |bytes| Self::decode_rows(bytes, whole))
+    }
+
+    /// `read_whole_by_rows` of the bytes of a store file.
+    pub(crate) fn decode_whole_by_rows(bytes: &[u8]) -> Result<(Self, Option<blocks::RowReader>)> {
+        Self::decode_rows(bytes, true)
+    }
+
+    fn decode_rows(bytes: &[u8], whole: bool) -> Result<(Self, Option<blocks::RowReader>)> {
+        if !blocks::is_block_store(bytes) {
+            return Ok((decode_settings_bytecode(bytes)?, None));
+        }
+        let (document, reader) = blocks::RowReader::decode(bytes)?;
+        if whole {
+            reader.check()?;
+        }
+        Ok((document, Some(reader)))
     }
 
     /// Decodes a store's instances without their properties and attributes.
