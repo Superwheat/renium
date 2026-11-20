@@ -1422,6 +1422,10 @@ struct IdentityAssignment<'a> {
     shape_keys: Option<(Vec<u64>, Vec<u64>)>,
     /// A matching that stops at what instances hold reached such a group.
     compares_values: bool,
+    /// The observed instances such a matching paired with a namesake by
+    /// their order under one parent, where it pairs them so, and whether
+    /// one copy holds more of those namesakes.
+    by_order: Option<Vec<(usize, bool)>>,
 }
 
 /// Hash of an instance's subtree by names and classes only, so same-named
@@ -1678,6 +1682,7 @@ impl<'a> IdentityAssignment<'a> {
             remaining: observed.instances.len(),
             shape_keys: None,
             compares_values: false,
+            by_order: None,
         }
     }
 
@@ -1861,8 +1866,23 @@ impl<'a> IdentityAssignment<'a> {
             }
 
             if inputs.told_alone {
-                self.compares_values = true;
-                return progressed;
+                // Namesakes under one parent stand in the order it was given
+                // them in both copies; what one copy holds more comes last.
+                let Some(by_order) = &mut self.by_order else {
+                    self.compares_values = true;
+                    return progressed;
+                };
+                let uneven = observed_group.len() != candidates.len();
+                let pairs = observed_group
+                    .into_iter()
+                    .zip(candidates)
+                    .collect::<Vec<_>>();
+                by_order.extend(pairs.iter().map(|(index, _)| (*index, uneven)));
+                for (index, candidate) in pairs {
+                    self.assign(index, candidate);
+                }
+                progressed = true;
+                continue;
             }
             let group_index = observed_group[0];
             if unchanged_content_groups.get(&group_index).is_some_and(
@@ -2203,7 +2223,7 @@ fn align_settings_ids_by_matching(
         remap_positional_ids(reference, observed);
         return true;
     }
-    let Some((ids, _)) = match_settings_ids(reference, observed, false) else {
+    let Some((ids, ..)) = match_settings_ids(reference, observed, false, false) else {
         return false;
     };
     take_settings_ids(observed, ids);
@@ -2221,7 +2241,20 @@ pub(crate) fn settings_ids_told_alone(
     reference: &SettingsBytecode,
     observed: &SettingsBytecode,
 ) -> Option<(Vec<String>, Vec<Option<usize>>)> {
-    match_settings_ids(reference, observed, true)
+    match_settings_ids(reference, observed, true, false).map(|(ids, places, _)| (ids, places))
+}
+
+/// `settings_ids_told_alone` where namesakes under one parent that nothing
+/// else tells apart are paired by their order, and with it the observed
+/// instances paired so, each with whether one copy holds more of its
+/// namesakes. Such a pair is one instance only where both hold the same,
+/// which is the caller's to see.
+#[allow(clippy::type_complexity)]
+pub(crate) fn settings_ids_told_in_order(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+) -> Option<(Vec<String>, Vec<Option<usize>>, Vec<(usize, bool)>)> {
+    match_settings_ids(reference, observed, true, true)
 }
 
 /// Gives the observed instances the ids a matching assigned them, in every
@@ -2251,12 +2284,15 @@ pub(crate) fn take_settings_ids(observed: &mut SettingsBytecode, ids: Vec<String
 
 /// The matching of `align_settings_ids_by_matching`: for each observed
 /// instance its id and the reference instance it is. With `told_alone` it
-/// stops where two instances are told apart by what they hold.
+/// stops where two instances are told apart by what they hold, or with
+/// `in_order` pairs those by their order and says which.
+#[allow(clippy::type_complexity)]
 fn match_settings_ids(
     reference: &SettingsBytecode,
     observed: &SettingsBytecode,
     told_alone: bool,
-) -> Option<(Vec<String>, Vec<Option<usize>>)> {
+    in_order: bool,
+) -> Option<(Vec<String>, Vec<Option<usize>>, Vec<(usize, bool)>)> {
     let preparation_started = Instant::now();
     let cameras = (
         workspace_current_camera_index(reference),
@@ -2311,6 +2347,7 @@ fn match_settings_ids(
             .push(index);
     }
     let mut state = IdentityAssignment::new(reference, observed);
+    state.by_order = in_order.then(Vec::new);
     if let (Some(reference_index), Some(observed_index)) = cameras {
         state.assign(observed_index, reference_index);
     }
@@ -2415,11 +2452,13 @@ fn match_settings_ids(
     let IdentityAssignment {
         assigned_ids,
         assigned_reference,
+        by_order,
         ..
     } = state;
     Some((
         assigned_ids.into_iter().map(Option::unwrap).collect(),
         assigned_reference,
+        by_order.unwrap_or_default(),
     ))
 }
 
@@ -8094,3 +8133,46 @@ mod already_aligned_tests {
 #[cfg(test)]
 #[path = "alignment_sim.rs"]
 mod alignment_sim;
+
+/// Namesakes under one parent that no UniqueId tells apart are paired by
+/// their order only where the matching is asked to, and it says which.
+#[test]
+fn namesakes_nothing_tells_apart_are_paired_by_their_order_where_asked() {
+    let row = |id: &str, name: &str| {
+        SettingsBytecodeInstance::new(id.into(), name.into(), "Part".into(), Some(0))
+    };
+    let document = |root: &str, rows: Vec<SettingsBytecodeInstance>| {
+        let mut instances = vec![SettingsBytecodeInstance::new(
+            root.into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        )];
+        instances.extend(rows);
+        SettingsBytecode {
+            version: super::bytecode::SETTINGS_BINARY_VERSION,
+            instances,
+        }
+    };
+    let files = document(
+        "root",
+        vec![
+            row("a", "Part"),
+            row("b", "Part"),
+            row("new", "Other"),
+            row("c", "Part"),
+        ],
+    );
+    // Studio holds one more of them, the last it was given.
+    let studio = document(
+        "debug:0",
+        (1..=4)
+            .map(|index| row(&format!("debug:{index}"), "Part"))
+            .collect(),
+    );
+    assert!(settings_ids_told_alone(&files, &studio).is_none());
+    let (ids, places, by_order) = settings_ids_told_in_order(&files, &studio).unwrap();
+    assert_eq!(places, [Some(0), Some(1), Some(2), Some(4), None]);
+    assert_eq!(ids, ["root", "a", "b", "c", "debug:4"]);
+    assert_eq!(by_order, [(1, true), (2, true), (3, true)]);
+}

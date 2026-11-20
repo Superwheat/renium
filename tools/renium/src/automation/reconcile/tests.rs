@@ -7280,6 +7280,71 @@ fn scripts_beside(
 /// holds. What a push makes of it is what it makes of the two whole
 /// documents: the same stores unchanged, the same plan, the same saved-field
 /// differences and the same verdict on what Studio holds afterwards.
+/// What came between two copies of a store since the files were written:
+/// Studio's ids, the files' edits. Answers whether Studio opened the place
+/// again, and whether a push imported the service.
+fn copies_apart(
+    seed: u64,
+    rng: &mut crate::tests::support::SimRng,
+    studio: &mut SettingsBytecode,
+    files: &mut SettingsBytecode,
+) -> (bool, bool) {
+    // Studio opened the place again since the files were written: it
+    // gave every instance another id of its own and another UniqueId.
+    let reopened = rng.below(3) == 0;
+    if reopened {
+        for (index, instance) in studio.instances.iter_mut().enumerate() {
+            // Studio numbers anew from where it did before, so an id of
+            // its own can be the one the files hold for another instance.
+            if instance.settings_id.starts_with("debug:") {
+                instance.settings_id = if seed.is_multiple_of(2) {
+                    format!("debug:0_{}", 500 + index)
+                } else {
+                    format!("debug:0_{}", 100 + index)
+                };
+            }
+            if instance.properties.contains_key("UniqueId") {
+                instance.properties.insert(
+                    "UniqueId".into(),
+                    json!({"_type": "UniqueId", "value": format!("{:024x}{:08x}", 5, index + 1)}),
+                );
+            }
+        }
+    }
+    // A push imported the service since: every instance of Studio's is
+    // another object, under an id of Studio's own and another UniqueId.
+    let imported = seed % 7 == 3;
+    if imported {
+        for (index, instance) in studio.instances.iter_mut().enumerate().skip(1) {
+            instance.settings_id = format!("debug:1_{}", 900 + index);
+            if instance.properties.contains_key("UniqueId") {
+                instance.properties.insert(
+                    "UniqueId".into(),
+                    json!({"_type": "UniqueId", "value": format!("{:024x}{:08x}", 9, index + 1)}),
+                );
+            }
+        }
+    }
+    let changes = if imported {
+        rng.below(2)
+    } else {
+        rng.below(5) + usize::from(!seed.is_multiple_of(16))
+    };
+    for _ in 0..changes {
+        change_an_instance(rng, files);
+    }
+    // A store edit added an instance to the files, or took one away.
+    if seed.is_multiple_of(3) {
+        add_or_remove_a_run(rng, files);
+    }
+    // The files hold an instance at the end that Studio holds among
+    // the others.
+    if (seed % 5 == 1 || imported) && !seed.is_multiple_of(3) {
+        move_a_leaf_to_the_end(rng, files);
+    }
+    (reopened, imported)
+}
+
 #[test]
 fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_push_it() {
     use crate::tests::support::{SimRng, run_seeds};
@@ -7302,6 +7367,9 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
     let (with_scripts, sources_sent) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let told_alone_before = super::replacement::TOLD_ALONE.load(Ordering::Relaxed);
     let paired_first_before = super::replacement::PAIRED_FIRST.load(Ordering::Relaxed);
+    let by_order_before = super::replacement::BY_ORDER
+        .each_ref()
+        .map(|count| count.load(Ordering::Relaxed));
     run_seeds(300, |seed, _| {
         use crate::settings::bytecode::blocks::sim::{blocks_of_both, in_blocks};
         let mut rng = SimRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
@@ -7310,40 +7378,7 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
         let block_rows = [1, 3, 8, 4096][(seed >> 2) as usize % 4];
         let mut studio = changed_instances_store(&mut rng);
         let mut files = studio.clone();
-        // Studio opened the place again since the files were written: it
-        // gave every instance another id of its own and another UniqueId.
-        let reopened = rng.below(3) == 0;
-        if reopened {
-            for (index, instance) in studio.instances.iter_mut().enumerate() {
-                // Studio numbers anew from where it did before, so an id of
-                // its own can be the one the files hold for another instance.
-                if instance.settings_id.starts_with("debug:") {
-                    instance.settings_id = if seed % 2 == 0 {
-                        format!("debug:0_{}", 500 + index)
-                    } else {
-                        format!("debug:0_{}", 100 + index)
-                    };
-                }
-                if instance.properties.contains_key("UniqueId") {
-                    instance.properties.insert(
-                        "UniqueId".into(),
-                        json!({"_type": "UniqueId", "value": format!("{:024x}{:08x}", 5, index + 1)}),
-                    );
-                }
-            }
-        }
-        for _ in 0..rng.below(5) + usize::from(seed % 16 != 0) {
-            change_an_instance(&mut rng, &mut files);
-        }
-        // A store edit added an instance to the files, or took one away.
-        if seed % 3 == 0 {
-            add_or_remove_a_run(&mut rng, &mut files);
-        }
-        // The files hold an instance at the end that Studio holds among
-        // the others.
-        if seed % 5 == 1 && seed % 3 != 0 {
-            move_a_leaf_to_the_end(&mut rng, &mut files);
-        }
+        let (reopened, imported) = copies_apart(seed, &mut rng, &mut studio, &mut files);
         let run = files.instances.len() != studio.instances.len();
         // Scripts beside them, their sources in files: with the text Studio
         // holds or another, held by the files alone, with its file gone, or
@@ -7354,7 +7389,8 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
         // One run of instances apart, with no script the files alone hold
         // beside it.
         let run = run && !uneven;
-        if run {
+        // After an import a run is told only where no namesake stands by it.
+        if run && !imported {
             runs.fetch_add(1, Ordering::Relaxed);
         }
         let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
@@ -7686,6 +7722,15 @@ from the whole documents:
         let paired_first =
             super::replacement::PAIRED_FIRST.load(Ordering::Relaxed) - paired_first_before;
         assert!(paired_first >= 5, "paired first: {paired_first}");
+        // The ones whose namesakes were paired by their order: refused for
+        // what such a pair holds, and taken.
+        let by_order = [0, 1].map(|taken| {
+            super::replacement::BY_ORDER[taken].load(Ordering::Relaxed) - by_order_before[taken]
+        });
+        assert!(
+            by_order[0] >= 5 && by_order[1] >= 8,
+            "namesakes paired by their order, refused and taken: {by_order:?}"
+        );
         let compared = compared_by_changed.load(Ordering::Relaxed);
         assert!(
             compared >= 100,
