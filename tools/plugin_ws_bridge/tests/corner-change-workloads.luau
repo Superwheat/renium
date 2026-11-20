@@ -947,6 +947,38 @@ for _, child in wide.children do
 end
 assert(burstOrdinals[late] == namesakes.Duplicate, "an addition after a removal must read its siblings anew")
 assert(siblingScans <= 3, `an addition burst rescanned siblings {siblingScans} times`)
+-- A namesake nothing listens to moves in beside them, which only ItemChanged
+-- reports: the next addition is numbered behind it.
+local ghost = instance("Part", "Duplicate")
+trackerConfig.shouldIgnoreInstance = function(item) return item == ghost end
+local function enter(item, parent)
+	item.Parent = parent
+	table.insert(parent.children, item)
+	testGame.ItemChanged:Fire(item, "Parent")
+	storage.DescendantAdded:Fire(item)
+end
+enter(ghost, deepParent)
+table.remove(deepParent.children, assert(table.find(deepParent.children, ghost)))
+table.insert(wide.children, ghost)
+ghost.Parent = wide
+testGame.ItemChanged:Fire(ghost, "Parent")
+local behind = instance("Part", "Duplicate")
+enter(behind, wide)
+siblingScans = 0
+local following = instance("Part", "Duplicate")
+enter(following, wide)
+journal = tracker.drainChangeJournal("wide")
+trackerConfig.shouldIgnoreInstance = function() return false end
+local foundBehind = 0
+for _, record in journal do
+	if record.instance == behind or record.instance == following then
+		local expected = namesakes.Duplicate + (if record.instance == behind then 2 else 3)
+		assert(record.pathOrdinals[#record.pathOrdinals] == expected,
+			`an addition behind an unobserved move recorded ordinal {record.pathOrdinals[#record.pathOrdinals]}, not {expected}`)
+		foundBehind += 1
+	end
+end
+assert(foundBehind == 2 and siblingScans == 0, `an addition after the repair rescanned siblings {siblingScans} times`)
 tracker.stop()
 remove(wide)
 remove(deepRoot)

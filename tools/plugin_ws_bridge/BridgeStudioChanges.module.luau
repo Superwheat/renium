@@ -174,6 +174,8 @@ type State = {
 	propertyBaselineByInstance: { [Instance]: PropertyBaselines },
 	ordinalCacheByParent: { [Instance]: any },
 	ordinalFrame: number,
+	ordinalUnobserved: number,
+	ordinalPending: Instance?,
 	ordinalFrameConnection: RBXScriptConnection?,
 	lastParentByInstance: { [Instance]: Instance? },
 	watchedServices: { [string]: boolean },
@@ -307,6 +309,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		propertyBaselineByInstance = setmetatable({}, { __mode = "k" }) :: any,
 		ordinalCacheByParent = setmetatable({}, { __mode = "k" }) :: any,
 		ordinalFrame = 0,
+		ordinalUnobserved = 0,
+		ordinalPending = nil,
 		ordinalFrameConnection = nil,
 		lastParentByInstance = setmetatable({}, { __mode = "k" }) :: any,
 		watchedServices = {},
@@ -1625,6 +1629,20 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
+	-- An instance nothing listens to (one the tracker ignores, or one without
+	-- scripts in code-only mode) that moves or is renamed inside its service
+	-- reaches no structural handler, and the ordinals cached for its old and
+	-- new siblings are stale. Only ItemChanged reports it: every entry notes
+	-- the count of such changes it was built at. An instance that enters a
+	-- service is reported the same way before its DescendantAdded, so one
+	-- report waits until that addition takes it back or anything else is asked.
+	local function noteUnobservedSiblingChange(instance: Instance?)
+		if state.ordinalPending ~= nil then
+			state.ordinalUnobserved += 1
+		end
+		state.ordinalPending = instance
+	end
+
 	-- A child given a parent is appended last among its siblings: they keep
 	-- their ordinals and it takes the next one of its name. Rebuilding the
 	-- parent's ordinals for every child of an addition burst (thousands of
@@ -1632,11 +1650,21 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	local function appendSiblingOrdinal(instance: Instance, parent: Instance?)
 		-- Its own children changed unobserved while it was outside the service.
 		state.ordinalCacheByParent[instance] = nil
+		if state.ordinalPending == instance then
+			state.ordinalPending = nil
+		else
+			noteUnobservedSiblingChange(nil)
+		end
 		local entry = if parent ~= nil then state.ordinalCacheByParent[parent] else nil
 		if entry == nil then
 			return
 		end
-		if entry.dirtyFrame ~= nil or instance.Parent ~= parent then
+		if
+			not state.itemChangedAvailable
+			or entry.dirtyFrame ~= nil
+			or entry.unobserved ~= state.ordinalUnobserved
+			or instance.Parent ~= parent
+		then
 			invalidateSiblingOrdinals(parent)
 		elseif entry.ordinals[instance] == nil then
 			local ordinal = (entry.counts[instance.Name] or 0) + 1
@@ -1653,7 +1681,13 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			counts[child.Name] = ordinal
 			ordinals[child] = ordinal
 		end
-		local entry = { ordinals = ordinals, counts = counts, dirtyFrame = nil, dirtyKind = nil }
+		local entry = {
+			ordinals = ordinals,
+			counts = counts,
+			dirtyFrame = nil,
+			dirtyKind = nil,
+			unobserved = state.ordinalUnobserved,
+		}
 		state.ordinalCacheByParent[parent] = entry
 		return entry
 	end
@@ -1664,8 +1698,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				state.ordinalFrame += 1
 			end)
 		end
+		noteUnobservedSiblingChange(nil)
 		local entry = state.ordinalCacheByParent[parent]
-		if entry == nil then
+		if entry == nil or entry.unobserved ~= state.ordinalUnobserved then
 			entry = rebuildSiblingOrdinals(parent)
 		elseif entry.dirtyFrame ~= nil then
 			local laterFrame = entry.dirtyFrame ~= state.ordinalFrame
@@ -3357,6 +3392,14 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				local trackedService = state.connectionServiceByInstance[instance]
 				if trackedService ~= nil then
 					observePropertyChange(instance, trackedService, tostring(propertyName))
+				elseif property == "parent" or property == "name" then
+					local above = instance.Parent
+					while above ~= nil and above ~= game and state.serviceNameByRoot[above] == nil do
+						above = above.Parent
+					end
+					if above ~= nil and above ~= game then
+						noteUnobservedSiblingChange(instance)
+					end
 				elseif property == "archivable" then
 					local serviceName = serviceNameForTrackedInstance(instance)
 					if serviceName ~= nil then
