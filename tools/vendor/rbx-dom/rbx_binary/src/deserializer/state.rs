@@ -164,6 +164,10 @@ struct Instance {
     has_name: bool,
     record_elided_defaults: bool,
     elided_defaults: Vec<Ustr>,
+
+    /// Whether `Deserializer::keep_below` leaves this instance its listed
+    /// properties alone.
+    bare: bool,
 }
 
 struct FlatPropChunk {
@@ -191,6 +195,9 @@ struct CanonicalProperty<'db> {
     migration: Option<&'db PropertySerialization<'db>>,
     default_value: Option<&'db Variant>,
     migration_default_values: Vec<(Ustr, &'db Variant)>,
+
+    /// Whether an instance that is `bare` keeps this property.
+    kept_bare: bool,
 }
 
 fn find_canonical_property<'de>(
@@ -246,6 +253,7 @@ fn find_canonical_property<'de>(
                 migration,
                 default_value: None,
                 migration_default_values: Vec::new(),
+                kept_bare: true,
             })
         }
         None => {
@@ -265,6 +273,7 @@ fn find_canonical_property<'de>(
                 migration: None,
                 default_value: None,
                 migration_default_values: Vec::new(),
+                kept_bare: true,
             })
         }
     }
@@ -367,6 +376,9 @@ fn exact_default(value: &Variant, default: &Variant) -> bool {
 }
 
 fn add_property(instance: &mut Instance, canonical_property: &CanonicalProperty, value: Variant) {
+    if instance.bare && !canonical_property.kept_bare {
+        return;
+    }
     if let Some(PropertySerialization::Migrate(migration)) = canonical_property.migration {
         let old_property_name = canonical_property.name;
         match migration.perform(&value) {
@@ -556,6 +568,7 @@ impl<'db, R: Read> DeserializerState<'db, R> {
                 has_name: false,
                 record_elided_defaults: self.deserializer.record_elided_defaults,
                 elided_defaults: Vec::new(),
+                bare: false,
             });
         }
         let end = self.instances.len();
@@ -729,6 +742,15 @@ This may cause unexpected or broken behavior in your final results if you rely o
                 })
         {
             return Ok(());
+        }
+        if let Some((_, kept)) = &self.deserializer.keep_below {
+            let migrated = property.migration.is_some_and(|serialization| {
+                let PropertySerialization::Migrate(migration) = serialization else {
+                    return false;
+                };
+                (migration.new_property_names().iter()).any(|name| kept.contains(*name))
+            });
+            property.kept_bare = migrated || kept.contains(property.name.as_str());
         }
         if self.deserializer.elide_defaults
             && !self
@@ -1988,6 +2010,37 @@ rbx-dom may require changes to fully support this property. Please open an issue
         Ok(())
     }
 
+    /// Marks every instance below the first top-level instance of each class
+    /// `Deserializer::keep_below` names, once the PRNT chunk has placed them.
+    pub(super) fn mark_kept_below(&mut self) {
+        let Some((classes, _)) = &self.deserializer.keep_below else {
+            return;
+        };
+        let mut seen = HashSet::new();
+        let mut below = Vec::new();
+        for &(_, key) in &self.root_instances {
+            let class = (self.type_infos.values())
+                .find(|info| info.instances.contains(&key))
+                .map(|info| info.type_name);
+            if seen.insert(class) && class.is_some_and(|class| classes.contains(class.as_str())) {
+                below.extend(self.instances[key].children.iter().map(|(_, key)| *key));
+            }
+        }
+        while let Some(key) = below.pop() {
+            self.instances[key].bare = true;
+            below.extend(self.instances[key].children.iter().map(|(_, key)| *key));
+        }
+    }
+
+    /// Whether a PROP chunk names a type an INST chunk has given.
+    pub(super) fn check_prop_chunk_type(&self, mut chunk: &[u8]) -> Result<(), InnerError> {
+        let type_id = chunk.read_le_u32()?;
+        match self.type_infos.contains_key(&type_id) {
+            true => Ok(()),
+            false => Err(InnerError::InvalidTypeId { type_id }),
+        }
+    }
+
     #[profiling::function]
     pub(super) fn decode_end_chunk(&mut self, _chunk: &[u8]) -> Result<(), InnerError> {
         log::trace!("END chunk");
@@ -2036,6 +2089,7 @@ rbx-dom may require changes to fully support this property. Please open an issue
                 has_name: false,
                 record_elided_defaults: false,
                 elided_defaults: Vec::new(),
+                bare: false,
             };
             let instance = core::mem::replace(&mut self.instances[instance_key], impostor);
             let id = self.tree.insert(parent_ref, instance.builder);
@@ -2074,6 +2128,7 @@ rbx-dom may require changes to fully support this property. Please open an issue
                     has_name: false,
                     record_elided_defaults: false,
                     elided_defaults: Vec::new(),
+                    bare: false,
                 });
             let index = instances.len();
             if parent_index.is_none() {

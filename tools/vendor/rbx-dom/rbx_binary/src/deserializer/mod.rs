@@ -88,6 +88,7 @@ pub struct Deserializer<'db> {
     retain_defaults_for_classes: HashSet<String>,
     retain_defaults_for_properties: HashSet<String>,
     flat_property_filter: Option<Arc<HashMap<String, HashSet<String>>>>,
+    keep_below: Option<(HashSet<String>, HashSet<String>)>,
 }
 
 impl<'db> Deserializer<'db> {
@@ -101,6 +102,7 @@ impl<'db> Deserializer<'db> {
             retain_defaults_for_classes: HashSet::new(),
             retain_defaults_for_properties: HashSet::new(),
             flat_property_filter: None,
+            keep_below: None,
         }
     }
 
@@ -150,6 +152,16 @@ impl<'db> Deserializer<'db> {
         self
     }
 
+    /// Give every instance below the first top-level instance of each of
+    /// these classes only these canonical properties and its name.
+    /// `deserialize` then reads the values once the file has placed its
+    /// instances, so a caller that drops those instances never holds what
+    /// they hold.
+    pub fn keep_below(mut self, classes: HashSet<String>, properties: HashSet<String>) -> Self {
+        self.keep_below = Some((classes, properties));
+        self
+    }
+
     /// Deserialize a Roblox binary model or place from the given stream using
     /// this deserializer.
     pub fn deserialize<R: Read>(&self, reader: R) -> Result<WeakDom, Error> {
@@ -191,6 +203,10 @@ impl<'db> Deserializer<'db> {
     fn read_state<R: Read>(&self, reader: R) -> Result<DeserializerState<'_, R>, Error> {
         profiling::scope!("rbx_binary::deserialize");
         let mut deserializer = DeserializerState::new(self, reader, false)?;
+        // With `keep_below`, the values wait for the chunk that places the
+        // instances.
+        let mut placed = self.keep_below.is_none();
+        let mut waiting = Vec::new();
 
         loop {
             let chunk = deserializer.next_chunk()?;
@@ -199,11 +215,24 @@ impl<'db> Deserializer<'db> {
                 b"META" => deserializer.decode_meta_chunk(&chunk.data)?,
                 b"SSTR" => deserializer.decode_sstr_chunk(&chunk.data)?,
                 b"INST" => deserializer.decode_inst_chunk(&chunk.data)?,
+                b"PROP" if !placed => {
+                    deserializer.check_prop_chunk_type(&chunk.data)?;
+                    waiting.push(chunk);
+                }
                 b"PROP" => deserializer.decode_prop_chunk(&chunk.data)?,
-                b"PRNT" => deserializer.decode_prnt_chunk(&chunk.data)?,
-                b"END\0" => {
-                    deserializer.decode_end_chunk(&chunk.data)?;
-                    break;
+                b"PRNT" | b"END\0" => {
+                    if &chunk.name == b"PRNT" {
+                        deserializer.decode_prnt_chunk(&chunk.data)?;
+                        deserializer.mark_kept_below();
+                        placed = true;
+                    }
+                    for held in waiting.drain(..) {
+                        deserializer.decode_prop_chunk(&held.data)?;
+                    }
+                    if &chunk.name == b"END\0" {
+                        deserializer.decode_end_chunk(&chunk.data)?;
+                        break;
+                    }
                 }
                 _ => match str::from_utf8(&chunk.name) {
                     Ok(name) => log::info!("Unknown binary chunk name {name}"),

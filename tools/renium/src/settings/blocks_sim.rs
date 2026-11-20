@@ -63,6 +63,12 @@ pub(crate) fn in_blocks(document: &SettingsBytecode, block_rows: usize) -> Resul
     encode_document_in_blocks(document, true, None, block_rows)
 }
 
+/// `in_blocks` by the encoder that leaves a reference by name as it stands,
+/// also where it names an instance of the document.
+pub(crate) fn in_dense_blocks(document: &SettingsBytecode, block_rows: usize) -> Result<Vec<u8>> {
+    encode_document_in_blocks(document, false, None, block_rows)
+}
+
 /// How many blocks the store `first` and the store `second` hold byte for
 /// byte, as a comparison of the two takes them.
 pub(crate) fn blocks_of_both(first: &[u8], second: &[u8]) -> usize {

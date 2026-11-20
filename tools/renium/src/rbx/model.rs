@@ -317,11 +317,11 @@ impl RbxPlaceFormat {
     }
 
     pub(crate) fn read(self, path: &Path) -> Result<RbxWeakDom> {
-        self.read_with_defaults(path, false)
+        self.read_with_defaults(path, false, None)
     }
 
     pub(crate) fn read_for_comparison(self, path: &Path) -> Result<RbxWeakDom> {
-        self.read_with_defaults(path, true)
+        self.read_with_defaults(path, true, None)
     }
 
     /// The format the file's own content declares, when it declares one. A
@@ -366,19 +366,28 @@ impl RbxPlaceFormat {
             .map(Some)
     }
 
-    fn read_with_defaults(self, path: &Path, elide_defaults: bool) -> Result<RbxWeakDom> {
+    /// `bare_below` names the services of a binary file whose instances are
+    /// read with nothing but their `BASE_GEOMETRY_PROPERTIES`.
+    fn read_with_defaults(
+        self,
+        path: &Path,
+        elide_defaults: bool,
+        bare_below: Option<&HashSet<String>>,
+    ) -> Result<RbxWeakDom> {
+        use crate::rbx::encode::{BASE_GEOMETRY_PROPERTIES, RETAINED_DEFAULT_PROPERTIES};
         let (format, reader) = self.open(path)?;
+        let named = |names: &[&str]| names.iter().map(|name| name.to_string()).collect();
         match format {
-            Self::Binary => rbx_binary::Deserializer::new()
-                .elide_defaults(elide_defaults)
-                .retain_defaults_for_properties(
-                    crate::rbx::encode::RETAINED_DEFAULT_PROPERTIES
-                        .iter()
-                        .map(|name| name.to_string())
-                        .collect(),
-                )
-                .deserialize(reader)
-                .with_context(|| format!("Failed to read {}", path.display())),
+            Self::Binary => {
+                let mut binary = rbx_binary::Deserializer::new()
+                    .elide_defaults(elide_defaults)
+                    .retain_defaults_for_properties(named(&RETAINED_DEFAULT_PROPERTIES));
+                if let Some(services) = bare_below {
+                    binary = binary.keep_below(services.clone(), named(&BASE_GEOMETRY_PROPERTIES));
+                }
+                (binary.deserialize(reader))
+                    .with_context(|| format!("Failed to read {}", path.display()))
+            }
             Self::Xml => rbx_xml::from_reader(
                 reader,
                 rbx_xml::DecodeOptions::new()
@@ -1199,7 +1208,7 @@ pub(crate) fn bytecode_export_model(mut args: BytecodeExportModelArgs) -> Result
         args.input.service_or_file.as_deref(),
         Some(args.service.as_str()),
     )?;
-    let document = SettingsBytecode::read_file(&settings_file)?;
+    let (mut document, mut rows) = crate::bytecode::read_store_checked(&settings_file)?;
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let root_index = resolve_bytecode_selector(
         &document,
@@ -1213,13 +1222,21 @@ pub(crate) fn bytecode_export_model(mut args: BytecodeExportModelArgs) -> Result
         None => RbxModelFormat::from_path(&args.output)?,
     };
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-    let service_dir = crate::project::storage::source_directory(&settings_file);
-    let source_paths = build_editor_source_paths_by_index(&document, &service, &service_dir);
-    let instance_paths_by_index = build_editor_instance_paths(&document, &service);
-
     let children_by_parent = settings_children_by_parent(&document);
     let mut subtree = Vec::new();
     collect_settings_subtree_preorder(&children_by_parent, root_index, &mut subtree);
+    // An export reads the values of its subtree and, for the size a mesh
+    // had before the models above it scaled it, of those models.
+    let mut read = subtree.clone();
+    let mut above = document.instances[root_index].parent_index;
+    while let Some(index) = above.filter(|_| read.len() <= document.instances.len()) {
+        read.push(index);
+        above = document.instances[index].parent_index;
+    }
+    crate::bytecode::fill_rows(&mut document, rows.as_mut(), &read)?;
+    let service_dir = crate::project::storage::source_directory(&settings_file);
+    let source_paths = build_editor_source_paths_by_index(&document, &service, &service_dir);
+    let instance_paths_by_index = build_editor_instance_paths(&document, &service);
 
     let mut export_refs = BytecodeModelExportRefs {
         service: Some(service.as_str()),
@@ -2476,20 +2493,100 @@ pub(crate) fn recorded_import_base(root: &Path) -> Result<Option<ImportBase>> {
     }))
 }
 
+/// A base place read before the build that goes into it, so that the two do
+/// not stand whole in memory together: the engine geometry of its parts, and
+/// the place without the values under the services the build brings.
+pub(crate) struct PlaceBase {
+    path: PathBuf,
+    dom: RbxWeakDom,
+    geometry: crate::rbx::encode::EngineGeometry,
+    emptied: Vec<String>,
+}
+
+/// The base a build will go into, read ahead of it: the one given, or the
+/// recorded one that is still the imported file. The build brings the
+/// services among `services` that have a store under `src_root`.
+pub(crate) fn read_base_ahead(
+    given: Option<&Path>,
+    recorded: &Result<Option<ImportBase>>,
+    src_root: &Path,
+    services: &[String],
+) -> Option<Result<PlaceBase>> {
+    let path = given.or_else(|| {
+        let recorded = recorded.as_ref().ok()?.as_ref()?;
+        (recorded.warning.is_none()).then_some(recorded.path.as_path())
+    })?;
+    let brought = (services.iter())
+        .filter(|service| service_settings_path(&src_root.join(service)).exists())
+        .cloned()
+        .collect();
+    Some(PlaceBase::read(path, &brought))
+}
+
+impl PlaceBase {
+    /// `brought` names the services the build will bring. The merge drops
+    /// what stands under the first of each in the place, so those instances
+    /// are read with no more than the engine geometry of the place asks for,
+    /// and keep only the UniqueId the place counts them by until then.
+    pub(crate) fn read(path: &Path, brought: &HashSet<String>) -> Result<Self> {
+        let format = RbxPlaceFormat::from_path(path)?;
+        // A file that read refuses is read whole, for what a whole read says
+        // of it.
+        let bare = (!brought.is_empty()).then_some(brought);
+        let mut dom =
+            (format.read_with_defaults(path, false, bare)).or_else(|_| format.read(path))?;
+        let geometry = crate::rbx::encode::capture_engine_geometry(&dom);
+        let unique_id = rbx_dom_weak::Ustr::from("UniqueId");
+        let mut seen = HashSet::new();
+        let mut emptied = Vec::new();
+        for service in dom.root().children().to_vec() {
+            let Some(instance) = dom.get_by_ref(service) else {
+                continue;
+            };
+            if !seen.insert(instance.class) || !brought.contains(instance.class.as_str()) {
+                continue;
+            }
+            emptied.push(instance.class.to_string());
+            let mut below = instance.children().to_vec();
+            while let Some(instance) = below.pop().and_then(|next| dom.get_by_ref_mut(next)) {
+                let kept = instance.properties.remove(&unique_id);
+                instance.properties = kept.map(|value| (unique_id, value)).into_iter().collect();
+                below.extend_from_slice(instance.children());
+            }
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            dom,
+            geometry,
+            emptied,
+        })
+    }
+}
+
+/// `merge_build_into_base_dom` of a base read ahead. A base that lost a
+/// service the build did not bring after all is read again.
+pub(crate) fn merge_build_into_read_base(
+    build: &RbxPlaceBuild,
+    dom: RbxWeakDom,
+    mut base: PlaceBase,
+) -> Result<(RbxWeakDom, Vec<RbxRef>)> {
+    let brought =
+        |service: &String| (build.service_roots.iter()).any(|(built, _)| built == service);
+    if !base.emptied.iter().all(brought) {
+        base = PlaceBase::read(&base.path, &HashSet::new())?;
+    }
+    let PlaceBase {
+        dom: base_dom,
+        geometry,
+        ..
+    } = base;
+    Ok(merge_build_into_base_dom(build, dom, base_dom, geometry))
+}
+
 /// Moves the built service roots into the base place, keeping the base's
 /// other services and the root fields the build does not carry. Engine
 /// geometry the build lacks (collision hulls, union meshes) comes from the
 /// same part in the base.
-pub(crate) fn merge_build_into_base(
-    build: &RbxPlaceBuild,
-    dom: RbxWeakDom,
-    base: &Path,
-) -> Result<(RbxWeakDom, Vec<RbxRef>)> {
-    let base_dom = RbxPlaceFormat::from_path(base)?.read(base)?;
-    let geometry = crate::rbx::encode::capture_engine_geometry(&base_dom);
-    Ok(merge_build_into_base_dom(build, dom, base_dom, geometry))
-}
-
 pub(crate) fn merge_build_into_base_dom(
     build: &RbxPlaceBuild,
     mut dom: RbxWeakDom,
@@ -2566,6 +2663,11 @@ pub(crate) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result
     } else {
         crate::snapshot::import::parse_services(&args.services)?
     };
+    let recorded = match args.base {
+        Some(_) => Ok(None),
+        None => recorded_import_base(&project_root),
+    };
+    let ahead = read_base_ahead(args.base.as_deref(), &recorded, active_root, &services);
     let mut build = build_rbx_place(active_root, services, None, false, false, false)?;
     let mut top_level_refs = build
         .service_roots
@@ -2579,9 +2681,7 @@ pub(crate) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result
     let mut base_source = args.base.is_some().then(|| "argument".to_string());
     let mut warning = None;
     let mut base = args.base.clone();
-    if base.is_none()
-        && let Some(recorded) = recorded_import_base(&project_root)?
-    {
+    if let Some(recorded) = recorded? {
         match recorded.warning {
             Some(reason) => warning = Some(reason),
             None => {
@@ -2590,8 +2690,8 @@ pub(crate) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result
             }
         }
     }
-    if let Some(base_path) = base.as_deref() {
-        let (merged, refs) = merge_build_into_base(&build, dom, base_path)?;
+    if let Some(ahead) = ahead {
+        let (merged, refs) = merge_build_into_read_base(&build, dom, ahead?)?;
         dom = merged;
         top_level_refs = refs;
     }
@@ -2962,8 +3062,18 @@ pub(crate) fn bytecode_repack(mut args: BytecodeRepackArgs) -> Result<()> {
         let before = fs::metadata(&settings_file)
             .with_context(|| format!("Failed to stat {}", settings_file.display()))?
             .len();
-        let document = SettingsBytecode::read_file(&settings_file)?;
-        let encoded = encode_settings_bytecode(&document)?;
+        // A store in blocks is encoded again from a few of them at a time;
+        // one that does not come out that way is decoded whole, as any
+        // other store is.
+        let by_blocks = (fs::read(&settings_file).ok()).and_then(|bytes| {
+            crate::settings::bytecode::blocks::encode_again(&bytes)
+                .ok()
+                .flatten()
+        });
+        let encoded = match by_blocks {
+            Some(encoded) => encoded,
+            None => encode_settings_bytecode(&SettingsBytecode::read_file(&settings_file)?)?,
+        };
         let changed = fs::read(&settings_file)? != encoded;
         write_bytes_if_changed(&settings_file, &encoded)?;
         let after = fs::metadata(&settings_file)

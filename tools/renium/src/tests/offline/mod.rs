@@ -19,6 +19,7 @@ mod edits;
 mod files;
 mod project;
 mod references;
+mod row_reads_sim;
 mod stores;
 mod structure_edits_sim;
 

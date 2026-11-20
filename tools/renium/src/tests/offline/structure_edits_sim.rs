@@ -20,7 +20,7 @@ use crate::tests::support::{SimRng, run_seeds};
 
 const SEEDS: u64 = 24;
 const STEPS: usize = 14;
-const SERVICES: [&str; 3] = ["Workspace", "ReplicatedStorage", "ServerStorage"];
+pub(super) const SERVICES: [&str; 3] = ["Workspace", "ReplicatedStorage", "ServerStorage"];
 /// Few names, so that siblings share them, and one no generated instance
 /// has, which the references that name nothing use.
 const NAMES: [&str; 6] = ["Model", "Part", "Door", "Value", "Config", "Ghost"];
@@ -28,7 +28,7 @@ const CLASSES: [&str; 5] = ["Folder", "Model", "Part", "ObjectValue", "ModuleScr
 /// The first instances of each store, which the commands pick more often
 /// than any other and under which the references to nothing name a child.
 const NEAR: usize = 4;
-const KINDS: [&str; 8] = [
+pub(super) const KINDS: [&str; 8] = [
     "add",
     "copy",
     "copy named",
@@ -50,7 +50,7 @@ fn reference(fields: Value) -> Value {
 }
 
 /// A store of `rows` instances under the root of `service`, without values.
-fn tree(rng: &mut SimRng, service: &str, rows: usize) -> SettingsBytecode {
+pub(super) fn tree(rng: &mut SimRng, service: &str, rows: usize) -> SettingsBytecode {
     let mut instances = vec![settings_instance(
         format!("{service}-root"),
         service,
@@ -121,7 +121,7 @@ fn generated_reference(
 
 /// Gives the instances of every store values: plain ones, long texts that
 /// several blocks name, and references of every kind.
-fn fill(rng: &mut SimRng, stores: &mut BTreeMap<&str, SettingsBytecode>) {
+pub(super) fn fill(rng: &mut SimRng, stores: &mut BTreeMap<&str, SettingsBytecode>) {
     let mut structure = BTreeMap::new();
     for (service, document) in stores.iter() {
         let paths = build_editor_instance_paths(document, service);
@@ -154,7 +154,7 @@ fn fill(rng: &mut SimRng, stores: &mut BTreeMap<&str, SettingsBytecode>) {
     root.insert("CurrentCamera".to_string(), camera);
 }
 
-fn project(tag: &str) -> Fixture {
+pub(super) fn project(tag: &str) -> Fixture {
     let root = temp_dir(tag);
     let config = root.join("renium.project.jsonc");
     fs::write(&config, "{\n  \"schemaVersion\": 1\n}\n").unwrap();
@@ -181,7 +181,12 @@ fn files_of(fixture: &Fixture) -> BTreeMap<String, Vec<u8>> {
 }
 
 /// One command of kind `kind` on instances drawn from the oracle's stores.
-fn command(rng: &mut SimRng, oracle: &Fixture, kind: usize, root: &str) -> Option<Vec<String>> {
+pub(super) fn command(
+    rng: &mut SimRng,
+    oracle: &Fixture,
+    kind: usize,
+    root: &str,
+) -> Option<Vec<String>> {
     let stored = |service: &&str| oracle.store(service).is_file();
     let services = SERVICES.into_iter().filter(stored).collect::<Vec<_>>();
     let service = rng.pick(&services)?;
@@ -286,7 +291,7 @@ fn difference(expected: &SettingsBytecode, read: &SettingsBytecode) -> String {
         })
 }
 
-fn run_on(fixture: &Fixture, args: &[String]) -> Outcome {
+pub(super) fn run_on(fixture: &Fixture, args: &[String]) -> Outcome {
     let root = fixture.root.to_string_lossy().into_owned();
     let store = fixture.store_arg("ReplicatedStorage");
     let args = (args.iter())

@@ -28,7 +28,9 @@ use crate::settings::tree::settings_children_by_parent;
 use crate::snapshot::refs::{
     remap_store_reference_ids, settings_instance_path, stabilize_record_references,
 };
-use crate::system::files::{fnv1a_hex, resolve_link_project_root, strip_extended_prefix};
+use crate::system::files::{
+    fnv1a_hex, resolve_link_project_root, strip_extended_prefix, write_bytes_if_changed,
+};
 use crate::system::tools::run_git_checked;
 
 const VC_GITATTRIBUTES_TEMPLATE: &str = "\
@@ -2585,15 +2587,33 @@ pub(crate) fn vc_merge(args: VcMergeArgs) -> Result<()> {
         Some("theirs") => Some(false),
         Some(other) => bail!("--prefer must be `ours` or `theirs`, got `{other}`"),
     };
-    let base = read_settings_doc_or_empty(&args.base, "base")?;
-    let ours = read_settings_doc_or_empty(&args.ours, "ours")?;
-    let theirs = read_settings_doc_or_empty(&args.theirs, "theirs")?;
     let label = args
         .path
         .clone()
         .unwrap_or_else(|| args.ours.display().to_string());
-
-    let (merged, conflicts) = merge_settings_documents(&base, &ours, &theirs, prefer);
+    // Whatever keeps the stores from being merged by their rows is said by
+    // the merge of the whole documents. The merge by rows writes over ours,
+    // in its blocks.
+    let cut_whole = |file: &[u8]| {
+        crate::settings::bytecode::blocks::BlockStore::open(file)
+            .is_ok_and(|store| store.cut_whole())
+    };
+    let by_rows = match &[&args.base, &args.ours, &args.theirs].map(fs::read) {
+        [Ok(base), Ok(ours), Ok(theirs)] if cut_whole(ours) => {
+            merge_stores_by_rows(base, ours, theirs, prefer)
+        }
+        _ => Ok(None),
+    };
+    let (merged, conflicts) = match by_rows.ok().flatten() {
+        Some((file, instances, conflicts)) => (MergedStore::File(file, instances), conflicts),
+        None => {
+            let base = read_settings_doc_or_empty(&args.base, "base")?;
+            let ours = read_settings_doc_or_empty(&args.ours, "ours")?;
+            let theirs = read_settings_doc_or_empty(&args.theirs, "theirs")?;
+            let (merged, conflicts) = merge_settings_documents(&base, &ours, &theirs, prefer);
+            (MergedStore::Document(merged), conflicts)
+        }
+    };
 
     if !conflicts.is_empty() {
         for conflict in &conflicts {
@@ -2609,7 +2629,20 @@ pub(crate) fn vc_merge(args: VcMergeArgs) -> Result<()> {
     }
 
     let out_path = args.output.clone().unwrap_or_else(|| args.ours.clone());
-    merged.write_file(&out_path)?;
+    let instances = match merged {
+        MergedStore::Document(merged) => {
+            merged.write_file(&out_path)?;
+            merged.instances.len()
+        }
+        MergedStore::File(file, instances) => {
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create {}", parent.display()))?;
+            }
+            write_bytes_if_changed(&out_path, &file)?;
+            instances
+        }
+    };
     if args.output.is_none() && !args.pretty {
         return Ok(());
     }
@@ -2617,11 +2650,183 @@ pub(crate) fn vc_merge(args: VcMergeArgs) -> Result<()> {
         &json!({
             "ok": true,
             "path": label,
-            "instances": merged.instances.len(),
+            "instances": instances,
             "output": out_path,
         }),
         args.pretty,
     )
+}
+
+/// How many instances the merges by rows of this process left unread.
+#[cfg(test)]
+pub(crate) static ROWS_NOT_READ: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// What a merge leaves to write: the merged document, or the file of a
+/// merge by rows with the number of its instances.
+enum MergedStore {
+    Document(SettingsBytecode),
+    File(Vec<u8>, usize),
+}
+
+/// The file of a merge by rows, the number of its instances, and its
+/// conflicts.
+type RowMerge = (Vec<u8>, usize, Vec<VcMergeConflict>);
+
+/// The rows of the base, ours and theirs that a merge reads, and the ids all
+/// three hold.
+type MergeReads = ([Vec<usize>; 3], Vec<String>);
+
+/// The merge of three stores in blocks, read by the instances that differ:
+/// its file, the number of its instances and its conflicts, as
+/// `merge_settings_documents` of the three documents and the whole encode
+/// of what it gives. An instance all three hold under one name, class and
+/// parent with the same values comes out of that merge as it stands, so the
+/// merge runs on the documents without the values of those instances, and
+/// its file is ours with the instances the merge read (`EditedStore`).
+/// `None` where the whole documents have to be merged: `rows_a_merge_reads`
+/// says so, or the merge left out an instance all three hold, which an
+/// instance that was not read may name.
+pub(crate) fn merge_stores_by_rows(
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    prefer: Option<bool>,
+) -> Result<Option<RowMerge>> {
+    use crate::settings::bytecode::blocks::{EditedStore, RowReader};
+
+    let Some(([base_read, ours_read, theirs_read], in_all)) =
+        rows_a_merge_reads(base, ours, theirs)?
+    else {
+        return Ok(None);
+    };
+    let (mut ours_document, mut edited) = EditedStore::decode(ours)?;
+    edited.materialize_in_passes(&mut ours_document, &ours_read)?;
+    let beside = |file: &[u8], read: &[usize]| -> Result<SettingsBytecode> {
+        let (mut document, mut rows) = RowReader::decode(file)?;
+        rows.fill(&mut document, read)?;
+        Ok(document)
+    };
+    let (base_document, theirs_document) =
+        rayon::join(|| beside(base, &base_read), || beside(theirs, &theirs_read));
+    let (merged, conflicts) =
+        merge_settings_documents(&base_document?, &ours_document, &theirs_document?, prefer);
+    if !conflicts.is_empty() {
+        return Ok(Some((Vec::new(), merged.instances.len(), conflicts)));
+    }
+    let merged_ids = (merged.instances.iter())
+        .map(|instance| instance.settings_id.as_str())
+        .collect::<HashSet<_>>();
+    if !in_all.iter().all(|id| merged_ids.contains(id.as_str())) {
+        return Ok(None);
+    }
+    let file = edited.encode_restructured(&merged)?;
+    Ok(Some((file, merged.instances.len(), conflicts)))
+}
+
+/// The rows of the base, ours and theirs that their merge reads, and the
+/// ids all three hold. Every other row is an instance all three hold with
+/// one digest of its whole row and of its UniqueId, each side digested as
+/// its instances stand in the base, so that a parent and a reference by
+/// place say the same of one instance in all three.
+///
+/// Read beside the instances that differ: the root, a script, which a merge
+/// gives a Source, and an instance that names another by an id, which a
+/// merge may settle. `None` where the whole documents have to be merged: a
+/// store is no store in blocks of this writer, has a frame that is not as its
+/// head says, which a whole decode refuses, or holds one id twice, or ours
+/// holds the name of a reference by place outside a reference, where a merge
+/// writes the id of that place beside it and `Moved` places nothing.
+fn rows_a_merge_reads(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<Option<MergeReads>> {
+    use crate::settings::bytecode::blocks::BlockStore;
+    use crate::settings::bytecode::property_edit::{Moved, StoreRows};
+
+    let open = |file| BlockStore::open(file).map(BlockStore::holding);
+    let stores = [open(base)?, open(ours)?, open(theirs)?];
+    let by_place = [vec!["instanceIndex".to_string()]];
+    let whole = |store: &BlockStore<'_>| !store.of_this_writer() || !store.intact();
+    if stores.iter().any(whole) || stores[1].holds_any(&by_place)? {
+        return Ok(None);
+    }
+    // A block all three hold byte for byte under one structure is not read.
+    let shared = (stores[1].blocks_held_by(&stores[0]).into_iter())
+        .zip(stores[2].blocks_held_by(&stores[0]))
+        .map(|(ours, theirs)| ours && theirs)
+        .collect::<Vec<_>>();
+    let rows_by_id = |rows: &StoreRows| {
+        let by_id = (rows.instances.iter().enumerate())
+            .map(|(row, instance)| (instance.settings_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        (by_id.len() == rows.instances.len()).then_some(by_id)
+    };
+    let Some(base_rows) = stores[0].row_digests(true, &shared, |_| Some((None, None)))? else {
+        return Ok(None);
+    };
+    let Some(in_base) = rows_by_id(&base_rows) else {
+        return Ok(None);
+    };
+    let beside = |store: &BlockStore<'_>| {
+        store.row_digests(true, &shared, |instances| {
+            let ids = |rows: &[SettingsBytecodeInstance]| {
+                rows.iter()
+                    .map(|row| row.settings_id.clone())
+                    .collect::<Vec<_>>()
+            };
+            let placed = ids(instances) != ids(&base_rows.instances);
+            let in_state = (instances.iter())
+                .map(|row| in_base.get(&row.settings_id).copied())
+                .collect();
+            let moved = placed.then(|| Moved::paired(in_state, base_rows.instances.len()));
+            Some((None, moved))
+        })
+    };
+    let (Some(ours_rows), Some(theirs_rows)) = (beside(&stores[1])?, beside(&stores[2])?) else {
+        return Ok(None);
+    };
+    let (Some(in_ours), Some(in_theirs)) = (rows_by_id(&ours_rows), rows_by_id(&theirs_rows))
+    else {
+        return Ok(None);
+    };
+    let sides = [&base_rows, &ours_rows, &theirs_rows];
+    let same_as_base = |row: usize, side: &StoreRows, at: Option<&usize>| {
+        at.is_some_and(|at| {
+            side.digests[*at] == base_rows.digests[row]
+                && side.unique_ids[*at] == base_rows.unique_ids[row]
+        })
+    };
+    let mut same = (base_rows.instances.iter().enumerate())
+        .map(|(row, instance)| {
+            instance.parent_index.is_some()
+                && !is_lua_source_class(&instance.class_name)
+                && same_as_base(row, &ours_rows, in_ours.get(&instance.settings_id))
+                && same_as_base(row, &theirs_rows, in_theirs.get(&instance.settings_id))
+        })
+        .collect::<Vec<_>>();
+    for side in sides {
+        for row in &side.named {
+            if let Some(row) = in_base.get(&side.instances[*row].settings_id) {
+                same[*row] = false;
+            }
+        }
+    }
+    #[cfg(test)]
+    ROWS_NOT_READ.fetch_add(
+        same.iter().filter(|same| **same).count(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let read = sides.map(|side| {
+        (0..side.instances.len())
+            .filter(|row| {
+                in_base
+                    .get(&side.instances[*row].settings_id)
+                    .is_none_or(|row| !same[*row])
+            })
+            .collect::<Vec<_>>()
+    });
+    let in_all = (in_base.into_keys())
+        .filter(|id| in_ours.contains_key(id) && in_theirs.contains_key(id))
+        .collect();
+    Ok(Some((read, in_all)))
 }
 
 #[cfg(test)]

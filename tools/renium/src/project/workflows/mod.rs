@@ -2433,6 +2433,11 @@ fn build_project_file(
         services
     };
     services.sort();
+    let recorded = match target_segments {
+        Some(_) => Ok(None),
+        None => crate::rbx::model::recorded_import_base(project_root),
+    };
+    let ahead = crate::rbx::model::read_base_ahead(None, &recorded, src_root, &services);
     let mut build =
         crate::rbx::model::build_rbx_place(src_root, services, None, false, false, false)?;
     let mut dom = std::mem::replace(
@@ -2440,18 +2445,13 @@ fn build_project_file(
         rbx_dom_weak::WeakDom::new(rbx_dom_weak::InstanceBuilder::new("DataModel")),
     );
     let mut base_roots = None;
-    if target_segments.is_none()
-        && let Some(recorded) = crate::rbx::model::recorded_import_base(project_root)?
-    {
-        match recorded.warning {
-            Some(reason) => crate::log_global(2, format_args!("[renium] {reason}")),
-            None => {
-                let (merged, refs) =
-                    crate::rbx::model::merge_build_into_base(&build, dom, &recorded.path)?;
-                dom = merged;
-                base_roots = Some(refs);
-            }
-        }
+    if let Some(reason) = recorded?.and_then(|recorded| recorded.warning) {
+        crate::log_global(2, format_args!("[renium] {reason}"));
+    }
+    if let Some(ahead) = ahead {
+        let (merged, refs) = crate::rbx::model::merge_build_into_read_base(&build, dom, ahead?)?;
+        dom = merged;
+        base_roots = Some(refs);
     }
     if let Some(parent) = output
         .parent()

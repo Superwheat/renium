@@ -312,6 +312,9 @@ struct Rewrite<'r> {
     ranges: Vec<Range<usize>>,
     /// Whether every row stays at its place, in the block that held it.
     kept: bool,
+    /// Whether every block is written from its rows, as a whole encode
+    /// writes it, and none taken as it stands without a read.
+    whole: bool,
     moved: AHashSet<&'r str>,
     /// The hash of each long string a reference may name an instance by.
     long: AHashSet<[u8; 16]>,
@@ -933,6 +936,33 @@ impl<'a> BlockStore<'a> {
         self
     }
 
+    /// Whether this writer wrote the file, whose frames it then copies.
+    pub(crate) fn of_this_writer(&self) -> bool {
+        self.writer == writer()
+    }
+
+    /// Whether this writer wrote the file in blocks of `block_rows` rows, so
+    /// that a write over it gives the file a whole encode in such blocks
+    /// gives.
+    fn cut_in(&self, block_rows: usize) -> bool {
+        let cut = block_ranges(self.rows, block_rows);
+        self.of_this_writer() && self.blocks.iter().map(Block::rows).eq(cut)
+    }
+
+    /// `cut_in` the blocks `encode_settings_bytecode` cuts.
+    pub(crate) fn cut_whole(&self) -> bool {
+        self.cut_in(BLOCK_ROWS)
+    }
+
+    /// Whether every frame of the file is as its head says.
+    pub(crate) fn intact(&self) -> bool {
+        let frames = std::iter::once(self.structure)
+            .chain(self.pool.iter().map(|pool| pool.frame))
+            .chain(self.blocks.iter().map(|block| block.frame))
+            .collect::<Vec<_>>();
+        (frames.par_iter()).all(|frame| self.frame_bytes(*frame).is_ok())
+    }
+
     /// Every instance with its id, name, class and parent, and no values.
     pub(crate) fn structure(&self) -> Result<SettingsBytecode> {
         self.structure_of(self.content(self.structure)?)
@@ -1022,12 +1052,14 @@ impl<'a> BlockStore<'a> {
     /// comes out otherwise. Where rows moved, every block is written from
     /// the blocks that held its rows. Blocks are read a few at a time, each
     /// batch on a budget of its own, and every frame that comes out the same
-    /// is copied.
+    /// is copied. `whole` writes every block and the structure from what
+    /// the store holds, also where the edit leaves them alone.
     fn rewrite(
         &self,
         document: &SettingsBytecode,
         placed: Placed<'_>,
         moved: &[&str],
+        whole: bool,
     ) -> Result<Vec<u8>> {
         let settled = settled_settings_document(document)?;
         let ranges = block_ranges(settled.instances.len(), self.block_rows());
@@ -1046,6 +1078,7 @@ impl<'a> BlockStore<'a> {
             placed,
             ranges,
             kept,
+            whole,
             moved: moved.iter().copied().collect(),
             long,
             dense: document_reference_lookup(&settled, false),
@@ -1083,7 +1116,10 @@ impl<'a> BlockStore<'a> {
         let entries = (counts.iter())
             .map(|(hash, count)| (*hash, (*count, brought.get(hash).map(String::as_str))))
             .collect::<PoolEntries<'_>>();
-        let structure = if kept && settled.instances.len() == self.rows && moved.is_empty() {
+        let structure = if whole {
+            let content = structure_content(&settled, &edit.dense)?;
+            framed(&content, Some((self, self.structure)))?
+        } else if kept && settled.instances.len() == self.rows && moved.is_empty() {
             self.raw(self.structure)?
         } else {
             compressed(&structure_content(&settled, &edit.dense)?)?
@@ -1119,7 +1155,7 @@ impl<'a> BlockStore<'a> {
         }
         sources.sort_unstable();
         sources.dedup();
-        let untouched = edit.kept && !range.clone().any(|row| held[row]);
+        let untouched = !edit.whole && edit.kept && !range.clone().any(|row| held[row]);
         if untouched && edit.moved.is_empty() {
             return Ok(None);
         }
@@ -1980,6 +2016,42 @@ pub(crate) fn decode_if_contains(
     store.decode_opened(structure, opened).map(Some)
 }
 
+/// Whether a whole decode refuses the file at `path` where a read of some
+/// of its rows may not: a store in blocks with a frame that is not as its
+/// head says, or a file that cannot be read. A command that read its store
+/// whole before it read rows still decodes such a file whole.
+pub(crate) fn damaged(path: &std::path::Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return true;
+    };
+    let intact = || BlockStore::open(bytes.as_slice()).is_ok_and(|store| store.intact());
+    is_block_store(&bytes) && !intact()
+}
+
+/// The file a whole encode gives of the document a v12 file holds, written
+/// from a few blocks at a time and never from the document. `None` for a
+/// file another writer wrote or one cut into other blocks than this writer
+/// cuts, which is decoded whole.
+pub(crate) fn encode_again(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    encode_again_cut(bytes, BLOCK_ROWS)
+}
+
+/// `encode_again` for a whole encode in blocks of `block_rows` rows.
+pub(crate) fn encode_again_cut(bytes: &[u8], block_rows: usize) -> Result<Option<Vec<u8>>> {
+    let store = BlockStore::open(bytes)?;
+    if !store.cut_in(block_rows) {
+        return Ok(None);
+    }
+    let rows = (0..store.rows).map(Some).collect::<Vec<_>>();
+    let placed = Placed {
+        from: &rows,
+        to: &rows,
+        held: &vec![false; store.rows],
+    };
+    let written = store.rewrite(&store.structure()?, placed, &[], true)?;
+    Ok(Some(written))
+}
+
 /// `property_edit::decode_rows` of a v12 file: the instances at `rows`, each
 /// as the whole decode gives it, and the id of every instance.
 pub(crate) fn decode_rows(
@@ -2071,6 +2143,21 @@ impl EditedStore {
             self.complete[row] = true;
         }
         Ok(())
+    }
+
+    /// `materialize` of instances that may stand in every block, the
+    /// instances of a few blocks at a time.
+    pub(crate) fn materialize_in_passes(
+        &mut self,
+        document: &mut SettingsBytecode,
+        indices: &[usize],
+    ) -> Result<()> {
+        let rows = self.store.chosen(indices)?;
+        let pass = |row: &usize| self.store.block_of(*row) / READ_AHEAD_BLOCKS;
+        let passes = (rows.chunk_by(|left, right| pass(left) == pass(right)))
+            .map(<[usize]>::to_vec)
+            .collect::<Vec<_>>();
+        (passes.iter()).try_for_each(|rows| self.materialize(document, rows))
     }
 
     /// `materialize` of each instance that holds a value `wanted` takes,
@@ -2172,7 +2259,7 @@ impl EditedStore {
         if self.store.writer != writer() {
             return self.whole(document, placed);
         }
-        self.store.rewrite(document, placed, &moved)
+        self.store.rewrite(document, placed, &moved, false)
     }
 
     /// The strings by which a reference may name an instance that the

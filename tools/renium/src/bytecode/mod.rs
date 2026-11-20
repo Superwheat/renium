@@ -343,6 +343,15 @@ fn with_run_contexts(
     Ok((document, rows))
 }
 
+/// `read_store`, or the whole decode of a store that decode refuses
+/// (`blocks::damaged`), for a command that read its store whole.
+pub(crate) fn read_store_checked(path: &Path) -> Result<(SettingsBytecode, Option<RowReader>)> {
+    if crate::settings::bytecode::blocks::damaged(path) {
+        return Ok((SettingsBytecode::read_file(path)?, None));
+    }
+    read_store(path)
+}
+
 /// A store as a command that adds, removes or moves instances reads it
 /// (`read_for_structural_edit`): a store read by its instances gives each
 /// Script its RunContext, which names its source file.

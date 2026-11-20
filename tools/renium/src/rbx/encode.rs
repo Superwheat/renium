@@ -951,6 +951,23 @@ pub(crate) fn engine_geometry_properties(class: &str) -> &'static [&'static str]
     }
 }
 
+/// Every property `capture_engine_geometry` reads of an instance, which are those of
+/// `engine_geometry_properties` and of `GeometrySources::of`, and the
+/// UniqueId a place counts its instances by.
+pub(crate) const BASE_GEOMETRY_PROPERTIES: [&str; 11] = [
+    "UniqueId",
+    COLLISION_HULL_PROPERTY,
+    "AeroMeshData",
+    "ChildData2",
+    "MeshData2",
+    "SolidMeshHolder",
+    "Materials",
+    "MeshContent",
+    "MeshId",
+    "AssetId",
+    "CollisionFidelity",
+];
+
 fn has_data(instance: &rbx_dom_weak::Instance, name: &str) -> bool {
     matches!(
         instance.properties.get(&rbx_dom_weak::Ustr::from(name)),
@@ -1104,9 +1121,9 @@ fn matching_geometry(
     matched
 }
 
-/// Gives every part the build lacks engine geometry for the data of the part
-/// at the same path in the base when their sources agree, and otherwise the
-/// one value the base holds for that asset, if there is exactly one.
+/// The engine geometry a base place holds, by the path of its part and by
+/// the asset it was built from.
+#[derive(Default)]
 pub(crate) struct EngineGeometry {
     by_path: HashMap<(Vec<String>, Vec<usize>), (GeometrySources, GeometryValues)>,
     by_identity: HashMap<(rbx_dom_weak::Ustr, rbx_dom_weak::Ustr, String), GeometryCandidates>,
@@ -1114,12 +1131,10 @@ pub(crate) struct EngineGeometry {
 
 pub(crate) fn capture_engine_geometry(base: &RbxWeakDom) -> EngineGeometry {
     let mut base_paths = crate::rbx::model::RbxDomPaths::new(base);
-    let mut by_path: HashMap<(Vec<String>, Vec<usize>), (GeometrySources, GeometryValues)> =
-        HashMap::new();
-    let mut by_identity: HashMap<
-        (rbx_dom_weak::Ustr, rbx_dom_weak::Ustr, String),
-        GeometryCandidates,
-    > = HashMap::new();
+    let EngineGeometry {
+        mut by_path,
+        mut by_identity,
+    } = EngineGeometry::default();
     for instance in base.descendants() {
         let values = engine_geometry_properties(instance.class.as_str())
             .iter()
@@ -1161,9 +1176,14 @@ pub(crate) fn fill_engine_geometry_from(dom: &mut RbxWeakDom, base: &RbxWeakDom)
     fill_engine_geometry_from_cache(dom, &capture_engine_geometry(base));
 }
 
+/// Gives every part the build lacks engine geometry for the data of the part
+/// at the same path in the base when their sources agree, and otherwise the
+/// one value the base holds for that asset, if there is exactly one.
 pub(crate) fn fill_engine_geometry_from_cache(dom: &mut RbxWeakDom, geometry: &EngineGeometry) {
-    let by_path = &geometry.by_path;
-    let by_identity = &geometry.by_identity;
+    let EngineGeometry {
+        by_path,
+        by_identity,
+    } = geometry;
     if by_path.is_empty() {
         return;
     }

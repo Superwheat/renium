@@ -42,7 +42,7 @@ pub(crate) fn import_place_file(mut args: ImportPlaceArgs) -> Result<()> {
     let project_root = resolve_existing_project_root(&args.project_root)?;
     config::validate_relative_portable_path(&args.src_dir, "srcDir")?;
     let services = parse_services(&args.services)?;
-    let flat = read_place(&args.input, &services)?;
+    let mut flat = read_place(&args.input, &services)?;
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let paths = PlacePaths::new(&flat);
     let subtrees = service_subtrees(&flat);
@@ -66,7 +66,7 @@ pub(crate) fn import_place_file(mut args: ImportPlaceArgs) -> Result<()> {
                 imported += indices.len() - 1;
                 convert_service(
                     service,
-                    &flat.instances,
+                    &mut flat.instances,
                     (
                         indices,
                         stored_service(&stored_root, service, copied.as_ref())?.as_ref(),
@@ -306,8 +306,9 @@ fn external_targets<T: Clone>(
         .collect()
 }
 
-/// The store the project has of a service, when it has one with a root,
-/// read once the stage holds its copy of the project.
+/// The instances of the store the project has of a service, without their
+/// values, when it has one with a root, read once the stage holds its copy
+/// of the project.
 fn stored_service(
     stored_root: &Path,
     service: &str,
@@ -317,7 +318,11 @@ fn stored_service(
     if let Some(copied) = copied {
         copied()?;
     }
-    Ok(SettingsBytecode::read_file(&path)
+    let read = match crate::settings::bytecode::blocks::damaged(&path) {
+        true => SettingsBytecode::read_file,
+        false => SettingsBytecode::read_structure_file,
+    };
+    Ok(read(&path)
         .ok()
         .filter(|store| settings_root_indices(store).len() == 1))
 }
@@ -409,9 +414,11 @@ fn stored_ids(
         .collect()
 }
 
+/// The parts of a service, whose instances' values it takes out of the
+/// place as it goes: no other service reads them.
 fn convert_service(
     service: &str,
-    instances: &[FlatInstance],
+    instances: &mut [FlatInstance],
     (indices, stored): (&[usize], Option<&SettingsBytecode>),
     paths: &PlacePaths,
     database: &ReflectionDatabase<'_>,
@@ -452,15 +459,13 @@ fn convert_service(
     let mut converted = Vec::with_capacity(indices.len());
     let mut native_by_instance = Vec::with_capacity(indices.len());
     for (local, &global) in indices.iter().enumerate() {
+        let saved = std::mem::take(&mut instances[global].properties);
         let instance = &instances[global];
         let class_name = instance.class.as_str();
         let filter = filters
             .entry(class_name.to_string())
             .or_insert_with(|| native_property_filter(database, class_name));
-        let properties = instance
-            .properties
-            .iter()
-            .map(|(name, value)| (name, value));
+        let properties = saved.iter().map(|(name, value)| (name, value));
         let (mut native_properties, mut properties, mut attributes, source) =
             rbx_properties_to_unshared_native_settings_records(
                 class_name,
