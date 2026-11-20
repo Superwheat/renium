@@ -7133,6 +7133,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		local packages = {}
 		local packageKeys = {}
+		local childIndex = BridgeIdentity.newChildIndex()
 		for index, descriptor in ipairs(rawTargets) do
 			if type(descriptor) ~= "table" then
 				error(`Editor mutation package target {index} must be an object`)
@@ -7145,12 +7146,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			local pathSegments = table.clone(descriptor.pathSegments)
 			local pathOrdinals = cloneArray(descriptor.pathOrdinals)
 			local exact = true
-			local instance = resolvePathSegments(pathSegments, nil, pathOrdinals)
+			local instance = resolvePathSegments(pathSegments, nil, pathOrdinals, childIndex)
 			while instance == nil and #pathSegments > 1 do
 				exact = false
 				table.remove(pathSegments)
 				table.remove(pathOrdinals)
-				instance = resolvePathSegments(pathSegments, nil, pathOrdinals)
+				instance = resolvePathSegments(pathSegments, nil, pathOrdinals, childIndex)
 			end
 			if exact and instance ~= nil and instance:IsA("PackageLink") then
 				error("PackageLink instances are read-only")
@@ -7169,6 +7170,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					if not packageKeys[key] then
 						packageKeys[key] = true
 						local creator, owned = packageOwnership(instance:FindFirstChildWhichIsA("PackageLink") :: Instance)
+						-- Reading an owner can yield, and Studio may change meanwhile.
+						childIndex = BridgeIdentity.newChildIndex()
 						packages[#packages + 1] = {
 							pathSegments = packageSegments,
 							pathOrdinals = packageOrdinals,
@@ -7325,13 +7328,14 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	): ({ [string]: boolean }, { [Instance]: boolean })
 		local changedSourceKeys = {}
 		local changedSourceInstances = {}
+		local childIndex = BridgeIdentity.newChildIndex()
 		for _, change in ipairs(changes) do
 			local pathSegments = change.pathSegments
 			if type(pathSegments) ~= "table" or not includedServices[tostring(change.service or "")] then
 				error("Invalid editor transaction source")
 			end
 			changedSourceKeys[pathCacheKey(pathSegments, change.pathOrdinals)] = true
-			local changedInstance = resolvePathSegments(pathSegments, nil, change.pathOrdinals)
+			local changedInstance = resolvePathSegments(pathSegments, nil, change.pathOrdinals, childIndex)
 			if changedInstance ~= nil and changedInstance:IsA("LuaSourceContainer") then
 				changedSourceInstances[changedInstance] = true
 			end
@@ -7364,6 +7368,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local restrictedServices = {}
 		local packageSnapshotRoots = {}
 		local explicitPackageRoots = params.packageRoots ~= nil
+		local childIndex = BridgeIdentity.newChildIndex()
 		for index, descriptor in ipairs(params.mutationRoots or {}) do
 			local serviceName = tostring(descriptor.service or "")
 			if not includedServices[serviceName] then
@@ -7371,7 +7376,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 			validateMutationPath(descriptor, serviceName, `Editor transaction mutation root {index}`, ctx)
 			restrictedServices[serviceName] = true
-			local root = resolvePathSegments(descriptor.pathSegments, nil, descriptor.pathOrdinals)
+			local root = resolvePathSegments(descriptor.pathSegments, nil, descriptor.pathOrdinals, childIndex)
 			if root ~= nil and root.Parent == game:GetService(serviceName) then
 				local serviceRoots = rootsByService[serviceName]
 				if serviceRoots == nil then
@@ -7406,7 +7411,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					`Editor transaction package root {index}`,
 					ctx
 				)
-				local root = resolvePathSegments(descriptor.pathSegments, nil, descriptor.pathOrdinals)
+				local root = resolvePathSegments(descriptor.pathSegments, nil, descriptor.pathOrdinals, childIndex)
 				if root == nil or not hasDirectPackageLink(root) then
 					error(`Editor transaction package root {index} changed before the transaction began`)
 				end
@@ -9360,6 +9365,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			transaction.historyRecording = nil
 			local prepared, byTarget = {}, {}
 			local paths = BridgeIdentity.newPathSnapshot()
+			local phaseStarted = os.clock()
 			for _, group in ipairs(session.groups) do
 				if ctx.studioChangeGeneration(group.serviceName) ~= group.changeGeneration then
 					error(`Studio changed {group.serviceName} before native insertion; retry the sync`)
@@ -9403,6 +9409,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			}
 			transaction.resolveStagedPath = resolveStagedPath
 			transaction.mutated = true
+			BridgeConnection.profileStep("native prepare: old root paths", phaseStarted)
+			phaseStarted = os.clock()
 			-- Keep the original trees themselves. No per-descendant undo copy.
 			runWithStudioChangeSuppression(ctx, function()
 				for _, group in ipairs(prepared) do
@@ -9411,6 +9419,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					end
 				end
 			end)
+			BridgeConnection.profileStep("native prepare: old roots detached", phaseStarted)
 			for serviceName, generation in pairs(transaction.studioGenerations) do
 				if ctx.studioChangeGeneration(serviceName) ~= generation then
 					error(`Studio changed {serviceName} while preparing native insertion; retry the sync`)
