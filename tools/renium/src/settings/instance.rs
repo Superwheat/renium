@@ -72,6 +72,24 @@ pub(crate) struct AddedInstance {
     pub(crate) settings_id: String,
 }
 
+impl InstanceQuery {
+    /// Whether matching an instance reads its stored values.
+    pub(crate) fn reads_values(&self) -> bool {
+        self.tag.is_some() || !self.properties.is_empty() || !self.attributes.is_empty()
+    }
+
+    /// Whether matching an instance reads its stored property `name`; its
+    /// attributes are the property "Attributes".
+    pub(crate) fn reads(&self, name: &str) -> bool {
+        name == "Tags" && self.tag.is_some()
+            || name == "Attributes" && !self.attributes.is_empty()
+            || self
+                .properties
+                .iter()
+                .any(|predicate| predicate.name == name)
+    }
+}
+
 impl PropertyPredicate {
     pub(crate) fn exists(name: impl Into<String>) -> Self {
         Self {
@@ -86,15 +104,6 @@ impl PropertyPredicate {
             value: Some(value),
         }
     }
-}
-
-pub(crate) fn find_instances(document: &SettingsBytecode, query: &InstanceQuery) -> Vec<usize> {
-    document
-        .instances
-        .iter()
-        .enumerate()
-        .filter_map(|(index, instance)| matches_query(document, instance, query).then_some(index))
-        .collect()
 }
 
 pub(crate) fn add_instance(
@@ -524,7 +533,7 @@ pub(crate) fn set_instance_property(
     }
 }
 
-fn matches_query(
+pub(crate) fn matches_query(
     document: &SettingsBytecode,
     instance: &SettingsBytecodeInstance,
     query: &InstanceQuery,

@@ -778,6 +778,174 @@ fn block_stores_keep_the_laws_against_v11() {
     run_seeds(SEEDS, run_seed);
 }
 
+/// A few rows of a store of `count` instances, or every row.
+fn asked(rng: &mut SimRng, count: usize) -> Vec<usize> {
+    if rng.below(4) == 0 {
+        return (0..count).rev().collect();
+    }
+    (0..rng.below(8)).map(|_| rng.below(count)).collect()
+}
+
+/// The row reader of the read commands against the whole decode, on the
+/// documents of `run_seed` in blocks of a size each seed draws. The
+/// structure is the whole decode without values; filled rows are those of
+/// the whole decode, and the other rows hold none; a walk visits the rows it
+/// is given in rising order, each with the whole decode's values, stops where
+/// it is told and leaves the document as it was; a property given alone is
+/// the whole decode's value of it. A batch of store queries over the file
+/// answers as over the v11 file of the document, which is read whole.
+fn run_row_reader_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
+    use clap::Parser;
+    let texts = long_texts(seed);
+    let document = document(seed, &texts);
+    let mut rng = SimRng(seed ^ 0x40e5);
+    let block_rows = [1, 2, 7, 64, BLOCK_ROWS][rng.below(5)];
+    let count = document.instances.len();
+    log.push(format!("{count} instances in blocks of {block_rows}"));
+    let (Ok(v11), Ok(bytes)) = (
+        encode_settings_bytecode_v11(&document),
+        in_blocks(&document, block_rows),
+    ) else {
+        return Ok(());
+    };
+    if count == 0 {
+        return Ok(());
+    }
+    let whole = decode_settings_bytecode(&bytes).map_err(failed("the whole decode"))?;
+    let (mut read, mut reader) = RowReader::decode(&bytes).map_err(failed("the structure"))?;
+    if read != bare(&whole) {
+        return Err("the structure differs from the whole decode without values".into());
+    }
+    let mut filled = vec![false; count];
+    for _ in 0..2 {
+        let rows = asked(&mut rng, count);
+        log.push(format!("filled {rows:?}"));
+        reader.fill(&mut read, &rows).map_err(failed("a fill"))?;
+        for row in rows {
+            filled[row] = true;
+        }
+        let expected = SettingsBytecode {
+            version: whole.version,
+            instances: (whole.instances.iter().zip(&filled))
+                .map(|(instance, filled)| match filled {
+                    true => instance.clone(),
+                    false => instance.bare(),
+                })
+                .collect(),
+        };
+        if !same_document(&read, &expected) {
+            return Err("filled rows differ from the whole decode's, or others hold values".into());
+        }
+    }
+    let rows = chosen(&asked(&mut rng, count));
+    let stop = rng.below(rows.len() + 1);
+    log.push(format!("walked {rows:?} to the {}th", stop + 1));
+    let before = read.clone();
+    let mut visited = Vec::new();
+    reader
+        .walk(
+            &mut read,
+            &rows,
+            |_| true,
+            |document, row| {
+                visited.push((row, document.instances[row].clone()));
+                visited.len() <= stop
+            },
+        )
+        .map_err(failed("a walk"))?;
+    let (visited_rows, visited): (Vec<_>, Vec<_>) = visited.into_iter().unzip();
+    let expected = &rows[..rows.len().min(stop + 1)];
+    if visited_rows != expected {
+        return Err(format!("a walk visited {visited_rows:?}"));
+    }
+    let visited = SettingsBytecode {
+        version: whole.version,
+        instances: visited,
+    };
+    if !same_document(&visited, &rows_of(&whole, expected)) {
+        return Err("a walk gave rows other values than the whole decode".into());
+    }
+    if !same_document(&read, &before) {
+        return Err("a walk left the document otherwise".into());
+    }
+    let properties = (whole.instances.iter())
+        .flat_map(|instance| instance.properties.iter())
+        .collect::<Vec<_>>();
+    let attributes = (whole.instances.iter())
+        .flat_map(|instance| instance.attributes.keys())
+        .collect::<Vec<_>>();
+    let property = rng.pick(&properties);
+    if let Some((name, _)) = property {
+        let rows = asked(&mut rng, count);
+        let mut given = bare(&whole);
+        reader
+            .give(&mut given, &rows, name)
+            .map_err(failed("a property given"))?;
+        let mut expected = bare(&whole);
+        for row in rows {
+            let value = whole.instances[row].properties.get(name);
+            let properties = &mut expected.instances[row].properties;
+            properties.extend(value.map(|value| (name.clone(), value.clone())));
+        }
+        if !same_document(&given, &expected) {
+            return Err(format!("the property {name:?} given alone differs"));
+        }
+    }
+    let row = rng.below(count);
+    let instance = &whole.instances[row];
+    let mut ops = vec![
+        json!({"type": "instance", "index": row, "output": "full"}),
+        json!({"type": "children", "index": row, "output": "full"}),
+        json!({"type": "service", "fields": "id,props,attrs"}),
+        json!({"type": "find", "className": &instance.class_name, "limit": 2, "output": "full"}),
+        json!({"type": "search", "query": &instance.name, "limit": 3, "fields": "id,attrs"}),
+    ];
+    if let Some((name, value)) = property {
+        ops.push(
+            json!({"type": "find", "properties": [format!("{name}={value}")],
+            "limit": 0, "output": "full"}),
+        );
+        ops.push(
+            json!({"type": "search", "query": format!("{name}="), "limit": 0,
+            "output": "full"}),
+        );
+    }
+    if let Some(name) = rng.pick(&attributes) {
+        ops.push(json!({"type": "find", "attributes": [name], "limit": 0, "fields": "id,attrs"}));
+    }
+    let request = json!({ "ops": ops }).to_string();
+    let dir = crate::tests::support::temp_dir("row-reader");
+    let file = dir.join("Store.renium");
+    let answer = |bytes: &[u8]| {
+        fs::write(&file, bytes).map_err(|error| error.to_string())?;
+        let path = file.to_string_lossy();
+        let args = crate::cli::BytecodeExplorerBatchArgs::try_parse_from([
+            "bb", "-f", &path, "-j", &request,
+        ])
+        .map_err(|error| error.to_string())?;
+        Ok::<_, String>(
+            crate::bytecode::explorer::bytecode_explorer_batch_result(args)
+                .unwrap_or_else(|error| json!(format!("{error:#}"))),
+        )
+    };
+    let answers = answer(&v11).and_then(|first| Ok((first, answer(&bytes)?)));
+    let _ = fs::remove_dir_all(&dir);
+    let (from_whole, from_rows) = answers?;
+    if from_whole != from_rows {
+        let op = (0..ops.len()).find(|op| from_whole["rs"][op] != from_rows["rs"][op]);
+        let kind = op.map(|op| &ops[op]["type"]);
+        return Err(format!(
+            "a batch answers otherwise read by rows, from op {op:?} {kind:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn row_reads_give_what_the_whole_decode_gives() {
+    run_seeds(SEEDS, run_row_reader_seed);
+}
+
 /// A frame of no content, with its checksum, under a digest that matches,
 /// which claims `decoded` bytes of content.
 fn claiming(decoded: usize) -> Section<'static> {

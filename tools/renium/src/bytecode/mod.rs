@@ -26,7 +26,7 @@ use crate::bytecode::edit::{
 };
 use crate::bytecode::explorer::{
     BytecodeNodeProjection, TextForm, explorer_search_groups, explorer_search_instance_matches,
-    insert_top_field, parse_requested_fields,
+    explorer_search_reads, explorer_search_value_names, insert_top_field, parse_requested_fields,
 };
 use crate::bytecode::query::{
     BytecodeInstanceTarget, parse_property_predicates, parse_property_scope,
@@ -58,6 +58,7 @@ use crate::rbx::model::{
     BytecodeModelImportRefs, canonicalize_settings_references_for_move,
     canonicalize_settings_references_for_moves, source_structure_settings_document,
 };
+use crate::settings::bytecode::blocks::RowReader;
 use crate::settings::bytecode::property_edit::{RetainedPropertyColumns, read_for_property_edit};
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode,
@@ -311,10 +312,63 @@ fn canonical_stored_property_name(
     Ok(logical.map(str::to_string).filter(|name| name != property))
 }
 
+/// A store as `f`, `tr`, `in`, `bg` and `bb` read it
+/// (`SettingsBytecode::read_by_rows`): a store read by its rows gives each
+/// Script its RunContext, which names its source file.
+pub(crate) fn read_store(path: &Path) -> Result<(SettingsBytecode, Option<RowReader>)> {
+    let (mut document, rows) = SettingsBytecode::read_by_rows(path)?;
+    if let Some(rows) = &rows {
+        let scripts = (0..document.instances.len())
+            .filter(|index| document.instances[*index].class_name == "Script")
+            .collect::<Vec<_>>();
+        rows.give(
+            &mut document,
+            &scripts,
+            crate::editor::paths::SOURCE_PATH_CONTEXT_PROPERTY,
+        )?;
+    }
+    Ok((document, rows))
+}
+
+/// Gives the instances at `indices` their stored values where the store is
+/// read by its rows; a store read whole holds them already.
+pub(crate) fn fill_rows(
+    document: &mut SettingsBytecode,
+    rows: Option<&mut RowReader>,
+    indices: &[usize],
+) -> Result<()> {
+    rows.map_or(Ok(()), |rows| rows.fill(document, indices))
+}
+
+/// Calls `visit` on the instances at `indices`, in rising order, until it
+/// gives false. Where `reads` names the properties it reads and the store is
+/// read by its rows, each instance holds its stored values of them while it
+/// is visited, a block of them at a time.
+pub(crate) fn visit_rows(
+    document: &mut SettingsBytecode,
+    rows: Option<&RowReader>,
+    indices: &[usize],
+    reads: Option<impl Fn(&str) -> bool + Sync>,
+    mut visit: impl FnMut(&SettingsBytecode, usize) -> bool,
+) -> Result<()> {
+    match rows.zip(reads) {
+        Some((rows, reads)) => rows.walk(document, indices, reads, visit),
+        None => {
+            for index in indices {
+                if !visit(document, *index) {
+                    break;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 struct HighLevelBytecodeContext {
     service: String,
     settings_file: PathBuf,
     document: SettingsBytecode,
+    rows: Option<RowReader>,
     children_by_parent: Vec<Vec<usize>>,
     path_segments_by_index: Vec<Option<Vec<String>>>,
     path_ordinals_by_index: Vec<Option<Vec<usize>>>,
@@ -324,6 +378,10 @@ struct HighLevelBytecodeContext {
 }
 
 impl HighLevelBytecodeContext {
+    fn fill(&mut self, indices: &[usize]) -> Result<()> {
+        fill_rows(&mut self.document, self.rows.as_mut(), indices)
+    }
+
     fn projection<'a>(
         &'a self,
         mode: OutputMode,
@@ -360,18 +418,19 @@ fn high_level_context(
         .as_ref()
         .map_or(canonical_service_dir, |stage| stage.root().join(service));
     let projected_settings = service_settings_path(&service_dir);
-    let document = if projected_settings.exists() {
-        SettingsBytecode::read_file(&projected_settings)
+    let (document, rows) = if projected_settings.exists() {
+        read_store(&projected_settings)
             .with_context(|| format!("Failed to read {}", projected_settings.display()))?
     } else if let Some(loaded) = loaded.as_ref()
         && service_dir.is_dir()
     {
-        source_structure_settings_document(
+        let document = source_structure_settings_document(
             &service_dir,
             service,
             &config::project_script_naming(&loaded.project),
             &[],
-        )?
+        )?;
+        (document, None)
     } else if loaded.is_none() {
         bail!(
             "No Renium project in {} or its parents; run the command from the project folder, pass -r DIR, or create one with `rbx init`",
@@ -416,6 +475,7 @@ fn high_level_context(
         service: service.to_string(),
         settings_file,
         document,
+        rows,
         children_by_parent,
         path_segments_by_index,
         path_ordinals_by_index,
@@ -781,21 +841,23 @@ pub(super) fn resolve_bytecode_cli_settings_file(
     )
 }
 
+/// The store a read command names, as `read_store` reads it, with its
+/// service.
 pub(super) fn resolve_bytecode_read_input(
     settings_file: Option<&Path>,
     service_or_file: Option<&str>,
     explicit_service: Option<&str>,
-) -> Result<(PathBuf, SettingsBytecode, String)> {
+) -> Result<(PathBuf, SettingsBytecode, Option<RowReader>, String)> {
     let (settings_file, service_hint) =
         resolve_bytecode_cli_settings_file(settings_file, service_or_file, explicit_service)?;
     pull_missing_service_store(&settings_file);
     if !settings_file.exists() {
         return Err(missing_service_store_error(&settings_file));
     }
-    let document = SettingsBytecode::read_file(&settings_file)
+    let (document, rows) = read_store(&settings_file)
         .with_context(|| format!("Failed to read {}", settings_file.display()))?;
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
-    Ok((settings_file, document, service))
+    Ok((settings_file, document, rows, service))
 }
 
 pub(super) fn parse_bytecode_path_segments(
@@ -1100,7 +1162,7 @@ fn high_level_shared_ambiguity(
 }
 
 fn high_level_print_ambiguity(
-    ctx: &HighLevelBytecodeContext,
+    ctx: &mut HighLevelBytecodeContext,
     mode: OutputMode,
     indices: &[usize],
     pretty: bool,
@@ -1130,6 +1192,7 @@ fn high_level_print_ambiguity(
             insert_top_field(&mut response, mode, "matches", Value::Array(matches));
         }
         None => {
+            ctx.fill(&indices[..indices.len().min(HIGH_LEVEL_AMBIGUITY_LIMIT)])?;
             let mut nodes = high_level_ambiguity_nodes(ctx, indices, mode);
             if mode.uses_short_keys() {
                 // A field every match shares is printed once at the top.
@@ -1405,7 +1468,7 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
     } else {
         (selection.value, None)
     };
-    let ctx = high_level_context(&args.project.project_root, &args.project.src_root, &service)?;
+    let mut ctx = high_level_context(&args.project.project_root, &args.project.src_root, &service)?;
     let mode = OutputMode::parse(&args.output)?;
     let fields = parse_requested_fields(Some(args.fields.as_str()));
     let properties = parse_property_predicates(&args.properties)?;
@@ -1464,7 +1527,7 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
                     usize::MAX,
                 )),
                 HighLevelTargetResolution::Ambiguous(indices) => {
-                    return high_level_print_ambiguity(&ctx, mode, &indices, args.pretty);
+                    return high_level_print_ambiguity(&mut ctx, mode, &indices, args.pretty);
                 }
             }
         }
@@ -1477,49 +1540,53 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
             .transpose()?,
     };
 
-    let structured_matches = has_structured_filters.then(|| {
-        let query = InstanceQuery {
-            name: args.name,
-            class_name: args.class_name,
-            parent_settings_id: None,
-            tag: args.tag,
-            properties,
-            attributes,
-        };
-        instance_api::find_instances(&ctx.document, &query)
-            .into_iter()
-            .collect::<HashSet<_>>()
+    let structured = has_structured_filters.then_some(InstanceQuery {
+        name: args.name,
+        class_name: args.class_name,
+        parent_settings_id: None,
+        tag: args.tag,
+        properties,
+        attributes,
     });
-
+    let compared = explorer_search_value_names(&groups);
+    let values =
+        structured.as_ref().is_some_and(InstanceQuery::reads_values) || !compared.is_empty();
+    let reads = |name: &str| {
+        structured.as_ref().is_some_and(|query| query.reads(name))
+            || !compared.is_empty() && explorer_search_reads(&compared, name)
+    };
+    let scoped = (0..ctx.document.instances.len())
+        .filter(|index| scope.as_ref().is_none_or(|scope| scope.contains(index)))
+        .collect::<Vec<_>>();
     let limit = if args.all { 0 } else { args.limit };
     let mut match_indices = Vec::new();
-    for index in 0..ctx.document.instances.len() {
-        if let Some(scope) = scope.as_ref()
-            && !scope.contains(&index)
-        {
-            continue;
-        }
-        if let Some(structured_matches) = structured_matches.as_ref()
-            && !structured_matches.contains(&index)
-        {
-            continue;
-        }
-        if !groups.is_empty()
-            && !explorer_search_instance_matches(
-                &ctx.document,
-                &ctx.path_segments_by_index,
-                index,
-                &groups,
-            )
-        {
-            continue;
-        }
-        match_indices.push(index);
-        if limit > 0 && match_indices.len() >= limit {
-            break;
-        }
-    }
+    visit_rows(
+        &mut ctx.document,
+        ctx.rows.as_ref(),
+        &scoped,
+        values.then_some(reads),
+        |document, index| {
+            if structured.as_ref().is_some_and(|query| {
+                !instance_api::matches_query(document, &document.instances[index], query)
+            }) || !groups.is_empty()
+                && !explorer_search_instance_matches(
+                    document,
+                    &ctx.path_segments_by_index,
+                    index,
+                    &groups,
+                )
+            {
+                return true;
+            }
+            match_indices.push(index);
+            limit == 0 || match_indices.len() < limit
+        },
+    )?;
 
+    // The text lines show a match's path and class alone.
+    if args.fields != FIND_DEFAULT_FIELDS {
+        ctx.fill(&match_indices)?;
+    }
     let projection = ctx.projection(mode, fields.as_ref());
     if let Some(row_fields) = tree_text::row_fields(
         &projection,
@@ -1538,6 +1605,8 @@ pub(super) fn find_command(args: FindArgs) -> Result<()> {
         println!("{text}");
         return Ok(());
     }
+    ctx.fill(&match_indices)?;
+    let projection = ctx.projection(mode, fields.as_ref());
     let matches = match_indices
         .into_iter()
         .map(|index| projection.node(index, false))
@@ -1564,7 +1633,7 @@ pub(super) fn tree_command(args: TreeArgs) -> Result<()> {
         "tree",
         |name| project_knows_service(&args.project.project_root, &args.project.src_root, name),
     )?;
-    let ctx = high_level_context(&args.project.project_root, &args.project.src_root, &service)?;
+    let mut ctx = high_level_context(&args.project.project_root, &args.project.src_root, &service)?;
     let mode = OutputMode::parse(&args.output)?;
     let fields = parse_requested_fields(Some(args.fields.as_str()));
     let root_index = match high_level_target_resolution(
@@ -1573,7 +1642,7 @@ pub(super) fn tree_command(args: TreeArgs) -> Result<()> {
     )? {
         HighLevelTargetResolution::Found(index) => index,
         HighLevelTargetResolution::Ambiguous(indices) => {
-            return high_level_print_ambiguity(&ctx, mode, &indices, args.pretty);
+            return high_level_print_ambiguity(&mut ctx, mode, &indices, args.pretty);
         }
     };
     let visible_indices = high_level_visible_tree(&ctx.children_by_parent, root_index, args.depth);
@@ -1582,6 +1651,10 @@ pub(super) fn tree_command(args: TreeArgs) -> Result<()> {
         .take(args.limit.unwrap_or(usize::MAX))
         .collect::<Vec<_>>();
     let visible_indices = node_indices.iter().copied().collect::<HashSet<_>>();
+    // The text tree shows names, classes and children alone.
+    if args.fields != TREE_DEFAULT_FIELDS {
+        ctx.fill(&node_indices)?;
+    }
     let projection = ctx.projection(mode, fields.as_ref());
     if let Some(row_fields) = tree_text::row_fields(
         &projection,
@@ -1602,6 +1675,8 @@ pub(super) fn tree_command(args: TreeArgs) -> Result<()> {
         );
         return Ok(());
     }
+    ctx.fill(&node_indices)?;
+    let projection = ctx.projection(mode, fields.as_ref());
     let nodes = node_indices
         .into_iter()
         .map(|index| projection.search_node(index, &visible_indices))
@@ -1653,10 +1728,9 @@ pub(crate) fn inspect_command(args: InspectArgs) -> Result<()> {
         "inspect",
         |name| project_knows_service(&args.project.project_root, &args.project.src_root, name),
     )?;
-    let ctx = high_level_context(&args.project.project_root, &args.project.src_root, &service)?;
+    let mut ctx = high_level_context(&args.project.project_root, &args.project.src_root, &service)?;
     let mode = OutputMode::parse(&args.output)?;
     let fields = parse_requested_fields(Some(args.fields.as_str()));
-    let projection = ctx.projection(mode, fields.as_ref());
     // The first target may carry flag selectors; the extra positionals are
     // names or dotted paths in the same store, resolved on the same decode.
     let mut inspected = Vec::new();
@@ -1681,13 +1755,15 @@ pub(crate) fn inspect_command(args: InspectArgs) -> Result<()> {
                     || high_level_shared_ambiguity(&ctx, &indices).is_none()
                     || indices.len() > HIGH_LEVEL_AMBIGUITY_LIMIT
                 {
-                    return high_level_print_ambiguity(&ctx, mode, &indices, args.pretty);
+                    return high_level_print_ambiguity(&mut ctx, mode, &indices, args.pretty);
                 }
                 inspected.push(indices[0]);
                 same_named.push(indices);
             }
         }
     }
+    ctx.fill(&inspected)?;
+    let projection = ctx.projection(mode, fields.as_ref());
     if let Some(text) = tree_text::inspect_text(&projection, &args.fields, &inspected) {
         println!("{text}");
         for indices in &same_named {
@@ -1704,8 +1780,9 @@ pub(crate) fn inspect_command(args: InspectArgs) -> Result<()> {
         return Ok(());
     }
     if let Some(indices) = same_named.first() {
-        return high_level_print_ambiguity(&ctx, mode, indices, args.pretty);
+        return high_level_print_ambiguity(&mut ctx, mode, indices, args.pretty);
     }
+    let projection = ctx.projection(mode, fields.as_ref());
     let mut nodes = inspected
         .into_iter()
         .map(|index| projection.node(index, true))
@@ -1738,7 +1815,7 @@ pub(super) fn bytecode_get_property(mut args: BytecodeGetPropertyArgs) -> Result
     )?;
     let direct = read_bytecode_document_if_present(&settings_file, &service_hint)?;
     let use_project = projected_service.is_some()
-        && direct.as_ref().is_none_or(|(document, service)| {
+        && direct.as_ref().is_none_or(|(document, service, _)| {
             resolve_bytecode_selector_or_service_root(
                 document,
                 service,
@@ -1747,19 +1824,20 @@ pub(super) fn bytecode_get_property(mut args: BytecodeGetPropertyArgs) -> Result
             )
             .is_err()
         });
-    let (document, service, source_paths, canonical_settings_ids) = if use_project {
+    let (mut document, service, mut rows, source_paths, canonical_settings_ids) = if use_project {
         let service = projected_service.context("Project service is missing")?;
         let context = high_level_context(Path::new("."), Path::new("src"), service)?;
         (
             context.document,
             context.service,
+            context.rows,
             Some(context.source_paths_by_index),
             Some(context.canonical_settings_ids_by_index),
         )
     } else {
-        let (document, service) =
+        let (document, service, rows) =
             direct.ok_or_else(|| missing_service_store_error(&settings_file))?;
-        (document, service, None, None)
+        (document, service, rows, None, None)
     };
     let scope = parse_property_scope(&args.scope)?;
     let index = resolve_bytecode_selector_or_service_root(
@@ -1769,6 +1847,7 @@ pub(super) fn bytecode_get_property(mut args: BytecodeGetPropertyArgs) -> Result
         "No matching instance",
     )?
     .index;
+    fill_rows(&mut document, rows.as_mut(), &[index])?;
     let (path_segments, path_ordinals) = build_editor_instance_path_parts(&document, &service);
     let mut values = Map::new();
     for property in &properties {
@@ -3914,7 +3993,7 @@ pub(super) fn bytecode_set_source(mut args: BytecodeSetSourceArgs) -> Result<()>
         .transpose()?;
     let direct = read_bytecode_document_if_present(&settings_file, &service_hint)?;
     let use_project = project_service.is_some()
-        && direct.as_ref().is_none_or(|(document, service)| {
+        && direct.as_ref().is_none_or(|(document, service, _)| {
             resolve_bytecode_selector(document, service, &args.selector, "No matching instance")
                 .is_err()
         });
@@ -3928,7 +4007,7 @@ pub(super) fn bytecode_set_source(mut args: BytecodeSetSourceArgs) -> Result<()>
             Some(context.path_segments_by_index),
         )
     } else {
-        let (document, service) =
+        let (document, service, _) =
             direct.ok_or_else(|| missing_service_store_error(&settings_file))?;
         (document, service, None, None)
     };
@@ -4000,17 +4079,18 @@ pub(super) fn bytecode_set_source(mut args: BytecodeSetSourceArgs) -> Result<()>
     print_json_output(&Value::Object(result), args.pretty)
 }
 
+/// The store at `settings_file` as `read_store` reads it, with its service.
 fn read_bytecode_document_if_present(
     settings_file: &Path,
     service_hint: &str,
-) -> Result<Option<(SettingsBytecode, String)>> {
+) -> Result<Option<(SettingsBytecode, String, Option<RowReader>)>> {
     if !settings_file.exists() {
         return Ok(None);
     }
-    let document = SettingsBytecode::read_file(settings_file)
+    let (document, rows) = read_store(settings_file)
         .with_context(|| format!("Failed to read {}", settings_file.display()))?;
     let service = bytecode_service_name(&document, settings_file, service_hint);
-    Ok(Some((document, service)))
+    Ok(Some((document, service, rows)))
 }
 
 fn project_service_input<'a>(

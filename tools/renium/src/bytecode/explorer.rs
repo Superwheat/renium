@@ -15,8 +15,8 @@ use crate::app::timing::elapsed_ms;
 use crate::bytecode::edit::has_direct_package_link_child;
 use crate::bytecode::query::{bytecode_selector, parse_property_predicates};
 use crate::bytecode::{
-    bytecode_input_looks_like_settings_file, ensure_bytecode_service_path_segments,
-    resolve_bytecode_read_input,
+    bytecode_input_looks_like_settings_file, ensure_bytecode_service_path_segments, fill_rows,
+    read_store, resolve_bytecode_read_input, visit_rows,
 };
 use crate::cli::{
     BytecodeBatchFields, BytecodeExplorerBatchArgs, BytecodeExplorerBatchOp,
@@ -33,6 +33,7 @@ use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
 use crate::rbx::encode::rbx_serialized_property_name_for_logical;
 use crate::roblox::services::{DEFAULT_SYNC_SERVICES, explorer_service_order};
+use crate::settings::bytecode::blocks::RowReader;
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
 };
@@ -173,7 +174,8 @@ fn text_field(field: &str, form: TextForm) -> TextField {
 }
 
 struct BytecodeExplorerBatchContext<'a> {
-    document: &'a SettingsBytecode,
+    document: &'a mut SettingsBytecode,
+    rows: Option<&'a mut RowReader>,
     service: &'a str,
     children_by_parent: &'a [Vec<usize>],
     service_path_segments_by_index: &'a [Option<Vec<String>>],
@@ -188,12 +190,26 @@ struct BytecodeExplorerBatchContext<'a> {
     default_fields: Option<&'a str>,
 }
 
-impl<'a> BytecodeExplorerBatchContext<'a> {
-    fn service_projection(
-        &'a self,
+impl BytecodeExplorerBatchContext<'_> {
+    /// Gives the instances at `indices` their stored values where a node of
+    /// `mode` and `fields` shows values.
+    fn fill(
+        &mut self,
+        indices: &[usize],
         mode: OutputMode,
-        fields: Option<&'a HashSet<String>>,
-    ) -> BytecodeNodeProjection<'a> {
+        fields: Option<&HashSet<String>>,
+    ) -> Result<()> {
+        if fields.is_none() && !matches!(mode, OutputMode::Full) {
+            return Ok(());
+        }
+        fill_rows(self.document, self.rows.as_deref_mut(), indices)
+    }
+
+    fn service_projection<'s>(
+        &'s self,
+        mode: OutputMode,
+        fields: Option<&'s HashSet<String>>,
+    ) -> BytecodeNodeProjection<'s> {
         BytecodeNodeProjection {
             document: self.document,
             children_by_parent: self.children_by_parent,
@@ -206,11 +222,11 @@ impl<'a> BytecodeExplorerBatchContext<'a> {
         }
     }
 
-    fn global_projection(
-        &'a self,
+    fn global_projection<'s>(
+        &'s self,
         mode: OutputMode,
-        fields: Option<&'a HashSet<String>>,
-    ) -> BytecodeNodeProjection<'a> {
+        fields: Option<&'s HashSet<String>>,
+    ) -> BytecodeNodeProjection<'s> {
         BytecodeNodeProjection {
             document: self.document,
             children_by_parent: self.children_by_parent,
@@ -673,7 +689,7 @@ pub(crate) fn bytecode_explorer_batch_result(mut args: BytecodeExplorerBatchArgs
 
     let mut loaded_project = None;
     let mut projection = None;
-    let (settings_file, document, service) = if let Some(project_root) =
+    let (settings_file, mut document, mut rows, service) = if let Some(project_root) =
         args.project_root.as_deref()
     {
         if args.input.settings_file.is_some() || args.input.service_or_file.is_some() {
@@ -686,10 +702,10 @@ pub(crate) fn bytecode_explorer_batch_result(mut args: BytecodeExplorerBatchArgs
         let staged = config::stage_project(&loaded)?;
         let service = canonical_explorer_service_name(&args.service);
         let staged_settings = service_settings_path(&staged.root().join(&service));
-        let document = if staged_settings.is_file() {
-            SettingsBytecode::read_file(&staged_settings)?
+        let (document, rows) = if staged_settings.is_file() {
+            read_store(&staged_settings)?
         } else {
-            SettingsBytecode {
+            let document = SettingsBytecode {
                 version: SETTINGS_BINARY_VERSION,
                 instances: vec![SettingsBytecodeInstance::new(
                     format!("service:{service}"),
@@ -697,13 +713,14 @@ pub(crate) fn bytecode_explorer_batch_result(mut args: BytecodeExplorerBatchArgs
                     service.clone(),
                     None,
                 )],
-            }
+            };
+            (document, None)
         };
         let display_settings =
             service_settings_path(&loaded.root.join(&loaded.project.source_root).join(&service));
         loaded_project = Some(loaded);
         projection = Some(staged);
-        (display_settings, document, service)
+        (display_settings, document, rows, service)
     } else {
         resolve_bytecode_read_input(
             args.input.settings_file.as_deref(),
@@ -865,8 +882,9 @@ pub(crate) fn bytecode_explorer_batch_result(mut args: BytecodeExplorerBatchArgs
         }
     }
     let global_source_paths_by_index = Vec::new();
-    let ctx = BytecodeExplorerBatchContext {
-        document: &document,
+    let mut ctx = BytecodeExplorerBatchContext {
+        document: &mut document,
+        rows: rows.as_mut(),
         service: &service,
         children_by_parent: &children_by_parent,
         service_path_segments_by_index: &service_path_segments_by_index,
@@ -882,10 +900,10 @@ pub(crate) fn bytecode_explorer_batch_result(mut args: BytecodeExplorerBatchArgs
     };
 
     let top_mode = OutputMode::parse(args.output.as_deref().unwrap_or("compact"))?;
-    let results = ops
-        .iter()
-        .map(|op| bytecode_explorer_batch_op_json(&ctx, op))
-        .collect::<Result<Vec<_>>>()?;
+    let mut results = Vec::with_capacity(ops.len());
+    for op in &ops {
+        results.push(bytecode_explorer_batch_op_json(&mut ctx, op)?);
+    }
     let mut response = Map::new();
     insert_top_field(
         &mut response,
@@ -914,7 +932,7 @@ fn project_store_path(path: &Path) -> PathBuf {
 }
 
 fn bytecode_explorer_batch_op_json(
-    ctx: &BytecodeExplorerBatchContext<'_>,
+    ctx: &mut BytecodeExplorerBatchContext<'_>,
     op: &BytecodeExplorerBatchOp,
 ) -> Result<Value> {
     let kind = normalize_bytecode_batch_op(&op.op)?;
@@ -996,10 +1014,12 @@ fn bytecode_explorer_batch_op_json(
                 insert_top_field(&mut response, mode, "found", Value::Bool(false));
                 return Ok(Value::Object(response));
             };
-            let child_nodes = ctx
+            let children = ctx
                 .children_by_parent
                 .get(parent_index)
-                .map_or(&[][..], Vec::as_slice)
+                .map_or(&[][..], Vec::as_slice);
+            ctx.fill(&[&[parent_index], children].concat(), mode, fields.as_ref())?;
+            let child_nodes = children
                 .iter()
                 .filter_map(|child_index| {
                     ctx.document.instances.get(*child_index)?;
@@ -1021,6 +1041,8 @@ fn bytecode_explorer_batch_op_json(
             insert_top_field(&mut response, mode, "children", Value::Array(child_nodes));
         }
         "service" => {
+            let all = (0..ctx.document.instances.len()).collect::<Vec<_>>();
+            ctx.fill(&all, mode, fields.as_ref())?;
             let nodes = ctx
                 .document
                 .instances
@@ -1061,13 +1083,41 @@ fn bytecode_explorer_batch_op_json(
                     }
                     cursor += 1;
                 }
+                // A search of values reads them in the order of the store,
+                // and the matches are taken in the order of the tree.
+                let paths = ctx.service_path_segments_by_index;
+                let compared = explorer_search_value_names(&groups);
+                let mut matched = None;
+                if !query.trim().is_empty() && !compared.is_empty() {
+                    let mut rows = candidates.clone();
+                    rows.sort_unstable();
+                    let mut found = HashSet::new();
+                    visit_rows(
+                        ctx.document,
+                        ctx.rows.as_deref(),
+                        &rows,
+                        Some(|name: &str| explorer_search_reads(&compared, name)),
+                        |document, index| {
+                            if explorer_search_instance_matches(document, paths, index, &groups) {
+                                found.insert(index);
+                            }
+                            true
+                        },
+                    )?;
+                    matched = Some(found);
+                }
                 for index in candidates {
                     if query.trim().is_empty()
-                        || explorer_search_instance_matches(
-                            ctx.document,
-                            ctx.service_path_segments_by_index,
-                            index,
-                            &groups,
+                        || matched.as_ref().map_or_else(
+                            || {
+                                explorer_search_instance_matches(
+                                    ctx.document,
+                                    paths,
+                                    index,
+                                    &groups,
+                                )
+                            },
+                            |found| found.contains(&index),
                         )
                     {
                         if limit > 0 && match_indices.len() >= limit {
@@ -1088,6 +1138,9 @@ fn bytecode_explorer_batch_op_json(
                 }
             }
             visible_indices.insert(root_index);
+            let mut visible_sorted = visible_indices.iter().copied().collect::<Vec<_>>();
+            visible_sorted.sort_unstable();
+            ctx.fill(&visible_sorted, mode, fields.as_ref())?;
             let projection = ctx.service_projection(mode, fields.as_ref());
             let nodes = (0..ctx.document.instances.len())
                 .filter(|index| visible_indices.contains(index))
@@ -1110,8 +1163,6 @@ fn bytecode_explorer_batch_op_json(
                 .filter_map(|index| ctx.document.instances.get(*index))
                 .map(|instance| Value::String(instance.settings_id.clone()))
                 .collect::<Vec<_>>();
-            let mut visible_sorted = visible_indices.iter().copied().collect::<Vec<_>>();
-            visible_sorted.sort_unstable();
             let visible_ids = visible_sorted
                 .iter()
                 .filter_map(|index| ctx.document.instances.get(*index))
@@ -1129,6 +1180,7 @@ fn bytecode_explorer_batch_op_json(
                 insert_top_field(&mut response, mode, "found", Value::Bool(false));
                 return Ok(Value::Object(response));
             };
+            ctx.fill(&[index], mode, fields.as_ref())?;
             let node = bytecode_project_explorer_node_json(ctx, index, true, mode, fields.as_ref());
             if let Some(node) = node.as_object() {
                 response.extend(node.clone());
@@ -1144,11 +1196,27 @@ fn bytecode_explorer_batch_op_json(
                 attributes: parse_property_predicates(&op.attributes)?,
             };
             let limit = op.limit.unwrap_or(20);
-            let mut match_indices = instance_api::find_instances(ctx.document, &query);
+            let all = (0..ctx.document.instances.len()).collect::<Vec<_>>();
+            let mut match_indices = Vec::new();
+            visit_rows(
+                ctx.document,
+                ctx.rows.as_deref(),
+                &all,
+                query
+                    .reads_values()
+                    .then_some(|name: &str| query.reads(name)),
+                |document, index| {
+                    if instance_api::matches_query(document, &document.instances[index], &query) {
+                        match_indices.push(index);
+                    }
+                    true
+                },
+            )?;
             let truncated = limit > 0 && match_indices.len() > limit;
             if limit > 0 {
                 match_indices.truncate(limit);
             }
+            ctx.fill(&match_indices, mode, fields.as_ref())?;
             let projection = ctx.global_projection(mode, fields.as_ref());
             let matches = match_indices
                 .into_iter()
@@ -1480,7 +1548,7 @@ pub(crate) fn explorer_search_instance_matches(
             let token = &group[token_index];
             let next = group.get(token_index + 1).map(String::as_str);
             let next_value = group.get(token_index + 2).map_or("", String::as_str);
-            if let Some(operator @ ("=" | "==" | "!=" | "~=" | "<" | ">" | "<=" | ">=")) = next {
+            if let Some(operator) = next.filter(|next| SEARCH_OPERATORS.contains(next)) {
                 if !explorer_search_property_matches(document, index, token, operator, next_value) {
                     return false;
                 }
@@ -1494,6 +1562,47 @@ pub(crate) fn explorer_search_instance_matches(
         }
         true
     })
+}
+
+/// What a search token compares a property by, in the order a token is
+/// split at them.
+const SEARCH_OPERATORS: [&str; 8] = ["==", "!=", "~=", "<=", ">=", "=", "<", ">"];
+
+/// The compacted names of the properties and attributes a search compares,
+/// with `tags` for a tag: none where it reads no stored values.
+pub(crate) fn explorer_search_value_names(groups: &[Vec<String>]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for group in groups {
+        let mut index = 0;
+        while index < group.len() {
+            let token = group[index].as_str();
+            if (group.get(index + 1)).is_some_and(|next| SEARCH_OPERATORS.contains(&next.as_str()))
+            {
+                names.insert(explorer_search_compact(token));
+                index += 3;
+                continue;
+            }
+            index += 1;
+            match token.split_once(':') {
+                Some((prefix, _)) if prefix.eq_ignore_ascii_case("is") => {}
+                Some((prefix, _)) if prefix.eq_ignore_ascii_case("tag") => {
+                    names.insert("tags".to_string());
+                }
+                _ => {
+                    let compared =
+                        (SEARCH_OPERATORS.iter()).find_map(|operator| token.split_once(operator));
+                    names.extend(compared.map(|(name, _)| explorer_search_compact(name)));
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Whether a search that compares the properties `names` reads the stored
+/// property `name`: one of those, or the attributes.
+pub(crate) fn explorer_search_reads(names: &HashSet<String>, name: &str) -> bool {
+    name == "Attributes" || names.contains(&explorer_search_compact(name))
 }
 
 fn explorer_search_token_matches(
@@ -1513,7 +1622,7 @@ fn explorer_search_token_matches(
                 .any(|tag| tag.contains(&explorer_search_compact(value)));
         }
     }
-    for operator in ["==", "!=", "~=", "<=", ">=", "=", "<", ">"] {
+    for operator in SEARCH_OPERATORS {
         if let Some((property_name, expected)) = token.split_once(operator) {
             return explorer_search_property_matches(
                 document,

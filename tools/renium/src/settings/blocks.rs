@@ -1640,10 +1640,7 @@ impl<'a> BlockStore<'a> {
             if !key && !matches!(texts, Texts::Resolved(real) if real(&hash)) {
                 return Ok(None);
             }
-            let (frame, place) = self.slots[self.entry_of(&hash)?];
-            let text = self.pool_frame(frame)?[place].clone();
-            self.budget.take(text.len())?;
-            Ok(Some(text))
+            self.pool_text(&hash).map(Some)
         };
         let pooled = open.pool_entries().next().is_some();
         for row in rows.iter_mut().enumerate().filter(|(row, _)| keep(*row)) {
@@ -1655,6 +1652,62 @@ impl<'a> BlockStore<'a> {
             if self.budget.holds_payloads {
                 for value in properties.values_mut() {
                     *value = self.budget.property(std::mem::take(value));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The text of the pool entry of hash `hash`, copied on the budget.
+    fn pool_text(&self, hash: &[u8; 16]) -> Result<String> {
+        let (frame, place) = self.slots[self.entry_of(hash)?];
+        let text = self.pool_frame(frame)?[place].clone();
+        self.budget.take(text.len())?;
+        Ok(text)
+    }
+
+    /// Gives `each`, in rising order, each row at `rows` with its values of
+    /// the properties `names` takes, as the whole decode gives them, until
+    /// `each` gives false. The blocks of those rows are decoded `at_once` at
+    /// a time with a marker for each pool entry, and a row's markers take
+    /// their texts as the row is given. A call is a pass on a budget of its
+    /// own, as a whole decode is.
+    fn read(
+        &self,
+        rows: &[usize],
+        at_once: usize,
+        names: impl Fn(&str) -> bool + Sync,
+        mut each: impl FnMut(usize, DecodedRowValues) -> Result<bool>,
+    ) -> Result<()> {
+        self.budget.renew(self.bytes.len());
+        let rows = self.chosen(rows)?;
+        let blocks = rows
+            .chunk_by(|left, right| self.block_of(*left) == self.block_of(*right))
+            .collect::<Vec<_>>();
+        let text = |hash: [u8; 16], _| self.pool_text(&hash).map(Some);
+        for few in blocks.chunks(at_once) {
+            let read = few
+                .par_iter()
+                .map(|rows| {
+                    let index = self.block_of(rows[0]);
+                    let first = self.blocks[index].first;
+                    let open = self.open_block(index)?;
+                    let mut values = (0..self.blocks[index].count)
+                        .map(|_| DecodedRowValues::default())
+                        .collect::<Vec<_>>();
+                    let keep = |row: usize| rows.binary_search(&(first + row)).is_ok();
+                    self.values(&open, &mut values, keep, &names, Texts::Marked)?;
+                    Ok((first, values))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for ((first, mut values), rows) in read.into_iter().zip(few) {
+                for row in *rows {
+                    let mut given = std::mem::take(&mut values[row - first]);
+                    unmark(&mut given.properties, &text)?;
+                    unmark(&mut given.attributes, &text)?;
+                    if !each(*row, given)? {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -2172,5 +2225,86 @@ fn give<T: DecodedPropertyTarget>(instance: &mut T, values: DecodedRowValues) {
     properties.extend(values.properties);
     if !values.attributes.is_empty() {
         *attributes = values.attributes;
+    }
+}
+
+/// A v12 store a read command reads by its rows: its document holds every
+/// instance without its values, and a row is given them, as the whole decode
+/// gives them, only when asked for.
+pub(crate) struct RowReader {
+    store: BlockStore<'static>,
+    /// The rows `fill` gave their values.
+    filled: Vec<bool>,
+}
+
+impl RowReader {
+    /// The instances of a v12 file without their values, and its reader.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<(SettingsBytecode, Self)> {
+        let store = BlockStore::open(bytes.to_vec())?;
+        let document = store.structure()?;
+        let filled = vec![false; document.instances.len()];
+        Ok((document, Self { store, filled }))
+    }
+
+    /// Gives the rows at `rows` their stored values, a few blocks at a time.
+    pub(crate) fn fill(&mut self, document: &mut SettingsBytecode, rows: &[usize]) -> Result<()> {
+        let rows = (rows.iter().copied())
+            .filter(|row| self.filled.get(*row) != Some(&true))
+            .collect::<Vec<_>>();
+        let filled = &mut self.filled;
+        self.store.read(
+            &rows,
+            READ_AHEAD_BLOCKS,
+            |_| true,
+            |row, values| {
+                let instance = &mut document.instances[row];
+                instance.properties = values.properties;
+                instance.attributes = values.attributes;
+                filled[row] = true;
+                Ok(true)
+            },
+        )
+    }
+
+    /// Gives the rows at `rows` their stored value of the property `name`
+    /// beside the values they hold.
+    pub(crate) fn give(
+        &self,
+        document: &mut SettingsBytecode,
+        rows: &[usize],
+        name: &str,
+    ) -> Result<()> {
+        self.store.read(
+            rows,
+            READ_AHEAD_BLOCKS,
+            |held| held == name,
+            |row, values| {
+                document.instances[row].properties.extend(values.properties);
+                Ok(true)
+            },
+        )
+    }
+
+    /// Calls `visit` on the rows at `rows` in rising order until it gives
+    /// false, each row holding its stored values of the properties `names`
+    /// takes while it is visited. One block is read at a time, and the
+    /// document holds after what it held before.
+    pub(crate) fn walk(
+        &self,
+        document: &mut SettingsBytecode,
+        rows: &[usize],
+        names: impl Fn(&str) -> bool + Sync,
+        mut visit: impl FnMut(&SettingsBytecode, usize) -> bool,
+    ) -> Result<()> {
+        self.store.read(rows, 1, names, |row, values| {
+            let instance = &mut document.instances[row];
+            let properties = std::mem::replace(&mut instance.properties, values.properties);
+            let attributes = std::mem::replace(&mut instance.attributes, values.attributes);
+            let more = visit(document, row);
+            let instance = &mut document.instances[row];
+            instance.properties = properties;
+            instance.attributes = attributes;
+            Ok(more)
+        })
     }
 }

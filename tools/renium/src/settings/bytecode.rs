@@ -355,6 +355,19 @@ impl SettingsBytecode {
         read_settings_file(path, decode_settings_bytecode_structure)
     }
 
+    /// A store file for a command that reads a few of its rows: a v12 store
+    /// without its values, with the reader that gives a row them, and a
+    /// store of an older version whole.
+    pub(crate) fn read_by_rows(path: &Path) -> Result<(Self, Option<blocks::RowReader>)> {
+        read_settings_file(path, |bytes| {
+            if !blocks::is_block_store(bytes) {
+                return Ok((decode_settings_bytecode(bytes)?, None));
+            }
+            let (document, reader) = blocks::RowReader::decode(bytes)?;
+            Ok((document, Some(reader)))
+        })
+    }
+
     /// Decodes a store's instances without their properties and attributes.
     pub(crate) fn decode_structure(bytes: &[u8]) -> Result<Self> {
         decode_settings_bytecode_structure(bytes)
