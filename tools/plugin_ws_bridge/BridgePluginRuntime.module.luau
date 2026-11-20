@@ -1704,11 +1704,13 @@ function BridgePluginRuntime.start(context)
 			error("setExportOptions expects an object")
 		end
 		for key, value in pairs(payload) do
-			if key ~= "exportAllProperties" then
-				error("Unknown export option " .. tostring(key))
-			end
-			if type(value) ~= "boolean" then
-				error(key .. " must be a boolean")
+			if key ~= "__reniumProfileStarted" then
+				if key ~= "exportAllProperties" then
+					error("Unknown export option " .. tostring(key))
+				end
+				if type(value) ~= "boolean" then
+					error(key .. " must be a boolean")
+				end
 			end
 		end
 		if payload.exportAllProperties ~= nil and payload.exportAllProperties ~= EXPORT_ALL_PROPERTIES then
