@@ -2338,6 +2338,44 @@ struct StoredPropertyForm {
     /// The store already held the property under another name than the
     /// requested one.
     requested_differs: bool,
+    /// The name Studio saved the property under before its successor, which
+    /// the store no longer holds beside it.
+    replaces: Option<String>,
+}
+
+/// The successor Studio saves a content id under (an Animation's AnimationId
+/// as AnimationContent): the name a capture gives the store, with the same
+/// text as its value.
+fn content_successor(class_name: &str, logical: &str) -> Option<String> {
+    let database = rbx_reflection_database::get().ok()?;
+    let descriptor = rbx_property_descriptor(database, class_name, logical)?;
+    let rbx_reflection::PropertyKind::Canonical {
+        serialization: rbx_reflection::PropertySerialization::Migrate(migration),
+    } = &descriptor.kind
+    else {
+        return None;
+    };
+    let [successor] = migration.new_property_names() else {
+        return None;
+    };
+    let probe = rbx_dom_weak::types::Variant::ContentId(String::new().into());
+    matches!(
+        migration.perform(&probe),
+        Ok(rbx_dom_weak::types::Variant::Content(_))
+    )
+    .then(|| (*successor).to_string())
+}
+
+/// The other name of a Decal's texture: Studio holds one value under
+/// TextureContent and ColorMapContent, and a capture stores both.
+fn decal_texture_mirror(class_name: &str, stored: &str) -> Option<&'static str> {
+    let mirror = match stored {
+        "TextureContent" => "ColorMapContent",
+        "ColorMapContent" => "TextureContent",
+        _ => return None,
+    };
+    let database = rbx_reflection_database::get().ok()?;
+    crate::rbx::decode::rbx_reflection_class_is_a(database, class_name, "Decal").then_some(mirror)
 }
 
 fn drop_other_property_spellings(instance: &mut SettingsBytecodeInstance, logical_name: &str) {
@@ -2361,6 +2399,16 @@ fn stored_property_edit(
     let form = stored_property_form(document, index, property, value, scope)?;
     if form.logical {
         drop_other_property_spellings(&mut document.instances[index], &form.name);
+    }
+    if let Some(replaced) = &form.replaces {
+        let properties = &mut document.instances[index].properties;
+        properties.retain(|name, _| !name.eq_ignore_ascii_case(replaced));
+    }
+    let instance = &mut document.instances[index];
+    if let Some(mirror) = decal_texture_mirror(&instance.class_name, &form.name)
+        && !value.is_null()
+    {
+        instance.properties.insert(mirror.into(), value.clone());
     }
     Ok((form.name, form.requested_differs))
 }
@@ -2398,9 +2446,14 @@ fn stored_property_form(
             std::mem::take(value),
         )?;
     }
-    let requested_differs = canonical_property.is_some();
+    let successor = logical_property
+        .as_deref()
+        .and_then(|logical| content_successor(&document.instances[index].class_name, logical));
+    let requested_differs = canonical_property.is_some() || successor.is_some();
     let logical = logical_property.is_some();
-    let name = logical_property
+    let replaces = successor.as_ref().and(logical_property.clone());
+    let name = successor
+        .or(logical_property)
         .or(canonical_property)
         .unwrap_or_else(|| property.to_string());
     // A null removes the attribute, which no name rules out.
@@ -2416,6 +2469,7 @@ fn stored_property_form(
         name,
         logical,
         requested_differs,
+        replaces,
     })
 }
 
@@ -4862,5 +4916,77 @@ mod project_discovery_tests {
                 .contains("No synced Renium store for service 'Workspace'")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod content_successor_tests {
+    use super::*;
+
+    #[test]
+    fn a_content_id_is_stored_under_the_name_studio_saves_it() {
+        assert_eq!(
+            content_successor("Animation", "AnimationId").as_deref(),
+            Some("AnimationContent")
+        );
+        assert_eq!(content_successor("Part", "Transparency"), None);
+        assert_eq!(content_successor("Sound", "Volume"), None);
+
+        let mut animation =
+            SettingsBytecodeInstance::new("a".into(), "Idle".into(), "Animation".into(), None);
+        animation
+            .properties
+            .insert("AnimationContent".into(), json!("rbxassetid://1"));
+        animation
+            .properties
+            .insert("AnimationId".into(), json!("rbxassetid://1"));
+        let mut document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![animation],
+        };
+        let mut value = json!("rbxassetid://2");
+        let (name, differs) = stored_property_edit(
+            &mut document,
+            0,
+            "AnimationId",
+            &mut value,
+            PropertyScope::Auto,
+        )
+        .unwrap();
+        assert_eq!((name.as_str(), differs), ("AnimationContent", true));
+        assert_eq!(value, json!("rbxassetid://2"));
+        assert!(!document.instances[0].properties.contains_key("AnimationId"));
+
+        let mut decal =
+            SettingsBytecodeInstance::new("d".into(), "Mark".into(), "Texture".into(), None);
+        for name in ["TextureContent", "ColorMapContent"] {
+            decal
+                .properties
+                .insert(name.into(), json!("rbxassetid://1"));
+        }
+        let mut document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![decal],
+        };
+        for (requested, text) in [
+            ("Texture", "rbxassetid://3"),
+            ("ColorMap", "rbxassetid://4"),
+        ] {
+            let mut value = json!(text);
+            stored_property_edit(&mut document, 0, requested, &mut value, PropertyScope::Auto)
+                .unwrap();
+            let properties = &mut document.instances[0].properties;
+            let stored = properties.entry(
+                if requested == "Texture" {
+                    "TextureContent"
+                } else {
+                    "ColorMapContent"
+                }
+                .to_string(),
+            );
+            stored.or_insert(Value::Null).clone_from(&value);
+            assert_eq!(properties.len(), 2, "{properties:?}");
+            assert!(properties.values().all(|held| held == &json!(text)));
+        }
     }
 }
