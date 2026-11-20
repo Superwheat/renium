@@ -542,6 +542,14 @@ fn write_json_streaming_inner<T: Serialize>(path: &Path, value: &T, durable: boo
 }
 
 pub(crate) fn atomic_write_file(path: &Path, content: &[u8]) -> Result<()> {
+    atomic_write_parts(path, [content])
+}
+
+/// `atomic_write_file` of `parts` one after another, without joining them.
+pub(crate) fn atomic_write_parts<'a>(
+    path: &Path,
+    parts: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
@@ -551,8 +559,10 @@ pub(crate) fn atomic_write_file(path: &Path, content: &[u8]) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut file = File::create(&temp_path)
             .with_context(|| format!("Failed to create {}", temp_path.display()))?;
-        file.write_all(content)
-            .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+        for part in parts {
+            file.write_all(part)
+                .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+        }
         file.sync_all()
             .with_context(|| format!("Failed to write {}", temp_path.display()))
     })();

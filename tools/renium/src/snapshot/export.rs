@@ -233,6 +233,7 @@ impl ExportProjectStage {
         src_dir: &Path,
         services: &[String],
     ) -> Result<Self> {
+        let _span = crate::app::profile::span("export project stage for comparison");
         if let Some(project) = config::try_load_project(None, Some(project_root))?
             && config::project_requires_temporary_stage(&project)?
         {

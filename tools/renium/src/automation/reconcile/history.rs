@@ -134,6 +134,7 @@ impl SyncHistory {
         before: &ProjectSnapshot,
         paths: &HashSet<PathBuf>,
     ) -> Result<Self> {
+        let _span = crate::app::profile::span("sync history begin");
         let source = absolutize_under(root, source)
             .strip_prefix(root)?
             .to_path_buf();
@@ -184,6 +185,7 @@ impl SyncHistory {
         after: &ProjectSnapshot,
         generated: &ProjectSnapshot,
     ) -> Result<String> {
+        let _span = crate::app::profile::span("sync history commit");
         // A verified native import can settle generated file state after the
         // Studio commit. Refresh its expected state without adding another undo.
         self.record.expected = Some(snapshot_digest(after, generated, &self.record.scopes));

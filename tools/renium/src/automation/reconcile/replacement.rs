@@ -326,7 +326,7 @@ pub(crate) fn unread_instance_refers(
     let Some(SnapshotEntry::File(bytes)) = entry else {
         return Ok(true);
     };
-    let Some(rows) = whole_row_digests(bytes, |_| Some((None, None)))? else {
+    let Some(rows) = whole_row_digests(bytes, None, |_| Some((None, None)))? else {
         return Ok(true);
     };
     let mut unread = rows
@@ -454,23 +454,27 @@ fn told_apart(
             break;
         }
         let (of_files, of_studio): (Vec<usize>, Vec<usize>) = pairs.iter().copied().unzip();
+        let read = crate::app::profile::span("store rows read for comparison");
         let (read_files, read_studio) = rayon::join(
             || files_rows.materialize(&mut files, &of_files),
             || studio_rows.materialize(&mut studio, &of_studio),
         );
+        drop(read);
         if read_files.is_err() || read_studio.is_err() {
             break;
         }
-        let (of_files, mut of_studio) = (
-            whole(&mut files, &of_files)?,
-            whole(&mut studio, &of_studio)?,
+        let _compared = crate::app::profile::span("store rows compared");
+        // The two copies are made whole together; one of the files' that
+        // cannot be is the one refused first.
+        let (of_files, of_studio) = rayon::join(
+            || whole(&mut files, &of_files),
+            || whole(&mut studio, &of_studio),
         );
+        let (of_files, mut of_studio) = (of_files?, of_studio?);
         // A reference by position is compared as the position its instance
         // has among the files'.
         if let Some(moved) = moved {
-            for instance in &mut of_studio {
-                moved.in_state_whole(instance);
-            }
+            (of_studio.par_iter_mut()).for_each(|instance| moved.in_state_whole(instance));
         }
         // Instances paired each by itself can stand under another name or
         // parent, which a push sends as well.
@@ -483,12 +487,17 @@ fn told_apart(
                     || !instance_values_equal(None, files, studio)
             })
             .collect::<Vec<_>>();
+        (of_files.into_par_iter().chain(of_studio)).for_each(drop);
         for ((_, row), differ) in pairs.iter().zip(differ) {
             differs[*row] = differ;
             unlike += usize::from(differ);
         }
         compared += pairs.len();
     }
+    rayon::join(
+        || drop_settings_documents(files, studio),
+        || drop((files_rows, studio_rows)),
+    );
     Ok(unlike + differing.len() - compared)
 }
 
@@ -560,12 +569,16 @@ fn instances_read(
 /// daemon far more than one import of the store, so the store is prepared
 /// as one Studio holds nothing of: the files' copy as `replaced_store_alone`
 /// reads it, beside the instances of Studio's copy that an import keeps.
-/// `studio` are the instances of that copy, bare. `None` where the import
+/// `studio` are the instances of that copy, bare, and `files` the files'
+/// with their UniqueIds alone where they were read. `None` where the import
 /// cannot place a camera or a package root, as
 /// `promote_heavy_deltas_to_replacement` asks.
 fn imported_store(
     (desired_bytes, observed_bytes): (&[u8], &[u8]),
-    studio: Vec<SettingsBytecodeInstance>,
+    (studio, files): (
+        Vec<SettingsBytecodeInstance>,
+        Option<Vec<SettingsBytecodeInstance>>,
+    ),
 ) -> Result<Option<(SettingsBytecode, SettingsBytecode)>> {
     let _span = crate::app::profile::span("store prepared for import");
     // What an import keeps of Studio's copy: its roots, the engine's
@@ -601,7 +614,7 @@ fn imported_store(
         return Ok(None);
     }
     drop(studio);
-    replaced_store_beside(desired_bytes, retained)
+    replaced_store_beside(desired_bytes, retained, files)
 }
 
 /// Whether the run of instances one copy alone holds is the one its place
@@ -653,11 +666,14 @@ fn run_is_told(
 /// import cannot take it.
 fn imported_anew(
     copies: (&[u8], &[u8]),
-    studio: Vec<SettingsBytecodeInstance>,
+    instances: (
+        Vec<SettingsBytecodeInstance>,
+        Option<Vec<SettingsBytecodeInstance>>,
+    ),
     why: &str,
 ) -> Result<ChangedInstances> {
-    let count = studio.len();
-    let Some(copies) = imported_store(copies, studio)? else {
+    let count = instances.0.len();
+    let Some(copies) = imported_store(copies, instances)? else {
         return Ok(ChangedInstances::Whole(None));
     };
     log_global(
@@ -751,9 +767,10 @@ fn changed_instances_compared(
         }
         _ => None,
     };
-    let paired = |told| {
+    let paired = |mut told: Told| {
+        let structures = told.structures.take();
         Ok(
-            match changed_instances_placed(desired, observed, how, Some(told))? {
+            match changed_instances_placed(desired, observed, how, Some(told), structures)? {
                 ChangedInstances::Apart(current) => ChangedInstances::Whole(current),
                 changed => {
                     #[cfg(test)]
@@ -768,7 +785,7 @@ fn changed_instances_compared(
     if let Some((files, studio)) = copies
         && apart.lock_recover().contains(path)
     {
-        match told_alone(files, studio) {
+        match told_alone(files, studio, None) {
             Some((told, true)) => {
                 #[cfg(test)]
                 PAIRED_FIRST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -779,12 +796,27 @@ fn changed_instances_compared(
             }
         }
     }
-    let current = match changed_instances_placed(desired, observed, how, None)? {
-        ChangedInstances::Apart(current) => current,
-        changed => return Ok(changed),
+    // Copies whose structures stand apart are paired without a comparison by
+    // place, which would read every value of both to say so.
+    let structures = match (desired, observed) {
+        (Some(SnapshotEntry::File(files)), Some(SnapshotEntry::File(studio))) => {
+            structures_of(files, studio)
+        }
+        _ => None,
+    };
+    let (current, structures) = match structures {
+        Some((files, studio))
+            if copies.is_some() && stand_apart(&files.instances, &studio.instances) =>
+        {
+            (None, Some((files, studio)))
+        }
+        structures => match changed_instances_placed(desired, observed, how, None, structures)? {
+            ChangedInstances::Apart(current) => (current, None),
+            changed => return Ok(changed),
+        },
     };
     if let Some((files, studio)) = copies
-        && let Some((told, as_many_apart)) = told_alone(files, studio)
+        && let Some((told, as_many_apart)) = told_alone(files, studio, structures)
     {
         if as_many_apart {
             apart.lock_recover().insert(path.to_path_buf());
@@ -823,6 +855,9 @@ struct Told {
     /// one parent: UniqueIds told none of those apart, as after an import
     /// of the service, which gives every instance another.
     by_order: Vec<(usize, ByOrder)>,
+    /// The instances of the files' copy and of Studio's without their
+    /// values, which the digests of the two read.
+    structures: Option<(SettingsBytecode, SettingsBytecode)>,
 }
 
 /// How Studio's instances stand among the files', each paired by itself,
@@ -831,12 +866,20 @@ struct Told {
 /// names, are read. `None` where the whole documents have to say. With it,
 /// whether the copies hold as many instances and one stands under another
 /// name, class or parent than the one at its place: a comparison by place
-/// finds such copies apart.
-fn told_alone(desired_bytes: &[u8], observed_bytes: &[u8]) -> Option<(Told, bool)> {
-    use crate::settings::bytecode::property_edit::decode_for_row_chunks;
+/// finds such copies apart. `structures` are the instances of the two
+/// without their values, where they are read.
+fn told_alone(
+    desired_bytes: &[u8],
+    observed_bytes: &[u8],
+    structures: Option<(SettingsBytecode, SettingsBytecode)>,
+) -> Option<(Told, bool)> {
+    use crate::settings::bytecode::property_edit::{decode_for_row_chunks, retained_row_columns};
     let _span = crate::app::profile::span("store instances told alone");
-    let bare = |bytes: &[u8]| {
-        let (mut document, columns) = decode_for_row_chunks(bytes).ok()?;
+    let bare = |bytes: &[u8], structure: Option<SettingsBytecode>| {
+        let (mut document, columns) = match structure {
+            Some(structure) => (structure, retained_row_columns(bytes).ok()?),
+            None => decode_for_row_chunks(bytes).ok()?,
+        };
         columns
             .project_properties(
                 &mut document,
@@ -848,29 +891,81 @@ fn told_alone(desired_bytes: &[u8], observed_bytes: &[u8]) -> Option<(Told, bool
             .ok()?;
         Some(document)
     };
-    let (files, studio) = rayon::join(|| bare(desired_bytes), || bare(observed_bytes));
-    let (files, studio) = (files?, studio?);
+    let (files, studio) = structures.unzip();
+    let read = crate::app::profile::span("store UniqueIds read");
+    let (files, studio) = rayon::join(
+        || bare(desired_bytes, files),
+        || bare(observed_bytes, studio),
+    );
+    drop(read);
+    let (mut files, mut studio) = (files?, studio?);
+    let told = crate::app::profile::span("store instances told in order");
     let (ids, places, by_order) =
         crate::settings::equivalence::settings_ids_told_in_order(&files, &studio)?;
-    let as_many_apart = files.instances.len() == studio.instances.len()
-        && files
-            .instances
-            .iter()
-            .zip(&studio.instances)
-            .any(|(files, studio)| {
-                files.name != studio.name
-                    || files.class_name != studio.class_name
-                    || files.parent_index != studio.parent_index
-            });
+    drop(told);
+    let as_many_apart = stand_apart(&files.instances, &studio.instances);
     let moved = Moved::paired(places, files.instances.len());
+    for instance in files.instances.iter_mut().chain(&mut studio.instances) {
+        instance.properties.clear();
+    }
     Some((
         Told {
             moved,
             ids,
             by_order,
+            structures: Some((files, studio)),
         },
         as_many_apart,
     ))
+}
+
+/// Whether two copies of a store are compared by their instances: a small
+/// store file is read whole, and so is a store Studio holds nearly empty, or
+/// holds far more of.
+fn compared_by_instances(desired_bytes: &[u8], observed_bytes: &[u8]) -> bool {
+    let (desired_len, observed_len) = (
+        store_payload_len(desired_bytes),
+        store_payload_len(observed_bytes),
+    );
+    desired_bytes.len() >= CHANGED_INSTANCES_MIN_BYTES
+        && observed_len.saturating_mul(4) >= desired_len
+        && desired_len.saturating_mul(4) >= observed_len
+}
+
+/// The instances of two v12 copies of a store that hold as many, without
+/// their values, where the two are compared by their instances. Their
+/// digests read them.
+fn structures_of(
+    desired_bytes: &[u8],
+    observed_bytes: &[u8],
+) -> Option<(SettingsBytecode, SettingsBytecode)> {
+    use crate::settings::bytecode::blocks::instance_count;
+    let counts = (
+        instance_count(desired_bytes),
+        instance_count(observed_bytes),
+    );
+    if !matches!(counts, (Some(files), Some(studio)) if files == studio)
+        || !compared_by_instances(desired_bytes, observed_bytes)
+    {
+        return None;
+    }
+    let (files, studio) = rayon::join(
+        || SettingsBytecode::decode_structure(desired_bytes),
+        || SettingsBytecode::decode_structure(observed_bytes),
+    );
+    Some((files.ok()?, studio.ok()?))
+}
+
+/// Whether two copies hold as many instances and one stands under another
+/// name, class or parent than the one at its place: a comparison by place
+/// finds such copies apart, whatever they hold.
+fn stand_apart(files: &[SettingsBytecodeInstance], studio: &[SettingsBytecodeInstance]) -> bool {
+    files.len() == studio.len()
+        && files.iter().zip(studio).any(|(files, studio)| {
+            files.name != studio.name
+                || files.class_name != studio.class_name
+                || files.parent_index != studio.parent_index
+        })
 }
 
 /// The instance of the other copy an instance of one stands for, if any.
@@ -977,12 +1072,15 @@ fn names_one_taken_by_order(
 
 /// `changed_instances_alone` for copies whose instances stand at the same
 /// places, one run apart, or as `told` pairs them. `as_stored` is for two
-/// copies of the files' own (`edited_store_alone`).
+/// copies of the files' own (`edited_store_alone`). `structures` are the
+/// instances of the files' copy and of Studio's without their values, where
+/// they were read before (`structures_of`).
 fn changed_instances_placed(
     desired: Option<&SnapshotEntry>,
     observed: Option<&SnapshotEntry>,
     (files_too, imports_heavy, viewport_first, as_stored): (bool, bool, bool, bool),
     told: Option<Told>,
+    structures: Option<(SettingsBytecode, SettingsBytecode)>,
 ) -> Result<ChangedInstances> {
     use crate::settings::bytecode::blocks::instance_count;
     use crate::settings::bytecode::property_edit::{
@@ -1000,14 +1098,7 @@ fn changed_instances_placed(
         return Ok(ChangedInstances::Whole(None));
     };
     // A store Studio holds nearly empty is replaced, not compared.
-    let (desired_len, observed_len) = (
-        store_payload_len(desired_bytes),
-        store_payload_len(observed_bytes),
-    );
-    if desired_bytes.len() < CHANGED_INSTANCES_MIN_BYTES
-        || observed_len.saturating_mul(4) < desired_len
-        || desired_len.saturating_mul(4) < observed_len
-    {
+    if !compared_by_instances(desired_bytes, observed_bytes) {
         return Ok(ChangedInstances::Whole(None));
     }
     // What is known of the files' copy: its instances whole, or their
@@ -1044,19 +1135,39 @@ fn changed_instances_placed(
         }
         Some((None, moved))
     };
+    // Copies whose structures stand apart are compared whole, and of those
+    // the files' document is all that is read here.
+    if !files_too
+        && told.is_none()
+        && let Some((files, studio)) = &structures
+        && stand_apart(&files.instances, &studio.instances)
+    {
+        let mut current =
+            crate::settings::bytecode::decode_settings_bytecode_holding(desired_bytes)?;
+        stabilize_settings_reference_ids(&mut current);
+        canonicalize_settings_property_names(&mut current)?;
+        return Ok(ChangedInstances::Apart(Some(current)));
+    }
+    let (files_structure, studio_structure) = structures
+        .map(|(files, studio)| (files.instances, studio.instances))
+        .unzip();
     let (observed_rows, files) = if files_too {
         let (files, observed_rows) = if as_many && told.is_none() {
-            whole_row_digests_of_both(desired_bytes, observed_bytes)
+            whole_row_digests_of_both(
+                desired_bytes,
+                observed_bytes,
+                files_structure.zip(studio_structure),
+            )
         } else {
             rayon::join(
-                || whole_row_digests(desired_bytes, |_| Some((None, None))),
-                || whole_row_digests(observed_bytes, stand),
+                || whole_row_digests(desired_bytes, files_structure, |_| Some((None, None))),
+                || whole_row_digests(observed_bytes, studio_structure, stand),
             )
         };
         (observed_rows, Ok(files.ok().flatten().map(Files::Rows)))
     } else {
         rayon::join(
-            || whole_row_digests(observed_bytes, stand),
+            || whole_row_digests(observed_bytes, studio_structure, stand),
             || -> Result<Option<Files>> {
                 // The files' copy as `settings_document` gives it, with the
                 // digests of its instances taken as they were decoded.
@@ -1207,9 +1318,14 @@ fn changed_instances_placed(
                 .filter(|&index| studio_of(index).is_none())
                 .count();
         if unlike > MAX_CHANGED_INSTANCES && imports_heavy {
-            // Neither copy is whole beside the ones the import reads.
-            drop(files);
-            return imported_anew(copies, skeleton, "most of its instances differ");
+            // Neither copy is whole beside the ones the import reads, which
+            // start from the files' instances as their digests left them.
+            let files = match files {
+                Files::Rows(rows) => Some(rows.instances),
+                Files::Whole(..) => None,
+            };
+            let why = "most of its instances differ";
+            return imported_anew(copies, (skeleton, files), why);
         }
         read = instances_read(&skeleton, (&differs, &kept), files_too);
     }
@@ -1337,7 +1453,7 @@ fn changed_instances_placed(
             return hand_over(current);
         }
         drop((current, previous));
-        let Some(studio) = whole_row_digests(observed_bytes, |_| Some((None, None)))
+        let Some(studio) = whole_row_digests(observed_bytes, None, |_| Some((None, None)))
             .ok()
             .flatten()
         else {
@@ -1345,7 +1461,7 @@ fn changed_instances_placed(
         };
         return imported_anew(
             (desired_bytes, observed_bytes),
-            studio.instances,
+            (studio.instances, None),
             "it creates more instances than a push sends one by one",
         );
     }
@@ -1381,35 +1497,48 @@ fn replaced_store_alone(
     {
         return Ok(None);
     }
-    replaced_store_beside(desired_bytes, settings_document(observed)?)
+    replaced_store_beside(desired_bytes, settings_document(observed)?, None)
 }
 
 /// `replaced_store_alone` for the files' store beside what Studio holds, or
-/// keeps, of its own.
+/// keeps, of its own. `files` are the instances of a v12 store file, each
+/// with its UniqueId alone, where they were read before.
 fn replaced_store_beside(
     desired_bytes: &[u8],
     previous: SettingsBytecode,
+    files: Option<Vec<SettingsBytecodeInstance>>,
 ) -> Result<Option<(SettingsBytecode, SettingsBytecode)>> {
-    use crate::settings::bytecode::property_edit::decode_for_row_chunks;
+    use crate::settings::bytecode::property_edit::{decode_for_row_chunks, retained_row_columns};
     use crate::settings::equivalence::stabilize_settings_reference_ids;
 
     // Every instance with its UniqueId alone, which says where Studio's
     // stand among them. A store this reader refuses is the whole decode's to
-    // refuse.
-    let Ok((structure, columns)) = decode_for_row_chunks(desired_bytes) else {
+    // refuse. The files' instances give their UniqueIds as it reads them
+    // where none is a held payload or stands for a pool entry.
+    let as_read = |instances: &[SettingsBytecodeInstance]| {
+        use crate::settings::bytecode::blocks::{holds_marker, is_block_store};
+        use crate::settings::held::holds_a_handle;
+        let plain = |value: &serde_json::Value| !holds_marker(value) && !holds_a_handle(value);
+        is_block_store(desired_bytes)
+            && (instances.iter()).all(|instance| instance.properties.values().all(plain))
+    };
+    let read = match files.filter(|instances| as_read(instances)) {
+        Some(instances) => retained_row_columns(desired_bytes).ok().map(|columns| {
+            let version = SETTINGS_BINARY_VERSION;
+            (SettingsBytecode { version, instances }, columns)
+        }),
+        None => decode_for_row_chunks(desired_bytes)
+            .ok()
+            .and_then(|(mut structure, columns)| {
+                let unique = |name: &str| name == "UniqueId";
+                let projected =
+                    columns.project_properties(&mut structure, unique, |_, _, value| Some(value));
+                projected.ok().map(|()| (structure, columns))
+            }),
+    };
+    let Some((mut current, columns)) = read else {
         return Ok(None);
     };
-    let mut current = structure;
-    if columns
-        .project_properties(
-            &mut current,
-            |name| name == "UniqueId",
-            |_, _, value| Some(value),
-        )
-        .is_err()
-    {
-        return Ok(None);
-    }
     let skeleton = &current.instances;
     let count = skeleton.len();
     // The identities of a store this much smaller are matched with the
@@ -1418,6 +1547,7 @@ fn replaced_store_beside(
     if previous.instances.len() >= count / 4 {
         return Ok(None);
     }
+    let chosen = crate::app::profile::span("store instances an import reads");
     let ids = previous
         .instances
         .iter()
@@ -1489,9 +1619,11 @@ fn replaced_store_beside(
     for index in read {
         wanted[index] = true;
     }
+    drop(chosen);
     if columns.materialize_selected(&mut current, &wanted).is_err() {
         return Ok(None);
     }
+    let _span = crate::app::profile::span("store instances settled for import");
     for (instance, wanted) in current.instances.iter_mut().zip(wanted) {
         if !wanted {
             crate::settings::held::stand_unchanged(&mut instance.properties);
@@ -2073,6 +2205,10 @@ pub(crate) fn create_symlink(target: &Path, link: &Path, directory: bool) -> Res
     }
     .with_context(|| format!("Failed to create symbolic link {}", link.display()))
 }
+
+#[cfg(test)]
+#[path = "replacement_tests.rs"]
+mod replacement_tests;
 
 #[cfg(test)]
 mod heavy_delta_tests {

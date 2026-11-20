@@ -4878,6 +4878,7 @@ pub(crate) fn saved_field_differences(
     files: &SettingsBytecode,
     studio: &SettingsBytecode,
 ) -> Vec<SavedFieldDifference> {
+    let _span = crate::app::profile::span("saved field differences");
     let Ok(database) = rbx_reflection_database::get() else {
         return Vec::new();
     };

@@ -720,24 +720,29 @@ pub(crate) fn decode_settings_bytecode_holding(bytes: &[u8]) -> Result<SettingsB
     )
 }
 
-/// Whether a store holds every string of one of the `required` sets, as
-/// `decode_settings_bytecode_if_contains_any_string_set` asks before it
-/// decodes one. A store that cannot be read counts as holding them: its
-/// decode is the one to say why.
-pub(crate) fn holds_any_string_set(bytes: &[u8], required: &[Vec<String>]) -> bool {
+/// Whether a store may hold a value that names an instance by one of `ids`:
+/// one of its instances has one of them as its id, or its strings hold one
+/// of them whole. Every text a value holds is one of its strings, and a
+/// reference by position names the id of its instance. A store that cannot
+/// be read may.
+pub(crate) fn may_name_any(bytes: &[u8], ids: &std::collections::HashSet<&str>) -> bool {
     if blocks::is_block_store(bytes) {
         return blocks::BlockStore::open(bytes)
-            .and_then(|store| store.holds_any(required))
+            .and_then(|store| store.holds_any_whole(ids))
             .unwrap_or(true);
     }
     let Ok((_, decoded)) = decode_settings_bytecode_container(bytes) else {
         return true;
     };
-    required.iter().any(|needles| {
-        needles
-            .iter()
-            .all(|needle| memmem::find(&decoded, needle.as_bytes()).is_some())
-    })
+    let mut reader = BytecodeReader::new(&decoded);
+    let Ok(header) =
+        decode_settings_payload_header(&mut reader, &DecodeBudget::for_file(bytes.len()))
+    else {
+        return true;
+    };
+    (header.instances.iter().map(|row| &row.settings_id))
+        .chain(&header.strings)
+        .any(|text| ids.contains(text.as_str()))
 }
 
 fn decode_settings_bytecode_if_contains_any_string_set(

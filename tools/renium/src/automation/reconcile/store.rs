@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{ProjectSnapshot, ScopeSet, SnapshotEntry};
-use crate::system::files::{atomic_write_file, sha256_hex};
+use crate::system::files::{atomic_write_parts, sha256_hex};
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StoredSnapshot {
@@ -317,15 +317,7 @@ fn store_entries<'a>(
     directory: &Path,
     entries: impl Iterator<Item = (&'a PathBuf, &'a SnapshotEntry)>,
 ) -> Result<BTreeMap<PathBuf, StoredEntry>> {
-    let entries = entries.collect::<Vec<_>>();
-    let size = entries
-        .iter()
-        .filter_map(|(_, entry)| match entry {
-            SnapshotEntry::File(bytes) => Some(bytes.len()),
-            _ => None,
-        })
-        .sum();
-    let mut pack = Vec::with_capacity(size);
+    use rayon::prelude::*;
     let mut files = Vec::new();
     let mut stored = BTreeMap::new();
     for (path, entry) in entries {
@@ -342,35 +334,47 @@ fn store_entries<'a>(
                     },
                 );
             }
-            SnapshotEntry::File(bytes) => {
-                let offset =
-                    u64::try_from(pack.len()).context("Reconciliation pack is too large")?;
-                let length =
-                    u64::try_from(bytes.len()).context("Reconciliation file is too large")?;
-                let digest = Sha256::digest(bytes).into();
-                pack.extend_from_slice(bytes);
-                files.push((path.clone(), offset, length, digest));
-            }
+            SnapshotEntry::File(bytes) => files.push((path, bytes.as_slice())),
         }
     }
-    if !files.is_empty() {
-        let name = sha256_hex(&pack);
-        let path = directory.join(format!("{name}.bin"));
-        let pack_len = u64::try_from(pack.len()).context("Reconciliation pack is too large")?;
-        if fs::metadata(&path).map_or(true, |metadata| metadata.len() != pack_len) {
-            atomic_write_file(&path, &pack)?;
-        }
-        for (path, offset, length, digest) in files {
-            stored.insert(
-                path,
-                StoredEntry::File(StoredFile {
-                    pack: name.clone(),
-                    offset,
-                    length,
-                    digest,
-                }),
-            );
-        }
+    if files.is_empty() {
+        return Ok(stored);
+    }
+    // The pack holds the files one after another and is named by its
+    // digest, taken beside the digest of each file.
+    let (name, digests) = rayon::join(
+        || {
+            let mut pack = Sha256::new();
+            for (_, bytes) in &files {
+                pack.update(bytes);
+            }
+            format!("{:x}", pack.finalize())
+        },
+        || {
+            (files.par_iter())
+                .map(|(_, bytes)| <[u8; 32]>::from(Sha256::digest(bytes)))
+                .collect::<Vec<_>>()
+        },
+    );
+    let path = directory.join(format!("{name}.bin"));
+    let pack_len = files.iter().map(|(_, bytes)| bytes.len()).sum::<usize>();
+    let pack_len = u64::try_from(pack_len).context("Reconciliation pack is too large")?;
+    if fs::metadata(&path).map_or(true, |metadata| metadata.len() != pack_len) {
+        atomic_write_parts(&path, files.iter().map(|(_, bytes)| *bytes))?;
+    }
+    let mut offset = 0;
+    for ((path, bytes), digest) in files.into_iter().zip(digests) {
+        let length = u64::try_from(bytes.len()).context("Reconciliation file is too large")?;
+        stored.insert(
+            path.clone(),
+            StoredEntry::File(StoredFile {
+                pack: name.clone(),
+                offset,
+                length,
+                digest,
+            }),
+        );
+        offset += length;
     }
     Ok(stored)
 }

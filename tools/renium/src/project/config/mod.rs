@@ -2380,6 +2380,7 @@ pub fn try_load_project(
     explicit: Option<&Path>,
     start: Option<&Path>,
 ) -> Result<Option<LoadedProject>> {
+    let _span = crate::app::profile::span("project configuration load");
     let Some(path) = try_resolve_project_path(explicit, start)? else {
         return Ok(None);
     };

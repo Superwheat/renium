@@ -65,6 +65,7 @@ pub(crate) fn respond_to_verified_import(
     bridge: &BridgeServer,
     summary: &Map<String, Value>,
 ) {
+    let _span = crate::app::profile::span("verified import answer");
     let parameters = IMPORT_REPLY_PARAMETERS
         .with(|slot| slot.borrow().clone())
         .unwrap_or(json!({}));

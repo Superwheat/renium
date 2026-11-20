@@ -1347,6 +1347,37 @@ impl<'a> BlockStore<'a> {
             .any(|set| set.iter().all(|needle| held.contains(needle.as_str()))))
     }
 
+    /// Whether an instance has one of `strings` as its id, or a block or a
+    /// pool entry holds one of them as a whole string. Each frame is read by
+    /// itself, and the pool only for a string as long as its entries.
+    pub(crate) fn holds_any_whole(
+        &self,
+        strings: &std::collections::HashSet<&str>,
+    ) -> Result<bool> {
+        let instances = self.structure()?.instances;
+        if instances
+            .iter()
+            .any(|row| strings.contains(row.settings_id.as_str()))
+        {
+            return Ok(true);
+        }
+        let in_blocks = (0..self.blocks.len()).into_par_iter().map(|index| {
+            let open = self.open_block(index)?;
+            Ok((open.strings.iter())
+                .any(|string| matches!(string, BlockString::Own(text) if strings.contains(text.as_str()))))
+        });
+        let long = strings.iter().any(|text| text.len() >= POOL_MIN_BYTES);
+        let in_pool = (0..self.pool.len())
+            .into_par_iter()
+            .filter(|_| long)
+            .map(|index| {
+                let texts = self.pool_texts(index)?;
+                Ok(texts.iter().any(|text| strings.contains(text.as_str())))
+            });
+        let found = in_blocks.chain(in_pool).collect::<Result<Vec<bool>>>()?;
+        Ok(found.contains(&true))
+    }
+
     /// The place of the pool entry of hash `hash`.
     fn entry_of(&self, hash: &[u8; 16]) -> Result<usize> {
         (self.hashes.binary_search(hash).ok()).context("A pool entry the store keeps is missing")
@@ -1378,17 +1409,22 @@ impl<'a> BlockStore<'a> {
     /// holds too (`blocks_held_by`), digested beside that store alone: each
     /// of its rows has the digest of the block and its place there, which is
     /// the same in both and no other row's, and none of them is given as
-    /// naming an instance.
+    /// naming an instance. `structure` is the instances of this store without
+    /// their values, where they were read before.
     pub(crate) fn row_digests(
         &self,
         whole: bool,
         shared: &[bool],
+        structure: Option<Vec<SettingsBytecodeInstance>>,
         plan: impl FnOnce(&[SettingsBytecodeInstance]) -> Option<(Option<usize>, Option<Moved>)>,
     ) -> Result<Option<StoreRows>> {
         use super::captured::{
             UNIQUE_ID, document_row_digest, value_digest, whole_document_row_digest,
         };
-        let mut instances = self.structure()?.instances;
+        let mut instances = match structure {
+            Some(instances) if instances.len() == self.rows => instances,
+            _ => self.structure()?.instances,
+        };
         let Some((kept, moved)) = plan(&instances) else {
             return Ok(None);
         };
@@ -1404,6 +1440,7 @@ impl<'a> BlockStore<'a> {
         if shared.contains(&true) {
             (self.pool.par_iter()).try_for_each(|pool| self.frame_bytes(pool.frame).map(drop))?;
         }
+        let blocks = crate::app::profile::span("store blocks digested");
         let digested = self
             .split(&mut instances)
             .into_par_iter()
@@ -1441,10 +1478,25 @@ impl<'a> BlockStore<'a> {
                             .any(names_an_instance_by_id);
                     let (sum, unique_id) = match &moved {
                         Some(moved) => {
-                            let mut placed = instance.clone();
-                            moved.in_state_whole(&mut placed);
+                            // The instance as the state places it, its values
+                            // that name one by its place given for the digest.
                             moved.parent_in_state(instance);
-                            digest_of(&placed)
+                            let (properties, attributes) = (
+                                moved.values_in_state(&instance.properties),
+                                moved.values_in_state(&instance.attributes),
+                            );
+                            let properties = properties
+                                .map(|placed| std::mem::replace(&mut instance.properties, placed));
+                            let attributes = attributes
+                                .map(|placed| std::mem::replace(&mut instance.attributes, placed));
+                            let digests = digest_of(instance);
+                            if let Some(properties) = properties {
+                                instance.properties = properties;
+                            }
+                            if let Some(attributes) = attributes {
+                                instance.attributes = attributes;
+                            }
+                            digests
                         }
                         None => digest_of(instance),
                     };
@@ -1464,6 +1516,7 @@ impl<'a> BlockStore<'a> {
                 Ok(digests)
             })
             .collect::<Result<Vec<_>>>()?;
+        drop(blocks);
         let (mut digests, mut unique_ids, mut named) = (Vec::new(), Vec::new(), Vec::new());
         for (sum, unique_id, row) in digested.into_iter().flatten() {
             digests.push(sum);
@@ -1849,14 +1902,20 @@ impl<'a> BlockStore<'a> {
             }
             self.pool_text(&hash).map(Some)
         };
-        let pooled = open.pool_entries().next().is_some();
-        for row in rows.iter_mut().enumerate().filter(|(row, _)| keep(*row)) {
-            let (properties, attributes) = row.1.maps();
-            if pooled {
-                unmark(properties, &text)?;
-                unmark(attributes, &text)?;
-            }
-            if self.budget.holds_payloads {
+        // Each row takes its texts by itself; the payloads are held in the
+        // order of the rows, which gives each its handle.
+        if open.pool_entries().next().is_some() {
+            (rows.par_iter_mut().enumerate())
+                .filter(|(row, _)| keep(*row))
+                .try_for_each(|(_, row)| {
+                    let (properties, attributes) = row.maps();
+                    unmark(properties, &text)?;
+                    unmark(attributes, &text)
+                })?;
+        }
+        if self.budget.holds_payloads {
+            for row in rows.iter_mut().enumerate().filter(|(row, _)| keep(*row)) {
+                let (properties, _) = row.1.maps();
                 for value in properties.values_mut() {
                     *value = self.budget.property(std::mem::take(value));
                 }
@@ -1964,6 +2023,17 @@ fn unmark_value(
         _ => {}
     }
     Ok(())
+}
+
+/// Whether `value` holds, at any depth, a text that stands for a pool entry
+/// (`Texts::Marked`).
+pub(crate) fn holds_marker(value: &Value) -> bool {
+    match value {
+        Value::String(text) => marked(text).is_some(),
+        Value::Array(items) => items.iter().any(holds_marker),
+        Value::Object(map) => map.values().any(holds_marker),
+        _ => false,
+    }
 }
 
 impl Block {

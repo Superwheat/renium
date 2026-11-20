@@ -2044,7 +2044,9 @@ where
     } else {
         collect_project_editor_changes_with_documents(&args, prepared_documents)?
     };
+    let amended = Instant::now();
     amend(&mut changes)?;
+    crate::app::profile::record("editor change set amended", amended);
     push_editor_changes_with_collected(
         args,
         bridge,
@@ -2696,6 +2698,7 @@ fn staged_folders_below_service(
 }
 
 fn log_editor_collection_timing(label: &str, started: Instant) {
+    crate::app::profile::record(&format!("editor collection {label}"), started);
     log_global(
         5,
         format_args!(
@@ -4161,6 +4164,7 @@ fn push_with_reader_platform(
         )?;
     }
     log_timing("native editor package ownership", phase_started);
+    let phase_started = Instant::now();
     let mut review_payload = (!args.no_review
         && !args.yes
         && !global_yes()
@@ -4174,6 +4178,7 @@ fn push_with_reader_platform(
         )
     });
     let review_payload_present = review_payload.is_some();
+    log_timing("native editor review payload", phase_started);
     let reviews_shown = std::cell::Cell::new(0);
     let mut review = |report| -> Result<Option<Map<String, Value>>> {
         let Some((payload, skipped)) = review_payload.take() else {
@@ -4254,10 +4259,13 @@ fn push_with_reader_platform(
     if global_log_enabled(5) {
         log_change_set_composition(&changes, binary_import.as_ref());
     }
+    let phase_started = Instant::now();
     let mut pre_routed_protected_writes =
         take_pre_routed_protected_writes(&mut changes, binary_import.as_ref());
     let mut rerouted_fields = 0;
-    if !changes.deferred_native_rows.is_empty() && !root_writes_available(bridge)? {
+    let routed = !changes.deferred_native_rows.is_empty() && !root_writes_available(bridge)?;
+    log_timing("native editor protected write routing", phase_started);
+    if routed {
         // Plugin-only imports cannot run the native follow-up transaction. Keep
         // its saved fields in the original transaction's protected snapshot.
         let rerouted = protected_write_rows(&std::mem::take(&mut changes.deferred_native_rows));
@@ -4571,6 +4579,7 @@ fn defer_imported_native_root_rows(
     let Some(import) = import else {
         return;
     };
+    let _span = crate::app::profile::span("native editor imported root rows deferred");
     let mut deferred = Vec::new();
     changes.property_changes.retain_mut(|change| {
         if property_change_needs_post_native_apply(change)
@@ -6578,6 +6587,7 @@ fn read_imported_documents_whole(
     args: &PushEditorChangesArgs,
     prepared: &mut PreparedEditorDocuments,
 ) -> Result<()> {
+    let _span = crate::app::profile::span("imported documents read whole");
     let (_, src_root) = editor_project_roots(args)?;
     let imported = std::mem::take(&mut prepared.native_services);
     for (service, document) in &mut prepared.documents {
@@ -7252,6 +7262,7 @@ fn log_change_set_composition(
     changes: &EditorChangeSet,
     binary_import: Option<&EditorBinaryImport>,
 ) {
+    let _span = crate::app::profile::span("native editor change set composition");
     let instances = changes
         .instance_changes
         .iter()

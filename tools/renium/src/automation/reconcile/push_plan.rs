@@ -108,6 +108,7 @@ pub(crate) fn push_staged_project(
             summary: Map::from_iter([("ok".to_string(), Value::Bool(true))]),
         });
     }
+    let supporting = crate::app::profile::span("staged push supporting data");
     let changed_paths = plan.changed_paths.iter().cloned().collect::<HashSet<_>>();
     let supporting_paths = supporting_settings_scopes(context, &changed_paths)?
         .into_iter()
@@ -137,6 +138,7 @@ pub(crate) fn push_staged_project(
             apply_snapshot_paths(&stage.project_root, &supporting_paths, &current)?;
         }
     }
+    drop(supporting);
     let project_root = push_args.project.project_root.clone();
     let planned_paths = plan.changed_paths.clone();
     // Only the files this push sends matter here. Edits elsewhere in the
@@ -211,6 +213,7 @@ pub(crate) fn push_staged_project(
             stage_native_bootstrap_services(changes, &initial_documents)
         },
         |changes| {
+            let _span = crate::app::profile::span("staged settings writes redirected");
             generated = redirect_staged_settings_writes(
                 changes,
                 &stage.project_root,
@@ -224,6 +227,7 @@ pub(crate) fn push_staged_project(
     if summary.get("skippedByReview").and_then(Value::as_bool) == Some(true) {
         return Err(SkippedPushReview.into());
     }
+    let _span = crate::app::profile::span("imported documents released");
     for document in initial_documents.into_values() {
         if let Some(document) = Arc::into_inner(document) {
             drop_settings_document(document);
@@ -544,88 +548,96 @@ pub(crate) fn append_recreated_reference_pushes(
     prepared_settings: &HashMap<PathBuf, PreparedEditorSettingsChange>,
     plan: &mut ReconcilePushPlan,
 ) -> Result<()> {
+    let _span = crate::app::profile::span("references to recreated instances");
     let targeted = plan
         .target_settings_ids
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let mut recreated = plan.recreated_settings_ids.clone();
+    let mut recreated = plan
+        .recreated_settings_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
     recreated.extend(
         plan.instance_deletes
             .iter()
             .flat_map(|change| &change.instances)
             .map(|instance| instance.settings_id.as_str())
-            .filter(|settings_id| targeted.contains(settings_id))
-            .map(str::to_string),
+            .filter(|settings_id| targeted.contains(settings_id)),
     );
     recreated.extend(
         plan.previous_class_names
             .keys()
-            .map(|(_, settings_id)| settings_id.clone()),
+            .map(|(_, settings_id)| settings_id.as_str()),
     );
     if recreated.is_empty() {
         return Ok(());
     }
+    let stores = desired
+        .entries
+        .iter()
+        .filter(|(path, _)| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_service_settings_file_name)
+        })
+        .collect::<Vec<_>>();
     // A store names another store's instance by its id, which its strings
-    // then hold: one that holds none of a few ids is not decoded for them.
-    let ids = (recreated.len() <= 8).then(|| {
-        recreated
-            .iter()
-            .map(|id| vec![id.clone()])
-            .collect::<Vec<_>>()
-    });
-
-    for (path, entry) in &desired.entries {
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(is_service_settings_file_name)
-        {
-            continue;
-        }
-        let decoded;
-        let document = if let Some(prepared) = prepared_settings.get(path) {
-            &prepared.current
-        } else {
-            if let (Some(ids), SnapshotEntry::File(bytes)) = (&ids, entry)
-                && !crate::settings::bytecode::holds_any_string_set(bytes, ids)
-            {
-                continue;
-            }
-            decoded = settings_document(Some(entry))?;
-            &decoded
+    // then hold: one that holds none of them is not decoded. The stores are
+    // looked through together and decoded one at a time.
+    let read = (stores.par_iter())
+        .map(|(path, entry)| {
+            prepared_settings.contains_key(*path)
+                || !matches!(entry, SnapshotEntry::File(bytes)
+                    if !crate::settings::bytecode::may_name_any(bytes, &recreated))
+        })
+        .collect::<Vec<_>>();
+    let mut referring = Vec::new();
+    for ((path, entry), _) in stores.into_iter().zip(read).filter(|(_, read)| *read) {
+        let mut decoded = None;
+        let document = match prepared_settings.get(path) {
+            Some(prepared) => &prepared.current,
+            None => &*decoded.insert(settings_document(Some(entry))?),
         };
         // Full-service payloads already carry every outgoing reference, including
         // the serializer's post-apply exceptions. Only incremental services need
         // additional referrer selections when an identity is recreated elsewhere.
-        if plan
-            .initial_native_services
-            .contains(&settings_service_name(path, document, document)?)
-        {
-            continue;
+        let service = settings_service_name(path, document, document)?;
+        if !plan.initial_native_services.contains(&service) {
+            let ids = document
+                .instances
+                .par_iter()
+                .filter(|instance| {
+                    instance.class_name != "PackageLink"
+                        && instance
+                            .properties
+                            .values()
+                            .chain(instance.attributes.values())
+                            .any(|value| value_references_any(value, &recreated))
+                })
+                .map(|instance| instance.settings_id.clone())
+                .collect::<Vec<_>>();
+            referring.push((path, service, ids));
         }
-        for instance in &document.instances {
-            if instance.class_name == "PackageLink"
-                || !instance
-                    .properties
-                    .values()
-                    .chain(instance.attributes.values())
-                    .any(|value| value_references_any(value, &recreated))
-            {
-                continue;
-            }
+        if let Some(decoded) = decoded {
+            drop_settings_document(decoded);
+        }
+    }
+    for (path, service, ids) in referring {
+        for id in ids {
             plan.changed_paths.push(path.clone());
-            plan.target_settings_ids.push(instance.settings_id.clone());
-            plan.attribute_only_instances.remove(&(
-                settings_service_name(path, document, document)?,
-                instance.settings_id.clone(),
-            ));
+            plan.target_settings_ids.push(id.clone());
+            plan.attribute_only_instances.remove(&(service.clone(), id));
         }
     }
     Ok(())
 }
 
-pub(crate) fn value_references_any(value: &Value, settings_ids: &HashSet<String>) -> bool {
+pub(crate) fn value_references_any<S: std::borrow::Borrow<str> + Eq + std::hash::Hash>(
+    value: &Value,
+    settings_ids: &HashSet<S>,
+) -> bool {
     match value {
         Value::Array(values) => values
             .iter()

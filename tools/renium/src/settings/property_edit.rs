@@ -276,27 +276,32 @@ pub(crate) fn row_digests(
         &[SettingsBytecodeInstance],
     ) -> Option<(Option<usize>, Option<super::captured::Moved>)>,
 ) -> Result<Option<StoreRows>> {
-    row_digests_of(bytes, false, plan)
+    row_digests_of(bytes, false, None, plan)
 }
 
 /// `row_digests` over every value an instance holds, what the engine alone
 /// sets included: two instances with one digest and one UniqueId digest hold
-/// the same values, whatever a comparison looks at.
+/// the same values, whatever a comparison looks at. `structure` is the
+/// instances of a v12 store without their values, where they were read
+/// before.
 pub(crate) fn whole_row_digests(
     bytes: &[u8],
+    structure: Option<Vec<SettingsBytecodeInstance>>,
     plan: impl FnOnce(
         &[SettingsBytecodeInstance],
     ) -> Option<(Option<usize>, Option<super::captured::Moved>)>,
 ) -> Result<Option<StoreRows>> {
-    row_digests_of(bytes, true, plan)
+    row_digests_of(bytes, true, structure, plan)
 }
 
 /// `whole_row_digests` of two copies of one store, for telling the rows of
-/// one from the rows of the other. A block both hold byte for byte is not
-/// digested row by row (`BlockStore::row_digests`).
+/// one from the rows of the other, with their `structures` where they were
+/// read before. A block both hold byte for byte is not digested row by row
+/// (`BlockStore::row_digests`).
 pub(crate) fn whole_row_digests_of_both(
     first: &[u8],
     second: &[u8],
+    structures: Option<(Vec<SettingsBytecodeInstance>, Vec<SettingsBytecodeInstance>)>,
 ) -> (Result<Option<StoreRows>>, Result<Option<StoreRows>>) {
     use super::blocks::BlockStore;
     let open = |bytes| BlockStore::open(bytes).map(BlockStore::holding);
@@ -304,20 +309,25 @@ pub(crate) fn whole_row_digests_of_both(
         (Ok(first), Ok(second)) => first.blocks_held_by(&second),
         _ => Vec::new(),
     };
-    let digests = |bytes| {
+    let digests = |bytes, structure| {
         let _span = crate::app::profile::span("store instance digests");
         if shared.contains(&true) {
-            open(bytes)?.row_digests(true, &shared, |_| Some((None, None)))
+            open(bytes)?.row_digests(true, &shared, structure, |_| Some((None, None)))
         } else {
-            whole_row_digests(bytes, |_| Some((None, None)))
+            whole_row_digests(bytes, structure, |_| Some((None, None)))
         }
     };
-    rayon::join(|| digests(first), || digests(second))
+    let (first_structure, second_structure) = structures.unzip();
+    rayon::join(
+        || digests(first, first_structure),
+        || digests(second, second_structure),
+    )
 }
 
 fn row_digests_of(
     bytes: &[u8],
     whole: bool,
+    structure: Option<Vec<SettingsBytecodeInstance>>,
     plan: impl FnOnce(
         &[SettingsBytecodeInstance],
     ) -> Option<(Option<usize>, Option<super::captured::Moved>)>,
@@ -328,7 +338,7 @@ fn row_digests_of(
     if super::blocks::is_block_store(bytes) {
         return super::blocks::BlockStore::open(bytes)?
             .holding()
-            .row_digests(whole, &[], plan);
+            .row_digests(whole, &[], structure, plan);
     }
     let (_, payload) = decode_settings_bytecode_container(bytes)?;
     let budget = DecodeBudget::for_file(bytes.len());

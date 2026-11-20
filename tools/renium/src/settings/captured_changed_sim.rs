@@ -1756,7 +1756,7 @@ fn rows_alone(
     // The digests taken column by column are the digests of the rows.
     let digested = |whole_rows: bool| {
         let read = if whole_rows {
-            property_edit::whole_row_digests(bytes, |_| Some((kept, None)))
+            property_edit::whole_row_digests(bytes, None, |_| Some((kept, None)))
         } else {
             property_edit::row_digests(bytes, |_| Some((kept, None)))
         };

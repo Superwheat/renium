@@ -706,6 +706,75 @@ fn damaged(
     Ok(())
 }
 
+/// Law 2 for the search a push plan makes before it decodes a store for the
+/// instances that name one of some ids: both versions of `document`, given a
+/// reference by `long`, a pool entry's length, are found for every id their
+/// decode names by a reference or holds as an instance's, and not for an id
+/// that no string of theirs is.
+fn may_name_any_as_decoded(
+    document: &SettingsBytecode,
+    block_rows: usize,
+    long: &str,
+) -> Result<(), String> {
+    use crate::automation::reconcile::value_references_any;
+    fn targets<'v>(value: &'v Value, found: &mut Vec<&'v str>) {
+        match value {
+            Value::Array(items) => items.iter().for_each(|item| targets(item, found)),
+            Value::Object(map) => {
+                if map.get("_type").and_then(Value::as_str) == Some("Ref") {
+                    let ids = ["settingsId", "instanceId"].map(|key| map.get(key));
+                    found.extend(ids.into_iter().flatten().filter_map(Value::as_str));
+                }
+                map.values().for_each(|item| targets(item, found));
+            }
+            _ => {}
+        }
+    }
+    let mut document = document.clone();
+    if let Some(instance) = document.instances.last_mut() {
+        let named = json!({"_type": "Ref", "settingsId": long});
+        instance.properties.insert("Long".into(), named);
+    }
+    let (Ok(v11), Ok(v12)) = (
+        encode_settings_bytecode_v11(&document),
+        in_blocks(&document, block_rows),
+    ) else {
+        return Ok(());
+    };
+    crate::settings::equivalence::stabilize_settings_reference_ids(&mut document);
+    let mut named = Vec::new();
+    for instance in &document.instances {
+        named.push(instance.settings_id.as_str());
+        let values = instance
+            .properties
+            .values()
+            .chain(instance.attributes.values());
+        values.for_each(|value| targets(value, &mut named));
+    }
+    let unnamed = format!("{}~", &long[1..]);
+    let absent = ["no-store-holds-this-id", unnamed.as_str()];
+    for id in named.iter().copied().chain(absent) {
+        let ids = HashSet::from([id]);
+        let names = (document.instances.iter()).any(|instance| {
+            let mut values = instance
+                .properties
+                .values()
+                .chain(instance.attributes.values());
+            instance.settings_id == id || values.any(|value| value_references_any(value, &ids))
+        });
+        for (version, file) in [("v11", &v11), ("v12", &v12)] {
+            let found = may_name_any(file, &ids);
+            if names && !found || absent.contains(&id) && found {
+                return Err(format!(
+                    "law 2: the {version} search for an id of {} bytes says {found}",
+                    id.len()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
     let texts = long_texts(seed);
     let document = document(seed, &texts);
@@ -785,6 +854,7 @@ fn run_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
             ));
         }
     }
+    may_name_any_as_decoded(&oracle, block_rows, &texts[2])?;
     edits(&store, &whole, block_rows, &texts, &mut rng)?;
     damaged(&store, &whole, &asked[..asked.len().min(3)], &mut rng)
 }
@@ -1249,7 +1319,8 @@ fn copies_digested_together_refuse_a_damaged_pool_frame_of_a_block_both_hold() {
     edited.insert("Transparency".into(), json!(0.5));
     let studio = in_blocks(&document, 4).unwrap();
     assert_eq!(blocks_of_both(&files, &studio), 3);
-    let digested = |files: &[u8]| super::property_edit::whole_row_digests_of_both(files, &studio).0;
+    let digested =
+        |files: &[u8]| super::property_edit::whole_row_digests_of_both(files, &studio, None).0;
     assert!(digested(&files).is_ok_and(|rows| rows.is_some()));
     let frame = BlockStore::open(&files).unwrap().pool[0].frame;
     let mut damaged = files.clone();

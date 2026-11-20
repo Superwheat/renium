@@ -1314,7 +1314,7 @@ pub(crate) fn store_rows_differ_only_at(
     exact: bool,
 ) -> Result<bool> {
     use crate::settings::bytecode::property_edit::{decode_rows, whole_row_digests_of_both};
-    let (was, now) = whole_row_digests_of_both(held, files);
+    let (was, now) = whole_row_digests_of_both(held, files, None);
     let (Some(was), Some(now)) = (was?, now?) else {
         return Ok(false);
     };

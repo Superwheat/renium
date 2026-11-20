@@ -2784,14 +2784,15 @@ fn rows_a_merge_reads(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<Option<
             .collect::<HashMap<_, _>>();
         (by_id.len() == rows.instances.len()).then_some(by_id)
     };
-    let Some(base_rows) = stores[0].row_digests(true, &shared, |_| Some((None, None)))? else {
+    let Some(base_rows) = stores[0].row_digests(true, &shared, None, |_| Some((None, None)))?
+    else {
         return Ok(None);
     };
     let Some(in_base) = rows_by_id(&base_rows) else {
         return Ok(None);
     };
     let beside = |store: &BlockStore<'_>| {
-        store.row_digests(true, &shared, |instances| {
+        store.row_digests(true, &shared, None, |instances| {
             let ids = |rows: &[SettingsBytecodeInstance]| {
                 rows.iter()
                     .map(|row| row.settings_id.clone())
