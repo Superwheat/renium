@@ -1187,52 +1187,57 @@ pub(crate) fn attach_capture_identities(
 pub(crate) fn move_escaping_instances_before_deletes(
     instance_changes: &mut Vec<EditorInstanceChange>,
 ) {
-    let deleted = instance_changes
-        .iter()
-        .filter(|change| change.mode == "deleteInstances")
-        .flat_map(|change| {
-            change
-                .instances
-                .iter()
-                .map(move |instance| (change.service.as_str(), instance.path_segments.as_slice()))
-        })
-        .map(|(service, path)| (service.to_string(), path.to_vec()))
-        .collect::<Vec<_>>();
+    let mut deleted = HashMap::<String, HashSet<Vec<String>>>::new();
+    for change in instance_changes.iter() {
+        if change.mode == "deleteInstances" && !change.instances.is_empty() {
+            let paths = deleted.entry(change.service.clone()).or_default();
+            paths.extend(
+                change
+                    .instances
+                    .iter()
+                    .map(|instance| instance.path_segments.clone()),
+            );
+        }
+    }
     if deleted.is_empty() {
         return;
+    }
+    // Every path a proper prefix of `path`, the shortest first.
+    fn above(path: &[String]) -> impl Iterator<Item = &[String]> {
+        (0..path.len()).map(move |length| &path[..length])
     }
     let mut escapes = Vec::new();
     for change in instance_changes.iter_mut() {
         if change.mode != "upsertInstances" {
             continue;
         }
+        let Some(deleted) = deleted.get(&change.service) else {
+            continue;
+        };
         let leaving = change
             .instances
             .iter()
             .filter(|instance| {
-                !instance.previous_path_segments.is_empty()
-                    && deleted.iter().any(|(service, path)| {
-                        *service == change.service
-                            && instance.previous_path_segments.len() > path.len()
-                            && instance.previous_path_segments.starts_with(path)
-                    })
+                above(&instance.previous_path_segments).any(|path| deleted.contains(path))
             })
             .map(|instance| instance.settings_id.clone())
             .collect::<HashSet<_>>();
         if leaving.is_empty() {
             continue;
         }
+        let mut at_path = HashMap::<&[String], Vec<&String>>::new();
+        for instance in &change.instances {
+            let at = at_path.entry(instance.path_segments.as_slice());
+            at.or_default().push(&instance.settings_id);
+        }
         let ancestors = change
             .instances
             .iter()
             .filter(|instance| leaving.contains(&instance.settings_id))
-            .flat_map(|instance| {
-                change.instances.iter().filter(|candidate| {
-                    candidate.path_segments.len() < instance.path_segments.len()
-                        && instance.path_segments.starts_with(&candidate.path_segments)
-                })
-            })
-            .map(|ancestor| ancestor.settings_id.clone())
+            .flat_map(|instance| above(&instance.path_segments))
+            .filter_map(|path| at_path.get(path))
+            .flatten()
+            .map(|ancestor| (*ancestor).clone())
             .collect::<HashSet<_>>();
         let (escaping, mut staying): (Vec<_>, Vec<_>) =
             change.instances.drain(..).partition(|instance| {
