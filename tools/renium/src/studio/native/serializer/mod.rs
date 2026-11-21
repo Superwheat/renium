@@ -4,6 +4,8 @@ mod arm64_functions;
 mod arm64_serializer;
 #[cfg(any(windows, target_os = "macos", test))]
 mod functions;
+#[cfg(any(windows, target_os = "macos", test))]
+pub(crate) use functions::FunctionFailure;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(any(target_os = "macos", test))]
@@ -153,8 +155,10 @@ pub(crate) fn validate_function_arguments(
     class: &str,
     name: &str,
     arguments: &[serde_json::Value],
+    items: &serde_json::Value,
 ) -> Result<()> {
-    functions::input(class, name, arguments).map(|_| ())
+    functions::input(class, name, arguments)?.validate_enums(items)?;
+    functions::validate_api_base(name, items)
 }
 
 // Windows binds native work to a document window; macOS discovers the DataModel

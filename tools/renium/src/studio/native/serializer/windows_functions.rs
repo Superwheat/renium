@@ -1,4 +1,5 @@
 use super::*;
+use crate::studio::native::serializer::functions::YieldContract;
 use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Clone)]
@@ -15,15 +16,146 @@ static BINDINGS: OnceLock<Mutex<HashMap<BindingKey, Binding>>> = OnceLock::new()
 mod yield_abi;
 pub(in super::super) use yield_abi::ContinuationAbi;
 
+pub(super) fn qualify_yield(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    table: usize,
+    binding: (usize, usize),
+    mode: u32,
+) -> Result<YieldContract> {
+    let methods = properties::vtable_methods(memory, studio, layout, table)?;
+    let copies = byte_copy_imports(memory, studio)?;
+    let mut cache = HashMap::new();
+    yield_abi::qualify(
+        mode,
+        binding.0,
+        binding.1 as u64,
+        &methods.into_iter().map(|at| at as u64).collect::<Vec<_>>(),
+        &mut |at| {
+            cache
+                .entry(at)
+                .or_insert_with(|| dispatch_code(memory, studio, layout, at as usize).ok())
+                .clone()
+        },
+        &mut |at| memory.read_u64(at as usize).ok(),
+        &mut |at| {
+            let Ok(bytes) = verified_code(memory, studio, layout, at as usize, 6) else {
+                return false;
+            };
+            let i = Decoder::with_ip(64, &bytes, at, DecoderOptions::NONE).decode();
+            i.flow_control() == FlowControl::IndirectBranch
+                && i.is_ip_rel_memory_operand()
+                && copies
+                    .get(&(i.ip_rel_memory_address() as usize))
+                    .is_some_and(|target| {
+                        memory.read_u64(i.ip_rel_memory_address() as usize).ok()
+                            == Some(*target as u64)
+                    })
+        },
+    )
+}
+
+fn byte_copy_imports(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+) -> Result<HashMap<usize, usize>> {
+    let mapped = ImageView::open(&studio.path)?;
+    let image = PeImage::parse(mapped.bytes())?;
+    let (rva, size) = probes::directory(&image, 1)?;
+    let table = image.rva_to_offset(rva)?;
+    let loaded = modules(memory.pid)?;
+    let mut copies = HashMap::new();
+    for offset in (0..size.saturating_sub(19)).step_by(20) {
+        let row = table + offset;
+        let name = read_u32(image.bytes, row + 12)? as usize;
+        if name == 0 {
+            break;
+        }
+        let dll = probes::image_string(&image, name)?;
+        if !dll.to_ascii_lowercase().starts_with("vcruntime")
+            && !dll.eq_ignore_ascii_case("ucrtbase.dll")
+        {
+            continue;
+        }
+        let names = image.rva_to_offset(read_u32(image.bytes, row)? as usize)?;
+        let iat = read_u32(image.bytes, row + 16)? as usize;
+        for slot in 0..4096 {
+            let entry = read_u64(image.bytes, names + slot * 8)?;
+            if entry == 0 {
+                break;
+            }
+            if entry >> 63 != 0 {
+                continue;
+            }
+            let name = probes::image_string(&image, entry as usize + 2)?;
+            if !matches!(name, "memcpy" | "memmove") {
+                continue;
+            }
+            let module = loaded
+                .iter()
+                .find(|m| m.name.eq_ignore_ascii_case(dll))
+                .context("yield-payload-string: byte-copy module missing")?;
+            let mapped = ImageView::open(&module.path)?;
+            let imported = PeImage::parse(mapped.bytes())?;
+            verify_loaded_image(memory, module, imported.image_stamp)?;
+            let target = probes::exported_rva(&imported, name)?;
+            // The export and each routine it jumps to are the file's code.
+            let (mut at, mut proved) = (target, false);
+            for _ in 0..3 {
+                let live = memory.read_vec(module.base + at, 32)?;
+                let file = (imported.require_executable_rva(at).is_ok()
+                    && imported.require_executable_rva(at + 31).is_ok())
+                .then(|| imported.rva_to_offset(at).ok())
+                .flatten()
+                .and_then(|offset| slice(imported.bytes, offset, 32).ok());
+                match file.and_then(|file| copy_entry(&live, file, at)) {
+                    Some(next) if next == at => {
+                        proved = true;
+                        break;
+                    }
+                    Some(next) => at = next,
+                    None => break,
+                }
+            }
+            anyhow::ensure!(proved, "yield-payload-string: byte-copy export changed");
+            copies.insert(studio.base + iat + slot * 8, module.base + target);
+        }
+    }
+    Ok(copies)
+}
+
+// Where the loaded bytes at `rva` of a copy export lead: `rva` itself where
+// they are the file's code, the RVA they jump to where the file holds a jump.
+// The C runtime points its memcpy export at the routine it picks for the CPU
+// when it loads: the export stays a five-byte jump with another displacement.
+// Nothing after a jump runs, so a neighbor the runtime moved as well does not
+// count against it.
+fn copy_entry(live: &[u8], file: &[u8], rva: usize) -> Option<usize> {
+    let jump = |code: &[u8]| {
+        (code.first() == Some(&0xe9))
+            .then(|| code.get(1..5)?.try_into().ok().map(i32::from_le_bytes))
+            .flatten()
+    };
+    if jump(file).is_none() {
+        return (live == file).then_some(rva);
+    }
+    let next = usize::try_from(rva as i64 + 5 + jump(live)? as i64).ok()?;
+    (next != rva).then_some(next)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Storage {
     Descriptor,
     Stack,
+    Capture,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Value {
     ImagePointer(u64),
+    Continuation(u8), // Symbolic incoming callback, used only by yield qualification.
+    Integer(u64),
     TaggedPointer(u64, u8),
     Pointer(Storage, i64),
     Bytes(Storage, i64, usize),
@@ -44,6 +176,9 @@ impl Value {
             Self::Bytes(storage, start, size) if offset.checked_add(width)? <= size => {
                 Some(Self::Bytes(storage, start + offset as i64, width))
             }
+            Self::Integer(value) if offset == 0 && width <= 8 => Some(Self::Integer(
+                value & u64::MAX.checked_shr((64 - width * 8) as u32).unwrap_or(0),
+            )),
             _ if offset == 0 && width == 8 => Some(self),
             _ => None,
         }
@@ -102,7 +237,7 @@ impl State {
                     Storage::Descriptor if (8..=65520).contains(&offset) => {
                         Some(Value::Bytes(storage, offset, width))
                     }
-                    Storage::Stack => {
+                    Storage::Stack | Storage::Capture => {
                         let (start, (size, value)) = self.stack.range(..=offset).next_back()?;
                         let relative = usize::try_from(offset - start).ok()?;
                         (relative.checked_add(width)? <= *size)
@@ -112,6 +247,14 @@ impl State {
                     _ => None,
                 }
             }
+            OpKind::Immediate8
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64 => Some(Value::Integer(i.immediate(operand))),
             _ => None,
         }
     }
@@ -130,6 +273,24 @@ impl State {
         }
         self.registers
             .retain(|key, value| other.registers.get(key) == Some(value));
+        for (reg, value) in &before.registers {
+            if matches!(value, Value::Continuation(0 | 1 | 4))
+                && matches!(
+                    other.registers.get(reg),
+                    Some(Value::Continuation(0 | 1 | 4))
+                )
+                && other.registers.get(reg) != Some(value)
+            {
+                self.registers.insert(*reg, Value::Continuation(4));
+            }
+        }
+        // Arity hazards are may-read facts: an unprovided input surviving on
+        // either branch must not disappear when ordinary must-facts merge.
+        for (reg, value) in before.registers.iter().chain(other.registers.iter()) {
+            if matches!(value, Value::Continuation(2..)) {
+                self.registers.insert(*reg, *value);
+            }
+        }
         self.stack
             .retain(|key, value| other.stack.get(key) == Some(value));
         *self != before
@@ -257,7 +418,7 @@ impl State {
             if let Some(value) = value {
                 self.registers.insert(dst, value);
             }
-        } else if let Some((Storage::Stack, offset)) = self.address(i) {
+        } else if let Some((Storage::Stack | Storage::Capture, offset)) = self.address(i) {
             self.store(offset, width, value);
         }
     }
@@ -301,6 +462,13 @@ impl State {
             self.zero = None;
         }
         match i.mnemonic() {
+            Mnemonic::Xor | Mnemonic::Xorps | Mnemonic::Pxor
+                if i.op0_kind() == OpKind::Register
+                    && i.op1_kind() == OpKind::Register
+                    && i.op0_register() == i.op1_register() =>
+            {
+                self.registers.insert(dst, Value::Integer(0));
+            }
             Mnemonic::Test if self.nonnull_test(i) => {
                 self.zero = Some(false);
             }
@@ -396,25 +564,28 @@ impl State {
                     self.registers.remove(&reg.full_register());
                 }
             }
-            _ => {
-                for reg in InstructionInfoFactory::new().info(i).used_registers() {
-                    if matches!(
-                        reg.access(),
-                        OpAccess::Write
-                            | OpAccess::CondWrite
-                            | OpAccess::ReadWrite
-                            | OpAccess::ReadCondWrite
-                    ) {
-                        self.registers.remove(&reg.register().full_register());
-                    }
-                }
-                if i.op0_kind() == OpKind::Memory
-                    && !matches!(i.mnemonic(), Mnemonic::Cmp | Mnemonic::Test)
-                    && let Some((Storage::Stack, offset)) = self.address(i)
-                {
-                    self.store(offset, i.memory_size().size(), None);
-                }
+            _ => self.forget_written(i),
+        }
+    }
+
+    // An instruction nothing above models: what it writes is no longer known.
+    fn forget_written(&mut self, i: &Instruction) {
+        for reg in InstructionInfoFactory::new().info(i).used_registers() {
+            if matches!(
+                reg.access(),
+                OpAccess::Write
+                    | OpAccess::CondWrite
+                    | OpAccess::ReadWrite
+                    | OpAccess::ReadCondWrite
+            ) {
+                self.registers.remove(&reg.register().full_register());
             }
+        }
+        if i.op0_kind() == OpKind::Memory
+            && !matches!(i.mnemonic(), Mnemonic::Cmp | Mnemonic::Test)
+            && let Some((Storage::Stack | Storage::Capture, offset)) = self.address(i)
+        {
+            self.store(offset, i.memory_size().size(), None);
         }
     }
 
@@ -429,7 +600,7 @@ impl State {
         let ranges = self
             .stack
             .iter()
-            .filter_map(|(at, (_, value))| match value {
+            .filter_map(|(at, (width, value))| match value {
                 Value::ImagePointer(_)
                     if self.stack.get(&(at + 56))
                         == Some(&(8, Value::Pointer(Storage::Stack, *at))) =>
@@ -437,11 +608,12 @@ impl State {
                     Some((*at, 64))
                 }
                 Value::TaggedPointer(..) => Some((*at - 24, 32)),
+                Value::Continuation(0 | 1 | 4) if *width == 32 => Some((*at, 32)),
                 _ => None,
             })
             .collect::<Vec<_>>();
         for (start, size) in ranges {
-            if passed.iter().any(|value| matches!(value, Value::Pointer(Storage::Stack, at) if *at >= start && *at < start + size as i64)) {
+            if passed.iter().any(|value| matches!(value, Value::Pointer(Storage::Stack | Storage::Capture, at) if *at >= start && *at < start + size as i64)) {
                 self.store(start, size, None);
             }
         }
@@ -453,10 +625,58 @@ struct Flow {
     states: HashMap<u64, State>,
 }
 
+// `State::step` of a call, with what the callee does to the callables it is handed.
+fn step_call(
+    state: &mut State,
+    i: &Instruction,
+    code: &mut dyn FnMut(u64, bool) -> Option<Vec<u8>>,
+) {
+    let target = i.near_branch_target();
+    let constructed = yield_abi::constructor(state, target, &mut |at| code(at, false));
+    let copied = yield_abi::copied_origin(state, target, &mut |at| code(at, false));
+    let copied_fields = if copied.is_none() {
+        yield_abi::captures::copied_fields(state, target, &mut |at| code(at, false), 0)
+    } else {
+        None
+    };
+    let heap = yield_abi::captures::heap_fields(state, target, &mut |at| code(at, false));
+    let source = state.register(Register::RDX);
+    state.step(i);
+    if let Some((object, origin, preserves)) = copied {
+        if preserves && let Some(Value::Pointer(Storage::Stack | Storage::Capture, source)) = source
+        {
+            state.store(source, 32, Some(Value::Continuation(origin)));
+        }
+        state.store(object, 32, Some(Value::Continuation(origin)));
+    }
+    if let Some(updates) = copied_fields {
+        for at in updates.consumed {
+            state.store(at, 32, None);
+        }
+        for (at, width, value) in updates.fields {
+            state.store(at, width, Some(value));
+        }
+        if let Some(value) = updates.returned {
+            state.registers.insert(Register::RAX, value);
+        }
+    }
+    if let Some((_, _, updates)) = heap {
+        for at in updates.consumed {
+            state.store(at, 32, None);
+        }
+    }
+    if let Some((object, table)) = constructed {
+        let value = Value::Pointer(Storage::Stack, object);
+        state.store(object, 8, Some(Value::ImagePointer(table)));
+        state.store(object + 56, 8, Some(value));
+        state.registers.insert(Register::RAX, value);
+    }
+}
+
 fn flow(
     entry: u64,
     initial: State,
-    code: &mut impl FnMut(u64, bool) -> Option<Vec<u8>>,
+    code: &mut dyn FnMut(u64, bool) -> Option<Vec<u8>>,
     budget: &mut usize,
 ) -> Option<Flow> {
     let bytes = code(entry, true)?;
@@ -491,17 +711,10 @@ fn flow(
             return None;
         }
         let mut state = states[&pc].clone();
-        let constructed = if i.flow_control() == FlowControl::Call {
-            yield_abi::constructor(&state, i.near_branch_target(), &mut |at| code(at, false))
+        if i.flow_control() == FlowControl::Call {
+            step_call(&mut state, i, code);
         } else {
-            None
-        };
-        state.step(i);
-        if let Some((object, table)) = constructed {
-            let value = Value::Pointer(Storage::Stack, object);
-            state.store(object, 8, Some(Value::ImagePointer(table)));
-            state.store(object + 56, 8, Some(value));
-            state.registers.insert(Register::RAX, value);
+            state.step(i);
         }
         let successors = match i.flow_control() {
             FlowControl::Return
@@ -861,6 +1074,8 @@ fn leaf_dispatch_length(bytes: &[u8]) -> Option<usize> {
         boundaries.insert(instruction.ip());
         match instruction.flow_control() {
             FlowControl::Return
+            | FlowControl::Exception
+            | FlowControl::Interrupt
             | FlowControl::IndirectBranch
             | FlowControl::UnconditionalBranch => {
                 // A leaf null guard may jump over a receiver conversion to
@@ -975,6 +1190,10 @@ mod tests {
         assert_eq!(leaf_dispatch_length(&[0xe8, 0, 0, 0, 0, 0xc3]), None);
         assert_eq!(leaf_dispatch_length(&[0x90, 0x0f]), None);
         assert_eq!(leaf_dispatch_length(&[0x74, 1, 0xc3, 0xc3]), None);
+        // MSVC can put a terminating trap just beyond a .pdata range. It is
+        // its own verified fragment, never permission to read the next function.
+        assert_eq!(leaf_dispatch_length(&[0xcc, 0xc3]), Some(1));
+        assert_eq!(leaf_dispatch_length(&[0x74, 1, 0xcc, 0xc3]), None);
     }
 
     use super::*;

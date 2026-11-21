@@ -247,7 +247,7 @@ pub(super) fn directory(image: &PeImage<'_>, index: usize) -> Result<(usize, usi
     ))
 }
 
-fn exported_rva(image: &PeImage<'_>, name: &str) -> Result<usize> {
+pub(super) fn exported_rva(image: &PeImage<'_>, name: &str) -> Result<usize> {
     let (rva, size) = directory(image, 0)?;
     let start = image.rva_to_offset(rva)?;
     let count = read_u32(image.bytes, start + 24)? as usize;

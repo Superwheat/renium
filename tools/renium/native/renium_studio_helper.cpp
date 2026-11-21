@@ -1455,6 +1455,7 @@ static_assert(sizeof(PropertyReadParams) == 132048);
 static_assert(offsetof(PropertyReadParams, reserved) == 131500);
 
 #include "renium_studio_functions.h"
+#include "renium_main_thread_release.h"
 
 struct PropertyReadTask
 {
@@ -1462,6 +1463,9 @@ struct PropertyReadTask
     std::vector<PropertyReadParams> batch;
     std::string extraInput;
     std::shared_ptr<renium_functions::Completion> function;
+    std::unique_ptr<renium_functions::MainThreadRelease> retirement;
+    std::atomic<unsigned> execution{0}; // queued, executing, cancelled before execution
+    std::weak_ptr<void> modelPin; // No strong cycle through a pending DataModel task.
     const char* stage = "preflight";
     std::uintptr_t entry = 0;
     HANDLE completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -1474,9 +1478,15 @@ static void ReadPropertyCore(PropertyReadTask* task)
     auto& p = task->result;
     task->stage = "preflight";
     task->entry = 0;
+    auto parentPin = task->modelPin.lock();
+    if (task->retirement && !parentPin) {
+        p.status = renium_functions::TimeoutCode;
+        strncpy_s(p.error, "Function request retired before Studio could run it", _TRUNCATE);
+        return;
+    }
     if (!RemainingMilliseconds(task->deadline))
     {
-        p.status = 0xE40F;
+        p.status = p.operation == 9 ? renium_functions::TimeoutCode : 0xE40F;
         strncpy_s(p.error, "property read expired before Studio could run it", _TRUNCATE);
         return;
     }
@@ -1498,9 +1508,10 @@ static void ReadPropertyCore(PropertyReadTask* task)
         // Only pin the target after validating it under the DataModel lock.
         // The raw pointer from an earlier lookup may already have been deleted.
         auto owner = reinterpret_cast<void*>(p.owner);
-        if (!AddOwnerReference(owner))
-            throw std::runtime_error("property target was destroyed before execution");
-        auto targetHold = std::shared_ptr<void>(owner, ReleaseOwnerReference);
+        std::shared_ptr<void> targetHold;
+        if (task->retirement) targetHold = task->retirement->Hold(owner, AddOwnerReference, ReleaseOwnerReference, parentPin);
+        else if (AddOwnerReference(owner)) targetHold = std::shared_ptr<void>(owner, ReleaseOwnerReference);
+        if (!targetHold) throw std::runtime_error("property target was destroyed before execution");
         using IdentityGetter = void*(__fastcall*)(void*, void*, void*);
         task->stage = "identity";
         task->entry = p.identityGetter;
@@ -1614,6 +1625,12 @@ static void ReadPropertyCore(PropertyReadTask* task)
             p.status = 4;
         }
         value->~basic_string();
+    }
+    catch (const renium_functions::Failure& error)
+    {
+        p.status = error.code;
+        p.exceptionCode = error.sent;
+        strncpy_s(p.error, error.what(), _TRUNCATE);
     }
     catch (const renium_functions::PackageFlagRefused& error)
     {
@@ -1798,6 +1815,11 @@ static bool ValidPropertyRead(const PropertyReadParams* params, bool& flag)
     return true;
 }
 
+static bool SubmitRetirement(std::uintptr_t entry, void* context, std::function<void()>* work) {
+    __try { return SubmitDataModelTask(entry)(context, work, 1); }
+    __except (GetExceptionCode() == 0xE06D7363 ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 static DWORD RunPropertyRead(PropertyReadParams* params, std::size_t count = 1)
 {
     bool flag = false;
@@ -1812,10 +1834,21 @@ static DWORD RunPropertyRead(PropertyReadParams* params, std::size_t count = 1)
     }
     if (params->operation == 9)
         renium_functions::ValidateCallContract(params->input, params->inputSize);
-    auto modelOwner = reinterpret_cast<void*>(params->dataModelOwner);
-    if (!AddOwnerReference(modelOwner)) { if (flag) params->status = 0xE410; return 0xE402; }
-    auto modelHold = std::shared_ptr<void>(modelOwner, ReleaseOwnerReference);
     auto task = std::make_shared<PropertyReadTask>();
+    renium_functions::Input function{};
+    if (params->operation == 9) std::memcpy(&function, params->input, sizeof(function));
+    if (function.mode == 1 || function.mode == 2) {
+        const auto entry = params->submitTask, context = params->taskContext;
+        task->retirement = std::make_unique<renium_functions::MainThreadRelease>([entry, context](std::function<void()>* work) {
+            return SubmitRetirement(entry, reinterpret_cast<void*>(context), work);
+        });
+    }
+    auto modelOwner = reinterpret_cast<void*>(params->dataModelOwner);
+    std::shared_ptr<void> modelHold;
+    if (task->retirement) modelHold = task->retirement->Hold(modelOwner, AddOwnerReference, ReleaseOwnerReference);
+    else if (AddOwnerReference(modelOwner)) modelHold = std::shared_ptr<void>(modelOwner, ReleaseOwnerReference);
+    if (!modelHold) { if (flag) params->status = 0xE410; return 0xE402; }
+    if (task->retirement) task->modelPin = modelHold;
     task->result = *params;
     if (count > 1) task->batch.assign(params, params + count);
     if (params->operation == 7) task->extraInput.assign(reinterpret_cast<const char*>(params->extraInput), static_cast<std::size_t>(params->extraInputSize));
@@ -1831,9 +1864,14 @@ static DWORD RunPropertyRead(PropertyReadParams* params, std::size_t count = 1)
         QueryPerformanceCounter(&started);
         const auto queueMicros = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             ElapsedMicros(queued, started, frequency), UINT32_MAX));
+        // Every engine task releases the pins an earlier refused drain left.
+        renium_functions::MainThreadRelease::TaskScope engineTask;
         if (task->batch.empty()) {
             task->result.reserved = queueMicros;
-            ReadPropertyCaught(task.get());
+            if (task->retirement) {
+                unsigned expectedQueued = 0;
+                if (task->execution.compare_exchange_strong(expectedQueued, 1)) ReadPropertyCaught(task.get());
+            } else ReadPropertyCaught(task.get());
         } else for (auto& row : task->batch) {
             task->result = row;
             task->result.reserved = queueMicros;
@@ -1845,11 +1883,24 @@ static DWORD RunPropertyRead(PropertyReadParams* params, std::size_t count = 1)
     auto submit = SubmitDataModelTask(params->submitTask);
     if (!submit(reinterpret_cast<void*>(params->taskContext), &readTask, 1)) return 0xE407;
     const auto remaining = RemainingMilliseconds(task->deadline);
-    if (!remaining || WaitForSingleObject(task->completed, remaining) != WAIT_OBJECT_0)
+    if (!remaining || WaitForSingleObject(task->completed, remaining) != WAIT_OBJECT_0) {
+        if (task->retirement) {
+            unsigned expectedQueued = 0;
+            const bool cancelled = task->execution.compare_exchange_strong(expectedQueued, 2);
+            throw renium_functions::Failure(renium_functions::TimeoutCode,
+                cancelled ? "Function submission timed out; requestSent=false" : "Function submission timed out; requestSent=unknown; inspect before retrying", cancelled ? 0 : 2);
+        }
+        if (params->operation == 9)
+            throw renium_functions::Failure(renium_functions::TimeoutCode, "Function submission timed out; execution unknown", 2);
         return 0xE40F;
+    }
     if (task->result.status == 4 && params->operation == 9) {
+        // Engine callback copies own RequestPins independently of this command.
+        // Timeout or task disposal cannot release their receiver/model pins.
         const auto value = task->function->Wait(std::chrono::milliseconds(RemainingMilliseconds(task->deadline)));
         task->result.outputSize = static_cast<std::uint32_t>(value.size());
+        // Success status + this discriminator carries the complete HTTP error.
+        task->result.exceptionCode = task->function->httpError ? 1 : 0;
         std::memcpy(task->result.output, value.data(), value.size());
     }
     if (count > 1) {
@@ -1863,6 +1914,11 @@ static DWORD RunPropertyRead(PropertyReadParams* params, std::size_t count = 1)
 static DWORD PropertyReadBoundary(PropertyReadParams* params, std::size_t count = 1)
 {
     try { return RunPropertyRead(params, count); }
+    catch (const renium_functions::Failure& error)
+    {
+        if (params) { params->status = error.code; params->exceptionCode = error.sent; strncpy_s(params->error, error.what(), _TRUNCATE); }
+        return error.code;
+    }
     catch (const std::exception& error)
     {
         if (params) strncpy_s(params->error, error.what(), _TRUNCATE);

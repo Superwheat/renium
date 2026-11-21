@@ -772,6 +772,7 @@ inline DWORD Queue(Parameters* parameters)
         QueryPerformanceCounter(&queued);
         ResetEvent(task->completed);
         std::function<void()> work{[task, modelHold, queued, frequency]() {
+            renium_functions::MainThreadRelease::TaskScope engineTask;
             LARGE_INTEGER begin{}, end{};
             QueryPerformanceCounter(&begin);
             task->result.queueMicros += ElapsedMicros(queued, begin, frequency);

@@ -469,6 +469,18 @@ pub(super) fn task_result(exit: u32, parameters: &[u8]) -> Result<()> {
     if exit != 0 || status != 4 {
         let exception = read_u32(parameters, EXCEPTION_CODE)?;
         let mut message = error_text_at(&parameters[..ERROR_END], ERROR_TEXT);
+        if (0xE412..=0xE417).contains(&status) && read_u32(parameters, 65912).ok() == Some(9) {
+            return Err(super::super::functions::FunctionFailure {
+                code: status,
+                sent: match exception {
+                    0 => Some(false),
+                    1 => Some(true),
+                    _ => None,
+                },
+                message,
+            }
+            .into());
+        }
         if exception != 0 {
             let description = match exception {
                 0xE06D7363 => "C++ exception",
@@ -507,12 +519,8 @@ impl NativeProperty {
         name: &str,
         arguments: &[serde_json::Value],
     ) -> Result<()> {
-        self.prepare_reflected_function(
-            pid,
-            title,
-            name,
-            super::super::functions::input(&self.class_name, name, arguments)?,
-        )
+        let input = super::super::functions::input(&self.class_name, name, arguments)?;
+        self.prepare_reflected_function(pid, title, name, input)
     }
 
     fn prepare_reflected_function(
@@ -612,7 +620,32 @@ impl NativeProperty {
             functions::binding(&self.memory, studio, &layout, descriptor, table)
                 .context("function-entrypoint detector")?
         };
-        input.validate_call_contract(name, &studio.name, (function - studio.base) as u64, field)?;
+        if matches!(input.mode, 1 | 2) {
+            let mode = input.mode;
+            input
+                .qualify_yield(|| {
+                    functions::qualify_yield(
+                        &self.memory,
+                        studio,
+                        &layout,
+                        table,
+                        (field, function),
+                        mode,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "yield-call-contract: {name} candidate={}+0x{:X}",
+                            studio.name,
+                            function - studio.base
+                        )
+                    })
+                })
+                .map_err(|error| super::super::functions::FunctionFailure {
+                    code: 0xE413,
+                    sent: Some(false),
+                    message: format!("{error:#}"),
+                })?;
+        }
         input.bytes[..8].copy_from_slice(&(descriptor as u64).to_le_bytes());
         input.bytes[8..16].copy_from_slice(&(table as u64).to_le_bytes());
         input.bytes[16..20].copy_from_slice(&(field as u32).to_le_bytes());
@@ -625,7 +658,18 @@ impl NativeProperty {
     pub(crate) fn call_function(&mut self, timeout: Duration) -> Result<String> {
         self.deadline = Instant::now() + timeout.min(Duration::from_secs(30));
         self.invoke(9)?;
-        self.value()
+        function_value(&self.parameters)
+    }
+
+    pub(crate) fn call_function_answer(&mut self, timeout: Duration) -> Result<serde_json::Value> {
+        let text = self.call_function(timeout)?;
+        Ok(
+            if matches!(read_u32(&self.parameters, INPUT + 20)?, 1 | 2) {
+                serde_json::json!({"httpError":read_u32(&self.parameters, EXCEPTION_CODE)? == 1,"text":text})
+            } else {
+                serde_json::Value::String(text)
+            },
+        )
     }
 
     pub(super) fn package_flag(&mut self, candidate: Option<usize>) -> Result<bool> {
@@ -754,6 +798,21 @@ fn property_value(parameters: &[u8]) -> Result<String> {
     }
     String::from_utf8(parameters[96..96 + len].to_vec())
         .context("Property is not UTF-8 text; it requires a binary value codec")
+}
+
+fn function_value(parameters: &[u8]) -> Result<String> {
+    property_value(parameters).map_err(|error| {
+        if read_u32(parameters, INPUT + 20).is_ok_and(|mode| matches!(mode, 1 | 2)) {
+            super::super::functions::FunctionFailure {
+                code: 0xE415,
+                sent: Some(true),
+                message: format!("yield-response-text detector: {error:#}"),
+            }
+            .into()
+        } else {
+            error
+        }
+    })
 }
 
 // Read only the relevant executable bytes, not the whole Studio image on every
@@ -2061,6 +2120,40 @@ mod tests {
     }
 
     #[test]
+    fn functions_failure_transport_preserves_sent_state_and_detector_code() {
+        for (code, discriminator, sent) in [
+            (0xE413, 0, Some(false)),
+            (0xE414, 1, Some(true)),
+            (0xE415, 1, Some(true)),
+            (0xE416, 0, Some(false)),
+            (0xE412, 2, None),
+            (0xE417, 2, None),
+        ] {
+            let mut parameters = vec![0; SIZE];
+            put_u32(&mut parameters, 65912, 9);
+            put_u32(&mut parameters, STATUS, code);
+            put_u32(&mut parameters, EXCEPTION_CODE, discriminator);
+            parameters[ERROR_TEXT..ERROR_TEXT + 8].copy_from_slice(b"detector");
+            let error = task_result(code, &parameters).unwrap_err();
+            let failure = error
+                .downcast_ref::<super::super::super::functions::FunctionFailure>()
+                .unwrap();
+            assert_eq!((failure.code, failure.sent), (code, sent));
+            assert_eq!(failure.message, "detector");
+        }
+        let mut parameters = vec![0; SIZE];
+        put_u32(&mut parameters, INPUT + 20, 1);
+        put_u32(&mut parameters, 88, 1);
+        parameters[96] = 0xff;
+        let error = function_value(&parameters).unwrap_err();
+        let failure = error
+            .downcast_ref::<super::super::super::functions::FunctionFailure>()
+            .unwrap();
+        assert_eq!((failure.code, failure.sent), (0xE415, Some(true)));
+        assert!(failure.message.contains("yield-response-text detector"));
+    }
+
+    #[test]
     fn property_exception_messages_and_native_result_layout() {
         let result = crate::system::tools::hidden_command(
             std::path::Path::new(env!("OUT_DIR")).join("renium-property-exception-test.exe"),
@@ -2244,6 +2337,8 @@ mod tests {
             ] {
                 let mut arguments = vec![serde_json::json!(if name.ends_with("FullUrl") {
                     "https://apis.roblox.com/"
+                } else if name.ends_with("Async") {
+                    "/Folder"
                 } else {
                     "Folder"
                 })];

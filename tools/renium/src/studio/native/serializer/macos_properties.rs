@@ -1398,9 +1398,11 @@ impl NativeProperty {
         self.memory.deadline = Instant::now() + timeout;
     }
 
-    pub(crate) fn call_function(&mut self, timeout: Duration) -> Result<String> {
+    pub(crate) fn call_function_answer(&mut self, timeout: Duration) -> Result<serde_json::Value> {
         self.memory.deadline = Instant::now() + timeout.min(Duration::from_secs(30));
-        String::from_utf8(self.invoke(9)?[16..].to_vec()).context("Function response is not UTF-8")
+        String::from_utf8(self.invoke(9)?[16..].to_vec())
+            .map(serde_json::Value::String)
+            .context("Function response is not UTF-8")
     }
     pub(crate) fn ensure_writable(&self) -> Result<()> {
         anyhow::ensure!(
@@ -1863,6 +1865,8 @@ fn live_function_dispatch() -> Result<()> {
         ] {
             let mut arguments = vec![serde_json::json!(if name.ends_with("FullUrl") {
                 "https://apis.roblox.com/"
+            } else if name.ends_with("Async") {
+                "/Folder"
             } else {
                 "Folder"
             })];

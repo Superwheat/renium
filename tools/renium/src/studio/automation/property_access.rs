@@ -156,7 +156,7 @@ fn function_arguments(raw: &str) -> Result<Value, String> {
     Ok(value)
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos"))]
 fn batch_arguments(value: &Value) -> Result<Vec<Vec<Value>>> {
     let arrays = value
         .as_array()
@@ -176,10 +176,10 @@ fn batch_arguments(value: &Value) -> Result<Vec<Vec<Value>>> {
         .collect()
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos"))]
 fn ordered_function_batch(
     arguments: &[Vec<Value>],
-    mut call: impl FnMut(&[Value]) -> Result<String>,
+    mut call: impl FnMut(&[Value]) -> Result<Value>,
 ) -> Value {
     let mut results = Vec::with_capacity(arguments.len());
     let mut stopped = false;
@@ -193,7 +193,16 @@ fn ordered_function_batch(
             Ok(value) => json!({"index":index,"status":"applied","value":value}),
             Err(error) => {
                 stopped = true;
-                json!({"index":index,"status":"unconfirmed","error":format!("{error:#}")})
+                let failure =
+                    error.downcast_ref::<crate::studio::native::serializer::FunctionFailure>();
+                let sent = failure.and_then(|failure| failure.sent);
+                let status = match sent {
+                    Some(true) => "sent",
+                    Some(false) => "not-executed",
+                    None => "unconfirmed",
+                };
+                json!({"index":index,"status":status,"requestSent":sent,
+                    "code":failure.map(|failure| format!("0x{:X}", failure.code)),"error":format!("{error:#}")})
             }
         };
         bytes += item.to_string().len();
@@ -357,7 +366,7 @@ pub(crate) fn command(args: PropertyAccessArgs) -> Result<()> {
     print_json_output(&result, false)?;
     if result["status"] == "partial" {
         bail!(
-            "Function batch stopped; completed results and the unconfirmed call are shown above. Inspect before retrying"
+            "Function batch stopped; results and requestSent are shown above. Inspect before retrying a sent or unconfirmed call"
         );
     }
     Ok(())
@@ -558,7 +567,26 @@ fn perform(
         class_name: native.class_name.clone(),
         instance_id: native.instance_id.clone(),
     };
+    let enum_items = if intent.class_name == "HttpRbxApiService"
+        && matches!(
+            intent.property.as_str(),
+            "GetAsync" | "GetAsyncFullUrl" | "PostAsync" | "PostAsyncFullUrl"
+        )
+        && matches!(
+            intent.operation,
+            Operation::Call { .. } | Operation::CallBatch { .. }
+        ) {
+        http_enum_items(bridge, scope)?
+    } else {
+        Value::Null
+    };
     if let Operation::Call { arguments } = &intent.operation {
+        crate::studio::native::serializer::validate_function_arguments(
+            &native.class_name,
+            &intent.property,
+            arguments,
+            &enum_items,
+        )?;
         native.prepare_function(scope.pid, &title, &intent.property, arguments)?;
     }
     if let Operation::CallBatch { arguments } = &intent.operation {
@@ -567,6 +595,7 @@ fn perform(
                 &native.class_name,
                 &intent.property,
                 item,
+                &enum_items,
             )?;
         }
         native.prepare_function(scope.pid, &title, &intent.property, &arguments[0])?;
@@ -586,7 +615,7 @@ fn perform(
         bail!("Protected property runtime was replaced");
     }
     if matches!(intent.operation, Operation::Call { .. }) {
-        let value = native.call_function(Duration::from_secs(30))?;
+        let value = native.call_function_answer(Duration::from_secs(30))?;
         return Ok(
             json!({"status":"applied","path":intent.path,"function":intent.property,
             "className":intent.class_name,"value":value,"runtimeId":scope.runtime}),
@@ -605,7 +634,7 @@ fn perform(
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .context("Function batch exceeded its 30-second deadline")?;
-            native.call_function(remaining)
+            native.call_function_answer(remaining)
         });
         if result["results"]
             .as_array()
@@ -756,6 +785,41 @@ fn perform_reads(
     )
 }
 
+// Read the selected engine's declarations and base address; never fall back to
+// the bundled API dump.
+#[cfg(any(windows, target_os = "macos"))]
+fn http_enum_items(bridge: &BridgeServer, scope: &Scope) -> Result<Value> {
+    let code = r#"
+local values = {}
+for _, name in {"ThrottlingPriority", "HttpContentType", "HttpRequestType"} do
+    local items = {}
+    for _, item in Enum[name]:GetEnumItems() do
+        table.insert(items, item.Value)
+    end
+    values[name] = items
+end
+values.BaseUrl = game:GetService("ContentProvider").BaseUrl
+return values
+"#;
+    let result = bridge
+        .call_for_runtime_with_timeout(
+            "executeLuau",
+            luau_request(code, "ReniumHttpEnums", BridgeTarget::Edit, 3.0)?,
+            BridgeTarget::Edit,
+            &scope.runtime,
+            Some(Duration::from_secs(4)),
+        )
+        .context("http-enum-items detector")?;
+    ensure_luau_api_ok(&result).context("http-enum-items detector")?;
+    result
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|values| values.first())
+        .filter(|value| value.is_object())
+        .cloned()
+        .context("http-enum-items detector: engine returned no enum declarations")
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 fn sample_completed_write(
     bridge: &BridgeServer,
@@ -898,6 +962,25 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn http_errors_keep_full_text_and_do_not_stop_a_batch() {
+        let arguments = vec![vec![], vec![]];
+        let text = format!("HTTP 404 {}", "e".repeat(60000));
+        let mut calls = 0;
+        let results = ordered_function_batch(&arguments, |_| {
+            calls += 1;
+            Ok(json!({"httpError":calls == 1,"text":if calls == 1 {text.as_str()} else {"body"}}))
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(results[0]["status"], "applied");
+        assert_eq!(results[0]["value"]["httpError"], true);
+        assert_eq!(results[0]["value"]["text"], text);
+        assert_eq!(results[1]["status"], "applied");
+        assert_eq!(results[1]["value"]["httpError"], false);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn batches_validate_before_execution_and_stop_without_replaying() {
         assert!(batch_arguments(&json!([])).is_err());
@@ -916,5 +999,41 @@ mod tests {
         assert_eq!(results[0]["value"], "first response");
         assert_eq!(results[1]["status"], "unconfirmed");
         assert_eq!(results[2]["status"], "not-executed");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn batches_distinguish_sent_refused_and_unknown_function_results() {
+        use crate::studio::native::serializer::FunctionFailure;
+        for (code, sent, status) in [
+            (0xE413, Some(false), "not-executed"),
+            (0xE414, Some(true), "sent"),
+            (0xE415, Some(true), "sent"),
+            (0xE416, Some(false), "not-executed"),
+            (0xE412, None, "unconfirmed"),
+            (0xE417, None, "unconfirmed"),
+        ] {
+            let mut calls = 0;
+            let result = ordered_function_batch(&[vec![], vec![]], |_| {
+                calls += 1;
+                Err(FunctionFailure {
+                    code,
+                    sent,
+                    message: "detector detail".into(),
+                }
+                .into())
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(result[0]["status"], status);
+            assert_eq!(result[0]["requestSent"], json!(sent));
+            assert_eq!(result[0]["code"], format!("0x{code:X}"));
+            assert!(
+                result[0]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("requestSent=")
+            );
+            assert_eq!(result[1]["status"], "not-executed");
+        }
     }
 }

@@ -114,7 +114,7 @@ static void BatchReads()
             input.mode = mode; input.function = 1;
             request->inputSize = sizeof(input);
             std::memcpy(request->input, &input, sizeof(input));
-            assert(ReniumReadProperty(request.get()) == 0xE408 && submissions == 0);
+            assert(ReniumReadProperty(request.get()) == renium_functions::DetectorCode && submissions == 0);
             assert(request->exceptionCode == 0 && std::strstr(request->error, "yield-call-contract"));
         }
         wire[0] = 33;

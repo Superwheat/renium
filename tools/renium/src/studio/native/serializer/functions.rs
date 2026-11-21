@@ -5,13 +5,61 @@ pub(super) struct FunctionInput {
     pub mode: u32,
     pub bytes: Vec<u8>,
 }
+#[cfg(windows)]
+#[derive(Debug)]
+pub(super) struct YieldContract {
+    pub layout: u32,
+    pub sites: Vec<[u64; 2]>,
+}
 
 impl FunctionInput {
-    // Reflection RTTI describes public arguments, not hidden continuations or
-    // the execution context required by the member. Receiver discovery alone
-    // cannot certify a yielding call. Keep it disabled until those contracts
-    // have runtime validators; the task-submission ABI is a different contract.
+    // Public RTTI and callable storage alone cannot authorize hidden callbacks.
+    // Windows runs the structural detector for each image; macOS has no
+    // qualified continuation adapter and refuses here.
+    #[cfg(windows)]
+    pub(super) fn qualify_yield(
+        &mut self,
+        qualify: impl FnOnce() -> Result<YieldContract>,
+    ) -> Result<()> {
+        self.bytes[52..56].fill(0);
+        let contract = qualify()?;
+        ensure!(
+            !contract.sites.is_empty() && contract.sites.len() < 64,
+            "yield-callback-site: invalid qualified caller count"
+        );
+        let encoded = contract.layout | ((contract.sites.len() as u32) << 26);
+        for site in contract.sites {
+            for address in site {
+                self.bytes.extend_from_slice(&address.to_le_bytes());
+            }
+        }
+        self.bytes[52..56].copy_from_slice(&encoded.to_le_bytes());
+        Ok(())
+    }
+
+    pub(super) fn validate_enums(&self, items: &Value) -> Result<()> {
+        let names: &[&str] = match self.mode {
+            1 => &["ThrottlingPriority", "HttpRequestType"],
+            2 => &["ThrottlingPriority", "HttpContentType", "HttpRequestType"],
+            _ => &[],
+        };
+        for (index, name) in names.iter().enumerate() {
+            let value = u32::from_le_bytes(self.bytes[32 + index * 4..36 + index * 4].try_into()?);
+            let declared = items[*name]
+                .as_array()
+                .with_context(|| format!("http-enum-items detector: engine omitted {name}"))?;
+            ensure!(
+                declared
+                    .iter()
+                    .any(|item| item.as_u64() == Some(value as u64)),
+                "http-enum-items detector: {name}={value} is not declared by this engine"
+            );
+        }
+        Ok(())
+    }
+
     #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    #[cfg(any(target_os = "macos", test))]
     pub(super) fn validate_call_contract(
         &self,
         name: &str,
@@ -25,6 +73,30 @@ impl FunctionInput {
         );
         Ok(())
     }
+}
+
+fn roblox_https(url: &url::Url) -> bool {
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url
+            .host_str()
+            .is_some_and(|host| host == "roblox.com" || host.ends_with(".roblox.com"))
+        && url.port().is_none_or(|port| port == 443)
+}
+
+// GetAsync and PostAsync send the signed-in session to a host the engine
+// derives from its own base address, so that address has to be Roblox's.
+pub(super) fn validate_api_base(name: &str, items: &Value) -> Result<()> {
+    if !matches!(name, "GetAsync" | "PostAsync") {
+        return Ok(());
+    }
+    let base = items["BaseUrl"].as_str().unwrap_or_default();
+    ensure!(
+        url::Url::parse(base).is_ok_and(|url| roblox_https(&url)),
+        "http-relative-base detector: the engine's base address {base:?} is not an HTTPS Roblox address; use {name}FullUrl with an explicit HTTPS Roblox URL"
+    );
+    Ok(())
 }
 
 pub(super) fn input(class: &str, name: &str, arguments: &[Value]) -> Result<FunctionInput> {
@@ -54,19 +126,38 @@ pub(super) fn input(class: &str, name: &str, arguments: &[Value]) -> Result<Func
         first.len() + second.len() <= 60 * 1024,
         "Function arguments exceed 60 KiB"
     );
-    if name.ends_with("FullUrl") {
+    let normalized;
+    let first = if name.ends_with("FullUrl") {
+        ensure!(
+            !first
+                .chars()
+                .any(|c| c == '\\' || c == '@' || c.is_control() || c.is_whitespace()),
+            "http-url detector: raw URL contains a backslash, @, control character or whitespace"
+        );
         let url = url::Url::parse(first).context("Expected an HTTPS Roblox URL")?;
         ensure!(
-            url.scheme() == "https"
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url
-                    .host_str()
-                    .is_some_and(|host| host == "roblox.com" || host.ends_with(".roblox.com"))
-                && url.port().is_none_or(|port| port == 443),
+            roblox_https(&url),
             "Authenticated Studio requests require an HTTPS Roblox URL"
         );
+        normalized = url.to_string();
+        normalized.as_str()
+    } else {
+        first
+    };
+    if matches!(name, "GetAsync" | "PostAsync") {
+        ensure!(
+            first.starts_with('/')
+                && !first.starts_with("//")
+                && !first
+                    .bytes()
+                    .any(|byte| byte == b'\\' || byte <= b' ' || byte == 127 || byte == b'#'),
+            "http-relative-path detector: expected /path on the engine's API host; authority, backslashes, fragments and whitespace are forbidden"
+        );
     }
+    ensure!(
+        first.len() + second.len() <= 60 * 1024,
+        "Normalized function arguments exceed 60 KiB"
+    );
     let mut bytes = vec![0; 56];
     bytes[20..24].copy_from_slice(&mode.to_le_bytes());
     for (index, argument) in arguments.iter().skip(required).enumerate() {
@@ -96,13 +187,233 @@ pub(super) fn package_flag_input() -> FunctionInput {
     FunctionInput { mode, bytes }
 }
 
+#[derive(Debug)]
+pub(crate) struct FunctionFailure {
+    pub code: u32,
+    pub sent: Option<bool>,
+    pub message: String,
+}
+impl std::fmt::Display for FunctionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sent = match self.sent {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "unknown",
+        };
+        write!(
+            f,
+            "Function call failed (0x{:X}; requestSent={sent}): {}",
+            self.code, self.message
+        )
+    }
+}
+impl std::error::Error for FunctionFailure {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     #[test]
-    fn yielding_calls_require_a_verified_contract_on_every_image() {
+    fn full_url_sends_only_the_validated_normalized_address() {
+        for name in ["GetAsyncFullUrl", "PostAsyncFullUrl"] {
+            let arguments = |raw: &str| {
+                if name.starts_with("Post") {
+                    vec![json!(raw), json!("")]
+                } else {
+                    vec![json!(raw)]
+                }
+            };
+            for raw in [
+                "https://www.roblox.com\\@other.example/",
+                "https://www.roblox.com\\x",
+                "https://www.roblox.com/@x",
+                "https://www.roblox.com/\t",
+                "https://www.roblox.com/\n",
+                "https://www.roblox.com/\0",
+                "https://www.roblox.com/a b",
+                "https://www.roblox.com/\u{a0}",
+            ] {
+                assert!(
+                    input("HttpRbxApiService", name, &arguments(raw)).is_err(),
+                    "{name}: {raw:?}"
+                );
+            }
+            let request = input(
+                "HttpRbxApiService",
+                name,
+                &arguments("HTTPS://WWW.ROBLOX.COM:443/a/../b"),
+            )
+            .unwrap();
+            assert_eq!(&request.bytes[56..], b"https://www.roblox.com/b");
+            assert_eq!(
+                u32::from_le_bytes(request.bytes[44..48].try_into().unwrap()) as usize,
+                request.bytes.len() - 56
+            );
+        }
+    }
+
+    #[test]
+    fn relative_paths_cannot_replace_the_engine_host() {
+        for name in ["GetAsync", "PostAsync"] {
+            for path in [
+                "https://apis.roblox.com/x",
+                "//evil.test/x",
+                "/\\evil.test",
+                " /x",
+                "/x\n",
+                "/x#fragment",
+                "x",
+            ] {
+                let args = if name == "PostAsync" {
+                    vec![json!(path), json!("")]
+                } else {
+                    vec![json!(path)]
+                };
+                assert!(input("HttpRbxApiService", name, &args).is_err(), "{path:?}");
+            }
+        }
+        input(
+            "HttpRbxApiService",
+            "GetAsync",
+            &[json!("/v1/items?q=a%20b")],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn relative_calls_need_a_roblox_base_address() {
+        for name in ["GetAsync", "PostAsync"] {
+            for base in [
+                json!(null),
+                json!(""),
+                json!("http://www.roblox.com/"),
+                json!("https://www.roblox.com.example.test/"),
+                json!("https://example.test/"),
+                json!("https://www.roblox.com:8443/"),
+            ] {
+                let error = validate_api_base(name, &json!({ "BaseUrl": base })).unwrap_err();
+                assert!(error.to_string().contains("http-relative-base detector"));
+            }
+            validate_api_base(name, &json!({"BaseUrl":"https://www.roblox.com/"})).unwrap();
+        }
+        validate_api_base("GetAsyncFullUrl", &json!({})).unwrap();
+        // The check every call path runs before a request is prepared.
+        let items = json!({"ThrottlingPriority":[0],"HttpContentType":[0],"HttpRequestType":[0]});
+        let error = super::super::validate_function_arguments(
+            "HttpRbxApiService",
+            "GetAsync",
+            &[json!("/x")],
+            &items,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("http-relative-base detector"));
+    }
+
+    // The request the daemon encodes is the request the helper reads: the
+    // proved layout, the proved call sites and both arguments.
+    #[cfg(windows)]
+    #[test]
+    fn helper_reads_the_yield_request_the_daemon_encodes() {
+        let helper = |arguments: &[&str]| {
+            let output = crate::system::tools::hidden_command(concat!(
+                env!("OUT_DIR"),
+                "/renium-functions-test.exe"
+            ))
+            .args(arguments)
+            .output()
+            .expect("run the native function test");
+            assert!(output.status.success(), "{arguments:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let hex = |request: &FunctionInput| {
+            request
+                .bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let request = || {
+            input(
+                "HttpRbxApiService",
+                "PostAsyncFullUrl",
+                &[json!("https://apis.roblox.com/x"), json!("{}")],
+            )
+            .unwrap()
+        };
+        let layout: u32 = helper(&["--contract"]).parse().unwrap();
+        assert_ne!(layout, 0);
+        assert_eq!(helper(&["--decode", &hex(&request())]), "refused");
+        let mut proved = request();
+        proved
+            .qualify_yield(|| {
+                Ok(YieldContract {
+                    layout,
+                    sites: vec![[0x1111, 0x2222], [0x3333, 0x4444]],
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            helper(&["--decode", &hex(&proved)]),
+            "mode=2 first=https://apis.roblox.com/x second={} sites=1111:2222,3333:4444,"
+        );
+        let mut other = request();
+        other
+            .qualify_yield(|| {
+                Ok(YieldContract {
+                    layout: layout ^ 4,
+                    sites: vec![[0x1111, 0x2222]],
+                })
+            })
+            .unwrap();
+        assert_eq!(helper(&["--decode", &hex(&other)]), "refused");
+    }
+
+    #[test]
+    fn enum_arguments_use_engine_items_including_omitted_defaults() {
+        let request = input(
+            "HttpRbxApiService",
+            "PostAsync",
+            &[json!("/x"), json!(""), json!(17), json!(23), json!(41)],
+        )
+        .unwrap();
+        let mut items =
+            json!({"ThrottlingPriority":[17],"HttpContentType":[23],"HttpRequestType":[41]});
+        request.validate_enums(&items).unwrap();
+        for name in ["ThrottlingPriority", "HttpContentType", "HttpRequestType"] {
+            let saved = items[name].take();
+            assert!(
+                request
+                    .validate_enums(&items)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(name)
+            );
+            items[name] = saved;
+        }
+        items["HttpRequestType"] = json!([42]);
+        assert!(request.validate_enums(&items).is_err());
+        let defaults = input("HttpRbxApiService", "GetAsync", &[json!("/x")]).unwrap();
+        assert!(defaults.validate_enums(&items).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_yield_callbacks_return_errors_and_retire_after_timeout() {
+        assert!(
+            crate::system::tools::hidden_command(concat!(
+                env!("OUT_DIR"),
+                "/renium-functions-test.exe"
+            ))
+            .arg("--yield")
+            .status()
+            .expect("isolated yield ABI regression")
+            .success()
+        );
+    }
+
+    #[test]
+    fn macos_yield_calls_refuse_without_a_continuation_adapter() {
         for name in [
             "GetAsync",
             "GetAsyncFullUrl",
@@ -110,9 +421,20 @@ mod tests {
             "PostAsyncFullUrl",
         ] {
             let args = if name.starts_with("Post") {
-                vec![json!("https://apis.roblox.com/x"), json!("{}")]
+                vec![
+                    json!(if name.ends_with("FullUrl") {
+                        "https://apis.roblox.com/x"
+                    } else {
+                        "/x"
+                    }),
+                    json!("{}"),
+                ]
             } else {
-                vec![json!("https://apis.roblox.com/x")]
+                vec![json!(if name.ends_with("FullUrl") {
+                    "https://apis.roblox.com/x"
+                } else {
+                    "/x"
+                })]
             };
             let input = input("HttpRbxApiService", name, &args).unwrap();
             for (entry, field) in [(0x1234, 16), (0x87654321, 768)] {

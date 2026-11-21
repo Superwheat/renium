@@ -585,6 +585,7 @@ fn build_native_test(out_dir: &Path, name: &str, source: &Path) {
 
 fn main() {
     println!("cargo:rerun-if-changed=native/renium_studio_functions.h");
+    println!("cargo:rerun-if-changed=native/renium_main_thread_release.h");
     println!("cargo:rerun-if-changed=native/renium_task_context_macos.h");
     println!("cargo:rerun-if-changed=native/renium_tagged_callback.h");
     println!("cargo:rerun-if-changed=native/renium_property_task.h");
