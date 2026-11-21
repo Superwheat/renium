@@ -816,6 +816,22 @@ flushDeferred()
 assert(codeRoot.AttributeChanged:Count() == 0 and codeBranch.AttributeChanged:Count() == 0)
 tracker.stop()
 deferred = nil
+do
+	-- Tracking asks the export filter once per instance; the export list
+	-- waits for the export that reads it.
+	local asked = 0
+	local countingConfig = table.clone(trackerConfig)
+	countingConfig.includeExportInstance = function()
+		asked += 1
+		return true
+	end
+	local counted = trackerModule.create(countingConfig, { ReplicatedStorage = true })
+	counted.getState({})
+	local walked = #storage:GetDescendants()
+	assert(asked == walked, `starting tracking asked {asked} times for {walked} instances`)
+	assert(#counted.exportInstances("ReplicatedStorage") == walked + 1 and asked == 2 * walked)
+	counted.stop()
+end
 print("Tracker indexing: nested source counts, mode transitions, export filtering and Archivable changes passed")
 
 -- Adding one subtree does not change the internal sibling order 2400 times.

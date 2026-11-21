@@ -1091,6 +1091,7 @@ fn close_studio(
     bridge_wait_seconds: f64,
 ) -> Result<Value> {
     let _selection = select_bridge_context(context, bridge);
+    let find = crate::app::profile::span("close Studio: find its process and place");
     bridge.wait_for_target(bridge_wait_seconds, BridgeTarget::Edit)?;
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
     if context.runtime_id.as_deref() != Some(info.runtime_id.as_str()) {
@@ -1098,6 +1099,7 @@ fn close_studio(
     }
     let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
     let file = local_place_path_for_pid(pid).filter(|path| path.is_file());
+    drop(find);
     let game_id = info.game_id.filter(|id| *id > 0).or(context.game_id);
     let place_id = info.place_id.filter(|id| *id > 0).or(context.place_id);
     let local_action = parameters.get("localAction").and_then(Value::as_str);
@@ -1120,7 +1122,9 @@ fn close_studio(
             "Closing a local Studio place requires --save or --terminate so Renium never guesses whether to keep unsaved work"
         );
     }
+    let stop = crate::app::profile::span("close Studio: stop Live Sync");
     state.live_sync().stop(context.id);
+    drop(stop);
     if target.file.is_some() || unpublished {
         match local_action {
             Some("saveAndClose") => save_local_studio(
@@ -1138,7 +1142,10 @@ fn close_studio(
     }
     state.remember_studio_target(context, target.clone());
     state.clear_studio_launch(context);
+    let end = crate::app::profile::span("close Studio: end its process");
     input_inject::terminate_studio_process(pid)?;
+    drop(end);
+    let _retire = crate::app::profile::span("close Studio: retire its runtime");
     bridge.retire_runtime(&info.runtime_id);
     state.clear_context_runtime(context.id);
     Ok(json!({ "closed": true, "pid": pid, "reopenTarget": target }))
@@ -4222,6 +4229,7 @@ fn execute_gated(
     if !is_studio_review_decision(request)
         && let Some(context) = request.cx.and_then(|id| state.context(id))
     {
+        let _settle = crate::app::profile::span("wait for an import to settle");
         if request.op == op::STUDIO_CLOSE {
             let discards_place =
                 request.p.get("localAction").and_then(Value::as_str) == Some("terminate");
@@ -4242,6 +4250,7 @@ fn execute_gated(
         automation::Failure::new("cancelled", error.to_string(), false, "retry")
     };
     let operation = operation_name(request.op);
+    let gate_wait = crate::app::profile::span("wait for the request gate");
     let _request_guard = match gate {
         None => None,
         // A play request holds a runtime gate, not the request gate, so it runs
@@ -4278,6 +4287,7 @@ fn execute_gated(
             request_lease.map(Arc::as_ref),
         )?),
     };
+    drop(gate_wait);
     let _project_access = request_project_access(request, request_lease.map(Arc::as_ref))
         .map_err(automation_failure)?;
     let _lease_guard = match request_lease {

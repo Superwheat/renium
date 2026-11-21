@@ -50,14 +50,22 @@ fn fixture_runtime(bridge: &BridgeServer, runtime: &'static str) -> thread::Join
     );
     thread::spawn(move || {
         let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
-        while let Ok(Message::Text(text)) = socket.read() {
+        while let Ok(message) = socket.read() {
+            // A baseline's connection check probes the socket.
+            let Message::Text(text) = message else {
+                if let Message::Ping(bytes) = message {
+                    let _ = socket.send(Message::Pong(bytes));
+                }
+                continue;
+            };
             let request: Value = serde_json::from_str(&text).unwrap();
             assert!(matches!(
                 request["method"].as_str(),
                 Some("getStudioChangeState" | "getStudioState")
             ));
+            let proof = &request["params"]["verifyPushProof"];
             let reply = json!({"id":request["id"], "ok":true, "result":{
-                "pushProofMatches":request["params"]["verifyPushProof"]["expired"] != true,
+                "pushProofMatches":proof.is_object() && proof["expired"] != true,
                 "retainedPushProof":{"test":true}, "retainedPushProofLocal":true,
                 "verifiedPushProof":{"test":true}, "runtimeId":runtime,
                 "seq":0, "tracking":true, "serviceGenerations":{"ReplicatedStorage":0,"Workspace":0}
@@ -866,5 +874,249 @@ fn source_edit_after_the_early_reply_is_never_published_over() -> Result<()> {
         "return 42"
     );
     assert!(!import_settle::pending(&fixture.context));
+    Ok(())
+}
+
+/// What a Live Sync start left: its outcome, the pair's setup and record,
+/// the last-sync copy and the files.
+#[derive(PartialEq)]
+struct Started {
+    outcome: String,
+    setup: String,
+    record: String,
+    last_sync: Option<ProjectSnapshot>,
+    files: ProjectSnapshot,
+}
+
+impl Started {
+    fn describe(&self) -> String {
+        format!(
+            "{} | {} | {} | last sync {:?} | {} files",
+            self.outcome,
+            self.setup,
+            self.record,
+            self.last_sync
+                .as_ref()
+                .map(|snapshot| snapshot.entries.len()),
+            self.files.entries.len()
+        )
+    }
+}
+
+/// One Live Sync start of a fresh fixture whose store holds a Block at
+/// transparency 0.25, with or without a held baseline of `held`'s kind:
+/// `exact` (a pull's, Studio and the files as it wrote them), `moved`
+/// (Studio moved since its proof), `pushed` (its files are what a push
+/// sent), `other` (kept for another push), `files` (the files changed
+/// since), `paths` (it read fewer paths than the comparison), or `links`
+/// (a link manifest folds into the comparison). `record` is the pair's
+/// last sync: `none`, `same` as the files, `stale`, or `review` (with a
+/// difference open). Also whether Studio was captured and when a baseline
+/// held after ends.
+fn live_start(
+    held: &str,
+    record_kind: &str,
+    mode: PairMode,
+    hold: bool,
+) -> Result<(Started, bool, Option<Instant>)> {
+    let mut fixture = Fixture::new()?;
+    fixture.context.experience.clone_from(&fixture.context.root);
+    let context = &fixture.context;
+    let root = Path::new(&context.root);
+    let bridge = fixture.bridge.as_ref().unwrap();
+    let store = fixture
+        .desired
+        .entries
+        .keys()
+        .find(|path| path.extension().is_some_and(|ext| ext == "renium"))
+        .unwrap()
+        .clone();
+    let paths = project_comparison_stage(context, &sync_services())?
+        .publish_paths()
+        .to_vec();
+    let mut document = decode_settings_bytecode(&fs::read(root.join(&store))?)?;
+    document.instances.push(SettingsBytecodeInstance::new(
+        "block".into(),
+        "Block".into(),
+        "Part".into(),
+        Some(0),
+    ));
+    let mut files_at = |transparency: f64| -> Result<ProjectSnapshot> {
+        document.instances[2]
+            .properties
+            .insert("Transparency".into(), json!(transparency));
+        fs::write(root.join(&store), encode_settings_bytecode(&document)?)?;
+        capture_snapshot(root, &paths)
+    };
+    let stale = files_at(0.5)?;
+    let moved = files_at(0.75)?;
+    let files = files_at(0.25)?;
+    let workspace = Path::new(&context.source).join("Workspace");
+    fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join("Extra.luau"), "return 1")?;
+    let extra = capture_snapshot(root, &paths)?;
+    fs::remove_dir_all(&workspace)?;
+    let coordinator = Coordinator::default();
+    let mut setup = coordinator.prepare(
+        context,
+        bridge,
+        PairConfiguration {
+            mode,
+            conflict_preference: ConflictPreference::None,
+            resolution_preference: None,
+            decisions: BTreeMap::new(),
+            runtime_settings: Map::new(),
+        },
+    )?;
+    let mut record = load_record(context, &setup.key)?.unwrap();
+    record.baseline = match record_kind {
+        "none" => None,
+        "stale" => Some(StoredSnapshot::write(root, &setup.key, &stale)?),
+        _ => Some(StoredSnapshot::write(root, &setup.key, &files)?),
+    };
+    if record_kind == "review" {
+        record
+            .differences
+            .push("push: an earlier difference".into());
+        record.resolution_required = true;
+    }
+    write_record(context, &setup.key, &record)?;
+    if held == "links" {
+        fs::write(
+            root.join("renium-link.json"),
+            r#"{"version":1,"links":[{"id":"other","readOnly":true,"source":{"type":"local","path":"links/missing.renium"},"targets":[{"service":"ReplicatedStorage","path":["ReplicatedStorage","Other"]}]}],"broken":[]}"#,
+        )?;
+    }
+    let (held_project, held_paths) = match held {
+        "files" => (stale.clone(), paths.clone()),
+        "paths" => {
+            let read = paths
+                .iter()
+                .filter(|path| !path.to_string_lossy().contains("Workspace"))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert!(read.len() < paths.len(), "the comparison reads Workspace");
+            (files.clone(), read)
+        }
+        _ => (files.clone(), paths.clone()),
+    };
+    if hold {
+        let input = if held == "other" {
+            json!({"other": true})
+        } else {
+            plain_push_input(&automation_push_args(context, &json!({}), false)?)?
+        };
+        bridge.verified_full_pushes.lock_recover().insert(
+            "push-fixture".into(),
+            VerifiedFullPush {
+                connections: bridge.runtime_connection_signature("push-fixture"),
+                input,
+                project: held_project,
+                paths: held_paths,
+                proof: if held == "moved" {
+                    json!({"expired": true})
+                } else {
+                    json!({"id": 1})
+                },
+                expires: Instant::now() + Duration::from_secs(600),
+                sourcemap: (held != "pushed").then(Box::default),
+                #[cfg(windows)]
+                relay: None,
+            },
+        );
+    }
+    replace_capture(match held {
+        "exact" | "links" => files,
+        "files" => stale,
+        "paths" => extra,
+        _ => moved,
+    });
+    let outcome = coordinator.reconcile_with_gate_held(context, bridge, &mut setup);
+    let captured = CAPTURES.with(|slot| slot.borrow().is_empty());
+    let kept = bridge
+        .verified_full_pushes
+        .lock_recover()
+        .get("push-fixture")
+        .map(|entry| entry.expires);
+    let anonymous = |text: &str| text.replace(&context.root, "<root>");
+    // When a file was written differs between two runs.
+    let unstamped = |conflicts: &[Conflict]| {
+        conflicts
+            .iter()
+            .cloned()
+            .map(|mut conflict| {
+                conflict.files_changed_at = None;
+                conflict
+            })
+            .collect::<Vec<_>>()
+    };
+    let record = load_record(context, &setup.key)?.unwrap();
+    let started = Started {
+        outcome: outcome.map_or_else(|error| anonymous(&format!("{error:#}")), |()| "ok".into()),
+        setup: format!(
+            "{:?} {:?} {} {:?} {:?} {:?} {}",
+            setup.mode,
+            setup.error.as_deref().map(anonymous),
+            setup.resolution_required,
+            unstamped(&setup.conflicts),
+            setup.differences,
+            setup.unsynced_paths,
+            setup.moot_decisions.len()
+        ),
+        record: format!(
+            "{:?} {} {:?} {:?} {}",
+            record.mode,
+            record.resolution_required,
+            unstamped(&record.conflicts),
+            record.differences,
+            record.studio_checkpoint.is_some()
+        ),
+        last_sync: record
+            .baseline
+            .map(|baseline| baseline.load(root, &setup.key))
+            .transpose()?,
+        files: capture_snapshot(root, &paths)?,
+    };
+    Ok((started, captured, kept))
+}
+
+/// A Live Sync start under a held baseline leaves the pair as a start that
+/// captures Studio leaves it. Only a pull's baseline that Studio and the
+/// files still hold spares the capture, and is held again for as long as a
+/// new one; every other stays held as it was.
+#[test]
+fn a_live_start_from_a_held_pull_leaves_what_a_capture_leaves() -> Result<()> {
+    for held in [
+        "exact", "moved", "pushed", "other", "files", "paths", "links",
+    ] {
+        let (modes, records): (&[PairMode], &[&str]) = if held == "exact" {
+            (
+                &[PairMode::Reconcile, PairMode::Verify],
+                &["none", "same", "stale", "review"],
+            )
+        } else {
+            (&[PairMode::Verify], &["none", "same"])
+        };
+        for &mode in modes {
+            for &record in records {
+                let what = format!("{held} baseline, {record} record, {mode:?}");
+                let (started, captured, kept) = live_start(held, record, mode, true)?;
+                let (oracle, _, _) = live_start(held, record, mode, false)?;
+                assert!(
+                    started == oracle,
+                    "{what}: {}\nagainst a capture: {}",
+                    started.describe(),
+                    oracle.describe()
+                );
+                assert_eq!(captured, held != "exact", "{what}: Studio captured");
+                let kept = kept.with_context(|| format!("{what}: no baseline held after"))?;
+                assert_eq!(
+                    kept > Instant::now() + Duration::from_secs(900),
+                    held == "exact",
+                    "{what}: baseline renewed"
+                );
+            }
+        }
+    }
     Ok(())
 }

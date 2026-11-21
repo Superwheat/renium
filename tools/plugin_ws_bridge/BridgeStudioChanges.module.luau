@@ -3804,7 +3804,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if state.onlyCodeMode then
 			rebuildLuaSourceCounts(service, descendants)
 		end
-		rebuildExportInstances(service, serviceName, descendants)
 
 		local connections: { RBXScriptConnection } = {
 			service.Changed:Connect(function(propertyName: string)

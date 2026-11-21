@@ -63,6 +63,7 @@ pub(crate) struct Coordinator {
 /// project, with packed link scripts folded into Studio's side.
 struct ReconcileCapture {
     stage: ExportProjectStage,
+    /// Studio's side; empty where the start knows it to be the files.
     studio: ProjectSnapshot,
     editor: ProjectSnapshot,
     loaded_baseline: Option<ProjectSnapshot>,
@@ -125,6 +126,365 @@ fn capture_for_reconcile(
         link_enforcement,
         publish_paths,
     })
+}
+
+/// What a held pull baseline tells a Live Sync start of Studio.
+enum HeldStart {
+    /// None is held whose files are still as its pull wrote them.
+    NotHeld,
+    /// Studio still holds the baseline's proof, so it holds these files,
+    /// read where the comparison's stage reads.
+    #[cfg(any(windows, target_os = "macos"))]
+    Unchanged(Box<(ExportProjectStage, ProjectSnapshot)>),
+    /// Studio moved since the proof of the baseline held again; outside the
+    /// services it moved in it holds the baseline's files, which are still
+    /// the files.
+    #[cfg(any(windows, target_os = "macos"))]
+    Moved,
+}
+
+/// Holds `entry` again as the runtime's baseline for the commands after.
+#[cfg(any(windows, target_os = "macos"))]
+fn hold_again(bridge: &BridgeServer, runtime: &str, entry: VerifiedFullPush) {
+    bridge
+        .verified_full_pushes
+        .lock_recover()
+        .insert(runtime.to_string(), entry);
+}
+
+/// A held baseline whose files are what a whole pull writes and still as it
+/// wrote them, with the comparison's stage and its read of those files.
+#[cfg(any(windows, target_os = "macos"))]
+struct HeldFiles {
+    entry: VerifiedFullPush,
+    stage: ExportProjectStage,
+    editor: ProjectSnapshot,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl HeldFiles {
+    /// Takes the runtime's baseline where a Live Sync start can begin from
+    /// it. One kept for another push, or whose files a push sent, is left
+    /// as it is; one whose files the start cannot read as held stays held.
+    fn take(context: &BoundContext, bridge: &BridgeServer) -> Option<Self> {
+        let runtime = context.runtime_id.as_deref()?;
+        let input = automation_push_args(context, &json!({}), false)
+            .and_then(|args| plain_push_input(&args))
+            .map_err(|error| {
+                log_global(
+                    5,
+                    format_args!("[renium] baseline: none for this live start: {error:#}"),
+                );
+            })
+            .ok()?;
+        let unusable = match bridge.verified_full_pushes.lock_recover().get(runtime) {
+            None => return None,
+            Some(held) if held.input != input => Some("it was kept for another push"),
+            Some(held) if held.sourcemap.is_none() => Some("its files are what a push sent"),
+            Some(_) => None,
+        };
+        let reason = if let Some(reason) = unusable {
+            reason.to_string()
+        } else {
+            let entry = take_baseline(context, bridge, &input)?;
+            let phase = Instant::now();
+            let files = held_comparison_files(context, &entry);
+            log_reconcile_timing("held baseline files", phase);
+            let reason = match files {
+                Ok(Ok((stage, editor))) => {
+                    return Some(Self {
+                        entry,
+                        stage,
+                        editor,
+                    });
+                }
+                Ok(Err(reason)) => reason.to_string(),
+                Err(error) => format!("{error:#}"),
+            };
+            hold_again(bridge, runtime, entry);
+            reason
+        };
+        log_global(
+            5,
+            format_args!("[renium] baseline: live start captures every service: {reason}"),
+        );
+        None
+    }
+
+    /// What the lease that verified the proof found: Studio still holds the
+    /// files, or it moved since. The baseline is held again for the
+    /// commands after either way, renewed where it held.
+    fn settle(self, bridge: &BridgeServer, runtime: &str, state: &Value) -> HeldStart {
+        let Self {
+            mut entry,
+            stage,
+            editor,
+        } = self;
+        if state["pushProofMatches"] != true {
+            log_global(
+                5,
+                format_args!(
+                    "[renium] baseline: live start: Studio moved since it: {}",
+                    state["pushProofMismatch"]
+                        .as_str()
+                        .unwrap_or("Studio proof unavailable")
+                ),
+            );
+            hold_again(bridge, runtime, entry);
+            return HeldStart::Moved;
+        }
+        log_global(
+            5,
+            format_args!("[renium] baseline: live start from it: Studio and the files hold it"),
+        );
+        entry.renew();
+        hold_again(bridge, runtime, entry);
+        HeldStart::Unchanged(Box::new((stage, editor)))
+    }
+}
+
+/// The comparison stage of a Live Sync start and the files it reads, where
+/// `held` says what Studio holds there: no packed link script folds into
+/// Studio's side, the comparison reads the paths the pull wrote, and the
+/// files are as it wrote them.
+#[cfg(any(windows, target_os = "macos"))]
+fn held_comparison_files(
+    context: &BoundContext,
+    held: &VerifiedFullPush,
+) -> Result<std::result::Result<(ExportProjectStage, ProjectSnapshot), &'static str>> {
+    let root = Path::new(&context.root);
+    if packing_link_enforcement(root, Path::new(&context.source))?.is_some() {
+        return Ok(Err("the comparison folds packed link scripts"));
+    }
+    let stage = project_comparison_stage(context, &sync_services())?;
+    let sorted = |paths: &[PathBuf]| {
+        let mut paths = paths.to_vec();
+        paths.sort();
+        paths
+    };
+    if sorted(stage.publish_paths()) != sorted(&held.paths) {
+        return Ok(Err("the comparison reads other paths than the pull wrote"));
+    }
+    let editor = capture_snapshot(root, stage.publish_paths())?;
+    if editor != held.project {
+        return Ok(Err("the files changed since"));
+    }
+    Ok(Ok((stage, editor)))
+}
+
+/// The lease a reconcile compares under. A held baseline a start can begin
+/// from has its proof verified in the request that starts the lease, so no
+/// edit falls between the two, and a proof that holds keeps the observation
+/// it stands on running instead of tracking Studio anew.
+fn studio_lease(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+) -> Result<(StudioChangeGuard, Value, HeldStart)> {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let held = HeldFiles::take(context, bridge);
+        let lease = current_studio_change_guard_verifying(
+            context,
+            bridge,
+            None,
+            held.as_ref().map(|held| &held.entry.proof),
+            |_| Ok(()),
+        );
+        let (guard, state) = match lease {
+            Ok(lease) => lease,
+            Err(error) => {
+                if let (Some(held), Some(runtime)) = (held, context.runtime_id.as_deref()) {
+                    hold_again(bridge, runtime, held.entry);
+                }
+                return Err(error);
+            }
+        };
+        let start = held.map_or(HeldStart::NotHeld, |held| {
+            held.settle(bridge, &guard.runtime_id, &state)
+        });
+        Ok((guard, state, start))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let (guard, state) = current_studio_change_guard_with_state(context, bridge, |_| Ok(()))?;
+        Ok((guard, state, HeldStart::NotHeld))
+    }
+}
+
+/// Both sides of a start's comparison and the paths at which they differ.
+/// Sides a held baseline shows equal are neither captured nor compared.
+fn compared_capture(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    (setup, record): (&PairSetup, &PairRecord),
+    studio_state: &Value,
+    start: HeldStart,
+) -> Result<(ReconcileCapture, HashSet<PathBuf>)> {
+    let capture = match start {
+        #[cfg(any(windows, target_os = "macos"))]
+        HeldStart::Unchanged(held) => {
+            let (stage, editor) = *held;
+            let publish_paths = stage.publish_paths().to_vec();
+            let capture = ReconcileCapture {
+                stage,
+                studio: ProjectSnapshot::default(),
+                editor,
+                loaded_baseline: None,
+                link_enforcement: None,
+                publish_paths,
+            };
+            return Ok((capture, HashSet::new()));
+        }
+        #[cfg(any(windows, target_os = "macos"))]
+        HeldStart::Moved => match capture_moved_services(context, bridge, studio_state)? {
+            Some(capture) => capture,
+            None => capture_for_reconcile(context, bridge, setup, record, studio_state)?,
+        },
+        HeldStart::NotHeld => capture_for_reconcile(context, bridge, setup, record, studio_state)?,
+    };
+    let phase = Instant::now();
+    // The files against Studio's capture, as a push compares them: a
+    // store by the instances that differ where that says as much.
+    let side_differences = super::replacement::snapshot_differences_prepared(
+        &capture.editor,
+        &capture.studio,
+        None,
+        true,
+    )?;
+    log_reconcile_timing("side comparison", phase);
+    Ok((capture, side_differences))
+}
+
+/// The services a start captures where Studio moved since `held`'s proof
+/// as `scope` says, with the stores in `held` referring into the services
+/// it moved paths in: a capture writes such a reference from where its
+/// target stands now. Otherwise why every service is captured.
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn moved_services(
+    scope: &ProofScope,
+    held: &ProjectSnapshot,
+    stores: &BTreeMap<String, PathBuf>,
+) -> Result<std::result::Result<BTreeSet<String>, String>> {
+    let (moved, touched) = match scope {
+        ProofScope::Unknown(reason) => return Ok(Err(reason.clone())),
+        ProofScope::Services { services, touched } => (services, touched),
+    };
+    let referring = referring_services(held, stores, &paths_moved_in(moved, touched))?;
+    let services = moved.union(&referring).cloned().collect::<BTreeSet<_>>();
+    if services.is_empty() {
+        return Ok(Err("Studio moved in no service".to_string()));
+    }
+    if services.len() >= sync_services().len() {
+        return Ok(Err("Studio moved in every service".to_string()));
+    }
+    log_global(
+        5,
+        format_args!(
+            "[renium] baseline: live start captures [{}]: Studio moved [{}], stores referring to them [{}]",
+            services.iter().cloned().collect::<Vec<_>>().join(", "),
+            moved.iter().cloned().collect::<Vec<_>>().join(", "),
+            referring.iter().cloned().collect::<Vec<_>>().join(", ")
+        ),
+    );
+    Ok(Ok(services))
+}
+
+/// Studio's side where it moved since the held baseline's proof: the
+/// services Studio says it moved in, captured, and the baseline's files
+/// elsewhere. `None` where Studio cannot say where it moved or changed while
+/// it was captured. The baseline is held again after.
+#[cfg(any(windows, target_os = "macos"))]
+fn capture_moved_services(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    studio_state: &Value,
+) -> Result<Option<ReconcileCapture>> {
+    let runtime = context
+        .runtime_id
+        .as_deref()
+        .context("Studio context has no edit-mode runtime")?;
+    let Some(held) = bridge.verified_full_pushes.lock_recover().remove(runtime) else {
+        return Ok(None);
+    };
+    let captured = capture_moved_services_of(context, (bridge, runtime), &held, studio_state);
+    hold_again(bridge, runtime, held);
+    captured
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn capture_moved_services_of(
+    context: &BoundContext,
+    (bridge, runtime): (&BridgeServer, &str),
+    held: &VerifiedFullPush,
+    studio_state: &Value,
+) -> Result<Option<ReconcileCapture>> {
+    let phase = Instant::now();
+    let scoped = bridge
+        .call_for_runtime_with_timeout(
+            "getStudioChangeState",
+            json!({"start": false, "verifyPushProof": held.proof, "scopePushProof": true}),
+            BridgeTarget::Edit,
+            runtime,
+            Some(Duration::from_secs(10)),
+        )
+        .and_then(|state| {
+            ensure_plugin_api_ok(&state)?;
+            let source = Path::new(&context.source);
+            let stores = crate::project::structural::service_store_paths(source)?
+                .into_iter()
+                .map(|(service, path)| {
+                    Ok((service, path.strip_prefix(&context.root)?.to_path_buf()))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            moved_services(
+                &ProofScope::parse(&state["pushProofScope"]),
+                &held.project,
+                &stores,
+            )
+        });
+    let services = match scoped {
+        Ok(Ok(services)) => services.into_iter().collect::<Vec<_>>(),
+        Ok(Err(reason)) => {
+            log_global(
+                5,
+                format_args!("[renium] baseline: live start captures every service: {reason}"),
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            log_global(
+                5,
+                format_args!("[renium] baseline: live start captures every service: {error:#}"),
+            );
+            return Ok(None);
+        }
+    };
+    let captured =
+        capture_changed_studio_services(context, bridge, &services, &held.project, studio_state);
+    let (stage, studio, editor) = match captured {
+        Ok(Some(captured)) => captured,
+        outcome => {
+            let reason = match outcome {
+                Err(error) => format!("{error:#}"),
+                _ => "Studio changed during the capture".to_string(),
+            };
+            log_global(
+                5,
+                format_args!("[renium] baseline: live start captures every service: {reason}"),
+            );
+            return Ok(None);
+        }
+    };
+    let publish_paths = stage.publish_paths().to_vec();
+    log_reconcile_timing("capture of the services Studio moved in", phase);
+    Ok(Some(ReconcileCapture {
+        stage,
+        studio,
+        editor,
+        loaded_baseline: None,
+        link_enforcement: None,
+        publish_paths,
+    }))
 }
 
 impl Coordinator {
@@ -410,8 +770,7 @@ impl Coordinator {
         let mut record = load_record(context, &setup.key)?
             .context("Reconciliation state disappeared while starting Live Sync")?;
         let _selection = bound_context::select(context);
-        let (studio_guard, studio_state) =
-            current_studio_change_guard_with_state(context, bridge, |_| Ok(()))?;
+        let (studio_guard, studio_state, start) = studio_lease(context, bridge)?;
         if setup.runtime_replacement_unproven && setup.resolution_preference.is_none() {
             setup.mode = PairMode::Verify;
             setup.error = Some(
@@ -451,20 +810,17 @@ impl Coordinator {
         )? {
             return Ok(());
         }
-        let ReconcileCapture {
-            stage,
-            studio,
-            editor,
-            loaded_baseline,
-            link_enforcement,
-            publish_paths,
-        } = capture_for_reconcile(context, bridge, setup, &record, &studio_state)?;
-        let phase = Instant::now();
-        // The files against Studio's capture, as a push compares them: a
-        // store by the instances that differ where that says as much.
-        let side_differences =
-            super::replacement::snapshot_differences_prepared(&editor, &studio, None, true)?;
-        log_reconcile_timing("side comparison", phase);
+        let (
+            ReconcileCapture {
+                stage,
+                studio,
+                editor,
+                loaded_baseline,
+                link_enforcement,
+                publish_paths,
+            },
+            side_differences,
+        ) = compared_capture(context, bridge, (&*setup, &record), &studio_state, start)?;
         let phase = Instant::now();
         let comparison = compare_sides(
             setup,

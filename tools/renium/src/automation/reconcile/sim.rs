@@ -2392,6 +2392,171 @@ fn seeded_baselines_answer_as_captures_do() {
     }
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+const LIVE_START_OUTCOMES: [&str; 5] = [
+    "started from the baseline",
+    "captured the services Studio moved in",
+    "captured a store referring into a moved service",
+    "captured every service: Studio could not say where it moved",
+    "captured every service: the files changed since the pull",
+];
+
+#[cfg(any(windows, target_os = "macos"))]
+static LIVE_START_COUNTS: [std::sync::atomic::AtomicUsize; 5] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 5];
+
+/// A Live Sync start of the scoped model under the baseline a pull keeps,
+/// decided by the code a start runs. Where it starts from the baseline,
+/// Studio and the files are that baseline; where it captures the services
+/// Studio moved in, its Studio side is byte for byte a whole capture's.
+#[cfg(any(windows, target_os = "macos"))]
+fn live_start_step(
+    studio: &ScopedStudio,
+    files: &Tree,
+    held: Option<&Held>,
+    log: &mut Vec<String>,
+) -> Result<(), String> {
+    let outcome = |index: usize| {
+        LIVE_START_COUNTS[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    };
+    let whole = studio.tree.snapshot(None);
+    let Some(held) = held.filter(|held| held.project == files.snapshot(None)) else {
+        log.push("live start captures every service".into());
+        outcome(4);
+        return Ok(());
+    };
+    if held.version == studio.version() {
+        log.push("live start from the baseline".into());
+        if let Some(difference) = files.difference(&studio.tree) {
+            return Err(format!(
+                "a live start from the baseline compared other Studio than a capture: {difference}"
+            ));
+        }
+        outcome(0);
+        return Ok(());
+    }
+    let stores = SCOPED_SERVICES
+        .iter()
+        .map(|service| {
+            let store = service_settings_path(&Path::new("src").join(service));
+            (service.to_string(), store)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let scope = ProofScope::parse(&studio.answer_since(held.version));
+    let services = match moved_services(&scope, &held.project, &stores)
+        .map_err(|error| format!("{error:#}"))?
+    {
+        Ok(services) => services,
+        Err(reason) => {
+            log.push(format!("live start captures every service: {reason}"));
+            outcome(3);
+            return Ok(());
+        }
+    };
+    log.push(format!("live start captures {services:?}"));
+    let ProofScope::Services {
+        services: moved, ..
+    } = scope
+    else {
+        return Err("a start captured services Studio could not name".into());
+    };
+    let scopes = services
+        .iter()
+        .flat_map(|service| {
+            let directory = Path::new("src").join(service);
+            [service_settings_path(&directory), directory]
+        })
+        .collect::<Vec<_>>();
+    let scope_set = ScopeSet::new(&scopes);
+    let mut side = held.project.clone();
+    side.entries.retain(|path, _| !scope_set.contains(path));
+    side.entries.extend(
+        whole
+            .entries
+            .iter()
+            .filter(|(path, _)| scope_set.contains(path))
+            .map(|(path, entry)| (path.clone(), entry.clone())),
+    );
+    if side != whole {
+        let difference = Tree::read(&side)?.difference(&studio.tree);
+        return Err(format!(
+            "a live start capturing {services:?} compared other Studio than a capture: {difference:?}"
+        ));
+    }
+    outcome(if services == moved { 1 } else { 2 });
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn run_live_start_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
+    let mut rng = Rng(seed);
+    let mut counter = 0;
+    let mut tree = first_tree(&mut rng, &mut counter);
+    add_second_service(&mut tree, &mut rng, &mut counter);
+    add_workspace(&mut tree, &mut rng, &mut counter);
+    let mut studio = ScopedStudio {
+        tree,
+        changes: Vec::new(),
+        removed: Vec::new(),
+        proof: counter,
+    };
+    let mut files = studio.tree.clone();
+    let mut held = Some(Held {
+        project: files.snapshot(None),
+        version: 0,
+    });
+    let mut from_scope = false;
+    for _ in 0..40 {
+        match rng.below(9) {
+            0 => {
+                let (what, _) =
+                    scoped_edit(&mut files, (&mut Vec::new(), 0), &mut rng, &mut counter);
+                log.push(format!("file edit: {what}"));
+            }
+            1..=3 => {
+                for _ in 0..1 + rng.below(3) {
+                    studio.edit(&mut rng, &mut counter, log);
+                }
+            }
+            4 => {
+                // A push keeps a baseline of what it sent, which a start
+                // does not begin from.
+                log.push("full push".into());
+                studio.tree = files.clone();
+                studio.changes.push(None);
+                studio.take_proof(counter);
+                held = None;
+            }
+            5 | 6 => {
+                held = scoped_pull_step(
+                    &mut rng,
+                    (&mut studio, &mut files),
+                    held,
+                    (&mut counter, &mut from_scope, log),
+                )?;
+            }
+            _ => live_start_step(&studio, &files, held.as_ref(), log)?,
+        }
+    }
+    Ok(())
+}
+
+/// A Live Sync start under a pull's baseline compares what a start that
+/// captures every service compares: random file and Studio edits, pushes,
+/// whole and scoped pulls, and starts where Studio moved in some services
+/// or where it cannot say.
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn seeded_live_starts_compare_what_a_capture_compares() {
+    run_seeds(1000, run_live_start_seed);
+    for (count, what) in LIVE_START_COUNTS.iter().zip(LIVE_START_OUTCOMES) {
+        assert!(
+            count.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "no seed reached: {what}"
+        );
+    }
+}
+
 /// A store outside a pull's scope that refers into a service the pull
 /// captures is written from the capture's paths: a change there during the
 /// pull is outside the scope, one in a service it does not refer to is not,
