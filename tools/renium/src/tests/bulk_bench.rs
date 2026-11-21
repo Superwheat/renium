@@ -398,13 +398,14 @@ fn changed_bulk_paths(root: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// New scripts, each with the history entry of its instance and that of its
+/// Source.
 #[test]
 #[ignore = "benchmark"]
 fn bulk_bench_scripts_created() {
     let root = project("created");
     write_bulk_files(&root, "print('new')\n");
     let changes = measure("created", || collect(&root, changed_bulk_paths(&root)));
-    // Each new script has the entry of its instance and that of its Source.
     assert_eq!(changes.history_entries.len(), 2 * BULK_SCRIPTS);
     write_history(&root, "created history", &changes, false);
     let _ = fs::remove_dir_all(&root);
@@ -434,33 +435,140 @@ fn bulk_bench_scripts_deleted() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// The scripts of a Bulk folder in the Workspace deleted, where an
-/// ObjectValue refers to the last one, so the last cannot join their run.
-#[test]
-#[ignore = "benchmark"]
-fn bulk_bench_scripts_deleted_blocked() {
-    let root = project("blocked");
+/// Adds a Bulk folder of Scripts to the Workspace, and ObjectValues that
+/// refer to them: one to the last, or with `every` one to each. With
+/// `children`, each script holds a Folder, so its file is the `init` file of
+/// its own folder. Returns the Bulk folder's directory, which holds none of
+/// their files.
+fn write_bulk_workspace(root: &Path, every: bool, children: bool) -> PathBuf {
     let mut instances = workspace_instances();
     let bulk = instances.len();
     instances.push(settings_instance("editor:bulk", "Bulk", "Folder", Some(0)));
     for at in 0..BULK_SCRIPTS {
         let name = format!("Script{at:04}");
+        let script_index = instances.len();
         instances.push(script(format!("editor:b{at:x}"), &name, "Script", bulk));
+        if children {
+            let id = format!("editor:c{at:x}");
+            instances.push(settings_instance(id, "Child", "Folder", Some(script_index)));
+        }
     }
-    let mut link = settings_instance("editor:link", "Link", "ObjectValue", Some(0));
-    let last = format!("editor:b{:x}", BULK_SCRIPTS - 1);
-    let value = json!({"_type": "Ref", "settingsId": last});
-    link.properties.insert("Value".to_string(), value);
-    instances.push(link);
+    let referred = if every { 0 } else { BULK_SCRIPTS - 1 };
+    for at in referred..BULK_SCRIPTS {
+        let id = format!("editor:link{at:x}");
+        let mut link = settings_instance(id, "Link", "ObjectValue", Some(0));
+        let value = json!({"_type": "Ref", "settingsId": format!("editor:b{at:x}")});
+        link.properties.insert("Value".to_string(), value);
+        instances.push(link);
+    }
     let workspace = root.join("src").join("Workspace");
     settings_document(instances)
         .write_file(&service_settings_path(&workspace))
         .unwrap();
-    let folder = workspace.join("Bulk");
+    workspace.join("Bulk")
+}
+
+/// The repairs of the ObjectValues that refer to the Bulk scripts.
+fn link_repairs(changes: &crate::editor::types::EditorChangeSet) -> usize {
+    (changes.property_changes.iter())
+        .filter(|change| {
+            (change.settings_id.as_deref()).is_some_and(|id| id.starts_with("editor:link"))
+        })
+        .count()
+}
+
+/// The Workspace's Bulk scripts deleted, where the last cannot join the run
+/// of the others as something refers to it, or with `every`, where
+/// something refers to each, so each goes alone.
+fn scripts_deleted(name: &str, every: bool) {
+    let root = project(&name.replace(' ', "-"));
+    let folder = write_bulk_workspace(&root, every, false);
     let mut changed = vec![folder.clone()];
     changed.extend((0..BULK_SCRIPTS).map(|at| folder.join(format!("Script{at:04}.server.luau"))));
-    let changes = measure("deleted blocked", || collect(&root, changed));
+    let changes = measure(name, || collect(&root, changed));
     assert_eq!(changes.history_entries.len(), BULK_SCRIPTS);
-    write_history(&root, "deleted blocked history", &changes, false);
+    assert_eq!(link_repairs(&changes), if every { BULK_SCRIPTS } else { 1 });
+    write_history(&root, &format!("{name} history"), &changes, false);
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+#[ignore = "benchmark"]
+fn bulk_bench_scripts_deleted_blocked() {
+    scripts_deleted("deleted blocked", false);
+}
+
+#[test]
+#[ignore = "benchmark"]
+fn bulk_bench_scripts_deleted_referenced() {
+    scripts_deleted("deleted referenced", true);
+}
+
+/// The Workspace's Bulk scripts renamed from `.server.luau` to
+/// `.client.luau`, which makes each a LocalScript with the history entries
+/// of its instance and its Source. With `every`, something refers to each.
+fn scripts_renamed(name: &str, every: bool) {
+    let root = project(&name.replace(' ', "-"));
+    let folder = write_bulk_workspace(&root, every, false);
+    fs::create_dir_all(&folder).unwrap();
+    let mut changed = Vec::new();
+    for at in 0..BULK_SCRIPTS {
+        let file = folder.join(format!("Script{at:04}.client.luau"));
+        fs::write(&file, "print('client')\n").unwrap();
+        changed.extend([file, folder.join(format!("Script{at:04}.server.luau"))]);
+    }
+    let changes = measure(name, || collect(&root, changed));
+    assert_eq!(changes.history_entries.len(), 2 * BULK_SCRIPTS);
+    assert_eq!(link_repairs(&changes), if every { BULK_SCRIPTS } else { 1 });
+    write_history(&root, &format!("{name} history"), &changes, false);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+#[ignore = "benchmark"]
+fn bulk_bench_scripts_renamed() {
+    scripts_renamed("renamed", false);
+}
+
+#[test]
+#[ignore = "benchmark"]
+fn bulk_bench_scripts_renamed_referenced() {
+    scripts_renamed("renamed referenced", true);
+}
+
+/// The `init` files of the Workspace's Bulk scripts deleted, which turns
+/// each script into a Folder that keeps its child.
+#[test]
+#[ignore = "benchmark"]
+fn bulk_bench_init_scripts_deleted() {
+    let root = project("init-deleted");
+    let folder = write_bulk_workspace(&root, false, true);
+    let changed = (0..BULK_SCRIPTS)
+        .map(|at| {
+            folder
+                .join(format!("Script{at:04}"))
+                .join("init.server.luau")
+        })
+        .collect();
+    let changes = measure("init deleted", || collect(&root, changed));
+    assert_eq!(changes.history_entries.len(), BULK_SCRIPTS);
+    write_history(&root, "init deleted history", &changes, false);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// One encode of the Workspace store, what a history entry's copy of the
+/// store costs.
+#[test]
+#[ignore = "benchmark"]
+fn bulk_bench_store_encoded() {
+    let root = project("encoded");
+    let workspace = root.join("src").join("Workspace");
+    let document =
+        crate::settings::bytecode::SettingsBytecode::read_file(&service_settings_path(&workspace))
+            .unwrap();
+    let _ = fs::remove_dir_all(&root);
+    let encoded = measure("store encoded", || {
+        crate::settings::bytecode::encode_settings_bytecode(&document).unwrap()
+    });
+    assert!(!encoded.is_empty());
 }

@@ -1314,7 +1314,7 @@ fn staged_settings_redirect_uses_original_project_not_merged_stage() {
         settings_writes: vec![EditorSettingsWrite {
             path: staged_path.clone(),
             expected_hash: settings_file_hash(&staged_path).unwrap(),
-            document: document("aligned-id"),
+            document: document("aligned-id").into(),
             encoded: None,
         }],
         ..Default::default()
@@ -1371,7 +1371,7 @@ fn staged_settings_redirect_keeps_concurrent_write_protection() {
                     settings_writes: vec![EditorSettingsWrite {
                         path: stage.join(relative),
                         expected_hash: hash,
-                        document: document.clone(),
+                        document: document.clone().into(),
                         encoded: None,
                     }],
                     ..Default::default()

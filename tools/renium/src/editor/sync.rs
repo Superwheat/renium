@@ -32,9 +32,9 @@ use crate::editor::document::{
 };
 use crate::editor::history::save_editor_history_entries;
 use crate::editor::paths::{
-    EditorChildStemCache, build_editor_instance_paths, editor_directory_target,
-    editor_run_context_value, editor_source_target_with_cache, infer_editor_source_path_spec,
-    infer_source_script, service_from_changed_path,
+    EditorChildStemCache, build_editor_instance_paths, build_editor_instance_paths_for_indices,
+    editor_directory_target, editor_run_context_value, editor_source_target_with_cache,
+    infer_editor_source_path_spec, infer_source_script, service_from_changed_path,
 };
 use crate::editor::review::{
     EditorReviewOutcome, OutsideReferencePaths, ProtectedPlaceCache,
@@ -2547,7 +2547,7 @@ fn collect_project_editor_changes_with_documents(
         changes.settings_writes.push(EditorSettingsWrite {
             expected_hash: settings_file_hash(&path)?,
             path,
-            document: crate::settings::bytecode::decode_settings_bytecode(&bytes)?,
+            document: Arc::new(crate::settings::bytecode::decode_settings_bytecode(&bytes)?),
             encoded: None,
         });
     }
@@ -3173,7 +3173,7 @@ fn build_editor_filter_candidates(
                 return None;
             }
             let service = service_from_changed_path(&src_root, &write.path)?;
-            Some((service, &write.document))
+            Some((service, &*write.document))
         })
         .collect::<HashMap<_, _>>();
     let mut candidates = Vec::new();
@@ -6269,22 +6269,102 @@ fn settings_value_references_target(
     }
 }
 
-fn append_editor_reference_repairs(
-    changes: &mut EditorChangeSet,
+/// An instance whose values refer to a target: its settings id and the
+/// names of the properties and attributes that do.
+struct EditorReferenceHit {
+    settings_id: String,
+    properties: Vec<String>,
+    attributes: Vec<String>,
+}
+
+/// The instances of `before` whose values refer to the instance
+/// `target_settings_id` names there, in store order.
+fn editor_reference_hits(
     before: &SettingsBytecode,
-    after: &SettingsBytecode,
     service: &str,
     target_settings_id: &str,
-) {
+) -> Vec<EditorReferenceHit> {
     let Some(target_index) = document_instance_index_by_settings_id(before, target_settings_id)
     else {
-        return;
+        return Vec::new();
     };
-    let before_paths = build_editor_instance_paths(before, service);
-    let Some(target_path) = before_paths.get(target_index).and_then(Clone::clone) else {
-        return;
+    let Some(target_path) =
+        build_editor_instance_paths_for_indices(before, service, &[target_index])
+            .remove(&target_index)
+    else {
+        return Vec::new();
     };
+    crate::settings::tree::count_whole_store_pass();
+    (before.instances.iter())
+        .filter_map(|instance| {
+            editor_reference_hit(instance, target_index, target_settings_id, &target_path)
+        })
+        .collect()
+}
+
+/// `instance` where its values refer to the target at `target_index`.
+fn editor_reference_hit(
+    instance: &crate::settings::bytecode::SettingsBytecodeInstance,
+    target_index: usize,
+    target_settings_id: &str,
+    target_path: &EditorInstancePath,
+) -> Option<EditorReferenceHit> {
+    let referring = |values: &Map<String, Value>| {
+        (values.iter())
+            .filter(|(_, value)| {
+                settings_value_references_target(
+                    value,
+                    target_index,
+                    target_settings_id,
+                    &target_path.path_segments,
+                    &target_path.path_ordinals,
+                )
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>()
+    };
+    let properties = referring(&instance.properties);
+    let attributes = referring(&instance.attributes);
+    (!properties.is_empty() || !attributes.is_empty()).then(|| EditorReferenceHit {
+        settings_id: instance.settings_id.clone(),
+        properties,
+        attributes,
+    })
+}
+
+/// The property changes that bring Studio's values of `hits` to those of
+/// `after`, the store once the target changed.
+fn append_editor_reference_hit_repairs(
+    changes: &mut EditorChangeSet,
+    hits: &[EditorReferenceHit],
+    after: &SettingsBytecode,
+    service: &str,
+) {
+    if hits.is_empty() {
+        return;
+    }
     let after_paths = build_editor_instance_paths(after, service);
+    let after_indices = after
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| (instance.settings_id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    append_editor_reference_repairs_from(changes, hits, after, service, &after_paths, |id| {
+        after_indices.get(id).copied()
+    });
+}
+
+/// `append_editor_reference_hit_repairs` with the paths of the instances of
+/// `after` and the last position of each of its settings ids.
+fn append_editor_reference_repairs_from(
+    changes: &mut EditorChangeSet,
+    hits: &[EditorReferenceHit],
+    after: &SettingsBytecode,
+    service: &str,
+    after_paths: &[Option<EditorInstancePath>],
+    after_index: impl Fn(&str) -> Option<usize>,
+) {
     let after_settings_ids = crate::editor::review::EditorReferenceIds::new(
         after
             .instances
@@ -6292,37 +6372,19 @@ fn append_editor_reference_repairs(
             .map(|instance| instance.settings_id.as_str()),
     )
     .in_service(service);
-    let after_indices = after
-        .instances
-        .iter()
-        .enumerate()
-        .map(|(index, instance)| (instance.settings_id.as_str(), index))
-        .collect::<HashMap<_, _>>();
 
-    for before_instance in &before.instances {
-        let Some(after_index) = after_indices
-            .get(before_instance.settings_id.as_str())
-            .copied()
-        else {
+    for hit in hits {
+        let Some(after_index) = after_index(&hit.settings_id) else {
             continue;
         };
         let after_instance = &after.instances[after_index];
         let mut properties = Map::new();
         let mut reset_properties = Vec::new();
-        for (name, value) in &before_instance.properties {
-            if !settings_value_references_target(
-                value,
-                target_index,
-                target_settings_id,
-                &target_path.path_segments,
-                &target_path.path_ordinals,
-            ) {
-                continue;
-            }
+        for name in &hit.properties {
             if let Some(value) = after_instance.properties.get(name) {
                 properties.insert(
                     name.clone(),
-                    normalize_editor_bridge_value(value, None, &after_paths, &after_settings_ids),
+                    normalize_editor_bridge_value(value, None, after_paths, &after_settings_ids),
                 );
             } else {
                 reset_properties.push(name.clone());
@@ -6331,20 +6393,11 @@ fn append_editor_reference_repairs(
 
         let mut attributes = Map::new();
         let mut deleted_attributes = Vec::new();
-        for (name, value) in &before_instance.attributes {
-            if !settings_value_references_target(
-                value,
-                target_index,
-                target_settings_id,
-                &target_path.path_segments,
-                &target_path.path_ordinals,
-            ) {
-                continue;
-            }
+        for name in &hit.attributes {
             if let Some(value) = after_instance.attributes.get(name) {
                 attributes.insert(
                     name.clone(),
-                    normalize_editor_bridge_value(value, None, &after_paths, &after_settings_ids),
+                    normalize_editor_bridge_value(value, None, after_paths, &after_settings_ids),
                 );
             } else {
                 deleted_attributes.push(name.clone());
@@ -6482,7 +6535,7 @@ fn finish_editor_change_collection(
             changes.settings_writes.push(EditorSettingsWrite {
                 expected_hash: settings_file_hash(&path)?,
                 path,
-                document: document.as_ref().clone(),
+                document: Arc::clone(document),
                 encoded: None,
             });
         }
@@ -6863,6 +6916,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
     let mut snapshots: HashMap<String, bulk::HistorySnapshot> = HashMap::new();
     let mut read_whole = HashSet::new();
     let mut store_references = HashMap::new();
+    let mut store_referrers = HashMap::new();
 
     let mut changed_paths = expand_editor_changed_paths(args)?;
     let full_reconcile = changed_paths.is_empty();
@@ -7047,7 +7101,8 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             let settings_before = documents
                 .get(&service)
                 .and_then(Option::as_ref)
-                .map(|document| snapshot.before_creating(document, index, spec));
+                .map(|document| snapshot.before_creating(document, index, spec))
+                .transpose()?;
             let slot = documents
                 .get_mut(&service)
                 .expect("service document should be loaded");
@@ -7092,14 +7147,15 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                     });
                 }
                 if !ensured.replace_instances.is_empty() {
-                    if let (Some(before), Some(target_settings_id)) =
+                    if let (Some(_), Some(target_settings_id)) =
                         (settings_before.as_ref(), target.settings_id.as_deref())
                     {
-                        append_editor_reference_repairs(
+                        bulk::repair_references(
+                            &mut store_referrers,
                             &mut changes,
-                            before,
                             document,
                             &service,
+                            &index.children,
                             target_settings_id,
                         );
                     }
@@ -7121,7 +7177,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                     source_key: Some(editor_source_key_from_target(&target)),
                     settings_before,
                 });
-                snapshot.created(document, added_from);
+                snapshot.created(document, added_from, target.settings_id.as_deref());
                 bulk::forget_added(
                     (&mut source_children, &mut source_stems),
                     &service,
@@ -7147,6 +7203,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                     documents: &mut documents,
                     read_whole: &mut read_whole,
                     references: &mut store_references,
+                    referrers: &mut store_referrers,
                     indexes: &mut source_children,
                     stems: &mut source_stems,
                     seen_paths: &mut seen_paths,
@@ -7163,7 +7220,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             if let Some(settings_id) = target.settings_id.as_deref()
                 && let Some(document) = documents.get_mut(&service).and_then(Option::as_mut)
                 && let Some(index) =
-                    document_instance_index_by_settings_id(document.as_ref(), settings_id)
+                    bulk::instance_index(&store_referrers, document, &service, settings_id)
                 && link_enforcement
                     .read_only_package_for_path(
                         &service,
@@ -7172,16 +7229,26 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                     )
                     .is_none()
             {
-                read_whole_for_edit(Some(&mut *document), src_root, &service)?;
-                let document = Arc::make_mut(document);
+                bulk::read_whole_once(&mut read_whole, &mut documents, src_root, &service)?;
+                let document = Arc::make_mut(
+                    (documents.get_mut(&service).and_then(Option::as_mut))
+                        .expect("the service's document is loaded above"),
+                );
                 let original_class = document.instances[index].class_name.clone();
+                let init = inferred_spec.as_ref().is_some_and(|spec| spec.is_init);
                 if is_lua_source_class(&original_class) {
-                    let settings_before = document.clone();
+                    let snapshot = snapshots.entry(service.clone()).or_default();
                     changed_services.dirty.insert(service.clone());
-                    if inferred_spec.as_ref().is_some_and(|spec| spec.is_init) {
+                    let settings_before = if init {
+                        let children = &(source_children.get(&service))
+                            .expect("the service's index is built above")
+                            .children;
+                        let settings_before =
+                            snapshot.before_changing_subtree(document, children, Some(index))?;
                         document.instances[index].class_name = "Folder".to_string();
-                        let descriptor = editor_instance_descriptor_for_known_path(
+                        let descriptor = bulk::descriptor_for_known_path(
                             document,
+                            children,
                             index,
                             target.path_segments.clone(),
                             target.path_ordinals.clone(),
@@ -7194,13 +7261,16 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                             instances: vec![descriptor],
                             preserve_instances: Vec::new(),
                         });
-                        append_editor_reference_repairs(
+                        bulk::repair_references(
+                            &mut store_referrers,
                             &mut changes,
-                            &settings_before,
                             document,
                             &service,
+                            children,
                             settings_id,
                         );
+                        snapshot.touch([settings_id.to_string()]);
+                        settings_before
                     } else {
                         let descriptor = editor_instance_descriptor_for_known_path(
                             document,
@@ -7215,18 +7285,24 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                             index,
                             &mut removed,
                         );
-                        retired_ids.entry(service.clone()).or_default().extend(
-                            removed
-                                .iter()
-                                .map(|removed| document.instances[*removed].settings_id.clone()),
-                        );
+                        let removed_ids = (removed.iter())
+                            .map(|removed| document.instances[*removed].settings_id.clone())
+                            .collect::<Vec<_>>();
+                        let settings_before = snapshot
+                            .before_changing(document, removed_ids.iter().map(String::as_str))?;
+                        let hits = editor_reference_hits(document, &service, settings_id);
+                        let parent = (document.instances[index].parent_index)
+                            .map(|parent| document.instances[parent].settings_id.clone());
+                        let referring = bulk::referring_by_index(document, &removed);
+                        (retired_ids.entry(service.clone()).or_default())
+                            .extend(removed_ids.iter().cloned());
                         remove_instances_at_indices(document, &[index], true)?;
-                        append_editor_reference_repairs(
+                        store_referrers.remove(&service);
+                        append_editor_reference_hit_repairs(
                             &mut changes,
-                            &settings_before,
+                            &hits,
                             document,
                             &service,
-                            settings_id,
                         );
                         changes.instance_changes.push(EditorInstanceChange {
                             mode: "deleteInstances".to_string(),
@@ -7235,7 +7311,9 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                             instances: vec![descriptor],
                             preserve_instances: Vec::new(),
                         });
-                    }
+                        snapshot.touch(removed_ids.into_iter().chain(parent).chain(referring));
+                        settings_before
+                    };
                     changes.history_entries.push(EditorHistoryEntry {
                         service: service.clone(),
                         source_path: Some(absolute_path.clone()),
@@ -7244,11 +7322,9 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                         path_ordinals: target.path_ordinals.clone(),
                         class_name: original_class,
                         source_key: Some(editor_source_key_from_target(target)),
-                        settings_before: Some(Arc::new(settings_before)),
+                        settings_before: Some(settings_before),
                     });
-                    source_children.remove(&service);
-                    source_stems.remove(&service);
-                    snapshots.remove(&service);
+                    bulk::forget_deleted((&mut source_children, &mut source_stems), &service, init);
                 }
             }
             continue;
@@ -9332,7 +9408,7 @@ mod saved_field_review_tests {
             settings_writes: vec![EditorSettingsWrite {
                 expected_hash: settings_file_hash(&settings_path).unwrap(),
                 path: settings_path.clone(),
-                document,
+                document: Arc::new(document),
                 encoded: None,
             }],
             property_changes: properties,

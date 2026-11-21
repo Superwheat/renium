@@ -867,7 +867,8 @@ impl EditorBinaryImport {
 pub(crate) struct EditorSettingsWrite {
     pub(crate) path: PathBuf,
     pub(crate) expected_hash: Option<[u8; 32]>,
-    pub(crate) document: SettingsBytecode,
+    /// Shared with the collection that wrote it until one of them changes it.
+    pub(crate) document: Arc<SettingsBytecode>,
     /// The store as it is written, where the write changed values of a few
     /// instances of the file: `document` then holds those instances whole
     /// and every other one bare.
@@ -894,9 +895,10 @@ pub(crate) struct EditorHistoryEntry {
     pub(crate) path_ordinals: Vec<usize>,
     pub(crate) class_name: String,
     pub(crate) source_key: Option<String>,
-    /// The store as undoing the change reads it from before the change:
-    /// entries share one copy where undoing each reads the same from it.
-    pub(crate) settings_before: Option<Arc<SettingsBytecode>>,
+    /// The bytes of the store as undoing the change reads it from before the
+    /// change: entries share one copy where undoing each reads the same from
+    /// it.
+    pub(crate) settings_before: Option<Arc<Vec<u8>>>,
 }
 
 #[derive(Serialize, Deserialize)]

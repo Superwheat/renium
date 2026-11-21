@@ -100,13 +100,13 @@ pub(crate) fn capture_generated(
             changes.settings_writes.push(EditorSettingsWrite {
                 expected_hash,
                 path,
-                document,
+                document: document.into(),
                 encoded: None,
             });
             changes.settings_writes.len() - 1
         };
         let write = &mut changes.settings_writes[index];
-        let document = &mut write.document;
+        let document = std::sync::Arc::make_mut(&mut write.document);
         let by_id = document
             .instances
             .iter()

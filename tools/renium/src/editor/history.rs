@@ -1,9 +1,8 @@
-use std::collections::hash_map::Entry;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
@@ -229,77 +228,19 @@ pub(crate) fn save_editor_history_entries(
     )
 }
 
-/// New store encodings a batch of history entries holds before it is
-/// written.
-const HISTORY_BATCH_BYTES: usize = 16 << 20;
+type HistoryFiles<'a> = Vec<(PathBuf, Cow<'a, [u8]>)>;
 
-type HistoryFiles = Vec<(PathBuf, Arc<Vec<u8>>)>;
-
-/// The history entries staged for writing and the store encodings they
-/// share. The staged entries are written once their new encodings reach
-/// `HISTORY_BATCH_BYTES`, and an encoding is held only while a later entry
-/// shares it.
-struct HistoryWrites {
-    staged: Vec<(PathBuf, HistoryFiles)>,
-    staged_bytes: usize,
-    encoded: HashMap<*const SettingsBytecode, Arc<Vec<u8>>>,
-    last_use: HashMap<*const SettingsBytecode, usize>,
-}
-
-impl HistoryWrites {
-    fn new(entries: &[EditorHistoryEntry]) -> Self {
-        let last_use = (entries.iter().enumerate())
-            .filter_map(|(sequence, entry)| {
-                Some((Arc::as_ptr(entry.settings_before.as_ref()?), sequence))
-            })
-            .collect();
-        Self {
-            staged: Vec::new(),
-            staged_bytes: 0,
-            encoded: HashMap::new(),
-            last_use,
-        }
-    }
-
-    fn encoded(&mut self, document: &Arc<SettingsBytecode>) -> Result<Arc<Vec<u8>>> {
-        Ok(match self.encoded.entry(Arc::as_ptr(document)) {
-            Entry::Occupied(bytes) => Arc::clone(bytes.get()),
-            Entry::Vacant(slot) => {
-                let bytes = encode_settings_bytecode(document)?;
-                self.staged_bytes += bytes.len();
-                Arc::clone(slot.insert(Arc::new(bytes)))
-            }
+/// Writes the files of history entries. Each entry is a directory of its own
+/// in the transaction's stage, which is published whole: the files are
+/// written side by side and none of them replaces a file in place.
+fn write_history_files(staged: &[(PathBuf, HistoryFiles<'_>)]) -> Result<()> {
+    staged.par_iter().try_for_each(|(entry_dir, files)| {
+        fs::create_dir_all(entry_dir)
+            .with_context(|| format!("Failed to create {}", entry_dir.display()))?;
+        files.iter().try_for_each(|(path, bytes)| {
+            fs::write(path, bytes).with_context(|| format!("Failed to write {}", path.display()))
         })
-    }
-
-    fn stage(&mut self, sequence: usize, entry_dir: PathBuf, files: HistoryFiles) -> Result<()> {
-        self.staged.push((entry_dir, files));
-        if self.staged_bytes >= HISTORY_BATCH_BYTES {
-            self.flush(sequence)?;
-        }
-        Ok(())
-    }
-
-    /// Writes the staged entries. They are directories of their own in the
-    /// transaction's stage, which is published whole: their files are
-    /// written side by side and none of them replaces a file in place.
-    fn flush(&mut self, sequence: usize) -> Result<()> {
-        std::mem::take(&mut self.staged)
-            .par_iter()
-            .try_for_each(|(entry_dir, files)| {
-                fs::create_dir_all(entry_dir)
-                    .with_context(|| format!("Failed to create {}", entry_dir.display()))?;
-                files.iter().try_for_each(|(path, bytes)| {
-                    fs::write(path, bytes.as_slice())
-                        .with_context(|| format!("Failed to write {}", path.display()))
-                })
-            })?;
-        self.staged_bytes = 0;
-        let last_use = &self.last_use;
-        (self.encoded)
-            .retain(|document, _| last_use.get(document).is_some_and(|last| *last > sequence));
-        Ok(())
-    }
+    })
 }
 
 pub(crate) fn write_editor_history_entries(
@@ -308,11 +249,30 @@ pub(crate) fn write_editor_history_entries(
     source_before_by_index: &HashMap<usize, String>,
     source_errors_by_index: &HashMap<usize, String>,
 ) -> Result<Option<EditorHistoryTransaction>> {
+    write_editor_history_entries_stamped(
+        project_root,
+        entries,
+        source_before_by_index,
+        source_errors_by_index,
+        current_millis,
+    )
+}
+
+/// `write_editor_history_entries` with the clock that stamps its entries. No
+/// stamp is below the one before it, so where the clock steps back the
+/// entries of the push still order by stamp and then by their sequence.
+fn write_editor_history_entries_stamped(
+    project_root: &Path,
+    entries: &[EditorHistoryEntry],
+    source_before_by_index: &HashMap<usize, String>,
+    source_errors_by_index: &HashMap<usize, String>,
+    mut clock: impl FnMut() -> u128,
+) -> Result<Option<EditorHistoryTransaction>> {
     let _span = crate::app::profile::span("editor history entries written");
+    let mut last_stamp = 0;
     let mut transaction = None;
     let mut seen = HashSet::new();
-    let mut writes = HistoryWrites::new(entries);
-    let mut last_created = 0;
+    let mut staged = Vec::new();
     for (sequence, entry) in entries.iter().enumerate() {
         let identity = format!(
             "{}:{}:{}",
@@ -357,10 +317,8 @@ pub(crate) fn write_editor_history_entries(
             continue;
         }
 
-        // Each entry's stamp follows the one before, so the entries keep
-        // the order they were collected in.
-        let created_unix_ms = current_millis().max(last_created + 1);
-        last_created = created_unix_ms;
+        let created_unix_ms = clock().max(last_stamp);
+        last_stamp = created_unix_ms;
         let safe_name = sanitize_history_component(
             entry
                 .settings_id
@@ -371,14 +329,14 @@ pub(crate) fn write_editor_history_entries(
         let transaction =
             transaction.get_or_insert(EditorHistoryTransaction::create(project_root)?);
         let entry_dir = transaction.stage_root.join(format!(
-            "{created_unix_ms}-{sequence}-{}-{safe_name}",
+            "{created_unix_ms}-{sequence:06}-{}-{safe_name}",
             entry.service
         ));
         let mut files = HistoryFiles::with_capacity(3);
 
-        let settings_backup = if let Some(document) = entry.settings_before.as_ref() {
+        let settings_backup = if let Some(bytes) = entry.settings_before.as_ref() {
             let file_name = "settings.renium";
-            files.push((entry_dir.join(file_name), writes.encoded(document)?));
+            files.push((entry_dir.join(file_name), Cow::Borrowed(bytes.as_slice())));
             Some(file_name.to_string())
         } else {
             None
@@ -387,10 +345,7 @@ pub(crate) fn write_editor_history_entries(
         let source_backup = if source_changed {
             let file_name = "source.luau";
             let source = source_before.expect("changed Source has a previous value");
-            files.push((
-                entry_dir.join(file_name),
-                Arc::new(source.as_bytes().to_vec()),
-            ));
+            files.push((entry_dir.join(file_name), Cow::Borrowed(source.as_bytes())));
             Some(file_name.to_string())
         } else {
             None
@@ -411,10 +366,10 @@ pub(crate) fn write_editor_history_entries(
             source_backup,
         };
         let manifest = pretty_json_text(&manifest)?.into_bytes();
-        files.push((entry_dir.join("manifest.json"), Arc::new(manifest)));
-        writes.stage(sequence, entry_dir, files)?;
+        files.push((entry_dir.join("manifest.json"), Cow::Owned(manifest)));
+        staged.push((entry_dir, files));
     }
-    writes.flush(entries.len())?;
+    write_history_files(&staged)?;
     Ok(transaction)
 }
 
@@ -614,8 +569,25 @@ fn find_newest_history_manifest(
             }
         }
     }
-    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
-    Ok(candidates.into_iter().next().map(|(_, path)| path))
+    Ok(newest_history_manifest(candidates))
+}
+
+/// The newest of the manifests a lookup found, each with its stamp: the one
+/// with the latest stamp and, of the entries of one push that share it, the
+/// one the push wrote last.
+fn newest_history_manifest(candidates: Vec<(u128, PathBuf)>) -> Option<PathBuf> {
+    (candidates.into_iter())
+        .min_by_key(|(created, path)| std::cmp::Reverse((*created, history_entry_sequence(path))))
+        .map(|(_, path)| path)
+}
+
+/// Where a push put the entry of `manifest_path` among its entries: the
+/// number after the stamp in the entry's directory name, which orders the
+/// entries of one push that share a stamp.
+fn history_entry_sequence(manifest_path: &Path) -> usize {
+    (manifest_path.parent().and_then(Path::file_name))
+        .and_then(|name| name.to_str()?.split('-').nth(1)?.parse().ok())
+        .unwrap_or(0)
 }
 
 #[derive(Deserialize)]
@@ -1154,6 +1126,7 @@ fn sanitize_history_component(value: &str) -> String {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use serde_json::{Map, Value, json};
 
@@ -1898,30 +1871,39 @@ mod tests {
         assert_eq!(restored, root_only);
     }
 
-    /// The entries of one push keep the order they were collected in, by
-    /// their stamps and by the names of their directories as text.
+    /// The entries of one push keep the order they were collected in by the
+    /// names of their directories as text, and the newest entry of an
+    /// instance is the last one written. Entries that share a store each
+    /// write it, and undoing an entry from its file does what undoing it from
+    /// the shared store does.
     #[test]
-    fn the_entries_of_a_push_keep_their_order() {
+    fn the_entries_of_a_push_keep_their_order_and_their_stores() {
         let root = create_unique_directory(&std::env::temp_dir(), "renium-history-order-").unwrap();
         let service = "ServerScriptService";
-        let store = Arc::new(document(vec![instance(
-            "root",
-            service,
-            service,
-            None,
-            &[],
-        )]));
-        let ids = (0..40).map(|at| format!("editor:{at}")).collect::<Vec<_>>();
-        let entries = (ids.iter())
-            .map(|id| EditorHistoryEntry {
+        let stores = (1..=3)
+            .map(|count| {
+                let mut instances = vec![instance("root", service, service, None, &[])];
+                instances.extend((0..count).map(|at| {
+                    let id = format!("editor:{at}");
+                    instance(&id, &format!("S{at}"), "Script", Some(0), &[])
+                }));
+                document(instances)
+            })
+            .collect::<Vec<_>>();
+        let encoded = (stores.iter())
+            .map(|store| Arc::new(encode_settings_bytecode(store).unwrap()))
+            .collect::<Vec<_>>();
+        let id = |at: usize| format!("editor:{}", at % 3);
+        let entries = (0..40)
+            .map(|at| EditorHistoryEntry {
                 service: service.to_string(),
-                source_path: None,
-                settings_id: Some(id.clone()),
-                path_segments: vec![service.to_string(), id.clone()],
+                source_path: Some(PathBuf::from(format!("S{at}.server.luau"))),
+                settings_id: Some(id(at)),
+                path_segments: vec![service.to_string(), format!("S{}", at % 3)],
                 path_ordinals: vec![1, 1],
                 class_name: "Script".to_string(),
                 source_key: None,
-                settings_before: Some(Arc::clone(&store)),
+                settings_before: Some(Arc::clone(&encoded[at * 3 / 40])),
             })
             .collect::<Vec<_>>();
         let transaction =
@@ -1932,16 +1914,105 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .collect::<Vec<_>>();
         dirs.sort();
-        let manifests = (dirs.iter())
-            .map(|dir| read_json_file::<EditorRevertManifest>(&dir.join("manifest.json")).unwrap())
-            .collect::<Vec<_>>();
-        let written = (manifests.iter())
-            .map(|manifest| manifest.settings_id.clone().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(written, ids);
-        assert!(
-            (manifests.windows(2)).all(|pair| pair[0].created_unix_ms < pair[1].created_unix_ms)
-        );
+        assert_eq!(dirs.len(), entries.len());
+        let sequence_widths = (dirs.iter())
+            .map(|dir| {
+                dir.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .split('-')
+                    .nth(1)
+                    .unwrap()
+                    .len()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(sequence_widths.len(), 1);
+        let current = document(vec![instance("root", service, service, None, &[])]);
+        for (at, dir) in dirs.iter().enumerate() {
+            let manifest = dir.join("manifest.json");
+            assert_eq!(history_entry_sequence(&manifest), at);
+            let manifest = read_json_file::<EditorRevertManifest>(&manifest).unwrap();
+            assert_eq!(manifest.settings_id, Some(id(at)));
+            let backup = SettingsBytecode::read_file(&dir.join("settings.renium")).unwrap();
+            assert_eq!(
+                restore_history_item(&current, &backup, &id(at), None, false).unwrap(),
+                restore_history_item(&current, &stores[at * 3 / 40], &id(at), None, false).unwrap(),
+            );
+        }
+        let newest = |settings_id: &str| {
+            let path = find_newest_history_manifest(
+                &root,
+                &transaction.stage_root,
+                Some(service),
+                Some(settings_id),
+                None,
+            );
+            path.unwrap().unwrap()
+        };
+        for at in 37..40 {
+            assert_eq!(history_entry_sequence(&newest(id(at).as_str())), at);
+        }
+        drop(transaction);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The newest of entries that share a stamp is the one its push wrote
+    /// last, in whichever order a lookup finds them, also in the names entries
+    /// had before their sequences were padded: as text, `-10-` comes before
+    /// `-9-`.
+    #[test]
+    fn the_newest_of_entries_that_share_a_stamp_is_the_last_written() {
+        let entry = |sequence: usize| {
+            let dir = format!("1700000000000-{sequence}-Workspace-editor_old");
+            (1_700_000_000_000, Path::new(&dir).join("manifest.json"))
+        };
+        for sequences in [[9, 10], [10, 9]] {
+            let newest = newest_history_manifest(sequences.map(entry).to_vec()).unwrap();
+            assert_eq!(history_entry_sequence(&newest), 10);
+        }
+    }
+
+    /// A clock that steps back while a push writes its entries leaves the
+    /// newest entry of an instance the last one the push wrote: here a
+    /// script made from `Made.server.lua`, then removed as `Made.server.luau`
+    /// is gone.
+    #[test]
+    fn a_clock_that_steps_back_leaves_the_last_entry_the_newest() {
+        let root = create_unique_directory(&std::env::temp_dir(), "renium-history-clock-").unwrap();
+        let service = "ServerScriptService";
+        let store = document(vec![instance("root", service, service, None, &[])]);
+        let store = Arc::new(encode_settings_bytecode(&store).unwrap());
+        let entries = ["Made.server.lua", "Made.server.luau"].map(|file| EditorHistoryEntry {
+            service: service.to_string(),
+            source_path: Some(PathBuf::from(file)),
+            settings_id: Some("editor:made".to_string()),
+            path_segments: vec![service.to_string(), "Made".to_string()],
+            path_ordinals: vec![1, 1],
+            class_name: "Script".to_string(),
+            source_key: None,
+            settings_before: Some(Arc::clone(&store)),
+        });
+        let mut stamps = [1_700_000_000_500, 1_700_000_000_000].into_iter();
+        let transaction = write_editor_history_entries_stamped(
+            &root,
+            &entries,
+            &HashMap::new(),
+            &HashMap::new(),
+            || stamps.next().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let newest = find_newest_history_manifest(
+            &root,
+            &transaction.stage_root,
+            Some(service),
+            Some("editor:made"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(history_entry_sequence(&newest), 1);
         drop(transaction);
         let _ = fs::remove_dir_all(&root);
     }
