@@ -2346,7 +2346,7 @@ struct StoredPropertyForm {
 /// The successor Studio saves a content id under (an Animation's AnimationId
 /// as AnimationContent): the name a capture gives the store, with the same
 /// text as its value.
-fn content_successor(class_name: &str, logical: &str) -> Option<String> {
+pub(crate) fn content_successor(class_name: &str, logical: &str) -> Option<String> {
     let database = rbx_reflection_database::get().ok()?;
     let descriptor = rbx_property_descriptor(database, class_name, logical)?;
     let rbx_reflection::PropertyKind::Canonical {
@@ -2368,7 +2368,7 @@ fn content_successor(class_name: &str, logical: &str) -> Option<String> {
 
 /// The other name of a Decal's texture: Studio holds one value under
 /// TextureContent and ColorMapContent, and a capture stores both.
-fn decal_texture_mirror(class_name: &str, stored: &str) -> Option<&'static str> {
+pub(crate) fn decal_texture_mirror(class_name: &str, stored: &str) -> Option<&'static str> {
     let mirror = match stored {
         "TextureContent" => "ColorMapContent",
         "ColorMapContent" => "TextureContent",

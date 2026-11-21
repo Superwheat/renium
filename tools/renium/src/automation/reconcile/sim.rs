@@ -246,7 +246,11 @@ impl Tree {
                     .parent_index
                     .map(|parent| document.instances[parent].settings_id.clone()),
                 value: value
-                    .and_then(|value| value.get("settingsId").or(Some(value)))
+                    .and_then(|value| {
+                        (value.get("settingsId"))
+                            .or_else(|| value.get("value"))
+                            .or(Some(value))
+                    })
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 attributes: instance
@@ -1815,11 +1819,39 @@ fn scoped_outcome(index: usize) {
     SCOPED_COUNTS[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// What the plugin lays one change to: each service it touched with how
-/// (`values`, `children`, `subtree`, or `whole`), or `None` where no service
-/// answers for it.
 #[cfg(any(windows, target_os = "macos"))]
-type Laid = Option<Vec<(String, &'static str)>>;
+const INSTANCE_OUTCOMES: [&str; 10] = [
+    "a pull of instances wrote",
+    "a pull of instances found nothing to write",
+    "a pull of instances met a difference Studio did not name",
+    "a pull of instances met a named reference",
+    "a pull of instances met a change outside its capture",
+    "a pull of instances wrote several",
+    "a pull of instances wrote one touched under another",
+    "a pull of instances wrote with a change since its proof",
+    "a pull of instances wrote over a store a pull aligned",
+    "a joint carried a change to an instance Studio named nothing of",
+];
+
+#[cfg(any(windows, target_os = "macos"))]
+static INSTANCE_COUNTS: [std::sync::atomic::AtomicUsize; 10] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 10];
+
+#[cfg(any(windows, target_os = "macos"))]
+fn instance_outcome(index: usize) {
+    INSTANCE_COUNTS[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What the plugin lays one change to: each service it touched with how
+/// (`values`, `children`, `subtree`, or `whole`) and, for values it names,
+/// the instance and what of it changed; or `None` where no service answers
+/// for it.
+#[cfg(any(windows, target_os = "macos"))]
+type Laid = Option<Vec<(String, &'static str, Option<(String, &'static str)>)>>;
+
+/// What Studio touched since a proof in each service it moved in.
+#[cfg(any(windows, target_os = "macos"))]
+type Touched = BTreeMap<String, Option<Vec<TouchedInstance>>>;
 
 /// Removed subtrees by when they left, which an undo brings back with their
 /// identities.
@@ -1852,32 +1884,60 @@ impl ScopedStudio {
         self.changes.len() as u64
     }
 
-    /// The plugin's answer for the proof taken at `proof`, as it sends it.
+    /// The plugin's answer for the proof taken at `proof`, as it sends it:
+    /// an instance whose values it named stands where it stands now, and
+    /// one that left its service since is left out.
     fn answer_since(&self, proof: u64) -> Value {
         let mut kinds = BTreeMap::<String, Vec<&str>>::new();
+        let mut named = BTreeMap::<(String, String), BTreeSet<&str>>::new();
         for change in &self.changes[proof as usize..] {
             let Some(touched) = change else {
                 return json!({"unknown": "no service answers for a change"});
             };
-            for (service, kind) in touched {
-                kinds.entry(service.clone()).or_default().push(*kind);
+            for (service, kind, instance) in touched {
+                match instance {
+                    Some((id, field)) => {
+                        named
+                            .entry((service.clone(), id.clone()))
+                            .or_default()
+                            .insert(*field);
+                    }
+                    None => kinds.entry(service.clone()).or_default().push(*kind),
+                }
             }
         }
-        let touched = kinds
+        let services = (kinds.keys())
+            .chain(named.keys().map(|(service, _)| service))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let touched = services
             .iter()
-            .map(|(service, kinds)| {
-                let entries = if kinds.contains(&"whole") {
+            .map(|service| {
+                let unnamed = kinds.get(service).map(Vec::as_slice).unwrap_or_default();
+                let mut entries = (unnamed.iter())
+                    .map(|kind| json!({"pathSegments": [service], "pathOrdinals": [1], "kind": kind}))
+                    .collect::<Vec<_>>();
+                for ((at, id), fields) in &named {
+                    if at != service || self.tree.service_of(id) != Some(service.as_str()) {
+                        continue;
+                    }
+                    let segments = self.tree.name_path(id);
+                    entries.push(json!({
+                        "pathSegments": segments, "pathOrdinals": vec![1; segments.len()],
+                        "kind": "values", "debugId": id,
+                        "properties": fields.iter().filter(|field| !field.starts_with('@')).collect::<Vec<_>>(),
+                        "attributes": fields.contains("@attributes"), "tags": fields.contains("@tags"),
+                    }));
+                }
+                let entries = if unnamed.contains(&"whole") || entries.is_empty() {
                     json!("whole")
                 } else {
-                    kinds
-                        .iter()
-                        .map(|kind| json!({"pathSegments": [service], "pathOrdinals": [1], "kind": kind}))
-                        .collect()
+                    Value::Array(entries)
                 };
                 (service.clone(), entries)
             })
             .collect::<Map<_, _>>();
-        json!({"services": kinds.keys().collect::<Vec<_>>(), "touched": touched})
+        json!({"services": services, "touched": touched})
     }
 
     fn edit(&mut self, rng: &mut Rng, counter: &mut u64, log: &mut Vec<String>) {
@@ -1981,29 +2041,64 @@ fn try_scoped_edit(
         .collect::<Vec<_>>();
     let all = tree.nodes.keys().cloned().collect::<Vec<_>>();
     let laid = |tree: &Tree, id: &str, kind: &'static str| {
-        Some(vec![(tree.service_of(id)?.to_string(), kind)])
+        Some(vec![(tree.service_of(id)?.to_string(), kind, None)])
+    };
+    // Values the plugin names: of the instance, or, as a model of a change
+    // it misses, of the instance's parent. A capture holds no reference, so
+    // a pull of instances counts on Studio naming each.
+    let misnamed = rng.below(6) == 0;
+    let named = |tree: &Tree, id: &str, field: &'static str, misnamed: bool| {
+        let parent = tree.nodes[id].parent.clone().filter(|parent| {
+            misnamed && tree.nodes[parent].parent.is_some() && tree.nodes[parent].class != "Terrain"
+        });
+        let id = parent.unwrap_or_else(|| id.to_string());
+        Some(vec![(
+            tree.service_of(&id)?.to_string(),
+            "values",
+            Some((id, field)),
+        )])
     };
     let edit = match rng.below(11) {
         0..=4 => {
             let id = rng.pick(&movable)?;
             let class = tree.nodes[&id].class.clone();
             let node = tree.nodes.get_mut(&id)?;
-            let (what, kind) = match (rng.below(5), class.as_str()) {
+            let (what, field) = match (rng.below(5), class.as_str()) {
                 (0, "StringValue") => {
                     node.value = Some(format!("v{fresh}"));
-                    ("value", "values")
+                    // A joint carries the change to another instance of the
+                    // service with no event of its own; the plugin names
+                    // nothing of an instance with a joint.
+                    let subtree = tree.subtree(&id);
+                    let service = tree.service_of(&id).map(str::to_string);
+                    let beside = (tree.nodes.iter())
+                        .filter(|(other, node)| {
+                            node.class == "StringValue"
+                                && !subtree.contains(other)
+                                && tree.service_of(other).map(str::to_string) == service
+                        })
+                        .map(|(other, _)| other.clone())
+                        .collect::<Vec<_>>();
+                    if let Some(other) = rng.pick(&beside).filter(|_| rng.below(4) == 0) {
+                        tree.nodes.get_mut(&other)?.value = Some(format!("j{fresh}"));
+                        instance_outcome(9);
+                        let touched = laid(tree, &id, "values");
+                        return Some((format!("value of {id}, carried to {other}"), touched));
+                    }
+                    ("value", Some("Value"))
                 }
                 (0, "ObjectValue") => {
                     node.value = rng.pick(&all);
-                    ("reference", "values")
+                    ("reference", Some("Value"))
                 }
                 (1, "ModuleScript") => {
                     node.source = Some(format!("return {fresh}\n"));
-                    ("source", "values")
+                    ("source", None)
                 }
                 (2, _) => {
                     node.name = format!("R{fresh}");
-                    ("rename", "children")
+                    let touched = laid(tree, &id, "children");
+                    return Some((format!("rename of {id}"), touched));
                 }
                 (3, _) => {
                     let key = format!("A{}", rng.below(2));
@@ -2012,7 +2107,7 @@ fn try_scoped_edit(
                     } else {
                         node.attributes.insert(key, format!("a{fresh}"));
                     }
-                    ("attribute", "values")
+                    ("attribute", Some("@attributes"))
                 }
                 (4, _) => {
                     // A tag is an attribute here; the first or last use of a
@@ -2031,13 +2126,17 @@ fn try_scoped_edit(
                     let touched = if first_or_last {
                         None
                     } else {
-                        laid(tree, &id, "values")
+                        named(tree, &id, "@attributes", misnamed)
                     };
                     return Some((format!("tag {key} of {id}"), touched));
                 }
                 _ => return None,
             };
-            (format!("{what} of {id}"), laid(tree, &id, kind))
+            let touched = match field {
+                Some(field) => named(tree, &id, field, misnamed && what != "reference"),
+                None => laid(tree, &id, "values"),
+            };
+            (format!("{what} of {id}"), touched)
         }
         5 => {
             tree.nodes.get_mut("terrain")?.value = Some(format!("voxels{fresh}"));
@@ -2057,9 +2156,9 @@ fn try_scoped_edit(
             Op::Move(id.clone(), parent.clone()).apply(tree);
             let to = tree.service_of(&id)?.to_string();
             let touched = if from == to {
-                vec![(to, "whole")]
+                vec![(to, "whole", None)]
             } else {
-                vec![(from, "children"), (to, "subtree")]
+                vec![(from, "children", None), (to, "subtree", None)]
             };
             (format!("move of {id} into {parent}"), Some(touched))
         }
@@ -2185,7 +2284,8 @@ fn scoped_pull_step(
             (service.to_string(), store)
         })
         .collect::<BTreeMap<_, _>>();
-    let (moved, paths_moved) = match ProofScope::parse(&studio.answer_since(held.version)) {
+    let (moved, paths_moved, touched) = match ProofScope::parse(&studio.answer_since(held.version))
+    {
         ProofScope::Unknown(reason) => {
             log.push(format!("pull not scoped: {reason}"));
             scoped_outcome(3);
@@ -2193,7 +2293,7 @@ fn scoped_pull_step(
         }
         ProofScope::Services { services, touched } => {
             let paths_moved = paths_moved_in(&services, &touched);
-            (services, paths_moved)
+            (services, paths_moved, touched)
         }
     };
     let referring = referring_services(&held.project, &stores, &paths_moved)
@@ -2240,6 +2340,25 @@ fn scoped_pull_step(
         log.push("  after the capture:".into());
         studio.edit(rng, counter, log);
     }
+    // An attribute of an instance Studio named, changed after the capture.
+    let named = (touched.values().flatten().flatten())
+        .filter_map(|entry| Some(entry.fields.as_ref()?.debug_id.clone()))
+        .collect::<Vec<_>>();
+    if let Some(id) = rng.pick(&named).filter(|_| rng.below(3) == 0)
+        && let Some(service) = studio.tree.service_of(&id).map(str::to_string)
+    {
+        *counter += 1;
+        let value = format!("a{counter}");
+        studio
+            .tree
+            .nodes
+            .get_mut(&id)
+            .unwrap()
+            .attributes
+            .insert("A0".into(), value);
+        log.push(format!("  after the capture: attribute of {id}"));
+        (studio.changes).push(Some(vec![(service, "values", Some((id, "@attributes")))]));
+    }
     let premise = if studio.version() == proof {
         ScopedPremise::Held
     } else {
@@ -2248,6 +2367,47 @@ fn scoped_pull_step(
             .map_err(|error| format!("{error:#}"))?
     };
     log.push(format!("  premise: {premise:?}"));
+    let since = (studio.version() != proof).then(|| ProofScope::parse(&studio.answer_since(proof)));
+    let (aligned, kept) = aligned_stores(&held.project, (&scope, &stores), rng);
+    match instance_pull(
+        &aligned,
+        (&scope, &touched, &stores),
+        &whole,
+        since.as_ref(),
+    ) {
+        Ok((project, roots, nested)) => {
+            if project != whole {
+                let difference = Tree::read(&project)?.difference(&Tree::read(&whole)?);
+                if !kept || difference.is_some() || !stores_a_pull_leaves(&project, &whole)? {
+                    return Err(format!(
+                        "a pull of instances wrote other files than a whole pull: {difference:?}"
+                    ));
+                }
+            }
+            let wrote = project != aligned;
+            log.push(format!(
+                "  instance pull of {roots} instances, written: {wrote}, over a store a pull aligned: {kept}"
+            ));
+            instance_outcome(usize::from(!wrote));
+            for (index, reached) in [(5, roots > 1), (6, nested), (7, since.is_some()), (8, kept)] {
+                if wrote && reached {
+                    instance_outcome(index);
+                }
+            }
+        }
+        Err(reason) => {
+            log.push(format!("  instance pull not taken: {reason}"));
+            for (index, cause) in [
+                (2, "where Studio named no change"),
+                (3, "which the capture does not hold"),
+                (4, "Studio moved outside the captured instances"),
+            ] {
+                if reason.contains(cause) {
+                    instance_outcome(index);
+                }
+            }
+        }
+    }
     if premise == ScopedPremise::False {
         scoped_outcome(2);
         return Ok(scoped_whole_pull(rng, (studio, files), (counter, log)));
@@ -2291,6 +2451,201 @@ fn scoped_pull_step(
             Ok(None)
         }
     }
+}
+
+/// The files a pull of the instances Studio named in `scope` leaves, by the
+/// code a pull runs, with what it captured, and whether one touched instance
+/// stood under another; or why it falls back. Studio is as `whole` holds it
+/// at the capture, and `since` says where it moved since the proof.
+#[cfg(any(windows, target_os = "macos"))]
+fn instance_pull(
+    held: &ProjectSnapshot,
+    (scope, touched, stores): (&BTreeSet<String>, &Touched, &BTreeMap<String, PathBuf>),
+    whole: &ProjectSnapshot,
+    since: Option<&ProofScope>,
+) -> Result<(ProjectSnapshot, usize, bool), String> {
+    let mut plans = BTreeMap::new();
+    let mut nested = false;
+    for service in scope {
+        let Some(Some(entries)) = touched.get(service) else {
+            return Err("a service moved as a whole".into());
+        };
+        if entries.is_empty()
+            || (entries.iter()).any(|entry| entry.kind != "values" || entry.fields.is_none())
+        {
+            return Err("not every touched instance is values Studio named".into());
+        }
+        let Some(SnapshotEntry::File(bytes)) = held.entries.get(&stores[service]) else {
+            return Err("the baseline holds no store of a service".into());
+        };
+        let plan = StoreInstancePull::plan(service, bytes, entries)?;
+        nested |= plan.roots.len() < entries.len();
+        plans.insert(service.clone(), plan);
+    }
+    if let Some(since) = since {
+        let pulls = (plans.iter())
+            .map(|(service, plan)| (service.clone(), plan))
+            .collect();
+        if instance_premise(since, &pulls) == ScopedPremise::False {
+            return Err("Studio moved outside the captured instances".into());
+        }
+        if let ProofScope::Services { touched, .. } = since {
+            for (service, plan) in &mut plans {
+                if let Some(Some(entries)) = touched.get(service) {
+                    plan.name_since(entries)?;
+                }
+            }
+        }
+    }
+    let mut project = held.clone();
+    for (service, plan) in &mut plans {
+        let captured = captured_from(whole, &stores[service], &plan.roots)?;
+        if let Some(bytes) = plan.apply(&captured)? {
+            (project.entries).insert(stores[service].clone(), SnapshotEntry::File(bytes));
+        }
+    }
+    let roots = plans.values().map(|plan| plan.roots.len()).sum();
+    Ok((project, roots, nested))
+}
+
+/// The held files as a pull that aligned the stores of `scope` may leave
+/// them: some values in the typed form an older store kept, which a pull
+/// counts as the value itself; and whether any is.
+#[cfg(any(windows, target_os = "macos"))]
+fn aligned_stores(
+    project: &ProjectSnapshot,
+    (scope, stores): (&BTreeSet<String>, &BTreeMap<String, PathBuf>),
+    rng: &mut Rng,
+) -> (ProjectSnapshot, bool) {
+    let mut project = project.clone();
+    let mut kept = false;
+    for service in scope {
+        let Some(SnapshotEntry::File(bytes)) = project.entries.get(&stores[service]) else {
+            continue;
+        };
+        let Ok(mut document) = decode_settings_bytecode(bytes) else {
+            continue;
+        };
+        for instance in &mut document.instances {
+            let text = instance.properties.get("Value").and_then(Value::as_str);
+            if let Some(text) = text.map(str::to_string)
+                && rng.below(3) == 0
+            {
+                let typed = json!({"_type": "Content", "value": text});
+                instance.properties.insert("Value".into(), typed);
+                kept = true;
+            }
+        }
+        let bytes = encode_settings_bytecode(&document).unwrap();
+        (project.entries).insert(stores[service].clone(), SnapshotEntry::File(bytes));
+    }
+    (project, kept)
+}
+
+/// Whether a whole pull of Studio as `whole` leaves each store of `project`
+/// as it is.
+#[cfg(any(windows, target_os = "macos"))]
+fn stores_a_pull_leaves(
+    project: &ProjectSnapshot,
+    whole: &ProjectSnapshot,
+) -> Result<bool, String> {
+    use crate::settings::equivalence::{
+        SettingsAlignment, align_pulled_settings_bytes_to_reference,
+    };
+    for (path, entry) in &project.entries {
+        let (SnapshotEntry::File(stored), Some(SnapshotEntry::File(captured))) =
+            (entry, whole.entries.get(path))
+        else {
+            continue;
+        };
+        let store = (path.file_name().and_then(|name| name.to_str()))
+            .is_some_and(is_service_settings_file_name);
+        if stored == captured || !store {
+            continue;
+        }
+        match align_pulled_settings_bytes_to_reference(stored, captured) {
+            Ok(SettingsAlignment::Equivalent) => {}
+            Ok(SettingsAlignment::Changed(_)) => return Ok(false),
+            Err(error) => return Err(format!("{error:#}")),
+        }
+    }
+    Ok(true)
+}
+
+/// What a native capture of `roots` holds where Studio is as `whole` holds
+/// it: each root, found by its debug id where its names lead, with the
+/// instances under it breadth first, without the references a native
+/// capture leaves out, and the plugin reading every ObjectValue's.
+#[cfg(any(windows, target_os = "macos"))]
+fn captured_from(
+    whole: &ProjectSnapshot,
+    store: &Path,
+    roots: &[InstanceRoot],
+) -> Result<Vec<Vec<CapturedInstance>>, String> {
+    let Some(SnapshotEntry::File(bytes)) = whole.entries.get(store) else {
+        return Err("a touched instance is gone".into());
+    };
+    let document = decode_settings_bytecode(bytes).map_err(|error| format!("{error:#}"))?;
+    let database = rbx_reflection_database::get().map_err(|error| format!("{error:#}"))?;
+    let schemas = crate::roblox::schema::PropertySchemaMap::from([(
+        "ObjectValue".to_string(),
+        vec![crate::roblox::schema::PropertySchemaEntry {
+            name: "Value".into(),
+            type_id: crate::roblox::schema::TYPE_ID_REF,
+            enum_type: None,
+        }],
+    )]);
+    let rows = &document.instances;
+    let conversions = class_conversions(
+        database,
+        &schemas,
+        rows.iter().map(|row| row.class_name.as_str()),
+    );
+    let names = |mut row: usize| {
+        let mut names = vec![rows[row].name.clone()];
+        while let Some(parent) = rows[row].parent_index {
+            names.insert(0, rows[parent].name.clone());
+            row = parent;
+        }
+        names
+    };
+    let mut captured = Vec::new();
+    for root in roots {
+        let top = (0..rows.len())
+            .find(|row| rows[*row].settings_id == root.debug_id && names(*row) == root.segments)
+            .ok_or("a touched instance is gone or stands elsewhere")?;
+        let mut order = vec![(top, None)];
+        let mut at = 0;
+        while let Some(&(row, _)) = order.get(at) {
+            let children = (0..rows.len()).filter(|child| rows[*child].parent_index == Some(row));
+            order.extend(children.map(|child| (child, Some(at))));
+            at += 1;
+        }
+        captured.push(
+            (order.into_iter())
+                .map(|(row, parent)| {
+                    let row = &rows[row];
+                    let mut properties = row.properties.clone();
+                    properties.retain(|_, value| {
+                        !crate::settings::equivalence::reconciliation_value_contains_reference(
+                            value,
+                        )
+                    });
+                    CapturedInstance {
+                        name: row.name.clone(),
+                        class_name: row.class_name.clone(),
+                        parent,
+                        values: CapturedValues {
+                            properties,
+                            attributes: row.attributes.clone(),
+                            overlaid: conversions[&row.class_name].overlaid.clone(),
+                        },
+                    }
+                })
+                .collect(),
+        );
+    }
+    Ok(captured)
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -2365,6 +2720,8 @@ fn run_scoped_pull_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> 
 /// writes, with edits in three services: values, attributes, tags, sources,
 /// renames, removals and their undo, moves between services, references
 /// across them and Terrain, some made before or after the pull's capture.
+/// So does a pull of the instances Studio named values of, where it writes:
+/// some changes are laid to the instance's parent, as Studio missing one.
 #[cfg(any(windows, target_os = "macos"))]
 #[test]
 fn seeded_baselines_answer_as_captures_do() {
@@ -2384,7 +2741,9 @@ fn seeded_baselines_answer_as_captures_do() {
         );
     }
     run_seeds(1000, run_scoped_pull_seed);
-    for (count, what) in SCOPED_COUNTS.iter().zip(SCOPED_OUTCOMES) {
+    for (count, what) in (SCOPED_COUNTS.iter().zip(SCOPED_OUTCOMES))
+        .chain(INSTANCE_COUNTS.iter().zip(INSTANCE_OUTCOMES))
+    {
         assert!(
             count.load(std::sync::atomic::Ordering::Relaxed) > 0,
             "no seed reached: {what}"
@@ -2609,6 +2968,7 @@ fn a_change_a_store_outside_the_scope_refers_to_falsifies_the_premise() {
                 path_segments: vec!["ServerStorage".into(), name.into()],
                 path_ordinals: vec![1, 1],
                 kind: kind.into(),
+                fields: None,
             }]
         });
         let now = ProofScope::Services {

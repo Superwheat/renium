@@ -690,6 +690,20 @@ pub(crate) struct TouchedInstance {
     pub(crate) path_segments: Vec<String>,
     pub(crate) path_ordinals: Vec<u64>,
     pub(crate) kind: String,
+    /// What changed of a `values` instance, where Studio named it.
+    pub(crate) fields: Option<TouchedFields>,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+/// What changed of an instance whose values alone changed: its properties by
+/// the names Studio announced them under, its attributes, its tags; with the
+/// instance's debug id.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TouchedFields {
+    pub(crate) debug_id: String,
+    pub(crate) properties: Vec<String>,
+    pub(crate) attributes: bool,
+    pub(crate) tags: bool,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -730,9 +744,25 @@ fn touched_instances(entries: &Value) -> Option<Vec<TouchedInstance>> {
                 path_segments: serde_json::from_value(entry["pathSegments"].clone()).ok()?,
                 path_ordinals: serde_json::from_value(entry["pathOrdinals"].clone()).ok()?,
                 kind: entry["kind"].as_str()?.to_string(),
+                fields: touched_fields(entry),
             })
         })
         .collect()
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn touched_fields(entry: &Value) -> Option<TouchedFields> {
+    let properties = match &entry["properties"] {
+        // Studio writes an empty list as an empty table.
+        Value::Object(names) if names.is_empty() => Vec::new(),
+        names => serde_json::from_value(names.clone()).ok()?,
+    };
+    Some(TouchedFields {
+        debug_id: entry["debugId"].as_str()?.to_string(),
+        properties,
+        attributes: entry["attributes"].as_bool()?,
+        tags: entry["tags"].as_bool()?,
+    })
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -754,8 +784,12 @@ fn log_touched(touched: &BTreeMap<String, Option<Vec<TouchedInstance>>>) {
         log_global(
             5,
             format_args!(
-                "[renium] baseline: touched {service}: {} values, {} subtree, {} children",
+                "[renium] baseline: touched {service}: {} values ({} named), {} subtree, {} children",
                 count("values"),
+                instances
+                    .iter()
+                    .filter(|instance| instance.fields.is_some())
+                    .count(),
                 count("subtree"),
                 count("children")
             ),
@@ -955,6 +989,9 @@ pub(crate) struct ScopedPull {
     proof: Value,
     services: BTreeSet<String>,
     stores: BTreeMap<String, PathBuf>,
+    /// What Studio touched in each service between the two proofs.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    touched: BTreeMap<String, Option<Vec<TouchedInstance>>>,
 }
 
 /// Has Studio take a new proof under the held proof's observation and, where
@@ -983,7 +1020,7 @@ fn plan_scoped_pull(
             format_args!("[renium] baseline: pull not scoped: {reason}"),
         );
     };
-    let (moved, paths_moved) = match ProofScope::parse(&state["pushProofScope"]) {
+    let (moved, paths_moved, touched) = match ProofScope::parse(&state["pushProofScope"]) {
         ProofScope::Unknown(reason) => {
             not_scoped(&reason);
             return Ok(None);
@@ -991,7 +1028,7 @@ fn plan_scoped_pull(
         ProofScope::Services { services, touched } => {
             log_touched(&touched);
             let paths_moved = paths_moved_in(&services, &touched);
-            (services, paths_moved)
+            (services, paths_moved, touched)
         }
     };
     let Some(proof) = state
@@ -1026,6 +1063,7 @@ fn plan_scoped_pull(
         proof,
         services,
         stores,
+        touched,
     }))
 }
 
@@ -1045,6 +1083,17 @@ impl ScopedPull {
             .runtime_id
             .as_deref()
             .context("Studio context has no edit-mode runtime")?;
+        #[cfg(windows)]
+        if let Some((published, premise)) = self.pull_instances(bridge, runtime, args)? {
+            if let Err(error) = self.keep(bridge, runtime, &args.project_root, &published, premise)
+            {
+                log_global(
+                    5,
+                    format_args!("[renium] baseline: not kept after instance pull: {error:#}"),
+                );
+            }
+            return Ok(Some(published));
+        }
         let mut premise = ScopedPremise::False;
         let mut check = || -> Result<()> {
             let state = bridge.call_for_runtime_with_timeout(
@@ -1191,6 +1240,12 @@ impl ScopedPull {
         Ok(())
     }
 }
+
+#[cfg(any(windows, target_os = "macos"))]
+#[path = "instance_pull.rs"]
+mod instance_pull;
+#[cfg(all(test, any(windows, target_os = "macos")))]
+pub(crate) use instance_pull::*;
 
 #[derive(Default)]
 pub(crate) struct ReconcilePushPlan {

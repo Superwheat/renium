@@ -14,6 +14,8 @@ local MAX_DIRECT_PROPERTY_BYTES = 8 * 1024 * 1024
 local TRACKING_GUARD_TTL_SECONDS = 300
 -- Past this many touched instances a service's answer is the whole service.
 local PROOF_TOUCHED_LIMIT = 256
+-- Past this many names one instance's entry names none.
+local PROOF_FIELD_LIMIT = 16
 local FLOAT32_FINGERPRINT_BUFFER = buffer.create(4)
 local CAMERA_FOV_PROPERTIES = { fieldofview = true, diagonalfieldofview = true, maxaxisfieldofview = true }
 -- A Decal's ColorMapContent mirrors TextureContent, so Studio signals both for one write.
@@ -433,10 +435,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	-- `values` (it alone), `subtree` (it and everything below) or `children`
 	-- (the set of its children). No instance, or more than the limit, leaves
 	-- the whole service. One event costs a few table reads and one write.
-	local function noteTouched(proof, serviceName: string?, instance: Instance?, kind: string)
+	-- `field` says what of a `values` instance changed: a property's name,
+	-- "@attributes" or "@tags"; without one its entry names nothing.
+	local function noteTouched(proof, serviceName: string?, instance: Instance?, kind: string, field: string?)
 		if proof == nil or serviceName == nil then return end
 		if proof == verifiedPushProof and keptPushProof ~= nil and keptPushProof ~= proof then
-			noteTouched(keptPushProof, serviceName, instance, kind)
+			noteTouched(keptPushProof, serviceName, instance, kind, field)
 		end
 		local touched = proof.touched[serviceName]
 		if touched == true then return end
@@ -445,8 +449,19 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			return
 		end
 		if touched == nil then
-			touched = { count = 0, kinds = {} }
+			touched = { count = 0, kinds = {}, fields = {} }
 			proof.touched[serviceName] = touched
+		end
+		if kind == "values" then
+			local fields = touched.fields[instance]
+			if field == nil or fields == false or fields ~= nil and fields.count >= PROOF_FIELD_LIMIT and not fields.names[field] then
+				touched.fields[instance] = false
+			elseif fields == nil then
+				touched.fields[instance] = { count = 1, names = { [field] = true } }
+			elseif not fields.names[field] then
+				fields.count += 1
+				fields.names[field] = true
+			end
 		end
 		local previous = touched.kinds[instance]
 		if previous == kind or previous == "subtree" then return end
@@ -575,7 +590,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 						observation.generation += 1
 						observation.instance = relay.camera
 					end
-					noteTouched(verifiedPushProof, "Workspace", relay.camera, "values")
+					noteTouched(verifiedPushProof, "Workspace", relay.camera, "values", "@attributes")
 					config.invalidateRuntimeExportCache("Workspace")
 				end))
 			end
@@ -742,6 +757,50 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		for instance, service in pairs(laid) do
 			noteTouched(proof, service, instance, "values")
 		end
+		-- Studio moves what a joint holds, a model's pivot with its primary
+		-- part, and a package's link, with no event on what it changes: an
+		-- entry of a part with a joint or a part joined to it, of a joint, a
+		-- constraint or an attachment of such a part, of a model's primary
+		-- part, or of anything in a package names nothing. Studio lists a part
+		-- among its own connected parts.
+		local packaged = {}
+		local function joined(instance: any): boolean
+			if instance:IsA("JointInstance") or instance:IsA("Constraint") or instance:IsA("WeldConstraint")
+				or instance:IsA("NoCollisionConstraint") then
+				return true
+			end
+			local part = if instance:IsA("Attachment") then instance.Parent else instance
+			if part ~= nil and part:IsA("BasePart") and (#part:GetJoints() > 0 or #part:GetConnectedParts() > 1) then
+				return true
+			end
+			local above = instance
+			while above.Parent ~= nil and above.Parent ~= game do
+				if packaged[above] == nil then
+					packaged[above] = above:FindFirstChildOfClass("PackageLink") ~= nil
+				end
+				if packaged[above] or above ~= instance and above:IsA("Model") and above.PrimaryPart == instance then
+					return true
+				end
+				above = above.Parent
+			end
+			return false
+		end
+		-- Scaling a model resizes its parts and changes the model's stored
+		-- scale with no event on the model: an entry naming Size under a model
+		-- names nothing.
+		local function scaled(instance: any, fields: any): boolean
+			if fields.names.Size ~= true then
+				return false
+			end
+			local above = instance.Parent
+			while above ~= nil and above.Parent ~= nil and above.Parent ~= game do
+				if above:IsA("Model") then
+					return true
+				end
+				above = above.Parent
+			end
+			return false
+		end
 		local services, touched = {}, {}
 		for service in pairs(differs) do
 			services[#services + 1] = service
@@ -755,7 +814,26 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					segments, ordinals = BridgeIdentity.getRefPathParts(instance)
 				end
 				if segments ~= nil then
-					list[#list + 1] = { pathSegments = segments, pathOrdinals = ordinals, kind = kind }
+					local entry = { pathSegments = segments, pathOrdinals = ordinals, kind = kind }
+					-- What changed, by name, with the instance's identity: a pull
+					-- may then capture the instance alone.
+					local fields = if kind == "values" then entries.fields[instance] else nil
+					local ok, debugId = pcall(instance.GetDebugId, instance, 32)
+					if fields and ok and type(debugId) == "string" and select(2, pcall(joined, instance)) == false
+						and select(2, pcall(scaled, instance, fields)) == false then
+						local properties = {}
+						for name in pairs(fields.names) do
+							if string.sub(name, 1, 1) ~= "@" then
+								properties[#properties + 1] = name
+							end
+						end
+						table.sort(properties)
+						entry.debugId = debugId
+						entry.properties = properties
+						entry.attributes = fields.names["@attributes"] == true
+						entry.tags = fields.names["@tags"] == true
+					end
+					list[#list + 1] = entry
 				end
 			end
 			touched[service] = if #list == 0 then "whole" else list
@@ -817,7 +895,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		elseif (property == "name" or property == "archivable") and instance.Parent ~= game then
 			noteTouched(proof, serviceName, instance.Parent, "children")
 		else
-			noteTouched(proof, serviceName, instance, "values")
+			noteTouched(proof, serviceName, instance, "values", tostring(propertyName))
 		end
 	end
 	-- The services Studio differs from proof `id` in now, read without
@@ -2537,7 +2615,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local proofService = proofServiceOf(instance)
 		if proofService ~= nil then
 			proofLedger.tags[proofService] = (proofLedger.tags[proofService] or 0) + 1
-			noteTouched(verifiedPushProof, proofService, instance, "values")
+			noteTouched(verifiedPushProof, proofService, instance, "values", "@tags")
 		end
 		if nativeAttributeRelay and nativeAttributeRelay.cached and (not state.started or heldOnlyByRetainedProofs()) then
 			return
@@ -3094,7 +3172,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				observation.generation += 1
 				observation.instance = instance
 				observation.attribute = attributeName
-				noteTouched(verifiedPushProof, serviceName, instance, "values")
+				noteTouched(verifiedPushProof, serviceName, instance, "values", "@attributes")
 			end
 			if not state.syncbackProperties then
 				return
@@ -3221,7 +3299,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			local proofService = proofServiceOf(instance)
 			if proofService ~= nil then
 				proofLedger.attributes[proofService] = (proofLedger.attributes[proofService] or 0) + 1
-				noteTouched(verifiedPushProof, proofService, instance, "values")
+				noteTouched(verifiedPushProof, proofService, instance, "values", "@attributes")
 			end
 			if relay.cached then return end
 			local connection = state.instanceConnections[instance]

@@ -4452,6 +4452,15 @@ function BridgePluginRuntime.start(context)
 			}
 		end
 		local changeState = Config.studioChanges.getState(p, leaseId)
+		-- A pull of chosen instances converts them by the schema a capture of
+		-- their service reads.
+		if type(p.propertySchemaClasses) == "table" then
+			local schemas = {}
+			for _, className in ipairs(p.propertySchemaClasses) do
+				schemas[tostring(className)] = getClassPropertySchema(tostring(className)) or {}
+			end
+			changeState.propertySchemaByClass = schemas
+		end
 		if p.nativeTerrainRelay == true then
 			changeState.nativeTerrainPaused = RuntimeApi.isPlayModeRunning()
 		end

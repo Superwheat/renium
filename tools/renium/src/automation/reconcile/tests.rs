@@ -9479,6 +9479,7 @@ fn a_scoped_answer_reads_its_services_their_touched_instances_and_unknowns() {
             path_segments: vec!["ReplicatedStorage".into(), "Box".into()],
             path_ordinals: vec![1, 2],
             kind: "children".into(),
+            fields: None,
         }])
     );
     assert_eq!(

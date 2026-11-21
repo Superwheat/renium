@@ -56,7 +56,17 @@ local function instance(className, name, parent)
 		or class == "BaseScript" and (self.ClassName == "Script" or self.ClassName == "LocalScript")
 		or class == "BasePart" and (self.ClassName == "Part" or self.ClassName == "MeshPart")
 		or class == "Decal" and self.ClassName == "Texture"
-		or class == "ValueBase" and self.ClassName == "StringValue" end
+		or class == "ValueBase" and self.ClassName == "StringValue"
+		or class == "JointInstance" and (self.ClassName == "Weld" or self.ClassName == "Motor6D")
+		or class == "Constraint" and (self.ClassName == "RigidConstraint" or self.ClassName == "HingeConstraint") end
+	function item:GetJoints() return self.joints or {} end
+	function item:GetConnectedParts() return { self, table.unpack(self.connected or {}) } end
+	function item:FindFirstChildOfClass(class)
+		for _, child in self.children do
+			if child.ClassName == class then return child end
+		end
+		return nil
+	end
 	local propertySignals = {}
 	function item:GetPropertyChangedSignal(property)
 		if not propertySignals[property] then propertySignals[property] = signal() end
@@ -2524,7 +2534,7 @@ do
 	end
 	-- An observer holding a retained native proof of both services, as a
 	-- pull leaves it. `generations` stand for the export observers' counts.
-	local function start()
+	local function start(module)
 		testGame.ItemChanged = signal()
 		local context = { generations = { ReplicatedStorage = 0, Workspace = 0 }, digest = "voxels", exported = true,
 			documents = { { instance = localScript, source = "original" } } }
@@ -2533,7 +2543,7 @@ do
 		config.exportProofGeneration = function(service) return context.generations[service] end
 		config.observeProofDocuments = function() return {} end
 		config.captureTerrainProof = function() return context.digest end
-		local observer = scopedModule.create(config, { ReplicatedStorage = true, Workspace = true })
+		local observer = (module or scopedModule).create(config, { ReplicatedStorage = true, Workspace = true })
 		observer.observeExports(function(service)
 			context.generations[service] += 1
 			return true
@@ -2600,6 +2610,116 @@ do
 	relocate(workspace.Terrain, nil)
 	workspace.Terrain = savedTerrain
 	context.observer.stop()
+
+	-- A values entry names what changed, with the instance's identity; a
+	-- buffer, or more names than the cap, leaves it naming nothing.
+	for _, item in { corner, beam, mesh, localScript } do
+		function item:GetDebugId(scope) return if scope == 32 then `{self.Name}-id` else nil end
+	end
+	context = start()
+	testGame.ItemChanged:Fire(corner, "TopLeftRadius")
+	testGame.ItemChanged:Fire(corner, "BottomRightRadius")
+	testGame.ItemChanged:Fire(corner, "TopLeftRadius")
+	context.relay.Changed:Fire(mesh)
+	tagAdded:Fire(beam)
+	context.documents = { { instance = localScript, source = "typed" } }
+	answer = scope(context)
+	local entries = {}
+	for _, entry in answer.touched.ReplicatedStorage do entries[entry.pathSegments[2]] = entry end
+	assert(entries.Corner.debugId == "Corner-id" and table.concat(entries.Corner.properties, ",") == "BottomRightRadius,TopLeftRadius"
+		and entries.Corner.attributes == false and entries.Corner.tags == false, "a property change names the property")
+	assert(entries.Mesh.debugId == "Mesh-id" and entries.Mesh.attributes == true and #entries.Mesh.properties == 0,
+		"an attribute change names attributes")
+	assert(entries.Beam.tags == true and entries.Beam.attributes == false, "a tag change names tags")
+	assert(entries.LocalScript.kind == "values" and entries.LocalScript.debugId == nil, "a buffer names nothing")
+	context.observer.stop()
+	context = start()
+	for index = 1, 17 do testGame.ItemChanged:Fire(corner, `P{index}`) end
+	answer = scope(context)
+	assert(#answer.touched.ReplicatedStorage == 1 and answer.touched.ReplicatedStorage[1].debugId == nil,
+		"past the cap an entry names nothing")
+	context.observer.stop()
+	for _, item in { corner, beam, mesh, localScript } do item.GetDebugId = nil end
+
+	-- Studio moves what a joint holds, a model's pivot with its primary part
+	-- and a package's link with no event: such an entry names nothing, while
+	-- an unjoined part and its attachment outside any package keep theirs.
+	local rig = instance("Model", "Rig", storage)
+	local loose, hub = instance("Part", "Loose", rig), instance("Part", "Hub", rig)
+	local joints = { instance("Motor6D", "Motor", rig), instance("WeldConstraint", "Weld", rig),
+		instance("RigidConstraint", "Rigid", rig), instance("NoCollisionConstraint", "Apart", rig) }
+	local free = instance("Part", "Free", storage)
+	local kit = instance("Model", "Kit", storage)
+	instance("PackageLink", "PackageLink", kit)
+	local car = instance("Model", "Car", storage)
+	car.PrimaryPart = instance("Part", "Body", instance("Folder", "Frame", car))
+	loose.joints = { joints[2] }
+	hub.connected = { loose }
+	local function names(item, property: string?)
+		function item:GetDebugId(scope) return if scope == 32 then `{self.Name}-id` else nil end
+		context = start()
+		testGame.ItemChanged:Fire(item, property or "CFrame")
+		local entries = scope(context).touched.ReplicatedStorage
+		context.observer.stop()
+		item.GetDebugId = nil
+		return #entries == 1 and entries[1].kind == "values" and entries[1].debugId ~= nil
+	end
+	for _, item in { loose, hub, instance("Attachment", "Socket", hub), kit, instance("Part", "Packed", instance("Folder", "Inside", kit)),
+		car.PrimaryPart, table.unpack(joints) } do
+		assert(not names(item), `{item.Name} names nothing`)
+	end
+	assert(names(free) and names(instance("Attachment", "Held", free)), "an unjoined part and its attachment keep their names")
+	-- Scaling a model resizes its parts and changes its stored scale with no
+	-- event on the model: a size named under a model names nothing.
+	local crate = instance("Model", "Crate", storage)
+	local plank = instance("Part", "Plank", instance("Folder", "Sides", crate))
+	assert(not names(plank, "Size"), "a part resized under a model names nothing")
+	assert(names(plank, "Transparency") and names(plank), "its other values keep their names")
+	assert(names(free, "Size"), "a part resized outside any model keeps its names")
+	-- The rule's cost at the most entries a service answers with, each part
+	-- eight folders deep, against the same answer without the rule.
+	local deep = instance("Folder", "Level1", storage)
+	local inner = deep
+	for depth = 2, 8 do inner = instance("Folder", `Level{depth}`, inner) end
+	local calls = 0
+	local function counted(item, method)
+		local plain = item[method]
+		item[method] = function(...)
+			calls += 1
+			return plain(...)
+		end
+	end
+	for index = 1, 256 do
+		local part = instance("Part", `Deep{index}`, inner)
+		function part:GetDebugId(scope) return if scope == 32 then `{self.Name}-id` else nil end
+		for _, method in { "GetJoints", "GetConnectedParts", "FindFirstChildOfClass" } do counted(part, method) end
+	end
+	for _, folder in deep:GetDescendants() do
+		if folder.ClassName == "Folder" then counted(folder, "FindFirstChildOfClass") end
+	end
+	counted(deep, "FindFirstChildOfClass")
+	local unruledSource, rules = trackerSource:gsub("select%(2, pcall%(joined, instance%)%) == false", "true")
+	assert(rules == 1, "the rule stands where the test takes it out")
+	local unruled = luau.load(unruledSource, { environment = environment })()
+	local function answered(module)
+		local best, entries = math.huge, nil
+		for _ = 1, 10 do
+			context = start(module)
+			for _, part in inner.children do testGame.ItemChanged:Fire(part, "Transparency") end
+			local began = os.clock()
+			entries = scope(context).touched.ReplicatedStorage
+			best = math.min(best, os.clock() - began)
+			context.observer.stop()
+		end
+		return entries, best
+	end
+	local _, without = answered(unruled)
+	calls = 0
+	local entries, with = answered(nil)
+	assert(#entries == 256 and entries[1].debugId ~= nil, "unjoined parts keep their names")
+	print(string.format("Joint rule: 256 entries answered in %.2f ms, %.2f ms without the rule; %d engine calls per answer",
+		with * 1000, without * 1000, calls // 10))
+	for _, item in { rig, free, kit, car, deep } do relocate(item, nil) end
 
 	local many = instance("Folder", "Many", storage)
 	for index = 1, 257 do instance("Part", `P{index}`, many) end
