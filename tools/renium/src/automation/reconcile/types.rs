@@ -77,8 +77,10 @@ pub(crate) struct VerifiedFullPush {
     /// writes the services it does not capture into the sourcemap as the
     /// file holds them. A whole push leaves the files only what a push
     /// sends: it sends no Game Settings and not the viewport's camera, so
-    /// Studio may hold other values there. A push of chosen paths keeps the
-    /// sourcemap only where it changed script sources alone.
+    /// Studio may hold other values there, unless a settlement published
+    /// them from its readback. A push of chosen paths keeps the sourcemap
+    /// only where it changed script sources alone, each held by Studio in
+    /// its file's bytes.
     pub(crate) sourcemap: Option<Box<SourcemapState>>,
     #[cfg(windows)]
     pub(crate) relay: Option<NativeRelay>,
@@ -298,6 +300,29 @@ pub(crate) fn retain_verified_full_push(
     release: &StudioTrackingGuardRelease<'_>,
     #[cfg(windows)] relay: &mut Option<NativeRelay>,
 ) {
+    retain_full_push(
+        bridge,
+        input,
+        paths,
+        (project, None),
+        release,
+        #[cfg(windows)]
+        relay,
+    );
+}
+
+/// Like `retain_verified_full_push`, for files that are what a pull writes
+/// where `sourcemap` is Some: those a settlement published from its
+/// readback.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn retain_full_push(
+    bridge: &BridgeServer,
+    input: Option<&Value>,
+    paths: &[PathBuf],
+    (project, sourcemap): (ProjectSnapshot, Option<Box<SourcemapState>>),
+    release: &StudioTrackingGuardRelease<'_>,
+    #[cfg(windows)] relay: &mut Option<NativeRelay>,
+) {
     let (Some(input), Some(proof)) = (input, release.retained_proof.as_ref()) else {
         log_global(
             5,
@@ -339,7 +364,7 @@ pub(crate) fn retain_verified_full_push(
             #[cfg(windows)]
             relay.as_ref(),
         ),
-        sourcemap: None,
+        sourcemap,
         #[cfg(windows)]
         relay,
     };
@@ -376,11 +401,15 @@ pub(crate) fn settled_sourcemap(
 
 /// The sourcemap a baseline keeps after a push of chosen paths left its
 /// files as `project`. A pull maps stores and file names; a push that
-/// changed only script sources changes neither.
+/// changed only script sources changes neither. A pull writes a script as
+/// Studio holds it, which its `summary` must say is the file byte for byte:
+/// Studio's copy passes for the file with other line breaks or without the
+/// file's final one.
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn sourcemap_after_push(
     held: &VerifiedFullPush,
     project: &ProjectSnapshot,
+    summary: &Map<String, Value>,
 ) -> Option<Box<SourcemapState>> {
     let sources_only = held.project.entries.len() == project.entries.len()
         && held.project.entries.iter().all(|(path, entry)| {
@@ -389,15 +418,22 @@ pub(crate) fn sourcemap_after_push(
                 .get(path)
                 .is_some_and(|now| now == entry || super::merge::is_source_path(path))
         });
-    if held.sourcemap.is_some() && !sources_only {
+    let exact =
+        summary.get("sourceInexact").and_then(Value::as_u64) == Some(0) || held.project == *project;
+    if held.sourcemap.is_some() && !(sources_only && exact) {
         log_global(
             5,
             format_args!(
-                "[renium] baseline: a pull on it captures every service: the push changed more than script sources"
+                "[renium] baseline: a pull on it captures every service: {}",
+                if sources_only {
+                    "Studio may hold a script the push wrote in other bytes than its file"
+                } else {
+                    "the push changed more than script sources"
+                }
             ),
         );
     }
-    held.sourcemap.clone().filter(|_| sources_only)
+    held.sourcemap.clone().filter(|_| sources_only && exact)
 }
 
 /// Whether the project's sourcemap is as `held` says the last pull on it

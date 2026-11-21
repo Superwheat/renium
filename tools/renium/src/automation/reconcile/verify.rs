@@ -363,6 +363,191 @@ pub(crate) fn verify_and_settle_native_import(
     Ok((result.mismatches, result.detail))
 }
 
+/// The services a push wrote in Studio: those its plan imports whole and
+/// those of the paths it changes.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn written_services(context: &BoundContext, plan: &ReconcilePushPlan) -> Vec<String> {
+    let mut written =
+        services_for_snapshot_paths(context, &plan.changed_paths.iter().cloned().collect());
+    written.extend(plan.initial_native_services.iter().cloned());
+    written
+}
+
+/// The services whose files the settlement of a verified import reads back,
+/// for a push whose lease verified `held`, the proof of a pull's files, as
+/// it began. Settling a service writes Studio's copy of it, which for any
+/// other service is still the copy in the files byte for byte: the push
+/// wrote nothing there, Studio differs from the held proof nowhere there,
+/// in what no event tracks either (open script buffers, Terrain voxels, the
+/// camera), its stores are a pull's own encoding, and they name none of
+/// these services, so no path-addressed reference followed an instance the
+/// import replaced. All of them when linked packages are restored or Studio
+/// cannot say where it differs.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn settled_services(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    (services, written): (&[String], Vec<String>),
+    held: &Value,
+    (before, project, generated): (&ProjectSnapshot, &ProjectSnapshot, &ProjectSnapshot),
+) -> Vec<String> {
+    let phase = Instant::now();
+    let root = Path::new(&context.root);
+    let settled = if root.join("renium-link.json").exists() {
+        Err("the project links packages")
+    } else {
+        moved_since_proof(context, bridge, held)
+            .ok_or("Studio cannot say where it differs from the held proof")
+            .map(|moved| {
+                services_settled_with(
+                    context,
+                    services,
+                    written.into_iter().chain(moved).collect(),
+                    (before, project, generated),
+                )
+            })
+            .and_then(|settled| skips_pulled(context, &settled, before).map(|()| settled))
+    };
+    log_reconcile_timing("import settlement services", phase);
+    match settled {
+        Ok(settled) => {
+            log_global(
+                4,
+                format_args!(
+                    "[renium] import settlement reads back {} of {} services: {}",
+                    settled.len(),
+                    services.len(),
+                    settled.join(", ")
+                ),
+            );
+            settled
+        }
+        Err(reason) => {
+            log_global(
+                4,
+                format_args!(
+                    "[renium] import settlement reads back all {} services: {reason}",
+                    services.len()
+                ),
+            );
+            services.to_vec()
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn services_settled_with(
+    context: &BoundContext,
+    services: &[String],
+    mut settled: HashSet<String>,
+    (before, project, generated): (&ProjectSnapshot, &ProjectSnapshot, &ProjectSnapshot),
+) -> Vec<String> {
+    let files = |path: &&PathBuf| {
+        generated
+            .entries
+            .get(*path)
+            .or_else(|| project.entries.get(*path))
+    };
+    let paths = before
+        .entries
+        .keys()
+        .chain(project.entries.keys())
+        .chain(generated.entries.keys())
+        .collect::<BTreeSet<_>>();
+    let differing = paths
+        .into_par_iter()
+        .filter(|path| files(path) != before.entries.get(*path))
+        .cloned()
+        .collect::<HashSet<_>>();
+    settled.extend(services_for_snapshot_paths(context, &differing));
+    let names = settled
+        .iter()
+        .map(|service| vec![service.clone()])
+        .collect::<Vec<_>>();
+    // One store at a time: an older store is decompressed whole to be read.
+    let referrers = stores_of(context, before)
+        .filter(|(owners, _)| owners.iter().any(|owner| !settled.contains(owner)))
+        .filter(|(_, bytes)| crate::settings::bytecode::holds_any_string_set(bytes, &names))
+        .flat_map(|(owners, _)| owners)
+        .collect::<Vec<_>>();
+    settled.extend(referrers);
+    services
+        .iter()
+        .filter(|service| settled.contains(*service))
+        .cloned()
+        .collect()
+}
+
+/// The stores among `files`, each with the services it belongs to.
+#[cfg(any(windows, target_os = "macos"))]
+fn stores_of<'a>(
+    context: &'a BoundContext,
+    files: &'a ProjectSnapshot,
+) -> impl Iterator<Item = (HashSet<String>, &'a [u8])> {
+    files.entries.iter().filter_map(|(path, entry)| {
+        let SnapshotEntry::File(bytes) = entry else {
+            return None;
+        };
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_service_settings_file_name)
+            .then(|| {
+                let owners = services_for_snapshot_paths(context, &HashSet::from([path.clone()]));
+                (owners.into_iter().collect(), bytes.as_slice())
+            })
+    })
+}
+
+/// Whether each store of a service a settlement skips is a pull's own
+/// encoding of Studio's copy, the bytes a readback of it writes.
+#[cfg(any(windows, target_os = "macos"))]
+fn skips_pulled(
+    context: &BoundContext,
+    settled: &[String],
+    before: &ProjectSnapshot,
+) -> std::result::Result<(), &'static str> {
+    let respelled = stores_of(context, before)
+        .filter(|(owners, _)| owners.iter().any(|owner| !settled.contains(owner)))
+        .any(|(_, bytes)| !crate::snapshot::import::store_is_pulled_encoding(bytes));
+    if respelled {
+        return Err("a store of a service it skips is not a pull's own encoding of it");
+    }
+    Ok(())
+}
+
+/// The services Studio differs from `proof` in now, in what no event tracks
+/// too, or None where it cannot say.
+#[cfg(any(windows, target_os = "macos"))]
+fn moved_since_proof(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    proof: &Value,
+) -> Option<BTreeSet<String>> {
+    let state = bridge
+        .call_for_runtime_with_timeout(
+            "getStudioChangeState",
+            json!({"start": false, "verifyPushProof": proof, "scopePushProof": true}),
+            BridgeTarget::Edit,
+            context.runtime_id.as_deref()?,
+            Some(Duration::from_secs(10)),
+        )
+        .ok()?;
+    ensure_plugin_api_ok(&state).ok()?;
+    if state["pushProofMatches"] == true {
+        return Some(BTreeSet::new());
+    }
+    match ProofScope::parse(&state["pushProofScope"]) {
+        ProofScope::Services { services, .. } => Some(services),
+        ProofScope::Unknown(reason) => {
+            log_global(
+                5,
+                format_args!("[renium] import settlement scope unknown: {reason}"),
+            );
+            None
+        }
+    }
+}
+
 struct SnapshotVerification {
     mismatches: Vec<PathBuf>,
     detail: Option<String>,

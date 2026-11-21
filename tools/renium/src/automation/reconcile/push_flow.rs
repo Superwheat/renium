@@ -261,7 +261,7 @@ pub(crate) fn push_project(
     replace: bool,
 ) -> Result<Map<String, Value>> {
     #[cfg(any(windows, target_os = "macos"))]
-    let verified_candidate = {
+    let mut verified_candidate = {
         match reuse_verified_full_push(
             context,
             bridge,
@@ -279,6 +279,11 @@ pub(crate) fn push_project(
         .transpose()?;
     #[cfg(windows)]
     let mut native_relay = None;
+    // A baseline over files a pull wrote holds the sourcemap that pull left.
+    #[cfg(any(windows, target_os = "macos"))]
+    let held_sourcemap = verified_candidate
+        .as_mut()
+        .and_then(|candidate| candidate.cached.sourcemap.take());
     let phase = Instant::now();
     // The previous push's native attribute observer must outlive the proof
     // check inside the lease request, yet stop before the new lease arms its
@@ -338,6 +343,12 @@ pub(crate) fn push_project(
     }
     #[cfg(not(windows))]
     let _ = &mut previous_attributes;
+    // The held proof the lease verified as it began, over files a pull wrote:
+    // the import settlement may skip services only from such a baseline.
+    #[cfg(any(windows, target_os = "macos"))]
+    let held_pull = held_sourcemap
+        .filter(|_| initial_state["pushProofMatches"] == true)
+        .zip(candidate_proof);
     // The proof was checked inside the request that armed tracking, so a match
     // means every later Studio edit is caught by the transaction's generation
     // checks and the last verified files are a complete baseline.
@@ -636,6 +647,10 @@ pub(crate) fn push_project(
         &mut push_args,
     )?;
     let settle_native_import = replace && !plan.initial_native_services.is_empty();
+    #[cfg(any(windows, target_os = "macos"))]
+    let held_pull = held_pull
+        .filter(|_| settle_native_import)
+        .map(|held| (held, written_services(context, &plan)));
     if !replace {
         apply_snapshot_paths(&stage.project_root, &mutation_paths, &project)?;
     }
@@ -731,6 +746,27 @@ pub(crate) fn push_project(
         // before the push answers.
         .filter(|proof| verified_full_push_proof_matches(context, bridge, proof).unwrap_or(false))
     {
+        // Only a settlement the commit proof fences until publication skips
+        // services: the held proof covers what changed before it.
+        let settled = held_pull.as_ref().map_or_else(
+            || services.to_vec(),
+            |((_, held), written)| {
+                settled_services(
+                    context,
+                    bridge,
+                    (services, written.clone()),
+                    held,
+                    (&studio, &project, &pushed.generated),
+                )
+            },
+        );
+        let narrowed = held_pull
+            .as_ref()
+            .filter(|_| settled.len() < services.len())
+            .map(|((sourcemap, _), _)| import_settle::Narrowed {
+                services: &settled,
+                sourcemap,
+            });
         let mut expected = project;
         expected.entries.extend(pushed.generated.entries);
         // A journal records only a verified Studio commit whose caller can
@@ -754,7 +790,7 @@ pub(crate) fn push_project(
         let (current, summary) = import_settle::settle(
             context,
             bridge,
-            services,
+            (services, narrowed),
             import_settle::ImportWork {
                 before: studio,
                 expected,
@@ -773,7 +809,7 @@ pub(crate) fn push_project(
             "Studio changed before import settlement was acknowledged"
         );
         if let Some(current) = current {
-            retain_verified_full_push(
+            retain_full_push(
                 bridge,
                 cache_input.as_ref(),
                 &source_paths,
@@ -786,16 +822,6 @@ pub(crate) fn push_project(
         return Ok(summary);
     }
 
-    // A full import allocates new native identities and settles service state.
-    // Reuse its verification capture to publish that accepted representation,
-    // with a file baseline taken before readback so newer editor work is safe.
-    let import_readback = settle_native_import
-        .then(|| -> Result<_> {
-            let mut stage = ExportProjectStage::create(&root, &src_dir, services)?;
-            stage.prepare_read_only_links(&root, &src_dir, services)?;
-            Ok(stage)
-        })
-        .transpose()?;
     let mut current = capture_snapshot(&root, stage.publish_paths())?;
     let mut verification_paths = differences;
     verification_paths.extend(mutation_paths);
@@ -879,6 +905,20 @@ pub(crate) fn push_project(
     } else {
         services_for_snapshot_paths(context, &verification_paths)
     };
+    // A full import allocates new native identities and settles service state.
+    // Reuse its verification capture to publish that accepted representation,
+    // with the files read above as its baseline so newer editor work is safe.
+    let import_readback = settle_native_import
+        .then(|| -> Result<_> {
+            let covered = ScopeSet::new(&source_paths);
+            let mut stage =
+                ExportProjectStage::create_with_baseline(&root, &src_dir, services, &|paths| {
+                    publish_baseline(&root, &current, &covered, paths)
+                })?;
+            stage.prepare_read_only_links(&root, &src_dir, services)?;
+            Ok(stage)
+        })
+        .transpose()?;
     let phase = Instant::now();
     let (mut readback_stage, mut readback, settle_verified_capture) = capture_push_readback(
         context,
@@ -945,20 +985,25 @@ pub(crate) fn push_project(
     }
     if settle_verified_capture {
         let phase = Instant::now();
-        stage_verified_import_readback(&mut readback_stage, &readback)?;
+        stage_verified_import_readback(&mut readback_stage, &readback, current.entries.keys())?;
         log_reconcile_timing("full push stage verified readback", phase);
     }
     let mut expected_after_push = project;
     expected_after_push.entries.extend(pushed.generated.entries);
-    let files_unchanged = expected_after_push == current
-        && (!settle_native_import
-            || settle_native_import_files(
+    let files_held = expected_after_push == current;
+    let published = (files_held && settle_native_import)
+        .then(|| {
+            settle_native_import_files(
                 readback_stage,
                 (&root, &source_paths),
                 &mut history,
                 &mut current,
                 &mut pushed.summary,
-            )?);
+            )
+        })
+        .transpose()?
+        .flatten();
+    let files_unchanged = files_held && (!settle_native_import || published.is_some());
     if files_unchanged && !requires_stage && replacement.is_none() {
         // Readback verified the remaining fields. The commit proof predates
         // that readback, so retaining it still requires Studio to have remained
@@ -969,11 +1014,14 @@ pub(crate) fn push_project(
     }
     acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
     #[cfg(any(windows, target_os = "macos"))]
-    retain_verified_full_push(
+    retain_full_push(
         bridge,
         cache_input.as_ref(),
         &source_paths,
-        current,
+        (
+            current,
+            published.as_ref().and_then(import_settle::pulled_sourcemap),
+        ),
         &tracking_release,
         #[cfg(windows)]
         &mut native_relay,
@@ -1085,7 +1133,7 @@ pub(crate) fn push_targeted(
     let entry = VerifiedFullPush {
         connections: bridge.runtime_connection_signature(&release.runtime_id),
         input: std::mem::take(&mut held.input),
-        sourcemap: sourcemap_after_push(&held, &project),
+        sourcemap: sourcemap_after_push(&held, &project, &summary),
         project,
         paths: std::mem::take(&mut held.paths),
         proof,
@@ -1504,12 +1552,21 @@ fn capture_push_readback(
     }
 }
 
-pub(super) fn stage_verified_import_readback(
+/// Writes `readback` over the stage, whose copy of the project's `files`
+/// under its publish paths is all it held besides what the capture staged.
+pub(super) fn stage_verified_import_readback<'a>(
     stage: &mut ExportProjectStage,
     readback: &ProjectSnapshot,
+    files: impl IntoIterator<Item = &'a PathBuf>,
 ) -> Result<()> {
-    let previous = capture_snapshot(&stage.project_root, stage.publish_paths())?;
-    let paths = project_replacement_paths(readback, &previous);
+    let scopes = ScopeSet::new(stage.publish_paths());
+    let mut paths = project_replacement_paths(readback, &ProjectSnapshot::default());
+    paths.extend(
+        files
+            .into_iter()
+            .filter(|path| scopes.contains(path) && !derived_project_path(path))
+            .cloned(),
+    );
     apply_snapshot_paths(&stage.project_root, &paths, readback)?;
     // Capture already built the map from its hierarchy. Rebuilding it from
     // stores here would decode the whole place again.
@@ -1518,8 +1575,47 @@ pub(super) fn stage_verified_import_readback(
     Ok(())
 }
 
+/// The publication baseline of `paths` from `files`, a read of the paths
+/// `covered` holds. Paths that read did not cover, or reached through a
+/// link, are hashed from disk.
+pub(super) fn publish_baseline(
+    root: &Path,
+    files: &ProjectSnapshot,
+    covered: &ScopeSet,
+    paths: &[PathBuf],
+) -> Result<BTreeMap<PathBuf, PublishEntryState>> {
+    let (read, unread): (Vec<_>, Vec<_>) = paths.iter().cloned().partition(|path| {
+        !derived_project_path(path)
+            && covered.contains(path)
+            && path.ancestors().skip(1).all(|ancestor| {
+                !matches!(
+                    files.entries.get(ancestor),
+                    Some(SnapshotEntry::Symlink { .. })
+                )
+            })
+    });
+    let mut baseline = crate::snapshot::export::collect_publish_hashes(root, &unread)?;
+    let read = ScopeSet::new(&read);
+    let hashed = files
+        .entries
+        .par_iter()
+        .filter(|(path, _)| read.contains(path))
+        .map(|(path, entry)| (path.clone(), entry_publish_state(entry)))
+        .collect::<Vec<_>>();
+    baseline.extend(hashed);
+    Ok(baseline)
+}
+
+pub(super) fn entry_publish_state(entry: &SnapshotEntry) -> PublishEntryState {
+    match entry {
+        SnapshotEntry::Directory => PublishEntryState::Directory,
+        SnapshotEntry::File(bytes) => crate::snapshot::export::file_publish_state(bytes),
+        SnapshotEntry::Symlink { target, .. } => PublishEntryState::Symlink(target.clone()),
+    }
+}
+
 /// Writes a verified import's state to the files and refreshes its undo
-/// entry; false when the files were left as they are. Studio holds the
+/// entry; None when the files were left as they are. Studio holds the
 /// import by now, so a file saved while it was read back is newer work and
 /// stays: the next pull brings the import's identities into the files.
 fn settle_native_import_files(
@@ -1528,20 +1624,20 @@ fn settle_native_import_files(
     history: &mut history::SyncHistory,
     current: &mut ProjectSnapshot,
     summary: &mut Map<String, Value>,
-) -> Result<bool> {
+) -> Result<Option<crate::snapshot::export::PublishedProjectChanges>> {
     match publish_native_import_readback(stage, root, paths) {
-        Ok(published) => {
-            *current = published;
+        Ok((files, published)) => {
+            *current = files;
             let id = history.commit(current, &ProjectSnapshot::default())?;
             summary.insert("historyId".into(), Value::String(id));
-            Ok(true)
+            Ok(Some(published))
         }
         Err(error) => {
             log_global(
                 3,
                 format_args!("[renium] the import's state was not written to the files: {error:#}"),
             );
-            Ok(false)
+            Ok(None)
         }
     }
 }
@@ -1550,7 +1646,10 @@ fn publish_native_import_readback(
     stage: ExportProjectStage,
     root: &Path,
     paths: &[PathBuf],
-) -> Result<ProjectSnapshot> {
+) -> Result<(
+    ProjectSnapshot,
+    crate::snapshot::export::PublishedProjectChanges,
+)> {
     let (published, _) = crate::snapshot::export::finish_export_publication(
         Some(stage),
         root,
@@ -1561,7 +1660,7 @@ fn publish_native_import_readback(
     )?;
     let current = capture_snapshot(root, paths)?;
     history::ensure_published_state(&published, &current)?;
-    Ok(current)
+    Ok((current, published))
 }
 
 #[test]
@@ -1601,17 +1700,17 @@ fn native_import_readback_publishes_once_and_protects_newer_files() -> Result<()
     crate::project::sourcemap::generate_project_sourcemap(&stage.project_root)?;
     let paths = stage.publish_paths().to_vec();
     let checked = capture_snapshot(&stage.project_root, &paths)?;
-    stage_verified_import_readback(&mut stage, &checked)?;
+    stage_verified_import_readback(&mut stage, &checked, checked.entries.keys())?;
     let map = fs::read(stage.project_root.join("sourcemap.json"))?;
     assert!(!map.is_empty(), "The verified capture must publish its map");
-    let after = publish_native_import_readback(stage, &root, &paths)?;
+    let (after, _) = publish_native_import_readback(stage, &root, &paths)?;
     assert_eq!(fs::read(root.join("sourcemap.json"))?, map);
     assert!(after.entries[&path] == SnapshotEntry::File(accepted.clone()));
     let modified = fs::metadata(root.join(&path))?.modified()?;
-    assert!(publish_native_import_readback(prepare()?, &root, &paths)? == after);
+    assert!(publish_native_import_readback(prepare()?, &root, &paths)?.0 == after);
     assert_eq!(fs::metadata(root.join(&path))?.modified()?, modified);
     let mut stage = prepare()?;
-    stage_verified_import_readback(&mut stage, &checked)?;
+    stage_verified_import_readback(&mut stage, &checked, checked.entries.keys())?;
     fs::write(root.join(&path), &original)?;
     assert!(publish_native_import_readback(stage, &root, &paths).is_err());
     assert_eq!(fs::read(root.join(path))?, original);
@@ -1685,7 +1784,8 @@ pub(crate) fn capture_studio_services_with_stage(
     stage: ExportProjectStage,
 ) -> Result<(ExportProjectStage, ProjectSnapshot)> {
     #[cfg(all(test, any(windows, target_os = "macos")))]
-    if let Some(snapshot) = super::push_flow_tests::capture(context) {
+    if let Some(snapshot) = super::push_flow_tests::capture(context, services, &stage.project_root)
+    {
         return Ok((stage, snapshot?));
     }
     let stage =
@@ -1736,7 +1836,7 @@ pub(crate) fn capture_studio_services_in_memory(
     preserve_saved_settings: bool,
 ) -> Result<ProjectSnapshot> {
     #[cfg(all(test, any(windows, target_os = "macos")))]
-    if let Some(result) = super::push_flow_tests::capture(context) {
+    if let Some(result) = super::push_flow_tests::capture(context, services, &stage.project_root) {
         return result;
     }
     pin_edit_runtime(context, bridge)?;

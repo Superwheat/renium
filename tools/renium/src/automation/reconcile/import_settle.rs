@@ -243,13 +243,13 @@ pub(super) fn committed(summary: &Map<String, Value>, expected: &ProjectSnapshot
     })
 }
 
-fn accepted(snapshot: &ProjectSnapshot) -> Result<()> {
+fn accepted<'a>(entries: impl Iterator<Item = (&'a PathBuf, &'a SnapshotEntry)>) -> Result<()> {
     CURRENT.with(|slot| {
         let mut slot = slot.borrow_mut();
         let journal = slot.as_mut().context("Missing import settlement journal")?;
         journal.record.accepted = Some(StoredSnapshot::write_at(
             &journal.directory.join("packs"),
-            snapshot.entries.iter(),
+            entries,
         )?);
         journal.save()
     })
@@ -389,28 +389,60 @@ pub(super) struct ImportWork {
     pub summary: Map<String, Value>,
 }
 
+/// A settlement that reads back only `services`, from a baseline over files
+/// a pull wrote whose sourcemap that pull left as `sourcemap`.
+pub(super) struct Narrowed<'a> {
+    pub services: &'a [String],
+    pub sourcemap: &'a SourcemapState,
+}
+
+/// The files a publication left and the sourcemap a baseline of them keeps.
+type Published = (ProjectSnapshot, Option<Box<SourcemapState>>);
+
 /// The same capture, verification and publication serve a live continuation
 /// and recovery after a daemon restart. Recovery never invokes the importer.
 pub(super) fn settle(
     context: &BoundContext,
     bridge: &BridgeServer,
-    services: &[String],
+    (full, narrowed): (&[String], Option<Narrowed<'_>>),
     mut work: ImportWork,
     proof: &Value,
-) -> Result<(Option<ProjectSnapshot>, Map<String, Value>)> {
+) -> Result<(Option<Published>, Map<String, Value>)> {
     let root = Path::new(&context.root);
     let source = bound_context::source_dir(context)?;
-    if let Err(error) = ensure_original_or_accepted_files(root, &work.paths) {
-        if !error.is::<NewerProjectFiles>() {
-            return Err(error);
-        }
+    let files = match ensure_original_or_accepted_files(root, &work.paths) {
+        Ok(files) => files,
+        Err(error) if !error.is::<NewerProjectFiles>() => return Err(error),
         // The caller can start editing as soon as its verified reply arrives.
         // Leave those files alone; the next push reconciles the newer work.
-        return Ok((None, work.summary));
-    }
-    crate::daemon::memory::release_between_phases();
+        Err(_) => return Ok((None, work.summary)),
+    };
     let phase = Instant::now();
-    let mut stage = ExportProjectStage::create(root, &source, services)?;
+    let covered = ScopeSet::new(&work.paths);
+    let baseline =
+        |paths: &[PathBuf]| super::push_flow::publish_baseline(root, &files, &covered, paths);
+    let stage_of =
+        |services| ExportProjectStage::create_with_baseline(root, &source, services, &baseline);
+    let mut services = narrowed.as_ref().map_or(full, |narrowed| narrowed.services);
+    let mut stage = stage_of(services)?;
+    // The services it skips keep their entries of the sourcemap it stages.
+    if narrowed.is_some_and(|narrowed| !staged_as(&stage, narrowed.sourcemap)) {
+        log_global(
+            4,
+            format_args!(
+                "[renium] import settlement reads back all services: sourcemap.json is not as the last pull left it"
+            ),
+        );
+        services = full;
+        stage = stage_of(services)?;
+    }
+    let scopes = ScopeSet::new(stage.publish_paths());
+    let staged = files
+        .entries
+        .into_keys()
+        .filter(|path| scopes.contains(path))
+        .collect::<Vec<_>>();
+    crate::daemon::memory::release_between_phases();
     let mut readback = capture_studio_services_in_memory(context, bridge, services, &stage, true)?;
     log_reconcile_timing("full push readback", phase);
     crate::daemon::memory::release_between_phases();
@@ -435,23 +467,54 @@ pub(super) fn settle(
         ));
     }
     let phase = Instant::now();
-    super::push_flow::stage_verified_import_readback(&mut stage, &readback)?;
+    super::push_flow::stage_verified_import_readback(&mut stage, &readback, &staged)?;
     log_reconcile_timing("full push stage verified readback", phase);
     let stable = || -> Result<()> {
         anyhow::ensure!(
             verified_full_push_proof_matches(context, bridge, proof)?,
             "Studio changed during import settlement; the committed import was not repeated"
         );
-        ensure_original_or_accepted_files(root, &work.paths)
+        ensure_original_or_accepted_files(root, &work.paths).map(drop)
     };
-    let current = match publish_checked(stage, root, &work.paths, stable) {
-        Ok(current) => current,
-        Err(error) if error.is::<NewerProjectFiles>() => return Ok((None, work.summary)),
-        Err(error) => return Err(error),
-    };
+    let (current, published) =
+        match publish_checked(stage, root, (&work.paths, &work.expected), stable) {
+            Ok(current) => current,
+            Err(error) if error.is::<NewerProjectFiles>() => return Ok((None, work.summary)),
+            Err(error) => return Err(error),
+        };
     let id = work.history.commit(&current, &ProjectSnapshot::default())?;
     work.summary.insert("historyId".into(), json!(id));
-    Ok((Some(current), work.summary))
+    let sourcemap = pulled_sourcemap(&published);
+    Ok((Some((current, sourcemap)), work.summary))
+}
+
+/// The sourcemap a baseline of the files `published` left keeps: none where
+/// it kept files back from Studio's copy, as a pull then keeps no baseline.
+pub(super) fn pulled_sourcemap(
+    published: &crate::snapshot::export::PublishedProjectChanges,
+) -> Option<Box<SourcemapState>> {
+    let kept_back = !published.preserved.is_empty()
+        || !published.read_only_links_restored.is_empty()
+        || !published.studio_overrides.is_empty();
+    if kept_back {
+        log_global(
+            5,
+            format_args!(
+                "[renium] baseline: a pull on it captures every service: the settlement kept files back"
+            ),
+        );
+        return None;
+    }
+    settled_sourcemap(published, None)
+}
+
+/// Whether the sourcemap `stage` copied is `sourcemap`.
+fn staged_as(stage: &ExportProjectStage, sourcemap: &SourcemapState) -> bool {
+    crate::snapshot::export::collect_publish_hashes(
+        &stage.project_root,
+        &[PathBuf::from("sourcemap.json")],
+    )
+    .is_ok_and(|staged| staged == *sourcemap)
 }
 
 #[derive(Debug)]
@@ -465,7 +528,7 @@ impl std::fmt::Display for NewerProjectFiles {
 
 impl std::error::Error for NewerProjectFiles {}
 
-fn ensure_original_or_accepted_files(root: &Path, paths: &[PathBuf]) -> Result<()> {
+fn ensure_original_or_accepted_files(root: &Path, paths: &[PathBuf]) -> Result<ProjectSnapshot> {
     let current = capture_snapshot(root, paths)?;
     let files_match = CURRENT.with(|slot| {
         slot.borrow().as_ref().is_some_and(|journal| {
@@ -481,17 +544,35 @@ fn ensure_original_or_accepted_files(root: &Path, paths: &[PathBuf]) -> Result<(
     if !files_match {
         return Err(NewerProjectFiles.into());
     }
-    Ok(())
+    Ok(current)
 }
 
+/// Publishes the stage, outside whose paths the files stay as `held` has
+/// them. The files must then be exactly what it staged and those; the
+/// returned snapshot covers all of `paths`.
 fn publish_checked(
     stage: ExportProjectStage,
     root: &Path,
-    paths: &[PathBuf],
+    (paths, held): (&[PathBuf], &ProjectSnapshot),
     stable: impl Fn() -> Result<()>,
-) -> Result<ProjectSnapshot> {
-    let accepted_files = capture_snapshot(&stage.project_root, paths)?;
-    accepted(&accepted_files)?;
+) -> Result<(
+    ProjectSnapshot,
+    crate::snapshot::export::PublishedProjectChanges,
+)> {
+    let scopes = ScopeSet::new(stage.publish_paths());
+    let staged = capture_snapshot(&stage.project_root, paths)?;
+    let accepted_files = || {
+        let unsettled = held
+            .entries
+            .iter()
+            .filter(|(path, _)| !scopes.contains(path));
+        staged
+            .entries
+            .iter()
+            .filter(|(path, _)| scopes.contains(path))
+            .chain(unsettled)
+    };
+    accepted(accepted_files())?;
     let (published, _) = crate::snapshot::export::finish_export_publication(
         Some(stage),
         root,
@@ -501,11 +582,13 @@ fn publish_checked(
         &stable,
     )?;
     let current = capture_snapshot(root, paths)?;
-    if current != accepted_files {
+    if current.entries.len() != accepted_files().count()
+        || !accepted_files().all(|(path, entry)| current.entries.get(path) == Some(entry))
+    {
         return Err(NewerProjectFiles.into());
     }
     history::ensure_published_state(&published, &current)?;
-    Ok(current)
+    Ok((current, published))
 }
 
 pub(crate) fn before_request(
@@ -720,13 +803,13 @@ fn recover(
     let proof = capture_push_proof(bridge, &guard)?
         .context("Studio cannot prove a stable recovery capture; run rbx pl")?;
     let paths = work.paths.clone();
-    let (current, _) = settle(context, bridge, services, work, &proof)?;
+    let (current, _) = settle(context, bridge, (services, None), work, &proof)?;
     release.proof = Some(proof);
     acknowledge_verified_push(bridge, services, &guard, &mut release)?;
     let Some(current) = current else {
         return Ok(false);
     };
-    retain_verified_full_push(
+    retain_full_push(
         bridge,
         input.as_ref(),
         &paths,
@@ -873,7 +956,13 @@ mod tests {
             history,
             summary: Map::new(),
         };
-        let (published, _) = settle(&context, &bridge, &["Workspace".into()], work, &json!({}))?;
+        let (published, _) = settle(
+            &context,
+            &bridge,
+            (&["Workspace".into()], None),
+            work,
+            &json!({}),
+        )?;
         assert!(published.is_none());
         finish_request(None)?;
         assert!(before_request(&context, &bridge, op::PUSH, &json!({}))?.is_none());
@@ -991,7 +1080,7 @@ mod tests {
         );
         assert!(!pending(context));
         assert!(
-            super::super::push_flow_tests::capture(context).is_none(),
+            super::super::push_flow_tests::capture(context, &[], Path::new("")).is_none(),
             "recovery must verify its fresh capture, even when the old observer expired"
         );
         Ok(())
@@ -1148,7 +1237,7 @@ mod tests {
             &Map::from_iter([("verifiedPushProof".into(), json!(3))]),
             &expected,
         )?;
-        accepted(&expected)?;
+        accepted(expected.entries.iter())?;
         let journal = Journal::load(&context)?.unwrap();
         assert!(journal.record.expected.matches(&expected));
         assert_eq!(journal.record.summary["historyId"], "test-history");
@@ -1175,7 +1264,7 @@ mod tests {
         published
             .entries
             .insert("src/B.luau".into(), SnapshotEntry::File(b"new".to_vec()));
-        accepted(&published)?;
+        accepted(published.entries.iter())?;
         fs::write(root.join("src/A.luau"), "accepted")?;
         ensure_original_or_accepted_files(&root, &["src".into()])?;
         fs::write(root.join("src/B.luau"), "unexpected edit")?;
@@ -1196,7 +1285,7 @@ mod tests {
         fs::write(root.join("src/A.luau"), "newer file edit")?;
         // A stage made after this edit would accept it as its own baseline.
         // Publication must also compare against the journal's earlier files.
-        accepted(&expected)?;
+        accepted(expected.entries.iter())?;
         assert!(ensure_original_or_accepted_files(&root, &["src".into()]).is_err());
         finish_request(Some("Project files changed during import settlement"))?;
         assert_eq!(
@@ -1250,7 +1339,7 @@ mod tests {
             "src/A.luau".into(),
             SnapshotEntry::File(b"return 3".to_vec()),
         );
-        accepted(&published)?;
+        accepted(published.entries.iter())?;
         // A daemon killed between publication and acknowledgment runs no
         // finalizer. Loading the disk journal must distinguish both states.
         CURRENT.with(|slot| slot.borrow_mut().take());
@@ -1283,7 +1372,9 @@ mod tests {
 
     #[test]
     fn publication_checks_studio_before_and_after_and_preserves_file_edits() -> Result<()> {
-        for failure_at in [0, 1, 2, 3] {
+        // At 4 a file of a service the stage does not settle is edited once
+        // the stage is published.
+        for failure_at in [0, 1, 2, 3, 4] {
             let root = crate::tests::support::temp_dir("import-publication-fence");
             let _cleanup = OnDrop::new(|| {
                 let _ = fs::remove_dir_all(&root);
@@ -1291,25 +1382,33 @@ mod tests {
             let context = context(&root);
             begin_test(&context)?;
             let relative = Path::new("src/Workspace/A.luau");
-            fs::create_dir_all(root.join(relative.parent().unwrap()))?;
-            fs::write(root.join(relative), "original")?;
+            let outside = Path::new("src/ServerStorage/B.luau");
+            for (path, text) in [(relative, "original"), (outside, "unsettled")] {
+                fs::create_dir_all(root.join(path.parent().unwrap()))?;
+                fs::write(root.join(path), text)?;
+            }
             let stage = ExportProjectStage::create(&root, Path::new("src"), &["Workspace".into()])?;
             fs::create_dir_all(stage.project_root.join(relative.parent().unwrap()))?;
             fs::write(stage.project_root.join(relative), "accepted")?;
-            let paths = stage.publish_paths().to_vec();
+            let mut paths = stage.publish_paths().to_vec();
+            paths.push(outside.parent().unwrap().to_path_buf());
+            let held = capture_snapshot(&root, &paths)?;
             if failure_at == 3 {
                 fs::write(root.join(relative), "newer file edit")?;
             }
             let calls = std::cell::Cell::new(0);
             let stable = || -> Result<()> {
                 calls.set(calls.get() + 1);
+                if failure_at == 4 && calls.get() == 2 {
+                    fs::write(root.join(outside), "newer edit elsewhere")?;
+                }
                 anyhow::ensure!(
                     calls.get() != failure_at,
                     "Studio closed or changed at publication boundary"
                 );
                 Ok(())
             };
-            let result = publish_checked(stage, &root, &paths, stable);
+            let result = publish_checked(stage, &root, (&paths, &held), stable);
             match failure_at {
                 0 => {
                     assert!(result.is_ok());
@@ -1322,6 +1421,17 @@ mod tests {
                 2 => {
                     assert!(result.is_err());
                     assert_eq!(fs::read_to_string(root.join(relative))?, "accepted");
+                }
+                4 => {
+                    assert!(
+                        result
+                            .as_ref()
+                            .is_err_and(|error| error.is::<NewerProjectFiles>())
+                    );
+                    assert_eq!(
+                        fs::read_to_string(root.join(outside))?,
+                        "newer edit elsewhere"
+                    );
                 }
                 _ => {
                     assert!(result.is_err());

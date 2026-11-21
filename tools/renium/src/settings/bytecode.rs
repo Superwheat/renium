@@ -745,6 +745,27 @@ pub(crate) fn may_name_any(bytes: &[u8], ids: &std::collections::HashSet<&str>) 
         .any(|text| ids.contains(text.as_str()))
 }
 
+/// Whether a store holds every string of one of the `required` sets, as
+/// `decode_settings_bytecode_if_contains_any_string_set` asks before it
+/// decodes one. A store that cannot be read counts as holding them: its
+/// decode is the one to say why.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn holds_any_string_set(bytes: &[u8], required: &[Vec<String>]) -> bool {
+    if blocks::is_block_store(bytes) {
+        return blocks::BlockStore::open(bytes)
+            .and_then(|store| store.holds_any(required))
+            .unwrap_or(true);
+    }
+    let Ok((_, decoded)) = decode_settings_bytecode_container(bytes) else {
+        return true;
+    };
+    required.iter().any(|needles| {
+        needles
+            .iter()
+            .all(|needle| memmem::find(&decoded, needle.as_bytes()).is_some())
+    })
+}
+
 fn decode_settings_bytecode_if_contains_any_string_set(
     bytes: &[u8],
     required: &[Vec<String>],

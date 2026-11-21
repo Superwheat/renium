@@ -1812,6 +1812,35 @@ fn remembered_pull(stored: &[u8; 32]) -> Option<RememberedPull> {
     remembered_pulls().lock_recover().get(stored).cloned()
 }
 
+/// Whether a pull remembers these store bytes as the own encoding of the
+/// state it captured: a capture of that state gives them again, where a pull
+/// keeps an equivalent store in whatever spelling the file already had.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn store_is_pulled_encoding(bytes: &[u8]) -> bool {
+    remembered_pull(&Sha256::digest(bytes).into()).is_some_and(|pull| pull.rows.is_some())
+}
+
+/// Has a pull remember `bytes` as the own encoding of a state of `service`
+/// that holds the service alone.
+#[cfg(all(test, any(windows, target_os = "macos")))]
+pub(crate) fn remember_pulled_encoding(bytes: &[u8], service: &str) -> Result<()> {
+    let root = SnapshotInstance {
+        name: service.into(),
+        class_name: service.into(),
+        instance_index: Some(1),
+        ..Default::default()
+    };
+    let state =
+        build_service_state_from_instances(service, None, vec![root], HashMap::new(), true)?;
+    let observed = pulled_digest_from_service_state(&state)?;
+    remember_pull(
+        Sha256::digest(bytes).into(),
+        observed.digest,
+        Some(observed.rows),
+    );
+    Ok(())
+}
+
 /// A file a pull replaced is not read again.
 fn forget_pull(stored: &[u8; 32]) {
     remembered_pulls().lock_recover().remove(stored);

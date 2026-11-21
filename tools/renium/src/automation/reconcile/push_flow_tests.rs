@@ -15,12 +15,26 @@ type Mutation = Box<dyn FnOnce(&BoundContext, MutationInput<'_>) -> Result<Stage
 thread_local! {
     static CAPTURES: RefCell<VecDeque<Capture>> = RefCell::new(VecDeque::new());
     static MUTATION: RefCell<Option<Mutation>> = RefCell::new(None);
+    static REQUESTED: RefCell<Vec<(Vec<String>, PathBuf)>> = const { RefCell::new(Vec::new()) };
 }
 
-pub(super) fn capture(context: &BoundContext) -> Option<Result<ProjectSnapshot>> {
+/// Answers a capture of `services` into the stage at `stage`.
+pub(super) fn capture(
+    context: &BoundContext,
+    services: &[String],
+    stage: &Path,
+) -> Option<Result<ProjectSnapshot>> {
+    REQUESTED.with(|slot| {
+        slot.borrow_mut()
+            .push((services.to_vec(), stage.to_path_buf()))
+    });
     CAPTURES
         .with(|slot| slot.borrow_mut().pop_front())
         .map(|capture| capture(context))
+}
+
+fn last_requested() -> (Vec<String>, PathBuf) {
+    REQUESTED.with(|slot| slot.borrow().last().cloned().unwrap_or_default())
 }
 
 pub(super) fn mutation(
@@ -39,10 +53,70 @@ pub(super) struct Fixture {
     pub(super) bridge: Option<BridgeServer>,
     service: String,
     plugin: Option<thread::JoinHandle<()>>,
+    tracker: Arc<Mutex<Tracker>>,
     pub(super) desired: ProjectSnapshot,
 }
 
-fn fixture_runtime(bridge: &BridgeServer, runtime: &'static str) -> thread::JoinHandle<()> {
+/// What the fixture plugin says of Studio: the generations its edits move,
+/// and how it stands against the proofs it holds. A push commits under the
+/// proof `{"test": true}`; a held proof is `{"held": true}`.
+struct Tracker {
+    /// The generations Studio's edits move (`serviceGenerations`).
+    edits: Map<String, Value>,
+    /// The push committed, so Studio no longer holds the held proof.
+    committed: bool,
+    /// Studio changed after the commit.
+    changed_since_commit: bool,
+    /// The services Studio differs from the held proof in once the push
+    /// committed, or None where it cannot say.
+    scope: Option<Vec<&'static str>>,
+}
+
+impl Default for Tracker {
+    fn default() -> Self {
+        Self {
+            edits: Map::from_iter([
+                ("ReplicatedStorage".into(), json!(0)),
+                ("Workspace".into(), json!(0)),
+            ]),
+            committed: false,
+            changed_since_commit: false,
+            scope: Some(Vec::new()),
+        }
+    }
+}
+
+/// Studio's reply to `params`: a proof holds unless it expired or Studio
+/// changed since, and one it keeps holds the same way.
+fn tracker_reply(tracker: &Tracker, params: &Value, runtime: &str) -> Value {
+    let differs = |proof: &Value| {
+        proof["expired"] == true
+            || (tracker.committed && proof["held"] == true)
+            || (tracker.changed_since_commit && proof["test"] == true)
+    };
+    let verify = &params["verifyPushProof"];
+    let matches = verify.is_object() && !differs(verify);
+    let scope = (!matches && params["scopePushProof"] == true).then(|| {
+        tracker.scope.as_ref().map_or_else(
+            || json!({"unknown": "Terrain unavailable"}),
+            |services| json!({"services": services, "touched": {}}),
+        )
+    });
+    let retain = &params["retainPushProof"];
+    let retained = (!retain.is_null() && !differs(retain)).then(|| retain.clone());
+    json!({
+        "pushProofMatches": matches, "pushProofScope": scope,
+        "retainedPushProof": retained, "retainedPushProofLocal": true,
+        "verifiedPushProof": {"test": true}, "runtimeId": runtime,
+        "seq": 0, "tracking": true, "serviceGenerations": tracker.edits
+    })
+}
+
+fn fixture_runtime(
+    bridge: &BridgeServer,
+    runtime: &'static str,
+    tracker: Arc<Mutex<Tracker>>,
+) -> thread::JoinHandle<()> {
     let stream = crate::studio::bridge::routing_tests::connect(
         bridge,
         0,
@@ -63,13 +137,8 @@ fn fixture_runtime(bridge: &BridgeServer, runtime: &'static str) -> thread::Join
                 request["method"].as_str(),
                 Some("getStudioChangeState" | "getStudioState")
             ));
-            let proof = &request["params"]["verifyPushProof"];
-            let reply = json!({"id":request["id"], "ok":true, "result":{
-                "pushProofMatches":proof.is_object() && proof["expired"] != true,
-                "retainedPushProof":{"test":true}, "retainedPushProofLocal":true,
-                "verifiedPushProof":{"test":true}, "runtimeId":runtime,
-                "seq":0, "tracking":true, "serviceGenerations":{"ReplicatedStorage":0,"Workspace":0}
-            }});
+            let result = tracker_reply(&tracker.lock().unwrap(), &request["params"], runtime);
+            let reply = json!({"id": request["id"], "ok": true, "result": result});
             if socket
                 .send(Message::Text(reply.to_string().into()))
                 .is_err()
@@ -132,7 +201,8 @@ impl Fixture {
             fingerprint: String::new(),
         };
         let bridge = crate::studio::bridge::routing_tests::fixture();
-        let plugin = fixture_runtime(&bridge, "push-fixture");
+        let tracker = Arc::new(Mutex::new(Tracker::default()));
+        let plugin = fixture_runtime(&bridge, "push-fixture", Arc::clone(&tracker));
         CAPTURES.with(|slot| {
             slot.borrow_mut()
                 .push_back(Box::new(|_| Ok(ProjectSnapshot::default())))
@@ -143,6 +213,7 @@ impl Fixture {
             service: service_name.into(),
             bridge: Some(bridge),
             plugin: Some(plugin),
+            tracker,
             desired,
         })
     }
@@ -152,13 +223,6 @@ impl Fixture {
     }
 
     fn push(&self, slow_import: bool) -> Result<Map<String, Value>> {
-        let _reply = crate::daemon::fixture_early_response();
-        let bridge = self.bridge.as_ref().unwrap();
-        let lease = Arc::new(crate::studio::bridge::BridgeRequestLease::new(
-            "push-fixture".into(),
-        ));
-        let _lease = bridge.activate_request_lease(lease)?;
-        let _cleanup = import_settle::RequestCleanup;
         let guard = StudioChangeGuard {
             runtime_id: "push-fixture".into(),
             change_seq: 0,
@@ -166,22 +230,40 @@ impl Fixture {
             runtime_bootstrap_safe: true,
             service_generations: BTreeMap::new(),
         };
-        let mut args = PushEditorChangesArgs::new(
+        self.push_with(
+            std::slice::from_ref(&self.service),
+            Some(&guard),
+            (slow_import, true),
+        )
+    }
+
+    fn push_args(&self) -> PushEditorChangesArgs {
+        PushEditorChangesArgs::new(
             crate::cli::ProjectSourceArgs {
                 project_root: self.context.root.clone().into(),
                 src_root: "src".into(),
             },
             crate::cli::BridgeConnectionArgs::local(0.1),
-        );
+        )
+    }
+
+    /// A push whose caller takes an early reply where `answers_early`.
+    fn push_with(
+        &self,
+        services: &[String],
+        guard: Option<&StudioChangeGuard>,
+        (slow_import, answers_early): (bool, bool),
+    ) -> Result<Map<String, Value>> {
+        let _reply = answers_early.then(crate::daemon::fixture_early_response);
+        let bridge = self.bridge.as_ref().unwrap();
+        let lease = Arc::new(crate::studio::bridge::BridgeRequestLease::new(
+            "push-fixture".into(),
+        ));
+        let _lease = bridge.activate_request_lease(lease)?;
+        let _cleanup = import_settle::RequestCleanup;
+        let mut args = self.push_args();
         args.slow_import = slow_import;
-        let result = push_project(
-            &self.context,
-            bridge,
-            std::slice::from_ref(&self.service),
-            args,
-            Some(&guard),
-            true,
-        );
+        let result = push_project(&self.context, bridge, services, args, guard, true);
         import_settle::finish_request(
             result
                 .as_ref()
@@ -688,7 +770,7 @@ fn offline_commit_keeps_undo_receipt_and_reopened_readback_when_saved_fields_are
     let desired = capture_snapshot(root, stage.publish_paths())?;
     replace_capture(before);
     let bridge = fixture.bridge.as_ref().unwrap();
-    let reopened = fixture_runtime(bridge, "saved-reopened");
+    let reopened = fixture_runtime(bridge, "saved-reopened", Arc::default());
     bridge.pin_runtime(crate::studio::bridge::BridgeTarget::Edit, "push-fixture");
     let busy = bridge
         .try_acquire_runtime_gate("saved-reopened", "test")
@@ -1119,4 +1201,567 @@ fn a_live_start_from_a_held_pull_leaves_what_a_capture_leaves() -> Result<()> {
         }
     }
     Ok(())
+}
+
+const SETTLE_SERVICES: [&str; 2] = ["ReplicatedStorage", "ServerStorage"];
+const SETTLE_SCRIPT: &str = "src/ServerStorage/Foo.luau";
+
+/// What a push that imports ReplicatedStorage finds of ServerStorage, which
+/// it writes nothing to. A pull of both wrote the files, a script among
+/// them, and Renium holds them as its baseline.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Elsewhere {
+    /// Studio's copy is the files'.
+    Untouched,
+    /// Studio edits it during the import, which moves its generation.
+    Edited,
+    /// Studio edits it during the import where no event tracks it, as with
+    /// Terrain voxels, and says it differs from the held proof there.
+    EditedUnseen,
+    /// As `EditedUnseen`, where Studio cannot say where it differs.
+    Unscoped,
+    /// Studio edits it once the push committed, while a push that answers
+    /// only after its settlement reads Studio back.
+    EditedLate,
+    /// The import moves the target of its reference into ReplicatedStorage.
+    Referring,
+    /// Its store is the older encoder's spelling of Studio's copy, under a
+    /// baseline a push kept: that says what Studio holds, not how a pull
+    /// spells it.
+    Respelled,
+    /// Its store is the older encoder's spelling of Studio's copy, which the
+    /// pull found alike and left as it was.
+    Unwitnessed,
+    /// Its store is edited in the files during the import.
+    EditedFile,
+    /// No baseline is held, and Studio edits it during the import where no
+    /// event tracks it.
+    Fresh,
+    /// A tool rewrote the sourcemap after the pull.
+    Remapped,
+    /// A push of its script, which the editor saved with a final line break,
+    /// kept the baseline, and Studio holds the script without that break.
+    PushedScript,
+}
+
+impl Elsewhere {
+    const ALL: [Self; 12] = [
+        Self::Untouched,
+        Self::Edited,
+        Self::EditedUnseen,
+        Self::Unscoped,
+        Self::EditedLate,
+        Self::Referring,
+        Self::Respelled,
+        Self::Unwitnessed,
+        Self::EditedFile,
+        Self::Fresh,
+        Self::Remapped,
+        Self::PushedScript,
+    ];
+
+    /// Whether the pull left the older encoder's store.
+    fn respelled(self) -> bool {
+        matches!(self, Self::Respelled | Self::Unwitnessed)
+    }
+
+    /// Where Studio says it differs from the held proof once the push
+    /// committed.
+    fn scope(self) -> Option<Vec<&'static str>> {
+        match self {
+            Self::Edited | Self::EditedUnseen => Some(SETTLE_SERVICES.to_vec()),
+            Self::Unscoped => None,
+            _ => Some(SETTLE_SERVICES[..1].to_vec()),
+        }
+    }
+}
+
+/// ServerStorage as the pull wrote it, as Studio holds it before the push
+/// and as Studio holds it after the import.
+struct Documents {
+    pulled: SettingsBytecode,
+    before: SettingsBytecode,
+    after: SettingsBytecode,
+}
+
+fn elsewhere_documents(seed: u64, elsewhere: Elsewhere) -> Documents {
+    let mut rng = crate::tests::support::SimRng(seed);
+    let mut pulled = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![SettingsBytecodeInstance::new(
+            "root".into(),
+            "ServerStorage".into(),
+            "ServerStorage".into(),
+            None,
+        )],
+    };
+    for index in 0..1 + rng.below(4) {
+        let mut value = SettingsBytecodeInstance::new(
+            format!("item{index}"),
+            format!("Item{index}"),
+            "StringValue".into(),
+            Some(0),
+        );
+        value.properties.insert(
+            "Value".into(),
+            json!(format!("s{seed}v{}", rng.below(1000))),
+        );
+        pulled.instances.push(value);
+    }
+    let reference = |ordinal: u64| {
+        json!({
+            "_type": "Ref",
+            "settingsId": "folder",
+            "pathSegments": ["ReplicatedStorage", "Imported"],
+            "pathOrdinals": [1, ordinal],
+        })
+    };
+    if elsewhere == Elsewhere::Referring {
+        let mut link = SettingsBytecodeInstance::new(
+            "link".into(),
+            "Link".into(),
+            "ObjectValue".into(),
+            Some(0),
+        );
+        link.properties.insert("Value".into(), reference(1));
+        pulled.instances.push(link);
+    }
+    let before = pulled.clone();
+    let mut after = before.clone();
+    match elsewhere {
+        Elsewhere::Edited
+        | Elsewhere::EditedUnseen
+        | Elsewhere::Unscoped
+        | Elsewhere::EditedLate
+        | Elsewhere::Fresh => {
+            let index = 1 + rng.below(after.instances.len() - 1);
+            after.instances[index]
+                .properties
+                .insert("Value".into(), json!(format!("edited{seed}")));
+        }
+        Elsewhere::Referring => {
+            let link = after.instances.last_mut().unwrap();
+            link.properties.insert("Value".into(), reference(2));
+        }
+        _ => {}
+    }
+    Documents {
+        pulled,
+        before,
+        after,
+    }
+}
+
+/// The sourcemap entry a capture writes for a service holding `document`.
+fn sourcemap_node(document: &SettingsBytecode) -> Value {
+    let (root, children) = document
+        .instances
+        .split_first()
+        .expect("a store holds its service");
+    json!({
+        "name": root.name,
+        "className": root.class_name,
+        "children": children
+            .iter()
+            .map(|child| json!({"name": child.name, "className": child.class_name}))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// The sourcemap `bytes` with `nodes` over the entries of their services.
+fn with_sourcemap_nodes(bytes: Option<&[u8]>, nodes: &[Value]) -> Result<Vec<u8>> {
+    let mut map = bytes
+        .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+        .unwrap_or_else(|| json!({"name": "Game", "className": "DataModel", "children": []}));
+    let children = map["children"]
+        .as_array_mut()
+        .context("the sourcemap has no services")?;
+    for node in nodes {
+        match children
+            .iter_mut()
+            .find(|child| child["name"] == node["name"])
+        {
+            Some(child) => child.clone_from(node),
+            None => children.push(node.clone()),
+        }
+    }
+    Ok(serde_json::to_vec(&map)?)
+}
+
+fn write_sourcemap_nodes(path: &Path, nodes: &[Value]) -> Result<()> {
+    let map = with_sourcemap_nodes(fs::read(path).ok().as_deref(), nodes)?;
+    fs::write(path, map)?;
+    Ok(())
+}
+
+/// A baseline's files and the sourcemap it holds them with.
+type Kept = (ProjectSnapshot, Option<Box<SourcemapState>>);
+
+struct Settled {
+    files: ProjectSnapshot,
+    sourcemap: Vec<u8>,
+    read_back: Vec<String>,
+    baseline: Option<Kept>,
+    /// What a whole capture of Studio writes after the push, and the
+    /// sourcemap it writes.
+    whole: (ProjectSnapshot, Vec<u8>),
+}
+
+/// Files as a pull of both services leaves them: what it wrote, where, and
+/// the sourcemap it wrote.
+struct Pulled {
+    paths: Vec<PathBuf>,
+    held: ProjectSnapshot,
+    sourcemap: Vec<u8>,
+}
+
+/// Pulls ReplicatedStorage as `empty` and ServerStorage as `documents` say.
+fn pull_settle_services(
+    root: &Path,
+    (imported, other): (&Path, &Path),
+    (empty, documents): (&SettingsBytecode, &Documents),
+    elsewhere: Elsewhere,
+) -> Result<Pulled> {
+    let services = SETTLE_SERVICES.map(String::from);
+    let pulled = if elsewhere.respelled() {
+        crate::settings::bytecode::encode_settings_bytecode_v11(&documents.pulled)?
+    } else {
+        encode_settings_bytecode(&documents.pulled)?
+    };
+    fs::write(root.join(imported), encode_settings_bytecode(empty)?)?;
+    fs::write(root.join(other), pulled)?;
+    fs::create_dir_all(root.join("src/ServerStorage"))?;
+    fs::write(root.join(SETTLE_SCRIPT), "return 1")?;
+    let sourcemap = root.join("sourcemap.json");
+    write_sourcemap_nodes(
+        &sourcemap,
+        &[sourcemap_node(empty), sourcemap_node(&documents.pulled)],
+    )?;
+    if elsewhere != Elsewhere::Unwitnessed {
+        crate::snapshot::import::remember_pulled_encoding(
+            &fs::read(root.join(other))?,
+            "ServerStorage",
+        )?;
+    }
+    let paths = ExportProjectStage::create_for_comparison(root, Path::new("src"), &services)?
+        .publish_paths()
+        .to_vec();
+    Ok(Pulled {
+        held: capture_snapshot(root, &paths)?,
+        sourcemap: fs::read(sourcemap)?,
+        paths,
+    })
+}
+
+/// A whole push that imports ReplicatedStorage after a pull of both
+/// services, into a Studio holding ServerStorage as `documents` say. In
+/// `full`, Studio cannot say where it differs from the held proof, so every
+/// service settles. A `synchronous` push has no caller to answer early, so
+/// it settles before it answers.
+fn settle_import(
+    elsewhere: Elsewhere,
+    documents: &Documents,
+    full: bool,
+    synchronous: bool,
+) -> Result<Settled> {
+    let fixture = Fixture::new()?;
+    let bridge = fixture
+        .bridge
+        .as_ref()
+        .context("the fixture has no bridge")?;
+    let root = PathBuf::from(&fixture.context.root);
+    let services = SETTLE_SERVICES.map(String::from);
+    let imported = fixture
+        .desired
+        .entries
+        .keys()
+        .find(|path| path.extension().is_some_and(|ext| ext == "renium"))
+        .context("missing fixture store")?
+        .clone();
+    let other = PathBuf::from(
+        imported
+            .to_string_lossy()
+            .replace("ReplicatedStorage", "ServerStorage"),
+    );
+    fs::create_dir_all(root.join(other.parent().context("store has no parent")?))?;
+    let imported_store = fs::read(root.join(&imported))?;
+    let empty = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![SettingsBytecodeInstance::new(
+            "root".into(),
+            "ReplicatedStorage".into(),
+            "ReplicatedStorage".into(),
+            None,
+        )],
+    };
+    let Pulled {
+        paths,
+        held,
+        sourcemap,
+    } = pull_settle_services(&root, (&imported, &other), (&empty, documents), elsewhere)?;
+    let held_sourcemap =
+        crate::snapshot::export::collect_publish_hashes(&root, &[PathBuf::from("sourcemap.json")])?;
+    if elsewhere == Elsewhere::Remapped {
+        write_sourcemap_nodes(
+            &root.join("sourcemap.json"),
+            &[json!({
+                "name": "ServerStorage", "className": "ServerStorage",
+                "filePaths": ["src/ServerStorage"], "children": [],
+            })],
+        )?;
+    }
+    fs::write(root.join(&imported), &imported_store)?;
+    let mut readback = capture_snapshot(&root, &paths)?;
+    readback.entries.insert(
+        other.clone(),
+        SnapshotEntry::File(encode_settings_bytecode(&documents.after)?),
+    );
+    if elsewhere == Elsewhere::PushedScript {
+        readback.entries.insert(
+            SETTLE_SCRIPT.into(),
+            SnapshotEntry::File(b"return 2".to_vec()),
+        );
+    }
+    let nodes = [
+        (
+            SETTLE_SERVICES[0],
+            sourcemap_node(&crate::settings::bytecode::decode_settings_bytecode(
+                &imported_store,
+            )?),
+        ),
+        (SETTLE_SERVICES[1], sourcemap_node(&documents.after)),
+    ];
+    let whole_sourcemap = with_sourcemap_nodes(
+        Some(&sourcemap),
+        &nodes
+            .iter()
+            .map(|(_, node)| node.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let whole = readback.clone();
+    CAPTURES.with(|slot| slot.borrow_mut().clear());
+    if elsewhere == Elsewhere::Fresh {
+        replace_capture(held);
+    } else {
+        let mut baseline = VerifiedFullPush {
+            connections: bridge.runtime_connection_signature("push-fixture"),
+            input: full_push_cache_input(&fixture.push_args(), &services)?,
+            project: held,
+            paths: paths.clone(),
+            proof: json!({"held": true}),
+            expires: Instant::now() + Duration::from_secs(60),
+            sourcemap: (elsewhere != Elsewhere::Respelled).then(|| Box::new(held_sourcemap)),
+            #[cfg(windows)]
+            relay: None,
+        };
+        if elsewhere == Elsewhere::PushedScript {
+            fs::write(root.join(SETTLE_SCRIPT), "return 2\n")?;
+            let mut pushed = baseline.project.clone();
+            pushed.entries.insert(
+                SETTLE_SCRIPT.into(),
+                SnapshotEntry::File(b"return 2\n".to_vec()),
+            );
+            let verified = Map::from_iter([("sourceInexact".to_string(), json!(1))]);
+            baseline.sourcemap = sourcemap_after_push(&baseline, &pushed, &verified);
+            baseline.project = pushed;
+        }
+        keep_baseline(bridge, "push-fixture", baseline, "a pull");
+    }
+    let mut edited = documents.before.clone();
+    edited.instances[1]
+        .properties
+        .insert("Value".into(), json!("file edit"));
+    let edit = (root.join(&other), encode_settings_bytecode(&edited)?);
+    let tracker = Arc::clone(&fixture.tracker);
+    CAPTURES.with(|slot| {
+        slot.borrow_mut().push_back(Box::new(move |context| {
+            anyhow::ensure!(
+                import_settle::pending(context) != synchronous,
+                "the settlement ran on the other path"
+            );
+            if elsewhere == Elsewhere::EditedFile {
+                fs::write(&edit.0, &edit.1)?;
+            }
+            if elsewhere == Elsewhere::EditedLate {
+                let mut tracker = tracker.lock().unwrap();
+                tracker.edits.insert("ServerStorage".into(), json!(1));
+                tracker.changed_since_commit = true;
+            }
+            let (requested, stage) = last_requested();
+            let read = |service: &str| requested.iter().any(|name| name == service);
+            readback.entries.retain(|path, _| {
+                path.components().any(|part| {
+                    requested.iter().any(|service| {
+                        part.as_os_str() == service.as_str()
+                            || part.as_os_str() == format!("{service}.renium").as_str()
+                    })
+                })
+            });
+            write_sourcemap_nodes(
+                &stage.join("sourcemap.json"),
+                &nodes
+                    .iter()
+                    .filter(|(service, _)| read(service))
+                    .map(|(_, node)| node.clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            Ok(readback)
+        }))
+    });
+    {
+        let mut tracker = fixture.tracker.lock().unwrap();
+        tracker.edits = crate::roblox::services::DEFAULT_SYNC_SERVICES
+            .iter()
+            .map(|service| ((*service).to_string(), json!(0)))
+            .collect();
+        tracker.scope = elsewhere.scope().filter(|_| !full);
+    }
+    let tracker = Arc::clone(&fixture.tracker);
+    MUTATION.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_, _| {
+            let mut tracker = tracker.lock().unwrap();
+            tracker.committed = true;
+            if elsewhere == Elsewhere::Edited {
+                tracker.edits.insert("ServerStorage".into(), json!(1));
+            }
+            let mut committed = summary(true);
+            committed.insert("nativeVerifiedServices".into(), json!(SETTLE_SERVICES));
+            Ok(StagedPushResult {
+                generated: ProjectSnapshot::default(),
+                summary: committed,
+            })
+        }))
+    });
+    fixture.push_with(&services, None, (false, !synchronous))?;
+    anyhow::ensure!(
+        !import_settle::pending(&fixture.context),
+        "the settlement kept its journal"
+    );
+    let baseline = bridge
+        .verified_full_pushes
+        .lock_recover()
+        .remove("push-fixture")
+        .map(|kept| (kept.project, kept.sourcemap));
+    Ok(Settled {
+        files: capture_snapshot(&root, &paths)?,
+        sourcemap: fs::read(root.join("sourcemap.json"))?,
+        read_back: last_requested().0,
+        baseline,
+        whole: (whole, whole_sourcemap),
+    })
+}
+
+fn store_bytes<'a>(files: &'a ProjectSnapshot, service: &str) -> Option<&'a [u8]> {
+    files.entries.iter().find_map(|(path, entry)| match entry {
+        SnapshotEntry::File(bytes)
+            if path.extension().is_some_and(|ext| ext == "renium")
+                && path.to_string_lossy().contains(service) =>
+        {
+            Some(bytes.as_slice())
+        }
+        _ => None,
+    })
+}
+
+/// A settlement that skips services leaves what the full one leaves, and a
+/// baseline either keeps is what a whole capture of Studio writes, its
+/// sourcemap included.
+fn narrowed_like_full(narrow: &Settled, full: &Settled) -> Result<(), String> {
+    let differing = narrow
+        .files
+        .entries
+        .keys()
+        .chain(full.files.entries.keys())
+        .filter(|path| narrow.files.entries.get(*path) != full.files.entries.get(*path))
+        .collect::<BTreeSet<_>>();
+    if !differing.is_empty() || narrow.sourcemap != full.sourcemap {
+        return Err(format!(
+            "the settled files differ at {differing:?}, sourcemap equal: {}",
+            narrow.sourcemap == full.sourcemap
+        ));
+    }
+    if narrow.baseline != full.baseline {
+        return Err(format!(
+            "kept a baseline: {} and, in full, {}",
+            narrow.baseline.is_some(),
+            full.baseline.is_some()
+        ));
+    }
+    let (whole, sourcemap) = &full.whole;
+    let captured = SourcemapState::from([(
+        PathBuf::from("sourcemap.json"),
+        crate::snapshot::export::file_publish_state(sourcemap),
+    )]);
+    match &full.baseline {
+        Some((files, _)) if files != whole => Err(format!(
+            "a kept baseline's files are not what a whole capture writes at {:?}",
+            files
+                .entries
+                .keys()
+                .chain(whole.entries.keys())
+                .filter(|path| files.entries.get(*path) != whole.entries.get(*path))
+                .collect::<BTreeSet<_>>()
+        )),
+        Some((_, kept)) if kept.as_deref() != Some(&captured) => {
+            Err("a kept baseline does not hold the sourcemap a whole capture writes".into())
+        }
+        _ => Ok(()),
+    }
+}
+
+// The oracle is the settlement that reads every service back. Reading back
+// only what the push wrote, what Studio says differs from the held proof and
+// what refers into those must leave the same files and keep the same
+// baseline, which must be what a whole capture of Studio writes.
+#[test]
+fn seeded_import_settlement_reads_back_only_what_can_differ() {
+    use Elsewhere::*;
+    let scenarios = Elsewhere::ALL.len() as u64;
+    crate::tests::support::run_seeds(2 * scenarios, |seed, log| {
+        let elsewhere = Elsewhere::ALL[(seed % scenarios) as usize];
+        let synchronous = elsewhere == EditedLate || seed / scenarios % 2 == 1;
+        let documents = elsewhere_documents(seed, elsewhere);
+        log.push(format!(
+            "{elsewhere:?} with {} ServerStorage instances, synchronous={synchronous}",
+            documents.before.instances.len()
+        ));
+        let run = |full| {
+            settle_import(elsewhere, &documents, full, synchronous)
+                .map_err(|error| format!("{error:#}"))
+        };
+        let (narrow, full) = (run(false)?, run(true)?);
+        let studio =
+            encode_settings_bytecode(&documents.after).map_err(|error| error.to_string())?;
+        if (elsewhere != EditedFile)
+            != (store_bytes(&full.files, "ServerStorage") == Some(studio.as_slice()))
+        {
+            return Err("the full settlement did not write Studio's copy".into());
+        }
+        let script: &[u8] = if elsewhere == PushedScript {
+            b"return 2"
+        } else {
+            b"return 1"
+        };
+        if full.files.entries.get(Path::new(SETTLE_SCRIPT))
+            != Some(&SnapshotEntry::File(script.into()))
+        {
+            return Err("the full settlement did not write Studio's script".into());
+        }
+        if full.baseline.is_some() == matches!(elsewhere, Edited | EditedLate | EditedFile) {
+            return Err(format!("kept a baseline: {}", full.baseline.is_some()));
+        }
+        narrowed_like_full(&narrow, &full)?;
+        let expected = if !synchronous && matches!(elsewhere, Untouched | EditedFile) {
+            &SETTLE_SERVICES[..1]
+        } else {
+            &SETTLE_SERVICES[..]
+        };
+        if narrow.read_back != expected || full.read_back != SETTLE_SERVICES {
+            return Err(format!(
+                "read back {:?} and, in full, {:?}",
+                narrow.read_back, full.read_back
+            ));
+        }
+        Ok(())
+    });
 }

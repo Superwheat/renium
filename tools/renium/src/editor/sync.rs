@@ -3663,6 +3663,10 @@ fn verify_pushed_sources(
         "sourceVerifyFailed".to_string(),
         json!(verification.failed.len() as u64),
     );
+    summary.insert(
+        "sourceInexact".to_string(),
+        json!(verification.inexact as u64),
+    );
     if verification.failed.is_empty() {
         return Ok(());
     }
@@ -4168,10 +4172,10 @@ fn push_with_reader_platform(
     announce_unreviewed_deletions(&args, &changes);
     log_timing("native editor push filters", phase_started);
     let phase_started = Instant::now();
-    let unchanged_sources = if prepared_binary_import.is_none() {
+    let (unchanged_sources, inexact_unchanged) = if prepared_binary_import.is_none() {
         drop_unchanged_source_changes(bridge, &mut changes)?
     } else {
-        0
+        (0, 0)
     };
     log_timing("native editor unchanged source filter", phase_started);
     let phase_started = Instant::now();
@@ -4404,6 +4408,16 @@ fn push_with_reader_platform(
         }
         if unchanged_sources > 0 {
             summary.insert("sourceUnchanged".to_string(), json!(unchanged_sources));
+            if inexact_unchanged > 0 {
+                let inexact = summary
+                    .get("sourceInexact")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                summary.insert(
+                    "sourceInexact".to_string(),
+                    json!(inexact + inexact_unchanged as u64),
+                );
+            }
             if args.verify_sources {
                 let verified = summary
                     .get("sourceVerified")
@@ -5430,6 +5444,8 @@ fn reject_direct_read_only_package_change(
 #[derive(Default)]
 struct EditorSourceVerification {
     verified: usize,
+    /// Verified sources Studio holds in other bytes than the file's.
+    inexact: usize,
     failed_indexes: Vec<usize>,
     failed: Vec<String>,
 }
@@ -5596,10 +5612,12 @@ fn fetch_live_source_batch(
 // preflight and history recording scoped to real edits. A final line break
 // the file has and Studio lacks is an edit: a sync compares the two texts as
 // they are, so leaving it out would make the next one see Studio differ.
+// Returns how many it dropped, and how many of those Studio holds with other
+// line breaks than the file.
 fn drop_unchanged_source_changes(
     bridge: &BridgeServer,
     changes: &mut EditorChangeSet,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
     let indexes = changes
         .source_changes
         .iter()
@@ -5607,7 +5625,7 @@ fn drop_unchanged_source_changes(
         .filter_map(|(index, change)| (!change.deleted && change.source.is_some()).then_some(index))
         .collect::<Vec<_>>();
     if indexes.is_empty() {
-        return Ok(0);
+        return Ok((0, 0));
     }
     let sources = fetch_live_editor_sources(bridge, changes, &indexes, None)?;
     let unchanged = indexes
@@ -5626,8 +5644,18 @@ fn drop_unchanged_source_changes(
         })
         .collect::<HashSet<_>>();
     if unchanged.is_empty() {
-        return Ok(0);
+        return Ok((0, 0));
     }
+    let inexact = unchanged
+        .iter()
+        .filter(|index| {
+            matches!(
+                sources.get(*index),
+                Some(Ok(live))
+                    if Some(live.source.as_str()) != changes.source_changes[**index].source.as_deref()
+            )
+        })
+        .count();
     if global_log_enabled(5) {
         for index in &unchanged {
             let change = &changes.source_changes[*index];
@@ -5663,7 +5691,7 @@ fn drop_unchanged_source_changes(
         index += 1;
         keep
     });
-    Ok(unchanged.len())
+    Ok((unchanged.len(), inexact))
 }
 
 fn verify_editor_source_changes(
@@ -5678,6 +5706,7 @@ fn verify_editor_source_changes(
         .filter_map(|(index, change)| (!change.deleted && change.source.is_some()).then_some(index))
         .collect::<Vec<_>>();
     let verified = pending.len();
+    let mut inexact = 0;
     let mut failures = HashMap::<usize, String>::with_capacity(verified);
     let retry_delays = [
         Duration::ZERO,
@@ -5704,7 +5733,10 @@ fn verify_editor_source_changes(
             let change = &changes.source_changes[*index];
             let expected = change.source.as_deref().unwrap_or_default();
             let failure = match sources.get(index) {
-                Some(Ok(live)) if editor_sources_match(expected, &live.source) => None,
+                Some(Ok(live)) if editor_sources_match(expected, &live.source) => {
+                    inexact += usize::from(live.source != expected);
+                    None
+                }
                 Some(Ok(live)) => Some(format!(
                     "{} source mismatch ({} vs {} bytes in Studio)",
                     change.path_segments.join("."),
@@ -5740,6 +5772,7 @@ fn verify_editor_source_changes(
         .collect();
     Ok(EditorSourceVerification {
         verified: verified - failed_indexes.len(),
+        inexact,
         failed_indexes,
         failed,
     })
@@ -7429,6 +7462,74 @@ mod sync_tests {
                 "{file:?} {studio:?}"
             );
         }
+    }
+
+    /// A push counts the scripts Studio holds in other bytes than the file:
+    /// those it verifies and those it finds unchanged.
+    #[test]
+    fn a_push_counts_the_scripts_studio_holds_in_other_bytes() -> anyhow::Result<()> {
+        use super::{EditorChangeSet, drop_unchanged_source_changes, verify_editor_source_changes};
+        use crate::editor::types::EditorSourceChange;
+        use crate::studio::bridge::routing_tests;
+        use serde_json::{Value, json};
+        use tungstenite::{Message, WebSocket, protocol::Role};
+        // (file, Studio)
+        let scripts = [
+            ("return 1", "return 1"),
+            ("return 2\n", "return 2"),
+            ("a\r\nb", "a\nb"),
+            ("return 3", "return 4"),
+        ];
+        let bridge = routing_tests::fixture();
+        let stream = routing_tests::connect(&bridge, 0, routing_tests::edit_info("sources", 20));
+        let studio = scripts.map(|(_, studio)| studio);
+        let plugin = std::thread::spawn(move || {
+            let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
+            while let Ok(Message::Text(text)) = socket.read() {
+                let request: Value = serde_json::from_str(&text).unwrap();
+                let rows = request["params"]["selectors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|selector| {
+                        let index = selector["index"].as_u64().unwrap();
+                        json!({"index": index, "source": studio[index as usize], "className": "ModuleScript"})
+                    })
+                    .collect::<Vec<_>>();
+                let reply = json!({"id": request["id"], "ok": true, "result": {"rows": rows}});
+                if socket
+                    .send(Message::Text(reply.to_string().into()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let mut changes = EditorChangeSet {
+            source_changes: scripts
+                .iter()
+                .enumerate()
+                .map(|(index, (file, _))| EditorSourceChange {
+                    service: "ServerStorage".into(),
+                    settings_id: None,
+                    path_segments: vec!["ServerStorage".into(), format!("Script{index}")],
+                    path_ordinals: vec![1, 1],
+                    class_name: "ModuleScript".into(),
+                    source: Some((*file).into()),
+                    deleted: false,
+                })
+                .collect(),
+            ..EditorChangeSet::default()
+        };
+        let verification = verify_editor_source_changes(&bridge, &changes, None)?;
+        assert_eq!((verification.verified, verification.inexact), (3, 2));
+        assert_eq!(
+            drop_unchanged_source_changes(&bridge, &mut changes)?,
+            (2, 1)
+        );
+        drop(bridge);
+        let _ = plugin.join();
+        Ok(())
     }
 
     #[test]

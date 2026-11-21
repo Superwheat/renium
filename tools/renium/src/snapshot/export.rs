@@ -205,7 +205,20 @@ impl ExportProjectStage {
     }
 
     pub(crate) fn create(project_root: &Path, src_dir: &Path, services: &[String]) -> Result<Self> {
-        Self::create_inner(project_root, src_dir, services, true, false)
+        Self::create_inner(project_root, src_dir, services, true, false, None)
+    }
+
+    /// Like `create`, with the publication baseline of the stage's publish
+    /// paths taken from `baseline` instead of hashing the files again, for a
+    /// caller that has just read them. Publication still compares the files
+    /// on disk with it, so a baseline older than the copy fails closed.
+    pub(crate) fn create_with_baseline(
+        project_root: &Path,
+        src_dir: &Path,
+        services: &[String],
+        baseline: PublishBaseline<'_>,
+    ) -> Result<Self> {
+        Self::create_inner(project_root, src_dir, services, true, false, Some(baseline))
     }
 
     /// Like `create`, but copies existing files in the background. Only callers
@@ -215,7 +228,7 @@ impl ExportProjectStage {
         src_dir: &Path,
         services: &[String],
     ) -> Result<Self> {
-        Self::create_inner(project_root, src_dir, services, true, true)
+        Self::create_inner(project_root, src_dir, services, true, true, None)
     }
 
     pub(crate) fn copy_gate(&self) -> Option<crate::snapshot::import::ImportReadyGate> {
@@ -239,7 +252,7 @@ impl ExportProjectStage {
         {
             bail!("Project requires a staged comparison");
         }
-        Self::create_inner(project_root, src_dir, services, false, false)
+        Self::create_inner(project_root, src_dir, services, false, false, None)
     }
 
     fn create_inner(
@@ -248,6 +261,7 @@ impl ExportProjectStage {
         services: &[String],
         clone_project_data: bool,
         background_copy: bool,
+        baseline: Option<PublishBaseline<'_>>,
     ) -> Result<Self> {
         let started = Instant::now();
         let parent = project_root
@@ -294,10 +308,10 @@ impl ExportProjectStage {
         publish_paths.push(PathBuf::from("sourcemap.json"));
         normalize_owned_paths(&mut clone_paths);
         normalize_owned_paths(&mut publish_paths);
-        let publish_baseline = if clone_project_data {
-            collect_publish_hashes(project_root, &publish_paths)?
-        } else {
-            BTreeMap::new()
+        let publish_baseline = match baseline {
+            _ if !clone_project_data => BTreeMap::new(),
+            Some(baseline) => baseline(&publish_paths)?,
+            None => collect_publish_hashes(project_root, &publish_paths)?,
         };
         // Loading the staged project below reads its configuration files, and a
         // temporary projection, tree nodes or mounts can read staged data too.
@@ -1225,6 +1239,10 @@ pub(crate) enum PublishEntryState {
     },
     Symlink(PathBuf),
 }
+
+/// The publication baseline of a stage's publish paths.
+pub(crate) type PublishBaseline<'a> =
+    &'a dyn Fn(&[PathBuf]) -> Result<BTreeMap<PathBuf, PublishEntryState>>;
 
 #[derive(Clone, Copy)]
 enum PublishEntryKind {

@@ -9516,7 +9516,8 @@ fn no_store_is_read_for_what_refers_to_no_service() -> Result<()> {
 /// A pull answered from a baseline writes no sourcemap for the services it
 /// does not capture, so it answers only while the sourcemap is the one the
 /// last pull on the baseline left. A push of script sources keeps that
-/// sourcemap; one of a store or of other files does not.
+/// sourcemap where Studio holds them byte for byte; one of a store or of
+/// other files does not, nor does a settlement that kept files back.
 #[cfg(any(windows, target_os = "macos"))]
 #[test]
 fn a_baseline_answers_a_pull_only_while_the_sourcemap_is_as_its_pull_left_it() -> Result<()> {
@@ -9557,14 +9558,32 @@ fn a_baseline_answers_a_pull_only_while_the_sourcemap_is_as_its_pull_left_it() -
         relay: None,
     };
     assert!(held.sourcemap.is_some() && sourcemap_as_left(&root, &held)?);
-    assert!(sourcemap_after_push(&held, &project(b"return 2", b"store")) == held.sourcemap);
-    assert!(sourcemap_after_push(&held, &project(b"return 1", b"renamed")).is_none());
+    let verified = |inexact: u64| Map::from_iter([("sourceInexact".to_string(), json!(inexact))]);
+    let exact = verified(0);
+    assert!(sourcemap_after_push(&held, &project(b"return 2", b"store"), &exact) == held.sourcemap);
+    assert!(
+        sourcemap_after_push(&held, &project(b"return 2\n", b"store"), &verified(1)).is_none(),
+        "Studio holds the script without the file's final line break"
+    );
+    assert!(sourcemap_after_push(&held, &project(b"return 2", b"store"), &Map::new()).is_none());
+    assert!(sourcemap_after_push(&held, &held.project, &Map::new()) == held.sourcemap);
+    assert!(sourcemap_after_push(&held, &project(b"return 1", b"renamed"), &exact).is_none());
     let mut added = project(b"return 1", b"store");
     added.entries.insert(
         PathBuf::from("src/ReplicatedStorage/Other.luau"),
         SnapshotEntry::File(b"return 3".to_vec()),
     );
-    assert!(sourcemap_after_push(&held, &added).is_none());
+    assert!(sourcemap_after_push(&held, &added, &exact).is_none());
+    let pulled = super::import_settle::pulled_sourcemap;
+    assert!(pulled(&published) == held.sourcemap);
+    published.preserved.push(module.clone());
+    assert!(pulled(&published).is_none(), "a file kept back");
+    published.preserved.clear();
+    published.read_only_links_restored.push(json!({}));
+    assert!(pulled(&published).is_none(), "a link restored");
+    published.read_only_links_restored.clear();
+    published.studio_overrides.insert(module.clone(), None);
+    assert!(pulled(&published).is_none(), "a Studio override kept");
     fs::write(root.join(&sourcemap), b"{\"name\":\"edited\"}")?;
     assert!(!sourcemap_as_left(&root, &held)?);
     fs::remove_file(root.join(&sourcemap))?;
