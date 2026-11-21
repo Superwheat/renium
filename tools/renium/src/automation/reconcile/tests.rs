@@ -7789,8 +7789,14 @@ from the whole documents:
         // one copy alone holds: about four for each store with a run over
         // 3,000 seeds, five over the 300 run by default.
         let copies = copies.into_inner().unwrap();
-        let held = super::replacement::ALIGNED_BESIDE_RUN.lock().unwrap();
-        let aligned = held.iter().filter(|key| copies.contains(*key)).count();
+        // Counted and let go: an assert that failed holding it would fail
+        // every later preparation of this binary too.
+        let aligned = (super::replacement::ALIGNED_BESIDE_RUN
+            .lock()
+            .unwrap()
+            .iter())
+        .filter(|key| copies.contains(*key))
+        .count();
         assert!(
             aligned >= 2 * counts[8],
             "aligned beside a run: {aligned}, of {} stores with a run",

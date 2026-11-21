@@ -65,6 +65,10 @@ fn send_on_stream(stream: &TcpStream, request: &super::Request) -> Result<super:
     send_on_stream_with_timeout(stream, request, timeout)
 }
 
+/// The longest `-w SECONDS` waits for a Studio to connect: a large place
+/// opened cold takes minutes.
+pub(crate) const MAX_BRIDGE_WAIT_SECONDS: f64 = 600.0;
+
 // A wait runs for up to an hour and answers `timedOut` itself, so the
 // client holds on for that timeout plus the connection wait and a margin
 // instead of the generic half-hour cap.
@@ -76,7 +80,7 @@ fn wait_response_limit(parameters: &serde_json::Value) -> Duration {
     let bridge_wait = parameters["bridgeWaitSeconds"]
         .as_f64()
         .unwrap_or(8.0)
-        .clamp(1.0, 30.0);
+        .clamp(1.0, MAX_BRIDGE_WAIT_SECONDS);
     Duration::from_secs_f64(timeout + bridge_wait) + LUAU_QUEUE_MARGIN
 }
 
@@ -85,7 +89,7 @@ fn wait_response_limit(parameters: &serde_json::Value) -> Duration {
 const STATUS_RESPONSE_MARGIN: Duration = Duration::from_secs(4);
 
 pub(crate) fn status_response_limit(bridge_wait_seconds: f64) -> Duration {
-    Duration::try_from_secs_f64(bridge_wait_seconds.clamp(1.0, 30.0))
+    Duration::try_from_secs_f64(bridge_wait_seconds.clamp(1.0, MAX_BRIDGE_WAIT_SECONDS))
         .unwrap_or(Duration::from_secs(8))
         + STATUS_RESPONSE_MARGIN
 }
@@ -103,7 +107,7 @@ fn luau_response_limit(parameters: &serde_json::Value) -> Duration {
     let bridge_wait = parameters["bridgeWaitSeconds"]
         .as_f64()
         .unwrap_or(8.0)
-        .clamp(1.0, 30.0);
+        .clamp(1.0, MAX_BRIDGE_WAIT_SECONDS);
     Duration::from_secs_f64(timeout + bridge_wait) + LUAU_QUEUE_MARGIN
 }
 
@@ -363,7 +367,11 @@ mod luau_response_limit_tests {
         );
         assert_eq!(
             luau_response_limit(&json!({ "timeout": 600.0, "bridgeWaitSeconds": 90.0 })),
-            Duration::from_secs(175)
+            Duration::from_secs(235)
+        );
+        assert_eq!(
+            luau_response_limit(&json!({ "timeout": 600.0, "bridgeWaitSeconds": 9000.0 })),
+            Duration::from_secs(745)
         );
         assert_eq!(luau_response_limit(&json!({})), Duration::from_secs(43));
     }
@@ -387,7 +395,8 @@ mod luau_response_limit_tests {
     #[test]
     fn status_waits_for_a_launching_studio_plus_its_state_read() {
         assert_eq!(status_response_limit(8.0), Duration::from_secs(12));
-        assert_eq!(status_response_limit(90.0), Duration::from_secs(34));
+        assert_eq!(status_response_limit(90.0), Duration::from_secs(94));
+        assert_eq!(status_response_limit(9000.0), Duration::from_secs(604));
         assert_eq!(status_response_limit(f64::NAN), Duration::from_secs(12));
     }
 }

@@ -1293,7 +1293,7 @@ fn daemon_control_request_inner(
         .get("bridgeWaitSeconds")
         .and_then(Value::as_f64)
         .unwrap_or(8.0)
-        .clamp(1.0, 30.0);
+        .clamp(1.0, crate::automation::client::MAX_BRIDGE_WAIT_SECONDS);
     let bridge_ports = parameters
         .get("bridgePorts")
         .and_then(Value::as_str)
