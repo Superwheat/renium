@@ -1297,18 +1297,12 @@ pub(super) fn compare(
     let paired = kept.and_then(|(kept, _)| pair_rows(kept, &second, &of_second, reading));
     let second = match paired {
         Ok(Some(mut paired)) => {
-            let release = move || {
+            // The DOM goes while the first place is read again and the
+            // answer is made.
+            let released = std::thread::spawn(move || {
                 drop(second);
                 release_between_phases();
-            };
-            // Where no place is read again, the DOM goes while the answer
-            // is made.
-            let released = if paired.owed.is_empty() {
-                Some(std::thread::spawn(release))
-            } else {
-                release();
-                None
-            };
+            });
             let by_rows = (|| -> Result<Option<Value>> {
                 if !fill_rows(&mut paired, before, &of_first, reading)? {
                     return Ok(None);
@@ -1318,9 +1312,7 @@ pub(super) fn compare(
             if let Ok(Some(result)) = by_rows {
                 return Ok(result);
             }
-            if let Some(released) = released {
-                let _ = released.join();
-            }
+            let _ = released.join();
             after()?
         }
         // The rows were read of the second DOM and it stands as it was read.
@@ -1986,7 +1978,7 @@ impl Pairing {
     ) -> Self {
         let rows = (first.instances.iter().enumerate())
             .map(|(row, instance)| (instance.settings_id.as_str(), row))
-            .collect::<HashMap<_, _>>();
+            .collect::<ahash::AHashMap<_, _>>();
         let in_first = (second.instances.iter())
             .map(|instance| rows.get(instance.settings_id.as_str()).copied())
             .collect::<Vec<_>>();
@@ -2108,7 +2100,7 @@ fn rows_read_whole([first, second]: [&SettingsBytecode; 2], pairing: &Pairing) -
     let shapes = std::cell::OnceCell::new();
     let mut weighed = 0;
     for siblings in children[1].iter().filter(|siblings| siblings.len() > 1) {
-        let mut groups: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+        let mut groups = ahash::AHashMap::<(&str, &str), Vec<usize>>::new();
         for sibling in siblings {
             let instance = &other[*sibling];
             let key = (instance.name.as_str(), instance.class_name.as_str());

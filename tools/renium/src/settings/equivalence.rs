@@ -1408,13 +1408,13 @@ fn store_identities_follow_mapping(
 type IdentityGroupKey<'a> = (Option<usize>, &'a str, &'a str);
 
 struct IdentityLookup<'a> {
-    reference_by_id: HashMap<&'a str, usize>,
+    reference_by_id: AHashMap<&'a str, usize>,
     reference_by_unique_id: AHashMap<&'a str, Option<usize>>,
     observed_by_unique_id: AHashMap<&'a str, Option<usize>>,
 }
 
 struct ScoreInputs<'a, 'b> {
-    reference_groups: &'b HashMap<IdentityGroupKey<'a>, Vec<usize>>,
+    reference_groups: &'b AHashMap<IdentityGroupKey<'a>, Vec<usize>>,
     reference_graph: &'b ReferenceGraph,
     observed_graph: &'b ReferenceGraph,
     subtree_keys: Option<&'b (Vec<usize>, Vec<usize>)>,
@@ -1437,14 +1437,17 @@ pub(crate) enum ByOrder {
 struct IdentityAssignment<'a> {
     reference: &'a SettingsBytecode,
     observed: &'a SettingsBytecode,
-    old_ids: Vec<String>,
-    reserved_reference_ids: HashSet<String>,
-    blocked_ids: HashSet<String>,
+    /// The ids of the reference, which only its own instances take.
+    reserved_reference_ids: AHashSet<&'a str>,
+    /// The ids an instance without a counterpart cannot be given a made-up
+    /// id of: those of both copies and the ones made up so far. Read at the
+    /// first id that has to be made up.
+    blocked_ids: Option<AHashSet<String>>,
     assigned_ids: Vec<Option<String>>,
     assigned_reference: Vec<Option<usize>>,
     assigned_observed: Vec<Option<usize>>,
     used_reference: Vec<bool>,
-    used_ids: HashSet<String>,
+    used_ids: AHashSet<std::borrow::Cow<'a, str>>,
     generated: usize,
     remaining: usize,
     shape_keys: Option<(Vec<u64>, Vec<u64>)>,
@@ -1693,18 +1696,13 @@ impl<'a> IdentityAssignment<'a> {
         Self {
             reference,
             observed,
-            old_ids: observed
-                .instances
-                .iter()
-                .map(|instance| instance.settings_id.clone())
-                .collect(),
-            reserved_reference_ids: HashSet::new(),
-            blocked_ids: HashSet::new(),
+            reserved_reference_ids: AHashSet::new(),
+            blocked_ids: None,
             assigned_ids: vec![None; observed.instances.len()],
             assigned_reference: vec![None; observed.instances.len()],
             assigned_observed: vec![None; reference.instances.len()],
             used_reference: vec![false; reference.instances.len()],
-            used_ids: HashSet::new(),
+            used_ids: AHashSet::new(),
             generated: 0,
             remaining: observed.instances.len(),
             shape_keys: None,
@@ -1714,27 +1712,35 @@ impl<'a> IdentityAssignment<'a> {
     }
 
     fn assign(&mut self, index: usize, candidate: usize) {
-        let id = self.reference.instances[candidate].settings_id.clone();
+        let reference = self.reference;
+        let id = &reference.instances[candidate].settings_id;
         self.used_reference[candidate] = true;
-        self.used_ids.insert(id.clone());
+        self.used_ids.insert(std::borrow::Cow::Borrowed(id));
         self.assigned_reference[index] = Some(candidate);
         self.assigned_observed[candidate] = Some(index);
-        self.assigned_ids[index] = Some(id);
+        self.assigned_ids[index] = Some(id.clone());
         self.remaining -= 1;
     }
 
     fn assign_fresh(&mut self, index: usize) {
-        let preferred = &self.old_ids[index];
+        let (reference, observed) = (self.reference, self.observed);
+        let preferred = observed.instances[index].settings_id.as_str();
         let id = if !self.reserved_reference_ids.contains(preferred)
-            && self.used_ids.insert(preferred.clone())
+            && self.used_ids.insert(std::borrow::Cow::Borrowed(preferred))
         {
-            preferred.clone()
+            preferred.to_string()
         } else {
+            let blocked = self.blocked_ids.get_or_insert_with(|| {
+                (reference.instances.iter())
+                    .chain(&observed.instances)
+                    .map(|instance| instance.settings_id.clone())
+                    .collect()
+            });
             loop {
                 let candidate = format!("reconcile:{:x}", self.generated);
                 self.generated += 1;
-                if self.blocked_ids.insert(candidate.clone())
-                    && self.used_ids.insert(candidate.clone())
+                if blocked.insert(candidate.clone())
+                    && (self.used_ids).insert(std::borrow::Cow::Owned(candidate.clone()))
                 {
                     break candidate;
                 }
@@ -1805,7 +1811,7 @@ impl<'a> IdentityAssignment<'a> {
                     !self.used_reference[*candidate]
                         && !self
                             .used_ids
-                            .contains(&reference.instances[*candidate].settings_id)
+                            .contains(reference.instances[*candidate].settings_id.as_str())
                 })
             else {
                 continue;
@@ -1816,7 +1822,7 @@ impl<'a> IdentityAssignment<'a> {
         progressed
     }
 
-    fn run_unique(&mut self, reference_groups: &HashMap<IdentityGroupKey<'a>, Vec<usize>>) {
+    fn run_unique(&mut self, reference_groups: &AHashMap<IdentityGroupKey<'a>, Vec<usize>>) {
         let observed = self.observed;
         let mut observed_counts = AHashMap::with_capacity(observed.instances.len());
         for instance in &observed.instances {
@@ -1940,7 +1946,7 @@ impl<'a> IdentityAssignment<'a> {
                 subtree_keys: inputs.subtree_keys,
             };
             let proposals = identity_group_proposals(&score_context, &observed_group, &candidates);
-            let mut proposal_counts = HashMap::<usize, usize>::new();
+            let mut proposal_counts = AHashMap::<usize, usize>::new();
             for (_, candidate) in &proposals {
                 *proposal_counts.entry(*candidate).or_default() += 1;
             }
@@ -1987,7 +1993,7 @@ impl<'a> IdentityAssignment<'a> {
 
     fn run_fallback(
         &mut self,
-        reference_groups: &HashMap<IdentityGroupKey<'a>, Vec<usize>>,
+        reference_groups: &AHashMap<IdentityGroupKey<'a>, Vec<usize>>,
     ) -> bool {
         let mut progressed = false;
         let shapes = self.shape_keys.take().unwrap_or_else(|| {
@@ -3041,7 +3047,7 @@ fn match_settings_ids(
         reference_by_unique_id: persistent_identity_index(reference),
         observed_by_unique_id: persistent_identity_index(observed),
     };
-    let mut reference_groups = HashMap::<IdentityGroupKey, Vec<usize>>::new();
+    let mut reference_groups = AHashMap::<IdentityGroupKey, Vec<usize>>::new();
     for (index, instance) in reference.instances.iter().enumerate() {
         if candidate_filters.as_ref().is_some_and(|(_, names)| {
             !names.contains(&(instance.name.as_str(), instance.class_name.as_str()))
@@ -3074,19 +3080,9 @@ fn match_settings_ids(
     );
 
     if state.remaining > 0 {
-        // Collision sets are needed only when matching must synthesize IDs.
-        // An empty destination normally resolves all retained roots directly;
-        // don't clone every incoming ID twice for that completed mapping.
-        state.reserved_reference_ids = reference
-            .instances
-            .iter()
-            .map(|instance| instance.settings_id.clone())
-            .collect();
-        state.blocked_ids = state
-            .reserved_reference_ids
-            .iter()
-            .chain(&state.old_ids)
-            .cloned()
+        // Needed only when matching leaves an instance without a counterpart.
+        state.reserved_reference_ids = (reference.instances.iter())
+            .map(|instance| instance.settings_id.as_str())
             .collect();
         let phase = Instant::now();
         let (reference_graph, observed_graph) = rayon::join(
@@ -3141,9 +3137,10 @@ fn match_settings_ids(
             told_alone,
         };
         let mut unchanged_content_groups = HashMap::new();
+        // `run_exact` paired what ids pair before this: an instance it left
+        // has no counterpart by id, or one that is taken for good.
         while state.remaining > 0 {
-            let mut progressed = state.run_exact(&lookup);
-            progressed |= state.run_scored(&inputs, &mut unchanged_content_groups);
+            let progressed = state.run_scored(&inputs, &mut unchanged_content_groups);
             if state.compares_values {
                 return None;
             }
