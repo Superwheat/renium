@@ -212,7 +212,9 @@ fn merge_sides(
             .and_then(|name| name.to_str())
             .is_some_and(is_service_settings_file_name)
         {
-            merge_settings_entry(&path, sides, base.is_none(), conflicts)?
+            pass("store merge", || {
+                merge_settings_entry(&path, sides, base.is_none(), conflicts)
+            })?
         } else {
             merge_entry(
                 &path,
@@ -239,14 +241,18 @@ fn merge_sides(
             merged.insert(path, value);
         }
     }
-    reference_settlement::settle_references_between_stores(
-        sides,
-        &mut merged,
-        conflicts,
-        &mut changes,
-    )?;
+    pass("merge: references between stores", || {
+        reference_settlement::settle_references_between_stores(
+            sides,
+            &mut merged,
+            conflicts,
+            &mut changes,
+        )
+    })?;
     keep_directories_implied_by_files(&mut merged, sides, &mut changes);
-    settle_script_paths(sides, &mut merged, conflicts, &mut changes)?;
+    pass("merge: script paths settled", || {
+        settle_script_paths(sides, &mut merged, conflicts, &mut changes)
+    })?;
     Ok((ProjectSnapshot { entries: merged }, changes))
 }
 
@@ -312,7 +318,28 @@ pub(crate) fn script_paths_by_settings_id(
     let Some(entry) = entries.get(settings_path) else {
         return Ok(HashMap::new());
     };
-    script_paths_of(&settings_document(Some(entry))?, settings_path)
+    script_paths_of(&scripts_document(Some(entry))?, settings_path)
+}
+
+/// A store's instances with the values of its scripts alone, which is all
+/// their paths are read from, where it is a store in blocks.
+fn scripts_document(entry: Option<&SnapshotEntry>) -> Result<SettingsBytecode> {
+    use crate::settings::bytecode::blocks::{RowReader, is_block_store};
+    let Some(SnapshotEntry::File(bytes)) = entry else {
+        return settings_document(entry);
+    };
+    if !is_block_store(bytes) {
+        return settings_document(entry);
+    }
+    let (mut document, mut rows) = RowReader::decode(bytes)?;
+    let scripts = (document.instances.iter().enumerate())
+        .filter(|(_, instance)| is_lua_source_class(&instance.class_name))
+        .map(|(row, _)| row)
+        .collect::<Vec<_>>();
+    rows.fill(&mut document, &scripts)?;
+    stabilize_settings_reference_ids(&mut document);
+    canonicalize_settings_property_names(&mut document)?;
+    Ok(document)
 }
 
 fn script_paths_of(
@@ -591,7 +618,7 @@ pub(crate) fn settle_script_paths(
             .unwrap_or_default();
         let editor_paths = script_paths_by_settings_id(&editor.entries, &settings_path)?;
         let studio_paths = script_paths_by_settings_id(&studio.entries, &settings_path)?;
-        let merged_store = settings_document(merged.get(&settings_path))?;
+        let merged_store = scripts_document(merged.get(&settings_path))?;
         let merged_paths = script_paths_of(&merged_store, &settings_path)?;
         // Each side by the identities the merged store uses. Where the merge
         // left a side's store as it was, that store is the merged one.
@@ -1010,6 +1037,9 @@ pub(crate) fn first_three_way_property_difference(
         ) else {
             continue;
         };
+        if base.properties == editor.properties && base.properties == studio.properties {
+            continue;
+        }
         let keys = base
             .properties
             .keys()
@@ -1048,6 +1078,11 @@ pub(crate) fn first_three_way_property_difference(
     None
 }
 
+fn pass<T>(label: &str, run: impl FnOnce() -> T) -> T {
+    let _span = crate::app::profile::span(label);
+    run()
+}
+
 pub(crate) fn merge_settings_entry(
     path: &Path,
     sides: &SnapshotSides<'_>,
@@ -1083,11 +1118,14 @@ pub(crate) fn merge_settings_entry(
             editor_script_paths: None,
         });
     }
-    let mut editor_doc = settings_document(editor)
+    let _whole = crate::app::profile::span("store merge: whole documents");
+    let mut editor_doc = pass("store merge: files decoded", || settings_document(editor))
         .with_context(|| format!("Could not read the store {}", path.display()))?;
-    let mut studio_doc = settings_document(studio)
+    let mut studio_doc = pass("store merge: Studio decoded", || settings_document(studio))
         .with_context(|| format!("Could not read Studio's copy of {}", path.display()))?;
-    if settings_documents_equivalent(&editor_doc, &studio_doc) {
+    if pass("store merge: sides compared", || {
+        settings_documents_equivalent(&editor_doc, &studio_doc)
+    }) {
         return Ok(MergedEntry {
             value: editor.cloned(),
             editor_changed: false,
@@ -1096,8 +1134,10 @@ pub(crate) fn merge_settings_entry(
             editor_script_paths: None,
         });
     }
-    remove_reconciliation_derived_properties(&mut editor_doc);
-    remove_reconciliation_derived_properties(&mut studio_doc);
+    pass("store merge: derived properties removed", || {
+        remove_reconciliation_derived_properties(&mut editor_doc);
+        remove_reconciliation_derived_properties(&mut studio_doc);
+    });
     let editor_script_paths;
     let (merged, editor_equivalent, studio_equivalent, aligned_studio) = if first_pairing {
         let previous_conflicts = conflicts.open().len();
@@ -1136,37 +1176,55 @@ pub(crate) fn merge_settings_entry(
             )
         }
     } else {
-        let mut base_doc = settings_document(base)?;
-        remove_reconciliation_derived_properties(&mut base_doc);
-        let referenced_elsewhere =
-            reassigned_ids_referenced_by_other_stores(path, sides.editor, &base_doc, &editor_doc)?;
+        let mut base_doc = pass("store merge: last sync decoded", || settings_document(base))?;
+        pass("store merge: derived properties removed", || {
+            remove_reconciliation_derived_properties(&mut base_doc);
+        });
+        let referenced_elsewhere = pass("store merge: reassigned ids", || {
+            reassigned_ids_referenced_by_other_stores(path, sides.editor, &base_doc, &editor_doc)
+        })?;
         release_reassigned_editor_ids(
             &base_doc,
             &mut editor_doc,
             &studio_doc,
             &referenced_elsewhere,
         );
-        align_observation_ids_to_baseline(&base_doc, &mut editor_doc);
-        align_observation_ids_to_baseline(&base_doc, &mut studio_doc);
-        align_new_instance_ids(&base_doc, &editor_doc, &mut studio_doc)?;
-        crate::settings::equivalence::inherit_workspace_viewport_reference(
-            &mut editor_doc,
-            &studio_doc,
-        );
-        align_reconciliation_protected_workspace_cameras(&editor_doc, &mut studio_doc);
-        align_equivalent_values(&base_doc, &mut editor_doc);
-        align_equivalent_values(&base_doc, &mut studio_doc);
-        align_equivalent_values(&editor_doc, &mut studio_doc);
-        protect_package_links(
-            path,
-            Some(&base_doc),
-            &mut editor_doc,
-            &mut studio_doc,
-            conflicts,
-        );
-        align_transient_script_guids(&mut base_doc, &mut editor_doc, &mut studio_doc);
-        editor_script_paths = script_paths_of(&editor_doc, path)?;
+        pass("store merge: ids aligned to the last sync", || {
+            align_observation_ids_to_baseline(&base_doc, &mut editor_doc);
+            align_observation_ids_to_baseline(&base_doc, &mut studio_doc);
+        });
+        pass("store merge: new instances paired", || {
+            align_new_instance_ids(&base_doc, &editor_doc, &mut studio_doc)
+        })?;
+        pass("store merge: viewport camera", || {
+            crate::settings::equivalence::inherit_workspace_viewport_reference(
+                &mut editor_doc,
+                &studio_doc,
+            );
+            align_reconciliation_protected_workspace_cameras(&editor_doc, &mut studio_doc);
+        });
+        pass("store merge: equivalent values aligned", || {
+            align_equivalent_values(&base_doc, &mut editor_doc);
+            align_equivalent_values(&base_doc, &mut studio_doc);
+            align_equivalent_values(&editor_doc, &mut studio_doc);
+        });
+        pass("store merge: package links", || {
+            protect_package_links(
+                path,
+                Some(&base_doc),
+                &mut editor_doc,
+                &mut studio_doc,
+                conflicts,
+            );
+        });
+        pass("store merge: script guids", || {
+            align_transient_script_guids(&mut base_doc, &mut editor_doc, &mut studio_doc);
+        });
+        editor_script_paths = pass("store merge: script paths", || {
+            script_paths_of(&editor_doc, path)
+        })?;
         if global_log_enabled(5) {
+            let _span = crate::app::profile::span("store merge: first difference logged");
             log_global(
                 5,
                 format_args!(
@@ -1181,52 +1239,97 @@ pub(crate) fn merge_settings_entry(
             .baseline
             .context("A reconciliation baseline is missing")?
             .entries;
-        let editor_source_changes = changed_script_source_ids(
-            path,
-            &base_doc,
-            baseline_entries,
+        let (editor_source_changes, studio_source_changes) =
+            pass("store merge: script sources", || {
+                let editor = changed_script_source_ids(
+                    path,
+                    &base_doc,
+                    baseline_entries,
+                    &editor_doc,
+                    &sides.editor.entries,
+                )?;
+                let studio = changed_script_source_ids(
+                    path,
+                    &base_doc,
+                    baseline_entries,
+                    &studio_doc,
+                    &sides.studio.entries,
+                )?;
+                anyhow::Ok((editor, studio))
+            })?;
+        let equivalent = |label, left: &SettingsBytecode, right: &SettingsBytecode| -> bool {
+            pass(label, || settings_documents_equivalent(left, right))
+        };
+        let taken = |document: &mut SettingsBytecode| SettingsBytecode {
+            version: document.version,
+            instances: std::mem::take(&mut document.instances),
+        };
+        let settled = if equivalent(
+            "store merge: aligned sides compared",
             &editor_doc,
-            &sides.editor.entries,
-        )?;
-        let studio_source_changes = changed_script_source_ids(
-            path,
-            &base_doc,
-            baseline_entries,
             &studio_doc,
-            &sides.studio.entries,
-        )?;
-        if settings_documents_equivalent(&editor_doc, &studio_doc) {
-            (editor_doc, true, true, None)
+        ) {
+            (taken(&mut editor_doc), true, true, None)
         } else if editor_source_changes.is_empty()
-            && settings_documents_equivalent(&editor_doc, &base_doc)
+            && equivalent(
+                "store merge: files against the last sync",
+                &editor_doc,
+                &base_doc,
+            )
         {
-            (studio_doc, false, true, None)
+            (taken(&mut studio_doc), false, true, None)
         } else if studio_source_changes.is_empty()
-            && settings_documents_equivalent(&studio_doc, &base_doc)
+            && equivalent(
+                "store merge: Studio against the last sync",
+                &studio_doc,
+                &base_doc,
+            )
         {
-            (editor_doc, true, false, Some(studio_doc))
+            (
+                taken(&mut editor_doc),
+                true,
+                false,
+                Some(taken(&mut studio_doc)),
+            )
         } else {
-            let merged = merge_reconciliation_settings_documents(
-                path,
-                [&base_doc, &editor_doc, &studio_doc],
-                conflicts,
-                &editor_source_changes,
-                &studio_source_changes,
+            let merged = pass("store merge: three-way merge", || {
+                merge_reconciliation_settings_documents(
+                    path,
+                    [&base_doc, &editor_doc, &studio_doc],
+                    conflicts,
+                    &editor_source_changes,
+                    &studio_source_changes,
+                )
+            });
+            let editor_equivalent =
+                equivalent("store merge: files against the merge", &editor_doc, &merged);
+            let studio_equivalent = equivalent(
+                "store merge: Studio against the merge",
+                &studio_doc,
+                &merged,
             );
-            let editor_equivalent = settings_documents_equivalent(&editor_doc, &merged);
-            let studio_equivalent = settings_documents_equivalent(&studio_doc, &merged);
             (
                 merged,
                 editor_equivalent,
                 studio_equivalent,
-                Some(studio_doc),
+                Some(taken(&mut studio_doc)),
             )
-        }
+        };
+        pass("store merge: documents dropped", || {
+            drop_settings_documents(base_doc, editor_doc);
+            drop_settings_document(studio_doc);
+        });
+        settled
     };
     let value = SnapshotEntry::File(
-        encode_settings_bytecode(&merged)
-            .with_context(|| format!("Failed to merge {}", path.display()))?,
+        pass("store merge: merged encoded", || {
+            encode_settings_bytecode(&merged)
+        })
+        .with_context(|| format!("Failed to merge {}", path.display()))?,
     );
+    pass("store merge: documents dropped", || {
+        drop_settings_document(merged);
+    });
     Ok(MergedEntry {
         value: Some(value),
         editor_changed: editor.is_none() || !editor_equivalent,

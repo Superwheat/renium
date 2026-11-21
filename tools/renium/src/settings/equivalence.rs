@@ -4949,10 +4949,15 @@ pub(crate) fn saved_field_differences(
 }
 
 pub(crate) fn remove_reconciliation_derived_properties(document: &mut SettingsBytecode) {
-    for instance in &mut document.instances {
+    let remove = |instance: &mut SettingsBytecodeInstance| {
         instance
             .properties
             .retain(|name, _| !reconciliation_property_is_derived(name));
+    };
+    if document.instances.len() >= 2_048 && rayon::current_num_threads() > 1 {
+        document.instances.par_iter_mut().for_each(remove);
+    } else {
+        document.instances.iter_mut().for_each(remove);
     }
 }
 
