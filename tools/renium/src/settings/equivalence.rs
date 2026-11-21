@@ -397,8 +397,8 @@ fn align_settings_documents(
             .is_some_and(|camera| keep_reference_viewport_camera(camera, observed))
     };
     let topology_matches = settings_topology_matches(&reference, &observed);
-    let mut positionally_equivalent =
-        topology_matches && positional_values_equivalent(&reference, &observed, None, false);
+    let mut positionally_equivalent = topology_matches
+        && positional_values_equivalent(&reference, &observed, None, false, Placed::default());
     // A pull keeps the viewport camera. Where every instance stands as in the
     // reference and the camera carries its stored id, the reference's camera
     // goes back before anything else is compared: a store whose camera alone
@@ -406,7 +406,8 @@ fn align_settings_documents(
     let camera_kept_early =
         topology_matches && !positionally_equivalent && keep_camera(&mut observed);
     if camera_kept_early {
-        positionally_equivalent = positional_values_equivalent(&reference, &observed, None, false);
+        positionally_equivalent =
+            positional_values_equivalent(&reference, &observed, None, false, Placed::default());
     }
     phases.end("comparison by position");
     if positionally_equivalent {
@@ -435,7 +436,8 @@ fn align_settings_documents(
     // to align. This is a pull after values changed in Studio, the common
     // one. Under store ids its own bytes are what the encoder writes for it
     // again; any other id passes through the encoder, which normalizes it.
-    let already_aligned = topology_matches && identities_already_aligned(&reference, &observed);
+    let already_aligned =
+        topology_matches && identities_already_aligned(&reference, &observed, Placed::default());
     phases.end("identity check");
     if already_aligned {
         rayon::join(
@@ -532,29 +534,35 @@ impl AlignmentPhases {
 /// additionally need the same topology and either exact persistent matches
 /// or unchanged duplicate subtrees with consistent incoming references.
 /// A moved persistent ID or viewport role invalidates either proof.
-fn identities_already_aligned(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
-    let mut seen = AHashSet::with_capacity(reference.instances.len());
+fn identities_already_aligned(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+    placed: Placed,
+) -> bool {
+    let mut seen = AHashSet::with_capacity(observed.instances.len());
     let mut all_store_ids = true;
-    if reference.instances.len() != observed.instances.len()
-        || !reference
+    if reference.instances.len() != observed.instances.len() + placed.len
+        || !observed
             .instances
             .iter()
-            .zip(&observed.instances)
-            .all(|(reference, observed)| {
+            .enumerate()
+            .all(|(index, observed)| {
+                let reference = &reference.instances[placed.at(index)];
                 all_store_ids &= is_store_identity(&reference.settings_id);
                 reference.settings_id == observed.settings_id
                     && seen.insert(reference.settings_id.as_str())
             })
-        || workspace_current_camera_index(reference) != workspace_current_camera_index(observed)
+        || placed.camera(reference)
+            != workspace_current_camera_index(observed).map(|index| placed.at(index))
     {
         return false;
     }
     if all_store_ids {
-        persistent_identities_follow_mapping(reference, observed, Some)
+        persistent_identities_follow_mapping(reference, observed, |index| Some(placed.at(index)))
     } else {
-        settings_topology_matches(reference, observed)
-            && (positional_identities_match_exactly(reference, observed)
-                || positional_identity_preserved(reference, observed))
+        settings_topology_placed(reference, observed, placed)
+            && (positional_identities_match_exactly(reference, observed, placed)
+                || positional_identity_preserved(reference, observed, placed))
     }
 }
 
@@ -565,16 +573,15 @@ fn identities_already_aligned(reference: &SettingsBytecode, observed: &SettingsB
 fn positional_identities_match_exactly(
     reference: &SettingsBytecode,
     observed: &SettingsBytecode,
+    placed: Placed,
 ) -> bool {
     let (reference_ids, observed_ids) = rayon::join(
         || persistent_identity_index(reference),
         || persistent_identity_index(observed),
     );
     let camera = workspace_current_camera_index(observed);
-    let sole_root = reference
-        .instances
-        .iter()
-        .filter(|instance| instance.parent_index.is_none())
+    let sole_root = (reference.instances.iter().enumerate())
+        .filter(|(index, instance)| !placed.passes(*index) && instance.parent_index.is_none())
         .count()
         == 1;
     observed
@@ -596,7 +603,7 @@ fn positional_identities_match_exactly(
                     !instance.settings_id.starts_with("debug:")
                         || (sole_root && instance.parent_index.is_none())
                 },
-                |candidate| candidate == index,
+                |candidate| candidate == placed.at(index),
             )
         })
 }
@@ -1253,15 +1260,7 @@ fn identity_score(
         context.assigned_reference,
         context.assigned_observed,
     )?;
-    let content_matches = reconciliation_identity_maps_equal(
-        &reference_instance.properties,
-        &observed_instance.properties,
-        true,
-    ) && reconciliation_identity_maps_equal(
-        &reference_instance.attributes,
-        &observed_instance.attributes,
-        false,
-    );
+    let content_matches = holds_same_content(reference_instance, observed_instance);
     if reference_evidence == 0 && !content_matches {
         return None;
     }
@@ -1276,17 +1275,34 @@ fn identity_score(
     })
 }
 
+/// Whether two instances hold the same to the matching: what they hold
+/// beside the references among it and what Studio keeps for itself.
+fn holds_same_content(
+    reference: &SettingsBytecodeInstance,
+    observed: &SettingsBytecodeInstance,
+) -> bool {
+    reconciliation_identity_maps_equal(&reference.properties, &observed.properties, true)
+        && reconciliation_identity_maps_equal(&reference.attributes, &observed.attributes, false)
+}
+
 fn settings_topology_matches(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
-    reference.instances.len() == observed.instances.len()
-        && reference
-            .instances
-            .iter()
-            .zip(&observed.instances)
-            .all(|(reference, observed)| {
-                reference.name == observed.name
-                    && reference.class_name == observed.class_name
-                    && reference.parent_index == observed.parent_index
-            })
+    settings_topology_placed(reference, observed, Placed::default())
+}
+
+/// Whether each observed instance stands under the name, class and parent of
+/// its counterpart (`Placed`).
+fn settings_topology_placed(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+    placed: Placed,
+) -> bool {
+    reference.instances.len() == observed.instances.len() + placed.len
+        && (observed.instances.iter().enumerate()).all(|(index, observed)| {
+            let reference = &reference.instances[placed.at(index)];
+            reference.name == observed.name
+                && reference.class_name == observed.class_name
+                && reference.parent_index == observed.parent_index.map(|parent| placed.at(parent))
+        })
 }
 
 pub(crate) fn persistent_identity(instance: &SettingsBytecodeInstance) -> Option<&str> {
@@ -2034,12 +2050,78 @@ pub(crate) fn align_settings_ids_to_reference(
 ) -> bool {
     // A store read back after it was aligned once: matching would leave
     // each instance where it stands.
-    if identities_already_aligned(reference, observed)
+    if identities_already_aligned(reference, observed, Placed::default())
         && settings_topology_matches(reference, observed)
     {
         return true;
     }
+    // Where one copy holds one run of instances the other lacks, and its
+    // place tells that run, the instances beside it stand where their
+    // places say, as a push of the instances that differ aligns them. A
+    // fresh destination holds its retained containers alone, which the
+    // matching finds without indexing the rest (`match_settings_ids`).
+    let run = (observed.instances.len() >= reference.instances.len() / 4)
+        .then(|| {
+            super::bytecode::property_edit::Moved::between_copies(
+                &observed.instances,
+                &reference.instances,
+            )
+        })
+        .flatten()
+        .flatten()
+        .and_then(|moved| moved.run())
+        .filter(|run| run_is_told(run.clone(), &reference.instances, &observed.instances));
+    if let Some((run, of_reference)) = run
+        && align_settings_ids_beside_run(reference, observed, run, !of_reference)
+    {
+        return true;
+    }
     align_settings_ids_by_matching(reference, observed)
+}
+
+/// Whether the run of instances one copy of a store alone holds is the one
+/// its place gives. Where the instance ahead of it is a namesake of its last,
+/// the run could as well start earlier, and only a UniqueId both copies hold
+/// for the instance ahead says it does not. An instance of the run under a
+/// UniqueId the other copy holds was moved, not added. A UniqueId is one
+/// `persistent_identity` reads.
+pub(crate) fn run_is_told(
+    (run, of_reference): (std::ops::Range<usize>, bool),
+    reference: &[SettingsBytecodeInstance],
+    observed: &[SettingsBytecodeInstance],
+) -> bool {
+    let (longer, shorter) = if of_reference {
+        (reference, observed)
+    } else {
+        (observed, reference)
+    };
+    let of_run = longer[run.clone()]
+        .iter()
+        .filter_map(persistent_identity)
+        .collect::<HashSet<_>>();
+    if !of_run.is_empty()
+        && shorter
+            .iter()
+            .filter_map(persistent_identity)
+            .any(|held| of_run.contains(held))
+    {
+        return false;
+    }
+    let (Some(ahead), Some(last)) = (run.start.checked_sub(1), run.end.checked_sub(1)) else {
+        return true;
+    };
+    if longer[ahead].name != longer[last].name
+        || longer[ahead].class_name != longer[last].class_name
+    {
+        return true;
+    }
+    matches!(
+        (
+            persistent_identity(&longer[ahead]),
+            shorter.get(ahead).and_then(persistent_identity)
+        ),
+        (Some(one), Some(other)) if one == other
+    )
 }
 
 /// `align_settings_ids_to_reference` where it leaves every instance at its
@@ -2052,21 +2134,31 @@ pub(crate) fn align_settings_ids_by_place(
     reference: &SettingsBytecode,
     observed: &mut SettingsBytecode,
 ) -> bool {
-    if !settings_topology_matches(reference, observed) {
+    align_settings_ids_placed(reference, observed, Placed::default())
+}
+
+/// `align_settings_ids_by_place` with each observed instance taken for the
+/// reference's at the place `placed` gives it.
+fn align_settings_ids_placed(
+    reference: &SettingsBytecode,
+    observed: &mut SettingsBytecode,
+    placed: Placed,
+) -> bool {
+    if !settings_topology_placed(reference, observed, placed) {
         return false;
     }
-    if identities_already_aligned(reference, observed) {
+    if identities_already_aligned(reference, observed, placed) {
         return true;
     }
     let camera_positions_match = match (
         workspace_current_camera_index(reference),
         workspace_current_camera_index(observed),
     ) {
-        (Some(reference), Some(observed)) => reference == observed,
+        (Some(reference), Some(observed)) => reference == placed.at(observed),
         _ => true,
     };
-    if camera_positions_match && positional_identity_preserved(reference, observed) {
-        remap_positional_ids(reference, observed);
+    if camera_positions_match && positional_identity_preserved(reference, observed, placed) {
+        remap_positional_ids(reference, observed, placed);
         return true;
     }
     false
@@ -2126,18 +2218,57 @@ fn put_run(
 /// their places. An instance of a run `observed` holds has no counterpart:
 /// it keeps its id, or takes a new one where the reference holds that id for
 /// another instance, as the matching gives one. `false` where the instances
-/// beside the run are not aligned by place, or more than one instance of the
-/// run needs a new id; `reference` is then as it was.
+/// beside the run are not aligned by place, where the matching may pair them
+/// otherwise by the viewport cameras, by their ids (`ids_paired_elsewhere`)
+/// or by what twins hold (`twins_paired_otherwise`), or where more than one
+/// instance of the run needs a new id; `observed` is then as it was.
 pub(crate) fn align_settings_ids_beside_run(
-    reference: &mut SettingsBytecode,
+    reference: &SettingsBytecode,
     observed: &mut SettingsBytecode,
     run: std::ops::Range<usize>,
     observed_holds_run: bool,
 ) -> bool {
+    #[cfg(test)]
+    let before = observed.clone();
+    let aligned = aligned_beside_run(reference, observed, run, observed_holds_run);
+    #[cfg(test)]
+    if aligned {
+        paired_as_the_matching_pairs(reference, before, observed);
+    }
+    aligned
+}
+
+fn aligned_beside_run(
+    reference: &SettingsBytecode,
+    observed: &mut SettingsBytecode,
+    run: std::ops::Range<usize>,
+    observed_holds_run: bool,
+) -> bool {
+    let placed = Placed {
+        start: run.start,
+        len: run.len(),
+    };
+    let (longer, shorter) = if observed_holds_run {
+        (&*observed, reference)
+    } else {
+        (reference, &*observed)
+    };
+    if run.end > longer.instances.len()
+        || shorter.instances.len() + run.len() != longer.instances.len()
+        || matches!(
+            (
+                workspace_current_camera_index(reference),
+                workspace_current_camera_index(observed),
+            ),
+            (Some(reference), Some(observed))
+                if placed.counterpart(observed, observed_holds_run) != Some(reference)
+        )
+        || ids_paired_elsewhere(reference, observed, placed, observed_holds_run)
+        || twins_paired_otherwise(reference, observed, placed, observed_holds_run)
+    {
+        return false;
+    }
     if !observed_holds_run {
-        let Some(taken) = take_run(reference, &run) else {
-            return false;
-        };
         // An identity of the store's own that the other copy holds as well
         // is no instance this copy alone holds.
         let held = observed
@@ -2145,15 +2276,10 @@ pub(crate) fn align_settings_ids_beside_run(
             .iter()
             .map(|instance| instance.settings_id.as_str())
             .collect::<AHashSet<_>>();
-        let aligned = !taken.iter().any(|instance| {
+        return !reference.instances[run].iter().any(|instance| {
             !instance.settings_id.starts_with("debug:")
                 && held.contains(instance.settings_id.as_str())
-        }) && align_settings_ids_by_place(reference, observed);
-        put_run(reference, &run, taken);
-        return aligned;
-    }
-    if run.end > observed.instances.len() {
-        return false;
+        }) && align_settings_ids_placed(reference, observed, placed);
     }
     let service = store_service(observed).map(str::to_string);
     // The id of an instance of the run that the reference holds for another
@@ -2191,15 +2317,20 @@ pub(crate) fn align_settings_ids_beside_run(
             (index, fresh)
         })
     };
-    if let Some((index, fresh)) = renamed {
-        let old = std::mem::replace(&mut observed.instances[index].settings_id, fresh.clone());
-        let remap = HashMap::from([(old, fresh)]);
+    let rename = |observed: &mut SettingsBytecode, index: usize, id: String| {
+        let old = std::mem::replace(&mut observed.instances[index].settings_id, id.clone());
+        let remap = HashMap::from([(old.clone(), id)]);
         for instance in &mut observed.instances {
             remap_record_reference_ids(&mut instance.properties, &remap, service.as_deref());
             remap_record_reference_ids(&mut instance.attributes, &remap, service.as_deref());
         }
-    }
+        old
+    };
+    let renamed = renamed.map(|(index, fresh)| (index, rename(observed, index, fresh)));
     let Some(mut taken) = take_run(observed, &run) else {
+        if let Some((index, old)) = renamed {
+            rename(observed, index, old);
+        }
         return false;
     };
     let before = observed
@@ -2223,7 +2354,565 @@ pub(crate) fn align_settings_ids_beside_run(
         }
     }
     put_run(observed, &run, taken);
+    if !aligned && let Some((index, old)) = renamed {
+        rename(observed, index, old);
+    }
     aligned
+}
+
+/// The most comparisons of what twins hold the alignment beside a run makes;
+/// past that it leaves the copies to the matching.
+const TWINS_WEIGHED: usize = 1 << 16;
+
+/// Whether the matching pairs an instance beside the run by its id with
+/// another than its counterpart: it takes every id the reference holds that
+/// is not Studio's own (`IdentityAssignment::run_exact`), a bare number too.
+fn ids_paired_elsewhere(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+    placed: Placed,
+    observed_holds_run: bool,
+) -> bool {
+    let mut held = None;
+    (observed.instances.iter().enumerate()).any(|(index, instance)| {
+        let id = instance.settings_id.as_str();
+        !id.starts_with("debug:")
+            && placed
+                .counterpart(index, observed_holds_run)
+                .is_some_and(|at| reference.instances[at].settings_id != id)
+            && held
+                .get_or_insert_with(|| {
+                    (reference.instances.iter())
+                        .map(|instance| instance.settings_id.as_str())
+                        .collect::<AHashSet<_>>()
+                })
+                .contains(id)
+    })
+}
+
+/// Whether the matching (`match_settings_ids`) may pair some twins,
+/// namesakes under one parent, otherwise than the places of `placed` do
+/// (the run the observed copy's with `observed_holds_run`): an alignment by
+/// those places stands for the matching only where this is false. The
+/// matching pairs the viewport cameras and the instances an id or a
+/// UniqueId tells first, at their places where `align_settings_ids_beside_run`
+/// goes on. Twins the run leaves as they stood, down to their descendants,
+/// it takes for their counterparts whatever else holds the same, once each
+/// instance beside the run holds the references its counterpart does at
+/// their places, as `positional_identity_preserved` requires before the
+/// alignment by places goes on; that check refuses namesakes beside the run
+/// that changed, and so does this one. That check leaves out what the
+/// viewport cameras name, which the matching weighs, so cameras that name
+/// otherwise than the places do leave the copies to the matching. Of a group
+/// the run touches, with a twin or under one, it pairs a twin that holds
+/// what its counterpart holds, and no other twin of the other copy does, in
+/// its first round, where the twin holds and receives the references its
+/// counterpart does at their places; twins that hold what none of those
+/// holds, and hold and receive no reference, it leaves to `run_fallback`,
+/// which pairs them by their shapes in their order. A twin left unread says
+/// nothing of what it holds, so a group the run touches with one is left to
+/// the matching.
+fn twins_paired_otherwise(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+    placed: Placed,
+    observed_holds_run: bool,
+) -> bool {
+    let (longer, shorter) = if observed_holds_run {
+        (observed, reference)
+    } else {
+        (reference, observed)
+    };
+    fn key(
+        instance: &SettingsBytecodeInstance,
+        parent: Option<usize>,
+    ) -> (Option<usize>, &str, &str) {
+        (parent, instance.name.as_str(), instance.class_name.as_str())
+    }
+    let mut counts = AHashMap::with_capacity(longer.instances.len());
+    for instance in &longer.instances {
+        *counts
+            .entry(key(instance, instance.parent_index))
+            .or_insert(0_usize) += 1;
+    }
+    let mut groups = AHashMap::<_, (Vec<usize>, Vec<usize>)>::new();
+    for (index, instance) in longer.instances.iter().enumerate() {
+        let key = key(instance, instance.parent_index);
+        if counts[&key] > 1 && (instance.parent_index).is_none_or(|parent| !placed.passes(parent)) {
+            groups.entry(key).or_default().0.push(index);
+        }
+    }
+    if groups.is_empty() {
+        return false;
+    }
+    for (index, instance) in shorter.instances.iter().enumerate() {
+        let parent = instance.parent_index.map(|parent| placed.at(parent));
+        if let Some((_, twins)) = groups.get_mut(&key(instance, parent)) {
+            twins.push(index);
+        }
+    }
+    let twins = Twins::new(reference, observed, placed, observed_holds_run);
+    !twins.cameras_name_alike()
+        || groups.into_values().any(|(longer_twins, shorter_twins)| {
+            let (observed_twins, reference_twins) = if observed_holds_run {
+                (longer_twins, shorter_twins)
+            } else {
+                (shorter_twins, longer_twins)
+            };
+            twins.paired_otherwise(observed_twins, reference_twins)
+        })
+}
+
+/// The copies `twins_paired_otherwise` weighs, with what it reads of them
+/// once a group of twins asks for it, each of the reference and then of the
+/// observed copy.
+struct Twins<'a> {
+    reference: &'a SettingsBytecode,
+    observed: &'a SettingsBytecode,
+    placed: Placed,
+    observed_holds_run: bool,
+    cameras: Option<(usize, usize)>,
+    /// The instances beside the run that hold one of its instances, at any
+    /// depth, in the copy that holds it.
+    run_holders: AHashSet<usize>,
+    /// The comparisons of what twins hold made so far (`TWINS_WEIGHED`).
+    weighed: std::cell::Cell<usize>,
+    unique_ids: std::cell::OnceCell<[AHashMap<&'a str, Option<usize>>; 2]>,
+    graphs: std::cell::OnceCell<[ReferenceGraph; 2]>,
+    shapes: std::cell::OnceCell<[Vec<u64>; 2]>,
+    children: std::cell::OnceCell<Vec<Vec<usize>>>,
+}
+
+impl<'a> Twins<'a> {
+    fn new(
+        reference: &'a SettingsBytecode,
+        observed: &'a SettingsBytecode,
+        placed: Placed,
+        observed_holds_run: bool,
+    ) -> Self {
+        let longer = if observed_holds_run {
+            observed
+        } else {
+            reference
+        };
+        let mut run_holders = AHashSet::new();
+        for index in placed.start..placed.start + placed.len {
+            let mut parent = longer.instances[index].parent_index;
+            while let Some(at) = parent.filter(|at| !placed.passes(*at)) {
+                if !run_holders.insert(at) {
+                    break;
+                }
+                parent = (longer.instances.get(at)).and_then(|holder| holder.parent_index);
+            }
+        }
+        Twins {
+            reference,
+            observed,
+            placed,
+            observed_holds_run,
+            cameras: workspace_current_camera_index(reference)
+                .zip(workspace_current_camera_index(observed)),
+            run_holders,
+            weighed: std::cell::Cell::new(0),
+            unique_ids: std::cell::OnceCell::new(),
+            graphs: std::cell::OnceCell::new(),
+            shapes: std::cell::OnceCell::new(),
+            children: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn counterpart(&self, index: usize) -> Option<usize> {
+        self.placed.counterpart(index, self.observed_holds_run)
+    }
+
+    /// The observed instance a reference instance stands for.
+    fn observed_of(&self, index: usize) -> Option<usize> {
+        if self.observed_holds_run {
+            Some(self.placed.at(index))
+        } else if self.placed.passes(index) {
+            None
+        } else if index < self.placed.start {
+            Some(index)
+        } else {
+            Some(index - self.placed.len)
+        }
+    }
+
+    /// Whether the matching pairs an observed twin with its counterpart
+    /// before the others: the viewport camera, and one whose id, or whose
+    /// UniqueId each copy holds once, its counterpart holds as well.
+    fn paired_first(&self, index: usize) -> bool {
+        let Some(at) = self.counterpart(index) else {
+            return false;
+        };
+        let (held, other) = (
+            &self.observed.instances[index],
+            &self.reference.instances[at],
+        );
+        if self.cameras == Some((at, index))
+            || !held.settings_id.starts_with("debug:") && held.settings_id == other.settings_id
+        {
+            return true;
+        }
+        let (Some(id), Some(other_id)) = (persistent_identity(held), persistent_identity(other))
+        else {
+            return false;
+        };
+        let [of_reference, of_observed] = self.unique_ids.get_or_init(|| {
+            [
+                persistent_identity_index(self.reference),
+                persistent_identity_index(self.observed),
+            ]
+        });
+        id == other_id
+            && of_reference.get(id) == Some(&Some(at))
+            && of_observed.get(id) == Some(&Some(index))
+    }
+
+    /// Whether the matching may pair a group of twins otherwise than their
+    /// places, the observed ones and the reference's each in their order.
+    fn paired_otherwise(
+        &self,
+        mut observed_twins: Vec<usize>,
+        mut reference_twins: Vec<usize>,
+    ) -> bool {
+        let mut taken = Vec::new();
+        observed_twins.retain(|index| {
+            let first = self.paired_first(*index);
+            if first {
+                taken.extend(self.counterpart(*index));
+            }
+            !first
+        });
+        if observed_twins.is_empty() {
+            return false;
+        }
+        let mut taken = taken.into_iter().peekable();
+        reference_twins.retain(|index| taken.next_if_eq(index).is_none());
+        let longer_twins = if self.observed_holds_run {
+            &observed_twins
+        } else {
+            &reference_twins
+        };
+        let touched = (observed_twins.iter()).any(|index| self.counterpart(*index).is_none())
+            || !self.observed_holds_run
+                && (reference_twins.iter()).any(|index| self.placed.passes(*index))
+            || (longer_twins.iter()).any(|index| self.run_holders.contains(index));
+        if !touched {
+            return !(observed_twins.iter()).all(|index| self.unchanged(*index));
+        }
+        let stands_in = |document: &SettingsBytecode, index: &usize| {
+            crate::settings::held::stands_unchanged(&document.instances[*index].properties)
+        };
+        if (observed_twins.iter()).any(|index| stands_in(self.observed, index))
+            || (reference_twins.iter()).any(|index| stands_in(self.reference, index))
+        {
+            return true;
+        }
+        let beside = (reference_twins.iter())
+            .filter(|index| self.observed_of(**index).is_some())
+            .count();
+        if beside > 1
+            && (observed_twins.iter())
+                .any(|index| self.counterpart(*index).is_some() && !self.unchanged(*index))
+        {
+            return true;
+        }
+        self.told_otherwise(&observed_twins, &reference_twins)
+    }
+
+    fn graphs(&self) -> &[ReferenceGraph; 2] {
+        self.graphs.get_or_init(|| {
+            let (reference, observed) = rayon::join(
+                || build_reference_graph(self.reference),
+                || build_reference_graph(self.observed),
+            );
+            [reference, observed]
+        })
+    }
+
+    /// Whether an observed twin holds a reference or another instance names
+    /// it by its id: either weighs in the matching
+    /// (`matching_reference_evidence`).
+    fn named(&self, index: usize) -> bool {
+        let [_, observed] = self.graphs();
+        !observed.outgoing[index].is_empty() || !observed.incoming[index].is_empty()
+    }
+
+    /// Whether an observed twin holds and receives the references its
+    /// counterpart `at` does, at their places: whatever the matching paired
+    /// at their places before, it then weighs that counterpart for the twin
+    /// (`matching_reference_evidence`). A reference from an instance of the
+    /// run weighs nothing there; one to an instance of the run may.
+    fn named_alike(&self, index: usize, at: usize) -> bool {
+        let [reference, observed] = self.graphs();
+        self.name_alike(&reference.outgoing[at], &observed.outgoing[index])
+            && observed.incoming[index].iter().all(|edge| {
+                self.counterpart(edge.source).is_none_or(|source| {
+                    (reference.incoming[at].iter())
+                        .any(|other| other.source == source && other.slot == edge.slot)
+                })
+            })
+            && reference.incoming[at].iter().all(|edge| {
+                self.observed_of(edge.source).is_none_or(|source| {
+                    (observed.incoming[index].iter())
+                        .any(|other| other.source == source && other.slot == edge.slot)
+                })
+            })
+    }
+
+    /// Whether the references of a reference instance, `held`, and of an
+    /// observed one, `edges`, name slot for slot instances that stand at
+    /// each other's places, or the same beyond the copies.
+    fn name_alike(&self, held: &[ReferenceEdge], edges: &[ReferenceEdge]) -> bool {
+        edges.len() == held.len()
+            && edges.iter().all(|edge| {
+                let other = held.iter().find(|other| other.slot == edge.slot);
+                other.is_some_and(|other| match (&other.target, &edge.target) {
+                    (ReferenceTarget::Internal(other), ReferenceTarget::Internal(target)) => {
+                        self.counterpart(*target) == Some(*other)
+                    }
+                    (ReferenceTarget::External(other), ReferenceTarget::External(value)) => {
+                        reconciliation_values_equal(other, value, false)
+                    }
+                    _ => false,
+                })
+            })
+    }
+
+    /// Whether the viewport cameras name what stands at each other's places
+    /// (`name_alike`): the matching pairs them first and weighs what they
+    /// name for the instances they name (`matching_reference_evidence`),
+    /// which the comparison by places leaves out
+    /// (`positional_values_equivalent`).
+    fn cameras_name_alike(&self) -> bool {
+        let Some((reference_camera, observed_camera)) = self.cameras else {
+            return true;
+        };
+        let named = |document: &SettingsBytecode, camera: usize| {
+            let camera = &document.instances[camera];
+            let mut ids = AHashSet::new();
+            collect_text_reference_ids(&camera.properties, &mut ids);
+            collect_text_reference_ids(&camera.attributes, &mut ids);
+            let by_id = if ids.is_empty() {
+                HashMap::new()
+            } else {
+                (document.instances.iter().enumerate())
+                    .filter(|(_, instance)| ids.contains(&instance.settings_id))
+                    .map(|(index, instance)| (instance.settings_id.as_str(), index))
+                    .collect()
+            };
+            let mut edges = Vec::new();
+            collect_map_references(&camera.properties, "properties", &by_id, &mut edges);
+            collect_map_references(&camera.attributes, "attributes", &by_id, &mut edges);
+            edges
+        };
+        let held = named(self.reference, reference_camera);
+        self.name_alike(&held, &named(self.observed, observed_camera))
+    }
+
+    /// Whether an observed twin and each of its descendants beside the run
+    /// hold, value for value, what the matching keys their counterparts by
+    /// (`identity_subtree_keys`). An instance that stands for its
+    /// counterpart unread holds what that one holds.
+    fn unchanged(&self, index: usize) -> bool {
+        let children = self.children.get_or_init(|| {
+            let mut children = vec![Vec::new(); self.observed.instances.len()];
+            for (index, instance) in self.observed.instances.iter().enumerate() {
+                if let Some(children) = instance.parent_index.and_then(|at| children.get_mut(at)) {
+                    children.push(index);
+                }
+            }
+            children
+        });
+        let mut pending = vec![index];
+        let mut seen = 0;
+        while let Some(index) = pending.pop() {
+            seen += 1;
+            if seen > children.len() {
+                return false;
+            }
+            let Some(at) = self.counterpart(index) else {
+                continue;
+            };
+            if !holds_exactly(
+                &self.reference.instances[at],
+                &self.observed.instances[index],
+            ) {
+                return false;
+            }
+            pending.extend(&children[index]);
+        }
+        true
+    }
+
+    /// Whether the matching may pair a group of twins otherwise where each
+    /// observed twin holds what its counterpart holds and no other twin of
+    /// the reference does, which pairs it first, or what none of them does
+    /// and no reference names, which leaves it to `run_fallback`.
+    fn told_otherwise(&self, observed_twins: &[usize], reference_twins: &[usize]) -> bool {
+        let content_index = IdentityCandidateIndex::build(self.reference, reference_twins);
+        let narrowed = (observed_twins.iter())
+            .map(|index| {
+                (content_index.as_ref())
+                    .and_then(|lookup| lookup.matching(&self.observed.instances[*index]))
+            })
+            .collect::<Vec<_>>();
+        let count_of = |narrowed: Option<&[_]>| narrowed.map_or(reference_twins.len(), <[_]>::len);
+        let weighed: usize = narrowed.iter().map(|each| count_of(*each)).sum();
+        self.weighed.set(self.weighed.get() + weighed);
+        if self.weighed.get() > TWINS_WEIGHED {
+            return true;
+        }
+        let mut told = AHashSet::new();
+        let mut untold = Vec::new();
+        for (&index, narrowed) in observed_twins.iter().zip(narrowed) {
+            let instance = &self.observed.instances[index];
+            let at = self.counterpart(index);
+            let count = count_of(narrowed);
+            let mut holds_counterpart = false;
+            for offset in 0..count {
+                let candidate =
+                    narrowed.map_or_else(|| reference_twins[offset], |values| values[offset].1);
+                if holds_same_content(&self.reference.instances[candidate], instance) {
+                    if Some(candidate) != at {
+                        return true;
+                    }
+                    holds_counterpart = true;
+                }
+            }
+            match at {
+                Some(at) if holds_counterpart => {
+                    if !self.named_alike(index, at) {
+                        return true;
+                    }
+                    told.insert(at);
+                }
+                _ if self.named(index) => return true,
+                _ => untold.push(index),
+            }
+        }
+        if untold.is_empty() {
+            return false;
+        }
+        let left = (reference_twins.iter())
+            .copied()
+            .filter(|index| !told.contains(index))
+            .collect::<Vec<_>>();
+        self.left_otherwise(&untold, &left)
+    }
+
+    /// Whether `run_fallback` pairs the observed twins `untold` otherwise
+    /// than their places among the reference twins `left`: by their shapes,
+    /// each in their order, and the rest in order.
+    fn left_otherwise(&self, untold: &[usize], left: &[usize]) -> bool {
+        let [reference_shapes, observed_shapes] = self.shapes.get_or_init(|| {
+            let (reference, observed) = rayon::join(
+                || subtree_shape_keys(self.reference),
+                || subtree_shape_keys(self.observed),
+            );
+            [reference, observed]
+        });
+        let mut by_shape = AHashMap::<u64, VecDeque<usize>>::new();
+        for (position, candidate) in left.iter().enumerate() {
+            (by_shape.entry(reference_shapes[*candidate]))
+                .or_default()
+                .push_back(position);
+        }
+        let mut taken = vec![false; left.len()];
+        let mut unpaired = Vec::new();
+        for &index in untold {
+            match (by_shape.get_mut(&observed_shapes[index])).and_then(VecDeque::pop_front) {
+                Some(position) => {
+                    taken[position] = true;
+                    if self.counterpart(index) != Some(left[position]) {
+                        return true;
+                    }
+                }
+                None => unpaired.push(index),
+            }
+        }
+        let mut leftovers = (left.iter().zip(&taken))
+            .filter(|(_, taken)| !**taken)
+            .map(|(candidate, _)| *candidate);
+        (unpaired.into_iter()).any(|index| leftovers.next() != self.counterpart(index))
+    }
+}
+
+/// Whether two instances hold, exactly, the values the matching keys an
+/// instance by (`identity_subtree_keys`). One that stands for its
+/// counterpart unread holds what that one holds.
+pub(crate) fn holds_exactly(
+    reference: &SettingsBytecodeInstance,
+    observed: &SettingsBytecodeInstance,
+) -> bool {
+    fn stable(
+        values: &Map<String, Value>,
+        properties: bool,
+    ) -> impl Iterator<Item = (&String, &Value)> {
+        (values.iter())
+            .filter(move |(name, value)| identity_value_is_stable(name, value, properties))
+    }
+    crate::settings::held::stands_unchanged(&reference.properties)
+        || crate::settings::held::stands_unchanged(&observed.properties)
+        || stable(&reference.properties, true).eq(stable(&observed.properties, true))
+            && stable(&reference.attributes, false).eq(stable(&observed.attributes, false))
+}
+
+/// Panics where the matching pairs an observed instance with another
+/// reference instance than an alignment beside a run did: that alignment
+/// stands for the matching. Copies with instances left unread are the
+/// matching's only once those are read, so they are not weighed here.
+#[cfg(test)]
+fn paired_as_the_matching_pairs(
+    reference: &SettingsBytecode,
+    matched: SettingsBytecode,
+    aligned: &SettingsBytecode,
+) {
+    if holds_unread_instances(reference) || holds_unread_instances(&matched) {
+        return;
+    }
+    paired_as_the_whole_matching_pairs(reference, matched, reference, aligned);
+}
+
+/// Panics where the matching of two whole copies, `whole_reference` and
+/// `whole_observed`, pairs an observed instance with another reference
+/// instance than an alignment beside a run of the same copies read in part,
+/// `reference` and `aligned`, did. Each instance stands at the same place in
+/// a copy read whole and in part.
+#[cfg(test)]
+pub(crate) fn paired_as_the_whole_matching_pairs(
+    whole_reference: &SettingsBytecode,
+    mut whole_observed: SettingsBytecode,
+    reference: &SettingsBytecode,
+    aligned: &SettingsBytecode,
+) {
+    assert!(
+        align_settings_ids_by_matching(whole_reference, &mut whole_observed),
+        "the matching aligns no ids"
+    );
+    let pairs = |reference: &SettingsBytecode, document: &SettingsBytecode| {
+        let ids = (reference.instances.iter().enumerate())
+            .map(|(index, instance)| (instance.settings_id.as_str(), index))
+            .collect::<AHashMap<_, _>>();
+        (document.instances.iter())
+            .map(|instance| ids.get(instance.settings_id.as_str()).copied())
+            .collect::<Vec<_>>()
+    };
+    let (by_run, by_matching) = (
+        pairs(reference, aligned),
+        pairs(whole_reference, &whole_observed),
+    );
+    let count = by_run.len().max(by_matching.len());
+    if let Some(index) = (0..count).find(|index| by_run.get(*index) != by_matching.get(*index)) {
+        let instance = (whole_observed.instances.get(index))
+            .map(|instance| (instance.class_name.as_str(), instance.name.as_str()));
+        panic!(
+            "beside a run {instance:?} ({index}) takes {:?}, in the matching {:?}",
+            by_run.get(index),
+            by_matching.get(index)
+        );
+    }
 }
 
 fn align_settings_ids_by_matching(
@@ -2240,8 +2929,10 @@ fn align_settings_ids_by_matching(
     };
     let positional_topology_matches =
         camera_positions_match && settings_topology_matches(reference, observed);
-    if positional_topology_matches && positional_identity_preserved(reference, observed) {
-        remap_positional_ids(reference, observed);
+    if positional_topology_matches
+        && positional_identity_preserved(reference, observed, Placed::default())
+    {
+        remap_positional_ids(reference, observed, Placed::default());
         return true;
     }
     let Some((ids, ..)) = match_settings_ids(reference, observed, false, false) else {
@@ -2482,34 +3173,80 @@ fn match_settings_ids(
     ))
 }
 
-fn remap_positional_ids(reference: &SettingsBytecode, observed: &mut SettingsBytecode) {
-    let remap = observed
-        .instances
-        .iter()
-        .zip(&reference.instances)
-        .map(|(observed, reference)| (observed.settings_id.clone(), reference.settings_id.clone()))
+/// Where the counterpart of each observed instance stands among the
+/// reference's: at the same place, or past a run of `len` instances at
+/// `start` that the reference alone holds.
+#[derive(Clone, Copy, Default)]
+struct Placed {
+    start: usize,
+    len: usize,
+}
+
+impl Placed {
+    fn at(self, index: usize) -> usize {
+        if index < self.start {
+            index
+        } else {
+            index + self.len
+        }
+    }
+
+    /// Whether an instance of the copy that holds the run is one of it.
+    fn passes(self, index: usize) -> bool {
+        (self.start..self.start + self.len).contains(&index)
+    }
+
+    /// The reference instance an observed one stands for, where the run is
+    /// the reference's or, with `observed_holds_run`, the observed copy's:
+    /// none for an instance of the run.
+    fn counterpart(self, index: usize, observed_holds_run: bool) -> Option<usize> {
+        if !observed_holds_run {
+            Some(self.at(index))
+        } else if self.passes(index) {
+            None
+        } else if index < self.start {
+            Some(index)
+        } else {
+            Some(index - self.len)
+        }
+    }
+
+    /// The reference's viewport camera, where it stands beside the run.
+    fn camera(self, reference: &SettingsBytecode) -> Option<usize> {
+        workspace_current_camera_index(reference).filter(|index| !self.passes(*index))
+    }
+}
+
+fn remap_positional_ids(
+    reference: &SettingsBytecode,
+    observed: &mut SettingsBytecode,
+    placed: Placed,
+) {
+    let counterpart = |index: usize| &reference.instances[placed.at(index)];
+    let remap = (observed.instances.iter().enumerate())
+        .map(|(index, observed)| {
+            let id = counterpart(index).settings_id.clone();
+            (observed.settings_id.clone(), id)
+        })
         .collect::<HashMap<_, _>>();
     let service = store_service(observed).map(str::to_string);
-    let rename =
-        |(observed, reference): (&mut SettingsBytecodeInstance, &SettingsBytecodeInstance)| {
-            observed.settings_id.clone_from(&reference.settings_id);
-            remap_record_reference_ids(&mut observed.properties, &remap, service.as_deref());
-            remap_record_reference_ids(&mut observed.attributes, &remap, service.as_deref());
-        };
+    let rename = |(index, observed): (usize, &mut SettingsBytecodeInstance)| {
+        observed
+            .settings_id
+            .clone_from(&counterpart(index).settings_id);
+        remap_record_reference_ids(&mut observed.properties, &remap, service.as_deref());
+        remap_record_reference_ids(&mut observed.attributes, &remap, service.as_deref());
+    };
     // Every record is walked for references: seconds on a large store when
     // one thread does it.
     if observed.instances.len() >= 2_048 && rayon::current_num_threads() > 1 {
         observed
             .instances
             .par_iter_mut()
-            .zip(reference.instances.par_iter())
+            .enumerate()
             .for_each(rename);
     } else {
-        observed
-            .instances
-            .iter_mut()
-            .zip(&reference.instances)
-            .for_each(rename);
+        observed.instances.iter_mut().enumerate().for_each(rename);
     }
 }
 
@@ -2528,21 +3265,25 @@ fn positional_documents_equivalent(
     reference: &SettingsBytecode,
     observed: &SettingsBytecode,
 ) -> bool {
-    positional_values_equivalent(reference, observed, None, true)
+    positional_values_equivalent(reference, observed, None, true, Placed::default())
 }
 
 fn positional_identity_preserved(
     reference: &SettingsBytecode,
     observed: &SettingsBytecode,
+    placed: Placed,
 ) -> bool {
-    if !persistent_identities_follow_mapping(reference, observed, Some)
-        || !store_identities_follow_mapping(reference, observed, Some)
+    let at = |index| Some(placed.at(index));
+    if !persistent_identities_follow_mapping(reference, observed, at)
+        || !store_identities_follow_mapping(reference, observed, at)
     {
         return false;
     }
+    let beside =
+        || (reference.instances.iter().enumerate()).filter(|(index, _)| !placed.passes(*index));
     let mut first_by_key = AHashMap::with_capacity(reference.instances.len());
     let mut ambiguous = vec![false; reference.instances.len()];
-    for (index, instance) in reference.instances.iter().enumerate() {
+    for (index, instance) in beside() {
         let key = (
             instance.parent_index,
             instance.name.as_str(),
@@ -2559,7 +3300,7 @@ fn positional_identity_preserved(
     // Unchanged duplicate subtrees may retain their positional identities even
     // when an unrelated unique instance changed. Reference-bearing instances
     // outside those subtrees must still agree, including incoming references.
-    for (index, instance) in reference.instances.iter().enumerate() {
+    for (index, instance) in beside() {
         if let Some(parent) = instance.parent_index {
             if parent >= index {
                 return false;
@@ -2567,7 +3308,7 @@ fn positional_identity_preserved(
             ambiguous[index] |= ambiguous[parent];
         }
     }
-    positional_values_equivalent(reference, observed, Some(&ambiguous), true)
+    positional_values_equivalent(reference, observed, Some(&ambiguous), true, placed)
 }
 
 fn positional_values_equivalent(
@@ -2575,31 +3316,34 @@ fn positional_values_equivalent(
     observed: &SettingsBytecode,
     identity_checks: Option<&[bool]>,
     preserve_viewport: bool,
+    placed: Placed,
 ) -> bool {
-    if workspace_current_camera_index(reference) != workspace_current_camera_index(observed) {
+    if placed.camera(reference)
+        != workspace_current_camera_index(observed).map(|index| placed.at(index))
+    {
         return false;
     }
     let reference_ids = reference
         .instances
         .iter()
         .enumerate()
+        .filter(|(index, _)| !placed.passes(*index))
         .map(|(index, instance)| (instance.settings_id.as_str(), index))
         .collect::<AHashMap<_, _>>();
     let observed_ids = observed
         .instances
         .iter()
         .enumerate()
-        .map(|(index, instance)| (instance.settings_id.as_str(), index))
+        .map(|(index, instance)| (instance.settings_id.as_str(), placed.at(index)))
         .collect::<AHashMap<_, _>>();
     let ids = PairedStoreIds {
         service: store_service(reference),
         left: &reference_ids,
         right: &observed_ids,
     };
-    let equivalent = |(index, (reference_instance, observed_instance)): (
-        usize,
-        (&SettingsBytecodeInstance, &SettingsBytecodeInstance),
-    )| {
+    let equivalent = |(observed_index, observed_instance): (usize, &SettingsBytecodeInstance)| {
+        let index = placed.at(observed_index);
+        let reference_instance = &reference.instances[index];
         // An instance that stands for its unchanged counterpart holds what
         // the counterpart holds.
         if crate::settings::held::stands_unchanged(&reference_instance.properties)
@@ -2627,7 +3371,7 @@ fn positional_values_equivalent(
         reference_instance.class_name == "PackageLink"
             || preserve_viewport
                 && is_reconciliation_protected_workspace_camera(reference, index)
-                && is_reconciliation_protected_workspace_camera(observed, index)
+                && is_reconciliation_protected_workspace_camera(observed, observed_index)
             || reconciliation_maps_equal_with_ids(
                 &reference_instance.class_name,
                 &reference_instance.properties,
@@ -2639,20 +3383,10 @@ fn positional_values_equivalent(
                 ids,
             )
     };
-    if reference.instances.len() >= 2_048 && rayon::current_num_threads() > 1 {
-        reference
-            .instances
-            .par_iter()
-            .zip(observed.instances.par_iter())
-            .enumerate()
-            .all(equivalent)
+    if observed.instances.len() >= 2_048 && rayon::current_num_threads() > 1 {
+        observed.instances.par_iter().enumerate().all(equivalent)
     } else {
-        reference
-            .instances
-            .iter()
-            .zip(&observed.instances)
-            .enumerate()
-            .all(equivalent)
+        observed.instances.iter().enumerate().all(equivalent)
     }
 }
 
@@ -5194,7 +5928,7 @@ mod tests {
                 .map(|instance| instance.settings_id.clone())
                 .collect::<Vec<_>>()
         };
-        let mut files = store(&[
+        let files = store(&[
             ("debug:0", "Workspace", "Workspace", None),
             ("debug:1", "A", "Part", Some(0)),
             ("debug:2", "B", "Part", Some(0)),
@@ -5215,14 +5949,12 @@ mod tests {
         studio.instances[2]
             .properties
             .insert("Target".into(), names("debug:12"));
-        let before = files.instances.clone();
         assert!(align_settings_ids_beside_run(
-            &mut files,
+            &files,
             &mut studio,
             2..3,
             true
         ));
-        assert!(files.instances == before);
         assert_eq!(
             ids(&studio),
             ["debug:0", "debug:1", "reconcile:0", "debug:2", "debug:3"]
@@ -5237,7 +5969,7 @@ mod tests {
         assert_eq!(studio.instances[4].parent_index, Some(3));
 
         // The files hold an instance Studio lacks.
-        let mut files = store(&[
+        let files = store(&[
             ("debug:0", "Workspace", "Workspace", None),
             ("debug:1", "A", "Part", Some(0)),
             ("editor:1", "New", "Part", Some(1)),
@@ -5250,14 +5982,12 @@ mod tests {
             ("debug:12", "B", "Part", Some(0)),
             ("debug:13", "Under", "Folder", Some(2)),
         ]);
-        let before = files.instances.clone();
         assert!(align_settings_ids_beside_run(
-            &mut files,
+            &files,
             &mut studio,
             2..3,
             false
         ));
-        assert!(files.instances == before);
         assert_eq!(ids(&studio), ["debug:0", "debug:1", "debug:2", "debug:3"]);
 
         // An instance beside the run stands under one of the run: the run is
@@ -5267,16 +5997,411 @@ mod tests {
             ("debug:11", "Gone", "Folder", Some(0)),
             ("debug:12", "A", "Part", Some(1)),
         ]);
-        let mut files = store(&[
+        let files = store(&[
             ("debug:0", "Workspace", "Workspace", None),
             ("debug:1", "A", "Part", Some(0)),
         ]);
         assert!(!align_settings_ids_beside_run(
-            &mut files,
+            &files,
             &mut studio,
             1..2,
             true
         ));
+    }
+
+    /// Two copies of a store one run of instances apart pair the namesakes
+    /// beside it as the matching does, which is not by their places: the
+    /// files removed the first of two twins and changed the other, which
+    /// holds what neither of Studio's does, or gave the first of two the
+    /// same a child, which sets it apart from Studio's.
+    #[test]
+    fn namesakes_beside_a_run_one_copy_alone_holds_are_paired_as_the_matching_pairs_them() {
+        let store = |rows: &[(&str, &str, Option<usize>, Option<&str>)]| SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: rows
+                .iter()
+                .map(|(id, name, parent, material)| {
+                    let class = if *name == "Added" { "Folder" } else { "Part" };
+                    let mut instance = SettingsBytecodeInstance::new(
+                        (*id).into(),
+                        (*name).into(),
+                        class.into(),
+                        *parent,
+                    );
+                    if let Some(material) = material {
+                        instance
+                            .properties
+                            .insert("Material".into(), json!(material));
+                    }
+                    instance
+                })
+                .collect(),
+        };
+        let ids = |document: &SettingsBytecode| {
+            document
+                .instances
+                .iter()
+                .map(|instance| instance.settings_id.clone())
+                .collect::<Vec<_>>()
+        };
+        // Studio opened the place again and numbered its instances anew.
+        let files = store(&[
+            ("debug:0", "Root", None, None),
+            ("debug:1", "Mid", Some(0), None),
+            ("debug:2", "Twin", Some(0), Some("Glass")),
+        ]);
+        let mut studio = store(&[
+            ("debug:10", "Root", None, None),
+            ("debug:11", "Twin", Some(0), Some("Wood")),
+            ("debug:12", "Mid", Some(0), None),
+            ("debug:13", "Twin", Some(0), Some("Neon")),
+        ]);
+        assert!(align_settings_ids_to_reference(&files, &mut studio));
+        assert_eq!(ids(&studio), ["debug:0", "debug:2", "debug:1", "debug:13"]);
+
+        let files = store(&[
+            ("debug:0", "Root", None, None),
+            ("debug:1", "Twin", Some(0), None),
+            ("editor:1", "Added", Some(1), None),
+            ("debug:2", "Twin", Some(0), None),
+        ]);
+        let mut studio = store(&[
+            ("debug:10", "Root", None, None),
+            ("debug:11", "Twin", Some(0), None),
+            ("debug:12", "Twin", Some(0), None),
+        ]);
+        assert!(align_settings_ids_to_reference(&files, &mut studio));
+        assert_eq!(ids(&studio), ["debug:0", "debug:2", "debug:1"]);
+    }
+
+    /// Twins beside a run whose children Studio swapped are left to the
+    /// matching, which pairs them by those children, read whole or standing
+    /// unread for their counterparts while the push read the children alone;
+    /// so is a twin left unread beside a run that holds a namesake of it.
+    #[test]
+    fn twins_whose_children_studio_swapped_beside_a_run_are_left_to_the_matching() {
+        let store = |rows: &[(&str, &str, Option<usize>, &str)]| SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: rows
+                .iter()
+                .map(|(id, name, parent, material)| {
+                    let class = if *name == "Added" { "Folder" } else { "Part" };
+                    let mut instance = SettingsBytecodeInstance::new(
+                        (*id).into(),
+                        (*name).into(),
+                        class.into(),
+                        *parent,
+                    );
+                    if !material.is_empty() {
+                        instance
+                            .properties
+                            .insert("Material".into(), json!(material));
+                    }
+                    instance
+                })
+                .collect(),
+        };
+        let files = store(&[
+            ("debug:0", "Root", None, ""),
+            ("debug:1", "Added", Some(0), ""),
+            ("debug:2", "Twin", Some(0), "Glass"),
+            ("debug:3", "D", Some(2), "Wood"),
+            ("debug:4", "Twin", Some(0), "Glass"),
+            ("debug:5", "D", Some(4), "Neon"),
+        ]);
+        let studio = store(&[
+            ("debug:10", "Root", None, ""),
+            ("debug:11", "Twin", Some(0), "Glass"),
+            ("debug:12", "D", Some(1), "Neon"),
+            ("debug:13", "Twin", Some(0), "Glass"),
+            ("debug:14", "D", Some(3), "Wood"),
+        ]);
+        let mut matched = studio.clone();
+        assert!(align_settings_ids_by_matching(&files, &mut matched));
+        assert_eq!(
+            (matched.instances.iter())
+                .map(|instance| instance.settings_id.as_str())
+                .collect::<Vec<_>>(),
+            ["debug:0", "debug:4", "debug:5", "debug:2", "debug:3"]
+        );
+        let mut unread = studio.clone();
+        for index in [1, 3] {
+            let twin = &mut unread.instances[index];
+            *twin = twin.bare();
+            crate::settings::held::stand_unchanged(&mut twin.properties);
+        }
+        for mut observed in [studio, unread] {
+            assert!(!align_settings_ids_beside_run(
+                &files,
+                &mut observed,
+                1..2,
+                false
+            ));
+        }
+
+        // The files added a namesake of a twin with the child Studio gave
+        // that twin, whose own values the push left unread.
+        let files = store(&[
+            ("debug:0", "Root", None, ""),
+            ("debug:1", "A", Some(0), "Wood"),
+            ("debug:2", "D", Some(1), "Wood"),
+            ("debug:3", "Y", Some(0), ""),
+            ("debug:4", "Added", Some(0), ""),
+            ("debug:5", "A", Some(0), "Wood"),
+            ("debug:6", "D", Some(5), "Neon"),
+        ]);
+        let studio = store(&[
+            ("debug:10", "Root", None, ""),
+            ("debug:11", "A", Some(0), "Wood"),
+            ("debug:12", "D", Some(1), "Neon"),
+            ("debug:13", "Y", Some(0), ""),
+        ]);
+        let mut matched = studio.clone();
+        assert!(align_settings_ids_by_matching(&files, &mut matched));
+        assert_eq!(matched.instances[1].settings_id, "debug:5");
+        let mut unread = studio;
+        let twin = &mut unread.instances[1];
+        *twin = twin.bare();
+        crate::settings::held::stand_unchanged(&mut twin.properties);
+        assert!(!align_settings_ids_beside_run(
+            &files,
+            &mut unread,
+            4..7,
+            false
+        ));
+    }
+
+    /// Twins beside a run that hold what their counterparts hold, which the
+    /// viewport cameras name otherwise than their places, are left to the
+    /// matching: it pairs the cameras first and the twins by what those
+    /// name. Cameras that name the twins at their places leave them there.
+    #[test]
+    fn twins_the_viewport_cameras_name_otherwise_than_their_places_are_left_to_the_matching() {
+        let store = |prefix: &str, added: bool, subject: usize| {
+            let instance = |id: &str, name: &str, class: &str| {
+                let id = format!("{prefix}{id}");
+                let parent = (name != "Workspace").then_some(0);
+                SettingsBytecodeInstance::new(id, name.into(), class.into(), parent)
+            };
+            let named = |id: &str| json!({"_type": "Ref", "settingsId": format!("{prefix}{id}")});
+            let mut root = instance("root", "Workspace", "Workspace");
+            root.properties
+                .insert("CurrentCamera".into(), named("camera"));
+            let mut camera = instance("camera", "Camera", "Camera");
+            camera
+                .properties
+                .insert("CameraSubject".into(), named(&format!("a{subject}")));
+            let mut instances = vec![root, camera];
+            for (at, material) in ["Wood", "Neon"].into_iter().enumerate() {
+                let mut twin = instance(&format!("a{at}"), "A", "Part");
+                twin.properties.insert("Material".into(), json!(material));
+                instances.push(twin);
+            }
+            if added {
+                instances.push(instance("added", "Added", "Folder"));
+            }
+            SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances,
+            }
+        };
+        let twins = |document: &SettingsBytecode| {
+            (document.instances[2..4].iter())
+                .map(|instance| instance.settings_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let files = store("editor:", true, 1);
+        let studio = store("debug:", false, 0);
+        let mut matched = studio.clone();
+        assert!(align_settings_ids_by_matching(&files, &mut matched));
+        assert_eq!(twins(&matched), ["editor:a1", "editor:a0"]);
+        let mut aligned = studio;
+        assert!(!align_settings_ids_beside_run(
+            &files,
+            &mut aligned,
+            4..5,
+            false
+        ));
+        let mut aligned = store("debug:", false, 1);
+        assert!(align_settings_ids_beside_run(
+            &files,
+            &mut aligned,
+            4..5,
+            false
+        ));
+        assert_eq!(twins(&aligned), ["editor:a0", "editor:a1"]);
+    }
+
+    /// Twins a run one copy alone holds stands among are paired by what
+    /// tells them apart, not by their places: Studio removed a folder and
+    /// the second of two twins or added them, kept the twin whose child the
+    /// files hold the same, or kept the viewport camera of two.
+    #[test]
+    fn twins_beside_a_run_are_paired_by_what_tells_them_apart() {
+        let store = |rows: &[(&str, &str, Option<usize>, &str)]| SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: rows
+                .iter()
+                .map(|(id, name, parent, material)| {
+                    let class = match *name {
+                        "X" => "Folder",
+                        "Workspace" | "Camera" => name,
+                        _ => "Part",
+                    };
+                    let mut instance = SettingsBytecodeInstance::new(
+                        (*id).into(),
+                        (*name).into(),
+                        class.into(),
+                        *parent,
+                    );
+                    if !material.is_empty() {
+                        instance
+                            .properties
+                            .insert("Material".into(), json!(material));
+                    }
+                    instance
+                })
+                .collect(),
+        };
+        let ids = |document: &SettingsBytecode| {
+            document
+                .instances
+                .iter()
+                .map(|instance| instance.settings_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let files = store(&[
+            ("editor:w", "Workspace", None, ""),
+            ("editor:x", "X", Some(0), ""),
+            ("editor:wood", "A", Some(0), "Wood"),
+            ("editor:neon", "A", Some(0), "Neon"),
+        ]);
+        let mut studio = store(&[
+            ("debug:0", "Workspace", None, ""),
+            ("debug:1", "A", Some(0), "Wood"),
+        ]);
+        assert!(align_settings_ids_to_reference(&files, &mut studio));
+        assert_eq!(ids(&studio), ["editor:w", "editor:wood"]);
+
+        let files = store(&[
+            ("editor:w", "Workspace", None, ""),
+            ("editor:wood", "A", Some(0), "Wood"),
+        ]);
+        let mut studio = store(&[
+            ("debug:0", "Workspace", None, ""),
+            ("debug:1", "X", Some(0), ""),
+            ("debug:2", "A", Some(0), "Wood"),
+            ("debug:3", "A", Some(0), "Neon"),
+        ]);
+        assert!(align_settings_ids_to_reference(&files, &mut studio));
+        assert_eq!(
+            ids(&studio),
+            ["editor:w", "debug:1", "editor:wood", "debug:3"]
+        );
+
+        let files = store(&[
+            ("editor:w", "Workspace", None, ""),
+            ("editor:x", "X", Some(0), ""),
+            ("editor:a1", "A", Some(0), ""),
+            ("editor:wood", "D", Some(2), "Wood"),
+            ("editor:a2", "A", Some(0), ""),
+            ("editor:neon", "D", Some(4), "Neon"),
+        ]);
+        let mut studio = store(&[
+            ("debug:0", "Workspace", None, ""),
+            ("debug:1", "A", Some(0), ""),
+            ("debug:2", "D", Some(1), "Wood"),
+        ]);
+        assert!(align_settings_ids_to_reference(&files, &mut studio));
+        assert_eq!(ids(&studio), ["editor:w", "editor:a1", "editor:wood"]);
+
+        let viewport = |mut document: SettingsBytecode, camera: &str| {
+            document.instances[0].properties.insert(
+                "CurrentCamera".into(),
+                json!({"_type": "Ref", "settingsId": camera}),
+            );
+            document
+        };
+        let files = viewport(
+            store(&[
+                ("editor:w", "Workspace", None, ""),
+                ("editor:x", "X", Some(0), ""),
+                ("editor:current", "Camera", Some(0), ""),
+                ("editor:other", "Camera", Some(0), ""),
+            ]),
+            "editor:current",
+        );
+        let mut studio = viewport(
+            store(&[
+                ("debug:0", "Workspace", None, ""),
+                ("debug:1", "Camera", Some(0), ""),
+            ]),
+            "debug:1",
+        );
+        assert!(align_settings_ids_to_reference(&files, &mut studio));
+        assert_eq!(ids(&studio), ["editor:w", "editor:current"]);
+
+        let files = viewport(
+            store(&[
+                ("editor:w", "Workspace", None, ""),
+                ("editor:current", "Camera", Some(0), ""),
+            ]),
+            "editor:current",
+        );
+        let mut studio = viewport(
+            store(&[
+                ("debug:0", "Workspace", None, ""),
+                ("debug:1", "X", Some(0), ""),
+                ("debug:2", "Camera", Some(0), ""),
+                ("debug:3", "Camera", Some(0), ""),
+            ]),
+            "debug:2",
+        );
+        assert!(align_settings_ids_to_reference(&files, &mut studio));
+        assert_eq!(
+            ids(&studio),
+            ["editor:w", "debug:1", "editor:current", "debug:3"]
+        );
+    }
+
+    /// A UniqueId of nothing but zeros is none: two of them ahead of a run
+    /// do not say where it starts.
+    #[test]
+    fn nil_unique_ids_ahead_of_a_run_do_not_tell_it() {
+        let copy = |unique_ids: &[Option<&str>]| {
+            let mut instances = vec![SettingsBytecodeInstance::new(
+                "w".into(),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            )];
+            for (index, unique_id) in unique_ids.iter().enumerate() {
+                let mut instance = SettingsBytecodeInstance::new(
+                    format!("a{index}"),
+                    "A".into(),
+                    "Part".into(),
+                    Some(0),
+                );
+                if let Some(unique_id) = unique_id {
+                    instance.properties.insert(
+                        "UniqueId".into(),
+                        json!({"_type": "UniqueId", "value": unique_id}),
+                    );
+                }
+                instances.push(instance);
+            }
+            instances
+        };
+        let (held, nil) = ("1f".repeat(16), "0".repeat(32));
+        let told = |ahead: &str| {
+            run_is_told(
+                (2..3, true),
+                &copy(&[Some(ahead), None]),
+                &copy(&[Some(ahead)]),
+            )
+        };
+        assert!(told(&held));
+        assert!(!told(&nil));
     }
 
     #[test]
@@ -8132,7 +9257,7 @@ mod already_aligned_tests {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             let reference = store(&mut rng);
             let observed = edited(&reference, &mut rng);
-            if !identities_already_aligned(&reference, &observed) {
+            if !identities_already_aligned(&reference, &observed, Placed::default()) {
                 said_not += 1;
                 continue;
             }

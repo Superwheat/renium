@@ -417,24 +417,29 @@ fn simulate(seed: u64, counts: &Counts) -> Result<(), String> {
 #[test]
 fn a_store_edit_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_push_it() {
     let counts = Counts::default();
-    run_seeds(SEEDS, |seed, _| simulate(seed, &counts));
+    let seeds = run_seeds(SEEDS, |seed, _| simulate(seed, &counts));
     if std::env::var_os("RENIUM_SIM_SEED").is_some() {
         return;
     }
+    // The counts below are those of `SEEDS` seeds, in proportion to the
+    // seeds run: a least one at least one, a most one rounded up.
     let of = |count: &AtomicUsize| count.load(Ordering::Relaxed);
+    let per = |count: usize| (count * seeds as usize / SEEDS as usize).max(usize::from(count > 0));
     let least = |counts: &[AtomicUsize], least: &[usize]| {
         let counts = counts.iter().zip(least);
-        counts.into_iter().all(|(count, least)| of(count) >= *least)
+        counts
+            .into_iter()
+            .all(|(count, least)| of(count) >= per(*least))
     };
     assert!(
         least(&counts.alone, &[18, 24, 24, 23, 9, 22, 0, 20])
             && least(&counts.alone_in_blocks, &[33; 4])
-            && of(&counts.sent) >= 50
-            && of(&counts.sent_beside_a_store) >= 8
-            && of(&counts.planned_whole) >= 50
-            && of(&counts.beside_another_file) >= 16
-            && of(&counts.refused) >= 2
-            && of(&counts.unstored) <= 70,
+            && of(&counts.sent) >= per(50)
+            && of(&counts.sent_beside_a_store) >= per(8)
+            && of(&counts.planned_whole) >= per(50)
+            && of(&counts.beside_another_file) >= per(16)
+            && of(&counts.refused) >= per(2)
+            && of(&counts.unstored) <= (70 * seeds as usize).div_ceil(SEEDS as usize),
         "too few of a kind ({KINDS:?}, in blocks of {BLOCK_ROWS:?} rows): {counts:?}"
     );
 }

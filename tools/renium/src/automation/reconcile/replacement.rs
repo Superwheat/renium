@@ -1,7 +1,7 @@
 use super::*;
 use crate::settings::bytecode::blocks::store_payload_len;
 use crate::settings::bytecode::property_edit::Moved;
-use crate::settings::equivalence::ByOrder;
+use crate::settings::equivalence::{ByOrder, run_is_told};
 use crate::settings::tree::settings_children_by_parent;
 
 pub(crate) fn project_replacement_paths(
@@ -409,6 +409,42 @@ fn sparse_document(
     Ok(document)
 }
 
+/// The instances of a copy that stand under their parent beside a namesake,
+/// twins, or under one at any depth.
+fn twins_or_under(instances: &[SettingsBytecodeInstance]) -> Vec<bool> {
+    let mut first = AHashMap::with_capacity(instances.len());
+    let mut twins = vec![false; instances.len()];
+    for (index, instance) in instances.iter().enumerate() {
+        let key = (
+            instance.parent_index,
+            instance.name.as_str(),
+            instance.class_name.as_str(),
+        );
+        if let Some(first) = first.insert(key, index) {
+            twins[first] = true;
+            twins[index] = true;
+        }
+    }
+    for (index, instance) in instances.iter().enumerate() {
+        if let Some(parent) = instance.parent_index {
+            twins[index] |= parent >= index || twins[parent];
+        }
+    }
+    twins
+}
+
+/// Of Studio's instances, by `files_of` each the files' one it stands for,
+/// the ones `twins_or_under` gives of either copy.
+fn twins_of_both(
+    (studio, files): (&[SettingsBytecodeInstance], &[SettingsBytecodeInstance]),
+    files_of: impl Fn(usize) -> Option<usize>,
+) -> Vec<bool> {
+    let (of_studio, of_files) = (twins_or_under(studio), twins_or_under(files));
+    (0..studio.len())
+        .map(|index| of_studio[index] || files_of(index).is_some_and(|files| of_files[files]))
+        .collect()
+}
+
 /// Tells the instances that differ in what they hold from the ones whose
 /// rows two copies of a store only write another way: `differs` keeps each
 /// of `differing`, an instance of the files' copy with Studio's, that holds
@@ -416,15 +452,18 @@ fn sparse_document(
 /// capture can write a value the other copy leaves out, in every row of a
 /// class. Once more than `MAX_CHANGED_INSTANCES` differ the store is not
 /// compared instance by instance, so the rest are left as they were, and so
-/// are all of a copy that cannot be read by its rows.
+/// are all of a copy that cannot be read by its rows. Of Studio's instances
+/// in `twins`, which an alignment by places pairs as they stand, `differs`
+/// keeps as well, uncounted, each that holds another value the matching
+/// keys an instance by (`holds_exactly`).
 fn told_apart(
     (desired_bytes, observed_bytes): (&[u8], &[u8]),
     differing: &[(usize, usize)],
-    differs: &mut [bool],
+    (differs, twins): (&mut [bool], Option<&[bool]>),
     moved: Option<&Moved>,
 ) -> Result<usize> {
     use crate::settings::bytecode::property_edit::decode_for_property_edit;
-    use crate::settings::equivalence::canonicalize_instances;
+    use crate::settings::equivalence::{canonicalize_instances, holds_exactly};
 
     let _span = crate::app::profile::span("store rows told apart");
     let (Ok((mut files, mut files_rows)), Ok((mut studio, mut studio_rows))) = rayon::join(
@@ -481,15 +520,18 @@ fn told_apart(
         let differ = of_files
             .par_iter()
             .zip(&of_studio)
-            .map(|(files, studio)| {
-                files.name != studio.name
+            .zip(pairs)
+            .map(|((files, studio), (_, row))| {
+                let differ = files.name != studio.name
                     || files.parent_index != studio.parent_index
-                    || !instance_values_equal(None, files, studio)
+                    || !instance_values_equal(None, files, studio);
+                let twin = twins.is_some_and(|twins| twins[*row]);
+                (differ, differ || twin && !holds_exactly(files, studio))
             })
             .collect::<Vec<_>>();
         (of_files.into_par_iter().chain(of_studio)).for_each(drop);
-        for ((_, row), differ) in pairs.iter().zip(differ) {
-            differs[*row] = differ;
+        for ((_, row), (differ, read)) in pairs.iter().zip(differ) {
+            differs[*row] = read;
             unlike += usize::from(differ);
         }
         compared += pairs.len();
@@ -615,50 +657,6 @@ fn imported_store(
     }
     drop(studio);
     replaced_store_beside(desired_bytes, retained, files)
-}
-
-/// Whether the run of instances one copy alone holds is the one its place
-/// gives. Where the instance ahead of it is a namesake of its last, the run
-/// could as well start earlier, and only a UniqueId both copies hold for the
-/// instance ahead says it does not. An instance of the run under a UniqueId
-/// the other copy holds was moved, not added.
-fn run_is_told(
-    (run, of_files): (std::ops::Range<usize>, bool),
-    files: &[SettingsBytecodeInstance],
-    studio: &[SettingsBytecodeInstance],
-) -> bool {
-    let (longer, shorter) = if of_files {
-        (files, studio)
-    } else {
-        (studio, files)
-    };
-    fn unique(instance: &SettingsBytecodeInstance) -> Option<&str> {
-        instance.properties.get("UniqueId")?.get("value")?.as_str()
-    }
-    let of_run = longer[run.clone()]
-        .iter()
-        .filter_map(unique)
-        .collect::<HashSet<_>>();
-    if !of_run.is_empty()
-        && shorter
-            .iter()
-            .filter_map(unique)
-            .any(|held| of_run.contains(held))
-    {
-        return false;
-    }
-    let (Some(ahead), Some(last)) = (run.start.checked_sub(1), run.end.checked_sub(1)) else {
-        return true;
-    };
-    if longer[ahead].name != longer[last].name
-        || longer[ahead].class_name != longer[last].class_name
-    {
-        return true;
-    }
-    matches!(
-        (unique(&longer[ahead]), shorter.get(ahead).and_then(unique)),
-        (Some(one), Some(other)) if one == other
-    )
 }
 
 /// What `changed_instances_alone` answers for a store it has imported anew
@@ -844,6 +842,22 @@ pub(crate) static BY_ORDER: [std::sync::atomic::AtomicUsize; 2] = [
 #[cfg(test)]
 pub(crate) static TOLD_ALONE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// The stores prepared from instances aligned beside a run of instances one
+/// copy alone holds, each by `copies_key` of its two copies.
+#[cfg(test)]
+pub(crate) static ALIGNED_BESIDE_RUN: std::sync::Mutex<Vec<u64>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// What tells the two copies of a store one test prepared from those of
+/// another test.
+#[cfg(test)]
+pub(crate) fn copies_key(desired: &[u8], observed: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (desired, observed).hash(&mut hasher);
+    hasher.finish()
+}
 
 /// How `told_alone` pairs the instances of two copies of a store.
 struct Told {
@@ -1295,6 +1309,7 @@ fn changed_instances_placed(
             }));
         }
     }
+    let beside_run = told.is_none() && moved.and_then(Moved::run).is_some();
     let mut read = instances_read(&skeleton, (&differs, &kept), files_too);
     if read.len() > MAX_CHANGED_INSTANCES {
         // The rows that only write the same values another way are not read.
@@ -1308,9 +1323,12 @@ fn changed_instances_placed(
             .filter(|&index| differs[index] && !names[index])
             .filter_map(|index| Some((files_of(index)?, index)))
             .collect::<Vec<_>>();
+        // Twins, which an alignment beside a run pairs by their places, are
+        // read where they hold what the matching weighs otherwise.
+        let twins = beside_run.then(|| twins_of_both((&skeleton, files_instances), files_of));
         let copies = (desired_bytes.as_slice(), observed_bytes.as_slice());
         // With the instances one copy alone holds.
-        let unlike = told_apart(copies, &differing, &mut differs, moved)?
+        let unlike = told_apart(copies, &differing, (&mut differs, twins.as_deref()), moved)?
             + (0..studio_count)
                 .filter(|&index| files_of(index).is_none())
                 .count()
@@ -1412,7 +1430,7 @@ fn changed_instances_placed(
         }
         (None, None) => align_settings_ids_by_place(&current, &mut previous),
         (None, Some((run, of_files))) => {
-            align_settings_ids_beside_run(&mut current, &mut previous, run, !of_files)
+            align_settings_ids_beside_run(&current, &mut previous, run, !of_files)
         }
     };
     // Two copies of the files' own share their ids: an alignment that gives
@@ -1423,6 +1441,16 @@ fn changed_instances_placed(
     });
     if !aligned || !kept {
         return hand_over(current);
+    }
+    #[cfg(test)]
+    if beside_run {
+        let key = copies_key(desired_bytes, observed_bytes);
+        ALIGNED_BESIDE_RUN.lock().unwrap().push(key);
+        if let (Ok(files), Ok(studio)) = (settings_document(desired), settings_document(observed)) {
+            crate::settings::equivalence::paired_as_the_whole_matching_pairs(
+                &files, studio, &current, &previous,
+            );
+        }
     }
     let reusable = previous
         .instances

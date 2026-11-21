@@ -75,11 +75,11 @@ impl SimRng {
 /// Runs a simulation once per seed and fails with every seed that did not
 /// hold. `RENIUM_SIM_SEEDS=N` runs N seeds instead of `default_seeds`,
 /// `RENIUM_SIM_FIRST=S` starts at seed S, and `RENIUM_SIM_SEED=S` replays one
-/// seed and prints its steps.
+/// seed and prints its steps. Gives the number of seeds it ran.
 pub(crate) fn run_seeds(
     default_seeds: u64,
     run: impl Fn(u64, &mut Vec<String>) -> Result<(), String> + Sync,
-) {
+) -> u64 {
     let number = |name: &str| {
         std::env::var(name)
             .ok()
@@ -139,6 +139,7 @@ pub(crate) fn run_seeds(
             .collect::<Vec<_>>()
             .join("\n")
     );
+    count
 }
 
 /// Raw saved names, including both a service-name collision and a same-Name

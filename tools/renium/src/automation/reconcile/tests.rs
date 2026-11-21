@@ -7310,6 +7310,40 @@ fn twins_alike(document: &mut SettingsBytecode) {
     }
 }
 
+/// Namesakes under the root whose own values are alike, told apart by their
+/// children: Studio gave the child of its one the files' other value, and
+/// the files added a folder and a namesake that holds the child Studio's
+/// does, a run beside the namesake Studio holds unchanged.
+fn namesakes_told_by_their_children(studio: &mut SettingsBytecode, files: &mut SettingsBytecode) {
+    let part = |id: &str, name: &str, parent: usize, material: &str| {
+        let mut part =
+            SettingsBytecodeInstance::new(id.into(), name.into(), "Part".into(), Some(parent));
+        part.properties.insert(
+            "Material".into(),
+            json!({"_type": "EnumItem", "name": material}),
+        );
+        part
+    };
+    let folder = |id: &str, name: &str| {
+        SettingsBytecodeInstance::new(id.into(), name.into(), "Folder".into(), Some(0))
+    };
+    let at = studio.instances.len();
+    studio.instances.extend([
+        part("debug:0_801", "Namesake", 0, "Wood"),
+        part("debug:0_802", "Under", at, "Neon"),
+        folder("debug:0_803", "Beside"),
+    ]);
+    let at = files.instances.len();
+    files.instances.extend([
+        part("debug:0_801", "Namesake", 0, "Wood"),
+        part("debug:0_802", "Under", at, "Wood"),
+        folder("debug:0_803", "Beside"),
+        folder("editor:801", "Added"),
+        part("editor:802", "Namesake", 0, "Wood"),
+        part("editor:803", "Under", at + 4, "Neon"),
+    ]);
+}
+
 /// What came between two copies of a store since the files were written:
 /// Studio's ids, the files' edits. Answers whether Studio opened the place
 /// again, and whether a push imported the service.
@@ -7390,12 +7424,13 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
     let from_both = AtomicUsize::new(0);
     let sent_from_both = AtomicUsize::new(0);
     let from_blocks_of_both = AtomicUsize::new(0);
-    let beside_a_run = AtomicUsize::new(0);
     let runs = AtomicUsize::new(0);
     let runs_sent_from_both = AtomicUsize::new(0);
     let compared_by_changed = AtomicUsize::new(0);
     let (with_scripts, sources_sent) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let told_alone_before = super::replacement::TOLD_ALONE.load(Ordering::Relaxed);
+    // The copies of each store this test prepares (`copies_key`).
+    let copies = std::sync::Mutex::new(HashSet::new());
     let paired_first_before = super::replacement::PAIRED_FIRST.load(Ordering::Relaxed);
     let by_order_before = super::replacement::BY_ORDER
         .each_ref()
@@ -7413,6 +7448,9 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
         }
         let mut files = studio.clone();
         let (reopened, imported) = copies_apart(seed, &mut rng, &mut studio, &mut files);
+        if seed % 13 == 6 && files.instances.len() == studio.instances.len() {
+            namesakes_told_by_their_children(&mut studio, &mut files);
+        }
         let run = files.instances.len() != studio.instances.len();
         // Scripts beside them, their sources in files: with the text Studio
         // holds or another, held by the files alone, with its file gone, or
@@ -7450,6 +7488,8 @@ fn a_store_prepared_from_its_changed_instances_is_pushed_as_the_whole_documents_
         };
         let held_by_both = match (desired.entries.get(&path), observed.entries.get(&path)) {
             (Some(SnapshotEntry::File(files)), Some(SnapshotEntry::File(studio))) => {
+                let key = super::replacement::copies_key(files, studio);
+                copies.lock().unwrap().insert(key);
                 blocks_of_both(files, studio)
             }
             _ => 0,
@@ -7717,9 +7757,6 @@ from the whole documents:
             if reopened {
                 under_other_ids.fetch_add(1, Ordering::Relaxed);
             }
-            if run {
-                beside_a_run.fetch_add(1, Ordering::Relaxed);
-            }
         } else {
             whole.fetch_add(1, Ordering::Relaxed);
         }
@@ -7730,8 +7767,6 @@ from the whole documents:
         }
         Ok(())
     });
-    // The share of the stores with such a run that are prepared so.
-    const RUNS_READ_SO: usize = 38;
     if std::env::var_os("RENIUM_SIM_SEED").is_none() {
         let counts = [
             &from_changed,
@@ -7742,7 +7777,6 @@ from the whole documents:
             &from_both,
             &sent_from_both,
             &from_blocks_of_both,
-            &beside_a_run,
             &runs,
             &runs_sent_from_both,
         ]
@@ -7751,6 +7785,17 @@ from the whole documents:
         // copies and were prepared from the ones that differ all the same.
         let told_alone = super::replacement::TOLD_ALONE.load(Ordering::Relaxed) - told_alone_before;
         assert!(told_alone >= 100, "paired each by itself: {told_alone}");
+        // The preparations of this test aligned beside a run of instances
+        // one copy alone holds: about four for each store with a run over
+        // 3,000 seeds, five over the 300 run by default.
+        let copies = copies.into_inner().unwrap();
+        let held = super::replacement::ALIGNED_BESIDE_RUN.lock().unwrap();
+        let aligned = held.iter().filter(|key| copies.contains(*key)).count();
+        assert!(
+            aligned >= 2 * counts[8],
+            "aligned beside a run: {aligned}, of {} stores with a run",
+            counts[8]
+        );
         // The ones paired so without a comparison by place before: the store
         // stood apart the last time it was compared.
         let paired_first =
@@ -7787,17 +7832,14 @@ from the whole documents:
                 && counts[5] >= 12
                 && counts[6] >= 8
                 && counts[7] >= 8
-                && counts[8] * 100 >= counts[9] * RUNS_READ_SO
-                && counts[10] >= 20,
-            "prepared from the changed instances {} ({} of them under other ids, {} with both copies read so, {} of those with values sent, {} of them with blocks both hold, {} beside a run of instances one copy alone holds, of {} such, {} of them sent from both), from whole documents {}, with a plan {}, unchanged {}",
+                && counts[9] >= 20,
+            "prepared from the changed instances {} ({} of them under other ids, {} with both copies read so, {} of those with values sent, {} of them with blocks both hold, {} of them sent from both with a run of instances one copy alone holds), from whole documents {}, with a plan {}, unchanged {}",
             counts[0],
             counts[4],
             counts[5],
             counts[6],
             counts[7],
-            counts[8],
             counts[9],
-            counts[10],
             counts[1],
             counts[2],
             counts[3]
@@ -8137,6 +8179,93 @@ fn a_store_most_of_whose_instances_differ_is_imported_anew() {
     let (imported, plan, previous) = pushed(&same, &studio, StoresRead::ChangedOfBoth);
     assert!(!imported && previous.is_empty());
     assert_eq!(plan, pushed(&same, &studio, StoresRead::Whole).1);
+}
+
+/// Beside a run of instances the files alone hold, in a store too many of
+/// whose rows Studio wrote another way to read them all, twins Studio holds
+/// crossed in an engine's attribute, which the comparison of such rows
+/// leaves out and the matching weighs, are read and left to the matching.
+/// Twins that hold the same stand unread for their counterparts. Either way
+/// the push is the one the whole documents make.
+#[test]
+fn twins_crossed_among_rows_written_another_way_are_read_beside_a_run() {
+    let store = |studio: bool, crossed: bool| {
+        let instance = |id: String, name: &str, class: &str, parent| {
+            SettingsBytecodeInstance::new(id, name.into(), class.into(), parent)
+        };
+        let session = usize::from(studio);
+        let mut root = instance("1".into(), "Workspace", "Workspace", None);
+        root.properties.insert(
+            "CurrentCamera".into(),
+            json!({"_type": "Ref", "instanceIndex": 2}),
+        );
+        let camera = format!("debug:{session}_2");
+        let mut instances = vec![root, instance(camera, "Camera", "Camera", Some(0))];
+        if !studio {
+            instances.push(instance("editor:added".into(), "Added", "Folder", Some(0)));
+        }
+        for seen in [1, 2] {
+            let id = format!("debug:{session}_{}", 2 + seen);
+            let mut twin = instance(id, "A", "Folder", Some(0));
+            let seen = if crossed { 3 - seen } else { seen };
+            twin.attributes.insert("RBX_Seen".into(), json!(seen));
+            instances.push(twin);
+        }
+        for index in 0..16_400 {
+            let id = format!("debug:{session}_{}", 10 + index);
+            let mut part = instance(id, &format!("Item{index}"), "MeshPart", Some(0));
+            part.properties.insert("Anchored".into(), json!(true));
+            if studio {
+                part.properties.insert(
+                    "CollisionFidelity".into(),
+                    json!({"_type": "EnumItem", "name": "Default"}),
+                );
+            }
+            instances.push(part);
+        }
+        SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances,
+        }
+    };
+    let path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+    let snapshot = |document: &SettingsBytecode| ProjectSnapshot {
+        entries: BTreeMap::from([(
+            path.clone(),
+            SnapshotEntry::File(encode_settings_bytecode(document).unwrap()),
+        )]),
+    };
+    // The plan, and whether the store Studio holds stands for the most of
+    // its instances unread.
+    let pushed = |studio: &SettingsBytecode, read: StoresRead| {
+        let (desired, observed) = (snapshot(&store(false, false)), snapshot(studio));
+        let paths = project_replacement_paths(&desired, &observed);
+        let mut prepared = HashMap::new();
+        prepare_project_replacement_from(&desired, &observed, &paths, &mut prepared, read).unwrap();
+        let stands = prepared.get(&path).is_some_and(|change| {
+            (change.previous.instances.iter())
+                .any(|instance| crate::settings::held::stands_unchanged(&instance.properties))
+        });
+        let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+            &observed, &desired, &paths, &prepared, true, false,
+        )
+        .unwrap();
+        let plan = super::push_flow::plan_from_whole_stores(
+            (read, true, plan),
+            (&desired, &observed),
+            &paths,
+            &mut prepared,
+        )
+        .unwrap();
+        (plan_text(&plan), stands)
+    };
+    for crossed in [true, false] {
+        let studio = store(true, crossed);
+        let (expected, _) = pushed(&studio, StoresRead::Whole);
+        for read in [StoresRead::Changed, StoresRead::ChangedOfBoth] {
+            assert_eq!(pushed(&studio, read), (expected.clone(), !crossed));
+        }
+    }
 }
 
 /// An instance the files hold in another store than Studio does is removed
@@ -8741,7 +8870,35 @@ fn a_bare_store_prepared_from_the_instances_its_push_reads_is_pushed_as_the_whol
         }
         match (&change, &expected_change) {
             (Some(change), Some(expected)) => {
-                if change.previous != expected.previous {
+                // An instance of Studio's copy the push left unread stands,
+                // bare, for the whole one, which the files hold the same
+                // under its id.
+                let edited = (expected.current.instances.iter().enumerate())
+                    .map(|(index, instance)| (instance.settings_id.as_str(), index))
+                    .collect::<HashMap<_, _>>();
+                let stands_for = |index: usize, read: &SettingsBytecodeInstance| {
+                    let held = &expected.previous.instances[index];
+                    let mut bare = held.bare();
+                    if let Some(unique_id) = held.properties.get("UniqueId") {
+                        bare.properties.insert("UniqueId".into(), unique_id.clone());
+                    }
+                    crate::settings::held::stand_unchanged(&mut bare.properties);
+                    *read == bare
+                        && edited.get(held.settings_id.as_str()).is_some_and(|at| {
+                            settings_instances_equal(
+                                &expected.current,
+                                *at,
+                                &expected.previous,
+                                index,
+                            )
+                        })
+                };
+                if change.previous.version != expected.previous.version
+                    || change.previous.instances.len() != expected.previous.instances.len()
+                    || (change.previous.instances.iter().enumerate()).any(|(index, read)| {
+                        *read != expected.previous.instances[index] && !stands_for(index, read)
+                    })
+                {
                     return Err("Studio's copy is another".to_string());
                 }
                 if let Some(index) = (0..expected.current.instances.len()).find(|&index| {
