@@ -2739,7 +2739,8 @@ pub(crate) fn bytecode_export_place(mut args: BytecodeExportPlaceArgs) -> Result
 /// A place file can store a number wider than the reflection database
 /// declares (Studio writes `Workspace.SimulationRate` as a double while the
 /// database says Float32). The writer refuses such a value, so numbers taken
-/// from a base place are brought to the declared width.
+/// from a base place are brought to the declared width. Only numbers are
+/// looked up, each class's property once.
 pub(crate) fn coerce_numeric_property_widths(dom: &mut RbxWeakDom) {
     use rbx_dom_weak::types::VariantType;
     use rbx_reflection::DataType;
@@ -2747,6 +2748,8 @@ pub(crate) fn coerce_numeric_property_widths(dom: &mut RbxWeakDom) {
     let Ok(database) = rbx_reflection_database::get() else {
         return;
     };
+    let mut declared_types =
+        ahash::AHashMap::<(rbx_dom_weak::Ustr, rbx_dom_weak::Ustr), Option<VariantType>>::new();
     let referents = dom
         .descendants()
         .map(|instance| instance.referent())
@@ -2757,9 +2760,25 @@ pub(crate) fn coerce_numeric_property_widths(dom: &mut RbxWeakDom) {
         };
         let class_name = instance.class;
         for (name, value) in instance.properties.iter_mut() {
-            let Some(DataType::Value(declared)) =
-                rbx_property_descriptor(database, &class_name, name)
-                    .map(|descriptor| &descriptor.data_type)
+            if !matches!(
+                value,
+                RbxVariant::Float64(_)
+                    | RbxVariant::Float32(_)
+                    | RbxVariant::Int64(_)
+                    | RbxVariant::Int32(_)
+            ) {
+                continue;
+            }
+            let Some(declared) = *declared_types
+                .entry((class_name, *name))
+                .or_insert_with(|| {
+                    match rbx_property_descriptor(database, &class_name, name)
+                        .map(|descriptor| &descriptor.data_type)
+                    {
+                        Some(DataType::Value(declared)) => Some(*declared),
+                        _ => None,
+                    }
+                })
             else {
                 continue;
             };

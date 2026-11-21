@@ -259,3 +259,122 @@ fn a_place_is_read_by_its_content_not_its_name() {
     assert_eq!(RbxPlaceFormat::sniff(b"not a place"), None);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// Numbers brought to their declared width by a lookup of every value.
+fn coerce_by_every_lookup(dom: &mut WeakDom) {
+    use rbx_dom_weak::types::VariantType;
+    use rbx_reflection::DataType;
+    let database = rbx_reflection_database::get().unwrap();
+    let referents = dom
+        .descendants()
+        .map(|instance| instance.referent())
+        .collect::<Vec<_>>();
+    for referent in referents {
+        let instance = dom.get_by_ref_mut(referent).unwrap();
+        let class_name = instance.class;
+        for (name, value) in instance.properties.iter_mut() {
+            let Some(DataType::Value(declared)) =
+                super::encode::rbx_property_descriptor(database, &class_name, name)
+                    .map(|descriptor| &descriptor.data_type)
+            else {
+                continue;
+            };
+            *value = match (&*value, declared) {
+                (Variant::Float64(number), VariantType::Float32) => {
+                    Variant::Float32(*number as f32)
+                }
+                (Variant::Float32(number), VariantType::Float64) => {
+                    Variant::Float64(f64::from(*number))
+                }
+                (Variant::Int64(number), VariantType::Int32) => Variant::Int32(*number as i32),
+                (Variant::Int32(number), VariantType::Int64) => Variant::Int64(i64::from(*number)),
+                _ => continue,
+            };
+        }
+    }
+}
+
+/// Places of every class's numbers at both widths, numbers of no declared
+/// property and other values come out of the save's width coercion as out
+/// of a lookup of every value, and some numbers change width.
+#[test]
+fn numbers_take_their_declared_width_as_a_lookup_of_every_value_gives() {
+    use crate::tests::support::{SimRng, run_seeds};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let generate = |seed: u64| {
+        let mut rng = SimRng(seed);
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let mut ids = vec![dom.root_ref()];
+        for _ in 0..200 {
+            let class = [
+                "Workspace",
+                "Part",
+                "MeshPart",
+                "IntValue",
+                "NumberValue",
+                "Sound",
+                "Folder",
+                "NotAClass",
+            ][rng.below(8)];
+            let mut builder = InstanceBuilder::new(class);
+            for name in [
+                "Transparency",
+                "Reflectance",
+                "Value",
+                "Volume",
+                "TimePosition",
+                "Gravity",
+                "StreamingMinRadius",
+                "StreamingTargetRadius",
+                "NotAProperty",
+            ] {
+                let number = rng.below(1 << 20);
+                let value = match rng.below(8) {
+                    0 => Variant::Float64(number as f64 / 7.0),
+                    1 => Variant::Float32(number as f32 / 7.0),
+                    2 => Variant::Int64(number as i64 - (1 << 19)),
+                    3 => Variant::Int32(number as i32 - (1 << 19)),
+                    4 => Variant::Bool(number.is_multiple_of(2)),
+                    5 => Variant::String(number.to_string()),
+                    _ => continue,
+                };
+                builder = builder.with_property(name, value);
+            }
+            let parent = ids[rng.below(ids.len())];
+            ids.push(dom.insert(parent, builder));
+        }
+        dom
+    };
+    let changed = AtomicUsize::new(0);
+    run_seeds(64, |seed, _| {
+        let (mut expected, mut found) = (generate(seed), generate(seed));
+        coerce_by_every_lookup(&mut expected);
+        super::model::coerce_numeric_property_widths(&mut found);
+        let before = generate(seed);
+        for ((expected, found), before) in expected
+            .descendants()
+            .zip(found.descendants())
+            .zip(before.descendants())
+        {
+            if expected.properties != found.properties {
+                return Err(format!(
+                    "{} {:?} took other widths",
+                    expected.class, expected.properties
+                ));
+            }
+            changed.fetch_add(
+                before
+                    .properties
+                    .iter()
+                    .filter(|(name, value)| expected.properties.get(*name) != Some(*value))
+                    .count(),
+                Ordering::Relaxed,
+            );
+        }
+        Ok(())
+    });
+    assert!(
+        changed.load(Ordering::Relaxed) > 0,
+        "no number changed width"
+    );
+}
