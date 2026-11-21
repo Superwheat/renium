@@ -43,7 +43,20 @@ pub(crate) fn assign_editor_instance_paths(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static WHOLE_STORE_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Notes a pass over every instance of a store, so a test can tell an edit
+/// of many items that reads the store once from one that reads it per item.
+pub(crate) fn count_whole_store_pass() {
+    #[cfg(test)]
+    WHOLE_STORE_PASSES.with(|passes| passes.set(passes.get() + 1));
+}
+
 pub(crate) fn settings_children_by_parent(document: &SettingsBytecode) -> Vec<Vec<usize>> {
+    count_whole_store_pass();
     let mut children = vec![Vec::new(); document.instances.len()];
     for (index, instance) in document.instances.iter().enumerate() {
         if let Some(parent_index) = instance.parent_index

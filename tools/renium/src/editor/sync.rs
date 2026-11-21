@@ -26,8 +26,9 @@ use crate::editor::diff::{
     append_editor_target_changes, editor_instance_descriptor_for_known_path,
 };
 use crate::editor::document::{
-    document_instance_index_by_settings_id, ensure_editor_source_target_in_bytecode_reserving,
-    read_editor_service_settings, read_editor_service_settings_cached,
+    EditorDocumentIndex, document_instance_index_by_settings_id,
+    ensure_editor_source_target_with_index, read_editor_service_settings,
+    read_editor_service_settings_cached,
 };
 use crate::editor::history::save_editor_history_entries;
 use crate::editor::paths::{
@@ -80,6 +81,9 @@ use crate::system::files::{
     service_settings_path, strip_extended_prefix, validate_filesystem_instance_name,
 };
 use crate::system::text::normalized_source_bytes;
+
+#[path = "sync_bulk.rs"]
+mod bulk;
 
 struct EditorTransaction<'a> {
     mutation_started: Option<&'a std::sync::atomic::AtomicBool>,
@@ -6851,11 +6855,14 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
         ..EditorChangeSet::default()
     };
     let mut documents: HashMap<String, Option<Arc<SettingsBytecode>>> = HashMap::new();
-    let mut source_children: HashMap<String, Vec<Vec<usize>>> = HashMap::new();
+    let mut source_children: HashMap<String, EditorDocumentIndex> = HashMap::new();
     let mut source_stems: HashMap<String, EditorChildStemCache> = HashMap::new();
     let mut changed_services = EditorChangedServices::default();
     let mut seen_paths = HashSet::new();
     let mut retired_ids: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut snapshots: HashMap<String, bulk::HistorySnapshot> = HashMap::new();
+    let mut read_whole = HashSet::new();
+    let mut store_references = HashMap::new();
 
     let mut changed_paths = expand_editor_changed_paths(args)?;
     let full_reconcile = changed_paths.is_empty();
@@ -6868,7 +6875,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
     // Each path needs a canonical form, its metadata and, for scripts, its
     // contents. Those file system calls dominate a large push, so they run in
     // parallel before the ordered pass below.
-    let inspected_paths = enforced_changed_paths
+    let mut inspected_paths = enforced_changed_paths
         .par_iter()
         .map(|changed_path| {
             let absolute_path = canonical_editor_changed_path(project_root, changed_path);
@@ -6887,7 +6894,12 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             (absolute_path, metadata, source)
         })
         .collect::<Vec<_>>();
-    for (absolute_path, metadata, mut prefetched_source) in inspected_paths {
+    let mut next = 0;
+    while next < inspected_paths.len() {
+        let at = next;
+        next += 1;
+        let (absolute_path, metadata, mut prefetched_source) =
+            std::mem::take(&mut inspected_paths[at]);
         let Some((absolute_path, service)) =
             unique_editor_canonical_path(src_root, absolute_path, &mut seen_paths)
         else {
@@ -6920,6 +6932,13 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             continue;
         }
 
+        source_children.entry(service.clone()).or_insert_with(|| {
+            (documents.get(&service).and_then(Option::as_ref))
+                .map_or_else(EditorDocumentIndex::default, |document| {
+                    EditorDocumentIndex::new(document)
+                })
+        });
+
         if (metadata.as_ref().is_some_and(std::fs::Metadata::is_dir)
             || prepared_documents
                 .instance_paths
@@ -6927,6 +6946,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             && let Some(document) = documents.get(&service).and_then(Option::as_ref)
             && let Some(target) = editor_directory_target(
                 document,
+                &source_children[&service].children,
                 &service,
                 &src_root.join(&service),
                 &absolute_path,
@@ -6964,26 +6984,17 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             continue;
         }
 
-        if !source_children.contains_key(&service) {
-            let children = documents
-                .get(&service)
-                .and_then(Option::as_ref)
-                .map(|document| settings_children_by_parent(document.as_ref()))
-                .unwrap_or_default();
-            source_children.insert(service.clone(), children);
-        }
-
         let mut mapped_target = documents
             .get(&service)
             .and_then(Option::as_ref)
             .zip(source_children.get(&service))
-            .and_then(|(document, children)| {
+            .and_then(|(document, index)| {
                 editor_source_target_with_cache(
                     document,
                     &service,
                     &src_root.join(&service),
                     &absolute_path,
-                    children,
+                    &index.children,
                     source_stems.entry(service.clone()).or_default(),
                 )
             });
@@ -7028,12 +7039,15 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             && exists_as_file
             && let Some(spec) = inferred_spec.as_ref()
         {
-            let held = documents.get_mut(&service).and_then(Option::as_mut);
-            read_whole_for_edit(held, src_root, &service)?;
+            bulk::read_whole_once(&mut read_whole, &mut documents, src_root, &service)?;
+            let index = source_children
+                .get_mut(&service)
+                .expect("the service's index is built above");
+            let snapshot = snapshots.entry(service.clone()).or_default();
             let settings_before = documents
                 .get(&service)
                 .and_then(Option::as_ref)
-                .map(|document| document.as_ref().clone());
+                .map(|document| snapshot.before_creating(document, index, spec));
             let slot = documents
                 .get_mut(&service)
                 .expect("service document should be loaded");
@@ -7043,9 +7057,9 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                     instances: Vec::new(),
                 })
             }));
-            let reserved = retired_ids.get(&service).cloned().unwrap_or_default();
-            let ensured =
-                ensure_editor_source_target_in_bytecode_reserving(document, spec, &reserved)?;
+            let reserved = retired_ids.entry(service.clone()).or_default();
+            let added_from = document.instances.len();
+            let ensured = ensure_editor_source_target_with_index(document, spec, reserved, index)?;
             let target = ensured.target;
             if ensured.changed {
                 if let Some(run_context) = spec.run_context.as_ref() {
@@ -7107,8 +7121,13 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                     source_key: Some(editor_source_key_from_target(&target)),
                     settings_before,
                 });
-                source_children.remove(&service);
-                source_stems.remove(&service);
+                snapshot.created(document, added_from);
+                bulk::forget_added(
+                    (&mut source_children, &mut source_stems),
+                    &service,
+                    document,
+                    added_from,
+                );
             }
             mapped_target = Some(target);
         }
@@ -7117,6 +7136,30 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
             && let Some(target) = mapped_target.as_ref()
             && is_lua_source_class(&target.class_name)
         {
+            if !explicit_targets.has_target_ids()
+                && inferred_spec.as_ref().is_some_and(|spec| !spec.is_init)
+                && let Some(collected) = (bulk::DeletedScriptRun {
+                    src_root,
+                    service: &service,
+                    full_reconcile,
+                    link_enforcement,
+                    instance_paths: &prepared_documents.instance_paths,
+                    documents: &mut documents,
+                    read_whole: &mut read_whole,
+                    references: &mut store_references,
+                    indexes: &mut source_children,
+                    stems: &mut source_stems,
+                    seen_paths: &mut seen_paths,
+                    changed_services: &mut changed_services,
+                    retired_ids: &mut retired_ids,
+                    snapshots: &mut snapshots,
+                    changes: &mut changes,
+                })
+                .collect(&absolute_path, &inspected_paths[at + 1..])?
+            {
+                next = at + 1 + collected;
+                continue;
+            }
             if let Some(settings_id) = target.settings_id.as_deref()
                 && let Some(document) = documents.get_mut(&service).and_then(Option::as_mut)
                 && let Some(index) =
@@ -7201,10 +7244,11 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                         path_ordinals: target.path_ordinals.clone(),
                         class_name: original_class,
                         source_key: Some(editor_source_key_from_target(target)),
-                        settings_before: Some(settings_before),
+                        settings_before: Some(Arc::new(settings_before)),
                     });
                     source_children.remove(&service);
                     source_stems.remove(&service);
+                    snapshots.remove(&service);
                 }
             }
             continue;

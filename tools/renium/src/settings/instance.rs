@@ -110,6 +110,22 @@ pub(crate) fn add_instance(
     document: &mut SettingsBytecode,
     spec: AddInstanceSpec,
 ) -> Result<AddedInstance> {
+    add_instance_where(document, spec, |document, settings_id| {
+        crate::settings::tree::count_whole_store_pass();
+        document
+            .instances
+            .iter()
+            .any(|instance| instance.settings_id == settings_id)
+    })
+}
+
+/// `add_instance` for a caller that knows the settings ids the document
+/// holds: `taken` says whether the document holds one.
+pub(crate) fn add_instance_where(
+    document: &mut SettingsBytecode,
+    spec: AddInstanceSpec,
+    taken: impl FnOnce(&SettingsBytecode, &str) -> bool,
+) -> Result<AddedInstance> {
     if spec.name.is_empty() {
         bail!("Instance name cannot be empty");
     }
@@ -131,11 +147,7 @@ pub(crate) fn add_instance(
 
     let settings_id = match spec.settings_id {
         Some(settings_id) if !settings_id.is_empty() => {
-            if document
-                .instances
-                .iter()
-                .any(|instance| instance.settings_id == settings_id)
-            {
+            if taken(document, &settings_id) {
                 bail!("settingsId already exists: {settings_id}");
             }
             settings_id
@@ -181,6 +193,7 @@ pub(crate) fn remove_instances_at_indices(
             bail!("Refusing to remove root instance");
         }
     }
+    crate::settings::tree::count_whole_store_pass();
 
     let mut children_by_parent = vec![Vec::new(); document.instances.len()];
     for (index, instance) in document.instances.iter().enumerate() {
@@ -732,6 +745,7 @@ pub(crate) fn next_editor_settings_id_avoiding(
     document: &SettingsBytecode,
     reserved: &HashSet<String>,
 ) -> String {
+    crate::settings::tree::count_whole_store_pass();
     let existing = document
         .instances
         .iter()

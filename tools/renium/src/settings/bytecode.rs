@@ -288,10 +288,20 @@ struct SettingsDocumentCache {
 
 static SETTINGS_DOCUMENT_CACHE: OnceLock<Mutex<SettingsDocumentCache>> = OnceLock::new();
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 pub(crate) struct SettingsBytecode {
     pub(crate) version: u8,
     pub(crate) instances: Vec<SettingsBytecodeInstance>,
+}
+
+impl Clone for SettingsBytecode {
+    fn clone(&self) -> Self {
+        crate::settings::tree::count_whole_store_pass();
+        Self {
+            version: self.version,
+            instances: self.instances.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

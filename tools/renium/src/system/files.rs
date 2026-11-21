@@ -237,13 +237,18 @@ pub(crate) fn write_json_file<T: Serialize>(path: &Path, value: &T, compact: boo
     if compact {
         write_json_streaming(path, value)
     } else {
-        let value =
-            serde_json::to_value(value).context("Failed to convert JSON value for formatting")?;
-        let mut serialized = String::new();
-        write_pretty_json_value(&value, 0, &mut serialized)?;
-        serialized.push('\n');
-        write_utf8_file(path, &serialized)
+        write_utf8_file(path, &pretty_json_text(value)?)
     }
+}
+
+/// The text `write_json_file` writes for `value` when not compact.
+pub(crate) fn pretty_json_text<T: Serialize>(value: &T) -> Result<String> {
+    let value =
+        serde_json::to_value(value).context("Failed to convert JSON value for formatting")?;
+    let mut serialized = String::new();
+    write_pretty_json_value(&value, 0, &mut serialized)?;
+    serialized.push('\n');
+    Ok(serialized)
 }
 
 fn write_pretty_json_value(value: &Value, indent: usize, out: &mut String) -> Result<()> {

@@ -30,6 +30,7 @@ pub(crate) type EditorSiblingGroupCounts<'a> = HashMap<(usize, &'a str), Vec<usi
 pub(crate) fn editor_sibling_group_counts(
     document: &SettingsBytecode,
 ) -> EditorSiblingGroupCounts<'_> {
+    crate::settings::tree::count_whole_store_pass();
     let mut counts = HashMap::<_, Vec<usize>>::new();
     for (index, instance) in document.instances.iter().enumerate() {
         let Some(parent_index) = instance.parent_index else {

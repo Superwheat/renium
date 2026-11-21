@@ -894,7 +894,9 @@ pub(crate) struct EditorHistoryEntry {
     pub(crate) path_ordinals: Vec<usize>,
     pub(crate) class_name: String,
     pub(crate) source_key: Option<String>,
-    pub(crate) settings_before: Option<SettingsBytecode>,
+    /// The store as undoing the change reads it from before the change:
+    /// entries share one copy where undoing each reads the same from it.
+    pub(crate) settings_before: Option<Arc<SettingsBytecode>>,
 }
 
 #[derive(Serialize, Deserialize)]

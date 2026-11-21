@@ -1,9 +1,12 @@
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use walkdir::WalkDir;
@@ -36,8 +39,8 @@ use crate::snapshot::refs::{settings_instance_path, stabilize_record_references}
 use crate::studio::bridge::BridgeServer;
 use crate::system::files::{
     absolutize_under, create_unique_directory, ensure_existing_ancestor_inside, path_key,
-    read_json_file, resolve_project_root_if_present, sanitize_ascii_identifier,
-    service_settings_path, validate_filesystem_instance_name, write_json_file, write_utf8_file,
+    pretty_json_text, read_json_file, resolve_project_root_if_present, sanitize_ascii_identifier,
+    service_settings_path, validate_filesystem_instance_name,
 };
 
 pub(crate) struct EditorHistoryTransaction {
@@ -216,12 +219,101 @@ pub(crate) fn save_editor_history_entries(
         return Ok(None);
     }
     let project_root = resolve_project_root_if_present(project_root_arg)?;
-    let mut transaction = None;
-    let mut seen = HashSet::new();
     let (source_before_by_index, source_errors_by_index) =
         fetch_editor_history_sources(bridge, &changes.history_entries);
+    write_editor_history_entries(
+        &project_root,
+        &changes.history_entries,
+        &source_before_by_index,
+        &source_errors_by_index,
+    )
+}
 
-    for (sequence, entry) in changes.history_entries.iter().enumerate() {
+/// New store encodings a batch of history entries holds before it is
+/// written.
+const HISTORY_BATCH_BYTES: usize = 16 << 20;
+
+type HistoryFiles = Vec<(PathBuf, Arc<Vec<u8>>)>;
+
+/// The history entries staged for writing and the store encodings they
+/// share. The staged entries are written once their new encodings reach
+/// `HISTORY_BATCH_BYTES`, and an encoding is held only while a later entry
+/// shares it.
+struct HistoryWrites {
+    staged: Vec<(PathBuf, HistoryFiles)>,
+    staged_bytes: usize,
+    encoded: HashMap<*const SettingsBytecode, Arc<Vec<u8>>>,
+    last_use: HashMap<*const SettingsBytecode, usize>,
+}
+
+impl HistoryWrites {
+    fn new(entries: &[EditorHistoryEntry]) -> Self {
+        let last_use = (entries.iter().enumerate())
+            .filter_map(|(sequence, entry)| {
+                Some((Arc::as_ptr(entry.settings_before.as_ref()?), sequence))
+            })
+            .collect();
+        Self {
+            staged: Vec::new(),
+            staged_bytes: 0,
+            encoded: HashMap::new(),
+            last_use,
+        }
+    }
+
+    fn encoded(&mut self, document: &Arc<SettingsBytecode>) -> Result<Arc<Vec<u8>>> {
+        Ok(match self.encoded.entry(Arc::as_ptr(document)) {
+            Entry::Occupied(bytes) => Arc::clone(bytes.get()),
+            Entry::Vacant(slot) => {
+                let bytes = encode_settings_bytecode(document)?;
+                self.staged_bytes += bytes.len();
+                Arc::clone(slot.insert(Arc::new(bytes)))
+            }
+        })
+    }
+
+    fn stage(&mut self, sequence: usize, entry_dir: PathBuf, files: HistoryFiles) -> Result<()> {
+        self.staged.push((entry_dir, files));
+        if self.staged_bytes >= HISTORY_BATCH_BYTES {
+            self.flush(sequence)?;
+        }
+        Ok(())
+    }
+
+    /// Writes the staged entries. They are directories of their own in the
+    /// transaction's stage, which is published whole: their files are
+    /// written side by side and none of them replaces a file in place.
+    fn flush(&mut self, sequence: usize) -> Result<()> {
+        std::mem::take(&mut self.staged)
+            .par_iter()
+            .try_for_each(|(entry_dir, files)| {
+                fs::create_dir_all(entry_dir)
+                    .with_context(|| format!("Failed to create {}", entry_dir.display()))?;
+                files.iter().try_for_each(|(path, bytes)| {
+                    fs::write(path, bytes.as_slice())
+                        .with_context(|| format!("Failed to write {}", path.display()))
+                })
+            })?;
+        self.staged_bytes = 0;
+        let last_use = &self.last_use;
+        (self.encoded)
+            .retain(|document, _| last_use.get(document).is_some_and(|last| *last > sequence));
+        Ok(())
+    }
+}
+
+pub(crate) fn write_editor_history_entries(
+    project_root: &Path,
+    entries: &[EditorHistoryEntry],
+    source_before_by_index: &HashMap<usize, String>,
+    source_errors_by_index: &HashMap<usize, String>,
+) -> Result<Option<EditorHistoryTransaction>> {
+    let _span = crate::app::profile::span("editor history entries written");
+    let mut transaction = None;
+    let mut seen = HashSet::new();
+    let mut writes = HistoryWrites::new(entries);
+    let mut last_created = 0;
+    for (sequence, entry) in entries.iter().enumerate() {
         let identity = format!(
             "{}:{}:{}",
             entry.service,
@@ -239,7 +331,7 @@ pub(crate) fn save_editor_history_entries(
         let source_path = entry
             .source_path
             .as_ref()
-            .map(|path| absolutize_under(&project_root, path));
+            .map(|path| absolutize_under(project_root, path));
         let source_before = source_before_by_index.get(&sequence);
         let source_changed = source_before.is_some_and(|before| {
             source_path
@@ -265,7 +357,10 @@ pub(crate) fn save_editor_history_entries(
             continue;
         }
 
-        let created_unix_ms = current_millis();
+        // Each entry's stamp follows the one before, so the entries keep
+        // the order they were collected in.
+        let created_unix_ms = current_millis().max(last_created + 1);
+        last_created = created_unix_ms;
         let safe_name = sanitize_history_component(
             entry
                 .settings_id
@@ -274,17 +369,16 @@ pub(crate) fn save_editor_history_entries(
                 .unwrap_or("item"),
         );
         let transaction =
-            transaction.get_or_insert(EditorHistoryTransaction::create(&project_root)?);
+            transaction.get_or_insert(EditorHistoryTransaction::create(project_root)?);
         let entry_dir = transaction.stage_root.join(format!(
             "{created_unix_ms}-{sequence}-{}-{safe_name}",
             entry.service
         ));
-        fs::create_dir_all(&entry_dir)
-            .with_context(|| format!("Failed to create {}", entry_dir.display()))?;
+        let mut files = HistoryFiles::with_capacity(3);
 
         let settings_backup = if let Some(document) = entry.settings_before.as_ref() {
             let file_name = "settings.renium";
-            document.write_file(&entry_dir.join(file_name))?;
+            files.push((entry_dir.join(file_name), writes.encoded(document)?));
             Some(file_name.to_string())
         } else {
             None
@@ -292,10 +386,11 @@ pub(crate) fn save_editor_history_entries(
 
         let source_backup = if source_changed {
             let file_name = "source.luau";
-            write_utf8_file(
-                &entry_dir.join(file_name),
-                source_before.expect("changed Source has a previous value"),
-            )?;
+            let source = source_before.expect("changed Source has a previous value");
+            files.push((
+                entry_dir.join(file_name),
+                Arc::new(source.as_bytes().to_vec()),
+            ));
             Some(file_name.to_string())
         } else {
             None
@@ -303,7 +398,7 @@ pub(crate) fn save_editor_history_entries(
 
         let source_path = source_path
             .as_ref()
-            .map(|path| path_to_sourcemap_relative(&project_root, path));
+            .map(|path| path_to_sourcemap_relative(project_root, path));
         let manifest = EditorRevertManifest {
             version: 1,
             created_unix_ms,
@@ -315,9 +410,11 @@ pub(crate) fn save_editor_history_entries(
             settings_backup,
             source_backup,
         };
-        write_json_file(&entry_dir.join("manifest.json"), &manifest, false)?;
+        let manifest = pretty_json_text(&manifest)?.into_bytes();
+        files.push((entry_dir.join("manifest.json"), Arc::new(manifest)));
+        writes.stage(sequence, entry_dir, files)?;
     }
-
+    writes.flush(entries.len())?;
     Ok(transaction)
 }
 
@@ -1799,5 +1896,53 @@ mod tests {
             .expect("unknown id is a no-op");
         assert_eq!(outcome, HistoryStoreRestore::Unchanged);
         assert_eq!(restored, root_only);
+    }
+
+    /// The entries of one push keep the order they were collected in, by
+    /// their stamps and by the names of their directories as text.
+    #[test]
+    fn the_entries_of_a_push_keep_their_order() {
+        let root = create_unique_directory(&std::env::temp_dir(), "renium-history-order-").unwrap();
+        let service = "ServerScriptService";
+        let store = Arc::new(document(vec![instance(
+            "root",
+            service,
+            service,
+            None,
+            &[],
+        )]));
+        let ids = (0..40).map(|at| format!("editor:{at}")).collect::<Vec<_>>();
+        let entries = (ids.iter())
+            .map(|id| EditorHistoryEntry {
+                service: service.to_string(),
+                source_path: None,
+                settings_id: Some(id.clone()),
+                path_segments: vec![service.to_string(), id.clone()],
+                path_ordinals: vec![1, 1],
+                class_name: "Script".to_string(),
+                source_key: None,
+                settings_before: Some(Arc::clone(&store)),
+            })
+            .collect::<Vec<_>>();
+        let transaction =
+            write_editor_history_entries(&root, &entries, &HashMap::new(), &HashMap::new())
+                .unwrap()
+                .unwrap();
+        let mut dirs = (fs::read_dir(&transaction.stage_root).unwrap())
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        dirs.sort();
+        let manifests = (dirs.iter())
+            .map(|dir| read_json_file::<EditorRevertManifest>(&dir.join("manifest.json")).unwrap())
+            .collect::<Vec<_>>();
+        let written = (manifests.iter())
+            .map(|manifest| manifest.settings_id.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(written, ids);
+        assert!(
+            (manifests.windows(2)).all(|pair| pair[0].created_unix_ms < pair[1].created_unix_ms)
+        );
+        drop(transaction);
+        let _ = fs::remove_dir_all(&root);
     }
 }

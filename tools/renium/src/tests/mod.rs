@@ -1,5 +1,6 @@
 use super::*;
 
+mod bulk_bench;
 mod offline;
 pub(crate) mod support;
 use std::collections::{BTreeMap, HashMap, HashSet};

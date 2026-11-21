@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use serde_json::{Map, Value, json};
 use walkdir::WalkDir;
 
-use crate::editor::document::ensure_editor_source_target_in_bytecode;
+use crate::editor::document::{EditorDocumentIndex, ensure_editor_source_target_with_index};
 use crate::editor::sync::is_lua_source_class;
 use crate::editor::types::{EditorInstancePath, EditorSourcePathSpec, EditorSourceTarget};
 use crate::project::config;
@@ -293,6 +293,26 @@ pub(crate) fn editor_source_target_with_cache(
     children_by_parent: &[Vec<usize>],
     stems: &mut EditorChildStemCache,
 ) -> Option<EditorSourceTarget> {
+    editor_source_index_with_cache(
+        document,
+        service,
+        service_dir,
+        source_path,
+        children_by_parent,
+        stems,
+    )
+    .map(|(_, target)| target)
+}
+
+/// `editor_source_target_with_cache` with the index of the instance.
+pub(crate) fn editor_source_index_with_cache(
+    document: &SettingsBytecode,
+    service: &str,
+    service_dir: &Path,
+    source_path: &Path,
+    children_by_parent: &[Vec<usize>],
+    stems: &mut EditorChildStemCache,
+) -> Option<(usize, EditorSourceTarget)> {
     let spec = infer_editor_source_path_spec_in_service(service_dir, service, source_path)?;
     let root_index = editor_service_root_index(document, service)?;
     let mut parent_index = root_index;
@@ -353,13 +373,16 @@ pub(crate) fn editor_source_target_with_cache(
     }
     path_segments.push(instance.name.clone());
     path_ordinals.push(ordinal);
-    Some(EditorSourceTarget {
-        service: service.to_string(),
-        settings_id: Some(instance.settings_id.clone()),
-        path_segments,
-        path_ordinals,
-        class_name: instance.class_name.clone(),
-    })
+    Some((
+        index,
+        EditorSourceTarget {
+            service: service.to_string(),
+            settings_id: Some(instance.settings_id.clone()),
+            path_segments,
+            path_ordinals,
+            class_name: instance.class_name.clone(),
+        },
+    ))
 }
 
 pub(crate) struct EditorDirectoryTarget {
@@ -368,13 +391,14 @@ pub(crate) struct EditorDirectoryTarget {
     pub(crate) settings_ids: Vec<String>,
 }
 
+/// `children_by_parent` is the document's `settings_children_by_parent`.
 pub(crate) fn editor_directory_target(
     document: &SettingsBytecode,
+    children_by_parent: &[Vec<usize>],
     service: &str,
     service_dir: &Path,
     directory: &Path,
 ) -> Option<EditorDirectoryTarget> {
-    let children_by_parent = settings_children_by_parent(document);
     let root_index = editor_service_root_index(document, service)?;
     let relative = directory.strip_prefix(service_dir).ok()?;
     let mut index = root_index;
@@ -471,11 +495,14 @@ pub(crate) fn merge_editor_source_files_into_document_with(
 
     let mut changed = false;
     let mut actual_source_paths = HashMap::new();
+    let mut index = None;
     for (path, spec) in files {
         let target = if let Some(target) = source_paths.get(&path_key(&path)) {
             target.clone()
         } else {
-            let ensured = ensure_editor_source_target_in_bytecode(document, &spec)?;
+            let index = index.get_or_insert_with(|| EditorDocumentIndex::new(document));
+            let ensured =
+                ensure_editor_source_target_with_index(document, &spec, &HashSet::new(), index)?;
             changed |= ensured.changed;
             ensured.target
         };
@@ -790,6 +817,7 @@ pub(crate) fn build_editor_instance_paths_for_indices(
     let Some(root_index) = editor_service_root_index(document, service) else {
         return HashMap::new();
     };
+    crate::settings::tree::count_whole_store_pass();
     let instances = &document.instances;
     let mut hierarchies = Vec::with_capacity(indices.len());
     let mut in_hierarchy = vec![false; instances.len()];
@@ -855,6 +883,7 @@ pub(crate) fn build_editor_instance_paths_with_children(
     children_by_parent: &[Vec<usize>],
 ) -> Vec<Option<EditorInstancePath>> {
     let _span = crate::app::profile::span("instance paths");
+    crate::settings::tree::count_whole_store_pass();
     let mut out = vec![None; document.instances.len()];
     let Some(root_index) = editor_service_root_index(document, service) else {
         return out;

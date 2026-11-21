@@ -3019,6 +3019,7 @@ fn canonicalize_content_uri_alias(instance: &mut SettingsBytecodeInstance) -> Re
 /// Whether a document left instances in its store file: each stands there
 /// with its UniqueId alone (`held::stand_unchanged`) until it is read.
 pub(crate) fn holds_unread_instances(document: &SettingsBytecode) -> bool {
+    crate::settings::tree::count_whole_store_pass();
     document
         .instances
         .iter()
