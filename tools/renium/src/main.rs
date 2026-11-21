@@ -306,6 +306,7 @@ fn run_cli() -> Result<()> {
     }
     let keeps_agent_files = !is_plugin_child() && checks_agent_instructions(&cli.command);
     if keeps_agent_files {
+        let _span = app::profile::span("agent instructions refresh");
         refresh_agent_instructions(cli.project.as_deref());
     }
 
@@ -321,7 +322,10 @@ fn run_cli() -> Result<()> {
         );
     }
     let project = cli.project.clone();
+    let dispatched = app::profile::span("command");
     let result = cli::dispatch::dispatch(cli.command, project.as_deref());
+    drop(dispatched);
+    let _span = app::profile::span("project map refresh");
     if keeps_agent_files
         && let Err(error) = project::workflows::refresh_project_maps(project.as_deref())
     {
@@ -375,12 +379,15 @@ fn checks_agent_update(command: &Commands) -> bool {
 }
 
 fn refresh_agent_instructions(project: Option<&Path>) {
+    let noting = app::profile::span("agent note refresh");
     if let Err(error) = app::agent_hints::refresh(app::build::VERSION) {
         log_global(
             4,
             format_args!("[renium] the agent note was not refreshed: {error:#}"),
         );
     }
+    drop(noting);
+    let _span = app::profile::span("agent files refresh");
     match project::workflows::refresh_outdated_agent_instructions(project) {
         Ok(changed) if !changed.is_empty() => eprintln!(
             "[renium] updated {}; reread before the next Renium step",

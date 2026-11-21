@@ -1714,6 +1714,7 @@ pub(crate) fn initialize_place_root(root: &Path, source_root: &Path) -> Result<P
 }
 
 pub(crate) fn refresh_agent_instructions(root: &Path) -> Result<()> {
+    let instructing = crate::app::profile::span("agent instructions written");
     for (path, content) in [
         (root.join(PROJECT_INSTRUCTIONS_FILE), agent_instructions()?),
         (
@@ -1727,6 +1728,8 @@ pub(crate) fn refresh_agent_instructions(root: &Path) -> Result<()> {
     ] {
         write_bytes_if_changed(&path, &content)?;
     }
+    drop(instructing);
+    let guiding = crate::app::profile::span("agent guides written");
     let destination = root.join(PROJECT_GUIDES_DIRECTORY);
     fs::create_dir_all(&destination)
         .with_context(|| format!("Failed to create {}", destination.display()))?;
@@ -1748,6 +1751,7 @@ pub(crate) fn refresh_agent_instructions(root: &Path) -> Result<()> {
     for (name, content) in guides {
         write_bytes_if_changed(&destination.join(name), &content)?;
     }
+    drop(guiding);
     refresh_project_map(root)?;
     Ok(())
 }
@@ -1769,6 +1773,7 @@ const PROJECT_MAP_MAX_CHARS: usize = 6000;
 /// second write of the same size the same stamp.
 pub(crate) fn refresh_project_map(root: &Path) -> Result<()> {
     const CLOCK_GRAIN_NANOS: u128 = 2_500_000_000;
+    let reading = crate::app::profile::span("project map cache read");
     let (root, places) = match load_experience(root)? {
         Some(layout) => (
             layout.root,
@@ -1788,11 +1793,15 @@ pub(crate) fn refresh_project_map(root: &Path) -> Result<()> {
         time.duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos())
     };
+    drop(reading);
     let mut stores = Map::new();
     let mut sections = Vec::new();
     for (alias, place) in places {
         let mut lines = Vec::new();
-        for store in crate::project::storage::store_files(&place)? {
+        let listing = crate::app::profile::span("project map stores listed");
+        let files = crate::project::storage::store_files(&place)?;
+        drop(listing);
+        for store in files {
             let Ok(metadata) = fs::metadata(&store) else {
                 continue;
             };
@@ -1844,6 +1853,7 @@ pub(crate) fn refresh_project_map(root: &Path) -> Result<()> {
             lines,
         });
     }
+    let _written = crate::app::profile::span("project map written");
     write_bytes_if_changed(
         &root.join(PROJECT_GUIDES_DIRECTORY).join(PROJECT_MAP_FILE),
         project_map_markdown(&sections).as_bytes(),
@@ -1859,11 +1869,13 @@ pub(crate) fn refresh_project_map(root: &Path) -> Result<()> {
 /// `project` or the current directory belongs to, where the project keeps its
 /// guide copies.
 pub(crate) fn refresh_project_maps(project: Option<&Path>) -> Result<()> {
+    let finding = crate::app::profile::span("project map homes");
     let mut homes = BTreeSet::new();
     homes.extend(agent_files_root(project).ok().flatten());
     for root in crate::project::storage::project_roots() {
         homes.insert(find_experience_root(&root).ok().flatten().unwrap_or(root));
     }
+    drop(finding);
     let mut outcome = Ok(());
     for home in homes {
         if home.join(PROJECT_GUIDES_DIRECTORY).is_dir() {
@@ -1878,6 +1890,7 @@ pub(crate) fn refresh_project_maps(project: Option<&Path>) -> Result<()> {
 fn project_map_store_line(store: &Path, service: &str) -> Result<Option<String>> {
     use crate::settings::bytecode::SettingsBytecode;
     use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
+    let _span = crate::app::profile::span("project map store line");
     let document = SettingsBytecode::read_structure_file(store)?;
     let Some(root_index) = editor_service_root_index(&document, service) else {
         return Ok(None);
@@ -1926,6 +1939,7 @@ fn project_map_store_line(store: &Path, service: &str) -> Result<Option<String>>
     if let Some((cut, _)) = line.char_indices().nth(PROJECT_MAP_MAX_CHARS) {
         line.truncate(cut);
     }
+    rayon::spawn(move || drop((document, children)));
     Ok(Some(line))
 }
 
@@ -2045,6 +2059,7 @@ pub(crate) fn refresh_outdated_agent_instructions(project: Option<&Path>) -> Res
     let same_text = |path: &Path, expected: &[u8]| {
         fs::read(path).is_ok_and(|contents| without_carriage_returns(&contents) == expected)
     };
+    let comparing = crate::app::profile::span("agent files compared");
     let mut changed = Vec::new();
     if !same_text(
         &root.join(PROJECT_INSTRUCTIONS_FILE),
@@ -2066,6 +2081,7 @@ pub(crate) fn refresh_outdated_agent_instructions(project: Option<&Path>) -> Res
     if claude_pointer_outdated(&root) {
         changed.push("CLAUDE.md".to_string());
     }
+    drop(comparing);
     if changed.is_empty() {
         return Ok(changed);
     }

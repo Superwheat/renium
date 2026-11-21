@@ -141,6 +141,7 @@ fn repacked(
     }
     let dense = encode_settings_bytecode_with_dense_references(document).map_err(text)?;
     let whole = encode_settings_bytecode(&decode_settings_bytecode(&dense).unwrap()).unwrap();
+    fs::create_dir_all(side.store(service).parent().unwrap()).unwrap();
     fs::write(side.store(service), &dense).unwrap();
     let (store, root) = (side.store_arg(service), side.path(""));
     let printed = side.json(&["bpack", &store, "-r", &root]);
@@ -161,6 +162,9 @@ fn repacked(
 /// stores it leaves in version 11.
 fn exported(rng: &mut SimRng, side: &Fixture, log: &mut Vec<String>) -> Result<(), String> {
     let service = SERVICES[rng.below(SERVICES.len())];
+    if !side.store(service).is_file() {
+        return Ok(());
+    }
     let document = side.read_store(service);
     let meshes = (document.instances.iter())
         .filter(|instance| instance.class_name == "MeshPart")
@@ -180,7 +184,10 @@ fn exported(rng: &mut SimRng, side: &Fixture, log: &mut Vec<String>) -> Result<(
     };
     log.push(args.join(" "));
     let blocks = ran(side, &args, &model);
-    for service in SERVICES {
+    for service in SERVICES
+        .into_iter()
+        .filter(|service| side.store(service).is_file())
+    {
         let whole = (FORMATS[0].encode)(&side.read_store(service)).map_err(text)?;
         fs::write(side.store(service), whole).unwrap();
     }
@@ -352,9 +359,10 @@ fn run_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
             side.json(&["bs", "-f", &store, "-i", id, "-p", "Label", "--str", value]);
         }
         // Another UniqueId alone, which no digest of the row tells.
-        if rng.below(3) == 0 {
-            let store = side.store(SERVICES[rng.below(SERVICES.len())]);
-            let file = fs::read(&store).unwrap();
+        let renewed = (rng.below(3) == 0).then(|| side.store(SERVICES[rng.below(SERVICES.len())]));
+        if let Some(store) = renewed
+            && let Ok(file) = fs::read(&store)
+        {
             let mut document = decode_settings_bytecode(&file).unwrap();
             let row = rng.below(document.instances.len().min(6));
             let renewed = unique_id(&mut rng);
@@ -373,8 +381,12 @@ fn run_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
     let prefer = [None, Some(true), Some(false)][rng.below(3)];
     let mut failures = Vec::new();
     for service in SERVICES {
-        let stored = |side: &Fixture| fs::read(side.store(service)).unwrap();
-        let (ours, theirs) = (stored(&sides[0]), stored(&sides[1]));
+        // A move of a service's last instance to another service removes its
+        // store, which leaves that side no file to merge.
+        let stored = |side: &Fixture| fs::read(side.store(service)).ok();
+        let (Some(ours), Some(theirs)) = (stored(&sides[0]), stored(&sides[1])) else {
+            continue;
+        };
         let law = merged(&sides[0], [&base[service], &ours, &theirs], prefer);
         failures.extend(
             (law.err()).map(|failure| format!("{service}, preferring {prefer:?}: {failure}")),

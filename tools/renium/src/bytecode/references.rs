@@ -2,18 +2,20 @@
 //! a command writes, and keeping the stored ones on their targets when an
 //! edit renames, moves or removes instances.
 
-use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use serde_json::{Map, Value, json};
 
 use crate::bytecode::edit::{
     collect_settings_subtree_preorder, instance_path_key, instance_path_parts_key,
 };
 use crate::bytecode::explorer::compact_path_string;
-use crate::editor::paths::{build_editor_instance_paths, build_editor_instance_paths_for_indices};
+use crate::editor::paths::build_editor_instance_paths_for_indices;
 use crate::editor::types::EditorInstancePath;
 use crate::settings::bytecode::property_edit::{
     RetainedPropertyColumns, read_for_structural_edit_if_contains,
@@ -406,23 +408,171 @@ impl ReferencedStores {
     }
 }
 
-/// Where the instances of one edited store were before the edit.
+/// What the references in some values name their targets by: each id (a
+/// debug id as the id it stands for), the last name of each path, and each
+/// position, under the service of the store that holds the reference. Only
+/// an instance with one of these, or with the id or name of an instance
+/// that has one, can be the target of such a reference, so a lookup of
+/// targets reads the paths of those instances alone.
+#[derive(Default)]
+pub(crate) struct ReferenceKeys {
+    ids: AHashSet<String>,
+    names: AHashSet<String>,
+    rows: HashMap<String, HashSet<usize>>,
+}
+
+/// The last name of the path an object holds, the name of the instance the
+/// path leads to.
+fn last_path_segment(object: &Map<String, Value>) -> Option<&str> {
+    let segments = object.get("pathSegments").and_then(Value::as_array)?;
+    segments.last().and_then(Value::as_str)
+}
+
+impl ReferenceKeys {
+    /// Adds what each object at any depth of `value`, a value of a store of
+    /// `service`, names an instance by, of the objects `wanted` takes.
+    fn add_value_where(
+        &mut self,
+        service: &str,
+        value: &Value,
+        wanted: &dyn Fn(&Map<String, Value>) -> bool,
+    ) {
+        match value {
+            Value::Array(values) => {
+                (values.iter()).for_each(|value| self.add_value_where(service, value, wanted));
+            }
+            Value::Object(object) => {
+                if wanted(object) {
+                    for key in ["settingsId", "instanceId"] {
+                        if let Some(id) = object.get(key).and_then(Value::as_str) {
+                            self.ids.insert(id.to_string());
+                        }
+                    }
+                    if let Some(id) = object.get("debugId").and_then(Value::as_str) {
+                        self.ids.insert(format!("debug:{id}"));
+                    }
+                    if let Some(name) = last_path_segment(object) {
+                        self.names.insert(name.to_string());
+                    }
+                    if let Some(row) = object
+                        .get("instanceIndex")
+                        .and_then(settings_reference_index)
+                    {
+                        self.rows
+                            .entry(service.to_string())
+                            .or_default()
+                            .insert(row);
+                    }
+                }
+                (object.values()).for_each(|value| self.add_value_where(service, value, wanted));
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether `object`, a value of a store of `service`, names an instance
+    /// by one of these keys.
+    fn names_object(&self, service: &str, object: &Map<String, Value>) -> bool {
+        let id = |key: &str| object.get(key).and_then(Value::as_str);
+        id("settingsId")
+            .into_iter()
+            .chain(id("instanceId"))
+            .any(|id| self.ids.contains(id))
+            || id("debugId").is_some_and(|id| self.ids.contains(&format!("debug:{id}")))
+            || last_path_segment(object).is_some_and(|name| self.names.contains(name))
+            || (object
+                .get("instanceIndex")
+                .and_then(settings_reference_index))
+            .zip(self.rows.get(service))
+            .is_some_and(|(row, rows)| rows.contains(&row))
+    }
+
+    /// Adds the values of each instance of `documents`, by service. With
+    /// `moved`, the instances of each service a move of references concerns,
+    /// only the values of those instances count, and of any other the objects
+    /// that name one of them: no other reference can take another target.
+    pub(crate) fn add_documents(
+        &mut self,
+        documents: &BTreeMap<String, SettingsBytecode>,
+        moved: Option<&HashMap<&str, &HashSet<usize>>>,
+    ) {
+        let mut scope = Self::default();
+        for (service, rows) in moved.into_iter().flatten() {
+            if let Some(document) = documents.get(*service) {
+                let rows = rows
+                    .iter()
+                    .copied()
+                    .filter(|row| *row < document.instances.len());
+                let rows = rows.collect::<Vec<_>>();
+                scope.add_instances(document, &rows);
+                scope
+                    .rows
+                    .entry(service.to_string())
+                    .or_default()
+                    .extend(rows);
+            }
+        }
+        for (service, document) in documents {
+            let owned = moved.and_then(|moved| moved.get(service.as_str()));
+            for (row, instance) in document.instances.iter().enumerate() {
+                let whole = moved.is_none() || owned.is_some_and(|rows| rows.contains(&row));
+                let wanted =
+                    |object: &Map<String, Value>| whole || scope.names_object(service, object);
+                let values = instance.properties.values();
+                values
+                    .chain(instance.attributes.values())
+                    .for_each(|value| self.add_value_where(service, value, &wanted));
+            }
+        }
+    }
+
+    /// The instances of `document`, a store of `service`, these keys name,
+    /// in order.
+    pub(crate) fn named(&self, service: &str, document: &SettingsBytecode) -> Vec<usize> {
+        let rows = self.rows.get(service);
+        (document.instances.iter().enumerate())
+            .filter(|(row, instance)| {
+                self.ids.contains(&instance.settings_id)
+                    || self.names.contains(&instance.name)
+                    || rows.is_some_and(|rows| rows.contains(row))
+            })
+            .map(|(row, _)| row)
+            .collect()
+    }
+
+    /// Takes the id and name of each instance at `rows` of `document` as
+    /// keys too: a reference that takes the selectors of its target names
+    /// the instances that share them.
+    pub(crate) fn add_instances(&mut self, document: &SettingsBytecode, rows: &[usize]) {
+        for row in rows {
+            let instance = &document.instances[*row];
+            self.ids.insert(instance.settings_id.clone());
+            self.names.insert(instance.name.clone());
+        }
+    }
+}
+
+/// Where the instances of one edited store were before the edit, of those
+/// the references followed name.
 struct EarlierTargets<'a> {
-    by_settings_id: HashMap<&'a str, usize>,
-    by_exact_path: HashMap<String, usize>,
-    by_segments: HashMap<String, Option<usize>>,
-    paths: Vec<Option<EditorInstancePath>>,
+    by_settings_id: AHashMap<&'a str, usize>,
+    by_exact_path: AHashMap<String, usize>,
+    by_segments: AHashMap<String, Option<usize>>,
+    paths: HashMap<usize, EditorInstancePath>,
 }
 
 /// One store an edit renamed, moved or removed instances in.
 struct EditedStore<'a> {
     service: &'a str,
     before: &'a SettingsBytecode,
-    /// Where every instance of the store is now, by settings id.
+    /// The instances of `before` the references followed name.
+    named: Vec<usize>,
+    /// Where each instance of the store is now, by settings id, of those a
+    /// reference followed names or an instance of `named` has the id of.
     current: HashMap<String, EditorInstancePath>,
     /// The ids of the instances the edit added and removed again.
     short_lived: Option<&'a HashSet<String>>,
-    earlier: OnceCell<EarlierTargets<'a>>,
+    earlier: OnceLock<EarlierTargets<'a>>,
 }
 
 /// What an edit did to the instance a reference names.
@@ -439,39 +589,58 @@ fn same_path(path: &EditorInstancePath, segments: &[String], ordinals: Option<&[
 }
 
 impl<'a> EditedStore<'a> {
+    /// `keys` are what the followed references name their targets by. Where
+    /// the instances are before the edit is found beside where they are now.
     fn new(
         service: &'a str,
         before: &'a SettingsBytecode,
         after: Option<&SettingsBytecode>,
         short_lived: Option<&'a HashSet<String>>,
+        keys: &ReferenceKeys,
     ) -> Self {
-        let current = after
-            .map(|after| {
-                after
-                    .instances
-                    .iter()
-                    .zip(build_editor_instance_paths(after, service))
-                    .filter_map(|(instance, path)| Some((instance.settings_id.clone(), path?)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Self {
+        let store = Self {
             service,
             before,
-            current,
+            named: keys.named(service, before),
+            current: HashMap::new(),
             short_lived,
-            earlier: OnceCell::new(),
-        }
+            earlier: OnceLock::new(),
+        };
+        let current = || {
+            let _span = crate::app::profile::span("current targets");
+            let Some(after) = after else {
+                return HashMap::new();
+            };
+            let mut ids = (store.named.iter())
+                .map(|row| before.instances[*row].settings_id.as_str())
+                .collect::<AHashSet<_>>();
+            ids.extend(keys.ids.iter().map(String::as_str));
+            let rows = (after.instances.iter().enumerate())
+                .filter(|(_, instance)| ids.contains(instance.settings_id.as_str()))
+                .map(|(row, _)| row)
+                .collect::<Vec<_>>();
+            let mut paths = build_editor_instance_paths_for_indices(after, service, &rows);
+            rows.iter()
+                .filter_map(|row| {
+                    let path = paths.remove(row)?;
+                    Some((after.instances[*row].settings_id.clone(), path))
+                })
+                .collect()
+        };
+        let (current, _) = rayon::join(current, || store.earlier());
+        Self { current, ..store }
     }
 
     fn earlier(&self) -> &EarlierTargets<'a> {
         self.earlier.get_or_init(|| {
-            let paths = build_editor_instance_paths(self.before, self.service);
-            let mut by_settings_id = HashMap::with_capacity(paths.len());
-            let mut by_exact_path = HashMap::with_capacity(paths.len());
-            let mut by_segments = HashMap::<String, Option<usize>>::with_capacity(paths.len());
-            for (index, path) in paths.iter().enumerate() {
-                let Some(path) = path else {
+            let _span = crate::app::profile::span("earlier targets");
+            let paths =
+                build_editor_instance_paths_for_indices(self.before, self.service, &self.named);
+            let mut by_settings_id = AHashMap::with_capacity(paths.len());
+            let mut by_exact_path = AHashMap::with_capacity(paths.len());
+            let mut by_segments = AHashMap::<String, Option<usize>>::with_capacity(paths.len());
+            for index in self.named.iter().copied() {
+                let Some(path) = paths.get(&index) else {
                     continue;
                 };
                 by_settings_id.insert(self.before.instances[index].settings_id.as_str(), index);
@@ -541,7 +710,7 @@ impl<'a> EditedStore<'a> {
             },
         };
         let stayed = earlier_index
-            .and_then(|index| earlier.paths[index].as_ref())
+            .and_then(|index| earlier.paths.get(&index))
             .is_some_and(|was| same_path(now, &was.path_segments, Some(&was.path_ordinals)));
         if stayed {
             Followed::Unchanged
@@ -618,6 +787,7 @@ fn materialize_referrers(
     stored: &mut RetainedPropertyColumns,
     names: &HashSet<String>,
 ) -> Result<()> {
+    let _span = crate::app::profile::span("referrers read");
     let names = names.iter().map(String::as_str).collect();
     stored.materialize_where(document, Some(&names), names_by_selector)
 }
@@ -655,6 +825,9 @@ pub(crate) fn materialize_for_moves(
     materialize_referrers(document, stored, names)
 }
 
+/// The stores read at once, each on a decode budget of its own.
+const REFERRING_STORES_AT_ONCE: usize = 4;
+
 /// Each store at `files` that holds every string of one of the sets in
 /// `required`, where there are any, by its service and with the values of
 /// the instances that refer to something `names` stands for.
@@ -663,14 +836,25 @@ pub(crate) fn read_referring_stores<'p>(
     names: &HashSet<String>,
     required: &[Vec<String>],
 ) -> Result<BTreeMap<String, ReferringStore>> {
-    let mut stores = BTreeMap::new();
-    for file in files {
+    let _span = crate::app::profile::span("referring stores read");
+    let files = files.collect::<Vec<_>>();
+    let read_one = |file: &&PathBuf| {
         let Some((mut document, mut stored)) =
             read_for_structural_edit_if_contains(file, required)?
         else {
-            continue;
+            return Ok(None);
         };
         materialize_referrers(&mut document, &mut stored, names)?;
+        Ok(Some((document, stored)))
+    };
+    let read = (files.chunks(REFERRING_STORES_AT_ONCE))
+        .flat_map(|chunk| chunk.par_iter().map(read_one).collect::<Vec<Result<_>>>())
+        .collect::<Vec<_>>();
+    let mut stores = BTreeMap::new();
+    for (file, read) in files.into_iter().zip(read) {
+        let Some((document, stored)) = read? else {
+            continue;
+        };
         let service = crate::project::storage::store_service_name(file)
             .context("Service settings path has no service name")?;
         let file = file.clone();
@@ -800,6 +984,8 @@ pub(crate) fn follow_edited_references_with_short_lived(
     short_lived: &BTreeMap<String, &HashSet<String>>,
     documents: &mut BTreeMap<String, SettingsBytecode>,
 ) -> BTreeSet<String> {
+    let _span = crate::app::profile::span("edited references follow");
+    let finding = crate::app::profile::span("reference holders found");
     let mut holders = Vec::new();
     for (service, document) in documents.iter() {
         for (index, instance) in document.instances.iter().enumerate() {
@@ -813,9 +999,27 @@ pub(crate) fn follow_edited_references_with_short_lived(
             }
         }
     }
+    drop(finding);
     let mut changed = BTreeSet::new();
     if holders.is_empty() {
         return changed;
+    }
+    let targeting = crate::app::profile::span("followed targets");
+    // Only a reference whose path leads into an edited store is followed.
+    let followed = |object: &Map<String, Value>| {
+        let segments = object.get("pathSegments").and_then(Value::as_array);
+        let service = segments.and_then(|segments| segments.first());
+        service
+            .and_then(Value::as_str)
+            .is_some_and(|service| edited.contains_key(service))
+    };
+    let mut keys = ReferenceKeys::default();
+    for (service, index) in &holders {
+        let instance = &documents[service].instances[*index];
+        let values = instance.properties.values();
+        values
+            .chain(instance.attributes.values())
+            .for_each(|value| keys.add_value_where(service, value, &followed));
     }
     let stores = edited
         .iter()
@@ -827,26 +1031,42 @@ pub(crate) fn follow_edited_references_with_short_lived(
                     before,
                     documents.get(service),
                     short_lived.get(service).copied(),
+                    &keys,
                 ),
             )
         })
         .collect::<HashMap<_, _>>();
-    for (service, index) in holders {
-        let Some(instance) = documents
-            .get_mut(&service)
-            .and_then(|document| document.instances.get_mut(index))
-        else {
-            continue;
-        };
-        let mut followed = false;
-        for record in [&mut instance.properties, &mut instance.attributes] {
-            visit_reference_objects_mut(record, |reference| {
-                followed |= follow_reference(reference, &stores);
-            });
+    drop(targeting);
+    let _following = crate::app::profile::span("references rewritten");
+    for (service, document) in documents.iter_mut() {
+        let mut held = vec![false; document.instances.len()];
+        for (_, index) in holders.iter().filter(|(holder, _)| holder == service) {
+            held[*index] = true;
         }
+        let followed = (document.instances.par_iter_mut().zip(held))
+            .filter(|(_, held)| *held)
+            .map(|(instance, _)| {
+                let mut followed = false;
+                for record in [&mut instance.properties, &mut instance.attributes] {
+                    visit_reference_objects_mut(record, |reference| {
+                        followed |= follow_reference(reference, &stores);
+                    });
+                }
+                followed
+            })
+            .reduce(|| false, |left, right| left || right);
         if followed {
-            changed.insert(service);
+            changed.insert(service.clone());
         }
     }
+    let targets = (stores.into_values())
+        .map(|store| {
+            let earlier = store.earlier.into_inner();
+            let earlier =
+                earlier.map(|earlier| (earlier.by_exact_path, earlier.by_segments, earlier.paths));
+            (store.current, earlier)
+        })
+        .collect::<Vec<_>>();
+    rayon::spawn(move || drop((targets, keys, holders)));
     changed
 }

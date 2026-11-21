@@ -358,10 +358,12 @@ pub(crate) fn read_store_checked(path: &Path) -> Result<(SettingsBytecode, Optio
 pub(crate) fn read_store_for_structure(
     path: &Path,
 ) -> Result<(SettingsBytecode, RetainedPropertyColumns)> {
+    let _span = crate::app::profile::span("store read by instances");
     let (mut document, mut stored) = read_for_structural_edit(path)?;
     let scripts = (0..document.instances.len())
         .filter(|index| document.instances[*index].class_name == "Script")
         .collect::<Vec<_>>();
+    let _given = crate::app::profile::span("script run contexts");
     stored.give(
         &mut document,
         &scripts,
@@ -932,6 +934,7 @@ pub(super) fn resolve_bytecode_selector(
     selector: &BytecodeInstanceSelectorArgs,
     not_found: &str,
 ) -> Result<ResolvedBytecodeSelector> {
+    let _span = crate::app::profile::span("edit target resolve");
     if let Some(target) = selector
         .target
         .as_deref()
@@ -2266,6 +2269,7 @@ pub(crate) fn store_link_enforcement(
     if override_packages {
         return Ok(LinkEnforcement::default());
     }
+    let _span = crate::app::profile::span("package links read");
     match config::try_load_project(None, settings_file.parent())? {
         Some(loaded) => build_loaded_project_link_enforcement(&loaded, false),
         None => Ok(LinkEnforcement::default()),
@@ -3060,6 +3064,7 @@ fn is_structural_property(property: &str, scope: PropertyScope) -> bool {
 /// that renames, moves or removes instances locks them all, since any of
 /// them may hold a reference it has to update.
 pub(crate) fn project_store_files(settings_file: &Path) -> Result<BTreeSet<PathBuf>> {
+    let _span = crate::app::profile::span("project stores listed");
     let mut files = BTreeSet::from([settings_file.to_path_buf()]);
     if let Some(src_root) = crate::project::storage::source_directory(settings_file).parent() {
         for service_dir in crate::project::storage::service_directories(src_root)? {
@@ -3101,7 +3106,7 @@ fn set_store_properties(
     } else {
         BTreeSet::from([settings_file.clone()])
     };
-    let _locks = lock_existing_service_stores(locked_stores.iter().map(PathBuf::as_path))?;
+    let locks = lock_existing_service_stores(locked_stores.iter().map(PathBuf::as_path))?;
     // An edit that may change a script path reads the store by its instances,
     // each script with what its path depends on; any other edit keeps the
     // columns of a store of an older version. Either way the edited instances
@@ -3113,6 +3118,7 @@ fn set_store_properties(
     let (mut document, mut stored) = if paths_change {
         read_store_for_structure(&settings_file)?
     } else {
+        let _span = crate::app::profile::span("store read for values");
         read_for_property_edit(&settings_file)?
     };
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
@@ -3128,8 +3134,11 @@ fn set_store_properties(
             .map(|resolved| resolved.index)
         })
         .collect::<Result<Vec<_>>>()?;
+    let materialized = crate::app::profile::span("edited rows read");
     stored.materialize(&mut document, &indices)?;
+    drop(materialized);
     let referring = if structural {
+        let _span = crate::app::profile::span("references read for moves");
         references::read_for_moves(
             (&settings_file, &service),
             (&mut document, &mut stored),
@@ -3156,6 +3165,7 @@ fn set_store_properties(
         sources: Vec::new(),
         store_edited: false,
     };
+    let assigning = crate::app::profile::span("property assignments");
     let mut applied = Vec::with_capacity(indices.len());
     for (index, (_, assignments)) in indices.into_iter().zip(edits) {
         reject_owned_instance_edit(&edit.document, &service, index, &links)?;
@@ -3165,7 +3175,10 @@ fn set_store_properties(
             .collect::<Result<Vec<_>>>()?;
         applied.push(outcomes);
     }
-    edit.finish(applied)
+    drop(assigning);
+    let finished = edit.finish(applied);
+    release_settings_file_locks(locks);
+    finished
 }
 
 /// One store's document while a `bs` call edits it in memory.
@@ -3260,6 +3273,7 @@ impl StorePropertyEdit<'_> {
             self.moved.extend(subtree);
         }
         if self.before.is_none() && property_affects_source_path(self.scope, &stored) {
+            let _span = crate::app::profile::span("edit before kept");
             let source_paths =
                 build_editor_source_paths_by_index(&self.document, self.service, &self.service_dir);
             self.before = Some((self.document.clone(), source_paths));
@@ -3287,6 +3301,7 @@ impl StorePropertyEdit<'_> {
         mut self,
         mut applied: Vec<Vec<AppliedAssignment>>,
     ) -> Result<(Vec<Vec<Value>>, add_batch::StudioPrep)> {
+        let ordering = crate::app::profile::span("edit order");
         if let Some((before_document, _)) = &self.before
             && let Some(moved_to) =
                 instance_api::order_reparented_instances_last(&mut self.document, before_document)
@@ -3299,6 +3314,8 @@ impl StorePropertyEdit<'_> {
                 assignment.index = moved_to[assignment.index];
             }
         }
+        drop(ordering);
+        let moving = crate::app::profile::span("edit script moves");
         let mut writes = BTreeMap::new();
         let mut removals = Vec::new();
         let source_paths = match &self.before {
@@ -3329,11 +3346,21 @@ impl StorePropertyEdit<'_> {
             writes.insert(source_path.clone(), source.clone().into_bytes());
             written_sources.insert(*index, source_path);
         }
-        let mut followed = None;
+        drop(moving);
+        let mut followed = false;
         if !self.moved.is_empty() {
+            let _span = crate::app::profile::span("references followed");
             let own_service = crate::project::storage::store_service_name(self.settings_file)
                 .context("Service settings path has no service name")?;
-            let mut documents = BTreeMap::from([(own_service.clone(), self.document.clone())]);
+            let version = self.document.version;
+            let own = std::mem::replace(
+                &mut self.document,
+                SettingsBytecode {
+                    version,
+                    instances: Vec::new(),
+                },
+            );
+            let mut documents = BTreeMap::from([(own_service.clone(), own)]);
             let mut stores = BTreeMap::new();
             for (service, store) in std::mem::take(&mut self.referring) {
                 documents.insert(service.clone(), store.document);
@@ -3357,18 +3384,23 @@ impl StorePropertyEdit<'_> {
                         let document = &documents[&changed_service];
                         writes.insert(file.clone(), stored.encode(document)?);
                     }
-                    None => followed = documents.remove(&changed_service),
+                    None => followed = documents.contains_key(&changed_service),
                 }
             }
+            self.document = (documents.remove(&own_service))
+                .context("The edited store left the reference update")?;
+            rayon::spawn(move || drop((documents, stores)));
         }
-        if self.store_edited || followed.is_some() {
-            let document = followed.as_ref().unwrap_or(&self.document);
+        if self.store_edited || followed {
+            let _span = crate::app::profile::span("edited store encode");
+            let document = &self.document;
             let encoded = match self.by_instances {
                 true => self.stored.encode_restructured(document)?,
                 false => self.stored.encode(document)?,
             };
             writes.insert(self.settings_file.to_path_buf(), encoded);
         }
+        let preparing = crate::app::profile::span("studio prep");
         let mut studio = add_batch::StudioPrep::default();
         if let Some((before_document, _)) = &self.before
             && studio
@@ -3377,13 +3409,15 @@ impl StorePropertyEdit<'_> {
         {
             bail!("A moved instance's new parent is not in the store");
         }
+        drop(preparing);
         let changed_paths = file_mutation_paths(&writes, &removals);
         apply_file_mutations(&writes, &removals)?;
-        let path_parts = applied
-            .iter()
-            .flatten()
-            .any(|assignment| assignment.structural)
-            .then(|| build_editor_instance_path_parts(&self.document, self.service));
+        let structural = (applied.iter().flatten())
+            .filter(|assignment| assignment.structural)
+            .map(|assignment| assignment.index)
+            .collect::<Vec<_>>();
+        let paths =
+            build_editor_instance_paths_for_indices(&self.document, self.service, &structural);
         let results = applied
             .iter()
             .map(|outcomes| {
@@ -3402,24 +3436,28 @@ impl StorePropertyEdit<'_> {
                         if assignment.requested_differs {
                             result["requestedProperty"] = json!(assignment.requested);
                         }
-                        if let Some((path_segments, path_ordinals)) = &path_parts
-                            && assignment.structural
-                        {
+                        if assignment.structural {
                             let index = assignment.index;
                             let instance = &self.document.instances[index];
+                            let path = paths.get(&index);
                             result["settingsId"] = json!(instance.settings_id);
                             result["name"] = json!(instance.name);
                             result["className"] = json!(instance.class_name);
-                            result["pathSegments"] =
-                                json!(path_segments.get(index).and_then(Clone::clone));
-                            result["pathOrdinals"] =
-                                json!(path_ordinals.get(index).and_then(Clone::clone));
+                            result["pathSegments"] = json!(path.map(|path| &path.path_segments));
+                            result["pathOrdinals"] = json!(path.map(|path| &path.path_ordinals));
                         }
                         result
                     })
                     .collect()
             })
             .collect();
+        let Self {
+            document,
+            stored,
+            before,
+            ..
+        } = self;
+        rayon::spawn(move || drop((document, stored, before)));
         Ok((results, studio))
     }
 }
@@ -4353,9 +4391,12 @@ pub(super) fn collect_source_path_updates(
     writes: &mut BTreeMap<PathBuf, Vec<u8>>,
     removals: &mut Vec<PathBuf>,
 ) -> Result<Vec<Option<PathBuf>>> {
+    let _span = crate::app::profile::span("script moves planned");
     let mut after = build_editor_source_paths_by_index(after_document, service, service_dir);
     for (instance, to) in after_document.instances.iter().zip(&mut after) {
-        if let (Some(from), Some(to)) = (before.0.get(&instance.settings_id), to) {
+        if let Some(to) = to
+            && let Some(from) = before.0.get(&instance.settings_id)
+        {
             preserve_source_path_extension(from, to);
         }
     }
@@ -4365,10 +4406,8 @@ pub(super) fn collect_source_path_updates(
             .iter()
             .zip(&after)
             .filter_map(|(instance, to)| {
-                Some((
-                    before.0.get(&instance.settings_id)?.as_path(),
-                    to.as_deref()?,
-                ))
+                let to = to.as_deref()?;
+                Some((before.0.get(&instance.settings_id)?.as_path(), to))
             }),
         writes,
         removals,
@@ -4387,6 +4426,7 @@ pub(super) fn file_mutation_paths(
     writes: &BTreeMap<PathBuf, Vec<u8>>,
     removals: &[PathBuf],
 ) -> Vec<PathBuf> {
+    let _span = crate::app::profile::span("changed files compare");
     let mut changed = BTreeSet::new();
     for (path, bytes) in writes {
         let case_move = removals.iter().any(|from| {
@@ -4410,6 +4450,7 @@ pub(super) fn apply_file_mutations_with_permissions(
     removals: &[PathBuf],
     permissions: &BTreeMap<PathBuf, bool>,
 ) -> Result<()> {
+    let _span = crate::app::profile::span("file writes");
     let mut case_moves = Vec::new();
     for from in removals {
         let Some(to) = writes.keys().find(|to| {
@@ -4612,6 +4653,14 @@ impl Drop for SettingsFileLock {
     }
 }
 
+/// Releases `locks` all at once: each is a file of its own to delete, and
+/// a delete waits on the disk.
+pub(super) fn release_settings_file_locks(locks: Vec<SettingsFileLock>) {
+    use rayon::prelude::*;
+    let _span = crate::app::profile::span("store locks released");
+    locks.into_par_iter().for_each(drop);
+}
+
 /// Pulls a missing service store from Studio before a command reads or edits
 /// it, so the first `bs`, `tr`, `in` or batch op on a service goes on instead
 /// of stopping at "pull from Studio". Only a daemon that is already running is
@@ -4734,6 +4783,7 @@ pub(super) fn lock_existing_service_store(settings_file: &Path) -> Result<Settin
 pub(super) fn lock_existing_service_stores<'a>(
     settings_files: impl IntoIterator<Item = &'a Path>,
 ) -> Result<Vec<SettingsFileLock>> {
+    let _span = crate::app::profile::span("store locks");
     let settings_files = settings_files.into_iter().collect::<Vec<_>>();
     for settings_file in &settings_files {
         pull_missing_service_store(settings_file);

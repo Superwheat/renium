@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use serde_json::{Map, Value, json};
 use walkdir::WalkDir;
 
@@ -20,6 +22,9 @@ use crate::system::files::{
 };
 
 pub(crate) const SOURCE_PATH_CONTEXT_PROPERTY: &str = "RunContext";
+
+/// The fewest paths a worker builds at once.
+const PATHS_PER_TASK: usize = 256;
 
 #[derive(Clone, Copy, PartialEq)]
 enum SourceContext {
@@ -604,6 +609,7 @@ fn source_paths_for_rows(
     children_by_parent: &[Vec<usize>],
     selected: impl IntoIterator<Item = usize>,
 ) -> Vec<Option<PathBuf>> {
+    let _span = crate::app::profile::span("script paths");
     let mut out = vec![None; document.instances.len()];
     let mut contains_source = vec![false; document.instances.len()];
     for index in selected {
@@ -784,34 +790,41 @@ pub(crate) fn build_editor_instance_paths_for_indices(
     let Some(root_index) = editor_service_root_index(document, service) else {
         return HashMap::new();
     };
-    let mut hierarchies = HashMap::with_capacity(indices.len());
-    let mut hierarchy_indices = HashSet::new();
-    let mut relevant_siblings = HashSet::new();
+    let instances = &document.instances;
+    let mut hierarchies = Vec::with_capacity(indices.len());
+    let mut in_hierarchy = vec![false; instances.len()];
+    let mut parents = vec![false; instances.len() + 1];
+    let mut relevant_siblings = AHashSet::new();
     for &index in indices {
-        if index >= document.instances.len() {
+        if index >= instances.len() {
             continue;
         }
         let mut hierarchy = Vec::new();
         let mut current = Some(index);
         while let Some(current_index) = current {
             hierarchy.push(current_index);
-            current = document.instances[current_index].parent_index;
+            current = instances[current_index].parent_index;
         }
         if hierarchy.last() != Some(&root_index) {
             continue;
         }
         hierarchy.reverse();
         for current_index in &hierarchy {
-            let instance = &document.instances[*current_index];
-            hierarchy_indices.insert(*current_index);
-            relevant_siblings.insert((instance.parent_index, instance.name.as_str()));
+            if !std::mem::replace(&mut in_hierarchy[*current_index], true) {
+                let instance = &instances[*current_index];
+                parents[instance.parent_index.map_or(0, |parent| parent + 1)] = true;
+                relevant_siblings.insert((instance.parent_index, instance.name.as_str()));
+            }
         }
-        hierarchies.insert(index, hierarchy);
+        hierarchies.push((index, hierarchy));
     }
 
-    let mut sibling_counts = HashMap::<(Option<usize>, &str), usize>::new();
-    let mut ordinals = HashMap::with_capacity(hierarchy_indices.len());
-    for (index, instance) in document.instances.iter().enumerate() {
+    let mut sibling_counts = AHashMap::<(Option<usize>, &str), usize>::new();
+    let mut ordinals = vec![0; instances.len()];
+    for (index, instance) in instances.iter().enumerate() {
+        if !parents[instance.parent_index.map_or(0, |parent| parent + 1)] {
+            continue;
+        }
         let key = (instance.parent_index, instance.name.as_str());
         if !relevant_siblings.contains(&key) {
             continue;
@@ -820,33 +833,20 @@ pub(crate) fn build_editor_instance_paths_for_indices(
             .entry(key)
             .and_modify(|value| *value += 1)
             .or_insert(1);
-        if hierarchy_indices.contains(&index) {
-            ordinals.insert(index, *ordinal);
+        if in_hierarchy[index] {
+            ordinals[index] = *ordinal;
         }
     }
 
-    let mut paths = HashMap::with_capacity(hierarchies.len());
-    for (index, hierarchy) in hierarchies {
-        paths.insert(
-            index,
-            EditorInstancePath {
-                path_segments: hierarchy
-                    .iter()
-                    .map(|index| document.instances[*index].name.clone())
-                    .collect(),
-                path_ordinals: hierarchy
-                    .iter()
-                    .map(|index| {
-                        ordinals
-                            .get(index)
-                            .copied()
-                            .expect("hierarchy ordinal should be recorded")
-                    })
-                    .collect(),
-            },
-        );
-    }
-    paths
+    let path = |hierarchy: Vec<usize>| EditorInstancePath {
+        path_segments: (hierarchy.iter())
+            .map(|index| instances[*index].name.clone())
+            .collect(),
+        path_ordinals: hierarchy.iter().map(|index| ordinals[*index]).collect(),
+    };
+    (hierarchies.into_par_iter().with_min_len(PATHS_PER_TASK))
+        .map(|(index, hierarchy)| (index, path(hierarchy)))
+        .collect()
 }
 
 pub(crate) fn build_editor_instance_paths_with_children(
@@ -854,6 +854,7 @@ pub(crate) fn build_editor_instance_paths_with_children(
     service: &str,
     children_by_parent: &[Vec<usize>],
 ) -> Vec<Option<EditorInstancePath>> {
+    let _span = crate::app::profile::span("instance paths");
     let mut out = vec![None; document.instances.len()];
     let Some(root_index) = editor_service_root_index(document, service) else {
         return out;
@@ -876,14 +877,18 @@ fn document_instance_path_matches(
     path_segments: &[String],
     path_ordinals: &[usize],
 ) -> Vec<(usize, EditorInstancePath)> {
-    let Some(service) = path_segments.first() else {
+    let (Some(service), Some(name)) = (path_segments.first(), path_segments.last()) else {
         return Vec::new();
     };
-    build_editor_instance_paths(document, service)
+    let named = (document.instances.iter().enumerate())
+        .filter(|(_, instance)| instance.name == *name)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut paths = build_editor_instance_paths_for_indices(document, service, &named);
+    named
         .into_iter()
-        .enumerate()
-        .filter_map(|(index, path)| {
-            let path = path?;
+        .filter_map(|index| {
+            let path = paths.remove(&index)?;
             if path.path_segments != path_segments {
                 return None;
             }

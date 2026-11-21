@@ -99,9 +99,21 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 /// The blocks an edit reads at once to write them or to learn whether they
 /// come out otherwise.
 const RESTRUCTURED_BATCH: usize = 4;
+/// The blocks an edit reads at once to learn whether they stand as they are,
+/// each read to its table and references alone.
+const STANDING_BATCH: usize = 16;
+/// The kinds of the property groups whose values may hold a reference by
+/// position: arrays and objects, which nest values of any kind, and the two
+/// kinds of reference.
+const REFERRING_KINDS: [u8; 4] = [7, 8, 10, 17];
 /// The content bytes the frames read in this process hold.
 #[cfg(test)]
 static DECOMPRESSED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+thread_local! {
+    /// The stores in blocks this thread decoded whole.
+    pub(crate) static WHOLE_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The start of the text a decode gives a pool entry in place of its own: no
 /// file can hold it, since every process draws it anew.
@@ -260,6 +272,14 @@ struct Section<'b> {
 /// blocks that name it and its text where the writer holds that.
 type PoolEntries<'t> = BTreeMap<[u8; 16], (usize, Option<&'t str>)>;
 
+/// The blocks an edit writes, each where it is written anew, with the count
+/// of each pool entry they leave and the text of each entry they bring.
+type RewrittenBlocks<'s> = (
+    BTreeMap<[u8; 16], usize>,
+    BTreeMap<[u8; 16], String>,
+    Vec<Option<Section<'s>>>,
+);
+
 /// A value block's strings, property names and property groups, in the
 /// order the block holds them. A long string, or a marker, stands at the
 /// table entry of its hash, as each other text of that hash does.
@@ -315,6 +335,10 @@ struct Rewrite<'r> {
     /// Whether every block is written from its rows, as a whole encode
     /// writes it, and none taken as it stands without a read.
     whole: bool,
+    /// Whether, where rows moved, a block whose rows all stand where they
+    /// stood is copied as it is (`BlockStore::standing`) rather than written
+    /// from its rows, which gives its values the form a whole encode does.
+    standing: bool,
     moved: AHashSet<&'r str>,
     /// The hash of each long string a reference may name an instance by.
     long: AHashSet<[u8; 16]>,
@@ -449,6 +473,7 @@ fn collected_records<'a, T: Sync>(
     items
         .par_chunks(BLOCK_ROWS)
         .map(|items| {
+            let _span = crate::app::profile::span("store records chunk collected");
             let mut collected = SettingsBinaryCollection::default();
             for item in items {
                 count(&mut collected, item);
@@ -536,7 +561,9 @@ fn structure_content(
     document: &SettingsBytecode,
     lookup: &SettingsBinaryInstanceLookup<'_>,
 ) -> Result<Vec<u8>> {
+    let collecting = crate::app::profile::span("store records collected");
     let records = collected_records(&document.instances, collect_settings_record_strings);
+    drop(collecting);
     encode_settings_bytecode_payload_collected(document, lookup, records)
 }
 
@@ -737,6 +764,7 @@ fn write_pool_entry(content: &mut Vec<u8>, text: &str) -> Result<()> {
 }
 
 fn compressed(content: &[u8]) -> Result<Section<'static>> {
+    let _span = crate::app::profile::span("frame compressed");
     check_settings_payload_len(content.len(), "Decoded")?;
     let bytes = compress_store_frame(content, 1, true)?;
     Ok(Section {
@@ -1003,6 +1031,8 @@ impl<'a> BlockStore<'a> {
         structure: Vec<u8>,
         opened: Vec<OpenBlock>,
     ) -> Result<SettingsBytecode> {
+        #[cfg(test)]
+        WHOLE_DECODES.set(WHOLE_DECODES.get() + 1);
         let mut document = self.structure_of(structure)?;
         self.split(&mut document.instances)
             .into_par_iter()
@@ -1052,16 +1082,21 @@ impl<'a> BlockStore<'a> {
     /// comes out otherwise. Where rows moved, every block is written from
     /// the blocks that held its rows. Blocks are read a few at a time, each
     /// batch on a budget of its own, and every frame that comes out the same
-    /// is copied. `whole` writes every block and the structure from what
-    /// the store holds, also where the edit leaves them alone.
+    /// is copied. Where rows moved, the structure is written beside the
+    /// blocks; else the few blocks written come first. `whole` writes every
+    /// block and then the structure from what the store holds, also where the
+    /// edit leaves them alone.
     fn rewrite(
         &self,
         document: &SettingsBytecode,
         placed: Placed<'_>,
         moved: &[&str],
-        whole: bool,
+        (whole, standing): (bool, bool),
     ) -> Result<Vec<u8>> {
+        let settling = crate::app::profile::span("store document settled");
         let settled = settled_settings_document(document)?;
+        drop(settling);
+        let prepared = crate::app::profile::span("store rewrite prepared");
         let ranges = block_ranges(settled.instances.len(), self.block_rows());
         let kept = (placed.to.iter().enumerate()).all(|(row, now)| *now == Some(row))
             && self.blocks.len() <= ranges.len()
@@ -1079,51 +1114,35 @@ impl<'a> BlockStore<'a> {
             ranges,
             kept,
             whole,
+            standing,
             moved: moved.iter().copied().collect(),
             long,
             dense: document_reference_lookup(&settled, false),
             every: OnceLock::new(),
         };
-        let mut counts = BTreeMap::new();
-        if kept {
-            counts.extend(self.hashes.iter().copied().zip(self.counts.iter().copied()));
-        }
-        let mut brought = BTreeMap::<[u8; 16], String>::new();
-        let mut sections = (edit.ranges.iter().map(|_| None)).collect::<Vec<Option<Section<'_>>>>();
-        let indices = (0..edit.ranges.len()).collect::<Vec<_>>();
-        for batch in indices.chunks(RESTRUCTURED_BATCH) {
-            self.budget.renew(self.bytes.len());
-            let written = (batch.par_iter())
-                .map(|index| self.rewritten(&edit, *index))
-                .collect::<Result<Vec<_>>>()?;
-            for (index, written) in batch.iter().zip(written) {
-                let Some(written) = written else {
-                    continue;
-                };
-                self.unname(&mut counts, written.before)?;
-                for (hash, text) in written.now {
-                    *counts.entry(hash).or_default() += 1;
-                    let Some(text) = text else {
-                        continue;
-                    };
-                    let held = brought.entry(hash).or_insert_with(|| text.clone());
-                    anyhow::ensure!(*held == text, "Two strings of a store share a hash");
-                }
-                sections[*index] = Some(written.section);
+        drop(prepared);
+        let structure = || {
+            let _structuring = crate::app::profile::span("store structure written");
+            if whole {
+                let content = structure_content(&settled, &edit.dense)?;
+                framed(&content, Some((self, self.structure)))
+            } else if kept && settled.instances.len() == self.rows && moved.is_empty() {
+                self.raw(self.structure)
+            } else {
+                compressed(&structure_content(&settled, &edit.dense)?)
             }
-        }
+        };
+        let (written, structure) = match whole || kept {
+            true => (self.rewritten_blocks(&edit), structure()),
+            false => rayon::join(|| self.rewritten_blocks(&edit), structure),
+        };
+        let (mut counts, brought, sections) = written?;
+        let structure = structure?;
+        let _assembled = crate::app::profile::span("store pool written");
         counts.retain(|_, count| *count > 0);
         let entries = (counts.iter())
             .map(|(hash, count)| (*hash, (*count, brought.get(hash).map(String::as_str))))
             .collect::<PoolEntries<'_>>();
-        let structure = if whole {
-            let content = structure_content(&settled, &edit.dense)?;
-            framed(&content, Some((self, self.structure)))?
-        } else if kept && settled.instances.len() == self.rows && moved.is_empty() {
-            self.raw(self.structure)?
-        } else {
-            compressed(&structure_content(&settled, &edit.dense)?)?
-        };
         let listed = listed(&entries, Some(self))?;
         let pool = pool_frames(&entries, &listed, Some(self))?;
         let blocks = (sections.into_iter().zip(&edit.ranges).enumerate())
@@ -1138,96 +1157,222 @@ impl<'a> BlockStore<'a> {
         assemble(structure, &listed, &pool, &blocks)
     }
 
-    /// Block `index` of the file `edit` writes, or none where the block the
-    /// store holds there stands as it is: its rows hold their stored values
-    /// at their places, and its table none of the strings the edit moved.
-    fn rewritten(&self, edit: &Rewrite<'_>, index: usize) -> Result<Option<Written<'_>>> {
+    /// The blocks of the file `edit` writes, each where it is written anew,
+    /// with the count of each pool entry they leave and the text of each
+    /// entry they bring.
+    fn rewritten_blocks(&self, edit: &Rewrite<'_>) -> Result<RewrittenBlocks<'_>> {
+        let _written = crate::app::profile::span("store blocks rewritten");
+        let mut counts = BTreeMap::new();
+        if edit.kept {
+            counts.extend(self.hashes.iter().copied().zip(self.counts.iter().copied()));
+        }
+        let mut brought = BTreeMap::<[u8; 16], String>::new();
+        let mut sections = (edit.ranges.iter().map(|_| None)).collect::<Vec<Option<Section<'_>>>>();
+        let indices = (0..edit.ranges.len()).collect::<Vec<_>>();
+        let mut written = Vec::with_capacity(indices.len());
+        let checking = crate::app::profile::span("store blocks checked");
+        for batch in indices.chunks(STANDING_BATCH) {
+            self.budget.renew(self.bytes.len());
+            let _batch = crate::app::profile::span("store block batch checked");
+            let standing = (batch.par_iter())
+                .map(|index| self.standing(edit, *index))
+                .collect::<Result<Vec<_>>>()?;
+            written.extend(standing);
+        }
+        drop(checking);
+        let rest = (indices.iter().copied())
+            .filter(|index| written[*index].is_none())
+            .collect::<Vec<_>>();
+        let writing = crate::app::profile::span("store blocks written anew");
+        for batch in rest.chunks(RESTRUCTURED_BATCH) {
+            self.budget.renew(self.bytes.len());
+            let _batch = crate::app::profile::span("store block batch written");
+            for (index, block) in batch.iter().zip(self.rewritten(edit, batch)?) {
+                written[*index] = Some(Some(block));
+            }
+        }
+        drop(writing);
+        let _counted = crate::app::profile::span("store pool entries counted");
+        for (index, written) in written.into_iter().enumerate() {
+            let Some(Some(written)) = written else {
+                continue;
+            };
+            self.unname(&mut counts, written.before)?;
+            for (hash, text) in written.now {
+                *counts.entry(hash).or_default() += 1;
+                let Some(text) = text else {
+                    continue;
+                };
+                let held = brought.entry(hash).or_insert_with(|| text.clone());
+                anyhow::ensure!(*held == text, "Two strings of a store share a hash");
+            }
+            sections[index] = Some(written.section);
+        }
+        Ok((counts, brought, sections))
+    }
+
+    /// Block `index` of the file `edit` writes where the block the store
+    /// holds there gives it without a write from its rows: none where that
+    /// block stands as it is, its rows holding their stored values at their
+    /// places and its table none of the strings the edit moved. Where rows
+    /// moved, a block whose rows all stand where they stood, whose references
+    /// by position name the rows they named, and which names no instance of
+    /// the store otherwise (`references_stay`) holds the same values; it is
+    /// copied, with the pool entries it names. `None` for a block `rewritten`
+    /// writes.
+    fn standing(&self, edit: &Rewrite<'_>, index: usize) -> Result<Option<Option<Written<'_>>>> {
         let range = edit.ranges[index].clone();
         let Placed { from, to, held } = edit.placed;
-        let mut sources = Vec::new();
-        for row in range.clone().filter(|row| !held[*row]) {
-            let stored =
-                from[row].context("An instance without its values is no row of the store")?;
-            sources.push(self.block_of(stored));
-        }
-        if edit.kept && index < self.blocks.len() {
-            sources.push(index);
-        }
-        sources.sort_unstable();
-        sources.dedup();
         let untouched = !edit.whole && edit.kept && !range.clone().any(|row| held[row]);
-        if untouched && edit.moved.is_empty() {
+        let stays = edit.standing
+            && !edit.whole
+            && !edit.kept
+            && (self.blocks.get(index)).is_some_and(|block| block.rows() == range)
+            && range
+                .clone()
+                .all(|row| !held[row] && from[row] == Some(row));
+        if !untouched && !stays {
             return Ok(None);
         }
-        let opened = (sources.iter())
-            .map(|source| self.open_block(*source))
-            .collect::<Result<Vec<_>>>()?;
+        if untouched && edit.moved.is_empty() {
+            return Ok(Some(None));
+        }
+        let _checking = crate::app::profile::span("store block checked");
+        let open = self.open_block(index)?;
         let names = |string: &BlockString| match string {
             BlockString::Own(text) => edit.moved.contains(text.as_str()),
             BlockString::Pool(entry) => edit.long.contains(&self.hashes[*entry]),
         };
-        if untouched && !opened.iter().any(|open| open.strings.iter().any(names)) {
+        if open.strings.iter().any(names) {
             return Ok(None);
         }
+        if untouched {
+            return Ok(Some(None));
+        }
+        let root_service = edit.dense.root_service.as_deref();
+        if !self.references_stay((&open, index), to, root_service)? {
+            return Ok(None);
+        }
+        let named = open.pool_entries().map(|entry| self.hashes[entry]);
+        Ok(Some(Some(Written {
+            section: self.raw(self.blocks[index].frame)?,
+            before: Vec::new(),
+            now: (named.collect::<AHashSet<_>>().into_iter())
+                .map(|hash| (hash, None))
+                .collect(),
+        })))
+    }
+
+    /// The blocks `batch` of the file `edit` writes, from the blocks that
+    /// held their rows and the values the document holds. Each block that
+    /// held rows of the batch is read once, for all of them.
+    fn rewritten(&self, edit: &Rewrite<'_>, batch: &[usize]) -> Result<Vec<Written<'_>>> {
+        let Placed { from, to, held } = edit.placed;
+        let mut sources = Vec::with_capacity(batch.len());
+        for index in batch {
+            let mut own = Vec::new();
+            for row in edit.ranges[*index].clone().filter(|row| !held[*row]) {
+                let stored =
+                    from[row].context("An instance without its values is no row of the store")?;
+                own.push(self.block_of(stored));
+            }
+            if edit.kept && *index < self.blocks.len() {
+                own.push(*index);
+            }
+            own.sort_unstable();
+            own.dedup();
+            sources.push(own);
+        }
+        let mut read = sources.iter().flatten().copied().collect::<Vec<_>>();
+        read.sort_unstable();
+        read.dedup();
+        let target =
+            |now: usize| (batch.iter()).position(|index| edit.ranges[*index].contains(&now));
+        let placed = |source: usize, row: usize| {
+            to[self.blocks[source].first + row].filter(|now| !held[*now] && target(*now).is_some())
+        };
         let resolved = |hash: &[u8; 16]| edit.long.contains(hash);
         let texts = match edit.long.is_empty() {
             true => Texts::Marked,
             false => Texts::Resolved(&resolved),
         };
-        let mut rows = edit.document.instances[range.clone()].to_vec();
-        for (source, open) in sources.iter().zip(&opened) {
-            let block = &self.blocks[*source];
-            let placed =
-                |row: usize| to[block.first + row].filter(|now| range.contains(now) && !held[*now]);
-            let mut values = (0..block.count)
-                .map(|_| DecodedRowValues::default())
-                .collect::<Vec<_>>();
-            self.block_into(open, &mut values, |row| placed(row).is_some(), texts)?;
+        let opened = (read.par_iter())
+            .map(|source| {
+                let _reading = crate::app::profile::span("store block rows read");
+                let open = self.open_block(*source)?;
+                let mut values = (0..self.blocks[*source].count)
+                    .map(|_| DecodedRowValues::default())
+                    .collect::<Vec<_>>();
+                let keep = |row: usize| placed(*source, row).is_some();
+                self.block_into(&open, &mut values, keep, texts)?;
+                Ok((open, values))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut rows = (batch.iter())
+            .map(|index| edit.document.instances[edit.ranges[*index].clone()].to_vec())
+            .collect::<Vec<_>>();
+        let mut blocks = Vec::with_capacity(opened.len());
+        for (source, (open, values)) in read.iter().zip(opened) {
             for (row, values) in values.into_iter().enumerate() {
-                let Some(now) = placed(row) else {
+                let Some(now) = placed(*source, row) else {
                     continue;
                 };
-                let instance = &mut rows[now - range.start];
+                let place = target(now).context("A row left the blocks it was read for")?;
+                let instance = &mut rows[place][now - edit.ranges[batch[place]].start];
                 instance.properties = values.properties;
                 instance.attributes = values.attributes;
-                if !edit.kept {
-                    let values = instance.properties.values_mut();
-                    for value in values.chain(instance.attributes.values_mut()) {
-                        remap_ref_indices_in_value(value, to);
-                    }
-                }
-                for value in instance.attributes.values_mut() {
-                    if let Some(canonical) = canonical_attribute_value(value) {
-                        *value = canonical;
-                    }
-                }
-                settle_forced_properties(&mut instance.properties);
             }
+            blocks.push(open);
         }
-        let lookup = edit.lookup(&rows);
-        let block = prepared(&rows, lookup)?;
-        let content = block.content(lookup)?;
-        let stands = (sources.iter().zip(&opened))
-            .any(|(source, open)| *source == index && open.content == content);
-        let section = match stands {
-            true => self.raw(self.blocks[index].frame)?,
-            false => compressed(&content)?,
-        };
-        let before = match edit.kept {
-            true => opened.iter().flat_map(OpenBlock::pool_entries).collect(),
-            false => Vec::new(),
-        };
-        let now = (block.strings.pooled())
-            .map(|(hash, text)| {
-                let brought = text.filter(|_| self.entry_of(&hash).is_err());
-                (hash, brought.map(str::to_string))
+        let open = |source: &usize| read.binary_search(source).ok().map(|place| &blocks[place]);
+        (batch.par_iter().zip(rows).zip(&sources))
+            .map(|((index, mut rows), sources)| {
+                let _encoding = crate::app::profile::span("store block encoded");
+                for (instance, now) in rows.iter_mut().zip(edit.ranges[*index].clone()) {
+                    if held[now] {
+                        continue;
+                    }
+                    if !edit.kept {
+                        let values = instance.properties.values_mut();
+                        for value in values.chain(instance.attributes.values_mut()) {
+                            remap_ref_indices_in_value(value, to);
+                        }
+                    }
+                    for value in instance.attributes.values_mut() {
+                        if let Some(canonical) = canonical_attribute_value(value) {
+                            *value = canonical;
+                        }
+                    }
+                    settle_forced_properties(&mut instance.properties);
+                }
+                let lookup = edit.lookup(&rows);
+                let block = prepared(&rows, lookup)?;
+                let content = block.content(lookup)?;
+                let stands = (sources.contains(index).then(|| open(index)).flatten())
+                    .is_some_and(|open| open.content == content);
+                let section = match stands {
+                    true => self.raw(self.blocks[*index].frame)?,
+                    false => compressed(&content)?,
+                };
+                let before = match edit.kept {
+                    true => (sources.iter().filter_map(open))
+                        .flat_map(OpenBlock::pool_entries)
+                        .collect(),
+                    false => Vec::new(),
+                };
+                let now = (block.strings.pooled())
+                    .map(|(hash, text)| {
+                        let brought = text.filter(|_| self.entry_of(&hash).is_err());
+                        (hash, brought.map(str::to_string))
+                    })
+                    .collect();
+                Ok(Written {
+                    section,
+                    before,
+                    now,
+                })
             })
-            .collect();
-        Ok(Some(Written {
-            section,
-            before,
-            now,
-        }))
+            .collect()
     }
 
     /// The rows of each block of this store but the last, which a file that
@@ -1258,10 +1403,10 @@ impl<'a> BlockStore<'a> {
         Ok(())
     }
 
-    /// The rows `wanted` takes by their stored values, a marker in place of
-    /// each pool entry: of the blocks whose table holds one of `strings`, or
-    /// of every block where there are none. Blocks are read a few at a time,
-    /// each batch on a budget of its own.
+    /// The rows `wanted` takes by their stored values that may hold a
+    /// reference, a marker in place of each pool entry: of the blocks whose
+    /// table holds one of `strings`, or of every block where there are none.
+    /// Blocks are read a few at a time, each batch on a budget of its own.
     fn rows_where(
         &self,
         strings: Option<&AHashSet<&str>>,
@@ -1280,6 +1425,7 @@ impl<'a> BlockStore<'a> {
         let mut rows = Vec::new();
         for batch in indices.chunks(RESTRUCTURED_BATCH) {
             self.budget.renew(self.bytes.len());
+            let _batch = crate::app::profile::span("store rows batch searched");
             let found = (batch.par_iter())
                 .map(|index| {
                     let open = self.open_block(*index)?;
@@ -1290,7 +1436,8 @@ impl<'a> BlockStore<'a> {
                     let mut values = (0..block.count)
                         .map(|_| DecodedRowValues::default())
                         .collect::<Vec<_>>();
-                    self.block_into(&open, &mut values, |_| true, Texts::Marked)?;
+                    let referring = |_: &str, kind: u8| REFERRING_KINDS.contains(&kind);
+                    self.values(&open, &mut values, |_| true, referring, Texts::Marked)?;
                     let rows = block.rows().zip(&values);
                     Ok((rows.filter(|(_, values)| wanted(values)))
                         .map(|(row, _)| row)
@@ -1453,7 +1600,7 @@ impl<'a> BlockStore<'a> {
                         &open,
                         rows,
                         |_| true,
-                        |name| name == UNIQUE_ID,
+                        |name, _| name == UNIQUE_ID,
                         Texts::Marked,
                     )?;
                     return Ok((0_u64..)
@@ -1810,20 +1957,50 @@ impl<'a> BlockStore<'a> {
         keep: impl Fn(usize) -> bool + Sync,
         texts: Texts<'_>,
     ) -> Result<()> {
-        self.values(open, rows, keep, |_| true, texts)
+        self.values(open, rows, keep, |_, _| true, texts)
+    }
+
+    /// Whether the references block `index`, opened as `open`, holds are
+    /// written as they stand once the rows stand where `to` puts them: each
+    /// by position names the row it named, and none names an instance of the
+    /// store of the root `root_service` by an id or a path, which a write
+    /// finds again in the store as the edit leaves it (`references_alike`):
+    /// a namesake removed, renamed or moved ahead of an instance changes what
+    /// a path with ordinals names. Its rows then keep their values as they
+    /// are.
+    fn references_stay(
+        &self,
+        (open, index): (&OpenBlock, usize),
+        to: &[Option<usize>],
+        root_service: Option<&str>,
+    ) -> Result<bool> {
+        let mut rows = (0..self.blocks[index].count)
+            .map(|_| DecodedRowValues::default())
+            .collect::<Vec<_>>();
+        let referring = |_: &str, kind: u8| REFERRING_KINDS.contains(&kind);
+        self.values(open, &mut rows, |_| true, referring, Texts::Marked)?;
+        let mut values = (rows.iter_mut()).flat_map(|row| {
+            row.properties
+                .values_mut()
+                .chain(row.attributes.values_mut())
+        });
+        Ok(!values.any(|value| {
+            remap_ref_indices_in_value(value, to) || !references_alike(value, root_service)
+        }))
     }
 
     /// Gives `rows`, the rows of one block in order, the values the block
-    /// holds for the rows `keep` takes of the properties `names` takes, with
-    /// `texts` for the pool entries they name; a property name is always its
-    /// own text. The table and the property names are copied on the budget,
-    /// as v11 copies its property names, before any copy is made.
+    /// holds for the rows `keep` takes of the property groups `groups` takes
+    /// by name and kind, with `texts` for the pool entries they name; a
+    /// property name is always its own text. The table and the property
+    /// names are copied on the budget, as v11 copies its property names,
+    /// before any copy is made.
     fn values<T: DecodedPropertyTarget>(
         &self,
         open: &OpenBlock,
         rows: &mut [T],
         keep: impl Fn(usize) -> bool + Sync,
-        names: impl Fn(&str) -> bool + Sync,
+        groups: impl Fn(&str, u8) -> bool + Sync,
         texts: Texts<'_>,
     ) -> Result<()> {
         let all = matches!(texts, Texts::All);
@@ -1857,7 +2034,7 @@ impl<'a> BlockStore<'a> {
         reader.finish()?;
         let specs = specs
             .into_iter()
-            .filter(|(name, ..)| names(name))
+            .filter(|(name, kind, ..)| groups(name, *kind))
             .collect::<Vec<_>>();
         // A marker is no payload: a store that holds payloads holds them once
         // the markers of the rows read have their texts. The decode charges
@@ -1962,7 +2139,8 @@ impl<'a> BlockStore<'a> {
                         .map(|_| DecodedRowValues::default())
                         .collect::<Vec<_>>();
                     let keep = |row: usize| rows.binary_search(&(first + row)).is_ok();
-                    self.values(&open, &mut values, keep, &names, Texts::Marked)?;
+                    let named = |name: &str, _| names(name);
+                    self.values(&open, &mut values, keep, named, Texts::Marked)?;
                     Ok((first, values))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -2118,7 +2296,7 @@ pub(crate) fn encode_again_cut(bytes: &[u8], block_rows: usize) -> Result<Option
         to: &rows,
         held: &vec![false; store.rows],
     };
-    let written = store.rewrite(&store.structure()?, placed, &[], true)?;
+    let written = store.rewrite(&store.structure()?, placed, &[], (true, false))?;
     Ok(Some(written))
 }
 
@@ -2204,11 +2382,23 @@ pub(crate) struct EditedStore {
     /// row, and each property `give` read.
     given: AHashMap<usize, Map<String, Value>>,
     complete: Vec<bool>,
+    /// `Rewrite::standing` of the files it writes: an edit leaves the
+    /// instances it does not touch as they are.
+    standing: bool,
 }
 
 impl EditedStore {
+    /// This store writing, where rows moved, every block that holds rows
+    /// from its rows, as a merge does to give the whole encode of what it
+    /// merged.
+    pub(crate) fn rewriting_moved_blocks(mut self) -> Self {
+        self.standing = false;
+        self
+    }
+
     /// The structure of a v12 file, with the root's viewport camera.
     pub(crate) fn decode(bytes: &[u8]) -> Result<(SettingsBytecode, Self)> {
+        let _span = crate::app::profile::span("store structure read");
         let store = BlockStore::open(bytes.to_vec())?;
         let mut document = store.structure()?;
         let records = document.instances.clone();
@@ -2218,6 +2408,7 @@ impl EditedStore {
             complete: vec![false; records.len()],
             records,
             given: AHashMap::new(),
+            standing: true,
         };
         edited.give(&mut document, root.as_slice(), "CurrentCamera")?;
         Ok((document, edited))
@@ -2231,6 +2422,7 @@ impl EditedStore {
         rows: &[usize],
         name: &str,
     ) -> Result<()> {
+        let _span = crate::app::profile::span("store property read");
         self.in_place(document)?;
         let (given, complete) = (&mut self.given, &self.complete);
         let rows = (rows.iter().copied())
@@ -2248,13 +2440,18 @@ impl EditedStore {
 
     /// Gives the instances at `indices` their stored values whole. Each call
     /// is a pass on a budget of its own, as `encode` is: a pass reads each
-    /// block it needs once, and so takes no more than a whole decode.
+    /// block it needs once, and so takes no more than a whole decode. A
+    /// document may hold new instances behind the store's rows.
     pub(crate) fn materialize(
         &mut self,
         document: &mut SettingsBytecode,
         indices: &[usize],
     ) -> Result<()> {
-        self.in_place(document)?;
+        let _span = crate::app::profile::span("store rows read");
+        anyhow::ensure!(
+            document.instances.len() >= self.records.len(),
+            "An edit of values changed how many instances the store holds"
+        );
         self.store.budget.renew(self.store.bytes.len());
         for (row, values) in self.store.rows(indices)? {
             document.instances[row].properties = values.properties;
@@ -2280,14 +2477,17 @@ impl EditedStore {
     }
 
     /// `materialize` of each instance that holds a value `wanted` takes,
-    /// which sees a marker in place of each pool entry: of the blocks that
-    /// hold one of `strings`, or of every block where there are none.
+    /// which sees only the values that may hold a reference (arrays, objects
+    /// and references) and a marker in place of each pool entry: of the
+    /// blocks that hold one of `strings`, or of every block where there are
+    /// none.
     pub(crate) fn materialize_where(
         &mut self,
         document: &mut SettingsBytecode,
         strings: Option<&AHashSet<&str>>,
         wanted: impl Fn(&Value) -> bool + Sync,
     ) -> Result<()> {
+        let _span = crate::app::profile::span("store rows found by values");
         let rows = self.store.rows_where(strings, |row| {
             let mut values = row.properties.values().chain(row.attributes.values());
             values.any(&wanted)
@@ -2327,12 +2527,14 @@ impl EditedStore {
     /// instance keeps follows its instance, and names nothing once that is
     /// gone.
     pub(crate) fn encode_restructured(&self, document: &SettingsBytecode) -> Result<Vec<u8>> {
+        let placing = crate::app::profile::span("store rows placed");
         let rows = (self.records.iter().enumerate())
             .map(|(row, record)| (record.settings_id.as_str(), row))
             .collect::<AHashMap<_, _>>();
-        let from = (document.instances.iter())
+        let from = (document.instances.par_iter())
             .map(|instance| rows.get(instance.settings_id.as_str()).copied())
             .collect::<Vec<_>>();
+        drop((placing, rows));
         self.written(document, &from, false)
     }
 
@@ -2344,6 +2546,7 @@ impl EditedStore {
         from: &[Option<usize>],
         in_place: bool,
     ) -> Result<Vec<u8>> {
+        let _span = crate::app::profile::span("store blocks write");
         let mut to = vec![None; self.records.len()];
         for (now, row) in from.iter().enumerate() {
             if let Some(row) = row {
@@ -2373,12 +2576,15 @@ impl EditedStore {
             to: &to,
             held: &held,
         };
+        let moving = crate::app::profile::span("store moved strings");
         let moved = self.moved(document, placed, in_place)?;
+        drop(moving);
         self.store.budget.renew(self.store.bytes.len());
         if self.store.writer != writer() {
             return self.whole(document, placed);
         }
-        self.store.rewrite(document, placed, &moved, false)
+        self.store
+            .rewrite(document, placed, &moved, (false, self.standing))
     }
 
     /// The strings by which a reference may name an instance that the
@@ -2590,7 +2796,7 @@ impl RowBlocks {
                 &open,
                 &mut values,
                 |_| true,
-                &names,
+                |name, _| names(name),
                 Texts::Resolved(&|_| true),
             )?;
             Ok(store.blocks[index]

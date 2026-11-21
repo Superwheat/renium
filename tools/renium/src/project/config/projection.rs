@@ -187,8 +187,14 @@ pub(super) fn fresh_projection_stage(parent: &Path, prefix: &str) -> Result<Path
 }
 
 pub fn stage_project(loaded: &LoadedProject) -> Result<ProjectionStage> {
+    let _span = crate::app::profile::span("project stage");
+    let validating = crate::app::profile::span("project validate");
     validate_project(loaded)?;
-    if !project_requires_temporary_stage(loaded)? {
+    drop(validating);
+    let needed = crate::app::profile::span("project stage needed");
+    let temporary = project_requires_temporary_stage(loaded)?;
+    drop(needed);
+    if !temporary {
         cache_script_naming(
             &loaded.root.join(&loaded.project.source_root),
             &loaded.project,
@@ -2200,10 +2206,44 @@ pub(super) fn projection_settings_id(kind: &str, value: &str) -> String {
     format!("projection:{:x}", digest.finalize())
 }
 
+/// Whether a metadata sidecar is anywhere under `root`. The folders of each
+/// depth are read in parallel: opening each one is what a large source tree
+/// spends its time on. Where a folder cannot be read, the tree is walked in
+/// order, so the answer is the one of a walk that stops at the first sidecar
+/// or the first folder it cannot read.
 fn contains_metadata_sidecars(root: &Path) -> Result<bool> {
+    use rayon::prelude::*;
+    fn listed(folder: &Path) -> std::io::Result<(bool, Vec<PathBuf>)> {
+        let (mut held, mut folders) = (false, Vec::new());
+        for entry in fs::read_dir(folder)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            held |= kind.is_file() && is_metadata_sidecar(&entry.path());
+            if kind.is_dir() {
+                folders.push(entry.path());
+            }
+        }
+        Ok((held, folders))
+    }
     if !root.is_dir() {
         return Ok(false);
     }
+    let (mut held, mut depth) = (false, vec![root.to_path_buf()]);
+    while !depth.is_empty() {
+        let read = depth.par_iter().map(|folder| listed(folder));
+        let Ok(read) = read.collect::<std::io::Result<Vec<_>>>() else {
+            return walked_for_metadata_sidecars(root);
+        };
+        depth = Vec::new();
+        for (holds, folders) in read {
+            held |= holds;
+            depth.extend(folders);
+        }
+    }
+    Ok(held)
+}
+
+fn walked_for_metadata_sidecars(root: &Path) -> Result<bool> {
     for entry in walkdir::WalkDir::new(root) {
         let entry = entry?;
         if entry.file_type().is_file() && is_metadata_sidecar(entry.path()) {
@@ -2862,6 +2902,22 @@ pub fn project_target_is_declarative(loaded: &LoadedProject, target: &[String]) 
     Ok(projection_field_owners(loaded)?
         .iter()
         .any(|owner| owner.target == target))
+}
+
+/// `project_target_is_declarative` of a project staged as `stage`. A project
+/// that needed no temporary stage has no metadata sidecar, mount, adapter or
+/// nested project, so only a node of its tree names a target.
+pub fn staged_target_is_declarative(
+    loaded: &LoadedProject,
+    stage: &ProjectionStage,
+    target: &[String],
+) -> Result<bool> {
+    if stage.is_temporary() {
+        return project_target_is_declarative(loaded, target);
+    }
+    Ok(project_tree_nodes(&loaded.project.tree)
+        .iter()
+        .any(|(node, _)| node == target))
 }
 
 pub fn project_structural_store_path(loaded: &LoadedProject, target: &[String]) -> Result<PathBuf> {

@@ -34,9 +34,10 @@ use crate::cli::{
     BytecodeExportModelArgs, BytecodeExportPlaceArgs, BytecodeImportModelArgs, BytecodeRepackArgs,
 };
 use crate::editor::paths::{
-    build_editor_instance_paths, build_editor_instance_paths_with_children,
-    build_editor_source_paths_by_index, build_editor_source_paths_by_index_with_children,
-    editor_run_context_value, infer_source_script, merge_editor_source_files_into_document_with,
+    build_editor_instance_paths, build_editor_instance_paths_for_indices,
+    build_editor_instance_paths_with_children, build_editor_source_paths_by_index,
+    build_editor_source_paths_by_index_with_children, editor_run_context_value,
+    infer_source_script, merge_editor_source_files_into_document_with,
 };
 use crate::project::config;
 use crate::project::layout::apply_configured_project_layout;
@@ -661,6 +662,18 @@ fn canonicalize_settings_reference_documents_scoped(
     documents: &mut BTreeMap<String, SettingsBytecode>,
     move_scope: Option<&HashMap<&str, &HashSet<usize>>>,
 ) -> BTreeSet<String> {
+    let _span = crate::app::profile::span("references canonicalized");
+    // A reference resolves to an instance with one of its selectors. Those
+    // of a reference this pass rewrites become those of its target, which
+    // are then the keys of the instances the reference may resolve to next.
+    let keying = crate::app::profile::span("reference keys");
+    let mut keys = crate::bytecode::references::ReferenceKeys::default();
+    keys.add_documents(documents, move_scope);
+    for (service, document) in documents.iter() {
+        keys.add_instances(document, &keys.named(service, document));
+    }
+    drop(keying);
+    let targeting = crate::app::profile::span("reference targets");
     let mut targets = Vec::new();
     let mut local_ids = HashMap::<String, HashMap<String, usize>>::new();
     let mut local_indices = HashMap::<String, Vec<Option<usize>>>::new();
@@ -668,9 +681,11 @@ fn canonicalize_settings_reference_documents_scoped(
     let mut exact_paths = HashMap::<String, Option<usize>>::new();
     let mut segment_paths = HashMap::<String, Option<usize>>::new();
     for (service, document) in documents.iter() {
-        let paths = build_editor_instance_paths(document, service);
-        for (index, instance) in document.instances.iter().enumerate() {
-            let Some(Some(path)) = paths.get(index) else {
+        let named = keys.named(service, document);
+        let paths = build_editor_instance_paths_for_indices(document, service, &named);
+        for index in named {
+            let instance = &document.instances[index];
+            let Some(path) = paths.get(&index) else {
                 continue;
             };
             let target = targets.len();
@@ -922,6 +937,7 @@ fn canonicalize_settings_reference_documents_scoped(
         }
     }
 
+    drop(targeting);
     let context = CanonicalReferenceContext {
         targets: &targets,
         local_ids: &local_ids,
@@ -931,6 +947,7 @@ fn canonicalize_settings_reference_documents_scoped(
         segment_paths: &segment_paths,
         move_scope,
     };
+    let _rewritten = crate::app::profile::span("references rewritten");
     let mut changed_services = BTreeSet::new();
     for (service, document) in documents.iter_mut() {
         let mut changed = false;

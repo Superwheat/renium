@@ -4,6 +4,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -24,19 +25,20 @@ use crate::bytecode::{
     SettingsFileLock, SourcePathsBefore, acquire_settings_file_locks, apply_file_mutations,
     check_new_source_file, collect_source_path_updates, ensure_settable_attribute_name,
     file_mutation_paths, fold_derived_property, high_level_split_path, missing_service_store_error,
-    preserve_source_path_extension, reject_owned_instance_edit, reject_read_only_link_edit,
-    reject_read_only_link_subtree_edit, resolve_bytecode_cli_settings_file,
-    settings_lock_order_key, store_link_enforcement, stored_property_edit,
+    preserve_source_path_extension, read_store_for_structure, reject_owned_instance_edit,
+    reject_read_only_link_edit, reject_read_only_link_subtree_edit, release_settings_file_locks,
+    resolve_bytecode_cli_settings_file, settings_lock_order_key, store_link_enforcement,
+    stored_property_edit,
 };
 use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
-    build_editor_instance_paths, build_editor_instance_paths_for_indices,
-    build_editor_source_paths_by_index, script_file_names,
+    build_editor_instance_paths_for_indices, build_editor_source_paths_by_index, script_file_names,
 };
 use crate::editor::sync::is_lua_source_class;
 use crate::editor::types::EditorInstancePath;
 use crate::project::package_links::LinkEnforcement;
 use crate::rbx::model::canonicalize_settings_references_for_moves;
+use crate::settings::bytecode::property_edit::RetainedPropertyColumns;
 use crate::settings::bytecode::{
     SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode,
 };
@@ -223,7 +225,7 @@ struct BatchRequest {
 /// Resolves a service name to its store file and service hint.
 pub(crate) type StoreResolver<'a> = dyn Fn(&str) -> Result<(PathBuf, String)> + 'a;
 
-type FileMutations = (BTreeMap<PathBuf, Vec<u8>>, Vec<PathBuf>);
+pub(super) type FileMutations = (BTreeMap<PathBuf, Vec<u8>>, Vec<PathBuf>);
 
 pub(crate) struct BatchOutcome {
     pub(crate) result: Value,
@@ -344,6 +346,7 @@ pub(crate) fn apply_store_batch(
     let mut batch = BatchState {
         resolve_store,
         override_packages,
+        by_instances: !ops.iter().any(BatchOp::restructures),
         locks: BatchLocks::acquire(&ops, resolve_store)?,
         stores: Vec::new(),
         positions: HashMap::new(),
@@ -485,6 +488,12 @@ struct StoreState {
     reserved_ids: HashSet<String>,
     next_id_seed: usize,
     document: SettingsBytecode,
+    /// The store's file where the batch read it by its instances: the
+    /// document then holds the values of the instances an op read and of
+    /// the new ones, and the store keeps the others.
+    stored: Option<RetainedPropertyColumns>,
+    /// The instances of the store an op read the values of.
+    read: HashSet<usize>,
     source_paths_before: Vec<Option<PathBuf>>,
     sources: HashMap<String, Vec<u8>>,
     copied_from: HashMap<String, Option<PathBuf>>,
@@ -526,6 +535,10 @@ struct PendingReference {
 struct BatchState<'a> {
     resolve_store: &'a StoreResolver<'a>,
     override_packages: bool,
+    /// Whether the batch reads its stores by their instances: no op of it
+    /// renames, moves or removes one, so the stores keep their rows and only
+    /// gain new ones behind them.
+    by_instances: bool,
     locks: BatchLocks,
     stores: Vec<StoreState>,
     positions: HashMap<String, usize>,
@@ -632,6 +645,7 @@ impl BatchState<'_> {
         if props.is_empty() && op.attrs.is_empty() && source.is_none() {
             bail!("set needs props, attrs, tags, source or sourceFile");
         }
+        self.stores[store].read_values(&[index])?;
         let fields = self.set_values(store, index, props, op.attrs)?;
         let state = &mut self.stores[store];
         let script = source.is_some();
@@ -672,6 +686,12 @@ impl BatchState<'_> {
         let source = given_source(None, None, &mut props)?;
         let state = &mut self.stores[store];
         state.reject_read_only_link_edit(parent_index)?;
+        if state.stored.is_some() {
+            let children = settings_children_by_parent(&state.document);
+            let mut subtree = Vec::new();
+            collect_settings_subtree_preorder(&children, source_index, &mut subtree);
+            state.read_values(&subtree)?;
+        }
         let from = state.path_of(source_index);
         let cloned = clone_store_subtree(
             &mut state.document,
@@ -951,10 +971,17 @@ impl BatchState<'_> {
                 settings_file.display()
             );
         }
-        let document = match decoded {
-            Some(document) => document,
-            None if settings_file.exists() => SettingsBytecode::read_file(&settings_file)?,
-            None => new_service_document(service_hint),
+        let _span = crate::app::profile::span("batch store load");
+        let (document, stored) = match decoded {
+            Some(document) => (document, None),
+            None if !settings_file.exists() => (new_service_document(service_hint), None),
+            None if self.by_instances
+                && !crate::settings::bytecode::blocks::damaged(&settings_file) =>
+            {
+                let (document, stored) = read_store_for_structure(&settings_file)?;
+                (document, Some(stored))
+            }
+            None => (SettingsBytecode::read_file(&settings_file)?, None),
         };
         let service = bytecode_service_name(&document, &settings_file, service_hint);
         let service_dir = crate::project::storage::source_directory(&settings_file);
@@ -976,6 +1003,8 @@ impl BatchState<'_> {
             before_ids,
             next_id_seed: document.instances.len(),
             document,
+            stored,
+            read: HashSet::new(),
             source_paths_before,
             sources: HashMap::new(),
             copied_from: HashMap::new(),
@@ -1288,6 +1317,7 @@ impl BatchState<'_> {
             if !store.touched {
                 continue;
             }
+            let _span = crate::app::profile::span("batch store plan");
             let (store_writes, store_removals) =
                 store.plan(&self.labels, &mut script_files[position])?;
             changed_paths.extend(file_mutation_paths(&store_writes, &store_removals));
@@ -1298,9 +1328,13 @@ impl BatchState<'_> {
         for store in self.stores.iter().filter(|store| store.touched) {
             prune_removed_source_dirs(&store.service_dir, &removals);
         }
+        release_settings_file_locks(std::mem::take(&mut self.locks._held));
+        let _span = crate::app::profile::span("batch receipts");
         let receipts = self.receipt_values(&script_files);
         let pushes = self.pushes();
         let touched = self.stores.iter().filter(|store| store.touched).count();
+        let stores = std::mem::take(&mut self.stores);
+        rayon::spawn(move || drop(stores));
         Ok(BatchOutcome {
             result: json!({
                 "ok": true,
@@ -1314,22 +1348,34 @@ impl BatchState<'_> {
     }
 
     fn receipt_values(&self, script_files: &[HashMap<String, (PathBuf, bool)>]) -> Vec<Value> {
+        let mut wanted = HashMap::<usize, HashSet<&str>>::new();
+        for receipt in self
+            .receipts
+            .iter()
+            .filter(|receipt| receipt.path.is_none())
+        {
+            let ids = wanted.entry(receipt.store).or_default();
+            ids.extend(receipt.settings_id.as_deref());
+        }
         let mut final_paths = HashMap::<usize, HashMap<String, Value>>::new();
-        for receipt in &self.receipts {
-            if receipt.path.is_none() && !final_paths.contains_key(&receipt.store) {
-                let store = &self.stores[receipt.store];
-                let paths = build_editor_instance_paths(&store.document, &store.service);
-                let by_id = store
-                    .document
-                    .instances
-                    .iter()
-                    .zip(&paths)
-                    .filter_map(|(instance, path)| {
-                        Some((instance.settings_id.clone(), compact_path(path.as_ref()?)))
-                    })
-                    .collect();
-                final_paths.insert(receipt.store, by_id);
-            }
+        for (position, ids) in wanted {
+            let store = &self.stores[position];
+            let instances = &store.document.instances;
+            let rows = (instances.iter().enumerate())
+                .filter(|(_, instance)| ids.contains(instance.settings_id.as_str()))
+                .map(|(row, _)| row)
+                .collect::<Vec<_>>();
+            let paths =
+                build_editor_instance_paths_for_indices(&store.document, &store.service, &rows);
+            let by_id = (rows.iter())
+                .filter_map(|row| {
+                    Some((
+                        instances[*row].settings_id.clone(),
+                        compact_path(paths.get(row)?),
+                    ))
+                })
+                .collect();
+            final_paths.insert(position, by_id);
         }
         self.receipts
             .iter()
@@ -1362,11 +1408,12 @@ impl BatchState<'_> {
             .stores
             .iter()
             .filter_map(|store| {
-                let present = store
-                    .document
-                    .instances
-                    .iter()
+                let pushed = (store.push_ids.iter())
+                    .map(String::as_str)
+                    .collect::<HashSet<_>>();
+                let present = (store.document.instances.iter())
                     .map(|instance| instance.settings_id.as_str())
+                    .filter(|id| pushed.contains(id))
                     .collect::<HashSet<_>>();
                 let mut seen = HashSet::new();
                 let settings_ids = store
@@ -1448,6 +1495,27 @@ impl StoreState {
     fn touch(&mut self, index: usize) {
         self.push_ids.push(self.id(index));
         self.touched = true;
+    }
+
+    /// Gives the instances at `indices` that the store held before the
+    /// batch their stored values, before an op changes or copies them; an
+    /// instance an op read already keeps what the ops gave it since.
+    fn read_values(&mut self, indices: &[usize]) -> Result<()> {
+        let Some(stored) = &mut self.stored else {
+            return Ok(());
+        };
+        let held = self.before.instances.len();
+        let mut rows = (indices.iter().copied())
+            .filter(|index| *index < held && !self.read.contains(index))
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        stored.materialize(&mut self.document, &rows)?;
+        self.read.extend(rows);
+        Ok(())
     }
 
     fn set_source(&mut self, index: usize, source: String) -> Result<()> {
@@ -1593,10 +1661,11 @@ impl StoreState {
         removals.retain(|path| !writes.keys().any(|write| path_key(write) == path_key(path)));
         removals.sort_by_key(|path| path_key(path));
         removals.dedup_by(|left, right| path_key(left) == path_key(right));
-        writes.insert(
-            self.settings_file.clone(),
-            encode_settings_bytecode(&self.document)?,
-        );
+        let encoded = match &self.stored {
+            Some(stored) => stored.encode_restructured(&self.document)?,
+            None => encode_settings_bytecode(&self.document)?,
+        };
+        writes.insert(self.settings_file.clone(), encoded);
         Ok((writes, removals))
     }
 }
@@ -1616,25 +1685,23 @@ impl StudioPrep {
         after: &SettingsBytecode,
         service: &str,
     ) -> std::result::Result<(), (usize, usize)> {
-        let by_id = |document: &'_ SettingsBytecode| {
+        fn by_id(document: &SettingsBytecode) -> ahash::AHashMap<&str, usize> {
             document
                 .instances
                 .iter()
                 .enumerate()
-                .map(|(index, instance)| (instance.settings_id.clone(), index))
-                .collect::<HashMap<_, _>>()
-        };
-        let (now_by_id, before_by_id) = (by_id(after), by_id(before));
-        let gone = before
-            .instances
-            .iter()
-            .map(|instance| !now_by_id.contains_key(&instance.settings_id))
+                .map(|(index, instance)| (instance.settings_id.as_str(), index))
+                .collect()
+        }
+        let (now_by_id, before_by_id) = rayon::join(|| by_id(after), || by_id(before));
+        let gone = (before.instances.par_iter())
+            .map(|instance| !now_by_id.contains_key(instance.settings_id.as_str()))
             .collect::<Vec<_>>();
         let mut renames = Vec::new();
         let mut moves = Vec::new();
         let mut destroys = Vec::new();
         for (index, instance) in before.instances.iter().enumerate() {
-            let Some(&now) = now_by_id.get(&instance.settings_id) else {
+            let Some(&now) = now_by_id.get(instance.settings_id.as_str()) else {
                 if instance.parent_index.is_some_and(|parent| !gone[parent]) {
                     destroys.push(index);
                 }
@@ -1653,7 +1720,9 @@ impl StudioPrep {
             if before.instances[old_parent].settings_id == *new_parent_id {
                 continue;
             }
-            let &parent = before_by_id.get(new_parent_id).ok_or((index, new_parent))?;
+            let &parent = before_by_id
+                .get(new_parent_id.as_str())
+                .ok_or((index, new_parent))?;
             moves.push((index, parent));
         }
         let indices = renames

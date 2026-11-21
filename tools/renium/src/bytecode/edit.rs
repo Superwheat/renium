@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -25,6 +25,7 @@ use crate::editor::paths::{
 };
 use crate::editor::sync::is_lua_source_class;
 use crate::editor::types::EditorInstancePath;
+use crate::rbx::model::canonicalize_settings_references_for_move;
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
     SETTINGS_REFERENCE_SELECTOR_KEYS, SettingsBytecode, SettingsBytecodeInstance,
@@ -371,7 +372,7 @@ fn read_store_for_instance(
     settings_file: &Path,
     settings_id: &str,
 ) -> Result<Option<(SettingsBytecode, usize)>> {
-    let mut document = SettingsBytecode::read_structure_file(settings_file)?;
+    let (mut document, mut reader) = SettingsBytecode::read_by_rows(settings_file)?;
     let Some(index) = document
         .instances
         .iter()
@@ -379,21 +380,7 @@ fn read_store_for_instance(
     else {
         return Ok(None);
     };
-    let bytes = std::fs::read(settings_file)
-        .with_context(|| format!("Failed to read {}", settings_file.display()))?;
-    let (mut rows, _) = crate::settings::bytecode::property_edit::decode_rows(&bytes, &[index])?;
-    // A store written between the two reads is read whole.
-    match rows.pop() {
-        Some(row) if row.settings_id == settings_id => document.instances[index] = row,
-        _ => {
-            let document = SettingsBytecode::read_file(settings_file)?;
-            let index = document
-                .instances
-                .iter()
-                .position(|instance| instance.settings_id == settings_id);
-            return Ok(index.map(|index| (document, index)));
-        }
-    }
+    crate::bytecode::fill_rows(&mut document, reader.as_mut(), &[index])?;
     Ok(Some((document, index)))
 }
 
@@ -627,38 +614,56 @@ pub(crate) fn stored_instances_push(
     // A scoped push creates the instances from the store; a script's text
     // travels as its file, so the files of the pushed scripts go along.
     let mut changed_paths = vec![settings_file.clone()];
-    // Only a script has a file, so the store is read for its values only
-    // where one of the pushed instances is a script.
-    let pushes_a_script =
-        SettingsBytecode::read_structure_file(&settings_file).is_ok_and(|store| {
-            store.instances.iter().any(|instance| {
-                settings_ids.contains(&instance.settings_id)
-                    && crate::editor::sync::is_lua_source_class(&instance.class_name)
-            })
-        });
-    if pushes_a_script && let Ok(document) = SettingsBytecode::read_file(&settings_file) {
-        let service = bytecode_service_name(&document, &settings_file, "");
-        let service_dir = crate::project::storage::source_directory(&settings_file);
-        let source_paths = crate::editor::paths::build_editor_source_paths_by_index(
-            &document,
-            &service,
-            &service_dir,
-        );
-        for (index, instance) in document.instances.iter().enumerate() {
-            if settings_ids.contains(&instance.settings_id)
-                && let Some(Some(path)) = source_paths.get(index)
-                && path.is_file()
-            {
-                changed_paths.push(path.clone());
-            }
-        }
-    }
+    changed_paths.extend(pushed_script_files(&settings_file, &settings_ids).unwrap_or_default());
     args.changed_paths = changed_paths;
     args.target_settings_ids = settings_ids;
     args.exact_target_ids = scope == PushedScope::Instance;
     args.yes = true;
     args.verify_sources = true;
     args
+}
+
+/// The files of the scripts among the instances `settings_ids` of a store.
+/// A script's file is named by its own values and by the names of the
+/// instances above it, so only the scripts and the instances above them are
+/// given their values (`SettingsBytecode::read_by_rows`).
+fn pushed_script_files(settings_file: &Path, settings_ids: &[String]) -> Result<Vec<PathBuf>> {
+    let (mut document, mut reader) = SettingsBytecode::read_by_rows(settings_file)?;
+    let scripts = (0..document.instances.len())
+        .filter(|index| {
+            let instance = &document.instances[*index];
+            settings_ids.contains(&instance.settings_id)
+                && is_lua_source_class(&instance.class_name)
+        })
+        .collect::<Vec<_>>();
+    if scripts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut rows = BTreeSet::new();
+    for &script in &scripts {
+        let mut row = Some(script);
+        while let Some(at) = row.filter(|at| rows.insert(*at)) {
+            row = document
+                .instances
+                .get(at)
+                .and_then(|instance| instance.parent_index);
+        }
+    }
+    let rows = rows.into_iter().collect::<Vec<_>>();
+    crate::bytecode::fill_rows(&mut document, reader.as_mut(), &rows)?;
+    let service = bytecode_service_name(&document, settings_file, "");
+    let service_dir = crate::project::storage::source_directory(settings_file);
+    let paths = crate::editor::paths::selected_editor_source_paths(
+        &document,
+        &service,
+        &service_dir,
+        &scripts,
+    );
+    Ok(paths
+        .into_iter()
+        .flatten()
+        .filter(|path| path.is_file())
+        .collect())
 }
 
 /// A script file imported with `--path-json` into a project whose service is
@@ -983,20 +988,21 @@ pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value>
         .cloned()
         .collect::<Vec<_>>();
     apply_file_mutations(&writes, &removals)?;
-    let (path_segments_by_index, path_ordinals_by_index) =
-        build_editor_instance_path_parts(&document, &service);
+    let path = build_editor_instance_paths_for_indices(&document, &service, &[added.index])
+        .remove(&added.index);
     let mut result = json!({
         "ok": true,
         "settingsFile": settings_file,
         "index": added.index,
         "settingsId": added.settings_id,
-        "pathSegments": path_segments_by_index.get(added.index).and_then(std::clone::Clone::clone),
-        "pathOrdinals": path_ordinals_by_index.get(added.index).and_then(std::clone::Clone::clone),
+        "pathSegments": path.as_ref().map(|path| &path.path_segments),
+        "pathOrdinals": path.as_ref().map(|path| &path.path_ordinals),
         "changedPaths": changed_paths,
         "sourceWrites": source_writes,
         "adoptedSource": adopted_source,
     });
     crate::app::output::drop_empty(&mut result, &["sourceWrites", "adoptedSource"]);
+    rayon::spawn(move || drop((document, stored, sources_before)));
     Ok(result)
 }
 
@@ -1027,15 +1033,29 @@ pub(crate) fn new_script_source(
 /// files, under `parent_id` in the same store. In the result
 /// `rootSettingsId` names the copy and `settingsIds` every copied instance.
 /// The caller applies the read-only link check.
+///
+/// With `name`, the copy then takes that name as `rbx bs` renames it (see
+/// `renamed_copy`), and the store is written once, with the name; the
+/// result is the copy's, with the name and the path it gives.
 pub(crate) fn clone_stored_instance(
     settings_file: &Path,
     service: &str,
     source_id: &str,
     parent_id: &str,
+    name: Option<&str>,
 ) -> Result<Value> {
     let (settings_file, service_hint) =
         resolve_bytecode_cli_settings_file(Some(settings_file), None, Some(service))?;
-    let _lock = lock_existing_service_store(&settings_file)?;
+    let project_stores = match name {
+        Some(_) => super::project_store_files(&settings_file)?,
+        None => BTreeSet::new(),
+    };
+    let locks = match name {
+        Some(_) => {
+            super::lock_existing_service_stores(project_stores.iter().map(PathBuf::as_path))?
+        }
+        None => vec![lock_existing_service_store(&settings_file)?],
+    };
     let (mut document, mut stored) = super::read_store_for_structure(&settings_file)?;
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let index_of = |settings_id: &str| {
@@ -1057,6 +1077,7 @@ pub(crate) fn clone_stored_instance(
     let service_dir = crate::project::storage::source_directory(&settings_file);
     let source_paths_before = build_editor_source_paths_by_index(&document, &service, &service_dir);
     let sources_before = SourcePathsBefore::capture(&document, &source_paths_before);
+    let _cloning = crate::app::profile::span("subtree copy");
     let cloned = clone_store_subtree(
         &mut document,
         &service,
@@ -1108,30 +1129,231 @@ pub(crate) fn clone_stored_instance(
             "to": to,
         }));
     }
+    let root_index = cloned.root_index;
+    let answer = |document: &SettingsBytecode, changed_paths: Vec<PathBuf>| {
+        let _answer = crate::app::profile::span("copy answer");
+        let root = &document.instances[root_index];
+        let path = build_editor_instance_paths_for_indices(document, &service, &[root_index])
+            .remove(&root_index);
+        json!({
+            "ok": true,
+            "settingsFile": settings_file,
+            "service": service,
+            "rootSettingsId": root_settings_id,
+            "name": root.name,
+            "className": root.class_name,
+            "pathSegments": path.as_ref().map(|path| &path.path_segments),
+            "pathOrdinals": path.as_ref().map(|path| &path.path_ordinals),
+            "settingsIds": cloned_settings_ids,
+            "sourceCopies": source_copies,
+            "changedPaths": changed_paths,
+        })
+    };
+    let Some(name) = name else {
+        writes.insert(
+            settings_file.clone(),
+            stored.encode_restructured(&document)?,
+        );
+        let changed_paths = file_mutation_paths(&writes, &removals);
+        apply_file_mutations(&writes, &removals)?;
+        super::release_settings_file_locks(locks);
+        let result = answer(&document, changed_paths);
+        rayon::spawn(move || drop((document, stored)));
+        return Ok(result);
+    };
+    // The copy and its rename are planned whole, and nothing is written until
+    // the store is encoded: a copy refused or failed leaves every file as it was.
+    let mut changed_paths = file_mutation_paths(&writes, &removals);
+    changed_paths.push(settings_file.clone());
+    changed_paths.sort();
+    changed_paths.dedup();
+    let mut result = answer(&document, changed_paths);
+    let copy_rows = cloned
+        .copies
+        .iter()
+        .map(|&(_, row)| row)
+        .collect::<Vec<_>>();
+    let names =
+        super::references::names_of_moved((&settings_file, &service), &document, &copy_rows);
+    let others = project_stores.iter().filter(|file| **file != settings_file);
+    super::references::materialize_for_moves((&mut document, &mut stored), &[], &names)?;
+    let referring = super::references::read_referring_stores(others, &names, &[])?;
+    let links = super::LinkEnforcement::default();
+    super::reject_owned_instance_edit(&document, &service, root_index, &links)?;
+    let copied = document.clone();
+    let root_index = renamed_copy(
+        (&settings_file, &service, &service_dir),
+        (&mut document, &copied),
+        (root_index, referring),
+        (name, &mut writes, &mut removals),
+    )?;
     writes.insert(
         settings_file.clone(),
         stored.encode_restructured(&document)?,
     );
-    let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
-    let root_index = cloned.root_index;
-    let root = &document.instances[root_index];
-    let (path_segments_by_index, path_ordinals_by_index) =
-        build_editor_instance_path_parts(&document, &service);
+    super::release_settings_file_locks(locks);
+    let path = build_editor_instance_paths_for_indices(&document, &service, &[root_index])
+        .remove(&root_index);
+    result["name"] = json!(name);
+    result["pathSegments"] = json!(path.as_ref().map(|path| &path.path_segments));
+    result["pathOrdinals"] = json!(path.as_ref().map(|path| &path.path_ordinals));
+    rayon::spawn(move || drop((document, copied, stored)));
+    Ok(result)
+}
 
-    Ok(json!({
-        "ok": true,
-        "settingsFile": settings_file,
-        "service": service,
-        "rootSettingsId": root_settings_id,
-        "name": root.name,
-        "className": root.class_name,
-        "pathSegments": path_segments_by_index.get(root_index).and_then(std::clone::Clone::clone),
-        "pathOrdinals": path_ordinals_by_index.get(root_index).and_then(std::clone::Clone::clone),
-        "settingsIds": cloned_settings_ids,
-        "sourceCopies": source_copies,
-        "changedPaths": changed_paths,
-    }))
+/// The rename `rbx cp -n` gives the copy at `root` of a store, as `rbx bs`
+/// renames an instance of a store `copied` holds as the copy left it: the
+/// script files of the copy and of any instance whose path the name changes
+/// move from where the copy put them, and the references of the store and of
+/// the `referring` stores follow the copy and the instances whose path the
+/// name changes. `writes` and `removals` are the copy's file changes, not yet
+/// made; they come out as the copy and the rename make them together.
+/// Returns where the copy stands.
+fn renamed_copy(
+    (settings_file, service, service_dir): (&Path, &str, &Path),
+    (document, copied): (&mut SettingsBytecode, &SettingsBytecode),
+    (root, referring): (usize, BTreeMap<String, super::references::ReferringStore>),
+    (name, writes, removals): (&str, &mut BTreeMap<PathBuf, Vec<u8>>, &mut Vec<PathBuf>),
+) -> Result<usize> {
+    let _span = crate::app::profile::span("copy renamed");
+    let mut property = "Name".to_string();
+    let mut value = Value::String(name.to_string());
+    super::fold_derived_property(document, root, &mut property, &mut value)?;
+    let scope = instance_api::PropertyScope::Metadata;
+    let (stored, _) = super::stored_property_edit(document, root, &property, &mut value, scope)?;
+    if is_protected_engine_container(document, root) {
+        bail!("{} metadata is read-only", document.instances[root].name);
+    }
+    let children = settings_children_by_parent(document);
+    let mut moved = Vec::new();
+    collect_settings_subtree_preorder(&children, root, &mut moved);
+    let paths_before = build_editor_source_paths_by_index(copied, service, service_dir);
+    instance_api::set_instance_property(document, root, &stored, value, scope)?;
+    let mut root = root;
+    if let Some(moved_to) = instance_api::order_reparented_instances_last(document, copied) {
+        moved = moved.iter().map(|index| moved_to[*index]).collect();
+        root = moved_to[root];
+    }
+    let paths_before = (paths_before.into_iter())
+        .map(|path| path.map(|path| as_copy_leaves(path, writes, removals)))
+        .collect::<Vec<_>>();
+    let before = SourcePathsBefore::capture(copied, &paths_before);
+    let mut moves = Vec::new();
+    let after = build_editor_source_paths_by_index(document, service, service_dir);
+    for (instance, to) in document.instances.iter().zip(after) {
+        if let (Some(mut to), Some(from)) = (to, before.0.get(&instance.settings_id)) {
+            preserve_source_path_extension(from, &mut to);
+            moves.push((from.clone(), to));
+        }
+    }
+    moved_after_copy(moves, writes, removals)?;
+    let own = crate::project::storage::store_service_name(settings_file)
+        .context("Service settings path has no service name")?;
+    let version = document.version;
+    let instances = std::mem::take(&mut document.instances);
+    let mut documents = BTreeMap::from([(own.clone(), SettingsBytecode { version, instances })]);
+    let mut stores = BTreeMap::new();
+    for (service, store) in referring {
+        documents.insert(service.clone(), store.document);
+        stores.insert(service, (store.file, store.stored));
+    }
+    let edited = BTreeMap::from([(own.clone(), copied)]);
+    let mut changed = super::references::follow_edited_references(&edited, &mut documents);
+    let moved = moved.into_iter().collect::<HashSet<_>>();
+    changed.extend(canonicalize_settings_references_for_move(
+        &mut documents,
+        service,
+        &moved,
+    ));
+    for changed in changed {
+        if let Some((file, stored)) = stores.get(&changed) {
+            writes.insert(file.clone(), stored.encode(&documents[&changed])?);
+        }
+    }
+    *document = (documents.remove(&own)).context("The copied store went missing")?;
+    rayon::spawn(move || drop((documents, stores)));
+    Ok(root)
+}
+
+/// The file a copy whose file changes are `writes` and `removals` leaves
+/// where the project's files hold it: the extension a script file keeps is
+/// the one of the file the project has, after the copy, as script paths are
+/// found from the files there.
+fn as_copy_leaves(
+    path: PathBuf,
+    writes: &BTreeMap<PathBuf, Vec<u8>>,
+    removals: &[PathBuf],
+) -> PathBuf {
+    let naming = path
+        .parent()
+        .map(crate::project::config::cached_script_naming);
+    let preserved = naming.is_some_and(|naming| {
+        naming.extension == crate::project::config::ScriptExtensionPolicy::Preserve
+    });
+    let scripted = (path.extension().and_then(|extension| extension.to_str()))
+        .is_some_and(|extension| matches!(extension, "luau" | "lua"));
+    if !preserved || !scripted {
+        return path;
+    }
+    let held = |path: &PathBuf| match copy_wrote(writes, path) {
+        Some(_) => true,
+        None => path.is_file() && !copy_removed(removals, path),
+    };
+    let found = ["luau", "lua"].map(|extension| path.with_extension(extension));
+    found.into_iter().find(held).unwrap_or(path)
+}
+
+fn copy_wrote<'w>(writes: &'w BTreeMap<PathBuf, Vec<u8>>, path: &Path) -> Option<&'w Vec<u8>> {
+    let key = exact_path_key(path);
+    (writes.iter()).find_map(|(written, bytes)| (exact_path_key(written) == key).then_some(bytes))
+}
+
+fn copy_removed(removals: &[PathBuf], path: &Path) -> bool {
+    (removals.iter()).any(|gone| exact_path_key(gone) == exact_path_key(path))
+}
+
+/// Adds to the file changes of a copy, `writes` and `removals`, the script
+/// moves `moves` that follow it, each reading its file as the copy leaves
+/// it: the changes come out as the copy's made and then the moves'.
+fn moved_after_copy(
+    moves: Vec<(PathBuf, PathBuf)>,
+    writes: &mut BTreeMap<PathBuf, Vec<u8>>,
+    removals: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let mut moved = BTreeMap::new();
+    let mut left = Vec::new();
+    for (from, to) in moves {
+        if exact_path_key(&from) == exact_path_key(&to) {
+            continue;
+        }
+        let bytes = match copy_wrote(writes, &from) {
+            Some(bytes) => bytes.clone(),
+            None if from.is_file() && !copy_removed(removals, &from) => {
+                fs::read(&from).with_context(|| format!("Failed to read {}", from.display()))?
+            }
+            None => continue,
+        };
+        moved.insert(to, bytes);
+        left.push(from);
+    }
+    left.retain(|from| {
+        !moved
+            .keys()
+            .any(|to| exact_path_key(to) == exact_path_key(from))
+    });
+    writes.retain(|written, _| !copy_removed(&left, written));
+    writes.extend(moved);
+    removals.extend(left);
+    removals.retain(|path| {
+        path.is_file()
+            && !writes
+                .keys()
+                .any(|write| exact_path_key(write) == exact_path_key(path))
+    });
+    removals.sort_by_key(|path| exact_path_key(path));
+    removals.dedup_by(|left, right| exact_path_key(left) == exact_path_key(right));
+    Ok(())
 }
 
 /// A subtree copied inside its store: the copy's root and, in subtree
@@ -1154,6 +1376,7 @@ pub(crate) fn clone_store_subtree(
     name: Option<&str>,
     reserved: &HashSet<String>,
 ) -> Result<ClonedSubtree> {
+    let _span = crate::app::profile::span("subtree copy in memory");
     let children_before = settings_children_by_parent(document);
     let mut source_subtree = Vec::new();
     collect_settings_subtree_preorder(&children_before, source_index, &mut source_subtree);
@@ -1162,8 +1385,13 @@ pub(crate) fn clone_store_subtree(
     if source_set.contains(&parent_index) {
         bail!("Cannot copy an instance into itself or one of its descendants");
     }
-    let (path_segments_before, path_ordinals_before) =
-        build_editor_instance_path_parts(document, service);
+    let mut path_segments_before = vec![None; document.instances.len()];
+    let mut path_ordinals_before = vec![None; document.instances.len()];
+    for (index, path) in build_editor_instance_paths_for_indices(document, service, &source_subtree)
+    {
+        path_segments_before[index] = Some(path.path_segments);
+        path_ordinals_before[index] = Some(path.path_ordinals);
+    }
     let root_name = name.map_or_else(
         || {
             unique_editor_child_name(
@@ -1790,21 +2018,25 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
         Some(document) => (document, Default::default()),
         None => super::read_store_for_structure(&settings_file)?,
     };
+    let keeping = crate::app::profile::span("removal before kept");
     let before_document = document.clone();
+    drop(keeping);
     let service = bytecode_service_name(&document, &settings_file, &service_hint);
     let source_paths_by_index = build_editor_source_paths_by_index(
         &document,
         &service,
         &crate::project::storage::source_directory(&settings_file),
     );
-    let paths_before = build_editor_instance_paths(&document, &service);
-    let path_of = |index: usize| {
-        paths_before
-            .get(index)
-            .and_then(Option::as_ref)
+    let paths_of = |indices: &[usize]| {
+        build_editor_instance_paths_for_indices(&before_document, &service, indices)
+    };
+    let segments_of = |paths: &HashMap<usize, EditorInstancePath>, index: usize| {
+        paths
+            .get(&index)
             .map(|path| path.path_segments.clone())
             .unwrap_or_else(|| vec![before_document.instances[index].name.clone()])
     };
+    let path_of = |index: usize| segments_of(&paths_of(&[index]), index);
     let indices = if let Some(query) = args.where_query.as_deref() {
         let scope = super::resolve_bytecode_selector_or_service_root(
             &document,
@@ -1857,13 +2089,14 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
             bail!("{} cannot be removed", document.instances[index].name);
         }
     }
+    let paths_before = paths_of(&indices);
     let removed_instance_paths = indices
         .iter()
-        .map(|&index| path_of(index))
+        .map(|&index| segments_of(&paths_before, index))
         .collect::<Vec<_>>();
     let removed_targets = indices
         .iter()
-        .filter_map(|&index| paths_before.get(index).cloned().flatten())
+        .filter_map(|index| paths_before.get(index).cloned())
         .collect::<Vec<_>>();
     let referring = super::references::read_for_removal(
         &settings_file,
@@ -1871,8 +2104,10 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
         &removed_instance_paths,
         store_files.iter().filter(|path| **path != settings_file),
     )?;
+    let removing = crate::app::profile::span("instances removed in memory");
     let removed =
         instance_api::remove_instances_at_indices(&mut document, &indices, !args.no_recursive)?;
+    drop(removing);
     if args.no_recursive {
         instance_api::order_reparented_instances_last(&mut document, &before_document);
     }
@@ -1924,12 +2159,15 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
     }
     let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
-    drop(locks);
+    super::release_settings_file_locks(locks);
+    let read = (document, before_document, stored);
+    rayon::spawn(move || drop((read, source_paths_by_index, children_by_parent)));
     let removed_source_paths_json = removed_source_paths
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     {
+        let _span = crate::app::profile::span("removed folders pruned");
         prune_removed_source_dirs(
             &crate::project::storage::source_directory(&settings_file),
             &removed_source_paths,

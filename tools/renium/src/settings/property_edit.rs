@@ -873,8 +873,9 @@ impl RetainedPropertyColumns {
     }
 
     /// `materialize` of each instance of a store read by its instances that
-    /// holds a value `wanted` takes: of the blocks that hold one of
-    /// `strings`, or of every block where there are none.
+    /// holds a value `wanted` takes, which sees only the values that may hold
+    /// a reference: of the blocks that hold one of `strings`, or of every
+    /// block where there are none.
     pub(crate) fn materialize_where(
         &mut self,
         document: &mut SettingsBytecode,

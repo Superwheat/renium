@@ -19,10 +19,12 @@ use crate::bytecode::references::{
 use crate::bytecode::{
     SourcePathsBefore, apply_file_mutations, collect_source_path_updates, file_mutation_paths,
     lock_existing_service_stores, preserve_source_path_extension, read_store_for_structure,
+    release_settings_file_locks,
 };
 use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
-    build_editor_instance_paths, build_editor_source_paths_by_index, script_file_names,
+    build_editor_instance_paths, build_editor_instance_paths_for_indices,
+    build_editor_source_paths_by_index, script_file_names,
 };
 use crate::rbx::model::canonicalize_settings_references_for_move;
 use crate::settings::bytecode::property_edit::RetainedPropertyColumns;
@@ -236,7 +238,7 @@ fn load_move_reference_documents(
     (source_service, source): (&str, SettingsBytecode),
     (target_service, target): (&str, SettingsBytecode),
     moved_indices: &HashSet<usize>,
-    old_paths: &[Option<crate::editor::types::EditorInstancePath>],
+    old_paths: &HashMap<usize, crate::editor::types::EditorInstancePath>,
     names: &HashSet<String>,
 ) -> Result<(
     BTreeMap<String, SettingsBytecode>,
@@ -276,7 +278,7 @@ fn load_move_reference_documents(
     }
     let mut needles = moved_indices
         .iter()
-        .filter_map(|index| old_paths.get(*index)?.as_ref())
+        .filter_map(|index| old_paths.get(index))
         .map(|path| path.path_segments.clone())
         .collect::<Vec<_>>();
     for (settings_id, count) in moved_id_counts {
@@ -316,7 +318,7 @@ pub(crate) fn move_instance_between_service_stores(
     let move_started = Instant::now();
     let src_root = source_root_for_stores(source_file, target_file)?;
     let files = service_store_paths(&src_root)?;
-    let _locks = lock_existing_service_stores(files.values().map(PathBuf::as_path))?;
+    let locks = lock_existing_service_stores(files.values().map(PathBuf::as_path))?;
     let load_started = Instant::now();
     let (source_before, target_before) = rayon::join(
         || read_store_for_structure(source_file),
@@ -355,7 +357,8 @@ pub(crate) fn move_instance_between_service_stores(
     collect_settings_subtree_preorder(&children, source_index, &mut subtree);
     reject_package_link_subtree_mutation(&source_before, &subtree, "moved between services")?;
     let moved_indices = subtree.iter().copied().collect::<HashSet<_>>();
-    let old_paths = build_editor_instance_paths(&source_before, source_service);
+    let old_paths =
+        build_editor_instance_paths_for_indices(&source_before, source_service, &subtree);
     let names = names_of_moved((source_file, source_service), &source_before, &subtree);
     let source_read = (&mut source_before, &mut source_stored);
     materialize_for_moves(source_read, &subtree, &names)?;
@@ -429,13 +432,20 @@ pub(crate) fn move_instance_between_service_stores(
     documents.insert(source_service.to_string(), source);
     documents.insert(target_service.to_string(), target);
 
-    let target_paths = build_editor_instance_paths(&documents[target_service], target_service);
+    let new_indices = (subtree.iter())
+        .map(|old_index| new_index_by_old[old_index])
+        .collect::<Vec<_>>();
+    let target_paths = build_editor_instance_paths_for_indices(
+        &documents[target_service],
+        target_service,
+        &new_indices,
+    );
     let moved_references = subtree
         .iter()
         .filter_map(|old_index| {
-            let old_path = old_paths.get(*old_index)?.as_ref()?;
+            let old_path = old_paths.get(old_index)?;
             let new_index = new_index_by_old[old_index];
-            let new_path = target_paths.get(new_index)?.as_ref()?;
+            let new_path = target_paths.get(&new_index)?;
             let moved = &documents[target_service].instances[new_index];
             Some((
                 instance_path_parts_key(&old_path.path_segments, &old_path.path_ordinals),
@@ -533,10 +543,11 @@ pub(crate) fn move_instance_between_service_stores(
     let changed_paths = file_mutation_paths(&writes, &removals);
     apply_file_mutations(&writes, &removals)?;
     prune_removed_source_dirs(&super::storage::source_directory(source_file), &removals);
+    release_settings_file_locks(locks);
 
     let root_new_index = new_index_by_old[&source_index];
     let root = &target_after.instances[root_new_index];
-    let root_path = target_paths[root_new_index].as_ref();
+    let root_path = target_paths.get(&root_new_index);
     let result = json!({
         "ok": true,
         "sourceService": source_service,
@@ -552,6 +563,8 @@ pub(crate) fn move_instance_between_service_stores(
         "sourceStoreRemoved": source_store_removed,
         "changedPaths": changed_paths,
     });
+    let read = (source_before, source_stored, target_stored, other_stores);
+    rayon::spawn(move || drop((read, documents, source_paths_before)));
     log_timing("cross-service move total", move_started);
     Ok(result)
 }

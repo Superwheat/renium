@@ -1255,12 +1255,28 @@ pub(crate) fn try_scoped_daemon_control_request(
     daemon_control_request_inner(operation, Some(root), parameters, false, false)
 }
 
+/// A test's answer to a daemon request, from its operation and parameters.
+#[cfg(test)]
+pub(crate) type TestAnswer = fn(u16, &Value) -> Value;
+
+#[cfg(test)]
+thread_local! {
+    /// The daemon's answer to each request of this thread, in a test that
+    /// answers for it.
+    pub(crate) static TEST_DAEMON: std::cell::Cell<Option<TestAnswer>> =
+        const { std::cell::Cell::new(None) };
+}
+
 pub(crate) fn daemon_control_request(
     operation: u16,
     project_root: Option<&Path>,
     parameters: Value,
     approved: bool,
 ) -> Result<Value> {
+    #[cfg(test)]
+    if let Some(answer) = TEST_DAEMON.get() {
+        return Ok(answer(operation, &parameters));
+    }
     daemon_control_request_inner(operation, project_root, parameters, approved, true)?
         .context("Renium daemon did not accept the command")
 }

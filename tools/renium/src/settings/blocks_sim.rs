@@ -1329,6 +1329,57 @@ fn copies_digested_together_refuse_a_damaged_pool_frame_of_a_block_both_hold() {
     assert!(error.contains("does not match its digest"), "{error}");
 }
 
+/// A store a pull wrote holds values as Studio gave them, which a whole
+/// encode settles: a TextLabel's TextWrapped off beside TextScaled on, and a
+/// reference by id to an instance of the store, which it writes by position.
+/// An edit whose rows move copies each block whose rows all stand where they
+/// stood byte for byte, as the pull wrote it, where the old path, kept for a
+/// merge, writes it from its rows, settled; a block with such a reference
+/// it writes as the old path does. Once a whole encode settles both, the two
+/// files are one.
+#[test]
+fn an_edit_of_a_pulled_store_copies_the_blocks_whose_rows_stand() {
+    let mut document = in_rows(3 * BLOCK_ROWS, |_| None);
+    for row in [1, BLOCK_ROWS + 1, 2 * BLOCK_ROWS + 1] {
+        let label = &mut document.instances[row];
+        label.class_name = "TextLabel".into();
+        label.properties.insert("TextScaled".into(), json!(true));
+        label.properties.insert("TextWrapped".into(), json!(false));
+    }
+    let local = json!({"_type": "Ref", "settingsId": "part-5"});
+    (document.instances[BLOCK_ROWS + 2].properties).insert("Value".into(), local.clone());
+    let state = crate::settings::bytecode::captured_sim::captured_state(&document, true);
+    let pulled = encode_service_settings_binary(&state).unwrap();
+    let held = decode_settings_bytecode(&pulled).unwrap();
+    assert_eq!(held.instances[1].properties["TextWrapped"], json!(false));
+    assert_eq!(held.instances[BLOCK_ROWS + 2].properties["Value"], local);
+    let written = |old: bool| {
+        let (mut edited, store) = EditedStore::decode(&pulled).unwrap();
+        let store = match old {
+            true => store.rewriting_moved_blocks(),
+            false => store,
+        };
+        edited.instances.remove(2 * BLOCK_ROWS + 10);
+        store.encode_restructured(&edited).unwrap()
+    };
+    let (now, old) = (written(false), written(true));
+    let frames = |bytes: &[u8]| {
+        let store = BlockStore::open(bytes).unwrap();
+        (store.blocks.iter())
+            .map(|block| bytes[block.frame.at..block.frame.at + block.frame.len].to_vec())
+            .collect::<Vec<_>>()
+    };
+    let (pulled_blocks, now_blocks, old_blocks) = (frames(&pulled), frames(&now), frames(&old));
+    assert_eq!((pulled_blocks.len(), now_blocks.len()), (4, 3));
+    assert!(now_blocks[0] == pulled_blocks[0]);
+    assert!(now_blocks[1] == old_blocks[1] && now_blocks[1] != pulled_blocks[1]);
+    assert!(now_blocks[2] != pulled_blocks[2]);
+    assert!(old_blocks[0] != pulled_blocks[0] && old_blocks[1] != pulled_blocks[1]);
+    let settled =
+        |bytes: &[u8]| encode_settings_bytecode(&decode_settings_bytecode(bytes).unwrap());
+    assert!(settled(&now).unwrap() == settled(&old).unwrap());
+}
+
 /// A root and `count` parts under it, each with the payload `payload` gives
 /// its place, where it gives one.
 fn in_rows(count: usize, payload: impl Fn(usize) -> Option<String>) -> SettingsBytecode {

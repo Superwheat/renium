@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -25,7 +26,7 @@ use crate::cli::{
     MoveInstanceArgs, ProjectInstanceArgs, ProjectSourceArgs, PushEditorChangesArgs,
     RemoveInstanceCommandArgs, RenameInstanceArgs,
 };
-use crate::editor::paths::{build_editor_instance_paths, infer_source_script};
+use crate::editor::paths::{build_editor_instance_paths_for_indices, infer_source_script};
 use crate::editor::sync::push_editor_changes;
 use crate::editor::types::EditorInstancePath;
 use crate::project::config;
@@ -70,6 +71,7 @@ pub(crate) fn load_structural_project(
     project: Option<&Path>,
     project_root: &Path,
 ) -> Result<config::LoadedProject> {
+    let _span = crate::app::profile::span("structural project load");
     if let Some(project) = project {
         return config::load_project(Some(project), None);
     }
@@ -88,34 +90,88 @@ pub(crate) fn load_structural_project(
     })
 }
 
+/// The instances of each store a command resolves its targets in, without
+/// their values, each store read once for all of them. They are freed on a
+/// worker: nothing after them waits for that.
+#[derive(Default)]
+struct Structures(HashMap<String, SettingsBytecode>);
+
+impl Structures {
+    fn read(&mut self, settings_file: &Path) -> Result<&SettingsBytecode> {
+        Ok(match self.0.entry(path_key(settings_file)) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                entry.insert(SettingsBytecode::read_structure_file(settings_file)?)
+            }
+        })
+    }
+}
+
+impl Drop for Structures {
+    fn drop(&mut self) {
+        let documents = std::mem::take(&mut self.0);
+        rayon::spawn(move || drop(documents));
+    }
+}
+
+/// The project staged, with the stores of `services` read beside the staging,
+/// which spends its time reading the project's folders. A project that needs
+/// no temporary stage resolves its targets in those stores; the stores of
+/// another are left to be read from its stage.
+fn stage_reading(
+    loaded: &config::LoadedProject,
+    services: &[&str],
+) -> Result<(config::ProjectionStage, Structures)> {
+    let source_root = loaded.root.join(&loaded.project.source_root);
+    let stores = (services.iter())
+        .map(|service| service_settings_path(&source_root.join(service)))
+        .filter(|store| store.is_file())
+        .collect::<Vec<_>>();
+    let (stage, read) = std::thread::scope(|scope| {
+        let reading = scope.spawn(|| {
+            let read = |store| SettingsBytecode::read_structure_file(store).ok();
+            (stores.iter())
+                .filter_map(|store| Some((path_key(store), read(store)?)))
+                .collect::<HashMap<_, _>>()
+        });
+        let stage = config::stage_project(loaded);
+        (stage, reading.join())
+    });
+    let read = read.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let stage = stage?;
+    let mut structures = Structures::default();
+    if !stage.is_temporary() {
+        structures.0 = read;
+    } else {
+        rayon::spawn(move || drop(read));
+    }
+    Ok((stage, structures))
+}
+
 /// Returns the target's projected path plus the settings ID it resolved to,
 /// so a dotted path given in place of an ID works everywhere an ID does.
 fn projected_structural_target(
     stage: &config::ProjectionStage,
     service: &str,
     target: Option<&str>,
+    structures: &mut Structures,
 ) -> Result<(Vec<String>, Vec<usize>, Option<String>)> {
     let settings = service_settings_path(&stage.root().join(service));
     let Some(target) = target else {
         return Ok((vec![service.to_string()], vec![1], None));
     };
+    let _span = crate::app::profile::span("projected target resolve");
     if !settings.is_file() {
         bail!("Projected service '{service}' has no Renium store");
     }
-    let document = SettingsBytecode::read_structure_file(&settings)?;
-    let index = crate::bytecode::query::resolve_document_id_or_target(&document, target)
+    let document = structures.read(&settings)?;
+    let index = crate::bytecode::query::resolve_document_id_or_target(document, target)
         .with_context(|| format!("Projected service '{service}' has no instance '{target}'"))?;
     let settings_id = document.instances[index].settings_id.clone();
-    let paths = build_editor_instance_paths(&document, service);
-    let path = paths
-        .get(index)
-        .and_then(Option::as_ref)
+    let path = build_editor_instance_paths_for_indices(document, service, &[index])
+        .remove(&index)
         .with_context(|| format!("Cannot resolve the projected path for '{settings_id}'"))?;
-    Ok((
-        path.path_segments.clone(),
-        path.path_ordinals.clone(),
-        Some(settings_id),
-    ))
+    Ok((path.path_segments, path.path_ordinals, Some(settings_id)))
 }
 
 /// What a structural command does with the instance it resolves.
@@ -137,9 +193,11 @@ fn projected_structural_store(
     settings_id: Option<&str>,
     target_use: TargetUse,
     override_packages: bool,
+    structures: &mut Structures,
 ) -> Result<(PathBuf, Vec<String>, Option<String>)> {
+    let _span = crate::app::profile::span("projected store resolve");
     let (target, target_ordinals, resolved_id) =
-        projected_structural_target(stage, service, settings_id)?;
+        projected_structural_target(stage, service, settings_id, structures)?;
     let settings_id = resolved_id.as_deref();
     let links = build_loaded_project_link_enforcement(loaded, override_packages)?;
     if target_use == TargetUse::Changed {
@@ -159,7 +217,9 @@ fn projected_structural_store(
             target.join(".")
         );
     }
-    if target_use != TargetUse::Parent && config::project_target_is_declarative(loaded, &target)? {
+    if target_use != TargetUse::Parent
+        && config::staged_target_is_declarative(loaded, stage, &target)?
+    {
         bail!(
             "Projected path '{}' is named by project configuration; edit the project or metadata sidecar instead",
             target.join(".")
@@ -181,7 +241,7 @@ fn projected_structural_store(
                 }
                 Ok(canonical_id.to_string())
             } else {
-                let document = SettingsBytecode::read_structure_file(&store)?;
+                let document = structures.read(&store)?;
                 if document
                     .instances
                     .iter()
@@ -211,7 +271,7 @@ fn projected_instance_store(
     override_packages: bool,
 ) -> Result<(PathBuf, Option<String>)> {
     let loaded = load_structural_project(project, &target.project_root)?;
-    let stage = config::stage_project(&loaded)?;
+    let (stage, mut structures) = stage_reading(&loaded, &[&target.service])?;
     let (settings_file, _, settings_id) = projected_structural_store(
         &loaded,
         &stage,
@@ -219,6 +279,7 @@ fn projected_instance_store(
         Some(&target.settings_id),
         TargetUse::Changed,
         override_packages,
+        &mut structures,
     )?;
     Ok((settings_file, settings_id))
 }
@@ -235,10 +296,15 @@ fn projected_unlink_store(
 ) -> Result<(PathBuf, Option<String>, Option<anyhow::Error>)> {
     let loaded = load_structural_project(project, &target.project_root)?;
     let stage = config::stage_project(&loaded)?;
+    let mut structures = Structures::default();
     let mut deferred = None;
     if !override_packages {
-        let (path, ordinals, _) =
-            projected_structural_target(&stage, &target.service, Some(&target.settings_id))?;
+        let (path, ordinals, _) = projected_structural_target(
+            &stage,
+            &target.service,
+            Some(&target.settings_id),
+            &mut structures,
+        )?;
         let enforcement = build_loaded_project_link_enforcement(&loaded, false)?;
         let refusal = enforcement.reject_read_only_package_path(&target.service, &path, &ordinals);
         if enforcement.unlink_matches_package(&target.service, &path, &ordinals) {
@@ -254,6 +320,7 @@ fn projected_unlink_store(
         Some(&target.settings_id),
         TargetUse::Source,
         true,
+        &mut structures,
     )?;
     Ok((settings_file, settings_id, deferred))
 }
@@ -286,9 +353,8 @@ fn metadata_property_change(
     }
 }
 
-fn service_root_settings_id(settings_file: &Path, service: &str) -> Result<String> {
-    let document = SettingsBytecode::read_structure_file(settings_file)?;
-    let root_index = editor_service_root_index(&document, service)
+fn service_root_settings_id(document: &SettingsBytecode, service: &str) -> Result<String> {
+    let root_index = editor_service_root_index(document, service)
         .with_context(|| format!("Service '{service}' has no root instance"))?;
     Ok(document.instances[root_index].settings_id.clone())
 }
@@ -299,7 +365,11 @@ pub(crate) fn create_instance_command(
 ) -> Result<()> {
     let loaded_project = structural_project(project, &args.project_root, args.src_root.as_deref())?;
     let settings_file = if let Some(loaded) = loaded_project.as_ref() {
-        let stage = config::stage_project(loaded)?;
+        let services = match args.parent_settings_id {
+            Some(_) => vec![args.service.as_str()],
+            None => Vec::new(),
+        };
+        let (stage, mut structures) = stage_reading(loaded, &services)?;
         let (settings_file, _, parent_settings_id) = projected_structural_store(
             loaded,
             &stage,
@@ -307,7 +377,9 @@ pub(crate) fn create_instance_command(
             args.parent_settings_id.as_deref(),
             TargetUse::Parent,
             args.override_packages,
+            &mut structures,
         )?;
+        drop(structures);
         return bytecode_add_instance(BytecodeAddInstanceArgs {
             input: BytecodeFileArgs::settings_file(settings_file),
             service_hint: Some(args.service),
@@ -362,7 +434,7 @@ pub(crate) fn clone_instance_command(
 ) -> Result<()> {
     let target = args.target;
     let loaded = load_structural_project(project, &target.project_root)?;
-    let stage = config::stage_project(&loaded)?;
+    let (stage, mut structures) = stage_reading(&loaded, &[&target.service])?;
     let (source_file, source_target, source_id) = projected_structural_store(
         &loaded,
         &stage,
@@ -370,6 +442,7 @@ pub(crate) fn clone_instance_command(
         Some(&target.settings_id),
         TargetUse::Source,
         args.override_packages,
+        &mut structures,
     )?;
     let (parent_file, parent_target, parent_id) = projected_structural_store(
         &loaded,
@@ -378,7 +451,9 @@ pub(crate) fn clone_instance_command(
         Some(&args.parent_settings_id),
         TargetUse::Parent,
         args.override_packages,
+        &mut structures,
     )?;
+    drop(structures);
     if source_file != parent_file {
         bail!(
             "Copying '{}' to '{}' crosses projected owners",
@@ -395,26 +470,12 @@ pub(crate) fn clone_instance_command(
         parent_id
             .as_deref()
             .context("Parent instance has no canonical id")?,
+        args.name.as_deref(),
     )?;
     let root_id = result
         .get("rootSettingsId")
         .and_then(Value::as_str)
         .map(str::to_string);
-    if let Some(name) = args.name
-        && let Some(root_id) = root_id.clone()
-    {
-        let renamed = crate::bytecode::bytecode_set_property_result(metadata_property_change(
-            source_file.clone(),
-            Some(root_id),
-            "Name",
-            Some(name.clone()),
-            false,
-        ))?;
-        result["name"] = json!(name);
-        if let Some(segments) = renamed.get("pathSegments") {
-            result["pathSegments"] = segments.clone();
-        }
-    }
     if args.push {
         result["settingsId"] = json!(root_id);
         result["settingsFile"] = json!(source_file);
@@ -438,7 +499,13 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
     let loaded_project =
         structural_project(project, &target.project_root, args.src_root.as_deref())?;
     let (source_file, target_file) = if let Some(loaded) = loaded_project.as_ref() {
-        let stage = config::stage_project(loaded)?;
+        let services = [target.service.as_str(), target_service.as_str()];
+        let read = if services[0] == services[1] {
+            &services[..1]
+        } else {
+            &services[..]
+        };
+        let (stage, mut structures) = stage_reading(loaded, read)?;
         let (source_file, _, source_id) = projected_structural_store(
             loaded,
             &stage,
@@ -446,6 +513,7 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
             Some(&target.settings_id),
             TargetUse::Changed,
             args.override_packages,
+            &mut structures,
         )?;
         let (target_file, _, parent_id) = projected_structural_store(
             loaded,
@@ -454,13 +522,15 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
             args.parent_settings_id.as_deref(),
             TargetUse::Parent,
             args.override_packages,
+            &mut structures,
         )?;
         if !target_file.is_file() {
             bail!("Target service '{target_service}' has no Renium store");
         }
-        let parent_id = parent_id
-            .map(Ok)
-            .unwrap_or_else(|| service_root_settings_id(&target_file, &target_service))?;
+        let parent_id = parent_id.map(Ok).unwrap_or_else(|| {
+            service_root_settings_id(structures.read(&target_file)?, &target_service)
+        })?;
+        drop(structures);
         if source_file != target_file {
             return move_between_stores(
                 (&source_file, &target.service),
@@ -490,10 +560,10 @@ pub(crate) fn move_instance_command(args: MoveInstanceArgs, project: Option<&Pat
     if !target_file.is_file() {
         bail!("Target service '{target_service}' has no Renium store");
     }
-    let parent_settings_id = args
-        .parent_settings_id
-        .map(Ok)
-        .unwrap_or_else(|| service_root_settings_id(&target_file, &target_service))?;
+    let parent_settings_id = args.parent_settings_id.map(Ok).unwrap_or_else(|| {
+        let document = SettingsBytecode::read_structure_file(&target_file)?;
+        service_root_settings_id(&document, &target_service)
+    })?;
     if target_service == target.service {
         return move_within_store(
             metadata_property_change(
@@ -527,7 +597,7 @@ fn move_between_stores(
 ) -> Result<()> {
     let live = if push {
         let stored_path = |(file, _): (&Path, &str), id: &str| -> Result<_> {
-            let document = SettingsBytecode::read_file(file)?;
+            let document = SettingsBytecode::read_structure_file(file)?;
             let service = crate::bytecode::edit::bytecode_service_name(&document, file, "");
             Ok(stored_instance_path(&document, &service, id))
         };
@@ -571,12 +641,12 @@ fn move_within_store(args: BytecodeSetPropertyArgs, push: bool) -> Result<()> {
         .context("A move names its store file")?;
     let settings_id = args.selector.settings_id.clone();
     let before = push
-        .then(|| SettingsBytecode::read_file(&settings_file))
+        .then(|| SettingsBytecode::read_structure_file(&settings_file))
         .transpose()?;
     let mut result = crate::bytecode::bytecode_set_property_result(args)?;
     if push {
         if let (Some(before), Some(settings_id)) = (&before, settings_id.as_deref()) {
-            let after = SettingsBytecode::read_file(&settings_file)?;
+            let after = SettingsBytecode::read_structure_file(&settings_file)?;
             if let Some(reparented) =
                 reparent_in_studio(&settings_file, before, &after, settings_id)?
             {
@@ -610,9 +680,10 @@ pub(crate) fn reparent_luau(instance: &EditorInstancePath, parent: &EditorInstan
 
 /// Sets the parent of a moved instance in the open place to its new parent,
 /// as one undo step, and returns what happened; `None` when the store does
-/// not place both. `before` and `after` are the store around the move. Both
-/// instances are found by their paths before the move, the tree the place
-/// still has: the move itself can shift the ordinals of same-named siblings.
+/// not place both. `before` and `after` are the store's instances around the
+/// move, without their values, which no path takes. Both instances are found
+/// by their paths before the move, the tree the place still has: the move
+/// itself can shift the ordinals of same-named siblings.
 fn reparent_in_studio(
     settings_file: &Path,
     before: &SettingsBytecode,
@@ -674,7 +745,7 @@ pub(crate) fn rename_instance_command(
     let loaded_project =
         structural_project(project, &target.project_root, args.src_root.as_deref())?;
     let (settings_file, settings_id) = if let Some(loaded) = loaded_project.as_ref() {
-        let stage = config::stage_project(loaded)?;
+        let (stage, mut structures) = stage_reading(loaded, &[&target.service])?;
         // With --where the target is the scope searched under; each match is
         // checked when it is renamed.
         let target_use = if args.where_query.is_some() {
@@ -689,6 +760,7 @@ pub(crate) fn rename_instance_command(
             Some(&target.settings_id),
             target_use,
             args.override_packages,
+            &mut structures,
         )?;
         (settings_file, settings_id)
     } else {
@@ -869,7 +941,7 @@ fn compared_again_summary(compared: Result<Value>) -> String {
 }
 
 fn store_has_package_link(settings_file: &Path, settings_id: Option<&str>) -> Result<bool> {
-    let document = SettingsBytecode::read_file(settings_file)?;
+    let document = SettingsBytecode::read_structure_file(settings_file)?;
     let Some(settings_id) = settings_id else {
         return Ok(false);
     };
@@ -899,7 +971,7 @@ fn stored_service_path(
     let Some(settings_id) = settings_id else {
         return Ok(service_root);
     };
-    let document = SettingsBytecode::read_file(settings_file)?;
+    let document = SettingsBytecode::read_structure_file(settings_file)?;
     if !document
         .instances
         .iter()
@@ -982,6 +1054,7 @@ pub(crate) fn import_model_command(
 ) -> Result<()> {
     let loaded = load_structural_project(project, &args.project_root)?;
     let stage = config::stage_project(&loaded)?;
+    let mut structures = Structures::default();
     let (settings_file, _, parent_settings_id) = projected_structural_store(
         &loaded,
         &stage,
@@ -989,7 +1062,9 @@ pub(crate) fn import_model_command(
         Some(&args.parent_settings_id),
         TargetUse::Parent,
         args.override_packages,
+        &mut structures,
     )?;
+    drop(structures);
     bytecode_import_model(BytecodeImportModelArgs {
         input: BytecodeFileArgs::settings_file(settings_file),
         service: args.service,
@@ -1009,12 +1084,18 @@ pub(crate) fn export_model_command(
     let target = args.target;
     let loaded = load_structural_project(project, &target.project_root)?;
     let stage = config::stage_project(&loaded)?;
+    let mut structures = Structures::default();
     let settings_file = service_settings_path(&stage.root().join(&target.service));
     if !settings_file.is_file() {
         bail!("Projected service '{}' has no Renium store", target.service);
     }
-    let (_, _, settings_id) =
-        projected_structural_target(&stage, &target.service, Some(&target.settings_id))?;
+    let (_, _, settings_id) = projected_structural_target(
+        &stage,
+        &target.service,
+        Some(&target.settings_id),
+        &mut structures,
+    )?;
+    drop(structures);
     bytecode_export_model(BytecodeExportModelArgs {
         input: BytecodeFileArgs::settings_file(settings_file),
         service: target.service,

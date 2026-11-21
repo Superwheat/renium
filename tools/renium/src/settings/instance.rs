@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use serde_json::{Map, Value, json};
 
@@ -265,6 +265,19 @@ pub(crate) fn order_reparented_instances_last(
             .and_then(|parent| document.instances.get(parent))
             .map(|parent| parent.settings_id.as_str())
     }
+    // The order stands where every instance is where `before` holds it, under
+    // the same parent, and after that parent.
+    let unchanged = document.instances.len() == before.instances.len()
+        && (document.instances.iter().zip(&before.instances).enumerate()).all(
+            |(index, (now, was))| {
+                now.parent_index == was.parent_index
+                    && now.parent_index.is_none_or(|parent| parent < index)
+                    && now.settings_id == was.settings_id
+            },
+        );
+    if unchanged {
+        return None;
+    }
     let before_by_id = before
         .instances
         .iter()
@@ -275,7 +288,7 @@ pub(crate) fn order_reparented_instances_last(
                 (index, parent_id(before, instance.parent_index)),
             )
         })
-        .collect::<HashMap<_, _>>();
+        .collect::<ahash::AHashMap<_, _>>();
     let mut order = document
         .instances
         .iter()
@@ -353,47 +366,52 @@ fn remap_ref_indices(document: &mut SettingsBytecode, old_to_new: &[Option<usize
 
 /// Brings the references by position in `value` to where their instances
 /// stand now: `old_to_new` gives each earlier position its present one, and
-/// a reference to an instance that is gone names nothing.
-pub(crate) fn remap_ref_indices_in_value(value: &mut Value, old_to_new: &[Option<usize>]) {
+/// a reference to an instance that is gone names nothing. Says whether any
+/// reference changed.
+pub(crate) fn remap_ref_indices_in_value(value: &mut Value, old_to_new: &[Option<usize>]) -> bool {
+    let mut changed = false;
     match value {
         Value::Array(items) => {
             for item in items {
-                remap_ref_indices_in_value(item, old_to_new);
+                changed |= remap_ref_indices_in_value(item, old_to_new);
             }
         }
         Value::Object(object) => {
             if object.get("_type").and_then(Value::as_str) == Some("Ref") {
-                remap_ref_object_index(object, old_to_new);
+                changed |= remap_ref_object_index(object, old_to_new);
             }
             if let Some(Value::Object(ref_object)) = object.get_mut("Ref") {
-                remap_ref_object_index(ref_object, old_to_new);
+                changed |= remap_ref_object_index(ref_object, old_to_new);
             }
             for item in object.values_mut() {
-                remap_ref_indices_in_value(item, old_to_new);
+                changed |= remap_ref_indices_in_value(item, old_to_new);
             }
         }
         _ => {}
     }
+    changed
 }
 
-fn remap_ref_object_index(object: &mut Map<String, Value>, old_to_new: &[Option<usize>]) {
+fn remap_ref_object_index(object: &mut Map<String, Value>, old_to_new: &[Option<usize>]) -> bool {
     let Some(old_index) = object
         .get("instanceIndex")
         .and_then(settings_reference_index)
     else {
-        return;
+        return false;
     };
 
     if let Some(new_index) = old_to_new.get(old_index).copied().flatten() {
         if old_index == new_index {
-            return;
+            return false;
         }
         object.insert("instanceIndex".to_string(), json!((new_index + 1) as u64));
-        return;
+        return true;
     }
+    let mut removed = false;
     for selector in SETTINGS_REFERENCE_SELECTOR_KEYS {
-        object.remove(selector);
+        removed |= object.remove(selector).is_some();
     }
+    removed
 }
 
 pub(crate) fn find_unique_instance_index(

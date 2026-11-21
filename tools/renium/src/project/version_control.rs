@@ -2725,7 +2725,8 @@ pub(crate) fn merge_stores_by_rows(
     else {
         return Ok(None);
     };
-    let (mut ours_document, mut edited) = EditedStore::decode(ours)?;
+    let (mut ours_document, edited) = EditedStore::decode(ours)?;
+    let mut edited = edited.rewriting_moved_blocks();
     edited.materialize_in_passes(&mut ours_document, &ours_read)?;
     let beside = |file: &[u8], read: &[usize]| -> Result<SettingsBytecode> {
         let (mut document, mut rows) = RowReader::decode(file)?;

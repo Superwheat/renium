@@ -488,7 +488,7 @@ fn cloning_a_script_refuses_to_overwrite_an_untracked_destination() {
     let destination = dir.join("Script Copy.luau");
     fs::write(&destination, "return 2").unwrap();
     let before = fs::read(&store).unwrap();
-    let result = clone_stored_instance(&store, "Workspace", "script", "root");
+    let result = clone_stored_instance(&store, "Workspace", "script", "root", None);
     assert!(result.unwrap_err().to_string().contains("already exists"));
     assert_eq!(fs::read(&store).unwrap(), before);
     assert_eq!(fs::read_to_string(destination).unwrap(), "return 2");
@@ -2417,7 +2417,7 @@ fn clone_instance_rebinds_internal_ref_properties() {
     ]);
     document.write_file(&settings_path).unwrap();
 
-    clone_stored_instance(&settings_path, "Workspace", "model", "root").unwrap();
+    clone_stored_instance(&settings_path, "Workspace", "model", "root", None).unwrap();
 
     let cloned = SettingsBytecode::read_file(&settings_path).unwrap();
     let cloned_model_index = cloned
@@ -2476,6 +2476,277 @@ fn clone_instance_rebinds_internal_ref_properties() {
     );
 
     let _ = fs::remove_dir_all(project_root);
+}
+
+/// A project whose two stores a pull wrote, each as the state encoder writes
+/// a capture: its values as Studio gave them, which a whole encode settles
+/// (a TextLabel's TextWrapped off beside TextScaled on). The Workspace store
+/// holds more rows than a block: a model with a script, a label and
+/// references, a folder of the name its copy takes holding a script, a
+/// camera its root does not name, and parts after them. The
+/// ReplicatedStorage store holds the item a reference of the model names by
+/// its id alone.
+fn pulled_copy_project(tag: &str) -> PathBuf {
+    let root = temp_dir(tag);
+    let workspace = root.join("src").join("Workspace");
+    let replicated = root.join("src").join("ReplicatedStorage");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&replicated).unwrap();
+    let mut model = settings_instance("model", "Model", "Model", Some(0));
+    let stale = json!({
+        "_type": "Ref",
+        "settingsId": "item",
+        "pathSegments": ["ReplicatedStorage", "Stale"],
+        "pathOrdinals": [1, 1],
+    });
+    model.properties.insert("Elsewhere".into(), stale);
+    model.properties.insert(
+        "PrimaryPart".into(),
+        json!({"_type": "Ref", "instanceIndex": 3}),
+    );
+    let mut weld = settings_instance("weld", "Weld", "WeldConstraint", Some(1));
+    weld.properties
+        .insert("Part0".into(), json!({"_type": "Ref", "instanceIndex": 3}));
+    weld.properties
+        .insert("Part1".into(), json!({"_type": "Ref", "instanceIndex": 6}));
+    let mut label = settings_instance("label", "Label", "TextLabel", Some(1));
+    label.properties.insert("TextScaled".into(), json!(true));
+    label.properties.insert("TextWrapped".into(), json!(false));
+    let mut instances = vec![
+        settings_instance("root", "Workspace", "Workspace", None),
+        model,
+        settings_instance("part", "Part", "Part", Some(1)),
+        settings_instance("module", "Module", "ModuleScript", Some(1)),
+        weld,
+        settings_instance("outside", "Outside", "Part", Some(0)),
+        settings_instance("taken", "Renamed", "Folder", Some(0)),
+        settings_instance("inner", "Inner", "ModuleScript", Some(6)),
+        label,
+        settings_instance("camera", "Cam", "Camera", Some(0)),
+    ];
+    instances.extend((0..4100).map(|index| {
+        settings_instance(
+            format!("filler-{index}"),
+            format!("Filler{index}"),
+            "Part",
+            Some(0),
+        )
+    }));
+    let document = settings_document(instances);
+    let pulled = |document: &SettingsBytecode| {
+        let state = crate::settings::bytecode::captured_sim::captured_state(document, true);
+        crate::settings::bytecode::encode_service_settings_binary(&state).unwrap()
+    };
+    fs::write(service_settings_path(&workspace), pulled(&document)).unwrap();
+    let paths = build_editor_source_paths_by_index(&document, "Workspace", &workspace);
+    for path in paths.into_iter().flatten() {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("return {:?}", path.file_name().unwrap())).unwrap();
+    }
+    let item = settings_document(vec![
+        settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("item", "Item", "Folder", Some(0)),
+    ]);
+    fs::write(service_settings_path(&replicated), pulled(&item)).unwrap();
+    root
+}
+
+/// Each file of a project but its locks and `.renium` folder, by its path
+/// from `root`.
+fn project_files(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut found = BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_none_or(|extension| extension != "lock") {
+                let relative = path.strip_prefix(root).unwrap().to_string_lossy();
+                let relative = relative.replace('\\', "/");
+                if !relative.starts_with(".renium/") {
+                    found.insert(relative, fs::read(&path).unwrap());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The sha256 of each file of a project: of the document a store decodes
+/// to, which holds its values as written, and of a script's bytes.
+fn project_digests(root: &Path) -> BTreeMap<String, String> {
+    use sha2::{Digest, Sha256};
+    let digest = |path: &str, bytes: Vec<u8>| {
+        let bytes = match path.ends_with(SERVICE_SETTINGS_FILE_NAME) {
+            true => serde_json::to_vec(
+                &crate::settings::bytecode::decode_settings_bytecode(&bytes).unwrap(),
+            )
+            .unwrap(),
+            false => bytes,
+        };
+        format!("{:x}", Sha256::digest(bytes))
+    };
+    (project_files(root).into_iter())
+        .map(|(path, bytes)| (path.clone(), digest(&path, bytes)))
+        .collect()
+}
+
+/// A command's answer with the project's folder as ROOT and every path
+/// separator as `/`.
+fn answer_in(root: &Path, answer: &Value) -> String {
+    let text = serde_json::to_string(answer).unwrap();
+    let prefix = serde_json::to_string(&root.to_string_lossy()).unwrap();
+    let text = text.replace(prefix.trim_matches('"'), "ROOT");
+    text.replace("\\\\", "/")
+}
+
+/// `cp -n` of stores a pull wrote answers and writes what it did as two
+/// steps, a copy and then a rename of the copy as `rbx bs` gives it a Name,
+/// as recorded from those steps at commit 8f748512: the stores, whose
+/// documents keep each value as the pull wrote it where the steps kept it,
+/// the script files the name moves (of the copy and of the instance whose
+/// name it takes), and a reference the copy holds by its selectors alone,
+/// which the rename brought to its target's path. The path ordinals of the
+/// answer name the copy, as its path segments do, where the steps gave the
+/// copy's ordinals before the rename. A copy the rename refuses (a camera
+/// under a root that names no camera) is refused as the rename refused it
+/// and writes nothing, where the two steps left the unnamed copy.
+#[test]
+fn a_named_copy_writes_what_a_copy_and_its_rename_wrote() {
+    const ANSWER: &str = concat!(
+        r#"{"changedPaths":["ROOT/src/Workspace/Model Copy/Module.luau","#,
+        r#""ROOT/src/Workspace/__roblox_sync_settings.renium"],"className":"Model","#,
+        r#""name":"Renamed","ok":true,"pathOrdinals":[1,2],"#,
+        r#""pathSegments":["Workspace","Renamed"],"rootSettingsId":"editor:100e","#,
+        r#""service":"Workspace","#,
+        r#""settingsFile":"ROOT/src/Workspace/__roblox_sync_settings.renium","#,
+        r#""settingsIds":["editor:100e","editor:100f","editor:1010","editor:1011","#,
+        r#""editor:1012"],"sourceCopies":[{"from":"ROOT/src/Workspace/Model/Module.luau","#,
+        r#""to":"ROOT/src/Workspace/Model Copy/Module.luau"}]}"#,
+    );
+    const DIGESTS: [(&str, &str); 5] = [
+        (
+            "src/ReplicatedStorage/__roblox_sync_settings.renium",
+            "1f6e4377c1936362f0f78b8cd6686021bed7c7ac25875f88e67ab72c469454ab",
+        ),
+        (
+            "src/Workspace/Model/Module.luau",
+            "928ef7236e1028dc0263dfa25b3f4660d5e93caeaafb36f1d5c3e2066965c4fa",
+        ),
+        (
+            "src/Workspace/Renamed/Inner.luau",
+            "d69b41b2c1b44988c8279ee463daef003000fb539fc5b2fb8a3623ee82eea6be",
+        ),
+        (
+            "src/Workspace/Renamed_2/Module.luau",
+            "928ef7236e1028dc0263dfa25b3f4660d5e93caeaafb36f1d5c3e2066965c4fa",
+        ),
+        (
+            "src/Workspace/__roblox_sync_settings.renium",
+            "ccf99a142bddcc971a97ed76b153f9e330016eb2103e3e7c028378d7b4740b8d",
+        ),
+    ];
+    const REFUSAL: &str = "Cam Copy is the Workspace viewport camera, which Studio owns; \
+        Renium does not sync it, so its properties cannot be set in the store";
+
+    let root = pulled_copy_project("clone-named-pulled");
+    let store = service_settings_path(&root.join("src").join("Workspace"));
+    let pulled = SettingsBytecode::read_file(&store).unwrap();
+    assert_eq!(pulled.instances[8].properties["TextWrapped"], json!(false));
+    let parent = pulled.instances[0].settings_id.clone();
+    let named = clone_stored_instance(&store, "Workspace", "model", &parent, Some("Renamed"));
+    assert_eq!(answer_in(&root, &named.unwrap()), ANSWER);
+    let digests = (DIGESTS.iter())
+        .map(|(path, digest)| (path.to_string(), digest.to_string()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(project_digests(&root), digests);
+    let written = SettingsBytecode::read_file(&store).unwrap();
+    let elsewhere = (written.instances.iter())
+        .filter(|instance| instance.name == "Renamed" && instance.class_name == "Model")
+        .map(|instance| &instance.properties["Elsewhere"]["pathSegments"])
+        .collect::<Vec<_>>();
+    assert_eq!(elsewhere, [&json!(["ReplicatedStorage", "Item"])]);
+
+    let before = project_files(&root);
+    let camera = clone_stored_instance(&store, "Workspace", "camera", &parent, Some("Viewer"));
+    assert_eq!(format!("{:#}", camera.unwrap_err()), REFUSAL);
+    assert!(project_files(&root) == before, "a refused copy wrote files");
+    let _ = fs::remove_dir_all(root);
+}
+
+/// `mv --push` in one store and into another, and the push after a store
+/// edit of a script (`cp`, `rn`, `ba`, `bs` and `br` with `--push`), decode
+/// no store whole: the paths the place is sent and the script files a push
+/// carries come from a store's instances and the rows of the scripts and of
+/// the instances above them. The daemon answers as the place would, and the
+/// project the push resolves is the test's.
+#[test]
+fn pushes_of_store_edits_decode_no_store_whole() {
+    use crate::bytecode::edit::{PushedScope, push_stored_instance_reading, stored_instances_push};
+    use crate::settings::bytecode::blocks::WHOLE_DECODES;
+    thread_local! {
+        static REPARENTS: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    let root = pulled_copy_project("pushed-edits-whole");
+    let config = root.join("renium.project.jsonc");
+    fs::write(&config, "{\n  \"schemaVersion\": 1\n}\n").unwrap();
+    crate::project::config::load_project(Some(&config), None).unwrap();
+    let store = root.join("instances").join("Workspace.renium");
+    let _selection = crate::app::context::select_automation_for_thread(None, root.clone(), None);
+    crate::daemon::TEST_DAEMON.set(Some(|_, parameters| {
+        let code = parameters["code"].as_str().unwrap_or_default();
+        if let Some((_, moved)) = code.split_once("local inst, parent = ")
+            && let Some((targets, _)) = moved.split_once(" if not inst")
+        {
+            REPARENTS.with_borrow_mut(|sent| sent.push(targets.to_string()));
+        }
+        json!({"results": ["moved"]})
+    }));
+    WHOLE_DECODES.set(0);
+    let moved = |id: &str, service: &str, parent: Option<&str>| {
+        let target = ProjectInstanceArgs {
+            service: "Workspace".to_string(),
+            settings_id: id.to_string(),
+            project_root: root.clone(),
+        };
+        let args = MoveInstanceArgs {
+            target,
+            target_service: Some(service.to_string()),
+            parent_settings_id: parent.map(str::to_string),
+            src_root: None,
+            override_packages: false,
+            push: true,
+        };
+        move_instance_command(args, None)
+    };
+    moved("filler-0", "Workspace", Some("model")).unwrap();
+    moved("filler-1", "ReplicatedStorage", None).unwrap();
+    let mut edited = json!({"settingsFile": store, "settingsId": "inner"});
+    push_stored_instance_reading(&mut edited, &[], &[], PushedScope::Instance, false).unwrap();
+    let pushed = stored_instances_push(store.clone(), vec!["inner".into()], PushedScope::Instance);
+    crate::daemon::TEST_DAEMON.set(None);
+
+    assert_eq!(WHOLE_DECODES.get(), 0);
+    let inner = root
+        .join("src")
+        .join("Workspace")
+        .join("Renamed")
+        .join("Inner.luau");
+    assert_eq!(pushed.changed_paths, [store.clone(), inner]);
+    assert_eq!(
+        REPARENTS.take(),
+        [
+            r#"at({ {"Workspace", "Filler0"}, {1, 1} }), at({ {"Workspace", "Model"}, {1, 1} })"#,
+            r#"at({ {"Workspace", "Filler1"}, {1, 1} }), at({ {"ReplicatedStorage"}, {1} })"#,
+        ]
+    );
+    SettingsBytecode::read_file(&store).unwrap();
+    assert_eq!(WHOLE_DECODES.get(), 1);
+    crate::project::storage::forget(&root);
+    let _ = fs::remove_dir_all(root);
 }
 
 fn assert_ref_index(value: Option<&Value>, expected_one_based_index: usize) {

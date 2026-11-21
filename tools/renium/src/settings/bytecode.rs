@@ -94,34 +94,6 @@ fn values_encode_alike(
     attributes: &Map<String, Value>,
     root_service: Option<&str>,
 ) -> bool {
-    fn references_alike(value: &Value, root_service: Option<&str>) -> bool {
-        match value {
-            Value::Array(items) => items
-                .iter()
-                .all(|item| references_alike(item, root_service)),
-            Value::Object(object) => {
-                let named = SETTINGS_REFERENCE_SELECTOR_KEYS[1..]
-                    .iter()
-                    .any(|key| object.contains_key(*key));
-                if object.get("Ref").is_some_and(Value::is_object) {
-                    return false;
-                }
-                if named {
-                    return matches!(
-                        strict_reference_path(object),
-                        Ok(Some((segments, _)))
-                            if root_service.is_some_and(|root| {
-                                segments.first().is_some_and(|service| service != root)
-                            })
-                    );
-                }
-                object
-                    .values()
-                    .all(|item| references_alike(item, root_service))
-            }
-            _ => true,
-        }
-    }
     !properties.contains_key("Attributes")
         && attributes.values().all(|value| {
             // An object without a type is one of the wrapped forms, whether
@@ -137,6 +109,40 @@ fn values_encode_alike(
             .values()
             .chain(attributes.values())
             .all(|value| references_alike(value, root_service))
+}
+
+/// Whether every reference in `value` is written as it stands, whatever
+/// instances the store of the root `root_service` holds: one by position,
+/// and one whose path leads into another service. A reference by an id or a
+/// path that may name an instance of the store is written by position where
+/// it names one.
+fn references_alike(value: &Value, root_service: Option<&str>) -> bool {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .all(|item| references_alike(item, root_service)),
+        Value::Object(object) => {
+            let named = SETTINGS_REFERENCE_SELECTOR_KEYS[1..]
+                .iter()
+                .any(|key| object.contains_key(*key));
+            if object.get("Ref").is_some_and(Value::is_object) {
+                return false;
+            }
+            if named {
+                return matches!(
+                    strict_reference_path(object),
+                    Ok(Some((segments, _)))
+                        if root_service.is_some_and(|root| {
+                            segments.first().is_some_and(|service| service != root)
+                        })
+                );
+            }
+            object
+                .values()
+                .all(|item| references_alike(item, root_service))
+        }
+        _ => true,
+    }
 }
 
 /// What a pull of `state` leaves of the stored file `stored`, where that file
@@ -856,13 +862,18 @@ fn decode_settings_payload_header(
 ) -> Result<SettingsPayloadHeader> {
     let _span = crate::app::profile::span("store header decode");
     let string_count = reader.read_collection_len("string count")?;
-    let mut strings = Vec::with_capacity(reader.capacity(string_count, 1));
+    let mut texts = Vec::with_capacity(reader.capacity(string_count, 1));
     for _ in 0..string_count {
         let len = reader.read_len("string byte length")?;
         check_settings_string_len(len)?;
         let bytes = reader.read_bytes(len)?;
-        strings.push(String::from_utf8(bytes.to_vec()).context("Invalid UTF-8 settings string")?);
+        texts.push(std::str::from_utf8(bytes).context("Invalid UTF-8 settings string")?);
     }
+    let strings = (texts
+        .par_iter()
+        .with_min_len(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE))
+    .map(|text| text.to_string())
+    .collect::<Vec<_>>();
 
     let class_count = reader.read_collection_len("class count")?;
     let mut classes = Vec::with_capacity(reader.capacity(class_count, 1));

@@ -11,11 +11,12 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
-use crate::editor::paths::build_editor_instance_paths;
+use crate::editor::paths::{build_editor_instance_paths, build_editor_instance_paths_for_indices};
 use crate::editor::types::EditorInstancePath;
 use crate::settings::bytecode::blocks::sim::{
     FORMATS, block_rows_of, foreign_file, in_blocks, same_document,
 };
+use crate::settings::instance::remap_ref_indices_in_value;
 use crate::tests::support::{SimRng, run_seeds};
 
 const SEEDS: u64 = 24;
@@ -152,6 +153,64 @@ pub(super) fn fill(rng: &mut SimRng, stores: &mut BTreeMap<&str, SettingsBytecod
     let camera = reference(json!({"instanceIndex": 2}));
     let root = &mut workspace.instances[0].properties;
     root.insert("CurrentCamera".to_string(), camera);
+}
+
+/// Now and then puts among the first instances of a store, once the stores
+/// hold their values, an instance of a name no other store holds, and a
+/// namesake of it behind every instance with a child named Ghost, and gives
+/// an instance ahead of the first a reference to that child by its path
+/// through the first, which names nothing until a command takes the first
+/// away. No other reference names either of them, so a removal of the first
+/// reads no other store, nor the instances of its own store that name others
+/// by a path (`read_for_removal`). Now and then the reference also names an
+/// id no instance has, with which the whole write refuses that command.
+fn through_namesakes(rng: &mut SimRng, stores: &mut BTreeMap<&str, SettingsBytecode>) {
+    for (service, document) in stores.iter_mut() {
+        if rng.below(3) == 0 {
+            continue;
+        }
+        let row = NEAR - 1;
+        let to = (0..document.instances.len())
+            .map(|at| Some(at + usize::from(at >= row)))
+            .collect::<Vec<_>>();
+        for instance in &mut document.instances {
+            instance.parent_index = instance.parent_index.and_then(|parent| to[parent]);
+            for value in instance.properties.values_mut() {
+                remap_ref_indices_in_value(value, &to);
+            }
+        }
+        let holders = (0..row)
+            .filter(|holder| document.instances[*holder].class_name != "Camera")
+            .collect::<Vec<_>>();
+        let (name, parent) = (format!("{service}Twin"), holders[rng.below(holders.len())]);
+        let twin = settings_instance(format!("{service}-twin"), &name, "Folder", Some(parent));
+        document.instances.insert(row, twin);
+        let behind = document.instances.len();
+        let instances = &mut document.instances;
+        instances.push(settings_instance(
+            format!("{service}-behind"),
+            name,
+            "Folder",
+            Some(parent),
+        ));
+        instances.push(settings_instance(
+            format!("{service}-ghost"),
+            "Ghost",
+            "Folder",
+            Some(behind),
+        ));
+        let path = build_editor_instance_paths_for_indices(document, service, &[behind + 1]);
+        let path = path[&(behind + 1)].clone();
+        let mut ordinals = path.path_ordinals;
+        ordinals[path.path_segments.len() - 2] -= 1;
+        let mut fields = json!({"pathSegments": path.path_segments, "pathOrdinals": ordinals});
+        if rng.below(2) == 0 {
+            fields["settingsId"] = json!("gone");
+        }
+        let holder = holders[rng.below(holders.len())];
+        let properties = &mut document.instances[holder].properties;
+        properties.insert("Through".to_string(), reference(fields));
+    }
 }
 
 pub(super) fn project(tag: &str) -> Fixture {
@@ -309,6 +368,7 @@ fn run_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
         stores.insert(service, tree(&mut rng, service, rows));
     }
     fill(&mut rng, &mut stores);
+    through_namesakes(&mut rng, &mut stores);
     // Now and then another writer wrote the stores, which are then written
     // whole on their first edit.
     let foreign = rng.below(5) == 0;
@@ -387,6 +447,17 @@ pub(super) fn same_projects(
         // A store the oracle's command left alone is of version 11 still.
         let mut expected = oracle.read_store(service);
         expected.version = FORMATS[1].version;
+        let rows = (0..expected.instances.len()).collect::<Vec<_>>();
+        let mut selected = build_editor_instance_paths_for_indices(&expected, service, &rows);
+        let parts = |path: Option<EditorInstancePath>| {
+            path.map(|path| (path.path_segments, path.path_ordinals))
+        };
+        let mut every = build_editor_instance_paths(&expected, service)
+            .into_iter()
+            .enumerate();
+        if every.any(|(row, path)| parts(path) != parts(selected.remove(&row))) {
+            return Err(format!("the paths of the {service} instances differ"));
+        }
         let written = fs::read(&blocks).unwrap();
         let read = sparse.read_store(service);
         if !same_document(&expected, &read) {
@@ -405,6 +476,83 @@ pub(super) fn same_projects(
         fs::write(&whole, whole_again.map_err(|error| format!("{error:#}"))?).unwrap();
     }
     Ok(())
+}
+
+/// A reference by a path through the first of two namesakes, to a child only
+/// the second holds, in a block ahead of both: it names nothing until an
+/// edit takes the first away, removing, renaming or moving it, and then the
+/// whole write gives the child by position; with an id beside the path that
+/// no instance has, the whole write refuses the edit. Each edit of the
+/// stores in blocks prints and writes what it does of the whole stores.
+#[test]
+fn a_path_through_a_namesake_an_edit_takes_away_matches_whole_documents() {
+    let store = |id: Option<&str>| {
+        let mut fields = json!({
+            "pathSegments": ["ReplicatedStorage", "A", "P"],
+            "pathOrdinals": [1, 1, 1],
+        });
+        if let Some(id) = id {
+            fields["settingsId"] = json!(id);
+        }
+        let mut holder = settings_instance("holder", "Holder", "ObjectValue", Some(0));
+        holder.properties.insert("Value".into(), reference(fields));
+        settings_document(vec![
+            settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None),
+            holder,
+            settings_instance("filler", "Filler", "Folder", Some(0)),
+            settings_instance("other", "Other", "Folder", Some(0)),
+            settings_instance("first", "A", "Folder", Some(0)),
+            settings_instance("inside", "Q", "Folder", Some(4)),
+            settings_instance("second", "A", "Folder", Some(0)),
+            settings_instance("target", "P", "Folder", Some(6)),
+        ])
+    };
+    let workspace = settings_document(vec![settings_instance(
+        "workspace",
+        "Workspace",
+        "Workspace",
+        None,
+    )]);
+    let edits: [&[&str]; 5] = [
+        &["rm", "ReplicatedStorage", "-i", "first"],
+        &["rm", "ReplicatedStorage", "-i", "first", "-R"],
+        &["rn", "ReplicatedStorage", "-i", "first", "B"],
+        &["mv", "ReplicatedStorage", "-i", "first", "-I", "filler"],
+        &[
+            "mv",
+            "ReplicatedStorage",
+            "-i",
+            "first",
+            "--to-service",
+            "Workspace",
+        ],
+    ];
+    for (id, edit) in [None, Some("gone")]
+        .into_iter()
+        .flat_map(|id| edits.map(|edit| (id, edit)))
+    {
+        let stores = BTreeMap::from([
+            ("ReplicatedStorage", store(id)),
+            ("Workspace", workspace.clone()),
+        ]);
+        let (oracle, sparse) = projects(&stores, 2, false).unwrap();
+        let args = (edit.iter().chain(&["-r", "<root>"]))
+            .map(|arg| arg.to_string())
+            .collect::<Vec<_>>();
+        let before = SERVICES.map(|service| fs::read(sparse.store(service)).ok());
+        let whole = printed(run_on(&oracle, &args));
+        assert_eq!(
+            printed(run_on(&sparse, &args)),
+            whole,
+            "{edit:?} beside {id:?}"
+        );
+        same_projects(&oracle, &sparse, before).unwrap();
+        let holder = oracle.read_store("ReplicatedStorage").instances[1].clone();
+        match id {
+            None => assert!(holder.properties["Value"].get("instanceIndex").is_some()),
+            Some(_) => assert!(whole.0.is_some_and(|error| error.contains("mix local"))),
+        }
+    }
 }
 
 #[test]
