@@ -96,6 +96,14 @@ function Fake:FindFirstChildOfClass(className)
 	end
 	return nil
 end
+function Fake:FindFirstChildWhichIsA(className, recursive)
+	for _, child in if recursive then self:GetDescendants() else self:GetChildren() do
+		if child:IsA(className) then
+			return child
+		end
+	end
+	return nil
+end
 function Fake:FindFirstAncestorWhichIsA(className)
 	local current = self.Parent
 	while current ~= nil and not current:IsA(className) do
@@ -374,6 +382,7 @@ local services = {
 		IsEdit = function() return false end,
 		IsRunning = function() return true end,
 		IsClient = function() return true end,
+		IsStudio = function() return not engine.published end,
 		Heartbeat = { Wait = function()
 			engine.frame += 1
 			scheduler.wait()
@@ -439,6 +448,7 @@ local function reset(options)
 	engine.delivered = {}
 	engine.buttons = {}
 	engine.pressTarget = nil
+	engine.published = false
 end
 
 local function favoritePrompt(name)
@@ -806,5 +816,237 @@ assert(message == "Expected one Activated and MouseButton1Click event, got 0 and
 store = shop()
 result = send({ { type = "click", path = "Main.Shop.Redeem", lenient = true } })
 assert(result.ok and result.verifiedClicks == 1 and result.unconfirmedClicks == nil, "a button that fires is verified either way")
+
+-- Studio's purchase dialog stands in an overlay of its own beside a style
+-- link: a close button with an icon, Buy, an upsell banner, and the line
+-- that says a test purchase charges nothing. Buy is pressed only where that
+-- line shows, in Studio. A plain click on a prompt's button says how to
+-- press it.
+local TEST_PURCHASE = "This is a test purchase. Your account will not be charged."
+local function purchasePrompt(disclaimer, itemName)
+	local layer = new("ScreenGui", coreGui, { Name = "FoundationOverlay" })
+	new("StyleLink", layer, { Name = "FoundationStyleLink" })
+	local framePosition, frameSize = at(0, -58, 1280, 720)
+	local frame = new("Frame", layer, { Name = "SafeAreaFrame", AbsolutePosition = framePosition, AbsoluteSize = frameSize })
+	local dialogPosition, dialogSize = at(400, 125, 480, 313)
+	local dialog = new("ImageButton", frame, { Name = "DialogInner", Active = true, AbsolutePosition = dialogPosition, AbsoluteSize = dialogSize })
+	local purchase = { layer = layer, answers = {} }
+	local function label(parent, name, text, x, y, width, height)
+		local position, size = at(x, y, width, height)
+		return new("TextLabel", parent, { Name = name, ContentText = text, AbsolutePosition = position, AbsoluteSize = size })
+	end
+	local function button(name, x, y, width, height)
+		local position, size = at(x, y, width, height)
+		local made = new("ImageButton", dialog, { Name = name, Active = true, AbsolutePosition = position, AbsoluteSize = size })
+		made.Activated:Connect(function()
+			table.insert(purchase.answers, name)
+			layer:Destroy()
+		end)
+		purchase[name] = made
+		return made
+	end
+	label(button("CloseAffordance", 824, 141, 40, 40), "Icon", "x", 832, 149, 24, 24)
+	label(dialog, "Title", "Buy item", 420, 145, 384, 32)
+	label(dialog, "ItemName", itemName or "Kitty Ears", 500, 211, 362, 18)
+	label(dialog, "ItemCost", "robux 25", 500, 237, 40, 18)
+	label(button("1-Buy", 420, 289, 440, 40), "Text", "Buy", 626, 301, 27, 16)
+	local banner = button("BlackbirdUpsellBanner", 420, 341, 440, 44)
+	label(banner, "BlackbirdIcon", "roblox-plus", 432, 353, 20, 20)
+	label(banner, "BannerText", "Get 20% off with Roblox Plus", 460, 354, 291, 17)
+	if disclaimer ~= nil then
+		purchase.disclaimer = label(dialog, "TestDisclaimer", disclaimer, 420, 405, 440, 13)
+	end
+	return purchase
+end
+local BUY_POINT = { x = 640, y = 367 }
+reset()
+local purchase = purchasePrompt(TEST_PURCHASE)
+result = send({ { type = "press", label = "Buy" } })
+assert(purchase.answers[1] == "1-Buy" and #purchase.answers == 1, "a test purchase is confirmed")
+assert(result.coreGui.pressed[1].button == "CoreGui.FoundationOverlay.SafeAreaFrame.DialogInner.1-Buy", "pressed path")
+assert(result.coreGui.pressed[1].label == "Buy", "pressed label")
+for _, action in {
+	{ type = "press", label = "Buy" },
+	{ type = "press", x = BUY_POINT.x, y = BUY_POINT.y },
+	{ type = "press", label = "roblox-plus" },
+} do
+	reset()
+	purchase = purchasePrompt(nil)
+	message = failure({ action })
+	assert(string.find(message, "is not pressed: it", 1, true), message)
+	assert(#purchase.answers == 0 and purchase.layer.Parent == coreGui, "a purchase that charges is never confirmed")
+	assert(delivered() == "", "and nothing is sent: " .. delivered())
+	result = send({ { type = "dismiss", x = 640, y = 300 } })
+	assert(purchase.answers[1] == "CloseAffordance", "its close button answers it all the same")
+end
+-- Of a dialog that sells, the line lets its Buy be pressed and nothing
+-- else that could spend: the banner beside it sells a subscription.
+reset()
+purchase = purchasePrompt(TEST_PURCHASE)
+message = failure({ { type = "press", label = "roblox-plus" } })
+assert(string.find(message, "is not pressed: its dialog sells", 1, true) and #purchase.answers == 0, message)
+message = failure({ { type = "button", x = 640, y = 421, down = true } })
+assert(string.find(message, "The Roblox prompt button 'roblox-plus' (", 1, true), message)
+assert(string.find(message, "inp press", 1, true) == nil, "no press is named for a button that is refused: " .. message)
+reset()
+purchase = purchasePrompt(nil)
+message = failure({ { type = "button", x = BUY_POINT.x, y = BUY_POINT.y, down = true } })
+assert(string.find(message, "The Roblox prompt button 'Buy' (", 1, true) and string.find(message, "inp press", 1, true) == nil, message)
+-- A second dialog of the overlay does not borrow the first one's line.
+reset()
+purchase = purchasePrompt(TEST_PURCHASE)
+local second = new("ImageButton", purchase.layer:FindFirstChildWhichIsA("Frame"), { Name = "SecondDialog", Active = true })
+second.AbsolutePosition, second.AbsoluteSize = at(400, 500, 480, 120)
+local subscribe = new("TextButton", second, { Name = "Join", ContentText = "Subscribe" })
+subscribe.AbsolutePosition, subscribe.AbsoluteSize = at(420, 520, 440, 40)
+subscribe.Activated:Connect(function()
+	table.insert(purchase.answers, "Subscribe")
+end)
+message = failure({ { type = "press", label = "Subscribe" } })
+assert(string.find(message, "is not pressed: it may confirm a purchase", 1, true) and #purchase.answers == 0, message)
+-- What the game names cannot pass for Studio's line, nor can a line that is
+-- not shown, nor any prompt outside Studio.
+for _, itemName in { "Test Purchase Pack", "Your latest purchase" } do
+	reset()
+	purchase = purchasePrompt(nil, itemName)
+	message = failure({ { type = "press", label = "Buy" } })
+	assert(string.find(message, "is not pressed: ", 1, true), itemName .. ": " .. message)
+	assert(#purchase.answers == 0, "an item's name confirms nothing")
+end
+reset()
+purchase = purchasePrompt(TEST_PURCHASE)
+purchase.disclaimer.Visible = false
+message = failure({ { type = "press", label = "Buy" } })
+assert(string.find(message, "is not pressed: ", 1, true) and #purchase.answers == 0, "a hidden line: " .. message)
+reset()
+engine.published = true
+purchase = purchasePrompt(TEST_PURCHASE)
+message = failure({ { type = "press", label = "Buy" } })
+assert(string.find(message, "is not pressed: outside Studio", 1, true) and #purchase.answers == 0, "outside Studio: " .. message)
+result = send({ { type = "dismiss", x = 640, y = 300 } })
+assert(purchase.answers[1] == "CloseAffordance", "its close button still answers it")
+-- A button that buys is known by its word, its price or its prompt.
+local function worded(layerName, labels, footer)
+	local layer = new("ScreenGui", coreGui, { Name = layerName })
+	local framePosition, frameSize = at(440, 200, 400, 220)
+	local frame = new("Frame", layer, { Name = "Alert", Active = true, AbsolutePosition = framePosition, AbsoluteSize = frameSize })
+	if footer ~= nil then
+		local footerPosition, footerSize = at(460, 320, 360, 30)
+		new("TextLabel", frame, { Name = "Footer", ContentText = footer, AbsolutePosition = footerPosition, AbsoluteSize = footerSize })
+	end
+	local answers = {}
+	for index, text in labels do
+		local position, size = at(460 + (index - 1) * 190, 360, 170, 48)
+		local made = new("TextButton", frame, { Name = "Button" .. index, ContentText = text, AbsolutePosition = position, AbsoluteSize = size })
+		made.Activated:Connect(function()
+			table.insert(answers, text)
+			layer:Destroy()
+		end)
+	end
+	return answers
+end
+for _, case in {
+	{ "MarketplacePrompt", { "Cancel", "Buy Now" }, { type = "press", label = "Buy Now" } },
+	{ "MarketplacePrompt", { "Cancel", "R$ 25" }, { type = "press", x = 735, y = 442 } },
+	{ "MarketplacePrompt", { "Cancel", "1.2K" }, { type = "press", label = "1.2K" } },
+	{ "MarketplacePrompt", { "Cancel", "4,99 \226\130\172" }, { type = "press", x = 735, y = 442 } },
+	{ "MarketplacePrompt", { "Buy", "Maybe" }, { type = "press", label = "Maybe" } },
+	{ "PurchasePromptApp", { "Cancel", "Continue" }, { type = "press", label = "Continue" } },
+	{ "PurchasePromptApp", { "Cancel", "OK" }, { type = "press", label = "OK" } },
+	{ "PurchasePromptApp", { "X", "OK" }, { type = "press", label = "OK" }, true },
+	{ "FavoritePrompt", { "No", "Yes" }, { type = "press", label = "Yes" }, true },
+	{ "MarketplacePrompt", { "Cancelar", "Comprar" }, { type = "press", label = "Comprar" }, true },
+	{ "Dialogo", { "Cancelar", "Comprar" }, { type = "press", label = "Comprar" }, false, "robux 25" },
+	{ "FoundationOverlay", { "Cancel", "Continue" }, { type = "press", label = "Continue" }, false, "$4.99/mo" },
+	{ "FoundationOverlay", { "Not now", "Join Roblox Plus" }, { type = "press", label = "Join Roblox Plus" }, false, "9,99 \226\130\172/month" },
+} do
+	reset()
+	engine.published = case[4] == true
+	local answers = worded(case[1], case[2], case[5])
+	message = failure({ case[3] })
+	assert(string.find(message, "is not pressed: ", 1, true), case[2][2] .. ": " .. message)
+	assert(#answers == 0, case[2][2] .. " is not pressed")
+end
+reset()
+engine.published = true
+local closing = worded("PurchasePromptApp", { "", "OK" }, nil)
+result = send({ { type = "dismiss", x = 640, y = 300 } })
+assert(#closing == 0 and result.coreGui.hidden ~= nil, "dismiss presses no OK that may buy; it hides the prompt")
+for _, case in {
+	{ "PurchasePromptApp", { "OK" }, "OK" },
+	{ "PurchasePromptApp", { "", "OK" }, "OK" },
+	{ "PurchasePromptApp", { "", "Done" }, "Done" },
+	{ "PermissionPrompt", { "Cancel", "OK" }, "OK" },
+	{ "TeleportPrompt", { "Cancel", "Continue (5)" }, "Continue (5)" },
+	{ "TeleportPrompt", { "Cancel", "OK (5)" }, "OK (5)" },
+	{ "FavoritePrompt", { "No", "Yes" }, "Yes" },
+	{ "PurchasePromptApp", { "Cancel", "OK" }, "OK", TEST_PURCHASE },
+} do
+	reset()
+	local answers = worded(case[1], case[2], case[4])
+	result = send({ { type = "press", label = case[3] } })
+	assert(answers[1] == case[3], case[3] .. " buys nothing in Studio and is pressed")
+end
+reset()
+engine.published = true
+local declined = worded("FavoritePrompt", { "No", "Yes" }, nil)
+result = send({ { type = "press", label = "No" } })
+assert(declined[1] == "No", "outside Studio a prompt is still declined")
+reset()
+favoritePrompt()
+message = failure({ { type = "press", label = "Buy" } })
+assert(string.find(message, "No visible Roblox button is labelled or named 'Buy'; the open Roblox prompts have 'No', 'Yes'", 1, true), message)
+-- A click as the command line sends it: the move, then the button.
+reset()
+local covered = purchasePrompt(TEST_PURCHASE)
+message = failure({ { type = "move", x = BUY_POINT.x, y = BUY_POINT.y }, { type = "button", x = BUY_POINT.x, y = BUY_POINT.y, down = true } })
+assert(string.find(message, "The Roblox prompt button 'Buy' (CoreGui.FoundationOverlay.SafeAreaFrame.DialogInner.1-Buy) is at 640,367", 1, true), message)
+assert(string.find(message, "`inp press Buy` presses it", 1, true), message)
+assert(string.find(delivered(), "MouseButton1", 1, true) == nil and #covered.answers == 0, "a click on a prompt's button is not sent to the game under it: " .. delivered())
+for _, descendant in covered.layer:GetDescendants() do
+	assert(descendant.Visible ~= false, descendant.Name .. " is shown again")
+end
+reset()
+covered = purchasePrompt(TEST_PURCHASE)
+message = failure({ { type = "button", x = 844, y = 219, down = true } })
+assert(string.find(message, "The Roblox prompt button 'x' (", 1, true) and string.find(message, "`inp press x` presses it", 1, true), message)
+result = send({ { type = "move", x = BUY_POINT.x, y = BUY_POINT.y } })
+assert(result.ok and result.throughSystemUi ~= nil, "the mouse still moves over a prompt")
+-- A move over the prompt's body hides all of it; its buttons are known still.
+for _, first in {
+	{ { type = "move", x = 640, y = 300 } },
+	{ { type = "button", x = 640, y = 300, down = true }, { type = "button", x = 640, y = 300, down = false } },
+} do
+	reset()
+	covered = purchasePrompt(TEST_PURCHASE)
+	local actions = table.clone(first)
+	table.insert(actions, { type = "move", x = BUY_POINT.x, y = BUY_POINT.y })
+	table.insert(actions, { type = "button", x = BUY_POINT.x, y = BUY_POINT.y, down = true })
+	message = failure(actions)
+	assert(string.find(message, "`inp press Buy` presses it", 1, true), message)
+	assert(#covered.answers == 0, "nothing is answered")
+end
+-- A press is the caller's own, whatever other prompt stands under it.
+reset()
+local under = favoritePrompt()
+covered = purchasePrompt(TEST_PURCHASE)
+covered.layer.DisplayOrder = 10
+for _, button in { under.No, under.Yes } do
+	button.AbsolutePosition, button.AbsoluteSize = covered["1-Buy"].AbsolutePosition, covered["1-Buy"].AbsoluteSize
+end
+result = send({ { type = "move", x = BUY_POINT.x, y = BUY_POINT.y }, { type = "press", label = "Buy" } })
+assert(covered.answers[1] == "1-Buy", "the prompt on top is answered, shown again for the press")
+-- A prompt answered since the mouse moved over its button holds no click back.
+reset()
+covered = purchasePrompt(TEST_PURCHASE)
+result = send({
+	{ type = "move", x = BUY_POINT.x, y = BUY_POINT.y },
+	{ type = "dismiss", x = 640, y = 300 },
+	{ type = "move", x = BUY_POINT.x, y = BUY_POINT.y },
+	{ type = "button", x = BUY_POINT.x, y = BUY_POINT.y, down = true },
+	{ type = "button", x = BUY_POINT.x, y = BUY_POINT.y, down = false },
+})
+assert(covered.answers[1] == "CloseAffordance", "dismiss closes it")
+assert(result.ok and string.find(delivered(), "MouseButton1", 1, true) ~= nil, "the game takes the click: " .. delivered())
 
 print("Renium CoreGui dismiss tests passed")

@@ -10,6 +10,8 @@ local CLIENT_RUNNER_NAME = "__ReniumClientRunner"
 local SERVER_RUNNER_NAME = "__ReniumServerRunner"
 local MOUSE_PROBE_NAME = "__ReniumMouseProbe"
 local KEY_OBSERVE_SECONDS = 0.5
+-- The dismissing labels that acknowledge instead of declining.
+local CORE_GUI_ACKNOWLEDGE_LABELS = { "ok", "okay", "got it", "done" }
 -- Labels of the buttons that close a Roblox prompt without accepting it,
 -- most preferred first.
 local CORE_GUI_DISMISS_LABELS = {
@@ -1848,10 +1850,64 @@ updateMouse()
 		-- them hidden until the batch ends, and report it: a player could not
 		-- have clicked there. The engine reserves the Roblox menu button's own
 		-- corner; nothing under it can be reached.
-		local function sendThroughSystemUi(position: Vector2, send: () -> ()): string?
+		local rememberPromptOf, rememberPromptAt, promptPressHint
+		local seenPromptButtons = {}
+		-- Set while `press` clicks a prompt's button in PlayerGui: that click
+		-- is the caller's press, whatever other prompt stands under it.
+		local pressingPrompt = false
+		-- Whether nothing but this batch's own hiding keeps `object` off the
+		-- screen.
+		local function standsButForHiding(object): boolean
+			local node = object
+			while node ~= nil and node ~= CoreGui do
+				if node:IsA("LayerCollector") then
+					if not node.Enabled then
+						return false
+					end
+				elseif node:IsA("GuiObject") and not node.Visible and table.find(hiddenSystemUi, node) == nil then
+					return false
+				end
+				node = node.Parent
+			end
+			return node == CoreGui
+		end
+		-- A press on a prompt's own button is not sent to the game under it:
+		-- the caller meant the button, which only `press` reaches. An earlier
+		-- move or click hides the prompt, so its buttons are kept, each with
+		-- the place it had before this batch hid anything of its prompt: a
+		-- dialog lays its buttons out anew around what is hidden.
+		local function refusePromptPress(position: Vector2)
+			local insetX, insetY = guiScreenArea()
+			local x, y = position.X - insetX, position.Y - insetY
+			for button, seen in seenPromptButtons do
+				local corner, size = seen.corner, seen.size
+				if
+					x >= corner.X
+					and y >= corner.Y
+					and x <= corner.X + size.X
+					and y <= corner.Y + size.Y
+					and standsButForHiding(button)
+				then
+					local point = `{position.X},{position.Y}`
+					local named = if seen.label ~= "" then `'{seen.label}' ` else ""
+					error(
+						`The Roblox prompt button {named}({button:GetFullName()}) is at {point}, and virtual clicks do not reach Roblox prompts. {promptPressHint(button, seen.label, point)}`,
+						0
+					)
+				end
+			end
+		end
+		local function sendThroughSystemUi(position: Vector2, send: () -> (), press: boolean?): string?
+			rememberPromptAt(position)
+			if press then
+				refusePromptPress(position)
+			end
 			local okList, objects = pcall(CoreGui.GetGuiObjectsAtPosition, CoreGui, position.X, position.Y)
 			if not okList or type(objects) ~= "table" then
 				return nil
+			end
+			for _, object in objects do
+				rememberPromptOf(object)
 			end
 			local hidden = {}
 			for _, object in objects do
@@ -1886,7 +1942,11 @@ updateMouse()
 			end
 			table.clear(hiddenSystemUi)
 		end
-		local function sendPointer(position: Vector2, send: () -> ())
+		local function sendPointer(position: Vector2, send: () -> (), press: boolean?)
+			press = press and not pressingPrompt
+			if press then
+				refusePromptPress(position)
+			end
 			local okSend, sendError = pcall(send)
 			if okSend then
 				return
@@ -1901,7 +1961,7 @@ updateMouse()
 				end
 				sendError = retryError
 			end
-			local element = sendThroughSystemUi(position, send)
+			local element = sendThroughSystemUi(position, send, press)
 			if element == nil then
 				error(`{tostring(sendError)} The engine reserves this point (the Roblox menu button); a player could not click there either.`, 0)
 			end
@@ -1954,7 +2014,7 @@ updateMouse()
 		local function sendMouseButton(position, button, down, repeatCount)
 			sendPointer(position, function()
 				virtualInput:SendMouseButton(position, button, down, repeatCount)
-			end)
+			end, down)
 			heldButtons[button] = if down then position else nil
 		end
 		local function releaseHeldInput()
@@ -2142,12 +2202,206 @@ updateMouse()
 			end
 			return topGuiObject, layer
 		end
+		-- The buttons of a prompt that hold no other button, each with its
+		-- label: the frame of a prompt is often a button itself.
+		local function promptButtons(layer)
+			local buttons = {}
+			for _, descendant in layer:GetDescendants() do
+				if
+					descendant:IsA("GuiButton")
+					and isEffectivelyVisible(descendant)
+					and descendant:FindFirstChildWhichIsA("GuiButton", true) == nil
+				then
+					buttons[#buttons + 1] = { button = descendant, label = buttonLabel(descendant) }
+				end
+			end
+			return buttons
+		end
+		-- The prompts that stand in a ScreenGui of their own.
+		local function openPrompts()
+			local layers = {}
+			for _, descendant in CoreGui:GetDescendants() do
+				if descendant:IsA("GuiButton") and isEffectivelyVisible(descendant) then
+					local _, layer = coreGuiBranch(descendant)
+					if layer ~= nil and table.find(layers, layer) == nil then
+						layers[#layers + 1] = layer
+					end
+				end
+			end
+			return layers
+		end
+		rememberPromptOf = function(object)
+			local _, layer = coreGuiBranch(object)
+			if layer == nil then
+				return
+			end
+			local whole = true
+			for _, hidden in hiddenSystemUi do
+				whole = whole and not hidden:IsDescendantOf(layer)
+			end
+			for _, entry in promptButtons(layer) do
+				if seenPromptButtons[entry.button] == nil or whole then
+					seenPromptButtons[entry.button] =
+						{ label = entry.label, corner = entry.button.AbsolutePosition, size = entry.button.AbsoluteSize }
+				end
+			end
+		end
+		rememberPromptAt = function(position: Vector2)
+			for _, object in coreGuiObjectsAt(position) do
+				rememberPromptOf(object)
+			end
+		end
+		local function openPromptButtonsNote(): string
+			local labels = {}
+			for _, layer in openPrompts() do
+				for _, entry in promptButtons(layer) do
+					if #labels < 8 then
+						labels[#labels + 1] = if entry.label ~= "" then `'{entry.label}'` else entry.button:GetFullName()
+					end
+				end
+			end
+			return if #labels > 0 then `; the open Roblox prompts have {table.concat(labels, ", ")}` else ""
+		end
+		-- A purchase is a test purchase where Studio's dialog says so.
+		local function showsTestPurchase(scope): boolean
+			for _, descendant in scope:GetDescendants() do
+				if
+					(descendant:IsA("TextLabel") or descendant:IsA("TextButton"))
+					and isEffectivelyVisible(descendant)
+					and string.find(string.lower(descendant.ContentText), "this is a test purchase", 1, true) ~= nil
+				then
+					return true
+				end
+			end
+			return false
+		end
+		-- Whether a label declines: one of the dismissing labels that does not
+		-- acknowledge.
+		local function declines(text: string): boolean
+			return table.find(CORE_GUI_DISMISS_LABELS, text) ~= nil
+				and table.find(CORE_GUI_ACKNOWLEDGE_LABELS, text) == nil
+		end
+		-- Whether a label says that its button buys, or shows a price: digits
+		-- with at most a currency or magnitude letter.
+		local function sells(text: string): boolean
+			local letters = string.gsub(text, "[%d%p%s\128-\255]", "")
+			return (string.find(text, "%d") ~= nil and table.find({ "", "k", "m", "b", "r", "rk", "rm", "rb" }, letters) ~= nil)
+				or string.find(text, "buy", 1, true) ~= nil
+				or string.find(text, "purchase", 1, true) ~= nil
+				or string.find(text, "subscribe", 1, true) ~= nil
+		end
+		-- Whether a text names an amount to pay: Robux, or digits beside a
+		-- currency mark.
+		local function prices(text: string): boolean
+			if string.find(text, "robux", 1, true) ~= nil then
+				return true
+			end
+			if string.find(text, "%d") == nil then
+				return false
+			end
+			for _, mark in { "$", "\226\130\172", "\194\163", "\194\165" } do
+				if string.find(text, mark, 1, true) ~= nil then
+					return true
+				end
+			end
+			return false
+		end
+		-- A dialog's own close button carries an icon, not a word.
+		local function closes(button, text: string): boolean
+			return string.find(string.lower(button.Name), "close", 1, true) ~= nil and not sells(text)
+		end
+		-- The dialog a button belongs to: the outermost button around it, as
+		-- the frame of a dialog is, in an overlay that several dialogs share;
+		-- else its whole prompt.
+		local function dialogOf(button, layer)
+			local scope = layer
+			local node = button.Parent
+			while node ~= nil and node ~= layer do
+				if node:IsA("GuiButton") then
+					scope = node
+				end
+				node = node.Parent
+			end
+			return scope
+		end
+		-- Why a button is not pressed for the caller: its press could spend
+		-- Robux. A button that declines or closes never does, nor one that
+		-- stands alone to acknowledge. Outside Studio every other button
+		-- could. In Studio a dialog sells where a button of it says that it
+		-- buys or shows a price, where it shows an amount to pay, or in a
+		-- purchase prompt. Of such a dialog the button that buys is pressed
+		-- where the dialog says the purchase is a test, as is an
+		-- acknowledgement that stands beside a button that declines; an
+		-- acknowledgement alone is a notice; nothing else of it is pressed.
+		local function purchaseRefusal(layer, button, label: string): string?
+			local text = normalizedLabel(label)
+			local acknowledges = table.find(CORE_GUI_ACKNOWLEDGE_LABELS, text) ~= nil
+			local scope = dialogOf(button, layer)
+			local buttons = {}
+			for _, entry in promptButtons(layer) do
+				if scope == layer or entry.button:IsDescendantOf(scope) then
+					buttons[#buttons + 1] = entry
+				end
+			end
+			if declines(text) or closes(button, text) or (acknowledges and #buttons == 1) then
+				return nil
+			end
+			if not RunService:IsStudio() then
+				return "outside Studio a Roblox prompt is only declined, closed or acknowledged for you"
+			end
+			local chooses = false
+			local selling = sells(text) or string.find(string.lower(layer.Name), "purchase", 1, true) ~= nil
+			for _, entry in buttons do
+				local other = normalizedLabel(entry.label)
+				chooses = chooses or declines(other)
+				selling = selling or sells(other)
+			end
+			for _, descendant in scope:GetDescendants() do
+				if
+					not selling
+					and (descendant:IsA("TextLabel") or descendant:IsA("TextButton"))
+					and isEffectivelyVisible(descendant)
+					and prices(string.lower(descendant.ContentText))
+				then
+					selling = true
+				end
+			end
+			if not selling or (acknowledges and not chooses) then
+				return nil
+			end
+			if not sells(text) and not acknowledges then
+				return "its dialog sells, and of such a dialog only the button that buys and those that decline or close are pressed for you"
+			end
+			if not showsTestPurchase(scope) then
+				return 'it may confirm a purchase, which is done for you only on a dialog that shows "This is a test purchase"'
+			end
+			return nil
+		end
+		promptPressHint = function(button, label: string, point: string): string
+			restoreSystemUi()
+			local _, layer = coreGuiBranch(button)
+			local declined = "`inp dismiss` declines or hides the prompt."
+			if layer == nil or purchaseRefusal(layer, button, label) ~= nil then
+				return declined
+			end
+			local pressBy = if label ~= "" and string.find(label, "[%s,]") == nil then label else point
+			return `\`inp press {pressBy}\` presses it; {declined}`
+		end
+		-- The button that answers a prompt without accepting it: one that
+		-- declines before the prompt's own close button, and that before one
+		-- that acknowledges.
 		local function dismissButton(layer)
 			local best, bestRank, bestLabel = nil, math.huge, ""
 			for _, descendant in layer:GetDescendants() do
 				if descendant:IsA("GuiButton") and isEffectivelyVisible(descendant) then
 					local label = buttonLabel(descendant)
-					local rank = table.find(CORE_GUI_DISMISS_LABELS, normalizedLabel(label))
+					local text = normalizedLabel(label)
+					local rank = table.find(CORE_GUI_DISMISS_LABELS, text)
+					if rank ~= nil and not declines(text) then
+						rank += #CORE_GUI_DISMISS_LABELS + 1
+					elseif rank == nil and closes(descendant, text) then
+						rank = #CORE_GUI_DISMISS_LABELS + 1
+					end
 					if rank ~= nil and rank < bestRank then
 						best, bestRank, bestLabel = descendant, rank, label
 					end
@@ -2177,8 +2431,10 @@ updateMouse()
 				layer.Parent = playerGui
 				moved = true
 				layer.DisplayOrder = topOrder
+				pressingPrompt = true
 				sendVerifiedClick({ id = getInstanceDebugId(button), holdMs = 30 })
 			end)
+			pressingPrompt = false
 			if okClick then
 				local deadline = os.clock() + 1
 				while layer.Parent == playerGui and isEffectivelyVisible(button) and os.clock() < deadline do
@@ -2225,6 +2481,7 @@ updateMouse()
 			report.menuOpen = if report.holdsKeyboard and GuiService.MenuIsOpen then true else nil
 		end
 		local function dismissCoreGui(position: Vector2)
+			restoreSystemUi()
 			local report = coreGuiResult()
 			for _ = 1, 4 do
 				if not coreGuiTakesPoint(position) then
@@ -2246,6 +2503,9 @@ updateMouse()
 				local button, label = nil, ""
 				if layer ~= nil then
 					button, label = dismissButton(layer)
+					if button ~= nil and purchaseRefusal(layer, button, label) ~= nil then
+						button = nil
+					end
 				end
 				if button ~= nil then
 					local path = button:GetFullName()
@@ -2278,6 +2538,7 @@ updateMouse()
 			finishCoreGui(report)
 		end
 		local function pressCoreGui(label: string?, position: Vector2)
+			restoreSystemUi()
 			local button = nil
 			if label ~= nil then
 				local wanted = normalizedLabel(label)
@@ -2293,7 +2554,7 @@ updateMouse()
 					end
 				end
 				if #matches == 0 then
-					error(`No visible Roblox button is labelled or named '{label}'`, 0)
+					error(`No visible Roblox button is labelled or named '{label}'{openPromptButtonsNote()}`, 0)
 				elseif #matches > 1 then
 					error(`'{label}' matches {#matches} Roblox buttons: {table.concat(matches, "; ")}`, 0)
 				end
@@ -2314,6 +2575,10 @@ updateMouse()
 				error(`{path} shares its ScreenGui with other Roblox UI and cannot be pressed; dismiss hides it`, 0)
 			end
 			local buttonText = buttonLabel(button)
+			local refusal = purchaseRefusal(layer, button, buttonText)
+			if refusal ~= nil then
+				error(`{path} is not pressed: {refusal}. \`inp dismiss\` declines or hides the prompt`, 0)
+			end
 			local pressed, pressError = pressCoreGuiButton(button, layer)
 			if not pressed then
 				error(`Could not press {path}: {pressError}`, 0)
