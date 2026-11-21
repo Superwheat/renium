@@ -607,14 +607,32 @@ pub(crate) fn studio_upload(parameters: &Value) -> bool {
     else {
         return false;
     };
+    // The command line sends every option, the unset ones as null.
+    let unset = |name: &str| parameters.get(name).is_none_or(Value::is_null);
     parameters.get("via").and_then(Value::as_str) != Some("open-cloud")
-        && parameters.get("userId").is_none()
-        && parameters.get("groupId").is_none()
+        && unset("userId")
+        && unset("groupId")
         && images.iter().all(|source| {
             source.as_str().is_some_and(|source| {
                 source.starts_with("https://") || source.starts_with("http://")
             })
         })
+}
+
+#[cfg(test)]
+#[test]
+fn web_images_without_a_creator_or_route_go_through_studio() {
+    let request = |user: Value, via: Value, image: &str| json!({ "images": [image], "userId": user, "groupId": null, "via": via });
+    let web = "https://example.com/a.png";
+    assert!(studio_upload(&request(Value::Null, Value::Null, web)));
+    assert!(studio_upload(&json!({ "imagePaths": [web] })));
+    assert!(!studio_upload(&request(json!(7), Value::Null, web)));
+    assert!(!studio_upload(&request(
+        Value::Null,
+        json!("open-cloud"),
+        web
+    )));
+    assert!(!studio_upload(&request(Value::Null, Value::Null, "a.png")));
 }
 
 #[cfg(test)]
