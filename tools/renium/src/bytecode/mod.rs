@@ -4451,7 +4451,7 @@ pub(super) fn apply_file_mutations_with_permissions(
     permissions: &BTreeMap<PathBuf, bool>,
 ) -> Result<()> {
     let _span = crate::app::profile::span("file writes");
-    let mut case_moves = Vec::new();
+    let mut case_moves: Vec<(PathBuf, PathBuf, PathBuf, Vec<u8>)> = Vec::new();
     for from in removals {
         let Some(to) = writes.keys().find(|to| {
             exact_path_key(from) != exact_path_key(to)
@@ -4469,7 +4469,10 @@ pub(super) fn apply_file_mutations_with_permissions(
                 std::process::id(),
                 current_millis()
             ));
-            if !candidate.exists() {
+            let key = case_folded_path_key(&candidate);
+            let taken =
+                (case_moves.iter()).any(|(_, _, staged, _)| case_folded_path_key(staged) == key);
+            if !candidate.exists() && !taken {
                 break candidate;
             }
             attempt = attempt.saturating_add(1);
@@ -4563,6 +4566,7 @@ pub(super) fn apply_file_mutations_with_permissions(
         Ok(())
     })();
     let Err(error) = apply else {
+        respell_directories(writes, removals);
         return Ok(());
     };
     let mut rollback_errors = Vec::new();
@@ -4635,6 +4639,44 @@ pub(super) fn apply_file_mutations_with_permissions(
             "Filesystem rollback was incomplete: {}",
             rollback_errors.join("; ")
         ))
+    }
+}
+
+/// Renames a directory that held files of `removals` to the letter case
+/// `writes` spell it in: a file system that ignores case puts a file written
+/// under a name that differs only in case into the directory as it was
+/// spelled. A directory that cannot be renamed keeps its name.
+fn respell_directories(writes: &BTreeMap<PathBuf, Vec<u8>>, removals: &[PathBuf]) {
+    let mut held = HashMap::new();
+    for directory in removals.iter().flat_map(|path| path.ancestors().skip(1)) {
+        held.insert(case_folded_path_key(directory), directory);
+    }
+    let mut seen = HashSet::new();
+    for directory in writes.keys().flat_map(|path| path.ancestors().skip(1)) {
+        let Some(old) = held.get(&case_folded_path_key(directory)) else {
+            continue;
+        };
+        if exact_path_key(old) == exact_path_key(directory)
+            || !seen.insert(exact_path_key(directory))
+        {
+            continue;
+        }
+        let (Some(parent), Some(old_name), Some(name)) =
+            (directory.parent(), old.file_name(), directory.file_name())
+        else {
+            continue;
+        };
+        let names = fs::read_dir(parent)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>();
+        let holds =
+            |wanted: &std::ffi::OsStr| names.iter().any(|entry| entry.as_os_str() == wanted);
+        if holds(old_name) && !holds(name) {
+            let _ = fs::rename(parent.join(old_name), directory);
+        }
     }
 }
 

@@ -2608,15 +2608,16 @@ fn answer_in(root: &Path, answer: &Value) -> String {
 /// documents keep each value as the pull wrote it where the steps kept it,
 /// the script files the name moves (of the copy and of the instance whose
 /// name it takes), and a reference the copy holds by its selectors alone,
-/// which the rename brought to its target's path. The path ordinals of the
-/// answer name the copy, as its path segments do, where the steps gave the
-/// copy's ordinals before the rename. A copy the rename refuses (a camera
+/// which the rename brought to its target's path. The answer names the copy
+/// and its files as the command leaves them, where the steps gave the copy's
+/// path ordinals, changed paths and script copy before the rename (a file the
+/// rename moved away). A copy the rename refuses (a camera
 /// under a root that names no camera) is refused as the rename refused it
 /// and writes nothing, where the two steps left the unnamed copy.
 #[test]
 fn a_named_copy_writes_what_a_copy_and_its_rename_wrote() {
     const ANSWER: &str = concat!(
-        r#"{"changedPaths":["ROOT/src/Workspace/Model Copy/Module.luau","#,
+        r#"{"changedPaths":["ROOT/src/Workspace/Renamed_2/Module.luau","#,
         r#""ROOT/src/Workspace/__roblox_sync_settings.renium"],"className":"Model","#,
         r#""name":"Renamed","ok":true,"pathOrdinals":[1,2],"#,
         r#""pathSegments":["Workspace","Renamed"],"rootSettingsId":"editor:100e","#,
@@ -2624,7 +2625,7 @@ fn a_named_copy_writes_what_a_copy_and_its_rename_wrote() {
         r#""settingsFile":"ROOT/src/Workspace/__roblox_sync_settings.renium","#,
         r#""settingsIds":["editor:100e","editor:100f","editor:1010","editor:1011","#,
         r#""editor:1012"],"sourceCopies":[{"from":"ROOT/src/Workspace/Model/Module.luau","#,
-        r#""to":"ROOT/src/Workspace/Model Copy/Module.luau"}]}"#,
+        r#""to":"ROOT/src/Workspace/Renamed_2/Module.luau"}]}"#,
     );
     const DIGESTS: [(&str, &str); 5] = [
         (
@@ -2657,7 +2658,14 @@ fn a_named_copy_writes_what_a_copy_and_its_rename_wrote() {
     assert_eq!(pulled.instances[8].properties["TextWrapped"], json!(false));
     let parent = pulled.instances[0].settings_id.clone();
     let named = clone_stored_instance(&store, "Workspace", "model", &parent, Some("Renamed"));
-    assert_eq!(answer_in(&root, &named.unwrap()), ANSWER);
+    let named = named.unwrap();
+    assert_eq!(answer_in(&root, &named), ANSWER);
+    let changed = named["changedPaths"].as_array().unwrap();
+    assert!(
+        changed
+            .iter()
+            .all(|path| Path::new(path.as_str().unwrap()).is_file())
+    );
     let digests = (DIGESTS.iter())
         .map(|(path, digest)| (path.to_string(), digest.to_string()))
         .collect::<BTreeMap<_, _>>();

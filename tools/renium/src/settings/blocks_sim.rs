@@ -97,6 +97,151 @@ pub(crate) fn encoded_as(file: &[u8], document: &SettingsBytecode) -> Result<Vec
     in_blocks(document, held.unwrap_or(BLOCK_ROWS))
 }
 
+/// `document` as a pull writes it in blocks of `block_rows` rows: the store
+/// the encoder of captured states writes of a capture that gives the
+/// document's values as Studio gives them, which it does not settle.
+pub(crate) fn pulled_in_blocks(document: &SettingsBytecode, block_rows: usize) -> Result<Vec<u8>> {
+    let state = crate::settings::bytecode::captured_sim::captured_state(document, true);
+    let records = crate::settings::bytecode::collect_service_settings_binary_instances(&state);
+    let lookup = crate::settings::bytecode::build_settings_binary_instance_lookup(&state, &records);
+    encode_state_in_blocks(&state, (&records, &lookup), None, None, block_rows)
+}
+
+/// `pulled_in_blocks` as a store of version 11.
+pub(crate) fn pulled_v11(document: &SettingsBytecode) -> Result<Vec<u8>> {
+    let state = crate::settings::bytecode::captured_sim::captured_state(document, true);
+    crate::settings::bytecode::encode_service_settings_binary_v11(&state)
+}
+
+/// `document` without the Source an edit gives a script whose text is its
+/// file's, which a pull never writes and compares as nothing
+/// (`reconciliation_property_is_metadata`).
+pub(crate) fn without_source_markers(document: &SettingsBytecode) -> SettingsBytecode {
+    let mut document = document.clone();
+    for instance in &mut document.instances {
+        let source = instance.properties.get("Source");
+        if source.and_then(serde_json::Value::as_str)
+            == Some(crate::settings::EXTERNAL_SOURCE_MARKER)
+        {
+            instance.properties.remove("Source");
+        }
+    }
+    document
+}
+
+/// `whole` with the Source markers `read` holds, instance by instance, where
+/// a pull of the store took them away (`without_source_markers`).
+pub(crate) fn with_source_markers_of(
+    whole: &SettingsBytecode,
+    read: &SettingsBytecode,
+) -> SettingsBytecode {
+    let mut whole = whole.clone();
+    for (instance, held) in whole.instances.iter_mut().zip(&read.instances) {
+        let source = held.properties.get("Source");
+        if let Some(source) =
+            source.filter(|source| source.as_str() == Some(crate::settings::EXTERNAL_SOURCE_MARKER))
+        {
+            let properties = &mut instance.properties;
+            properties.entry("Source").or_insert_with(|| source.clone());
+        }
+    }
+    whole
+}
+
+/// Holds `read`, the document of a store in blocks that a pull wrote and an
+/// edit then wrote, to `whole`, the document the whole path writes of the
+/// same edit of the same store. The encoder of captured states writes values
+/// as Studio gives them, and the encoder of documents settles them: a forced
+/// property, an attribute in a wrapped form, and a reference that names an
+/// instance of the store by an id or a path, which it writes by position.
+/// Which values the two write apart, `forced_property_differs` and
+/// `values_encode_alike` decide, as a pull decides that a stored instance is
+/// written as documents are today. A block an edit leaves standing keeps its
+/// rows as the pull wrote them. So each instance of `read` stands where
+/// `whole`'s does, under its id, name, class and parent, and holds its values
+/// or values the two encoders write apart; and the two documents, settled as
+/// a whole encode settles them (`encode_settings_bytecode`), are one. Both
+/// are compared without the Source markers a pull never writes.
+pub(crate) fn pulled_alike(
+    read: &SettingsBytecode,
+    whole: &SettingsBytecode,
+    service: &str,
+) -> std::result::Result<(), String> {
+    let (read, whole) = (
+        &without_source_markers(read),
+        &without_source_markers(whole),
+    );
+    if read.instances.len() != whole.instances.len() {
+        let (held, written) = (read.instances.len(), whole.instances.len());
+        return Err(format!(
+            "{held} instances, where the whole path wrote {written}"
+        ));
+    }
+    let one = |instance: &SettingsBytecodeInstance| SettingsBytecode {
+        version: read.version,
+        instances: vec![instance.clone()],
+    };
+    let apart = |instance: &SettingsBytecodeInstance| {
+        crate::settings::equivalence::forced_property_differs(&instance.properties)
+            || !crate::settings::bytecode::values_encode_alike(
+                &instance.properties,
+                &instance.attributes,
+                Some(service),
+            )
+    };
+    for (row, (held, written)) in read.instances.iter().zip(&whole.instances).enumerate() {
+        let placed = held.settings_id == written.settings_id
+            && held.name == written.name
+            && held.class_name == written.class_name
+            && held.parent_index == written.parent_index;
+        if !placed || !same_document(&one(held), &one(written)) && !apart(held) && !apart(written) {
+            let shown = |instance: &SettingsBytecodeInstance| {
+                json!([
+                    instance.settings_id,
+                    instance.parent_index,
+                    instance.properties,
+                    instance.attributes
+                ])
+            };
+            return Err(format!(
+                "instance {row} holds {}, where the whole path wrote {}",
+                shown(held),
+                shown(written)
+            ));
+        }
+    }
+    let settled = |document: &SettingsBytecode| {
+        let file = encode_settings_bytecode(document).map_err(|error| format!("{error:#}"))?;
+        decode_settings_bytecode(&file).map_err(|error| format!("{error:#}"))
+    };
+    match same_document(&settled(read)?, &settled(whole)?) {
+        true => Ok(()),
+        false => Err("the two documents differ once a whole encode settles them".into()),
+    }
+}
+
+/// The first value block of the store `written` that is neither the block
+/// the store `whole` holds at its place nor the block the store `before`
+/// held there, of as many rows; a block `whole` holds and `written` does
+/// not counts as one.
+pub(crate) fn block_apart(written: &[u8], whole: &[u8], before: &[u8]) -> Option<usize> {
+    let (Ok(written), Ok(whole)) = (BlockStore::open(written), BlockStore::open(whole)) else {
+        return Some(0);
+    };
+    let before = BlockStore::open(before).ok();
+    fn block<'s>(store: &'s BlockStore<'_>, index: usize) -> Option<(usize, &'s [u8])> {
+        (store.blocks.get(index)).map(|block| {
+            let frame = block.frame;
+            (block.count, &store.bytes[frame.at..frame.at + frame.len])
+        })
+    }
+    (0..written.blocks.len().max(whole.blocks.len())).find(|index| {
+        let mine = block(&written, *index);
+        let standing = (before.as_ref()).is_some_and(|before| mine == block(before, *index));
+        mine.is_none() || mine != block(&whole, *index) && !standing
+    })
+}
+
 /// The file after an edit of the values of the rows at `rows`, each as
 /// `change` leaves it, through `RetainedPropertyColumns`; `reorder` then
 /// swaps the first two rows the edit read.

@@ -4,13 +4,15 @@
 //! whose stores are in small blocks, where a query reads the values it
 //! compares by the rows of the store and the edit reads the store by its
 //! instances. The first is the oracle, and the two are held to one another
-//! after every command as `structure_edits_sim` holds them.
+//! after every command as `structure_edits_sim` holds them, also where a pull
+//! wrote the stores.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::structure_edits_sim::{
-    CLASSES, NAMES, NEAR, SERVICES, fill, printed, projects, same_projects, tree,
+    CLASSES, NAMES, NEAR, SERVICES, Writer, fill, printed, projects, pulled_roots, pulled_values,
+    same_projects, tree,
 };
 use super::*;
 use crate::tests::support::{SimRng, run_seeds};
@@ -28,6 +30,8 @@ const KINDS: [&str; 4] = [
 /// How often each kind of command went through, and how often a query was
 /// refused for matching more instances than a call takes.
 static DONE: [AtomicUsize; KINDS.len()] = [const { AtomicUsize::new(0) }; KINDS.len()];
+/// How often a store in blocks held values that the whole path settled.
+static APART: AtomicUsize = AtomicUsize::new(0);
 
 /// Gives the instances the values the queries compare beside those `fill`
 /// gave: tags, attributes, and a property that some parts hold and the
@@ -162,11 +166,19 @@ fn run_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
         };
         stores.insert(service, tree(&mut rng, service, rows));
     }
+    let writer = Writer::drawn(&mut rng);
+    if writer == Writer::Pull {
+        pulled_roots(&mut stores);
+    }
     fill(&mut rng, &mut stores);
     compared_values(&mut rng, &mut stores);
-    let foreign = rng.below(5) == 0;
-    let (oracle, sparse) = projects(&stores, block_rows, foreign)?;
-    log.push(format!("blocks of {block_rows} rows, foreign: {foreign}"));
+    if writer == Writer::Pull {
+        pulled_values(&mut rng, &mut stores);
+    }
+    let (oracle, sparse) = projects(&stores, block_rows, writer)?;
+    log.push(format!(
+        "blocks of {block_rows} rows, written by {writer:?}"
+    ));
     // Half the scripts have a file, which a rename, a removal and another
     // run context of theirs reach.
     for (service, document) in &stores {
@@ -210,7 +222,9 @@ fn run_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
         if let Some(done) = done {
             DONE[done].fetch_add(1, Ordering::Relaxed);
         }
-        same_projects(&oracle, &sparse, before).map_err(|error| format!("step {step}: {error}"))?;
+        let held = same_projects(&oracle, &sparse, before, (writer, false));
+        let apart = held.map_err(|error| format!("step {step}: {error}"))?;
+        APART.fetch_add(apart, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -224,4 +238,9 @@ fn query_edits_of_stores_in_blocks_match_whole_documents() {
     for (name, done) in KINDS.into_iter().zip(&DONE) {
         assert!(done.load(Ordering::Relaxed) > 0, "no {name} went through");
     }
+    let apart = APART.load(Ordering::Relaxed);
+    assert!(
+        apart > 0,
+        "no store in blocks held values the whole path settled"
+    );
 }

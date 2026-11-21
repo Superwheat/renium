@@ -420,14 +420,27 @@ pub(super) fn encode_with_lookup(
 /// store's file holds that.
 pub(super) fn encode_state<'a>(
     state: &'a ServiceState,
-    (records, lookup): (
+    records: (
         &'a [SettingsBinaryInstance<'a>],
         &SettingsBinaryInstanceLookup<'_>,
     ),
     replaced: Option<ReplacedRow<'a>>,
     previous: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    let ranges = block_ranges(records.len(), BLOCK_ROWS);
+    encode_state_in_blocks(state, records, replaced, previous, BLOCK_ROWS)
+}
+
+fn encode_state_in_blocks<'a>(
+    state: &'a ServiceState,
+    (records, lookup): (
+        &'a [SettingsBinaryInstance<'a>],
+        &SettingsBinaryInstanceLookup<'_>,
+    ),
+    replaced: Option<ReplacedRow<'a>>,
+    previous: Option<&[u8]>,
+    block_rows: usize,
+) -> Result<Vec<u8>> {
+    let ranges = block_ranges(records.len(), block_rows);
     let (structure, prepared) = rayon::join(
         || {
             let collected = collected_records(records, collect_settings_binary_record_strings);

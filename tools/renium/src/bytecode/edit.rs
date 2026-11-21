@@ -1124,17 +1124,19 @@ pub(crate) fn clone_stored_instance(
         let bytes = fs::read(from).with_context(|| format!("Failed to read {}", from.display()))?;
         super::check_new_source_file(to, &bytes)?;
         writes.insert(to.clone(), bytes);
-        source_copies.push(json!({
-            "from": from,
-            "to": to,
-        }));
+        source_copies.push((from.clone(), to.clone()));
     }
-    let root_index = cloned.root_index;
-    let answer = |document: &SettingsBytecode, changed_paths: Vec<PathBuf>| {
+    let answer = |document: &SettingsBytecode,
+                  root_index: usize,
+                  changed_paths: Vec<PathBuf>,
+                  source_copies: Vec<(PathBuf, PathBuf)>| {
         let _answer = crate::app::profile::span("copy answer");
         let root = &document.instances[root_index];
         let path = build_editor_instance_paths_for_indices(document, &service, &[root_index])
             .remove(&root_index);
+        let source_copies = (source_copies.into_iter())
+            .map(|(from, to)| json!({ "from": from, "to": to }))
+            .collect::<Vec<_>>();
         json!({
             "ok": true,
             "settingsFile": settings_file,
@@ -1157,17 +1159,13 @@ pub(crate) fn clone_stored_instance(
         let changed_paths = file_mutation_paths(&writes, &removals);
         apply_file_mutations(&writes, &removals)?;
         super::release_settings_file_locks(locks);
-        let result = answer(&document, changed_paths);
+        let result = answer(&document, cloned.root_index, changed_paths, source_copies);
         rayon::spawn(move || drop((document, stored)));
         return Ok(result);
     };
     // The copy and its rename are planned whole, and nothing is written until
     // the store is encoded: a copy refused or failed leaves every file as it was.
-    let mut changed_paths = file_mutation_paths(&writes, &removals);
-    changed_paths.push(settings_file.clone());
-    changed_paths.sort();
-    changed_paths.dedup();
-    let mut result = answer(&document, changed_paths);
+    let root_index = cloned.root_index;
     let copy_rows = cloned
         .copies
         .iter()
@@ -1181,7 +1179,7 @@ pub(crate) fn clone_stored_instance(
     let links = super::LinkEnforcement::default();
     super::reject_owned_instance_edit(&document, &service, root_index, &links)?;
     let copied = document.clone();
-    let root_index = renamed_copy(
+    let (root_index, moves) = renamed_copy(
         (&settings_file, &service, &service_dir),
         (&mut document, &copied),
         (root_index, referring),
@@ -1191,13 +1189,21 @@ pub(crate) fn clone_stored_instance(
         settings_file.clone(),
         stored.encode_restructured(&document)?,
     );
+    let changed_paths = file_mutation_paths(&writes, &removals);
+    let mut moved_to = HashMap::with_capacity(moves.len());
+    for (from, to) in &moves {
+        moved_to.entry(exact_path_key(from)).or_insert(to);
+    }
+    let moved = |path: PathBuf| match moved_to.get(&exact_path_key(&path)) {
+        Some(&to) => to.clone(),
+        None => path,
+    };
+    let source_copies = (source_copies.into_iter())
+        .map(|(from, to)| (moved(from), moved(to)))
+        .collect();
     apply_file_mutations(&writes, &removals)?;
     super::release_settings_file_locks(locks);
-    let path = build_editor_instance_paths_for_indices(&document, &service, &[root_index])
-        .remove(&root_index);
-    result["name"] = json!(name);
-    result["pathSegments"] = json!(path.as_ref().map(|path| &path.path_segments));
-    result["pathOrdinals"] = json!(path.as_ref().map(|path| &path.path_ordinals));
+    let result = answer(&document, root_index, changed_paths, source_copies);
     rayon::spawn(move || drop((document, copied, stored)));
     Ok(result)
 }
@@ -1209,13 +1215,14 @@ pub(crate) fn clone_stored_instance(
 /// the `referring` stores follow the copy and the instances whose path the
 /// name changes. `writes` and `removals` are the copy's file changes, not yet
 /// made; they come out as the copy and the rename make them together.
-/// Returns where the copy stands.
+/// Returns where the copy stands and the script files the rename moves, each
+/// from where the copy leaves it.
 fn renamed_copy(
     (settings_file, service, service_dir): (&Path, &str, &Path),
     (document, copied): (&mut SettingsBytecode, &SettingsBytecode),
     (root, referring): (usize, BTreeMap<String, super::references::ReferringStore>),
     (name, writes, removals): (&str, &mut BTreeMap<PathBuf, Vec<u8>>, &mut Vec<PathBuf>),
-) -> Result<usize> {
+) -> Result<(usize, Vec<(PathBuf, PathBuf)>)> {
     let _span = crate::app::profile::span("copy renamed");
     let mut property = "Name".to_string();
     let mut value = Value::String(name.to_string());
@@ -1247,7 +1254,7 @@ fn renamed_copy(
             moves.push((from.clone(), to));
         }
     }
-    moved_after_copy(moves, writes, removals)?;
+    moved_after_copy(&moves, writes, removals)?;
     let own = crate::project::storage::store_service_name(settings_file)
         .context("Service settings path has no service name")?;
     let version = document.version;
@@ -1273,7 +1280,7 @@ fn renamed_copy(
     }
     *document = (documents.remove(&own)).context("The copied store went missing")?;
     rayon::spawn(move || drop((documents, stores)));
-    Ok(root)
+    Ok((root, moves))
 }
 
 /// The file a copy whose file changes are `writes` and `removals` leaves
@@ -1317,25 +1324,25 @@ fn copy_removed(removals: &[PathBuf], path: &Path) -> bool {
 /// moves `moves` that follow it, each reading its file as the copy leaves
 /// it: the changes come out as the copy's made and then the moves'.
 fn moved_after_copy(
-    moves: Vec<(PathBuf, PathBuf)>,
+    moves: &[(PathBuf, PathBuf)],
     writes: &mut BTreeMap<PathBuf, Vec<u8>>,
     removals: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let mut moved = BTreeMap::new();
     let mut left = Vec::new();
     for (from, to) in moves {
-        if exact_path_key(&from) == exact_path_key(&to) {
+        if exact_path_key(from) == exact_path_key(to) {
             continue;
         }
-        let bytes = match copy_wrote(writes, &from) {
+        let bytes = match copy_wrote(writes, from) {
             Some(bytes) => bytes.clone(),
-            None if from.is_file() && !copy_removed(removals, &from) => {
-                fs::read(&from).with_context(|| format!("Failed to read {}", from.display()))?
+            None if from.is_file() && !copy_removed(removals, from) => {
+                fs::read(from).with_context(|| format!("Failed to read {}", from.display()))?
             }
             None => continue,
         };
-        moved.insert(to, bytes);
-        left.push(from);
+        moved.insert(to.clone(), bytes);
+        left.push(from.clone());
     }
     left.retain(|from| {
         !moved
