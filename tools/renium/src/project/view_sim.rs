@@ -262,7 +262,8 @@ fn place_views(rng: &mut SimRng, root: &Path, log: &mut Vec<String>) -> Result<(
 }
 
 /// Two reads of a drawn place file, the second edited: a value, an attribute
-/// or a reference changed, an instance added, the values of twins swapped.
+/// or a reference changed, an instance added or removed, the values of twins
+/// swapped.
 /// Where the comparison by rows answers, it answers as the comparison of the
 /// whole documents, and it answers for an unchanged place.
 fn place_comparisons(rng: &mut SimRng, root: &Path, log: &mut Vec<String>) -> Result<(), String> {
@@ -272,14 +273,14 @@ fn place_comparisons(rng: &mut SimRng, root: &Path, log: &mut Vec<String>) -> Re
     told(RbxPlaceFormat::Binary.write(&file, &dom, dom.root().children()))?;
     let read = || told(RbxPlaceFormat::Binary.read_for_comparison(&file));
     let (before, mut after) = (read()?, read()?);
-    let instances = (after.descendants().skip(1))
+    let mut instances = (after.descendants().skip(1))
         .map(|node| node.referent())
         .collect::<Vec<_>>();
     let edits = [0, 1, 1, 3][rng.below(4)] * usize::from(!instances.is_empty());
     for _ in 0..edits {
         let id = instances[rng.below(instances.len())];
         let target = instances[rng.below(instances.len())];
-        let edit = rng.below(5);
+        let edit = rng.below(6);
         log.push(format!("edit {edit}"));
         let node = after.get_by_ref_mut(id).ok_or("no instance")?;
         match edit {
@@ -298,6 +299,20 @@ fn place_comparisons(rng: &mut SimRng, root: &Path, log: &mut Vec<String>) -> Re
             }
             3 => {
                 after.insert(id, InstanceBuilder::new("Folder").with_name("same"));
+            }
+            5 => {
+                // One that holds no other and that none names: a place file
+                // names no instance it does not hold.
+                let (childless, parent) = (node.children().is_empty(), node.parent());
+                let named = after.descendants().any(|node| {
+                    (node.properties.values())
+                        .any(|value| matches!(value, Variant::Ref(to) if *to == id))
+                });
+                let alone = childless && parent != after.root_ref();
+                if alone && !named && instances.len() > 1 {
+                    after.destroy(id);
+                    instances.retain(|other| *other != id);
+                }
             }
             _ => {
                 let (name, class, parent) = (node.name.clone(), node.class, node.parent());
@@ -558,9 +573,13 @@ fn managed_comparisons(rng: &mut SimRng, log: &mut Vec<String>) -> Result<(), St
         args.against = args.other.take();
     }
     let services = BTreeSet::from(["Workspace".to_string()]);
+    // An answer is written with each payload it holds, as it is printed.
     let answer = |result: anyhow::Result<serde_json::Value>| {
         result
-            .map(|value| value.to_string())
+            .map(|mut value| {
+                crate::settings::held::resolve_all(&mut value);
+                value.to_string()
+            })
             .map_err(|error| format!("{error:#}"))
     };
     let documents_whole = || -> anyhow::Result<serde_json::Value> {
@@ -592,10 +611,13 @@ fn managed_comparisons(rng: &mut SimRng, log: &mut Vec<String>) -> Result<(), St
     if answer(place_diff::compare_whole(&before, &lent, &services, &args)) != expected {
         return Err("the whole documents of lent DOMs answer otherwise".into());
     }
-    if let Ok(Some(result)) = by_rows
-        && Ok(result.to_string()) != expected
-    {
-        return Err("the comparison by rows answers otherwise".into());
+    if let Ok(Some(result)) = by_rows {
+        let by_rows = answer(Ok(result));
+        if by_rows != expected {
+            log.push(format!("by rows: {}", by_rows.unwrap_or_default()));
+            log.push(format!("whole: {}", expected.unwrap_or_default()));
+            return Err("the comparison by rows answers otherwise".into());
+        }
     }
     let given = place_diff::compare(
         &mut || Ok(managed_place(seed, count)),

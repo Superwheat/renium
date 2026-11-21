@@ -129,7 +129,6 @@ fn release_now() {
 /// before its next phase allocates as much again: the allocator keeps freed
 /// pages for reuse, and what one phase freed across many threads is not
 /// where the next one allocates.
-#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn release_between_phases() {
     release_now();
 }

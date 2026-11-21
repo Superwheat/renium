@@ -4873,7 +4873,11 @@ fn reconciliation_identity_maps_equal(
             })
 }
 
-fn identity_value_is_stable(name: &str, value: &Value, ignore_transient_properties: bool) -> bool {
+pub(crate) fn identity_value_is_stable(
+    name: &str,
+    value: &Value,
+    ignore_transient_properties: bool,
+) -> bool {
     (!ignore_transient_properties
         || name != "ScriptGuid"
             && !reconciliation_property_is_derived(name)

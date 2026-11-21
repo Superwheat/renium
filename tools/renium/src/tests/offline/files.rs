@@ -891,9 +891,15 @@ fn compare_place_compares_two_files_in_either_format() {
         .ok();
     assert_eq!(reversed["added"], json!(5));
     assert_eq!(reversed["removed"], json!(2));
+    // The services are compared in the order of their names.
     assert_eq!(
-        reversed["differences"][0]["before"]["className"],
-        json!("Workspace")
+        reversed["differences"][0]["after"]["className"],
+        json!("ObjectValue")
+    );
+    assert!(
+        (reversed["differences"].as_array().unwrap().iter())
+            .any(|difference| difference["before"]["className"] == json!("Workspace")),
+        "{reversed}"
     );
     assert_eq!(
         fx.json(&[

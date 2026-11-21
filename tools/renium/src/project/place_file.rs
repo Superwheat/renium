@@ -636,6 +636,8 @@ pub(crate) fn compare_place(mut args: ComparePlaceArgs, project: Option<&Path>) 
     let read = |path: &Path| -> Result<RbxWeakDom> {
         let read = std::time::Instant::now();
         let dom = RbxPlaceFormat::from_path(path)?.read_for_comparison(path)?;
+        // The file's bytes and what they unpacked to go back to the system.
+        crate::daemon::memory::release_between_phases();
         crate::app::output::log_global(
             4,
             format_args!(
@@ -687,11 +689,22 @@ pub(crate) fn compare_place(mut args: ComparePlaceArgs, project: Option<&Path>) 
             &mut || read_already.take().map_or_else(&place, Ok),
             &mut || -> Result<RbxWeakDom> {
                 let services = services.clone();
+                let built = std::time::Instant::now();
                 let mut dom =
                     build_rbx_place(projection.root(), services, None, false, false, false)?.dom;
+                let saved = std::time::Instant::now();
                 *not_serialized.borrow_mut() =
                     super::place_diff::project_properties_as_saved(&mut dom)?;
+                crate::app::output::log_global(
+                    4,
+                    format_args!(
+                        "[renium] place comparison project: built {:.1}ms, as saved {:.1}ms",
+                        (saved - built).as_secs_f64() * 1000.0,
+                        saved.elapsed().as_secs_f64() * 1000.0
+                    ),
+                );
                 unsaved_instances.set(super::place_diff::omit_unsaved_project_instances(&mut dom));
+                crate::daemon::memory::release_between_phases();
                 // An imported project carries the pivot the place gave up.
                 *unsaved_project_service.borrow_mut() =
                     super::place_diff::omit_unsaved_service_properties(&mut dom)?;

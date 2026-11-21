@@ -646,3 +646,338 @@ fn places_read_in_turn_are_read_again_only_for_the_rows_that_differ() {
     assert_eq!(added, at_hand(turned_place(4.0, 1), 4.0));
     assert_eq!((added["removed"].as_u64(), reads), (Some(1), 2));
 }
+
+/// A Workspace of ten parts under a folder and a model whose `PrimaryPart`
+/// names its body, with a folder of one part between them where `gated`. A
+/// value past them names the gate's part where `seen`, the body otherwise.
+fn gated_place(gated: bool, seen: bool, tall: f32) -> WeakDom {
+    let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+    let props = dom.insert(workspace, InstanceBuilder::new("Folder").with_name("Props"));
+    for index in 0..10 {
+        let part = InstanceBuilder::new("Part").with_name(format!("Part{index}"));
+        dom.insert(
+            props,
+            part.with_property("Size", Vector3::new(1.0, 2.0, 1.0)),
+        );
+    }
+    let bar = gated.then(|| {
+        let gate = dom.insert(workspace, InstanceBuilder::new("Folder").with_name("Gate"));
+        dom.insert(gate, InstanceBuilder::new("Part").with_name("Bar"))
+    });
+    let car = dom.insert(workspace, InstanceBuilder::new("Model").with_name("Car"));
+    let body = InstanceBuilder::new("Part").with_name("Body");
+    let body = dom.insert(
+        car,
+        body.with_property("Size", Vector3::new(1.0, tall, 1.0)),
+    );
+    let named = dom.get_by_ref_mut(car).unwrap();
+    named
+        .properties
+        .insert("PrimaryPart".into(), Variant::Ref(body));
+    let value = InstanceBuilder::new("ObjectValue").with_name("Seen");
+    let target = bar.filter(|_| seen).unwrap_or(body);
+    dom.insert(
+        workspace,
+        value.with_property("Value", Variant::Ref(target)),
+    );
+    dom
+}
+
+#[test]
+fn places_one_run_apart_are_compared_by_their_rows() {
+    let services = BTreeSet::from(["Workspace".to_string()]);
+    let args = args(&["--against", "Other.rbxl"]);
+    let both = |before: &WeakDom, after: &WeakDom| {
+        let by_rows = compare_by_rows(before, after, &services, &args).unwrap();
+        let whole = compare_whole(before, after, &services, &args).unwrap();
+        assert_eq!(by_rows.as_ref(), Some(&whole), "by rows, then whole");
+        let count = |key: &str| whole[key].as_u64().unwrap();
+        (count("added"), count("removed"), count("changed"))
+    };
+    let plain = gated_place(false, false, 2.0);
+    let gated = gated_place(true, false, 2.0);
+    // The rows past the run name each other at other places in the two.
+    assert_eq!(both(&plain, &gated), (2, 0, 0));
+    assert_eq!(both(&gated, &plain), (0, 2, 0));
+    // A value past the run that differs, and one that names a row of it.
+    assert_eq!(both(&plain, &gated_place(true, false, 3.0)), (2, 0, 1));
+    assert_eq!(both(&gated_place(true, true, 2.0), &plain), (0, 2, 1));
+    assert_eq!(both(&plain, &gated_place(true, true, 3.0)), (2, 0, 2));
+}
+
+/// A Workspace of rigs of one name, each a model whose `PrimaryPart` names
+/// its torso, as tall as `tall` says: between two folders where `framed`,
+/// so that the place stands two runs apart from one without them. A value
+/// past the rigs names the torso of the rig `seen` says.
+fn rigged_place(framed: bool, tall: &[f32], seen: Option<usize>) -> WeakDom {
+    let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+    if framed {
+        dom.insert(workspace, InstanceBuilder::new("Folder").with_name("Ahead"));
+    }
+    let mut torsos = Vec::new();
+    for tall in tall {
+        let rig = dom.insert(workspace, InstanceBuilder::new("Model").with_name("Rig"));
+        let torso = InstanceBuilder::new("Part").with_name("Torso");
+        let torso = dom.insert(
+            rig,
+            torso.with_property("Size", Vector3::new(1.0, *tall, 1.0)),
+        );
+        let named = dom.get_by_ref_mut(rig).unwrap();
+        named
+            .properties
+            .insert("PrimaryPart".into(), Variant::Ref(torso));
+        torsos.push(torso);
+    }
+    if let Some(seen) = seen {
+        let value = InstanceBuilder::new("ObjectValue").with_name("Seen");
+        dom.insert(
+            workspace,
+            value.with_property("Value", Variant::Ref(torsos[seen])),
+        );
+    }
+    if framed {
+        dom.insert(workspace, InstanceBuilder::new("Folder").with_name("Past"));
+    }
+    dom
+}
+
+#[test]
+fn namesakes_that_differ_are_compared_by_their_rows() {
+    let services = BTreeSet::from(["Workspace".to_string()]);
+    let args = args(&["--against", "Other.rbxl"]);
+    let both = |before: &WeakDom, after: &WeakDom| {
+        let by_rows = compare_by_rows(before, after, &services, &args).unwrap();
+        let whole = compare_whole(before, after, &services, &args).unwrap();
+        assert_eq!(by_rows.as_ref(), Some(&whole), "by rows, then whole");
+        let count = |key: &str| whole[key].as_u64().unwrap();
+        (count("added"), count("removed"), count("changed"))
+    };
+    let plain = rigged_place(false, &[2.0, 3.0, 4.0], None);
+    // Namesakes taken by their order that hold what their counterparts hold.
+    assert_eq!(
+        both(&plain, &rigged_place(true, &[2.0, 3.0, 4.0], None)),
+        (2, 0, 0)
+    );
+    // One of them differs, in either place.
+    assert_eq!(
+        both(&plain, &rigged_place(true, &[2.0, 3.0, 5.0], None)),
+        (2, 0, 1)
+    );
+    assert_eq!(
+        both(&rigged_place(true, &[2.0, 3.0, 5.0], None), &plain),
+        (0, 2, 1)
+    );
+    // Twins that swapped what they hold, and one place with more of them.
+    both(&plain, &rigged_place(true, &[3.0, 2.0, 4.0], None));
+    both(&plain, &rigged_place(true, &[3.0, 2.0, 5.0], None));
+    assert_eq!(
+        both(&plain, &rigged_place(true, &[2.0, 4.0], None)),
+        (2, 2, 0)
+    );
+    assert_eq!(
+        both(&plain, &rigged_place(true, &[2.0, 9.0, 3.0, 4.0], None)),
+        (4, 0, 0)
+    );
+    both(&plain, &rigged_place(true, &[9.0, 4.0], None));
+    // A row past the group names one of it.
+    let seen = rigged_place(false, &[2.0, 3.0, 4.0], Some(0));
+    assert_eq!(
+        both(&seen, &rigged_place(true, &[2.0, 3.0, 5.0], Some(0))),
+        (2, 0, 1)
+    );
+    both(&seen, &rigged_place(true, &[2.0, 3.0, 5.0], Some(2)));
+    both(&seen, &rigged_place(true, &[3.0, 2.0, 5.0], Some(1)));
+    both(&plain, &rigged_place(true, &[2.0, 3.0, 5.0], Some(1)));
+    both(&seen, &rigged_place(true, &[2.0, 3.0, 5.0], None));
+}
+
+/// A Workspace whose folder holds two models of one name, a value that names
+/// the part of the second, and a folder past it. The first of the models
+/// holds a part too where `both`, and the last folder one more where `more`:
+/// the places stand apart where no one run tells.
+fn twinned_place(both: bool, more: bool) -> WeakDom {
+    let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+    let folder = dom.insert(workspace, InstanceBuilder::new("Folder").with_name("F"));
+    let mut part = None;
+    for holds in [both, true] {
+        let twin = dom.insert(folder, InstanceBuilder::new("Model").with_name("A"));
+        if holds {
+            part = Some(dom.insert(twin, InstanceBuilder::new("Part").with_name("C")));
+        }
+    }
+    let value = InstanceBuilder::new("ObjectValue").with_name("R");
+    dom.insert(
+        workspace,
+        value.with_property("Value", Variant::Ref(part.unwrap())),
+    );
+    let last = dom.insert(workspace, InstanceBuilder::new("Folder").with_name("G"));
+    if more {
+        dom.insert(last, InstanceBuilder::new("Folder").with_name("N"));
+    }
+    dom
+}
+
+#[test]
+fn a_row_removed_under_namesakes_is_paired_as_the_whole_documents_pair_it() {
+    let services = BTreeSet::from(["Workspace".to_string()]);
+    let args = args(&["--against", "Other.rbxl"]);
+    for (before, after) in [
+        (twinned_place(true, false), twinned_place(false, true)),
+        (twinned_place(false, true), twinned_place(true, false)),
+        (twinned_place(false, false), twinned_place(true, true)),
+    ] {
+        let by_rows = compare_by_rows(&before, &after, &services, &args).unwrap();
+        let whole = compare_whole(&before, &after, &services, &args).unwrap();
+        assert_eq!(by_rows.as_ref(), Some(&whole), "by rows, then whole");
+    }
+}
+
+/// A Workspace of three models of one name, each of a part as tall as `tall`
+/// says and, the one `more` names, of a second part.
+fn modelled_place(tall: [f32; 3], more: Option<usize>) -> WeakDom {
+    let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+    for (index, tall) in tall.into_iter().enumerate() {
+        let model = dom.insert(workspace, InstanceBuilder::new("Model").with_name("Tree"));
+        let trunk = InstanceBuilder::new("Part").with_name("Trunk");
+        dom.insert(
+            model,
+            trunk.with_property("Size", Vector3::new(1.0, tall, 1.0)),
+        );
+        if more == Some(index) {
+            dom.insert(model, InstanceBuilder::new("Part").with_name("Leaf"));
+        }
+    }
+    dom
+}
+
+/// How many rows of the first place a comparison by rows reads whole beside
+/// its services.
+fn owed_by_rows(
+    before: &WeakDom,
+    after: &WeakDom,
+    services: &BTreeSet<String>,
+    args: &ComparePlaceArgs,
+) -> usize {
+    let reading = Reading::of(args);
+    let (first, _) = keep_rows(before, "before", services, reading).unwrap();
+    let paired = pair_rows(first, after, services, reading).unwrap();
+    paired.unwrap().owed.len()
+}
+
+#[test]
+fn twins_are_read_whole_only_where_they_may_be_paired_anew() {
+    let services = BTreeSet::from(["Workspace".to_string()]);
+    let args = args(&["--against", "Other.rbxl"]);
+    // How many rows of the first place a comparison by rows reads whole
+    // beside its service, with whether it answers as the whole documents do.
+    let owed = |before: WeakDom, after: WeakDom| {
+        let by_rows = compare_by_rows(&before, &after, &services, &args).unwrap();
+        let whole = compare_whole(&before, &after, &services, &args).unwrap();
+        assert_eq!(by_rows.as_ref(), Some(&whole), "by rows, then whole");
+        (
+            owed_by_rows(&before, &after, &services, &args),
+            whole["changed"].as_u64().unwrap(),
+        )
+    };
+    let stands = || modelled_place([4.0, 5.0, 6.0], None);
+    assert_eq!(owed(stands(), stands()), (0, 0));
+    // A twin that holds another value may be another twin's counterpart:
+    // every twin and what it holds is read.
+    assert_eq!(
+        owed(stands(), modelled_place([4.0, 7.0, 6.0], None)),
+        (6, 1)
+    );
+    // Twins that swapped what they hold are paired by it and hold the same.
+    assert_eq!(
+        owed(stands(), modelled_place([5.0, 4.0, 6.0], None)),
+        (0, 0)
+    );
+    // A twin that holds a row more matches no counterpart, so no twin is
+    // paired anew and none is read.
+    assert_eq!(
+        owed(stands(), modelled_place([4.0, 5.0, 6.0], Some(1))),
+        (0, 0)
+    );
+    assert_eq!(
+        owed(modelled_place([4.0, 5.0, 6.0], Some(1)), stands()),
+        (1, 0)
+    );
+}
+
+#[test]
+fn a_property_named_as_the_digest_of_a_kept_row_is_compared_by_the_whole_documents() {
+    let place = |value: &str| {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+        let part = InstanceBuilder::new("Part").with_property(KEPT_VALUES, value.to_string());
+        dom.insert(workspace, part);
+        dom
+    };
+    let services = BTreeSet::from(["Workspace".to_string()]);
+    let args = args(&["--against", "Other.rbxl"]);
+    assert!(compare_by_rows(&place("a"), &place("b"), &services, &args).is_err());
+    let whole = compare_whole(&place("a"), &place("b"), &services, &args).unwrap();
+    assert_eq!(whole["changed"].as_u64(), Some(1), "{whole}");
+    let in_turn = super::compare(
+        &mut || Ok(place("a")),
+        &mut || Ok(place("b")),
+        Some(&services),
+        &args,
+    );
+    assert_eq!(in_turn.unwrap(), whole);
+}
+
+#[test]
+fn what_a_project_never_captures_leaves_twins_unread_against_a_project() {
+    let database = rbx_reflection_database::get().unwrap();
+    // A Bool a class has a default of and no project captures, the first by
+    // the names.
+    let mut bools = Vec::new();
+    for (class_name, class) in &database.classes {
+        if class.tags.contains(&rbx_reflection::ClassTag::Service) {
+            continue;
+        }
+        for (name, default) in &class.default_properties {
+            let apart = left_out(database, class_name, name);
+            if let Variant::Bool(default) = default
+                && apart.never_captured
+                && !apart.one_sided
+                && !engine_managed_property(class_name, name, &json!(!default))
+            {
+                bools.push((class_name.to_string(), name.to_string(), !default));
+            }
+        }
+    }
+    bools.sort();
+    let (class_name, name, value) = bools.first().expect("a Bool no project captures").clone();
+    let place = |holds: bool| {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+        for _ in 0..3 {
+            let mut twin = InstanceBuilder::new(class_name.as_str()).with_name("Twin");
+            if holds {
+                twin = twin.with_property(name.as_str(), value);
+            }
+            dom.insert(workspace, twin);
+        }
+        dom
+    };
+    let services = BTreeSet::from(["Workspace".to_string()]);
+    let (before, after) = (place(true), place(false));
+    for (extra, changed, owed) in [(&[][..], 0, 0), (&["--against", "Other.rbxl"][..], 3, 3)] {
+        let args = args(extra);
+        let by_rows = compare_by_rows(&before, &after, &services, &args).unwrap();
+        let whole = compare_whole(&before, &after, &services, &args).unwrap();
+        assert_eq!(by_rows.as_ref(), Some(&whole), "{class_name}.{name}");
+        assert_eq!(
+            whole["changed"].as_u64(),
+            Some(changed),
+            "{class_name}.{name}: {whole}"
+        );
+        assert_eq!(owed_by_rows(&before, &after, &services, &args), owed);
+    }
+}
