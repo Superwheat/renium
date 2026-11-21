@@ -34,6 +34,14 @@ use crate::snapshot::refs::{remap_record_reference_ids, stabilize_record_referen
 const UNIFIED_LIGHTING_MARKER: &str = "RBX_LightingTechnologyUnifiedMigration";
 const ENGINE_INTERNAL_SERVICES: [&str; 2] = ["ConfigureServerService", "FilteredSelection"];
 
+/// The rows a whole document reads of a DOM a turn at a time. A test reads
+/// few, so that its places take several turns.
+const WHOLE_ROWS_AT_ONCE: usize = if cfg!(test) {
+    16
+} else {
+    super::version_control::VIEW_ROWS_AT_ONCE
+};
+
 /// Studio session state saved with a place; two saves of unchanged content
 /// disagree on it.
 pub(super) fn is_engine_internal_service(name: &str) -> bool {
@@ -86,7 +94,8 @@ fn is_block_physics_placeholder_json(value: &Value) -> bool {
 
 /// Properties named in `keep` stay even when the engine manages them, so an
 /// explicit `--props PhysicalConfigData` compares the cached physics data.
-fn omit_engine_managed_properties(
+#[cfg(test)]
+pub(super) fn omit_engine_managed_properties(
     document: &mut SettingsBytecode,
     keep: &[String],
 ) -> BTreeMap<String, usize> {
@@ -304,26 +313,30 @@ pub(super) fn omit_unsaved_service_properties(
 
 pub(super) fn document(
     dom: &WeakDom,
-    prefix: &str,
+    prefix: &'static str,
     services: Option<&BTreeSet<String>>,
     elide_defaults: bool,
 ) -> Result<SettingsBytecode> {
     let rows = dom_rows(dom, prefix, services, elide_defaults)?;
-    let every = (0..rows.refs.len()).collect::<Vec<_>>();
+    let every = (0..rows.plan.refs.len()).collect::<Vec<_>>();
     let mut document = SettingsBytecode {
         version: SETTINGS_BINARY_VERSION,
-        instances: records(&rows, &every)?,
+        instances: records(dom, &rows.plan, &every, None)?.0,
     };
     stabilize_settings_reference_ids(&mut document);
     Ok(document)
 }
 
-/// What `document` reads of a DOM before it converts an instance: the
-/// instances in the order of its document, where each stands there, and how
-/// a reference names one.
+/// A DOM and what `document` reads of it before it converts an instance.
 pub(super) struct DomRows<'a> {
     dom: &'a WeakDom,
-    prefix: &'a str,
+    pub(super) plan: RowPlan,
+}
+
+/// The instances of a DOM in the order of its document, where each stands
+/// there, and how a reference names one.
+pub(super) struct RowPlan {
+    prefix: &'static str,
     elide_defaults: bool,
     database: &'static rbx_reflection::ReflectionDatabase<'static>,
     refs: Vec<Ref>,
@@ -345,15 +358,15 @@ impl DomRows<'_> {
         let bare = |(index, id): (usize, &Ref)| {
             let node = self.dom.get_by_ref(*id).unwrap();
             SettingsBytecodeInstance::new(
-                format!("{}:{index}", self.prefix),
+                format!("{}:{index}", self.plan.prefix),
                 node.name.clone(),
                 node.class.to_string(),
-                self.indices.get(&node.parent()).copied(),
+                self.plan.indices.get(&node.parent()).copied(),
             )
         };
         SettingsBytecode {
             version: SETTINGS_BINARY_VERSION,
-            instances: self.refs.iter().enumerate().map(bare).collect(),
+            instances: self.plan.refs.iter().enumerate().map(bare).collect(),
         }
     }
 
@@ -370,7 +383,7 @@ impl DomRows<'_> {
             .map(|instance| instance.settings_id.clone())
             .collect::<Vec<_>>();
         for turn in rows.chunks(at_once.max(1)) {
-            let mut read = records(self, turn)?;
+            let (mut read, _) = records(self.dom, &self.plan, turn, None)?;
             read.par_iter_mut().for_each(|record| {
                 stabilize_record_references(&mut record.properties, &ids);
                 stabilize_record_references(&mut record.attributes, &ids);
@@ -390,7 +403,7 @@ impl DomRows<'_> {
 
 pub(super) fn dom_rows<'a>(
     dom: &'a WeakDom,
-    prefix: &'a str,
+    prefix: &'static str,
     services: Option<&BTreeSet<String>>,
     elide_defaults: bool,
 ) -> Result<DomRows<'a>> {
@@ -447,23 +460,30 @@ pub(super) fn dom_rows<'a>(
     }
     Ok(DomRows {
         dom,
-        prefix,
-        elide_defaults,
-        database,
-        refs,
-        indices,
-        current_camera,
-        import_refs,
-        left_out: HashMap::new(),
-        holds_payloads: elide_defaults,
+        plan: RowPlan {
+            prefix,
+            elide_defaults,
+            database,
+            refs,
+            indices,
+            current_camera,
+            import_refs,
+            left_out: HashMap::new(),
+            holds_payloads: elide_defaults,
+        },
     })
 }
 
 /// The instances at `rows` of a DOM's rows, as `document` holds them before
-/// it stabilizes their references.
-fn records(plan: &DomRows<'_>, rows: &[usize]) -> Result<Vec<SettingsBytecodeInstance>> {
-    let &DomRows {
-        dom,
+/// it stabilizes their references. With `keep`, without the values the
+/// engine manages but those `keep` names, which are counted.
+fn records(
+    dom: &WeakDom,
+    plan: &RowPlan,
+    rows: &[usize],
+    keep: Option<&[String]>,
+) -> Result<(Vec<SettingsBytecodeInstance>, BTreeMap<String, usize>)> {
+    let &RowPlan {
         prefix,
         elide_defaults,
         database,
@@ -476,11 +496,13 @@ fn records(plan: &DomRows<'_>, rows: &[usize]) -> Result<Vec<SettingsBytecodeIns
     } = plan;
     // Indexed collection keeps file traversal order while independent records
     // convert in parallel. Each worker reuses its reflection/default metadata.
-    rows.par_iter()
+    let read = rows
+        .par_iter()
         .map(|index| (*index, &refs[*index]))
         .map_init(
             HashMap::new,
             |property_metadata, (index, id)| -> Result<_> {
+                let mut omitted = Map::new();
                 let node = dom.get_by_ref(*id).unwrap();
                 let mut record = SettingsBytecodeInstance::new(
                     format!("{prefix}:{index}"),
@@ -626,34 +648,63 @@ fn records(plan: &DomRows<'_>, rows: &[usize]) -> Result<Vec<SettingsBytecodeIns
                     {
                         continue;
                     }
-                    // A comparison holds a payload its instances share once.
-                    let value = if holds_payloads {
-                        crate::settings::held::held(value)
-                    } else {
-                        value
-                    };
                     let output_name = if elide_defaults {
                         canonical.as_str()
                     } else {
                         key
                     };
-                    match record.properties.entry(output_name.to_string()) {
-                        serde_json::map::Entry::Vacant(entry) => {
-                            entry.insert(value);
-                        }
-                        serde_json::map::Entry::Occupied(entry) if entry.get() != &value => {
-                            bail!(
-                                "{} contains conflicting aliases for property {output_name}",
-                                node.name
-                            );
-                        }
-                        _ => {}
+                    let managed = keep.is_some_and(|keep| {
+                        !keep.iter().any(|kept| kept == output_name)
+                            && engine_managed_property(&record.class_name, output_name, &value)
+                            && !(output_name == "PhysicalConfigData"
+                                && is_block_physics_placeholder_json(&value))
+                    });
+                    // A comparison holds a payload its instances share once.
+                    let value = if holds_payloads && !managed {
+                        crate::settings::held::held(value)
+                    } else {
+                        value
+                    };
+                    let (into, beside) = if managed {
+                        (&mut omitted, &record.properties)
+                    } else {
+                        (&mut record.properties, &omitted)
+                    };
+                    let conflicting = beside.contains_key(output_name)
+                        || match into.entry(output_name.to_string()) {
+                            serde_json::map::Entry::Vacant(entry) => {
+                                entry.insert(value);
+                                false
+                            }
+                            serde_json::map::Entry::Occupied(entry) => entry.get() != &value,
+                        };
+                    if conflicting {
+                        bail!(
+                            "{} contains conflicting aliases for property {output_name}",
+                            node.name
+                        );
                     }
                 }
-                Ok(record)
+                Ok((
+                    record,
+                    omitted
+                        .into_iter()
+                        .map(|(name, _)| name)
+                        .collect::<Vec<_>>(),
+                ))
             },
         )
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let mut omitted = BTreeMap::new();
+    let records = (read.into_iter())
+        .map(|(record, names)| {
+            for name in names {
+                *omitted.entry(name).or_default() += 1;
+            }
+            record
+        })
+        .collect();
+    Ok((records, omitted))
 }
 
 fn collect_attribute_values(
@@ -1086,11 +1137,29 @@ fn field_noise(before: Option<&Value>, after: Option<&Value>) -> bool {
 /// twins it paired by their content.
 type SetAside = (BTreeMap<String, usize>, BTreeMap<String, usize>, usize);
 
+/// A DOM a comparison reads: one given whole gives up the values of the
+/// instances it has read.
+pub(super) trait ComparedDom: std::borrow::Borrow<WeakDom> {
+    fn release(&mut self, _ids: &[Ref]) {}
+}
+
+impl ComparedDom for &WeakDom {}
+
+impl ComparedDom for WeakDom {
+    fn release(&mut self, ids: &[Ref]) {
+        for id in ids {
+            if let Some(instance) = self.get_by_ref_mut(*id) {
+                instance.properties = Default::default();
+            }
+        }
+    }
+}
+
 /// The comparison of two DOMs, by their rows where it can be
 /// (`compare_by_rows`) and else of their whole documents.
 pub(super) fn compare(
-    before: impl std::borrow::Borrow<WeakDom>,
-    after: impl std::borrow::Borrow<WeakDom>,
+    before: impl ComparedDom,
+    after: impl ComparedDom,
     services: &BTreeSet<String>,
     args: &ComparePlaceArgs,
 ) -> Result<Value> {
@@ -1110,12 +1179,37 @@ fn compared_records(
     at: &[usize],
     keep: &[String],
 ) -> Result<(Vec<SettingsBytecodeInstance>, BTreeMap<String, usize>)> {
-    let mut read = SettingsBytecode {
+    records(rows.dom, &rows.plan, at, Some(keep))
+}
+
+/// The whole document of a DOM as a comparison holds it, without the values
+/// the engine manages but those `keep` names, which are counted. The DOM
+/// gives up the values of each turn of rows once they are read.
+fn compared_document(
+    mut dom: impl ComparedDom,
+    prefix: &'static str,
+    services: &BTreeSet<String>,
+    keep: &[String],
+) -> Result<(SettingsBytecode, BTreeMap<String, usize>)> {
+    let plan = dom_rows(dom.borrow(), prefix, Some(services), true)?.plan;
+    let every = (0..plan.refs.len()).collect::<Vec<_>>();
+    let mut instances = Vec::with_capacity(every.len());
+    let mut omitted = BTreeMap::new();
+    for rows in every.chunks(WHOLE_ROWS_AT_ONCE) {
+        let (read, counted) = records(dom.borrow(), &plan, rows, Some(keep))?;
+        instances.extend(read);
+        for (name, count) in counted {
+            *omitted.entry(name).or_default() += count;
+        }
+        dom.release(&plan.refs[rows[0]..][..rows.len()]);
+    }
+    drop(dom);
+    let mut document = SettingsBytecode {
         version: SETTINGS_BINARY_VERSION,
-        instances: records(rows, at)?,
+        instances,
     };
-    let omitted = omit_engine_managed_properties(&mut read, keep);
-    Ok((read.instances, omitted))
+    stabilize_settings_reference_ids(&mut document);
+    Ok((document, omitted))
 }
 
 /// Of what a record holds a digest that two records share only where they
@@ -1186,7 +1280,7 @@ pub(super) fn compare_by_rows(
     // Every row is read and few are kept: a payload held once would stay
     // held for the process.
     for side in &mut rows {
-        side.holds_payloads = false;
+        side.plan.holds_payloads = false;
     }
     let mut documents = rows.each_ref().map(DomRows::structure);
     let [reference, observed] = &documents;
@@ -1297,29 +1391,32 @@ fn put_records(
 }
 
 /// `compare` of the whole documents of two DOMs. A DOM given whole is
-/// released once its document is read, the first before the second is
+/// released as its document is read, the first before the second is
 /// converted, so the two documents never stand beside both DOMs.
 pub(super) fn compare_whole(
-    before: impl std::borrow::Borrow<WeakDom>,
-    after: impl std::borrow::Borrow<WeakDom>,
+    before: impl ComparedDom,
+    after: impl ComparedDom,
     services: &BTreeSet<String>,
     args: &ComparePlaceArgs,
 ) -> Result<Value> {
     let started = Instant::now();
-    let mut before = {
-        let document = document(before.borrow(), "before", Some(services), true);
-        drop(before);
-        document?
-    };
-    let mut after = {
-        let document = document(after.borrow(), "after", Some(services), true);
-        drop(after);
-        document?
-    };
-    let mut engine_managed = omit_engine_managed_properties(&mut before, &args.props);
-    for (name, count) in omit_engine_managed_properties(&mut after, &args.props) {
+    let (before, mut engine_managed) = compared_document(before, "before", services, &args.props)?;
+    let (after, omitted) = compared_document(after, "after", services, &args.props)?;
+    for (name, count) in omitted {
         *engine_managed.entry(name).or_default() += count;
     }
+    compare_documents([before, after], engine_managed, started, services, args)
+}
+
+/// `compare_whole` of the documents it read since `started`, without the
+/// values the engine manages that `engine_managed` counts.
+pub(super) fn compare_documents(
+    [mut before, mut after]: [SettingsBytecode; 2],
+    engine_managed: BTreeMap<String, usize>,
+    started: Instant,
+    services: &BTreeSet<String>,
+    args: &ComparePlaceArgs,
+) -> Result<Value> {
     let database = rbx_reflection_database::get()?;
     let one_sided = omit_one_sided_class_properties(&mut before, &mut after, database);
     log_global(

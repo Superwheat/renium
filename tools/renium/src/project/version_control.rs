@@ -510,7 +510,7 @@ pub(crate) fn store_text_of(bytes: &[u8], out: impl FnMut(String)) -> Result<()>
 pub(super) fn place_text(path: &Path, at_once: usize, out: impl FnMut(String)) -> Result<()> {
     let place = super::place_file::sparse_place_dom(path)?;
     let mut rows = super::place_diff::dom_rows(&place.dom, "place", None, false)?;
-    rows.left_out = place.elided_defaults;
+    rows.plan.left_out = place.elided_defaults;
     text_by_rows(&mut rows.structure(), &rows, at_once, out)
 }
 

@@ -4,12 +4,12 @@
 //! text of a place file, the scripts a comparison reads of a place file, and
 //! the full comparison of two places.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::Path;
 
 use clap::Parser;
-use rbx_dom_weak::types::{Attributes, Ref, Variant, Vector3};
+use rbx_dom_weak::types::{Attributes, Ref, SharedString, Variant, Vector3};
 use rbx_dom_weak::{InstanceBuilder, WeakDom};
 use serde_json::json;
 
@@ -352,6 +352,238 @@ fn place_comparisons(rng: &mut SimRng, root: &Path, log: &mut Vec<String>) -> Re
         None if edits == 0 => Err("an unchanged place is not compared by its rows".into()),
         _ => Ok(()),
     }
+}
+
+const MANAGED_CLASSES: [&str; 5] = [
+    "MeshPart",
+    "Part",
+    "WeldConstraint",
+    "AnimationRigData",
+    "Folder",
+];
+
+fn managed_names(class: &str) -> &'static [&'static str] {
+    match class {
+        "MeshPart" => &[
+            "Size",
+            "InitialSize",
+            "MeshSize",
+            "PhysicalConfigData",
+            "UnscaledVolume",
+        ],
+        "Part" => &["Size", "Anchored", "CollisionGroupId"],
+        "WeldConstraint" => &["State", "Part0Internal", "Part1Internal"],
+        "AnimationRigData" => &["articulatedJoint", "rootMotion"],
+        _ => &[],
+    }
+}
+
+/// A value of a property `managed_place` draws: payloads that are a hull's
+/// placeholder, empty, a few bytes or long, sizes, numbers and references.
+fn managed_value(rng: &mut SimRng, name: &str, made: &[Ref]) -> Variant {
+    let bytes = |rng: &mut SimRng| match rng.below(4) {
+        0 => b"CSGPHS\x00BLOCK".to_vec(),
+        1 => Vec::new(),
+        2 => vec![0xff, rng.below(2) as u8],
+        _ => format!("hull {} ", rng.below(2)).repeat(60).into_bytes(),
+    };
+    match name {
+        "Size" | "InitialSize" | "MeshSize" => Vector3::new(rng.below(3) as f32, 1.0, 2.5).into(),
+        "PhysicalConfigData" => SharedString::new(bytes(rng)).into(),
+        "UnscaledVolume" => Variant::Float32(rng.below(3) as f32),
+        "Anchored" => Variant::Bool(rng.below(2) == 0),
+        "CollisionGroupId" | "State" => Variant::Int32(rng.below(3) as i32),
+        "Part0Internal" | "Part1Internal" => Variant::Ref(made[rng.below(made.len())]),
+        _ if rng.below(3) == 0 => Variant::String(String::new()),
+        _ => Variant::BinaryString(bytes(rng).into()),
+    }
+}
+
+/// A place whose instances hold, beside their own values, values the engine
+/// manages: cached sizes and collision data, a hull's placeholder, rig
+/// tables, welds that name parts. On a draw one instance spells a property
+/// twice, with its value or another.
+fn managed_place(seed: u64, count: usize) -> WeakDom {
+    let mut rng = SimRng(seed);
+    let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let root = dom.root_ref();
+    let mut made = vec![dom.insert(root, InstanceBuilder::new("Workspace"))];
+    let twice = rng.below(count * 3 + 1);
+    for index in 0..count {
+        let class = MANAGED_CLASSES[rng.below(MANAGED_CLASSES.len())];
+        let mut builder = InstanceBuilder::new(class).with_name(NAMES[rng.below(6)]);
+        for name in managed_names(class) {
+            if rng.below(3) > 0 {
+                builder = builder.with_property(*name, managed_value(&mut rng, name, &made));
+            }
+        }
+        if index == twice
+            && let Some(name) = rng.pick(managed_names(class))
+        {
+            let value = managed_value(&mut rng, name, &made);
+            builder = builder.with_property(name.to_lowercase(), value);
+        }
+        made.push(dom.insert(made[rng.below(made.len())], builder));
+    }
+    dom
+}
+
+/// Edits a place of `managed_place`: a value drawn anew, an instance
+/// renamed, added, removed or moved, the values of twins swapped. A
+/// reference to a removed instance is cleared, as a save clears it.
+fn edit_managed_place(rng: &mut SimRng, dom: &mut WeakDom, log: &mut Vec<String>) {
+    let ids = (dom.descendants().skip(1))
+        .map(|node| node.referent())
+        .collect::<Vec<_>>();
+    for _ in 0..[0, 1, 3, 6][rng.below(4)] * usize::from(ids.len() > 1) {
+        let (id, target) = (ids[rng.below(ids.len())], ids[rng.below(ids.len())]);
+        let Some(node) = dom.get_by_ref(id) else {
+            continue;
+        };
+        let (name, class, parent) = (node.name.clone(), node.class.to_string(), node.parent());
+        let edit = rng.below(6);
+        log.push(format!("edit {edit}"));
+        match edit {
+            0 => {
+                if let Some(name) = rng.pick(managed_names(&class)) {
+                    let value = managed_value(rng, name, &ids);
+                    let node = dom.get_by_ref_mut(id).unwrap();
+                    node.properties.insert(name.into(), value);
+                }
+            }
+            1 => dom.get_by_ref_mut(id).unwrap().name = NAMES[rng.below(6)].to_string(),
+            2 => {
+                let size = Vector3::new(rng.below(3) as f32, 1.0, 2.5);
+                let part = InstanceBuilder::new("Part").with_name(NAMES[rng.below(6)]);
+                dom.insert(id, part.with_property("Size", size));
+            }
+            3 if parent != dom.root_ref() => dom.destroy(id),
+            4 if dom.get_by_ref(target).is_some() && parent != dom.root_ref() => {
+                let mut above = target;
+                while above.is_some() && above != id {
+                    above = dom.get_by_ref(above).unwrap().parent();
+                }
+                if above != id {
+                    dom.transfer_within(id, target);
+                }
+            }
+            5 => {
+                let twin = (dom.get_by_ref(parent).unwrap().children().iter())
+                    .copied()
+                    .find(|sibling| {
+                        let sibling = dom.get_by_ref(*sibling).unwrap();
+                        sibling.referent() != id
+                            && sibling.name == name
+                            && sibling.class.as_str() == class
+                    });
+                if let Some(twin) = twin {
+                    let mut take =
+                        |id| std::mem::take(&mut dom.get_by_ref_mut(id).unwrap().properties);
+                    let (mine, theirs) = (take(id), take(twin));
+                    dom.get_by_ref_mut(id).unwrap().properties = theirs;
+                    dom.get_by_ref_mut(twin).unwrap().properties = mine;
+                }
+            }
+            _ => {}
+        }
+    }
+    let standing = (dom.descendants())
+        .map(|node| node.referent())
+        .collect::<HashSet<_>>();
+    for id in &standing {
+        let node = dom.get_by_ref_mut(*id).unwrap();
+        for value in node.properties.values_mut() {
+            if let Variant::Ref(target) = value
+                && target.is_some()
+                && !standing.contains(target)
+            {
+                *value = Variant::Ref(Ref::none());
+            }
+        }
+    }
+}
+
+/// A drawn place against itself edited, compared as the comparison did
+/// before it left out the values the engine manages as it read them: by two
+/// whole documents that held every value and then gave up those. Lent or
+/// given whole, by rows or by documents, the DOMs give that answer byte for
+/// byte, or its error.
+fn managed_comparisons(rng: &mut SimRng, log: &mut Vec<String>) -> Result<(), String> {
+    let count = [0, 4, 60, 300][rng.below(4)];
+    let (seed, edits) = (rng.next(), rng.next());
+    let after = |log: &mut Vec<String>| {
+        let mut dom = managed_place(seed, count);
+        edit_managed_place(&mut SimRng(edits), &mut dom, log);
+        dom
+    };
+    let (before, lent) = (managed_place(seed, count), after(log));
+    let extra = [
+        &[][..],
+        &["--props", "PhysicalConfigData"],
+        &["--props", "Size,MeshSize,State,rootMotion"],
+        &["--all", "--values"],
+        &["--class", "MeshPart"],
+    ][rng.below(5)];
+    let words = ["cmp", "a.rbxl", "b.rbxl", "--full"].iter().chain(extra);
+    let mut args = ComparePlaceArgs::try_parse_from(words).map_err(|e| e.to_string())?;
+    if rng.below(2) == 0 {
+        args.against = args.other.take();
+    }
+    let services = BTreeSet::from(["Workspace".to_string()]);
+    let answer = |result: anyhow::Result<serde_json::Value>| {
+        result
+            .map(|value| value.to_string())
+            .map_err(|error| format!("{error:#}"))
+    };
+    let documents_whole = || -> anyhow::Result<serde_json::Value> {
+        let started = std::time::Instant::now();
+        let mut documents = [
+            place_diff::document(&before, "before", Some(&services), true)?,
+            place_diff::document(&lent, "after", Some(&services), true)?,
+        ];
+        let mut engine_managed = BTreeMap::new();
+        for document in &mut documents {
+            let omitted = place_diff::omit_engine_managed_properties(document, &args.props);
+            for (name, count) in omitted {
+                *engine_managed.entry(name).or_insert(0) += count;
+            }
+        }
+        place_diff::compare_documents(documents, engine_managed, started, &services, &args)
+    };
+    let expected = answer(documents_whole());
+    let by_rows = place_diff::compare_by_rows(&before, &lent, &services, &args);
+    log.push(format!(
+        "{count} instances, {extra:?}, by rows: {}, {}",
+        matches!(by_rows, Ok(Some(_))),
+        if expected.is_ok() {
+            "answered"
+        } else {
+            "refused"
+        }
+    ));
+    if answer(place_diff::compare_whole(&before, &lent, &services, &args)) != expected {
+        return Err("the whole documents of lent DOMs answer otherwise".into());
+    }
+    if let Ok(Some(result)) = by_rows
+        && Ok(result.to_string()) != expected
+    {
+        return Err("the comparison by rows answers otherwise".into());
+    }
+    let given = place_diff::compare(
+        managed_place(seed, count),
+        after(&mut Vec::new()),
+        &services,
+        &args,
+    );
+    if answer(given) != expected {
+        return Err("DOMs given whole answer otherwise".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn a_comparison_answers_as_documents_holding_every_value_did() {
+    run_seeds(48, |seed, log| managed_comparisons(&mut SimRng(seed), log));
 }
 
 #[test]

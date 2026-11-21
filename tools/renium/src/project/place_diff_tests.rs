@@ -209,6 +209,49 @@ fn full_diff_reports_box_hulls_even_when_they_equal_the_reflection_default() {
     assert_eq!(diff(&boxed, &boxed, &[])["matches"], true);
 }
 
+#[test]
+fn two_spellings_of_an_engine_managed_value_agree_or_conflict_as_in_the_whole_document() {
+    let payload = |bytes: &[u8]| {
+        Variant::SharedString(rbx_dom_weak::types::SharedString::new(bytes.to_vec()))
+    };
+    let (boxed, hull, other) = (
+        &b"CSGPHS\0\0\0\0BLOCK"[..],
+        &b"CSGPHS-computed-hull"[..],
+        &b"CSGPHS-other-hull"[..],
+    );
+    let services = BTreeSet::from(["Workspace".to_string()]);
+    let mut conflicts = 0;
+    for (first, second) in [(boxed, hull), (hull, other), (hull, hull), (boxed, boxed)] {
+        for keep in [vec![], vec!["PhysicalConfigData".to_string()]] {
+            let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+            let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+            dom.insert(
+                workspace,
+                InstanceBuilder::new("MeshPart")
+                    .with_name("Track")
+                    .with_property("PhysicalConfigData", payload(first))
+                    .with_property("physicalconfigdata", payload(second)),
+            );
+            let whole = document(&dom, "before", Some(&services), true).map(|mut document| {
+                let omitted = omit_engine_managed_properties(&mut document, &keep);
+                (document, omitted)
+            });
+            match (whole, compared_document(&dom, "before", &services, &keep)) {
+                (Ok(whole), Ok(read)) => assert_eq!(whole, read),
+                (Err(whole), Err(read)) => {
+                    conflicts += 1;
+                    assert_eq!(whole.to_string(), read.to_string());
+                }
+                (whole, read) => panic!("{whole:?} against {read:?}"),
+            }
+        }
+    }
+    assert_eq!(
+        conflicts, 4,
+        "two payloads conflict whether the engine manages one or not"
+    );
+}
+
 fn fixture(reverse: bool, revision: f64) -> WeakDom {
     let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
     let root = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
