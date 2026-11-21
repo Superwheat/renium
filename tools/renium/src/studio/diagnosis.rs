@@ -407,8 +407,18 @@ fn open_failure_in_log(text: &str) -> Option<String> {
     let mut failure = None;
     let mut awaiting_message = false;
     for line in text.lines() {
-        if line.contains("[telemetryLog] State: OpenPlaceSuccess") {
+        if line.contains("[telemetryLog] State: OpenPlaceSuccess")
+            || line.contains("[FLog::PlaceManager] Start to open place")
+        {
             failure = None;
+            awaiting_message = false;
+        } else if line.contains("studio-open-place/v1/openplace?")
+            && let Some((_, error)) = line.split_once("message:HttpError: ")
+        {
+            // Without a network Studio asks for the place once, logs no
+            // failure state and stays at its start page.
+            let error = error.split_whitespace().next().unwrap_or_default();
+            failure = Some(format!("no connection to Roblox (HttpError: {error})"));
             awaiting_message = false;
         } else if line.contains("[telemetryLog] State: OpenPlaceFailure") {
             failure = Some("Studio could not open the place".to_string());
@@ -1194,6 +1204,21 @@ mod tests {
         );
         let recovered = format!("{failed}a,b,c,6 [telemetryLog] State: OpenPlaceSuccess\n");
         assert_eq!(open_failure_in_log(&recovered), None);
+        let offline = "t,5.8,6498,6,Info [FLog::PlaceManager] PlaceManager::createAndShowIDEDoc with task EditPlace\n\
+            t,6.6,6678,12 [DFLog::HttpTraceError] HttpResponse(#47 0x14dbb0169f8) time:0.4ms (net:0.4ms timeInRetryQueue:0.0ms) error:3 message:HttpError: ConnectFail url:{ \"https://apis.roblox.com/studio-open-place/v1/openplace?placeId=1\" } ip: external:0 numberOfTimesRetried:0\n\
+            t,6.7,6498,6,Info [DFLog::StudioPerformanceMeasurementsSummary] StudioPerformanceMeasurements summary for StudioOpenPlace: 4ms\n";
+        assert_eq!(
+            open_failure_in_log(offline).as_deref(),
+            Some("no connection to Roblox (HttpError: ConnectFail)")
+        );
+        // Another request that failed the same way says nothing of the place.
+        let elsewhere = offline.replace("studio-open-place/v1/openplace", "v1/universes/multiget");
+        assert_eq!(open_failure_in_log(&elsewhere), None);
+        // The same Studio opening the place again is no longer left there.
+        let again = format!(
+            "{offline}t,151.9,6498,6,Info [FLog::PlaceManager] Start to open place with traceId: 1\n"
+        );
+        assert_eq!(open_failure_in_log(&again), None);
         let hung = "x [FLog::SystemCheck] Running instance count at launch 2\nx [FLog::StudioKeyEvents] login (automatic) [start]\nx,Warning [FLog::StudioHangMonitor] Hang In Progress. HangId: 1\nx,Warning [FLog::StudioHangMonitor] Hang Detected. HangId: 1\n";
         assert_eq!(
             startup_hang_in_log(hung),
