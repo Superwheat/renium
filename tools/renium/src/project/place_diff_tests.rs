@@ -286,6 +286,19 @@ fn fixture(reverse: bool, revision: f64) -> WeakDom {
     dom
 }
 
+/// `compare` of DOMs at hand.
+fn compare(
+    before: impl ComparedDom,
+    after: impl ComparedDom,
+    services: &BTreeSet<String>,
+    args: &ComparePlaceArgs,
+) -> Result<Value> {
+    if let Ok(Some(result)) = compare_by_rows(before.borrow(), after.borrow(), services, args) {
+        return Ok(result);
+    }
+    compare_whole(before, after, services, args)
+}
+
 fn args(extra: &[&str]) -> ComparePlaceArgs {
     ComparePlaceArgs::try_parse_from(
         ["cmp", "Before.rbxl", "--full"]
@@ -569,4 +582,67 @@ fn project_diff_omits_unsaved_instances_and_fields_the_project_never_captures() 
         result["notCapturedProjectProperties"]["IsLegacyChatDisabled"],
         1
     );
+}
+
+/// A Workspace of 41 parts under a folder, one of them `tall`, and `more`
+/// folders beside it.
+fn turned_place(tall: f32, more: usize) -> WeakDom {
+    let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+    let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+    let props = dom.insert(workspace, InstanceBuilder::new("Folder").with_name("Props"));
+    for index in 0..41 {
+        let part = InstanceBuilder::new("Part").with_name(format!("Part{index}"));
+        let size = Vector3::new(1.0, if index == 20 { tall } else { 2.0 }, 1.0);
+        dom.insert(props, part.with_property("Size", size));
+    }
+    for index in 0..more {
+        let folder = InstanceBuilder::new("Folder").with_name(format!("More{index}"));
+        dom.insert(workspace, folder);
+    }
+    dom
+}
+
+#[test]
+fn places_read_in_turn_are_read_again_only_for_the_rows_that_differ() {
+    let services = BTreeSet::from(["Workspace".to_string()]);
+    let args = args(&["--against", "Other.rbxl", "--values"]);
+    // The answer of places read when asked for, the first as `before` gives
+    // it at each of its reads, and how often the first was read.
+    let in_turn = |before: &dyn Fn(usize) -> WeakDom, after: f32| {
+        let reads = std::cell::Cell::new(0);
+        let mut read = || {
+            reads.set(reads.get() + 1);
+            Ok(before(reads.get()))
+        };
+        let answer = super::compare(
+            &mut read,
+            &mut || Ok(turned_place(after, 0)),
+            Some(&services),
+            &args,
+        );
+        (answer.unwrap(), reads.get())
+    };
+    let at_hand = |before: WeakDom, after: f32| {
+        compare(before, turned_place(after, 0), &services, &args).unwrap()
+    };
+    let same = in_turn(&|_| turned_place(4.0, 0), 4.0);
+    assert_eq!(same, (at_hand(turned_place(4.0, 0), 4.0), 1));
+    let (changed, reads) = in_turn(&|_| turned_place(4.0, 0), 5.0);
+    assert_eq!(changed, at_hand(turned_place(4.0, 0), 5.0));
+    assert_eq!((changed["changed"].as_u64(), reads), (Some(1), 2));
+    assert!(changed.to_string().contains("\"Size\""), "{changed}");
+    // A first place written between its reads is compared as it stands at
+    // the last: its changed row holds another value, or it holds other
+    // instances.
+    let rewritten = |read| turned_place(if read == 1 { 4.0 } else { 6.0 }, 0);
+    let answer = in_turn(&rewritten, 5.0);
+    assert_eq!(answer, (at_hand(turned_place(6.0, 0), 5.0), 3));
+    let grown = |read| turned_place(4.0, usize::from(read > 1));
+    let answer = in_turn(&grown, 5.0);
+    assert_eq!(answer, (at_hand(turned_place(4.0, 1), 5.0), 3));
+    // Places whose instances stand at other places are each read once more
+    // at most: the first for its whole document.
+    let (added, reads) = in_turn(&|_| turned_place(4.0, 1), 4.0);
+    assert_eq!(added, at_hand(turned_place(4.0, 1), 4.0));
+    assert_eq!((added["removed"].as_u64(), reads), (Some(1), 2));
 }

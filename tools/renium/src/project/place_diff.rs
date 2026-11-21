@@ -34,8 +34,8 @@ use crate::snapshot::refs::{remap_record_reference_ids, stabilize_record_referen
 const UNIFIED_LIGHTING_MARKER: &str = "RBX_LightingTechnologyUnifiedMigration";
 const ENGINE_INTERNAL_SERVICES: [&str; 2] = ["ConfigureServerService", "FilteredSelection"];
 
-/// The rows a whole document reads of a DOM a turn at a time. A test reads
-/// few, so that its places take several turns.
+/// The rows a comparison reads of a DOM a turn at a time. A test reads few,
+/// so that its places take several turns.
 const WHOLE_ROWS_AT_ONCE: usize = if cfg!(test) {
     16
 } else {
@@ -368,6 +368,18 @@ impl DomRows<'_> {
             version: SETTINGS_BINARY_VERSION,
             instances: self.plan.refs.iter().enumerate().map(bare).collect(),
         }
+    }
+
+    /// Whether the instances stand as those of `document` do: `structure`
+    /// would hold the same names, classes and parents.
+    fn stand_as(&self, document: &SettingsBytecode) -> bool {
+        self.plan.refs.len() == document.instances.len()
+            && (self.plan.refs.iter().zip(&document.instances)).all(|(id, instance)| {
+                let node = self.dom.get_by_ref(*id).unwrap();
+                node.name == instance.name
+                    && node.class.as_str() == instance.class_name
+                    && self.plan.indices.get(&node.parent()).copied() == instance.parent_index
+            })
     }
 
     /// `RowReader::walk_turns` of `structure`: each row of a turn holds the
@@ -1155,31 +1167,97 @@ impl ComparedDom for WeakDom {
     }
 }
 
-/// The comparison of two DOMs, by their rows where it can be
-/// (`compare_by_rows`) and else of their whole documents.
+/// The comparison of two places, each read when it is asked for, so that the
+/// DOM of one never stands beside the DOM of the other. By their rows where
+/// it can be (`compare_by_rows`): the first is read for a digest of each row
+/// and let go, the second read beside those, and the first read once more for
+/// the rows that differ. Else by their whole documents, each made of its DOM
+/// in turn. Without `services`, each place gives those it holds.
 pub(super) fn compare(
-    before: impl ComparedDom,
-    after: impl ComparedDom,
-    services: &BTreeSet<String>,
+    before: &mut dyn FnMut() -> Result<WeakDom>,
+    after: &mut dyn FnMut() -> Result<WeakDom>,
+    services: Option<&BTreeSet<String>>,
     args: &ComparePlaceArgs,
 ) -> Result<Value> {
-    // A comparison by rows that fails leaves the error, as every other
-    // answer, to the whole documents.
-    if let Ok(Some(result)) = compare_by_rows(before.borrow(), after.borrow(), services, args) {
-        return Ok(result);
+    let started = Instant::now();
+    let keep = &args.props;
+    let scope = |dom: &WeakDom| match services {
+        Some(services) => services.clone(),
+        None => (dom.root().children().iter())
+            .filter_map(|id| Some(dom.get_by_ref(*id)?.name.clone()))
+            .filter(|name| !is_engine_internal_service(name))
+            .collect(),
+    };
+    let first = before()?;
+    let of_first = scope(&first);
+    let digested = digest_rows(&first, &of_first, keep);
+    drop(first);
+    let mut second = after()?;
+    // Rows of the first place that do not convert are its whole document's
+    // error as well.
+    let digested = digested?;
+    let of_second = scope(&second);
+    let all = &of_first.union(&of_second).cloned().collect::<BTreeSet<_>>();
+    // A comparison by rows that fails from here on leaves the error, as
+    // every other answer, to the whole documents.
+    let second = match pair_rows(digested, &mut second, &of_second, keep) {
+        Ok(Some(mut paired)) => {
+            drop(second);
+            let by_rows = (|| -> Result<Option<Value>> {
+                if !fill_rows(&mut paired, before, &of_first, keep)? {
+                    return Ok(None);
+                }
+                rows_report(paired, started, all, args)
+            })();
+            if let Ok(Some(result)) = by_rows {
+                return Ok(result);
+            }
+            after()?
+        }
+        // Rows that stand at other places left the second DOM as it was read.
+        Ok(None) => second,
+        Err(_) => {
+            drop(second);
+            after()?
+        }
+    };
+    let (after, mut engine_managed) = compared_document(second, "after", all, keep)?;
+    let (before, omitted) = compared_document(before()?, "before", all, keep)?;
+    for (name, count) in omitted {
+        *engine_managed.entry(name).or_default() += count;
     }
-    compare_whole(before, after, services, args)
+    compare_documents([before, after], engine_managed, started, all, args)
 }
 
-/// The records at `at` of a DOM's rows as a comparison holds them before
-/// their references are stabilized, without the values the engine manages
-/// but those `keep` names, which are counted.
-fn compared_records(
-    rows: &DomRows<'_>,
-    at: &[usize],
-    keep: &[String],
-) -> Result<(Vec<SettingsBytecodeInstance>, BTreeMap<String, usize>)> {
-    records(rows.dom, &rows.plan, at, Some(keep))
+/// The DOM a comparison was given or lent.
+fn lent(dom: &impl ComparedDom) -> &WeakDom {
+    dom.borrow()
+}
+
+/// The rows of a DOM as a comparison by rows reads them, with its instances
+/// without their values and the id of each. Every row is read and few are
+/// kept: a payload held once would stay held for the process.
+fn compared_rows(
+    dom: &WeakDom,
+    prefix: &'static str,
+    services: &BTreeSet<String>,
+) -> Result<(SettingsBytecode, Vec<String>, RowPlan)> {
+    let mut rows = dom_rows(dom, prefix, Some(services), true)?;
+    rows.plan.holds_payloads = false;
+    let document = rows.structure();
+    let ids = (document.instances.iter())
+        .map(|instance| instance.settings_id.clone())
+        .collect();
+    Ok((document, ids, rows.plan))
+}
+
+/// Whether two documents hold the same instances at the same places.
+fn same_places(left: &SettingsBytecode, right: &SettingsBytecode) -> bool {
+    left.instances.len() == right.instances.len()
+        && (left.instances.iter().zip(&right.instances)).all(|(left, right)| {
+            (&left.name, &left.class_name, left.parent_index)
+                == (&right.name, &right.class_name, right.parent_index)
+        })
 }
 
 /// The whole document of a DOM as a comparison holds it, without the values
@@ -1266,55 +1344,201 @@ fn rows_under_twins(document: &SettingsBytecode, whole: &[bool]) -> Vec<usize> {
 /// the whole documents have to say: the instances stand at other places, the
 /// places do not tell them (`align_settings_ids_by_place`), or twins swapped
 /// their contents.
+#[cfg(test)]
 pub(super) fn compare_by_rows(
     before: &WeakDom,
-    after: &WeakDom,
+    mut after: &WeakDom,
     services: &BTreeSet<String>,
     args: &ComparePlaceArgs,
 ) -> Result<Option<Value>> {
     let started = Instant::now();
-    let mut rows = [
-        dom_rows(before, "before", Some(services), true)?,
-        dom_rows(after, "after", Some(services), true)?,
-    ];
-    // Every row is read and few are kept: a payload held once would stay
-    // held for the process.
-    for side in &mut rows {
-        side.plan.holds_payloads = false;
-    }
-    let mut documents = rows.each_ref().map(DomRows::structure);
-    let [reference, observed] = &documents;
-    if reference.instances.len() != observed.instances.len()
-        || (reference.instances.iter().zip(&observed.instances)).any(|(left, right)| {
-            (&left.name, &left.class_name, left.parent_index)
-                != (&right.name, &right.class_name, right.parent_index)
-        })
-    {
+    let rows = digest_rows(before, services, &args.props)?;
+    let Some(mut paired) = pair_rows(rows, &mut after, services, &args.props)? else {
+        return Ok(None);
+    };
+    if !fill_rows(&mut paired, &mut || Ok(before), services, &args.props)? {
         return Ok(None);
     }
-    let ids = documents.each_ref().map(|document| {
-        (document.instances.iter())
-            .map(|instance| instance.settings_id.clone())
-            .collect::<Vec<_>>()
-    });
-    let (engine_managed, members, whole) = read_pairs(&rows, &mut documents, &ids, &args.props)?;
-    let twins = (rows_under_twins(&documents[1], &whole).into_iter())
+    rows_report(paired, started, services, args)
+}
+
+/// What a comparison by rows keeps of the first of two DOMs once it lets go
+/// of it: its instances, without values but for its services, a digest of
+/// what each row holds (`record_digest`), the members its classes carry and
+/// the values the engine manages, counted.
+struct RowsDigested {
+    document: SettingsBytecode,
+    ids: Vec<String>,
+    digests: Vec<[u8; 32]>,
+    members: HashMap<String, ClassMembers>,
+    engine_managed: BTreeMap<String, usize>,
+}
+
+/// The documents of two DOMs that hold the same instances at the same
+/// places, the second read: it holds whole its services, the rows whose
+/// values differ and the twins beside those. The first owes the rows `owed`
+/// names, of which `digests` tells what its DOM held.
+struct RowsPaired {
+    documents: [SettingsBytecode; 2],
+    ids: [Vec<String>; 2],
+    digests: Vec<[u8; 32]>,
+    members: [HashMap<String, ClassMembers>; 2],
+    engine_managed: BTreeMap<String, usize>,
+    owed: Vec<usize>,
+}
+
+/// Reads the rows of the first DOM a turn at a time for what the comparison
+/// keeps of them.
+fn digest_rows(
+    before: &WeakDom,
+    services: &BTreeSet<String>,
+    keep: &[String],
+) -> Result<RowsDigested> {
+    let (mut document, ids, plan) = compared_rows(before, "before", services)?;
+    let mut digests = Vec::with_capacity(ids.len());
+    let mut members = HashMap::new();
+    let mut engine_managed = BTreeMap::new();
+    let every = (0..ids.len()).collect::<Vec<_>>();
+    for turn in every.chunks(WHOLE_ROWS_AT_ONCE) {
+        let (read, omitted) = records(before, &plan, turn, Some(keep))?;
+        for (name, count) in omitted {
+            *engine_managed.entry(name).or_default() += count;
+        }
+        add_class_members(&mut members, &read);
+        let read_digests = (read.par_iter().map(record_digest)).collect::<Result<Vec<_>>>()?;
+        digests.extend(read_digests);
+        for (row, record) in turn.iter().zip(read) {
+            if record.parent_index.is_none() {
+                put_record(&mut document, &ids, *row, record);
+            }
+        }
+    }
+    Ok(RowsDigested {
+        document,
+        ids,
+        digests,
+        members,
+        engine_managed,
+    })
+}
+
+/// Reads the rows of the second DOM a turn at a time beside what the first
+/// left. A row of a service, or whose records differ, is put whole in its
+/// document and given up by a DOM given whole; any other is left without
+/// values, but the twins read at the end. `None`, before any row is read,
+/// where the instances stand at other places.
+fn pair_rows(
+    first: RowsDigested,
+    after: &mut impl ComparedDom,
+    services: &BTreeSet<String>,
+    keep: &[String],
+) -> Result<Option<RowsPaired>> {
+    let (mut document, ids, plan) = compared_rows(lent(after), "after", services)?;
+    if !same_places(&first.document, &document) {
+        return Ok(None);
+    }
+    let mut engine_managed = first.engine_managed;
+    let mut members = HashMap::new();
+    let mut whole = vec![false; ids.len()];
+    let every = (0..ids.len()).collect::<Vec<_>>();
+    for turn in every.chunks(WHOLE_ROWS_AT_ONCE) {
+        let (read, omitted) = records(lent(after), &plan, turn, Some(keep))?;
+        for (name, count) in omitted {
+            *engine_managed.entry(name).or_default() += count;
+        }
+        add_class_members(&mut members, &read);
+        let digests = (read.par_iter().map(record_digest)).collect::<Result<Vec<_>>>()?;
+        let mut put = Vec::new();
+        for ((row, record), digest) in turn.iter().zip(read).zip(digests) {
+            if digest != first.digests[*row] || record.parent_index.is_none() {
+                whole[*row] = true;
+                put_record(&mut document, &ids, *row, record);
+                put.push(plan.refs[*row]);
+            }
+        }
+        after.release(&put);
+    }
+    let twins = (rows_under_twins(&document, &whole).into_iter())
         .filter(|row| !whole[*row])
         .collect::<Vec<_>>();
-    let [left, right] = (rows.each_ref()).map(|side| compared_records(side, &twins, &args.props));
-    for ((row, left), right) in twins.iter().zip(left?.0).zip(right?.0) {
-        put_records(&mut documents, &ids, *row, [left, right]);
+    let (read, _) = records(lent(after), &plan, &twins, Some(keep))?;
+    for (row, record) in twins.iter().zip(read) {
+        put_record(&mut document, &ids, *row, record);
     }
-    let [mut before, mut after] = documents;
-    let database = rbx_reflection_database::get()?;
-    let one_sided = omit_one_sided_members(&mut before, &mut after, &members, database);
+    let mut owed = (0..ids.len())
+        .filter(|row| whole[*row] && first.document.instances[*row].parent_index.is_some())
+        .chain(twins)
+        .collect::<Vec<_>>();
+    owed.sort_unstable();
     log_global(
         4,
         format_args!(
-            "[renium] place comparison rows: {:.1}ms, {} of {} whole",
-            started.elapsed().as_secs_f64() * 1000.0,
-            whole.iter().filter(|whole| **whole).count() + twins.len(),
+            "[renium] place comparison rows: {} of {} differ or stand beside twins",
+            owed.len(),
             whole.len()
+        ),
+    );
+    Ok(Some(RowsPaired {
+        documents: [first.document, document],
+        ids: [first.ids, ids],
+        digests: first.digests,
+        members: [first.members, members],
+        engine_managed,
+        owed,
+    }))
+}
+
+/// Puts in the first document the rows it owes, of its DOM read once more
+/// where it owes any. False where that DOM no longer holds what it held: a
+/// place file written between the two reads.
+fn fill_rows<D: ComparedDom>(
+    paired: &mut RowsPaired,
+    before: &mut dyn FnMut() -> Result<D>,
+    services: &BTreeSet<String>,
+    keep: &[String],
+) -> Result<bool> {
+    if paired.owed.is_empty() {
+        return Ok(true);
+    }
+    let mut before = before()?;
+    let mut rows = dom_rows(lent(&before), "before", Some(services), true)?;
+    rows.plan.holds_payloads = false;
+    if !rows.stand_as(&paired.documents[0]) {
+        return Ok(false);
+    }
+    let plan = rows.plan;
+    for turn in paired.owed.chunks(WHOLE_ROWS_AT_ONCE) {
+        let (read, _) = records(lent(&before), &plan, turn, Some(keep))?;
+        let held = (read.par_iter().zip(turn))
+            .map(|(record, row)| Ok(record_digest(record)? == paired.digests[*row]))
+            .collect::<Result<Vec<_>>>()?;
+        if held.contains(&false) {
+            return Ok(false);
+        }
+        for (row, record) in turn.iter().zip(read) {
+            put_record(&mut paired.documents[0], &paired.ids[0], *row, record);
+        }
+        before.release(&turn.iter().map(|row| plan.refs[*row]).collect::<Vec<_>>());
+    }
+    Ok(true)
+}
+
+/// The answer of two documents `pair_rows` and `fill_rows` made, or `None`
+/// where the whole documents have to say.
+fn rows_report(
+    paired: RowsPaired,
+    started: Instant,
+    services: &BTreeSet<String>,
+    args: &ComparePlaceArgs,
+) -> Result<Option<Value>> {
+    let [mut before, mut after] = paired.documents;
+    let database = rbx_reflection_database::get()?;
+    let one_sided = omit_one_sided_members(&mut before, &mut after, &paired.members, database);
+    log_global(
+        4,
+        format_args!(
+            "[renium] place comparison rows: {:.1}ms",
+            started.elapsed().as_secs_f64() * 1000.0
         ),
     );
     if !align_settings_ids_by_place(&before, &mut after)
@@ -1322,77 +1546,27 @@ pub(super) fn compare_by_rows(
     {
         return Ok(None);
     }
-    let set_aside = (engine_managed, one_sided, 0);
+    let set_aside = (paired.engine_managed, one_sided, 0);
     report(before, after, set_aside, services, args).map(Some)
 }
 
-/// What `read_pairs` counts of the rows of two documents: the values the
-/// engine manages, the members of each class each side carries, and the
-/// rows it put whole.
-type PairsRead = (
-    BTreeMap<String, usize>,
-    [HashMap<String, ClassMembers>; 2],
-    Vec<bool>,
-);
-
-/// Reads the rows of two documents whose instances stand at the same places
-/// a turn at a time. A row of a service, or whose records differ, is put
-/// whole in both (`put_records`); any other is left without values.
-fn read_pairs(
-    rows: &[DomRows<'_>; 2],
-    documents: &mut [SettingsBytecode; 2],
-    ids: &[Vec<String>; 2],
-    keep: &[String],
-) -> Result<PairsRead> {
-    let mut engine_managed = BTreeMap::new();
-    let mut members = [HashMap::new(), HashMap::new()];
-    let mut whole = vec![false; ids[0].len()];
-    let every = (0..whole.len()).collect::<Vec<_>>();
-    for turn in every.chunks(super::version_control::VIEW_ROWS_AT_ONCE) {
-        let (left, right) = rayon::join(
-            || compared_records(&rows[0], turn, keep),
-            || compared_records(&rows[1], turn, keep),
-        );
-        let read = [left?, right?].map(|(records, omitted)| {
-            for (name, count) in omitted {
-                *engine_managed.entry(name).or_default() += count;
-            }
-            records
-        });
-        add_class_members(&mut members[0], &read[0]);
-        add_class_members(&mut members[1], &read[1]);
-        let same = (read[0].par_iter().zip(&read[1]))
-            .map(|(left, right)| Ok(record_digest(left)? == record_digest(right)?))
-            .collect::<Result<Vec<_>>>()?;
-        let [left, right] = read;
-        for (((row, left), right), same) in turn.iter().zip(left).zip(right).zip(same) {
-            if !same || documents[0].instances[*row].parent_index.is_none() {
-                whole[*row] = true;
-                put_records(documents, ids, *row, [left, right]);
-            }
-        }
-    }
-    Ok((engine_managed, members, whole))
-}
-
-/// Puts the records of a row in both documents, their references stabilized
-/// under the `ids` of each, as `document` holds them.
-fn put_records(
-    documents: &mut [SettingsBytecode; 2],
-    ids: &[Vec<String>; 2],
+/// Puts a record in its row of a document, its references stabilized under
+/// the document's `ids`, as `document` holds it.
+fn put_record(
+    document: &mut SettingsBytecode,
+    ids: &[String],
     row: usize,
-    records: [SettingsBytecodeInstance; 2],
+    mut record: SettingsBytecodeInstance,
 ) {
-    for ((document, ids), mut record) in documents.iter_mut().zip(ids).zip(records) {
-        stabilize_record_references(&mut record.properties, ids);
-        stabilize_record_references(&mut record.attributes, ids);
-        document.instances[row] = record;
-    }
+    stabilize_record_references(&mut record.properties, ids);
+    stabilize_record_references(&mut record.attributes, ids);
+    document.instances[row] = record;
 }
 
 /// `compare` of the whole documents of two DOMs. A DOM given whole is
 /// released as its document is read, the first before the second is
 /// converted, so the two documents never stand beside both DOMs.
+#[cfg(test)]
 pub(super) fn compare_whole(
     before: impl ComparedDom,
     after: impl ComparedDom,

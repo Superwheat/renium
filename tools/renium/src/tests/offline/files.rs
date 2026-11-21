@@ -1227,6 +1227,36 @@ fn import_place_creates_a_project_and_records_the_build_base() {
 }
 
 #[test]
+fn an_imported_project_matches_its_place_on_the_workspace_pivot() {
+    use rbx_dom_weak::types::{CFrame, Matrix3, Variant, Vector3};
+    let fx = Fixture::new("import-pivot");
+    let saved = fx.root.join("saved.rbxl");
+    let mut dom = sample_place_dom();
+    let workspace = (dom.root().children().iter().copied())
+        .find(|id| dom.get_by_ref(*id).unwrap().class == "Workspace")
+        .unwrap();
+    let pivot = CFrame::new(Vector3::new(1.0, 2.0, 3.0), Matrix3::identity());
+    dom.get_by_ref_mut(workspace).unwrap().properties.insert(
+        "WorldPivotData".into(),
+        Variant::OptionalCFrame(Some(pivot)),
+    );
+    write_place_file(&saved, &dom);
+    let saved_text = saved.to_string_lossy().into_owned();
+    let fresh = fx.path("fresh");
+    fx.text(&["pi", &saved_text, "-r", &fresh]).ok();
+    let project = fx.path("fresh/renium.project.jsonc");
+    let compared = fx
+        .json(&["cmp", &saved_text, "--full", "--project", &project])
+        .ok();
+    assert_eq!(compared["changed"], json!(0), "{compared}");
+    assert_eq!(
+        compared["unsavedServiceProperties"]["WorldPivotData"],
+        json!(2),
+        "the place's and the project's"
+    );
+}
+
+#[test]
 fn import_place_records_the_build_base_and_warns_when_it_changes() {
     let fx = Fixture::new("import-base");
     let saved = fx.root.join("saved.rbxl");

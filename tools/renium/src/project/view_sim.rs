@@ -345,6 +345,34 @@ fn place_comparisons(rng: &mut SimRng, root: &Path, log: &mut Vec<String>) -> Re
     ))?;
     let whole = told(place_diff::compare_whole(&before, &after, &services, &args));
     log.push(format!("{extra:?}, by rows: {}", by_rows.is_some()));
+    // Each place read when asked for answers as the two at hand, whichever
+    // way it takes, and an unchanged place is read once on each side.
+    let second = if edits == 0 {
+        file.clone()
+    } else {
+        let edited = root.join("edited.rbxl");
+        told(RbxPlaceFormat::Binary.write(&edited, &after, after.root().children()))?;
+        edited
+    };
+    let reads = std::cell::Cell::new(0);
+    let turn = |file: &Path| {
+        reads.set(reads.get() + 1);
+        RbxPlaceFormat::Binary.read_for_comparison(file)
+    };
+    let scope = (rng.below(2) == 0).then_some(&services);
+    let in_turn = place_diff::compare(&mut || turn(&file), &mut || turn(&second), scope, &args);
+    if edits == 0 && reads.get() != 2 {
+        return Err("an unchanged place is read more than once on a side".into());
+    }
+    let at_hand = place_diff::compare_whole(&read()?, &told(turn(&second))?, &services, &args);
+    let text = |answer: anyhow::Result<serde_json::Value>| {
+        answer
+            .map(|value| value.to_string())
+            .map_err(|error| format!("{error:#}"))
+    };
+    if text(in_turn) != text(at_hand) {
+        return Err("places read in turn answer otherwise than the two at hand".into());
+    }
     match by_rows {
         Some(result) if whole.as_ref().ok() != Some(&result) => {
             Err("the comparison by rows is not the comparison of the whole documents".into())
@@ -570,13 +598,13 @@ fn managed_comparisons(rng: &mut SimRng, log: &mut Vec<String>) -> Result<(), St
         return Err("the comparison by rows answers otherwise".into());
     }
     let given = place_diff::compare(
-        managed_place(seed, count),
-        after(&mut Vec::new()),
-        &services,
+        &mut || Ok(managed_place(seed, count)),
+        &mut || Ok(after(&mut Vec::new())),
+        Some(&services),
         &args,
     );
     if answer(given) != expected {
-        return Err("DOMs given whole answer otherwise".into());
+        return Err("DOMs given in turn answer otherwise".into());
     }
     Ok(())
 }

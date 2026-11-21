@@ -633,61 +633,84 @@ pub(crate) fn compare_place(mut args: ComparePlaceArgs, project: Option<&Path>) 
     }
     // Full comparison already normalizes exact reflection defaults away.
     // Omit them during decoding instead of allocating then dropping them.
-    let read = |path: &Path| RbxPlaceFormat::from_path(path)?.read_for_comparison(path);
-    let (mut place_dom, mut project_dom, project_path, service_set) =
-        if let Some(against) = &args.against {
-            let (before, target) = rayon::join(|| read(&args.input), || read(against));
-            let before = before?;
-            let target = target?;
-            let services = [&before, &target]
-                .into_iter()
-                .flat_map(|dom| {
-                    dom.root()
-                        .children()
-                        .iter()
-                        .filter_map(|id| dom.get_by_ref(*id).map(|node| node.name.clone()))
-                })
-                .filter(|name| !super::place_diff::is_engine_internal_service(name))
-                .collect::<BTreeSet<_>>();
-            (before, target, against.clone(), services)
-        } else {
-            let before = read(&args.input)?;
-            let loaded = config::load_project(project, None)?;
-            let projection = config::stage_project(&loaded)?;
-            let services = projected_services(projection.root())?;
-            let service_set = services.iter().cloned().collect::<BTreeSet<_>>();
-            let dom = build_rbx_place(projection.root(), services, None, false, false, false)?.dom;
-            (before, dom, loaded.path, service_set)
-        };
-    crate::app::output::log_global(
-        4,
-        format_args!(
-            "[renium] place comparison input decoding: {:.1}ms",
-            started.elapsed().as_secs_f64() * 1000.0
-        ),
-    );
-    let (not_serialized, unsaved_instances, unsaved_service) = if args.against.is_none() {
-        (
-            super::place_diff::project_properties_as_saved(&mut project_dom)?,
-            super::place_diff::omit_unsaved_project_instances(&mut project_dom),
-            super::place_diff::omit_unsaved_service_properties(&mut place_dom)?,
-        )
-    } else {
-        (BTreeMap::new(), 0, BTreeMap::new())
+    let read = |path: &Path| -> Result<RbxWeakDom> {
+        let read = std::time::Instant::now();
+        let dom = RbxPlaceFormat::from_path(path)?.read_for_comparison(path)?;
+        crate::app::output::log_global(
+            4,
+            format_args!(
+                "[renium] place comparison input decoding: {:.1}ms",
+                read.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
+        Ok(dom)
     };
-    let internal = [&place_dom, &project_dom]
-        .into_iter()
-        .filter(|_| args.against.is_some())
-        .flat_map(|dom| {
-            dom.root()
-                .children()
-                .iter()
-                .filter_map(|id| dom.get_by_ref(*id))
-        })
-        .map(|node| node.name.clone())
-        .filter(|name| super::place_diff::is_engine_internal_service(name))
-        .collect::<BTreeSet<_>>();
-    let mut result = super::place_diff::compare(place_dom, project_dom, &service_set, &args)?;
+    // What each place gives up as it is read; a place read twice gives up
+    // the same.
+    let internal = std::cell::RefCell::new(BTreeSet::new());
+    let not_serialized = std::cell::RefCell::new(BTreeMap::new());
+    let unsaved_service = std::cell::RefCell::new(BTreeMap::new());
+    let unsaved_project_service = std::cell::RefCell::new(BTreeMap::new());
+    let unsaved_instances = std::cell::Cell::new(0);
+    let (mut result, project_path) = if let Some(against) = &args.against {
+        let place = |path: &Path| -> Result<RbxWeakDom> {
+            let dom = read(path)?;
+            internal.borrow_mut().extend(
+                (dom.root().children().iter())
+                    .filter_map(|id| Some(dom.get_by_ref(*id)?.name.clone()))
+                    .filter(|name| super::place_diff::is_engine_internal_service(name)),
+            );
+            Ok(dom)
+        };
+        let result = super::place_diff::compare(
+            &mut || place(&args.input),
+            &mut || place(against),
+            None,
+            &args,
+        )?;
+        (result, against.clone())
+    } else {
+        let place = || -> Result<RbxWeakDom> {
+            let mut dom = read(&args.input)?;
+            *unsaved_service.borrow_mut() =
+                super::place_diff::omit_unsaved_service_properties(&mut dom)?;
+            Ok(dom)
+        };
+        // The place is read before the project is looked at: a place that
+        // cannot be read is what the command says first.
+        let mut read_already = Some(place()?);
+        let loaded = config::load_project(project, None)?;
+        let projection = config::stage_project(&loaded)?;
+        let services = projected_services(projection.root())?;
+        let service_set = services.iter().cloned().collect::<BTreeSet<_>>();
+        let result = super::place_diff::compare(
+            &mut || read_already.take().map_or_else(&place, Ok),
+            &mut || -> Result<RbxWeakDom> {
+                let services = services.clone();
+                let mut dom =
+                    build_rbx_place(projection.root(), services, None, false, false, false)?.dom;
+                *not_serialized.borrow_mut() =
+                    super::place_diff::project_properties_as_saved(&mut dom)?;
+                unsaved_instances.set(super::place_diff::omit_unsaved_project_instances(&mut dom));
+                // An imported project carries the pivot the place gave up.
+                *unsaved_project_service.borrow_mut() =
+                    super::place_diff::omit_unsaved_service_properties(&mut dom)?;
+                Ok(dom)
+            },
+            Some(&service_set),
+            &args,
+        )?;
+        (result, loaded.path)
+    };
+    let (internal, not_serialized, mut unsaved_service, unsaved_instances) = (
+        internal.into_inner(),
+        not_serialized.into_inner(),
+        unsaved_service.into_inner(),
+        unsaved_instances.get(),
+    );
+    for (name, count) in unsaved_project_service.into_inner() {
+        *unsaved_service.entry(name).or_default() += count;
+    }
     if !not_serialized.is_empty() {
         result["notSerializedProjectProperties"] = json!(not_serialized);
     }
