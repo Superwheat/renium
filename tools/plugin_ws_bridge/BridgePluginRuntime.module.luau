@@ -808,6 +808,17 @@ function BridgePluginRuntime.start(context)
 			or not instance:IsA("Player") and not instance:FindFirstAncestorWhichIsA("Player")
 	end
 	Config.includeExportInstance = includeExportInstance
+	-- includeExportInstance for every instance under a service at once, where
+	-- none of them can be a session lock or a player.
+	Config.exportInclusionUnder = function(serviceName: string, service: Instance): ((Instance, string) -> boolean)?
+		if serviceName == "Players" or sessionLock.holdsLock(service) then
+			return nil
+		end
+		return function(_instance: Instance, className: string): boolean
+			return NEVER_SERIALIZED_CLASSES[className] ~= true
+		end
+	end
+	Config.profileStep = ConnectionModule.profileStep
 	local nativeStructureGenerationByService: { [string]: number } = {}
 	local nativeContentGenerationByService: { [string]: number } = {}
 	local nativeArchivableGenerationByService: { [string]: number } = {}

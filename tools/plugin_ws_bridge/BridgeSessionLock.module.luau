@@ -186,6 +186,11 @@ function BridgeSessionLock.create(runtimeId: string, ownershipLost: () -> (), us
 		return false
 	end
 
+	-- A lock and everything inside one lie under an instance of the lock's name.
+	function api.holdsLock(root: Instance): boolean
+		return root:FindFirstChild(LOCK_NAME, true) ~= nil
+	end
+
 	local ownershipCheckPending = false
 	local function verifyOwnership()
 		if not active or ownershipCheckPending then

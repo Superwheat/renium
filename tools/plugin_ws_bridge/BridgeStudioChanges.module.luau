@@ -3591,7 +3591,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
-	local function connectInstance(instance: Instance, serviceName: string, primeCurrentValues: boolean?, nativeInsertion: boolean?, serializedInsertion: boolean?)
+	-- `bulk` holds what is the same for every instance of one service: which
+	-- of them a capture leaves out, which bear tags, which classes are constraints.
+	local function connectInstance(instance: Instance, serviceName: string, primeCurrentValues: boolean?, nativeInsertion: boolean?, serializedInsertion: boolean?, bulk: any?)
 		local connectedServiceName = state.connectionServiceByInstance[instance]
 		if state.instanceConnections[instance] ~= nil then
 			if connectedServiceName == serviceName then
@@ -3599,8 +3601,22 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			end
 			disconnectInstance(instance, connectedServiceName)
 		end
-		if not nativeInsertion and shouldIgnoreInstance(instance, serviceName) then
-			return
+		local constraint
+		if bulk ~= nil then
+			local className = instance.ClassName
+			if instance == bulk.camera or not bulk.included(instance, className) then
+				return
+			end
+			constraint = bulk.constraints[className]
+			if constraint == nil then
+				constraint = instance:IsA("Constraint")
+				bulk.constraints[className] = constraint
+			end
+		else
+			if not nativeInsertion and shouldIgnoreInstance(instance, serviceName) then
+				return
+			end
+			constraint = instance:IsA("Constraint")
 		end
 		local nativeAttributes = nativeAttributeRelay ~= nil and nativeAttributeRelay.ready
 			and nativeAttributeRelay.services[serviceName] == true
@@ -3608,7 +3624,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local journal = state.changeJournal
 		-- Existing constraints can notify as well when package contents are
 		-- staged. Their first unchanged notification needs a baseline too.
-		if instance:IsA("Constraint") then
+		if constraint then
 			primeCurrentProperties(instance)
 		end
 		if nativeInsertion or serializedInsertion then
@@ -3630,7 +3646,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			state.connectedInstanceCount += 1
 			return
 		end
-		local tags = tagFingerprint(instance)
+		local tags = if bulk ~= nil and bulk.tagged[instance] == nil then "" else tagFingerprint(instance)
 		state.tagFingerprintByInstance[instance] = if tags == "" then nil else tags
 
 		if primeCurrentValues or state.expectedFreshInstances[instance] then
@@ -3719,10 +3735,28 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	end
 
 	local function connectExistingDescendants(descendants: { Instance }, serviceName: string)
+		local started = os.clock()
+		local bulk = nil
+		local service = state.serviceRoots[serviceName]
+		local included = if type(config.exportInclusionUnder) == "function" and service ~= nil
+			then config.exportInclusionUnder(serviceName, service)
+			else nil
+		if included ~= nil then
+			local tagged = {}
+			for _, tag in ipairs(CollectionService:GetAllTags()) do
+				for _, instance in ipairs(CollectionService:GetTagged(tag)) do
+					tagged[instance] = true
+				end
+			end
+			bulk = { included = included, camera = Workspace.CurrentCamera, tagged = tagged, constraints = {} }
+		end
 		for _, descendant in ipairs(descendants) do
 			if not state.onlyCodeMode or hasLuaSourceDescendant(descendant) then
-				connectInstance(descendant, serviceName)
+				connectInstance(descendant, serviceName, nil, nil, nil, bulk)
 			end
+		end
+		if type(config.profileStep) == "function" then
+			config.profileStep(`tracking: {serviceName} observers`, started, { instances = #descendants })
 		end
 	end
 
@@ -4753,8 +4787,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			if type(trackingGuardId) == "string" and trackingGuardId ~= "" then
 				acquireTrackingGuard(trackingGuardId)
 			else
+				local started = os.clock()
 				promoteNativeAttributeConnections()
 				state.persistentTracking = true
+				if type(config.profileStep) == "function" then
+					config.profileStep("tracking: attribute observers", started)
+				end
 			end
 			if params.replaceServices == true or params.reset == true then
 				local requested = {}

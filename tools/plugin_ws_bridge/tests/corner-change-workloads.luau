@@ -2965,3 +2965,69 @@ do
 	for key, value in pairs(savedCollection) do collection[key] = value end
 	testGame.ItemChanged = savedItemChanged
 end
+
+do
+	local collection = services.CollectionService
+	local savedCollection = table.clone(collection)
+	local savedItemChanged = testGame.ItemChanged
+	testGame.ItemChanged = signal()
+	local holder = instance("Folder", "BulkHolder", storage)
+	local plain = instance("Part", "BulkPlain", holder)
+	local tagged = instance("Part", "BulkTagged", holder)
+	local left = instance("Status", "BulkLeftOut", holder)
+	local hinge = instance("HingeConstraint", "BulkHinge", holder)
+	plain.Anchored = true
+	hinge.Enabled = true
+	local tagReads = 0
+	collection.GetTags = function(_, target)
+		tagReads += 1
+		return if target == tagged then { "Zeta", "Alpha" } else {}
+	end
+	collection.GetAllTags = function() return { "Alpha", "Zeta" } end
+	collection.GetTagged = function() return { tagged } end
+	local function observed(inclusion)
+		local config = table.clone(trackerConfig)
+		config.includeExportInstance = function(_, target) return target.ClassName ~= "Status" end
+		config.exportInclusionUnder = inclusion
+		local observer = trackerModule.create(config, { ReplicatedStorage = true })
+		observer.configurePropertyCandidates({ Part = { "Anchored" }, HingeConstraint = { "Enabled" } })
+		tagReads = 0
+		observer.getState({ services = { "ReplicatedStorage" }, reset = true })
+		local state = observer.reviewState
+		local seen = {
+			reads = tagReads,
+			plain = state.connectionServiceByInstance[plain],
+			left = state.connectionServiceByInstance[left],
+			hinge = state.connectionServiceByInstance[hinge],
+			hingePrimed = state.propertyBaselineByInstance[hinge] ~= nil,
+			plainPrimed = state.propertyBaselineByInstance[plain] ~= nil,
+			tags = state.tagFingerprintByInstance[tagged],
+			plainTags = state.tagFingerprintByInstance[plain],
+			count = state.connectedInstanceCount,
+		}
+		observer.stop()
+		return seen
+	end
+	local each = observed(nil)
+	local unknown = observed(function() return nil end)
+	local bulk = observed(function(serviceName, service)
+		assert(serviceName == "ReplicatedStorage" and service == storage, "inclusion is asked for the watched service")
+		return function(_, className) return className ~= "Status" end
+	end)
+	assert(each.plain == "ReplicatedStorage" and each.left == nil and each.hinge == "ReplicatedStorage"
+		and each.tags == "Alpha\0Zeta" and each.plainTags == nil and each.count > 3
+		and each.hingePrimed and not each.plainPrimed, "instance by instance tracking start")
+	for name, value in each do
+		if name ~= "reads" then
+			assert(unknown[name] == value, `a service that may hold a lock tracks {name} instance by instance`)
+			assert(bulk[name] == value, `tracking a service at once differs in {name}`)
+		end
+	end
+	assert(unknown.reads == each.reads, "a service that may hold a lock reads every instance's tags")
+	assert(bulk.reads < each.reads and bulk.reads <= 2, `tracking a service at once read tags {bulk.reads} times`)
+	remove(holder)
+	table.clear(collection)
+	for key, value in pairs(savedCollection) do collection[key] = value end
+	testGame.ItemChanged = savedItemChanged
+end
+print("Tracking start: a service tracked at once holds what instance by instance tracking holds, reading tags of tagged instances alone")
