@@ -349,6 +349,16 @@ pub(crate) fn secret(name: Option<&str>) -> Result<Option<(String, String)>> {
     secret_in(&store_path()?, name)
 }
 
+/// Whether the store names a default key, or cannot be read to say: either
+/// way a request without a key of its own was meant to go with a stored one.
+pub(crate) fn default_stored_in(path: &Path) -> bool {
+    read_store(path).map_or(true, |store| store.default.is_some())
+}
+
+pub(crate) fn default_stored() -> bool {
+    store_path().map_or(true, |path| default_stored_in(&path))
+}
+
 /// Reads one line from stdin without echoing it on a terminal, so the key
 /// never appears in a command line, a shell history or a transcript.
 pub(crate) fn read_secret_from_stdin() -> Result<String> {

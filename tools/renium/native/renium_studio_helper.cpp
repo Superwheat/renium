@@ -1538,7 +1538,7 @@ static void ReadPropertyCore(PropertyReadTask* task)
                 p.input, p.inputSize, [](std::uintptr_t address, void* output, std::size_t size) {
                     SIZE_T copied = 0;
                     return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), output, size, &copied) && copied == size;
-                });
+                }, std::move(task->extraInput));
             p.status = 4;
             return;
         }
@@ -1799,15 +1799,17 @@ static bool ValidPropertyRead(const PropertyReadParams* params, bool& flag)
         && function.firstSize == sizeof("RemovePackageModificationPopupDialog") - 1
         && params->inputSize >= sizeof(function) + function.firstSize
         && !std::memcmp(params->input + sizeof(function), "RemovePackageModificationPopupDialog", function.firstSize)));
+    // A post is a call on the DataModel itself and carries its body beside it.
+    const bool posts = function.mode == 5;
     if (!params || !params->taskContext || !params->submitTask || !params->target ||
         !params->owner || !params->dataModelOwner || !params->descriptor || !params->getter ||
         !params->classDescriptor || !params->descriptorVtable || params->classOffset > 0x100 ||
         !params->identityBinding || !params->identityGetter || (params->operation > 3 && params->operation != 6 && params->operation != 7 && params->operation != 8 && params->operation != 9 && params->operation != 10) ||
         (params->operation == 2 && !params->setter) || params->inputSize > sizeof(params->input) ||
         params->extraInputSize > 128 * 1024 * 1024 ||
-        (params->operation == 7 ? (!params->extraInput || !params->extraInputSize) : params->extraInputSize != 0) ||
+        (params->operation == 7 || posts ? (!params->extraInput || !params->extraInputSize) : params->extraInputSize != 0) ||
         params->parentOffset > 0x200 || params->selfOffset > 0x80 || params->ancestorCount < 1 || params->ancestorCount > 65 ||
-        (params->ancestorCount == 1 && (!flag || params->owner != params->dataModelOwner))
+        (params->ancestorCount == 1 && ((!flag && !posts) || params->owner != params->dataModelOwner))
         || (params->operation == 10 && params->ancestorCount != 1) ||
         params->ancestors[0] != params->target ||
         !params->timeoutMs || params->timeoutMs > (params->operation == 9 ? 30000 : 3000))
@@ -1837,7 +1839,7 @@ static DWORD RunPropertyRead(PropertyReadParams* params, std::size_t count = 1)
     auto task = std::make_shared<PropertyReadTask>();
     renium_functions::Input function{};
     if (params->operation == 9) std::memcpy(&function, params->input, sizeof(function));
-    if (function.mode == 1 || function.mode == 2) {
+    if (renium_functions::Yields(function.mode)) {
         const auto entry = params->submitTask, context = params->taskContext;
         task->retirement = std::make_unique<renium_functions::MainThreadRelease>([entry, context](std::function<void()>* work) {
             return SubmitRetirement(entry, reinterpret_cast<void*>(context), work);
@@ -1851,7 +1853,7 @@ static DWORD RunPropertyRead(PropertyReadParams* params, std::size_t count = 1)
     if (task->retirement) task->modelPin = modelHold;
     task->result = *params;
     if (count > 1) task->batch.assign(params, params + count);
-    if (params->operation == 7) task->extraInput.assign(reinterpret_cast<const char*>(params->extraInput), static_cast<std::size_t>(params->extraInputSize));
+    if (params->operation == 7 || function.mode == 5) task->extraInput.assign(reinterpret_cast<const char*>(params->extraInput), static_cast<std::size_t>(params->extraInputSize));
     task->deadline = GetTickCount64() + params->timeoutMs;
     if (!task->completed) return 0xE406;
     // Keep the DataModel alive through submission/wait, but do not put a strong

@@ -10,6 +10,7 @@ use serde_json::{Map, Value, json};
 use crate::app::output::ensure_plugin_api_ok;
 use crate::automation::Failure;
 use crate::cloud::{API_ROOT, CloudAuth, agent, read_response};
+use crate::studio::automation::studio_login::StudioLogin;
 use crate::studio::bridge::{BridgeServer, BridgeTarget};
 
 const MAX_UPLOAD_BYTES: u64 = 20 * 1024 * 1024;
@@ -57,8 +58,7 @@ struct ImageUpload {
     oauth_env: Option<String>,
     #[serde(default = "default_upload_wait")]
     wait_seconds: f64,
-    #[serde(rename = "via")]
-    _via: Option<String>,
+    via: Option<String>,
 }
 
 fn default_store_scope() -> String {
@@ -443,12 +443,139 @@ fn operation_path(body: &Value) -> Option<&str> {
         .filter(|path| path.starts_with("operations/"))
 }
 
-fn wait_for_upload(path: &str, auth: &CloudAuth, wait_seconds: f64) -> Result<Value, Failure> {
+/// How an upload reaches Roblox: with an Open Cloud credential, or without
+/// one under the login of the connected Studio.
+enum UploadRoute<'a> {
+    OpenCloud(CloudAuth),
+    Login(StudioLogin<'a>),
+}
+
+/// Whether a request that names no credential may go under the Studio login:
+/// it asked for neither Open Cloud nor a key or token of its own, and no
+/// default key is stored (`default_stored`), which it would have gone with.
+fn login_allowed(request: &ImageUpload, default_stored: bool) -> bool {
+    request.via.as_deref() != Some("open-cloud")
+        && request.oauth_env.is_none()
+        && request.key_env == crate::cloud::transport::DEFAULT_KEY_ENV
+        && crate::cloud::keys::selected().is_none()
+        && !default_stored
+}
+
+impl<'a> UploadRoute<'a> {
+    fn choose(request: &ImageUpload, bridge: Option<&'a BridgeServer>) -> Result<Self, Failure> {
+        let login = |reason: &str| {
+            let refused = |error: String| {
+                let text = format!("{reason} the upload goes under the Studio login: {error}");
+                failure("cloud_auth", text, false, "image-upload")
+            };
+            let bridge = bridge.ok_or_else(|| refused("no Studio is connected".into()))?;
+            StudioLogin::connect(bridge)
+                .map(Self::Login)
+                .map_err(|error| refused(format!("{error:#}")))
+        };
+        if request.via.as_deref() == Some("login") {
+            return login("As asked,");
+        }
+        match CloudAuth::from_env(
+            false,
+            &request.key_env,
+            request.oauth_env.as_deref(),
+            "image-upload",
+        ) {
+            Ok(auth) => Ok(Self::OpenCloud(auth)),
+            Err(missing)
+                if bridge.is_some()
+                    && login_allowed(request, crate::cloud::keys::default_stored()) =>
+            {
+                login(&format!("{}; without a key", missing.0.m))
+            }
+            Err(missing) => Err(missing),
+        }
+    }
+
+    /// Sends one multipart upload and returns what Roblox answered.
+    fn create(&self, boundary: &str, body: &[u8]) -> Result<Value, Failure> {
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        match self {
+            Self::OpenCloud(auth) => checked_response(
+                auth.apply(agent().post(&format!("{API_ROOT}/assets/v1/assets")))
+                    .set("Content-Type", &content_type)
+                    .send_bytes(body),
+                "image-upload",
+            ),
+            Self::Login(login) => login_answer(login.post(
+                &format!("{API_ROOT}/assets/user-auth/v1/assets"),
+                &content_type,
+                body,
+            )),
+        }
+    }
+
+    /// Reads the upload operation `id`.
+    fn operation(&self, id: &str) -> Result<Value, Failure> {
+        match self {
+            Self::OpenCloud(auth) => checked_response(
+                auth.apply(agent().get(&format!("{API_ROOT}/assets/v1/operations/{id}")))
+                    .call(),
+                "image-upload",
+            ),
+            Self::Login(login) => {
+                login_answer(login.get(&format!("{API_ROOT}/assets/user-auth/v1/operations/{id}")))
+            }
+        }
+    }
+
+    /// The wait between two reads of an operation; a read under the Studio
+    /// login is a task on Studio's main thread.
+    fn poll(&self) -> Duration {
+        match self {
+            Self::OpenCloud(_) => Duration::from_millis(200),
+            Self::Login(_) => Duration::from_secs(1),
+        }
+    }
+
+    /// Puts the route, the creator and the credential's name in front of
+    /// what Roblox answered: a refusal such as "User is moderated" names none
+    /// of them.
+    fn refusal(&self, mut refusal: Failure, creator: &str) -> Failure {
+        refusal.0.m = match self {
+            Self::OpenCloud(auth) => format!(
+                "Open Cloud upload for {creator} with {}: {}",
+                auth.name(),
+                refusal.0.m
+            ),
+            Self::Login(_) => format!(
+                "Upload for {creator} under the Studio login: {}",
+                refusal.0.m
+            ),
+        };
+        refusal
+    }
+}
+
+/// The JSON a request under the Studio login was answered with.
+fn login_answer(answer: anyhow::Result<String>) -> Result<Value, Failure> {
+    let text = answer
+        .map_err(|error| failure("cloud_http", format!("{error:#}"), false, "image-upload"))?;
+    serde_json::from_str(&text).map_err(|_| {
+        failure(
+            "cloud_http",
+            format!("Roblox answered with text that is not JSON: {text}"),
+            false,
+            "image-upload",
+        )
+    })
+}
+
+fn wait_for_upload(
+    path: &str,
+    route: &UploadRoute<'_>,
+    wait_seconds: f64,
+) -> Result<Value, Failure> {
     let operation_id = path.trim_start_matches("operations/");
-    let url = format!("{API_ROOT}/assets/v1/operations/{operation_id}");
     let deadline = Instant::now() + Duration::from_secs_f64(wait_seconds.clamp(0.0, 120.0));
     loop {
-        let operation = checked_response(auth.apply(agent().get(&url)).call(), "image-upload")?;
+        let operation = route.operation(operation_id)?;
         if operation.get("done").and_then(Value::as_bool) == Some(true) {
             if let Some(error) = operation.get("error") {
                 return Err(failure(
@@ -463,18 +590,8 @@ fn wait_for_upload(path: &str, auth: &CloudAuth, wait_seconds: f64) -> Result<Va
         if Instant::now() >= deadline {
             return Ok(operation);
         }
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(route.poll());
     }
-}
-
-/// Puts the route, the creator and the credential's name in front of what
-/// Roblox answered: a refusal such as "User is moderated" names none of them.
-fn upload_refusal(mut refusal: Failure, creator: &str, credential: &str) -> Failure {
-    refusal.0.m = format!(
-        "Open Cloud upload for {creator} with {credential}: {}",
-        refusal.0.m
-    );
-    refusal
 }
 
 pub(crate) fn upload(
@@ -482,7 +599,14 @@ pub(crate) fn upload(
     parameters: &Value,
     bridge: Option<&BridgeServer>,
 ) -> Result<Value, Failure> {
-    let request: ImageUpload = serde_json::from_value(parameters.clone()).map_err(|error| {
+    // A request that came through the daemon carries how the command line
+    // reaches Studio.
+    let mut parameters = parameters.clone();
+    if let Some(options) = parameters.as_object_mut() {
+        options.remove("bridgePorts");
+        options.remove("bridgeWaitSeconds");
+    }
+    let request: ImageUpload = serde_json::from_value(parameters).map_err(|error| {
         failure(
             "bad_req",
             format!("Invalid image-upload payload: {error}"),
@@ -529,13 +653,8 @@ pub(crate) fn upload(
             format!("user {user_id}"),
         )
     };
-    let auth = CloudAuth::from_env(
-        false,
-        &request.key_env,
-        request.oauth_env.as_deref(),
-        "image-upload",
-    )?;
-    let refused = |refusal| upload_refusal(refusal, &creator_name, auth.name());
+    let route = UploadRoute::choose(&request, bridge)?;
+    let refused = |refusal| route.refusal(refusal, &creator_name);
     let mut results = Vec::with_capacity(request.images.len());
     for (index, source) in request.images.iter().enumerate() {
         let (bytes, label) = load_image(root, source)?;
@@ -566,18 +685,9 @@ pub(crate) fn upload(
         });
         let filename = format!("image-{}.{}", index + 1, extension);
         let (boundary, body) = multipart_body(&metadata, &filename, mime, &bytes);
-        let created = checked_response(
-            auth.apply(agent().post(&format!("{API_ROOT}/assets/v1/assets")))
-                .set(
-                    "Content-Type",
-                    &format!("multipart/form-data; boundary={boundary}"),
-                )
-                .send_bytes(&body),
-            "image-upload",
-        )
-        .map_err(refused)?;
+        let created = route.create(&boundary, &body).map_err(refused)?;
         let operation = match operation_path(&created) {
-            Some(path) => wait_for_upload(path, &auth, request.wait_seconds).map_err(refused)?,
+            Some(path) => wait_for_upload(path, &route, request.wait_seconds).map_err(refused)?,
             None => created,
         };
         let asset_id = operation
@@ -637,6 +747,88 @@ fn web_images_without_a_creator_or_route_go_through_studio() {
 
 #[cfg(test)]
 #[test]
+fn an_upload_asked_through_the_daemon_is_read_with_its_connection_options() {
+    let asked = json!({ "images": [], "bridgePorts": "1-2", "bridgeWaitSeconds": 5.0 });
+    let refusal = upload(Path::new("."), &asked, None)
+        .err()
+        .map(|refusal| refusal.0.m);
+    assert_eq!(
+        refusal.as_deref(),
+        Some("image-upload requires 1 through 20 images")
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn only_a_request_that_names_no_credential_may_use_the_studio_login() {
+    let request = |options: Value| {
+        let mut request = json!({ "images": ["a.png"] });
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(options.as_object().unwrap().clone());
+        serde_json::from_value::<ImageUpload>(request).unwrap()
+    };
+    assert!(login_allowed(&request(json!({})), false));
+    assert!(login_allowed(
+        &request(json!({ "groupId": 7, "keyEnv": "ROBLOX_API_KEY" })),
+        false
+    ));
+    assert!(
+        !login_allowed(&request(json!({})), true),
+        "a stored default key that could not be read"
+    );
+    for named in [
+        json!({ "via": "open-cloud" }),
+        json!({ "oauthEnv": "TOKEN" }),
+        json!({ "keyEnv": "OTHER_KEY" }),
+    ] {
+        assert!(!login_allowed(&request(named.clone()), false), "{named}");
+    }
+    // With a Studio connection at hand, a request that names its own key
+    // fails on that key; only one that asks for the login reaches for it.
+    let bridge = crate::studio::bridge::routing_tests::fixture();
+    let refused = |options: Value, bridge: Option<&BridgeServer>| {
+        UploadRoute::choose(&request(options), bridge)
+            .err()
+            .map(|refusal| refusal.0.m)
+            .unwrap_or_default()
+    };
+    let own = refused(
+        json!({ "keyEnv": "RENIUM_TEST_NO_SUCH_KEY" }),
+        Some(&bridge),
+    );
+    assert!(own.contains("RENIUM_TEST_NO_SUCH_KEY is not set"), "{own}");
+    assert!(!own.contains("Studio login"), "{own}");
+    let asked = refused(json!({ "via": "login" }), None);
+    assert!(
+        asked.contains("under the Studio login: no Studio is connected"),
+        "{asked}"
+    );
+    let stores = crate::tests::support::temp_dir("upload-keys");
+    let store = stores.join("keys.json");
+    assert!(!crate::cloud::keys::default_stored_in(&store));
+    std::fs::write(&store, "not a store").unwrap();
+    assert!(crate::cloud::keys::default_stored_in(&store));
+    let _ = std::fs::remove_dir_all(stores);
+    let created = login_answer(Ok(r#"{"path":"operations/1"}"#.into())).ok();
+    assert_eq!(created, Some(json!({ "path": "operations/1" })));
+    for answer in [
+        Ok("<html>".to_string()),
+        Err(anyhow::anyhow!("Roblox answered HTTP 400")),
+    ] {
+        assert_eq!(login_answer(answer).unwrap_err().0.c, "cloud_http");
+    }
+}
+
+/// Whether an upload request finds an Open Cloud credential where it runs;
+/// without one it goes to the daemon, for the login of its Studio.
+pub(crate) fn has_credential(key_env: &str, oauth_env: Option<&str>) -> bool {
+    CloudAuth::from_env(false, key_env, oauth_env, "image-upload").is_ok()
+}
+
+#[cfg(test)]
+#[test]
 fn a_refused_upload_names_its_route_creator_and_key() {
     let answer =
         r#"Roblox returned HTTP 403: {"errors":[{"code":0,"message":"User is moderated"}]}"#;
@@ -645,7 +837,9 @@ fn a_refused_upload_names_its_route_creator_and_key() {
         name: "the stored default key studio".to_string(),
     };
     let refusal = failure("cloud_auth", answer, false, "image-upload");
-    let refusal = upload_refusal(refusal, "user 123456", auth.name()).0;
+    let refusal = UploadRoute::OpenCloud(auth)
+        .refusal(refusal, "user 123456")
+        .0;
     assert_eq!(
         refusal.m,
         format!("Open Cloud upload for user 123456 with the stored default key studio: {answer}")

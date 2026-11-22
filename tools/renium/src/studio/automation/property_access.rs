@@ -788,7 +788,7 @@ fn perform_reads(
 // Read the selected engine's declarations and base address; never fall back to
 // the bundled API dump.
 #[cfg(any(windows, target_os = "macos"))]
-fn http_enum_items(bridge: &BridgeServer, scope: &Scope) -> Result<Value> {
+pub(super) fn http_enum_items(bridge: &BridgeServer, scope: &Scope) -> Result<Value> {
     let code = r#"
 local values = {}
 for _, name in {"ThrottlingPriority", "HttpContentType", "HttpRequestType"} do

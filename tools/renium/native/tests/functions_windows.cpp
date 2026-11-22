@@ -96,6 +96,10 @@ static void Post(void* target, std::string url, std::string body, int priority, 
     Check(body == std::string(4096, 'b') && content == 3);
     Get(target, std::move(url), priority, request, success, failure);
 }
+static void Upload(void* target, std::string url, std::string body, std::string type, int request, RawCallback* success, RawCallback* failure) {
+    Check(body == std::string(200000, 'b') && type == "multipart/form-data; boundary=x" && request == 0);
+    Get(target, std::move(url), 1, 2, success, failure);
+}
 static void GuardedPayloads() {
     auto rejected = [](const void* payload) {
         auto result = std::make_shared<renium_functions::Completion>();
@@ -287,20 +291,49 @@ static int YieldCalls() {
     MainThreadRetirement();
     GuardedPayloads();
     UnprovedSites();
-    for (unsigned mode : {1u, 2u}) for (unsigned outcome = 0; outcome < 4; ++outcome) {
-        const std::string url(2048, 'u'), body = mode == 2 ? std::string(4096, 'b') : "";
-        const auto function = mode == 1 ? reinterpret_cast<std::uintptr_t>(&Get) : reinterpret_cast<std::uintptr_t>(&Post);
-        std::uint64_t descriptor[]{123, function, 0};
+    for (unsigned mode : {1u, 2u, 5u}) for (unsigned outcome = 0; outcome < 4; ++outcome) {
+        const std::string url(2048, 'u'), body = mode == 2 ? std::string(4096, 'b') : mode == 5 ? "multipart/form-data; boundary=x" : "";
+        const auto function = mode == 1 ? reinterpret_cast<std::uintptr_t>(&Get)
+            : mode == 2 ? reinterpret_cast<std::uintptr_t>(&Post) : reinterpret_cast<std::uintptr_t>(&Upload);
+        // Beside a post's function stands another field, not an adjustment.
+        std::uint64_t descriptor[]{123, function, mode == 5 ? 77u : 0u};
         renium_functions::Input input{};
         input.descriptor = reinterpret_cast<std::uintptr_t>(descriptor); input.table = 123;
         input.field = 8; input.function = function; input.mode = mode;
         input.enums[0] = 1; input.enums[1] = mode == 1 ? 2 : 3; input.enums[2] = 2;
-        const auto bytes = Request(input, url, body);
         auto owner = std::make_shared<int>(1); std::weak_ptr<int> weak = owner;
-        auto result = renium_functions::Begin(&calls, owner, bytes.data(), bytes.size(), [&](std::uintptr_t at, void* out, std::size_t size) {
-            if (at < input.descriptor || at + size > input.descriptor + sizeof(descriptor)) return false;
+        // A post reaches its receiver from the instance through the live
+        // DataModel reference, sixteen bytes under the instance here.
+        std::uintptr_t live[2]{reinterpret_cast<std::uintptr_t>(&calls), reinterpret_cast<std::uintptr_t>(owner.get())};
+        void* target = &calls;
+        if (mode == 5) {
+            const auto reference = reinterpret_cast<std::uintptr_t>(live);
+            std::memcpy(input.enums, &reference, sizeof(reference)); input.enums[2] = 16;
+            target = reinterpret_cast<char*>(&calls) + 16;
+        }
+        const auto bytes = Request(input, url, body);
+        const auto readable = [&](std::uintptr_t at, void* out, std::size_t size) {
+            const auto within = [&](std::uintptr_t from, std::size_t length) { return at >= from && at + size <= from + length; };
+            if (!within(input.descriptor, sizeof(descriptor)) && !within(reinterpret_cast<std::uintptr_t>(live), sizeof(live))) return false;
             std::memcpy(out, reinterpret_cast<void*>(at), size); return true;
-        });
+        };
+        if (mode == 5 && !outcome) {
+            // No body, a receiver that is not the live DataModel, another owner.
+            for (unsigned wrong = 0; wrong < 3; ++wrong) {
+                auto changed = input;
+                if (wrong == 1) changed.enums[2] = 8;
+                auto other = std::make_shared<int>(2);
+                bool refused = false;
+                try {
+                    const auto request = Request(changed, url, body);
+                    renium_functions::Begin(target, wrong == 2 ? other : owner, request.data(), request.size(), readable,
+                        wrong ? std::string(200000, 'b') : std::string());
+                } catch (const std::runtime_error&) { refused = true; }
+                Check(refused && renium_functions::completions.empty() && !pending[0].tagged);
+            }
+        }
+        auto result = renium_functions::Begin(target, owner, bytes.data(), bytes.size(), readable,
+            mode == 5 ? std::string(200000, 'b') : std::string());
         owner.reset(); Check(!weak.expired()); // Engine copies, not Wait, own the pins.
         if (outcome < 2) {
             std::thread delivery([outcome] { Deliver(pending[outcome], outcome ? "HTTP 403 " + std::string(60000, 'e') : std::string(8192, 'r')); });
@@ -354,7 +387,7 @@ static int YieldCalls() {
     try { renium_functions::RegisterCompletion(std::make_shared<renium_functions::Completion>()); }
     catch (const renium_functions::Failure& error) { limited = error.code == renium_functions::LimitCode && error.sent == 0; }
     Check(limited); full.clear(); Check(renium_functions::completions.empty());
-    Check(calls == 8);
+    Check(calls == 12);
     return 0;
 }
 
@@ -447,7 +480,7 @@ int main(int argc, char** argv) {
     // Refuse even a stale/direct helper request before any engine memory read:
     // a wrong layout, and the right layout with no proved site or a missing one.
     const auto layout = renium_functions::NativeStringContract();
-    for (unsigned mode : {1u, 2u}) for (auto contract : {0u, 2u, layout ^ (1u << 8), layout, layout | 1u << renium_functions::LayoutBits,
+    for (unsigned mode : {1u, 2u, 5u}) for (auto contract : {0u, 2u, layout ^ (1u << 8), layout, layout | 1u << renium_functions::LayoutBits,
             (layout ^ (1u << 8)) | 1u << renium_functions::LayoutBits}) {
         renium_functions::Input input{};
         input.mode = mode;

@@ -309,6 +309,84 @@ fn builder(
         })
 }
 
+// Every path reaching the consumer crosses a qualified producer, or stores a
+// whole empty string itself: the engine passes an empty answer without
+// building one. No call and no other write to the object may follow either.
+fn constructed(
+    analysis: &Flow,
+    entry: u64,
+    consumer: u64,
+    (payload, layout): (i64, Layout),
+    producers: &HashSet<u64>,
+) -> bool {
+    let fields = [
+        (layout.data, 0),
+        (layout.size, 0),
+        (layout.capacity, layout.small),
+    ];
+    let end = payload + layout.capacity.max(layout.size) + 8;
+    let mut pending = vec![(consumer, 0u8)];
+    let mut seen = HashSet::new();
+    while let Some((at, mut stored)) = pending.pop() {
+        if !seen.insert((at, stored)) {
+            continue;
+        }
+        if producers.contains(&at) {
+            // A store over a built string leaves neither kind of string.
+            if stored != 0 {
+                return false;
+            }
+            continue;
+        }
+        let (Some(i), Some(state)) = (analysis.instructions.get(&at), analysis.states.get(&at))
+        else {
+            return false;
+        };
+        if at != consumer {
+            if matches!(
+                i.flow_control(),
+                FlowControl::Call | FlowControl::IndirectCall
+            ) {
+                return false;
+            }
+            if writes_memory(i) {
+                let width = i.memory_size().size() as i64;
+                match state.address(i) {
+                    Some((Storage::Stack, to)) if to + width <= payload || to >= end => {}
+                    Some((Storage::Stack, to)) => {
+                        let Some(field) = fields.iter().position(|(offset, value)| {
+                            to == payload + offset
+                                && i.mnemonic() == Mnemonic::Mov
+                                && width == 8
+                                && state.read(i, 1, 8) == Some(Value::Integer(*value))
+                        }) else {
+                            return false;
+                        };
+                        stored |= 1 << field;
+                    }
+                    _ => return false,
+                }
+            }
+            if stored == 7 {
+                continue;
+            }
+        }
+        if at == entry {
+            return false;
+        }
+        let before = pending.len();
+        for (pc, i) in &analysis.instructions {
+            if analysis.states.contains_key(pc) && next(i).is_some_and(|next| next.contains(&at)) {
+                pending.push((*pc, stored));
+            }
+        }
+        if pending.len() == before {
+            return false;
+        }
+    }
+    true
+}
+
 pub(super) fn payload(
     analysis: &Flow,
     entry: u64,
@@ -347,25 +425,7 @@ pub(super) fn payload(
             producers.insert(*pc);
         }
     }
-    preceded(analysis, entry, consumer_pc, |at| {
-        if producers.contains(&at) {
-            return Some(true);
-        }
-        if at == consumer_pc {
-            return None;
-        }
-        let i = &analysis.instructions[&at];
-        let state = &analysis.states[&at];
-        (matches!(
-            i.flow_control(),
-            FlowControl::Call | FlowControl::IndirectCall
-        ) || writes_memory(i)
-            && state.address(i).is_none_or(|(storage, at)| {
-                storage != Storage::Stack
-                    || at >= payload && at < payload + layout.capacity.max(layout.size) + 8
-            }))
-        .then_some(false)
-    })
-    .then(|| layout.encoded())
-    .flatten()
+    constructed(analysis, entry, consumer_pc, (payload, layout), &producers)
+        .then(|| layout.encoded())
+        .flatten()
 }

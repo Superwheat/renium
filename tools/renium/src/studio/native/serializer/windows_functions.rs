@@ -14,7 +14,7 @@ static BINDINGS: OnceLock<Mutex<HashMap<BindingKey, Binding>>> = OnceLock::new()
 
 #[path = "windows_functions_yield.rs"]
 mod yield_abi;
-pub(in super::super) use yield_abi::ContinuationAbi;
+pub(in super::super) use yield_abi::{ContinuationAbi, Member};
 
 pub(super) fn qualify_yield(
     memory: &ProcessMemory,
@@ -22,13 +22,13 @@ pub(super) fn qualify_yield(
     layout: &PackageLayout,
     table: usize,
     binding: (usize, usize),
-    mode: u32,
+    member: Member,
 ) -> Result<YieldContract> {
     let methods = properties::vtable_methods(memory, studio, layout, table)?;
     let copies = byte_copy_imports(memory, studio)?;
     let mut cache = HashMap::new();
     yield_abi::qualify(
-        mode,
+        member,
         binding.0,
         binding.1 as u64,
         &methods.into_iter().map(|at| at as u64).collect::<Vec<_>>(),
@@ -302,9 +302,17 @@ impl State {
         let Value::Bytes(Storage::Descriptor, field, 8) = self.read(i, 0, 8)? else {
             return None;
         };
-        (field % 8 == 0 && self.register(Register::RCX) == Some(Value::AdjustedInstance(field + 8)))
-            .then(|| usize::try_from(field).ok())
-            .flatten()
+        (field % 8 == 0
+            && (self.register(Register::RCX) == Some(Value::AdjustedInstance(field + 8))
+                || self.unadjusted_receiver()))
+        .then(|| usize::try_from(field).ok())
+        .flatten()
+    }
+    /// Whether the receiver passed is the converted instance itself: the
+    /// descriptor then holds a function that takes it as it is, with no
+    /// adjustment beside it.
+    fn unadjusted_receiver(&self) -> bool {
+        self.complete_receiver && self.register(Register::RCX) == Some(Value::Instance)
     }
     fn passed_origins(&self) -> bool {
         let mut values = Vec::new();
@@ -415,7 +423,10 @@ impl State {
         let value = self.moved_value(i, width);
         if i.op0_kind() == OpKind::Register {
             self.registers.remove(&dst);
-            if let Some(value) = value {
+            // A number moved into the low byte or word leaves the rest of
+            // the register as it was, which is not known here.
+            let partial = i.op0_register().size() < 4 && matches!(value, Some(Value::Integer(_)));
+            if let Some(value) = value.filter(|_| !partial) {
                 self.registers.insert(dst, value);
             }
         } else if let Some((Storage::Stack | Storage::Capture, offset)) = self.address(i) {
@@ -436,6 +447,18 @@ impl State {
     }
 
     fn lea_value(&self, i: &Instruction, width: usize) -> Option<Value> {
+        // A constant built from a known integer, as `lea edx,[rbx+88]`
+        // after `xor ebx,ebx`.
+        if i.memory_index() == Register::None
+            && let Some(Value::Integer(base)) = self.register(i.memory_base())
+        {
+            let sum = base.wrapping_add(i.memory_displacement64());
+            return match width {
+                8 => Some(Value::Integer(sum)),
+                4 => Some(Value::Integer(u64::from(sum as u32))),
+                _ => None,
+            };
+        }
         if width != 8 {
             return None;
         }
@@ -898,8 +921,23 @@ pub(in super::super) fn binding_for_receiver(
         studio,
         layout,
         descriptor,
-        member_field_for(memory, studio, layout, table, false, Some(receiver_offset))?,
+        member_field_for(memory, studio, layout, table, Some(receiver_offset), false)?,
     )
+}
+
+/// The binding of a member the descriptor stores as a function that takes
+/// the converted receiver as it is, with no adjustment beside it.
+pub(in super::super) fn unadjusted_binding(
+    memory: &ProcessMemory,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    (descriptor, table): (usize, usize),
+    receiver_offset: usize,
+) -> Result<(usize, usize)> {
+    let field = member_field_for(memory, studio, layout, table, Some(receiver_offset), true)?;
+    let function = memory.read_u64(descriptor + field)? as usize;
+    verified_code(memory, studio, layout, function, 64)?;
+    Ok((field, function))
 }
 
 pub(in super::super) fn member_field(
@@ -909,21 +947,24 @@ pub(in super::super) fn member_field(
     _descriptor: usize,
     table: usize,
 ) -> Result<usize> {
-    member_field_for(memory, studio, layout, table, false, None)
+    member_field_for(memory, studio, layout, table, None, false)
 }
 
+/// The descriptor field the dispatch of `table` calls. `unadjusted` asks
+/// for a function called with the converted receiver as it is, and refuses
+/// one called with an adjusted receiver; without it the reverse.
 fn member_field_for(
     memory: &ProcessMemory,
     studio: &ModuleEntry,
     layout: &PackageLayout,
     table: usize,
-    lua_callback: bool,
     receiver_offset: Option<usize>,
+    unadjusted: bool,
 ) -> Result<usize> {
     let key = (
         layout.image_stamp,
         table.wrapping_sub(studio.base),
-        lua_callback,
+        unadjusted,
         receiver_offset,
     );
     let cached = BINDINGS
@@ -976,9 +1017,9 @@ fn member_field_for(
                     }
                 }
             },
-            lua_callback,
+            false,
             receiver_offset,
-            &mut |_, _| true,
+            &mut |_, state| state.unadjusted_receiver() == unadjusted,
         );
         if let Some(error) = error {
             let message = format!("Could not verify reflection dispatch: {error:#}");
@@ -1277,6 +1318,53 @@ mod tests {
             code[2] = 0xc0; // test rax,rax cannot prove the null guard is not taken.
             assert_eq!(check(&code, offset as usize), None);
         }
+    }
+
+    #[test]
+    fn a_function_stored_without_an_adjustment_takes_the_converted_receiver() {
+        // mov r10,[rcx+0x78]; test rdx,rdx; lea rcx,[rdx-0x1f0]; jmp r10
+        let mut code = vec![0x4c, 0x8b, 0x51, 0x78, 0x48, 0x85, 0xd2, 0x48, 0x8d, 0x8a];
+        code.extend((-0x1f0i32).to_le_bytes());
+        code.extend([0x41, 0xff, 0xe2]);
+        let bound = |bytes: &[u8], receiver: Option<usize>| {
+            let mut unadjusted = None;
+            let field = dispatch_field_fetch(
+                0,
+                &mut |at, _| (at == 0).then(|| bytes.to_vec()),
+                false,
+                receiver,
+                &mut |_, state| {
+                    unadjusted = Some(state.unadjusted_receiver());
+                    true
+                },
+            );
+            (field, unadjusted)
+        };
+        assert_eq!(bound(&code, Some(0x1f0)), (Some(0x78), Some(true)));
+        assert_eq!(bound(&code, Some(0x1f8)), (None, None), "another receiver");
+        assert_eq!(bound(&code, None), (None, None), "the instance unconverted");
+        // mov r10,[rcx+0x78]; mov rcx,rdx; jmp r10
+        let passed = [0x4c, 0x8b, 0x51, 0x78, 0x48, 0x89, 0xd1, 0x41, 0xff, 0xe2];
+        assert_eq!(
+            bound(&passed, None),
+            (None, None),
+            "an instance no receiver was proved for"
+        );
+        // mov bl,15; mov rax,rbx: the rest of rbx is not known.
+        let mut state = State {
+            registers: HashMap::from([(Register::RBX, Value::Integer(0))]),
+            stack: BTreeMap::new(),
+            lua_callback: false,
+            zero: None,
+            complete_receiver: false,
+        };
+        let low = [0xb3, 0x0f, 0x48, 0x89, 0xd8];
+        for i in Decoder::with_ip(64, &low, 0, DecoderOptions::NONE) {
+            state.step(&i);
+        }
+        assert_eq!(state.register(Register::RAX), None);
+        let adjusted = bound(&scalar(0x78, 0x80), None);
+        assert_eq!(adjusted, (Some(0x78), Some(false)));
     }
 
     #[test]

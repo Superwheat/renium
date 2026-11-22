@@ -22,6 +22,11 @@ struct Failure : std::runtime_error {
 inline std::string TooLargeText(std::size_t size) {
     return "http-response-size: response too large (" + std::to_string(size) + " bytes; limit " + std::to_string(MaxResponse) + " bytes)";
 }
+// Modes: 1 and 2 are the HTTP service's yielding get and post, 3 a string
+// getter, 4 the package flag, 5 DataModel.HttpPostAsync. Mode 5 names the
+// address and the content type as its two strings and takes the body beside
+// the request; `enums` then holds the live DataModel reference (8 bytes) and
+// the receiver offset, and the request type is the engine's default.
 struct Input {
     std::uint64_t descriptor, table;
     std::uint32_t field, mode;
@@ -29,6 +34,7 @@ struct Input {
     std::uint32_t enums[3], firstSize, secondSize, reserved;
 };
 static_assert(sizeof(Input) == 56);
+constexpr bool Yields(std::uint32_t mode) { return mode == 1 || mode == 2 || mode == 5; }
 
 inline std::uint32_t NativeStringContract() {
     const std::string inlineValue("abc"), heapValue(80, 'x');
@@ -73,7 +79,7 @@ inline void ValidateCallContract(const char* bytes, std::size_t size) {
     Input input{};
     if (size < sizeof(input)) throw std::runtime_error("Truncated function request");
     std::memcpy(&input, bytes, sizeof(input));
-    if (input.mode == 1 || input.mode == 2) {
+    if (Yields(input.mode)) {
 #ifdef _WIN32
         Sites sites;
         const auto layout = input.reserved & ((1u << LayoutBits) - 1);
@@ -301,7 +307,7 @@ static_assert(sizeof(Callback) == 32 && sizeof(Callback::Capture) == 24);
 
 struct YieldInvocation {
     const Input* input; void* target;
-    const std::string* first; const std::string* second;
+    const std::string* first; const std::string* second; const std::string* third;
     Callback* success; Callback* error;
 };
 inline void InvokeYield(YieldInvocation* call) {
@@ -311,6 +317,9 @@ inline void InvokeYield(YieldInvocation* call) {
     if (input.mode == 1) {
         using Function = void(*)(void*, std::string, int, int, Callback*, Callback*);
         reinterpret_cast<Function>(input.function)(call->target, *call->first, input.enums[0], input.enums[1], call->success, call->error);
+    } else if (input.mode == 5) {
+        using Function = void(*)(void*, std::string, std::string, std::string, int, Callback*, Callback*);
+        reinterpret_cast<Function>(input.function)(call->target, *call->first, *call->third, *call->second, 0, call->success, call->error);
     } else {
         using Function = void(*)(void*, std::string, std::string, int, int, int, Callback*, Callback*);
         reinterpret_cast<Function>(input.function)(call->target, *call->first, *call->second, input.enums[0], input.enums[1], input.enums[2], call->success, call->error);
@@ -326,14 +335,14 @@ __declspec(noinline) inline DWORD GuardYield(YieldInvocation* call) {
 
 template<class Read>
 std::shared_ptr<Completion> Begin(void* target, std::shared_ptr<void> hold,
-    const char* bytes, std::size_t size, Read read) {
+    const char* bytes, std::size_t size, Read read, std::string third = {}) {
     ValidateCallContract(bytes, size);
     Input input{};
     if (size < sizeof(input)) throw std::runtime_error("Truncated function request");
     std::memcpy(&input, bytes, sizeof(input));
     Sites sites;
-    const bool yields = input.mode == 1 || input.mode == 2;
-    if (input.mode < 1 || input.mode > 4 || (input.reserved && input.mode == 3) || input.field < 8 || input.field > 65520
+    const bool yields = Yields(input.mode);
+    if (input.mode < 1 || input.mode > 5 || (input.reserved && input.mode == 3) || input.field < 8 || input.field > 65520
         || input.field % 8 || (yields ? !ReadYieldSites(input, bytes, size, sites)
             : size != sizeof(input) + static_cast<std::uint64_t>(input.firstSize) + input.secondSize))
         throw std::runtime_error("Invalid function request");
@@ -343,9 +352,10 @@ std::shared_ptr<Completion> Begin(void* target, std::shared_ptr<void> hold,
 #else
     std::int64_t adjustment = 0;
 #endif
+    // A post's function is stored without a receiver adjustment beside it.
     if (!read(input.descriptor, &table, sizeof(table)) || table != input.table
         || !read(input.descriptor + input.field, &function, sizeof(function)) || function != input.function
-        || !read(input.descriptor + input.field + 8, &adjustment, sizeof(adjustment)) || adjustment != 0)
+        || (input.mode != 5 && (!read(input.descriptor + input.field + 8, &adjustment, sizeof(adjustment)) || adjustment != 0)))
         throw std::runtime_error("Function binding was replaced before execution");
     const std::string first(bytes + sizeof(input), input.firstSize);
     const std::string second(bytes + sizeof(input) + input.firstSize, input.secondSize);
@@ -384,14 +394,25 @@ std::shared_ptr<Completion> Begin(void* target, std::shared_ptr<void> hold,
         result->Finish(value ? "true" : "false", true);
     }
 #ifdef _WIN32
-    else if (input.mode == 1 || input.mode == 2) {
+    else if (yields) {
+        if (input.mode == 5) {
+            // The receiver is the selected DataModel, live as the task starts.
+            const auto instance = reinterpret_cast<std::uintptr_t>(target);
+            if (third.empty() || input.enums[2] > instance) throw std::runtime_error("Invalid DataModel post request");
+            std::uintptr_t reference = 0, live[2]{};
+            std::memcpy(&reference, input.enums, sizeof(reference));
+            if (!read(reference, live, sizeof(live)) || live[0] != instance - input.enums[2]
+                || live[1] != reinterpret_cast<std::uintptr_t>(hold.get()))
+                throw StaleDataModel("The DataModel is no longer live; retry");
+            target = reinterpret_cast<void*>(instance - input.enums[2]);
+        }
         auto request = RegisterCompletion(result, std::move(hold), std::move(sites));
         Callback success(request, true), error(request, false);
         struct Cleanup {
             Callback* success; Callback* error;
             ~Cleanup() { Callback::Destroy(success); Callback::Destroy(error); }
         } cleanup{&success, &error};
-        YieldInvocation invocation{&input, target, &first, &second, &success, &error};
+        YieldInvocation invocation{&input, target, &first, &second, &third, &success, &error};
         try {
             if (GuardYield(&invocation))
                 throw Failure(InvocationCode, "yield-invocation: engine fault; requestSent=unknown; inspect before retrying", 2);

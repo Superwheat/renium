@@ -444,7 +444,10 @@ fn incoming_ownership(
             if let Some(Value::Pointer(Storage::Descriptor, origin @ (4096 | 8192))) =
                 state.register(register)
                 && let Some(bytes) = code(instruction.near_branch_target())
-                && callable_consumer(&bytes, instruction.near_branch_target(), role)
+                && (callable_consumer(&bytes, instruction.near_branch_target(), role)
+                    // A member that takes its continuation moves it out of
+                    // the argument instead of copying it.
+                    || role == 1 && direct_move(&bytes, instruction.near_branch_target()))
             {
                 evidence.insert((origin, role));
             }
@@ -466,8 +469,36 @@ fn incoming_ownership(
     Ok(())
 }
 
+/// A yielding member as the verifier needs it: the place of its success
+/// continuation among its arguments, the receiver counted, and the offset of
+/// the instance inside the receiver where the member is not the instance's
+/// own class's.
+#[derive(Clone, Copy)]
+pub(in super::super::super) struct Member {
+    argument: usize,
+    receiver: Option<usize>,
+    /// The member's function takes the converted receiver as it is.
+    unadjusted: bool,
+}
+
+impl Member {
+    /// The member a request of `mode` calls.
+    pub(in super::super::super) fn of(mode: u32, receiver: Option<usize>) -> Self {
+        let argument = match mode {
+            1 => 4,
+            5 => 5,
+            _ => 6,
+        };
+        Self {
+            argument,
+            receiver,
+            unadjusted: mode == 5,
+        }
+    }
+}
+
 pub(super) fn qualify(
-    mode: u32,
+    member: Member,
     field: usize,
     entry: u64,
     methods: &[u64],
@@ -475,23 +506,29 @@ pub(super) fn qualify(
     operation: &mut impl FnMut(u64) -> Option<u64>,
     byte_copy: &mut impl FnMut(u64) -> bool,
 ) -> Result<YieldContract> {
-    let argument = if mode == 1 { 4 } else { 6 };
+    let argument = member.argument;
     let mut proved = false;
     let mut tables = HashSet::new();
     for &method in methods {
-        let result = dispatch_field_checked(method, code, false, &mut |candidate, state| {
-            if candidate != field {
-                return false;
-            }
-            let (Some(success), Some(error)) = (
-                tagged_table(state, argument),
-                tagged_table(state, argument + 1),
-            ) else {
-                return false;
-            };
-            tables.extend([success, error]);
-            true
-        });
+        let result = dispatch_field_fetch(
+            method,
+            &mut |at, _| code(at),
+            false,
+            member.receiver,
+            &mut |candidate, state| {
+                if candidate != field || state.unadjusted_receiver() != member.unadjusted {
+                    return false;
+                }
+                let (Some(success), Some(error)) = (
+                    tagged_table(state, argument),
+                    tagged_table(state, argument + 1),
+                ) else {
+                    return false;
+                };
+                tables.extend([success, error]);
+                true
+            },
+        );
         proved |= result == Some(field);
     }
     anyhow::ensure!(

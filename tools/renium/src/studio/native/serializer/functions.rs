@@ -37,10 +37,14 @@ impl FunctionInput {
         Ok(())
     }
 
+    /// Checks the enum arguments against the items this engine declares. A
+    /// post names none: before it is prepared its first word is the zero the
+    /// helper sends as the request type.
     pub(super) fn validate_enums(&self, items: &Value) -> Result<()> {
         let names: &[&str] = match self.mode {
             1 => &["ThrottlingPriority", "HttpRequestType"],
             2 => &["ThrottlingPriority", "HttpContentType", "HttpRequestType"],
+            5 => &["HttpRequestType"],
             _ => &[],
         };
         for (index, name) in names.iter().enumerate() {
@@ -68,7 +72,7 @@ impl FunctionInput {
         field: usize,
     ) -> Result<()> {
         ensure!(
-            !matches!(self.mode, 1 | 2),
+            !matches!(self.mode, 1 | 2 | 5),
             "yield-call-contract: HttpRbxApiService.{name}; candidate={module}+0x{entry_rva:X}, descriptor-field=0x{field:X}; hidden success/error continuation ABI, ownership and execution context unverified; no call executed"
         );
         Ok(())
@@ -83,6 +87,21 @@ fn roblox_https(url: &url::Url) -> bool {
             .host_str()
             .is_some_and(|host| host == "roblox.com" || host.ends_with(".roblox.com"))
         && url.port().is_none_or(|port| port == 443)
+}
+
+/// The address an authenticated request may go to, as the engine will read it.
+fn roblox_url(raw: &str) -> Result<String> {
+    ensure!(
+        !raw.chars()
+            .any(|c| c == '\\' || c == '@' || c.is_control() || c.is_whitespace()),
+        "http-url detector: raw URL contains a backslash, @, control character or whitespace"
+    );
+    let url = url::Url::parse(raw).context("Expected an HTTPS Roblox URL")?;
+    ensure!(
+        roblox_https(&url),
+        "Authenticated Studio requests require an HTTPS Roblox URL"
+    );
+    Ok(url.to_string())
 }
 
 // GetAsync and PostAsync send the signed-in session to a host the engine
@@ -128,18 +147,7 @@ pub(super) fn input(class: &str, name: &str, arguments: &[Value]) -> Result<Func
     );
     let normalized;
     let first = if name.ends_with("FullUrl") {
-        ensure!(
-            !first
-                .chars()
-                .any(|c| c == '\\' || c == '@' || c.is_control() || c.is_whitespace()),
-            "http-url detector: raw URL contains a backslash, @, control character or whitespace"
-        );
-        let url = url::Url::parse(first).context("Expected an HTTPS Roblox URL")?;
-        ensure!(
-            roblox_https(&url),
-            "Authenticated Studio requests require an HTTPS Roblox URL"
-        );
-        normalized = url.to_string();
+        normalized = roblox_url(first)?;
         normalized.as_str()
     } else {
         first
@@ -185,6 +193,29 @@ pub(super) fn package_flag_input() -> FunctionInput {
     bytes[44..48].copy_from_slice(&(flag.len() as u32).to_le_bytes());
     bytes.extend_from_slice(flag);
     FunctionInput { mode, bytes }
+}
+
+// Internal-only as well: DataModel.HttpPostAsync, the one engine request
+// that takes its content type as text, for the uploads Renium makes under the
+// Studio login. The body travels beside the request.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn post_input(url: &str, content_type: &str) -> Result<FunctionInput> {
+    let url = roblox_url(url)?;
+    ensure!(
+        !content_type.is_empty()
+            && content_type.len() <= 256
+            && content_type.bytes().all(|byte| (b' '..127).contains(&byte)),
+        "http-content-type detector: expected printable ASCII"
+    );
+    ensure!(url.len() <= 8 * 1024, "The address exceeds 8 KiB");
+    let mode = 5u32;
+    let mut bytes = vec![0; 56];
+    bytes[20..24].copy_from_slice(&mode.to_le_bytes());
+    bytes[44..48].copy_from_slice(&(url.len() as u32).to_le_bytes());
+    bytes[48..52].copy_from_slice(&(content_type.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(url.as_bytes());
+    bytes.extend_from_slice(content_type.as_bytes());
+    Ok(FunctionInput { mode, bytes })
 }
 
 #[derive(Debug)]
@@ -251,6 +282,42 @@ mod tests {
                 request.bytes.len() - 56
             );
         }
+    }
+
+    #[test]
+    fn a_post_takes_a_roblox_address_and_a_plain_content_type() {
+        let multipart = "multipart/form-data; boundary=renium-1f";
+        for (url, content_type) in [
+            ("https://apis.roblox.com.example.test/x", multipart),
+            ("http://apis.roblox.com/x", multipart),
+            ("https://apis.roblox.com/x", ""),
+            ("https://apis.roblox.com/x", "text/plain\r\nCookie: a=b"),
+            ("https://apis.roblox.com/x", "text/pl\u{e4}in"),
+        ] {
+            assert!(
+                post_input(url, content_type).is_err(),
+                "{url} {content_type:?}"
+            );
+        }
+        assert!(post_input("https://apis.roblox.com/x", &"a".repeat(256)).is_ok());
+        assert!(post_input("https://apis.roblox.com/x", &"a".repeat(257)).is_err());
+        let long = format!("https://apis.roblox.com/{}", "a".repeat(8 * 1024));
+        assert!(post_input(&long, multipart).is_err());
+        let request = post_input("HTTPS://APIS.ROBLOX.COM:443/assets/../x", multipart).unwrap();
+        assert_eq!(request.mode, 5);
+        assert_eq!(
+            &request.bytes[56..],
+            format!("https://apis.roblox.com/x{multipart}").as_bytes()
+        );
+        assert_eq!(request.bytes[32..44], [0; 12]);
+        let declared = |items: Value| request.validate_enums(&json!({ "HttpRequestType": items }));
+        declared(json!([0, 2])).unwrap();
+        assert!(declared(json!([2])).is_err());
+        assert!(
+            request
+                .validate_call_contract("HttpPostAsync", "Studio", 1, 16)
+                .is_err()
+        );
     }
 
     #[test]

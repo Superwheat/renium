@@ -542,12 +542,15 @@ impl NativeProperty {
             "Function DataModel was replaced"
         );
         let target = read_u64(&self.parameters, 16)? as usize;
-        let receiver_offset = if input.mode == 4 {
+        // The package flag getter and a post are members of the DataModel.
+        let of_model = matches!(input.mode, 4 | 5);
+        let receiver_offset = if of_model {
             anyhow::ensure!(
                 model.outer.checked_add(model.layout.data_model_instance) == Some(target),
-                "Package flag target is not the selected DataModel"
+                "Function target is not the selected DataModel"
             );
-            input.bytes[52..56]
+            let receiver = if input.mode == 4 { 52 } else { 40 };
+            input.bytes[receiver..receiver + 4]
                 .copy_from_slice(&u32::try_from(model.layout.data_model_instance)?.to_le_bytes());
             // Reuse the live shared DataModel reference used by discovery; the
             // engine task checks it again immediately before any flag access.
@@ -582,14 +585,18 @@ impl NativeProperty {
                 "BoundYieldFuncDesc",
                 "V34@0W4ThrottlingPriority@2@W4HttpContentType@HttpContentTypeEnum@Enums@2@W4HttpRequestType@2@@Z$0A@$04@Reflection@RBX@@",
             ),
+            5 => (
+                "BoundYieldFuncDesc",
+                "V34@00W4HttpRequestType@2@@Z$00$03@Reflection@RBX@@",
+            ),
             _ => ("BoundFuncDesc", "V34@@Z$0A@$00@Reflection@RBX@@"),
         };
         anyhow::ensure!(
             signature
-                == if input.mode == 4 {
-                    ".?AV?$BoundFuncDesc@VDataModel@RBX@@$$A6A_NV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z$0A@$00@Reflection@RBX@@".to_string()
-                } else {
-                    format!(".?AV?${kind}@VHttpRbxApiService@RBX@@$$A6A{string}{tail}")
+                == match input.mode {
+                    4 => ".?AV?$BoundFuncDesc@VDataModel@RBX@@$$A6A_NV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z$0A@$00@Reflection@RBX@@".to_string(),
+                    5 => format!(".?AV?${kind}@VDataModel@RBX@@$$A6A{string}{tail}"),
+                    _ => format!(".?AV?${kind}@VHttpRbxApiService@RBX@@$$A6A{string}{tail}"),
                 },
             NativeError::Unsupported(format!(
                 "function-signature detector: unsupported native function signature: {signature}"
@@ -607,7 +614,16 @@ impl NativeProperty {
                 "function-descriptor detector: not a complete reflection object".into()
             )
         );
-        let (field, function) = if input.mode == 4 {
+        let (field, function) = if input.mode == 5 {
+            functions::unadjusted_binding(
+                &self.memory,
+                studio,
+                &layout,
+                (descriptor, table),
+                receiver_offset,
+            )
+            .context("function-entrypoint detector")?
+        } else if of_model {
             functions::binding_for_receiver(
                 &self.memory,
                 studio,
@@ -620,8 +636,8 @@ impl NativeProperty {
             functions::binding(&self.memory, studio, &layout, descriptor, table)
                 .context("function-entrypoint detector")?
         };
-        if matches!(input.mode, 1 | 2) {
-            let mode = input.mode;
+        if matches!(input.mode, 1 | 2 | 5) {
+            let member = functions::Member::of(input.mode, of_model.then_some(receiver_offset));
             input
                 .qualify_yield(|| {
                     functions::qualify_yield(
@@ -630,7 +646,7 @@ impl NativeProperty {
                         &layout,
                         table,
                         (field, function),
-                        mode,
+                        member,
                     )
                     .with_context(|| {
                         format!(
@@ -661,10 +677,24 @@ impl NativeProperty {
         function_value(&self.parameters)
     }
 
+    /// Sends the prepared post with `body` and returns the answer as a
+    /// yielding call does.
+    pub(super) fn post(&mut self, body: &[u8], timeout: Duration) -> Result<serde_json::Value> {
+        anyhow::ensure!(
+            read_u32(&self.parameters, INPUT + 20)? == 5 && !body.is_empty(),
+            NativeError::Unsupported("A post was not prepared".into())
+        );
+        self.parameters.truncate(SIZE);
+        self.parameters.extend_from_slice(body);
+        let answer = self.call_function_answer(timeout);
+        self.parameters.truncate(SIZE);
+        answer
+    }
+
     pub(crate) fn call_function_answer(&mut self, timeout: Duration) -> Result<serde_json::Value> {
         let text = self.call_function(timeout)?;
         Ok(
-            if matches!(read_u32(&self.parameters, INPUT + 20)?, 1 | 2) {
+            if matches!(read_u32(&self.parameters, INPUT + 20)?, 1 | 2 | 5) {
                 serde_json::json!({"httpError":read_u32(&self.parameters, EXCEPTION_CODE)? == 1,"text":text})
             } else {
                 serde_json::Value::String(text)
@@ -727,7 +757,7 @@ impl NativeProperty {
         put_u32(&mut self.parameters, EXCEPTION_CODE, 0);
         put_u32(&mut self.parameters, 65912, operation);
         let mut remote = self.memory.allocate(self.parameters.len())?;
-        if operation == 7 {
+        if operation == 7 || (operation == 9 && self.parameters.len() > SIZE) {
             put_u64(&mut self.parameters, 132032, remote.address + SIZE);
             let length = self.parameters.len() - SIZE;
             put_u64(&mut self.parameters, 132040, length);
@@ -802,7 +832,7 @@ fn property_value(parameters: &[u8]) -> Result<String> {
 
 fn function_value(parameters: &[u8]) -> Result<String> {
     property_value(parameters).map_err(|error| {
-        if read_u32(parameters, INPUT + 20).is_ok_and(|mode| matches!(mode, 1 | 2)) {
+        if read_u32(parameters, INPUT + 20).is_ok_and(|mode| matches!(mode, 1 | 2 | 5)) {
             super::super::functions::FunctionFailure {
                 code: 0xE415,
                 sent: Some(true),
@@ -2100,6 +2130,21 @@ fn prepare(
 }
 
 pub(super) use batch::prepare_package_flag;
+
+/// Posts `body` to a Roblox address under the Studio login of the place
+/// `pid` has open, through `DataModel.HttpPostAsync`, and returns the answer
+/// with whether it is an HTTP error. `declared` are the HTTP enum items the
+/// engine names.
+pub(crate) fn studio_post(
+    pid: u32,
+    (url, content_type): (&str, &str),
+    body: &[u8],
+    declared: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let input = super::super::functions::post_input(url, content_type)?;
+    input.validate_enums(declared)?;
+    batch::prepare_post(pid, input)?.post(body, Duration::from_secs(30))
+}
 
 #[cfg(test)]
 mod tests {

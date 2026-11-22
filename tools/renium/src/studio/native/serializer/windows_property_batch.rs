@@ -432,6 +432,27 @@ fn resolve_indexed(
 }
 
 pub(in super::super) fn prepare_package_flag(pid: u32) -> Result<NativeProperty> {
+    prepare_model_function(
+        pid,
+        "GetFastFlag",
+        super::super::super::functions::package_flag_input(),
+    )
+}
+
+/// Prepares `DataModel.HttpPostAsync` with the request `input`.
+pub(super) fn prepare_post(
+    pid: u32,
+    input: super::super::super::functions::FunctionInput,
+) -> Result<NativeProperty> {
+    prepare_model_function(pid, "HttpPostAsync", input)
+}
+
+/// Prepares the member `name` of the DataModel the Studio `pid` shows.
+fn prepare_model_function(
+    pid: u32,
+    name: &str,
+    input: super::super::super::functions::FunctionInput,
+) -> Result<NativeProperty> {
     let title = crate::studio::input::studio_window_title(pid)?;
     let mut batch = NativePropertyBatch::new(pid, &title, &[], Duration::from_secs(30), None)?;
     batch.package_flag = true;
@@ -446,14 +467,9 @@ pub(in super::super) fn prepare_package_flag(pid: u32) -> Result<NativeProperty>
     let mut prepared = batch.prepare(0, "Name", Duration::from_secs(30))?;
     anyhow::ensure!(
         prepared.class_name == "DataModel",
-        "Package flag target is not DataModel"
+        "Function target is not DataModel"
     );
-    prepared.prepare_reflected_function(
-        pid,
-        &title,
-        "GetFastFlag",
-        super::super::super::functions::package_flag_input(),
-    )?;
+    prepared.prepare_reflected_function(pid, &title, name, input)?;
     Ok(prepared)
 }
 

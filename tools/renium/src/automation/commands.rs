@@ -228,6 +228,12 @@ pub(crate) struct ImageUploadArgs {
     upload_wait_seconds: f64,
     #[arg(long)]
     open_cloud: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["open_cloud", "oauth_env"],
+        help = "Upload under the Studio login, also when a key is stored"
+    )]
+    login: bool,
     #[command(flatten)]
     bridge: BridgeConnectionArgs,
 }
@@ -922,6 +928,8 @@ pub(crate) fn image_upload(args: ImageUploadArgs, project: Option<&Path>) -> Res
     if args.user == Some(0) || args.group == Some(0) {
         bail!("Creator IDs must be greater than zero");
     }
+    let keyed =
+        !args.login && cloud::assets::has_credential(&args.key_env, args.oauth_env.as_deref());
     let parameters = json!({
         "images": args.images,
         "userId": args.user,
@@ -931,9 +939,10 @@ pub(crate) fn image_upload(args: ImageUploadArgs, project: Option<&Path>) -> Res
         "keyEnv": args.key_env,
         "oauthEnv": args.oauth_env,
         "waitSeconds": args.upload_wait_seconds,
-        "via": args.open_cloud.then_some("open-cloud"),
+        "via": upload_route(args.login, args.open_cloud, keyed),
     });
-    if args.user.is_some() || args.group.is_some() {
+    let named_creator = args.user.is_some() || args.group.is_some();
+    if named_creator && keyed {
         let project = daemon_project_root(project);
         let root = config::try_load_project(project, None)?
             .map_or_else(std::env::current_dir, |loaded| Ok(loaded.root))?;
@@ -950,9 +959,28 @@ pub(crate) fn image_upload(args: ImageUploadArgs, project: Option<&Path>) -> Res
     )
 }
 
+/// The route an upload asks for: the Studio login when asked, Open Cloud
+/// when asked or when the caller holds a credential (`keyed`), which the
+/// background process may not see, and otherwise whichever is there.
+fn upload_route(login: bool, open_cloud: bool, keyed: bool) -> Option<&'static str> {
+    if login {
+        Some("login")
+    } else {
+        (open_cloud || keyed).then_some("open-cloud")
+    }
+}
+
 #[cfg(test)]
 mod input_action_tests {
     use super::*;
+
+    #[test]
+    fn an_upload_with_a_credential_at_hand_never_asks_for_the_login() {
+        assert_eq!(upload_route(true, false, false), Some("login"));
+        assert_eq!(upload_route(false, true, false), Some("open-cloud"));
+        assert_eq!(upload_route(false, false, true), Some("open-cloud"));
+        assert_eq!(upload_route(false, false, false), None);
+    }
 
     #[test]
     fn wait_durations_accept_milliseconds_and_seconds() {

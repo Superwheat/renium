@@ -42,6 +42,7 @@ mod recording;
 mod recording_review;
 pub(crate) mod render_quality;
 pub(crate) mod result_text;
+pub(crate) mod studio_login;
 pub(crate) mod test_processes;
 mod wait_parts;
 

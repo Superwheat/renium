@@ -326,7 +326,7 @@ fn captured_http_yield_contract() -> Result<()> {
                     .map(|rva| rva + slide)
             };
             qualify(
-                if index < 2 { 1 } else { 2 },
+                Member::of(if index < 2 { 1 } else { 2 }, None),
                 0xa8,
                 entry + slide,
                 &[methods[usize::from(index >= 2)].as_u64().unwrap() + slide],
@@ -346,7 +346,7 @@ fn captured_http_yield_contract() -> Result<()> {
             .with_context(|| format!("captured member=0x{entry:x} slide=0x{slide:x}"))?;
             let changed = extra_parameter(entry, if index < 2 { 6 } else { 8 }, &mut code);
             let error = qualify(
-                if index < 2 { 1 } else { 2 },
+                Member::of(if index < 2 { 1 } else { 2 }, None),
                 0xa8,
                 entry + slide,
                 &[methods[usize::from(index >= 2)].as_u64().unwrap() + slide],
@@ -373,7 +373,7 @@ fn captured_http_yield_contract() -> Result<()> {
                 "{error:#}"
             );
             let error = qualify(
-                if index < 2 { 1 } else { 2 },
+                Member::of(if index < 2 { 1 } else { 2 }, None),
                 0xa8,
                 entry + slide,
                 &[methods[usize::from(index >= 2)].as_u64().unwrap() + slide],
@@ -400,7 +400,7 @@ fn captured_http_yield_contract() -> Result<()> {
             // Changed invocation: cleanup receives another register instead of
             // the original payload. A valid callable table must not hide this.
             let error = qualify(
-                if index < 2 { 1 } else { 2 },
+                Member::of(if index < 2 { 1 } else { 2 }, None),
                 0xa8,
                 entry + slide,
                 &[methods[usize::from(index >= 2)].as_u64().unwrap() + slide],
@@ -430,7 +430,7 @@ fn captured_http_yield_contract() -> Result<()> {
             // Keep both callbacks and their consumer intact, but stop storing
             // the copied byte count in the constructed payload's length field.
             let error = qualify(
-                if index < 2 { 1 } else { 2 },
+                Member::of(if index < 2 { 1 } else { 2 }, None),
                 0xa8,
                 entry + slide,
                 &[methods[usize::from(index >= 2)].as_u64().unwrap() + slide],
@@ -512,7 +512,7 @@ fn changed_callback_payloads_refuse_and_failed_qualification_clears_reserved() {
     let error = input
         .qualify_yield(|| {
             qualify(
-                1,
+                Member::of(1, None),
                 8,
                 0,
                 &[0],
@@ -615,7 +615,7 @@ fn captured_string_construction_covers_both_response_paths() -> Result<()> {
 fn captured_success_continuation_cannot_be_substituted() -> Result<()> {
     let fixture = captured_fixture()?;
     let error = qualify(
-        1,
+        Member::of(1, None),
         0xa8,
         fixture["members"][1].as_u64().unwrap(),
         &[fixture["methods"][0].as_u64().unwrap()],
@@ -798,7 +798,7 @@ fn installed_image_http_yield_contract() -> Result<()> {
     for (index, entry) in fixture["members"].as_array().unwrap().iter().enumerate() {
         let entry = entry.as_u64().unwrap();
         let result = qualify(
-            if index < 2 { 1 } else { 2 },
+            Member::of(if index < 2 { 1 } else { 2 }, None),
             0xa8,
             entry,
             &[methods[usize::from(index >= 2)].as_u64().unwrap()],
@@ -813,5 +813,105 @@ fn installed_image_http_yield_contract() -> Result<()> {
         }
     }
     anyhow::ensure!(failed.is_empty(), "{failed:#?}");
+    Ok(())
+}
+
+fn post_fixture() -> serde_json::Result<serde_json::Value> {
+    serde_json::from_str(include_str!(
+        "../../../../native/tests/windows-post-yield.json"
+    ))
+}
+
+// Qualifies the captured post member with `change` applied to its code.
+fn post_contract(
+    fixture: &serde_json::Value,
+    member: Member,
+    slide: u64,
+    change: &dyn Fn(u64, &mut Vec<u8>),
+) -> Result<YieldContract> {
+    qualify(
+        member,
+        0xa8,
+        fixture["entry"].as_u64().unwrap() + slide,
+        &[fixture["method"].as_u64().unwrap() + slide],
+        &mut |at| {
+            let at = at.checked_sub(slide)?;
+            let mut bytes = hex(fixture["code"][at.to_string()].as_str()?).ok()?;
+            change(at, &mut bytes);
+            Some(bytes)
+        },
+        &mut |at| {
+            fixture["operations"][at.checked_sub(slide)?.to_string()]
+                .as_u64()
+                .map(|rva| rva + slide)
+        },
+        &mut |at| {
+            fixture["byteCopies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_u64() == at.checked_sub(slide))
+        },
+    )
+}
+
+fn replaced(bytes: &mut [u8], from: &[u8], to: &[u8]) {
+    let at = bytes
+        .windows(from.len())
+        .position(|window| window == from)
+        .expect("the captured instruction");
+    bytes[at..at + to.len()].copy_from_slice(to);
+}
+
+#[test]
+fn captured_post_yield_contract() -> Result<()> {
+    // The member takes the converted DataModel as it is, moves both
+    // continuations into a bound closure, and answers an empty body with a
+    // string it initialized itself. Captured code is only fixture data.
+    let fixture = post_fixture()?;
+    let member = || Member::of(5, Some(0x1f0));
+    let unchanged = |_: u64, _: &mut Vec<u8>| {};
+    let contract = post_contract(&fixture, member(), 0, &unchanged)?;
+    let moved = post_contract(&fixture, member(), 0x140000000, &unchanged)?;
+    assert_eq!(contract.layout, moved.layout);
+    assert_eq!(contract.sites.len(), moved.sites.len());
+    assert!(!contract.sites.is_empty());
+
+    let refused = |member: Member, change: &dyn Fn(u64, &mut Vec<u8>)| {
+        post_contract(&fixture, member, 0, change)
+            .err()
+            .map(|error| format!("{error:#}"))
+    };
+    assert!(refused(Member::of(5, Some(0x1f8)), &unchanged).is_some());
+    assert!(refused(Member::of(5, None), &unchanged).is_some());
+    assert!(refused(Member::of(1, None), &unchanged).is_some());
+    let adjusted = Member {
+        unadjusted: false,
+        ..member()
+    };
+    assert!(
+        refused(adjusted, &unchanged).is_some(),
+        "a function the dispatch calls another way than the helper will"
+    );
+    // The answer handler: an empty string with another capacity, and one
+    // whose size was never stored, are not strings the helper may read.
+    let handler = 0x776330;
+    let changes: [(&[u8], &[u8]); 3] = [
+        (
+            &[0x48, 0xc7, 0x45, 0xd0, 0x0f, 0, 0, 0],
+            &[0x48, 0xc7, 0x45, 0xd0, 0x1f, 0, 0, 0],
+        ),
+        (&[0x48, 0x89, 0x5d, 0xc8], &[0x90; 4]),
+        (&[0x48, 0x89, 0x5d, 0xb8], &[0x90; 4]),
+    ];
+    for (from, to) in changes {
+        let change = |at: u64, bytes: &mut Vec<u8>| {
+            if at == handler {
+                replaced(bytes, from, to);
+            }
+        };
+        let error = refused(member(), &change).expect("a changed handler");
+        assert!(error.contains("yield-callback-consumers"), "{error}");
+    }
     Ok(())
 }

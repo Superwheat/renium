@@ -4165,7 +4165,9 @@ fn automation_execute_request_inner(
             if operation.id == op::IMAGE_UPLOAD {
                 let _selection = bound_context::select(&context);
                 bridge.clear_runtime_pins();
-                return if crate::cloud::assets::studio_upload(&request.p) {
+                // On Windows a web image is fetched here and uploaded as a
+                // file is, with a key or under the Studio login.
+                return if !cfg!(windows) && crate::cloud::assets::studio_upload(&request.p) {
                     bridge
                         .wait_for_target(bridge_wait_seconds, BridgeTarget::Edit)
                         .map_err(automation_failure)?;
