@@ -6,6 +6,10 @@
 
 - On a large place Renium's background process stays under 2 GB of memory in every pull and push. Measured on a place of 202,000 instances: a push of the whole project used 2.7 GB and the check that follows it 3.8 GB, and they now use 1.7 GB and 1.8 GB; a pull of one changed property used 1.7 GB and now uses 1.5 GB; the first pull of the place used 1.5 GB and now uses 1.3 GB. A pull or a push reads the instances that differ instead of every instance of a store, and a store pushed whole goes to Studio from its file and is checked a few thousand instances at a time.
 - `rbx iu FILE` uploads a local image as an asset without an API key. When no key is set or stored, the upload goes under the login of the open Studio (Windows), through Studio's own request path; `--login` asks for that route when a key is stored too. A request that names a key, a token or `--open-cloud` never goes under the login.
+- `rbx ro` and `rbx so` open a published place by its id: `rbx ro PLACE_ID`, or `rbx ro UNIVERSE_ID:PLACE_ID`. A Studio that has the place open, or is still starting on it, is reused. `rbx ro --check` names what would open without opening it, and a place another task holds is refused.
+- A recording of a Studio window that stands behind other windows keeps its frame rate on Windows: a recording asked for at 60 FPS came out at 55 to 58 FPS in Edit and in Play with the window unfocused. The window's own rendering is captured on one thread and encoded on another. A capture that returns a blank or frozen picture falls back to the earlier route and says so (`captureFallback`).
+- `rbx inp` does not buy by accident. A mouse press where a Roblox prompt button stands fails and names the press that takes it. A button that buys is pressed only in Studio, on a dialog that says the purchase is a test, and `dismiss` answers a dialog by its own close button.
+- `rbx cmp --full` holds one place at a time: it reads the first place for a digest of each instance, lets it go before it reads the second, and reads again only the instances that differ. It lists differences with the services in name order and pairs same-named instances by exact content.
 - Pulls are faster on a large place. On that place a pull that finds nothing changed takes 2.0 s where it took 2.6 s, a pull of one changed property 3.3 s where it took 4.0 s, and the pull after a push of the whole project 3.4 s where it took 4.7 s.
 - The background process gives a command's memory back to the system when the command ends. It held that memory for two seconds, so commands sent one after another stacked their memory on each other.
 - When the files and Studio both edited one script while Live Sync was off, the two are merged line by line: edits to different lines are both kept. Where both changed the same lines the script is a conflict, or the lines of the preferred side stand when a side is preferred and the rest still merges.
@@ -33,6 +37,8 @@
 
 ### Bug fixes
 
+- `-w SECONDS` waits for a Studio connection as long as asked, up to ten minutes. The wait was cut to 30 seconds whatever `-w` said, so a Studio still opening a large place could not be waited for.
+- A place that did not open because the PC was offline is reported as that. Studio asks for the place once, logs no failure and stays at its start page; the answer said the Studio had not connected yet.
 - A push no longer treats a store as changed when it differs from Studio only in the player capacity, which Roblox takes from Game Settings and no push writes. Such a push answers `unchanged`.
 - A push runs as usual, with a notice, when an earlier push's result could no longer be written to the files because Studio had moved on. It failed until the next pull.
 - A script both sides edited no longer comes out with a line written twice or a repeated line missing when each side moved the same line to another place. Such a script is a conflict.
