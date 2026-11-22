@@ -44,6 +44,10 @@ fn startup_dialogs_only_acknowledge_known_notices() {
 mod windows_shield;
 
 #[cfg(windows)]
+#[path = "input/recording_capture.rs"]
+pub(crate) mod recording_capture;
+
+#[cfg(windows)]
 #[path = "input/background_dialog.rs"]
 mod background_dialog;
 
@@ -118,6 +122,14 @@ where
 #[cfg(windows)]
 pub(crate) fn studio_recording_window(pid: u32) -> Result<StudioWindow> {
     platform::studio_recording_window(pid)
+}
+
+#[cfg(windows)]
+pub(crate) fn client_recording_window(
+    pid: u32,
+    viewport: Option<(i32, i32)>,
+) -> Result<StudioWindow> {
+    platform::client_recording_window(pid, viewport)
 }
 
 #[cfg(windows)]
@@ -551,9 +563,9 @@ mod platform {
     const MK_RBUTTON: WPARAM = 0x0002;
     pub struct WindowHandle {
         viewport: isize,
-        capture: isize,
+        pub(super) capture: isize,
         capture_verified: bool,
-        recording_owner: Option<(u32, String)>,
+        pub(super) recording_owner: Option<(u32, String)>,
         offset_x: i32,
         offset_y: i32,
         scale_x: f64,
@@ -1045,6 +1057,34 @@ mod platform {
                 "Studio exposed multiple native engine viewports; refusing to choose a different document"
             ),
         }
+    }
+
+    /// Whether the recorded window still is the Studio window the recording
+    /// began on, with the viewport where Studio's own widget tree puts it.
+    pub(super) fn verify_recording_target(handle: &WindowHandle) -> Result<()> {
+        let (pid, identity) = handle
+            .recording_owner
+            .as_ref()
+            .context("Unverified recording owner")?;
+        let mut current = 0;
+        unsafe { GetWindowThreadProcessId(handle.capture as HWND, &mut current) };
+        if current != *pid
+            || crate::app::update::process_start_identity(*pid).as_ref() != Some(identity)
+        {
+            bail!("Studio recording owner ended");
+        }
+        let root = unsafe { GetAncestor(handle.capture as HWND, GA_ROOT) } as isize;
+        unsafe { GetWindowThreadProcessId(root as HWND, &mut current) };
+        if current != *pid {
+            bail!("The recording root no longer belongs to Studio");
+        }
+        if root != handle.capture
+            && native_viewport_candidate(root, *pid)?.map(|candidate| candidate.hwnd)
+                != Some(handle.capture)
+        {
+            bail!("Studio's recording viewport identity is unavailable or changed");
+        }
+        Ok(())
     }
 
     fn is_engine_viewport(
@@ -1722,6 +1762,19 @@ mod platform {
         }
         unsafe { CloseHandle(handle) };
         Ok(())
+    }
+
+    /// A client's window as a recording follows it: tied to the process that
+    /// owns it now, so a later frame never comes from a window that reused
+    /// its handle.
+    pub fn client_recording_window(pid: u32, viewport: Option<(i32, i32)>) -> Result<StudioWindow> {
+        let mut window = window_for_pid(pid, viewport)?;
+        window.handle.recording_owner = Some((
+            pid,
+            crate::app::update::process_start_identity(pid)
+                .context("Studio recording owner ended")?,
+        ));
+        Ok(window)
     }
 
     pub fn window_for_pid(pid: u32, viewport: Option<(i32, i32)>) -> Result<StudioWindow> {

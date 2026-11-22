@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from run import ScenarioSkip, RBX, Context, Scenario
+from recording_fps import recording_keeps_its_rate_unfocused
 
 MAIN = "src/ServerScriptService/Main.server.luau"
 SAMPLER = (
@@ -1954,6 +1955,7 @@ SCENARIOS = [
     Scenario("PLAY-104", "capture paths relative to the cwd (D7)", "small", capture_paths_relative_to_the_cwd, platforms=("nt",)),
     Scenario("PLAY-105", "recording conflicts and validation", "small", recording_conflicts_and_validation, platforms=("nt",)),
     Scenario("PLAY-106", "stop a recording behind an Edit holder (D11)", "small", stop_recording_behind_an_edit_holder, platforms=("nt",)),
+    Scenario("PLAY-107", "unfocused recording keeps its frame rate", "small", recording_keeps_its_rate_unfocused, platforms=("nt",), long=True),
     Scenario("PLAY-110", "device simulator", "small", device_simulator_edit_only, exclusive=True),
     Scenario("PLAY-111", "device errors", "small", device_errors, exclusive=True),
     Scenario("PLAY-112", "network simulation settings", "small", network_simulation_settings, exclusive=True),

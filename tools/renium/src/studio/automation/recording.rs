@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -14,7 +15,7 @@ use openh264::encoder::{
     Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Profile, QpRange,
     RateControlMode, UsageType, VuiConfig,
 };
-use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
+use openh264::formats::{BgraSliceU8, RgbaSliceU8, YUVBuffer, YUVSource};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -66,9 +67,9 @@ struct ActiveRecording {
     worker: JoinHandle<Result<FinishedRecording>>,
 }
 
-/// Frames per second the file actually holds, and whether the source fell
-/// well short of the request: Windows and Roblox throttle a minimized or
-/// fully covered window, so a clip then stutters however high `fps` was.
+/// Frames per second the file actually holds, and whether the recording fell
+/// well short of the request: rendering, capture or encoding was slower, as
+/// in a minimized or fully covered window, which Windows and Roblox throttle.
 fn capture_rate(requested_fps: f64, frames: usize, duration_ms: u64) -> (f64, bool) {
     if duration_ms == 0 || frames < 2 {
         return (0.0, false);
@@ -82,6 +83,7 @@ fn capture_rate(requested_fps: f64, frames: usize, duration_ms: u64) -> (f64, bo
 }
 
 struct FinishedRecording {
+    capture_fallback: Option<String>,
     width: u32,
     height: u32,
     frames: usize,
@@ -89,7 +91,16 @@ struct FinishedRecording {
     resized_frames: usize,
 }
 
+/// A picture as a capture hands it over: width, height and four bytes a pixel.
+type Frame = (u32, u32, Vec<u8>);
+
 struct RecordingOptions {
+    /// Whether the frames are BGRA, as the capture thread hands them over,
+    /// and encoded for motion; otherwise they are RGBA.
+    bgra: bool,
+    /// Whether the capture thread keeps the frame rate. Once it does not, the
+    /// encoding loop skips the frame times it has missed.
+    paced_by_capture: Cell<bool>,
     output: PathBuf,
     fps: f64,
     max_seconds: f64,
@@ -149,7 +160,14 @@ fn client_window(
     let pid = bridge.studio_pid_for_selector(BridgeTarget::Client, player)?;
     let viewport = client_viewport_size(bridge, player);
     let viewport = recover_client_viewport(bridge, player, pid, viewport)?;
-    input_inject::window_for_pid(pid, viewport)
+    #[cfg(windows)]
+    {
+        input_inject::client_recording_window(pid, viewport)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        input_inject::window_for_pid(pid, viewport)
+    }
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -197,9 +215,18 @@ fn annex_b_payload(nal: &[u8]) -> Result<&[u8]> {
     }
 }
 
-fn encode_frame(encoder: &mut Encoder, yuv: &mut YUVBuffer, rgba: &[u8]) -> Result<EncodedFrame> {
+fn encode_frame(
+    encoder: &mut Encoder,
+    yuv: &mut YUVBuffer,
+    pixels: &[u8],
+    bgra: bool,
+) -> Result<EncodedFrame> {
     let dimensions = yuv.dimensions();
-    yuv.read_rgba8(RgbaSliceU8::new(rgba, dimensions));
+    if bgra {
+        yuv.read_bgra8(BgraSliceU8::new(pixels, dimensions));
+    } else {
+        yuv.read_rgba8(RgbaSliceU8::new(pixels, dimensions));
+    }
     let bitstream = encoder
         .encode(yuv)
         .context("Failed to encode a recording frame")?;
@@ -275,14 +302,18 @@ fn record_file(
     ready: mpsc::SyncSender<Result<()>>,
     temp_path: &Path,
 ) -> Result<FinishedRecording> {
-    let (source_width, source_height, first_pixels) = first;
-    let (first_pixels, width, height) = even_rgba(&first_pixels, source_width, source_height)?;
+    let (source_width, source_height, source_pixels) = first;
+    let (first_pixels, width, height) = even_rgba(&source_pixels, source_width, source_height)?;
     let quality = (51.0 - options.quality * 0.41).round().clamp(10.0, 51.0) as u8;
     let frame_rate = options.fps as f32;
     let intra_period = (options.fps.round() as u32).saturating_mul(2).max(1);
     let config = EncoderConfig::new()
         .max_frame_rate(FrameRate::from_hz(frame_rate))
-        .usage_type(UsageType::ScreenContentRealTime)
+        .usage_type(if options.bgra {
+            UsageType::CameraVideoRealTime
+        } else {
+            UsageType::ScreenContentRealTime
+        })
         .rate_control_mode(RateControlMode::Quality)
         .skip_frames(false)
         .profile(Profile::Baseline)
@@ -293,7 +324,9 @@ fn record_file(
     let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
         .context("Failed to initialize the H.264 encoder")?;
     let mut yuv = YUVBuffer::new(width, height);
-    let mut pending = encode_frame(&mut encoder, &mut yuv, &first_pixels)?;
+    let mut pending = encode_frame(&mut encoder, &mut yuv, &first_pixels, options.bgra)?;
+    drop(first_pixels);
+    drop(source_pixels);
     let sps = pending
         .sps
         .take()
@@ -348,7 +381,11 @@ fn record_file(
         if stop.load(Ordering::Relaxed) || started.elapsed() >= limit {
             break;
         }
-        let (frame_width, frame_height, pixels) = capture()?;
+        let captured = capture();
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let (frame_width, frame_height, pixels) = captured?;
         let (pixels, frame_width, frame_height) = even_rgba(&pixels, frame_width, frame_height)?;
         // A document replacement can change the viewport without changing the
         // client window. Keep capturing live frames on the original canvas.
@@ -376,14 +413,16 @@ fn record_file(
             Cow::Owned(canvas)
         };
         let timestamp = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        let next = encode_frame(&mut encoder, &mut yuv, &pixels)?;
+        let next = encode_frame(&mut encoder, &mut yuv, &pixels, options.bgra)?;
         write_sample(&mut writer, pending, pending_at, timestamp)?;
         pending = next;
         pending_at = timestamp;
         frames += 1;
         next_frame += interval;
-        while next_frame <= Instant::now() {
-            next_frame += interval;
+        if !options.paced_by_capture.get() {
+            while next_frame <= Instant::now() {
+                next_frame += interval;
+            }
         }
     }
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -400,6 +439,7 @@ fn record_file(
     drop(file);
     replace_file_with_backup(temp_path, &options.output, "recording")?;
     Ok(FinishedRecording {
+        capture_fallback: None,
         width: u32::from(width),
         height: u32::from(height),
         frames,
@@ -417,18 +457,307 @@ fn record(
 ) -> Result<FinishedRecording> {
     cleanup_stale_sibling_temps(&options.output);
     let temp_path = sibling_temp_path(&options.output);
-    let result = record_file(
-        || input_inject::capture_window_rgba(&window),
-        first,
-        &options,
-        &stop,
-        ready,
-        &temp_path,
-    );
+    let result = record_window(&window, first, options, &stop, ready, &temp_path);
     if result.is_err() {
         let _ = fs::remove_file(temp_path);
     }
     result
+}
+
+fn record_window(
+    window: &input_inject::StudioWindow,
+    first: Frame,
+    options: RecordingOptions,
+    stop: &AtomicBool,
+    ready: mpsc::SyncSender<Result<()>>,
+    temp_path: &Path,
+) -> Result<FinishedRecording> {
+    let shown = || input_inject::capture_window_rgba(window);
+    #[cfg(windows)]
+    if options.bgra {
+        let interval = Duration::from_secs_f64(1.0 / options.fps);
+        return record_pipelined(
+            |frames, done| stream_frames(window, frames, stop, done, interval),
+            shown,
+            first,
+            options,
+            stop,
+            ready,
+            temp_path,
+        );
+    }
+    record_file(shown, first, &options, stop, ready, temp_path)
+}
+
+/// Encodes on this thread the frames `produce` captures on another, so a
+/// slow capture and a slow encoder overlap. When the producer refuses or
+/// ends, the recording goes on with `shown`, the slower capture of the
+/// window, and the answer names why.
+#[cfg(any(windows, test))]
+fn record_pipelined(
+    produce: impl FnOnce(mpsc::SyncSender<Result<Frame>>, &AtomicBool) + Send,
+    mut shown: impl FnMut() -> Result<Frame>,
+    first: Frame,
+    mut options: RecordingOptions,
+    stop: &AtomicBool,
+    ready: mpsc::SyncSender<Result<()>>,
+    temp_path: &Path,
+) -> Result<FinishedRecording> {
+    let done = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let producer_done = &done;
+        let producer = scope.spawn(move || produce(sender, producer_done));
+        let receive = || receiver.recv().context("Capture worker stopped")?;
+        let mut fallback = None;
+        let first = match receive() {
+            Ok(frame) => frame,
+            Err(error) => {
+                fallback = Some(format!("{error:#}"));
+                options.bgra = false;
+                options.paced_by_capture.set(false);
+                first
+            }
+        };
+        let result = record_file(
+            || {
+                if fallback.is_none() {
+                    match receive() {
+                        Ok(frame) => return Ok(frame),
+                        Err(error) if stop.load(Ordering::Relaxed) => return Err(error),
+                        Err(error) => fallback = Some(format!("{error:#}")),
+                    }
+                    options.paced_by_capture.set(false);
+                }
+                let mut frame = shown()?;
+                if options.bgra {
+                    for pixel in frame.2.chunks_exact_mut(4) {
+                        pixel.swap(0, 2);
+                    }
+                }
+                Ok(frame)
+            },
+            first,
+            &options,
+            stop,
+            ready,
+            temp_path,
+        );
+        done.store(true, Ordering::Relaxed);
+        drop(receiver);
+        if producer.join().is_err() {
+            fallback = Some("Capture worker panicked".into());
+        }
+        result.map(|mut finished| {
+            finished.capture_fallback = fallback;
+            finished
+        })
+    })
+}
+
+/// Notices a capture that returns a blank or frozen picture where the window
+/// shows another: its frames are compared with the window's own rendering at
+/// the start and while they stand still, ever less often.
+#[cfg(any(windows, test))]
+struct Freshness {
+    rows: u64,
+    still_since: Option<Instant>,
+    checked: Option<Instant>,
+    gap: Duration,
+}
+
+#[cfg(any(windows, test))]
+impl Freshness {
+    const STILL: Duration = Duration::from_millis(500);
+    const APART: Duration = Duration::from_secs(2);
+    const LONGEST: Duration = Duration::from_secs(16);
+
+    fn new() -> Self {
+        Self {
+            rows: 0,
+            still_since: None,
+            checked: None,
+            gap: Self::APART,
+        }
+    }
+
+    /// Whether this frame is to be compared with the window's rendering.
+    fn due(&mut self, frame: &Frame, now: Instant) -> bool {
+        let rows = sampled_rows(frame);
+        if self.checked.is_none() {
+            self.rows = rows;
+            return true;
+        }
+        if rows != self.rows {
+            self.rows = rows;
+            self.still_since = Some(now);
+            self.gap = Self::APART;
+            return false;
+        }
+        let since = *self.still_since.get_or_insert(now);
+        now.duration_since(since) >= Self::STILL
+            && self
+                .checked
+                .is_some_and(|checked| now.duration_since(checked) >= self.gap)
+    }
+
+    /// Whether a BGRA frame shows what the window shows: `shown` is the
+    /// window's own RGBA rendering taken after it, `again` the next frame. A
+    /// moving picture differs from `shown`, but then differs from `again` as
+    /// much; a frozen or blank one differs from `shown` alone. A picture of
+    /// one color is held to the window's exactly, since a capture that
+    /// painted nothing is one too. Each agreement on a picture that stands
+    /// still doubles the wait for the next comparison.
+    fn agrees(&mut self, frame: &Frame, shown: &Frame, again: &Frame, now: Instant) -> bool {
+        self.checked = Some(now);
+        self.still_since = None;
+        let blank = difference(frame, &(frame.0, frame.1, first_pixel(frame)), false, 0) == 0.0;
+        let tolerance = if blank { 4 } else { 32 };
+        let apart = difference(frame, shown, true, tolerance);
+        let agreed = apart < 0.02 || difference(frame, again, false, tolerance) * 2.0 > apart;
+        self.gap = if agreed && !blank {
+            (self.gap * 2).min(Self::LONGEST)
+        } else {
+            Self::APART
+        };
+        agreed
+    }
+}
+
+/// A picture of the frame's size that repeats its first pixel.
+#[cfg(any(windows, test))]
+fn first_pixel(frame: &Frame) -> Vec<u8> {
+    let pixel = frame.2.get(..4).unwrap_or(&[0; 4]);
+    pixel.repeat(frame.0 as usize * frame.1 as usize)
+}
+
+/// A hash of every fourth row of a frame.
+#[cfg(any(windows, test))]
+fn sampled_rows(frame: &Frame) -> u64 {
+    let (width, height) = (frame.0 as usize, frame.1 as usize);
+    let mut hash = (width as u64) << 32 | height as u64;
+    for y in (0..height).step_by(4) {
+        let Some(row) = frame.2.get(y * width * 4..(y + 1) * width * 4) else {
+            break;
+        };
+        for word in row.chunks_exact(8) {
+            let word = u64::from_le_bytes(<[u8; 8]>::try_from(word).unwrap_or_default());
+            hash = (hash ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+    hash
+}
+
+/// The share of a grid of sample points at which two frames of one size
+/// differ by more than `tolerance` in a channel; `swapped` when `other` has
+/// red and blue the other way around. Frames of different sizes differ
+/// everywhere.
+#[cfg(any(windows, test))]
+fn difference(frame: &Frame, other: &Frame, swapped: bool, tolerance: u8) -> f64 {
+    let (width, height) = (frame.0.min(other.0) as usize, frame.1.min(other.1) as usize);
+    if width == 0 || height == 0 || frame.0.abs_diff(other.0) > 1 || frame.1.abs_diff(other.1) > 1 {
+        return 1.0;
+    }
+    let (columns, rows) = (width.min(64), height.min(36));
+    let pixel = |of: &Frame, x: usize, y: usize| -> Option<[u8; 3]> {
+        let at = (y * of.0 as usize + x) * 4;
+        of.2.get(at..at + 3)?.try_into().ok()
+    };
+    let mut apart = 0usize;
+    for row in 0..rows {
+        let y = (row * 2 + 1) * height / (rows * 2);
+        for column in 0..columns {
+            let x = (column * 2 + 1) * width / (columns * 2);
+            let alike = pixel(frame, x, y)
+                .zip(pixel(other, x, y))
+                .is_some_and(|(a, mut b)| {
+                    if swapped {
+                        b.swap(0, 2);
+                    }
+                    a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= tolerance)
+                });
+            if !alike {
+                apart += 1;
+            }
+        }
+    }
+    apart as f64 / (columns * rows) as f64
+}
+
+/// Captures the window's frames at `interval` and hands each to the
+/// recording. A capture refused five times in a row, or one whose picture is
+/// not the window's, is handed over as the error that ends this route.
+#[cfg(windows)]
+fn stream_frames(
+    window: &input_inject::StudioWindow,
+    sender: mpsc::SyncSender<Result<Frame>>,
+    stop: &AtomicBool,
+    done: &AtomicBool,
+    interval: Duration,
+) {
+    let ended = || stop.load(Ordering::Relaxed) || done.load(Ordering::Relaxed);
+    let mut capture = match input_inject::recording_capture::Capture::new(window) {
+        Ok(capture) => capture,
+        Err(error) => {
+            let _ = sender.send(Err(error));
+            return;
+        }
+    };
+    let mut freshness = Freshness::new();
+    let mut refused = 0;
+    let mut next = Instant::now();
+    while !ended() {
+        while Instant::now() < next && !ended() {
+            thread::sleep(
+                next.saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(10)),
+            );
+        }
+        if ended() {
+            break;
+        }
+        next = (next + interval).max(Instant::now());
+        let frame = match capture.next(stop) {
+            Err(_) if refused < 4 => {
+                refused += 1;
+                continue;
+            }
+            Err(error) => Err(error),
+            Ok(frame) => {
+                refused = 0;
+                shown_by_window(window, &mut capture, &mut freshness, frame, stop)
+            }
+        };
+        let failed = frame.is_err();
+        if sender.send(frame).is_err() || failed {
+            break;
+        }
+    }
+}
+
+/// The frame, or the one after it where it was due for a comparison with the
+/// window's own rendering; an error when the capture's picture is not the
+/// window's.
+#[cfg(windows)]
+fn shown_by_window(
+    window: &input_inject::StudioWindow,
+    capture: &mut input_inject::recording_capture::Capture,
+    freshness: &mut Freshness,
+    mut frame: Frame,
+    stop: &AtomicBool,
+) -> Result<Frame> {
+    if !freshness.due(&frame, Instant::now()) {
+        return Ok(frame);
+    }
+    for _ in 0..2 {
+        let shown = input_inject::capture_window_rgba(window)?;
+        let again = capture.next(stop)?;
+        if freshness.agrees(&frame, &shown, &again, Instant::now()) {
+            return Ok(again);
+        }
+        frame = again;
+    }
+    bail!("The fast capture returned a picture the window does not show")
 }
 
 pub(crate) fn start(
@@ -512,6 +841,8 @@ pub(crate) fn start(
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let recording_options = RecordingOptions {
+        bgra: cfg!(windows),
+        paced_by_capture: Cell::new(cfg!(windows)),
         output: output.clone(),
         fps: request.fps,
         max_seconds: request.max_seconds,
@@ -605,15 +936,254 @@ pub(crate) fn end(parameters: &Value) -> Result<Value> {
     if throttled {
         result["throttled"] = json!(true);
         result["note"] = json!(format!(
-            "The window delivered {achieved_fps} frames per second against {} requested; a minimized or fully covered window is throttled by Windows and Roblox. Keep the recorded window restored behind your other windows, never minimized, and record again",
+            "The recording holds {achieved_fps} frames per second against {} requested: rendering, capture or encoding was slower. A minimized or fully covered window is throttled by Windows and Roblox; keep the recorded window restored behind your other windows, never minimized, and record again",
             active.fps
         ));
+    }
+    if let Some(reason) = finished.capture_fallback {
+        result["captureFallback"] = json!(reason);
     }
     Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_bgra_preserves_rgba_colors_and_ignores_unused_alpha() {
+        let rgba = [
+            [240, 30, 60, 255],
+            [20, 210, 80, 255],
+            [30, 40, 220, 255],
+            [250, 180, 10, 255],
+        ]
+        .concat()
+        .repeat(64);
+        let bgra = [
+            [60, 30, 240, 0],
+            [80, 210, 20, 0],
+            [220, 40, 30, 0],
+            [10, 180, 250, 0],
+        ]
+        .concat()
+        .repeat(64);
+        let encode = |pixels: &[u8], bgra| {
+            let mut encoder =
+                Encoder::with_api_config(OpenH264API::from_source(), EncoderConfig::new()).unwrap();
+            encode_frame(&mut encoder, &mut YUVBuffer::new(16, 16), pixels, bgra).unwrap()
+        };
+        let expected = encode(&rgba, false);
+        let actual = encode(&bgra, true);
+        assert_eq!(actual.bytes, expected.bytes);
+        assert_eq!(actual.sps, expected.sps);
+        assert_eq!(actual.pps, expected.pps);
+    }
+
+    fn picture(width: u32, height: u32, color: impl Fn(u32, u32) -> [u8; 4]) -> Frame {
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                pixels.extend_from_slice(&color(x, y));
+            }
+        }
+        (width, height, pixels)
+    }
+
+    #[test]
+    fn pictures_differ_by_what_they_show_whatever_their_channel_order() {
+        let bars = |shift: u32| move |x: u32, _| [((x + shift) / 8 % 2 * 255) as u8, 90, 200, 255];
+        let bgra = picture(96, 64, bars(0));
+        let rgba = picture(96, 64, |x, y| {
+            let [blue, green, red, alpha] = bars(0)(x, y);
+            [red, green, blue, alpha]
+        });
+        assert_eq!(difference(&bgra, &rgba, true, 32), 0.0);
+        assert_eq!(difference(&bgra, &bgra, false, 32), 0.0);
+        assert!(difference(&bgra, &rgba, false, 32) > 0.9);
+        assert!(difference(&bgra, &picture(96, 64, bars(8)), false, 32) > 0.9);
+        assert_eq!(difference(&bgra, &picture(95, 64, bars(0)), false, 32), 0.0);
+        assert_eq!(difference(&bgra, &picture(64, 64, bars(0)), false, 32), 1.0);
+        assert_eq!(difference(&bgra, &(96, 64, Vec::new()), false, 32), 1.0);
+        let near = picture(96, 64, |x, y| {
+            let [blue, green, red, alpha] = bars(0)(x, y);
+            [blue.saturating_sub(20), green + 20, red, alpha]
+        });
+        assert_eq!(difference(&bgra, &near, false, 32), 0.0);
+        assert_eq!(difference(&bgra, &near, false, 4), 1.0);
+    }
+
+    #[test]
+    fn a_frozen_or_blank_fast_capture_is_told_from_a_moving_one() {
+        let scene =
+            |shift: u32| picture(96, 64, move |x, _| [((x + shift) / 8 % 2 * 255) as u8; 4]);
+        let blank = picture(96, 64, |_, _| [0, 0, 0, 255]);
+        let now = Instant::now();
+        let mut freshness = Freshness::new();
+        assert!(freshness.agrees(&scene(0), &scene(0), &scene(0), now));
+        assert!(freshness.agrees(&scene(0), &scene(8), &scene(8), now));
+        assert!(freshness.agrees(&blank, &blank, &blank, now));
+        assert!(!freshness.agrees(&scene(0), &scene(8), &scene(0), now));
+        assert!(!freshness.agrees(&blank, &scene(0), &blank, now));
+        let dim = picture(96, 64, |x, _| [6 + (x % 16) as u8; 4]);
+        assert!(
+            !freshness.agrees(&blank, &dim, &blank, now),
+            "a dark scene is not a blank one"
+        );
+        assert!(freshness.agrees(&dim, &dim, &dim, now));
+        let mut frame = scene(0);
+        frame.2[..2400].fill(7);
+        assert!(!freshness.agrees(&scene(0), &scene(8), &frame, now));
+    }
+
+    #[test]
+    fn the_fast_capture_is_compared_at_the_start_and_when_it_stops_changing() {
+        let scene =
+            |shift: u32| picture(96, 64, move |x, _| [((x + shift) / 8 % 2 * 255) as u8; 4]);
+        let start = Instant::now();
+        let at = |millis: u64| start + Duration::from_millis(millis);
+        let mut freshness = Freshness::new();
+        assert!(freshness.due(&scene(0), at(0)));
+        assert!(
+            freshness.due(&scene(0), at(16)),
+            "until a comparison is made"
+        );
+        assert!(freshness.agrees(&scene(0), &scene(0), &scene(0), at(20)));
+        for (frame, millis) in (1..200).map(|frame| (frame, 20 + frame * 16)) {
+            assert!(
+                !freshness.due(&scene(frame as u32), at(millis)),
+                "a moving picture"
+            );
+        }
+        let still = scene(3);
+        assert!(!freshness.due(&still, at(4000)));
+        assert!(
+            !freshness.due(&still, at(4400)),
+            "still for less than half a second"
+        );
+        assert!(freshness.due(&still, at(4600)));
+        assert!(freshness.agrees(&still, &still, &still, at(4610)));
+        assert!(
+            !freshness.due(&still, at(5200)),
+            "compared less than two seconds ago"
+        );
+        assert!(!freshness.due(&still, at(6500)));
+        assert!(
+            !freshness.due(&still, at(6700)),
+            "the wait doubles while it stands still"
+        );
+        assert!(freshness.due(&still, at(8700)));
+        assert!(freshness.agrees(&still, &still, &still, at(8710)));
+        assert!(!freshness.due(&scene(4), at(9000)), "a changed picture");
+        assert!(!freshness.due(&scene(4), at(10000)));
+        assert!(freshness.due(&scene(4), at(10800)), "the wait starts over");
+    }
+
+    struct Pipelined {
+        root: PathBuf,
+        stop: AtomicBool,
+    }
+
+    impl Pipelined {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(automation_token(name));
+            fs::create_dir_all(&root).unwrap();
+            Self {
+                root,
+                stop: AtomicBool::new(false),
+            }
+        }
+
+        fn record(
+            &self,
+            produce: impl FnOnce(mpsc::SyncSender<Result<Frame>>, &AtomicBool) + Send,
+            shown: impl FnMut() -> Result<Frame>,
+        ) -> Result<FinishedRecording> {
+            let options = RecordingOptions {
+                bgra: true,
+                paced_by_capture: Cell::new(true),
+                output: self.root.join("clip.mp4"),
+                fps: 60.0,
+                max_seconds: 5.0,
+                quality: 80.0,
+            };
+            let (ready, _ready) = mpsc::sync_channel(1);
+            let temp = sibling_temp_path(&options.output);
+            let first = picture(64, 32, |_, _| [9, 9, 9, 255]);
+            record_pipelined(produce, shown, first, options, &self.stop, ready, &temp)
+        }
+    }
+
+    impl Drop for Pipelined {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn a_pipelined_recording_ends_with_its_capture_thread_when_it_is_stopped() {
+        let run = Pipelined::new("recording-pipelined-stop");
+        let sent = std::sync::atomic::AtomicUsize::new(0);
+        let finished = run
+            .record(
+                |frames, done| {
+                    while !done.load(Ordering::Relaxed) {
+                        if sent.fetch_add(1, Ordering::Relaxed) == 4 {
+                            run.stop.store(true, Ordering::Relaxed);
+                        }
+                        if frames
+                            .send(Ok(picture(64, 32, |x, _| [x as u8, 0, 0, 255])))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                },
+                || bail!("the window is not captured while the fast capture runs"),
+            )
+            .unwrap();
+        assert_eq!(finished.capture_fallback, None);
+        assert!(finished.frames >= 2);
+        assert_eq!((finished.width, finished.height), (64, 32));
+        assert!(run.root.join("clip.mp4").is_file());
+    }
+
+    #[test]
+    fn a_refused_fast_capture_records_the_window_and_names_why() {
+        for (name, good, panics, reason) in [
+            ("refused", 0, false, "the viewport is not Studio's"),
+            ("ended", 3, false, "the viewport is not Studio's"),
+            ("panicked", 3, true, "Capture worker panicked"),
+        ] {
+            let run = Pipelined::new(&format!("recording-pipelined-{name}"));
+            let mut shown = 0;
+            let finished = run
+                .record(
+                    |frames, _| {
+                        for _ in 0..good {
+                            frames
+                                .send(Ok(picture(64, 32, |_, _| [200, 80, 20, 255])))
+                                .unwrap();
+                        }
+                        if panics {
+                            panic!("capture worker test panic");
+                        }
+                        let _ = frames.send(Err(anyhow!("the viewport is not Studio's")));
+                    },
+                    || {
+                        shown += 1;
+                        if shown == 3 {
+                            run.stop.store(true, Ordering::Relaxed);
+                        }
+                        Ok(picture(64, 32, |_, _| [20, 80, 200, 255]))
+                    },
+                )
+                .unwrap();
+            assert_eq!(finished.capture_fallback.as_deref(), Some(reason), "{name}");
+            assert!(finished.frames >= good + 2, "{name}: {}", finished.frames);
+            assert!(shown >= 2, "{name}");
+            assert!(run.root.join("clip.mp4").is_file(), "{name}");
+        }
+    }
+
     #[test]
     fn capture_rate_reports_the_file_rate_and_flags_a_throttled_source() {
         assert_eq!(capture_rate(60.0, 600, 10_000), (60.0, false));
@@ -640,6 +1210,8 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = Arc::clone(&stop);
             let options = RecordingOptions {
+                bgra: name == "normal",
+                paced_by_capture: Cell::new(name == "normal"),
                 output: output.clone(),
                 fps: 30.0,
                 max_seconds: 5.0,
@@ -649,17 +1221,18 @@ mod tests {
             let (done_tx, done_rx) = mpsc::sync_channel(1);
             let worker = thread::spawn(move || {
                 let mut frames = 0;
+                let color = if options.bgra {
+                    [200, 80, 20, 255]
+                } else {
+                    [20, 80, 200, 255]
+                };
                 let mut frame = || {
                     frames += 1;
                     if frames == 3 {
                         thread_stop.store(true, Ordering::Relaxed);
                     }
                     let (width, height) = if frames == 2 { (97, 65) } else { (65, 33) };
-                    Ok((
-                        width,
-                        height,
-                        [20, 80, 200, 255].repeat((width * height) as usize),
-                    ))
+                    Ok((width, height, color.repeat((width * height) as usize)))
                 };
                 let first = frame()?;
                 let temp = sibling_temp_path(&options.output);
