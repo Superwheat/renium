@@ -342,6 +342,26 @@ fn scripts_document(entry: Option<&SnapshotEntry>) -> Result<SettingsBytecode> {
     Ok(document)
 }
 
+/// Whether a store holds a PackageLink. A store in blocks answers from its
+/// structure, read in place: no instance is built where it does not hold
+/// the class's name.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn holds_package_link(entry: Option<&SnapshotEntry>) -> Result<bool> {
+    use crate::settings::bytecode::blocks::{BlockStore, is_block_store};
+    const CLASS: &str = "PackageLink";
+    let document = match entry {
+        Some(SnapshotEntry::File(bytes)) if is_block_store(bytes) => {
+            let store = BlockStore::open(bytes.as_slice())?;
+            if !store.structure_holds(CLASS)? {
+                return Ok(false);
+            }
+            store.structure()?
+        }
+        _ => settings_document(entry)?,
+    };
+    Ok((document.instances.iter()).any(|instance| instance.class_name == CLASS))
+}
+
 fn script_paths_of(
     document: &SettingsBytecode,
     settings_path: &Path,

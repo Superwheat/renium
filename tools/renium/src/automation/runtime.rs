@@ -826,7 +826,13 @@ fn pull_publication(
         return Ok(PublishedProjectChanges::default());
     }
     if let Some(PullBaseline::Scoped(scoped)) = baseline {
-        if let Some(published) = scoped.run(context, bridge, info, &mut args)? {
+        if let Some(published) = scoped.run(
+            context,
+            bridge,
+            info,
+            &mut args,
+            &mut |_: &[PathBuf]| Ok(()),
+        )? {
             return Ok(published);
         }
         // The held baseline is gone: this one captures the whole place.

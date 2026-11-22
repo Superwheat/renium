@@ -2141,17 +2141,36 @@ struct ServiceExportRun<'a> {
     native_finish_guard: Option<EditorBinaryExportFinishGuard<'a>>,
 }
 
+/// What a test's Studio holds, in place of a capture and its import: it
+/// writes the services it is asked for into the stage, whose copy is done.
+#[cfg(test)]
+pub(crate) type StudioExport = Box<dyn FnMut(&[String], &ExportProjectStage) -> Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static STUDIO_EXPORT: std::cell::RefCell<Option<StudioExport>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn run_service_exports<'a>(
     bridge: &'a BridgeServer,
     run_started: Instant,
     services: &[String],
     dispatcher: &DirectImportDispatcher,
+    #[cfg_attr(not(test), allow(unused_variables))] stage: &ExportProjectStage,
 ) -> Result<ServiceExportRun<'a>> {
     let mut run = ServiceExportRun {
         spans: Vec::with_capacity(services.len()),
         cumulative_latency_ms: 0.0,
         native_finish_guard: None,
     };
+    #[cfg(test)]
+    if let Some(staged) = STUDIO_EXPORT.with(|studio| {
+        (studio.borrow_mut().as_mut())
+            .map(|studio| stage.wait_for_copy().and_then(|()| studio(services, stage)))
+    }) {
+        return staged.map(|()| run);
+    }
     let guard = {
         let mut finish_output = |output| {
             finish_service_export_output(
@@ -2388,6 +2407,7 @@ fn export_snapshots_core(
         total_started,
         &export_services,
         &direct_import_dispatcher,
+        &project_stage,
     )?;
     let first_service_export_ms = service_export_spans
         .first()

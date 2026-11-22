@@ -138,9 +138,42 @@ enum HeldStart {
     Unchanged(Box<(ExportProjectStage, ProjectSnapshot)>),
     /// Studio moved since the proof of the baseline held again; outside the
     /// services it moved in it holds the baseline's files, which are still
-    /// the files.
+    /// the files, and the last sync too where `synced`. The start merges
+    /// from the last sync either way: nothing tells whether one that holds
+    /// other files is older than the baseline's pull.
     #[cfg(any(windows, target_os = "macos"))]
-    Moved,
+    Moved { synced: bool },
+    /// Studio still holds the baseline's proof, so it holds the baseline's
+    /// files, and the files moved since.
+    #[cfg(any(windows, target_os = "macos"))]
+    FilesMoved(Box<HeldFiles>),
+}
+
+impl HeldStart {
+    /// The files as the start read them, where it did.
+    fn files(&self) -> Option<&ProjectSnapshot> {
+        #[cfg(any(windows, target_os = "macos"))]
+        if let Self::Unchanged(held) = self {
+            return Some(&held.1);
+        }
+        #[cfg(any(windows, target_os = "macos"))]
+        if let Self::FilesMoved(held) = self {
+            return Some(&held.editor);
+        }
+        None
+    }
+}
+
+/// Whether a start may take one side where only it moved since a held
+/// baseline: it writes, and no decision, open review, start of Studio from
+/// the files or restart Renium cannot prove asks for a comparison.
+fn takes_one_side(setup: &PairSetup, record: &PairRecord) -> bool {
+    setup.mode.writes()
+        && setup.decisions.is_empty()
+        && !setup.bootstrap_studio_from_editor
+        && !setup.runtime_replacement_unproven
+        && !record.has_open_review()
+        && !record.resolution_required
 }
 
 /// Holds `entry` again as the runtime's baseline for the commands after.
@@ -153,20 +186,24 @@ fn hold_again(bridge: &BridgeServer, runtime: &str, entry: VerifiedFullPush) {
 }
 
 /// A held baseline whose files are what a whole pull writes and still as it
-/// wrote them, with the comparison's stage and its read of those files.
+/// wrote them, with the comparison's stage and its read of those files, and
+/// whether they are the last sync too.
 #[cfg(any(windows, target_os = "macos"))]
 struct HeldFiles {
     entry: VerifiedFullPush,
     stage: ExportProjectStage,
     editor: ProjectSnapshot,
+    synced: bool,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
 impl HeldFiles {
     /// Takes the runtime's baseline where a Live Sync start can begin from
-    /// it. One kept for another push, or whose files a push sent, is left
-    /// as it is; one whose files the start cannot read as held stays held.
-    fn take(context: &BoundContext, bridge: &BridgeServer) -> Option<Self> {
+    /// it, with files that moved since where `files_may_move`, and as the
+    /// files without reading them where `files_known`. One kept for another
+    /// push, or whose files a push sent, is left as it is; one whose files
+    /// the start cannot read as held stays held.
+    fn take(context: &BoundContext, bridge: &BridgeServer, files: (bool, bool)) -> Option<Self> {
         let runtime = context.runtime_id.as_deref()?;
         let input = automation_push_args(context, &json!({}), false)
             .and_then(|args| plain_push_input(&args))
@@ -188,7 +225,7 @@ impl HeldFiles {
         } else {
             let entry = take_baseline(context, bridge, &input)?;
             let phase = Instant::now();
-            let files = held_comparison_files(context, &entry);
+            let files = held_comparison_files(context, &entry, files);
             log_reconcile_timing("held baseline files", phase);
             let reason = match files {
                 Ok(Ok((stage, editor))) => {
@@ -196,6 +233,7 @@ impl HeldFiles {
                         entry,
                         stage,
                         editor,
+                        synced: false,
                     });
                 }
                 Ok(Err(reason)) => reason.to_string(),
@@ -212,13 +250,45 @@ impl HeldFiles {
     }
 
     /// What the lease that verified the proof found: Studio still holds the
-    /// files, or it moved since. The baseline is held again for the
-    /// commands after either way, renewed where it held.
-    fn settle(self, bridge: &BridgeServer, runtime: &str, state: &Value) -> HeldStart {
+    /// files, or it moved since, or the files moved since it; and, for a
+    /// start that may take one side, given the pair's last sync as
+    /// `one_side`, whether that holds the baseline's files. The baseline is
+    /// held again for the commands after, renewed where it held, except
+    /// where Studio holds it and the files moved: the start takes it then.
+    fn settle(
+        mut self,
+        bridge: &BridgeServer,
+        (runtime, state): (&str, &Value),
+        one_side: Option<Option<&StoredSnapshot>>,
+    ) -> HeldStart {
+        let files_moved = self.editor != self.entry.project;
+        let synced = |project: &ProjectSnapshot| {
+            let synced = one_side
+                .flatten()
+                .is_some_and(|stored| stored.matches(project));
+            if one_side.is_some() && !synced {
+                log_global(
+                    5,
+                    format_args!("[renium] baseline: live start: the last sync is not its files"),
+                );
+            }
+            synced
+        };
+        if files_moved && state["pushProofMatches"] == true {
+            log_global(
+                5,
+                format_args!(
+                    "[renium] baseline: live start from it: Studio holds it, the files moved since"
+                ),
+            );
+            self.synced = synced(&self.entry.project);
+            return HeldStart::FilesMoved(Box::new(self));
+        }
         let Self {
             mut entry,
             stage,
             editor,
+            ..
         } = self;
         if state["pushProofMatches"] != true {
             log_global(
@@ -230,8 +300,18 @@ impl HeldFiles {
                         .unwrap_or("Studio proof unavailable")
                 ),
             );
+            let synced = !files_moved && synced(&entry.project);
             hold_again(bridge, runtime, entry);
-            return HeldStart::Moved;
+            if files_moved {
+                log_global(
+                    5,
+                    format_args!(
+                        "[renium] baseline: live start captures every service: the files changed since"
+                    ),
+                );
+                return HeldStart::NotHeld;
+            }
+            return HeldStart::Moved { synced };
         }
         log_global(
             5,
@@ -243,14 +323,59 @@ impl HeldFiles {
     }
 }
 
+/// The paths a start pushes alone where Studio holds `held` and the files
+/// moved since: those the files changed. `None` where it compares instead: no
+/// path a push sends moved, a store was removed from the files, which a push
+/// refuses, or a store that moved holds a PackageLink on either side, whose
+/// changes the merge alone refuses.
+#[cfg(any(windows, target_os = "macos"))]
+fn pushed_alone(
+    context: &BoundContext,
+    (held, editor): (&ProjectSnapshot, &ProjectSnapshot),
+) -> Result<Option<Vec<PathBuf>>> {
+    let paths = (held.entries.keys().chain(editor.entries.keys()))
+        .filter(|path| held.entries.get(*path) != editor.entries.get(*path))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let compares = |reason: &str| {
+        log_global(
+            5,
+            format_args!("[renium] baseline: live start compares the files moved since: {reason}"),
+        );
+        Ok(None)
+    };
+    if baseline_scopes(context, &paths)?.is_empty() {
+        return compares("no path a push sends moved");
+    }
+    for path in &paths {
+        let store = (path.file_name().and_then(|name| name.to_str()))
+            .is_some_and(is_service_settings_file_name);
+        if store && !editor.entries.contains_key(path) {
+            return compares("a store was removed from the files");
+        }
+        if store
+            && (holds_package_link(held.entries.get(path))?
+                || holds_package_link(editor.entries.get(path))?)
+        {
+            return compares("a store that moved holds a PackageLink");
+        }
+    }
+    Ok(Some(paths))
+}
+
 /// The comparison stage of a Live Sync start and the files it reads, where
 /// `held` says what Studio holds there: no packed link script folds into
 /// Studio's side, the comparison reads the paths the pull wrote, and the
-/// files are as it wrote them.
+/// files are as it wrote them, or moved since where `files_may_move`. Where
+/// `files_known`, the start knows the files hold `held`'s and reads none:
+/// what moved after is pending when it ends.
 #[cfg(any(windows, target_os = "macos"))]
 fn held_comparison_files(
     context: &BoundContext,
     held: &VerifiedFullPush,
+    (files_may_move, files_known): (bool, bool),
 ) -> Result<std::result::Result<(ExportProjectStage, ProjectSnapshot), &'static str>> {
     let root = Path::new(&context.root);
     if packing_link_enforcement(root, Path::new(&context.source))?.is_some() {
@@ -265,8 +390,11 @@ fn held_comparison_files(
     if sorted(stage.publish_paths()) != sorted(&held.paths) {
         return Ok(Err("the comparison reads other paths than the pull wrote"));
     }
+    if files_known {
+        return Ok(Ok((stage, held.project.clone())));
+    }
     let editor = capture_snapshot(root, stage.publish_paths())?;
-    if editor != held.project {
+    if !files_may_move && editor != held.project {
         return Ok(Err("the files changed since"));
     }
     Ok(Ok((stage, editor)))
@@ -275,14 +403,18 @@ fn held_comparison_files(
 /// The lease a reconcile compares under. A held baseline a start can begin
 /// from has its proof verified in the request that starts the lease, so no
 /// edit falls between the two, and a proof that holds keeps the observation
-/// it stands on running instead of tracking Studio anew.
+/// it stands on running instead of tracking Studio anew. Files that moved
+/// since the baseline begin from it where `one_side`, the record of a start
+/// that may take one side, is given; where `files_known`, the files are
+/// known to hold the baseline's and are not read.
 fn studio_lease(
     context: &BoundContext,
     bridge: &BridgeServer,
+    (one_side, files_known): (Option<&PairRecord>, bool),
 ) -> Result<(StudioChangeGuard, Value, HeldStart)> {
     #[cfg(any(windows, target_os = "macos"))]
     {
-        let held = HeldFiles::take(context, bridge);
+        let held = HeldFiles::take(context, bridge, (one_side.is_some(), files_known));
         let lease = current_studio_change_guard_verifying(
             context,
             bridge,
@@ -299,20 +431,26 @@ fn studio_lease(
                 return Err(error);
             }
         };
+        let one_side = one_side.map(|record| record.baseline.as_ref());
         let start = held.map_or(HeldStart::NotHeld, |held| {
-            held.settle(bridge, &guard.runtime_id, &state)
+            held.settle(bridge, (&guard.runtime_id, &state), one_side)
         });
         Ok((guard, state, start))
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
+        let _ = (one_side, files_known);
         let (guard, state) = current_studio_change_guard_with_state(context, bridge, |_| Ok(()))?;
         Ok((guard, state, HeldStart::NotHeld))
     }
 }
 
 /// Both sides of a start's comparison and the paths at which they differ.
-/// Sides a held baseline shows equal are neither captured nor compared.
+/// Sides a held baseline shows equal are neither captured nor compared;
+/// where it shows Studio holds its files, those are Studio's side, staged
+/// over a copy of the files as a capture stages Studio, and the common
+/// ancestor the comparison merges from where the last sync holds other
+/// files: Studio has taken no push since their pull.
 fn compared_capture(
     context: &BoundContext,
     bridge: &BridgeServer,
@@ -336,10 +474,51 @@ fn compared_capture(
             return Ok((capture, HashSet::new()));
         }
         #[cfg(any(windows, target_os = "macos"))]
-        HeldStart::Moved => match capture_moved_services(context, bridge, studio_state)? {
+        HeldStart::Moved { .. } => match capture_moved_services(context, bridge, studio_state)? {
             Some(capture) => capture,
             None => capture_for_reconcile(context, bridge, setup, record, studio_state)?,
         },
+        #[cfg(any(windows, target_os = "macos"))]
+        HeldStart::FilesMoved(held) => {
+            let HeldFiles {
+                entry,
+                stage,
+                editor,
+                synced,
+            } = *held;
+            let studio = entry.project.clone();
+            let ancestor = if synced {
+                if let Some(runtime) = context.runtime_id.as_deref() {
+                    hold_again(bridge, runtime, entry);
+                }
+                None
+            } else {
+                Some(entry.project)
+            };
+            let root = Path::new(&context.root);
+            let covered = ScopeSet::new(stage.publish_paths());
+            drop(stage);
+            let stage = ExportProjectStage::create_with_baseline(
+                root,
+                &bound_context::source_dir(context)?,
+                &sync_services(),
+                &|paths| super::push_flow::publish_baseline(root, &editor, &covered, paths),
+            )?;
+            let moved = (studio.entries.keys().chain(editor.entries.keys()))
+                .filter(|path| studio.entries.get(*path) != editor.entries.get(*path))
+                .cloned()
+                .collect::<HashSet<_>>();
+            apply_snapshot_paths(&stage.project_root, &moved, &studio)?;
+            let publish_paths = stage.publish_paths().to_vec();
+            ReconcileCapture {
+                stage,
+                studio,
+                editor,
+                loaded_baseline: ancestor,
+                link_enforcement: None,
+                publish_paths,
+            }
+        }
         HeldStart::NotHeld => capture_for_reconcile(context, bridge, setup, record, studio_state)?,
     };
     let phase = Instant::now();
@@ -409,6 +588,178 @@ fn capture_moved_services(
     let captured = capture_moved_services_of(context, (bridge, runtime), &held, studio_state);
     hold_again(bridge, runtime, held);
     captured
+}
+
+/// Pulls what Studio moved since the held baseline into the files, which
+/// still hold it as `last_sync` does, as a scoped `rbx pull` takes it: the
+/// instances Studio named the values of, else the services it moved in,
+/// keeping a baseline where Studio holds what it wrote. Answers the paths
+/// the pull published and what they hold, which the last sync takes in their
+/// place. `None`, having written nothing, where no baseline is held, a
+/// scoped `rbx pull` would not run, the pull cannot be scoped, a store it
+/// would write holds a PackageLink, whose removal, rename or move only a
+/// comparison refuses, the files under the services it pulls moved from the
+/// last sync before it wrote them or it failed before writing, and where it
+/// kept files back, which only a comparison tells from edits; the baseline
+/// stays held where the pull did not take it. A pull that failed, or wrote
+/// files that moved after, where the files no longer hold what it read, is
+/// an error: nothing tells its writes from edits.
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn pull_what_studio_moved(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    last_sync: &StoredSnapshot,
+) -> Result<Option<(Vec<PathBuf>, ProjectSnapshot)>> {
+    let phase = Instant::now();
+    let root = Path::new(&context.root);
+    let runtime = context
+        .runtime_id
+        .as_deref()
+        .context("Studio context has no edit-mode runtime")?;
+    let input = plain_push_input(&automation_push_args(context, &json!({}), false)?)?;
+    let mut held = take_baseline(context, bridge, &input);
+    let Some(paths) = held.as_ref().map(|entry| entry.paths.clone()) else {
+        return Ok(None);
+    };
+    let files_moved = std::cell::Cell::new(false);
+    let mut files_held = |scopes: &[PathBuf]| {
+        if last_sync.holds_within(scopes, &capture_snapshot(root, scopes)?) {
+            return Ok(());
+        }
+        files_moved.set(true);
+        bail!("the files moved since the start read them")
+    };
+    let published = (|| -> Result<Option<crate::snapshot::export::PublishedProjectChanges>> {
+        let mut args = automation_pull_args(context, &json!({}))?;
+        if !pull_is_whole(&args)? {
+            return Ok(None);
+        }
+        let Some(scoped) = plan_scoped_pull(context, bridge, &args, &mut held)? else {
+            return Ok(None);
+        };
+        if scoped.holds_package_link()? {
+            log_global(
+                5,
+                format_args!(
+                    "[renium] baseline: live start compares what Studio moved: a store its pull would write holds a PackageLink"
+                ),
+            );
+            held = Some(scoped.into_held());
+            return Ok(None);
+        }
+        let info = bridge.cached_bridge_info_for_target(BridgeTarget::Main)?;
+        scoped.run(context, bridge, &info, &mut args, &mut files_held)
+    })();
+    if let Some(entry) = held {
+        hold_again(bridge, runtime, entry);
+    }
+    let pulled = published.and_then(|published| {
+        let Some(published) = published else {
+            return Ok(None);
+        };
+        if !published.preserved.is_empty()
+            || !published.read_only_links_restored.is_empty()
+            || !published.studio_overrides.is_empty()
+        {
+            log_global(
+                5,
+                format_args!("[renium] baseline: live start compares: its pull kept files back"),
+            );
+            return Ok(None);
+        }
+        let written = capture_snapshot(root, &published.publish_paths)?;
+        anyhow::ensure!(
+            publish_settled(&written, &published.settled),
+            "the files changed as the pull wrote them"
+        );
+        Ok(Some((published.publish_paths, written)))
+    });
+    log_reconcile_timing("pull of what Studio moved", phase);
+    match pulled {
+        Err(error)
+            if files_moved.get()
+                || capture_snapshot(root, &paths).is_ok_and(|files| last_sync.matches(&files)) =>
+        {
+            log_global(
+                5,
+                format_args!("[renium] baseline: live start pull of what Studio moved wrote nothing: {error:#}"),
+            );
+            Ok(None)
+        }
+        pulled => pulled.context("The start's pull of what Studio moved failed and the files no longer hold what it read; pull again or start Live Sync again"),
+    }
+}
+
+/// The fields a push's summary says Studio deferred: those of instances it
+/// imported whose write after the import failed.
+fn deferred_fields(
+    summary: &Map<String, Value>,
+) -> Result<Vec<crate::editor::types::PendingImportFields>> {
+    Ok((summary.get("supplementalImportPendingFields").cloned())
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default())
+}
+
+/// What a start or a push says of the fields Studio deferred.
+fn deferred_fields_message(pending: &[crate::editor::types::PendingImportFields]) -> String {
+    format!(
+        "Studio committed; {} deferred fields remain pending. Retry the push to write them.",
+        pending
+            .iter()
+            .map(|row| row.properties.len())
+            .sum::<usize>()
+    )
+}
+
+/// What a push says of the fields its summary names as deferred; `None`
+/// where Studio deferred none.
+pub(crate) fn deferred_fields_error(summary: &Map<String, Value>) -> Result<Option<String>> {
+    let pending = deferred_fields(summary)?;
+    Ok((!pending.is_empty()).then(|| deferred_fields_message(&pending)))
+}
+
+/// Makes the last sync what Studio holds at the paths a push wrote whose
+/// fields Studio deferred: read back there, Studio must hold `sent` but for
+/// those fields. Answers the paths at which it holds other than `sent`: the
+/// files stay changed there, and the next push plans from what Studio holds.
+fn record_deferred_push(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    (key, record): (&str, &mut PairRecord),
+    (pushed, sent): (&HashSet<PathBuf>, &ProjectSnapshot),
+    pending: &[crate::editor::types::PendingImportFields],
+) -> Result<Vec<PathBuf>> {
+    let services = services_for_snapshot_paths(context, pushed);
+    let (_, captured) = capture_studio_services(context, bridge, &services, false)?;
+    let mismatches = reconciled_path_differences(&captured, sent, pushed, pending)?;
+    if !mismatches.is_empty() {
+        let details = snapshot_mismatch_details(&captured, sent, &mismatches)?;
+        return Err(retention_failure(
+            "reconciled paths",
+            &mismatches,
+            details.as_deref(),
+        ));
+    }
+    record_pushed_baseline(context, key, record, pushed, &captured)?;
+    let mut deferred = (pushed.iter())
+        .filter(|path| {
+            !entries_equivalent(path, captured.entries.get(*path), sent.entries.get(*path))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    deferred.sort();
+    Ok(deferred)
+}
+
+/// Leaves the paths at which Studio deferred fields of a push pending, with
+/// the error that says so.
+fn note_deferred(setup: &mut PairSetup, applied: &AppliedEditorChanges) -> Result<()> {
+    if let Some(error) = deferred_fields_error(&applied.summary)? {
+        setup.unsynced_paths.clone_from(&applied.deferred);
+        setup.error = Some(error);
+    }
+    Ok(())
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -701,31 +1052,39 @@ impl Coordinator {
 
     /// A clean restart whose files match the stored baseline continues the
     /// pair without a comparison, or pushes the file changes made meanwhile;
-    /// answers whether the setup was finished that way.
+    /// answers whether the setup was finished that way, and whether it
+    /// pushed. `files` is the files as the start read them, where it did.
     fn finish_clean_restart(
         &self,
         context: &BoundContext,
         bridge: &BridgeServer,
-        setup: &mut PairSetup,
-        record: &mut PairRecord,
-        studio_guard: &StudioChangeGuard,
-        studio_state: &Value,
-    ) -> Result<bool> {
+        (setup, record): (&mut PairSetup, &mut PairRecord),
+        (studio_guard, studio_state): (&StudioChangeGuard, &Value),
+        files: Option<&ProjectSnapshot>,
+    ) -> Result<Option<bool>> {
         if !setup.requires_reconcile
             && let (Some(checkpoint), Some(baseline)) =
                 (record.studio_checkpoint.as_ref(), record.baseline.as_ref())
             && checkpoint.matches_state(context, studio_state)
         {
             let phase = Instant::now();
-            let stage = project_comparison_stage(context, &sync_services())?;
-            let editor = capture_snapshot(Path::new(&context.root), stage.publish_paths())?;
-            drop(stage);
+            let read = match files {
+                Some(_) => None,
+                None => {
+                    let stage = project_comparison_stage(context, &sync_services())?;
+                    Some(capture_snapshot(
+                        Path::new(&context.root),
+                        stage.publish_paths(),
+                    )?)
+                }
+            };
+            let editor = files.or(read.as_ref()).context("no read of the files")?;
             log_reconcile_timing("clean restart comparison", phase);
-            let differences = if baseline.matches(&editor) {
+            let differences = if baseline.matches(editor) {
                 HashSet::new()
             } else {
                 let previous = baseline.load(Path::new(&context.root), &setup.key)?;
-                snapshot_differences(&previous, &editor)?
+                snapshot_differences(&previous, editor)?
             };
             let confirmed = read_studio_change_state(context, bridge)?;
             if checkpoint.matches_state(context, &confirmed) && differences.is_empty() {
@@ -733,13 +1092,13 @@ impl Coordinator {
                 record.note_setup(setup);
                 write_record(context, &setup.key, record)?;
                 setup.resolution_required = false;
-                return Ok(true);
+                return Ok(Some(false));
             }
             if checkpoint.matches_state(context, &confirmed) && setup.mode.writes() {
                 let mut paths = differences.into_iter().collect::<Vec<_>>();
                 paths.sort();
                 record.note_setup(setup);
-                self.push_editor_changes_locked(
+                let applied = self.push_editor_changes_locked(
                     context,
                     &setup.key,
                     bridge,
@@ -747,11 +1106,121 @@ impl Coordinator {
                     Some(studio_guard),
                     record,
                 )?;
+                note_deferred(setup, &applied)?;
                 setup.resolution_required = false;
-                return Ok(true);
+                return Ok(Some(true));
             }
         }
-        Ok(false)
+        Ok(None)
+    }
+
+    /// A start under a held baseline Studio still holds, whose files moved
+    /// since: `paths`, which the files changed since, are pushed as Live Sync
+    /// pushes the files' edits, from the baseline's files as the last sync.
+    /// Where the last sync holds other files or there is none, those take
+    /// its place first: Studio holds them and has taken no push since their
+    /// pull, so every difference of the files is an edit made after it.
+    /// Files that differ from what the push left as the last sync stay
+    /// pending, those Studio deferred fields of among them.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn push_over_held(
+        &self,
+        context: &BoundContext,
+        bridge: &BridgeServer,
+        (setup, record): (&mut PairSetup, &mut PairRecord),
+        studio_guard: &StudioChangeGuard,
+        (held, paths): (HeldFiles, Vec<PathBuf>),
+    ) -> Result<()> {
+        let HeldFiles {
+            entry,
+            stage,
+            editor,
+            synced,
+        } = held;
+        drop(editor);
+        let root = Path::new(&context.root);
+        if !synced {
+            let phase = Instant::now();
+            record.baseline = Some(StoredSnapshot::write(root, &setup.key, &entry.project)?);
+            record.studio_checkpoint = None;
+            log_reconcile_timing("held baseline as the last sync", phase);
+        }
+        drop(entry);
+        continue_clean_verify(setup, record);
+        record.note_setup(setup);
+        let applied = self.push_editor_changes_locked(
+            context,
+            &setup.key,
+            bridge,
+            &paths,
+            Some(studio_guard),
+            record,
+        )?;
+        note_deferred(setup, &applied)?;
+        setup.resolution_required = false;
+        let files = capture_snapshot(root, stage.publish_paths())?;
+        setup.unsynced_paths = (record.baseline.as_ref())
+            .context("Reconciliation baseline is missing")?
+            .moved_paths(&files);
+        Ok(())
+    }
+
+    /// Takes one side where the held baseline lets a start: pushes the files'
+    /// changes over it, or pulls what Studio moved since and leases Studio
+    /// again. Answers the lease the start compares under, or `None` where it
+    /// ended.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn one_side_start(
+        &self,
+        context: &BoundContext,
+        bridge: &BridgeServer,
+        (setup, record): (&mut PairSetup, &mut PairRecord),
+        (studio_guard, studio_state, start): (StudioChangeGuard, Value, HeldStart),
+    ) -> Result<Option<(StudioChangeGuard, Value, HeldStart)>> {
+        match start {
+            HeldStart::FilesMoved(held) => {
+                match pushed_alone(context, (&held.entry.project, &held.editor)) {
+                    Ok(Some(paths)) => {
+                        self.push_over_held(
+                            context,
+                            bridge,
+                            (setup, record),
+                            &studio_guard,
+                            (*held, paths),
+                        )?;
+                        Ok(None)
+                    }
+                    Ok(None) => Ok(Some((
+                        studio_guard,
+                        studio_state,
+                        HeldStart::FilesMoved(held),
+                    ))),
+                    Err(error) => {
+                        hold_again(bridge, &studio_guard.runtime_id, held.entry);
+                        Err(error)
+                    }
+                }
+            }
+            HeldStart::Moved { synced: true, .. } => {
+                let last_sync = record
+                    .baseline
+                    .as_mut()
+                    .context("Reconciliation baseline is missing")?;
+                let pulled = pull_what_studio_moved(context, bridge, last_sync);
+                drop(StudioTrackingGuardRelease::new(
+                    bridge,
+                    &studio_guard.runtime_id,
+                    studio_guard.tracking_guard_id.clone(),
+                ));
+                let Some((paths, written)) = pulled? else {
+                    return studio_lease(context, bridge, (None, false)).map(Some);
+                };
+                last_sync.replace_scopes(Path::new(&context.root), &setup.key, &paths, &written)?;
+                write_record(context, &setup.key, record)?;
+                studio_lease(context, bridge, (None, true)).map(Some)
+            }
+            start => Ok(Some((studio_guard, studio_state, start))),
+        }
     }
 
     // Lock order everywhere: the bridge request gate first (this Edit
@@ -770,7 +1239,9 @@ impl Coordinator {
         let mut record = load_record(context, &setup.key)?
             .context("Reconciliation state disappeared while starting Live Sync")?;
         let _selection = bound_context::select(context);
-        let (studio_guard, studio_state, start) = studio_lease(context, bridge)?;
+        let one_side = takes_one_side(setup, &record);
+        let (studio_guard, studio_state, start) =
+            studio_lease(context, bridge, (one_side.then_some(&record), false))?;
         if setup.runtime_replacement_unproven && setup.resolution_preference.is_none() {
             setup.mode = PairMode::Verify;
             setup.error = Some(
@@ -800,16 +1271,30 @@ impl Coordinator {
                     .is_some_and(|checkpoint| checkpoint.matches_state(context, &studio_state))
             ),
         );
-        if self.finish_clean_restart(
+        let finished = self.finish_clean_restart(
             context,
             bridge,
-            setup,
-            &mut record,
-            &studio_guard,
-            &studio_state,
-        )? {
-            return Ok(());
+            (setup, &mut record),
+            (&studio_guard, &studio_state),
+            start.files(),
+        );
+        if !matches!(finished, Ok(None)) {
+            #[cfg(any(windows, target_os = "macos"))]
+            if let (Ok(Some(false)), HeldStart::FilesMoved(held)) = (&finished, start) {
+                hold_again(bridge, &studio_guard.runtime_id, held.entry);
+            }
+            return finished.map(|_| ());
         }
+        #[cfg(any(windows, target_os = "macos"))]
+        let Some((studio_guard, studio_state, start)) = self.one_side_start(
+            context,
+            bridge,
+            (&mut *setup, &mut record),
+            (studio_guard, studio_state, start),
+        )?
+        else {
+            return Ok(());
+        };
         let (
             ReconcileCapture {
                 stage,
@@ -980,18 +1465,17 @@ impl Coordinator {
                     later_edits_follow: true,
                 },
             )?;
-            let pending: Vec<crate::editor::types::PendingImportFields> = pushed
-                .summary
-                .get("supplementalImportPendingFields")
-                .cloned()
-                .map(serde_json::from_value)
-                .transpose()?
-                .unwrap_or_default();
+            let pending = deferred_fields(&pushed.summary)?;
             let generated = pushed.generated;
             // Studio now holds the project's content for these paths. Record
             // that before anything else can fail, or the next reconcile would
             // mistake Renium's own push for a Studio edit and report a conflict.
-            record_pushed_baseline(context, &setup.key, &mut record, &changes.studio, &editor)?;
+            if pending.is_empty() {
+                record_pushed_baseline(context, &setup.key, &mut record, &changes.studio, &editor)?;
+            } else {
+                record.studio_checkpoint = None;
+                write_record(context, &setup.key, &record)?;
+            }
             let generated_paths = generated.entries.keys().cloned().collect::<HashSet<_>>();
             if !generated_paths.is_empty() {
                 apply_snapshot_paths(&stage.project_root, &generated_paths, &generated)?;
@@ -1134,15 +1618,10 @@ impl Coordinator {
                 record.studio_checkpoint = None;
                 record.note_setup(setup);
                 write_record(context, &setup.key, &record)?;
-                setup.unsynced_paths = changes.studio.iter().cloned().collect();
-                setup.unsynced_paths.sort();
-                setup.error = Some(format!(
-                    "Studio committed; {} deferred fields remain pending. Retry the push to write them.",
-                    pending
-                        .iter()
-                        .map(|row| row.properties.len())
-                        .sum::<usize>()
-                ));
+                let files = capture_snapshot(Path::new(&context.root), &publish_paths)?;
+                setup.unsynced_paths = (record.baseline.as_ref())
+                    .map_or_else(Vec::new, |last_sync| last_sync.moved_paths(&files));
+                setup.error = Some(deferred_fields_message(&pending));
                 return Ok(());
             }
             if !changes.editor.is_empty() {
@@ -1560,24 +2039,48 @@ impl Coordinator {
         drop(stage);
         log_reconcile_timing("incremental stage cleanup", phase);
         let phase = Instant::now();
-        let baseline = record
-            .baseline
-            .as_mut()
-            .context("Reconciliation baseline is missing")?;
-        let mut changed_scopes = changed.iter().cloned().collect::<Vec<_>>();
-        changed_scopes.sort();
-        baseline.replace_scopes(root, key, &changed_scopes, &current)?;
-        if !generated.entries.is_empty() {
-            let generated_scopes = generated.entries.keys().cloned().collect::<Vec<_>>();
-            baseline.replace_scopes(root, key, &generated_scopes, &generated)?;
-        }
+        let pending = deferred_fields(&summary)?;
+        let deferred = if pending.is_empty() {
+            let baseline = record
+                .baseline
+                .as_mut()
+                .context("Reconciliation baseline is missing")?;
+            let mut changed_scopes = changed.iter().cloned().collect::<Vec<_>>();
+            changed_scopes.sort();
+            baseline.replace_scopes(root, key, &changed_scopes, &current)?;
+            if !generated.entries.is_empty() {
+                let generated_scopes = generated.entries.keys().cloned().collect::<Vec<_>>();
+                baseline.replace_scopes(root, key, &generated_scopes, &generated)?;
+            }
+            Vec::new()
+        } else {
+            // No clean restart continues from the last sync before Studio
+            // was read back: it lacks what the push committed.
+            record.studio_checkpoint = None;
+            write_record(context, key, record)?;
+            let mut sent = current.clone();
+            sent.entries.extend(generated.entries.clone());
+            let pushed = (changed.iter().chain(generated.entries.keys()))
+                .cloned()
+                .collect::<HashSet<_>>();
+            record_deferred_push(context, bridge, (key, record), (&pushed, &sent), &pending)?
+        };
         log_reconcile_timing("incremental baseline update", phase);
-        let accepted = accepted_editor_entries(root, &previous, &current, &generated);
+        let mut accepted = accepted_editor_entries(root, &previous, &current, &generated);
+        for path in &deferred {
+            accepted.remove(&root.join(path));
+        }
         let phase = Instant::now();
-        record.studio_checkpoint = current_studio_checkpoint(context, bridge);
-        write_record(context, key, record)?;
+        if pending.is_empty() {
+            record.studio_checkpoint = current_studio_checkpoint(context, bridge);
+            write_record(context, key, record)?;
+        }
         log_reconcile_timing("incremental record write", phase);
-        Ok(AppliedEditorChanges { accepted, summary })
+        Ok(AppliedEditorChanges {
+            accepted,
+            summary,
+            deferred,
+        })
     }
 
     pub(crate) fn baseline_files(
@@ -2570,5 +3073,66 @@ mod decision_tests {
         let error = refused.unwrap_err().to_string();
         assert!(error.contains("0a1b2c3d"), "{error}");
         assert!(prepared.unwrap().decisions.is_empty());
+    }
+}
+
+#[cfg(all(test, any(windows, target_os = "macos")))]
+mod pushed_alone_tests {
+    use super::*;
+
+    /// A start pushes the files moved since a held baseline alone only where
+    /// a push sends a path that moved, here one under the source root, and
+    /// no store that moved holds a PackageLink, on the baseline's side or
+    /// the files': an instance of that class, not one of that name.
+    #[test]
+    fn a_start_pushes_alone_only_what_a_push_sends_without_package_links() -> Result<()> {
+        let fixture = super::super::push_flow_tests::Fixture::new()?;
+        let held = fixture.desired.clone();
+        let store = (held.entries.keys())
+            .find(|path| path.extension().is_some_and(|ext| ext == "renium"))
+            .cloned()
+            .context("the fixture holds no store")?;
+        let files = |link: bool, name: &str| -> Result<ProjectSnapshot> {
+            let mut document = settings_document(held.entries.get(&store))?;
+            document.instances[1].name = name.into();
+            if link {
+                document.instances.push(SettingsBytecodeInstance::new(
+                    "link".into(),
+                    "PackageLink".into(),
+                    "PackageLink".into(),
+                    Some(1),
+                ));
+            }
+            let mut files = held.clone();
+            files.entries.insert(
+                store.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(&document)?),
+            );
+            Ok(files)
+        };
+        let mut unsent = held.clone();
+        unsent.entries.insert(
+            "elsewhere/Note.txt".into(),
+            SnapshotEntry::File(b"note".to_vec()),
+        );
+        let pushed = |held: &ProjectSnapshot, files: &ProjectSnapshot| {
+            pushed_alone(&fixture.context, (held, files))
+        };
+        assert_eq!(
+            pushed(&held, &files(false, "Renamed")?)?,
+            Some(vec![store.clone()])
+        );
+        assert_eq!(
+            pushed(&held, &files(false, "PackageLink")?)?,
+            Some(vec![store.clone()])
+        );
+        assert_eq!(pushed(&held, &unsent)?, None);
+        assert_eq!(pushed(&held, &files(true, "Imported")?)?, None);
+        assert_eq!(pushed(&files(true, "Imported")?, &held)?, None);
+        assert_eq!(
+            pushed(&files(true, "Imported")?, &files(true, "Renamed")?)?,
+            None
+        );
+        Ok(())
     }
 }

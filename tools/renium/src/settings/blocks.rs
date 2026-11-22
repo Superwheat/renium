@@ -1009,6 +1009,14 @@ impl<'a> BlockStore<'a> {
         self.structure_of(self.content(self.structure)?)
     }
 
+    /// Whether the structure holds `text`, read without building an
+    /// instance: where it does not, none has it as its id, name or class.
+    #[cfg(any(windows, target_os = "macos"))]
+    pub(crate) fn structure_holds(&self, text: &str) -> Result<bool> {
+        let content = self.content(self.structure)?;
+        Ok(memmem::find(&content, text.as_bytes()).is_some())
+    }
+
     fn structure_of(&self, content: Vec<u8>) -> Result<SettingsBytecode> {
         let mut reader = BytecodeReader::new(&content);
         let header = decode_settings_payload_header(&mut reader, &self.budget)?;

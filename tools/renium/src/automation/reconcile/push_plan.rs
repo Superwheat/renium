@@ -19,6 +19,11 @@ impl std::error::Error for SkippedPushReview {}
 pub(crate) struct AppliedEditorChanges {
     pub(crate) accepted: BTreeMap<PathBuf, Option<PublishEntryState>>,
     pub(crate) summary: Map<String, Value>,
+    /// The project paths at which Studio holds other than the files after
+    /// the push: it deferred fields of instances the push imported there.
+    /// The last sync holds them as Studio does, and no file of them is
+    /// accepted.
+    pub(crate) deferred: Vec<PathBuf>,
 }
 
 pub(crate) fn accepted_editor_entries(
@@ -195,7 +200,9 @@ pub(crate) fn push_staged_project(
         .map(|(service, document)| (service.clone(), Arc::clone(document)))
         .collect::<HashMap<_, _>>();
     #[cfg(all(test, any(windows, target_os = "macos")))]
-    if let Some(result) = super::push_flow_tests::mutation(context, &push_args, &plan) {
+    if let Some(result) =
+        super::push_flow_tests::mutation(context, &push_args, &plan, &prepared_documents)
+    {
         return result;
     }
     let mut generated = ProjectSnapshot::default();

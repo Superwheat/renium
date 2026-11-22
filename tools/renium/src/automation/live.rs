@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 use super::context as bound_context;
 use super::reconcile::{
     AppliedEditorChanges, BaselineSide, Conflict, Coordinator, PairConfiguration, PairMode,
-    PairSetup, push_project_delta, studio_change_guard_from_state,
+    PairSetup, deferred_fields_error, push_project_delta, studio_change_guard_from_state,
 };
 use super::runtime::{
     acknowledge_pulled_changes, automation_failure_ref, automation_pull_args, automation_push_args,
@@ -165,6 +165,29 @@ pub(super) fn report_plugin_stopped(bridge: &BridgeServer, runtime_id: &str) -> 
 struct LivePushResult {
     accepted: BTreeMap<PathBuf, Option<PublishEntryState>>,
     auto_desynced_packages: Vec<String>,
+    /// The files at which Studio deferred fields of the push, and what the
+    /// session says of them.
+    deferred: Option<(Vec<PathBuf>, String)>,
+}
+
+/// Holds the files at which Studio deferred fields of a push as files whose
+/// push failed: pending, and pushed again once they change.
+fn hold_deferred(
+    deferred: &[PathBuf],
+    captured: &BTreeMap<PathBuf, Option<FileStamp>>,
+    baseline: &mut BTreeMap<PathBuf, FileStamp>,
+    pending: &mut BTreeSet<PathBuf>,
+    blocked: &mut BTreeMap<PathBuf, Option<FileStamp>>,
+) {
+    for path in deferred {
+        let attempted = match captured.get(path) {
+            Some(attempted) => *attempted,
+            None => stamp(path).unwrap_or(None),
+        };
+        baseline.remove(path);
+        pending.insert(path.clone());
+        blocked.insert(path.clone(), attempted);
+    }
 }
 
 fn auto_desynced_packages(summary: &serde_json::Map<String, Value>) -> Vec<String> {
@@ -2021,6 +2044,7 @@ fn push_full(
     Ok(LivePushResult {
         accepted: BTreeMap::new(),
         auto_desynced_packages: auto_desynced_packages(&summary),
+        deferred: None,
     })
 }
 
@@ -3209,10 +3233,23 @@ impl LiveLoop {
                         &push.paths,
                         Some(&push.guard),
                     )
-                    .map(
-                        |AppliedEditorChanges { accepted, summary }| LivePushResult {
-                            accepted,
-                            auto_desynced_packages: auto_desynced_packages(&summary),
+                    .and_then(
+                        |AppliedEditorChanges {
+                             accepted,
+                             summary,
+                             deferred,
+                         }| {
+                            let deferred = deferred_fields_error(&summary)?.map(|error| {
+                                let files = (deferred.into_iter())
+                                    .map(|path| absolute(path, &self.project.root))
+                                    .collect();
+                                (files, error)
+                            });
+                            Ok(LivePushResult {
+                                accepted,
+                                auto_desynced_packages: auto_desynced_packages(&summary),
+                                deferred,
+                            })
                         },
                     )
             }
@@ -3341,6 +3378,7 @@ impl LiveLoop {
         let LivePushResult {
             accepted,
             auto_desynced_packages,
+            deferred,
         } = result;
         if push.refresh_project {
             if !self.record_full_push(push)? {
@@ -3349,12 +3387,24 @@ impl LiveLoop {
         } else {
             self.record_incremental_push(push, accepted);
         }
+        if let Some((files, _)) = &deferred {
+            hold_deferred(
+                files,
+                &push.captured,
+                &mut self.baseline,
+                &mut self.pending,
+                &mut self.blocked,
+            );
+        }
         let mut status = self.control.status.lock_recover();
         record_successful_push(&mut status, auto_desynced_packages);
         if self.blocked.is_empty() {
             status.error = None;
         }
         drop(status);
+        if let Some((_, error)) = deferred {
+            self.control.fail(error);
+        }
         self.control.update_pending(&self.pending);
         self.push_ready = self
             .pending
@@ -3754,6 +3804,35 @@ fn is_concurrent_edit_message(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file Studio deferred fields of after a push is not synchronized: it
+    /// leaves the stamps the session holds as pushed, stays pending, and is
+    /// held back from the next push until it changes from what was tried.
+    #[test]
+    fn a_file_studio_deferred_fields_of_stays_pending_and_held() {
+        let path = PathBuf::from("store");
+        let attempted = FileStamp {
+            directory: false,
+            length: 3,
+            hash: 7,
+        };
+        let mut baseline = BTreeMap::from([(path.clone(), attempted)]);
+        let (mut pending, mut blocked) = (BTreeSet::new(), BTreeMap::new());
+        let captured = BTreeMap::from([(path.clone(), Some(attempted))]);
+        hold_deferred(
+            std::slice::from_ref(&path),
+            &captured,
+            &mut baseline,
+            &mut pending,
+            &mut blocked,
+        );
+        assert!(!baseline.contains_key(&path), "its stamp counts as pushed");
+        assert!(pending.contains(&path), "it is not pending");
+        assert!(
+            blocked.get(&path) == Some(&Some(attempted)),
+            "it is pushed again unchanged"
+        );
+    }
 
     #[test]
     fn ordinary_live_failures_keep_classified_help_and_source_messages() {

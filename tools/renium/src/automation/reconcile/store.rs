@@ -115,14 +115,48 @@ impl StoredSnapshot {
     }
 
     pub(super) fn matches(&self, snapshot: &ProjectSnapshot) -> bool {
+        use rayon::prelude::*;
         let _span = crate::app::profile::span("last-sync copy: compare with a snapshot");
         self.entries.len() == snapshot.entries.len()
-            && self.entries.iter().all(|(path, stored)| {
+            && self.entries.par_iter().all(|(path, stored)| {
                 snapshot
                     .entries
                     .get(path)
                     .is_some_and(|entry| stored.matches(entry))
             })
+    }
+
+    /// Whether this copy holds what `snapshot` holds under `scopes`.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    pub(super) fn holds_within(&self, scopes: &[PathBuf], snapshot: &ProjectSnapshot) -> bool {
+        let scopes = ScopeSet::new(scopes);
+        let within = |path: &&PathBuf| scopes.contains(path);
+        self.entries.keys().filter(within).count() == snapshot.entries.keys().filter(within).count()
+            && (self.entries.iter())
+                .filter(|(path, _)| within(path))
+                .all(|(path, stored)| {
+                    (snapshot.entries.get(path)).is_some_and(|entry| stored.matches(entry))
+                })
+    }
+
+    /// The paths at which `snapshot` holds other than this copy, in order.
+    pub(super) fn moved_paths(&self, snapshot: &ProjectSnapshot) -> Vec<PathBuf> {
+        use rayon::prelude::*;
+        let _span = crate::app::profile::span("last-sync copy: paths moved from it");
+        let paths = (self.entries.keys().chain(snapshot.entries.keys()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        paths
+            .into_par_iter()
+            .filter(
+                |path| match (self.entries.get(*path), snapshot.entries.get(*path)) {
+                    (Some(stored), Some(entry)) => !stored.matches(entry),
+                    (stored, entry) => stored.is_some() || entry.is_some(),
+                },
+            )
+            .cloned()
+            .collect()
     }
 
     /// A process can stop between atomic file replacements. Every path must

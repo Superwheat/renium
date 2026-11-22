@@ -12,12 +12,24 @@ type Capture = Box<dyn FnOnce(&BoundContext) -> Result<ProjectSnapshot>>;
 struct MutationInput<'a> {
     plan: &'a ReconcilePushPlan,
     args: &'a PushEditorChangesArgs,
+    prepared: &'a HashMap<String, Arc<SettingsBytecode>>,
 }
 type Mutation = Box<dyn FnOnce(&BoundContext, MutationInput<'_>) -> Result<StagedPushResult>>;
+type Published = crate::snapshot::export::PublishedProjectChanges;
+type Export = Box<dyn FnOnce(&mut dyn FnMut() -> Result<()>) -> Result<Published>>;
 thread_local! {
     static CAPTURES: RefCell<VecDeque<Capture>> = RefCell::new(VecDeque::new());
     static MUTATION: RefCell<Option<Mutation>> = RefCell::new(None);
     static REQUESTED: RefCell<Vec<(Vec<String>, PathBuf)>> = const { RefCell::new(Vec::new()) };
+    static EXPORT: RefCell<Option<Export>> = const { RefCell::new(None) };
+}
+
+/// Answers the capture and publish of a scoped pull's services, which runs
+/// `check` before it publishes.
+pub(super) fn export(check: &mut dyn FnMut() -> Result<()>) -> Option<Result<Published>> {
+    EXPORT
+        .with(|slot| slot.borrow_mut().take())
+        .map(|answer| answer(check))
 }
 
 /// Answers a capture of `services` into the stage at `stage`.
@@ -39,14 +51,29 @@ fn last_requested() -> (Vec<String>, PathBuf) {
     REQUESTED.with(|slot| slot.borrow().last().cloned().unwrap_or_default())
 }
 
+/// How many captures of Studio this thread asked for.
+fn capture_requests() -> usize {
+    REQUESTED.with(|slot| slot.borrow().len())
+}
+
 pub(super) fn mutation(
     context: &BoundContext,
     args: &PushEditorChangesArgs,
     plan: &ReconcilePushPlan,
+    prepared: &HashMap<String, Arc<SettingsBytecode>>,
 ) -> Option<Result<StagedPushResult>> {
     MUTATION
         .with(|slot| slot.borrow_mut().take())
-        .map(|mutation| mutation(context, MutationInput { args, plan }))
+        .map(|mutation| {
+            mutation(
+                context,
+                MutationInput {
+                    plan,
+                    args,
+                    prepared,
+                },
+            )
+        })
 }
 
 pub(super) struct Fixture {
@@ -83,6 +110,16 @@ struct Tracker {
     /// where `edit_on_release`.
     edit: Option<(PathBuf, Vec<u8>)>,
     edit_on_release: bool,
+    /// A file edit made as Studio first answers whether it holds a proof.
+    edit_on_verify: Option<(PathBuf, Vec<u8>)>,
+    /// Studio tracks every service with nothing pending, so its state is a
+    /// checkpoint a clean restart continues from.
+    checkpoint: bool,
+    /// The services Studio changed that no pull took yet.
+    dirty: Vec<&'static str>,
+    /// Where Studio says it differs from a proof it no longer holds, in
+    /// place of `scope`.
+    answer: Option<Value>,
 }
 
 impl Default for Tracker {
@@ -100,6 +137,10 @@ impl Default for Tracker {
             late: None,
             edit: None,
             edit_on_release: false,
+            edit_on_verify: None,
+            checkpoint: false,
+            dirty: Vec::new(),
+            answer: None,
         }
     }
 }
@@ -114,20 +155,34 @@ fn tracker_reply(tracker: &Tracker, params: &Value, runtime: &str) -> Value {
     };
     let verify = &params["verifyPushProof"];
     let matches = verify.is_object() && !differs(verify);
-    let scope = (!matches && params["scopePushProof"] == true).then(|| {
-        tracker.scope.as_ref().map_or_else(
-            || json!({"unknown": "Terrain unavailable"}),
-            |services| json!({"services": services, "touched": {}}),
-        )
+    let scoped = params["scopePushProof"] == true || !params["scopeFrom"].is_null();
+    let scope = (!matches && scoped).then(|| {
+        tracker.answer.clone().unwrap_or_else(|| {
+            tracker.scope.as_ref().map_or_else(
+                || json!({"unknown": "Terrain unavailable"}),
+                |services| json!({"services": services, "touched": {}}),
+            )
+        })
     });
     let retain = &params["retainPushProof"];
     let retained = (!retain.is_null() && !differs(retain)).then(|| retain.clone());
-    json!({
+    let mut reply = json!({
         "pushProofMatches": matches, "pushProofScope": scope,
         "retainedPushProof": retained, "retainedPushProofLocal": true,
         "verifiedPushProof": {"test": true}, "runtimeId": runtime,
         "seq": 0, "tracking": true, "serviceGenerations": tracker.edits
-    })
+    });
+    if tracker.checkpoint {
+        let generations = (sync_services().into_iter())
+            .map(|service| (service, json!(0)))
+            .collect::<Map<_, _>>();
+        reply["trackedServices"] = json!(generations.len());
+        reply["dirtyServices"] = json!(tracker.dirty);
+        reply["fullSyncServices"] = json!([]);
+        reply["changeTrackerVersion"] = json!(1);
+        reply["checkpointGenerations"] = Value::Object(generations);
+    }
+    reply
 }
 
 fn fixture_runtime(
@@ -151,9 +206,10 @@ fn fixture_runtime(
                 continue;
             };
             let request: Value = serde_json::from_str(&text).unwrap();
+            let method = request["method"].as_str();
             assert!(matches!(
-                request["method"].as_str(),
-                Some("getStudioChangeState" | "getStudioState")
+                method,
+                Some("getStudioChangeState" | "getStudioState" | "recordSyncCompletion")
             ));
             let params = &request["params"];
             let result = {
@@ -173,7 +229,16 @@ fn fixture_runtime(
                 {
                     fs::write(path, bytes).unwrap();
                 }
-                tracker_reply(&state, params, runtime)
+                if params["verifyPushProof"].is_object()
+                    && let Some((path, bytes)) = state.edit_on_verify.take()
+                {
+                    fs::write(path, bytes).unwrap();
+                }
+                if method == Some("recordSyncCompletion") {
+                    json!({})
+                } else {
+                    tracker_reply(&state, params, runtime)
+                }
             };
             let reply = json!({"id": request["id"], "ok": true, "result": result});
             if socket
@@ -325,6 +390,8 @@ impl Drop for Fixture {
         let _ = import_settle::finish_request(Some("test ended"));
         CAPTURES.with(|slot| slot.borrow_mut().clear());
         MUTATION.with(|slot| slot.borrow_mut().take());
+        EXPORT.with(|slot| slot.borrow_mut().take());
+        crate::snapshot::export::STUDIO_EXPORT.with(|slot| slot.borrow_mut().take());
         drop(self.bridge.take());
         self.plugin.take().unwrap().join().unwrap();
         let _ = fs::remove_dir_all(&self.context.root);
@@ -997,7 +1064,8 @@ fn source_edit_after_the_early_reply_is_never_published_over() -> Result<()> {
 }
 
 /// What a Live Sync start left: its outcome, the pair's setup and record,
-/// the last-sync copy and the files.
+/// the last-sync copy and the files, whether it pushed to Studio, and how
+/// many files it left to push.
 #[derive(PartialEq)]
 struct Started {
     outcome: String,
@@ -1005,19 +1073,23 @@ struct Started {
     record: String,
     last_sync: Option<ProjectSnapshot>,
     files: ProjectSnapshot,
+    pushed: bool,
+    pending: usize,
 }
 
 impl Started {
     fn describe(&self) -> String {
         format!(
-            "{} | {} | {} | last sync {:?} | {} files",
+            "{} | {} | {} | last sync {:?} | {} files | pushed {} | {} pending",
             self.outcome,
             self.setup,
             self.record,
             self.last_sync
                 .as_ref()
                 .map(|snapshot| snapshot.entries.len()),
-            self.files.entries.len()
+            self.files.entries.len(),
+            self.pushed,
+            self.pending
         )
     }
 }
@@ -1027,11 +1099,31 @@ impl Started {
 /// `exact` (a pull's, Studio and the files as it wrote them), `moved`
 /// (Studio moved since its proof), `pushed` (its files are what a push
 /// sent), `other` (kept for another push), `files` (the files changed
-/// since), `paths` (it read fewer paths than the comparison), or `links`
-/// (a link manifest folds into the comparison). `record` is the pair's
-/// last sync: `none`, `same` as the files, `stale`, or `review` (with a
-/// difference open). Also whether Studio was captured and when a baseline
-/// held after ends.
+/// since), `link` (the files changed since and created a PackageLink),
+/// `paths` (it read fewer paths than the comparison), `links` (a link
+/// manifest folds into the comparison), or one of `PULLED`, whose start
+/// pulls what Studio moved. `record` is the pair's last sync: `none`, `same`
+/// as the files, `stale`, `edited` (stale, and the store is edited during a
+/// push), `raced` (stale, and the store is edited before a push reads it and
+/// put back during it), `deferred` (stale, and Studio defers the push's
+/// field), `failed` (stale with a Studio checkpoint, where the pair asks for
+/// a comparison, and the push fails), `deferred-stop` (stale with a
+/// Studio checkpoint, and Studio defers the push's field and stops
+/// answering after), `deferred-next` (as `deferred-stop`, and the start
+/// after, which Studio answers again holding the deferred field as it was),
+/// `removed` (stale, and the store is removed from the files),
+/// `checkpointed` (stale with a Studio checkpoint, where the pair
+/// asks for a comparison), `studio-edited` (as `checkpointed`, and Studio
+/// changes a service during the push), `restart` (stale, after a clean
+/// restart of Studio), `restart-deferred` (as `restart`, and Studio defers
+/// the push's field), `resumed`
+/// (the files, after a clean restart), or `review` (with a difference
+/// open); or the files with only a `difference`
+/// open, only a resolution asked for (`unresolved`), a decision taken
+/// (`decided`), Studio to start from the files (`bootstrap`), or a restart
+/// Renium cannot prove (`unproven`). A capture of Studio stages what it
+/// holds, as an export does. Also whether Studio was captured and when a
+/// baseline held after ends.
 fn live_start(
     held: &str,
     record_kind: &str,
@@ -1068,38 +1160,49 @@ fn live_start(
         capture_snapshot(root, &paths)
     };
     let stale = files_at(0.5)?;
+    let stale_bytes = fs::read(root.join(&store))?;
     let moved = files_at(0.75)?;
+    let moved_bytes = fs::read(root.join(&store))?;
     let files = files_at(0.25)?;
+    let files_bytes = fs::read(root.join(&store))?;
+    let files = if held == "link" {
+        with_package_link(root, &store, &paths)?
+    } else {
+        files
+    };
+    let pulls = PULLED.contains(&held);
     let workspace = Path::new(&context.source).join("Workspace");
     fs::create_dir_all(&workspace)?;
     fs::write(workspace.join("Extra.luau"), "return 1")?;
     let extra = capture_snapshot(root, &paths)?;
     fs::remove_dir_all(&workspace)?;
     let coordinator = Coordinator::default();
-    let mut setup = coordinator.prepare(
-        context,
-        bridge,
-        PairConfiguration {
-            mode,
-            conflict_preference: ConflictPreference::None,
-            resolution_preference: None,
-            decisions: BTreeMap::new(),
-            runtime_settings: Map::new(),
-        },
-    )?;
-    let mut record = load_record(context, &setup.key)?.unwrap();
-    record.baseline = match record_kind {
-        "none" => None,
-        "stale" => Some(StoredSnapshot::write(root, &setup.key, &stale)?),
-        _ => Some(StoredSnapshot::write(root, &setup.key, &files)?),
+    let configuration = || PairConfiguration {
+        mode,
+        conflict_preference: ConflictPreference::None,
+        resolution_preference: None,
+        decisions: BTreeMap::new(),
+        runtime_settings: Map::new(),
     };
-    if record_kind == "review" {
-        record
-            .differences
-            .push("push: an earlier difference".into());
-        record.resolution_required = true;
+    let mut setup = coordinator.prepare(context, bridge, configuration())?;
+    let last_sync = match record_kind {
+        "none" => None,
+        "stale" | "edited" | "deferred" | "failed" | "raced" | "restart" | "restart-deferred"
+        | "deferred-stop" | "deferred-next" | "removed" | "checkpointed" | "studio-edited" => {
+            Some(&stale)
+        }
+        _ if !hold && PULLED[..3].contains(&held) => Some(&moved),
+        _ => Some(&files),
+    };
+    record_of_kind(
+        (context, bridge),
+        &fixture.tracker,
+        &mut setup,
+        (record_kind, last_sync),
+    )?;
+    if !hold {
+        written_before(held, &root.join(&store), (&moved_bytes, &stale_bytes))?;
     }
-    write_record(context, &setup.key, &record)?;
     if held == "links" {
         fs::write(
             root.join("renium-link.json"),
@@ -1107,7 +1210,7 @@ fn live_start(
         )?;
     }
     let (held_project, held_paths) = match held {
-        "files" => (stale.clone(), paths.clone()),
+        "files" | "link" => (stale.clone(), paths.clone()),
         "paths" => {
             let read = paths
                 .iter()
@@ -1132,7 +1235,7 @@ fn live_start(
                 input,
                 project: held_project,
                 paths: held_paths,
-                proof: if held == "moved" {
+                proof: if held == "moved" || pulls {
                     json!({"expired": true})
                 } else {
                     json!({"id": 1})
@@ -1143,15 +1246,104 @@ fn live_start(
                 relay: None,
             },
         );
+        hold_pull(
+            held,
+            (root, &store),
+            &fixture.tracker,
+            (moved_bytes.clone(), stale_bytes),
+        );
     }
-    replace_capture(match held {
-        "exact" | "links" => files,
-        "files" => stale,
+    let deferred = matches!(
+        record_kind,
+        "deferred" | "deferred-stop" | "deferred-next" | "restart-deferred"
+    );
+    let stops = matches!(record_kind, "deferred-stop" | "deferred-next");
+    let after_push = if deferred {
+        stale.clone()
+    } else {
+        files.clone()
+    };
+    if record_kind == "raced" {
+        fixture.tracker.lock().unwrap().edit_on_verify =
+            Some((root.join(&store), moved_bytes.clone()));
+    }
+    let edit = match record_kind {
+        "edited" => Some((root.join(&store), moved_bytes)),
+        "raced" => Some((root.join(&store), files_bytes)),
+        _ => None,
+    };
+    let fails = record_kind == "failed";
+    let next = (record_kind == "deferred-next").then(|| (stale.clone(), files.clone()));
+    let studio_edits = (record_kind == "studio-edited").then(|| fixture.tracker.clone());
+    let studio = match held {
+        "exact" | "links" | "undone" => files,
+        "files" | "link" | "again" => stale,
         "paths" => extra,
         _ => moved,
+    };
+    let captured = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = captured.clone();
+    CAPTURES.with(|slot| {
+        let mut captures = slot.borrow_mut();
+        captures.clear();
+        captures.push_back(Box::new(move |_| {
+            seen.set(true);
+            let (_, stage) = last_requested();
+            let paths = studio.entries.keys().cloned().collect::<HashSet<_>>();
+            apply_snapshot_paths(&stage, &paths, &studio)?;
+            Ok(studio)
+        }));
     });
-    let outcome = coordinator.reconcile_with_gate_held(context, bridge, &mut setup);
-    let captured = CAPTURES.with(|slot| slot.borrow().is_empty());
+    let pushes = mode == PairMode::Reconcile;
+    if pushes {
+        MUTATION.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |_, _| {
+                if fails {
+                    bail!("WebSocket closed");
+                }
+                edit.map(|(path, bytes)| fs::write(path, bytes))
+                    .transpose()?;
+                change_workspace(studio_edits);
+                let readback: Capture = if stops {
+                    Box::new(|_| bail!("Studio stopped answering"))
+                } else {
+                    Box::new(move |_| Ok(after_push))
+                };
+                CAPTURES.with(|slot| slot.borrow_mut().push_front(readback));
+                let mut summary = summary(!deferred);
+                if deferred {
+                    summary.insert(
+                        "supplementalImportPendingFields".into(),
+                        json!([{
+                            "service": "ReplicatedStorage", "settingsId": "block", "className": "Part",
+                            "pathSegments": ["ReplicatedStorage", "Block"], "pathOrdinals": [1, 1],
+                            "properties": {"Transparency": 0.25}
+                        }]),
+                    );
+                }
+                Ok(StagedPushResult {
+                    generated: ProjectSnapshot::default(),
+                    summary,
+                })
+            }));
+        });
+    }
+    if record_kind == "removed" {
+        fs::remove_file(root.join(&store))?;
+    }
+    let first = coordinator.reconcile_with_gate_held(context, bridge, &mut setup);
+    let outcome = match next {
+        Some(next) => start_after(
+            &coordinator,
+            (context, bridge),
+            (&mut setup, configuration()),
+            first,
+            next,
+        ),
+        None => first,
+    };
+    let pushed = pushes && MUTATION.with(|slot| slot.borrow().is_none());
+    let captured = captured.get();
     let kept = bridge
         .verified_full_pushes
         .lock_recover()
@@ -1195,8 +1387,180 @@ fn live_start(
             .map(|baseline| baseline.load(root, &setup.key))
             .transpose()?,
         files: capture_snapshot(root, &paths)?,
+        pushed,
+        pending: setup.unsynced_paths.len(),
     };
     Ok((started, captured, kept))
+}
+
+/// Gives the pair of `setup` the record of `record_kind`, a kind of
+/// `live_start`, whose last sync is `last_sync`: with a checkpoint of Studio
+/// as `tracker` reports it where the kind starts from one.
+fn record_of_kind(
+    (context, bridge): (&BoundContext, &BridgeServer),
+    tracker: &Arc<Mutex<Tracker>>,
+    setup: &mut PairSetup,
+    (record_kind, last_sync): (&str, Option<&ProjectSnapshot>),
+) -> Result<()> {
+    let mut record = load_record(context, &setup.key)?.unwrap();
+    let compares = matches!(
+        record_kind,
+        "failed" | "deferred-stop" | "deferred-next" | "checkpointed" | "studio-edited"
+    );
+    if compares || matches!(record_kind, "restart" | "restart-deferred" | "resumed") {
+        tracker.lock().unwrap().checkpoint = true;
+        record.studio_checkpoint = current_studio_checkpoint(context, bridge);
+        assert!(record.studio_checkpoint.is_some(), "no Studio checkpoint");
+        setup.requires_reconcile = compares;
+    }
+    record.baseline = last_sync
+        .map(|synced| StoredSnapshot::write(Path::new(&context.root), &setup.key, synced))
+        .transpose()?;
+    if matches!(record_kind, "review" | "difference") {
+        record
+            .differences
+            .push("push: an earlier difference".into());
+    }
+    record.resolution_required = matches!(record_kind, "review" | "unresolved");
+    match record_kind {
+        "decided" => {
+            setup
+                .decisions
+                .insert("0a1b2c3d".into(), ConflictSide::Studio);
+        }
+        "bootstrap" => setup.bootstrap_studio_from_editor = true,
+        "unproven" => setup.runtime_replacement_unproven = true,
+        _ => {}
+    }
+    write_record(context, &setup.key, &record)
+}
+
+/// Changes Workspace in Studio as its change tracker reports it, where
+/// `tracker` is given.
+fn change_workspace(tracker: Option<Arc<Mutex<Tracker>>>) {
+    if let Some(tracker) = tracker {
+        let mut studio = tracker.lock().unwrap();
+        studio.dirty = vec!["Workspace"];
+        studio.edits.insert("Workspace".into(), json!(1));
+    }
+}
+
+/// The start after `first`, which Studio stopped answering during: it
+/// captures Studio holding `studio`, as an export stages it, and pushes the
+/// files over it, after which Studio holds `files`.
+fn start_after(
+    coordinator: &Coordinator,
+    (context, bridge): (&BoundContext, &BridgeServer),
+    (setup, configuration): (&mut PairSetup, PairConfiguration),
+    first: Result<()>,
+    (studio, files): (ProjectSnapshot, ProjectSnapshot),
+) -> Result<()> {
+    let first = first.map_or_else(|error| format!("{error:#}"), |()| "ok".into());
+    anyhow::ensure!(first.contains("Studio stopped answering"), "{first}");
+    *setup = coordinator.prepare(context, bridge, configuration)?;
+    CAPTURES.with(|slot| {
+        let mut captures = slot.borrow_mut();
+        captures.clear();
+        captures.push_back(Box::new(move |_| {
+            let (_, stage) = last_requested();
+            let paths = studio.entries.keys().cloned().collect::<HashSet<_>>();
+            apply_snapshot_paths(&stage, &paths, &studio)?;
+            Ok(studio)
+        }));
+    });
+    MUTATION.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_, _| {
+            CAPTURES.with(|slot| slot.borrow_mut().push_front(Box::new(move |_| Ok(files))));
+            Ok(StagedPushResult {
+                generated: ProjectSnapshot::default(),
+                summary: summary(true),
+            })
+        }));
+    });
+    coordinator.reconcile_with_gate_held(context, bridge, setup)
+}
+
+/// The held kinds whose start pulls what Studio moved: Studio `pulled` it
+/// and held it, `undone` it after, or moved `again`; or the pull failed
+/// before it wrote (`pull-failed`), after it wrote (`pull-partial`), or met
+/// the files edited before it wrote (`pull-edited`), or kept back the store
+/// edited as it wrote (`pull-kept`).
+const PULLED: [&str; 7] = [
+    "pulled",
+    "undone",
+    "again",
+    "pull-failed",
+    "pull-partial",
+    "pull-edited",
+    "pull-kept",
+];
+
+/// Has the start's pull of what Studio moved, scoped to the store's service,
+/// write `pulled` into `store` under `root` as `held` says, checking Studio
+/// and the files first; Studio moves after it where `held` says so.
+fn hold_pull(
+    held: &str,
+    (root, store): (&Path, &Path),
+    tracker: &Arc<Mutex<Tracker>>,
+    (pulled, edit): (Vec<u8>, Vec<u8>),
+) {
+    if !PULLED.contains(&held) {
+        return;
+    }
+    tracker.lock().unwrap().scope = Some(vec!["ReplicatedStorage"]);
+    let (held, path, store) = (held.to_string(), root.join(store), store.to_path_buf());
+    let tracker = Arc::clone(tracker);
+    EXPORT.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |check: &mut dyn FnMut() -> Result<()>| {
+            if held == "pull-edited" {
+                fs::write(&path, &edit)?;
+            }
+            check()?;
+            if held == "pull-failed" {
+                bail!("the capture failed");
+            }
+            let kept = held == "pull-kept";
+            fs::write(&path, if kept { &edit } else { &pulled })?;
+            if held == "pull-partial" {
+                bail!("the publish failed after it wrote");
+            }
+            tracker.lock().unwrap().changed_since_commit = held != "pulled";
+            let settled = crate::snapshot::export::file_publish_state(&pulled);
+            Ok(Published {
+                publish_paths: vec![store.clone()],
+                settled: (!kept)
+                    .then(|| (store.clone(), settled))
+                    .into_iter()
+                    .collect(),
+                preserved: kept.then_some(store).into_iter().collect(),
+                ..Published::default()
+            })
+        }));
+    });
+}
+
+/// Writes into `path` what a start without the held baseline finds where
+/// the start with it pulls: what the pull writes, or the edit it meets.
+fn written_before(held: &str, path: &Path, (pulled, edit): (&[u8], &[u8])) -> Result<()> {
+    match held {
+        "pulled" | "undone" | "again" => fs::write(path, pulled)?,
+        "pull-edited" | "pull-kept" => fs::write(path, edit)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The files once the store at `store` holds a PackageLink under its Block.
+fn with_package_link(root: &Path, store: &Path, paths: &[PathBuf]) -> Result<ProjectSnapshot> {
+    let mut document = decode_settings_bytecode(&fs::read(root.join(store))?)?;
+    document.instances.push(SettingsBytecodeInstance::new(
+        "link".into(),
+        "PackageLink".into(),
+        "PackageLink".into(),
+        Some(2),
+    ));
+    fs::write(root.join(store), encode_settings_bytecode(&document)?)?;
+    capture_snapshot(root, paths)
 }
 
 /// A Live Sync start under a held baseline leaves the pair as a start that
@@ -1237,6 +1601,1495 @@ fn a_live_start_from_a_held_pull_leaves_what_a_capture_leaves() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// A Live Sync start under a pull's baseline that Studio still holds, whose
+/// files moved since, leaves the pair as a start that captures Studio leaves
+/// it whose last sync is what that pull wrote, without capturing Studio: it
+/// pushes the files' changes alone, with no read of Studio after, from the
+/// pull's files as the last sync, which they become first where the last
+/// sync holds other files or there is none, and compares where a store was
+/// removed from the files, which a push refuses. One that pushes leaves
+/// what Studio deferred pending. One whose push fails leaves the record as
+/// it was, the checkpoint of Studio it started with included; one whose
+/// deferred push Studio stops answering after leaves the last sync as it
+/// was where it pushed and no checkpoint, and the start after pushes again.
+/// One Studio changed during leaves no checkpoint. After a clean restart of
+/// Studio it pushes as that restart does, or itself where the pair asks for
+/// a comparison, and holds the pull's baseline again only where it pushed
+/// nothing.
+#[test]
+fn a_live_start_pushes_the_files_moved_since_a_held_pull() -> Result<()> {
+    for record in [
+        "stale",
+        "same",
+        "none",
+        "removed",
+        "deferred",
+        "failed",
+        "deferred-stop",
+        "checkpointed",
+        "studio-edited",
+        "restart",
+        "resumed",
+    ] {
+        let requested = capture_requests();
+        let (started, captured, kept) = live_start("files", record, PairMode::Reconcile, true)?;
+        let requested = capture_requests() - requested;
+        let from = if matches!(record, "same" | "none") {
+            "stale"
+        } else {
+            record
+        };
+        let (oracle, _, _) = live_start("files", from, PairMode::Reconcile, false)?;
+        let same = match record {
+            "failed" | "deferred-stop" => {
+                let (stopped, checkpoint) = if record == "failed" {
+                    ("WebSocket closed", "true")
+                } else {
+                    ("Studio stopped answering", "false")
+                };
+                started.outcome.contains(stopped)
+                    && (started.record == oracle.record)
+                    && (started.last_sync == oracle.last_sync)
+                    && started.files == oracle.files
+                    && started.last_sync.as_ref() != Some(&started.files)
+                    && started.record.ends_with(checkpoint)
+            }
+            "studio-edited" => started == oracle && started.record.ends_with("false"),
+            "checkpointed" => started == oracle && started.record.ends_with("true"),
+            _ => started == oracle,
+        };
+        assert!(
+            same,
+            "{record}: {}\nagainst a capture from the pull: {}",
+            started.describe(),
+            oracle.describe()
+        );
+        assert!(!captured, "{record}: Studio captured");
+        assert!(
+            requested == 0 || !matches!(record, "stale" | "same" | "none"),
+            "{record}: Studio read {requested} times"
+        );
+        assert_eq!(
+            started.pushed,
+            !matches!(record, "resumed" | "removed"),
+            "{record}: {}",
+            started.describe()
+        );
+        assert_eq!(
+            started.pending,
+            usize::from(record == "deferred"),
+            "{record}: {}",
+            started.describe()
+        );
+        match record {
+            "resumed" => assert!(kept.is_some(), "{record}: no baseline held after"),
+            "restart" | "checkpointed" | "studio-edited" => {
+                assert!(kept.is_none(), "{record}: the baseline held after a push");
+            }
+            _ => {}
+        }
+    }
+    for hold in [true, false] {
+        let (next, _, _) = live_start("files", "deferred-next", PairMode::Reconcile, hold)?;
+        assert!(
+            next.outcome == "ok"
+                && next.pushed
+                && next.pending == 0
+                && next.last_sync.as_ref() == Some(&next.files),
+            "held {hold}, the start after: {}",
+            next.describe()
+        );
+    }
+    Ok(())
+}
+
+/// A Live Sync start after `rbx pull` with Live Sync off, whose last sync
+/// is older than the pull, pushes a script the pull wrote and the user then
+/// edited, with no conflict and no read of Studio: the pull's files, which
+/// Studio still holds, become the last sync, and the edit is pushed alone.
+#[test]
+fn a_live_start_after_a_pull_pushes_an_edit_of_what_it_pulled() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.context.experience.clone_from(&fixture.context.root);
+    let context = &fixture.context;
+    let root = Path::new(&context.root);
+    let bridge = fixture.bridge.as_ref().unwrap();
+    let script = Path::new(&context.source).join("ReplicatedStorage/Shared.luau");
+    let paths = project_comparison_stage(context, &sync_services())?
+        .publish_paths()
+        .to_vec();
+    fs::write(&script, "return 1\n")?;
+    let synced = capture_snapshot(root, &paths)?;
+    fs::write(&script, "return 2\n")?;
+    let pulled = capture_snapshot(root, &paths)?;
+    fs::write(&script, "return 3\n")?;
+    let coordinator = Coordinator::default();
+    let mut setup = coordinator.prepare(
+        context,
+        bridge,
+        PairConfiguration {
+            mode: PairMode::Reconcile,
+            conflict_preference: ConflictPreference::None,
+            resolution_preference: None,
+            decisions: BTreeMap::new(),
+            runtime_settings: Map::new(),
+        },
+    )?;
+    let mut record = load_record(context, &setup.key)?.unwrap();
+    record.baseline = Some(StoredSnapshot::write(root, &setup.key, &synced)?);
+    write_record(context, &setup.key, &record)?;
+    bridge.verified_full_pushes.lock_recover().insert(
+        "push-fixture".into(),
+        VerifiedFullPush {
+            connections: bridge.runtime_connection_signature("push-fixture"),
+            input: plain_push_input(&automation_push_args(context, &json!({}), false)?)?,
+            project: pulled.clone(),
+            paths: paths.clone(),
+            proof: json!({"id": 1}),
+            expires: Instant::now() + Duration::from_secs(600),
+            sourcemap: Some(Box::default()),
+            #[cfg(windows)]
+            relay: None,
+        },
+    );
+    replace_capture(pulled);
+    let after_push = capture_snapshot(root, &paths)?;
+    MUTATION.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_, _| {
+            CAPTURES.with(|slot| {
+                slot.borrow_mut()
+                    .push_front(Box::new(move |_| Ok(after_push)))
+            });
+            Ok(StagedPushResult {
+                generated: ProjectSnapshot::default(),
+                summary: summary(true),
+            })
+        }));
+    });
+    let requested = capture_requests();
+    coordinator.reconcile_with_gate_held(context, bridge, &mut setup)?;
+    assert_eq!(capture_requests(), requested, "the start read Studio");
+    let record = load_record(context, &setup.key)?.unwrap();
+    assert!(
+        setup.conflicts.is_empty() && record.conflicts.is_empty() && setup.error.is_none(),
+        "conflicts {:?}, error {:?}",
+        setup.conflicts,
+        setup.error
+    );
+    assert!(
+        MUTATION.with(|slot| slot.borrow().is_none()),
+        "nothing pushed"
+    );
+    assert_eq!(fs::read_to_string(&script)?, "return 3\n");
+    let last_sync = record.baseline.unwrap().load(root, &setup.key)?;
+    assert!(
+        last_sync == capture_snapshot(root, &paths)?,
+        "the last sync is not the files"
+    );
+    Ok(())
+}
+
+/// The configuration of a pair that writes, with no preference or decision.
+fn writing_pair() -> PairConfiguration {
+    PairConfiguration {
+        mode: PairMode::Reconcile,
+        conflict_preference: ConflictPreference::None,
+        resolution_preference: None,
+        decisions: BTreeMap::new(),
+        runtime_settings: Map::new(),
+    }
+}
+
+/// A Live Sync start after a session of the pair pushed an edit of a script
+/// since `rbx pull`, where the script was then put back as the pull wrote
+/// it: the pull's baseline is still held and the files hold it again, but
+/// the last sync is the newer of the two. The start, and the comparison a
+/// running session makes, merge from the last sync: they push the script as
+/// the files hold it and leave its file alone, where a merge from the
+/// pull's files would write the pushed edit back over it.
+#[test]
+fn a_live_start_merges_from_a_last_sync_newer_than_the_held_pull() -> Result<()> {
+    for running in [false, true] {
+        let mut fixture = Fixture::new()?;
+        fixture.context.experience.clone_from(&fixture.context.root);
+        let context = &fixture.context;
+        let root = Path::new(&context.root);
+        let bridge = fixture.bridge.as_ref().unwrap();
+        let script = Path::new(&context.source).join("ReplicatedStorage/Shared.luau");
+        let paths = project_comparison_stage(context, &sync_services())?
+            .publish_paths()
+            .to_vec();
+        fs::write(&script, "return 2\n")?;
+        let synced = capture_snapshot(root, &paths)?;
+        fs::write(&script, "return 1\n")?;
+        let pulled = capture_snapshot(root, &paths)?;
+        let coordinator = Coordinator::default();
+        let mut setup = coordinator.prepare(context, bridge, writing_pair())?;
+        let mut record = load_record(context, &setup.key)?.unwrap();
+        record.mode = PairMode::Reconcile;
+        record.baseline = Some(StoredSnapshot::write(root, &setup.key, &synced)?);
+        write_record(context, &setup.key, &record)?;
+        bridge.verified_full_pushes.lock_recover().insert(
+            "push-fixture".into(),
+            VerifiedFullPush {
+                connections: bridge.runtime_connection_signature("push-fixture"),
+                input: plain_push_input(&automation_push_args(context, &json!({}), false)?)?,
+                project: pulled.clone(),
+                paths: paths.clone(),
+                proof: json!({"expired": true}),
+                expires: Instant::now() + Duration::from_secs(600),
+                sourcemap: Some(Box::default()),
+                #[cfg(windows)]
+                relay: None,
+            },
+        );
+        CAPTURES.with(|slot| {
+            let mut captures = slot.borrow_mut();
+            captures.clear();
+            captures.push_back(Box::new(move |_| {
+                let (_, stage) = last_requested();
+                let paths = synced.entries.keys().cloned().collect::<HashSet<_>>();
+                apply_snapshot_paths(&stage, &paths, &synced)?;
+                Ok(synced)
+            }));
+        });
+        let sent = std::rc::Rc::new(RefCell::new(None));
+        let seen = sent.clone();
+        let staged = PathBuf::from("src/ReplicatedStorage/Shared.luau");
+        MUTATION.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |_, input| {
+                let stage = &input.args.project.project_root;
+                *seen.borrow_mut() = Some(fs::read_to_string(stage.join(&staged))?);
+                CAPTURES.with(|slot| slot.borrow_mut().push_front(Box::new(move |_| Ok(pulled))));
+                Ok(StagedPushResult {
+                    generated: ProjectSnapshot::default(),
+                    summary: summary(true),
+                })
+            }));
+        });
+        if running {
+            setup = coordinator.reconcile_current_with_gate_held(context, bridge)?;
+        } else {
+            coordinator.reconcile_with_gate_held(context, bridge, &mut setup)?;
+        }
+        let record = load_record(context, &setup.key)?.unwrap();
+        assert!(
+            setup.conflicts.is_empty() && record.conflicts.is_empty() && setup.error.is_none(),
+            "running {running}: conflicts {:?}, error {:?}",
+            setup.conflicts,
+            setup.error
+        );
+        assert_eq!(
+            sent.take().as_deref(),
+            Some("return 1\n"),
+            "running {running}: the script as the files hold it was not pushed"
+        );
+        assert_eq!(
+            fs::read_to_string(&script)?,
+            "return 1\n",
+            "running {running}"
+        );
+        let last_sync = record.baseline.unwrap().load(root, &setup.key)?;
+        assert!(
+            last_sync == capture_snapshot(root, &paths)?,
+            "running {running}: the last sync is not the files"
+        );
+    }
+    Ok(())
+}
+
+/// A clean restart whose push Studio deferred a field of leaves what a start
+/// over a held pull leaves that Studio deferred it for: the last sync as
+/// Studio holds the pushed store, that store pending, no checkpoint of
+/// Studio, and the error that counts the deferred fields.
+#[test]
+fn a_clean_restart_leaves_what_studio_deferred_pending() -> Result<()> {
+    let (started, captured, _) =
+        live_start("files", "restart-deferred", PairMode::Reconcile, false)?;
+    let (over_held, _, _) = live_start("files", "deferred", PairMode::Reconcile, true)?;
+    assert!(
+        started == over_held,
+        "{}\nover a held pull: {}",
+        started.describe(),
+        over_held.describe()
+    );
+    assert!(
+        !captured
+            && started.pushed
+            && started.pending == 1
+            && started.setup.contains("1 deferred fields remain pending")
+            && started.record.ends_with("false")
+            && started.last_sync.as_ref() != Some(&started.files),
+        "Studio captured {captured}: {}",
+        started.describe()
+    );
+    Ok(())
+}
+
+/// A push of a running session that imports an instance whose field Studio
+/// defers leaves the last sync as Studio holds the store, read back, and the
+/// store not accepted: the next push of that store writes the field of the
+/// instance Studio holds and creates none again.
+#[test]
+fn a_session_push_studio_deferred_a_field_of_plans_the_next_from_studio() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.context.experience.clone_from(&fixture.context.root);
+    let context = &fixture.context;
+    let root = Path::new(&context.root);
+    let bridge = fixture.bridge.as_ref().unwrap();
+    let store = (fixture.desired.entries.keys())
+        .find(|path| path.extension().is_some_and(|ext| ext == "renium"))
+        .unwrap()
+        .clone();
+    let paths = project_comparison_stage(context, &sync_services())?
+        .publish_paths()
+        .to_vec();
+    let synced = capture_snapshot(root, &paths)?;
+    let coordinator = Coordinator::default();
+    let setup = coordinator.prepare(context, bridge, writing_pair())?;
+    let mut record = load_record(context, &setup.key)?.unwrap();
+    record.mode = PairMode::Reconcile;
+    record.baseline = Some(StoredSnapshot::write(root, &setup.key, &synced)?);
+    write_record(context, &setup.key, &record)?;
+    let mut document = decode_settings_bytecode(&fs::read(root.join(&store))?)?;
+    let mut block =
+        SettingsBytecodeInstance::new("block".into(), "Block".into(), "Part".into(), Some(0));
+    block.properties.insert("Transparency".into(), json!(0.0));
+    document.instances.push(block);
+    let mut imported = synced.clone();
+    imported.entries.insert(
+        store.clone(),
+        SnapshotEntry::File(encode_settings_bytecode(&document)?),
+    );
+    document.instances[2]
+        .properties
+        .insert("Transparency".into(), json!(0.25));
+    fs::write(root.join(&store), encode_settings_bytecode(&document)?)?;
+    let studio = imported.clone();
+    MUTATION.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_, _| {
+            CAPTURES.with(|slot| slot.borrow_mut().push_front(Box::new(move |_| Ok(studio))));
+            let mut summary = summary(false);
+            summary.insert(
+                "supplementalImportPendingFields".into(),
+                json!([{
+                    "service": "ReplicatedStorage", "settingsId": "block", "className": "Part",
+                    "pathSegments": ["ReplicatedStorage", "Block"], "pathOrdinals": [1, 1],
+                    "properties": {"Transparency": 0.25}
+                }]),
+            );
+            Ok(StagedPushResult {
+                generated: ProjectSnapshot::default(),
+                summary,
+            })
+        }));
+    });
+    let pushed = std::slice::from_ref(&store);
+    let applied = coordinator.push_editor_changes(context, &setup.key, bridge, pushed, None)?;
+    assert_eq!(applied.deferred, std::slice::from_ref(&store));
+    assert!(
+        !applied.accepted.contains_key(&root.join(&store)),
+        "the store Studio deferred a field of was accepted"
+    );
+    assert!(deferred_fields_error(&applied.summary)?.is_some());
+    let record = load_record(context, &setup.key)?.unwrap();
+    assert!(
+        record.studio_checkpoint.is_none(),
+        "a checkpoint of Studio over deferred fields"
+    );
+    let last_sync = record.baseline.unwrap().load(root, &setup.key)?;
+    assert!(
+        last_sync == imported,
+        "the last sync is not what Studio holds"
+    );
+    document.instances[1].name = "Renamed".into();
+    fs::write(root.join(&store), encode_settings_bytecode(&document)?)?;
+    let planned = std::rc::Rc::new(RefCell::new(None));
+    let seen = planned.clone();
+    MUTATION.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_, input| {
+            let mut targets = input.plan.target_settings_ids.clone();
+            targets.sort();
+            let created =
+                (input.plan.recreated_settings_ids.iter().cloned()).collect::<BTreeSet<_>>();
+            *seen.borrow_mut() = Some((targets, created));
+            Ok(StagedPushResult {
+                generated: ProjectSnapshot::default(),
+                summary: summary(true),
+            })
+        }));
+    });
+    let applied = coordinator.push_editor_changes(context, &setup.key, bridge, pushed, None)?;
+    assert_eq!(
+        planned.take(),
+        Some((
+            vec!["block".to_string(), "folder".to_string()],
+            BTreeSet::new()
+        )),
+        "the next push does not write the deferred field of the instance Studio holds"
+    );
+    assert!(applied.deferred.is_empty());
+    let record = load_record(context, &setup.key)?.unwrap();
+    let last_sync = record.baseline.unwrap().load(root, &setup.key)?;
+    assert!(
+        last_sync == capture_snapshot(root, &paths)?,
+        "the last sync is not the files"
+    );
+    Ok(())
+}
+
+/// What a push sent to Studio: what its stage held at each path it planned,
+/// and the identities its plan targets, recreates and deletes.
+type Sent = (BTreeMap<PathBuf, Option<SnapshotEntry>>, String);
+
+/// The seed whose edits also add as many instances to a store as make a push
+/// replace its service whole.
+const HEAVY_SEED: u64 = 24;
+
+/// The file edits of `seed` to a project a pull wrote: scripts renamed,
+/// moved to another service, given a same-named sibling, edited or removed,
+/// and same-named instances added to a store or one of them renamed.
+fn seeded_script_edits(seed: u64, root: &Path, store: &Path) -> Result<Vec<String>> {
+    let mut rng = crate::tests::support::SimRng(seed);
+    let source = root.join("src");
+    let mut done = Vec::new();
+    if seed == HEAVY_SEED {
+        let mut document = decode_settings_bytecode(&fs::read(root.join(store))?)?;
+        for index in 0..2000 {
+            (document.instances).push(SettingsBytecodeInstance::new(
+                format!("heavy{index}"),
+                format!("Heavy{index}"),
+                "Folder".into(),
+                Some(0),
+            ));
+        }
+        fs::write(root.join(store), encode_settings_bytecode(&document)?)?;
+        done.push("heavy".into());
+    }
+    for _ in 0..1 + rng.below(4) {
+        let what = rng.below(7);
+        let moved = |from: &str, to: &str| -> Result<bool> {
+            if !source.join(from).is_file() || source.join(to).exists() {
+                return Ok(false);
+            }
+            fs::create_dir_all(source.join(to).parent().unwrap())?;
+            fs::rename(source.join(from), source.join(to))?;
+            Ok(true)
+        };
+        let applied = match what {
+            0 => moved(
+                "ReplicatedStorage/Shared.luau",
+                "ReplicatedStorage/Renamed.luau",
+            )?,
+            1 => moved("ReplicatedStorage/Folder/Twin.luau", "Workspace/Twin.luau")?,
+            2 => {
+                fs::write(
+                    source.join("ReplicatedStorage/Folder/Twin.server.luau"),
+                    "print(2)",
+                )?;
+                true
+            }
+            3 => {
+                let path = source.join("Workspace/Thing.server.luau");
+                path.is_file() && fs::write(path, format!("print({})", seed + 100)).is_ok()
+            }
+            4 => fs::remove_file(source.join("ReplicatedStorage/Shared.luau")).is_ok(),
+            _ => {
+                let mut document = decode_settings_bytecode(&fs::read(root.join(store))?)?;
+                let twins = (document.instances.iter())
+                    .filter(|instance| instance.name == "Twin")
+                    .count();
+                if what == 5 || twins == 0 {
+                    for _ in 0..2 {
+                        let id = format!("twin{}", document.instances.len());
+                        (document.instances).push(SettingsBytecodeInstance::new(
+                            id,
+                            "Twin".into(),
+                            "Part".into(),
+                            Some(0),
+                        ));
+                    }
+                } else if let Some(twin) =
+                    (document.instances.iter_mut()).rfind(|instance| instance.name == "Twin")
+                {
+                    twin.name = "Single".into();
+                }
+                fs::write(root.join(store), encode_settings_bytecode(&document)?)?;
+                true
+            }
+        };
+        if applied {
+            done.push(what.to_string());
+        }
+    }
+    Ok(done)
+}
+
+/// Checks that each instance the documents a push prepared read from a
+/// store, under `source`, is the one the push's stage holds there, under the
+/// same parent; answers how many it checked.
+fn prepared_as_staged(
+    source: &Path,
+    prepared: &HashMap<String, Arc<SettingsBytecode>>,
+) -> Result<usize> {
+    let described = |document: &SettingsBytecode| -> Result<HashMap<String, Value>> {
+        (document.instances.iter())
+            .filter(|instance| !crate::settings::held::stands_unchanged(&instance.properties))
+            .map(|instance| {
+                let mut value = serde_json::to_value(instance)?;
+                value["parentIndex"] = json!(
+                    (instance.parent_index).map(|index| &document.instances[index].settings_id)
+                );
+                Ok((instance.settings_id.clone(), value))
+            })
+            .collect()
+    };
+    let mut checked = 0;
+    for (service, document) in prepared {
+        let store = service_settings_path(&source.join(service));
+        let staged = described(&decode_settings_bytecode(&fs::read(&store)?)?)?;
+        for (id, instance) in described(document)? {
+            anyhow::ensure!(
+                staged.get(&id) == Some(&instance),
+                "{service}: the prepared {id} is not the staged one: {instance} against {:?}",
+                staged.get(&id)
+            );
+            checked += 1;
+        }
+    }
+    Ok(checked)
+}
+
+/// One Live Sync start of a fresh fixture with scripts in two services,
+/// whose files the edits of `seed` moved from what a pull wrote, which the
+/// last sync holds: with that pull's baseline held, or Studio captured as it
+/// holds it. What the start left, what its push sent, which edits ran, and
+/// how many instances of the documents it prepared were checked against its
+/// stage.
+fn start_over_seeded_edits(seed: u64, hold: bool) -> Result<(Started, Sent, Vec<String>, usize)> {
+    let mut fixture = Fixture::new()?;
+    fixture.context.experience.clone_from(&fixture.context.root);
+    let context = &fixture.context;
+    let root = Path::new(&context.root);
+    let bridge = fixture.bridge.as_ref().unwrap();
+    for (path, text) in [
+        ("ReplicatedStorage/Shared.luau", "return 1"),
+        ("ReplicatedStorage/Folder/Twin.luau", "return 2"),
+        ("Workspace/Thing.server.luau", "print(3)"),
+    ] {
+        let path = Path::new(&context.source).join(path);
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(path, text)?;
+    }
+    let store = (fixture.desired.entries.keys())
+        .find(|path| path.extension().is_some_and(|ext| ext == "renium"))
+        .unwrap()
+        .clone();
+    let paths = project_comparison_stage(context, &sync_services())?
+        .publish_paths()
+        .to_vec();
+    let pulled = capture_snapshot(root, &paths)?;
+    let coordinator = Coordinator::default();
+    let mut setup = coordinator.prepare(
+        context,
+        bridge,
+        PairConfiguration {
+            mode: PairMode::Reconcile,
+            conflict_preference: ConflictPreference::None,
+            resolution_preference: None,
+            decisions: BTreeMap::new(),
+            runtime_settings: Map::new(),
+        },
+    )?;
+    let mut record = load_record(context, &setup.key)?.unwrap();
+    record.baseline = Some(StoredSnapshot::write(root, &setup.key, &pulled)?);
+    write_record(context, &setup.key, &record)?;
+    let edits = seeded_script_edits(seed, root, &store)?;
+    let after_push = capture_snapshot(root, &paths)?;
+    if hold {
+        bridge.verified_full_pushes.lock_recover().insert(
+            "push-fixture".into(),
+            VerifiedFullPush {
+                connections: bridge.runtime_connection_signature("push-fixture"),
+                input: plain_push_input(&automation_push_args(context, &json!({}), false)?)?,
+                project: pulled.clone(),
+                paths: paths.clone(),
+                proof: json!({"id": 1}),
+                expires: Instant::now() + Duration::from_secs(600),
+                sourcemap: Some(Box::default()),
+                #[cfg(windows)]
+                relay: None,
+            },
+        );
+    }
+    replace_capture(pulled);
+    let sent = std::rc::Rc::new(RefCell::new(Sent::default()));
+    let seen = sent.clone();
+    let checked = std::rc::Rc::new(std::cell::Cell::new(0));
+    let compared = checked.clone();
+    MUTATION.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_, input| {
+            let changed = input.plan.changed_paths.clone();
+            let mut staged = capture_snapshot(&input.args.project.project_root, &changed)?;
+            let sorted = |ids: Vec<String>| ids.into_iter().collect::<BTreeSet<_>>();
+            let deletes = (input.plan.instance_deletes.iter())
+                .map(serde_json::to_string)
+                .collect::<serde_json::Result<BTreeSet<_>>>()?;
+            compared.set(prepared_as_staged(
+                &input.args.project.src_root,
+                input.prepared,
+            )?);
+            *seen.borrow_mut() = (
+                (changed.into_iter())
+                    .map(|path| {
+                        let entry = staged.entries.remove(&path);
+                        (path, entry)
+                    })
+                    .collect(),
+                format!(
+                    "targets {:?} recreated {:?} deletes {:?} replaced {:?}",
+                    sorted(input.plan.target_settings_ids.clone()),
+                    sorted(input.plan.recreated_settings_ids.iter().cloned().collect()),
+                    deletes,
+                    sorted(input.plan.initial_native_services.iter().cloned().collect())
+                ),
+            );
+            CAPTURES.with(|slot| {
+                slot.borrow_mut()
+                    .push_front(Box::new(move |_| Ok(after_push)));
+            });
+            Ok(StagedPushResult {
+                generated: ProjectSnapshot::default(),
+                summary: summary(true),
+            })
+        }));
+    });
+    let outcome = coordinator.reconcile_with_gate_held(context, bridge, &mut setup);
+    let pushed = MUTATION.with(|slot| slot.borrow().is_none());
+    let record = load_record(context, &setup.key)?.unwrap();
+    let anonymous = |text: &str| text.replace(&context.root, "<root>");
+    let started = Started {
+        outcome: outcome.map_or_else(|error| anonymous(&format!("{error:#}")), |()| "ok".into()),
+        setup: format!(
+            "{:?} {:?} {} {:?} {:?} {:?}",
+            setup.mode,
+            setup.error.as_deref().map(anonymous),
+            setup.resolution_required,
+            setup.conflicts.len(),
+            setup.differences,
+            setup.unsynced_paths
+        ),
+        record: format!(
+            "{:?} {} {} {:?} {}",
+            record.mode,
+            record.resolution_required,
+            record.conflicts.len(),
+            record.differences,
+            record.studio_checkpoint.is_some()
+        ),
+        last_sync: record
+            .baseline
+            .map(|baseline| baseline.load(root, &setup.key))
+            .transpose()?,
+        files: capture_snapshot(root, &paths)?,
+        pushed,
+        pending: setup.unsynced_paths.len(),
+    };
+    let sent = sent.take();
+    Ok((started, sent, edits, checked.get()))
+}
+
+/// A Live Sync start under a pull's baseline Studio still holds, whose
+/// files moved since by renames, moves across services, same-named siblings
+/// in folders and stores, and script edits, pushes what a start that
+/// captures Studio pushes and leaves the pair as it leaves it: the same
+/// paths, targets, recreations and deletes, with the documents it prepared
+/// as its stage holds them. A service so many new instances moved it pushes
+/// as Live Sync pushes an edit, replacing it whole, where the comparison's
+/// push writes them one at a time.
+#[test]
+fn seeded_file_edits_push_over_a_held_pull_as_a_capture_does() -> Result<()> {
+    let mut checked = 0;
+    for seed in 0..=HEAVY_SEED {
+        let (started, sent, edits, prepared) = start_over_seeded_edits(seed, true)?;
+        let (oracle, expected, _, _) = start_over_seeded_edits(seed, false)?;
+        checked += prepared;
+        let replaced = seed == HEAVY_SEED
+            && sent.0 == expected.0
+            && sent.1.ends_with(r#"replaced {"ReplicatedStorage"}"#)
+            && expected.1.ends_with("replaced {}");
+        assert!(
+            started == oracle && (sent == expected || replaced),
+            "seed {seed}, edits {edits:?}: {}\nsent {:?} {}\nagainst a capture: {}\nsent {:?} {}",
+            started.describe(),
+            sent.0.keys().collect::<Vec<_>>(),
+            sent.1,
+            oracle.describe(),
+            expected.0.keys().collect::<Vec<_>>(),
+            expected.1
+        );
+        assert!(
+            edits.is_empty() || started.pushed,
+            "seed {seed}, edits {edits:?}: nothing pushed: {}",
+            started.describe()
+        );
+        assert!(
+            replaced || seed != HEAVY_SEED,
+            "seed {seed} replaced no service: {}",
+            sent.1
+        );
+    }
+    assert!(checked > 0, "no prepared instance checked");
+    Ok(())
+}
+
+/// How the sides of a drawn start stand since the held pull: the files moved
+/// or Studio did, and the pair's last sync holds the pull's files, those of
+/// an older sync, or there is none.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Drawn {
+    Files,
+    FilesOlder,
+    FilesFirst,
+    Studio,
+    StudioOlder,
+}
+
+impl Drawn {
+    fn files_move(self) -> bool {
+        matches!(self, Self::Files | Self::FilesOlder | Self::FilesFirst)
+    }
+}
+
+const DRAWN_OUTCOMES: [&str; 6] = [
+    "pushed the files' edits alone over the last sync",
+    "pushed the files' edits alone over a pull the last sync did not hold",
+    "compared the files' edits with the held pull",
+    "pulled what Studio moved through the export",
+    "captured the services Studio moved in through the export",
+    "refused a PackageLink Studio moved where the last sync is the pull",
+];
+
+static DRAWN_COUNTS: [std::sync::atomic::AtomicUsize; 6] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 6];
+
+/// What one drawn start left and whether that leaves nothing open, what its
+/// push sent, how often it captured Studio whole or read it back, how often
+/// it exported services, whether a pull of its own kept a baseline, and how
+/// long it took.
+struct DrawnEnd {
+    started: Started,
+    settled: bool,
+    sent: Sent,
+    captures: usize,
+    exports: usize,
+    pulled: bool,
+    took: Duration,
+}
+
+/// Gives `studio` the folders a capture of it writes: those of its scripts
+/// under the service `folders`, and no other.
+fn with_script_folders(studio: &mut ProjectSnapshot, folders: &[&PathBuf]) {
+    let nested = |path: &Path| {
+        folders
+            .iter()
+            .any(|folder| path.starts_with(folder) && path != *folder)
+    };
+    (studio.entries)
+        .retain(|path, entry| !matches!(entry, SnapshotEntry::Directory) || !nested(path));
+    let above = (studio.entries.keys())
+        .flat_map(|path| path.ancestors().skip(1))
+        .filter(|path| nested(path))
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    (studio.entries).extend(
+        above
+            .into_iter()
+            .map(|path| (path, SnapshotEntry::Directory)),
+    );
+}
+
+/// The kind and the model's start of `seed`.
+fn drawn_of(seed: u64, log: &mut Vec<String>) -> (Drawn, super::sim::DrawnStart) {
+    let mut rng = crate::tests::support::SimRng(seed);
+    let kind = [
+        Drawn::Files,
+        Drawn::FilesOlder,
+        Drawn::FilesFirst,
+        Drawn::Studio,
+        Drawn::Studio,
+        Drawn::StudioOlder,
+    ][rng.below(6)];
+    log.push(format!("{kind:?}"));
+    let drawn = super::sim::drawn_start(&mut rng, kind.files_move(), log);
+    (kind, drawn)
+}
+
+/// Writes `project` as the files under `root`; answers them as a read of
+/// `paths` holds them.
+fn write_project(
+    root: &Path,
+    paths: &[PathBuf],
+    project: &ProjectSnapshot,
+) -> Result<ProjectSnapshot> {
+    let before = capture_snapshot(root, paths)?;
+    let written = (before.entries.keys().chain(project.entries.keys()))
+        .cloned()
+        .collect::<HashSet<_>>();
+    apply_snapshot_paths(root, &written, project)?;
+    capture_snapshot(root, paths)
+}
+
+/// The folder and the store of each service the project of `context`
+/// syncs, by its path from the project's root.
+fn service_scopes(context: &BoundContext) -> Result<BTreeMap<String, [PathBuf; 2]>> {
+    let relative =
+        |path: PathBuf| -> Result<PathBuf> { Ok(path.strip_prefix(&context.root)?.to_path_buf()) };
+    (sync_services().into_iter())
+        .map(|service| {
+            let folder = Path::new(&context.source).join(&service);
+            let scopes = [relative(service_settings_path(&folder))?, relative(folder)?];
+            Ok((service, scopes))
+        })
+        .collect()
+}
+
+/// The model's `project` with each store where the project of `context`
+/// keeps the store of its service.
+fn laid_out(context: &BoundContext, project: &ProjectSnapshot) -> Result<ProjectSnapshot> {
+    let scopes = service_scopes(context)?;
+    let entries = (project.entries.iter())
+        .map(|(path, entry)| {
+            let service = (path.parent())
+                .filter(|_| {
+                    (path.file_name().and_then(|name| name.to_str()))
+                        .is_some_and(is_service_settings_file_name)
+                })
+                .and_then(|folder| folder.file_name()?.to_str());
+            let path = match service {
+                Some(service) => scopes
+                    .get(service)
+                    .with_context(|| format!("{service} is no synced service"))?[0]
+                    .clone(),
+                None => path.clone(),
+            };
+            Ok((path, entry.clone()))
+        })
+        .collect::<Result<_>>()?;
+    Ok(ProjectSnapshot { entries })
+}
+
+/// One Live Sync start of the model's start `drawn`, with the pull's
+/// baseline held or Studio captured. Studio is the model's: a capture
+/// stages what it holds over the files, an export writes the services it is
+/// asked for into its stage, and a push leaves it holding the paths the
+/// push planned and the stores of the services it touched as the push's
+/// stage holds them. A start that leaves nothing open leaves the files,
+/// Studio and the last sync alike. Without the baseline, the last sync of a start whose files
+/// moved is the pull's files: what a capture start merges from where the
+/// pull wrote it.
+fn drawn_live_start(kind: Drawn, drawn: &super::sim::DrawnStart, hold: bool) -> Result<DrawnEnd> {
+    let mut fixture = Fixture::new()?;
+    fixture.context.experience.clone_from(&fixture.context.root);
+    let context = &fixture.context;
+    let root = Path::new(&context.root);
+    let bridge = fixture.bridge.as_ref().unwrap();
+    let paths = project_comparison_stage(context, &sync_services())?
+        .publish_paths()
+        .to_vec();
+    let written = |project: &ProjectSnapshot| -> Result<ProjectSnapshot> {
+        write_project(root, &paths, &laid_out(context, project)?)
+    };
+    let older = written(&drawn.older)?;
+    let studio = written(&drawn.studio)?;
+    let pulled = written(&drawn.pulled)?;
+    let scopes = std::rc::Rc::new(service_scopes(context)?);
+    let coordinator = Coordinator::default();
+    let mut setup = coordinator.prepare(context, bridge, writing_pair())?;
+    let last_sync = match (kind, hold) {
+        (Drawn::Files | Drawn::Studio, _) | (Drawn::FilesOlder | Drawn::FilesFirst, false) => {
+            Some(&pulled)
+        }
+        (Drawn::FilesOlder | Drawn::StudioOlder, _) => Some(&older),
+        (Drawn::FilesFirst, true) => None,
+    };
+    let mut record = load_record(context, &setup.key)?.unwrap();
+    record.baseline = last_sync
+        .map(|synced| StoredSnapshot::write(root, &setup.key, synced))
+        .transpose()?;
+    write_record(context, &setup.key, &record)?;
+    if kind.files_move() {
+        written(&drawn.files)?;
+    }
+    if hold {
+        bridge.verified_full_pushes.lock_recover().insert(
+            "push-fixture".into(),
+            VerifiedFullPush {
+                connections: bridge.runtime_connection_signature("push-fixture"),
+                input: plain_push_input(&automation_push_args(context, &json!({}), false)?)?,
+                project: pulled.clone(),
+                paths: paths.clone(),
+                proof: if kind.files_move() {
+                    json!({"id": 1})
+                } else {
+                    json!({"expired": true})
+                },
+                expires: Instant::now() + Duration::from_secs(600),
+                sourcemap: Some(Box::default()),
+                #[cfg(windows)]
+                relay: None,
+            },
+        );
+    }
+    fixture.tracker.lock().unwrap().answer = Some(drawn.scope.clone());
+    let studio = std::rc::Rc::new(RefCell::new(studio));
+    let requested = capture_requests();
+    CAPTURES.with(|slot| {
+        let mut captures = slot.borrow_mut();
+        captures.clear();
+        for _ in 0..8 {
+            let (studio, root, paths) = (studio.clone(), root.to_path_buf(), paths.clone());
+            captures.push_back(Box::new(move |_| {
+                let (_, stage) = last_requested();
+                let files = capture_snapshot(&root, &paths)?;
+                let captured = super::sim::pulled_over(&files, &studio.borrow())?;
+                let staged = (captured.entries.keys().chain(files.entries.keys()))
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                apply_snapshot_paths(&stage, &staged, &captured)?;
+                Ok(captured)
+            }));
+        }
+    });
+    let exports = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (exported, held, by_service) = (exports.clone(), studio.clone(), scopes.clone());
+    crate::snapshot::export::STUDIO_EXPORT.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |services, stage| {
+            exported.set(exported.get() + 1);
+            let scopes = (services.iter())
+                .flat_map(|service| by_service.get(service).cloned())
+                .flatten()
+                .collect::<Vec<_>>();
+            let files = capture_snapshot(&stage.import_project_root, &scopes)?;
+            let scope = ScopeSet::new(&scopes);
+            let mut studio = held.borrow().clone();
+            studio.entries.retain(|path, _| scope.contains(path));
+            let captured = super::sim::pulled_over(&files, &studio)?;
+            let staged = (captured.entries.keys().chain(files.entries.keys()))
+                .cloned()
+                .collect::<HashSet<_>>();
+            apply_snapshot_paths(&stage.import_project_root, &staged, &captured)
+        }));
+    });
+    let sent = std::rc::Rc::new(RefCell::new(Sent::default()));
+    let (seen, pushed_to) = (sent.clone(), studio.clone());
+    MUTATION.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_, input| {
+            let changed = input.plan.changed_paths.clone();
+            let staged = capture_snapshot(&input.args.project.project_root, &changed)?;
+            let sorted = |ids: Vec<String>| ids.into_iter().collect::<BTreeSet<_>>();
+            let mut deleted_in = BTreeSet::new();
+            let deletes = (input.plan.instance_deletes.iter())
+                .map(|delete| {
+                    let mut delete = serde_json::to_value(delete)?;
+                    deleted_in.extend(delete["service"].as_str().map(str::to_string));
+                    let instances = delete.get_mut("instances").and_then(Value::as_array_mut);
+                    for instance in instances.into_iter().flatten() {
+                        if instance.get("previousSettingsId") == instance.get("settingsId")
+                            && let Some(instance) = instance.as_object_mut()
+                        {
+                            instance.remove("previousSettingsId");
+                        }
+                    }
+                    Ok(delete.to_string())
+                })
+                .collect::<Result<BTreeSet<_>>>()?;
+            *seen.borrow_mut() = (
+                (changed.iter())
+                    .map(|path| (path.clone(), staged.entries.get(path).cloned()))
+                    .collect(),
+                format!(
+                    "targets {:?} recreated {:?} deletes {:?} replaced {:?}",
+                    sorted(input.plan.target_settings_ids.clone()),
+                    sorted(input.plan.recreated_settings_ids.iter().cloned().collect()),
+                    deletes,
+                    sorted(input.plan.initial_native_services.iter().cloned().collect())
+                ),
+            );
+            let touched = (scopes.iter())
+                .filter(|(service, scopes)| {
+                    let within = ScopeSet::new(scopes.iter());
+                    changed.iter().any(|path| within.contains(path))
+                        || input.prepared.contains_key(*service)
+                        || deleted_in.contains(*service)
+                })
+                .collect::<Vec<_>>();
+            let stores = (touched.iter())
+                .map(|(_, scopes)| scopes[0].clone())
+                .collect::<Vec<_>>();
+            let stores = capture_snapshot(&input.args.project.project_root, &stores)?;
+            let scope = ScopeSet::new(&changed);
+            let mut studio = pushed_to.borrow_mut();
+            studio.entries.retain(|path, _| !scope.contains(path));
+            studio.entries.extend(staged.entries);
+            studio.entries.extend(stores.entries);
+            let folders = scopes.values().map(|scopes| &scopes[1]).collect::<Vec<_>>();
+            with_script_folders(&mut studio, &folders);
+            let verified = touched
+                .iter()
+                .map(|(service, _)| service)
+                .collect::<Vec<_>>();
+            let mut summary = summary(true);
+            summary.insert("nativeVerifiedServices".into(), json!(verified));
+            Ok(StagedPushResult {
+                generated: ProjectSnapshot::default(),
+                summary,
+            })
+        }));
+    });
+    let began = Instant::now();
+    let outcome = coordinator.reconcile_with_gate_held(context, bridge, &mut setup);
+    let took = began.elapsed();
+    let pushed = MUTATION.with(|slot| slot.borrow().is_none());
+    let record = load_record(context, &setup.key)?.unwrap();
+    let open = setup.error.is_some()
+        || setup.resolution_required
+        || !setup.conflicts.is_empty()
+        || !setup.differences.is_empty()
+        || !setup.unsynced_paths.is_empty();
+    let anonymous = |text: &str| text.replace(&context.root, "<root>");
+    let started = Started {
+        outcome: outcome.map_or_else(|error| anonymous(&format!("{error:#}")), |()| "ok".into()),
+        setup: format!(
+            "{:?} {:?} {} {:?} {:?} {:?}",
+            setup.mode,
+            setup.error.as_deref().map(anonymous),
+            setup.resolution_required,
+            (setup.conflicts.iter().cloned())
+                .map(|mut conflict| {
+                    conflict.files_changed_at = None;
+                    conflict
+                })
+                .collect::<Vec<_>>(),
+            setup.differences,
+            setup.unsynced_paths
+        ),
+        record: format!(
+            "{:?} {} {} {:?} {}",
+            record.mode,
+            record.resolution_required,
+            record.conflicts.len(),
+            record.differences,
+            record.studio_checkpoint.is_some()
+        ),
+        last_sync: record
+            .baseline
+            .map(|baseline| baseline.load(root, &setup.key))
+            .transpose()?,
+        files: capture_snapshot(root, &paths)?,
+        pushed,
+        pending: setup.unsynced_paths.len(),
+    };
+    let settled = started.outcome == "ok" && !open;
+    if settled {
+        if let Some(unsettled) = super::sim::unsettled(&started.files, &studio.borrow())? {
+            let sent = sent.borrow();
+            bail!(
+                "{kind:?}, held {hold}: {unsettled}: {}; sent {:?} {}",
+                started.describe(),
+                sent.0.keys().collect::<Vec<_>>(),
+                sent.1
+            );
+        }
+        anyhow::ensure!(
+            started.last_sync.as_ref() == Some(&started.files),
+            "{kind:?}, held {hold}: the last sync is not the files: {}",
+            started.describe()
+        );
+    }
+    let pulled = (bridge.verified_full_pushes.lock_recover())
+        .get("push-fixture")
+        .is_some_and(|kept| kept.proof == json!({"test": true}));
+    Ok(DrawnEnd {
+        started,
+        settled,
+        sent: sent.take(),
+        captures: capture_requests() - requested,
+        exports: exports.get(),
+        pulled,
+        took,
+    })
+}
+
+/// Where two starts' ends differ: the fields, and the first path the files
+/// hold otherwise, or the last sync where `with_last_sync`.
+fn started_difference(left: &Started, right: &Started, with_last_sync: bool) -> String {
+    let path = |left: &ProjectSnapshot, right: &ProjectSnapshot| {
+        (left.entries.keys().chain(right.entries.keys()))
+            .find(|path| left.entries.get(*path) != right.entries.get(*path))
+            .map(|path| path.display().to_string())
+    };
+    let mut differences = Vec::new();
+    for (what, left, right) in [
+        ("outcome", &left.outcome, &right.outcome),
+        ("setup", &left.setup, &right.setup),
+        ("record", &left.record, &right.record),
+    ] {
+        if left != right {
+            differences.push(format!("{what}: {left} against {right}"));
+        }
+    }
+    if let Some(path) = path(&left.files, &right.files) {
+        differences.push(format!("files at {path}"));
+    }
+    match (&left.last_sync, &right.last_sync) {
+        _ if !with_last_sync => {}
+        (Some(left), Some(right)) => {
+            differences.extend(path(left, right).map(|path| format!("last sync at {path}")));
+        }
+        (None, None) => {}
+        _ => differences.push("one has no last sync".into()),
+    }
+    if (left.pushed, left.pending) != (right.pushed, right.pending) {
+        differences.push(format!(
+            "pushed {} with {} pending against {} with {}",
+            left.pushed, left.pending, right.pushed, right.pending
+        ));
+    }
+    differences.join("; ")
+}
+
+fn run_drawn_start_seed(seed: u64, log: &mut Vec<String>) -> Result<(), String> {
+    let (kind, drawn) = drawn_of(seed, log);
+    let start = |hold| drawn_live_start(kind, &drawn, hold).map_err(|error| format!("{error:#}"));
+    let (held, oracle) = (start(true)?, start(false)?);
+    // A start that leaves a review open leaves the last sync it began from,
+    // which the one that captures Studio begins from the pull's files for.
+    let same_sync = oracle.settled || !matches!(kind, Drawn::FilesOlder | Drawn::FilesFirst);
+    let difference = started_difference(&held.started, &oracle.started, same_sync);
+    if !difference.is_empty() || held.sent != oracle.sent {
+        return Err(format!(
+            "{kind:?}: a start from the held pull ends otherwise than one that captures Studio: {difference}\nsent {:?} {}\nagainst {:?} {}",
+            held.sent.0.keys().collect::<Vec<_>>(),
+            held.sent.1,
+            oracle.sent.0.keys().collect::<Vec<_>>(),
+            oracle.sent.1
+        ));
+    }
+    let reached = match kind {
+        Drawn::Files if held.started.pushed && held.captures == 0 => Some(0),
+        Drawn::FilesOlder | Drawn::FilesFirst if held.started.pushed && held.captures == 0 => {
+            Some(1)
+        }
+        _ if kind.files_move() && held.started.pushed => Some(2),
+        Drawn::Studio if held.pulled && held.captures == 0 => Some(3),
+        Drawn::Studio if held.started.setup.contains("PackageLink") => Some(5),
+        Drawn::StudioOlder if held.exports > 0 => Some(4),
+        _ => None,
+    };
+    if let Some(index) = reached {
+        DRAWN_COUNTS[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// A Live Sync start under a held pull ends as a start that captures Studio
+/// and merges whole ends, on both of its routes: with the files moved since
+/// the pull it pushes what that one pushes, and with Studio moved it pulls
+/// through the export what that one writes, or compares a capture of the
+/// services Studio moved in where the last sync is older than the pull.
+/// The model draws values, references, attributes, tags, sources, renames,
+/// moves within and between services, removals and their undo, additions,
+/// twins and PackageLinks. A start that leaves nothing open leaves files a
+/// pull would not write and a push would send nothing of.
+#[test]
+fn seeded_starts_over_a_held_pull_end_as_a_capture_and_merge_do() {
+    crate::tests::support::run_seeds(120, run_drawn_start_seed);
+    for (count, what) in DRAWN_COUNTS.iter().zip(DRAWN_OUTCOMES) {
+        assert!(
+            count.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "no seed reached: {what}"
+        );
+    }
+}
+
+/// A project whose ReplicatedStorage store holds `parts` Parts in folders of
+/// 120 beside 300 scripts, with the first two Parts at `transparencies`.
+fn large_project(parts: usize, transparencies: [f64; 2]) -> Result<ProjectSnapshot> {
+    use crate::tests::support::{settings_document, settings_instance};
+    let service = "ReplicatedStorage";
+    let mut document = settings_document(vec![settings_instance("root", service, service, None)]);
+    let mut folder = 0;
+    for index in 0..parts {
+        if index % 120 == 0 {
+            folder = document.instances.len();
+            let name = format!("Folder{}", index / 120);
+            (document.instances).push(settings_instance(name.clone(), name, "Folder", Some(0)));
+        }
+        let name = format!("Part{index}");
+        let mut part = settings_instance(name.clone(), name, "Part", Some(folder));
+        let transparency = transparencies.get(index).copied().unwrap_or(0.0);
+        for (property, value) in [
+            ("Anchored", json!(true)),
+            (
+                "Size",
+                json!({"_type": "Vector3", "x": 4.0, "y": 1.0 + (index % 7) as f64, "z": 2.0}),
+            ),
+            ("Transparency", json!(transparency)),
+        ] {
+            part.properties.insert(property.to_string(), value);
+        }
+        document.instances.push(part);
+    }
+    let scripts = document.instances.len();
+    (document.instances).push(settings_instance("scripts", "Scripts", "Folder", Some(0)));
+    for index in 0..300 {
+        let name = format!("Script{index}");
+        (document.instances).push(settings_instance(
+            name.clone(),
+            name,
+            "ModuleScript",
+            Some(scripts),
+        ));
+    }
+    let service_dir = Path::new("src").join(service);
+    let sources = build_editor_source_paths_by_index(&document, service, &service_dir);
+    let mut entries = (sources.into_iter().flatten().enumerate())
+        .map(|(index, path)| {
+            let source = format!("return {index}\n").into_bytes();
+            (path, SnapshotEntry::File(source))
+        })
+        .collect::<BTreeMap<_, _>>();
+    entries.insert(
+        service_settings_path(&service_dir),
+        SnapshotEntry::File(encode_settings_bytecode(&document)?),
+    );
+    Ok(ProjectSnapshot { entries })
+}
+
+/// Prints how long a start over a held pull takes on each route, beside the
+/// start that captures Studio, and what such a start still pays for, on a
+/// store of 120,000 instances beside 300 scripts. Studio's own work is not
+/// in these times: the model answers a capture, an export and a push at once.
+#[test]
+#[ignore = "timing probe: run alone in an optimized build with --ignored --nocapture"]
+fn a_start_over_a_held_pull_of_a_large_store_times() -> Result<()> {
+    const PARTS: usize = 120_000;
+    let milliseconds = |took: Duration| took.as_secs_f64() * 1000.0;
+    let pulled = large_project(PARTS, [0.0, 0.0])?;
+    let moved = large_project(PARTS, [0.5, 0.0])?;
+    let older = large_project(PARTS, [0.0, 0.25])?;
+    let drawn = |files: &ProjectSnapshot, studio: &ProjectSnapshot| super::sim::DrawnStart {
+        older: older.clone(),
+        pulled: pulled.clone(),
+        files: files.clone(),
+        studio: studio.clone(),
+        scope: json!({
+            "services": ["ReplicatedStorage"],
+            "touched": {"ReplicatedStorage": "whole"}
+        }),
+    };
+    for (kind, drawn) in [
+        (Drawn::Files, drawn(&moved, &pulled)),
+        (Drawn::FilesOlder, drawn(&moved, &pulled)),
+        (Drawn::Studio, drawn(&pulled, &moved)),
+        (Drawn::StudioOlder, drawn(&pulled, &moved)),
+    ] {
+        for hold in [true, false] {
+            let end = drawn_live_start(kind, &drawn, hold)?;
+            println!(
+                "{kind:?}, held {hold}: {:.0} ms: {}; {} captures, {} exports",
+                milliseconds(end.took),
+                end.started.describe(),
+                end.captures,
+                end.exports
+            );
+        }
+    }
+    let mut fixture = Fixture::new()?;
+    fixture.context.experience.clone_from(&fixture.context.root);
+    let context = &fixture.context;
+    let root = Path::new(&context.root);
+    let paths = project_comparison_stage(context, &sync_services())?
+        .publish_paths()
+        .to_vec();
+    let project = write_project(root, &paths, &laid_out(context, &pulled)?)?;
+    let key = Coordinator::default()
+        .prepare(context, fixture.bridge.as_ref().unwrap(), writing_pair())?
+        .key;
+    let scopes = service_scopes(context)?;
+    let entry = project.entries.get(&scopes["ReplicatedStorage"][0]);
+    let timed = |what: &str, cost: &mut dyn FnMut() -> Result<()>| -> Result<()> {
+        let began = Instant::now();
+        cost()?;
+        println!("{what}: {:.1} ms", milliseconds(began.elapsed()));
+        Ok(())
+    };
+    timed("PackageLink check from the store's structure", &mut || {
+        anyhow::ensure!(!holds_package_link(entry)?);
+        Ok(())
+    })?;
+    timed("PackageLink check from every instance", &mut || {
+        let document = settings_document(entry)?;
+        anyhow::ensure!(
+            (document.instances.iter()).all(|instance| instance.class_name != "PackageLink")
+        );
+        Ok(())
+    })?;
+    timed("copy of the project", &mut || {
+        drop(project.clone());
+        Ok(())
+    })?;
+    let mut stored = None;
+    timed("write of the project as the last sync", &mut || {
+        stored = Some(StoredSnapshot::write(root, &key, &project)?);
+        Ok(())
+    })?;
+    let stored = stored.context("no last sync")?;
+    timed("the last sync against a read of the files", &mut || {
+        anyhow::ensure!(stored.matches(&project));
+        Ok(())
+    })?;
+    timed("read of the files and the paths that moved", &mut || {
+        let files = capture_snapshot(root, &paths)?;
+        anyhow::ensure!(stored.moved_paths(&files).is_empty());
+        Ok(())
+    })
+}
+
+/// A Live Sync start that pushes the files moved since a held pull leaves a
+/// file edited after the start read it, which the push sent, pending when it
+/// is put back before the push lands: Studio holds the edit.
+#[test]
+fn a_live_start_leaves_a_file_put_back_during_its_push_pending() -> Result<()> {
+    let (started, captured, _) = live_start("files", "raced", PairMode::Reconcile, true)?;
+    assert!(
+        !captured && started.pushed && started.pending == 1,
+        "Studio captured {captured}: {}",
+        started.describe()
+    );
+    Ok(())
+}
+
+/// A Live Sync start that may not take one side, under a pull's baseline
+/// whose files moved since, captures Studio where a start without that
+/// baseline does and leaves what that start leaves, and the baseline stays
+/// held: with a difference open, a resolution asked for, a decision taken,
+/// Studio to start from the files, or a restart Renium cannot prove.
+#[test]
+fn a_live_start_that_compares_holds_the_pull_whose_files_moved() -> Result<()> {
+    for record in [
+        "difference",
+        "unresolved",
+        "decided",
+        "bootstrap",
+        "unproven",
+    ] {
+        let (started, captured, kept) = live_start("files", record, PairMode::Reconcile, true)?;
+        let (oracle, compared, _) = live_start("files", record, PairMode::Reconcile, false)?;
+        assert!(
+            started == oracle,
+            "{record}: {}\nwithout the baseline: {}",
+            started.describe(),
+            oracle.describe()
+        );
+        assert!(
+            captured == compared && kept.is_some(),
+            "{record}: Studio captured {captured}, the baseline held {}",
+            kept.is_some()
+        );
+    }
+    Ok(())
+}
+
+/// A Live Sync start that pulls what Studio moved since a held pull, scoped
+/// to the service it moved in, leaves what a start leaves whose files and
+/// last sync hold what the pull wrote, whatever Studio did after it: held
+/// it, which the baseline the pull kept shows without a capture, undid it,
+/// or moved again. A pull that wrote nothing, or met the files edited before
+/// it wrote, leaves what a start without it leaves, and one that kept a file
+/// back what a start after it leaves that compares; one that wrote part of
+/// the files fails the start before anything compares.
+#[test]
+fn a_live_start_compares_from_what_its_pull_wrote() -> Result<()> {
+    for held in [
+        "pulled",
+        "undone",
+        "again",
+        "pull-failed",
+        "pull-edited",
+        "pull-kept",
+    ] {
+        let (started, captured, kept) = live_start(held, "same", PairMode::Reconcile, true)?;
+        let (oracle, _, _) = live_start(held, "same", PairMode::Reconcile, false)?;
+        assert!(
+            started == oracle,
+            "{held}: {}\nwithout the pull: {}",
+            started.describe(),
+            oracle.describe()
+        );
+        assert!(
+            captured == (held != "pulled") && oracle.outcome == "ok" && !oracle.pushed,
+            "{held}: Studio captured {captured}: {}",
+            oracle.describe()
+        );
+        assert!(
+            kept.is_some() || held != "pulled",
+            "{held}: no baseline kept after the pull"
+        );
+    }
+    let (started, captured, _) = live_start("pull-partial", "same", PairMode::Reconcile, true)?;
+    assert!(
+        started.outcome.contains("no longer hold what it read") && !captured,
+        "{}",
+        started.describe()
+    );
+    Ok(())
+}
+
+/// A Live Sync start under a pull's baseline Studio still holds, whose files
+/// created a PackageLink in a store since, compares that store as a start
+/// that captures Studio does and pushes nothing; the baseline stays held.
+#[test]
+fn a_live_start_compares_a_moved_store_with_a_package_link() -> Result<()> {
+    let (started, captured, kept) = live_start("link", "stale", PairMode::Reconcile, true)?;
+    assert!(kept.is_some(), "no baseline held after");
+    let (oracle, _, _) = live_start("link", "stale", PairMode::Reconcile, false)?;
+    assert!(
+        started == oracle,
+        "{}\nagainst a capture: {}",
+        started.describe(),
+        oracle.describe()
+    );
+    assert!(
+        !captured && !started.pushed,
+        "Studio captured {captured}: {}",
+        started.describe()
+    );
+    Ok(())
+}
+
+/// A Live Sync start that pushes the files moved since a held pull leaves a
+/// file edited during its push to push after it, as a start that captures
+/// Studio does.
+#[test]
+fn a_live_start_leaves_a_file_edited_during_its_push_pending() -> Result<()> {
+    let (started, captured, _) = live_start("files", "edited", PairMode::Reconcile, true)?;
+    let (oracle, _, _) = live_start("files", "edited", PairMode::Reconcile, false)?;
+    assert!(
+        started == oracle,
+        "{}\nagainst a capture: {}",
+        started.describe(),
+        oracle.describe()
+    );
+    assert!(
+        !captured && started.pushed && started.pending == 1,
+        "Studio captured {captured}: {}",
+        started.describe()
+    );
     Ok(())
 }
 

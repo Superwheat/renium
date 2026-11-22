@@ -2412,7 +2412,8 @@ fn scoped_pull_step(
         scoped_outcome(2);
         return Ok(scoped_whole_pull(rng, (studio, files), (counter, log)));
     }
-    let published = scoped_project(&current, &captured, &paths);
+    let mut published = current.clone();
+    rescope(&mut published, captured.clone(), &paths);
     if published != whole {
         let difference = Tree::read(&published)?.difference(&Tree::read(&whole)?);
         return Err(format!(
@@ -2426,8 +2427,8 @@ fn scoped_pull_step(
     }
     let written = under_scope(&files.snapshot(None));
     match scoped_baseline(
-        &held.project,
-        &written,
+        held.project.clone(),
+        written,
         (&paths, &settled_of(&captured)),
         premise,
     ) {
@@ -3073,4 +3074,265 @@ fn a_targeted_baseline_holds_only_rows_a_push_sends() {
     assert!(kept(&decal("rbxassetid://2", "rbxassetid://2")));
     assert!(!kept(&decal("rbxassetid://1", "rbxassetid://2")));
     assert!(!kept(&decal("rbxassetid://2", "rbxassetid://1")));
+}
+
+/// What a pull writes of Studio, as `studio` holds it, over the files
+/// `files`: each store aligned to the files' copy, or left as the files hold
+/// it where Studio holds it alike, and every other path as Studio has it.
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn pulled_over(
+    files: &ProjectSnapshot,
+    studio: &ProjectSnapshot,
+) -> Result<ProjectSnapshot> {
+    use crate::settings::equivalence::{
+        SettingsAlignment, align_pulled_settings_bytes_to_reference,
+    };
+    let mut pulled = studio.clone();
+    for (path, entry) in &mut pulled.entries {
+        let (Some(SnapshotEntry::File(held)), SnapshotEntry::File(observed)) =
+            (files.entries.get(path), &*entry)
+        else {
+            continue;
+        };
+        if !(path.file_name().and_then(|name| name.to_str()))
+            .is_some_and(is_service_settings_file_name)
+        {
+            continue;
+        }
+        let aligned = match align_pulled_settings_bytes_to_reference(held, observed)
+            .with_context(|| format!("{} does not align", path.display()))?
+        {
+            SettingsAlignment::Equivalent => held.clone(),
+            SettingsAlignment::Changed(aligned) => aligned,
+        };
+        *entry = SnapshotEntry::File(aligned);
+    }
+    Ok(pulled)
+}
+
+/// Why a pull of Studio as `studio` holds it would write over `files`, or a
+/// push of them send anything; `None` where neither does.
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn unsettled(
+    files: &ProjectSnapshot,
+    studio: &ProjectSnapshot,
+) -> Result<Option<String>> {
+    let file = |entry: Option<&SnapshotEntry>| matches!(entry, Some(SnapshotEntry::File(_)));
+    let pulled = pulled_over(files, studio)?;
+    let written = (files.entries.keys().chain(pulled.entries.keys())).find(|path| {
+        let (held, taken) = (files.entries.get(*path), pulled.entries.get(*path));
+        held != taken && (file(held) || file(taken))
+    });
+    if let Some(path) = written {
+        return Ok(Some(format!(
+            "a pull after the start writes {}",
+            path.display()
+        )));
+    }
+    let mut sent = super::replacement::snapshot_differences_prepared(files, studio, None, true)?
+        .into_iter()
+        .filter(|path| file(files.entries.get(path)) || file(studio.entries.get(path)))
+        .collect::<Vec<_>>();
+    sent.sort();
+    Ok((!sent.is_empty()).then(|| format!("a push after the start sends {sent:?}")))
+}
+
+/// A PackageLink under an instance of `tree` that is not one.
+#[cfg(any(windows, target_os = "macos"))]
+fn add_package_link(tree: &mut Tree, rng: &mut Rng, counter: &mut u64, side: Side) -> Option<Op> {
+    *counter += 1;
+    let parents = (tree.nodes.iter())
+        .filter(|(_, node)| node.class != "PackageLink")
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let id = format!("{}{counter}", if side == Side::Editor { "e" } else { "s" });
+    let op = Op::Add(
+        id,
+        new_node("PackageLink", rng.pick(&parents)?, *counter, None),
+    );
+    op.apply(tree);
+    Some(op)
+}
+
+/// A rename, a removal or a move of a PackageLink of `tree`, which a merge
+/// refuses.
+#[cfg(any(windows, target_os = "macos"))]
+fn edit_package_link(tree: &mut Tree, rng: &mut Rng, counter: &mut u64) -> Option<Op> {
+    *counter += 1;
+    let of_class = |link: bool| {
+        (tree.nodes.iter())
+            .filter(|(_, node)| (node.class == "PackageLink") == link)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>()
+    };
+    let link = rng.pick(&of_class(true))?;
+    let op = match rng.below(3) {
+        0 => Op::Rename(link, format!("N{counter}")),
+        1 => Op::Delete(link),
+        _ => {
+            let parent = rng.pick(&of_class(false))?;
+            if parent == tree.nodes[&link].parent.clone()?
+                || tree.subtree(&link).contains(&parent)
+                || tree.service_of(&parent) != tree.service_of(&link)
+            {
+                return None;
+            }
+            Op::Move(link, parent)
+        }
+    };
+    op.apply(tree);
+    Some(op)
+}
+
+/// An edit that leaves or takes away instances alike in parent, name and
+/// class: a copy of an instance beside it, or the removal or a move to
+/// another parent of one of two such siblings.
+#[cfg(any(windows, target_os = "macos"))]
+fn twin_edit(tree: &mut Tree, rng: &mut Rng, counter: &mut u64) -> Option<Op> {
+    *counter += 1;
+    let alike = |id: &String, other: &String| {
+        let (left, right) = (&tree.nodes[id], &tree.nodes[other]);
+        id != other
+            && left.parent.is_some()
+            && (left.parent.as_ref(), &left.name, &left.class)
+                == (right.parent.as_ref(), &right.name, &right.class)
+    };
+    let twins = (tree.nodes.keys())
+        .filter(|id| tree.nodes.keys().any(|other| alike(id, other)))
+        .cloned()
+        .collect::<Vec<_>>();
+    let op = match rng.below(3) {
+        0 => {
+            let leaves = (tree.nodes.iter())
+                .filter(|(id, node)| {
+                    node.parent.is_some()
+                        && node.class != "ModuleScript"
+                        && tree.children(id).is_empty()
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            let copied = rng.pick(&leaves)?;
+            Op::Add(format!("e{counter}"), tree.nodes[&copied].clone())
+        }
+        1 => Op::Delete(rng.pick(&twins)?),
+        _ => {
+            let twin = rng.pick(&twins)?;
+            let parents = (tree.nodes.keys())
+                .filter(|id| {
+                    **id != twin
+                        && !tree.subtree(&twin).contains(*id)
+                        && tree.nodes[&twin].parent.as_ref() != Some(*id)
+                        && tree.service_of(id) == tree.service_of(&twin)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            Op::Move(twin, rng.pick(&parents)?)
+        }
+    };
+    op.apply(tree);
+    Some(op)
+}
+
+/// A PackageLink of Studio added, renamed, removed or moved, which the
+/// plugin lays to its service as a whole.
+#[cfg(any(windows, target_os = "macos"))]
+fn studio_package_edit(
+    studio: &mut ScopedStudio,
+    rng: &mut Rng,
+    counter: &mut u64,
+    log: &mut Vec<String>,
+) {
+    let before = studio.tree.clone();
+    let op = if rng.below(3) == 0 {
+        add_package_link(&mut studio.tree, rng, counter, Side::Studio)
+    } else {
+        edit_package_link(&mut studio.tree, rng, counter)
+    };
+    let at = match &op {
+        Some(Op::Add(_, node)) => node.parent.clone(),
+        Some(Op::Rename(id, _) | Op::Delete(id) | Op::Move(id, _)) => Some(id.clone()),
+        _ => None,
+    };
+    let Some(service) = at.and_then(|id| before.service_of(&id).map(str::to_string)) else {
+        return;
+    };
+    log.push(format!("Studio: {op:?}, laid to {service}"));
+    studio.changes.push(Some(vec![(service, "whole", None)]));
+}
+
+/// A Live Sync start the coordinator's simulation draws: what a pull wrote,
+/// a sync older than it, and the files and Studio now, of which one moved
+/// since the pull, with Studio's answer of where it moved since.
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) struct DrawnStart {
+    pub(super) older: ProjectSnapshot,
+    pub(super) pulled: ProjectSnapshot,
+    pub(super) files: ProjectSnapshot,
+    pub(super) studio: ProjectSnapshot,
+    pub(super) scope: Value,
+}
+
+/// Draws a start in two services, with twins and a PackageLink now and then:
+/// the files move since the pull where `files_move`, by values, references,
+/// attributes, sources, renames, moves, removals, additions, twins and
+/// PackageLinks; else Studio does, by those and tags, moves between
+/// services and the undo of a removal. Studio that moved holds its siblings
+/// in another order than the files, and names no instance by its debug id,
+/// so a pull takes a service it moved in whole.
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn drawn_start(rng: &mut Rng, files_move: bool, log: &mut Vec<String>) -> DrawnStart {
+    let mut counter = 0;
+    let mut older = first_tree(rng, &mut counter);
+    add_second_service(&mut older, rng, &mut counter);
+    if rng.below(3) == 0 {
+        let link = add_package_link(&mut older, rng, &mut counter, Side::Studio);
+        log.push(format!("older sync: {link:?}"));
+    }
+    for _ in 0..rng.below(3) {
+        let twin = twin_edit(&mut older, rng, &mut counter);
+        log.push(format!("older sync: {twin:?}"));
+    }
+    let mut pulled = older.clone();
+    for _ in 0..1 + rng.below(2) {
+        let op = edit_freely(&mut pulled, rng, &mut counter, Side::Studio);
+        log.push(format!("before the pull: {op:?}"));
+    }
+    let mut files = pulled.clone();
+    let mut studio = ScopedStudio {
+        tree: pulled.clone(),
+        changes: Vec::new(),
+        removed: Vec::new(),
+        proof: counter,
+    };
+    for _ in 0..1 + rng.below(3) {
+        if files_move {
+            let op = match rng.below(10) {
+                0 => add_package_link(&mut files, rng, &mut counter, Side::Editor),
+                1 => edit_package_link(&mut files, rng, &mut counter),
+                2 | 3 => twin_edit(&mut files, rng, &mut counter),
+                _ => edit_freely(&mut files, rng, &mut counter, Side::Editor),
+            };
+            log.push(format!("file edit: {op:?}"));
+        } else if rng.below(10) == 0 {
+            studio_package_edit(&mut studio, rng, &mut counter, log);
+        } else {
+            studio.edit(rng, &mut counter, log);
+        }
+    }
+    let mut scope = studio.answer_since(0);
+    let touched = scope.get_mut("touched").and_then(Value::as_object_mut);
+    for entries in touched.into_iter().flat_map(|touched| touched.values_mut()) {
+        for entry in entries.as_array_mut().into_iter().flatten() {
+            if let Some(entry) = entry.as_object_mut() {
+                entry.remove("debugId");
+            }
+        }
+    }
+    DrawnStart {
+        older: older.snapshot(None),
+        pulled: pulled.snapshot(None),
+        files: files.snapshot(None),
+        studio: studio.tree.snapshot((!files_move).then_some(rng)),
+        scope,
+    }
 }

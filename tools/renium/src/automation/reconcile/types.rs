@@ -479,7 +479,7 @@ pub(crate) struct PullLease<'a> {
 /// layout that transforms the export (adapters, a temporary stage, linked
 /// packages).
 #[cfg(any(windows, target_os = "macos"))]
-fn pull_is_whole(args: &crate::cli::PullArgs) -> Result<bool> {
+pub(crate) fn pull_is_whole(args: &crate::cli::PullArgs) -> Result<bool> {
     let mut services = crate::snapshot::import::parse_services(&args.services)?;
     services.sort();
     let mut synced = sync_services();
@@ -900,27 +900,12 @@ pub(crate) fn referring_services(
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-/// The held files with what a scoped publish left under its paths in place
-/// of what they held there.
-pub(crate) fn scoped_project(
-    held: &ProjectSnapshot,
-    written: &ProjectSnapshot,
-    paths: &[PathBuf],
-) -> ProjectSnapshot {
+/// Puts what a scoped publish left under its paths in place of what the
+/// held files hold there.
+pub(crate) fn rescope(held: &mut ProjectSnapshot, written: ProjectSnapshot, paths: &[PathBuf]) {
     let scope = ScopeSet::new(paths);
-    let mut entries = held
-        .entries
-        .iter()
-        .filter(|(path, _)| !scope.contains(path))
-        .map(|(path, entry)| (path.clone(), entry.clone()))
-        .collect::<BTreeMap<_, _>>();
-    entries.extend(
-        written
-            .entries
-            .iter()
-            .map(|(path, entry)| (path.clone(), entry.clone())),
-    );
-    ProjectSnapshot { entries }
+    held.entries.retain(|path, _| !scope.contains(path));
+    held.entries.extend(written.entries);
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -1001,18 +986,35 @@ pub(crate) fn scoped_premise(
 /// other service's files hold what Studio held at the old proof, which
 /// differs from this one only in the scoped services.
 pub(crate) fn scoped_baseline(
-    held: &ProjectSnapshot,
-    written: &ProjectSnapshot,
+    mut held: ProjectSnapshot,
+    written: ProjectSnapshot,
     (paths, settled): (&[PathBuf], &BTreeMap<PathBuf, PublishEntryState>),
     premise: ScopedPremise,
 ) -> std::result::Result<ProjectSnapshot, &'static str> {
     if premise != ScopedPremise::Held {
         return Err("Studio changed during the pull");
     }
-    if !publish_settled(written, settled) {
+    if !publish_settled(&written, settled) {
         return Err("the files changed after the pull wrote them");
     }
-    Ok(scoped_project(held, written, paths))
+    rescope(&mut held, written, paths);
+    Ok(held)
+}
+
+/// Captures and publishes the services `args` names, running `check` before
+/// the publish.
+#[cfg(any(windows, target_os = "macos"))]
+fn export_scoped(
+    args: &crate::cli::PullArgs,
+    bridge: &BridgeServer,
+    info: &crate::studio::bridge::BridgeInfoPayload,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<crate::snapshot::export::PublishedProjectChanges> {
+    #[cfg(test)]
+    if let Some(exported) = super::push_flow_tests::export(check) {
+        return exported;
+    }
+    crate::snapshot::export::export_pull_checked(args, bridge, info, check)
 }
 
 /// A pull of the services Studio moved in since the held baseline, with
@@ -1033,7 +1035,7 @@ pub(crate) struct ScopedPull {
 /// Has Studio take a new proof under the held proof's observation and, where
 /// it can say which services moved between the two, plans a pull of those.
 #[cfg(any(windows, target_os = "macos"))]
-fn plan_scoped_pull(
+pub(crate) fn plan_scoped_pull(
     context: &BoundContext,
     bridge: &BridgeServer,
     args: &crate::cli::PullArgs,
@@ -1105,20 +1107,49 @@ fn plan_scoped_pull(
 
 #[cfg(any(windows, target_os = "macos"))]
 impl ScopedPull {
+    /// Whether the held files hold a PackageLink in the store of a service
+    /// the pull writes.
+    pub(crate) fn holds_package_link(&self) -> Result<bool> {
+        for service in &self.services {
+            let store =
+                (self.stores.get(service)).and_then(|store| self.held.project.entries.get(store));
+            if super::merge::holds_package_link(store)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The baseline the pull was planned over, for a pull that does not run.
+    pub(crate) fn into_held(self) -> VerifiedFullPush {
+        self.held
+    }
+
     /// Captures and publishes the scoped services, checking before the
     /// publish that Studio moved nowhere else since the proof; `None`, having
-    /// written nothing, where it did.
+    /// written nothing, where it did. `files_held` checks the files under
+    /// the services' folders and stores before a publish of services too; an
+    /// error from it publishes nothing.
     pub(crate) fn run(
         self,
         context: &BoundContext,
         bridge: &BridgeServer,
         info: &crate::studio::bridge::BridgeInfoPayload,
         args: &mut crate::cli::PullArgs,
+        files_held: &mut dyn FnMut(&[PathBuf]) -> Result<()>,
     ) -> Result<Option<crate::snapshot::export::PublishedProjectChanges>> {
         let runtime = context
             .runtime_id
             .as_deref()
             .context("Studio context has no edit-mode runtime")?;
+        let root = Path::new(&context.root);
+        let pulled = (self.services.iter())
+            .flat_map(|service| {
+                let folder = Path::new(&context.source).join(service);
+                [service_settings_path(&folder), folder]
+            })
+            .map(|path| Ok(path.strip_prefix(root)?.to_path_buf()))
+            .collect::<Result<Vec<_>>>()?;
         #[cfg(windows)]
         if let Some((published, premise)) = self.pull_instances(bridge, runtime, args)? {
             if let Err(error) = self.keep(bridge, runtime, &args.project_root, &published, premise)
@@ -1153,7 +1184,7 @@ impl ScopedPull {
             if premise == ScopedPremise::False {
                 bail!("Studio moved outside the scoped services during the pull");
             }
-            Ok(())
+            files_held(&pulled)
         };
         let result = if self.services.is_empty() {
             check().and_then(|()| {
@@ -1165,8 +1196,7 @@ impl ScopedPull {
                 &mut args.services,
                 self.services.iter().cloned().collect::<Vec<_>>().join(","),
             );
-            let result =
-                crate::snapshot::export::export_pull_checked(args, bridge, info, &mut check);
+            let result = export_scoped(args, bridge, info, &mut check);
             args.services = whole;
             result
         };
@@ -1195,7 +1225,7 @@ impl ScopedPull {
     /// left them as the baseline, on the proof taken before the capture,
     /// when Studio still holds that proof.
     fn keep(
-        self,
+        mut self,
         bridge: &BridgeServer,
         runtime: &str,
         root: &Path,
@@ -1226,8 +1256,8 @@ impl ScopedPull {
         }
         let written = capture_snapshot(root, &published.publish_paths)?;
         let project = match scoped_baseline(
-            &self.held.project,
-            &written,
+            std::mem::take(&mut self.held.project),
+            written,
             (&published.publish_paths, &published.settled),
             premise,
         ) {
