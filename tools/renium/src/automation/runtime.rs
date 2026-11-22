@@ -171,6 +171,14 @@ fn classify_failure(error: &anyhow::Error) -> automation::Failure {
         return automation::Failure::new(code, format!("{error:#}"), false, "context")
             .detail(json!({"code":code}));
     }
+    if error.is::<crate::snapshot::export::IncompleteRollback>() {
+        return automation::Failure::new(
+            "recovery_required",
+            format!("{error:#}"),
+            false,
+            "context",
+        );
+    }
     if let Some(verification) =
         error.downcast_ref::<crate::editor::sync::EditorSourceVerificationError>()
     {
@@ -3411,12 +3419,7 @@ fn restore_persisted_live_sync(
         ) {
             Ok(_) => return Ok(()),
             Err(failure)
-                if attempts < 3
-                    && !matches!(
-                        failure.0.c.as_str(),
-                        "slow_import_required" | "review_skipped"
-                    )
-                    && automation::live::is_concurrent_edit_message(&failure.0.m) =>
+                if attempts < 3 && automation::live::is_concurrent_edit_reply(&failure) =>
             {
                 attempts += 1;
                 state.live_sync().clear_restore_failure(context);

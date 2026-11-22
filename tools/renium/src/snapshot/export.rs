@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
@@ -186,10 +187,86 @@ pub(crate) struct ExportProjectStage {
     preserve_paths: Vec<PathBuf>,
     keep_local_only_scripts: bool,
     holds_project_files: bool,
+    /// Whether dropping the stage discards its container. A publication
+    /// clears it before it moves a first project path aside: from then on
+    /// the container holds the only copy of one, which a stop or a panic
+    /// leaves to recovery, and only a complete rollback sets it again.
     active: bool,
 }
 
+/// A step of a publication, where a test can stop it as a killed daemon
+/// would or change the files as a user would.
+#[cfg(test)]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PublicationStep {
+    /// The settlement journal does not yet hold what recovery needs.
+    BeforeRecord,
+    /// The path is about to be moved aside.
+    MoveAside(PathBuf),
+    /// The path is moved aside, and its replacement still staged.
+    MovedAside(PathBuf),
+    /// The staged path is in place.
+    PublishedIn(PathBuf),
+    /// Every path is in place. The container, which holds what was moved
+    /// aside, is not yet removed.
+    Swapped,
+    /// The settlement journal is about to be cleared.
+    BeforeClear,
+}
+
+#[cfg(test)]
+pub(crate) type StepHook = Box<dyn FnMut(&PublicationStep)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs at each step of a publication of this thread.
+    pub(crate) static PUBLICATION_STEP: std::cell::RefCell<Option<StepHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn publication_step(step: PublicationStep) {
+    PUBLICATION_STEP.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(&step);
+        }
+    });
+}
+
+/// Runs `hook` at each step of the publications of this thread until the
+/// returned guard drops.
+#[cfg(test)]
+pub(crate) fn hook_publication_steps(hook: impl FnMut(&PublicationStep) + 'static) -> impl Drop {
+    PUBLICATION_STEP.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    OnDrop::new(|| {
+        PUBLICATION_STEP.with(|slot| slot.borrow_mut().take());
+    })
+}
+
+/// A path a publication moved aside, put in place, or both.
+struct Swap {
+    relative: PathBuf,
+    backup: Option<PathBuf>,
+    placed: bool,
+}
+
+/// The size and last write of a file. A rename keeps both.
+type FileStamp = (u64, SystemTime);
+
+/// How long after a file's last write its stamp can still be that of a later
+/// write: the coarsest clock a file system stamps writes with, FAT's two
+/// seconds.
+const STAMP_SETTLES: Duration = Duration::from_secs(2);
+
 impl ExportProjectStage {
+    /// The directory of the stage, which holds what its publication moved
+    /// aside under `previous`.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    pub(crate) fn container(&self) -> &Path {
+        &self.container
+    }
+
     /// Project paths whose current content the publish leaves untouched: edits
     /// Live Sync has not delivered to Studio yet must not be replaced by the
     /// Studio copy they are waiting to overwrite.
@@ -815,7 +892,8 @@ impl ExportProjectStage {
             .filter(|path| path.as_path() != Path::new("sourcemap.json"))
             .cloned()
             .collect::<Vec<_>>();
-        let latest = collect_publish_hashes(project_root, &concurrency_paths)?;
+        let (latest, stamps) =
+            collect_publish_entries(project_root, &concurrency_paths, Some(SystemTime::now()))?;
         ensure_publish_entries_unchanged(&current, &latest, &concurrency_paths)?;
         log_phase("concurrency check", phase);
         let phase = Instant::now();
@@ -831,85 +909,85 @@ impl ExportProjectStage {
             .collect();
         let changed_roots = operation_paths.clone();
         log_phase("final staging plan", phase);
-        let mut published = Vec::<(PathBuf, Option<PathBuf>)>::new();
+        let mut swaps = Vec::<Swap>::new();
         let phase = Instant::now();
         let publish_result = (|| -> Result<()> {
-            for relative in write_paths {
-                let staged = self.project_root.join(&relative);
-                let destination = project_root.join(&relative);
+            for relative in &write_paths {
+                let staged = self.project_root.join(relative);
+                let destination = project_root.join(relative);
                 if let Some(parent) = destination.parent() {
                     fs::create_dir_all(parent)
                         .with_context(|| format!("Failed to create {}", parent.display()))?;
                 }
+                #[cfg(test)]
+                publication_step(PublicationStep::MoveAside(relative.clone()));
                 let backup = if fs::symlink_metadata(&destination).is_ok() {
-                    let backup = backup_root.join(&relative);
+                    let backup = backup_root.join(relative);
                     if let Some(parent) = backup.parent() {
                         fs::create_dir_all(parent)?;
                     }
+                    self.active = false;
                     fs::rename(&destination, &backup)
                         .with_context(|| format!("Failed to preserve {}", destination.display()))?;
                     Some(backup)
                 } else {
                     None
                 };
-                published.push((destination.clone(), backup));
-                if fs::symlink_metadata(&staged).is_ok() {
-                    let result = if directory_swaps.contains(&relative) {
-                        // This isolated subtree is consumed exactly once. Moving
-                        // it avoids both recursive copying and deleting that copy.
-                        fs::rename(&staged, &destination).map_err(anyhow::Error::from)
-                    } else {
-                        copy_isolated_path(&staged, &destination)
-                    };
-                    result.with_context(|| {
-                        format!("Failed to publish staged path {}", relative.display())
-                    })?;
+                swaps.push(Swap {
+                    relative: relative.clone(),
+                    backup: backup.clone(),
+                    placed: false,
+                });
+                #[cfg(test)]
+                if backup.is_some() {
+                    publication_step(PublicationStep::MovedAside(relative.clone()));
                 }
+                // A file saved since the concurrency check is the one moved
+                // aside: put it back rather than replace it. Tools rewrite the
+                // sourcemap at any time, which that check leaves out too.
+                if backup.is_some() && relative.as_path() != Path::new("sourcemap.json") {
+                    moved_aside_unchanged(&backup_root, relative, &current, &stamps)?;
+                }
+                let Ok(metadata) = fs::symlink_metadata(&staged) else {
+                    continue;
+                };
+                // This isolated subtree is consumed exactly once. Moving it
+                // avoids both recursive copying and deleting that copy.
+                let movable = !metadata.is_dir() || directory_swaps.contains(relative);
+                let placed = place_staged(&staged, &destination, movable).with_context(|| {
+                    format!("Failed to publish staged path {}", relative.display())
+                })?;
+                if !placed {
+                    return Err(ProjectFilesChanged(relative.display().to_string()).into());
+                }
+                if let Some(swap) = swaps.last_mut() {
+                    swap.placed = true;
+                }
+                #[cfg(test)]
+                publication_step(PublicationStep::PublishedIn(relative.clone()));
             }
+            #[cfg(test)]
+            publication_step(PublicationStep::Swapped);
             Ok(())
         })();
         if let Err(error) = publish_result {
-            let mut rollback_errors = Vec::new();
-            for (destination, backup) in published.into_iter().rev() {
-                if let Ok(metadata) = fs::symlink_metadata(&destination) {
-                    let remove_result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                        fs::remove_dir_all(&destination)
-                    } else {
-                        fs::remove_file(&destination)
-                    };
-                    if let Err(remove_error) = remove_result {
-                        rollback_errors.push(format!(
-                            "could not remove {}: {remove_error}",
-                            destination.display()
-                        ));
-                        continue;
-                    }
+            let failures = self.roll_back(project_root, &swaps, &staged);
+            if !failures.is_empty() {
+                return Err(IncompleteRollback {
+                    container: self.container.clone(),
+                    failures,
+                    cause: format!("{error:#}"),
                 }
-                if let Some(backup) = backup
-                    && let Err(restore_error) = fs::rename(&backup, &destination)
-                {
-                    rollback_errors.push(format!(
-                        "could not restore {} from {}: {restore_error}",
-                        destination.display(),
-                        backup.display()
-                    ));
-                }
+                .into());
             }
-            if !rollback_errors.is_empty() {
-                self.active = false;
-                return Err(error).context(format!(
-                    "Export rollback was incomplete; recovery data remains in {}: {}",
-                    self.container.display(),
-                    rollback_errors.join("; ")
-                ));
-            }
+            self.active = true;
             return Err(error);
         }
         log_phase("file swaps", phase);
         self.active = false;
         // Backups live under the container, so discarding it removes them too.
-        debug_assert!(published.iter().all(|(_, backup)| {
-            backup
+        debug_assert!(swaps.iter().all(|swap| {
+            swap.backup
                 .as_ref()
                 .is_none_or(|backup| backup.starts_with(&self.container))
         }));
@@ -939,6 +1017,90 @@ impl ExportProjectStage {
             #[cfg(any(windows, target_os = "macos"))]
             settled: staged,
         })
+    }
+
+    /// Undoes `swaps`, the latest first, and says what it could not undo.
+    fn roll_back(
+        &self,
+        project_root: &Path,
+        swaps: &[Swap],
+        staged: &BTreeMap<PathBuf, PublishEntryState>,
+    ) -> Vec<String> {
+        swaps
+            .iter()
+            .rev()
+            .filter_map(|swap| {
+                self.undo_swap(project_root, swap, staged)
+                    .err()
+                    .map(|error| format!("{}: {error:#}", swap.relative.display()))
+            })
+            .collect()
+    }
+
+    /// Takes back what the publication put in place, then puts back what it
+    /// moved aside: wherever nothing is, and into a directory saved there
+    /// meanwhile, each entry that directory lacks. Nothing saved since the
+    /// swap is removed or replaced.
+    fn undo_swap(
+        &self,
+        project_root: &Path,
+        swap: &Swap,
+        staged: &BTreeMap<PathBuf, PublishEntryState>,
+    ) -> Result<()> {
+        let destination = project_root.join(&swap.relative);
+        if swap.placed {
+            self.take_back(project_root, swap, staged)
+                .context("could not take back what was put in place")?;
+        }
+        let Some(backup) = &swap.backup else {
+            return Ok(());
+        };
+        match crate::system::files::move_no_replace(backup, &destination) {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if fs::symlink_metadata(backup)?.is_dir()
+                    && fs::symlink_metadata(&destination)?.is_dir()
+                {
+                    put_back_missing(backup, &destination)?;
+                }
+                Ok(())
+            }
+            outcome => outcome,
+        }
+        .with_context(|| format!("could not restore it from {}", backup.display()))
+    }
+
+    /// Moves what the publication put in place for `swap` back into the
+    /// stage where it is as staged. Otherwise only the entries that still
+    /// are go, and what was saved there since stays, with each directory
+    /// that holds a save. It reads what is in place and then renames it, so
+    /// a save between the two goes into the stage with it.
+    fn take_back(
+        &self,
+        project_root: &Path,
+        swap: &Swap,
+        staged: &BTreeMap<PathBuf, PublishEntryState>,
+    ) -> Result<()> {
+        let scope = std::slice::from_ref(&swap.relative);
+        let placed = collect_publish_hashes(project_root, scope)?;
+        let destination = project_root.join(&swap.relative);
+        if ensure_publish_entries_unchanged(staged, &placed, scope).is_ok()
+            && fs::rename(destination, self.project_root.join(&swap.relative)).is_ok()
+        {
+            return Ok(());
+        }
+        let unchanged = placed
+            .iter()
+            .rev()
+            .filter(|(path, state)| staged.get(*path) == Some(*state));
+        for (path, state) in unchanged {
+            let path = project_root.join(path);
+            if *state == PublishEntryState::Directory {
+                let _ = fs::remove_dir(&path);
+            } else {
+                fs::remove_file(&path).or_else(|_| fs::remove_dir(&path))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1255,6 +1417,21 @@ pub(crate) fn collect_publish_hashes(
     root: &Path,
     publish_paths: &[PathBuf],
 ) -> Result<BTreeMap<PathBuf, PublishEntryState>> {
+    Ok(collect_publish_entries(root, publish_paths, None)?.0)
+}
+
+/// What `collect_publish_hashes` finds and, where `stamped_at` is the time
+/// of this read, the stamp of each file a later write is sure to change. A
+/// stamp is read before the file's bytes, so a write after it changes the
+/// stamp or the bytes read.
+fn collect_publish_entries(
+    root: &Path,
+    publish_paths: &[PathBuf],
+    stamped_at: Option<SystemTime>,
+) -> Result<(
+    BTreeMap<PathBuf, PublishEntryState>,
+    BTreeMap<PathBuf, FileStamp>,
+)> {
     let mut candidates = Vec::new();
     for relative in publish_paths {
         let path = root.join(relative);
@@ -1290,15 +1467,201 @@ pub(crate) fn collect_publish_hashes(
     let entries = candidates
         .into_par_iter()
         .map(|(relative, path, kind)| {
-            let state = match kind {
-                PublishEntryKind::Directory => PublishEntryState::Directory,
-                PublishEntryKind::Symlink => PublishEntryState::Symlink(fs::read_link(path)?),
-                PublishEntryKind::File => file_publish_state(&fs::read(path)?),
+            let (state, stamp) = match (kind, stamped_at) {
+                (PublishEntryKind::Directory, _) => (PublishEntryState::Directory, None),
+                (PublishEntryKind::Symlink, _) => {
+                    (PublishEntryState::Symlink(fs::read_link(path)?), None)
+                }
+                (PublishEntryKind::File, Some(read_at)) => {
+                    let mut file = fs::File::open(&path)?;
+                    let stamp = settled_stamp(&file.metadata()?, read_at);
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                    (file_publish_state(&bytes), stamp)
+                }
+                (PublishEntryKind::File, None) => (file_publish_state(&fs::read(path)?), None),
             };
-            Ok((relative, state))
+            Ok((relative, state, stamp))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(entries.into_iter().collect())
+    let mut states = BTreeMap::new();
+    let mut stamps = BTreeMap::new();
+    for (relative, state, stamp) in entries {
+        if let Some(stamp) = stamp {
+            stamps.insert(relative.clone(), stamp);
+        }
+        states.insert(relative, state);
+    }
+    Ok((states, stamps))
+}
+
+fn file_stamp(metadata: &fs::Metadata) -> Option<FileStamp> {
+    Some((metadata.len(), metadata.modified().ok()?))
+}
+
+/// The stamp of a file read at `read_at`, where its last write is old enough
+/// that a write after the read changes it.
+fn settled_stamp(metadata: &fs::Metadata, read_at: SystemTime) -> Option<FileStamp> {
+    file_stamp(metadata).filter(|(_, modified)| {
+        read_at
+            .duration_since(*modified)
+            .is_ok_and(|age| age > STAMP_SETTLES)
+    })
+}
+
+/// Checks that what was moved aside to `relative` under `backup_root` is
+/// what the publication found at `relative` as it began. Files that hold
+/// the stamps the concurrency check read them with are not read again.
+fn moved_aside_unchanged(
+    backup_root: &Path,
+    relative: &Path,
+    current: &BTreeMap<PathBuf, PublishEntryState>,
+    stamps: &BTreeMap<PathBuf, FileStamp>,
+) -> Result<()> {
+    if stamps_hold(backup_root, relative, current, stamps)? {
+        return Ok(());
+    }
+    let scope = [relative.to_path_buf()];
+    let moved = collect_publish_hashes(backup_root, &scope)?;
+    if entries_at(current, relative).eq(moved.iter()) {
+        return Ok(());
+    }
+    ensure_publish_entries_unchanged(current, &moved, &scope)
+}
+
+/// The entries of `entries` at `path` and under it. Paths order by their
+/// components, so those under one follow it.
+fn entries_at<'a>(
+    entries: &'a BTreeMap<PathBuf, PublishEntryState>,
+    path: &'a Path,
+) -> impl Iterator<Item = (&'a PathBuf, &'a PublishEntryState)> {
+    entries
+        .range::<Path, _>((Bound::Included(path), Bound::Unbounded))
+        .take_while(move |(entry, _)| entry.starts_with(path))
+}
+
+/// Whether the entries at `relative` under `root` are those `current` holds
+/// there, each file with its stamp in `stamps`. The stamp is read from the
+/// file: a directory listing may hold an older last write.
+fn stamps_hold(
+    root: &Path,
+    relative: &Path,
+    current: &BTreeMap<PathBuf, PublishEntryState>,
+    stamps: &BTreeMap<PathBuf, FileStamp>,
+) -> Result<bool> {
+    let entries = WalkDir::new(root.join(relative))
+        .follow_links(false)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    if entries.len() != entries_at(current, relative).count() {
+        return Ok(false);
+    }
+    entries
+        .par_iter()
+        .map(|entry| {
+            let path = entry.path().strip_prefix(root)?;
+            Ok(match current.get(path) {
+                Some(PublishEntryState::Directory) => entry.file_type().is_dir(),
+                Some(PublishEntryState::File { .. }) if entry.file_type().is_file() => {
+                    let stamp = file_stamp(&fs::symlink_metadata(entry.path())?);
+                    stamp.is_some() && stamp.as_ref() == stamps.get(path)
+                }
+                _ => false,
+            })
+        })
+        .try_reduce(|| true, |held, holds| Ok(held && holds))
+}
+
+/// Puts the staged path at `destination` without replacing what is there:
+/// false where something is. A path that cannot move there, on another
+/// volume or as a directory whose path crosses a link, is copied beside
+/// `destination` first, and that copy moved in.
+fn place_staged(staged: &Path, destination: &Path, movable: bool) -> Result<bool> {
+    use crate::system::files::{move_no_replace, sibling_temp_path};
+    let taken = |error: &std::io::Error| error.kind() == std::io::ErrorKind::AlreadyExists;
+    if movable {
+        match move_no_replace(staged, destination) {
+            Ok(()) => return Ok(true),
+            Err(error) if taken(&error) => return Ok(false),
+            Err(_) => {}
+        }
+    }
+    let copy = sibling_temp_path(destination);
+    let moved = copy_isolated_path(staged, &copy).and_then(|()| {
+        match move_no_replace(&copy, destination) {
+            Err(error) if taken(&error) => Ok(false),
+            outcome => Ok(outcome.map(|()| true)?),
+        }
+    });
+    if !matches!(moved, Ok(true)) {
+        let _ = remove_path(&copy);
+        return moved;
+    }
+    let _ = remove_path(staged);
+    Ok(true)
+}
+
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Moves each entry of `backup` that `target` lacks into it, through every
+/// directory both hold. What `target` holds already stays.
+fn put_back_missing(backup: &Path, target: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(backup)? {
+        let entry = entry?;
+        let path = target.join(entry.file_name());
+        match crate::system::files::move_no_replace(&entry.path(), &path) {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if entry.file_type()?.is_dir() && fs::symlink_metadata(&path)?.is_dir() {
+                    put_back_missing(&entry.path(), &path)?;
+                }
+            }
+            outcome => outcome?,
+        }
+    }
+    Ok(())
+}
+
+/// A failed publication that could not put every path back; the container
+/// holds what it moved aside.
+#[derive(Debug)]
+pub(crate) struct IncompleteRollback {
+    container: PathBuf,
+    failures: Vec<String>,
+    cause: String,
+}
+
+impl std::fmt::Display for IncompleteRollback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Export rollback was incomplete; recovery data remains in {}: {}. The export failed: {}",
+            self.container.display(),
+            self.failures.join("; "),
+            self.cause
+        )
+    }
+}
+
+impl std::error::Error for IncompleteRollback {}
+
+#[cfg(test)]
+impl IncompleteRollback {
+    /// One of a publication into `container` that files saved meanwhile
+    /// stopped.
+    pub(crate) fn after_changed_files(container: &Path) -> Self {
+        Self {
+            container: container.to_path_buf(),
+            failures: vec!["src/A.luau: could not restore it".into()],
+            cause: ProjectFilesChanged("src/B.luau".into()).to_string(),
+        }
+    }
 }
 
 pub(crate) fn file_publish_state(bytes: &[u8]) -> PublishEntryState {
@@ -1347,11 +1710,25 @@ fn ensure_publish_entries_unchanged(
     if changed.is_empty() {
         return Ok(());
     }
-    bail!(
-        "Project files changed while Studio export was running; retry without overwriting: {}",
-        changed.join(", ")
-    )
+    Err(ProjectFilesChanged(changed.join(", ")).into())
 }
+
+/// Files a publication would replace changed since its stage read them; it
+/// replaced none of them.
+#[derive(Debug)]
+pub(crate) struct ProjectFilesChanged(String);
+
+impl std::fmt::Display for ProjectFilesChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Project files changed while Studio export was running; retry without overwriting: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ProjectFilesChanged {}
 
 pub(crate) fn publish_operation_paths(
     current: &BTreeMap<PathBuf, PublishEntryState>,
@@ -2901,6 +3278,317 @@ mod publication_tests {
             "second original"
         );
         assert!(!stage_container.exists());
+    }
+
+    const OTHER: &str = "src/ServerStorage/Other.luau";
+    const EXTRA: &str = "src/ServerStorage/Extra.luau";
+
+    /// A stage over two services whose every file changes, so that each
+    /// service is swapped as one directory. With `by_file`, each also holds
+    /// a file the stage leaves alone, and their files are swapped one by one.
+    fn two_services(fixture: &mut Fixture, by_file: bool) -> ExportProjectStage {
+        drop(fixture.stage.take());
+        fs::create_dir_all(fixture.root.join("src/ServerStorage")).unwrap();
+        fs::write(fixture.root.join(OTHER), "other original").unwrap();
+        fs::write(fixture.root.join(EXTRA), "extra original").unwrap();
+        if by_file {
+            for service in ["ReplicatedStorage", "ServerStorage"] {
+                let kept = Path::new("src").join(service).join("Kept.luau");
+                fs::write(fixture.root.join(kept), "kept").unwrap();
+            }
+        }
+        let stage = ExportProjectStage::create(
+            &fixture.root,
+            Path::new("src"),
+            &["ReplicatedStorage".into(), "ServerStorage".into()],
+        )
+        .unwrap();
+        fs::write(stage.project_root.join(SOURCE), "first captured").unwrap();
+        fs::write(stage.project_root.join(OTHER), "other captured").unwrap();
+        fs::write(stage.project_root.join(EXTRA), "extra captured").unwrap();
+        stage
+    }
+
+    /// Publishes `stage`, whose services are swapped as `two_services` says.
+    fn publish_two(
+        fixture: &Fixture,
+        stage: ExportProjectStage,
+        by_file: bool,
+    ) -> Result<PublishedProjectChanges> {
+        let swaps = fixture.planned_directory_swaps(&stage);
+        if by_file {
+            assert!(swaps.is_empty(), "{swaps:?}");
+        } else {
+            assert_eq!(
+                swaps,
+                [
+                    PathBuf::from("src/ReplicatedStorage"),
+                    PathBuf::from("src/ServerStorage")
+                ]
+            );
+        }
+        stage.publish(&fixture.root, false)
+    }
+
+    fn save(path: &Path, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    fn read(fixture: &Fixture, path: &str) -> String {
+        fs::read_to_string(fixture.root.join(path)).unwrap()
+    }
+
+    /// A file saved after the publication checked the files and before it
+    /// moves that file aside is put back, with every swap before it.
+    #[test]
+    fn export_publication_puts_back_a_file_saved_before_its_swap() {
+        for by_file in [false, true] {
+            let mut fixture = Fixture::new();
+            let stage = two_services(&mut fixture, by_file);
+            let saved = fixture.root.join(OTHER);
+            let _hook = hook_publication_steps(move |step| {
+                if matches!(step, PublicationStep::MoveAside(path) if Path::new(OTHER).starts_with(path))
+                {
+                    save(&saved, "saved meanwhile");
+                }
+            });
+            let stage_container = stage.container.clone();
+            let error = publish_two(&fixture, stage, by_file).err().unwrap();
+            assert!(error.is::<ProjectFilesChanged>(), "{error:#}");
+            assert_eq!(read(&fixture, SOURCE), "return 'original'\n");
+            assert_eq!(read(&fixture, OTHER), "saved meanwhile");
+            assert_eq!(read(&fixture, EXTRA), "extra original");
+            assert!(!stage_container.exists());
+        }
+    }
+
+    /// A path saved once the publication moved the project's copy aside is
+    /// never replaced: the save stays, beside what was moved aside with it,
+    /// and every swap before it is undone.
+    #[test]
+    fn export_publication_keeps_a_path_saved_once_it_was_moved_aside() {
+        for by_file in [false, true] {
+            let mut fixture = Fixture::new();
+            let stage = two_services(&mut fixture, by_file);
+            let saved = fixture.root.join(OTHER);
+            let _hook = hook_publication_steps(move |step| {
+                if matches!(step, PublicationStep::MovedAside(path) if Path::new(OTHER).starts_with(path))
+                {
+                    save(&saved, "saved meanwhile");
+                }
+            });
+            let stage_container = stage.container.clone();
+            let error = publish_two(&fixture, stage, by_file).err().unwrap();
+            assert!(error.is::<ProjectFilesChanged>(), "{error:#}");
+            assert!(error.to_string().contains("Project files changed"));
+            assert_eq!(read(&fixture, SOURCE), "return 'original'\n");
+            assert_eq!(read(&fixture, OTHER), "saved meanwhile");
+            assert_eq!(read(&fixture, EXTRA), "extra original");
+            assert!(!stage_container.exists());
+        }
+    }
+
+    /// Undoing the swaps takes back only what the publication put in place:
+    /// a file saved over one of them since stays as saved.
+    #[test]
+    fn export_publication_rolls_back_around_a_save_over_what_it_put_in_place() {
+        for by_file in [false, true] {
+            let mut fixture = Fixture::new();
+            let added = "src/ReplicatedStorage/Added.luau";
+            let beside = "src/ReplicatedStorage/Beside.luau";
+            fs::write(fixture.root.join(beside), "beside original").unwrap();
+            let stage = two_services(&mut fixture, by_file);
+            fs::write(stage.project_root.join(added), "added captured").unwrap();
+            fs::write(stage.project_root.join(beside), "beside captured").unwrap();
+            let (first, second) = (fixture.root.join(SOURCE), fixture.root.join(OTHER));
+            let _hook = hook_publication_steps(move |step| match step {
+                PublicationStep::PublishedIn(path) if Path::new(SOURCE).starts_with(path) => {
+                    save(&first, "saved after");
+                }
+                PublicationStep::MoveAside(path) if Path::new(OTHER).starts_with(path) => {
+                    save(&second, "saved meanwhile");
+                }
+                _ => {}
+            });
+            let stage_container = stage.container.clone();
+            let error = publish_two(&fixture, stage, by_file).err().unwrap();
+            assert!(error.is::<ProjectFilesChanged>(), "{error:#}");
+            assert_eq!(read(&fixture, SOURCE), "saved after");
+            assert_eq!(read(&fixture, beside), "beside original");
+            assert!(!fixture.root.join(added).exists());
+            assert_eq!(read(&fixture, OTHER), "saved meanwhile");
+            assert_eq!(read(&fixture, EXTRA), "extra original");
+            assert!(!stage_container.exists());
+        }
+    }
+
+    /// A publication that panics once it moved a path aside leaves the
+    /// container, which holds the only copy of that path.
+    #[test]
+    fn export_publication_that_panics_during_its_swaps_leaves_what_it_moved_aside() {
+        let mut fixture = Fixture::new();
+        let stage = two_services(&mut fixture, true);
+        let _hook = hook_publication_steps(|step| {
+            if matches!(step, PublicationStep::MovedAside(path) if path == Path::new(OTHER)) {
+                panic!("stopped in the swaps");
+            }
+        });
+        let stage_container = stage.container.clone();
+        let root = fixture.root.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _ = stage.publish(&root, false);
+        }));
+        assert!(outcome.is_err());
+        assert!(!fixture.root.join(OTHER).exists());
+        assert_eq!(
+            fs::read_to_string(stage_container.join("previous").join(OTHER)).unwrap(),
+            "other original"
+        );
+    }
+
+    /// Rewrites `path` as a save that leaves its size and last write alone.
+    fn save_under_the_same_stamp(path: &Path, text: &str) {
+        let modified = fs::metadata(path).unwrap().modified().unwrap();
+        assert_eq!(fs::metadata(path).unwrap().len(), text.len() as u64);
+        fs::write(path, text).unwrap();
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(modified).unwrap();
+    }
+
+    /// Dates the last write of each file under `root` far enough back that
+    /// a publication trusts its stamp.
+    fn settle_stamps(root: &Path) {
+        for entry in WalkDir::new(root) {
+            let entry = entry.unwrap();
+            if entry.file_type().is_file() {
+                let file = fs::File::options().write(true).open(entry.path()).unwrap();
+                file.set_modified(SystemTime::now() - 10 * STAMP_SETTLES)
+                    .unwrap();
+            }
+        }
+    }
+
+    /// The swap reads a file again unless it holds the size and last write
+    /// the check before it read: a save within the file system's clock of
+    /// the last write can keep both, so a stamp that recent is not trusted.
+    #[test]
+    fn export_publication_reads_a_moved_aside_file_again_unless_its_stamp_holds() {
+        for (by_file, settled) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut fixture = Fixture::new();
+            let stage = two_services(&mut fixture, by_file);
+            let saved = fixture.root.join(OTHER);
+            if settled {
+                settle_stamps(&fixture.root.join("src"));
+            }
+            let _hook = hook_publication_steps(move |step| {
+                if matches!(step, PublicationStep::MoveAside(path) if Path::new(OTHER).starts_with(path))
+                {
+                    save_under_the_same_stamp(&saved, "other reedited");
+                }
+            });
+            let published = publish_two(&fixture, stage, by_file);
+            if settled {
+                // Only a write that keeps the size and an old last write
+                // passes for no write: the file was not read again.
+                published.unwrap();
+                assert_eq!(read(&fixture, OTHER), "other captured");
+            } else {
+                let error = published.err().unwrap();
+                assert!(error.is::<ProjectFilesChanged>(), "{error:#}");
+                assert_eq!(read(&fixture, OTHER), "other reedited");
+                assert_eq!(read(&fixture, SOURCE), "return 'original'\n");
+            }
+        }
+    }
+
+    /// Stamps that hold stand for the files that carry them alone: a
+    /// directory an entry left or joined since the check before the swaps is
+    /// read again, and put back as it was found.
+    #[test]
+    fn export_publication_reads_a_moved_aside_directory_again_where_its_entries_differ() {
+        for renamed in [false, true] {
+            let mut fixture = Fixture::new();
+            let stage = two_services(&mut fixture, false);
+            settle_stamps(&fixture.root.join("src"));
+            let extra = fixture.root.join(EXTRA);
+            let moved = fixture.root.join("src/ServerStorage/Renamed.luau");
+            let renames = moved.clone();
+            let _hook = hook_publication_steps(move |step| {
+                if !matches!(step, PublicationStep::MoveAside(path) if Path::new(EXTRA).starts_with(path))
+                {
+                    return;
+                }
+                if renamed {
+                    fs::rename(&extra, &renames).unwrap();
+                } else {
+                    fs::remove_file(&extra).unwrap();
+                }
+            });
+            let error = publish_two(&fixture, stage, false).err().unwrap();
+            assert!(error.is::<ProjectFilesChanged>(), "{error:#}");
+            assert_eq!(read(&fixture, SOURCE), "return 'original'\n");
+            assert_eq!(read(&fixture, OTHER), "other original");
+            assert!(!fixture.root.join(EXTRA).exists());
+            assert_eq!(moved.exists(), renamed);
+        }
+    }
+
+    /// A staged path that cannot move into place is copied beside its
+    /// destination and that copy moved in, which replaces nothing either.
+    #[test]
+    fn a_staged_path_that_cannot_move_is_copied_in_without_replacing() {
+        let fixture = Fixture::new();
+        for directory in [false, true] {
+            let staged = fixture.container.join("staged");
+            let destination = fixture.root.join("src/Placed");
+            let file = |base: &Path| {
+                if directory {
+                    base.join("Inner.luau")
+                } else {
+                    base.to_path_buf()
+                }
+            };
+            save(&file(&staged), "staged");
+            save(&file(&destination), "saved");
+            assert!(!place_staged(&staged, &destination, false).unwrap());
+            assert_eq!(fs::read_to_string(file(&destination)).unwrap(), "saved");
+            assert!(staged.exists());
+            remove_path(&destination).unwrap();
+            assert!(place_staged(&staged, &destination, false).unwrap());
+            assert_eq!(fs::read_to_string(file(&destination)).unwrap(), "staged");
+            assert!(!staged.exists());
+            remove_path(&destination).unwrap();
+            let left = fs::read_dir(fixture.root.join("src"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(left, ["ReplicatedStorage"], "a copy was left behind");
+        }
+    }
+
+    /// Tools rewrite the sourcemap at any time: one rewritten just before the
+    /// publication moves it aside is replaced like an unchanged one.
+    #[test]
+    fn export_publication_replaces_a_sourcemap_rewritten_before_its_swap() {
+        let mut fixture = Fixture::new();
+        let stage = fixture.stage.take().unwrap();
+        let map = fixture.root.join("sourcemap.json");
+        let _hook = hook_publication_steps(move |step| {
+            if matches!(step, PublicationStep::MoveAside(path) if path == Path::new("sourcemap.json"))
+            {
+                fs::write(&map, "{\"name\":\"Rewritten\"}").unwrap();
+            }
+        });
+        stage.publish(&fixture.root, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("sourcemap.json")).unwrap(),
+            "{\"name\":\"Captured\"}"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(SOURCE)).unwrap(),
+            "return 'captured'\n"
+        );
     }
 
     #[test]

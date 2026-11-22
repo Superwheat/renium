@@ -649,7 +649,7 @@ pub(crate) fn push_project(
     let settle_native_import = replace && !plan.initial_native_services.is_empty();
     #[cfg(any(windows, target_os = "macos"))]
     let held_pull = held_pull
-        .filter(|_| settle_native_import)
+        .filter(|_| replace)
         .map(|held| (held, written_services(context, &plan)));
     if !replace {
         apply_snapshot_paths(&stage.project_root, &mutation_paths, &project)?;
@@ -669,8 +669,8 @@ pub(crate) fn push_project(
         );
     }
     #[cfg(any(windows, target_os = "macos"))]
-    let can_settle_in_background = settle_native_import
-        && import_settle::can_continue(&stage, requires_stage, link_enforcement.is_some());
+    let can_settle_in_background =
+        replace && import_settle::can_continue(&stage, requires_stage, link_enforcement.is_some());
     let saved_fields = push_args.saved_fields.clone();
     let mut pushed = push_staged_project(
         context,
@@ -737,89 +737,141 @@ pub(crate) fn push_project(
             .clone_from(&guard.tracking_guard_id);
     }
 
+    // A settlement reads back fewer services than a pull only from a held
+    // pull, where the push wrote some services alone and no linked package
+    // is restored.
     #[cfg(any(windows, target_os = "macos"))]
-    if let Some(proof) = can_settle_in_background
+    let narrowable = held_pull.as_ref().filter(|(_, written)| {
+        services.iter().any(|service| !written.contains(service))
+            && !Path::new(&context.root).join("renium-link.json").exists()
+    });
+    // Roots imported beside a service's other instances take values Studio
+    // generates for them, which only a pull writes to the files. A service
+    // the importer replaced whole carries its loader receipt instead. Their
+    // settlement must read back fewer services than a pull, which only a
+    // held pull whose sourcemap the files still hold allows.
+    #[cfg(any(windows, target_os = "macos"))]
+    let added_roots = !settle_native_import
+        && pushed
+            .summary
+            .get("binaryInstances")
+            .and_then(Value::as_f64)
+            .is_some_and(|count| count > 0.0)
+        && pushed
+            .summary
+            .get("nativeVerifiedServices")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+        && narrowable.is_some_and(|((sourcemap, _), _)| {
+            import_settle::holds_sourcemap(Path::new(&context.root), sourcemap)
+        });
+    // Files the push wrote itself are read back to be verified.
+    #[cfg(any(windows, target_os = "macos"))]
+    let generated_files = !pushed.generated.entries.is_empty();
+    #[cfg(any(windows, target_os = "macos"))]
+    if let Some((proof, settled)) = (can_settle_in_background
+        && (settle_native_import || added_roots))
         .then_some(())
         .filter(|_| replacement.is_none())
-        .and_then(|()| committed_import_proof(context, &pushed.summary, &mutation_paths, services))
+        .and_then(|()| {
+            committed_import_proof(
+                context,
+                &pushed.summary,
+                &mutation_paths,
+                services,
+                settle_native_import,
+            )
+        })
+        .map(|proof| {
+            // Only a settlement the commit proof fences until publication
+            // skips services: the held proof covers what changed before it.
+            let settled = narrowable.map_or_else(
+                || services.to_vec(),
+                |((_, held), written)| {
+                    settled_services(
+                        context,
+                        bridge,
+                        (services, written.clone()),
+                        held,
+                        (&studio, &project, &pushed.generated),
+                    )
+                },
+            );
+            (proof, settled)
+        })
+        // Added roots are settled only where that reads back less than a
+        // pull would; their receipt already verified the push.
+        .filter(|(_, settled)| settle_native_import || settled.len() < services.len())
         // A Studio that changed since the commit gets the full readback below
         // before the push answers.
-        .filter(|proof| verified_full_push_proof_matches(context, bridge, proof).unwrap_or(false))
-    {
-        // Only a settlement the commit proof fences until publication skips
-        // services: the held proof covers what changed before it.
-        let settled = held_pull.as_ref().map_or_else(
-            || services.to_vec(),
-            |((_, held), written)| {
-                settled_services(
-                    context,
-                    bridge,
-                    (services, written.clone()),
-                    held,
-                    (&studio, &project, &pushed.generated),
-                )
-            },
-        );
-        let narrowed = held_pull
-            .as_ref()
-            .filter(|_| settled.len() < services.len())
-            .map(|((sourcemap, _), _)| import_settle::Narrowed {
-                services: &settled,
-                sourcemap,
-            });
-        let mut expected = project;
-        expected.entries.extend(pushed.generated.entries);
+        .filter(|(proof, _)| verified_full_push_proof_matches(context, bridge, proof).unwrap_or(false))
         // A journal records only a verified Studio commit whose caller can
         // leave before publication. Failed/review-held pushes and synchronous
         // readback never create recovery obligations.
-        import_settle::begin(
+        && import_settle::journal(
             context,
             import_settle::ImportStart {
                 services,
                 paths: &source_paths,
                 verification_paths: &mutation_paths,
                 before: &studio,
-                expected: &expected,
+                expected: &project,
+                generated: &pushed.generated,
                 input: cache_input.as_ref(),
                 history_id: history.id()?,
+                optional: added_roots,
             },
-        )?;
-        import_settle::committed(&pushed.summary, &expected)?;
+            &pushed.summary,
+        )?
+    {
+        let narrowed =
+            narrowable
+                .filter(|_| settled.len() < services.len())
+                .map(|((sourcemap, _), _)| import_settle::Narrowed {
+                    services: &settled,
+                    sourcemap,
+                });
+        let mut expected = project;
+        expected.entries.extend(pushed.generated.entries);
         import_settle::continue_request(context, bridge)?;
         crate::automation::runtime::respond_to_verified_import(context, bridge, &pushed.summary);
-        let (current, summary) = import_settle::settle(
-            context,
-            bridge,
-            (services, narrowed),
-            import_settle::ImportWork {
-                before: studio,
-                expected,
-                paths: source_paths.clone(),
-                verification_paths: mutation_paths,
-                prepared: prepared_verification,
-                history,
-                summary: pushed.summary,
-            },
-            &proof,
-        )?;
+        let mut work = import_settle::ImportWork {
+            before: studio,
+            expected,
+            paths: source_paths.clone(),
+            verification_paths: mutation_paths,
+            prepared: prepared_verification,
+            history,
+            summary: pushed.summary,
+        };
+        let settlement =
+            import_settle::settle(context, bridge, (services, narrowed), &mut work, &proof)?;
         tracking_release.proof = Some(proof);
         acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
         anyhow::ensure!(
             tracking_release.retained_proof.is_some(),
             "Studio changed before import settlement was acknowledged"
         );
-        if let Some(current) = current {
-            retain_full_push(
-                bridge,
-                cache_input.as_ref(),
-                &source_paths,
-                current,
-                &tracking_release,
-                #[cfg(windows)]
-                &mut native_relay,
-            );
-        }
-        return Ok(summary);
+        let kept = match settlement {
+            import_settle::Settlement::Published(published) => published,
+            // Files a settlement of added roots left as the push wrote them
+            // stand for the Studio that holds its commit, as after a push
+            // that reads nothing back, but for files it wrote itself.
+            import_settle::Settlement::Unwritten if added_roots && !generated_files => {
+                (work.expected, None)
+            }
+            _ => return Ok(work.summary),
+        };
+        retain_full_push(
+            bridge,
+            cache_input.as_ref(),
+            &source_paths,
+            kept,
+            &tracking_release,
+            #[cfg(windows)]
+            &mut native_relay,
+        );
+        return Ok(work.summary);
     }
 
     let mut current = capture_snapshot(&root, stage.publish_paths())?;
@@ -1471,6 +1523,7 @@ fn committed_import_proof(
     summary: &Map<String, Value>,
     paths: &HashSet<PathBuf>,
     services: &[String],
+    native: bool,
 ) -> Option<Value> {
     let verified = ["nativeVerifiedServices", "fieldVerifiedServices"]
         .into_iter()
@@ -1488,6 +1541,9 @@ fn committed_import_proof(
         .filter(|_| {
             covered && summary.get("sourceVerifyFailed").and_then(Value::as_u64) == Some(0)
         });
+    if !native {
+        return proof;
+    }
     if proof.is_some() {
         log_native_settlement_fallbacks(services, &verified);
     } else {
@@ -1614,10 +1670,12 @@ pub(super) fn entry_publish_state(entry: &SnapshotEntry) -> PublishEntryState {
     }
 }
 
-/// Writes a verified import's state to the files and refreshes its undo
-/// entry; None when the files were left as they are. Studio holds the
-/// import by now, so a file saved while it was read back is newer work and
-/// stays: the next pull brings the import's identities into the files.
+/// Writes a verified import's state to the files, which `current` has as
+/// the push left them, and refreshes its undo entry; None when the files
+/// are not that state alone. Studio holds the import by now, so a file
+/// saved while it was read back or written is newer work and stays: the
+/// next pull brings the import's identities into the files. A publication
+/// that could not put back all it moved aside is an error.
 fn settle_native_import_files(
     stage: ExportProjectStage,
     (root, paths): (&Path, &[PathBuf]),
@@ -1625,27 +1683,31 @@ fn settle_native_import_files(
     current: &mut ProjectSnapshot,
     summary: &mut Map<String, Value>,
 ) -> Result<Option<crate::snapshot::export::PublishedProjectChanges>> {
-    match publish_native_import_readback(stage, root, paths) {
+    match publish_native_import_readback(stage, root, (paths, current)) {
         Ok((files, published)) => {
             *current = files;
             let id = history.commit(current, &ProjectSnapshot::default())?;
             summary.insert("historyId".into(), Value::String(id));
             Ok(Some(published))
         }
+        Err(error) if error.is::<crate::snapshot::export::IncompleteRollback>() => Err(error),
         Err(error) => {
             log_global(
                 3,
-                format_args!("[renium] the import's state was not written to the files: {error:#}"),
+                format_args!("[renium] the files are not the import's state alone: {error:#}"),
             );
             Ok(None)
         }
     }
 }
 
+/// Publishes the stage over the files `held` has under `paths`. Fails where
+/// a file it left alone is no longer as `held` has it: saved meanwhile, it
+/// belongs to no baseline of what Studio holds.
 fn publish_native_import_readback(
     stage: ExportProjectStage,
     root: &Path,
-    paths: &[PathBuf],
+    (paths, held): (&[PathBuf], &ProjectSnapshot),
 ) -> Result<(
     ProjectSnapshot,
     crate::snapshot::export::PublishedProjectChanges,
@@ -1657,9 +1719,26 @@ fn publish_native_import_readback(
         None,
         || Ok(()),
         || Ok(()),
-    )?;
+    )
+    .context("the import's state was not written")?;
     let current = capture_snapshot(root, paths)?;
     history::ensure_published_state(&published, &current)?;
+    let written = ScopeSet::new(&published.changed_roots);
+    let saved = held
+        .entries
+        .keys()
+        .chain(current.entries.keys())
+        .find(|path| {
+            !written.contains(path)
+                && !derived_project_path(path)
+                && held.entries.get(*path) != current.entries.get(*path)
+        });
+    if let Some(path) = saved {
+        bail!(
+            "{} was saved while the import's state was written",
+            path.display()
+        );
+    }
     Ok((current, published))
 }
 
@@ -1703,17 +1782,95 @@ fn native_import_readback_publishes_once_and_protects_newer_files() -> Result<()
     stage_verified_import_readback(&mut stage, &checked, checked.entries.keys())?;
     let map = fs::read(stage.project_root.join("sourcemap.json"))?;
     assert!(!map.is_empty(), "The verified capture must publish its map");
-    let (after, _) = publish_native_import_readback(stage, &root, &paths)?;
+    let held = capture_snapshot(&root, &paths)?;
+    let (after, _) = publish_native_import_readback(stage, &root, (&paths, &held))?;
     assert_eq!(fs::read(root.join("sourcemap.json"))?, map);
     assert!(after.entries[&path] == SnapshotEntry::File(accepted.clone()));
     let modified = fs::metadata(root.join(&path))?.modified()?;
-    assert!(publish_native_import_readback(prepare()?, &root, &paths)?.0 == after);
+    assert!(publish_native_import_readback(prepare()?, &root, (&paths, &after))?.0 == after);
     assert_eq!(fs::metadata(root.join(&path))?.modified()?, modified);
     let mut stage = prepare()?;
     stage_verified_import_readback(&mut stage, &checked, checked.entries.keys())?;
     fs::write(root.join(&path), &original)?;
-    assert!(publish_native_import_readback(stage, &root, &paths).is_err());
-    assert_eq!(fs::read(root.join(path))?, original);
+    assert!(publish_native_import_readback(stage, &root, (&paths, &after)).is_err());
+    assert_eq!(fs::read(root.join(&path))?, original);
+    // A file the publication leaves alone, saved once the push had read the
+    // files and before the stage did, is in no baseline the stage checks.
+    let held = capture_snapshot(&root, &paths)?;
+    let outside = PathBuf::from("src/Workspace/Saved.luau");
+    fs::write(root.join(&outside), "saved meanwhile")?;
+    let mut stage = prepare()?;
+    stage_verified_import_readback(&mut stage, &checked, checked.entries.keys())?;
+    let error = publish_native_import_readback(stage, &root, (&paths, &held))
+        .err()
+        .context("a file saved outside the written paths went unseen")?;
+    assert!(
+        format!("{error:#}").contains("Saved.luau was saved while"),
+        "{error:#}"
+    );
+    assert_eq!(fs::read(root.join(path))?, accepted);
+    assert_eq!(fs::read_to_string(root.join(outside))?, "saved meanwhile");
+    Ok(())
+}
+
+/// A synchronous settlement whose publication cannot put back all it moved
+/// aside fails and names the stage that holds the files; one that files
+/// saved meanwhile stopped, and that put everything back, settles nothing.
+#[test]
+fn a_synchronous_settlement_fails_on_an_incomplete_rollback() -> Result<()> {
+    use crate::snapshot::export::{IncompleteRollback, PublicationStep, hook_publication_steps};
+    for incomplete in [false, true] {
+        let root = crate::tests::support::temp_dir("native-import-rollback");
+        let first = Path::new("src/Workspace/A.luau");
+        let second = Path::new("src/Workspace/B.luau");
+        fs::create_dir_all(root.join(first.parent().unwrap()))?;
+        for path in [first, second, Path::new("src/Workspace/Kept.luau")] {
+            fs::write(root.join(path), "pushed")?;
+        }
+        let stage = ExportProjectStage::create(&root, Path::new("src"), &["Workspace".into()])?;
+        for path in [first, second] {
+            fs::write(stage.project_root.join(path), "accepted")?;
+        }
+        let container = stage.container().to_path_buf();
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+            let _ = fs::remove_dir_all(&container);
+        });
+        let paths = stage.publish_paths().to_vec();
+        let mut current = capture_snapshot(&root, &paths)?;
+        let mut history =
+            history::SyncHistory::begin(&root, &root.join("src"), &current, &HashSet::new())?;
+        let (saved, moved_aside) = (root.join(second), container.join("previous").join(first));
+        let hook = hook_publication_steps(move |step| {
+            if *step == PublicationStep::MoveAside(second.into()) {
+                fs::write(&saved, "saved meanwhile").unwrap();
+                if incomplete {
+                    fs::remove_file(&moved_aside).unwrap();
+                }
+            }
+        });
+        let settled = settle_native_import_files(
+            stage,
+            (&root, &paths),
+            &mut history,
+            &mut current,
+            &mut Map::new(),
+        );
+        drop(hook);
+        assert_eq!(fs::read_to_string(root.join(second))?, "saved meanwhile");
+        if !incomplete {
+            assert!(settled?.is_none());
+            assert_eq!(fs::read_to_string(root.join(first))?, "pushed");
+            continue;
+        }
+        let error = settled.err().context("the push answered success")?;
+        assert!(error.is::<IncompleteRollback>(), "{error:#}");
+        assert!(
+            format!("{error:#}").contains(&container.display().to_string()),
+            "{error:#}"
+        );
+        assert!(container.join("previous").exists());
+    }
     Ok(())
 }
 

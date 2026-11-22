@@ -79,6 +79,37 @@ impl StoredSnapshot {
         })
     }
 
+    /// What says whether files are those of `entries`, without their bytes:
+    /// nothing loads from it.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    pub(super) fn digests<'a>(
+        entries: impl Iterator<Item = (&'a PathBuf, &'a SnapshotEntry)>,
+    ) -> Self {
+        use rayon::prelude::*;
+        let entries = entries.collect::<Vec<_>>();
+        Self {
+            entries: entries
+                .into_par_iter()
+                .map(|(path, entry)| {
+                    let stored = match entry {
+                        SnapshotEntry::Directory => StoredEntry::Directory,
+                        SnapshotEntry::Symlink { target, directory } => StoredEntry::Symlink {
+                            target: target.clone(),
+                            directory: *directory,
+                        },
+                        SnapshotEntry::File(bytes) => StoredEntry::File(StoredFile {
+                            pack: String::new(),
+                            offset: 0,
+                            length: bytes.len() as u64,
+                            digest: Sha256::digest(bytes).into(),
+                        }),
+                    };
+                    (path.clone(), stored)
+                })
+                .collect(),
+        }
+    }
+
     pub(super) fn contains(&self, path: &Path) -> bool {
         self.entries.contains_key(path)
     }
@@ -117,6 +148,26 @@ impl StoredSnapshot {
             };
             matches(self.entries.get(path)) || matches(accepted.entries.get(path))
         })
+    }
+
+    /// Whether `snapshot`, a read of `path` alone, holds what this holds at
+    /// `path` and under it: nothing where this holds nothing. Paths order by
+    /// their components, so those under one follow it.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    pub(super) fn matches_at(&self, path: &Path, snapshot: &ProjectSnapshot) -> bool {
+        use std::ops::Bound;
+        let mut stored = self
+            .entries
+            .range::<Path, _>((Bound::Included(path), Bound::Unbounded))
+            .take_while(|(entry, _)| entry.starts_with(path));
+        let mut held = 0;
+        stored.all(|(entry, stored)| {
+            held += 1;
+            snapshot
+                .entries
+                .get(entry)
+                .is_some_and(|current| stored.matches(current))
+        }) && held == snapshot.entries.len()
     }
 
     pub(super) fn load(&self, root: &Path, key: &str) -> Result<ProjectSnapshot> {

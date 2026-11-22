@@ -376,6 +376,25 @@ pub(crate) fn fixture_early_response() -> impl Drop {
     })
 }
 
+/// Takes the notices this thread's requests send; the returned function
+/// stops and gives their text.
+#[cfg(test)]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+pub(crate) fn fixture_request_notices() -> impl FnOnce() -> Vec<String> {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let peer = crate::system::net::SharedTcpStream::from(listener.accept().unwrap().0);
+    REQUEST_NOTICE_SINK.with(|slot| *slot.borrow_mut() = Some((peer, 1)));
+    move || {
+        REQUEST_NOTICE_SINK.with(|slot| slot.borrow_mut().take());
+        io::BufRead::lines(io::BufReader::new(client))
+            .map_while(io::Result::ok)
+            .filter_map(|line| serde_json::from_str::<automation::Response>(&line).ok())
+            .filter_map(|response| response.notice_text().map(str::to_string))
+            .collect()
+    }
+}
+
 /// The request thread becomes the daemon's continuation. Its stack still
 /// owns the Edit gate, tracking guard, selection and Live Sync pause.
 /// The caller must switch to a daemon lease and persist recovery first.

@@ -455,6 +455,29 @@ fn rename_with_retries(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Moves `from` to `to` without replacing what is there, which fails with
+/// `AlreadyExists`. A file is linked under its new name, which never
+/// replaces, and its old name is removed after; an old name that cannot go
+/// stays. A directory or a link, or a file on a volume that links none, is
+/// renamed once nothing is found at `to`: that rename replaces what is
+/// saved there in the instant between the two.
+pub(crate) fn move_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(from)?.is_file() {
+        match fs::hard_link(from, to) {
+            Ok(()) => {
+                let _ = fs::remove_file(from);
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Err(error),
+            Err(_) => {}
+        }
+    }
+    if fs::symlink_metadata(to).is_ok() {
+        return Err(io::ErrorKind::AlreadyExists.into());
+    }
+    fs::rename(from, to)
+}
+
 #[cfg(all(test, windows))]
 mod replacement_tests {}
 

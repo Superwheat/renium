@@ -382,7 +382,8 @@ pub(crate) fn written_services(context: &BoundContext, plan: &ReconcilePushPlan)
 /// camera), its stores are a pull's own encoding, and they name none of
 /// these services, so no path-addressed reference followed an instance the
 /// import replaced. All of them when linked packages are restored or Studio
-/// cannot say where it differs.
+/// cannot say where it differs, and, with no look at the files, when the
+/// push and Studio's own changes reached every service.
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn settled_services(
     context: &BoundContext,
@@ -398,15 +399,15 @@ pub(crate) fn settled_services(
     } else {
         moved_since_proof(context, bridge, held)
             .ok_or("Studio cannot say where it differs from the held proof")
-            .map(|moved| {
-                services_settled_with(
-                    context,
-                    services,
-                    written.into_iter().chain(moved).collect(),
-                    (before, project, generated),
-                )
+            .map(|moved| written.into_iter().chain(moved).collect::<HashSet<_>>())
+            .and_then(|touched| {
+                if services.iter().all(|service| touched.contains(service)) {
+                    return Err("the push and Studio's changes reached each of them");
+                }
+                let settled =
+                    services_settled_with(context, services, touched, (before, project, generated));
+                skips_pulled(context, &settled, before).map(|()| settled)
             })
-            .and_then(|settled| skips_pulled(context, &settled, before).map(|()| settled))
     };
     log_reconcile_timing("import settlement services", phase);
     match settled {
@@ -435,6 +436,14 @@ pub(crate) fn settled_services(
     }
 }
 
+#[cfg(all(test, any(windows, target_os = "macos")))]
+thread_local! {
+    /// How often this thread compared the files of a push with Studio's to
+    /// find the services its settlement reads back.
+    pub(crate) static SETTLED_COMPARISONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 fn services_settled_with(
     context: &BoundContext,
@@ -442,6 +451,8 @@ fn services_settled_with(
     mut settled: HashSet<String>,
     (before, project, generated): (&ProjectSnapshot, &ProjectSnapshot, &ProjectSnapshot),
 ) -> Vec<String> {
+    #[cfg(test)]
+    SETTLED_COMPARISONS.with(|count| count.set(count.get() + 1));
     let files = |path: &&PathBuf| {
         generated
             .entries

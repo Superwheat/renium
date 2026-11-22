@@ -3724,13 +3724,24 @@ fn live_failure_message(error: &anyhow::Error) -> String {
 fn is_concurrent_edit_failure(error: &anyhow::Error) -> bool {
     if error.is::<crate::editor::sync::SlowImportRequired>()
         || error.is::<super::reconcile::SkippedPushReview>()
+        || error.is::<crate::snapshot::export::IncompleteRollback>()
     {
         return false;
     }
     is_concurrent_edit_message(&format!("{error:#}"))
 }
 
-pub(crate) fn is_concurrent_edit_message(message: &str) -> bool {
+/// Whether the failure a request answered with is of edits that raced its
+/// sync pass, which a retry starts over from. One whose code names a review
+/// or a recovery is not, whatever its text quotes.
+pub(crate) fn is_concurrent_edit_reply(failure: &super::Failure) -> bool {
+    !matches!(
+        failure.0.c.as_str(),
+        "slow_import_required" | "review_skipped" | "recovery_required"
+    ) && is_concurrent_edit_message(&failure.0.m)
+}
+
+fn is_concurrent_edit_message(message: &str) -> bool {
     let retryable =
         message.contains("retry the sync") || message.contains("retry without overwriting");
     retryable
@@ -3807,6 +3818,31 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    /// A publication that could not put back all it moved aside quotes the
+    /// race that stopped it. It is shown as a failure that names the folder
+    /// holding the files, at the pull, the reconcile and the restore.
+    #[test]
+    fn an_incomplete_rollback_is_shown_and_not_retried_as_a_racing_edit() {
+        let container = Path::new("project-parent/.renium-export-1");
+        let rollback = crate::snapshot::export::IncompleteRollback::after_changed_files(container);
+        let error = anyhow::Error::new(rollback).context("live pull");
+        assert!(is_concurrent_edit_message(&format!("{error:#}")));
+        assert!(!is_concurrent_edit_failure(&error));
+        let failure = automation_failure_ref(&error);
+        assert_eq!(failure.0.c, "recovery_required");
+        assert_eq!(failure.0.rt, 0);
+        assert!(!is_concurrent_edit_reply(&failure));
+        assert!(
+            failure.0.m.contains(&container.display().to_string()),
+            "{}",
+            failure.0.m
+        );
+        let race = automation_failure_ref(&anyhow::anyhow!(
+            "Project files changed while Studio recovery was being captured; retry the sync"
+        ));
+        assert!(is_concurrent_edit_reply(&race));
     }
 
     fn test_control() -> Arc<Control> {

@@ -24,7 +24,20 @@ struct Record {
     error: Option<String>,
     #[serde(default)]
     journal_id: String,
+    /// The files already hold what the push wrote: a settlement that cannot
+    /// finish leaves them so, as a push that reads nothing back does. Such a
+    /// record is version 2, which a daemon that would load its absent
+    /// snapshots refuses.
+    #[serde(default)]
+    optional: bool,
+    /// The stage whose publication began, which holds under `previous` what
+    /// its swaps moved aside.
+    #[serde(default)]
+    container: Option<PathBuf>,
 }
+
+/// The version of a record that keeps only the digests of the files.
+const OPTIONAL_VERSION: u8 = 2;
 
 struct Journal {
     directory: PathBuf,
@@ -90,7 +103,7 @@ impl Journal {
             .or_else(|| header.get(0))
             .and_then(Value::as_u64);
         anyhow::ensure!(
-            version == Some(1),
+            version == Some(1) || version == Some(OPTIONAL_VERSION.into()),
             "Unsupported import settlement journal; run a full pull to recover"
         );
         let record: Record = rmp_serde::from_slice(&bytes)
@@ -122,6 +135,41 @@ impl Journal {
         CURRENT.with(|slot| *slot.borrow_mut() = Some(self));
         Ok(())
     }
+
+    /// Keeps the snapshots recovery loads, which an optional record leaves
+    /// out: a settlement that stops after this leaves something to report.
+    fn recoverable(&mut self, before: &ProjectSnapshot, expected: &ProjectSnapshot) -> Result<()> {
+        if !self.record.optional {
+            return Ok(());
+        }
+        let packs = self.directory.join("packs");
+        self.record.before = StoredSnapshot::write_at(&packs, before.entries.iter())?;
+        self.record.expected = StoredSnapshot::write_at(&packs, expected.entries.iter())?;
+        self.record.optional = false;
+        self.record.version = 1;
+        Ok(())
+    }
+
+    fn accept<'a>(
+        &mut self,
+        entries: impl Iterator<Item = (&'a PathBuf, &'a SnapshotEntry)>,
+    ) -> Result<()> {
+        self.record.accepted = Some(StoredSnapshot::write_at(
+            &self.directory.join("packs"),
+            entries,
+        )?);
+        Ok(())
+    }
+}
+
+/// Changes the journal of this request and saves it.
+fn amend(change: impl FnOnce(&mut Journal) -> Result<()>) -> Result<()> {
+    CURRENT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let journal = slot.as_mut().context("Missing import settlement journal")?;
+        change(journal)?;
+        journal.save()
+    })
 }
 
 pub(super) struct ImportStart<'a> {
@@ -130,8 +178,11 @@ pub(super) struct ImportStart<'a> {
     pub verification_paths: &'a HashSet<PathBuf>,
     pub before: &'a ProjectSnapshot,
     pub expected: &'a ProjectSnapshot,
+    /// What the push wrote into the files itself, over `expected`.
+    pub generated: &'a ProjectSnapshot,
     pub input: Option<&'a Value>,
     pub history_id: String,
+    pub optional: bool,
 }
 
 pub(super) fn can_continue(
@@ -159,19 +210,42 @@ pub(super) fn begin(context: &BoundContext, start: ImportStart<'_>) -> Result<()
     let mut nonce = [0u8; 16];
     getrandom::fill(&mut nonce)
         .map_err(|error| anyhow::anyhow!("Cannot identify import journal: {error}"))?;
+    let expected = start
+        .expected
+        .entries
+        .iter()
+        .filter(|(path, _)| !start.generated.entries.contains_key(*path))
+        .chain(start.generated.entries.iter());
+    // Nothing loads the snapshots of an optional record until it publishes:
+    // it holds only what says whether newer edits came.
+    let (version, before, expected) = if start.optional {
+        (
+            OPTIONAL_VERSION,
+            StoredSnapshot::digests(std::iter::empty()),
+            StoredSnapshot::digests(expected),
+        )
+    } else {
+        (
+            1,
+            StoredSnapshot::write_at(&packs, start.before.entries.iter())?,
+            StoredSnapshot::write_at(&packs, expected)?,
+        )
+    };
     let record = Record {
-        version: 1,
+        version,
         journal_id: nonce.iter().map(|byte| format!("{byte:02x}")).collect(),
         runtime: context.runtime_id.clone(),
         services: start.services.to_vec(),
         paths: start.paths.to_vec(),
         verification_paths: start.verification_paths.clone(),
-        before: StoredSnapshot::write_at(&packs, start.before.entries.iter())?,
-        expected: StoredSnapshot::write_at(&packs, start.expected.entries.iter())?,
+        before,
+        expected,
         accepted: None,
         input: start.input.cloned(),
         summary: Map::from_iter([("historyId".into(), json!(start.history_id))]),
         error: None,
+        optional: start.optional,
+        container: None,
     };
     let journal = Journal {
         directory,
@@ -180,6 +254,31 @@ pub(super) fn begin(context: &BoundContext, start: ImportStart<'_>) -> Result<()
     };
     journal.save()?;
     journal.install()
+}
+
+/// Journals a verified commit, with what Studio reported of it, before the
+/// push answers. A push whose files already hold what it wrote settles
+/// before it answers instead where that fails: false.
+pub(super) fn journal(
+    context: &BoundContext,
+    start: ImportStart<'_>,
+    summary: &Map<String, Value>,
+) -> Result<bool> {
+    let optional = start.optional;
+    match begin(context, start).and_then(|()| committed(summary)) {
+        Ok(()) => Ok(true),
+        Err(error) if optional => {
+            let _ = finish_request(None);
+            log_global(
+                3,
+                format_args!(
+                    "[renium] import settlement runs before the push answers: cannot journal it: {error:#}"
+                ),
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn active() -> bool {
@@ -228,31 +327,16 @@ impl Drop for RequestCleanup {
     }
 }
 
-pub(super) fn committed(summary: &Map<String, Value>, expected: &ProjectSnapshot) -> Result<()> {
-    CURRENT.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let journal = slot.as_mut().context("Missing import settlement journal")?;
+pub(super) fn committed(summary: &Map<String, Value>) -> Result<()> {
+    amend(|journal| {
         journal.record.summary.extend(summary.clone());
-        if !journal.record.expected.matches(expected) {
-            journal.record.expected = StoredSnapshot::write_at(
-                &journal.directory.join("packs"),
-                expected.entries.iter(),
-            )?;
-        }
-        journal.save()
+        Ok(())
     })
 }
 
+#[cfg(test)]
 fn accepted<'a>(entries: impl Iterator<Item = (&'a PathBuf, &'a SnapshotEntry)>) -> Result<()> {
-    CURRENT.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let journal = slot.as_mut().context("Missing import settlement journal")?;
-        journal.record.accepted = Some(StoredSnapshot::write_at(
-            &journal.directory.join("packs"),
-            entries,
-        )?);
-        journal.save()
-    })
+    amend(|journal| journal.accept(entries))
 }
 
 /// Called before the gate is released, after Live Sync's acknowledgment too.
@@ -264,6 +348,12 @@ pub(crate) fn finish_request(error: Option<&str>) -> Result<()> {
         }
         return Ok(());
     }
+    #[cfg(test)]
+    if error.is_none() && CURRENT.with(|slot| slot.borrow().is_some()) {
+        crate::snapshot::export::publication_step(
+            crate::snapshot::export::PublicationStep::BeforeClear,
+        );
+    }
     let Some(mut journal) = CURRENT.with(|slot| slot.borrow_mut().take()) else {
         return Ok(());
     };
@@ -272,18 +362,28 @@ pub(crate) fn finish_request(error: Option<&str>) -> Result<()> {
         .summary
         .get("verifiedPushProof")
         .is_some_and(|value| !value.is_null());
-    let result = if let Some(error) = error.filter(|_| has_commit) {
-        journal
-            .record
-            .error
-            .get_or_insert_with(|| error.to_string());
-        log_global(
-            3,
-            format_args!("[renium] import settlement failed: {error}"),
-        );
-        journal.save()
-    } else {
-        resolve_journal(&journal.directory)
+    let result = match error.filter(|_| has_commit) {
+        Some(error) if !journal.record.optional => {
+            journal
+                .record
+                .error
+                .get_or_insert_with(|| error.to_string());
+            log_global(
+                3,
+                format_args!("[renium] import settlement failed: {error}"),
+            );
+            journal.save()
+        }
+        Some(error) => {
+            log_global(
+                3,
+                format_args!(
+                    "[renium] import settlement left the files as the push wrote them: {error}"
+                ),
+            );
+            resolve_journal(&journal.directory)
+        }
+        None => resolve_journal(&journal.directory),
     };
     RUNNING
         .0
@@ -399,15 +499,25 @@ pub(super) struct Narrowed<'a> {
 /// The files a publication left and the sourcemap a baseline of them keeps.
 type Published = (ProjectSnapshot, Option<Box<SourcemapState>>);
 
+/// What a settlement left the files as.
+pub(super) enum Settlement {
+    Published(Published),
+    /// As the push left them but for newer edits, or a sourcemap no longer
+    /// the pull's, which stopped it before it wrote any.
+    Unwritten,
+    /// Newer edits stopped it once it had written Studio's copy.
+    Stopped,
+}
+
 /// The same capture, verification and publication serve a live continuation
 /// and recovery after a daemon restart. Recovery never invokes the importer.
 pub(super) fn settle(
     context: &BoundContext,
     bridge: &BridgeServer,
     (full, narrowed): (&[String], Option<Narrowed<'_>>),
-    mut work: ImportWork,
+    work: &mut ImportWork,
     proof: &Value,
-) -> Result<(Option<Published>, Map<String, Value>)> {
+) -> Result<Settlement> {
     let root = Path::new(&context.root);
     let source = bound_context::source_dir(context)?;
     let files = match ensure_original_or_accepted_files(root, &work.paths) {
@@ -415,7 +525,7 @@ pub(super) fn settle(
         Err(error) if !error.is::<NewerProjectFiles>() => return Err(error),
         // The caller can start editing as soon as its verified reply arrives.
         // Leave those files alone; the next push reconciles the newer work.
-        Err(_) => return Ok((None, work.summary)),
+        Err(_) => return Ok(Settlement::Unwritten),
     };
     let phase = Instant::now();
     let covered = ScopeSet::new(&work.paths);
@@ -426,7 +536,20 @@ pub(super) fn settle(
     let mut services = narrowed.as_ref().map_or(full, |narrowed| narrowed.services);
     let mut stage = stage_of(services)?;
     // The services it skips keep their entries of the sourcemap it stages.
-    if narrowed.is_some_and(|narrowed| !staged_as(&stage, narrowed.sourcemap)) {
+    if narrowed.is_some_and(|narrowed| !holds_sourcemap(&stage.project_root, narrowed.sourcemap)) {
+        if CURRENT.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|journal| journal.record.optional)
+        }) {
+            log_global(
+                4,
+                format_args!(
+                    "[renium] import settlement leaves the files as pushed: sourcemap.json is not as the last pull left it"
+                ),
+            );
+            return Ok(Settlement::Unwritten);
+        }
         log_global(
             4,
             format_args!(
@@ -460,6 +583,8 @@ pub(super) fn settle(
     )?;
     log_reconcile_timing("full push verification", phase);
     if !mismatches.is_empty() {
+        // Studio does not hold what the push sent: the next command says so.
+        amend(|journal| journal.recoverable(&work.before, &work.expected))?;
         return Err(retention_failure(
             "pushed project changes",
             &mismatches,
@@ -476,16 +601,26 @@ pub(super) fn settle(
         );
         ensure_original_or_accepted_files(root, &work.paths).map(drop)
     };
-    let (current, published) =
-        match publish_checked(stage, root, (&work.paths, &work.expected), stable) {
-            Ok(current) => current,
-            Err(error) if error.is::<NewerProjectFiles>() => return Ok((None, work.summary)),
-            Err(error) => return Err(error),
-        };
+    let published = publish_checked(
+        stage,
+        root,
+        (&work.paths, &work.before, &work.expected),
+        stable,
+    );
+    let (current, published) = match published {
+        Ok(published) => published,
+        Err(error) => {
+            return match error.downcast_ref::<NewerProjectFiles>() {
+                Some(NewerProjectFiles { written: true }) => Ok(Settlement::Stopped),
+                Some(_) => Ok(Settlement::Unwritten),
+                None => Err(error),
+            };
+        }
+    };
     let id = work.history.commit(&current, &ProjectSnapshot::default())?;
     work.summary.insert("historyId".into(), json!(id));
     let sourcemap = pulled_sourcemap(&published);
-    Ok((Some((current, sourcemap)), work.summary))
+    Ok(Settlement::Published((current, sourcemap)))
 }
 
 /// The sourcemap a baseline of the files `published` left keeps: none where
@@ -508,17 +643,18 @@ pub(super) fn pulled_sourcemap(
     settled_sourcemap(published, None)
 }
 
-/// Whether the sourcemap `stage` copied is `sourcemap`.
-fn staged_as(stage: &ExportProjectStage, sourcemap: &SourcemapState) -> bool {
-    crate::snapshot::export::collect_publish_hashes(
-        &stage.project_root,
-        &[PathBuf::from("sourcemap.json")],
-    )
-    .is_ok_and(|staged| staged == *sourcemap)
+/// Whether the sourcemap.json under `root` is `sourcemap`.
+pub(super) fn holds_sourcemap(root: &Path, sourcemap: &SourcemapState) -> bool {
+    crate::snapshot::export::collect_publish_hashes(root, &[PathBuf::from("sourcemap.json")])
+        .is_ok_and(|held| held == *sourcemap)
 }
 
+/// Files changed since the push, which the settlement leaves as they are:
+/// `written` once it had written Studio's copy.
 #[derive(Debug)]
-struct NewerProjectFiles;
+struct NewerProjectFiles {
+    written: bool,
+}
 
 impl std::fmt::Display for NewerProjectFiles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -542,18 +678,19 @@ fn ensure_original_or_accepted_files(root: &Path, paths: &[PathBuf]) -> Result<P
         })
     });
     if !files_match {
-        return Err(NewerProjectFiles.into());
+        return Err(NewerProjectFiles { written: false }.into());
     }
     Ok(current)
 }
 
 /// Publishes the stage, outside whose paths the files stay as `held` has
-/// them. The files must then be exactly what it staged and those; the
-/// returned snapshot covers all of `paths`.
+/// them, the files of the push whose Studio held `before`. The files must
+/// then be exactly what it staged and those; the returned snapshot covers
+/// all of `paths`.
 fn publish_checked(
     stage: ExportProjectStage,
     root: &Path,
-    (paths, held): (&[PathBuf], &ProjectSnapshot),
+    (paths, before, held): (&[PathBuf], &ProjectSnapshot, &ProjectSnapshot),
     stable: impl Fn() -> Result<()>,
 ) -> Result<(
     ProjectSnapshot,
@@ -572,20 +709,50 @@ fn publish_checked(
             .filter(|(path, _)| scopes.contains(path))
             .chain(unsettled)
     };
-    accepted(accepted_files())?;
+    let container = stage.container().to_path_buf();
+    let written = std::cell::Cell::new(false);
     let (published, _) = crate::snapshot::export::finish_export_publication(
         Some(stage),
         root,
         false,
         None,
-        &stable,
-        &stable,
-    )?;
+        || {
+            stable()?;
+            #[cfg(test)]
+            crate::snapshot::export::publication_step(
+                crate::snapshot::export::PublicationStep::BeforeRecord,
+            );
+            // A stop between two of its swaps leaves a file moved aside, which
+            // only a restart that loads this record puts back.
+            amend(|journal| {
+                journal.recoverable(before, held)?;
+                journal.accept(accepted_files())?;
+                journal.record.container = Some(container);
+                Ok(())
+            })
+        },
+        || {
+            written.set(true);
+            stable()
+        },
+    )
+    .map_err(|error| {
+        let newer = error.is::<NewerProjectFiles>()
+            || error.is::<crate::snapshot::export::ProjectFilesChanged>();
+        if newer {
+            NewerProjectFiles {
+                written: written.get(),
+            }
+            .into()
+        } else {
+            error
+        }
+    })?;
     let current = capture_snapshot(root, paths)?;
     if current.entries.len() != accepted_files().count()
         || !accepted_files().all(|(path, entry)| current.entries.get(path) == Some(entry))
     {
-        return Err(NewerProjectFiles.into());
+        return Err(NewerProjectFiles { written: true }.into());
     }
     history::ensure_published_state(&published, &current)?;
     Ok((current, published))
@@ -619,9 +786,18 @@ pub(crate) fn before_request(
             .iter()
             .all(|service| selected.iter().any(|name| name == service))
     };
-    // Do not decode an old/new/corrupt record before accepting the very
-    // recovery command named in its error. Failed pulls leave its bytes intact.
+    // An old/new/corrupt record does not stop the very recovery command named
+    // in its error. Failed pulls leave its bytes intact.
     if full_pull && pending(context) {
+        if let Ok(Some(journal)) = Journal::load(context) {
+            if journal.record.optional {
+                resolve_journal(&journal.directory)?;
+                return Ok(None);
+            }
+            if let Err(error) = restore_moved_aside(Path::new(&context.root), &journal.record) {
+                log_global(3, format_args!("[renium] {error:#}"));
+            }
+        }
         crate::daemon::emit_request_notice(
             "This full pull recovers the unfinished import from Studio. Project files are replaced only by the requested pull.",
         );
@@ -655,14 +831,21 @@ pub(crate) fn before_request(
     };
     // Version one's old writer created records before committing. A proof
     // was persisted only after commit and before answering the caller.
-    if journal
-        .record
-        .summary
-        .get("verifiedPushProof")
-        .is_none_or(Value::is_null)
+    if journal.record.optional
+        || journal
+            .record
+            .summary
+            .get("verifiedPushProof")
+            .is_none_or(Value::is_null)
     {
         resolve_journal(&journal.directory)?;
         return Ok(None);
+    }
+    if let Err(error) = restore_moved_aside(Path::new(&context.root), &journal.record) {
+        if full_push {
+            return Err(error);
+        }
+        log_global(3, format_args!("[renium] {error:#}"));
     }
     // Only a full push or a full pull settles the import. Every other command
     // runs on the files and the Studio as they are, as it did after a push
@@ -724,6 +907,12 @@ pub(crate) fn before_request(
     // unsettled even when that push finds no authored differences.
     let settled = match recover(context, bridge, &services, work, input) {
         Ok(settled) => settled,
+        // A half-restored project is none to push from: the record stays,
+        // with the stage that holds what was moved aside.
+        Err(error) if error.is::<crate::snapshot::export::IncompleteRollback>() => {
+            finish_request(Some(&format!("{error:#}")))?;
+            return Err(error);
+        }
         // Studio no longer holds what the earlier push left there, or cannot
         // prove it. Nothing of that push is repeated or reported as failed:
         // this push reconciles the files with Studio as it is now.
@@ -756,6 +945,127 @@ fn unsettled_notice(operation: u16, reason: &str) {
     }
 }
 
+/// Puts back what a publication that stopped between two of its swaps had
+/// moved aside and not replaced. The stage that held it is discarded once
+/// the project accounts for every file still moved aside; until then it
+/// holds the only copy of one.
+fn restore_moved_aside(root: &Path, record: &Record) -> Result<()> {
+    let Some(container) = record.container.as_deref() else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        container.parent() == root.parent()
+            && container
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".renium-export-")),
+        "The import settlement journal names a stage outside the project; run rbx pl to recover"
+    );
+    let staged = container.join(root.file_name().context("Project root has no name")?);
+    let previous = container.join("previous");
+    restore_missing(&previous, root, &staged)?;
+    if accounted_for(&previous, root, record)? {
+        let _ = fs::remove_dir_all(container);
+    } else {
+        log_global(
+            3,
+            format_args!(
+                "[renium] kept {}: an unfinished import settlement moved files aside into it, and the project no longer holds what replaced them. Delete the folder once none of them is needed.",
+                container.display()
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// Whether the project accounts for each file still under `previous`. One
+/// that is what `record` expected at its path is accounted for where the
+/// project holds what the publication was to leave there: its accepted
+/// files, which hold nothing where it deleted. Any other was saved before
+/// the publication moved it aside: it goes back where the project holds
+/// nothing, and is unaccounted for where it cannot. No snapshot holds a
+/// derived file, which tools rewrite at any time, so none is asked of.
+fn accounted_for(previous: &Path, root: &Path, record: &Record) -> Result<bool> {
+    if fs::symlink_metadata(previous).is_err() {
+        return Ok(true);
+    }
+    let entries = WalkDir::new(previous)
+        .follow_links(false)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut accounted = true;
+    for entry in entries.iter().filter(|entry| !entry.file_type().is_dir()) {
+        let relative = as_recorded(&record.paths, entry.path().strip_prefix(previous)?);
+        let scope = std::slice::from_ref(&relative);
+        let moved_aside = capture_snapshot(previous, scope)?;
+        accounted &= if record.expected.matches_at(&relative, &moved_aside) {
+            let held = capture_snapshot(root, scope)?;
+            let accepted = record.accepted.as_ref();
+            accepted.is_some_and(|accepted| accepted.matches_at(&relative, &held))
+        } else {
+            let target = root.join(&relative);
+            target
+                .parent()
+                .is_some_and(|parent| fs::create_dir_all(parent).is_ok())
+                && crate::system::files::move_no_replace(entry.path(), &target).is_ok()
+        };
+    }
+    Ok(accounted)
+}
+
+/// `relative` as the path of `paths` it lies under spells it: a source root
+/// given as `./src` keeps that spelling in every path of a snapshot.
+fn as_recorded(paths: &[PathBuf], relative: &Path) -> PathBuf {
+    paths
+        .iter()
+        .find_map(|scope| {
+            let plain = scope
+                .components()
+                .filter(|part| matches!(part, Component::Normal(_)))
+                .collect::<PathBuf>();
+            let rest = relative.strip_prefix(plain).ok()?;
+            Some(scope.join(rest))
+        })
+        .unwrap_or_else(|| relative.to_path_buf())
+}
+
+/// Moves back each entry under `backup` whose path under `root` is gone while
+/// the stage still holds its replacement: a replacement the publication put
+/// in place has left the stage. A path it deleted has none, so it stays
+/// deleted, and a path saved meanwhile stays as saved. A kill between the
+/// link that put a replacement in place and the removal of its staged name
+/// leaves both, so a file the user then deletes comes back as the old one.
+fn restore_missing(backup: &Path, root: &Path, staged: &Path) -> Result<()> {
+    let entries = match fs::read_dir(backup) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let target = root.join(entry.file_name());
+        let replacement = staged.join(entry.file_name());
+        match fs::symlink_metadata(&target) {
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && fs::symlink_metadata(&replacement).is_ok() =>
+            {
+                match crate::system::files::move_no_replace(&entry.path(), &target) {
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    outcome => {
+                        outcome.with_context(|| format!("Cannot restore {}", target.display()))?
+                    }
+                }
+            }
+            Ok(metadata) if metadata.is_dir() && entry.file_type()?.is_dir() => {
+                restore_missing(&entry.path(), &target, &replacement)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn root_history(context: &BoundContext, summary: &Map<String, Value>) -> Result<PathBuf> {
     let id = summary.get("historyId").and_then(Value::as_str).context("The daemon stopped before the import commit was recorded. Run rbx pl to recover; no import will be repeated")?;
     anyhow::ensure!(
@@ -775,7 +1085,7 @@ fn recover(
     context: &BoundContext,
     bridge: &BridgeServer,
     services: &[String],
-    work: ImportWork,
+    mut work: ImportWork,
     input: Option<Value>,
 ) -> Result<bool> {
     #[cfg(windows)]
@@ -802,17 +1112,16 @@ fn recover(
     }
     let proof = capture_push_proof(bridge, &guard)?
         .context("Studio cannot prove a stable recovery capture; run rbx pl")?;
-    let paths = work.paths.clone();
-    let (current, _) = settle(context, bridge, (services, None), work, &proof)?;
+    let settlement = settle(context, bridge, (services, None), &mut work, &proof)?;
     release.proof = Some(proof);
     acknowledge_verified_push(bridge, services, &guard, &mut release)?;
-    let Some(current) = current else {
+    let Settlement::Published(current) = settlement else {
         return Ok(false);
     };
     retain_full_push(
         bridge,
         input.as_ref(),
-        &paths,
+        &work.paths,
         current,
         &release,
         #[cfg(windows)]
@@ -832,19 +1141,22 @@ pub(crate) fn fixture_running_import(context: &BoundContext) -> Result<()> {
             verification_paths: &HashSet::new(),
             before: &snapshot,
             expected: &snapshot,
+            generated: &ProjectSnapshot::default(),
             input: None,
             history_id: "fixture".into(),
+            optional: false,
         },
     )?;
-    committed(
-        &Map::from_iter([("verifiedPushProof".into(), json!({"fixture": true}))]),
-        &snapshot,
-    )
+    committed(&Map::from_iter([(
+        "verifiedPushProof".into(),
+        json!({"fixture": true}),
+    )]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot::export::PublicationStep;
 
     fn context(root: &Path) -> BoundContext {
         BoundContext {
@@ -865,6 +1177,10 @@ mod tests {
     }
 
     fn begin_test(context: &BoundContext) -> Result<ProjectSnapshot> {
+        begin_test_as(context, false)
+    }
+
+    fn begin_test_as(context: &BoundContext, optional: bool) -> Result<ProjectSnapshot> {
         let root = Path::new(&context.root);
         fs::create_dir_all(root.join("src"))?;
         fs::write(root.join("src/A.luau"), "return 1")?;
@@ -877,14 +1193,16 @@ mod tests {
                 verification_paths: &HashSet::from(["src/A.luau".into()]),
                 before: &ProjectSnapshot::default(),
                 expected: &expected,
+                generated: &ProjectSnapshot::default(),
                 input: None,
                 history_id: "test-history".into(),
+                optional,
             },
         )?;
-        committed(
-            &Map::from_iter([("verifiedPushProof".into(), json!({"test": true}))]),
-            &expected,
-        )?;
+        committed(&Map::from_iter([(
+            "verifiedPushProof".into(),
+            json!({"test": true}),
+        )]))?;
         Ok(expected)
     }
 
@@ -947,7 +1265,7 @@ mod tests {
             history::SyncHistory::begin(&root, &root.join("src"), &expected, &verification_paths)?;
         fs::write(root.join("src/A.luau"), "return 2")?;
         let bridge = crate::studio::bridge::routing_tests::fixture();
-        let work = ImportWork {
+        let mut work = ImportWork {
             before: ProjectSnapshot::default(),
             expected,
             paths,
@@ -956,14 +1274,14 @@ mod tests {
             history,
             summary: Map::new(),
         };
-        let (published, _) = settle(
+        let settlement = settle(
             &context,
             &bridge,
             (&["Workspace".into()], None),
-            work,
+            &mut work,
             &json!({}),
         )?;
-        assert!(published.is_none());
+        assert!(matches!(settlement, Settlement::Unwritten));
         finish_request(None)?;
         assert!(before_request(&context, &bridge, op::PUSH, &json!({}))?.is_none());
         assert_eq!(fs::read_to_string(root.join("src/A.luau"))?, "return 2");
@@ -1056,17 +1374,16 @@ mod tests {
                 verification_paths: &verification_paths,
                 before: &ProjectSnapshot::default(),
                 expected: &fixture.desired,
+                generated: &ProjectSnapshot::default(),
                 input: None,
                 history_id: history.id()?,
+                optional: false,
             },
         )?;
-        committed(
-            &Map::from_iter([
-                ("historyId".into(), json!(history.id()?)),
-                ("verifiedPushProof".into(), json!({"expired":true})),
-            ]),
-            &fixture.desired,
-        )?;
+        committed(&Map::from_iter([
+            ("historyId".into(), json!(history.id()?)),
+            ("verifiedPushProof".into(), json!({"expired":true})),
+        ]))?;
         interrupt_test_request();
         super::super::push_flow_tests::replace_capture(fixture.desired.clone());
         assert!(
@@ -1093,7 +1410,7 @@ mod tests {
     {
         let bridge = crate::studio::bridge::routing_tests::fixture();
         for bytes in [
-            rmp_serde::to_vec_named(&json!({"version": 2, "future": "field"}))?,
+            rmp_serde::to_vec_named(&json!({"version": 3, "future": "field"}))?,
             vec![0xc1],
         ] {
             let root = crate::tests::support::temp_dir("settle-future-journal");
@@ -1233,10 +1550,7 @@ mod tests {
         });
         let context = context(&root);
         let expected = begin_test(&context)?;
-        committed(
-            &Map::from_iter([("verifiedPushProof".into(), json!(3))]),
-            &expected,
-        )?;
+        committed(&Map::from_iter([("verifiedPushProof".into(), json!(3))]))?;
         accepted(expected.entries.iter())?;
         let journal = Journal::load(&context)?.unwrap();
         assert!(journal.record.expected.matches(&expected));
@@ -1373,8 +1687,8 @@ mod tests {
     #[test]
     fn publication_checks_studio_before_and_after_and_preserves_file_edits() -> Result<()> {
         // At 4 a file of a service the stage does not settle is edited once
-        // the stage is published.
-        for failure_at in [0, 1, 2, 3, 4] {
+        // the stage is published; at 5 the check after it finds newer files.
+        for failure_at in [0, 1, 2, 3, 4, 5] {
             let root = crate::tests::support::temp_dir("import-publication-fence");
             let _cleanup = OnDrop::new(|| {
                 let _ = fs::remove_dir_all(&root);
@@ -1402,13 +1716,35 @@ mod tests {
                 if failure_at == 4 && calls.get() == 2 {
                     fs::write(root.join(outside), "newer edit elsewhere")?;
                 }
+                if failure_at == 5 && calls.get() == 2 {
+                    return Err(NewerProjectFiles { written: false }.into());
+                }
                 anyhow::ensure!(
                     calls.get() != failure_at,
                     "Studio closed or changed at publication boundary"
                 );
                 Ok(())
             };
-            let result = publish_checked(stage, &root, (&paths, &held), stable);
+            let result = publish_checked(
+                stage,
+                &root,
+                (&paths, &ProjectSnapshot::default(), &held),
+                stable,
+            );
+            let newer = result.as_ref().err().and_then(|error| {
+                error
+                    .downcast_ref::<NewerProjectFiles>()
+                    .map(|newer| newer.written)
+            });
+            assert_eq!(
+                newer,
+                match failure_at {
+                    3 => Some(false),
+                    4 | 5 => Some(true),
+                    _ => None,
+                },
+                "failure at {failure_at}"
+            );
             match failure_at {
                 0 => {
                     assert!(result.is_ok());
@@ -1418,7 +1754,7 @@ mod tests {
                     assert!(result.is_err());
                     assert_eq!(fs::read_to_string(root.join(relative))?, "original");
                 }
-                2 => {
+                2 | 5 => {
                     assert!(result.is_err());
                     assert_eq!(fs::read_to_string(root.join(relative))?, "accepted");
                 }
@@ -1539,6 +1875,784 @@ mod tests {
         Ok(())
     }
 
+    /// A settlement of files that hold what the push wrote copies none of
+    /// them before the push answers, and leaves nothing unsettled and says
+    /// nothing when it fails or the daemon stops before it publishes.
+    #[test]
+    fn an_optional_settlement_that_cannot_finish_leaves_nothing_unsettled() -> Result<()> {
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        for next in [None, Some(op::LIVE_START), Some(op::PULL)] {
+            let root = crate::tests::support::temp_dir("settle-optional");
+            let _cleanup = OnDrop::new(|| {
+                let _ = fs::remove_dir_all(&root);
+            });
+            let context = context(&root);
+            begin_test_as(&context, true)?;
+            assert!(!directory(&context).join("packs").exists());
+            let record: Value =
+                rmp_serde::from_slice(&fs::read(directory(&context).join("pending.rmp"))?)?;
+            assert_eq!(record["version"], 2);
+            let notices = crate::daemon::fixture_request_notices();
+            match next {
+                Some(operation) => {
+                    interrupt_test_request();
+                    before_request(&context, &bridge, operation, &json!({}))?;
+                }
+                None => finish_request(Some(
+                    "Studio changed during import settlement; the committed import was not repeated",
+                ))?,
+            }
+            assert_eq!(notices(), Vec::<String>::new(), "{next:?}");
+            assert!(!pending(&context), "{next:?}");
+            assert!(
+                RECOVERY_PULL
+                    .with(|slot| slot.borrow_mut().take())
+                    .is_none()
+            );
+        }
+        Ok(())
+    }
+
+    /// A readback of an optional settlement that finds Studio does not hold
+    /// what the push sent leaves a record the next command reports.
+    #[test]
+    fn a_readback_mismatch_of_an_optional_settlement_stays_unsettled() -> Result<()> {
+        let root = crate::tests::support::temp_dir("settle-optional-mismatch");
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let context = context(&root);
+        let expected = begin_test_as(&context, true)?;
+        let verification_paths = HashSet::from([PathBuf::from("src/A.luau")]);
+        let history =
+            history::SyncHistory::begin(&root, &root.join("src"), &expected, &verification_paths)?;
+        let mut work = ImportWork {
+            before: ProjectSnapshot::default(),
+            expected: expected.clone(),
+            paths: vec![PathBuf::from("src")],
+            verification_paths,
+            prepared: HashMap::new(),
+            history,
+            summary: Map::new(),
+        };
+        let mut observed = expected.clone();
+        observed.entries.insert(
+            "src/A.luau".into(),
+            SnapshotEntry::File(b"return 999".to_vec()),
+        );
+        super::super::push_flow_tests::replace_capture(observed);
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        let error = settle(
+            &context,
+            &bridge,
+            (&["Workspace".into()], None),
+            &mut work,
+            &json!({}),
+        )
+        .err()
+        .context("the readback matched")?;
+        finish_request(Some(&format!("{error:#}")))?;
+        let journal = Journal::load(&context)?.context("nothing stayed unsettled")?;
+        assert!(!journal.record.optional);
+        assert!(journal.record.error.is_some());
+        let packs = journal.directory.join("packs");
+        assert!(journal.record.expected.load_at(&packs, |_| true)? == expected);
+        let notices = crate::daemon::fixture_request_notices();
+        before_request(&context, &bridge, op::LIVE_START, &json!({}))?;
+        let notices = notices();
+        assert!(
+            notices.len() == 1
+                && notices[0].starts_with("The files of the last push were not settled"),
+            "{notices:?}"
+        );
+        Ok(())
+    }
+
+    /// An optional settlement narrowed on a pull whose sourcemap the files
+    /// no longer hold reads nothing back and leaves the files as pushed.
+    #[test]
+    fn an_optional_settlement_off_the_pulls_sourcemap_reads_nothing_back() -> Result<()> {
+        let root = crate::tests::support::temp_dir("settle-optional-sourcemap");
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let context = context(&root);
+        let expected = begin_test_as(&context, true)?;
+        fs::write(root.join("sourcemap.json"), "{}")?;
+        let verification_paths = HashSet::from([PathBuf::from("src/A.luau")]);
+        let history =
+            history::SyncHistory::begin(&root, &root.join("src"), &expected, &verification_paths)?;
+        let mut work = ImportWork {
+            before: ProjectSnapshot::default(),
+            expected,
+            paths: vec![PathBuf::from("src")],
+            verification_paths,
+            prepared: HashMap::new(),
+            history,
+            summary: Map::new(),
+        };
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        super::super::push_flow_tests::replace_capture(ProjectSnapshot::default());
+        let narrowed = Narrowed {
+            services: &["Workspace".into()],
+            sourcemap: &SourcemapState::new(),
+        };
+        let settlement = settle(
+            &context,
+            &bridge,
+            (
+                &["Workspace".into(), "ServerStorage".into()],
+                Some(narrowed),
+            ),
+            &mut work,
+            &json!({}),
+        )?;
+        assert!(matches!(settlement, Settlement::Unwritten));
+        assert!(
+            super::super::push_flow_tests::capture(&context, &[], Path::new("")).is_some(),
+            "the settlement read Studio back"
+        );
+        finish_request(None)?;
+        assert!(!pending(&context));
+        assert_eq!(fs::read_to_string(root.join("src/A.luau"))?, "return 1");
+        Ok(())
+    }
+
+    /// The files a killed publication replaces, as the push left them and as
+    /// the settlement leaves them. Every file of ReplicatedStorage changes,
+    /// so that service is swapped as one directory; the files of Workspace
+    /// are swapped one by one.
+    const PUSHED: [(&str, &str); 5] = [
+        ("src/ReplicatedStorage/Gone.luau", "old gone"),
+        ("src/ReplicatedStorage/Mod.luau", "old mod"),
+        ("src/Workspace/Kept.luau", "kept"),
+        ("src/Workspace/Removed.luau", "old removed"),
+        ("src/Workspace/Replaced.luau", "old replaced"),
+    ];
+    const SETTLED: [(&str, &str); 5] = [
+        ("src/ReplicatedStorage/Fresh.luau", "new fresh"),
+        ("src/ReplicatedStorage/Mod.luau", "new mod"),
+        ("src/Workspace/Added.luau", "new added"),
+        ("src/Workspace/Kept.luau", "kept"),
+        ("src/Workspace/Replaced.luau", "new replaced"),
+    ];
+    /// The paths that publication swaps under the source root. It swaps the
+    /// sourcemap too, a derived file the record of the import leaves out.
+    const SWAPPED: [&str; 4] = [
+        "src/ReplicatedStorage",
+        "src/Workspace/Added.luau",
+        "src/Workspace/Removed.luau",
+        "src/Workspace/Replaced.luau",
+    ];
+    const MAP: &str = "sourcemap.json";
+    const SAVED: &str = "saved while down";
+    const SAVED_BEFORE: &str = "saved before the kill";
+
+    type Tree = BTreeMap<PathBuf, String>;
+
+    fn tree(files: &[(&str, &str)]) -> Tree {
+        files
+            .iter()
+            .map(|(path, text)| (PathBuf::from(path), (*text).to_string()))
+            .collect()
+    }
+
+    /// The files under `base/src`, by their path under `base`.
+    fn read_tree(base: &Path) -> Result<Tree> {
+        let mut files = Tree::new();
+        if !base.join("src").exists() {
+            return Ok(files);
+        }
+        for entry in WalkDir::new(base.join("src")) {
+            let entry = entry?;
+            if entry.file_type().is_file() {
+                files.insert(
+                    entry.path().strip_prefix(base)?.to_path_buf(),
+                    fs::read_to_string(entry.path())?,
+                );
+            }
+        }
+        Ok(files)
+    }
+
+    /// What the user does to a file while the daemon is down.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum WhileDown {
+        Nothing,
+        Delete,
+        Rename,
+        Save,
+    }
+
+    enum Report {
+        Container(PathBuf),
+        Killed(Vec<PublicationStep>, Option<PathBuf>),
+        Finished(Result<(), String>),
+    }
+
+    /// The file a user acts on at a swapped `path`: that file, or one of
+    /// the directory.
+    fn file_at(path: &Path) -> PathBuf {
+        if path == Path::new(SWAPPED[0]) {
+            path.join("Mod.luau")
+        } else {
+            path.to_path_buf()
+        }
+    }
+
+    /// A publication stopped as a killed daemon stops it.
+    struct Killed {
+        _history: history::SyncHistory,
+        fixture: super::super::push_flow_tests::Fixture,
+        /// The files Studio held before the push, and those the push left.
+        before: ProjectSnapshot,
+        expected: ProjectSnapshot,
+        container: PathBuf,
+        /// The steps it reached, the last the one it stopped at.
+        steps: Vec<PublicationStep>,
+        /// The file saved as SAVED_BEFORE once the publication had checked
+        /// the path the kill came at, and before it moved that path aside.
+        saved: Option<PathBuf>,
+    }
+
+    /// Publishes SETTLED over PUSHED for a journaled import, on a thread that
+    /// stops at its `kill_at`th step and never runs again: nothing it holds
+    /// is dropped, and the journal and its lock go as with a dead process.
+    /// None where the publication ends before that step. With `save_before`
+    /// a file is saved at the path under `src` that the step before the
+    /// kill is to move aside.
+    fn publication_killed_at(
+        kill_at: usize,
+        optional: bool,
+        save_before: bool,
+    ) -> Result<Option<Killed>> {
+        let fixture = super::super::push_flow_tests::Fixture::new()?;
+        let context = fixture.context.clone();
+        let root = PathBuf::from(&context.root);
+        for (path, text) in PUSHED {
+            fs::create_dir_all(root.join(path).parent().unwrap())?;
+            fs::write(root.join(path), text)?;
+        }
+        fs::write(root.join(MAP), "old map")?;
+        let paths = vec![PathBuf::from("src"), PathBuf::from("instances")];
+        let expected = capture_snapshot(&root, &paths)?;
+        let mut before = expected.clone();
+        before.entries.insert(
+            "src/Workspace/Replaced.luau".into(),
+            SnapshotEntry::File(b"before the push".to_vec()),
+        );
+        let verification_paths = expected.entries.keys().cloned().collect::<HashSet<_>>();
+        let history = history::SyncHistory::begin(
+            &root,
+            Path::new(&context.source),
+            &before,
+            &verification_paths,
+        )?;
+        let history_id = history.id()?;
+        let (held, pushed_over) = (expected.clone(), before.clone());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::Builder::new().spawn(move || {
+            let publish = || -> Result<()> {
+                let services = ["ReplicatedStorage".to_string(), "Workspace".to_string()];
+                begin(
+                    &context,
+                    ImportStart {
+                        services: &services,
+                        paths: &paths,
+                        verification_paths: &verification_paths,
+                        before: &before,
+                        expected: &held,
+                        generated: &ProjectSnapshot::default(),
+                        input: None,
+                        history_id: history_id.clone(),
+                        optional,
+                    },
+                )?;
+                committed(&Map::from_iter([
+                    ("historyId".into(), json!(history_id)),
+                    ("verifiedPushProof".into(), json!({"expired": true})),
+                ]))?;
+                let stage = ExportProjectStage::create(&root, Path::new("src"), &services)?;
+                for (path, _) in PUSHED {
+                    fs::remove_file(stage.project_root.join(path))?;
+                }
+                for (path, text) in SETTLED {
+                    fs::write(stage.project_root.join(path), text)?;
+                }
+                fs::write(stage.project_root.join(MAP), "new map")?;
+                let _ = sender.send(Report::Container(stage.container().to_path_buf()));
+                let mut steps = Vec::new();
+                let killed = sender.clone();
+                let (project, mut saved) = (root.clone(), None);
+                let _hook = crate::snapshot::export::hook_publication_steps(move |step| {
+                    steps.push(step.clone());
+                    if let PublicationStep::MoveAside(path) = step
+                        && save_before
+                        && steps.len() == kill_at
+                        && path.starts_with("src")
+                    {
+                        let file = file_at(path);
+                        fs::write(project.join(&file), SAVED_BEFORE).unwrap();
+                        saved = Some(file);
+                    }
+                    if steps.len() > kill_at {
+                        interrupt_test_request();
+                        let _ = killed.send(Report::Killed(steps.clone(), saved.clone()));
+                        loop {
+                            thread::park();
+                        }
+                    }
+                });
+                let (_, published) =
+                    publish_checked(stage, &root, (&paths, &before, &held), || Ok(()))?;
+                drop(published);
+                finish_request(None)
+            };
+            let outcome = publish().map_err(|error| format!("{error:#}"));
+            let _ = sender.send(Report::Finished(outcome));
+        })?;
+        let mut container = None;
+        loop {
+            let report = receiver
+                .recv_timeout(Duration::from_secs(60))
+                .context("the publication neither stopped nor ended")?;
+            match report {
+                Report::Container(path) => container = Some(path),
+                Report::Finished(outcome) => {
+                    outcome.map_err(anyhow::Error::msg)?;
+                    return Ok(None);
+                }
+                Report::Killed(steps, saved) => {
+                    return Ok(Some(Killed {
+                        _history: history,
+                        fixture,
+                        before: pushed_over,
+                        expected,
+                        container: container.context("the publication staged nothing")?,
+                        steps,
+                        saved,
+                    }));
+                }
+            }
+        }
+    }
+
+    impl Killed {
+        fn reached(&self, step: PublicationStep) -> bool {
+            self.steps.contains(&step)
+        }
+
+        /// Whether the swap of `path` was done at the kill: its replacement
+        /// was in place, or it was moved aside with none to come.
+        fn swapped(&self, path: &Path) -> bool {
+            let replaced =
+                path == Path::new(MAP) || tree(&SETTLED).keys().any(|file| file.starts_with(path));
+            self.reached(PublicationStep::PublishedIn(path.into()))
+                || !replaced && self.reached(PublicationStep::MovedAside(path.into()))
+        }
+
+        /// The files once the next command recovered: each swapped path as
+        /// the settlement leaves it, every other as the push left it.
+        fn recovered(&self) -> Tree {
+            let (pushed, settled) = (tree(&PUSHED), tree(&SETTLED));
+            pushed
+                .keys()
+                .chain(settled.keys())
+                .filter_map(|file| {
+                    let swap = SWAPPED.iter().find(|swap| file.starts_with(swap));
+                    let from = if swap.is_some_and(|swap| self.swapped(Path::new(swap))) {
+                        &settled
+                    } else {
+                        &pushed
+                    };
+                    Some((file.clone(), from.get(file)?.clone()))
+                })
+                .collect()
+        }
+
+        /// The file the user acts on: the one the kill came at, or one of
+        /// the directory it came at.
+        fn acted_on(&self) -> PathBuf {
+            use PublicationStep::*;
+            match self.steps.last() {
+                Some(MoveAside(path) | MovedAside(path) | PublishedIn(path))
+                    if path.starts_with("src") =>
+                {
+                    file_at(path)
+                }
+                _ => PathBuf::from("src/Workspace/Replaced.luau"),
+            }
+        }
+
+        /// Does `action` to the project and to `recovered`, the files
+        /// recovery leaves without it. A save into a directory that was
+        /// moved aside makes that directory anew: beside the save come back
+        /// the files the stage holds a replacement of, and the others stay
+        /// moved aside, which the settlement deletes.
+        fn act(&self, action: WhileDown, recovered: &mut Tree) -> Result<()> {
+            let root = Path::new(&self.fixture.context.root);
+            let file = self.acted_on();
+            let on_disk = root.join(&file);
+            match action {
+                WhileDown::Delete if on_disk.exists() => {
+                    fs::remove_file(on_disk)?;
+                    recovered.remove(&file);
+                }
+                WhileDown::Rename if on_disk.exists() => {
+                    let renamed = PathBuf::from(format!("{}.renamed", file.display()));
+                    fs::rename(on_disk, root.join(&renamed))?;
+                    let text = recovered.remove(&file).context("no file to rename")?;
+                    recovered.insert(renamed, text);
+                }
+                WhileDown::Save => {
+                    let folder = file.parent().context("the file has no folder")?;
+                    if !root.join(folder).exists() {
+                        let settled = tree(&SETTLED);
+                        recovered.retain(|path, _| {
+                            !path.starts_with(folder) || settled.contains_key(path)
+                        });
+                        fs::create_dir_all(root.join(folder))?;
+                    }
+                    fs::write(on_disk, SAVED)?;
+                    recovered.insert(file, SAVED.to_string());
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        /// Checks the record a restart finds: until the publication records
+        /// itself it is the push's own, and from then on one that an older
+        /// daemon reads too, with the stage and the files of the push.
+        fn check_record(&self, optional: bool) -> Result<()> {
+            let context = &self.fixture.context;
+            let journal = Journal::load(context)?.context("the kill left no record")?;
+            let saved: Value =
+                rmp_serde::from_slice(&fs::read(journal.directory.join("pending.rmp"))?)?;
+            if self.steps.len() == 1 {
+                assert_eq!(journal.record.optional, optional);
+                assert_eq!(journal.record.container, None);
+                return Ok(());
+            }
+            assert_eq!(saved["version"], 1);
+            assert!(!journal.record.optional);
+            assert_eq!(
+                journal.record.container.as_deref(),
+                Some(self.container.as_path())
+            );
+            let packs = journal.directory.join("packs");
+            assert!(journal.record.expected.load_at(&packs, |_| true)? == self.expected);
+            assert!(journal.record.before.load_at(&packs, |_| true)? == self.before);
+            Ok(())
+        }
+
+        /// Runs the restart's recovery through `operation` after `action`,
+        /// and checks what it leaves.
+        fn recover(&self, action: WhileDown, operation: u16, optional: bool) -> Result<()> {
+            let context = &self.fixture.context;
+            let root = Path::new(&context.root);
+            let case = format!("{:?}, {action:?}, op {operation}", self.steps.last());
+            let unrecorded = self.steps.len() == 1;
+            let moved_aside = read_tree(&self.container.join("previous"))?;
+            let mut recovered = self.recovered();
+            if let Some(saved) = &self.saved {
+                recovered.insert(saved.clone(), SAVED_BEFORE.to_string());
+            }
+            self.act(action, &mut recovered)?;
+            let settles = operation == op::PUSH && !(optional && unrecorded);
+            if operation == op::PUSH {
+                super::super::push_flow_tests::replace_capture(self.expected.clone());
+                recovered = tree(&PUSHED);
+            }
+            let notices = crate::daemon::fixture_request_notices();
+            let bridge = self.fixture.bridge.as_ref().unwrap();
+            let answered = before_request(context, bridge, operation, &json!({}))
+                .with_context(|| case.clone())?;
+            let notices = notices();
+            assert!(answered.is_none(), "{case}");
+            let files = read_tree(root)?;
+            assert_eq!(files, recovered, "{case}");
+            let map = if self.swapped(Path::new(MAP)) {
+                "new map"
+            } else {
+                "old map"
+            };
+            assert_eq!(fs::read_to_string(root.join(MAP))?, map, "{case}");
+            let settled = tree(&SETTLED);
+            let unaccounted = moved_aside
+                .iter()
+                .filter(|(path, text)| {
+                    files.get(*path) != Some(*text) && files.get(*path) != settled.get(*path)
+                })
+                .collect::<Vec<_>>();
+            for (path, text) in &unaccounted {
+                let kept = fs::read_to_string(self.container.join("previous").join(path));
+                assert_eq!(
+                    kept.ok().as_ref(),
+                    Some(*text),
+                    "{case}: {}",
+                    path.display()
+                );
+            }
+            if unaccounted.is_empty() && !unrecorded {
+                assert!(!self.container.exists(), "{case}");
+            }
+            if operation == op::PUSH || optional && unrecorded {
+                assert_eq!(notices, Vec::<String>::new(), "{case}");
+                assert!(!pending(context), "{case}");
+            } else {
+                assert_eq!(
+                    notices,
+                    [
+                        "The files of the last push were not settled: the daemon stopped before settlement finished. Repeat rbx ps to reconcile your files, or run rbx pl to take Studio's state."
+                    ],
+                    "{case}"
+                );
+                assert!(pending(context), "{case}");
+            }
+            let unread =
+                super::super::push_flow_tests::capture(context, &[], Path::new("")).is_some();
+            assert_eq!(unread, !settles, "{case}: the restart settled the files");
+            Ok(())
+        }
+    }
+
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.container);
+        }
+    }
+
+    /// A daemon killed at any step of a publication leaves each path whole:
+    /// as the publication found it or as it was to leave it, with what the
+    /// user did to it while the daemon was down. Nothing is truncated or
+    /// there twice, the stage stays while it holds the only copy of a file,
+    /// and a full push settles the files. A file saved once the publication
+    /// had checked its path, and moved aside with the kill before the check
+    /// of what was moved, comes back, also where the publication deletes
+    /// that path; where the user saved it again while the daemon was down,
+    /// the stage keeps the earlier save.
+    #[test]
+    fn a_kill_at_any_step_of_a_publication_leaves_each_path_whole() -> Result<()> {
+        use WhileDown::*;
+        let cases = [
+            (Nothing, op::LIVE_START),
+            (Nothing, op::PUSH),
+            (Delete, op::LIVE_START),
+            (Rename, op::LIVE_START),
+            (Save, op::LIVE_START),
+        ];
+        for optional in [true, false] {
+            let mut walked = Vec::<PublicationStep>::new();
+            let mut saved_before = Vec::new();
+            'steps: for kill_at in 0.. {
+                anyhow::ensure!(kill_at < 64, "the publication does not end");
+                let moved_aside = match walked.last() {
+                    Some(PublicationStep::MoveAside(path)) if path.starts_with("src") => {
+                        Some(path.clone())
+                    }
+                    _ => None,
+                };
+                for (action, operation) in cases {
+                    let Some(killed) = publication_killed_at(kill_at, optional, false)? else {
+                        break 'steps;
+                    };
+                    if (action, operation) == cases[0] {
+                        killed.check_record(optional)?;
+                        walked.push(killed.steps.last().cloned().unwrap());
+                    }
+                    killed.recover(action, operation, optional)?;
+                }
+                for action in [Nothing, Save] {
+                    let Some(path) = &moved_aside else {
+                        break;
+                    };
+                    let killed = publication_killed_at(kill_at, optional, true)?
+                        .context("the publication ended before the kill")?;
+                    let stopped_at = PublicationStep::MovedAside(path.clone());
+                    assert_eq!(killed.steps.last(), Some(&stopped_at));
+                    assert_eq!(killed.saved, Some(file_at(path)));
+                    killed.recover(action, op::LIVE_START, optional)?;
+                    saved_before.push(path.clone());
+                }
+            }
+            for path in SWAPPED {
+                assert!(
+                    saved_before.contains(&PathBuf::from(path)),
+                    "no save before the kill at {path}: {saved_before:?}"
+                );
+            }
+            let at = |path: &str| PathBuf::from(path);
+            for step in [
+                PublicationStep::BeforeRecord,
+                PublicationStep::MovedAside(at(MAP)),
+                PublicationStep::PublishedIn(at(MAP)),
+                PublicationStep::MovedAside(at(SWAPPED[0])),
+                PublicationStep::PublishedIn(at(SWAPPED[0])),
+                PublicationStep::PublishedIn(at(SWAPPED[1])),
+                PublicationStep::MovedAside(at(SWAPPED[2])),
+                PublicationStep::MovedAside(at(SWAPPED[3])),
+                PublicationStep::PublishedIn(at(SWAPPED[3])),
+                PublicationStep::Swapped,
+                PublicationStep::BeforeClear,
+            ] {
+                assert!(walked.contains(&step), "no kill at {step:?}: {walked:?}");
+            }
+            assert_eq!(walked.len(), 18, "{walked:?}");
+        }
+        Ok(())
+    }
+
+    /// A publication that cannot put back all it moved aside is an error,
+    /// not newer files: its record stays, with the stage that holds them.
+    /// Here a save stops the publication, which then finds the first file it
+    /// moved aside gone.
+    #[test]
+    fn an_incomplete_rollback_keeps_its_record_and_what_it_moved_aside() -> Result<()> {
+        let root = crate::tests::support::temp_dir("settle-incomplete-rollback");
+        let context = context(&root);
+        begin_test_as(&context, true)?;
+        let first = Path::new("src/Workspace/A.luau");
+        let second = Path::new("src/Workspace/B.luau");
+        let kept = Path::new("src/Workspace/Kept.luau");
+        fs::create_dir_all(root.join(first.parent().unwrap()))?;
+        for path in [first, second, kept] {
+            fs::write(root.join(path), "original")?;
+        }
+        let stage = ExportProjectStage::create(&root, Path::new("src"), &["Workspace".into()])?;
+        for path in [first, second] {
+            fs::write(stage.project_root.join(path), "accepted")?;
+        }
+        let container = stage.container().to_path_buf();
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+            let _ = fs::remove_dir_all(&container);
+        });
+        let paths = stage.publish_paths().to_vec();
+        let held = capture_snapshot(&root, &paths)?;
+        let (saved, moved_aside) = (root.join(second), container.join("previous").join(first));
+        let hook = crate::snapshot::export::hook_publication_steps(move |step| {
+            if *step == PublicationStep::MoveAside(second.into()) {
+                fs::write(&saved, "saved meanwhile").unwrap();
+                fs::remove_file(&moved_aside).unwrap();
+            }
+        });
+        let result = publish_checked(
+            stage,
+            &root,
+            (&paths, &ProjectSnapshot::default(), &held),
+            || Ok(()),
+        );
+        drop(hook);
+        let error = result.err().context("the publication went through")?;
+        assert!(
+            error.downcast_ref::<NewerProjectFiles>().is_none()
+                && error.to_string().contains("rollback was incomplete"),
+            "{error:#}"
+        );
+        finish_request(Some(&format!("{error:#}")))?;
+        let journal = Journal::load(&context)?.context("the record was dropped")?;
+        assert!(!journal.record.optional);
+        assert!(
+            journal
+                .record
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("rollback was incomplete"))
+        );
+        assert_eq!(
+            journal.record.container.as_deref(),
+            Some(container.as_path())
+        );
+        assert!(container.join("previous").exists());
+        assert_eq!(fs::read_to_string(root.join(second))?, "saved meanwhile");
+        Ok(())
+    }
+
+    /// A recovery push whose publication cannot put back all it moved aside
+    /// fails and names the stage that holds the files; its record stays,
+    /// with that stage. Here the daemon was killed once every path was
+    /// swapped, so the recovery swaps each back: a save stops it, and it
+    /// then finds a file it moved aside gone.
+    #[test]
+    fn a_recovery_push_fails_on_an_incomplete_rollback_and_keeps_its_record() -> Result<()> {
+        let mut kill_at = 0;
+        let killed = loop {
+            let killed = publication_killed_at(kill_at, false, false)?
+                .context("no kill once every path was swapped")?;
+            if killed.steps.last() == Some(&PublicationStep::Swapped) {
+                break killed;
+            }
+            kill_at += 1;
+        };
+        let context = &killed.fixture.context;
+        let root = Path::new(&context.root);
+        let first = Path::new("src/Workspace/Added.luau");
+        let second = Path::new("src/Workspace/Replaced.luau");
+        super::super::push_flow_tests::replace_capture(killed.expected.clone());
+        let stage = std::rc::Rc::new(RefCell::new(None::<PathBuf>));
+        let _cleanup = OnDrop::new({
+            let stage = std::rc::Rc::clone(&stage);
+            move || {
+                if let Some(stage) = stage.borrow().as_ref() {
+                    let _ = fs::remove_dir_all(stage);
+                }
+            }
+        });
+        let (saved, staged) = (root.join(second), std::rc::Rc::clone(&stage));
+        let hook = crate::snapshot::export::hook_publication_steps(move |step| {
+            if *step == PublicationStep::MoveAside(second.into()) {
+                let container = CURRENT
+                    .with(|slot| slot.borrow().as_ref()?.record.container.clone())
+                    .unwrap();
+                fs::write(&saved, "saved meanwhile").unwrap();
+                fs::remove_file(container.join("previous").join(first)).unwrap();
+                *staged.borrow_mut() = Some(container);
+            }
+        });
+        let bridge = killed.fixture.bridge.as_ref().unwrap();
+        let result = before_request(context, bridge, op::PUSH, &json!({}));
+        drop(hook);
+        let error = result.err().context("the recovery push went on")?;
+        assert!(
+            error.is::<crate::snapshot::export::IncompleteRollback>(),
+            "{error:#}"
+        );
+        let stage = stage.borrow().clone().context("nothing was moved aside")?;
+        assert_ne!(stage, killed.container);
+        assert!(
+            format!("{error:#}").contains(&stage.display().to_string()),
+            "{error:#}"
+        );
+        let journal = Journal::load(context)?.context("the record was resolved")?;
+        assert!(
+            journal
+                .record
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("rollback was incomplete"))
+        );
+        assert_eq!(journal.record.container.as_deref(), Some(stage.as_path()));
+        assert!(stage.join("previous").exists());
+        assert_eq!(fs::read_to_string(root.join(second))?, "saved meanwhile");
+        Ok(())
+    }
+
+    /// A project that names its source root `./src` keeps that spelling in
+    /// the paths of its record, which a file moved aside is looked up under.
+    #[test]
+    fn a_moved_aside_file_is_looked_up_as_its_record_spells_it() {
+        let paths = [PathBuf::from("./src"), PathBuf::from("instances")];
+        for (found, recorded) in [
+            ("src/Workspace/A.luau", "./src/Workspace/A.luau"),
+            ("instances/Workspace.renium", "instances/Workspace.renium"),
+            ("sourcemap.json", "sourcemap.json"),
+        ] {
+            // Paths compare by their components, a leading `.` among them.
+            assert_eq!(as_recorded(&paths, Path::new(found)), Path::new(recorded));
+        }
+    }
+
     /// A journal that names a path outside the project is not followed.
     #[test]
     fn a_journal_path_outside_the_project_is_refused() -> Result<()> {
@@ -1596,17 +2710,16 @@ mod tests {
                 verification_paths: &verification_paths,
                 before: &ProjectSnapshot::default(),
                 expected: &fixture.desired,
+                generated: &ProjectSnapshot::default(),
                 input: None,
                 history_id: history.id()?,
+                optional: false,
             },
         )?;
-        committed(
-            &Map::from_iter([
-                ("historyId".into(), json!(history.id()?)),
-                ("verifiedPushProof".into(), json!({"expired": true})),
-            ]),
-            &fixture.desired,
-        )?;
+        committed(&Map::from_iter([
+            ("historyId".into(), json!(history.id()?)),
+            ("verifiedPushProof".into(), json!({"expired": true})),
+        ]))?;
         interrupt_test_request();
         super::super::push_flow_tests::replace_capture(ProjectSnapshot::default());
         let result = before_request(
@@ -1654,14 +2767,16 @@ mod tests {
                 verification_paths: &HashSet::new(),
                 before: &ProjectSnapshot::default(),
                 expected: &ProjectSnapshot::default(),
+                generated: &ProjectSnapshot::default(),
                 input: None,
                 history_id: "dot-history".into(),
+                optional: false,
             },
         )?;
-        committed(
-            &Map::from_iter([("verifiedPushProof".into(), json!({"test": true}))]),
-            &ProjectSnapshot::default(),
-        )?;
+        committed(&Map::from_iter([(
+            "verifiedPushProof".into(),
+            json!({"test": true}),
+        )]))?;
         interrupt_test_request();
         let loaded = Journal::load(&context);
         assert!(loaded.is_ok(), "{:#}", loaded.err().unwrap());

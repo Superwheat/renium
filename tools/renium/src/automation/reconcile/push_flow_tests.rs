@@ -6,6 +6,8 @@ use std::collections::VecDeque;
 use std::thread;
 use tungstenite::{Message, WebSocket, protocol::Role};
 
+use crate::snapshot::export::{PublicationStep, hook_publication_steps};
+
 type Capture = Box<dyn FnOnce(&BoundContext) -> Result<ProjectSnapshot>>;
 struct MutationInput<'a> {
     plan: &'a ReconcilePushPlan,
@@ -70,6 +72,17 @@ struct Tracker {
     /// The services Studio differs from the held proof in once the push
     /// committed, or None where it cannot say.
     scope: Option<Vec<&'static str>>,
+    /// How often Studio was asked whether it still holds the commit's proof.
+    proofs: usize,
+    /// How often Studio was asked where it differs from the held proof.
+    scopes: usize,
+    /// What changes Studio or the files when Studio is asked of the commit's
+    /// proof for the given time.
+    late: Late,
+    /// A file edit not yet made, which lands as the push releases its proof
+    /// where `edit_on_release`.
+    edit: Option<(PathBuf, Vec<u8>)>,
+    edit_on_release: bool,
 }
 
 impl Default for Tracker {
@@ -82,6 +95,11 @@ impl Default for Tracker {
             committed: false,
             changed_since_commit: false,
             scope: Some(Vec::new()),
+            proofs: 0,
+            scopes: 0,
+            late: None,
+            edit: None,
+            edit_on_release: false,
         }
     }
 }
@@ -137,7 +155,26 @@ fn fixture_runtime(
                 request["method"].as_str(),
                 Some("getStudioChangeState" | "getStudioState")
             ));
-            let result = tracker_reply(&tracker.lock().unwrap(), &request["params"], runtime);
+            let params = &request["params"];
+            let result = {
+                let mut state = tracker.lock().unwrap();
+                if params["scopePushProof"] == true {
+                    state.scopes += 1;
+                } else if params["verifyPushProof"]["test"] == true {
+                    state.proofs += 1;
+                    let count = state.proofs;
+                    if let Some((_, change)) = state.late.take_if(|(at, _)| *at == count) {
+                        change(&mut state);
+                    }
+                }
+                if params["retainPushProof"]["test"] == true
+                    && state.edit_on_release
+                    && let Some((path, bytes)) = state.edit.take()
+                {
+                    fs::write(path, bytes).unwrap();
+                }
+                tracker_reply(&state, params, runtime)
+            };
             let reply = json!({"id": request["id"], "ok": true, "result": result});
             if socket
                 .send(Message::Text(reply.to_string().into()))
@@ -1239,13 +1276,49 @@ enum Elsewhere {
     Fresh,
     /// A tool rewrote the sourcemap after the pull.
     Remapped,
+    /// A tool rewrites the sourcemap once the push committed, as the push
+    /// asks Studio of its commit before it answers, which a push that
+    /// answers only after its settlement never does.
+    RemappedLate,
+    /// Its store is edited in the files once the settlement wrote Studio's
+    /// copy.
+    EditedAfterSwaps,
+    /// Studio edits it once the settlement wrote Studio's copy.
+    ChangedAfterSwaps,
+    /// ReplicatedStorage's store is saved after the settlement found the
+    /// files unchanged and before it moves that store aside.
+    SavedDuringSwap,
     /// A push of its script, which the editor saved with a final line break,
     /// kept the baseline, and Studio holds the script without that break.
     PushedScript,
 }
 
+/// How the push writes ReplicatedStorage, where Studio generates an
+/// identity for the folder it adds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Import {
+    /// It imports the whole service.
+    Whole,
+    /// The pull left an instance there, so it imports the folder's root
+    /// beside it, with a field receipt.
+    AddedRoot,
+    /// As `AddedRoot`, where the importer replaces the service whole all the
+    /// same, for a saved field no setter writes, with its loader receipt.
+    Replaced,
+    /// As `Whole`, where the push also adds roots to ServerStorage, with a
+    /// field receipt.
+    Mixed,
+}
+
+impl Import {
+    /// Whether the pull left an instance in ReplicatedStorage.
+    fn beside_kept(self) -> bool {
+        matches!(self, Self::AddedRoot | Self::Replaced)
+    }
+}
+
 impl Elsewhere {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 16] = [
         Self::Untouched,
         Self::Edited,
         Self::EditedUnseen,
@@ -1257,6 +1330,10 @@ impl Elsewhere {
         Self::EditedFile,
         Self::Fresh,
         Self::Remapped,
+        Self::RemappedLate,
+        Self::EditedAfterSwaps,
+        Self::ChangedAfterSwaps,
+        Self::SavedDuringSwap,
         Self::PushedScript,
     ];
 
@@ -1405,6 +1482,23 @@ struct Settled {
     /// What a whole capture of Studio writes after the push, and the
     /// sourcemap it writes.
     whole: (ProjectSnapshot, Vec<u8>),
+    /// The files as the push found them.
+    pushed: ProjectSnapshot,
+    /// ServerStorage's store as an edit in the files during the import
+    /// leaves it.
+    file_edit: (PathBuf, SnapshotEntry),
+    /// ReplicatedStorage's store as a save during the settlement's swaps
+    /// leaves it.
+    saved: (PathBuf, SnapshotEntry),
+    /// How often the push asked Studio whether it holds the commit's proof,
+    /// and where it differs from the held one.
+    asks: (usize, usize),
+    /// How often it compared the files with Studio's to find the services
+    /// its settlement reads back.
+    compared: usize,
+    /// The push's error, and the error its unsettled journal holds.
+    failed: Option<String>,
+    unsettled: Option<String>,
 }
 
 /// Files as a pull of both services leaves them: what it wrote, where, and
@@ -1415,11 +1509,12 @@ struct Pulled {
     sourcemap: Vec<u8>,
 }
 
-/// Pulls ReplicatedStorage as `empty` and ServerStorage as `documents` say.
+/// Pulls ReplicatedStorage as `replicated` and ServerStorage as `documents`
+/// say.
 fn pull_settle_services(
     root: &Path,
     (imported, other): (&Path, &Path),
-    (empty, documents): (&SettingsBytecode, &Documents),
+    (replicated, documents): (&SettingsBytecode, &Documents),
     elsewhere: Elsewhere,
 ) -> Result<Pulled> {
     let services = SETTLE_SERVICES.map(String::from);
@@ -1428,14 +1523,17 @@ fn pull_settle_services(
     } else {
         encode_settings_bytecode(&documents.pulled)?
     };
-    fs::write(root.join(imported), encode_settings_bytecode(empty)?)?;
+    fs::write(root.join(imported), encode_settings_bytecode(replicated)?)?;
     fs::write(root.join(other), pulled)?;
     fs::create_dir_all(root.join("src/ServerStorage"))?;
     fs::write(root.join(SETTLE_SCRIPT), "return 1")?;
     let sourcemap = root.join("sourcemap.json");
     write_sourcemap_nodes(
         &sourcemap,
-        &[sourcemap_node(empty), sourcemap_node(&documents.pulled)],
+        &[
+            sourcemap_node(replicated),
+            sourcemap_node(&documents.pulled),
+        ],
     )?;
     if elsewhere != Elsewhere::Unwitnessed {
         crate::snapshot::import::remember_pulled_encoding(
@@ -1453,13 +1551,13 @@ fn pull_settle_services(
     })
 }
 
-/// A whole push that imports ReplicatedStorage after a pull of both
-/// services, into a Studio holding ServerStorage as `documents` say. In
-/// `full`, Studio cannot say where it differs from the held proof, so every
-/// service settles. A `synchronous` push has no caller to answer early, so
-/// it settles before it answers.
+/// A whole push that imports into ReplicatedStorage as `import` says after
+/// a pull of both services, into a Studio holding ServerStorage as
+/// `documents` say. In `full`, Studio cannot say where it differs from the
+/// held proof, so every service settles. A `synchronous` push has no caller
+/// to answer early, so it settles before it answers.
 fn settle_import(
-    elsewhere: Elsewhere,
+    (import, elsewhere): (Import, Elsewhere),
     documents: &Documents,
     full: bool,
     synchronous: bool,
@@ -1484,8 +1582,8 @@ fn settle_import(
             .replace("ReplicatedStorage", "ServerStorage"),
     );
     fs::create_dir_all(root.join(other.parent().context("store has no parent")?))?;
-    let imported_store = fs::read(root.join(&imported))?;
-    let empty = SettingsBytecode {
+    let mut imported_store = fs::read(root.join(&imported))?;
+    let mut replicated = SettingsBytecode {
         version: SETTINGS_BINARY_VERSION,
         instances: vec![SettingsBytecodeInstance::new(
             "root".into(),
@@ -1494,24 +1592,56 @@ fn settle_import(
             None,
         )],
     };
+    if import.beside_kept() {
+        let kept =
+            SettingsBytecodeInstance::new("kept".into(), "Kept".into(), "Folder".into(), Some(0));
+        replicated.instances.push(kept.clone());
+        let mut desired = crate::settings::bytecode::decode_settings_bytecode(&imported_store)?;
+        desired.instances.insert(1, kept);
+        imported_store = encode_settings_bytecode(&desired)?;
+    }
+    REQUESTED.with(|slot| slot.borrow_mut().clear());
+    verify::SETTLED_COMPARISONS.with(|count| count.set(0));
     let Pulled {
         paths,
         held,
         sourcemap,
-    } = pull_settle_services(&root, (&imported, &other), (&empty, documents), elsewhere)?;
+    } = pull_settle_services(
+        &root,
+        (&imported, &other),
+        (&replicated, documents),
+        elsewhere,
+    )?;
     let held_sourcemap =
         crate::snapshot::export::collect_publish_hashes(&root, &[PathBuf::from("sourcemap.json")])?;
+    let remapped = with_sourcemap_nodes(
+        Some(&sourcemap),
+        &[json!({
+            "name": "ServerStorage", "className": "ServerStorage",
+            "filePaths": ["src/ServerStorage"], "children": [],
+        })],
+    )?;
     if elsewhere == Elsewhere::Remapped {
-        write_sourcemap_nodes(
-            &root.join("sourcemap.json"),
-            &[json!({
-                "name": "ServerStorage", "className": "ServerStorage",
-                "filePaths": ["src/ServerStorage"], "children": [],
-            })],
-        )?;
+        fs::write(root.join("sourcemap.json"), &remapped)?;
     }
     fs::write(root.join(&imported), &imported_store)?;
-    let mut readback = capture_snapshot(&root, &paths)?;
+    let pushed = capture_snapshot(&root, &paths)?;
+    let mut readback = pushed.clone();
+    let mut generated = crate::settings::bytecode::decode_settings_bytecode(&imported_store)?;
+    generated
+        .instances
+        .iter_mut()
+        .find(|instance| instance.name == "Imported")
+        .context("the push adds no folder")?
+        .properties
+        .insert(
+            "UniqueId".into(),
+            json!({"_type": "UniqueId", "value": format!("{:032x}", 7)}),
+        );
+    readback.entries.insert(
+        imported.clone(),
+        SnapshotEntry::File(encode_settings_bytecode(&generated)?),
+    );
     readback.entries.insert(
         other.clone(),
         SnapshotEntry::File(encode_settings_bytecode(&documents.after)?),
@@ -1541,7 +1671,13 @@ fn settle_import(
     let whole = readback.clone();
     CAPTURES.with(|slot| slot.borrow_mut().clear());
     if elsewhere == Elsewhere::Fresh {
-        replace_capture(held);
+        // Studio's capture before the push reads nothing back.
+        CAPTURES.with(|slot| {
+            slot.borrow_mut().push_back(Box::new(|_| {
+                REQUESTED.with(|slot| slot.borrow_mut().clear());
+                Ok(held)
+            }))
+        });
     } else {
         let mut baseline = VerifiedFullPush {
             connections: bridge.runtime_connection_signature("push-fixture"),
@@ -1571,7 +1707,9 @@ fn settle_import(
     edited.instances[1]
         .properties
         .insert("Value".into(), json!("file edit"));
-    let edit = (root.join(&other), encode_settings_bytecode(&edited)?);
+    let file_edit = (other.clone(), encode_settings_bytecode(&edited)?);
+    let edit = (root.join(&other), file_edit.1.clone());
+    let saved = (imported.clone(), encode_settings_bytecode(&replicated)?);
     let tracker = Arc::clone(&fixture.tracker);
     CAPTURES.with(|slot| {
         slot.borrow_mut().push_back(Box::new(move |context| {
@@ -1579,24 +1717,40 @@ fn settle_import(
                 import_settle::pending(context) != synchronous,
                 "the settlement ran on the other path"
             );
-            if elsewhere == Elsewhere::EditedFile {
-                fs::write(&edit.0, &edit.1)?;
+            // A daemon that stops during it reads the same of the journal.
+            if !synchronous {
+                let journal =
+                    fs::read_dir(Path::new(&context.root).join(".renium/import-settlement"))?
+                        .next()
+                        .context("no settlement journal")??
+                        .path();
+                let record: Value = rmp_serde::from_slice(&fs::read(journal.join("pending.rmp"))?)?;
+                anyhow::ensure!(
+                    record["optional"] == (import == Import::AddedRoot),
+                    "the journal is optional: {}",
+                    record["optional"]
+                );
+                // Nothing loads an optional record's copies of the files.
+                anyhow::ensure!(
+                    record["optional"] == false || !journal.join("packs").exists(),
+                    "the optional journal copied the files"
+                );
             }
-            if elsewhere == Elsewhere::EditedLate {
+            {
                 let mut tracker = tracker.lock().unwrap();
-                tracker.edits.insert("ServerStorage".into(), json!(1));
-                tracker.changed_since_commit = true;
+                if let Some((path, bytes)) = tracker.edit.take() {
+                    fs::write(path, bytes)?;
+                }
+                if elsewhere == Elsewhere::EditedLate {
+                    tracker.edits.insert("ServerStorage".into(), json!(1));
+                    tracker.changed_since_commit = true;
+                }
             }
             let (requested, stage) = last_requested();
             let read = |service: &str| requested.iter().any(|name| name == service);
-            readback.entries.retain(|path, _| {
-                path.components().any(|part| {
-                    requested.iter().any(|service| {
-                        part.as_os_str() == service.as_str()
-                            || part.as_os_str() == format!("{service}.renium").as_str()
-                    })
-                })
-            });
+            readback
+                .entries
+                .retain(|path, _| of_services(path, &requested));
             write_sourcemap_nodes(
                 &stage.join("sourcemap.json"),
                 &nodes
@@ -1615,40 +1769,193 @@ fn settle_import(
             .map(|service| ((*service).to_string(), json!(0)))
             .collect();
         tracker.scope = elsewhere.scope().filter(|_| !full);
+        let sourcemap = root.join("sourcemap.json");
+        tracker.late = (elsewhere == Elsewhere::RemappedLate)
+            .then(|| late(1, move |_| fs::write(sourcemap, remapped).unwrap()))
+            .flatten();
+        tracker.edit = (elsewhere == Elsewhere::EditedFile).then(|| edit.clone());
+        // A push of added roots that reads nothing back still meets the edit.
+        tracker.edit_on_release = import == Import::AddedRoot;
     }
+    let mut unsaved =
+        (elsewhere == Elsewhere::SavedDuringSwap).then(|| (root.join(&saved.0), saved.1.clone()));
+    let tracker = Arc::clone(&fixture.tracker);
+    let mut after_swaps: Option<Box<dyn FnOnce()>> = match elsewhere {
+        Elsewhere::EditedAfterSwaps => Some(Box::new(move || fs::write(edit.0, edit.1).unwrap())),
+        Elsewhere::ChangedAfterSwaps => Some(Box::new(move || {
+            let mut tracker = tracker.lock().unwrap();
+            tracker.edits.insert("ServerStorage".into(), json!(1));
+            tracker.changed_since_commit = true;
+        })),
+        _ => None,
+    };
+    let store = imported.clone();
+    let _hook = hook_publication_steps(move |step| match step {
+        PublicationStep::MoveAside(path) if store.starts_with(path) => {
+            if let Some((path, bytes)) = unsaved.take() {
+                fs::write(path, bytes).unwrap();
+            }
+        }
+        PublicationStep::Swapped => {
+            if let Some(change) = after_swaps.take() {
+                change();
+            }
+        }
+        _ => {}
+    });
     let tracker = Arc::clone(&fixture.tracker);
     MUTATION.with(|slot| {
-        *slot.borrow_mut() = Some(Box::new(move |_, _| {
+        *slot.borrow_mut() = Some(Box::new(move |_, request| {
+            anyhow::ensure!(
+                request.plan.initial_native_services.is_empty() == import.beside_kept(),
+                "the push imports {:?} whole",
+                request.plan.initial_native_services
+            );
             let mut tracker = tracker.lock().unwrap();
             tracker.committed = true;
             if elsewhere == Elsewhere::Edited {
                 tracker.edits.insert("ServerStorage".into(), json!(1));
             }
             let mut committed = summary(true);
-            committed.insert("nativeVerifiedServices".into(), json!(SETTLE_SERVICES));
+            match import {
+                Import::Whole => {
+                    committed.insert("nativeVerifiedServices".into(), json!(SETTLE_SERVICES));
+                }
+                Import::AddedRoot => {
+                    committed.remove("nativeVerifiedServices");
+                    committed.insert("fieldVerifiedServices".into(), json!(SETTLE_SERVICES));
+                }
+                Import::Replaced => {}
+                Import::Mixed => {
+                    committed.insert("fieldVerifiedServices".into(), json!(["ServerStorage"]));
+                }
+            }
+            if import != Import::Whole {
+                committed.insert("binaryInstances".into(), json!(1));
+            }
             Ok(StagedPushResult {
                 generated: ProjectSnapshot::default(),
                 summary: committed,
             })
         }))
     });
-    fixture.push_with(&services, None, (false, !synchronous))?;
+    // Only a settlement of added roots fails a push that answered, where
+    // Studio changes during it.
+    let fails = import == Import::AddedRoot
+        && matches!(
+            elsewhere,
+            Elsewhere::EditedLate | Elsewhere::ChangedAfterSwaps
+        );
+    let failed = match fixture.push_with(&services, None, (false, !synchronous)) {
+        Ok(_) => None,
+        Err(error) if fails => Some(format!("{error:#}")),
+        Err(error) => return Err(error),
+    };
+    let unsettled = if import_settle::pending(&fixture.context) {
+        let journal = fs::read_dir(root.join(".renium/import-settlement"))?
+            .next()
+            .context("no settlement journal")??
+            .path();
+        let record: Value = rmp_serde::from_slice(&fs::read(journal.join("pending.rmp"))?)?;
+        Some(record["error"].as_str().unwrap_or_default().to_string())
+    } else {
+        None
+    };
     anyhow::ensure!(
-        !import_settle::pending(&fixture.context),
+        unsettled.is_none() || fails,
         "the settlement kept its journal"
     );
     let baseline = bridge
         .verified_full_pushes
         .lock_recover()
-        .remove("push-fixture")
-        .map(|kept| (kept.project, kept.sourcemap));
-    Ok(Settled {
+        .get("push-fixture")
+        .map(|kept| (kept.project.clone(), kept.sourcemap.clone()));
+    let (asks, edit_left) = {
+        let tracker = fixture.tracker.lock().unwrap();
+        ((tracker.proofs, tracker.scopes), tracker.edit.is_some())
+    };
+    let settled = Settled {
         files: capture_snapshot(&root, &paths)?,
         sourcemap: fs::read(root.join("sourcemap.json"))?,
         read_back: last_requested().0,
         baseline,
         whole: (whole, whole_sourcemap),
+        pushed,
+        file_edit: (file_edit.0, SnapshotEntry::File(file_edit.1)),
+        saved: (saved.0, SnapshotEntry::File(saved.1)),
+        asks,
+        compared: verify::SETTLED_COMPARISONS.get(),
+        failed,
+        unsettled,
+    };
+    if import == Import::AddedRoot && elsewhere == Elsewhere::EditedFile {
+        anyhow::ensure!(!edit_left, "the file edit was not made");
+        // The next push sends the file edit on the baseline this one kept.
+        // It reads Studio only back, where it imports the edited service
+        // whole, and Studio then holds what the files hold.
+        let read = paths.clone();
+        CAPTURES.with(|slot| {
+            let mut captures = slot.borrow_mut();
+            captures.clear();
+            captures.push_back(Box::new(move |context| {
+                anyhow::ensure!(
+                    MUTATION.with(|slot| slot.borrow().is_none()),
+                    "the push after the edit captured Studio"
+                );
+                let mut held = capture_snapshot(Path::new(&context.root), &read)?;
+                let (requested, _) = last_requested();
+                held.entries.retain(|path, _| of_services(path, &requested));
+                Ok(held)
+            }));
+        });
+        let sent = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let plan_paths = std::rc::Rc::clone(&sent);
+        MUTATION.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |_, request| {
+                plan_paths
+                    .borrow_mut()
+                    .clone_from(&request.plan.changed_paths);
+                let mut committed = summary(false);
+                committed.insert("fieldVerifiedServices".into(), json!(["ServerStorage"]));
+                committed.insert("verifiedPushProof".into(), json!({"test": true}));
+                Ok(StagedPushResult {
+                    generated: ProjectSnapshot::default(),
+                    summary: committed,
+                })
+            }))
+        });
+        fixture.push_with(&services, None, (false, true))?;
+        anyhow::ensure!(
+            MUTATION.with(|slot| slot.borrow().is_none()),
+            "the push after the edit sent nothing"
+        );
+        let sent = sent.borrow();
+        anyhow::ensure!(
+            sent.iter().any(|path| path.ends_with(&other)),
+            "the push after the edit sent {sent:?}, not {}",
+            other.display()
+        );
+    }
+    Ok(settled)
+}
+
+/// Whether `path` is a file of one of `services`: its store or under its
+/// folder.
+fn of_services(path: &Path, services: &[String]) -> bool {
+    path.components().any(|part| {
+        services.iter().any(|service| {
+            part.as_os_str() == service.as_str()
+                || part.as_os_str() == format!("{service}.renium").as_str()
+        })
     })
+}
+
+type Late = Option<(usize, Box<dyn FnOnce(&mut Tracker) + Send>)>;
+
+/// `change` made when Studio is asked of the commit's proof for the `at`th
+/// time.
+fn late(at: usize, change: impl FnOnce(&mut Tracker) + Send + 'static) -> Late {
+    Some((at, Box::new(change)))
 }
 
 fn store_bytes<'a>(files: &'a ProjectSnapshot, service: &str) -> Option<&'a [u8]> {
@@ -1687,12 +1994,18 @@ fn narrowed_like_full(narrow: &Settled, full: &Settled) -> Result<(), String> {
             full.baseline.is_some()
         ));
     }
-    let (whole, sourcemap) = &full.whole;
+    kept_as_whole(full)
+}
+
+/// A baseline `settled` keeps is what a whole capture of Studio writes, its
+/// sourcemap included.
+fn kept_as_whole(settled: &Settled) -> Result<(), String> {
+    let (whole, sourcemap) = &settled.whole;
     let captured = SourcemapState::from([(
         PathBuf::from("sourcemap.json"),
         crate::snapshot::export::file_publish_state(sourcemap),
     )]);
-    match &full.baseline {
+    match &settled.baseline {
         Some((files, _)) if files != whole => Err(format!(
             "a kept baseline's files are not what a whole capture writes at {:?}",
             files
@@ -1709,6 +2022,138 @@ fn narrowed_like_full(narrow: &Settled, full: &Settled) -> Result<(), String> {
     }
 }
 
+/// A push that adds roots settles only in the background, from a held pull
+/// whose sourcemap the files still hold, where that reads back fewer
+/// services than a pull, and asks Studio nothing of its commit for one it
+/// cannot settle so. Its files are then what a whole capture writes but for
+/// newer edits; otherwise they are as the push found them but for newer
+/// edits, and the files the push wrote stay its baseline, with no pull's
+/// sourcemap, while Studio holds its commit. A Studio change during it fails
+/// it, which leaves it unsettled only once it wrote Studio's copy.
+fn added_roots_left(
+    (import, elsewhere, synchronous): (Import, Elsewhere, bool),
+    narrow: &Settled,
+    full: &Settled,
+) -> Result<(), String> {
+    use Elsewhere::*;
+    for (settled, full) in [(narrow, false), (full, true)] {
+        let reads = import == Import::AddedRoot
+            && !synchronous
+            && !full
+            && matches!(
+                elsewhere,
+                Untouched
+                    | EditedLate
+                    | EditedFile
+                    | EditedAfterSwaps
+                    | ChangedAfterSwaps
+                    | SavedDuringSwap
+            );
+        let publishes =
+            reads && matches!(elsewhere, Untouched | EditedAfterSwaps | ChangedAfterSwaps);
+        let stopped = reads && matches!(elsewhere, EditedAfterSwaps | ChangedAfterSwaps);
+        let failed = reads && matches!(elsewhere, EditedLate | ChangedAfterSwaps);
+        // Only a settlement that wrote Studio's copy leaves one unsettled.
+        let unsettled = reads && elsewhere == ChangedAfterSwaps;
+        let studio_changed = |error: &Option<String>| {
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains("Studio changed during import settlement"))
+        };
+        if (settled.failed.is_some(), settled.unsettled.is_some()) != (failed, unsettled)
+            || failed && !studio_changed(&settled.failed)
+            || unsettled && !studio_changed(&settled.unsettled)
+        {
+            return Err(format!(
+                "the push failed with {:?}, its journal holds {:?}, full={full}",
+                settled.failed, settled.unsettled
+            ));
+        }
+        let expected: &[&str] = if reads { &SETTLE_SERVICES[..1] } else { &[] };
+        if settled.read_back != expected {
+            return Err(format!("read back {:?}, full={full}", settled.read_back));
+        }
+        let mut wanted = if publishes {
+            settled.whole.0.clone()
+        } else {
+            settled.pushed.clone()
+        };
+        let edits = [
+            (
+                import == Import::AddedRoot && elsewhere == EditedFile,
+                &settled.file_edit,
+            ),
+            (reads && elsewhere == EditedAfterSwaps, &settled.file_edit),
+            (reads && elsewhere == SavedDuringSwap, &settled.saved),
+        ];
+        for (_, (path, entry)) in edits.into_iter().filter(|(made, _)| *made) {
+            wanted.entries.insert(path.clone(), entry.clone());
+        }
+        let wanted = &wanted;
+        if &settled.files != wanted {
+            return Err(format!(
+                "the files are not {} at {:?}, full={full}",
+                if publishes {
+                    "what a whole capture writes"
+                } else {
+                    "as the push found them"
+                },
+                settled
+                    .files
+                    .entries
+                    .keys()
+                    .chain(wanted.entries.keys())
+                    .filter(|path| settled.files.entries.get(*path) != wanted.entries.get(*path))
+                    .collect::<BTreeSet<_>>()
+            ));
+        }
+        let studio_moved = elsewhere == Edited || (reads && elsewhere == EditedLate);
+        let kept = match &settled.baseline {
+            None => studio_moved || stopped,
+            Some((_, Some(_))) => publishes && !stopped,
+            Some((files, None)) => !publishes && !studio_moved && files == &settled.pushed,
+        };
+        if !kept {
+            return Err(format!(
+                "kept a baseline: {}, a pull's sourcemap: {}, full={full}",
+                settled.baseline.is_some(),
+                settled
+                    .baseline
+                    .as_ref()
+                    .is_some_and(|(_, sourcemap)| sourcemap.is_some())
+            ));
+        }
+        // Where nothing could narrow the settlement Studio is asked nothing,
+        // and where only its answer rules that out, only where it differs.
+        // A settlement that reads back asks of the commit's proof before
+        // the push answers, then before and after its swaps, up to where it
+        // stops.
+        let unasked = synchronous
+            || import == Import::Replaced
+            || matches!(elsewhere, Remapped | Fresh | Referring);
+        let unnarrowed = full || elsewhere == Edited;
+        let asks = match (unasked, unnarrowed) {
+            (true, _) => (0, 0),
+            (false, true) => (0, 1),
+            (false, false) => match elsewhere {
+                RemappedLate => (1, 1),
+                EditedLate | EditedFile | SavedDuringSwap => (2, 1),
+                _ => (3, 1),
+            },
+        };
+        if asks != settled.asks {
+            return Err(format!(
+                "asked Studio of the commit's proof and where it differs {:?} times, not {asks:?}, full={full}",
+                settled.asks
+            ));
+        }
+        if publishes && !stopped {
+            kept_as_whole(settled)?;
+        }
+    }
+    Ok(())
+}
+
 // The oracle is the settlement that reads every service back. Reading back
 // only what the push wrote, what Studio says differs from the held proof and
 // what refers into those must leave the same files and keep the same
@@ -1716,24 +2161,61 @@ fn narrowed_like_full(narrow: &Settled, full: &Settled) -> Result<(), String> {
 #[test]
 fn seeded_import_settlement_reads_back_only_what_can_differ() {
     use Elsewhere::*;
-    let scenarios = Elsewhere::ALL.len() as u64;
-    crate::tests::support::run_seeds(2 * scenarios, |seed, log| {
-        let elsewhere = Elsewhere::ALL[(seed % scenarios) as usize];
-        let synchronous = elsewhere == EditedLate || seed / scenarios % 2 == 1;
+    let scenarios = Elsewhere::ALL
+        .map(|elsewhere| (Import::Whole, elsewhere))
+        .into_iter()
+        .chain(
+            [
+                Untouched,
+                Edited,
+                EditedLate,
+                EditedFile,
+                Referring,
+                Remapped,
+                RemappedLate,
+                Fresh,
+                EditedAfterSwaps,
+                ChangedAfterSwaps,
+                SavedDuringSwap,
+            ]
+            .map(|elsewhere| (Import::AddedRoot, elsewhere)),
+        )
+        .chain([(Import::Replaced, Untouched), (Import::Mixed, Untouched)])
+        .collect::<Vec<_>>();
+    let count = scenarios.len() as u64;
+    crate::tests::support::run_seeds(2 * count, |seed, log| {
+        let (import, elsewhere) = scenarios[(seed % count) as usize];
+        // A whole import that answers before its settlement fails on a
+        // Studio that changes during it, and leaves it to the next command.
+        let synchronous = (import == Import::Whole
+            && matches!(elsewhere, EditedLate | ChangedAfterSwaps))
+            || seed / count % 2 == 1;
         let documents = elsewhere_documents(seed, elsewhere);
         log.push(format!(
-            "{elsewhere:?} with {} ServerStorage instances, synchronous={synchronous}",
+            "{import:?} with {elsewhere:?} and {} ServerStorage instances, synchronous={synchronous}",
             documents.before.instances.len()
         ));
         let run = |full| {
-            settle_import(elsewhere, &documents, full, synchronous)
+            settle_import((import, elsewhere), &documents, full, synchronous)
                 .map_err(|error| format!("{error:#}"))
         };
         let (narrow, full) = (run(false)?, run(true)?);
+        // The files are compared only where Studio says which services it
+        // differs in and the push and those leave a service out.
+        let compares = narrow.asks.1 == 1 && !matches!(elsewhere, Edited | EditedUnseen | Unscoped);
+        if (narrow.compared, full.compared) != (usize::from(compares), 0) {
+            return Err(format!(
+                "compared the files {} times and, in full, {}",
+                narrow.compared, full.compared
+            ));
+        }
+        if import.beside_kept() {
+            return added_roots_left((import, elsewhere, synchronous), &narrow, &full);
+        }
         let studio =
             encode_settings_bytecode(&documents.after).map_err(|error| error.to_string())?;
-        if (elsewhere != EditedFile)
-            != (store_bytes(&full.files, "ServerStorage") == Some(studio.as_slice()))
+        if matches!(elsewhere, EditedFile | EditedAfterSwaps)
+            == (store_bytes(&full.files, "ServerStorage") == Some(studio.as_slice()))
         {
             return Err("the full settlement did not write Studio's copy".into());
         }
@@ -1747,11 +2229,24 @@ fn seeded_import_settlement_reads_back_only_what_can_differ() {
         {
             return Err("the full settlement did not write Studio's script".into());
         }
-        if full.baseline.is_some() == matches!(elsewhere, Edited | EditedLate | EditedFile) {
+        let newer = matches!(
+            elsewhere,
+            Edited
+                | EditedLate
+                | EditedFile
+                | EditedAfterSwaps
+                | ChangedAfterSwaps
+                | SavedDuringSwap
+        );
+        if full.baseline.is_some() == newer {
             return Err(format!("kept a baseline: {}", full.baseline.is_some()));
         }
         narrowed_like_full(&narrow, &full)?;
-        let expected = if !synchronous && matches!(elsewhere, Untouched | EditedFile) {
+        let narrows = matches!(
+            elsewhere,
+            Untouched | EditedFile | EditedAfterSwaps | SavedDuringSwap
+        );
+        let expected = if !synchronous && narrows {
             &SETTLE_SERVICES[..1]
         } else {
             &SETTLE_SERVICES[..]
