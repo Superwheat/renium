@@ -1,7 +1,7 @@
 # Renium
 
 Two-way sync between Roblox Studio and a project folder, made for large places and
-for working with AI coding agents.
+for working with AI agents.
 
 ## Why Renium
 
