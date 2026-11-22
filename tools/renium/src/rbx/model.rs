@@ -25,10 +25,9 @@ use crate::bytecode::edit::{
 use crate::bytecode::explorer::explorer_daemon_services;
 use crate::bytecode::query::bytecode_parent_index;
 use crate::bytecode::{
-    SourcePathsBefore, acquire_settings_file_lock, adopt_single_positional_target,
-    apply_file_mutations, bytecode_input_looks_like_settings_file, collect_source_path_updates,
-    ensure_service_store_exists, file_mutation_paths, resolve_bytecode_cli_settings_file,
-    resolve_bytecode_selector,
+    FolderSpellings, SourcePathsBefore, acquire_settings_file_lock, adopt_single_positional_target,
+    bytecode_input_looks_like_settings_file, collect_source_path_updates,
+    ensure_service_store_exists, resolve_bytecode_cli_settings_file, resolve_bytecode_selector,
 };
 use crate::cli::{
     BytecodeExportModelArgs, BytecodeExportPlaceArgs, BytecodeImportModelArgs, BytecodeRepackArgs,
@@ -2845,7 +2844,7 @@ pub(crate) fn bytecode_import_model(args: BytecodeImportModelArgs) -> Result<()>
         args.parent.parent_name.as_deref(),
         args.parent.parent_class_name.as_deref(),
     )?;
-    let outcome = import_rbx_model_into_document(
+    let mut outcome = import_rbx_model_into_document(
         &mut document,
         &settings_file,
         &service,
@@ -2878,8 +2877,14 @@ pub(crate) fn bytecode_import_model(args: BytecodeImportModelArgs) -> Result<()>
         settings_file.clone(),
         stored.encode_restructured(&document)?,
     );
-    let changed_paths = file_mutation_paths(&writes, &removals);
-    apply_file_mutations(&writes, &removals)?;
+    let folders = FolderSpellings::respell(&writes, &removals, &[]);
+    let changed_paths = folders.changed_paths(&writes, &removals);
+    folders.apply(&writes, &removals)?;
+    for write in &mut outcome.source_writes {
+        if let Some(path) = write["path"].as_str().map(Path::new) {
+            write["path"] = json!(folders.spelled(path, true));
+        }
+    }
     print_json_output(
         &json!({
             "ok": true,

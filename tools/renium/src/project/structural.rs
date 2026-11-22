@@ -17,7 +17,7 @@ use crate::bytecode::references::{
     materialize_for_moves, names_of_moved, names_row_of, read_referring_stores,
 };
 use crate::bytecode::{
-    SourcePathsBefore, apply_file_mutations, collect_source_path_updates, file_mutation_paths,
+    FolderSpellings, SourcePathsBefore, collect_source_path_updates, first_of_each_file,
     lock_existing_service_stores, preserve_source_path_extension, read_store_for_structure,
     release_settings_file_locks,
 };
@@ -317,7 +317,21 @@ pub(crate) fn move_instance_between_service_stores(
 ) -> Result<Value> {
     let move_started = Instant::now();
     let src_root = source_root_for_stores(source_file, target_file)?;
-    let files = service_store_paths(&src_root)?;
+    let mut files = service_store_paths(&src_root)?;
+    let named = [source_service, target_service].map(|service| files.get(service).cloned());
+    let listed = named.iter().flatten().cloned();
+    let kept = first_of_each_file(listed.chain(files.values().cloned()));
+    // Two services whose stores the disk takes for one file are one store.
+    if let [Some(_), Some(target)] = &named
+        && source_service != target_service
+        && !kept.contains(target)
+    {
+        bail!(
+            "{source_service} and {target_service} are one store on this disk ({}); nothing was moved",
+            target.display()
+        );
+    }
+    files.retain(|_, path| kept.contains(path));
     let locks = lock_existing_service_stores(files.values().map(PathBuf::as_path))?;
     let load_started = Instant::now();
     let (source_before, target_before) = rayon::join(
@@ -533,15 +547,14 @@ pub(crate) fn move_instance_between_service_stores(
             writes.insert(path.clone(), stored.encode(document)?);
         }
     }
-    removals.retain(|path| {
-        !writes
-            .keys()
-            .any(|write| exact_path_key(write) == exact_path_key(path))
-    });
+    let written = writes.keys().map(|write| exact_path_key(write));
+    let written = written.collect::<HashSet<_>>();
+    removals.retain(|path| !written.contains(&exact_path_key(path)));
     removals.sort_by_key(|path| exact_path_key(path));
     removals.dedup_by(|left, right| exact_path_key(left) == exact_path_key(right));
-    let changed_paths = file_mutation_paths(&writes, &removals);
-    apply_file_mutations(&writes, &removals)?;
+    let folders = FolderSpellings::respell(&writes, &removals, &[]);
+    let changed_paths = folders.changed_paths(&writes, &removals);
+    folders.apply(&writes, &removals)?;
     prune_removed_source_dirs(&super::storage::source_directory(source_file), &removals);
     release_settings_file_locks(locks);
 

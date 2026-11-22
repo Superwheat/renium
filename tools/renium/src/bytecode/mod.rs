@@ -3060,21 +3060,33 @@ fn is_structural_property(property: &str, scope: PropertyScope) -> bool {
         && (property.eq_ignore_ascii_case("name") || property.eq_ignore_ascii_case("parent"))
 }
 
-/// The store at `settings_file` and the project's other stores. An edit
-/// that renames, moves or removes instances locks them all, since any of
-/// them may hold a reference it has to update.
+/// The store at `settings_file` and the project's other stores, each file
+/// once (`first_of_each_file`), the edited one as `settings_file` spells it.
+/// An edit that renames, moves or removes instances locks them all, since
+/// any of them may hold a reference it has to update.
 pub(crate) fn project_store_files(settings_file: &Path) -> Result<BTreeSet<PathBuf>> {
     let _span = crate::app::profile::span("project stores listed");
-    let mut files = BTreeSet::from([settings_file.to_path_buf()]);
+    let mut files = vec![settings_file.to_path_buf()];
     if let Some(src_root) = crate::project::storage::source_directory(settings_file).parent() {
         for service_dir in crate::project::storage::service_directories(src_root)? {
             let path = service_settings_path(&service_dir);
             if path.is_file() {
-                files.insert(path);
+                files.push(path);
             }
         }
     }
-    Ok(files)
+    Ok(first_of_each_file(files).into_iter().collect())
+}
+
+/// Of `paths`, the first that names each file. A store is listed under two
+/// spellings where the disk takes both for one file, as it does for a service
+/// folder in another letter case than its store; read and written as two
+/// stores, the one written last would undo the other's edit. A path the disk
+/// tells nothing about stays.
+pub(crate) fn first_of_each_file(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let first = |path: &PathBuf| identity(path).map_or(true, |identity| seen.insert(identity));
+    paths.into_iter().filter(first).collect()
 }
 
 /// Applies to each selected instance of one store its assignments and
@@ -3162,6 +3174,7 @@ fn set_store_properties(
         references: references::ReferencedStores::default(),
         before: None,
         moved: HashSet::new(),
+        children: None,
         sources: Vec::new(),
         store_edited: false,
     };
@@ -3205,6 +3218,8 @@ struct StorePropertyEdit<'a> {
     before: Option<(SettingsBytecode, Vec<Option<PathBuf>>)>,
     /// The renamed and moved instances with their descendants.
     moved: HashSet<usize>,
+    /// The children of each instance, kept until an assignment moves one.
+    children: Option<Vec<Vec<usize>>>,
     /// The script sources to write, by instance index.
     sources: Vec<(usize, String)>,
     store_edited: bool,
@@ -3267,9 +3282,10 @@ impl StorePropertyEdit<'_> {
         }
         if structural {
             reject_read_only_link_subtree_edit(self.links, &self.document, self.service, index)?;
-            let children = settings_children_by_parent(&self.document);
+            let children =
+                (self.children).get_or_insert_with(|| settings_children_by_parent(&self.document));
             let mut subtree = Vec::new();
-            collect_settings_subtree_preorder(&children, index, &mut subtree);
+            collect_settings_subtree_preorder(children, index, &mut subtree);
             self.moved.extend(subtree);
         }
         if self.before.is_none() && property_affects_source_path(self.scope, &stored) {
@@ -3279,6 +3295,9 @@ impl StorePropertyEdit<'_> {
             self.before = Some((self.document.clone(), source_paths));
         }
         instance_api::set_instance_property(&mut self.document, index, &stored, value, self.scope)?;
+        if structural && stored != "Name" {
+            self.children = None;
+        }
         if structural
             && stored == "Parent"
             && let Some(parent) = self.document.instances[index].parent_index
@@ -3410,8 +3429,9 @@ impl StorePropertyEdit<'_> {
             bail!("A moved instance's new parent is not in the store");
         }
         drop(preparing);
-        let changed_paths = file_mutation_paths(&writes, &removals);
-        apply_file_mutations(&writes, &removals)?;
+        let folders = FolderSpellings::respell(&writes, &removals, &[]);
+        let changed_paths = folders.changed_paths(&writes, &removals);
+        folders.apply(&writes, &removals)?;
         let structural = (applied.iter().flatten())
             .filter(|assignment| assignment.structural)
             .map(|assignment| assignment.index)
@@ -3431,7 +3451,9 @@ impl StorePropertyEdit<'_> {
                             "changedPaths": changed_paths,
                         });
                         if assignment.stored.is_none() {
-                            result["sourcePath"] = json!(written_sources.get(&assignment.index));
+                            let path = written_sources.get(&assignment.index);
+                            result["sourcePath"] =
+                                json!(path.map(|path| folders.spelled(path, true)));
                         }
                         if assignment.requested_differs {
                             result["requestedProperty"] = json!(assignment.requested);
@@ -4114,8 +4136,9 @@ fn apply_property_batch_to_root(
     canonicalize_property_batch_references(&mut documents, structural_roots, &before)?;
     let (writes, removals, source_paths) =
         property_batch_file_mutations(&documents, &allowed_entries)?;
-    apply_file_mutations(&writes, &removals)?;
-    let changed_paths = file_mutation_paths(&writes, &removals);
+    let folders = FolderSpellings::respell(&writes, &removals, &[]);
+    let changed_paths = folders.changed_paths(&writes, &removals);
+    folders.apply(&writes, &removals)?;
     Ok(BytecodePropertyBatchResult {
         applied: allowed_entries.len(),
         filtered,
@@ -4335,11 +4358,9 @@ fn collect_source_path_move_pairs<'a>(
         );
         removals.push(from.to_path_buf());
     }
-    removals.retain(|path| {
-        !writes
-            .keys()
-            .any(|write| exact_path_key(write) == exact_path_key(path))
-    });
+    let written = writes.keys().map(|write| exact_path_key(write));
+    let written = written.collect::<HashSet<_>>();
+    removals.retain(|path| !written.contains(&exact_path_key(path)));
     removals.sort_by_key(|path| exact_path_key(path));
     removals.dedup_by(|left, right| exact_path_key(left) == exact_path_key(right));
     Ok(())
@@ -4422,71 +4443,416 @@ pub(super) fn apply_file_mutations(
     apply_file_mutations_with_permissions(writes, removals, &BTreeMap::new())
 }
 
-pub(super) fn file_mutation_paths(
-    writes: &BTreeMap<PathBuf, Vec<u8>>,
-    removals: &[PathBuf],
-) -> Vec<PathBuf> {
-    let _span = crate::app::profile::span("changed files compare");
-    let mut changed = BTreeSet::new();
-    for (path, bytes) in writes {
-        let case_move = removals.iter().any(|from| {
-            exact_path_key(from) != exact_path_key(path)
-                && case_folded_path_key(from) == case_folded_path_key(path)
+/// The folders of an edit's files that the disk holds under a name in another
+/// letter case, on a file system that ignores case; one that keeps case apart
+/// has none. Each is keyed by its path as the edit spells it, with the name
+/// the disk holds and whether it took the edit's spelling: a folder of a file
+/// the edit writes takes it where the edit removes files from it under the
+/// name the disk holds, as a rename in another case does, and the rename goes
+/// through. Elsewhere the edit's files land in the folder as the disk spells
+/// it.
+#[derive(Default)]
+pub(super) struct FolderSpellings(BTreeMap<String, (PathBuf, std::ffi::OsString, bool)>);
+
+impl FolderSpellings {
+    /// Finds the folders of an edit's `writes` and `removals` and of the files
+    /// it reads, `read`, below the source folders of the stores it writes, and
+    /// renames the folders that take its spelling.
+    pub(super) fn respell(
+        writes: &BTreeMap<PathBuf, Vec<u8>>,
+        removals: &[PathBuf],
+        read: &[&Path],
+    ) -> Self {
+        Self::found(writes, removals, read, true)
+    }
+
+    /// The folders of `respell`, or with `every` false only the ones the edit
+    /// renames, wherever they are.
+    fn found(
+        writes: &BTreeMap<PathBuf, Vec<u8>>,
+        removals: &[PathBuf],
+        read: &[&Path],
+        every: bool,
+    ) -> Self {
+        let _span = crate::app::profile::span("folder spellings");
+        let mut folders = Self::default();
+        let stores = (writes.keys().chain(removals)).filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "renium")
         });
-        if case_move || fs::read(path).map_or(true, |current| current != *bytes) {
-            changed.insert(path.clone());
+        let roots = if every {
+            (stores.map(|store| crate::project::storage::source_directory(store)))
+                .filter(|root| ignores_case(root))
+                .collect::<Vec<_>>()
+        } else {
+            vec![PathBuf::new()]
+        };
+        if roots.is_empty() || (removals.is_empty() && !every) {
+            return folders;
         }
-    }
-    for path in removals {
-        if path.is_file() {
-            changed.insert(path.clone());
+        let under = |path: &Path| roots.iter().find(|root| path.starts_with(root));
+        let mut removed = HashMap::new();
+        for path in removals {
+            if let Some(root) = under(path) {
+                for folder in folders_below(path, root) {
+                    removed.insert(case_folded_path_key(folder), folder);
+                }
+            }
         }
+        let (mut seen, mut listed) = (HashSet::new(), HashMap::new());
+        let others = (removals.iter().map(PathBuf::as_path)).chain(read.iter().copied());
+        let paths = (writes.keys().map(|path| (path.as_path(), true)))
+            .chain(others.map(|path| (path, false)));
+        for (path, written) in paths {
+            let Some(root) = under(path) else {
+                continue;
+            };
+            for folder in folders_below(path, root) {
+                let key = exact_path_key(folder);
+                if !seen.insert(key.clone()) {
+                    continue;
+                }
+                let old = written.then(|| removed.get(&case_folded_path_key(folder)));
+                let old = old.flatten().filter(|old| exact_path_key(old) != key);
+                if (old.is_none() && !every) || !folder.is_dir() {
+                    continue;
+                }
+                if let Some(held) = held_otherwise(folder, &mut listed) {
+                    let taken = old.is_some_and(|old| old.file_name() == Some(held.as_os_str()));
+                    folders.0.insert(key, (folder.to_path_buf(), held, taken));
+                }
+            }
+        }
+        for (folder, held, respelled) in folders.0.values_mut().filter(|(.., taken)| *taken) {
+            *respelled = fs::rename(folder.with_file_name(&*held), &*folder).is_ok();
+        }
+        folders
     }
-    changed.into_iter().collect()
+
+    /// The paths an edit changes, as the disk spells them after it, with the
+    /// spelling before it of each written file whose folder it renamed. A
+    /// removal the disk takes for a written file that already holds its bytes
+    /// changes nothing: the edit keeps that file (`kept_removals`).
+    pub(super) fn changed_paths(
+        &self,
+        writes: &BTreeMap<PathBuf, Vec<u8>>,
+        removals: &[PathBuf],
+    ) -> Vec<PathBuf> {
+        let _span = crate::app::profile::span("changed files compare");
+        let pairs = case_pairs(writes, removals);
+        let from_of = pairs
+            .iter()
+            .map(|(from, to)| (to.as_path(), from.as_path()));
+        let from_of = from_of.collect::<HashMap<_, _>>();
+        let mut changed = BTreeSet::new();
+        let mut unchanged = HashMap::<u64, Vec<&Path>>::new();
+        for (path, bytes) in writes {
+            let landed = self.spelled(path, true);
+            let held = self.spelled(from_of.get(path.as_path()).copied().unwrap_or(path), false);
+            let moved = exact_path_key(&landed) != exact_path_key(&held) && held.is_file();
+            if moved || fs::read(path).map_or(true, |current| current != *bytes) {
+                changed.insert(landed);
+            } else {
+                let sized = unchanged.entry(bytes.len() as u64).or_default();
+                sized.push(path);
+            }
+            if moved {
+                changed.insert(held);
+            }
+        }
+        let paired = pairs.iter().map(|(from, _)| *from).collect::<HashSet<_>>();
+        // The disk is asked about each unchanged file once.
+        let mut files = HashMap::<u64, HashSet<Identity>>::new();
+        for path in removals.iter().filter(|path| !paired.contains(path)) {
+            let Ok(data) = fs::metadata(path) else {
+                continue;
+            };
+            if !data.is_file() {
+                continue;
+            }
+            let sized = files.entry(data.len()).or_insert_with(|| {
+                let sized = unchanged.get(&data.len()).into_iter().flatten();
+                sized.filter_map(|written| identity(written).ok()).collect()
+            });
+            let written =
+                !sized.is_empty() && identity(path).is_ok_and(|file| sized.contains(&file));
+            if !written {
+                changed.insert(self.spelled(path, false));
+            }
+        }
+        changed.into_iter().collect()
+    }
+
+    /// Script file copies with both files as the disk spells them after the
+    /// edit.
+    pub(super) fn landed(&self, copies: Vec<(PathBuf, PathBuf)>) -> Vec<(PathBuf, PathBuf)> {
+        let landed =
+            |(from, to): (PathBuf, PathBuf)| (self.spelled(&from, true), self.spelled(&to, true));
+        copies.into_iter().map(landed).collect()
+    }
+
+    /// Writes and removes the files of the edit these spellings were found
+    /// for.
+    pub(super) fn apply(
+        &self,
+        writes: &BTreeMap<PathBuf, Vec<u8>>,
+        removals: &[PathBuf],
+    ) -> Result<()> {
+        self.applied(write_file_mutations(writes, removals, &BTreeMap::new()))
+    }
+
+    /// `written`, the outcome of writing the edit's files, with the folders
+    /// that took its spelling renamed back where it failed.
+    fn applied(&self, written: Result<()>) -> Result<()> {
+        let Err(error) = written else {
+            return Ok(());
+        };
+        let mut failed = Vec::new();
+        for (folder, held, respelled) in self.0.values().rev() {
+            if *respelled && let Err(rename) = fs::rename(folder, folder.with_file_name(held)) {
+                failed.push(format!("{}: {rename}", folder.display()));
+            }
+        }
+        if failed.is_empty() {
+            return Err(error);
+        }
+        Err(error).context(format!(
+            "Folder renames were not undone: {}",
+            failed.join("; ")
+        ))
+    }
+
+    /// `path` with the names the disk holds: of the folders that keep their
+    /// spelling where `kept`, else of every folder, as it was before the edit.
+    pub(super) fn spelled(&self, path: &Path, kept: bool) -> PathBuf {
+        if self.0.is_empty() {
+            return path.to_path_buf();
+        }
+        let (mut spelled, mut held, mut otherwise) = (PathBuf::new(), PathBuf::new(), false);
+        for component in path.components() {
+            spelled.push(component);
+            match self.0.get(&exact_path_key(&spelled)) {
+                Some((_, name, respelled)) if !(kept && *respelled) => {
+                    held.push(name);
+                    otherwise = true;
+                }
+                _ => held.push(component),
+            }
+        }
+        if otherwise { held } else { path.to_path_buf() }
+    }
 }
 
+/// The names a folder holds, by each name in lower case: the names that
+/// differ only in letter case, in the order the folder lists them.
+type NamesByFold = HashMap<String, Vec<std::ffi::OsString>>;
+
+/// The name the parent of `folder` holds it under, where that differs from
+/// the name `folder` spells only in letter case. `listed` keeps each parent's
+/// names once read, so that a folder of many folders is asked for each of
+/// them without going through its names again.
+fn held_otherwise(
+    folder: &Path,
+    listed: &mut HashMap<String, NamesByFold>,
+) -> Option<std::ffi::OsString> {
+    let (parent, name) = (folder.parent()?, folder.file_name()?);
+    let names = listed.entry(exact_path_key(parent)).or_insert_with(|| {
+        let mut names = NamesByFold::new();
+        for entry in fs::read_dir(parent).into_iter().flatten().flatten() {
+            let folded = entry.file_name().to_string_lossy().to_lowercase();
+            names.entry(folded).or_default().push(entry.file_name());
+        }
+        names
+    });
+    let alike = names.get(&name.to_string_lossy().to_lowercase())?;
+    if alike.iter().any(|held| held.as_os_str() == name) {
+        return None;
+    }
+    alike.first().cloned()
+}
+
+/// The folders `path` is in below `root`, nearest first.
+fn folders_below<'a>(path: &'a Path, root: &'a Path) -> impl Iterator<Item = &'a Path> {
+    let below = move |folder: &&Path| *folder != root;
+    path.ancestors().skip(1).take_while(below)
+}
+
+/// Whether the file system holding `folder` finds it under its name in other
+/// letter case.
+fn ignores_case(folder: &Path) -> bool {
+    let Some(name) = folder.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let swapped = |letter: char| {
+        if letter.is_ascii_uppercase() {
+            letter.to_ascii_lowercase()
+        } else {
+            letter.to_ascii_uppercase()
+        }
+    };
+    let other = name.chars().map(swapped).collect::<String>();
+    other != name && same_file(folder, &folder.with_file_name(other))
+}
+
+#[cfg(unix)]
+type Identity = (u64, u64);
+#[cfg(not(unix))]
+type Identity = PathBuf;
+
+// The disk's answers to `identity` on this thread.
+#[cfg(test)]
+thread_local! {
+    static IDENTITIES_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// What tells the file or folder at `path` apart from every other on its
+/// disk.
+fn identity(path: &Path) -> io::Result<Identity> {
+    #[cfg(test)]
+    IDENTITIES_ASKED.with(|asked| asked.set(asked.get() + 1));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).map(|data| (data.dev(), data.ino()))
+    }
+    #[cfg(not(unix))]
+    fs::canonicalize(path)
+}
+
+/// Whether `left` and `right` name one file or folder on the disk.
+pub(super) fn same_file(left: &Path, right: &Path) -> bool {
+    matches!((identity(left), identity(right)), (Ok(left), Ok(right)) if left == right)
+}
+
+/// Whether the disk shows `from` and `to` to be files of their own: `to` is
+/// missing, or both have identities and they differ. Where it cannot tell,
+/// they are taken for one file, which an edit never removes.
+fn other_files(from: &Path, to: &Path) -> bool {
+    if fs::symlink_metadata(to).is_err_and(|error| error.kind() == io::ErrorKind::NotFound) {
+        return true;
+    }
+    matches!((identity(from), identity(to)), (Ok(from), Ok(to)) if from != to)
+}
+
+/// Each removal of an edit that one of its writes spells only in another
+/// letter case, with that write.
+fn case_pairs<'a>(
+    writes: &'a BTreeMap<PathBuf, Vec<u8>>,
+    removals: &'a [PathBuf],
+) -> Vec<(&'a PathBuf, &'a PathBuf)> {
+    if removals.is_empty() {
+        return Vec::new();
+    }
+    let mut folded = HashMap::new();
+    for to in writes.keys() {
+        folded.entry(case_folded_path_key(to)).or_insert(to);
+    }
+    let pair = |from: &'a PathBuf| {
+        let to = *folded.get(&case_folded_path_key(from))?;
+        (exact_path_key(from) != exact_path_key(to)).then_some((from, to))
+    };
+    removals.iter().filter_map(pair).collect()
+}
+
+/// Writes and removes an edit's files, first renaming the folders whose
+/// letter case it changes where they take it (`FolderSpellings`).
 pub(super) fn apply_file_mutations_with_permissions(
     writes: &BTreeMap<PathBuf, Vec<u8>>,
     removals: &[PathBuf],
     permissions: &BTreeMap<PathBuf, bool>,
 ) -> Result<()> {
+    let folders = FolderSpellings::found(writes, removals, &[], false);
+    folders.applied(write_file_mutations(writes, removals, permissions))
+}
+
+/// Puts a case-only move back: the file under its name before the move, with
+/// the bytes it held. Where the rename back fails, as it does while another
+/// program holds the file open, the bytes are written into the file where it
+/// is, which such a program does not stop as it stops a replacement.
+fn put_back(from: &Path, to: &Path, renamed: bool, original: &[u8]) -> Result<()> {
+    let moved = if renamed {
+        fs::rename(to, from)
+    } else {
+        Ok(())
+    };
+    let Err(error) = moved else {
+        return write_bytes_if_changed(from, original);
+    };
+    fs::write(from, original).with_context(|| format!("Failed to write {}", from.display()))?;
+    Err(error.into())
+}
+
+/// The removals of an edit that it leaves alone, by their exact keys, from
+/// its `paths` and what each held before it wrote, `originals`. A path that
+/// was no file then names, where it is one after, a file the edit wrote. A
+/// path the disk takes for a file the edit writes under another name, as it
+/// does for names it folds otherwise than `case_pairs`, is that file; two
+/// names of one file held the same bytes, so the disk is asked only about
+/// those.
+fn kept_removals(
+    writes: &BTreeMap<PathBuf, Vec<u8>>,
+    paths: &[PathBuf],
+    originals: &[Option<Vec<u8>>],
+) -> HashSet<String> {
+    let held = || paths.iter().zip(originals);
+    let mut rewritten = HashMap::<usize, Vec<(&Path, &[u8])>>::new();
+    for (path, original) in held() {
+        if let Some(original) = original
+            && writes.contains_key(path)
+        {
+            let sized = rewritten.entry(original.len()).or_default();
+            sized.push((path.as_path(), original.as_slice()));
+        }
+    }
+    // The disk is asked about each written file once, however many removals
+    // share its size.
+    let mut files = HashMap::<usize, HashMap<Identity, Vec<&[u8]>>>::new();
+    let mut kept = HashSet::new();
+    for (path, original) in held().filter(|(path, _)| !writes.contains_key(*path)) {
+        let written = original.as_ref().is_none_or(|original| {
+            let sized = files.entry(original.len()).or_insert_with(|| {
+                let mut sized = HashMap::<Identity, Vec<&[u8]>>::new();
+                for (to, bytes) in rewritten.get(&original.len()).into_iter().flatten() {
+                    if let Ok(file) = identity(to) {
+                        sized.entry(file).or_default().push(bytes);
+                    }
+                }
+                sized
+            });
+            !sized.is_empty()
+                && identity(path).is_ok_and(|file| {
+                    (sized.get(&file).into_iter().flatten())
+                        .any(|bytes| *bytes == original.as_slice())
+                })
+        });
+        if written {
+            kept.insert(exact_path_key(path));
+        }
+    }
+    kept
+}
+
+/// Writes and removes an edit's files: a file moved to a name in another
+/// letter case on a file system that ignores case is renamed in place before
+/// any other file is written, and a removal that names a file the edit writes
+/// is left alone (`kept_removals`).
+fn write_file_mutations(
+    writes: &BTreeMap<PathBuf, Vec<u8>>,
+    removals: &[PathBuf],
+    permissions: &BTreeMap<PathBuf, bool>,
+) -> Result<()> {
     let _span = crate::app::profile::span("file writes");
-    let mut case_moves: Vec<(PathBuf, PathBuf, PathBuf, Vec<u8>)> = Vec::new();
-    for from in removals {
-        let Some(to) = writes.keys().find(|to| {
-            exact_path_key(from) != exact_path_key(to)
-                && case_folded_path_key(from) == case_folded_path_key(to)
-        }) else {
-            continue;
-        };
-        let parent = from
-            .parent()
-            .context("Source path has no parent directory")?;
-        let mut attempt = 0u32;
-        let temporary = loop {
-            let candidate = parent.join(format!(
-                ".renium-case-move-{}-{}-{attempt}",
-                std::process::id(),
-                current_millis()
-            ));
-            let key = case_folded_path_key(&candidate);
-            let taken =
-                (case_moves.iter()).any(|(_, _, staged, _)| case_folded_path_key(staged) == key);
-            if !candidate.exists() && !taken {
-                break candidate;
-            }
-            attempt = attempt.saturating_add(1);
-        };
-        case_moves.push((
-            from.clone(),
-            to.clone(),
-            temporary,
-            fs::read(from).with_context(|| format!("Failed to read {}", from.display()))?,
-        ));
+    let mut case_moves = Vec::new();
+    for (from, to) in case_pairs(writes, removals) {
+        if from.is_file() && !other_files(from, to) {
+            let original =
+                fs::read(from).with_context(|| format!("Failed to read {}", from.display()))?;
+            case_moves.push((from, to, original));
+        }
     }
     let case_paths = case_moves
         .iter()
-        .flat_map(|(from, to, _, _)| [exact_path_key(from), exact_path_key(to)])
+        .flat_map(|(from, to, _)| [exact_path_key(from), exact_path_key(to)])
         .collect::<BTreeSet<_>>();
     let mut paths = writes.keys().cloned().collect::<Vec<_>>();
     paths.extend(removals.iter().cloned());
@@ -4498,10 +4864,11 @@ pub(super) fn apply_file_mutations_with_permissions(
         .iter()
         .map(|path| read_file_if_present(path))
         .collect::<io::Result<Vec<_>>>()?;
+    let kept = kept_removals(writes, &paths, &originals);
     let mut permission_paths = paths.clone();
-    for (from, to, _, _) in &case_moves {
-        permission_paths.push(from.clone());
-        permission_paths.push(to.clone());
+    for (from, to, _) in &case_moves {
+        permission_paths.push((*from).clone());
+        permission_paths.push((*to).clone());
     }
     permission_paths.sort_by_key(|path| exact_path_key(path));
     permission_paths.dedup_by(|left, right| exact_path_key(left) == exact_path_key(right));
@@ -4514,13 +4881,22 @@ pub(super) fn apply_file_mutations_with_permissions(
         })
         .collect::<Vec<_>>();
     let mut created_directories = Vec::new();
+    let mut started = Vec::new();
     let apply = (|| -> Result<()> {
-        for (from, _, temporary, _) in &case_moves {
-            fs::rename(from, temporary).with_context(|| {
-                format!("Failed to stage case-only source move {}", from.display())
-            })?;
+        for (index, (from, to, _)) in case_moves.iter().enumerate() {
+            let renamed = from.file_name() != to.file_name();
+            if renamed {
+                fs::rename(from, to).with_context(|| {
+                    format!("Failed to move {} to {}", from.display(), to.display())
+                })?;
+            }
+            started.push((index, renamed));
+            write_bytes_if_changed(to, &writes[*to])?;
         }
         for (path, bytes) in writes {
+            if case_paths.contains(&exact_path_key(path)) {
+                continue;
+            }
             if let Some(parent) = path.parent() {
                 let mut missing = Vec::new();
                 let mut current = parent;
@@ -4537,7 +4913,8 @@ pub(super) fn apply_file_mutations_with_permissions(
             write_bytes_if_changed(path, bytes)?;
         }
         for path in removals {
-            if case_paths.contains(&exact_path_key(path)) {
+            let key = exact_path_key(path);
+            if case_paths.contains(&key) || kept.contains(&key) {
                 continue;
             }
             if path.is_file() {
@@ -4545,14 +4922,6 @@ pub(super) fn apply_file_mutations_with_permissions(
                 fs::remove_file(path)
                     .with_context(|| format!("Failed to remove {}", path.display()))?;
             }
-        }
-        for (_, _, temporary, _) in &case_moves {
-            fs::remove_file(temporary).with_context(|| {
-                format!(
-                    "Failed to finish case-only source move {}",
-                    temporary.display()
-                )
-            })?;
         }
         for (path, readonly) in permissions {
             if !path.is_file() {
@@ -4566,7 +4935,6 @@ pub(super) fn apply_file_mutations_with_permissions(
         Ok(())
     })();
     let Err(error) = apply else {
-        respell_directories(writes, removals);
         return Ok(());
     };
     let mut rollback_errors = Vec::new();
@@ -4588,22 +4956,9 @@ pub(super) fn apply_file_mutations_with_permissions(
             rollback_errors.push(format!("{}: {restore_error}", path.display()));
         }
     }
-    for (from, to, temporary, original) in case_moves.iter().rev() {
-        let restore = (|| -> Result<()> {
-            if to.is_file() {
-                fs::remove_file(to)?;
-            }
-            if temporary.is_file() {
-                fs::rename(temporary, from)?;
-            } else {
-                if let Some(parent) = from.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                write_bytes_if_changed(from, original)?;
-            }
-            Ok(())
-        })();
-        if let Err(restore_error) = restore {
+    for (index, renamed) in started.into_iter().rev() {
+        let (from, to, original) = &case_moves[index];
+        if let Err(restore_error) = put_back(from, to, renamed, original) {
             rollback_errors.push(format!("{}: {restore_error}", from.display()));
         }
     }
@@ -4639,44 +4994,6 @@ pub(super) fn apply_file_mutations_with_permissions(
             "Filesystem rollback was incomplete: {}",
             rollback_errors.join("; ")
         ))
-    }
-}
-
-/// Renames a directory that held files of `removals` to the letter case
-/// `writes` spell it in: a file system that ignores case puts a file written
-/// under a name that differs only in case into the directory as it was
-/// spelled. A directory that cannot be renamed keeps its name.
-fn respell_directories(writes: &BTreeMap<PathBuf, Vec<u8>>, removals: &[PathBuf]) {
-    let mut held = HashMap::new();
-    for directory in removals.iter().flat_map(|path| path.ancestors().skip(1)) {
-        held.insert(case_folded_path_key(directory), directory);
-    }
-    let mut seen = HashSet::new();
-    for directory in writes.keys().flat_map(|path| path.ancestors().skip(1)) {
-        let Some(old) = held.get(&case_folded_path_key(directory)) else {
-            continue;
-        };
-        if exact_path_key(old) == exact_path_key(directory)
-            || !seen.insert(exact_path_key(directory))
-        {
-            continue;
-        }
-        let (Some(parent), Some(old_name), Some(name)) =
-            (directory.parent(), old.file_name(), directory.file_name())
-        else {
-            continue;
-        };
-        let names = fs::read_dir(parent)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.file_name())
-            .collect::<Vec<_>>();
-        let holds =
-            |wanted: &std::ffi::OsStr| names.iter().any(|entry| entry.as_os_str() == wanted);
-        if holds(old_name) && !holds(name) {
-            let _ = fs::rename(parent.join(old_name), directory);
-        }
     }
 }
 
@@ -4842,22 +5159,51 @@ pub(super) fn settings_lock_order_key(settings_file: &Path) -> String {
     crate::system::files::path_key(&crate::system::files::absolutize_for_daemon(settings_file))
 }
 
-/// Locks several stores, each once, in one order for every command. Two
-/// commands that need the same stores then never hold one each while they
-/// wait for the other's, which would stop both until a lock times out.
+/// Locks several stores, each once, in one order for every command: by their
+/// order keys without letter case, so that the order is the same however a
+/// command spells them. Two commands that need the same stores then never
+/// hold one each while they wait for the other's, which would stop both until
+/// a lock times out. A store named twice in different letter case is locked
+/// once where the disk takes the lock just taken under the one name for the
+/// lock file of the other, which tells also for a store that has no file yet.
 pub(super) fn acquire_settings_file_locks<'a>(
     settings_files: impl IntoIterator<Item = &'a Path>,
 ) -> Result<Vec<SettingsFileLock>> {
-    let mut ordered = settings_files
-        .into_iter()
-        .map(|settings_file| (settings_lock_order_key(settings_file), settings_file))
-        .collect::<Vec<_>>();
-    ordered.sort_by(|left, right| left.0.cmp(&right.0));
-    ordered.dedup_by(|later, earlier| later.0 == earlier.0);
-    ordered
-        .into_iter()
-        .map(|(_, settings_file)| acquire_settings_file_lock(settings_file))
-        .collect()
+    let keyed = |settings_file: &'a Path| {
+        let key = settings_lock_order_key(settings_file);
+        (key.to_lowercase(), key, settings_file)
+    };
+    let mut ordered = settings_files.into_iter().map(keyed).collect::<Vec<_>>();
+    ordered.sort();
+    ordered.dedup_by(|later, earlier| later.1 == earlier.1);
+    let mut locks = Vec::<SettingsFileLock>::new();
+    let (mut alike, mut spelled) = (0, None);
+    for (folded, _, settings_file) in &ordered {
+        if spelled != Some(folded) {
+            (alike, spelled) = (locks.len(), Some(folded));
+        }
+        let lock_path = settings_lock_path(settings_file);
+        let held = |lock: &SettingsFileLock| same_file(&lock.path, &lock_path);
+        if !locks[alike..].iter().any(held) {
+            locks.push(acquire_settings_file_lock(settings_file)?);
+        }
+    }
+    Ok(locks)
+}
+
+/// The lock file of the store at `settings_file`.
+fn settings_lock_path(settings_file: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.lock", settings_file.display()))
+}
+
+/// What tells a store a command holds the lock of apart from the others it
+/// locked: its lock file as the disk knows it, so that a store named under
+/// two spellings is one.
+pub(super) fn locked_store_key(settings_file: &Path) -> String {
+    match identity(&settings_lock_path(settings_file)) {
+        Ok(identity) => format!("{identity:?}"),
+        Err(_) => settings_lock_order_key(settings_file),
+    }
 }
 
 pub(super) fn acquire_settings_file_lock(settings_file: &Path) -> Result<SettingsFileLock> {
@@ -4867,7 +5213,7 @@ pub(super) fn acquire_settings_file_lock(settings_file: &Path) -> Result<Setting
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
-    let lock_path = PathBuf::from(format!("{}.lock", settings_file.display()));
+    let lock_path = settings_lock_path(settings_file);
     for attempt in 0..240 {
         match OpenOptions::new()
             .write(true)
@@ -5007,6 +5353,170 @@ mod project_discovery_tests {
                 .to_string()
                 .contains("No synced Renium store for service 'Workspace'")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod case_move_tests {
+    use super::*;
+
+    /// A folder of scripts removed while its twin's scripts, of the same
+    /// bytes, are written: each removal is checked against the written files
+    /// of its size with one question to the disk for each file, not one for
+    /// each pair.
+    #[test]
+    fn removals_ask_the_disk_about_each_file_once() {
+        let root = crate::tests::support::temp_dir("removals-once");
+        let (written, removed) = (root.join("Forest"), root.join("Forest_2"));
+        fs::create_dir_all(&written).unwrap();
+        fs::create_dir_all(&removed).unwrap();
+        let count = 60;
+        let file = |folder: &Path, index: usize| folder.join(format!("S{index}.luau"));
+        let mut writes = BTreeMap::new();
+        let (mut paths, mut originals) = (Vec::new(), Vec::new());
+        for index in 0..count {
+            for folder in [&written, &removed] {
+                fs::write(file(folder, index), "return 1").unwrap();
+                paths.push(file(folder, index));
+                originals.push(Some(b"return 1".to_vec()));
+            }
+            writes.insert(file(&written, index), b"return 1".to_vec());
+        }
+        IDENTITIES_ASKED.with(|asked| asked.set(0));
+        assert!(kept_removals(&writes, &paths, &originals).is_empty());
+        let asked = IDENTITIES_ASKED.with(std::cell::Cell::get);
+        assert_eq!(asked, 2 * count, "one question for each file");
+        // The one name the disk takes for a written file is kept.
+        let (alias, other) = (written.join("S0.luau"), written.join("s0.LUAU"));
+        let folds = same_file(&alias, &other);
+        writes.remove(&alias);
+        writes.insert(other.clone(), b"return 1".to_vec());
+        paths.push(other);
+        originals.push(folds.then(|| b"return 1".to_vec()));
+        let kept = kept_removals(&writes, &paths, &originals);
+        assert_eq!(kept.contains(&exact_path_key(&alias)), folds);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A case-only move put back gives its file the bytes it held even where
+    /// the rename back fails, and says that it failed. Only Windows lets a
+    /// test hold a file so that its rename fails; here the rename fails for a
+    /// file that is gone, on every system.
+    #[test]
+    fn a_case_move_put_back_restores_the_bytes_when_its_rename_fails() {
+        let root = crate::tests::support::temp_dir("case-move-back");
+        let (from, gone) = (root.join("A.luau"), root.join("gone.luau"));
+        fs::write(&from, "edited").unwrap();
+        assert!(put_back(&from, &gone, true, b"original").is_err());
+        assert_eq!(fs::read(&from).unwrap(), b"original");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A case-only move put back while another program holds the moved file
+    /// open, which is the file under both names: it can be neither renamed
+    /// back nor replaced, takes the bytes it held where it is, and the failed
+    /// rename is reported.
+    #[cfg(windows)]
+    #[test]
+    fn a_case_move_put_back_restores_the_bytes_of_a_file_held_open() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = crate::tests::support::temp_dir("case-move-held");
+        let (from, to) = (root.join("A.luau"), root.join("a.luau"));
+        fs::write(&to, "edited").unwrap();
+        let held = (fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2))
+            .open(&to)
+            .unwrap();
+        assert!(put_back(&from, &to, true, b"original").is_err());
+        drop(held);
+        assert_eq!(fs::read(&from).unwrap(), b"original");
+        let names = (fs::read_dir(&root).unwrap())
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["a.luau"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A removal that names a written file in another letter case, where the
+    /// disk does not show them to be two files, keeps the written one: here
+    /// the file the removal names went away before the edit wrote.
+    #[test]
+    fn a_removal_in_another_case_keeps_the_file_written_under_it() {
+        let root = crate::tests::support::temp_dir("case-move-gone");
+        let writes = BTreeMap::from([(root.join("a.luau"), b"return 1\n".to_vec())]);
+        apply_file_mutations(&writes, &[root.join("A.luau")]).unwrap();
+        assert_eq!(fs::read(root.join("a.luau")).unwrap(), b"return 1\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A removal the disk takes for a written file, under a name no fold of
+    /// letter case pairs with it, keeps that file: the short name Windows
+    /// gives a long one where the disk keeps short names, and on macOS a
+    /// sigma for a final sigma and a decomposed letter for the composed one.
+    /// A disk that keeps the two names apart holds the written file alone
+    /// after the edit.
+    #[test]
+    fn a_removal_the_disk_takes_for_a_written_file_keeps_it() {
+        let root = crate::tests::support::temp_dir("case-move-alias");
+        let pairs = [
+            ("LongScriptName.lua", "LONGSC~1.LUA"),
+            ("aς.luau", "aσ.luau"),
+            ("é.luau", "e\u{301}.luau"),
+        ];
+        for (from, to) in pairs {
+            let (from, to) = (root.join(from), root.join(to));
+            fs::write(&from, "return 1\n").unwrap();
+            let writes = BTreeMap::from([(to.clone(), b"return 1\n".to_vec())]);
+            apply_file_mutations(&writes, &[from]).unwrap();
+            assert_eq!(fs::read(&to).unwrap(), b"return 1\n", "{}", to.display());
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 1, "{}", to.display());
+            fs::remove_file(&to).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod store_lock_tests {
+    use super::*;
+
+    /// The lock files `stores` are locked with, each by its name in lower
+    /// case, in the order they were taken.
+    fn locked(stores: &[PathBuf]) -> Vec<String> {
+        let locks = acquire_settings_file_locks(stores.iter().map(PathBuf::as_path)).unwrap();
+        let name = |lock: &SettingsFileLock| lock.path.file_name().map(|name| name.to_owned());
+        let names = locks.iter().filter_map(name);
+        names
+            .map(|name| name.to_string_lossy().to_lowercase())
+            .collect()
+    }
+
+    /// A store named in two spellings is locked once where the disk takes
+    /// both for one file: a store that has a file, one of its names through a
+    /// folder and back, and a store that has none yet. A disk that keeps the
+    /// names apart locks two stores. The letters are outside ASCII, which
+    /// the order key folds on Windows before any lock is compared.
+    #[test]
+    fn a_store_named_in_two_spellings_is_locked_once() {
+        let root = crate::tests::support::temp_dir("store-locks");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("Ä.renium"), "").unwrap();
+        let stores = if root.join("SUB").is_dir() { 1 } else { 2 };
+        let held = [root.join("Ä.renium"), root.join("sub/../ä.renium")];
+        assert_eq!(locked(&held).len(), stores);
+        let new = [root.join("Ö.renium"), root.join("ö.renium")];
+        assert_eq!(locked(&new).len(), stores);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Stores are locked in one order however a command spells them.
+    #[test]
+    fn stores_are_locked_in_one_order_in_any_spelling() {
+        let root = crate::tests::support::temp_dir("store-lock-order");
+        let first = locked(&[root.join("ä.renium"), root.join("Ö.renium")]);
+        let second = locked(&[root.join("Ä.renium"), root.join("ö.renium")]);
+        assert_eq!(first, ["ä.renium.lock", "ö.renium.lock"]);
+        assert_eq!(second, first);
         fs::remove_dir_all(root).unwrap();
     }
 }

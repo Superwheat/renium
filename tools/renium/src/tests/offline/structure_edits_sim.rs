@@ -17,15 +17,15 @@
 //! the values the two encoders write apart (`pulled_alike`), and each of its
 //! blocks is the whole encode's or the one it held before, left standing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 use crate::editor::paths::{build_editor_instance_paths, build_editor_instance_paths_for_indices};
 use crate::editor::types::EditorInstancePath;
 use crate::settings::bytecode::blocks::sim::{
-    FORMATS, block_apart, block_rows_of, foreign_file, in_blocks, pulled_alike, pulled_in_blocks,
-    pulled_v11, same_document, with_source_markers_of, without_source_markers,
+    FORMATS, block_apart, block_rows_of, foreign_file, in_blocks, in_dense_blocks, pulled_alike,
+    pulled_in_blocks, pulled_v11, same_document, with_source_markers_of, without_source_markers,
 };
 use crate::settings::bytecode::decode_settings_bytecode;
 use crate::settings::instance::remap_ref_indices_in_value;
@@ -434,27 +434,13 @@ fn in_other_case(
 /// its project `before` and `after` it: each path it names as changed holds
 /// other bytes, or none, and each script file it names as copied holds the
 /// bytes its source held. Gives the paths it names as changed, from the root
-/// of the project, and how many script files it copied.
-///
-/// A path is read as spelled and as a file system that ignores the case of
-/// directories finds it, and it changed if it did either way: a file
-/// written under a directory name that differs only in case from one left
-/// by an earlier edit lands in that directory as it is spelled.
+/// of the project, and how many script files it copied. Paths are read as
+/// spelled, letter case and all.
 fn answered_files(
     outcome: &Outcome,
     before: &BTreeMap<String, Vec<u8>>,
     after: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(Vec<String>, usize), String> {
-    let found = |path: &str| match path.rsplit_once('/') {
-        Some((directory, name)) => format!("{}/{name}", directory.to_ascii_lowercase()),
-        None => path.to_string(),
-    };
-    let found_before = (before.iter())
-        .map(|(path, bytes)| (found(path), bytes))
-        .collect::<BTreeMap<_, _>>();
-    let found_after = (after.iter())
-        .map(|(path, bytes)| (found(path), bytes))
-        .collect::<BTreeMap<_, _>>();
     let listed = |field: &str| {
         let list = outcome.value.get(field).and_then(Value::as_array);
         list.into_iter().flatten()
@@ -464,19 +450,13 @@ fn answered_files(
         path.strip_prefix("<root>/").unwrap_or(path).to_string()
     };
     let changed = listed("changedPaths").map(relative).collect::<Vec<_>>();
-    let same = |path: &str| {
-        before.get(path) == after.get(path)
-            && found_before.get(&found(path)) == found_after.get(&found(path))
-    };
-    if let Some(path) = changed.iter().find(|path| same(path)) {
+    if let Some(path) = (changed.iter()).find(|path| before.get(*path) == after.get(*path)) {
         return Err(format!("{path} is named as changed but holds what it held"));
     }
     let copies = listed("sourceCopies").collect::<Vec<_>>();
     for copy in &copies {
         let (from, to) = (relative(&copy["from"]), relative(&copy["to"]));
-        let source = (before.get(&from)).or_else(|| found_before.get(&found(&from)).copied());
-        let copied = (after.get(&to)).or_else(|| found_after.get(&found(&to)).copied());
-        if source.is_none() || copied != source {
+        if before.get(&from).is_none() || after.get(&to) != before.get(&from) {
             return Err(format!("the copy {to} does not hold what {from} held"));
         }
     }
@@ -940,9 +920,19 @@ fn a_path_through_a_namesake_an_edit_takes_away_matches_whole_documents() {
     }
 }
 
+/// The names a folder holds.
+fn names_in(folder: &Path) -> BTreeSet<String> {
+    let entries = fs::read_dir(folder).into_iter().flatten().flatten();
+    entries
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
 /// A rename that changes only the letter case of a folder moves the script
-/// files in it to the new spelling, the folder with them, and names each
-/// file it moved as changed.
+/// files in it to the new spelling and names each file it moved as changed.
+/// On a file system that ignores case the folder takes the new spelling, with
+/// the files a file browser keeps in it; on one that keeps case apart the
+/// files go to a folder of their own and the old one stays.
 #[test]
 fn a_rename_in_another_case_moves_the_files_of_a_folder() {
     let document = settings_document(vec![
@@ -955,6 +945,11 @@ fn a_rename_in_another_case_moves_the_files_of_a_folder() {
         projects(&BTreeMap::from([("Workspace", document)]), 2, Writer::Whole).unwrap();
     for row in [2, 3] {
         fixture.write_source("Workspace", row, &format!("return {row}\n"));
+    }
+    let workspace = fixture.service_dir("Workspace");
+    let browsed = [".DS_Store", "desktop.ini"].map(str::to_string);
+    for name in &browsed {
+        fs::write(workspace.join("Model").join(name), "").unwrap();
     }
     let before = files_of(&fixture, &fixture.root);
     let args = ["rn", "Workspace", "-i", "folder", "model", "-r", "<root>"].map(str::to_string);
@@ -972,6 +967,470 @@ fn a_rename_in_another_case_moves_the_files_of_a_folder() {
             changed.contains(&from) && changed.contains(&to),
             "{changed:?}"
         );
+    }
+    let mut moved = BTreeSet::from(["A.luau".to_string(), "B.luau".to_string()]);
+    if fixture.root.join("SRC").is_dir() {
+        assert_eq!(names_in(&workspace), BTreeSet::from(["model".to_string()]));
+        moved.extend(browsed);
+    } else {
+        let both = BTreeSet::from(["Model".to_string(), "model".to_string()]);
+        assert_eq!(names_in(&workspace), both);
+        assert_eq!(names_in(&workspace.join("Model")), BTreeSet::from(browsed));
+    }
+    assert_eq!(names_in(&workspace.join("model")), moved);
+}
+
+/// A service folder the disk holds in another letter case is never renamed,
+/// and the answers spell it as the stores do.
+#[test]
+fn a_service_folder_in_another_case_keeps_its_name_and_the_stores_spelling() {
+    let (fixture, workspace) = workspace_of(vec![
+        settings_instance("folder", "Model", "Folder", Some(0)),
+        settings_instance("a", "A", "ModuleScript", Some(1)),
+    ]);
+    fixture.write_source("Workspace", 2, "return 2\n");
+    fs::rename(&workspace, workspace.with_file_name("workspace")).unwrap();
+    let args = ["rn", "Workspace", "-i", "folder", "model", "-r", "<root>"];
+    let outcome = run_on(&fixture, &args.map(str::to_string));
+    assert_eq!(outcome.error, None);
+    let changed = outcome.value["changedPaths"].as_array().unwrap();
+    let scripts = (changed.iter().filter_map(Value::as_str)).filter(|path| path.ends_with(".luau"));
+    for path in scripts {
+        assert!(path.starts_with("<root>/src/Workspace/"), "{changed:?}");
+    }
+    let held = names_in(&workspace.with_file_name("workspace"));
+    assert_eq!(held.len(), 1, "{held:?}");
+    if fixture.root.join("SRC").is_dir() {
+        let source = names_in(workspace.parent().unwrap());
+        assert_eq!(source, BTreeSet::from(["workspace".to_string()]));
+    }
+}
+
+/// A folder of a store with `rows` under its service, and its project.
+fn workspace_of(rows: Vec<SettingsBytecodeInstance>) -> (Fixture, PathBuf) {
+    let mut instances = vec![settings_instance("root", "Workspace", "Workspace", None)];
+    instances.extend(rows);
+    let stores = BTreeMap::from([("Workspace", settings_document(instances))]);
+    let (fixture, _) = projects(&stores, 2, Writer::Whole).unwrap();
+    let workspace = fixture.service_dir("Workspace");
+    (fixture, workspace)
+}
+
+/// Runs `args` on `fixture`, holding its answer to the files it changed, and
+/// gives that answer.
+fn edited(fixture: &Fixture, args: &[&str]) -> Outcome {
+    let before = files_of(fixture, &fixture.root);
+    let outcome = run_on(
+        fixture,
+        &args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+    );
+    assert_eq!(outcome.error, None);
+    let after = files_of(fixture, &fixture.root);
+    answered_files(&outcome, &before, &after).unwrap();
+    outcome
+}
+
+/// A rename in another case takes a folder to the new spelling with every
+/// file in it, a file no edit writes too, and a rename back takes it back.
+#[test]
+fn a_folder_renamed_in_another_case_and_back_takes_each_spelling() {
+    let (fixture, workspace) = workspace_of(vec![
+        settings_instance("folder", "Model", "Folder", Some(0)),
+        settings_instance("a", "A", "ModuleScript", Some(1)),
+    ]);
+    fixture.write_source("Workspace", 2, "return 2\n");
+    fs::write(workspace.join("Model/README.md"), "kept\n").unwrap();
+    let rename = |name| ["rn", "Workspace", "-i", "folder", name, "-r", "<root>"];
+    edited(&fixture, &rename("model"));
+    let folds = fixture.root.join("SRC").is_dir();
+    if folds {
+        assert_eq!(names_in(&workspace), BTreeSet::from(["model".to_string()]));
+        let held = BTreeSet::from(["A.luau".to_string(), "README.md".to_string()]);
+        assert_eq!(names_in(&workspace.join("model")), held);
+    }
+    fs::remove_file(workspace.join("Model/README.md")).unwrap();
+    edited(&fixture, &rename("Model"));
+    let names = names_in(&workspace);
+    assert!(
+        names.contains("Model") && !(folds && names.contains("model")),
+        "{names:?}"
+    );
+    let held = BTreeSet::from(["A.luau".to_string()]);
+    assert_eq!(names_in(&workspace.join("Model")), held);
+    assert_eq!(
+        fs::read(workspace.join("Model/A.luau")).unwrap(),
+        b"return 2\n"
+    );
+}
+
+/// A case-only rename of a folder inside one the disk holds in another
+/// spelling than its store: the inner folder takes the new spelling, the
+/// outer keeps its own, and the answers name the files where they are.
+#[test]
+fn a_folder_renamed_in_another_case_inside_a_kept_folder_answers_its_real_path() {
+    let (fixture, workspace) = workspace_of(vec![
+        settings_instance("folder", "model", "Folder", Some(0)),
+        settings_instance("sub", "Sub", "Folder", Some(1)),
+        settings_instance("x", "X", "ModuleScript", Some(2)),
+    ]);
+    fixture.write_source("Workspace", 3, "return 3\n");
+    fs::rename(workspace.join("model"), workspace.join("Model")).unwrap();
+    if !fixture.root.join("SRC").is_dir() {
+        return;
+    }
+    let args = ["rn", "Workspace", "-i", "sub", "sub", "-r", "<root>"];
+    let outcome = edited(&fixture, &args);
+    let changed = (outcome.value["changedPaths"].as_array().unwrap().iter())
+        .map(|path| path.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let landed = "<root>/src/Workspace/Model/sub/X.luau".to_string();
+    let left = "<root>/src/Workspace/Model/Sub/X.luau".to_string();
+    assert!(
+        changed.contains(&landed) && changed.contains(&left),
+        "{changed:?}"
+    );
+    assert_eq!(names_in(&workspace), BTreeSet::from(["Model".to_string()]));
+    let held = BTreeSet::from(["X.luau".to_string()]);
+    assert_eq!(names_in(&workspace.join("Model").join("sub")), held);
+}
+
+/// A rename in another case of letters outside ASCII moves the files as one
+/// in ASCII does: none is lost where the file system takes both names for
+/// one file.
+#[test]
+fn a_rename_in_another_case_outside_ascii_keeps_the_files() {
+    let (fixture, workspace) = workspace_of(vec![
+        settings_instance("folder", "Äpfel", "Folder", Some(0)),
+        settings_instance("oil", "Öl", "ModuleScript", Some(1)),
+        settings_instance("over", "Über", "ModuleScript", Some(0)),
+    ]);
+    fixture.write_source("Workspace", 2, "return 2\n");
+    fixture.write_source("Workspace", 3, "return 3\n");
+    edited(
+        &fixture,
+        &["rn", "Workspace", "-i", "over", "über", "-r", "<root>"],
+    );
+    edited(
+        &fixture,
+        &["rn", "Workspace", "-i", "folder", "äpfel", "-r", "<root>"],
+    );
+    let files = files_of(&fixture, &workspace);
+    let held = |path: &str| files.get(path).map(Vec::as_slice);
+    assert_eq!(
+        held("src/Workspace/über.luau"),
+        Some(&b"return 3\n"[..]),
+        "{files:?}"
+    );
+    assert_eq!(
+        held("src/Workspace/äpfel/Öl.luau"),
+        Some(&b"return 2\n"[..]),
+        "{files:?}"
+    );
+}
+
+/// Siblings whose names differ only in the case of letters outside ASCII get
+/// script files of their own.
+#[test]
+fn siblings_named_alike_outside_ascii_get_files_of_their_own() {
+    let (fixture, _) = workspace_of(vec![
+        settings_instance("upper", "Äpfel", "ModuleScript", Some(0)),
+        settings_instance("lower", "äpfel", "ModuleScript", Some(0)),
+    ]);
+    let folded = |row| {
+        let path = fixture.source_path("Workspace", row);
+        path.to_string_lossy().to_lowercase()
+    };
+    assert_ne!(folded(1), folded(2));
+}
+
+/// An edit that fails after renaming a folder to another letter case gives
+/// the folder its name back; once it goes through, the folder takes the new
+/// spelling.
+#[test]
+fn a_failed_edit_puts_a_folder_renamed_in_another_case_back() {
+    let root = temp_dir("folder-back");
+    let (store, folder) = (root.join("Workspace.renium"), root.join("Model"));
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(&store, "store\n").unwrap();
+    fs::write(folder.join("A.luau"), "A").unwrap();
+    fs::write(root.join("blocked"), "a file").unwrap();
+    let writes = BTreeMap::from([
+        (store.clone(), b"edited\n".to_vec()),
+        (root.join("model/A.luau"), b"A".to_vec()),
+        (root.join("blocked/B.luau"), b"B".to_vec()),
+    ]);
+    let removals = [folder.join("A.luau")];
+    assert!(crate::bytecode::apply_file_mutations(&writes, &removals).is_err());
+    let names = names_in(&root);
+    assert!(
+        names.contains("Model") && !names.contains("model"),
+        "{names:?}"
+    );
+    assert_eq!(fs::read(&store).unwrap(), b"store\n");
+    assert_eq!(fs::read(folder.join("A.luau")).unwrap(), b"A");
+    let folds = root.join("MODEL").is_dir();
+    fs::remove_file(root.join("blocked")).unwrap();
+    crate::bytecode::apply_file_mutations(&writes, &removals).unwrap();
+    let names = names_in(&root);
+    assert!(
+        names.contains("model") && !(folds && names.contains("Model")),
+        "{names:?}"
+    );
+}
+
+/// A batch that renames a folder and a folder inside it in another case each:
+/// both take the new spelling on the disk, as the store spells them.
+#[test]
+fn nested_folders_renamed_in_another_case_by_a_batch_keep_their_files() {
+    let (fixture, workspace) = workspace_of(vec![
+        settings_instance("folder", "Model", "Folder", Some(0)),
+        settings_instance("a", "A", "ModuleScript", Some(1)),
+        settings_instance("sub", "Sub", "Folder", Some(1)),
+        settings_instance("x", "X", "ModuleScript", Some(3)),
+    ]);
+    fixture.write_source("Workspace", 2, "return 2\n");
+    fixture.write_source("Workspace", 4, "return 4\n");
+    let ops = json!([
+        {"op": "rename", "service": "Workspace", "path": "folder", "name": "model"},
+        {"op": "rename", "service": "Workspace", "path": "sub", "name": "sub"},
+    ]);
+    edited(&fixture, &["ba", "-J", &ops.to_string()]);
+    let (outer, inner) = ("model", "sub");
+    let held = BTreeSet::from(["A.luau".to_string(), inner.to_string()]);
+    assert_eq!(names_in(&workspace.join(outer)), held);
+    let sub = workspace.join(outer).join(inner);
+    assert_eq!(names_in(&sub), BTreeSet::from(["X.luau".to_string()]));
+    assert_eq!(fs::read(sub.join("X.luau")).unwrap(), b"return 4\n");
+    if fixture.root.join("SRC").is_dir() {
+        assert_eq!(names_in(&workspace), BTreeSet::from([outer.to_string()]));
+    }
+}
+
+/// A project whose store `service` the disk finds also under the name of the
+/// folder `folder`, where it takes that spelling of the service for the same
+/// one: a part and a model whose PrimaryPart names the part by its path,
+/// which the store holds as it is written, beside a ReplicatedStorage store.
+fn store_under_two_spellings(service: &str, folder: &str) -> Fixture {
+    let mut model = settings_instance("model", "Model", "Model", Some(0));
+    let part = json!({"pathSegments": [service, "P"], "pathOrdinals": [1, 1]});
+    model
+        .properties
+        .insert("PrimaryPart".into(), reference(part));
+    let store = settings_document(vec![
+        settings_instance("root", service, service, None),
+        settings_instance("p", "P", "Part", Some(0)),
+        model,
+    ]);
+    let storage = "ReplicatedStorage";
+    let other = settings_document(vec![settings_instance("storage", storage, storage, None)]);
+    let fixture = project("two-spellings");
+    fs::create_dir_all(fixture.root.join("instances")).unwrap();
+    fs::write(fixture.store(service), in_dense_blocks(&store, 2).unwrap()).unwrap();
+    fs::write(fixture.store(storage), in_blocks(&other, 2).unwrap()).unwrap();
+    fs::create_dir_all(fixture.root.join("src").join(folder)).unwrap();
+    fixture
+}
+
+/// The stores of a project are listed once each, the edited one as the edit
+/// spells it, where a folder spells one of them in another letter case.
+#[test]
+fn a_store_under_two_spellings_is_listed_once() {
+    let fixture = store_under_two_spellings("Workspace", "workspace");
+    let edited = fixture.store("Workspace");
+    let listed = crate::bytecode::project_store_files(&edited).unwrap();
+    let stores = BTreeSet::from([edited, fixture.store("ReplicatedStorage")]);
+    assert_eq!(listed, stores);
+}
+
+/// A rename, a removal and a move to another service of an instance of a
+/// store that is listed under two spellings, with a reference to it in that
+/// store: the edit stands in the store after it. Read as two stores, the one
+/// the edit only followed the reference in would be written last.
+#[test]
+fn an_edit_of_a_store_under_two_spellings_stands() {
+    let storage = "ReplicatedStorage";
+    let edits: [(&[&str], &[&str]); 3] = [
+        (
+            &["rn", "Workspace", "-i", "p", "Q"],
+            &["Workspace", "Q", "Model"],
+        ),
+        (&["rm", "Workspace", "-i", "p"], &["Workspace", "Model"]),
+        (
+            &["mv", "Workspace", "-i", "p", "--to-service", storage],
+            &["Workspace", "Model"],
+        ),
+    ];
+    for (edit, names) in edits {
+        let fixture = store_under_two_spellings("Workspace", "workspace");
+        let args = edit.iter().chain(&["-r", "<root>"]).copied();
+        edited(&fixture, &args.collect::<Vec<_>>());
+        assert_eq!(fixture.names("Workspace"), names, "{edit:?}");
+        let moved = fixture.names(storage).contains(&"P".to_string());
+        assert_eq!(moved, edit[0] == "mv", "{edit:?}");
+    }
+}
+
+/// A batch that renames an instance of a store its op and the project's
+/// folders spell in two ways loads and writes that store once: with letters
+/// of ASCII, which a batch folds on Windows before it compares the two
+/// spellings, and with letters outside it, which it compares as they are.
+#[test]
+fn a_batch_on_a_store_under_two_spellings_loads_it_once() {
+    for (service, folder) in [("Workspace", "workspace"), ("Äther", "äther")] {
+        let fixture = store_under_two_spellings(service, folder);
+        let ops = json!([{"op": "rename", "service": service, "path": "p", "name": "Q"}]);
+        edited(&fixture, &["ba", "-J", &ops.to_string()]);
+        assert_eq!(fixture.names(service), [service, "Q", "Model"]);
+    }
+}
+
+/// A rename to a name the disk takes for the old one, though no fold of
+/// letter case pairs the two, keeps the script file under its name and names
+/// no file as changed that holds what it held: the short name Windows gives
+/// a long one where the disk keeps short names, and a sigma for a final
+/// sigma on macOS. A disk that keeps the names apart moves the file.
+#[test]
+fn a_rename_the_disk_takes_for_the_old_name_keeps_the_file() {
+    for (name, alias) in [("LongScriptName", "LONGSC~1"), ("aς", "aσ")] {
+        let (fixture, workspace) =
+            workspace_of(vec![settings_instance("a", name, "ModuleScript", Some(0))]);
+        let script = fixture.source_path("Workspace", 1).with_extension("lua");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(script, "return 1\n").unwrap();
+        edited(
+            &fixture,
+            &["rn", "Workspace", "-i", "a", alias, "-r", "<root>"],
+        );
+        let files = files_of(&fixture, &workspace);
+        assert_eq!(files.len(), 1, "{files:?}");
+        let renamed = workspace.join(alias).with_extension("lua");
+        assert_eq!(fs::read(renamed).unwrap(), b"return 1\n", "{files:?}");
+    }
+}
+
+/// A folder that cannot take a rename's spelling keeps its own: the edit goes
+/// through, and its answers and those of a later edit name the files where
+/// they land.
+#[cfg(windows)]
+#[test]
+fn a_folder_that_cannot_be_renamed_keeps_its_name_and_answers_say_so() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let (fixture, workspace) = workspace_of(vec![
+        settings_instance("folder", "Model", "Folder", Some(0)),
+        settings_instance("a", "A", "ModuleScript", Some(1)),
+    ]);
+    fixture.write_source("Workspace", 2, "return 2\n");
+    // Read and write sharing without delete sharing refuses any rename of the
+    // folder while it is open; a folder opens only with backup semantics.
+    let held = (fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2))
+        .custom_flags(0x0200_0000)
+        .open(workspace.join("Model"))
+        .unwrap();
+    edited(
+        &fixture,
+        &["rn", "Workspace", "-i", "folder", "model", "-r", "<root>"],
+    );
+    let ops = json!([
+        {"service": "Workspace", "parent": "folder", "name": "New", "class": "ModuleScript", "ref": "a0"},
+    ]);
+    let outcome = edited(&fixture, &["ba", "-J", &ops.to_string()]);
+    drop(held);
+    assert_eq!(names_in(&workspace), BTreeSet::from(["Model".to_string()]));
+    let held = BTreeSet::from(["A.luau".to_string(), "New.luau".to_string()]);
+    assert_eq!(names_in(&workspace.join("Model")), held);
+    let landed = "<root>/src/Workspace/Model/New.luau";
+    let changed = outcome.value["changedPaths"].as_array().unwrap();
+    assert!(changed.iter().any(|path| path == landed), "{changed:?}");
+    let ops = outcome.value["ops"].as_array().unwrap();
+    assert!(ops.iter().any(|op| op["sourcePath"] == landed), "{ops:?}");
+}
+
+/// An edit's files moved to a name in another letter case go before any other
+/// write: one that fails stops the edit with its store as it was, and only
+/// the moves that started are put back.
+#[cfg(windows)]
+#[test]
+fn a_failed_case_move_stops_an_edit_before_its_store() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let root = temp_dir("case-moves");
+    let (store, folder) = (root.join("Workspace.renium"), root.join("Model"));
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(&store, "store\n").unwrap();
+    let names = ["A", "B", "C"];
+    for name in names {
+        fs::write(folder.join(format!("{name}.luau")), name).unwrap();
+    }
+    let modified = |path: &Path| fs::metadata(path).unwrap().modified().unwrap();
+    let (stored, untouched) = (modified(&store), modified(&folder.join("C.luau")));
+    let mut writes = BTreeMap::from([(store.clone(), b"edited\n".to_vec())]);
+    let mut removals = Vec::new();
+    for name in names {
+        let lower = name.to_ascii_lowercase();
+        writes.insert(folder.join(format!("{lower}.luau")), lower.into_bytes());
+        removals.push(folder.join(format!("{name}.luau")));
+    }
+    let held = (fs::OpenOptions::new().read(true).share_mode(0x1 | 0x2))
+        .open(folder.join("B.luau"))
+        .unwrap();
+    assert!(crate::bytecode::apply_file_mutations(&writes, &removals).is_err());
+    drop(held);
+    assert_eq!(fs::read(&store).unwrap(), b"store\n");
+    assert_eq!(modified(&store), stored);
+    let held = names.map(|name| format!("{name}.luau"));
+    assert_eq!(names_in(&folder), BTreeSet::from(held));
+    assert_eq!(fs::read(folder.join("A.luau")).unwrap(), b"A");
+    assert_eq!(modified(&folder.join("C.luau")), untouched);
+}
+
+/// A copy into a folder whose name differs only in letter case from a folder
+/// an earlier edit left, empty or not: on a file system that ignores case the
+/// left folder keeps its spelling and the answer names the copy where it
+/// lands. A file system that keeps case apart keeps both folders.
+#[test]
+fn a_folder_left_in_another_case_keeps_its_spelling_through_a_copy_into_it() {
+    let document = settings_document(vec![
+        settings_instance("root", "Workspace", "Workspace", None),
+        settings_instance("module", "A", "ModuleScript", Some(0)),
+        settings_instance("folder", "config", "Folder", Some(0)),
+    ]);
+    for held in [None, Some("notes.txt")] {
+        let stores = BTreeMap::from([("Workspace", document.clone())]);
+        let (fixture, _) = projects(&stores, 2, Writer::Whole).unwrap();
+        fixture.write_source("Workspace", 1, "return 1\n");
+        let left = fixture.service_dir("Workspace").join("CONFIG");
+        fs::create_dir_all(&left).unwrap();
+        if let Some(name) = held {
+            fs::write(left.join(name), "kept\n").unwrap();
+        }
+        let before = files_of(&fixture, &fixture.root);
+        let args = [
+            "cp",
+            "Workspace",
+            "-i",
+            "module",
+            "-I",
+            "folder",
+            "-r",
+            "<root>",
+        ];
+        let outcome = run_on(&fixture, &args.map(str::to_string));
+        assert_eq!(outcome.error, None);
+        let after = files_of(&fixture, &fixture.root);
+        let (changed, copies) = answered_files(&outcome, &before, &after).unwrap();
+        let folds = fixture.root.join("SRC").is_dir();
+        let folder = if folds { "CONFIG" } else { "config" };
+        let landed = format!("src/Workspace/{folder}/A.luau");
+        assert!(
+            after.contains_key(&landed) && changed.contains(&landed),
+            "{after:?}"
+        );
+        assert_eq!(copies, 1);
+        if let Some(name) = held {
+            let kept = after.get(&format!("src/Workspace/CONFIG/{name}"));
+            assert_eq!(kept.map(Vec::as_slice), Some(&b"kept\n"[..]), "{after:?}");
+        }
+        let names = names_in(&fixture.service_dir("Workspace"));
+        assert!(names.contains("CONFIG"), "{names:?}");
     }
 }
 

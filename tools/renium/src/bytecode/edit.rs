@@ -10,10 +10,9 @@ use crate::app::output::print_json_output;
 use crate::bytecode::query::{bytecode_parent_index, parse_property_assignments};
 use crate::bytecode::references::{MissingTarget, ReferencedStores};
 use crate::bytecode::{
-    SourcePathsBefore, acquire_settings_file_lock, adopt_single_positional_target,
-    apply_file_mutations, collect_source_path_updates, ensure_service_store_exists,
-    file_mutation_paths, lock_existing_service_store, preserve_source_path_extension,
-    resolve_bytecode_cli_settings_file, resolve_bytecode_selector,
+    FolderSpellings, SourcePathsBefore, acquire_settings_file_lock, adopt_single_positional_target,
+    collect_source_path_updates, ensure_service_store_exists, lock_existing_service_store,
+    preserve_source_path_extension, resolve_bytecode_cli_settings_file, resolve_bytecode_selector,
 };
 use crate::cli::{
     BytecodeAddInstanceArgs, BytecodeDesyncPackageLinkArgs, BytecodeRemoveInstanceArgs,
@@ -33,7 +32,7 @@ use crate::settings::bytecode::{
 };
 use crate::settings::instance::{self as instance_api, AddInstanceSpec};
 use crate::settings::tree::settings_children_by_parent;
-use crate::system::files::{ensure_existing_ancestor_inside, exact_path_key, path_key};
+use crate::system::files::{ensure_existing_ancestor_inside, exact_path_key};
 
 /// Studio cannot instantiate a class tagged NotCreatable (Player, Terrain, a
 /// service); a store holding one makes every push of that service fail, and
@@ -981,13 +980,16 @@ pub(crate) fn add_store_instance(request: StoreInstanceRequest) -> Result<Value>
             None => adopted_source = Some(source_path.clone()),
         }
     }
-    let changed_paths = file_mutation_paths(&writes, &removals);
+    let read = adopted_source.as_deref().into_iter().collect::<Vec<_>>();
+    let folders = FolderSpellings::respell(&writes, &removals, &read);
+    let changed_paths = folders.changed_paths(&writes, &removals);
     let source_writes = changed_paths
         .iter()
         .filter(|path| *path != &settings_file)
         .cloned()
         .collect::<Vec<_>>();
-    apply_file_mutations(&writes, &removals)?;
+    let adopted_source = adopted_source.map(|path| folders.spelled(&path, true));
+    folders.apply(&writes, &removals)?;
     let path = build_editor_instance_paths_for_indices(&document, &service, &[added.index])
         .remove(&added.index);
     let mut result = json!({
@@ -1156,8 +1158,11 @@ pub(crate) fn clone_stored_instance(
             settings_file.clone(),
             stored.encode_restructured(&document)?,
         );
-        let changed_paths = file_mutation_paths(&writes, &removals);
-        apply_file_mutations(&writes, &removals)?;
+        let read = (source_copies.iter().map(|(from, _)| from.as_path())).collect::<Vec<_>>();
+        let folders = FolderSpellings::respell(&writes, &removals, &read);
+        let changed_paths = folders.changed_paths(&writes, &removals);
+        let source_copies = folders.landed(source_copies);
+        folders.apply(&writes, &removals)?;
         super::release_settings_file_locks(locks);
         let result = answer(&document, cloned.root_index, changed_paths, source_copies);
         rayon::spawn(move || drop((document, stored)));
@@ -1189,7 +1194,6 @@ pub(crate) fn clone_stored_instance(
         settings_file.clone(),
         stored.encode_restructured(&document)?,
     );
-    let changed_paths = file_mutation_paths(&writes, &removals);
     let mut moved_to = HashMap::with_capacity(moves.len());
     for (from, to) in &moves {
         moved_to.entry(exact_path_key(from)).or_insert(to);
@@ -1200,8 +1204,12 @@ pub(crate) fn clone_stored_instance(
     };
     let source_copies = (source_copies.into_iter())
         .map(|(from, to)| (moved(from), moved(to)))
-        .collect();
-    apply_file_mutations(&writes, &removals)?;
+        .collect::<Vec<_>>();
+    let read = (source_copies.iter().map(|(from, _)| from.as_path())).collect::<Vec<_>>();
+    let folders = FolderSpellings::respell(&writes, &removals, &read);
+    let changed_paths = folders.changed_paths(&writes, &removals);
+    let source_copies = folders.landed(source_copies);
+    folders.apply(&writes, &removals)?;
     super::release_settings_file_locks(locks);
     let result = answer(&document, root_index, changed_paths, source_copies);
     rayon::spawn(move || drop((document, copied, stored)));
@@ -1330,13 +1338,17 @@ fn moved_after_copy(
 ) -> Result<()> {
     let mut moved = BTreeMap::new();
     let mut left = Vec::new();
+    let wrote = (writes.iter()).map(|(path, bytes)| (exact_path_key(path), bytes));
+    let wrote = wrote.collect::<HashMap<_, _>>();
+    let removed = exact_keys(removals.iter());
     for (from, to) in moves {
-        if exact_path_key(from) == exact_path_key(to) {
+        let key = exact_path_key(from);
+        if key == exact_path_key(to) {
             continue;
         }
-        let bytes = match copy_wrote(writes, from) {
-            Some(bytes) => bytes.clone(),
-            None if from.is_file() && !copy_removed(removals, from) => {
+        let bytes = match wrote.get(&key) {
+            Some(bytes) => (*bytes).clone(),
+            None if from.is_file() && !removed.contains(&key) => {
                 fs::read(from).with_context(|| format!("Failed to read {}", from.display()))?
             }
             None => continue,
@@ -1344,23 +1356,23 @@ fn moved_after_copy(
         moved.insert(to.clone(), bytes);
         left.push(from.clone());
     }
-    left.retain(|from| {
-        !moved
-            .keys()
-            .any(|to| exact_path_key(to) == exact_path_key(from))
-    });
-    writes.retain(|written, _| !copy_removed(&left, written));
+    let landed = exact_keys(moved.keys());
+    left.retain(|from| !landed.contains(&exact_path_key(from)));
+    let gone = exact_keys(&left);
+    writes.retain(|written, _| !gone.contains(&exact_path_key(written)));
     writes.extend(moved);
     removals.extend(left);
-    removals.retain(|path| {
-        path.is_file()
-            && !writes
-                .keys()
-                .any(|write| exact_path_key(write) == exact_path_key(path))
-    });
+    let written = exact_keys(writes.keys());
+    removals.retain(|path| path.is_file() && !written.contains(&exact_path_key(path)));
     removals.sort_by_key(|path| exact_path_key(path));
     removals.dedup_by(|left, right| exact_path_key(left) == exact_path_key(right));
     Ok(())
+}
+
+/// The exact keys of `paths`, to look many paths up in without going through
+/// them for each.
+fn exact_keys<'p>(paths: impl IntoIterator<Item = &'p PathBuf>) -> HashSet<String> {
+    paths.into_iter().map(|path| exact_path_key(path)).collect()
 }
 
 /// A subtree copied inside its store: the copy's root and, in subtree
@@ -2151,9 +2163,10 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
         &mut removals,
     )?;
     removals.extend(removed_paths);
-    removals.retain(|path| !writes.keys().any(|write| path_key(write) == path_key(path)));
-    removals.sort_by_key(|path| path_key(path));
-    removals.dedup_by(|left, right| path_key(left) == path_key(right));
+    let written = exact_keys(writes.keys());
+    removals.retain(|path| !written.contains(&exact_path_key(path)));
+    removals.sort_by_key(|path| exact_path_key(path));
+    removals.dedup_by(|left, right| exact_path_key(left) == exact_path_key(right));
     let removed_source_paths = removals.clone();
     let removed_settings_file = document.instances.is_empty();
     if removed_settings_file {
@@ -2164,14 +2177,15 @@ pub(crate) fn bytecode_remove_instance(mut args: BytecodeRemoveInstanceArgs) -> 
             stored.encode_restructured(&document)?,
         );
     }
-    let changed_paths = file_mutation_paths(&writes, &removals);
-    apply_file_mutations(&writes, &removals)?;
+    let folders = FolderSpellings::respell(&writes, &removals, &[]);
+    let changed_paths = folders.changed_paths(&writes, &removals);
+    folders.apply(&writes, &removals)?;
     super::release_settings_file_locks(locks);
     let read = (document, before_document, stored);
     rayon::spawn(move || drop((read, source_paths_by_index, children_by_parent)));
     let removed_source_paths_json = removed_source_paths
         .iter()
-        .map(|path| path.to_string_lossy().into_owned())
+        .map(|path| folders.spelled(path, false).to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     {
         let _span = crate::app::profile::span("removed folders pruned");
@@ -2404,8 +2418,9 @@ pub(crate) fn bytecode_desync_package_link(mut args: BytecodeDesyncPackageLinkAr
         &mut removals,
     )?;
     writes.insert(settings_file.clone(), encode_settings_bytecode(&document)?);
-    let changed_paths = file_mutation_paths(&writes, &removals);
-    apply_file_mutations(&writes, &removals)?;
+    let folders = FolderSpellings::respell(&writes, &removals, &[]);
+    let changed_paths = folders.changed_paths(&writes, &removals);
+    folders.apply(&writes, &removals)?;
     prune_removed_source_dirs(service_dir, &removals);
     print_json_output(
         &json!({

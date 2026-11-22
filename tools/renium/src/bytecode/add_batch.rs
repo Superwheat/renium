@@ -22,9 +22,9 @@ use crate::bytecode::references::{
     qualify_reference_targets,
 };
 use crate::bytecode::{
-    SettingsFileLock, SourcePathsBefore, acquire_settings_file_locks, apply_file_mutations,
+    FolderSpellings, SettingsFileLock, SourcePathsBefore, acquire_settings_file_locks,
     check_new_source_file, collect_source_path_updates, ensure_settable_attribute_name,
-    file_mutation_paths, fold_derived_property, high_level_split_path, missing_service_store_error,
+    fold_derived_property, high_level_split_path, locked_store_key, missing_service_store_error,
     preserve_source_path_extension, read_store_for_structure, reject_owned_instance_edit,
     reject_read_only_link_edit, reject_read_only_link_subtree_edit, release_settings_file_locks,
     resolve_bytecode_cli_settings_file, settings_lock_order_key, store_link_enforcement,
@@ -44,7 +44,9 @@ use crate::settings::bytecode::{
 };
 use crate::settings::instance::{self as instance_api, AddInstanceSpec, PropertyScope};
 use crate::settings::tree::{editor_service_root_index, settings_children_by_parent};
-use crate::system::files::{path_key, service_settings_path, validate_filesystem_instance_name};
+use crate::system::files::{
+    exact_path_key, path_key, service_settings_path, validate_filesystem_instance_name,
+};
 
 /// The longest first name of a dotted string that is looked up as a service.
 const MAX_SERVICE_NAME_LEN: usize = 100;
@@ -409,9 +411,11 @@ fn collect_dotted_path_services(value: &Value, services: &mut BTreeSet<String>) 
 }
 
 /// The store locks a batch holds from before its first op until its files
-/// are written.
+/// are written, with the store each locked path stands for
+/// (`locked_store_key`), by its order key: a store the ops and the project's
+/// folders spell in two ways is loaded and written once.
 struct BatchLocks {
-    keys: HashSet<String>,
+    keys: HashMap<String, String>,
     _held: Vec<SettingsFileLock>,
 }
 
@@ -467,13 +471,18 @@ impl BatchLocks {
                     .filter(|path| path.is_file()),
             );
         }
-        Ok(Self {
-            keys: files
-                .iter()
-                .map(|file| settings_lock_order_key(file))
-                .collect(),
-            _held: acquire_settings_file_locks(files.iter().map(PathBuf::as_path))?,
-        })
+        let held = acquire_settings_file_locks(files.iter().map(PathBuf::as_path))?;
+        let mut keys = HashMap::new();
+        for file in &files {
+            let store = keys.entry(settings_lock_order_key(file));
+            store.or_insert_with(|| locked_store_key(file));
+        }
+        Ok(Self { keys, _held: held })
+    }
+
+    /// The store the locked path `settings_file` stands for.
+    fn store_key(&self, settings_file: &Path) -> Option<&String> {
+        self.keys.get(&settings_lock_order_key(settings_file))
     }
 }
 
@@ -958,19 +967,19 @@ impl BatchState<'_> {
         create: bool,
         decoded: Option<SettingsBytecode>,
     ) -> Result<usize> {
-        let key = settings_lock_order_key(&settings_file);
-        if let Some(position) = self.positions.get(&key) {
+        let locked = self.locks.store_key(&settings_file);
+        if let Some(position) = locked.and_then(|key| self.positions.get(key)) {
             return Ok(*position);
         }
         if !create && !settings_file.exists() {
             return Err(missing_service_store_error(&settings_file));
         }
-        if !self.locks.keys.contains(&key) {
+        let Some(key) = locked.cloned() else {
             bail!(
                 "{} was not locked before the batch ran",
                 settings_file.display()
             );
-        }
+        };
         let _span = crate::app::profile::span("batch store load");
         let (document, stored) = match decoded {
             Some(document) => (document, None),
@@ -1033,8 +1042,9 @@ impl BatchState<'_> {
                 continue;
             }
             let mut decoded = None;
+            let locked = self.locks.store_key(&path);
             if let Some(paths) = holding
-                && !self.positions.contains_key(&settings_lock_order_key(&path))
+                && !locked.is_some_and(|key| self.positions.contains_key(key))
             {
                 if !paths.is_empty() {
                     decoded = SettingsBytecode::read_file_if_contains_any_string_set(&path, paths)?;
@@ -1313,24 +1323,36 @@ impl BatchState<'_> {
         let mut removals = Vec::new();
         let mut changed_paths = Vec::new();
         let mut script_files = vec![HashMap::new(); self.stores.len()];
+        let mut planned = Vec::new();
         for (position, store) in self.stores.iter().enumerate() {
             if !store.touched {
                 continue;
             }
             let _span = crate::app::profile::span("batch store plan");
-            let (store_writes, store_removals) =
-                store.plan(&self.labels, &mut script_files[position])?;
-            changed_paths.extend(file_mutation_paths(&store_writes, &store_removals));
+            planned.push((
+                position,
+                store.plan(&self.labels, &mut script_files[position])?,
+            ));
+        }
+        let mut folders = FolderSpellings::default();
+        for (position, (store_writes, store_removals)) in planned {
+            let adopted = (script_files[position].values())
+                .filter(|(_, adopted)| *adopted)
+                .map(|(path, _)| path.as_path())
+                .collect::<Vec<_>>();
+            let store_folders = FolderSpellings::respell(&store_writes, &store_removals, &adopted);
+            changed_paths.extend(store_folders.changed_paths(&store_writes, &store_removals));
+            folders.0.extend(store_folders.0);
             writes.extend(store_writes);
             removals.extend(store_removals);
         }
-        apply_file_mutations(&writes, &removals)?;
+        folders.apply(&writes, &removals)?;
         for store in self.stores.iter().filter(|store| store.touched) {
             prune_removed_source_dirs(&store.service_dir, &removals);
         }
         release_settings_file_locks(std::mem::take(&mut self.locks._held));
         let _span = crate::app::profile::span("batch receipts");
-        let receipts = self.receipt_values(&script_files);
+        let receipts = self.receipt_values(&script_files, &folders);
         let pushes = self.pushes();
         let touched = self.stores.iter().filter(|store| store.touched).count();
         let stores = std::mem::take(&mut self.stores);
@@ -1347,7 +1369,11 @@ impl BatchState<'_> {
         })
     }
 
-    fn receipt_values(&self, script_files: &[HashMap<String, (PathBuf, bool)>]) -> Vec<Value> {
+    fn receipt_values(
+        &self,
+        script_files: &[HashMap<String, (PathBuf, bool)>],
+        folders: &FolderSpellings,
+    ) -> Vec<Value> {
         let mut wanted = HashMap::<usize, HashSet<&str>>::new();
         for receipt in self
             .receipts
@@ -1393,6 +1419,7 @@ impl BatchState<'_> {
                         .as_ref()
                         .and_then(|settings_id| script_files[receipt.store].get(settings_id))
                 {
+                    let source_path = folders.spelled(source_path, true);
                     object.insert("sourcePath".to_string(), json!(source_path));
                     if *adopted {
                         object.insert("adoptedSource".to_string(), json!(true));
@@ -1658,9 +1685,11 @@ impl StoreState {
             }
             script_files.insert(settings_id.to_string(), (path, adopted));
         }
-        removals.retain(|path| !writes.keys().any(|write| path_key(write) == path_key(path)));
-        removals.sort_by_key(|path| path_key(path));
-        removals.dedup_by(|left, right| path_key(left) == path_key(right));
+        let written = writes.keys().map(|write| exact_path_key(write));
+        let written = written.collect::<HashSet<_>>();
+        removals.retain(|path| !written.contains(&exact_path_key(path)));
+        removals.sort_by_key(|path| exact_path_key(path));
+        removals.dedup_by(|left, right| exact_path_key(left) == exact_path_key(right));
         let encoded = match &self.stored {
             Some(stored) => stored.encode_restructured(&self.document)?,
             None => encode_settings_bytecode(&self.document)?,

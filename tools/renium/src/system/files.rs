@@ -197,7 +197,7 @@ fn sweep_abandoned_trash(parent: &Path) {
 }
 
 pub(crate) fn case_folded_path_key(path: &Path) -> String {
-    exact_path_key(path).to_ascii_lowercase()
+    exact_path_key(path).to_lowercase()
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
@@ -690,7 +690,7 @@ pub(crate) fn normalized_child_stem_key(value: &str) -> String {
         if ch == '\\' {
             out.push('/');
         } else {
-            out.push(ch.to_ascii_lowercase());
+            out.extend(ch.to_lowercase());
         }
     }
     out

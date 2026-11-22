@@ -14,8 +14,8 @@ use crate::app::output::{log_global, print_json_output};
 use crate::app::timing::current_millis;
 use crate::automation::reconcile::history as sync_history;
 use crate::bytecode::{
-    SourcePathsBefore, acquire_settings_file_lock, apply_file_mutations,
-    collect_source_path_updates, file_mutation_paths,
+    FolderSpellings, SourcePathsBefore, acquire_settings_file_lock, collect_source_path_updates,
+    same_file,
 };
 use crate::cli::{EditorRevertArgs, ProjectSourceArgs, PushEditorChangesArgs};
 use crate::editor::document::document_instance_index_by_settings_id;
@@ -37,9 +37,10 @@ use crate::settings::tree::settings_children_by_parent;
 use crate::snapshot::refs::{settings_instance_path, stabilize_record_references};
 use crate::studio::bridge::BridgeServer;
 use crate::system::files::{
-    absolutize_under, create_unique_directory, ensure_existing_ancestor_inside, path_key,
-    pretty_json_text, read_json_file, resolve_project_root_if_present, sanitize_ascii_identifier,
-    service_settings_path, validate_filesystem_instance_name,
+    absolutize_under, case_folded_path_key, create_unique_directory,
+    ensure_existing_ancestor_inside, path_key, pretty_json_text, read_json_file,
+    resolve_project_root_if_present, sanitize_ascii_identifier, service_settings_path,
+    validate_filesystem_instance_name,
 };
 
 pub(crate) struct EditorHistoryTransaction {
@@ -722,11 +723,15 @@ pub(crate) fn revert_history_manifest(
             .zip(&after)
             .filter_map(|(instance, to)| {
                 let from = current_paths.get(instance.settings_id.as_str())?;
-                (Some(*from) != to.as_ref()).then(|| path_key(from))
+                (Some(*from) != to.as_ref()).then(|| (case_folded_path_key(from), *from))
             })
-            .collect::<HashSet<_>>();
+            .collect::<HashMap<_, _>>();
+        let moving_away = |path: &Path| {
+            (moving_from.get(&case_folded_path_key(path)))
+                .is_some_and(|from| path_key(from) == path_key(path) || same_file(from, path))
+        };
         for destination in writes.keys() {
-            if destination.exists() && !moving_from.contains(&path_key(destination)) {
+            if destination.exists() && !moving_away(destination) {
                 bail!(
                     "History source destination is occupied: {}",
                     destination.display()
@@ -742,7 +747,7 @@ pub(crate) fn revert_history_manifest(
                 && current_paths
                     .get(settings_id)
                     .is_none_or(|current| path_key(current) != path_key(path))
-                && !moving_from.contains(&path_key(path))
+                && !moving_away(path)
             {
                 bail!("History source destination is occupied: {}", path.display());
             }
@@ -765,8 +770,9 @@ pub(crate) fn revert_history_manifest(
     for path in writes.keys().chain(removals.iter()) {
         ensure_existing_ancestor_inside(project_root, path, "history destination")?;
     }
-    let changed_paths = file_mutation_paths(&writes, &removals);
-    apply_file_mutations(&writes, &removals)?;
+    let folders = FolderSpellings::respell(&writes, &removals, &[]);
+    let changed_paths = folders.changed_paths(&writes, &removals);
+    folders.apply(&writes, &removals)?;
     output["changedPaths"] = json!(
         changed_paths
             .iter()
@@ -1308,6 +1314,39 @@ mod tests {
         assert!(!before.exists());
         assert_eq!(
             fs::read_to_string(project.src_root.join("Workspace/A.server.luau")).unwrap(),
+            "return 'latest source'"
+        );
+    }
+
+    /// Undoing a rename in another letter case moves the file back under its
+    /// old spelling, also where the file system takes both for one file. The
+    /// letter is outside ASCII: `path_key` folds ASCII on Windows, and only a
+    /// name it keeps apart has the disk asked whether the two are one file. A
+    /// file system that keeps case apart finds the old spelling free and asks
+    /// nothing.
+    #[test]
+    fn restoring_a_script_name_in_another_case_moves_its_file() {
+        let (mut backup, _) = deleted_script_fixture();
+        backup.instances[1].name = "Ä".into();
+        let mut current = backup.clone();
+        current.instances[1].name = "ä".into();
+        let project = HistoryProject::new(&current);
+        let folder = project.src_root.join("Workspace");
+        fs::write(folder.join("ä.server.luau"), "return 'latest source'").unwrap();
+        let manifest = project.write_entry(
+            "case",
+            Some(&backup),
+            None,
+            &[("propertyName", json!("Name"))],
+        );
+        revert_history_manifest(&project.root, &project.src_root, &manifest).unwrap();
+        let names = (fs::read_dir(&folder).unwrap())
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".luau"))
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Ä.server.luau"]);
+        assert_eq!(
+            fs::read_to_string(folder.join("Ä.server.luau")).unwrap(),
             "return 'latest source'"
         );
     }
