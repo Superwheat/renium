@@ -208,7 +208,13 @@ fn luau_trailer(result: &Value) -> Vec<String> {
         .filter(|(key, _)| {
             !matches!(
                 key.as_str(),
-                "ok" | "context" | "persistence" | "results" | "output" | "timeoutSeconds" | "hint"
+                "ok" | "context"
+                    | "persistence"
+                    | "results"
+                    | "output"
+                    | "timeoutSeconds"
+                    | "hint"
+                    | "nativeProfile"
             )
         })
         .map(|(key, value)| (key.clone(), value.clone()))
@@ -6940,7 +6946,8 @@ mod compact_result_tests {
         let result = json!({
             "ok": true,
             "results": [(1..=2000).map(|n| format!("line {n} of a listing")).collect::<Vec<_>>()],
-            "hint": "store it", "syncReview": "waiting"
+            "hint": "store it", "syncReview": "waiting",
+            "nativeProfile": {"version": 1, "elapsedMs": 3.0}
         });
         let body = luau_body(&result);
         let trailer = luau_trailer(&result);
