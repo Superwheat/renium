@@ -523,10 +523,10 @@ pub(super) fn dom_rows<'a>(
         new_index_by_ref: indices.clone(),
         ..Default::default()
     };
+    let mut paths = crate::rbx::model::RbxDomPaths::new(dom);
     for node in dom.descendants() {
         if !indices.contains_key(&node.referent()) {
-            let (path, ordinals) =
-                crate::rbx::model::rbx_dom_instance_path_parts(dom, node.referent());
+            let (path, ordinals) = paths.parts(node.referent());
             std::sync::Arc::make_mut(&mut import_refs.path_segments_by_ref)
                 .insert(node.referent(), path);
             std::sync::Arc::make_mut(&mut import_refs.path_ordinals_by_ref)

@@ -17,7 +17,7 @@ use crate::rbx::encode::{
     enum_item_name_by_value, rbx_logical_property_name, rbx_property_descriptor, strip_enum_prefix,
 };
 use crate::rbx::model::{
-    BytecodeModelImportRefs, RbxPlaceFormat, build_rbx_place, is_service_class,
+    BytecodeModelImportRefs, RbxDomPaths, RbxPlaceFormat, build_rbx_place, is_service_class,
     rbx_dom_instance_path_parts,
 };
 use crate::system::text::normalized_source_bytes;
@@ -89,11 +89,11 @@ fn script_source(dom: &RbxWeakDom, referent: RbxRef) -> Option<&str> {
     }
 }
 
-fn query_result(dom: &RbxWeakDom, referent: RbxRef) -> Value {
+fn query_result(dom: &RbxWeakDom, paths: &mut RbxDomPaths<'_>, referent: RbxRef) -> Value {
     let instance = dom
         .get_by_ref(referent)
         .expect("query results contain live referents");
-    let (path, ordinals) = rbx_dom_instance_path_parts(dom, referent);
+    let (path, ordinals) = paths.parts(referent);
     let mut result = Map::from_iter([
         ("path".to_string(), json!(path)),
         ("name".to_string(), json!(instance.name)),
@@ -130,11 +130,11 @@ impl<'a> PropertyRequest<'a> {
     }
 }
 
-fn reference_value(dom: &RbxWeakDom, target: RbxRef) -> Value {
+fn reference_value(dom: &RbxWeakDom, paths: &mut RbxDomPaths<'_>, target: RbxRef) -> Value {
     if target == dom.root_ref() || dom.get_by_ref(target).is_none() {
         return Value::Null;
     }
-    let (path, ordinals) = rbx_dom_instance_path_parts(dom, target);
+    let (path, ordinals) = paths.parts(target);
     compact_path_string(&path, Some(&ordinals)).map_or_else(
         || json!({"path": path, "ordinals": ordinals}),
         Value::String,
@@ -145,6 +145,7 @@ fn reference_value(dom: &RbxWeakDom, target: RbxRef) -> Value {
 /// and references (the target's path), which read better by name.
 fn property_value(
     dom: &RbxWeakDom,
+    paths: &mut RbxDomPaths<'_>,
     class_name: &str,
     property_name: &str,
     value: &RbxVariant,
@@ -159,7 +160,7 @@ fn property_value(
             })
             .map(|enum_name| (enum_name, item.to_u32())),
         RbxVariant::EnumItem(item) => Some((item.ty.as_str(), item.value)),
-        RbxVariant::Ref(target) => return reference_value(dom, *target),
+        RbxVariant::Ref(target) => return reference_value(dom, paths, *target),
         _ => None,
     };
     if let Some((enum_name, item_value)) = enum_item
@@ -227,6 +228,7 @@ fn migrated_property<'a>(
 fn insert_property_values(
     result: &mut Value,
     dom: &RbxWeakDom,
+    paths: &mut RbxDomPaths<'_>,
     referent: RbxRef,
     request: &PropertyRequest<'_>,
     database: &ReflectionDatabase<'_>,
@@ -246,7 +248,7 @@ fn insert_property_values(
             for (name, value) in properties {
                 values.insert(
                     name.to_string(),
-                    property_value(dom, class_name, name.as_str(), value, database),
+                    property_value(dom, paths, class_name, name.as_str(), value, database),
                 );
             }
         }
@@ -256,7 +258,7 @@ fn insert_property_values(
                 let intrinsic = match logical.unwrap_or(requested) {
                     "Name" => Some(json!(instance.name)),
                     "ClassName" => Some(json!(class_name)),
-                    "Parent" => Some(reference_value(dom, instance.parent())),
+                    "Parent" => Some(reference_value(dom, paths, instance.parent())),
                     _ => None,
                 };
                 if let Some(value) = intrinsic {
@@ -266,7 +268,7 @@ fn insert_property_values(
                 if let Some((name, value)) = saved_property(instance, logical, requested) {
                     values.insert(
                         name.to_string(),
-                        property_value(dom, class_name, name, value, database),
+                        property_value(dom, paths, class_name, name, value, database),
                     );
                     continue;
                 }
@@ -282,7 +284,7 @@ fn insert_property_values(
                 {
                     values.insert(
                         logical.to_string(),
-                        property_value(dom, class_name, name, value, database),
+                        property_value(dom, paths, class_name, name, value, database),
                     );
                     continue;
                 }
@@ -302,7 +304,7 @@ fn insert_property_values(
                     Some(value) => {
                         values.insert(
                             logical.to_string(),
-                            property_value(dom, class_name, logical, value, database),
+                            property_value(dom, paths, class_name, logical, value, database),
                         );
                         defaulted.push(logical);
                     }
@@ -352,6 +354,7 @@ pub(crate) fn query_place(args: QueryPlaceArgs) -> Result<()> {
     } else {
         args.limit.get()
     };
+    let mut paths = RbxDomPaths::new(&dom);
     let mut matches = Vec::new();
     let mut truncated = false;
     let mut searched = 0usize;
@@ -380,9 +383,16 @@ pub(crate) fn query_place(args: QueryPlaceArgs) -> Result<()> {
             truncated = true;
             break;
         }
-        let mut result = query_result(&dom, referent);
+        let mut result = query_result(&dom, &mut paths, referent);
         if let (Some(properties), Some(database)) = (&properties, database) {
-            insert_property_values(&mut result, &dom, referent, properties, database);
+            insert_property_values(
+                &mut result,
+                &dom,
+                &mut paths,
+                referent,
+                properties,
+                database,
+            );
         }
         matches.push(result);
     }
@@ -909,6 +919,31 @@ mod tests {
     }
 
     #[test]
+    fn every_match_among_namesakes_reads_its_siblings_once() {
+        use crate::rbx::model::PATH_SIBLING_VISITS;
+        let mut dom = RbxWeakDom::new(InstanceBuilder::new("DataModel"));
+        let workspace = dom.insert(dom.root_ref(), InstanceBuilder::new("Workspace"));
+        let parts = (0..400)
+            .map(|_| dom.insert(workspace, InstanceBuilder::new("Part").with_name("Pad")))
+            .collect::<Vec<_>>();
+        PATH_SIBLING_VISITS.set(0);
+        let mut paths = RbxDomPaths::new(&dom);
+        let results = (parts.iter())
+            .map(|part| query_result(&dom, &mut paths, *part))
+            .collect::<Vec<_>>();
+        assert!(PATH_SIBLING_VISITS.get() <= 401);
+        for (index, (part, result)) in parts.iter().zip(&results).enumerate() {
+            let (path, ordinals) = rbx_dom_instance_path_parts(&dom, *part);
+            assert_eq!(ordinals, [1, index + 1]);
+            assert_eq!(result["path"], json!(path));
+            assert_eq!(
+                result.get("ordinals"),
+                (index > 0).then(|| json!(ordinals)).as_ref()
+            );
+        }
+    }
+
+    #[test]
     fn place_query_prints_requested_saved_properties_from_both_formats() {
         use clap::Parser;
         let root = crate::system::files::create_unique_directory(
@@ -1040,6 +1075,7 @@ mod tests {
         insert_property_values(
             &mut result,
             &old,
+            &mut RbxDomPaths::new(&old),
             workspace,
             &PropertyRequest::Named(vec!["PlayerCharacterDestroyBehavior"]),
             database,
