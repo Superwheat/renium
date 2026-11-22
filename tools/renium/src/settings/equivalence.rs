@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -198,6 +198,34 @@ pub(crate) fn align_pulled_settings_documents_to_reference(
     })
 }
 
+/// Like `align_pulled_settings_documents_to_reference`, when the caller has
+/// already dropped the captured `ServiceState` and `observed` encodes to the
+/// exact bytes that `ServiceState` would produce.
+pub(crate) fn align_pulled_settings_documents_without_state(
+    reference: SettingsBytecode,
+    observed: SettingsBytecode,
+    started: std::time::Instant,
+    stored: &[u8],
+) -> Result<PulledAlignment> {
+    let stored_as_observed = AtomicBool::new(false);
+    let alignment = align_settings_documents(
+        reference,
+        observed,
+        AlignmentInput {
+            observed_bytes: ObservedBytes::EncodeDocument,
+            keep_viewport_camera: true,
+            cache_key: None,
+            started,
+            stored_as_observed: Some(&stored_as_observed),
+            previous: Some(stored),
+        },
+    )?;
+    Ok(PulledAlignment {
+        alignment,
+        stored_as_observed: stored_as_observed.into_inner(),
+    })
+}
+
 /// A pull's alignment, and whether the store it leaves on disk holds the
 /// observed document, with the viewport camera a pull keeps: exactly so where
 /// the store was left as it was, and as the encoder of documents writes that
@@ -205,6 +233,2359 @@ pub(crate) fn align_pulled_settings_documents_to_reference(
 pub(crate) struct PulledAlignment {
     pub(crate) alignment: SettingsAlignment,
     pub(crate) stored_as_observed: bool,
+}
+
+/// Compact per-instance metadata computed while streaming a store block or
+/// captured chunk, allowing full-fidelity alignment without materializing
+/// whole `SettingsBytecode` documents in memory.
+#[derive(Clone, Copy)]
+pub(crate) struct CompactRowMeta {
+    pub(crate) exact_digest: [u8; 16],
+    pub(crate) full_digest: [u8; 16],
+    pub(crate) compared_digest: [u8; 16],
+    pub(crate) unique_id_digest: [u8; 16],
+    pub(crate) keys_hash: u64,
+    pub(crate) reflexive: bool,
+    pub(crate) has_untyped_enum: bool,
+    pub(crate) has_ref: bool,
+}
+
+/// Compact representation of a store document for streamed alignment: bare
+/// instances retaining only reference-bearing properties/attributes and root
+/// `CurrentCamera`, out-of-band `UniqueId` strings, per-row digests, and full
+/// `Camera` rows for viewport preservation.
+pub(crate) struct CompactDocument {
+    pub(crate) document: SettingsBytecode,
+    pub(crate) unique_ids: Vec<Option<Box<str>>>,
+    pub(crate) meta: Vec<CompactRowMeta>,
+    pub(crate) cameras: Vec<(usize, SettingsBytecodeInstance)>,
+}
+
+pub(crate) fn stabilize_instance_references(
+    instance: &mut SettingsBytecodeInstance,
+    ids: &[String],
+) {
+    stabilize_record_references(&mut instance.properties, ids);
+    stabilize_record_references(&mut instance.attributes, ids);
+}
+
+fn digest_exact_value_and_check(
+    digest: &mut Sha256,
+    value: &Value,
+    mut reflexive: Option<&mut bool>,
+    has_untyped_enum: &mut bool,
+) {
+    if let Value::Object(map) = value
+        && let Some(held_digest) = crate::settings::held::digest_once(value, |resolved| {
+            let mut sub = Sha256::new();
+            digest_value(&mut sub, resolved);
+            let whole = <[u8; 32]>::from(sub.finalize());
+            <[u8; 16]>::try_from(&whole[..16]).unwrap()
+        })
+    {
+        let _ = map;
+        digest.update([8]);
+        digest.update(held_digest);
+        return;
+    }
+    match value {
+        Value::Null => digest.update([0]),
+        Value::Bool(flag) => digest.update([1, u8::from(*flag)]),
+        Value::Number(number) => {
+            if let Some(v) = number.as_u64() {
+                digest.update([2]);
+                digest.update(v.to_le_bytes());
+            } else if let Some(v) = number.as_i64() {
+                digest.update([3]);
+                digest.update(v.to_le_bytes());
+            } else {
+                let f = number.as_f64().unwrap_or(f64::NAN);
+                let bits = if f == 0.0 {
+                    0.0f64.to_bits()
+                } else {
+                    f.to_bits()
+                };
+                digest.update([4]);
+                digest.update(bits.to_le_bytes());
+            }
+        }
+        Value::String(text) => {
+            digest.update([5]);
+            digest_text(digest, text);
+        }
+        Value::Array(items) => {
+            digest.update([6]);
+            digest.update((items.len() as u64).to_le_bytes());
+            for item in items {
+                digest_exact_value_and_check(
+                    digest,
+                    item,
+                    reflexive.as_deref_mut(),
+                    has_untyped_enum,
+                );
+            }
+        }
+        Value::Object(map) => {
+            digest.update([7]);
+            digest.update((map.len() as u64).to_le_bytes());
+            let check_refl = reflexive.as_deref().is_some_and(|r| *r);
+            let mut need_cframe_components = false;
+            let mut saw_cframe_components = false;
+            let mut need_enum_field = false;
+            let mut saw_enum_field = false;
+            let single_key = map.len() == 1;
+            if map.get("_type").and_then(Value::as_str) == Some("EnumItem")
+                && map
+                    .get("enumType")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+            {
+                *has_untyped_enum = true;
+            }
+            for (k, v) in map {
+                if check_refl {
+                    let ks = k.as_str();
+                    if ks == "_type" {
+                        if let Some(type_name) = v.as_str() {
+                            match type_name {
+                                "CFrame" => need_cframe_components = true,
+                                "EnumItem" => need_enum_field = true,
+                                "NumberSequence" | "ColorSequence" | "Font" => {
+                                    if let Some(refl) = reflexive.as_deref_mut() {
+                                        *refl = false;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    } else if single_key && matches!(ks, "NumberSequence" | "ColorSequence" | "Ref")
+                    {
+                        if let Some(refl) = reflexive.as_deref_mut() {
+                            *refl = false;
+                        }
+                    } else if need_cframe_components && ks == "components" {
+                        saw_cframe_components = matches!(
+                            v,
+                            Value::Array(arr) if arr.len() == 12 && arr.iter().all(Value::is_number)
+                        );
+                    } else if need_enum_field
+                        && ((ks == "value" && v.is_u64()) || (ks == "name" && v.is_string()))
+                    {
+                        saw_enum_field = true;
+                    }
+                }
+                digest_text(digest, k);
+                digest_exact_value_and_check(digest, v, reflexive.as_deref_mut(), has_untyped_enum);
+            }
+            if check_refl
+                && ((need_cframe_components && !saw_cframe_components)
+                    || (need_enum_field && !saw_enum_field))
+                && let Some(refl) = reflexive
+            {
+                *refl = false;
+            }
+        }
+    }
+}
+
+fn value_has_untyped_enum(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.get("_type").and_then(Value::as_str) == Some("EnumItem")
+                && map
+                    .get("enumType")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                || map.values().any(value_has_untyped_enum)
+        }
+        Value::Array(values) => values.iter().any(value_has_untyped_enum),
+        _ => false,
+    }
+}
+
+/// Hashes the value of a stable non-ref property into `keys_hash` whenever
+/// `reconciliation_values_equal(..., false)` compares that value strictly
+/// (no float32 tolerance, no optional `EnumItem.enumType`, no Font filtering).
+/// Values with any non-exact rule contribute a fixed sentinel so equal values
+/// under `reconciliation_values_equal(..., false)` are mathematically guaranteed
+/// to produce the exact same `keys_hash`.
+fn hash_strict_identity_value(value: &Value, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash as _;
+    if let Value::Object(_) = value
+        && let Some(held_digest) = crate::settings::held::digest_once(value, |resolved| {
+            let mut sub = Sha256::new();
+            digest_value(&mut sub, resolved);
+            let whole = <[u8; 32]>::from(sub.finalize());
+            <[u8; 16]>::try_from(&whole[..16]).unwrap()
+        })
+    {
+        0x51u8.hash(hasher);
+        held_digest.hash(hasher);
+        return;
+    }
+    let value = typed_scalar(value);
+    match value {
+        Value::Null => 0x00u8.hash(hasher),
+        Value::Bool(flag) => {
+            0x01u8.hash(hasher);
+            flag.hash(hasher);
+        }
+        Value::Number(number) => {
+            if let Some(i) = number
+                .as_i64()
+                .map(i128::from)
+                .or_else(|| number.as_u64().map(i128::from))
+            {
+                0x02u8.hash(hasher);
+                i.hash(hasher);
+            } else if let Some(f) = number.as_f64() {
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && f >= (i64::MIN as f64)
+                    && f <= (u64::MAX as f64)
+                {
+                    let i = f as i128;
+                    if (i as f64) == f {
+                        0x02u8.hash(hasher);
+                        i.hash(hasher);
+                        return;
+                    }
+                }
+                0x03u8.hash(hasher);
+                let bits = if f == 0.0 {
+                    0.0f64.to_bits()
+                } else {
+                    f.to_bits()
+                };
+                bits.hash(hasher);
+            } else {
+                0xffu8.hash(hasher);
+            }
+        }
+        Value::String(text) => {
+            0x04u8.hash(hasher);
+            text.hash(hasher);
+        }
+        Value::Object(map) => {
+            let type_name = map.get("_type").and_then(Value::as_str);
+            if type_name == Some("BinaryString")
+                && map.len() == 2
+                && let Some(b64) = map.get("base64").and_then(Value::as_str)
+            {
+                0x05u8.hash(hasher);
+                b64.hash(hasher);
+            } else if type_name == Some("SharedString")
+                && map.len() == 2
+                && map.get("base64").and_then(Value::as_str).is_some()
+            {
+                let mut sub = Sha256::new();
+                digest_value(&mut sub, value);
+                let whole = <[u8; 32]>::from(sub.finalize());
+                0x51u8.hash(hasher);
+                whole[..16].hash(hasher);
+            } else {
+                0xffu8.hash(hasher);
+            }
+        }
+        Value::Array(_) => 0xffu8.hash(hasher),
+    }
+}
+
+/// Strips `instance` down to its compact form (keeping only root `CurrentCamera`
+/// and reference-bearing properties/attributes, freeing empty `BTreeMap` nodes)
+/// and returns its out-of-band `UniqueId`, compact metadata, and a full clone
+/// when `instance.class_name == "Camera"`.
+pub(crate) fn compact_row(
+    instance: &mut SettingsBytecodeInstance,
+) -> (
+    Option<Box<str>>,
+    CompactRowMeta,
+    Option<SettingsBytecodeInstance>,
+) {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let database = rbx_reflection_database::get().ok();
+    let camera = (instance.class_name == "Camera").then(|| instance.clone());
+    let unique_id = persistent_identity(instance).map(Box::<str>::from);
+    let mut exact = Sha256::new();
+    let mut full = Sha256::new();
+    let mut compared = Sha256::new();
+    let mut unique_id_digest = [0u8; 16];
+    let mut keys_hasher = fixed_identity_hasher();
+    let mut reflexive = true;
+    let mut has_untyped_enum = false;
+    let mut has_ref = false;
+    let is_root = instance.parent_index.is_none();
+    let mut kept_props = Map::new();
+    let mut kept_attrs = Map::new();
+
+    exact.update([0x11]);
+    full.update([0x11]);
+    compared.update([0x11]);
+    0x11u8.hash(&mut keys_hasher);
+    for (name, value) in std::mem::take(&mut instance.properties) {
+        let contains_ref = matches!(value, Value::Array(_) | Value::Object(_))
+            && reconciliation_value_contains_reference(&value);
+        if contains_ref {
+            has_ref = true;
+            if !has_untyped_enum {
+                has_untyped_enum = value_has_untyped_enum(&value);
+            }
+            kept_props.insert(name, value);
+            continue;
+        }
+        let mut entry_digest = Sha256::new();
+        let stable = property_name_is_stable_no_ref(&name, &value);
+        let mut prop_untyped = false;
+        digest_exact_value_and_check(
+            &mut entry_digest,
+            &value,
+            stable.then_some(&mut reflexive),
+            &mut prop_untyped,
+        );
+        has_untyped_enum |= prop_untyped;
+        let val_hash = <[u8; 32]>::from(entry_digest.finalize());
+        if name == "UniqueId" {
+            unique_id_digest.copy_from_slice(&val_hash[..16]);
+        } else {
+            full.update([1]);
+            digest_text(&mut full, &name);
+            full.update(&val_hash[..16]);
+        }
+        if !reconciliation_property_is_engine_state(database, &instance.class_name, &name, &value) {
+            compared.update([1]);
+            digest_text(&mut compared, &name);
+            compared.update(&val_hash[..16]);
+        }
+        if stable {
+            exact.update([1]);
+            digest_text(&mut exact, &name);
+            exact.update(&val_hash[..16]);
+            name.hash(&mut keys_hasher);
+            hash_strict_identity_value(&value, &mut keys_hasher);
+        }
+        if is_root && name == "CurrentCamera" {
+            kept_props.insert(name, value);
+        }
+    }
+
+    exact.update([0x22]);
+    full.update([0x22]);
+    compared.update([0x22]);
+    0x22u8.hash(&mut keys_hasher);
+    for (name, value) in std::mem::take(&mut instance.attributes) {
+        let contains_ref = matches!(value, Value::Array(_) | Value::Object(_))
+            && reconciliation_value_contains_reference(&value);
+        if contains_ref {
+            has_ref = true;
+            if !has_untyped_enum {
+                has_untyped_enum = value_has_untyped_enum(&value);
+            }
+            kept_attrs.insert(name, value);
+            continue;
+        }
+        let mut entry_digest = Sha256::new();
+        let mut attr_untyped = false;
+        digest_exact_value_and_check(
+            &mut entry_digest,
+            &value,
+            Some(&mut reflexive),
+            &mut attr_untyped,
+        );
+        has_untyped_enum |= attr_untyped;
+        let val_hash = <[u8; 32]>::from(entry_digest.finalize());
+        full.update([1]);
+        digest_text(&mut full, &name);
+        full.update(&val_hash[..16]);
+        if !is_engine_managed_attribute(&name) {
+            compared.update([1]);
+            digest_text(&mut compared, &name);
+            compared.update(&val_hash[..16]);
+        }
+        exact.update([1]);
+        digest_text(&mut exact, &name);
+        exact.update(&val_hash[..16]);
+        name.hash(&mut keys_hasher);
+        hash_strict_identity_value(&value, &mut keys_hasher);
+    }
+
+    instance.properties = kept_props;
+    instance.attributes = kept_attrs;
+    let exact_full = <[u8; 32]>::from(exact.finalize());
+    let full_full = <[u8; 32]>::from(full.finalize());
+    let compared_full = <[u8; 32]>::from(compared.finalize());
+    let meta = CompactRowMeta {
+        exact_digest: <[u8; 16]>::try_from(&exact_full[..16]).unwrap(),
+        full_digest: <[u8; 16]>::try_from(&full_full[..16]).unwrap(),
+        compared_digest: <[u8; 16]>::try_from(&compared_full[..16]).unwrap(),
+        unique_id_digest,
+        keys_hash: keys_hasher.finish(),
+        reflexive,
+        has_untyped_enum,
+        has_ref,
+    };
+    (unique_id, meta, camera)
+}
+
+type HydrateRowsFn<'a> =
+    &'a (dyn Fn(&[usize]) -> Result<Vec<(usize, SettingsBytecodeInstance)>> + Sync);
+
+struct CompactMatching<'a> {
+    ref_unique_ids: &'a [Option<Box<str>>],
+    obs_unique_ids: &'a [Option<Box<str>>],
+    ref_meta: &'a [CompactRowMeta],
+    obs_meta: &'a [CompactRowMeta],
+    hydrate_ref: HydrateRowsFn<'a>,
+    hydrate_obs: HydrateRowsFn<'a>,
+}
+
+fn persistent_identity_index_from_slice(
+    unique_ids: &[Option<Box<str>>],
+) -> AHashMap<&str, Option<usize>> {
+    let mut result = AHashMap::new();
+    for (index, id) in unique_ids.iter().enumerate() {
+        if let Some(id) = id.as_deref() {
+            result
+                .entry(id)
+                .and_modify(|value| *value = None)
+                .or_insert(Some(index));
+        }
+    }
+    result
+}
+
+fn compute_subtree_keys_compact(
+    reference: &SettingsBytecode,
+    ref_meta: &[CompactRowMeta],
+    ref_required: Vec<bool>,
+    observed: &SettingsBytecode,
+    obs_meta: &[CompactRowMeta],
+    obs_tree: &DocTree,
+    obs_required: Vec<bool>,
+) -> ExactSubtreeKeys {
+    use std::hash::{Hash as _, Hasher as _};
+    const OBS_BIT: u32 = 1 << 31;
+    const IDX_MASK: u32 = !OBS_BIT;
+
+    let ref_count = reference.instances.len();
+    let obs_count = observed.instances.len();
+    assert!(ref_count < (OBS_BIT as usize) && obs_count < (OBS_BIT as usize));
+
+    let ((ref_tree, (ref_in_levels, ref_levels)), (obs_in_levels, obs_levels)) = rayon::join(
+        || {
+            let tree = DocTree::build(reference);
+            let prepared = prepare_subtree_levels(reference, &tree, ref_required);
+            (tree, prepared)
+        },
+        || prepare_subtree_levels(observed, obs_tree, obs_required),
+    );
+
+    let parallel = ref_count + obs_count >= 512 && rayon::current_num_threads() > 1;
+    let hash_self = |inst: &SettingsBytecodeInstance, digest: &[u8; 16]| -> u64 {
+        let mut hasher = fixed_identity_hasher();
+        inst.name.hash(&mut hasher);
+        inst.class_name.hash(&mut hasher);
+        digest.hash(&mut hasher);
+        hasher.finish()
+    };
+    let ((ref_self_hash, ref_reflexive), obs_self_hash) = rayon::join(
+        || {
+            let hashes: Vec<u64> = if parallel {
+                (0..ref_count)
+                    .into_par_iter()
+                    .map(|i| {
+                        if ref_in_levels[i] {
+                            hash_self(&reference.instances[i], &ref_meta[i].exact_digest)
+                        } else {
+                            0
+                        }
+                    })
+                    .collect()
+            } else {
+                (0..ref_count)
+                    .map(|i| {
+                        if ref_in_levels[i] {
+                            hash_self(&reference.instances[i], &ref_meta[i].exact_digest)
+                        } else {
+                            0
+                        }
+                    })
+                    .collect()
+            };
+            let refl = (0..ref_count)
+                .map(|i| ref_in_levels[i] && ref_meta[i].reflexive)
+                .collect::<Vec<_>>();
+            (hashes, refl)
+        },
+        || {
+            if parallel {
+                (0..obs_count)
+                    .into_par_iter()
+                    .map(|i| {
+                        if obs_in_levels[i] {
+                            hash_self(&observed.instances[i], &obs_meta[i].exact_digest)
+                        } else {
+                            0
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                (0..obs_count)
+                    .map(|i| {
+                        if obs_in_levels[i] {
+                            hash_self(&observed.instances[i], &obs_meta[i].exact_digest)
+                        } else {
+                            0
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            }
+        },
+    );
+    drop(ref_in_levels);
+    drop(obs_in_levels);
+
+    let mut ref_child_keys: Vec<u32> = vec![0; ref_tree.child_indices.len()];
+    let mut obs_child_keys: Vec<u32> = vec![0; obs_tree.child_indices.len()];
+    let mut ref_result: Vec<usize> = vec![0; ref_count];
+    let mut obs_result: Vec<usize> = vec![0; obs_count];
+    let mut next_id = 1usize;
+
+    let max_levels = ref_levels.len().max(obs_levels.len());
+    for height in 0..max_levels {
+        let r_nodes: &[u32] = ref_levels.get(height).map_or(&[], Vec::as_slice);
+        let o_nodes: &[u32] = obs_levels.get(height).map_or(&[], Vec::as_slice);
+        let total = r_nodes.len() + o_nodes.len();
+        if total == 0 {
+            continue;
+        }
+
+        if height > 0 {
+            for &node in r_nodes {
+                let idx = node as usize;
+                let s = ref_tree.child_offsets[idx] as usize;
+                let e = ref_tree.child_offsets[idx + 1] as usize;
+                let dst = &mut ref_child_keys[s..e];
+                for (slot, &child) in dst.iter_mut().zip(&ref_tree.child_indices[s..e]) {
+                    *slot = ref_result[child as usize] as u32;
+                }
+                dst.sort_unstable();
+            }
+            for &node in o_nodes {
+                let idx = node as usize;
+                let s = obs_tree.child_offsets[idx] as usize;
+                let e = obs_tree.child_offsets[idx + 1] as usize;
+                let dst = &mut obs_child_keys[s..e];
+                for (slot, &child) in dst.iter_mut().zip(&obs_tree.child_indices[s..e]) {
+                    *slot = obs_result[child as usize] as u32;
+                }
+                dst.sort_unstable();
+            }
+        }
+
+        let full_hash_ref = |node: u32| -> u64 {
+            let idx = node as usize;
+            let mut h = ref_self_hash[idx];
+            if height > 0 {
+                let s = ref_tree.child_offsets[idx] as usize;
+                let e = ref_tree.child_offsets[idx + 1] as usize;
+                let mut hasher = fixed_identity_hasher();
+                h.hash(&mut hasher);
+                ref_child_keys[s..e].hash(&mut hasher);
+                h = hasher.finish();
+            }
+            h
+        };
+        let full_hash_obs = |node: u32| -> u64 {
+            let idx = node as usize;
+            let mut h = obs_self_hash[idx];
+            if height > 0 {
+                let s = obs_tree.child_offsets[idx] as usize;
+                let e = obs_tree.child_offsets[idx + 1] as usize;
+                let mut hasher = fixed_identity_hasher();
+                h.hash(&mut hasher);
+                obs_child_keys[s..e].hash(&mut hasher);
+                h = hasher.finish();
+            }
+            h
+        };
+
+        let num_shards = if total >= 512 && rayon::current_num_threads() > 1 {
+            64usize
+        } else {
+            1usize
+        };
+        let mut shards: Vec<Vec<(u64, u32)>> = if num_shards == 1 {
+            vec![Vec::with_capacity(total)]
+        } else {
+            let per = (total / num_shards).saturating_add(16);
+            (0..num_shards).map(|_| Vec::with_capacity(per)).collect()
+        };
+        if num_shards == 1 {
+            let shard = &mut shards[0];
+            for &node in r_nodes {
+                shard.push((full_hash_ref(node), node));
+            }
+            for &node in o_nodes {
+                shard.push((full_hash_obs(node), node | OBS_BIT));
+            }
+        } else {
+            for &node in r_nodes {
+                let h = full_hash_ref(node);
+                shards[(h >> 58) as usize].push((h, node));
+            }
+            for &node in o_nodes {
+                let h = full_hash_obs(node);
+                shards[(h >> 58) as usize].push((h, node | OBS_BIT));
+            }
+        }
+
+        let nodes_equal = |left_packed: u32, right_packed: u32| -> bool {
+            let (left_obs, left_idx) = (
+                (left_packed & OBS_BIT) != 0,
+                (left_packed & IDX_MASK) as usize,
+            );
+            let (right_obs, right_idx) = (
+                (right_packed & OBS_BIT) != 0,
+                (right_packed & IDX_MASK) as usize,
+            );
+            let left_inst = if left_obs {
+                &observed.instances[left_idx]
+            } else {
+                &reference.instances[left_idx]
+            };
+            let right_inst = if right_obs {
+                &observed.instances[right_idx]
+            } else {
+                &reference.instances[right_idx]
+            };
+            if left_inst.name != right_inst.name || left_inst.class_name != right_inst.class_name {
+                return false;
+            }
+            let left_digest = if left_obs {
+                obs_meta[left_idx].exact_digest
+            } else {
+                ref_meta[left_idx].exact_digest
+            };
+            let right_digest = if right_obs {
+                obs_meta[right_idx].exact_digest
+            } else {
+                ref_meta[right_idx].exact_digest
+            };
+            if left_digest != right_digest {
+                return false;
+            }
+            if height > 0 {
+                let left_kids = if left_obs {
+                    let s = obs_tree.child_offsets[left_idx] as usize;
+                    let e = obs_tree.child_offsets[left_idx + 1] as usize;
+                    &obs_child_keys[s..e]
+                } else {
+                    let s = ref_tree.child_offsets[left_idx] as usize;
+                    let e = ref_tree.child_offsets[left_idx + 1] as usize;
+                    &ref_child_keys[s..e]
+                };
+                let right_kids = if right_obs {
+                    let s = obs_tree.child_offsets[right_idx] as usize;
+                    let e = obs_tree.child_offsets[right_idx + 1] as usize;
+                    &obs_child_keys[s..e]
+                } else {
+                    let s = ref_tree.child_offsets[right_idx] as usize;
+                    let e = ref_tree.child_offsets[right_idx + 1] as usize;
+                    &ref_child_keys[s..e]
+                };
+                if left_kids != right_kids {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let intern_shard = |shard: &mut Vec<(u64, u32)>| -> usize {
+            shard.sort_unstable_by_key(|&(h, _)| h);
+            let mut local_next = 0usize;
+            let mut reps: Vec<(u32, usize)> = Vec::new();
+            let mut pos = 0usize;
+            while pos < shard.len() {
+                let h = shard[pos].0;
+                let mut end = pos + 1;
+                while end < shard.len() && shard[end].0 == h {
+                    end += 1;
+                }
+                if end == pos + 1 {
+                    shard[pos].0 = local_next as u64;
+                    local_next += 1;
+                } else {
+                    reps.clear();
+                    for item in &mut shard[pos..end] {
+                        let packed = item.1;
+                        let found = reps
+                            .iter()
+                            .find(|&&(rep, _)| nodes_equal(packed, rep))
+                            .map(|&(_, id)| id);
+                        let id = match found {
+                            Some(id) => id,
+                            None => {
+                                let id = local_next;
+                                local_next += 1;
+                                reps.push((packed, id));
+                                id
+                            }
+                        };
+                        item.0 = id as u64;
+                    }
+                }
+                pos = end;
+            }
+            local_next
+        };
+
+        let counts: Vec<usize> = if num_shards > 1 {
+            shards.par_iter_mut().map(intern_shard).collect()
+        } else {
+            shards.iter_mut().map(intern_shard).collect()
+        };
+
+        for (shard, count) in shards.into_iter().zip(counts) {
+            let base = next_id;
+            next_id += count;
+            for (local_id, packed) in shard {
+                let id = base + local_id as usize;
+                let idx = (packed & IDX_MASK) as usize;
+                if (packed & OBS_BIT) != 0 {
+                    obs_result[idx] = id;
+                } else {
+                    ref_result[idx] = id;
+                }
+            }
+        }
+    }
+
+    ExactSubtreeKeys {
+        keys: (ref_result, obs_result),
+        ref_reflexive,
+    }
+}
+
+const COMPACT_HYDRATE_BATCH: usize = 16_384;
+
+/// Runs only the O(1) exact-subtree fast path (reading zero properties).
+fn exact_subtree_fast_proposals(
+    reference_graph: &ReferenceGraph,
+    observed_graph: &ReferenceGraph,
+    assigned_observed: &[Option<usize>],
+    exact: &ExactSubtreeKeys,
+    observed_group: &[usize],
+    candidates: &[usize],
+) -> (Vec<Option<usize>>, Vec<(usize, usize)>) {
+    let unreferenced = |index: usize| !observed_graph.has_edges(index);
+    let mut results: Vec<Option<usize>> = vec![None; observed_group.len()];
+    let mut fallback: Vec<(usize, usize)> = Vec::new();
+    if candidates.len() <= 8 {
+        let mut eligible = [(0usize, 0usize); 8];
+        let mut eligible_len = 0usize;
+        for &candidate in candidates {
+            let key = exact.keys.0[candidate];
+            if key == 0 || reference_graph.has_outgoing(candidate) {
+                continue;
+            }
+            if reference_graph
+                .incoming(candidate)
+                .iter()
+                .any(|edge| assigned_observed[edge.source].is_some())
+            {
+                continue;
+            }
+            eligible[eligible_len] = (key, candidate);
+            eligible_len += 1;
+        }
+        for (pos, &index) in observed_group.iter().enumerate() {
+            if unreferenced(index) {
+                let obs_key = exact.keys.1[index];
+                if obs_key != 0 {
+                    let mut first_cand = None;
+                    let mut count = 0usize;
+                    for &(key, cand) in &eligible[..eligible_len] {
+                        if key == obs_key {
+                            if first_cand.is_none() {
+                                first_cand = Some(cand);
+                            }
+                            count += 1;
+                        }
+                    }
+                    if let Some(candidate) = first_cand
+                        && exact.ref_reflexive[candidate]
+                    {
+                        if count == 1 {
+                            results[pos] = Some(candidate);
+                        }
+                        continue;
+                    }
+                }
+            }
+            fallback.push((pos, index));
+        }
+    } else {
+        let mut by_subtree: AHashMap<usize, (usize, usize)> =
+            AHashMap::with_capacity(candidates.len());
+        for &candidate in candidates {
+            let key = exact.keys.0[candidate];
+            if key == 0 || reference_graph.has_outgoing(candidate) {
+                continue;
+            }
+            if reference_graph
+                .incoming(candidate)
+                .iter()
+                .any(|edge| assigned_observed[edge.source].is_some())
+            {
+                continue;
+            }
+            by_subtree
+                .entry(key)
+                .and_modify(|(_, count)| *count += 1)
+                .or_insert((candidate, 1));
+        }
+        for (pos, &index) in observed_group.iter().enumerate() {
+            if unreferenced(index) {
+                let obs_key = exact.keys.1[index];
+                if obs_key != 0
+                    && let Some(&(candidate, count)) = by_subtree.get(&obs_key)
+                    && exact.ref_reflexive[candidate]
+                {
+                    if count == 1 {
+                        results[pos] = Some(candidate);
+                    }
+                    continue;
+                }
+            }
+            fallback.push((pos, index));
+        }
+    }
+    (results, fallback)
+}
+
+fn score_fallback_entries(
+    context: &IdentityScoreContext<'_>,
+    representatives: &[usize],
+    multiplicities: &AHashMap<usize, usize>,
+    content_index: Option<&IdentityCandidateIndex>,
+    fallback: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let unreferenced = |index: usize| !context.observed_graph.has_edges(index);
+    let propose = |&(pos, index): &(usize, usize)| {
+        let mut best = None;
+        let mut best_candidate = None;
+        let mut tied = false;
+        let obs_inst = context.observed.get(index);
+        let narrowed_range = content_index
+            .filter(|_| unreferenced(index))
+            .and_then(|lookup| lookup.matching_range(obs_inst));
+        let secondary_filter = narrowed_range
+            .as_ref()
+            .filter(|range| range.len() > 4)
+            .and_then(|_| content_index?.secondary.as_ref())
+            .and_then(|(sec_field, sec_values)| {
+                let val = sec_field.read(obs_inst)?;
+                Some((val, identity_number_radius(val), sec_values.as_slice()))
+            });
+        let mut visit_candidate = |candidate: usize| {
+            let Some(score) = identity_score(context, candidate, index) else {
+                return;
+            };
+            match best {
+                None => {
+                    best = Some(score);
+                    best_candidate = Some(candidate);
+                    tied = multiplicities[&candidate] > 1;
+                }
+                Some(current) if score > current => {
+                    best = Some(score);
+                    best_candidate = Some(candidate);
+                    tied = multiplicities[&candidate] > 1;
+                }
+                Some(current) if score == current => tied = true,
+                _ => {}
+            }
+        };
+        if let Some(range) = narrowed_range {
+            let values = &content_index.unwrap().values;
+            for slot in range {
+                if let Some((sec_val, sec_radius, sec_values)) = secondary_filter {
+                    let cand_sec = sec_values[slot];
+                    if cand_sec.is_finite() && (cand_sec - sec_val).abs() > sec_radius {
+                        continue;
+                    }
+                }
+                visit_candidate(values[slot].1);
+            }
+        } else {
+            for &candidate in representatives {
+                visit_candidate(candidate);
+            }
+        }
+        best_candidate
+            .filter(|_| !tied)
+            .map(|candidate| (pos, candidate))
+    };
+    if fallback.len() >= 32 && rayon::current_num_threads() > 1 {
+        fallback.par_iter().filter_map(propose).collect()
+    } else {
+        fallback.iter().filter_map(propose).collect()
+    }
+}
+
+/// Filters a ref-free group's fallback observed rows and candidate
+/// representatives using `CompactRowMeta` alone (zero hydration):
+/// 1. Any observed row whose `keys_hash` matches zero candidates can never have
+///    `holds_same_content == true` (and has no reference evidence), so it scores
+///    `None` for every candidate.
+/// 2. When no candidate matches an observed row's exact subtree key, every
+///    candidate has `subtree_matches == false`, so any observed row with >= 2
+///    candidates matching its `exact_digest` (with `reflexive == true`) is
+///    guaranteed tied at the maximum possible score `(false, 0, true, false)`.
+/// 3. Any candidate representative whose `keys_hash` matches no remaining
+///    observed row cannot score for any remaining observed row.
+fn prune_ref_free_fallback(
+    fallback: Vec<(usize, usize)>,
+    representatives: Vec<usize>,
+    multiplicities: &AHashMap<usize, usize>,
+    exact: Option<&ExactSubtreeKeys>,
+    ref_meta: &[CompactRowMeta],
+    obs_meta: &[CompactRowMeta],
+) -> (Vec<(usize, usize)>, Vec<usize>) {
+    if fallback.is_empty() || representatives.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut ref_keys = AHashSet::with_capacity(representatives.len().min(64));
+    let mut ref_exact_counts: AHashMap<[u8; 16], usize> = AHashMap::new();
+    let mut ref_nonrefl_subtrees = AHashSet::new();
+    for &rep in &representatives {
+        let meta = ref_meta[rep];
+        ref_keys.insert(meta.keys_hash);
+        if meta.reflexive {
+            *ref_exact_counts.entry(meta.exact_digest).or_default() += multiplicities[&rep];
+        }
+        if let Some(exact) = exact
+            && !exact.ref_reflexive[rep]
+            && exact.keys.0[rep] != 0
+        {
+            ref_nonrefl_subtrees.insert(exact.keys.0[rep]);
+        }
+    }
+    let mut obs_keys_needed = AHashSet::new();
+    let mut pruned_fallback = Vec::with_capacity(fallback.len());
+    for (pos, obs_idx) in fallback {
+        let meta = obs_meta[obs_idx];
+        if !ref_keys.contains(&meta.keys_hash) {
+            continue;
+        }
+        let could_have_subtree_match = exact.is_some_and(|exact| {
+            let k = exact.keys.1[obs_idx];
+            k != 0 && ref_nonrefl_subtrees.contains(&k)
+        });
+        if !could_have_subtree_match
+            && ref_exact_counts
+                .get(&meta.exact_digest)
+                .is_some_and(|&count| count >= 2)
+        {
+            continue;
+        }
+        obs_keys_needed.insert(meta.keys_hash);
+        pruned_fallback.push((pos, obs_idx));
+    }
+    if pruned_fallback.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let pruned_reps: Vec<usize> = representatives
+        .into_iter()
+        .filter(|&rep| obs_keys_needed.contains(&ref_meta[rep].keys_hash))
+        .collect();
+    (pruned_fallback, pruned_reps)
+}
+
+struct CompactRefBearingBatch {
+    end_group_idx: usize,
+    ref_indices: Vec<usize>,
+    obs_indices: Vec<usize>,
+}
+
+struct CompactRefBearingCache<'a> {
+    compact: &'a CompactMatching<'a>,
+    batches: std::collections::VecDeque<CompactRefBearingBatch>,
+    loaded_end: Option<usize>,
+    ref_rows: AHashMap<usize, SettingsBytecodeInstance>,
+    obs_rows: AHashMap<usize, SettingsBytecodeInstance>,
+}
+
+impl<'a> CompactRefBearingCache<'a> {
+    fn plan(
+        groups: &[(IdentityGroupKey<'_>, GroupIndices)],
+        ref_bearing_groups: &[(usize, &[usize])],
+        inputs: &ScoreInputs<'_, '_>,
+        compact: &'a CompactMatching<'a>,
+    ) -> Self {
+        let mut batches = std::collections::VecDeque::new();
+        let mut cur_ref: Vec<usize> = Vec::new();
+        let mut cur_obs: Vec<usize> = Vec::new();
+        let mut cur_end = 0usize;
+        for &(group_idx, candidates) in ref_bearing_groups {
+            let observed_slice = groups[group_idx].1.as_slice();
+            let (representatives, _) = compact_candidate_representatives(
+                inputs.reference_graph,
+                inputs.subtree_keys,
+                compact.ref_meta,
+                candidates,
+            );
+            let mut need_ref = Vec::new();
+            let mut need_obs = Vec::new();
+            let mut seen_ref = AHashSet::new();
+            let mut any_unref_ambiguous = false;
+            for &obs_idx in observed_slice {
+                let obs_m = compact.obs_meta[obs_idx];
+                let mut obs_ambiguous = false;
+                for &rep in &representatives {
+                    let ref_m = compact.ref_meta[rep];
+                    if ref_m.keys_hash == obs_m.keys_hash
+                        && !(ref_m.reflexive && ref_m.exact_digest == obs_m.exact_digest)
+                    {
+                        obs_ambiguous = true;
+                        if seen_ref.insert(rep) {
+                            need_ref.push(rep);
+                        }
+                    }
+                }
+                if obs_ambiguous {
+                    need_obs.push(obs_idx);
+                    if !inputs.observed_graph.has_edges(obs_idx) {
+                        any_unref_ambiguous = true;
+                    }
+                }
+            }
+            if need_obs.is_empty() {
+                continue;
+            }
+            if representatives.len() >= 32 && any_unref_ambiguous {
+                for &rep in &representatives {
+                    if seen_ref.insert(rep) {
+                        need_ref.push(rep);
+                    }
+                }
+            }
+            if need_ref.len() + need_obs.len() > COMPACT_HYDRATE_BATCH {
+                if !cur_obs.is_empty() {
+                    batches.push_back(CompactRefBearingBatch {
+                        end_group_idx: cur_end,
+                        ref_indices: std::mem::take(&mut cur_ref),
+                        obs_indices: std::mem::take(&mut cur_obs),
+                    });
+                }
+                continue;
+            }
+            if !cur_obs.is_empty()
+                && cur_ref.len() + cur_obs.len() + need_ref.len() + need_obs.len()
+                    > COMPACT_HYDRATE_BATCH
+            {
+                batches.push_back(CompactRefBearingBatch {
+                    end_group_idx: cur_end,
+                    ref_indices: std::mem::take(&mut cur_ref),
+                    obs_indices: std::mem::take(&mut cur_obs),
+                });
+            }
+            cur_ref.extend(need_ref);
+            cur_obs.extend(need_obs);
+            cur_end = group_idx;
+        }
+        if !cur_obs.is_empty() {
+            batches.push_back(CompactRefBearingBatch {
+                end_group_idx: cur_end,
+                ref_indices: cur_ref,
+                obs_indices: cur_obs,
+            });
+        }
+        Self {
+            compact,
+            batches,
+            loaded_end: None,
+            ref_rows: AHashMap::new(),
+            obs_rows: AHashMap::new(),
+        }
+    }
+
+    fn ensure_loaded(&mut self, group_idx: usize) -> Result<()> {
+        if self.loaded_end.is_some_and(|end| group_idx <= end) {
+            return Ok(());
+        }
+        while let Some(front) = self.batches.front() {
+            if group_idx <= front.end_group_idx {
+                let batch = self.batches.pop_front().unwrap();
+                self.ref_rows.clear();
+                self.obs_rows.clear();
+                let (ref_res, obs_res) = rayon::join(
+                    || (self.compact.hydrate_ref)(&batch.ref_indices),
+                    || (self.compact.hydrate_obs)(&batch.obs_indices),
+                );
+                self.ref_rows = ref_res?.into_iter().collect();
+                self.obs_rows = obs_res?.into_iter().collect();
+                self.loaded_end = Some(batch.end_group_idx);
+                return Ok(());
+            }
+            self.batches.pop_front();
+        }
+        self.ref_rows.clear();
+        self.obs_rows.clear();
+        self.loaded_end = None;
+        Ok(())
+    }
+}
+
+type ScoredProposals = (Vec<(usize, usize)>, std::time::Duration);
+
+fn log_slow_identity_group(
+    key: IdentityGroupKey<'_>,
+    observed_count: usize,
+    candidate_count: usize,
+    elapsed: std::time::Duration,
+) {
+    if elapsed.as_millis() >= 10 {
+        log_global(
+            4,
+            format_args!(
+                "[renium] identity candidate group: parent={:?} name={:?} class={} observed={observed_count} candidates={candidate_count} elapsed_ms={:.1}",
+                key.0,
+                key.1,
+                key.2,
+                elapsed.as_secs_f64() * 1000.0,
+            ),
+        );
+    }
+}
+
+fn compact_group_has_ambiguous_pair(
+    fallback: &[(usize, usize)],
+    representatives: &[usize],
+    compact: &CompactMatching<'_>,
+) -> bool {
+    fallback.iter().any(|&(_, obs_idx)| {
+        let obs_m = compact.obs_meta[obs_idx];
+        representatives.iter().any(|&rep| {
+            let ref_m = compact.ref_meta[rep];
+            ref_m.keys_hash == obs_m.keys_hash
+                && !(ref_m.reflexive && ref_m.exact_digest == obs_m.exact_digest)
+        })
+    })
+}
+
+fn score_compact_with_content_check(
+    fallback: &[(usize, usize)],
+    representatives: &[usize],
+    multiplicities: &AHashMap<usize, usize>,
+    inputs: &ScoreInputs<'_, '_>,
+    (assigned_reference, assigned_observed): (&[Option<usize>], &[Option<usize>]),
+    results: &mut [Option<usize>],
+    content_matches_fn: impl Fn(usize, usize) -> bool,
+) {
+    for &(pos, obs_idx) in fallback {
+        let mut best = None;
+        let mut best_candidate = None;
+        let mut tied = false;
+        for &candidate in representatives {
+            let Some(reference_evidence) = matching_reference_evidence(
+                candidate,
+                obs_idx,
+                inputs.reference_graph,
+                inputs.observed_graph,
+                assigned_reference,
+                assigned_observed,
+            ) else {
+                continue;
+            };
+            let content_matches = content_matches_fn(candidate, obs_idx);
+            if reference_evidence == 0 && !content_matches {
+                continue;
+            }
+            let score = IdentityScore {
+                has_reference_evidence: reference_evidence != 0,
+                reference_evidence,
+                content_matches,
+                subtree_matches: inputs.subtree_keys.is_some_and(|exact| {
+                    exact.keys.0[candidate] != 0 && exact.keys.0[candidate] == exact.keys.1[obs_idx]
+                }),
+            };
+            match best {
+                None => {
+                    best = Some(score);
+                    best_candidate = Some(candidate);
+                    tied = multiplicities[&candidate] > 1;
+                }
+                Some(current) if score > current => {
+                    best = Some(score);
+                    best_candidate = Some(candidate);
+                    tied = multiplicities[&candidate] > 1;
+                }
+                Some(current) if score == current => tied = true,
+                _ => {}
+            }
+        }
+        if let Some(candidate) = best_candidate.filter(|_| !tied) {
+            results[pos] = Some(candidate);
+        }
+    }
+}
+
+fn try_score_compact_from_cache(
+    fallback: &[(usize, usize)],
+    representatives: &[usize],
+    multiplicities: &AHashMap<usize, usize>,
+    inputs: &ScoreInputs<'_, '_>,
+    assignments: (&[Option<usize>], &[Option<usize>]),
+    compact: &CompactMatching<'_>,
+    cache: &CompactRefBearingCache<'_>,
+) -> Option<Vec<(usize, usize)>> {
+    let use_index = representatives.len() >= 32
+        && fallback
+            .iter()
+            .any(|&(_, index)| !inputs.observed_graph.has_edges(index));
+    let all_cached_present = if use_index {
+        representatives
+            .iter()
+            .all(|r| cache.ref_rows.contains_key(r))
+            && fallback.iter().all(|&(_, o)| {
+                let obs_m = compact.obs_meta[o];
+                let needs = representatives.iter().any(|&r| {
+                    let ref_m = compact.ref_meta[r];
+                    ref_m.keys_hash == obs_m.keys_hash
+                        && !(ref_m.reflexive && ref_m.exact_digest == obs_m.exact_digest)
+                });
+                !needs || cache.obs_rows.contains_key(&o)
+            })
+    } else {
+        fallback.iter().all(|&(_, o)| {
+            let obs_m = compact.obs_meta[o];
+            representatives.iter().all(|&r| {
+                let ref_m = compact.ref_meta[r];
+                !(ref_m.keys_hash == obs_m.keys_hash
+                    && !(ref_m.reflexive && ref_m.exact_digest == obs_m.exact_digest))
+                    || (cache.ref_rows.contains_key(&r) && cache.obs_rows.contains_key(&o))
+            })
+        })
+    };
+    if !all_cached_present {
+        return None;
+    }
+    if use_index
+        && fallback
+            .iter()
+            .all(|&(_, o)| cache.obs_rows.contains_key(&o))
+    {
+        let content_index =
+            IdentityCandidateIndex::build(RowSource::Hydrated(&cache.ref_rows), representatives);
+        let context = IdentityScoreContext {
+            reference: RowSource::Hydrated(&cache.ref_rows),
+            observed: RowSource::Hydrated(&cache.obs_rows),
+            reference_graph: inputs.reference_graph,
+            observed_graph: inputs.observed_graph,
+            assigned_reference: assignments.0,
+            assigned_observed: assignments.1,
+            subtree_keys: inputs.subtree_keys.map(|exact| &exact.keys),
+        };
+        return Some(score_fallback_entries(
+            &context,
+            representatives,
+            multiplicities,
+            content_index.as_ref(),
+            fallback,
+        ));
+    }
+    let mut resolved = Vec::new();
+    let mut temp = vec![None; fallback.len()];
+    let local_fallback: Vec<(usize, usize)> = fallback
+        .iter()
+        .enumerate()
+        .map(|(i, &(_, obs_idx))| (i, obs_idx))
+        .collect();
+    score_compact_with_content_check(
+        &local_fallback,
+        representatives,
+        multiplicities,
+        inputs,
+        assignments,
+        &mut temp,
+        |candidate, obs_idx| {
+            let ref_m = compact.ref_meta[candidate];
+            let obs_m = compact.obs_meta[obs_idx];
+            if ref_m.keys_hash != obs_m.keys_hash {
+                false
+            } else if ref_m.reflexive && ref_m.exact_digest == obs_m.exact_digest {
+                true
+            } else {
+                holds_same_content_hint(
+                    &cache.ref_rows[&candidate],
+                    &cache.obs_rows[&obs_idx],
+                    !inputs.reference_graph.has_outgoing(candidate),
+                    !inputs.observed_graph.has_outgoing(obs_idx),
+                )
+            }
+        },
+    );
+    for (local_i, &(pos, _)) in fallback.iter().enumerate() {
+        if let Some(candidate) = temp[local_i] {
+            resolved.push((pos, candidate));
+        }
+    }
+    Some(resolved)
+}
+
+fn score_compact_single_group(
+    observed_group: &[usize],
+    candidates: &[usize],
+    inputs: &ScoreInputs<'_, '_>,
+    assignments: (&[Option<usize>], &[Option<usize>]),
+    compact: &CompactMatching<'_>,
+    cache: Option<(&mut CompactRefBearingCache<'_>, usize)>,
+) -> Result<Vec<(usize, usize)>> {
+    let (assigned_reference, assigned_observed) = assignments;
+    let (mut results, fallback) = if let Some(exact) = inputs.subtree_keys {
+        exact_subtree_fast_proposals(
+            inputs.reference_graph,
+            inputs.observed_graph,
+            assigned_observed,
+            exact,
+            observed_group,
+            candidates,
+        )
+    } else {
+        (
+            vec![None; observed_group.len()],
+            observed_group
+                .iter()
+                .enumerate()
+                .map(|(pos, &idx)| (pos, idx))
+                .collect(),
+        )
+    };
+    let finish = |results: Vec<Option<usize>>| {
+        observed_group
+            .iter()
+            .zip(results)
+            .filter_map(|(&index, candidate)| candidate.map(|candidate| (index, candidate)))
+            .collect()
+    };
+    if fallback.is_empty() {
+        return Ok(finish(results));
+    }
+    let (representatives, multiplicities) = compact_candidate_representatives(
+        inputs.reference_graph,
+        inputs.subtree_keys,
+        compact.ref_meta,
+        candidates,
+    );
+    if !compact_group_has_ambiguous_pair(&fallback, &representatives, compact) {
+        score_compact_with_content_check(
+            &fallback,
+            &representatives,
+            &multiplicities,
+            inputs,
+            assignments,
+            &mut results,
+            |candidate, obs_idx| {
+                let ref_m = compact.ref_meta[candidate];
+                ref_m.reflexive && ref_m.exact_digest == compact.obs_meta[obs_idx].exact_digest
+            },
+        );
+        return Ok(finish(results));
+    }
+
+    if let Some((cache, group_idx)) = cache {
+        cache.ensure_loaded(group_idx)?;
+        if let Some(resolved) = try_score_compact_from_cache(
+            &fallback,
+            &representatives,
+            &multiplicities,
+            inputs,
+            assignments,
+            compact,
+            cache,
+        ) {
+            for (pos, candidate) in resolved {
+                results[pos] = Some(candidate);
+            }
+            return Ok(finish(results));
+        }
+    }
+
+    let ref_rows: AHashMap<usize, SettingsBytecodeInstance> =
+        (compact.hydrate_ref)(&representatives)?
+            .into_iter()
+            .collect();
+    let content_index = if representatives.len() > 1
+        && fallback
+            .iter()
+            .any(|&(_, index)| !inputs.observed_graph.has_edges(index))
+    {
+        IdentityCandidateIndex::build(RowSource::Hydrated(&ref_rows), &representatives)
+    } else {
+        None
+    };
+    for chunk in fallback.chunks(COMPACT_HYDRATE_BATCH) {
+        let obs_indices: Vec<usize> = chunk.iter().map(|&(_, idx)| idx).collect();
+        let obs_rows: AHashMap<usize, SettingsBytecodeInstance> =
+            (compact.hydrate_obs)(&obs_indices)?.into_iter().collect();
+        let context = IdentityScoreContext {
+            reference: RowSource::Hydrated(&ref_rows),
+            observed: RowSource::Hydrated(&obs_rows),
+            reference_graph: inputs.reference_graph,
+            observed_graph: inputs.observed_graph,
+            assigned_reference,
+            assigned_observed,
+            subtree_keys: inputs.subtree_keys.map(|exact| &exact.keys),
+        };
+        for (pos, candidate) in score_fallback_entries(
+            &context,
+            &representatives,
+            &multiplicities,
+            content_index.as_ref(),
+            chunk,
+        ) {
+            results[pos] = Some(candidate);
+        }
+    }
+    Ok(finish(results))
+}
+
+fn score_compact_ref_free_jobs(
+    groups: &[(IdentityGroupKey<'_>, GroupIndices)],
+    ref_free_jobs: &[(usize, Vec<usize>)],
+    inputs: &ScoreInputs<'_, '_>,
+    assigned_reference: &[Option<usize>],
+    assigned_observed: &[Option<usize>],
+    compact: &CompactMatching<'_>,
+) -> Result<Vec<ScoredProposals>> {
+    struct PendingFallback {
+        slot: usize,
+        observed_group: Vec<usize>,
+        results: Vec<Option<usize>>,
+        fallback: Vec<(usize, usize)>,
+        representatives: Vec<usize>,
+        multiplicities: AHashMap<usize, usize>,
+        min_ref_row: usize,
+    }
+
+    let mut final_results: Vec<Option<ScoredProposals>> = vec![None; ref_free_jobs.len()];
+    let fast_pass = |(slot, (group_idx, candidates)): (usize, &(usize, Vec<usize>))| {
+        let started = Instant::now();
+        let observed_slice = groups[*group_idx].1.as_slice();
+        let (results, fallback) = if let Some(exact) = inputs.subtree_keys {
+            exact_subtree_fast_proposals(
+                inputs.reference_graph,
+                inputs.observed_graph,
+                assigned_observed,
+                exact,
+                observed_slice,
+                candidates,
+            )
+        } else {
+            (
+                vec![None; observed_slice.len()],
+                observed_slice
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, &idx)| (pos, idx))
+                    .collect(),
+            )
+        };
+        if fallback.is_empty() {
+            let proposals = observed_slice
+                .iter()
+                .zip(results)
+                .filter_map(|(&index, candidate)| candidate.map(|candidate| (index, candidate)))
+                .collect();
+            return (slot, Ok((proposals, started.elapsed())));
+        }
+        let (representatives, multiplicities) = compact_candidate_representatives(
+            inputs.reference_graph,
+            inputs.subtree_keys,
+            compact.ref_meta,
+            candidates,
+        );
+        let (fallback, representatives) = prune_ref_free_fallback(
+            fallback,
+            representatives,
+            &multiplicities,
+            inputs.subtree_keys,
+            compact.ref_meta,
+            compact.obs_meta,
+        );
+        if fallback.is_empty() || representatives.is_empty() {
+            let proposals = observed_slice
+                .iter()
+                .zip(results)
+                .filter_map(|(&index, candidate)| candidate.map(|candidate| (index, candidate)))
+                .collect();
+            return (slot, Ok((proposals, started.elapsed())));
+        }
+        let min_ref_row = representatives.iter().copied().min().unwrap_or(0);
+        (
+            slot,
+            Err(PendingFallback {
+                slot,
+                observed_group: observed_slice.to_vec(),
+                results,
+                fallback,
+                representatives,
+                multiplicities,
+                min_ref_row,
+            }),
+        )
+    };
+    let outcomes: Vec<_> = if ref_free_jobs.len() >= 2 && rayon::current_num_threads() > 1 {
+        ref_free_jobs
+            .par_iter()
+            .enumerate()
+            .map(fast_pass)
+            .collect()
+    } else {
+        ref_free_jobs.iter().enumerate().map(fast_pass).collect()
+    };
+
+    let mut pending: Vec<PendingFallback> = Vec::new();
+    for (slot, outcome) in outcomes {
+        match outcome {
+            Ok(done) => final_results[slot] = Some(done),
+            Err(job) => pending.push(job),
+        }
+    }
+    pending.sort_unstable_by_key(|job| job.min_ref_row);
+
+    let mut cursor = 0usize;
+    while cursor < pending.len() {
+        if pending[cursor].fallback.len() > COMPACT_HYDRATE_BATCH {
+            let job = &mut pending[cursor];
+            let started = Instant::now();
+            let ref_rows: AHashMap<usize, SettingsBytecodeInstance> =
+                (compact.hydrate_ref)(&job.representatives)?
+                    .into_iter()
+                    .collect();
+            let content_index = if job.representatives.len() > 1 {
+                IdentityCandidateIndex::build(RowSource::Hydrated(&ref_rows), &job.representatives)
+            } else {
+                None
+            };
+            for chunk in job.fallback.chunks(COMPACT_HYDRATE_BATCH) {
+                let obs_indices: Vec<usize> = chunk.iter().map(|&(_, idx)| idx).collect();
+                let obs_rows: AHashMap<usize, SettingsBytecodeInstance> =
+                    (compact.hydrate_obs)(&obs_indices)?.into_iter().collect();
+                let context = IdentityScoreContext {
+                    reference: RowSource::Hydrated(&ref_rows),
+                    observed: RowSource::Hydrated(&obs_rows),
+                    reference_graph: inputs.reference_graph,
+                    observed_graph: inputs.observed_graph,
+                    assigned_reference,
+                    assigned_observed,
+                    subtree_keys: inputs.subtree_keys.map(|exact| &exact.keys),
+                };
+                for (pos, candidate) in score_fallback_entries(
+                    &context,
+                    &job.representatives,
+                    &job.multiplicities,
+                    content_index.as_ref(),
+                    chunk,
+                ) {
+                    job.results[pos] = Some(candidate);
+                }
+            }
+            let proposals = job
+                .observed_group
+                .iter()
+                .zip(job.results.iter().copied())
+                .filter_map(|(&index, candidate)| candidate.map(|candidate| (index, candidate)))
+                .collect();
+            final_results[job.slot] = Some((proposals, started.elapsed()));
+            cursor += 1;
+            continue;
+        }
+
+        let batch_start = cursor;
+        let mut ref_set = Vec::new();
+        let mut obs_set = Vec::new();
+        while cursor < pending.len() {
+            let add_ref = pending[cursor].representatives.len();
+            let add_obs = pending[cursor].fallback.len();
+            if cursor > batch_start
+                && ref_set.len() + obs_set.len() + add_ref + add_obs > COMPACT_HYDRATE_BATCH
+            {
+                break;
+            }
+            ref_set.extend_from_slice(&pending[cursor].representatives);
+            obs_set.extend(pending[cursor].fallback.iter().map(|&(_, idx)| idx));
+            cursor += 1;
+        }
+        let (ref_res, obs_res) = rayon::join(
+            || (compact.hydrate_ref)(&ref_set),
+            || (compact.hydrate_obs)(&obs_set),
+        );
+        let ref_rows: AHashMap<usize, SettingsBytecodeInstance> = ref_res?.into_iter().collect();
+        let obs_rows: AHashMap<usize, SettingsBytecodeInstance> = obs_res?.into_iter().collect();
+        let context = IdentityScoreContext {
+            reference: RowSource::Hydrated(&ref_rows),
+            observed: RowSource::Hydrated(&obs_rows),
+            reference_graph: inputs.reference_graph,
+            observed_graph: inputs.observed_graph,
+            assigned_reference,
+            assigned_observed,
+            subtree_keys: inputs.subtree_keys.map(|exact| &exact.keys),
+        };
+        let batch_slice = &mut pending[batch_start..cursor];
+        let score_one = |job: &mut PendingFallback| {
+            let started = Instant::now();
+            let content_index = if job.representatives.len() > 1 {
+                IdentityCandidateIndex::build(RowSource::Hydrated(&ref_rows), &job.representatives)
+            } else {
+                None
+            };
+            for (pos, candidate) in score_fallback_entries(
+                &context,
+                &job.representatives,
+                &job.multiplicities,
+                content_index.as_ref(),
+                &job.fallback,
+            ) {
+                job.results[pos] = Some(candidate);
+            }
+            let proposals = job
+                .observed_group
+                .iter()
+                .zip(job.results.iter().copied())
+                .filter_map(|(&index, candidate)| candidate.map(|candidate| (index, candidate)))
+                .collect();
+            (job.slot, (proposals, started.elapsed()))
+        };
+        let scored: Vec<(usize, ScoredProposals)> =
+            if batch_slice.len() >= 2 && rayon::current_num_threads() > 1 {
+                batch_slice.par_iter_mut().map(score_one).collect()
+            } else {
+                batch_slice.iter_mut().map(score_one).collect()
+            };
+        for (slot, result) in scored {
+            final_results[slot] = Some(result);
+        }
+    }
+
+    Ok(final_results.into_iter().map(Option::unwrap).collect())
+}
+
+fn compact_persistent_identities_follow_mapping(
+    ref_doc: &SettingsBytecode,
+    ref_unique_ids: &[Option<Box<str>>],
+    obs_doc: &SettingsBytecode,
+    obs_unique_ids: &[Option<Box<str>>],
+    reference_position: impl Fn(usize) -> Option<usize>,
+) -> bool {
+    let reference_ids = persistent_identity_index_from_slice(ref_unique_ids);
+    if reference_ids.is_empty() {
+        return true;
+    }
+    let observed_ids = persistent_identity_index_from_slice(obs_unique_ids);
+    observed_ids.iter().all(|(id, observed_index)| {
+        let (Some(reference_index), Some(observed_index)) =
+            (reference_ids.get(id).copied().flatten(), *observed_index)
+        else {
+            return true;
+        };
+        reference_position(observed_index) == Some(reference_index)
+            || is_reconciliation_protected_workspace_camera(ref_doc, reference_index)
+                && is_reconciliation_protected_workspace_camera(obs_doc, observed_index)
+    })
+}
+
+fn compact_reference_viewport_camera(compact: &CompactDocument) -> Option<ReferenceViewportCamera> {
+    let root =
+        compact.document.instances.iter().find(|instance| {
+            instance.parent_index.is_none() && instance.class_name == "Workspace"
+        })?;
+    Some(ReferenceViewportCamera {
+        root_names_camera: root.properties.contains_key("CurrentCamera"),
+        current: workspace_current_camera_index(&compact.document)
+            .map(|index| compact.document.instances[index].settings_id.clone()),
+        cameras: compact.cameras.iter().map(|(_, cam)| cam.clone()).collect(),
+    })
+}
+
+fn compact_viewport_camera_lacks_enum_types(compact: &CompactDocument) -> bool {
+    let Some(index) = workspace_current_camera_index(&compact.document) else {
+        return false;
+    };
+    compact
+        .cameras
+        .iter()
+        .find(|(cam_idx, _)| *cam_idx == index)
+        .is_some_and(|(_, cam)| instance_lacks_enum_types(cam))
+}
+
+fn compact_kept_camera<'a>(
+    viewport_camera: Option<&'a ReferenceViewportCamera>,
+    obs_doc: &SettingsBytecode,
+    obs_cameras: &[(usize, SettingsBytecodeInstance)],
+    obs_camera_id: Option<&str>,
+) -> Option<(usize, &'a SettingsBytecodeInstance)> {
+    let reference = viewport_camera?;
+    let index = workspace_current_camera_index(obs_doc)?;
+    let id = obs_camera_id.unwrap_or(obs_doc.instances[index].settings_id.as_str());
+    if reference.root_names_camera && reference.current.as_deref() != Some(id) {
+        return None;
+    }
+    let saved = reference
+        .cameras
+        .iter()
+        .find(|camera| camera.settings_id == id)?;
+    let obs_cam = obs_cameras
+        .iter()
+        .find(|(cam_idx, _)| *cam_idx == index)
+        .map(|(_, cam)| cam);
+    if let Some(obs_cam) = obs_cam
+        && obs_cam.properties == saved.properties
+        && obs_cam.attributes == saved.attributes
+    {
+        return None;
+    }
+    Some((index, saved))
+}
+
+fn compact_same_instances(
+    reference: &CompactDocument,
+    observed: &CompactDocument,
+    kept_camera: Option<(usize, &SettingsBytecodeInstance)>,
+) -> bool {
+    reference.document.instances.len() == observed.document.instances.len()
+        && reference
+            .document
+            .instances
+            .par_iter()
+            .enumerate()
+            .all(|(i, ref_inst)| {
+                let obs_inst = &observed.document.instances[i];
+                if ref_inst.settings_id != obs_inst.settings_id
+                    || ref_inst.name != obs_inst.name
+                    || ref_inst.class_name != obs_inst.class_name
+                    || ref_inst.parent_index != obs_inst.parent_index
+                {
+                    return false;
+                }
+                if let Some((cam_idx, saved_cam)) = kept_camera
+                    && cam_idx == i
+                {
+                    return reference
+                        .cameras
+                        .iter()
+                        .find(|(idx, _)| *idx == i)
+                        .is_some_and(|(_, ref_cam)| {
+                            ref_cam.properties == saved_cam.properties
+                                && ref_cam.attributes == saved_cam.attributes
+                        });
+                }
+                reference.meta[i].full_digest == observed.meta[i].full_digest
+                    && reference.meta[i].unique_id_digest == observed.meta[i].unique_id_digest
+                    && ref_inst.properties == obs_inst.properties
+                    && ref_inst.attributes == obs_inst.attributes
+            })
+}
+
+fn compact_positional_values_equivalent(
+    reference: &CompactDocument,
+    observed: &CompactDocument,
+    hydrate_ref: HydrateRowsFn<'_>,
+    hydrate_obs: HydrateRowsFn<'_>,
+    identity_checks: Option<&[bool]>,
+    preserve_viewport: bool,
+    kept_camera: Option<(usize, &SettingsBytecodeInstance)>,
+) -> Result<bool> {
+    if workspace_current_camera_index(&reference.document)
+        != workspace_current_camera_index(&observed.document)
+    {
+        return Ok(false);
+    }
+    let count = observed.document.instances.len();
+    let reference_ids = reference
+        .document
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| (instance.settings_id.as_str(), index))
+        .collect::<AHashMap<_, _>>();
+    let observed_ids = observed
+        .document
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(index, instance)| (instance.settings_id.as_str(), index))
+        .collect::<AHashMap<_, _>>();
+    let ids = PairedStoreIds {
+        service: store_service(&reference.document),
+        left: &reference_ids,
+        right: &observed_ids,
+    };
+
+    let mut need_hydrate: Vec<usize> = Vec::new();
+    for i in 0..count {
+        let ref_inst = &reference.document.instances[i];
+        let obs_inst = &observed.document.instances[i];
+        let is_kept_cam = kept_camera.is_some_and(|(idx, _)| idx == i);
+        if !preserve_viewport
+            && !is_kept_cam
+            && reference.meta[i].unique_id_digest != observed.meta[i].unique_id_digest
+        {
+            return Ok(false);
+        }
+        if identity_checks.is_some_and(|checks| !checks[i])
+            && !reference.meta[i].has_ref
+            && !observed.meta[i].has_ref
+        {
+            continue;
+        }
+        if ref_inst.class_name == "PackageLink"
+            || preserve_viewport
+                && is_reconciliation_protected_workspace_camera(&reference.document, i)
+                && is_reconciliation_protected_workspace_camera(&observed.document, i)
+        {
+            continue;
+        }
+        if is_kept_cam {
+            need_hydrate.push(i);
+            continue;
+        }
+        if reference.meta[i].compared_digest == observed.meta[i].compared_digest {
+            if !reference.meta[i].has_ref && !observed.meta[i].has_ref {
+                continue;
+            }
+            if reconciliation_maps_equal_with_ids(
+                &ref_inst.class_name,
+                &ref_inst.properties,
+                &obs_inst.properties,
+                ids,
+            ) && reconciliation_values_map_equal_with_ids(
+                &ref_inst.attributes,
+                &obs_inst.attributes,
+                ids,
+            ) {
+                continue;
+            }
+        }
+        need_hydrate.push(i);
+    }
+
+    let check_chunk = |chunk: &[usize]| -> Result<bool> {
+        let (ref_res, obs_res) = rayon::join(|| hydrate_ref(chunk), || hydrate_obs(chunk));
+        let ref_rows: AHashMap<usize, SettingsBytecodeInstance> = ref_res?.into_iter().collect();
+        let obs_rows: AHashMap<usize, SettingsBytecodeInstance> = obs_res?.into_iter().collect();
+        Ok(chunk.par_iter().all(|&i| {
+            let ref_inst = &ref_rows[&i];
+            let obs_inst = match kept_camera {
+                Some((cam_idx, saved)) if cam_idx == i => saved,
+                _ => &obs_rows[&i],
+            };
+            if !preserve_viewport
+                && ref_inst.properties.get("UniqueId") != obs_inst.properties.get("UniqueId")
+            {
+                return false;
+            }
+            reconciliation_maps_equal_with_ids(
+                &ref_inst.class_name,
+                &ref_inst.properties,
+                &obs_inst.properties,
+                ids,
+            ) && reconciliation_values_map_equal_with_ids(
+                &ref_inst.attributes,
+                &obs_inst.attributes,
+                ids,
+            )
+        }))
+    };
+
+    if need_hydrate.len() > 512 {
+        let sample_len = 256usize;
+        let step = need_hydrate.len() / sample_len;
+        let sample: Vec<usize> = (0..sample_len).map(|k| need_hydrate[k * step]).collect();
+        if !check_chunk(&sample)? {
+            return Ok(false);
+        }
+    }
+
+    for chunk in need_hydrate.chunks(COMPACT_HYDRATE_BATCH) {
+        if !check_chunk(chunk)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn compact_positions_add_enum_types(
+    reference: &CompactDocument,
+    hydrate_ref: HydrateRowsFn<'_>,
+    hydrate_obs: HydrateRowsFn<'_>,
+    kept_camera: Option<(usize, &SettingsBytecodeInstance)>,
+) -> Result<bool> {
+    let candidates: Vec<usize> = reference
+        .meta
+        .iter()
+        .enumerate()
+        .filter_map(|(i, meta)| meta.has_untyped_enum.then_some(i))
+        .collect();
+    for chunk in candidates.chunks(COMPACT_HYDRATE_BATCH) {
+        let ref_rows: AHashMap<usize, SettingsBytecodeInstance> =
+            hydrate_ref(chunk)?.into_iter().collect();
+        let obs_rows: AHashMap<usize, SettingsBytecodeInstance> =
+            hydrate_obs(chunk)?.into_iter().collect();
+        let adds = chunk.par_iter().any(|&i| {
+            let obs_inst = match kept_camera {
+                Some((cam_idx, saved)) if cam_idx == i => saved,
+                _ => &obs_rows[&i],
+            };
+            instance_adds_enum_types(&ref_rows[&i], obs_inst)
+        });
+        if adds {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn compact_final_documents_equivalent(
+    reference: &CompactDocument,
+    observed: &CompactDocument,
+    aligned_ids: &[String],
+    obs_remap: &HashMap<String, String>,
+    kept_camera: Option<(usize, &SettingsBytecodeInstance)>,
+    hydrate_ref: HydrateRowsFn<'_>,
+    hydrate_obs: HydrateRowsFn<'_>,
+) -> Result<bool> {
+    let count = reference.document.instances.len();
+    if count != observed.document.instances.len() {
+        return Ok(false);
+    }
+    let mut ref_by_id = AHashMap::with_capacity(count);
+    for (i, inst) in reference.document.instances.iter().enumerate() {
+        if ref_by_id.insert(inst.settings_id.as_str(), i).is_some() {
+            return Ok(false);
+        }
+    }
+    let mut obs_by_id = AHashMap::with_capacity(count);
+    for (i, id) in aligned_ids.iter().enumerate() {
+        if obs_by_id.insert(id.as_str(), i).is_some() {
+            return Ok(false);
+        }
+    }
+    let service = store_service(&reference.document);
+    let no_ids = AHashMap::new();
+    let ids = PairedStoreIds {
+        service,
+        left: &no_ids,
+        right: &no_ids,
+    };
+
+    let mut pairs_to_hydrate: Vec<(usize, usize)> = Vec::new();
+    for (ref_idx, ref_inst) in reference.document.instances.iter().enumerate() {
+        let Some(&obs_idx) = obs_by_id.get(ref_inst.settings_id.as_str()) else {
+            return Ok(false);
+        };
+        let obs_inst = &observed.document.instances[obs_idx];
+        let is_kept_cam = kept_camera.is_some_and(|(idx, _)| idx == obs_idx);
+        if ref_inst.name != obs_inst.name || ref_inst.class_name != obs_inst.class_name {
+            return Ok(false);
+        }
+        let ref_parent_id = ref_inst
+            .parent_index
+            .and_then(|p| reference.document.instances.get(p))
+            .map(|p| p.settings_id.as_str());
+        let obs_parent_id = obs_inst
+            .parent_index
+            .and_then(|p| aligned_ids.get(p))
+            .map(String::as_str);
+        if ref_parent_id != obs_parent_id {
+            return Ok(false);
+        }
+        if is_reconciliation_protected_workspace_camera(&reference.document, ref_idx)
+            != is_reconciliation_protected_workspace_camera(&observed.document, obs_idx)
+        {
+            return Ok(false);
+        }
+        if !is_kept_cam
+            && reference.meta[ref_idx].unique_id_digest != observed.meta[obs_idx].unique_id_digest
+        {
+            return Ok(false);
+        }
+        if ref_inst.class_name == "PackageLink" {
+            if reference.meta[ref_idx].has_untyped_enum {
+                pairs_to_hydrate.push((ref_idx, obs_idx));
+            }
+            continue;
+        }
+        if is_kept_cam {
+            pairs_to_hydrate.push((ref_idx, obs_idx));
+            continue;
+        }
+        if reference.meta[ref_idx].full_digest == observed.meta[obs_idx].full_digest
+            && !reference.meta[ref_idx].has_untyped_enum
+            && ((!reference.meta[ref_idx].has_ref && !observed.meta[obs_idx].has_ref)
+                || (reconciliation_maps_equal_with_ids(
+                    &ref_inst.class_name,
+                    &ref_inst.properties,
+                    &obs_inst.properties,
+                    ids,
+                ) && reconciliation_values_map_equal_with_ids(
+                    &ref_inst.attributes,
+                    &obs_inst.attributes,
+                    ids,
+                )))
+        {
+            continue;
+        }
+        pairs_to_hydrate.push((ref_idx, obs_idx));
+    }
+
+    let obs_service = store_service(&observed.document).map(str::to_string);
+    for chunk in pairs_to_hydrate.chunks(COMPACT_HYDRATE_BATCH) {
+        let ref_indices: Vec<usize> = chunk.iter().map(|&(r, _)| r).collect();
+        let obs_indices: Vec<usize> = chunk.iter().map(|&(_, o)| o).collect();
+        let (ref_res, obs_res) =
+            rayon::join(|| hydrate_ref(&ref_indices), || hydrate_obs(&obs_indices));
+        let (ref_idxs, mut ref_plain): (Vec<usize>, Vec<SettingsBytecodeInstance>) =
+            ref_res?.into_iter().unzip();
+        let (obs_idxs, mut obs_plain): (Vec<usize>, Vec<SettingsBytecodeInstance>) =
+            obs_res?.into_iter().unzip();
+        if !obs_remap.is_empty() {
+            obs_plain.par_iter_mut().for_each(|inst| {
+                remap_record_reference_ids(&mut inst.properties, obs_remap, obs_service.as_deref());
+                remap_record_reference_ids(&mut inst.attributes, obs_remap, obs_service.as_deref());
+            });
+        }
+        if let Some((cam_idx, saved)) = kept_camera {
+            for (idx, inst) in obs_idxs.iter().zip(&mut obs_plain) {
+                if *idx == cam_idx {
+                    inst.properties.clone_from(&saved.properties);
+                    inst.attributes.clone_from(&saved.attributes);
+                }
+            }
+        }
+        let (ref_res, obs_res) = rayon::join(
+            || {
+                ref_plain
+                    .par_chunks_mut(1024)
+                    .try_for_each(canonicalize_instances)
+            },
+            || {
+                obs_plain
+                    .par_chunks_mut(1024)
+                    .try_for_each(canonicalize_instances)
+            },
+        );
+        ref_res?;
+        obs_res?;
+        let ref_lookup: AHashMap<usize, &SettingsBytecodeInstance> = ref_idxs
+            .iter()
+            .zip(&ref_plain)
+            .map(|(&idx, inst)| (idx, inst))
+            .collect();
+        let obs_lookup: AHashMap<usize, &SettingsBytecodeInstance> = obs_idxs
+            .iter()
+            .zip(&obs_plain)
+            .map(|(&idx, inst)| (idx, inst))
+            .collect();
+        let batch_ok = chunk.par_iter().all(|&(r, o)| {
+            let ref_inst = ref_lookup[&r];
+            let obs_inst = obs_lookup[&o];
+            if instance_adds_enum_types(ref_inst, obs_inst) {
+                return false;
+            }
+            if ref_inst.class_name == "PackageLink" {
+                return true;
+            }
+            ref_inst.properties.get("UniqueId") == obs_inst.properties.get("UniqueId")
+                && reconciliation_maps_equal_with_ids(
+                    &ref_inst.class_name,
+                    &ref_inst.properties,
+                    &obs_inst.properties,
+                    ids,
+                )
+                && reconciliation_values_map_equal_with_ids(
+                    &ref_inst.attributes,
+                    &obs_inst.attributes,
+                    ids,
+                )
+        });
+        if !batch_ok {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(crate) enum StreamingAlignmentPlan {
+    Equivalent {
+        stored_as_observed: bool,
+        answer_follows_camera: bool,
+    },
+    Changed {
+        aligned_ids: Vec<String>,
+        kept_camera: Option<(usize, SettingsBytecodeInstance)>,
+        stored_as_observed: bool,
+        answer_follows_camera: bool,
+    },
+}
+
+pub(crate) fn plan_captured_store_streaming(
+    reference: CompactDocument,
+    mut observed: CompactDocument,
+    hydrate_ref: HydrateRowsFn<'_>,
+    hydrate_obs: HydrateRowsFn<'_>,
+    started: std::time::Instant,
+) -> Result<StreamingAlignmentPlan> {
+    let mut phases = AlignmentPhases {
+        instances: observed.document.instances.len(),
+        started,
+    };
+    phases.end("decode");
+    let answer_follows_camera = compact_viewport_camera_lacks_enum_types(&reference);
+    let viewport_camera = compact_reference_viewport_camera(&reference);
+
+    let topology_matches = settings_topology_matches(&reference.document, &observed.document);
+    let mut positionally_equivalent = topology_matches
+        && compact_positional_values_equivalent(
+            &reference,
+            &observed,
+            hydrate_ref,
+            hydrate_obs,
+            None,
+            false,
+            None,
+        )?;
+    let early_camera = (topology_matches && !positionally_equivalent)
+        .then(|| {
+            compact_kept_camera(
+                viewport_camera.as_ref(),
+                &observed.document,
+                &observed.cameras,
+                None,
+            )
+        })
+        .flatten();
+    if let Some(kept_cam) = early_camera {
+        positionally_equivalent = compact_positional_values_equivalent(
+            &reference,
+            &observed,
+            hydrate_ref,
+            hydrate_obs,
+            None,
+            false,
+            Some(kept_cam),
+        )?;
+    }
+    phases.end("comparison by position");
+
+    if positionally_equivalent
+        && !compact_positions_add_enum_types(&reference, hydrate_ref, hydrate_obs, early_camera)?
+    {
+        return Ok(StreamingAlignmentPlan::Equivalent {
+            stored_as_observed: compact_same_instances(&reference, &observed, early_camera),
+            answer_follows_camera,
+        });
+    }
+
+    let already_aligned = topology_matches && {
+        let mut seen = AHashSet::with_capacity(observed.document.instances.len());
+        let mut all_store_ids = true;
+        let ids_match = reference.document.instances.len() == observed.document.instances.len()
+            && observed
+                .document
+                .instances
+                .iter()
+                .enumerate()
+                .all(|(i, obs)| {
+                    let ref_inst = &reference.document.instances[i];
+                    all_store_ids &= is_store_identity(&ref_inst.settings_id);
+                    ref_inst.settings_id == obs.settings_id
+                        && seen.insert(ref_inst.settings_id.as_str())
+                })
+            && workspace_current_camera_index(&reference.document)
+                == workspace_current_camera_index(&observed.document);
+        if !ids_match {
+            false
+        } else if all_store_ids {
+            compact_persistent_identities_follow_mapping(
+                &reference.document,
+                &reference.unique_ids,
+                &observed.document,
+                &observed.unique_ids,
+                Some,
+            )
+        } else {
+            let ref_uids = persistent_identity_index_from_slice(&reference.unique_ids);
+            let obs_uids = persistent_identity_index_from_slice(&observed.unique_ids);
+            let camera = workspace_current_camera_index(&observed.document);
+            let sole_root = reference
+                .document
+                .instances
+                .iter()
+                .filter(|inst| inst.parent_index.is_none())
+                .count()
+                == 1;
+            let exact_ids = observed
+                .document
+                .instances
+                .par_iter()
+                .enumerate()
+                .all(|(i, inst)| {
+                    if camera == Some(i) {
+                        return true;
+                    }
+                    let persistent = observed.unique_ids[i]
+                        .as_deref()
+                        .filter(|id| obs_uids.get(id) == Some(&Some(i)))
+                        .and_then(|id| ref_uids.get(id).copied().flatten())
+                        .filter(|c| reference.document.instances[*c].class_name == inst.class_name);
+                    persistent.map_or_else(
+                        || {
+                            !inst.settings_id.starts_with("debug:")
+                                || (sole_root && inst.parent_index.is_none())
+                        },
+                        |candidate| candidate == i,
+                    )
+                });
+            if exact_ids {
+                true
+            } else if compact_persistent_identities_follow_mapping(
+                &reference.document,
+                &reference.unique_ids,
+                &observed.document,
+                &observed.unique_ids,
+                Some,
+            ) && store_identities_follow_mapping(
+                &reference.document,
+                &observed.document,
+                Some,
+            ) {
+                let mut first_by_key = AHashMap::with_capacity(reference.document.instances.len());
+                let mut ambiguous = vec![false; reference.document.instances.len()];
+                for (i, inst) in reference.document.instances.iter().enumerate() {
+                    let key = (
+                        inst.parent_index,
+                        inst.name.as_str(),
+                        inst.class_name.as_str(),
+                    );
+                    if let Some(first) = first_by_key.insert(key, i) {
+                        ambiguous[first] = true;
+                        ambiguous[i] = true;
+                    }
+                }
+                if !ambiguous.iter().any(|v| *v) {
+                    true
+                } else {
+                    let mut ordered = true;
+                    for (i, inst) in reference.document.instances.iter().enumerate() {
+                        if let Some(parent) = inst.parent_index {
+                            if parent >= i {
+                                ordered = false;
+                                break;
+                            }
+                            ambiguous[i] |= ambiguous[parent];
+                        }
+                    }
+                    ordered
+                        && compact_positional_values_equivalent(
+                            &reference,
+                            &observed,
+                            hydrate_ref,
+                            hydrate_obs,
+                            Some(&ambiguous),
+                            true,
+                            None,
+                        )?
+                }
+            } else {
+                false
+            }
+        }
+    };
+    phases.end("identity check");
+
+    let (aligned_ids, obs_remap, stored_as_observed_on_change, same_before_canon) =
+        if already_aligned {
+            let kept_cam = compact_kept_camera(
+                viewport_camera.as_ref(),
+                &observed.document,
+                &observed.cameras,
+                None,
+            );
+            let same = compact_same_instances(&reference, &observed, kept_cam);
+            let ids: Vec<String> = observed
+                .document
+                .instances
+                .iter()
+                .map(|inst| inst.settings_id.clone())
+                .collect();
+            (ids, HashMap::new(), true, same)
+        } else {
+            let compact = CompactMatching {
+                ref_unique_ids: &reference.unique_ids,
+                obs_unique_ids: &observed.unique_ids,
+                ref_meta: &reference.meta,
+                obs_meta: &observed.meta,
+                hydrate_ref,
+                hydrate_obs,
+            };
+            let Some((ids, ..)) = match_settings_ids_with_compact(
+                &reference.document,
+                &observed.document,
+                false,
+                false,
+                Some(&compact),
+            )?
+            else {
+                bail!("duplicate instance identity is ambiguous after comparing references");
+            };
+            let mut remap = HashMap::new();
+            let has_any_obs_ref = observed.meta.iter().any(|m| m.has_ref);
+            if has_any_obs_ref {
+                remap.reserve(observed.document.instances.len());
+                for (inst, new_id) in observed.document.instances.iter().zip(&ids) {
+                    if inst.settings_id != *new_id {
+                        remap.insert(inst.settings_id.clone(), new_id.clone());
+                    }
+                }
+            }
+            take_settings_ids(&mut observed.document, ids.clone());
+            phases.end("identity matching");
+            (ids, remap, false, false)
+        };
+
+    let kept_cam = compact_kept_camera(
+        viewport_camera.as_ref(),
+        &observed.document,
+        &observed.cameras,
+        workspace_current_camera_index(&observed.document).map(|i| aligned_ids[i].as_str()),
+    );
+    let equivalent = compact_final_documents_equivalent(
+        &reference,
+        &observed,
+        &aligned_ids,
+        &obs_remap,
+        kept_cam,
+        hydrate_ref,
+        hydrate_obs,
+    )?;
+    phases.end("final comparison");
+
+    if equivalent {
+        return Ok(StreamingAlignmentPlan::Equivalent {
+            stored_as_observed: stored_as_observed_on_change && same_before_canon,
+            answer_follows_camera,
+        });
+    }
+
+    Ok(StreamingAlignmentPlan::Changed {
+        aligned_ids,
+        kept_camera: kept_cam.map(|(idx, saved)| (idx, saved.clone())),
+        stored_as_observed: stored_as_observed_on_change,
+        answer_follows_camera,
+    })
 }
 
 /// Whether a pull holds the values of the observed instance for the stored
@@ -345,6 +2726,7 @@ pub(crate) fn instance_lacks_enum_types(instance: &SettingsBytecodeInstance) -> 
 enum ObservedBytes<'a> {
     Given(&'a [u8]),
     Encode(&'a dyn Fn() -> Result<Vec<u8>>),
+    EncodeDocument,
 }
 
 struct AlignmentInput<'a> {
@@ -387,7 +2769,6 @@ fn align_settings_documents(
         started,
     };
     phases.end("decode");
-    // Taken before alignment rewrites either document.
     let viewport_camera = keep_viewport_camera
         .then(|| reference_viewport_camera(&reference))
         .flatten();
@@ -399,10 +2780,6 @@ fn align_settings_documents(
     let topology_matches = settings_topology_matches(&reference, &observed);
     let mut positionally_equivalent = topology_matches
         && positional_values_equivalent(&reference, &observed, None, false, Placed::default());
-    // A pull keeps the viewport camera. Where every instance stands as in the
-    // reference and the camera carries its stored id, the reference's camera
-    // goes back before anything else is compared: a store whose camera alone
-    // moved is unchanged the way one whose camera stood still is.
     let camera_kept_early =
         topology_matches && !positionally_equivalent && keep_camera(&mut observed);
     if camera_kept_early {
@@ -420,8 +2797,6 @@ fn align_settings_documents(
             drop_settings_documents(reference, observed);
             return Ok(SettingsAlignment::Changed(upgraded));
         }
-        // The cache answers for the bytes alone, also to a caller that keeps
-        // no camera.
         if let Some(key) = cache_key.filter(|_| !camera_kept_early) {
             cache_settings_alignment(key);
         }
@@ -431,11 +2806,6 @@ fn align_settings_documents(
         drop_settings_documents(reference, observed);
         return Ok(SettingsAlignment::Equivalent);
     }
-    // A store whose instances stand where the reference's stand, under the
-    // same ids, already carries the reference's identities: nothing is left
-    // to align. This is a pull after values changed in Studio, the common
-    // one. Under store ids its own bytes are what the encoder writes for it
-    // again; any other id passes through the encoder, which normalizes it.
     let already_aligned =
         topology_matches && identities_already_aligned(&reference, &observed, Placed::default());
     phases.end("identity check");
@@ -456,10 +2826,12 @@ fn align_settings_documents(
             match observed_bytes {
                 ObservedBytes::Given(bytes) => bytes.to_vec(),
                 ObservedBytes::Encode(encode) => encode()?,
+                ObservedBytes::EncodeDocument => {
+                    encode_settings_bytecode_over(&observed, false, previous)?
+                }
             }
         };
         phases.end("encode in place");
-        // The bytes written here are the observed document's own.
         let same = stored_as_observed.map(|_| same_instances(&reference, &observed));
         let result =
             finish_settings_alignment(reference, observed, aligned, cache_key, camera_kept);
@@ -500,11 +2872,26 @@ fn align_settings_documents(
     }
     phases.end("identity matching");
     let camera_kept = keep_camera(&mut observed) || camera_kept_early;
+    canonicalize_settings_property_names(&mut reference)?;
+    let restored = canonicalize_settings_property_names_recording(&mut observed)?;
+    let equivalent = settings_documents_match(&reference, &observed, false)
+        && !document_adds_enum_types(&reference, &observed);
+    drop_settings_document(reference);
+    phases.end("final comparison");
+    if equivalent {
+        if let Some(key) = cache_key.filter(|_| !camera_kept) {
+            cache_settings_alignment(key);
+        }
+        drop_settings_document(observed);
+        return Ok(SettingsAlignment::Equivalent);
+    }
+    for (index, original) in restored {
+        observed.instances[index].properties = original;
+    }
     let aligned = encode_settings_bytecode_over(&observed, false, previous)?;
     phases.end("encode");
-    let result = finish_settings_alignment(reference, observed, aligned, cache_key, camera_kept);
-    phases.end("final comparison");
-    result
+    drop_settings_document(observed);
+    Ok(SettingsAlignment::Changed(aligned))
 }
 
 /// Step timings of one alignment in the trace log, for stores large enough
@@ -566,10 +2953,6 @@ fn identities_already_aligned(
     }
 }
 
-// Equal, unique IDs and topology are checked by the caller. The matcher
-// assigns the viewport first, then unique persistent IDs, then
-// non-debug IDs. A sole root without any of those is its unique root group.
-// Every other runtime ID still needs the content-based positional proof.
 fn positional_identities_match_exactly(
     reference: &SettingsBytecode,
     observed: &SettingsBytecode,
@@ -622,8 +3005,6 @@ fn finish_settings_alignment(
     let result = if settings_documents_match(&reference, &observed, false)
         && !document_adds_enum_types(&reference, &observed)
     {
-        // The cache answers for the bytes alone, also to a caller that keeps
-        // no camera: a pair that only matches with the camera kept stays out.
         if let Some(key) = cache_key.filter(|_| !camera_kept) {
             cache_settings_alignment(key);
         }
@@ -637,17 +3018,20 @@ fn finish_settings_alignment(
 
 pub(crate) fn drop_settings_document(document: SettingsBytecode) {
     let SettingsBytecode { instances, .. } = document;
-    if instances.len() >= 8_192 && rayon::current_num_threads() > 1 {
+    let count = instances.len();
+    if count >= 8_192 && rayon::current_num_threads() > 1 {
         instances.into_par_iter().for_each(drop);
+        if count >= 32_768 {
+            crate::daemon::memory::release_between_phases();
+        }
     } else {
         drop(instances);
     }
 }
 
 pub(crate) fn drop_settings_documents(left: SettingsBytecode, right: SettingsBytecode) {
-    if left.instances.len().saturating_add(right.instances.len()) >= 16_384
-        && rayon::current_num_threads() > 1
-    {
+    let total = left.instances.len().saturating_add(right.instances.len());
+    if total >= 16_384 && rayon::current_num_threads() > 1 {
         let SettingsBytecode {
             instances: left, ..
         } = left;
@@ -655,6 +3039,9 @@ pub(crate) fn drop_settings_documents(left: SettingsBytecode, right: SettingsByt
             instances: right, ..
         } = right;
         left.into_par_iter().chain(right).for_each(drop);
+        if total >= 65_536 {
+            crate::daemon::memory::release_between_phases();
+        }
     } else {
         drop(left);
         drop(right);
@@ -730,8 +3117,6 @@ pub(crate) fn instance_places(
         .enumerate()
         .any(|(index, place)| index != *place)
     {
-        // An id the store gave, or an import numbered, that both copies hold
-        // names one instance: the whole documents pair the two by it.
         let ids = reference
             .instances
             .iter()
@@ -786,8 +3171,6 @@ fn places_among_namesakes(
         );
         namesakes.entry(key).or_default().0.push(index);
     }
-    // The instances by their parents, each parent's in their order: a store
-    // can hold a parent after its child.
     let mut by_parent = (0..count).collect::<Vec<_>>();
     by_parent.sort_by_key(|index| reference.instances[*index].parent_index);
     let children = |parent: Option<usize>| {
@@ -875,62 +3258,182 @@ enum ReferenceTarget {
 }
 
 struct ReferenceEdge {
-    slot: String,
+    slot: std::sync::Arc<str>,
     target: ReferenceTarget,
 }
 
 struct IncomingReference {
-    slot: String,
+    slot: std::sync::Arc<str>,
     source: usize,
 }
 
 struct ReferenceGraph {
-    outgoing: Vec<Vec<ReferenceEdge>>,
-    incoming: Vec<Vec<IncomingReference>>,
+    outgoing_offsets: Vec<u32>,
+    outgoing_edges: Vec<ReferenceEdge>,
+    incoming_offsets: Vec<u32>,
+    incoming_edges: Vec<IncomingReference>,
+}
+
+impl ReferenceGraph {
+    #[inline]
+    fn outgoing(&self, index: usize) -> &[ReferenceEdge] {
+        let start = self.outgoing_offsets[index] as usize;
+        let end = self.outgoing_offsets[index + 1] as usize;
+        &self.outgoing_edges[start..end]
+    }
+
+    #[inline]
+    fn incoming(&self, index: usize) -> &[IncomingReference] {
+        let start = self.incoming_offsets[index] as usize;
+        let end = self.incoming_offsets[index + 1] as usize;
+        &self.incoming_edges[start..end]
+    }
+
+    #[inline]
+    fn has_outgoing(&self, index: usize) -> bool {
+        self.outgoing_offsets[index] != self.outgoing_offsets[index + 1]
+    }
+
+    #[inline]
+    fn has_edges(&self, index: usize) -> bool {
+        self.outgoing_offsets[index] != self.outgoing_offsets[index + 1]
+            || self.incoming_offsets[index] != self.incoming_offsets[index + 1]
+    }
+}
+
+struct RawReferenceEdge<'a> {
+    source: u32,
+    slot: std::sync::Arc<str>,
+    target_id: Option<&'a str>,
+    value: &'a Value,
 }
 
 fn build_reference_graph(document: &SettingsBytecode) -> ReferenceGraph {
-    let by_id = document
-        .instances
-        .iter()
-        .enumerate()
-        .map(|(index, instance)| (instance.settings_id.as_str(), index))
-        .collect::<HashMap<_, _>>();
-    let collect = |instance: &SettingsBytecodeInstance| {
-        let mut edges = Vec::new();
-        collect_map_references(&instance.properties, "properties", &by_id, &mut edges);
-        collect_map_references(&instance.attributes, "attributes", &by_id, &mut edges);
-        edges
-    };
-    let outgoing = if document.instances.len() >= 2_048 {
-        document
-            .instances
-            .par_iter()
-            .map(collect)
-            .collect::<Vec<_>>()
-    } else {
-        document.instances.iter().map(collect).collect::<Vec<_>>()
-    };
-    let mut incoming = (0..document.instances.len())
-        .map(|_| Vec::new())
-        .collect::<Vec<_>>();
-    for (source, edges) in outgoing.iter().enumerate() {
-        for edge in edges {
-            if let ReferenceTarget::Internal(target) = edge.target {
-                incoming[target].push(IncomingReference {
-                    slot: edge.slot.clone(),
-                    source,
-                });
+    fn collect_chunk<'a>(
+        chunk_start: usize,
+        instances: &'a [SettingsBytecodeInstance],
+    ) -> Vec<RawReferenceEdge<'a>> {
+        let mut slot = String::new();
+        let mut raw: Vec<RawReferenceEdge<'a>> = Vec::new();
+        for (offset, instance) in instances.iter().enumerate() {
+            let source = (chunk_start + offset) as u32;
+            slot.clear();
+            slot.push_str("properties");
+            collect_object_raw_references(&instance.properties, &mut slot, source, &mut raw);
+            if !instance.attributes.is_empty() {
+                slot.clear();
+                slot.push_str("attributes");
+                collect_object_raw_references(&instance.attributes, &mut slot, source, &mut raw);
             }
         }
+        raw
     }
-    ReferenceGraph { outgoing, incoming }
+    let count = document.instances.len();
+    let chunk_raw: Vec<Vec<RawReferenceEdge<'_>>> =
+        if count >= 2_048 && rayon::current_num_threads() > 1 {
+            document
+                .instances
+                .par_chunks(512)
+                .enumerate()
+                .map(|(chunk_idx, chunk)| collect_chunk(chunk_idx * 512, chunk))
+                .collect()
+        } else {
+            vec![collect_chunk(0, &document.instances)]
+        };
+    let total_outgoing: usize = chunk_raw.iter().map(Vec::len).sum();
+    if total_outgoing == 0 {
+        return ReferenceGraph {
+            outgoing_offsets: vec![0u32; count + 1],
+            outgoing_edges: Vec::new(),
+            incoming_offsets: vec![0u32; count + 1],
+            incoming_edges: Vec::new(),
+        };
+    }
+    let needs_by_id = chunk_raw
+        .iter()
+        .any(|chunk| chunk.iter().any(|edge| edge.target_id.is_some()));
+    let by_id = if needs_by_id {
+        let mut map = AHashMap::with_capacity(count);
+        for (index, instance) in document.instances.iter().enumerate() {
+            map.insert(instance.settings_id.as_str(), index);
+        }
+        map
+    } else {
+        AHashMap::new()
+    };
+    let mut outgoing_offsets = vec![0u32; count + 1];
+    let mut outgoing_edges = Vec::with_capacity(total_outgoing);
+    let mut incoming_counts = vec![0u32; count];
+    let mut total_incoming = 0usize;
+    let mut prev_source = 0usize;
+    for chunk in chunk_raw {
+        for raw in chunk {
+            let source_idx = raw.source as usize;
+            while prev_source < source_idx {
+                prev_source += 1;
+                outgoing_offsets[prev_source] = outgoing_edges.len() as u32;
+            }
+            let target = raw
+                .target_id
+                .and_then(|id| by_id.get(id).copied())
+                .map(ReferenceTarget::Internal)
+                .unwrap_or_else(|| ReferenceTarget::External(raw.value.clone()));
+            if let ReferenceTarget::Internal(target_idx) = target {
+                incoming_counts[target_idx] += 1;
+                total_incoming += 1;
+            }
+            outgoing_edges.push(ReferenceEdge {
+                slot: raw.slot,
+                target,
+            });
+        }
+    }
+    drop(by_id);
+    while prev_source < count {
+        prev_source += 1;
+        outgoing_offsets[prev_source] = outgoing_edges.len() as u32;
+    }
+    let mut incoming_offsets = Vec::with_capacity(count + 1);
+    let mut running = 0u32;
+    for &c in &incoming_counts {
+        incoming_offsets.push(running);
+        running += c;
+    }
+    incoming_offsets.push(running);
+    let incoming_edges = if total_incoming == 0 {
+        Vec::new()
+    } else {
+        let mut incoming_slots: Vec<Option<IncomingReference>> =
+            (0..total_incoming).map(|_| None).collect();
+        incoming_counts.copy_from_slice(&incoming_offsets[..count]);
+        for source in 0..count {
+            let start = outgoing_offsets[source] as usize;
+            let end = outgoing_offsets[source + 1] as usize;
+            for edge in &outgoing_edges[start..end] {
+                if let ReferenceTarget::Internal(target) = edge.target {
+                    let pos = incoming_counts[target] as usize;
+                    incoming_counts[target] += 1;
+                    incoming_slots[pos] = Some(IncomingReference {
+                        slot: std::sync::Arc::clone(&edge.slot),
+                        source,
+                    });
+                }
+            }
+        }
+        incoming_slots.into_iter().map(Option::unwrap).collect()
+    };
+    ReferenceGraph {
+        outgoing_offsets,
+        outgoing_edges,
+        incoming_offsets,
+        incoming_edges,
+    }
 }
 
 fn collect_map_references(
     values: &Map<String, Value>,
     prefix: &str,
-    by_id: &HashMap<&str, usize>,
+    by_id: &AHashMap<&str, usize>,
     output: &mut Vec<ReferenceEdge>,
 ) {
     let mut slot = prefix.to_string();
@@ -972,11 +3475,13 @@ fn collect_text_reference_ids_from_value(value: &Value, output: &mut AHashSet<St
 fn collect_object_references(
     values: &Map<String, Value>,
     slot: &mut String,
-    by_id: &HashMap<&str, usize>,
+    by_id: &AHashMap<&str, usize>,
     output: &mut Vec<ReferenceEdge>,
 ) {
     for (name, value) in values {
-        if !reconciliation_value_contains_reference(value) {
+        if !matches!(value, Value::Array(_) | Value::Object(_))
+            || !reconciliation_value_contains_reference(value)
+        {
             continue;
         }
         let original_len = slot.len();
@@ -989,13 +3494,15 @@ fn collect_object_references(
 fn collect_value_references(
     value: &Value,
     slot: &mut String,
-    by_id: &HashMap<&str, usize>,
+    by_id: &AHashMap<&str, usize>,
     output: &mut Vec<ReferenceEdge>,
 ) {
     match value {
         Value::Array(values) => {
             for (index, value) in values.iter().enumerate() {
-                if !reconciliation_value_contains_reference(value) {
+                if !matches!(value, Value::Array(_) | Value::Object(_))
+                    || !reconciliation_value_contains_reference(value)
+                {
                     continue;
                 }
                 let original_len = slot.len();
@@ -1014,11 +3521,88 @@ fn collect_value_references(
                 .map(ReferenceTarget::Internal)
                 .unwrap_or_else(|| ReferenceTarget::External(value.clone()));
             output.push(ReferenceEdge {
-                slot: slot.clone(),
+                slot: std::sync::Arc::from(slot.as_str()),
                 target,
             });
         }
         Value::Object(object) => collect_object_references(object, slot, by_id, output),
+        _ => {}
+    }
+}
+
+fn collect_object_raw_references<'a>(
+    values: &'a Map<String, Value>,
+    slot: &mut String,
+    source: u32,
+    output: &mut Vec<RawReferenceEdge<'a>>,
+) {
+    for (name, value) in values {
+        if !matches!(value, Value::Array(_) | Value::Object(_)) {
+            continue;
+        }
+        if let Value::Object(object) = value
+            && is_reference_object(object)
+        {
+            let original_len = slot.len();
+            write!(slot, "/{}:{name}", name.len()).expect("writing to a String cannot fail");
+            let target_id = object
+                .get("settingsId")
+                .or_else(|| object.get("instanceId"))
+                .and_then(Value::as_str);
+            output.push(RawReferenceEdge {
+                source,
+                slot: std::sync::Arc::from(slot.as_str()),
+                target_id,
+                value,
+            });
+            slot.truncate(original_len);
+            continue;
+        }
+        if !reconciliation_value_contains_reference(value) {
+            continue;
+        }
+        let original_len = slot.len();
+        write!(slot, "/{}:{name}", name.len()).expect("writing to a String cannot fail");
+        collect_value_raw_references(value, slot, source, output);
+        slot.truncate(original_len);
+    }
+}
+
+fn collect_value_raw_references<'a>(
+    value: &'a Value,
+    slot: &mut String,
+    source: u32,
+    output: &mut Vec<RawReferenceEdge<'a>>,
+) {
+    match value {
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                if !matches!(value, Value::Array(_) | Value::Object(_))
+                    || !reconciliation_value_contains_reference(value)
+                {
+                    continue;
+                }
+                let original_len = slot.len();
+                write!(slot, "[{index}]").expect("writing to a String cannot fail");
+                collect_value_raw_references(value, slot, source, output);
+                slot.truncate(original_len);
+            }
+        }
+        Value::Object(object) if is_reference_object(object) => {
+            let target_id = object
+                .get("settingsId")
+                .or_else(|| object.get("instanceId"))
+                .and_then(Value::as_str);
+            output.push(RawReferenceEdge {
+                source,
+                slot: std::sync::Arc::from(slot.as_str()),
+                target_id,
+                value,
+            });
+        }
+        Value::Object(object) => {
+            collect_object_raw_references(object, slot, source, output);
+        }
         _ => {}
     }
 }
@@ -1031,8 +3615,8 @@ fn matching_reference_evidence(
     assigned_reference: &[Option<usize>],
     assigned_observed: &[Option<usize>],
 ) -> Option<usize> {
-    let reference_outgoing = &reference_graph.outgoing[reference_index];
-    let observed_outgoing = &observed_graph.outgoing[observed_index];
+    let reference_outgoing = reference_graph.outgoing(reference_index);
+    let observed_outgoing = observed_graph.outgoing(observed_index);
     if reference_outgoing.len() != observed_outgoing.len() {
         return None;
     }
@@ -1076,14 +3660,16 @@ fn matching_reference_evidence(
         }
     }
 
-    for observed_edge in &observed_graph.incoming[observed_index] {
+    let observed_incoming = observed_graph.incoming(observed_index);
+    let reference_incoming = reference_graph.incoming(reference_index);
+    for observed_edge in observed_incoming {
         let expected_source = if observed_edge.source == observed_index {
             Some(reference_index)
         } else {
             assigned_reference[observed_edge.source]
         };
         if let Some(expected_source) = expected_source {
-            if !reference_graph.incoming[reference_index]
+            if !reference_incoming
                 .iter()
                 .any(|edge| edge.source == expected_source && edge.slot == observed_edge.slot)
             {
@@ -1092,14 +3678,14 @@ fn matching_reference_evidence(
             evidence += 1;
         }
     }
-    for reference_edge in &reference_graph.incoming[reference_index] {
+    for reference_edge in reference_incoming {
         let expected_source = if reference_edge.source == reference_index {
             Some(observed_index)
         } else {
             assigned_observed[reference_edge.source]
         };
         if let Some(expected_source) = expected_source
-            && !observed_graph.incoming[observed_index]
+            && !observed_incoming
                 .iter()
                 .any(|edge| edge.source == expected_source && edge.slot == reference_edge.slot)
         {
@@ -1117,6 +3703,7 @@ struct IdentityScore {
     subtree_matches: bool,
 }
 
+#[cfg(test)]
 #[derive(Hash, PartialEq, Eq)]
 struct IdentitySubtreeKey<'a> {
     name: &'a str,
@@ -1126,36 +3713,181 @@ struct IdentitySubtreeKey<'a> {
     children: Vec<usize>,
 }
 
-#[derive(Hash, PartialEq, Eq)]
-struct IdentityCandidateKey<'a> {
-    properties: Vec<(&'a String, &'a Value)>,
-    attributes: Vec<(&'a String, &'a Value)>,
-    subtree: usize,
-    reference_identity: Option<usize>,
+#[inline]
+fn fixed_identity_hasher() -> ahash::AHasher {
+    use std::hash::BuildHasher as _;
+    ahash::RandomState::with_seeds(
+        0x243f_6a88_85a3_08d3,
+        0x1319_8a2e_0370_7344,
+        0xa409_3822_299f_31d0,
+        0x082e_fa98_ec4e_6c89,
+    )
+    .build_hasher()
 }
 
-// Collapse only candidates that receive exactly the same identity_score for every
-// observed instance. Multiplicity still makes a winning bucket ambiguous; this
-// does not choose an identity by content hash or skip reference evidence.
+#[inline]
+fn hash_str_fast(text: &str, hasher: &mut ahash::AHasher) {
+    use std::hash::Hash as _;
+    let bytes = text.as_bytes();
+    bytes.len().hash(hasher);
+    if bytes.len() <= 256 {
+        bytes.hash(hasher);
+    } else {
+        bytes[..64].hash(hasher);
+        let mid = bytes.len() / 2;
+        bytes[mid - 32..mid + 32].hash(hasher);
+        bytes[bytes.len() - 64..].hash(hasher);
+    }
+}
+
+fn hash_value_fast(value: &Value, hasher: &mut ahash::AHasher, mut reflexive: Option<&mut bool>) {
+    use std::hash::Hash as _;
+    match value {
+        Value::Null => 0u8.hash(hasher),
+        Value::Bool(flag) => {
+            1u8.hash(hasher);
+            flag.hash(hasher);
+        }
+        Value::Number(number) => {
+            2u8.hash(hasher);
+            number.hash(hasher);
+        }
+        Value::String(text) => {
+            3u8.hash(hasher);
+            hash_str_fast(text, hasher);
+        }
+        Value::Array(items) => {
+            4u8.hash(hasher);
+            items.len().hash(hasher);
+            for item in items {
+                hash_value_fast(item, hasher, reflexive.as_deref_mut());
+            }
+        }
+        Value::Object(map) => {
+            5u8.hash(hasher);
+            map.len().hash(hasher);
+            let check_refl = reflexive.as_deref().is_some_and(|r| *r);
+            let mut need_cframe_components = false;
+            let mut saw_cframe_components = false;
+            let mut need_enum_field = false;
+            let mut saw_enum_field = false;
+            let single_key = map.len() == 1;
+            for (k, v) in map {
+                if check_refl {
+                    let ks = k.as_str();
+                    if ks == "_type" {
+                        if let Some(type_name) = v.as_str() {
+                            match type_name {
+                                "CFrame" => need_cframe_components = true,
+                                "EnumItem" => need_enum_field = true,
+                                "NumberSequence" | "ColorSequence" | "Font" => {
+                                    if let Some(refl) = reflexive.as_deref_mut() {
+                                        *refl = false;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    } else if single_key && matches!(ks, "NumberSequence" | "ColorSequence" | "Ref")
+                    {
+                        if let Some(refl) = reflexive.as_deref_mut() {
+                            *refl = false;
+                        }
+                    } else if need_cframe_components && ks == "components" {
+                        saw_cframe_components = matches!(
+                            v,
+                            Value::Array(arr) if arr.len() == 12 && arr.iter().all(Value::is_number)
+                        );
+                    } else if need_enum_field
+                        && ((ks == "value" && v.is_u64()) || (ks == "name" && v.is_string()))
+                    {
+                        saw_enum_field = true;
+                    }
+                }
+                k.hash(hasher);
+                hash_value_fast(v, hasher, reflexive.as_deref_mut());
+            }
+            if check_refl
+                && ((need_cframe_components && !saw_cframe_components)
+                    || (need_enum_field && !saw_enum_field))
+                && let Some(refl) = reflexive
+            {
+                *refl = false;
+            }
+        }
+    }
+}
+
+struct CandidateRefKey<'a> {
+    instance: &'a SettingsBytecodeInstance,
+    subtree: usize,
+    reference_identity: Option<usize>,
+    hash: u64,
+}
+
+impl<'a> CandidateRefKey<'a> {
+    fn new(
+        instance: &'a SettingsBytecodeInstance,
+        subtree: usize,
+        reference_identity: Option<usize>,
+    ) -> Self {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = fixed_identity_hasher();
+        subtree.hash(&mut hasher);
+        reference_identity.hash(&mut hasher);
+        instance.properties.len().hash(&mut hasher);
+        for (k, v) in &instance.properties {
+            k.hash(&mut hasher);
+            hash_value_fast(v, &mut hasher, None);
+        }
+        instance.attributes.len().hash(&mut hasher);
+        for (k, v) in &instance.attributes {
+            k.hash(&mut hasher);
+            hash_value_fast(v, &mut hasher, None);
+        }
+        Self {
+            instance,
+            subtree,
+            reference_identity,
+            hash: hasher.finish(),
+        }
+    }
+}
+
+impl PartialEq for CandidateRefKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash
+            && self.subtree == other.subtree
+            && self.reference_identity == other.reference_identity
+            && self.instance.properties == other.instance.properties
+            && self.instance.attributes == other.instance.attributes
+    }
+}
+
+impl Eq for CandidateRefKey<'_> {}
+
+impl std::hash::Hash for CandidateRefKey<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
+}
+
 fn identity_candidate_representatives(
-    document: &SettingsBytecode,
+    rows: RowSource<'_>,
     graph: &ReferenceGraph,
     subtree_keys: Option<&[usize]>,
     candidates: &[usize],
 ) -> (Vec<usize>, AHashMap<usize, usize>) {
-    let mut groups = AHashMap::new();
+    let mut groups = AHashMap::with_capacity(candidates.len());
     let mut representatives = Vec::new();
-    let mut multiplicities = AHashMap::new();
+    let mut multiplicities = AHashMap::with_capacity(candidates.len());
     for &candidate in candidates {
-        let instance = &document.instances[candidate];
-        let key = IdentityCandidateKey {
-            properties: instance.properties.iter().collect(),
-            attributes: instance.attributes.iter().collect(),
-            subtree: subtree_keys.map_or(0, |keys| keys[candidate]),
-            reference_identity: (!graph.outgoing[candidate].is_empty()
-                || !graph.incoming[candidate].is_empty())
-            .then_some(candidate),
-        };
+        let instance = rows.get(candidate);
+        let key = CandidateRefKey::new(
+            instance,
+            subtree_keys.map_or(0, |keys| keys[candidate]),
+            graph.has_edges(candidate).then_some(candidate),
+        );
         let representative = *groups.entry(key).or_insert_with(|| {
             representatives.push(candidate);
             candidate
@@ -1165,9 +3897,598 @@ fn identity_candidate_representatives(
     (representatives, multiplicities)
 }
 
+fn identity_candidate_representatives_exact(
+    rows: RowSource<'_>,
+    graph: &ReferenceGraph,
+    exact: &ExactSubtreeKeys,
+    candidates: &[usize],
+) -> (Vec<usize>, AHashMap<usize, usize>) {
+    let mut by_exact_key: AHashMap<usize, usize> = AHashMap::new();
+    let mut fallback_groups: AHashMap<CandidateRefKey<'_>, usize> = AHashMap::new();
+    let mut representatives = Vec::new();
+    let mut multiplicities = AHashMap::with_capacity(candidates.len());
+    for &candidate in candidates {
+        let subtree = exact.keys.0[candidate];
+        let representative = if subtree != 0 && !graph.has_edges(candidate) {
+            *by_exact_key.entry(subtree).or_insert_with(|| {
+                representatives.push(candidate);
+                candidate
+            })
+        } else {
+            let instance = rows.get(candidate);
+            let key = CandidateRefKey::new(
+                instance,
+                subtree,
+                graph.has_edges(candidate).then_some(candidate),
+            );
+            *fallback_groups.entry(key).or_insert_with(|| {
+                representatives.push(candidate);
+                candidate
+            })
+        };
+        *multiplicities.entry(representative).or_default() += 1;
+    }
+    (representatives, multiplicities)
+}
+
+/// Compact equivalent of `identity_candidate_representatives` / `_exact` that
+/// requires zero row hydration: unreferenced candidates are deduplicated by
+/// exact subtree key (when available) or by exact non-ref content digest, and
+/// referenced candidates are kept individually (matching `CandidateRefKey`,
+/// which distinguishes every referenced candidate by its own index).
+fn compact_candidate_representatives(
+    graph: &ReferenceGraph,
+    exact: Option<&ExactSubtreeKeys>,
+    ref_meta: &[CompactRowMeta],
+    candidates: &[usize],
+) -> (Vec<usize>, AHashMap<usize, usize>) {
+    let mut by_exact_key: AHashMap<usize, usize> = AHashMap::new();
+    let mut by_full_digest: AHashMap<([u8; 16], [u8; 16]), usize> = AHashMap::new();
+    let mut representatives = Vec::new();
+    let mut multiplicities = AHashMap::with_capacity(candidates.len());
+    for &candidate in candidates {
+        let representative = if graph.has_edges(candidate) {
+            representatives.push(candidate);
+            candidate
+        } else if let Some(exact) = exact
+            && exact.keys.0[candidate] != 0
+        {
+            *by_exact_key
+                .entry(exact.keys.0[candidate])
+                .or_insert_with(|| {
+                    representatives.push(candidate);
+                    candidate
+                })
+        } else {
+            let m = ref_meta[candidate];
+            *by_full_digest
+                .entry((m.full_digest, m.unique_id_digest))
+                .or_insert_with(|| {
+                    representatives.push(candidate);
+                    candidate
+                })
+        };
+        *multiplicities.entry(representative).or_default() += 1;
+    }
+    (representatives, multiplicities)
+}
+
+struct DocTree {
+    child_offsets: Vec<u32>,
+    child_indices: Vec<u32>,
+}
+
+impl DocTree {
+    fn build(document: &SettingsBytecode) -> Self {
+        let count = document.instances.len();
+        let mut counts = vec![0u32; count];
+        for instance in &document.instances {
+            if let Some(parent) = instance.parent_index
+                && parent < count
+            {
+                counts[parent] += 1;
+            }
+        }
+        let mut child_offsets = Vec::with_capacity(count + 1);
+        let mut total = 0u32;
+        for &c in &counts {
+            child_offsets.push(total);
+            total += c;
+        }
+        child_offsets.push(total);
+        let mut child_indices = vec![0u32; total as usize];
+        counts.copy_from_slice(&child_offsets[..count]);
+        for (index, instance) in document.instances.iter().enumerate() {
+            if let Some(parent) = instance.parent_index
+                && parent < count
+            {
+                let slot = counts[parent] as usize;
+                child_indices[slot] = index as u32;
+                counts[parent] += 1;
+            }
+        }
+        Self {
+            child_offsets,
+            child_indices,
+        }
+    }
+
+    #[inline]
+    fn children(&self, index: usize) -> &[u32] {
+        let start = self.child_offsets[index] as usize;
+        let end = self.child_offsets[index + 1] as usize;
+        &self.child_indices[start..end]
+    }
+}
+
+struct ExactSubtreeKeys {
+    keys: (Vec<usize>, Vec<usize>),
+    /// True when `holds_same_content(ref[i], ref[i])` is guaranteed true.
+    ref_reflexive: Vec<bool>,
+}
+
+fn prepare_subtree_levels(
+    document: &SettingsBytecode,
+    tree: &DocTree,
+    mut required: Vec<bool>,
+) -> (Vec<bool>, Vec<Vec<u32>>) {
+    let count = document.instances.len();
+    let mut pending = required
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &needed)| needed.then_some(index as u32))
+        .collect::<Vec<_>>();
+    while let Some(index) = pending.pop() {
+        for &child in tree.children(index as usize) {
+            let child_idx = child as usize;
+            if !required[child_idx] {
+                required[child_idx] = true;
+                pending.push(child);
+            }
+        }
+    }
+    let mut remaining = Vec::with_capacity(count);
+    let mut ready = Vec::new();
+    for (index, &is_required) in required.iter().enumerate() {
+        let deg = tree.child_offsets[index + 1] - tree.child_offsets[index];
+        remaining.push(deg);
+        if deg == 0 && is_required {
+            ready.push(index as u32);
+        }
+    }
+    let mut height = vec![0u32; count];
+    let mut in_levels = vec![false; count];
+    let mut levels: Vec<Vec<u32>> = Vec::new();
+    while let Some(node) = ready.pop() {
+        let idx = node as usize;
+        in_levels[idx] = true;
+        let h = height[idx] as usize;
+        if h >= levels.len() {
+            levels.resize_with(h + 1, Vec::new);
+        }
+        levels[h].push(node);
+        if let Some(parent) = document.instances[idx].parent_index
+            && parent < count
+            && required[parent]
+        {
+            let next_h = height[idx] + 1;
+            if next_h > height[parent] {
+                height[parent] = next_h;
+            }
+            remaining[parent] -= 1;
+            if remaining[parent] == 0 {
+                ready.push(parent as u32);
+            }
+        }
+    }
+    (in_levels, levels)
+}
+
+#[inline]
+fn property_name_is_stable_no_ref(name: &str, value: &Value) -> bool {
+    name != "ScriptGuid"
+        && !reconciliation_property_is_derived(name)
+        && !reconciliation_property_is_metadata(name, value)
+}
+
+fn hash_instance_self_content(
+    instance: &SettingsBytecodeInstance,
+    no_refs: bool,
+    check_reflexive: bool,
+) -> (u64, bool) {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = fixed_identity_hasher();
+    let mut reflexive = check_reflexive;
+    instance.name.hash(&mut hasher);
+    instance.class_name.hash(&mut hasher);
+    0x11u8.hash(&mut hasher);
+    for (name, value) in &instance.properties {
+        if !property_name_is_stable_no_ref(name, value) {
+            continue;
+        }
+        if !no_refs && reconciliation_value_contains_reference(value) {
+            continue;
+        }
+        name.hash(&mut hasher);
+        hash_value_fast(
+            value,
+            &mut hasher,
+            check_reflexive.then_some(&mut reflexive),
+        );
+    }
+    0x22u8.hash(&mut hasher);
+    for (name, value) in &instance.attributes {
+        if !no_refs && reconciliation_value_contains_reference(value) {
+            continue;
+        }
+        name.hash(&mut hasher);
+        hash_value_fast(
+            value,
+            &mut hasher,
+            check_reflexive.then_some(&mut reflexive),
+        );
+    }
+    (hasher.finish(), reflexive)
+}
+
+fn exact_stable_map_eq(
+    left: &Map<String, Value>,
+    right: &Map<String, Value>,
+    ignore_transient: bool,
+    left_no_refs: bool,
+    right_no_refs: bool,
+) -> bool {
+    if !ignore_transient && left_no_refs && right_no_refs {
+        return left == right;
+    }
+    let mut left_iter = left.iter().filter(|(name, value)| {
+        (!ignore_transient || property_name_is_stable_no_ref(name, value))
+            && (left_no_refs || !reconciliation_value_contains_reference(value))
+    });
+    let mut right_iter = right.iter().filter(|(name, value)| {
+        (!ignore_transient || property_name_is_stable_no_ref(name, value))
+            && (right_no_refs || !reconciliation_value_contains_reference(value))
+    });
+    loop {
+        match (left_iter.next(), right_iter.next()) {
+            (Some((lk, lv)), Some((rk, rv))) => {
+                if lk != rk || lv != rv {
+                    return false;
+                }
+            }
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn compute_subtree_keys(
+    reference: &SettingsBytecode,
+    ref_graph: &ReferenceGraph,
+    ref_required: Vec<bool>,
+    observed: &SettingsBytecode,
+    obs_graph: &ReferenceGraph,
+    obs_tree: &DocTree,
+    obs_required: Vec<bool>,
+) -> ExactSubtreeKeys {
+    use std::hash::{Hash as _, Hasher as _};
+    const OBS_BIT: u32 = 1 << 31;
+    const IDX_MASK: u32 = !OBS_BIT;
+
+    let ref_count = reference.instances.len();
+    let obs_count = observed.instances.len();
+    assert!(ref_count < (OBS_BIT as usize) && obs_count < (OBS_BIT as usize));
+
+    let ((ref_tree, (ref_in_levels, ref_levels)), (obs_in_levels, obs_levels)) = rayon::join(
+        || {
+            let tree = DocTree::build(reference);
+            let prepared = prepare_subtree_levels(reference, &tree, ref_required);
+            (tree, prepared)
+        },
+        || prepare_subtree_levels(observed, obs_tree, obs_required),
+    );
+
+    let parallel = ref_count + obs_count >= 512 && rayon::current_num_threads() > 1;
+    let ((ref_self_hash, ref_reflexive), obs_self_hash) = rayon::join(
+        || {
+            let compute = |index: usize| {
+                if !ref_in_levels[index] {
+                    (0u64, false)
+                } else {
+                    hash_instance_self_content(
+                        &reference.instances[index],
+                        !ref_graph.has_outgoing(index),
+                        true,
+                    )
+                }
+            };
+            let pairs: Vec<(u64, bool)> = if parallel {
+                (0..ref_count).into_par_iter().map(compute).collect()
+            } else {
+                (0..ref_count).map(compute).collect()
+            };
+            let mut hashes = Vec::with_capacity(ref_count);
+            let mut refl = Vec::with_capacity(ref_count);
+            for (h, r) in pairs {
+                hashes.push(h);
+                refl.push(r);
+            }
+            (hashes, refl)
+        },
+        || {
+            let compute = |index: usize| {
+                if !obs_in_levels[index] {
+                    0u64
+                } else {
+                    hash_instance_self_content(
+                        &observed.instances[index],
+                        !obs_graph.has_outgoing(index),
+                        false,
+                    )
+                    .0
+                }
+            };
+            if parallel {
+                (0..obs_count)
+                    .into_par_iter()
+                    .map(compute)
+                    .collect::<Vec<_>>()
+            } else {
+                (0..obs_count).map(compute).collect::<Vec<_>>()
+            }
+        },
+    );
+    drop(ref_in_levels);
+    drop(obs_in_levels);
+
+    let max_height = ref_levels.len().max(obs_levels.len());
+    let mut ref_result = vec![0usize; ref_count];
+    let mut obs_result = vec![0usize; obs_count];
+    let mut ref_child_keys = if max_height > 1 {
+        vec![0u32; ref_tree.child_indices.len()]
+    } else {
+        Vec::new()
+    };
+    let mut obs_child_keys = if max_height > 1 {
+        vec![0u32; obs_tree.child_indices.len()]
+    } else {
+        Vec::new()
+    };
+
+    let mut next_id = 1usize;
+    for height in 0..max_height {
+        let r_nodes = ref_levels.get(height).map_or(&[][..], Vec::as_slice);
+        let o_nodes = obs_levels.get(height).map_or(&[][..], Vec::as_slice);
+        let total = r_nodes.len() + o_nodes.len();
+        if total == 0 {
+            continue;
+        }
+        if height > 0 {
+            for &node in r_nodes {
+                let idx = node as usize;
+                let start = ref_tree.child_offsets[idx] as usize;
+                let end = ref_tree.child_offsets[idx + 1] as usize;
+                for (slot, &child) in ref_child_keys[start..end]
+                    .iter_mut()
+                    .zip(&ref_tree.child_indices[start..end])
+                {
+                    *slot = ref_result[child as usize] as u32;
+                }
+                ref_child_keys[start..end].sort_unstable();
+            }
+            for &node in o_nodes {
+                let idx = node as usize;
+                let start = obs_tree.child_offsets[idx] as usize;
+                let end = obs_tree.child_offsets[idx + 1] as usize;
+                for (slot, &child) in obs_child_keys[start..end]
+                    .iter_mut()
+                    .zip(&obs_tree.child_indices[start..end])
+                {
+                    *slot = obs_result[child as usize] as u32;
+                }
+                obs_child_keys[start..end].sort_unstable();
+            }
+        }
+
+        let full_hash_ref = |node: u32| {
+            let idx = node as usize;
+            let base = ref_self_hash[idx];
+            if height == 0 {
+                base
+            } else {
+                let start = ref_tree.child_offsets[idx] as usize;
+                let end = ref_tree.child_offsets[idx + 1] as usize;
+                let mut h = fixed_identity_hasher();
+                base.hash(&mut h);
+                ref_child_keys[start..end].hash(&mut h);
+                h.finish()
+            }
+        };
+        let full_hash_obs = |node: u32| {
+            let idx = node as usize;
+            let base = obs_self_hash[idx];
+            if height == 0 {
+                base
+            } else {
+                let start = obs_tree.child_offsets[idx] as usize;
+                let end = obs_tree.child_offsets[idx + 1] as usize;
+                let mut h = fixed_identity_hasher();
+                base.hash(&mut h);
+                obs_child_keys[start..end].hash(&mut h);
+                h.finish()
+            }
+        };
+
+        let num_shards = if total >= 512 && rayon::current_num_threads() > 1 {
+            64usize
+        } else {
+            1usize
+        };
+        let mut shards: Vec<Vec<(u64, u32)>> = if num_shards == 1 {
+            vec![Vec::with_capacity(total)]
+        } else {
+            let per = (total / num_shards).saturating_add(16);
+            (0..num_shards).map(|_| Vec::with_capacity(per)).collect()
+        };
+        if num_shards == 1 {
+            let shard = &mut shards[0];
+            for &node in r_nodes {
+                shard.push((full_hash_ref(node), node));
+            }
+            for &node in o_nodes {
+                shard.push((full_hash_obs(node), node | OBS_BIT));
+            }
+        } else {
+            for &node in r_nodes {
+                let h = full_hash_ref(node);
+                shards[(h >> 58) as usize].push((h, node));
+            }
+            for &node in o_nodes {
+                let h = full_hash_obs(node);
+                shards[(h >> 58) as usize].push((h, node | OBS_BIT));
+            }
+        }
+
+        let nodes_equal = |left_packed: u32, right_packed: u32| -> bool {
+            let (left_obs, left_idx) = (
+                (left_packed & OBS_BIT) != 0,
+                (left_packed & IDX_MASK) as usize,
+            );
+            let (right_obs, right_idx) = (
+                (right_packed & OBS_BIT) != 0,
+                (right_packed & IDX_MASK) as usize,
+            );
+            let left_inst = if left_obs {
+                &observed.instances[left_idx]
+            } else {
+                &reference.instances[left_idx]
+            };
+            let right_inst = if right_obs {
+                &observed.instances[right_idx]
+            } else {
+                &reference.instances[right_idx]
+            };
+            if left_inst.name != right_inst.name || left_inst.class_name != right_inst.class_name {
+                return false;
+            }
+            if height > 0 {
+                let left_kids = if left_obs {
+                    let s = obs_tree.child_offsets[left_idx] as usize;
+                    let e = obs_tree.child_offsets[left_idx + 1] as usize;
+                    &obs_child_keys[s..e]
+                } else {
+                    let s = ref_tree.child_offsets[left_idx] as usize;
+                    let e = ref_tree.child_offsets[left_idx + 1] as usize;
+                    &ref_child_keys[s..e]
+                };
+                let right_kids = if right_obs {
+                    let s = obs_tree.child_offsets[right_idx] as usize;
+                    let e = obs_tree.child_offsets[right_idx + 1] as usize;
+                    &obs_child_keys[s..e]
+                } else {
+                    let s = ref_tree.child_offsets[right_idx] as usize;
+                    let e = ref_tree.child_offsets[right_idx + 1] as usize;
+                    &ref_child_keys[s..e]
+                };
+                if left_kids != right_kids {
+                    return false;
+                }
+            }
+            let left_no_refs = if left_obs {
+                !obs_graph.has_outgoing(left_idx)
+            } else {
+                !ref_graph.has_outgoing(left_idx)
+            };
+            let right_no_refs = if right_obs {
+                !obs_graph.has_outgoing(right_idx)
+            } else {
+                !ref_graph.has_outgoing(right_idx)
+            };
+            exact_stable_map_eq(
+                &left_inst.properties,
+                &right_inst.properties,
+                true,
+                left_no_refs,
+                right_no_refs,
+            ) && exact_stable_map_eq(
+                &left_inst.attributes,
+                &right_inst.attributes,
+                false,
+                left_no_refs,
+                right_no_refs,
+            )
+        };
+
+        let intern_shard = |shard: &mut Vec<(u64, u32)>| -> usize {
+            shard.sort_unstable_by_key(|&(h, _)| h);
+            let mut local_next = 0usize;
+            let mut reps: Vec<(u32, usize)> = Vec::new();
+            let mut pos = 0usize;
+            while pos < shard.len() {
+                let h = shard[pos].0;
+                let mut end = pos + 1;
+                while end < shard.len() && shard[end].0 == h {
+                    end += 1;
+                }
+                if end == pos + 1 {
+                    shard[pos].0 = local_next as u64;
+                    local_next += 1;
+                } else {
+                    reps.clear();
+                    for item in &mut shard[pos..end] {
+                        let packed = item.1;
+                        let found = reps
+                            .iter()
+                            .find(|&&(rep, _)| nodes_equal(packed, rep))
+                            .map(|&(_, id)| id);
+                        let id = match found {
+                            Some(id) => id,
+                            None => {
+                                let id = local_next;
+                                local_next += 1;
+                                reps.push((packed, id));
+                                id
+                            }
+                        };
+                        item.0 = id as u64;
+                    }
+                }
+                pos = end;
+            }
+            local_next
+        };
+
+        let counts: Vec<usize> = if num_shards > 1 {
+            shards.par_iter_mut().map(intern_shard).collect()
+        } else {
+            shards.iter_mut().map(intern_shard).collect()
+        };
+
+        for (shard, count) in shards.into_iter().zip(counts) {
+            let base = next_id;
+            next_id += count;
+            for (local_id, packed) in shard {
+                let id = base + local_id as usize;
+                let idx = (packed & IDX_MASK) as usize;
+                if (packed & OBS_BIT) != 0 {
+                    obs_result[idx] = id;
+                } else {
+                    ref_result[idx] = id;
+                }
+            }
+        }
+    }
+
+    ExactSubtreeKeys {
+        keys: (ref_result, obs_result),
+        ref_reflexive,
+    }
+}
+
 // Intern exact content, not hashes used as identity. Children are an unordered multiset;
 // references remain separate, stronger evidence in identity_score. A non-match here
 // never excludes a candidate (float rounding or an actual edit may change its key).
+#[cfg(test)]
 fn identity_subtree_keys<'a>(
     document: &'a SettingsBytecode,
     keys: &mut AHashMap<IdentitySubtreeKey<'a>, usize>,
@@ -1235,9 +4556,25 @@ fn identity_subtree_keys<'a>(
     result
 }
 
+#[derive(Clone, Copy)]
+enum RowSource<'a> {
+    Full(&'a [SettingsBytecodeInstance]),
+    Hydrated(&'a AHashMap<usize, SettingsBytecodeInstance>),
+}
+
+impl<'a> RowSource<'a> {
+    #[inline]
+    fn get(self, index: usize) -> &'a SettingsBytecodeInstance {
+        match self {
+            Self::Full(instances) => &instances[index],
+            Self::Hydrated(rows) => &rows[&index],
+        }
+    }
+}
+
 struct IdentityScoreContext<'a> {
-    reference: &'a SettingsBytecode,
-    observed: &'a SettingsBytecode,
+    reference: RowSource<'a>,
+    observed: RowSource<'a>,
     reference_graph: &'a ReferenceGraph,
     observed_graph: &'a ReferenceGraph,
     assigned_reference: &'a [Option<usize>],
@@ -1250,8 +4587,8 @@ fn identity_score(
     reference_index: usize,
     observed_index: usize,
 ) -> Option<IdentityScore> {
-    let reference_instance = &context.reference.instances[reference_index];
-    let observed_instance = &context.observed.instances[observed_index];
+    let reference_instance = context.reference.get(reference_index);
+    let observed_instance = context.observed.get(observed_index);
     let reference_evidence = matching_reference_evidence(
         reference_index,
         observed_index,
@@ -1260,7 +4597,12 @@ fn identity_score(
         context.assigned_reference,
         context.assigned_observed,
     )?;
-    let content_matches = holds_same_content(reference_instance, observed_instance);
+    let content_matches = holds_same_content_hint(
+        reference_instance,
+        observed_instance,
+        !context.reference_graph.has_outgoing(reference_index),
+        !context.observed_graph.has_outgoing(observed_index),
+    );
     if reference_evidence == 0 && !content_matches {
         return None;
     }
@@ -1281,8 +4623,28 @@ fn holds_same_content(
     reference: &SettingsBytecodeInstance,
     observed: &SettingsBytecodeInstance,
 ) -> bool {
-    reconciliation_identity_maps_equal(&reference.properties, &observed.properties, true)
-        && reconciliation_identity_maps_equal(&reference.attributes, &observed.attributes, false)
+    holds_same_content_hint(reference, observed, false, false)
+}
+
+fn holds_same_content_hint(
+    reference: &SettingsBytecodeInstance,
+    observed: &SettingsBytecodeInstance,
+    reference_no_refs: bool,
+    observed_no_refs: bool,
+) -> bool {
+    reconciliation_identity_maps_equal_hint(
+        &reference.properties,
+        &observed.properties,
+        true,
+        reference_no_refs,
+        observed_no_refs,
+    ) && reconciliation_identity_maps_equal_hint(
+        &reference.attributes,
+        &observed.attributes,
+        false,
+        reference_no_refs,
+        observed_no_refs,
+    )
 }
 
 fn settings_topology_matches(reference: &SettingsBytecode, observed: &SettingsBytecode) -> bool {
@@ -1327,6 +4689,37 @@ pub(crate) fn persistent_identity_text(id: &str) -> Option<&str> {
 pub(crate) fn persistent_identity_index(
     document: &SettingsBytecode,
 ) -> AHashMap<&str, Option<usize>> {
+    if document.instances.len() >= 8_192 && rayon::current_num_threads() > 1 {
+        let chunks: Vec<Vec<(&str, usize)>> = document
+            .instances
+            .par_chunks(2_048)
+            .enumerate()
+            .map(|(chunk_idx, chunk)| {
+                let base = chunk_idx * 2_048;
+                let mut found = Vec::new();
+                for (offset, instance) in chunk.iter().enumerate() {
+                    if let Some(id) = persistent_identity(instance) {
+                        found.push((id, base + offset));
+                    }
+                }
+                found
+            })
+            .collect();
+        let total: usize = chunks.iter().map(Vec::len).sum();
+        if total == 0 {
+            return AHashMap::new();
+        }
+        let mut result = AHashMap::with_capacity(total);
+        for chunk in chunks {
+            for (id, index) in chunk {
+                result
+                    .entry(id)
+                    .and_modify(|value| *value = None)
+                    .or_insert(Some(index));
+            }
+        }
+        return result;
+    }
     let mut result = AHashMap::new();
     for (index, instance) in document.instances.iter().enumerate() {
         if let Some(id) = persistent_identity(instance) {
@@ -1407,19 +4800,56 @@ fn store_identities_follow_mapping(
 
 type IdentityGroupKey<'a> = (Option<usize>, &'a str, &'a str);
 
+enum GroupIndices {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl GroupIndices {
+    #[inline]
+    fn push(&mut self, index: usize) {
+        match self {
+            Self::One(first) => {
+                let first = *first;
+                *self = Self::Many(vec![first, index]);
+            }
+            Self::Many(indices) => indices.push(index),
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::One(index) => std::slice::from_ref(index),
+            Self::Many(indices) => indices.as_slice(),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::One(_) => 1,
+            Self::Many(indices) => indices.len(),
+        }
+    }
+}
+
 struct IdentityLookup<'a> {
     reference_by_id: AHashMap<&'a str, usize>,
     reference_by_unique_id: AHashMap<&'a str, Option<usize>>,
     observed_by_unique_id: AHashMap<&'a str, Option<usize>>,
+    reference_ids_unique: bool,
 }
 
 struct ScoreInputs<'a, 'b> {
-    reference_groups: &'b AHashMap<IdentityGroupKey<'a>, Vec<usize>>,
+    reference_groups: &'b AHashMap<IdentityGroupKey<'a>, GroupIndices>,
     reference_graph: &'b ReferenceGraph,
     observed_graph: &'b ReferenceGraph,
-    subtree_keys: Option<&'b (Vec<usize>, Vec<usize>)>,
+    subtree_keys: Option<&'b ExactSubtreeKeys>,
+    observed_tree: &'b DocTree,
     /// The matching stops at instances only what they hold tells apart.
     told_alone: bool,
+    compact: Option<&'b CompactMatching<'b>>,
 }
 
 /// How a matching by order took an observed instance among its namesakes
@@ -1437,17 +4867,18 @@ pub(crate) enum ByOrder {
 struct IdentityAssignment<'a> {
     reference: &'a SettingsBytecode,
     observed: &'a SettingsBytecode,
-    /// The ids of the reference, which only its own instances take.
-    reserved_reference_ids: AHashSet<&'a str>,
+    /// The ids of the reference, lazily built on the first `assign_fresh`.
+    reserved_reference_ids: Option<AHashSet<&'a str>>,
     /// The ids an instance without a counterpart cannot be given a made-up
     /// id of: those of both copies and the ones made up so far. Read at the
     /// first id that has to be made up.
     blocked_ids: Option<AHashSet<String>>,
-    assigned_ids: Vec<Option<String>>,
+    /// Fresh ids assigned to observed instances without a reference counterpart.
+    assigned_fresh: AHashMap<usize, String>,
     assigned_reference: Vec<Option<usize>>,
     assigned_observed: Vec<Option<usize>>,
-    used_reference: Vec<bool>,
-    used_ids: AHashSet<std::borrow::Cow<'a, str>>,
+    /// Ids consumed by `assign_fresh`, lazily populated.
+    fresh_used_ids: AHashSet<std::borrow::Cow<'a, str>>,
     generated: usize,
     remaining: usize,
     shape_keys: Option<(Vec<u64>, Vec<u64>)>,
@@ -1456,6 +4887,12 @@ struct IdentityAssignment<'a> {
     /// The observed instances such a matching took by their order among
     /// their namesakes under one parent, where it pairs them so.
     by_order: Option<Vec<(usize, ByOrder)>>,
+    /// Ready unassigned observed indices for the frontier loop.
+    active_ready: Vec<usize>,
+    /// Newly unblocked children collected during a pass.
+    newly_ready: Vec<usize>,
+    /// Stalled ref-free groups with `key.0.is_some()` waiting for fallback.
+    stalled_groups: Vec<(IdentityGroupKey<'a>, Vec<usize>)>,
 }
 
 /// Hash of an instance's subtree by names and classes only, so same-named
@@ -1463,21 +4900,44 @@ struct IdentityAssignment<'a> {
 fn subtree_shape_keys(document: &SettingsBytecode) -> Vec<u64> {
     use std::hash::{Hash, Hasher};
     let count = document.instances.len();
-    let mut children = vec![Vec::new(); count];
+    let mut counts = vec![0u32; count];
     for (index, instance) in document.instances.iter().enumerate() {
         if let Some(parent) = instance.parent_index
             && parent < index
         {
-            children[parent].push(index);
+            counts[parent] += 1;
+        }
+    }
+    let mut offsets = Vec::with_capacity(count + 1);
+    let mut total = 0u32;
+    for &c in &counts {
+        offsets.push(total);
+        total += c;
+    }
+    offsets.push(total);
+    let mut children = vec![0u32; total as usize];
+    counts.copy_from_slice(&offsets[..count]);
+    for (index, instance) in document.instances.iter().enumerate() {
+        if let Some(parent) = instance.parent_index
+            && parent < index
+        {
+            let pos = counts[parent] as usize;
+            children[pos] = index as u32;
+            counts[parent] += 1;
         }
     }
     let mut keys = vec![0u64; count];
+    let mut child_keys = Vec::new();
     for index in (0..count).rev() {
         let instance = &document.instances[index];
-        let mut child_keys = children[index]
-            .iter()
-            .map(|child| keys[*child])
-            .collect::<Vec<_>>();
+        let start = offsets[index] as usize;
+        let end = offsets[index + 1] as usize;
+        child_keys.clear();
+        child_keys.extend(
+            children[start..end]
+                .iter()
+                .map(|&child| keys[child as usize]),
+        );
         child_keys.sort_unstable();
         let mut hasher = ahash::AHasher::default();
         instance.name.hash(&mut hasher);
@@ -1488,13 +4948,68 @@ fn subtree_shape_keys(document: &SettingsBytecode) -> Vec<u64> {
     keys
 }
 
+enum NumberPointerStep {
+    Key(String),
+    Index(usize),
+}
+
+enum CompiledNumberAccess {
+    Direct,
+    Field(String),
+    ArrayIndex(String, usize),
+    Steps(Vec<NumberPointerStep>),
+}
+
+impl CompiledNumberAccess {
+    fn from_steps(steps: &[NumberPointerStep]) -> Self {
+        match steps {
+            [] => Self::Direct,
+            [NumberPointerStep::Key(k)] => Self::Field(k.clone()),
+            [NumberPointerStep::Key(k), NumberPointerStep::Index(i)] => {
+                Self::ArrayIndex(k.clone(), *i)
+            }
+            _ => Self::Steps(
+                steps
+                    .iter()
+                    .map(|step| match step {
+                        NumberPointerStep::Key(k) => NumberPointerStep::Key(k.clone()),
+                        NumberPointerStep::Index(i) => NumberPointerStep::Index(*i),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    #[inline]
+    fn read<'a>(&self, value: &'a Value) -> Option<&'a Value> {
+        match self {
+            Self::Direct => Some(value),
+            Self::Field(key) => value.as_object()?.get(key),
+            Self::ArrayIndex(key, index) => value.as_object()?.get(key)?.as_array()?.get(*index),
+            Self::Steps(steps) => {
+                let mut current = value;
+                for step in steps {
+                    current = match step {
+                        NumberPointerStep::Key(key) => current.as_object()?.get(key)?,
+                        NumberPointerStep::Index(index) => current.as_array()?.get(*index)?,
+                    };
+                }
+                Some(current)
+            }
+        }
+    }
+}
+
 struct IdentityNumberField {
     attribute: bool,
     property: String,
+    #[allow(dead_code)]
     pointer: String,
+    access: CompiledNumberAccess,
 }
 
 impl IdentityNumberField {
+    #[inline]
     fn read(&self, instance: &SettingsBytecodeInstance) -> Option<f64> {
         let values = if self.attribute {
             &instance.attributes
@@ -1503,11 +5018,11 @@ impl IdentityNumberField {
         };
         let value = values.get(&self.property)?;
         // Enum equality can use either name or number, so its number is not a safe filter.
-        if contains_identity_enum(value) {
+        if !matches!(self.access, CompiledNumberAccess::Direct) && contains_identity_enum(value) {
             return None;
         }
-        value
-            .pointer(&self.pointer)?
+        self.access
+            .read(value)?
             .as_f64()
             .filter(|value| value.is_finite())
     }
@@ -1515,24 +5030,40 @@ impl IdentityNumberField {
 
 fn contains_identity_enum(value: &Value) -> bool {
     match value {
-        Value::Object(values) => {
-            values.get("_type").and_then(Value::as_str) == Some("EnumItem")
-                || values.values().any(contains_identity_enum)
-        }
-        Value::Array(values) => values.iter().any(contains_identity_enum),
+        Value::Object(values) => values.iter().any(|(key, val)| {
+            (key == "_type" && val.as_str() == Some("EnumItem"))
+                || (matches!(val, Value::Object(_) | Value::Array(_))
+                    && contains_identity_enum(val))
+        }),
+        Value::Array(values) => values.iter().any(|val| {
+            matches!(val, Value::Object(_) | Value::Array(_)) && contains_identity_enum(val)
+        }),
         _ => false,
     }
 }
 
-fn identity_number_pointers(value: &Value, pointer: &mut String, output: &mut Vec<String>) {
+fn identity_number_pointers(
+    value: &Value,
+    pointer: &mut String,
+    steps: &mut Vec<NumberPointerStep>,
+    output: &mut Vec<(String, CompiledNumberAccess)>,
+) {
     match value {
-        Value::Number(_) => output.push(pointer.clone()),
+        Value::Number(_) => {
+            output.push((pointer.clone(), CompiledNumberAccess::from_steps(steps)));
+        }
         Value::Object(values) => {
             for (name, value) in values {
                 let length = pointer.len();
                 pointer.push('/');
-                pointer.push_str(&name.replace('~', "~0").replace('/', "~1"));
-                identity_number_pointers(value, pointer, output);
+                if name.contains('~') || name.contains('/') {
+                    pointer.push_str(&name.replace('~', "~0").replace('/', "~1"));
+                } else {
+                    pointer.push_str(name);
+                }
+                steps.push(NumberPointerStep::Key(name.clone()));
+                identity_number_pointers(value, pointer, steps, output);
+                steps.pop();
                 pointer.truncate(length);
             }
         }
@@ -1540,7 +5071,9 @@ fn identity_number_pointers(value: &Value, pointer: &mut String, output: &mut Ve
             for (index, value) in values.iter().enumerate() {
                 let length = pointer.len();
                 write!(pointer, "/{index}").expect("writing to a String cannot fail");
-                identity_number_pointers(value, pointer, output);
+                steps.push(NumberPointerStep::Index(index));
+                identity_number_pointers(value, pointer, steps, output);
+                steps.pop();
                 pointer.truncate(length);
             }
         }
@@ -1551,16 +5084,29 @@ fn identity_number_pointers(value: &Value, pointer: &mut String, output: &mut Ve
 struct IdentityCandidateIndex {
     field: IdentityNumberField,
     values: Vec<(f64, usize)>,
+    secondary: Option<(IdentityNumberField, Vec<f64>)>,
+}
+
+#[inline]
+fn identity_number_radius(value: f64) -> f64 {
+    let epsilon = 4.0 * f64::from(f32::EPSILON);
+    ((epsilon + 4.0 * f64::EPSILON) / (1.0 - epsilon) * value.abs().max(1.0)).max(
+        CFRAME_ROTATION_EPSILON
+            .max(CFRAME_ROTATION_NOISE)
+            .max(CFRAME_POSITION_NOISE)
+            + 4.0 * f64::EPSILON,
+    )
 }
 
 impl IdentityCandidateIndex {
-    fn build(document: &SettingsBytecode, candidates: &[usize]) -> Option<Self> {
+    fn build(rows: RowSource<'_>, candidates: &[usize]) -> Option<Self> {
         if candidates.len() < 32 {
             return None;
         }
-        let first = &document.instances[candidates[0]];
-        let mut best = None;
-        let mut best_distinct = 1;
+        let first = rows.get(candidates[0]);
+        let mut fields = Vec::new();
+        let mut pointer_buf = String::new();
+        let mut steps_buf = Vec::new();
         for (attribute, properties) in [(false, &first.properties), (true, &first.attributes)] {
             for (property, value) in properties {
                 if !identity_value_is_stable(property, value, !attribute)
@@ -1569,126 +5115,237 @@ impl IdentityCandidateIndex {
                     continue;
                 }
                 let mut pointers = Vec::new();
-                identity_number_pointers(value, &mut String::new(), &mut pointers);
-                for pointer in pointers {
-                    let field = IdentityNumberField {
+                pointer_buf.clear();
+                steps_buf.clear();
+                identity_number_pointers(value, &mut pointer_buf, &mut steps_buf, &mut pointers);
+                for (pointer, access) in pointers {
+                    fields.push(IdentityNumberField {
                         attribute,
                         property: property.clone(),
                         pointer,
-                    };
-                    let values = candidates
-                        .iter()
-                        .filter_map(|index| {
-                            field
-                                .read(&document.instances[*index])
-                                .map(|value| (value, *index))
-                        })
-                        .collect::<Vec<_>>();
-                    let distinct = values
-                        .iter()
-                        .map(|(value, _)| value.to_bits())
-                        .collect::<AHashSet<_>>()
-                        .len();
-                    if distinct > best_distinct {
-                        best_distinct = distinct;
-                        best = Some(Self { field, values });
-                    }
+                        access,
+                    });
                 }
             }
         }
+        if fields.is_empty() {
+            return None;
+        }
+
+        let mut seen = AHashSet::with_capacity(candidates.len().min(256));
+        let (chosen_primary, chosen_secondary) = if candidates.len() > 256 {
+            let sample_len = 128usize;
+            let step = candidates.len() / sample_len;
+            let sample = (0..sample_len)
+                .map(|i| candidates[i * step])
+                .collect::<Vec<_>>();
+            let mut best_idx = None;
+            let mut best_distinct = 1usize;
+            let mut second_idx = None;
+            let mut second_distinct = 1usize;
+            for (idx, field) in fields.iter().enumerate() {
+                seen.clear();
+                for &cand in &sample {
+                    if let Some(v) = field.read(rows.get(cand)) {
+                        seen.insert(v.to_bits());
+                    }
+                }
+                let distinct = seen.len();
+                if distinct > best_distinct {
+                    second_distinct = best_distinct;
+                    second_idx = best_idx;
+                    best_distinct = distinct;
+                    best_idx = Some(idx);
+                } else if distinct > second_distinct {
+                    second_distinct = distinct;
+                    second_idx = Some(idx);
+                }
+                if best_distinct == sample_len && second_distinct >= sample_len / 2 {
+                    break;
+                }
+            }
+            (best_idx, second_idx)
+        } else {
+            (None, None)
+        };
+
+        let mut secondary_field: Option<IdentityNumberField> = None;
+        let mut best = if let Some(primary_idx) = chosen_primary {
+            let mut fields = fields.into_iter().map(Some).collect::<Vec<_>>();
+            let field = fields[primary_idx].take().unwrap();
+            secondary_field = chosen_secondary.and_then(|idx| fields[idx].take());
+            let values: Vec<(f64, usize)> =
+                if candidates.len() >= 2_048 && rayon::current_num_threads() > 1 {
+                    candidates
+                        .par_iter()
+                        .filter_map(|&index| field.read(rows.get(index)).map(|v| (v, index)))
+                        .collect()
+                } else {
+                    candidates
+                        .iter()
+                        .filter_map(|&index| field.read(rows.get(index)).map(|v| (v, index)))
+                        .collect()
+                };
+            Some(Self {
+                field,
+                values,
+                secondary: None,
+            })
+        } else {
+            let mut best: Option<Self> = None;
+            let mut best_distinct = 1usize;
+            for field in fields {
+                seen.clear();
+                let mut values = Vec::with_capacity(candidates.len());
+                for &index in candidates {
+                    if let Some(value) = field.read(rows.get(index)) {
+                        seen.insert(value.to_bits());
+                        values.push((value, index));
+                    }
+                }
+                let distinct = seen.len();
+                if distinct > best_distinct {
+                    best_distinct = distinct;
+                    best = Some(Self {
+                        field,
+                        values,
+                        secondary: None,
+                    });
+                    if best_distinct == candidates.len() {
+                        break;
+                    }
+                }
+            }
+            best
+        };
+
         if let Some(index) = best.as_mut() {
-            index
-                .values
-                .sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
+            if index.values.len() >= 4_096 && rayon::current_num_threads() > 1 {
+                index
+                    .values
+                    .par_sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
+            } else {
+                index
+                    .values
+                    .sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
+            }
+            if let Some(sec_field) = secondary_field {
+                let sec_values: Vec<f64> =
+                    if index.values.len() >= 2_048 && rayon::current_num_threads() > 1 {
+                        index
+                            .values
+                            .par_iter()
+                            .map(|&(_, cand)| sec_field.read(rows.get(cand)).unwrap_or(f64::NAN))
+                            .collect()
+                    } else {
+                        index
+                            .values
+                            .iter()
+                            .map(|&(_, cand)| sec_field.read(rows.get(cand)).unwrap_or(f64::NAN))
+                            .collect()
+                    };
+                index.secondary = Some((sec_field, sec_values));
+            }
         }
         best
     }
 
-    fn matching(&self, instance: &SettingsBytecodeInstance) -> Option<&[(f64, usize)]> {
+    fn matching_range(
+        &self,
+        instance: &SettingsBytecodeInstance,
+    ) -> Option<std::ops::Range<usize>> {
         let value = self.field.read(instance)?;
-        // A conservative superset of the existing f32 comparison, including its relative
-        // tolerance and rounding at either boundary. identity_score remains authoritative.
-        let epsilon = 4.0 * f64::from(f32::EPSILON);
-        let radius = ((epsilon + 4.0 * f64::EPSILON) / (1.0 - epsilon) * value.abs().max(1.0)).max(
-            CFRAME_ROTATION_EPSILON
-                .max(CFRAME_ROTATION_NOISE)
-                .max(CFRAME_POSITION_NOISE)
-                + 4.0 * f64::EPSILON,
-        );
+        let radius = identity_number_radius(value);
         let start = self
             .values
             .partition_point(|(candidate, _)| *candidate < value - radius);
         let end = self
             .values
             .partition_point(|(candidate, _)| *candidate <= value + radius);
-        Some(&self.values[start..end])
+        Some(start..end)
+    }
+
+    fn matching(&self, instance: &SettingsBytecodeInstance) -> Option<&[(f64, usize)]> {
+        let range = self.matching_range(instance)?;
+        Some(&self.values[range])
     }
 }
 
+#[cfg(test)]
 fn identity_group_proposals(
     context: &IdentityScoreContext<'_>,
     observed_group: &[usize],
     candidates: &[usize],
 ) -> Vec<(usize, usize)> {
-    let (representatives, multiplicities) = identity_candidate_representatives(
-        context.reference,
-        context.reference_graph,
-        context
-            .subtree_keys
-            .map(|(reference, _)| reference.as_slice()),
-        candidates,
-    );
-    let unreferenced = |index: usize| {
-        context.observed_graph.outgoing[index].is_empty()
-            && context.observed_graph.incoming[index].is_empty()
+    identity_group_proposals_with_exact(context, observed_group, candidates, None)
+}
+
+fn identity_group_proposals_with_exact(
+    context: &IdentityScoreContext<'_>,
+    observed_group: &[usize],
+    candidates: &[usize],
+    exact_subtree: Option<&ExactSubtreeKeys>,
+) -> Vec<(usize, usize)> {
+    let unreferenced = |index: usize| !context.observed_graph.has_edges(index);
+    let (mut results, fallback) = if let Some(exact) = exact_subtree {
+        exact_subtree_fast_proposals(
+            context.reference_graph,
+            context.observed_graph,
+            context.assigned_observed,
+            exact,
+            observed_group,
+            candidates,
+        )
+    } else {
+        (
+            vec![None; observed_group.len()],
+            observed_group
+                .iter()
+                .enumerate()
+                .map(|(pos, &idx)| (pos, idx))
+                .collect(),
+        )
     };
-    let content_index =
-        if representatives.len() > 1 && observed_group.iter().any(|index| unreferenced(*index)) {
+    if !fallback.is_empty() {
+        let (representatives, multiplicities) = if let Some(exact) = exact_subtree {
+            identity_candidate_representatives_exact(
+                context.reference,
+                context.reference_graph,
+                exact,
+                candidates,
+            )
+        } else {
+            identity_candidate_representatives(
+                context.reference,
+                context.reference_graph,
+                context
+                    .subtree_keys
+                    .map(|(reference, _)| reference.as_slice()),
+                candidates,
+            )
+        };
+        let content_index = if representatives.len() > 1
+            && fallback.iter().any(|&(_, index)| unreferenced(index))
+        {
             IdentityCandidateIndex::build(context.reference, &representatives)
         } else {
             None
         };
-    let propose = |&index: &usize| {
-        let mut best = None;
-        let mut best_candidate = None;
-        let mut tied = false;
-        let narrowed = content_index
-            .as_ref()
-            .filter(|_| unreferenced(index))
-            .and_then(|lookup| lookup.matching(&context.observed.instances[index]));
-        let count = narrowed.map_or(representatives.len(), <[_]>::len);
-        for offset in 0..count {
-            let candidate =
-                narrowed.map_or_else(|| representatives[offset], |values| values[offset].1);
-            let Some(score) = identity_score(context, candidate, index) else {
-                continue;
-            };
-            match best {
-                None => {
-                    best = Some(score);
-                    best_candidate = Some(candidate);
-                    tied = multiplicities[&candidate] > 1;
-                }
-                Some(current) if score > current => {
-                    best = Some(score);
-                    best_candidate = Some(candidate);
-                    tied = multiplicities[&candidate] > 1;
-                }
-                Some(current) if score == current => tied = true,
-                _ => {}
-            }
+        for (pos, candidate) in score_fallback_entries(
+            context,
+            &representatives,
+            &multiplicities,
+            content_index.as_ref(),
+            &fallback,
+        ) {
+            results[pos] = Some(candidate);
         }
-        best_candidate
-            .filter(|_| !tied)
-            .map(|candidate| (index, candidate))
-    };
-    // Scores use one immutable assignment snapshot. Preserve observed order;
-    // conflicting proposals are rejected before any assignment is applied.
-    if observed_group.len() >= 32 && rayon::current_num_threads() > 1 {
-        observed_group.par_iter().filter_map(propose).collect()
-    } else {
-        observed_group.iter().filter_map(propose).collect()
     }
+    observed_group
+        .iter()
+        .zip(results)
+        .filter_map(|(&index, candidate)| candidate.map(|candidate| (index, candidate)))
+        .collect()
 }
 
 impl<'a> IdentityAssignment<'a> {
@@ -1696,101 +5353,190 @@ impl<'a> IdentityAssignment<'a> {
         Self {
             reference,
             observed,
-            reserved_reference_ids: AHashSet::new(),
+            reserved_reference_ids: None,
             blocked_ids: None,
-            assigned_ids: vec![None; observed.instances.len()],
+            assigned_fresh: AHashMap::new(),
             assigned_reference: vec![None; observed.instances.len()],
             assigned_observed: vec![None; reference.instances.len()],
-            used_reference: vec![false; reference.instances.len()],
-            used_ids: AHashSet::new(),
+            fresh_used_ids: AHashSet::new(),
             generated: 0,
             remaining: observed.instances.len(),
             shape_keys: None,
             compares_values: false,
             by_order: None,
+            active_ready: Vec::new(),
+            newly_ready: Vec::new(),
+            stalled_groups: Vec::new(),
         }
     }
 
+    #[inline]
+    fn is_assigned(&self, index: usize) -> bool {
+        self.assigned_reference[index].is_some()
+            || (!self.assigned_fresh.is_empty() && self.assigned_fresh.contains_key(&index))
+    }
+
+    #[inline]
+    fn is_reference_used(&self, candidate: usize) -> bool {
+        self.assigned_observed[candidate].is_some()
+    }
+
     fn assign(&mut self, index: usize, candidate: usize) {
-        let reference = self.reference;
-        let id = &reference.instances[candidate].settings_id;
-        self.used_reference[candidate] = true;
-        self.used_ids.insert(std::borrow::Cow::Borrowed(id));
         self.assigned_reference[index] = Some(candidate);
         self.assigned_observed[candidate] = Some(index);
-        self.assigned_ids[index] = Some(id.clone());
         self.remaining -= 1;
+    }
+
+    fn assign_and_unblock(&mut self, index: usize, candidate: usize, observed_tree: &DocTree) {
+        self.assign(index, candidate);
+        for &child in observed_tree.children(index) {
+            let child = child as usize;
+            if !self.is_assigned(child) {
+                self.newly_ready.push(child);
+            }
+        }
     }
 
     fn assign_fresh(&mut self, index: usize) {
         let (reference, observed) = (self.reference, self.observed);
+        let reserved = self.reserved_reference_ids.get_or_insert_with(|| {
+            let mut set = AHashSet::with_capacity(reference.instances.len());
+            for instance in &reference.instances {
+                set.insert(instance.settings_id.as_str());
+            }
+            set
+        });
         let preferred = observed.instances[index].settings_id.as_str();
-        let id = if !self.reserved_reference_ids.contains(preferred)
-            && self.used_ids.insert(std::borrow::Cow::Borrowed(preferred))
+        let id = if !reserved.contains(preferred)
+            && self
+                .fresh_used_ids
+                .insert(std::borrow::Cow::Borrowed(preferred))
         {
             preferred.to_string()
         } else {
             let blocked = self.blocked_ids.get_or_insert_with(|| {
-                (reference.instances.iter())
-                    .chain(&observed.instances)
-                    .map(|instance| instance.settings_id.clone())
-                    .collect()
+                let mut set =
+                    AHashSet::with_capacity(reference.instances.len() + observed.instances.len());
+                for instance in reference.instances.iter().chain(&observed.instances) {
+                    set.insert(instance.settings_id.clone());
+                }
+                set
             });
             loop {
                 let candidate = format!("reconcile:{:x}", self.generated);
                 self.generated += 1;
                 if blocked.insert(candidate.clone())
-                    && (self.used_ids).insert(std::borrow::Cow::Owned(candidate.clone()))
+                    && self
+                        .fresh_used_ids
+                        .insert(std::borrow::Cow::Owned(candidate.clone()))
                 {
                     break candidate;
                 }
             }
         };
-        self.assigned_ids[index] = Some(id);
+        self.assigned_fresh.insert(index, id);
         self.remaining -= 1;
     }
 
-    fn unassigned_groups(&self) -> BTreeMap<IdentityGroupKey<'a>, Vec<usize>> {
-        let mut groups = BTreeMap::<IdentityGroupKey<'a>, Vec<usize>>::new();
+    fn assign_fresh_and_unblock(&mut self, index: usize, observed_tree: &DocTree) {
+        self.assign_fresh(index);
+        for &child in observed_tree.children(index) {
+            let child = child as usize;
+            if !self.is_assigned(child) {
+                self.newly_ready.push(child);
+            }
+        }
+    }
+
+    fn init_frontier(&mut self) {
+        self.active_ready.clear();
+        self.newly_ready.clear();
+        self.stalled_groups.clear();
+        let count = self.observed.instances.len();
         for (index, instance) in self.observed.instances.iter().enumerate() {
-            if self.assigned_ids[index].is_some() {
+            if self.is_assigned(index) {
                 continue;
             }
-            let reference_parent = match instance.parent_index {
-                Some(parent) => {
-                    if self
-                        .assigned_ids
-                        .get(parent)
-                        .and_then(Option::as_ref)
-                        .is_none()
-                    {
-                        continue;
-                    }
-                    self.assigned_reference[parent]
-                }
-                None => None,
+            let parent_ready = match instance.parent_index {
+                Some(parent) => parent < count && self.is_assigned(parent),
+                None => true,
             };
-            groups
-                .entry((
-                    reference_parent,
-                    instance.name.as_str(),
-                    instance.class_name.as_str(),
-                ))
-                .or_default()
-                .push(index);
+            if parent_ready {
+                self.active_ready.push(index);
+            }
         }
+    }
+
+    fn flush_frontier(&mut self) {
+        let assigned_ref = &self.assigned_reference;
+        let assigned_fresh = &self.assigned_fresh;
+        self.active_ready.retain(|&index| {
+            assigned_ref[index].is_none()
+                && (assigned_fresh.is_empty() || !assigned_fresh.contains_key(&index))
+        });
+        self.active_ready.append(&mut self.newly_ready);
+    }
+
+    fn active_groups(&self) -> Vec<(IdentityGroupKey<'a>, GroupIndices)> {
+        let mut by_key: AHashMap<IdentityGroupKey<'a>, GroupIndices> =
+            AHashMap::with_capacity((self.active_ready.len() / 2).clamp(16, 4_096));
+        for &index in &self.active_ready {
+            if self.is_assigned(index) {
+                continue;
+            }
+            let instance = &self.observed.instances[index];
+            let reference_parent = instance
+                .parent_index
+                .and_then(|parent| self.assigned_reference[parent]);
+            let key = (
+                reference_parent,
+                instance.name.as_str(),
+                instance.class_name.as_str(),
+            );
+            match by_key.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().push(index);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(GroupIndices::One(index));
+                }
+            }
+        }
+        let mut groups: Vec<(IdentityGroupKey<'a>, GroupIndices)> = by_key.into_iter().collect();
+        for (_, indices) in &mut groups {
+            if let GroupIndices::Many(vec) = indices {
+                vec.sort_unstable();
+            }
+        }
+        groups.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         groups
     }
 
-    fn run_exact(&mut self, lookup: &IdentityLookup<'_>) -> bool {
+    fn run_exact(
+        &mut self,
+        lookup: &IdentityLookup<'a>,
+        initial_camera_ref: Option<usize>,
+        obs_unique_ids: Option<&[Option<Box<str>>]>,
+    ) -> bool {
         let reference = self.reference;
         let observed = self.observed;
+        let mut used_exact_ids = (!lookup.reference_ids_unique).then(|| {
+            let mut set = AHashSet::new();
+            if let Some(cam) = initial_camera_ref {
+                set.insert(reference.instances[cam].settings_id.as_str());
+            }
+            set
+        });
         let mut progressed = false;
         for (index, instance) in observed.instances.iter().enumerate() {
-            if self.assigned_ids[index].is_some() {
+            if self.is_assigned(index) {
                 continue;
             }
-            let persistent = persistent_identity(instance)
+            let persistent_id = match obs_unique_ids {
+                Some(ids) => ids[index].as_deref(),
+                None => persistent_identity(instance),
+            };
+            let persistent = persistent_id
                 .filter(|id| lookup.observed_by_unique_id.get(id) == Some(&Some(index)))
                 .and_then(|id| lookup.reference_by_unique_id.get(id).copied().flatten())
                 .filter(|candidate| {
@@ -1808,43 +5554,44 @@ impl<'a> IdentityAssignment<'a> {
                         .flatten()
                 })
                 .filter(|candidate| {
-                    !self.used_reference[*candidate]
-                        && !self
-                            .used_ids
-                            .contains(reference.instances[*candidate].settings_id.as_str())
+                    !self.is_reference_used(*candidate)
+                        && used_exact_ids.as_ref().is_none_or(|used| {
+                            !used.contains(reference.instances[*candidate].settings_id.as_str())
+                        })
                 })
             else {
                 continue;
             };
+            if let Some(used) = &mut used_exact_ids {
+                used.insert(reference.instances[candidate].settings_id.as_str());
+            }
             self.assign(index, candidate);
             progressed = true;
         }
         progressed
     }
 
-    fn run_unique(&mut self, reference_groups: &AHashMap<IdentityGroupKey<'a>, Vec<usize>>) {
+    fn run_unique(&mut self, reference_groups: &AHashMap<IdentityGroupKey<'a>, GroupIndices>) {
         let observed = self.observed;
-        let mut observed_counts = AHashMap::with_capacity(observed.instances.len());
-        for instance in &observed.instances {
-            *observed_counts
-                .entry((
-                    instance.parent_index,
-                    instance.name.as_str(),
-                    instance.class_name.as_str(),
-                ))
-                .or_insert(0usize) += 1;
+        let mut first_obs = AHashMap::with_capacity(observed.instances.len() / 4);
+        let mut obs_unique = vec![true; observed.instances.len()];
+        for (index, instance) in observed.instances.iter().enumerate() {
+            let key = (
+                instance.parent_index,
+                instance.name.as_str(),
+                instance.class_name.as_str(),
+            );
+            if let Some(prev) = first_obs.insert(key, index) {
+                obs_unique[prev] = false;
+                obs_unique[index] = false;
+            }
         }
+        drop(first_obs);
         // Resolve parent-before-child singleton groups in one pass. The scored
         // path makes the same decision, but builds a Vec for every unique child
         // and revisits the entire document at each depth after a reorder.
         for (index, instance) in observed.instances.iter().enumerate() {
-            if self.assigned_ids[index].is_some()
-                || observed_counts[&(
-                    instance.parent_index,
-                    instance.name.as_str(),
-                    instance.class_name.as_str(),
-                )] != 1
-            {
+            if self.is_assigned(index) || !obs_unique[index] {
                 continue;
             }
             let parent = match instance.parent_index {
@@ -1854,13 +5601,14 @@ impl<'a> IdentityAssignment<'a> {
                 },
                 None => None,
             };
-            let Some([candidate]) = reference_groups
-                .get(&(parent, instance.name.as_str(), instance.class_name.as_str()))
-                .map(Vec::as_slice)
-            else {
+            let Some(GroupIndices::One(candidate)) = reference_groups.get(&(
+                parent,
+                instance.name.as_str(),
+                instance.class_name.as_str(),
+            )) else {
                 continue;
             };
-            if !self.used_reference[*candidate] {
+            if !self.is_reference_used(*candidate) {
                 self.assign(index, *candidate);
             }
         }
@@ -1869,148 +5617,326 @@ impl<'a> IdentityAssignment<'a> {
     fn run_scored(
         &mut self,
         inputs: &ScoreInputs<'a, '_>,
-        unchanged_content_groups: &mut HashMap<usize, (Vec<usize>, Vec<usize>)>,
-    ) -> bool {
+        unchanged_content_groups: &mut AHashMap<usize, (Vec<usize>, Vec<usize>)>,
+    ) -> Result<bool> {
         let reference = self.reference;
         let observed = self.observed;
-        let mut progressed = false;
-        for (key, observed_group) in self.unassigned_groups() {
-            let group_started = Instant::now();
-            let observed_count = observed_group.len();
+        let groups = self.active_groups();
+        if groups.is_empty() {
+            return Ok(false);
+        }
+
+        enum PreparedGroup {
+            Empty,
+            Singleton(usize),
+            ToldAlone(Vec<usize>),
+            Skipped,
+            RefFree { slot: usize },
+            RefBearing { candidates: Vec<usize> },
+        }
+
+        let mut prepared = Vec::with_capacity(groups.len());
+        let mut ref_free_jobs: Vec<(usize, Vec<usize>)> = Vec::new();
+
+        for (group_idx, (key, observed_group)) in groups.iter().enumerate() {
+            let observed_slice = observed_group.as_slice();
+            match inputs.reference_groups.get(key) {
+                None => {
+                    prepared.push(PreparedGroup::Empty);
+                    continue;
+                }
+                Some(GroupIndices::One(candidate)) => {
+                    if self.is_reference_used(*candidate) {
+                        prepared.push(PreparedGroup::Empty);
+                        continue;
+                    }
+                    if observed_slice.len() == 1 {
+                        prepared.push(PreparedGroup::Singleton(*candidate));
+                        continue;
+                    }
+                }
+                Some(GroupIndices::Many(_)) => {}
+            }
             let candidates = inputs
                 .reference_groups
-                .get(&key)
+                .get(key)
+                .map(GroupIndices::as_slice)
                 .into_iter()
                 .flatten()
                 .copied()
-                .filter(|candidate| !self.used_reference[*candidate])
+                .filter(|candidate| !self.is_reference_used(*candidate))
                 .collect::<Vec<_>>();
             if candidates.is_empty() {
-                for index in observed_group {
-                    self.assign_fresh(index);
-                }
-                progressed = true;
+                prepared.push(PreparedGroup::Empty);
                 continue;
             }
-            if observed_group.len() == 1 && candidates.len() == 1 {
-                self.assign(observed_group[0], candidates[0]);
-                progressed = true;
+            if observed_slice.len() == 1 && candidates.len() == 1 {
+                prepared.push(PreparedGroup::Singleton(candidates[0]));
                 continue;
             }
-
             if inputs.told_alone {
-                // Namesakes under one parent stand in the order it was given
-                // them in both copies; what one copy holds more comes last.
-                let Some(by_order) = &mut self.by_order else {
-                    self.compares_values = true;
-                    return progressed;
-                };
-                let how = if observed_group.len() == candidates.len() {
-                    ByOrder::Paired
-                } else {
-                    ByOrder::BesideMore
-                };
-                by_order.extend(
-                    observed_group
-                        .iter()
-                        .skip(candidates.len())
-                        .map(|index| (*index, ByOrder::More)),
-                );
-                let pairs = observed_group
-                    .into_iter()
-                    .zip(candidates)
-                    .collect::<Vec<_>>();
-                by_order.extend(pairs.iter().map(|(index, _)| (*index, how)));
-                for (index, candidate) in pairs {
-                    self.assign(index, candidate);
-                }
-                progressed = true;
+                prepared.push(PreparedGroup::ToldAlone(candidates));
                 continue;
             }
-            let group_index = observed_group[0];
-            if unchanged_content_groups.get(&group_index).is_some_and(
-                |(previous_observed, previous_candidates)| {
-                    previous_observed == &observed_group && previous_candidates == &candidates
-                },
-            ) {
-                continue;
-            }
-
-            let score_context = IdentityScoreContext {
-                reference,
-                observed,
-                reference_graph: inputs.reference_graph,
-                observed_graph: inputs.observed_graph,
-                assigned_reference: &self.assigned_reference,
-                assigned_observed: &self.assigned_observed,
-                subtree_keys: inputs.subtree_keys,
-            };
-            let proposals = identity_group_proposals(&score_context, &observed_group, &candidates);
-            let mut proposal_counts = AHashMap::<usize, usize>::new();
-            for (_, candidate) in &proposals {
-                *proposal_counts.entry(*candidate).or_default() += 1;
-            }
-            let mut assigned = false;
-            for (index, candidate) in proposals {
-                if proposal_counts.get(&candidate) != Some(&1) || self.used_reference[candidate] {
-                    continue;
-                }
-                self.assign(index, candidate);
-                progressed = true;
-                assigned = true;
-            }
-            if group_started.elapsed().as_millis() >= 10 {
-                log_global(
-                    4,
-                    format_args!(
-                        "[renium] identity candidate group: parent={:?} name={:?} class={} observed={observed_count} candidates={} elapsed_ms={:.1}",
-                        key.0,
-                        key.1,
-                        key.2,
-                        candidates.len(),
-                        group_started.elapsed().as_secs_f64() * 1000.0,
-                    ),
-                );
-            }
-            // No score can change without different group membership when
-            // neither side has reference edges. Leave ties for the existing
-            // fallback pass instead of rescoring them at every hierarchy depth.
-            if !assigned
-                && observed_group.iter().all(|index| {
-                    inputs.observed_graph.outgoing[*index].is_empty()
-                        && inputs.observed_graph.incoming[*index].is_empty()
-                })
-                && candidates.iter().all(|index| {
-                    inputs.reference_graph.outgoing[*index].is_empty()
-                        && inputs.reference_graph.incoming[*index].is_empty()
-                })
+            let group_index = observed_slice[0];
+            if key.0.is_none()
+                && unchanged_content_groups.get(&group_index).is_some_and(
+                    |(previous_observed, previous_candidates)| {
+                        previous_observed.as_slice() == observed_slice
+                            && previous_candidates == &candidates
+                    },
+                )
             {
-                unchanged_content_groups.insert(group_index, (observed_group, candidates));
+                prepared.push(PreparedGroup::Skipped);
+                continue;
+            }
+            let ref_free = observed_slice
+                .iter()
+                .all(|&index| !inputs.observed_graph.has_edges(index))
+                && candidates
+                    .iter()
+                    .all(|&index| !inputs.reference_graph.has_edges(index));
+            if ref_free {
+                let slot = ref_free_jobs.len();
+                ref_free_jobs.push((group_idx, candidates));
+                prepared.push(PreparedGroup::RefFree { slot });
+            } else {
+                prepared.push(PreparedGroup::RefBearing { candidates });
             }
         }
-        progressed
+
+        let mut ref_free_results: Vec<Option<ScoredProposals>> =
+            if let Some(compact) = inputs.compact {
+                score_compact_ref_free_jobs(
+                    &groups,
+                    &ref_free_jobs,
+                    inputs,
+                    &self.assigned_reference,
+                    &self.assigned_observed,
+                    compact,
+                )?
+                .into_iter()
+                .map(Some)
+                .collect()
+            } else {
+                let score_context_shared = IdentityScoreContext {
+                    reference: RowSource::Full(&reference.instances),
+                    observed: RowSource::Full(&observed.instances),
+                    reference_graph: inputs.reference_graph,
+                    observed_graph: inputs.observed_graph,
+                    assigned_reference: &self.assigned_reference,
+                    assigned_observed: &self.assigned_observed,
+                    subtree_keys: inputs.subtree_keys.map(|exact| &exact.keys),
+                };
+                let score_job = |&(group_idx, ref candidates): &(usize, Vec<usize>)| {
+                    let group_started = Instant::now();
+                    let proposals = identity_group_proposals_with_exact(
+                        &score_context_shared,
+                        groups[group_idx].1.as_slice(),
+                        candidates,
+                        inputs.subtree_keys,
+                    );
+                    (proposals, group_started.elapsed())
+                };
+                let results: Vec<ScoredProposals> =
+                    if ref_free_jobs.len() >= 2 && rayon::current_num_threads() > 1 {
+                        ref_free_jobs.par_iter().map(score_job).collect()
+                    } else {
+                        ref_free_jobs.iter().map(score_job).collect()
+                    };
+                results.into_iter().map(Some).collect()
+            };
+        let mut ref_free_candidates: Vec<Vec<usize>> =
+            ref_free_jobs.into_iter().map(|(_, c)| c).collect();
+
+        let mut ref_bearing_cache = inputs.compact.map(|compact| {
+            let ref_bearing_groups: Vec<(usize, &[usize])> = prepared
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, item)| match item {
+                    PreparedGroup::RefBearing { candidates } => Some((idx, candidates.as_slice())),
+                    _ => None,
+                })
+                .collect();
+            CompactRefBearingCache::plan(&groups, &ref_bearing_groups, inputs, compact)
+        });
+
+        let mut progressed = false;
+        let mut stalled_indices: Vec<usize> = Vec::new();
+        for (group_idx, ((key, observed_group), item)) in
+            groups.into_iter().zip(prepared).enumerate()
+        {
+            match item {
+                PreparedGroup::Empty => {
+                    for &index in observed_group.as_slice() {
+                        self.assign_fresh_and_unblock(index, inputs.observed_tree);
+                    }
+                    progressed = true;
+                }
+                PreparedGroup::Singleton(candidate) => {
+                    self.assign_and_unblock(
+                        observed_group.as_slice()[0],
+                        candidate,
+                        inputs.observed_tree,
+                    );
+                    progressed = true;
+                }
+                PreparedGroup::ToldAlone(candidates) => {
+                    let Some(by_order) = &mut self.by_order else {
+                        self.compares_values = true;
+                        self.flush_frontier();
+                        return Ok(progressed);
+                    };
+                    let observed_slice = observed_group.as_slice();
+                    let how = if observed_slice.len() == candidates.len() {
+                        ByOrder::Paired
+                    } else {
+                        ByOrder::BesideMore
+                    };
+                    by_order.extend(
+                        observed_slice
+                            .iter()
+                            .skip(candidates.len())
+                            .map(|index| (*index, ByOrder::More)),
+                    );
+                    let pairs = observed_slice
+                        .iter()
+                        .copied()
+                        .zip(candidates)
+                        .collect::<Vec<_>>();
+                    by_order.extend(pairs.iter().map(|(index, _)| (*index, how)));
+                    for (index, candidate) in pairs {
+                        self.assign_and_unblock(index, candidate, inputs.observed_tree);
+                    }
+                    progressed = true;
+                }
+                PreparedGroup::Skipped => {}
+                PreparedGroup::RefFree { slot } => {
+                    let observed_count = observed_group.len();
+                    let candidates = std::mem::take(&mut ref_free_candidates[slot]);
+                    let (proposals, elapsed) = ref_free_results[slot].take().unwrap();
+                    let assigned = self.apply_unique_proposals(proposals, inputs.observed_tree);
+                    progressed |= assigned;
+                    log_slow_identity_group(key, observed_count, candidates.len(), elapsed);
+                    if !assigned {
+                        let observed_vec = match observed_group {
+                            GroupIndices::One(i) => vec![i],
+                            GroupIndices::Many(v) => v,
+                        };
+                        if key.0.is_some() {
+                            stalled_indices.extend_from_slice(&observed_vec);
+                            self.stalled_groups.push((key, observed_vec));
+                        } else {
+                            let group_index = observed_vec[0];
+                            unchanged_content_groups
+                                .insert(group_index, (observed_vec, candidates));
+                        }
+                    }
+                }
+                PreparedGroup::RefBearing { candidates } => {
+                    let group_started = Instant::now();
+                    let observed_slice = observed_group.as_slice();
+                    let observed_count = observed_slice.len();
+                    let proposals = if let Some(compact) = inputs.compact {
+                        score_compact_single_group(
+                            observed_slice,
+                            &candidates,
+                            inputs,
+                            (&self.assigned_reference, &self.assigned_observed),
+                            compact,
+                            ref_bearing_cache.as_mut().map(|c| (c, group_idx)),
+                        )?
+                    } else {
+                        let score_context = IdentityScoreContext {
+                            reference: RowSource::Full(&reference.instances),
+                            observed: RowSource::Full(&observed.instances),
+                            reference_graph: inputs.reference_graph,
+                            observed_graph: inputs.observed_graph,
+                            assigned_reference: &self.assigned_reference,
+                            assigned_observed: &self.assigned_observed,
+                            subtree_keys: inputs.subtree_keys.map(|exact| &exact.keys),
+                        };
+                        identity_group_proposals_with_exact(
+                            &score_context,
+                            observed_slice,
+                            &candidates,
+                            inputs.subtree_keys,
+                        )
+                    };
+                    progressed |= self.apply_unique_proposals(proposals, inputs.observed_tree);
+                    log_slow_identity_group(
+                        key,
+                        observed_count,
+                        candidates.len(),
+                        group_started.elapsed(),
+                    );
+                }
+            }
+        }
+        if !stalled_indices.is_empty() {
+            let mut stalled_mask = AHashSet::with_capacity(stalled_indices.len());
+            stalled_mask.extend(stalled_indices);
+            self.active_ready.retain(|idx| !stalled_mask.contains(idx));
+        }
+        self.flush_frontier();
+        Ok(progressed)
+    }
+
+    fn apply_unique_proposals(
+        &mut self,
+        proposals: Vec<(usize, usize)>,
+        observed_tree: &DocTree,
+    ) -> bool {
+        let mut proposal_counts = AHashMap::<usize, usize>::with_capacity(proposals.len());
+        for &(_, candidate) in &proposals {
+            *proposal_counts.entry(candidate).or_default() += 1;
+        }
+        let mut assigned = false;
+        for (index, candidate) in proposals {
+            if proposal_counts.get(&candidate) != Some(&1) || self.is_reference_used(candidate) {
+                continue;
+            }
+            self.assign_and_unblock(index, candidate, observed_tree);
+            assigned = true;
+        }
+        assigned
     }
 
     fn run_fallback(
         &mut self,
-        reference_groups: &AHashMap<IdentityGroupKey<'a>, Vec<usize>>,
+        reference_groups: &AHashMap<IdentityGroupKey<'a>, GroupIndices>,
+        observed_tree: &DocTree,
     ) -> bool {
         let mut progressed = false;
         let shapes = self.shape_keys.take().unwrap_or_else(|| {
-            (
-                subtree_shape_keys(self.reference),
-                subtree_shape_keys(self.observed),
+            rayon::join(
+                || subtree_shape_keys(self.reference),
+                || subtree_shape_keys(self.observed),
             )
         });
-        for (key, observed_group) in self.unassigned_groups() {
+        let mut groups = self.active_groups();
+        if !self.stalled_groups.is_empty() {
+            for (key, indices) in self.stalled_groups.drain(..) {
+                let group = if indices.len() == 1 {
+                    GroupIndices::One(indices[0])
+                } else {
+                    GroupIndices::Many(indices)
+                };
+                groups.push((key, group));
+            }
+            groups.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        }
+        for (key, observed_group) in groups {
             let candidates = reference_groups
                 .get(&key)
+                .map(GroupIndices::as_slice)
                 .into_iter()
                 .flatten()
                 .copied()
-                .filter(|candidate| !self.used_reference[*candidate])
+                .filter(|candidate| !self.is_reference_used(*candidate))
                 .collect::<Vec<_>>();
-            let mut by_shape: HashMap<u64, std::collections::VecDeque<usize>> = HashMap::new();
+            let mut by_shape: AHashMap<u64, std::collections::VecDeque<usize>> =
+                AHashMap::with_capacity(candidates.len());
             for (position, candidate) in candidates.iter().enumerate() {
                 by_shape
                     .entry(shapes.0[*candidate])
@@ -2019,14 +5945,14 @@ impl<'a> IdentityAssignment<'a> {
             }
             let mut taken = vec![false; candidates.len()];
             let mut unpaired = Vec::new();
-            for index in observed_group {
+            for &index in observed_group.as_slice() {
                 match by_shape
                     .get_mut(&shapes.1[index])
                     .and_then(std::collections::VecDeque::pop_front)
                 {
                     Some(position) => {
                         taken[position] = true;
-                        self.assign(index, candidates[position]);
+                        self.assign_and_unblock(index, candidates[position], observed_tree);
                         progressed = true;
                     }
                     None => unpaired.push(index),
@@ -2039,12 +5965,13 @@ impl<'a> IdentityAssignment<'a> {
                 .map(|(candidate, _)| *candidate);
             for index in unpaired {
                 match leftovers.next() {
-                    Some(candidate) => self.assign(index, candidate),
-                    None => self.assign_fresh(index),
+                    Some(candidate) => self.assign_and_unblock(index, candidate, observed_tree),
+                    None => self.assign_fresh_and_unblock(index, observed_tree),
                 }
                 progressed = true;
             }
         }
+        self.flush_frontier();
         self.shape_keys = Some(shapes);
         progressed
     }
@@ -2642,7 +6569,7 @@ impl<'a> Twins<'a> {
     /// (`matching_reference_evidence`).
     fn named(&self, index: usize) -> bool {
         let [_, observed] = self.graphs();
-        !observed.outgoing[index].is_empty() || !observed.incoming[index].is_empty()
+        observed.has_edges(index)
     }
 
     /// Whether an observed twin holds and receives the references its
@@ -2652,16 +6579,20 @@ impl<'a> Twins<'a> {
     /// run weighs nothing there; one to an instance of the run may.
     fn named_alike(&self, index: usize, at: usize) -> bool {
         let [reference, observed] = self.graphs();
-        self.name_alike(&reference.outgoing[at], &observed.outgoing[index])
-            && observed.incoming[index].iter().all(|edge| {
+        self.name_alike(reference.outgoing(at), observed.outgoing(index))
+            && observed.incoming(index).iter().all(|edge| {
                 self.counterpart(edge.source).is_none_or(|source| {
-                    (reference.incoming[at].iter())
+                    reference
+                        .incoming(at)
+                        .iter()
                         .any(|other| other.source == source && other.slot == edge.slot)
                 })
             })
-            && reference.incoming[at].iter().all(|edge| {
+            && reference.incoming(at).iter().all(|edge| {
                 self.observed_of(edge.source).is_none_or(|source| {
-                    (observed.incoming[index].iter())
+                    observed
+                        .incoming(index)
+                        .iter()
                         .any(|other| other.source == source && other.slot == edge.slot)
                 })
             })
@@ -2701,7 +6632,7 @@ impl<'a> Twins<'a> {
             collect_text_reference_ids(&camera.properties, &mut ids);
             collect_text_reference_ids(&camera.attributes, &mut ids);
             let by_id = if ids.is_empty() {
-                HashMap::new()
+                AHashMap::new()
             } else {
                 (document.instances.iter().enumerate())
                     .filter(|(_, instance)| ids.contains(&instance.settings_id))
@@ -2757,7 +6688,10 @@ impl<'a> Twins<'a> {
     /// the reference does, which pairs it first, or what none of them does
     /// and no reference names, which leaves it to `run_fallback`.
     fn told_otherwise(&self, observed_twins: &[usize], reference_twins: &[usize]) -> bool {
-        let content_index = IdentityCandidateIndex::build(self.reference, reference_twins);
+        let content_index = IdentityCandidateIndex::build(
+            RowSource::Full(&self.reference.instances),
+            reference_twins,
+        );
         let narrowed = (observed_twins.iter())
             .map(|index| {
                 (content_index.as_ref())
@@ -2978,17 +6912,54 @@ pub(crate) fn settings_ids_told_in_order(
 /// reference among them as well.
 pub(crate) fn take_settings_ids(observed: &mut SettingsBytecode, ids: Vec<String>) {
     let phase = Instant::now();
-    let remap = observed
+    let any_changed = observed
         .instances
         .iter()
-        .map(|instance| instance.settings_id.clone())
-        .zip(ids.iter().cloned())
-        .collect::<HashMap<_, _>>();
-    let service = store_service(observed).map(str::to_string);
+        .zip(&ids)
+        .any(|(instance, id)| instance.settings_id != *id);
+    if !any_changed {
+        return;
+    }
+    let has_any_ref = if observed.instances.len() >= 2_048 && rayon::current_num_threads() > 1 {
+        observed.instances.par_iter().any(|instance| {
+            instance.properties.values().any(|value| {
+                matches!(value, Value::Array(_) | Value::Object(_))
+                    && reconciliation_value_contains_reference(value)
+            }) || instance.attributes.values().any(|value| {
+                matches!(value, Value::Array(_) | Value::Object(_))
+                    && reconciliation_value_contains_reference(value)
+            })
+        })
+    } else {
+        true
+    };
+    if !has_any_ref {
+        for (instance, id) in observed.instances.iter_mut().zip(ids) {
+            instance.settings_id = id;
+        }
+        log_global(
+            4,
+            format_args!(
+                "[renium] identity reference remap: {:.1}ms",
+                phase.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
+        return;
+    }
+    let mut remap = HashMap::with_capacity(observed.instances.len());
     for (instance, id) in observed.instances.iter_mut().zip(ids) {
-        instance.settings_id = id;
+        let old_id = std::mem::replace(&mut instance.settings_id, id);
+        remap.insert(old_id, instance.settings_id.clone());
+    }
+    let service = store_service(observed).map(str::to_string);
+    let apply = |instance: &mut SettingsBytecodeInstance| {
         remap_record_reference_ids(&mut instance.properties, &remap, service.as_deref());
         remap_record_reference_ids(&mut instance.attributes, &remap, service.as_deref());
+    };
+    if observed.instances.len() >= 2_048 && rayon::current_num_threads() > 1 {
+        observed.instances.par_iter_mut().for_each(apply);
+    } else {
+        observed.instances.iter_mut().for_each(apply);
     }
     log_global(
         4,
@@ -3010,11 +6981,27 @@ fn match_settings_ids(
     told_alone: bool,
     in_order: bool,
 ) -> Option<(Vec<String>, Vec<Option<usize>>, Vec<(usize, ByOrder)>)> {
+    match_settings_ids_with_compact(reference, observed, told_alone, in_order, None)
+        .expect("in-memory identity matching cannot fail")
+}
+
+#[allow(clippy::type_complexity)]
+fn match_settings_ids_with_compact(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+    told_alone: bool,
+    in_order: bool,
+    compact: Option<&CompactMatching<'_>>,
+) -> Result<Option<(Vec<String>, Vec<Option<usize>>, Vec<(usize, ByOrder)>)>> {
     let preparation_started = Instant::now();
     let cameras = (
         workspace_current_camera_index(reference),
         workspace_current_camera_index(observed),
     );
+    let obs_has_non_debug_id = observed
+        .instances
+        .iter()
+        .any(|instance| !instance.settings_id.starts_with("debug:"));
     // A fresh destination has only its retained containers. Index candidates
     // it can actually match rather than allocating a group for every incoming
     // descendant. Full comparisons keep the direct index construction.
@@ -3024,51 +7011,99 @@ fn match_settings_ids(
                 .instances
                 .iter()
                 .map(|instance| instance.settings_id.as_str())
-                .collect::<HashSet<_>>(),
+                .collect::<AHashSet<_>>(),
             observed
                 .instances
                 .iter()
                 .map(|instance| (instance.name.as_str(), instance.class_name.as_str()))
-                .collect::<HashSet<_>>(),
+                .collect::<AHashSet<_>>(),
         )
     });
+    let ((reference_by_id, reference_groups), (reference_by_unique_id, observed_by_unique_id)) =
+        rayon::join(
+            || {
+                let cap = if candidate_filters.is_some() {
+                    observed.instances.len()
+                } else {
+                    reference.instances.len()
+                };
+                let mut reference_by_id = if obs_has_non_debug_id {
+                    AHashMap::with_capacity(cap)
+                } else {
+                    AHashMap::new()
+                };
+                let mut reference_groups =
+                    AHashMap::<IdentityGroupKey, GroupIndices>::with_capacity(cap / 4);
+                for (index, instance) in reference.instances.iter().enumerate() {
+                    if obs_has_non_debug_id
+                        && candidate_filters
+                            .as_ref()
+                            .is_none_or(|(ids, _)| ids.contains(instance.settings_id.as_str()))
+                    {
+                        reference_by_id.insert(instance.settings_id.as_str(), index);
+                    }
+                    if candidate_filters.as_ref().is_some_and(|(_, names)| {
+                        !names.contains(&(instance.name.as_str(), instance.class_name.as_str()))
+                    }) {
+                        continue;
+                    }
+                    let key = (
+                        instance.parent_index,
+                        instance.name.as_str(),
+                        instance.class_name.as_str(),
+                    );
+                    match reference_groups.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            entry.get_mut().push(index);
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(GroupIndices::One(index));
+                        }
+                    }
+                }
+                (reference_by_id, reference_groups)
+            },
+            || {
+                rayon::join(
+                    || match compact {
+                        Some(compact) => {
+                            persistent_identity_index_from_slice(compact.ref_unique_ids)
+                        }
+                        None => persistent_identity_index(reference),
+                    },
+                    || match compact {
+                        Some(compact) => {
+                            persistent_identity_index_from_slice(compact.obs_unique_ids)
+                        }
+                        None => persistent_identity_index(observed),
+                    },
+                )
+            },
+        );
+    let reference_ids_unique = obs_has_non_debug_id
+        && candidate_filters.is_none()
+        && reference_by_id.len() == reference.instances.len();
+    drop(candidate_filters);
     let lookup = IdentityLookup {
-        reference_by_id: reference
-            .instances
-            .iter()
-            .enumerate()
-            .filter(|(_, instance)| {
-                candidate_filters
-                    .as_ref()
-                    .is_none_or(|(ids, _)| ids.contains(instance.settings_id.as_str()))
-            })
-            .map(|(index, instance)| (instance.settings_id.as_str(), index))
-            .collect(),
-        reference_by_unique_id: persistent_identity_index(reference),
-        observed_by_unique_id: persistent_identity_index(observed),
+        reference_by_id,
+        reference_by_unique_id,
+        observed_by_unique_id,
+        reference_ids_unique,
     };
-    let mut reference_groups = AHashMap::<IdentityGroupKey, Vec<usize>>::new();
-    for (index, instance) in reference.instances.iter().enumerate() {
-        if candidate_filters.as_ref().is_some_and(|(_, names)| {
-            !names.contains(&(instance.name.as_str(), instance.class_name.as_str()))
-        }) {
-            continue;
-        }
-        reference_groups
-            .entry((
-                instance.parent_index,
-                instance.name.as_str(),
-                instance.class_name.as_str(),
-            ))
-            .or_default()
-            .push(index);
-    }
     let mut state = IdentityAssignment::new(reference, observed);
     state.by_order = in_order.then(Vec::new);
-    if let (Some(reference_index), Some(observed_index)) = cameras {
+    let initial_camera_ref = if let (Some(reference_index), Some(observed_index)) = cameras {
         state.assign(observed_index, reference_index);
-    }
-    state.run_exact(&lookup);
+        Some(reference_index)
+    } else {
+        None
+    };
+    state.run_exact(
+        &lookup,
+        initial_camera_ref,
+        compact.map(|compact| compact.obs_unique_ids),
+    );
+    drop(lookup);
     state.run_unique(&reference_groups);
     log_global(
         4,
@@ -3080,14 +7115,15 @@ fn match_settings_ids(
     );
 
     if state.remaining > 0 {
-        // Needed only when matching leaves an instance without a counterpart.
-        state.reserved_reference_ids = (reference.instances.iter())
-            .map(|instance| instance.settings_id.as_str())
-            .collect();
         let phase = Instant::now();
-        let (reference_graph, observed_graph) = rayon::join(
-            || build_reference_graph(reference),
-            || build_reference_graph(observed),
+        let ((reference_graph, observed_graph), observed_tree) = rayon::join(
+            || {
+                rayon::join(
+                    || build_reference_graph(reference),
+                    || build_reference_graph(observed),
+                )
+            },
+            || DocTree::build(observed),
         );
         log_global(
             4,
@@ -3097,29 +7133,48 @@ fn match_settings_ids(
             ),
         );
         let phase = Instant::now();
-        let parents = reference
-            .instances
-            .iter()
-            .filter_map(|instance| instance.parent_index)
-            .collect::<AHashSet<_>>();
-        let subtree_keys = (!told_alone
-            && reference_groups
-                .values()
-                .any(|group| group.len() > 1 && group.iter().any(|index| parents.contains(index))))
-        .then(|| {
-            let mut keys = AHashMap::new();
-            (
-                identity_subtree_keys(
+        let needs_subtree_keys = !told_alone && {
+            let mut is_parent = vec![false; reference.instances.len()];
+            for instance in &reference.instances {
+                if let Some(parent) = instance.parent_index
+                    && parent < is_parent.len()
+                {
+                    is_parent[parent] = true;
+                }
+            }
+            reference_groups.values().any(|group| {
+                group.len() > 1 && group.as_slice().iter().any(|&index| is_parent[index])
+            })
+        };
+        let subtree_keys = needs_subtree_keys.then(|| {
+            let ref_required = state
+                .assigned_observed
+                .iter()
+                .map(Option::is_none)
+                .collect();
+            let obs_required = (0..observed.instances.len())
+                .map(|index| !state.is_assigned(index))
+                .collect();
+            match compact {
+                Some(compact) => compute_subtree_keys_compact(
                     reference,
-                    &mut keys,
-                    state.used_reference.iter().map(|used| !used).collect(),
-                ),
-                identity_subtree_keys(
+                    compact.ref_meta,
+                    ref_required,
                     observed,
-                    &mut keys,
-                    state.assigned_ids.iter().map(Option::is_none).collect(),
+                    compact.obs_meta,
+                    &observed_tree,
+                    obs_required,
                 ),
-            )
+                None => compute_subtree_keys(
+                    reference,
+                    &reference_graph,
+                    ref_required,
+                    observed,
+                    &observed_graph,
+                    &observed_tree,
+                    obs_required,
+                ),
+            }
         });
         log_global(
             4,
@@ -3134,20 +7189,23 @@ fn match_settings_ids(
             reference_graph: &reference_graph,
             observed_graph: &observed_graph,
             subtree_keys: subtree_keys.as_ref(),
+            observed_tree: &observed_tree,
             told_alone,
+            compact,
         };
-        let mut unchanged_content_groups = HashMap::new();
+        state.init_frontier();
+        let mut unchanged_content_groups = AHashMap::new();
         // `run_exact` paired what ids pair before this: an instance it left
         // has no counterpart by id, or one that is taken for good.
         while state.remaining > 0 {
-            let progressed = state.run_scored(&inputs, &mut unchanged_content_groups);
+            let progressed = state.run_scored(&inputs, &mut unchanged_content_groups)?;
             if state.compares_values {
-                return None;
+                return Ok(None);
             }
-            if progressed || !told_alone && state.run_fallback(&reference_groups) {
+            if progressed || !told_alone && state.run_fallback(&reference_groups, &observed_tree) {
                 continue;
             }
-            return None;
+            return Ok(None);
         }
         log_global(
             4,
@@ -3158,16 +7216,25 @@ fn match_settings_ids(
         );
     }
     let IdentityAssignment {
-        assigned_ids,
+        assigned_fresh,
         assigned_reference,
         by_order,
         ..
     } = state;
-    Some((
-        assigned_ids.into_iter().map(Option::unwrap).collect(),
+    let mut assigned_fresh = assigned_fresh;
+    let ids = assigned_reference
+        .iter()
+        .enumerate()
+        .map(|(index, reference_index)| match reference_index {
+            Some(candidate) => reference.instances[*candidate].settings_id.clone(),
+            None => assigned_fresh.remove(&index).unwrap(),
+        })
+        .collect();
+    Ok(Some((
+        ids,
         assigned_reference,
         by_order.unwrap_or_default(),
-    ))
+    )))
 }
 
 /// Where the counterpart of each observed instance stands among the
@@ -3861,6 +7928,122 @@ pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsByteco
         .instances
         .par_chunks_mut(4096)
         .try_for_each(canonicalize_instances)
+}
+
+/// Canonicalizes property names in place and returns `(index, original_properties)`
+/// only for instances whose properties actually changed, so callers can restore
+/// `document` to its pre-canonicalized form before encoding.
+fn canonicalize_settings_property_names_recording(
+    document: &mut SettingsBytecode,
+) -> Result<Vec<(usize, Map<String, Value>)>> {
+    let chunks = document
+        .instances
+        .par_chunks_mut(4096)
+        .enumerate()
+        .map(|(chunk_idx, chunk)| canonicalize_instances_recording(chunk_idx * 4096, chunk))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(chunks.into_iter().flatten().collect())
+}
+
+fn canonicalize_instances_recording(
+    base_index: usize,
+    instances: &mut [SettingsBytecodeInstance],
+) -> Result<Vec<(usize, Map<String, Value>)>> {
+    let database = rbx_reflection_database::get()?;
+    let mut names_by_class = AHashMap::<&str, AHashMap<String, Option<&str>>>::new();
+    let mut migrations_by_class = AHashMap::<&str, AHashMap<String, bool>>::new();
+    let mut restored = Vec::new();
+    for (offset, instance) in instances.iter_mut().enumerate() {
+        let has_uri_alias =
+            matches!(
+                instance.class_name.as_str(),
+                "PartOperation"
+                    | "UnionOperation"
+                    | "NegateOperation"
+                    | "IntersectOperation"
+                    | "Shirt"
+                    | "Pants"
+            ) || crate::roblox::schema::has_protected_texture_pack(&instance.class_name);
+        let mut original = if has_uri_alias {
+            let saved = instance.properties.clone();
+            canonicalize_content_uri_alias(instance)?;
+            Some(saved)
+        } else {
+            None
+        };
+        let names = names_by_class.entry(&instance.class_name).or_default();
+        let mut renamed_property = |name: &str| {
+            if let Some(renamed) = names.get(name) {
+                return *renamed;
+            }
+            let renamed = serialized_only_logical_name(database, &instance.class_name, name)
+                .or_else(|| rbx_logical_property_name(database, &instance.class_name, name))
+                .filter(|canonical| *canonical != name);
+            names.insert(name.to_string(), renamed);
+            renamed
+        };
+        let migrations = migrations_by_class.entry(&instance.class_name).or_default();
+        let mut migrated_property = |name: &str| {
+            if let Some(migrated) = migrations.get(name) {
+                return *migrated;
+            }
+            let migrated =
+                legacy_property_migration(database, &instance.class_name, name).is_some();
+            migrations.insert(name.to_string(), migrated);
+            migrated
+        };
+        let legacy_disabled = instance.properties.contains_key("Disabled")
+            && crate::rbx::decode::rbx_reflection_class_is_a(
+                database,
+                &instance.class_name,
+                "BaseScript",
+            );
+        let needs_rewrite = legacy_disabled
+            || instance
+                .properties
+                .keys()
+                .any(|name| renamed_property(name).is_some() || migrated_property(name));
+        if needs_rewrite {
+            if original.is_none() {
+                original = Some(instance.properties.clone());
+            }
+            let mut canonical = Map::new();
+            for (name, value) in std::mem::take(&mut instance.properties) {
+                let name = renamed_property(&name).map_or(name, str::to_string);
+                if let Some(existing) = canonical.get(&name)
+                    && !reconciliation_values_equal(existing, &value, false)
+                {
+                    bail!(
+                        "{} contains conflicting values for property {name}",
+                        instance.name
+                    );
+                }
+                canonical.insert(name, value);
+            }
+            let legacy = canonical
+                .keys()
+                .filter(|name| migrated_property(name))
+                .cloned()
+                .collect::<Vec<_>>();
+            for name in legacy {
+                migrate_legacy_property(database, &instance.class_name, &name, &mut canonical);
+            }
+            if legacy_disabled
+                && let Some(disabled) = canonical.remove("Disabled")
+                && !canonical.contains_key("Enabled")
+                && let Some(flag) = disabled.as_bool()
+            {
+                canonical.insert("Enabled".to_string(), Value::Bool(!flag));
+            }
+            instance.properties = canonical;
+        }
+        if let Some(original) = original
+            && instance.properties != original
+        {
+            restored.push((base_index + offset, original));
+        }
+    }
+    Ok(restored)
 }
 
 /// `canonicalize_settings_property_names` for some instances of a document.
@@ -4845,29 +9028,72 @@ fn reconciliation_values_map_equal_with_ids(
         })
 }
 
+#[cfg(test)]
 fn reconciliation_identity_maps_equal(
     left: &Map<String, Value>,
     right: &Map<String, Value>,
     ignore_transient_properties: bool,
 ) -> bool {
-    let stable = |name: &str, value: &Value| {
-        identity_value_is_stable(name, value, ignore_transient_properties)
-    };
-    left.iter()
-        .filter(|(name, value)| stable(name, value))
-        .count()
-        == right
-            .iter()
-            .filter(|(name, value)| stable(name, value))
-            .count()
-        && left
-            .iter()
-            .filter(|(name, value)| stable(name, value))
-            .all(|(name, value)| {
-                right
-                    .get(name)
-                    .is_some_and(|other| reconciliation_values_equal(value, other, false))
-            })
+    reconciliation_identity_maps_equal_hint(left, right, ignore_transient_properties, false, false)
+}
+
+#[inline]
+fn value_has_large_payload(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.len() > 256,
+        Value::Object(map) => {
+            map.len() == 2
+                && map
+                    .get("base64")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.len() > 256)
+        }
+        _ => false,
+    }
+}
+
+fn reconciliation_identity_maps_equal_hint(
+    left: &Map<String, Value>,
+    right: &Map<String, Value>,
+    ignore_transient_properties: bool,
+    left_no_refs: bool,
+    right_no_refs: bool,
+) -> bool {
+    let mut left_iter = left.iter().filter(|(name, value)| {
+        (!ignore_transient_properties || property_name_is_stable_no_ref(name, value))
+            && (left_no_refs || !reconciliation_value_contains_reference(value))
+    });
+    let mut right_iter = right.iter().filter(|(name, value)| {
+        (!ignore_transient_properties || property_name_is_stable_no_ref(name, value))
+            && (right_no_refs || !reconciliation_value_contains_reference(value))
+    });
+    let mut deferred: [(&Value, &Value); 4] = [(&Value::Null, &Value::Null); 4];
+    let mut deferred_len = 0usize;
+    loop {
+        match (left_iter.next(), right_iter.next()) {
+            (Some((lk, lv)), Some((rk, rv))) => {
+                if lk != rk {
+                    return false;
+                }
+                if deferred_len < deferred.len()
+                    && (value_has_large_payload(lv) || value_has_large_payload(rv))
+                {
+                    deferred[deferred_len] = (lv, rv);
+                    deferred_len += 1;
+                } else if !reconciliation_values_equal(lv, rv, false) {
+                    return false;
+                }
+            }
+            (None, None) => break,
+            _ => return false,
+        }
+    }
+    for &(lv, rv) in &deferred[..deferred_len] {
+        if !reconciliation_values_equal(lv, rv, false) {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) fn identity_value_is_stable(
@@ -4884,11 +9110,22 @@ pub(crate) fn identity_value_is_stable(
 
 pub(crate) fn reconciliation_value_contains_reference(value: &Value) -> bool {
     match value {
-        Value::Array(values) => values.iter().any(reconciliation_value_contains_reference),
-        Value::Object(object) => {
-            is_reference_object(object)
-                || object.values().any(reconciliation_value_contains_reference)
-        }
+        Value::Array(values) => values.iter().any(|value| {
+            matches!(value, Value::Array(_) | Value::Object(_))
+                && reconciliation_value_contains_reference(value)
+        }),
+        Value::Object(object) => object.iter().any(|(key, value)| match key.as_str() {
+            "_type" => {
+                value.as_str() == Some("Ref")
+                    || (matches!(value, Value::Array(_) | Value::Object(_))
+                        && reconciliation_value_contains_reference(value))
+            }
+            "settingsId" | "instanceId" | "instanceIndex" => true,
+            _ => {
+                matches!(value, Value::Array(_) | Value::Object(_))
+                    && reconciliation_value_contains_reference(value)
+            }
+        }),
         _ => false,
     }
 }
@@ -4935,34 +9172,52 @@ fn typed_scalar(value: &Value) -> &Value {
 /// as arrays; stores merged from such exports carry them verbatim.
 fn canonical_wrapped_value(value: &Value) -> Option<Value> {
     let object = value.as_object()?;
-    for type_name in ["NumberSequence", "ColorSequence"] {
-        let sequence = if object.len() == 1 {
-            object.get(type_name)
-        } else if object.get("_type").and_then(Value::as_str) == Some(type_name) {
-            Some(value)
-        } else {
-            None
-        };
-        if let Some(sequence) = sequence {
-            let normalized =
-                crate::editor::review::normalize_editor_sequence_value(sequence, type_name);
-            return (normalized != *value).then_some(normalized);
+    if object.len() == 1 {
+        for type_name in ["NumberSequence", "ColorSequence"] {
+            if let Some(sequence) = object.get(type_name) {
+                let normalized =
+                    crate::editor::review::normalize_editor_sequence_value(sequence, type_name);
+                return (normalized != *value).then_some(normalized);
+            }
         }
+        if let Some(reference) = object.get("Ref").and_then(Value::as_object) {
+            let mut out = reference.clone();
+            out.insert("_type".to_string(), Value::String("Ref".to_string()));
+            return Some(Value::Object(out));
+        }
+        if let Some(number) = object.get("BrickColor")
+            && number.is_number()
+        {
+            return Some(serde_json::json!({"_type": "BrickColor", "number": number}));
+        }
+        return None;
     }
-    if object.len() == 1
-        && let Some(reference) = object.get("Ref").and_then(Value::as_object)
+    if let Some(type_name @ ("NumberSequence" | "ColorSequence")) =
+        object.get("_type").and_then(Value::as_str)
     {
-        let mut out = reference.clone();
-        out.insert("_type".to_string(), Value::String("Ref".to_string()));
-        return Some(Value::Object(out));
-    }
-    if object.len() == 1
-        && let Some(number) = object.get("BrickColor")
-        && number.is_number()
-    {
-        return Some(serde_json::json!({"_type": "BrickColor", "number": number}));
+        let normalized = crate::editor::review::normalize_editor_sequence_value(value, type_name);
+        return (normalized != *value).then_some(normalized);
     }
     None
+}
+
+#[inline]
+fn reconciliation_numbers_equal(
+    left: &serde_json::Number,
+    right: &serde_json::Number,
+    approximate: bool,
+) -> bool {
+    if !approximate {
+        return exact_json_numbers_equal(left, right);
+    }
+    let (Some(left), Some(right)) = (left.as_f64(), right.as_f64()) else {
+        return left == right;
+    };
+    left == right
+        || left.is_finite()
+            && right.is_finite()
+            && (left - right).abs()
+                <= 4.0 * f64::from(f32::EPSILON) * left.abs().max(right.abs()).max(1.0)
 }
 
 fn reconciliation_values_equal_with_ids(
@@ -4971,6 +9226,26 @@ fn reconciliation_values_equal_with_ids(
     approximate: bool,
     ids: Option<PairedStoreIds<'_>>,
 ) -> bool {
+    match (left, right) {
+        (Value::Null, Value::Null) => return true,
+        (Value::Bool(left), Value::Bool(right)) => return left == right,
+        (Value::String(left), Value::String(right)) => return left == right,
+        (Value::Number(left), Value::Number(right)) => {
+            return reconciliation_numbers_equal(left, right, approximate);
+        }
+        (Value::Object(lo), Value::Object(ro))
+            if lo.len() == 2
+                && ro.len() == 2
+                && let (Some(lid), Some(rid)) = (
+                    crate::settings::held::handle_id(lo),
+                    crate::settings::held::handle_id(ro),
+                )
+                && lid == rid =>
+        {
+            return true;
+        }
+        _ => {}
+    }
     // Two handles of one payload hold one value; any other pair compares
     // as the payloads they stand for.
     let held = (
@@ -4991,18 +9266,8 @@ fn reconciliation_values_equal_with_ids(
         canonical.1.as_ref().unwrap_or(right),
     );
     match (left, right) {
-        (Value::Number(left), Value::Number(right)) if !approximate => {
-            exact_json_numbers_equal(left, right)
-        }
-        (Value::Number(left), Value::Number(right)) if approximate => {
-            let (Some(left), Some(right)) = (left.as_f64(), right.as_f64()) else {
-                return left == right;
-            };
-            left == right
-                || left.is_finite()
-                    && right.is_finite()
-                    && (left - right).abs()
-                        <= 4.0 * f64::from(f32::EPSILON) * left.abs().max(right.abs()).max(1.0)
+        (Value::Number(left), Value::Number(right)) => {
+            reconciliation_numbers_equal(left, right, approximate)
         }
         (Value::Array(left), Value::Array(right)) => {
             left.len() == right.len()
@@ -5091,61 +9356,62 @@ fn reconciliation_values_equal_with_ids(
             }
             let approximate = approximate || type_name.is_some_and(reconciliation_value_uses_f32);
             left.len() == right.len()
-                && left.iter().all(|(name, value)| {
-                    let Some(other) = right.get(name) else {
-                        return false;
-                    };
-                    if type_name == Some("CFrame") && name == "components" {
-                        let (Some(left), Some(right)) = (value.as_array(), other.as_array()) else {
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|((name, value), (other_name, other))| {
+                        if name != other_name {
                             return false;
-                        };
-                        return left.len() == 12
-                            && right.len() == 12
-                            && left
-                                .iter()
-                                .zip(right)
-                                .enumerate()
-                                .all(|(index, (left, right))| {
-                                    let (Some(a), Some(b)) = (left.as_f64(), right.as_f64()) else {
-                                        // Saved engine fields can contain NaN/inf sentinels.
-                                        // Preserve identical encodings, not numeric NaN equality.
-                                        return left == right
-                                            && nonfinite_float_from_json(left).is_some();
-                                    };
-                                    a.is_finite()
-                                        && b.is_finite()
-                                        && if index < 3 {
-                                            reconciliation_values_equal(left, right, true)
-                                                || (a - b).abs() <= CFRAME_POSITION_NOISE
-                                        } else {
-                                            (a - b).abs()
-                                                <= CFRAME_ROTATION_EPSILON
-                                                    .max(CFRAME_ROTATION_NOISE)
-                                        }
-                                });
-                    }
-                    if type_name == Some("Ref")
-                        && matches!(name.as_str(), "settingsId" | "instanceId")
-                    {
-                        let (Some(left), Some(right)) = (value.as_str(), other.as_str()) else {
-                            return value == other;
-                        };
-                        return match (
-                            ids.and_then(|ids| ids.left.get(left)),
-                            ids.and_then(|ids| ids.right.get(right)),
-                        ) {
-                            (Some(left), Some(right)) => left == right,
-                            (None, None) => left == right,
-                            _ => false,
-                        };
-                    }
-                    let approximate = approximate
-                        && !matches!(
-                            (type_name, name.as_str()),
-                            (Some("UDim"), "offset") | (Some("UDim2"), "xOffset" | "yOffset")
-                        );
-                    reconciliation_values_equal_with_ids(value, other, approximate, ids)
-                })
+                        }
+                        if type_name == Some("CFrame") && name == "components" {
+                            let (Some(left), Some(right)) = (value.as_array(), other.as_array())
+                            else {
+                                return false;
+                            };
+                            return left.len() == 12
+                                && right.len() == 12
+                                && left.iter().zip(right).enumerate().all(
+                                    |(index, (left, right))| {
+                                        let (Some(a), Some(b)) = (left.as_f64(), right.as_f64())
+                                        else {
+                                            return left == right
+                                                && nonfinite_float_from_json(left).is_some();
+                                        };
+                                        a.is_finite()
+                                            && b.is_finite()
+                                            && if index < 3 {
+                                                reconciliation_values_equal(left, right, true)
+                                                    || (a - b).abs() <= CFRAME_POSITION_NOISE
+                                            } else {
+                                                (a - b).abs()
+                                                    <= CFRAME_ROTATION_EPSILON
+                                                        .max(CFRAME_ROTATION_NOISE)
+                                            }
+                                    },
+                                );
+                        }
+                        if type_name == Some("Ref")
+                            && matches!(name.as_str(), "settingsId" | "instanceId")
+                        {
+                            let (Some(left), Some(right)) = (value.as_str(), other.as_str()) else {
+                                return value == other;
+                            };
+                            return match (
+                                ids.and_then(|ids| ids.left.get(left)),
+                                ids.and_then(|ids| ids.right.get(right)),
+                            ) {
+                                (Some(left), Some(right)) => left == right,
+                                (None, None) => left == right,
+                                _ => false,
+                            };
+                        }
+                        let approximate = approximate
+                            && !matches!(
+                                (type_name, name.as_str()),
+                                (Some("UDim"), "offset") | (Some("UDim2"), "xOffset" | "yOffset")
+                            );
+                        reconciliation_values_equal_with_ids(value, other, approximate, ids)
+                    })
         }
         _ => left == right,
     }
@@ -7098,7 +11364,9 @@ mod tests {
             .attributes
             .insert("Edited".into(), json!(true));
         let candidates = (1..reference.instances.len()).collect::<Vec<_>>();
-        let index = IdentityCandidateIndex::build(&reference, &candidates).unwrap();
+        let index =
+            IdentityCandidateIndex::build(RowSource::Full(&reference.instances), &candidates)
+                .unwrap();
         for instance in &observed.instances[1..] {
             assert_eq!(index.matching(instance).unwrap().len(), 1);
         }
@@ -7144,7 +11412,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 let subtree_keys = with_subtrees.then(|| (keys.clone(), keys));
                 let (representatives, multiplicities) = identity_candidate_representatives(
-                    &reference,
+                    RowSource::Full(&reference.instances),
                     &reference_graph,
                     subtree_keys.as_ref().map(|(keys, _)| keys.as_slice()),
                     &candidates,
@@ -7156,8 +11424,8 @@ mod tests {
                         .map(|index| assigned.then_some(index))
                         .collect::<Vec<_>>();
                     let context = IdentityScoreContext {
-                        reference: &reference,
-                        observed: &observed,
+                        reference: RowSource::Full(&reference.instances),
+                        observed: RowSource::Full(&observed.instances),
                         reference_graph: &reference_graph,
                         observed_graph: &observed_graph,
                         assigned_reference: &assignment,
@@ -7194,8 +11462,12 @@ mod tests {
         }
         let graph = build_reference_graph(&reference);
         let candidates = (1..reference.instances.len()).collect::<Vec<_>>();
-        let (representatives, multiplicities) =
-            identity_candidate_representatives(&reference, &graph, None, &candidates);
+        let (representatives, multiplicities) = identity_candidate_representatives(
+            RowSource::Full(&reference.instances),
+            &graph,
+            None,
+            &candidates,
+        );
         assert_eq!(representatives.len(), 6);
         assert!(multiplicities.values().all(|count| *count == 400));
     }
@@ -7208,7 +11480,9 @@ mod tests {
             instance.properties["Position"]["x"] = json!(value);
         }
         let candidates = (1..reference.instances.len()).collect::<Vec<_>>();
-        let index = IdentityCandidateIndex::build(&reference, &candidates).unwrap();
+        let index =
+            IdentityCandidateIndex::build(RowSource::Full(&reference.instances), &candidates)
+                .unwrap();
         for candidate in &candidates {
             let original = &reference.instances[*candidate];
             let value = original.properties["Position"]["x"].as_f64().unwrap();
@@ -8356,7 +12630,9 @@ mod tests {
             );
         }
         let candidates = (1..reference.instances.len()).collect::<Vec<_>>();
-        let index = IdentityCandidateIndex::build(&reference, &candidates).unwrap();
+        let index =
+            IdentityCandidateIndex::build(RowSource::Full(&reference.instances), &candidates)
+                .unwrap();
         assert_eq!(index.field.pointer, "/components/3");
         for candidate in candidates {
             let original = &reference.instances[candidate];

@@ -315,11 +315,7 @@ impl RetainedRowColumns {
         rows: Range<usize>,
     ) -> Result<()> {
         let _span = crate::app::profile::span("store row chunk materialize");
-        let scope = ValueScope {
-            strings: &self.strings,
-            instance_count: self.instance_count,
-            budget: &self.budget,
-        };
+        let scope = ValueScope::from_owned(&self.strings, self.instance_count, &self.budget);
         let groups = self
             .groups
             .par_iter_mut()
@@ -373,11 +369,7 @@ impl RetainedRowColumns {
             return blocks.project(document, names, project);
         }
         let budget = DecodeBudget::for_file(self.file_bytes).holding_payloads();
-        let scope = ValueScope {
-            strings: &self.strings,
-            instance_count: self.instance_count,
-            budget: &budget,
-        };
+        let scope = ValueScope::from_owned(&self.strings, self.instance_count, &budget);
         for group in self.groups.iter().filter(|group| names(&group.name)) {
             budget.property_group(group.count, &group.name, group.kind)?;
             let mut cursor = GroupCursor::beginning(group);
@@ -426,11 +418,7 @@ impl RetainedRowColumns {
             .filter(|group| REFERENCE_KINDS.contains(&group.kind))
             .map(|group| &group.name)
             .collect::<std::collections::HashSet<_>>();
-        let scope = ValueScope {
-            strings: &self.strings,
-            instance_count: self.instance_count,
-            budget: &self.budget,
-        };
+        let scope = ValueScope::from_owned(&self.strings, self.instance_count, &self.budget);
         let groups = self
             .groups
             .par_iter()
@@ -479,11 +467,7 @@ impl RetainedRowColumns {
         if let Some(blocks) = &mut self.blocks {
             return blocks.select(document, wanted, self.reference_budget.is_some());
         }
-        let scope = ValueScope {
-            strings: &self.strings,
-            instance_count: self.instance_count,
-            budget: &self.budget,
-        };
+        let scope = ValueScope::from_owned(&self.strings, self.instance_count, &self.budget);
         let groups = self
             .groups
             .par_iter()
@@ -518,11 +502,7 @@ impl RetainedRowColumns {
                     .all(|(cursor, group)| cursor.value == group.count),
             "Store rows were not completely read; restart the import before writing to Studio"
         );
-        let scope = ValueScope {
-            strings: &self.strings,
-            instance_count: self.instance_count,
-            budget: &self.budget,
-        };
+        let scope = ValueScope::from_owned(&self.strings, self.instance_count, &self.budget);
         // Also validate empty groups in an empty document, where no row range
         // caused materialize to visit their bodies.
         for (cursor, group) in self.cursors.iter_mut().zip(&self.groups) {

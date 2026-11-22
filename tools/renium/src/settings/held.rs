@@ -225,11 +225,59 @@ pub(crate) fn held_copy(value: &Arc<Value>) -> Value {
     }
 }
 
+/// The payload id of a `SharedString` whose base64 text is `text`, holding it
+/// once without allocating a temporary `Value` when it is already held.
+/// Returns `None` when `text` is shorter than `MIN_HELD_TEXT`.
+pub(crate) fn held_shared_string_id(text: &str) -> Option<u64> {
+    if text.len() < MIN_HELD_TEXT {
+        return None;
+    }
+    if let Some(id) = known(text) {
+        return Some(id);
+    }
+    let value = Arc::new(Value::Object(Map::from_iter([
+        ("_type".to_string(), Value::String(HELD_TYPE.to_string())),
+        ("base64".to_string(), Value::String(text.to_string())),
+    ])));
+    let hash = HASHER.hash_one(text);
+    let mut store = STORE.write().unwrap_or_else(PoisonError::into_inner);
+    if let Some(id) = store.known(hash, text) {
+        return Some(id);
+    }
+    store.sweep(now());
+    let id = store.next;
+    store.next += 1;
+    store.by_text.entry(hash).or_default().push(id);
+    store.payloads.insert(
+        id,
+        Arc::new(Payload {
+            value,
+            digest: OnceLock::new(),
+            used: AtomicU64::new(now()),
+        }),
+    );
+    Some(id)
+}
+
+/// The handle value for a payload id previously returned by `held_shared_string_id`.
+#[inline]
+pub(crate) fn handle_value(id: u64) -> Value {
+    handle(id)
+}
+
+/// The payload id of a handle, without looking up or touching the store.
+#[inline]
+pub(crate) fn handle_id(object: &Map<String, Value>) -> Option<u64> {
+    if object.len() == 2 && object.get("_type").and_then(Value::as_str) == Some(HELD_TYPE) {
+        object.get(KEY.as_str()).and_then(Value::as_u64)
+    } else {
+        None
+    }
+}
+
 /// Whether an object is a handle, whether or not its payload is still held.
 pub(crate) fn is_handle(object: &Map<String, Value>) -> bool {
-    object.len() == 2
-        && object.get("_type").and_then(Value::as_str) == Some(HELD_TYPE)
-        && object.get(KEY.as_str()).is_some_and(Value::is_u64)
+    handle_id(object).is_some()
 }
 
 fn held_payload_of(object: &Map<String, Value>) -> Option<Arc<Payload>> {

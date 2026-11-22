@@ -33,7 +33,8 @@ use crate::settings::bytecode::{
 };
 use crate::settings::equivalence::{
     SettingsAlignment, align_pulled_settings_bytes_to_reference,
-    align_pulled_settings_documents_to_reference, viewport_camera_lacks_enum_types,
+    align_pulled_settings_documents_to_reference, align_pulled_settings_documents_without_state,
+    viewport_camera_lacks_enum_types,
 };
 use crate::settings::tree::editor_service_root_index;
 use crate::snapshot::codec::parse_source_range_batch;
@@ -327,18 +328,14 @@ impl DirectImportWorker {
                     let _waiting = profile::span(&format!("{service}: wait for the stage"));
                     ready()?;
                 }
-                let node = import_service_state_with_sourcemap(
-                    &state,
+                import_service_state_with_sourcemap(
+                    state,
                     &self.roots.project_root,
                     &src_root,
                     self.roots.layout_src_root.as_deref(),
                     &service,
                     &self.store_gate,
-                );
-                // Freeing a large captured service takes a few hundred
-                // milliseconds that nothing after it waits for.
-                rayon::spawn(move || drop(state));
-                node
+                )
             });
         match result {
             Ok(node) => {
@@ -512,7 +509,7 @@ impl Drop for DirectImportDispatcher {
 }
 
 pub(crate) fn import_service_state_with_sourcemap(
-    state: &ServiceState,
+    state: ServiceState,
     project_root: &Path,
     src_root: &Path,
     layout_src_root: Option<&Path>,
@@ -521,7 +518,7 @@ pub(crate) fn import_service_state_with_sourcemap(
 ) -> Result<SourcemapNode> {
     let import_started = Instant::now();
     let write_tree_started = Instant::now();
-    let node = import_service_tree_with_store_gate(
+    let node = import_service_tree_owned_with_store_gate(
         state,
         project_root,
         src_root,
@@ -1275,6 +1272,87 @@ fn import_service_tree(
     )
 }
 
+fn import_service_tree_owned_with_store_gate(
+    state: ServiceState,
+    project_root: &Path,
+    src_root: &Path,
+    layout_src_root: Option<&Path>,
+    service: &str,
+    store_gate: Option<&Mutex<()>>,
+) -> Result<SourcemapNode> {
+    if state.instances.len() >= 4_096 {
+        let service_dir = src_root.join(sanitize_name(service));
+        let layout_dir = layout_src_root.map_or_else(
+            || service_dir.clone(),
+            |root| root.join(sanitize_name(service)),
+        );
+        let cleanup_required = ensure_import_service_dir(&service_dir)?;
+        let fresh_service_dir = !cleanup_required;
+        let expected_paths = Arc::new(ImportPathSets::default());
+        track_expected_dir(&expected_paths, &service_dir);
+
+        let visited = (0..state.instances.len())
+            .map(|_| AtomicBool::new(false))
+            .collect::<Vec<_>>();
+        mark_visited(&visited, state.service_root_index);
+        let root_children = child_indices_for_instance(&state, state.service_root_index);
+        let emitting = profile::span(&format!("{service}: write script files"));
+        let expected_batch = emit_children_indices(
+            &state,
+            root_children,
+            &service_dir,
+            &layout_dir,
+            &SourceOutput::Files {
+                fresh: fresh_service_dir,
+            },
+            &visited,
+        )?;
+        expected_batch.merge_into(&expected_paths);
+        drop(emitting);
+
+        let mapping = profile::span(&format!("{service}: build sourcemap"));
+        let node = build_service_sourcemap_from_state(&state, project_root, &service_dir);
+        drop(mapping);
+
+        write_service_settings_file_owned(
+            service,
+            Some(state),
+            None,
+            &service_dir,
+            &expected_paths,
+            fresh_service_dir,
+            store_gate,
+        )?;
+
+        log_timing_ms(
+            &format!("{service}: expected-path tracking"),
+            expected_path_tracking_ms(&expected_paths),
+        );
+        if cleanup_required {
+            let _cleaning = profile::span(&format!("{service}: remove files Studio dropped"));
+            let cleanup_handle =
+                spawn_cleanup_service_dir(service_dir.clone(), Arc::clone(&expected_paths));
+            join_cleanup_handle(service, cleanup_handle)?;
+        }
+        return Ok(node);
+    }
+
+    let node = import_service_tree_with_store_gate(
+        &state,
+        project_root,
+        src_root,
+        layout_src_root,
+        service,
+        store_gate,
+    );
+    if state.instances.len() >= 4_096 {
+        drop(state);
+    } else {
+        rayon::spawn(move || drop(state));
+    }
+    node
+}
+
 fn import_service_tree_with_store_gate(
     state: &ServiceState,
     project_root: &Path,
@@ -1458,6 +1536,35 @@ fn write_service_settings_file(
     fresh_stage: bool,
     store_gate: Option<&Mutex<()>>,
 ) -> Result<()> {
+    write_service_settings_file_owned(
+        service,
+        None,
+        Some(state),
+        service_dir,
+        expected_paths,
+        fresh_stage,
+        store_gate,
+    )
+}
+
+fn write_service_settings_file_owned(
+    service: &str,
+    mut owned_state: Option<ServiceState>,
+    borrowed_state: Option<&ServiceState>,
+    service_dir: &Path,
+    expected_paths: &ImportPathSets,
+    fresh_stage: bool,
+    store_gate: Option<&Mutex<()>>,
+) -> Result<()> {
+    fn state_ref<'a>(
+        owned: &'a Option<ServiceState>,
+        borrowed: Option<&'a ServiceState>,
+    ) -> &'a ServiceState {
+        owned
+            .as_ref()
+            .or(borrowed)
+            .expect("write_service_settings_file requires a ServiceState")
+    }
     let settings_path = service_settings_path(service_dir);
     // A cloned project can retain its store without an empty script folder.
     // Fresh scripts do not imply a fresh store or disposable instance IDs.
@@ -1474,6 +1581,7 @@ fn write_service_settings_file(
     }
     let started = Instant::now();
     if fresh_stage {
+        let state = state_ref(&owned_state, borrowed_state);
         // A fresh capture encodes every store while other services are still
         // converting. Bound those temporary buffers per export; scripts,
         // sourcemaps, comparisons of small stores and other places can proceed.
@@ -1501,13 +1609,19 @@ fn write_service_settings_file(
             lock_started,
         );
         let preservation_started = Instant::now();
-        let preserved_state =
-            state_with_preserved_material_service_settings(service, state, &settings_path)?;
+        let mut preserved_state = state_with_preserved_material_service_settings(
+            service,
+            state_ref(&owned_state, borrowed_state),
+            &settings_path,
+        )?;
         log_timing(
             &format!("{service}: preserve material settings"),
             preservation_started,
         );
-        let state_to_write = preserved_state.as_ref().unwrap_or(state);
+        let state_to_write = preserved_state
+            .as_ref()
+            .unwrap_or_else(|| state_ref(&owned_state, borrowed_state));
+        let instance_count = state_to_write.instances.len();
         // A store whose file and observed state are the ones the last pull
         // found unchanged is unchanged again, and nothing is decoded for it.
         // One whose file holds an earlier state's own document, where only
@@ -1581,19 +1695,52 @@ fn write_service_settings_file(
             Ok(Some((_, digest, _))) => Some(*digest),
             _ => None,
         };
-        // Whole-document reconciliation also owns large temporary values. The
-        // row comparison above takes the gate to encode, and for a large
-        // store also to read it.
-        let _store_guard = if !unchanged_again && changed_values.is_none() {
-            store_gate.map(LockRecover::lock_recover)
+        let streamed_alignment = if !unchanged_again
+            && changed_values.is_none()
+            && !pull_aligns_whole_documents()
+            && instance_count >= 4_096
+            && let (Ok(Some((bytes, digest, _))), Some(pulled_ref)) = (&stored_file, &pulled)
+        {
+            match crate::settings::bytecode::pull_align_captured_store_streaming(
+                state_to_write,
+                &pulled_ref.rows,
+                bytes,
+                store_gate,
+                alignment_started,
+            ) {
+                Ok(Some((pulled_alignment, answer_follows_camera))) => {
+                    Some(Ok((pulled_alignment, answer_follows_camera, *digest)))
+                }
+                Ok(None) => None,
+                Err(error) => Some(Err(
+                    error.context(format!("Failed to align {}", settings_path.display()))
+                )),
+            }
         } else {
             None
         };
-        let (stored, observed) = if unchanged_again || changed_values.is_some() {
+        let _store_guard =
+            if !unchanged_again && changed_values.is_none() && streamed_alignment.is_none() {
+                store_gate.map(LockRecover::lock_recover)
+            } else {
+                None
+            };
+        let can_drop_state_before_reference = owned_state.is_some()
+            && instance_count >= 4_096
+            && matches!(&stored_file, Ok(Some(_)))
+            && pulled
+                .as_ref()
+                .is_some_and(|p| p.rows.encodes_as_its_document());
+        let mut dropped_state = false;
+        let mut oracle_state: Option<ServiceState> = None;
+        let (stored, observed) = if unchanged_again
+            || changed_values.is_some()
+            || streamed_alignment.is_some()
+        {
             (Ok(None), Ok(None))
         } else {
-            rayon::join(
-                || -> Result<Option<StoredSettings>> {
+            let decode_stored =
+                |stored_file: Result<Option<StoredFile>>| -> Result<Option<StoredSettings>> {
                     let Some((bytes, digest, _)) = stored_file? else {
                         return Ok(None);
                     };
@@ -1602,14 +1749,59 @@ fn write_service_settings_file(
                         document: decode_stored_settings(&settings_path, &bytes)?,
                         bytes,
                     }))
-                },
-                || {
+                };
+            if can_drop_state_before_reference {
+                let observed = {
+                    let _converting = profile::span(&format!("{service}: captured store document"));
+                    let state_to_write = preserved_state
+                        .as_ref()
+                        .unwrap_or_else(|| state_ref(&owned_state, borrowed_state));
+                    Ok::<_, anyhow::Error>(Some(settings_bytecode_from_service_state(
+                        state_to_write,
+                    )?))
+                };
+                if matches!(&observed, Ok(Some(_))) {
+                    let released = preserved_state.take().or_else(|| owned_state.take());
+                    drop(owned_state.take());
+                    if cfg!(debug_assertions) {
+                        oracle_state = released;
+                    } else {
+                        drop(released);
+                    }
+                    dropped_state = true;
+                    if instance_count >= 32_768 {
+                        crate::daemon::memory::release_between_phases();
+                    }
+                }
+                let stored = decode_stored(stored_file);
+                (stored, observed)
+            } else if instance_count >= 4_096 {
+                let state_to_write = preserved_state
+                    .as_ref()
+                    .unwrap_or_else(|| state_ref(&owned_state, borrowed_state));
+                let stored = decode_stored(stored_file);
+                let observed = {
                     let _converting = profile::span(&format!("{service}: captured store document"));
                     Ok::<_, anyhow::Error>(Some(settings_bytecode_from_service_state(
                         state_to_write,
                     )?))
-                },
-            )
+                };
+                (stored, observed)
+            } else {
+                let state_to_write = preserved_state
+                    .as_ref()
+                    .unwrap_or_else(|| state_ref(&owned_state, borrowed_state));
+                rayon::join(
+                    || decode_stored(stored_file),
+                    || {
+                        let _converting =
+                            profile::span(&format!("{service}: captured store document"));
+                        Ok::<_, anyhow::Error>(Some(settings_bytecode_from_service_state(
+                            state_to_write,
+                        )?))
+                    },
+                )
+            }
         };
         let aligned = (|| -> Result<Option<Vec<u8>>> {
             if unchanged_again {
@@ -1638,26 +1830,73 @@ fn write_service_settings_file(
                     }
                 });
             }
+            if let Some(streamed) = streamed_alignment {
+                let (pulled_alignment, answer_follows_camera, stored_digest) = streamed?;
+                let rows = |pulled: &PulledDigest| {
+                    (pulled_alignment.stored_as_observed && pulled.rows.encodes_as_its_document())
+                        .then(|| pulled.rows.clone())
+                };
+                return Ok(match pulled_alignment.alignment {
+                    SettingsAlignment::Equivalent => {
+                        if !answer_follows_camera && let Some(pulled) = &pulled {
+                            remember_pull(stored_digest, pulled.digest, rows(pulled));
+                        }
+                        None
+                    }
+                    SettingsAlignment::Changed(aligned) => {
+                        forget_pull(&stored_digest);
+                        if !answer_follows_camera
+                            && let Some(pulled) = &pulled
+                            && let Some(rows) = rows(pulled)
+                        {
+                            remember_pull(
+                                Sha256::digest(&aligned).into(),
+                                pulled.digest,
+                                Some(rows),
+                            );
+                        }
+                        Some(aligned)
+                    }
+                });
+            }
             #[cfg(test)]
             WHOLLY_ALIGNED.lock_recover().push(settings_path.clone());
             // A captured state the decoder would refuse goes the way it went
             // before: its own bytes are written or compared as they are.
             let Ok(Some(observed)) = observed else {
+                let state_to_write = preserved_state
+                    .as_ref()
+                    .unwrap_or_else(|| state_ref(&owned_state, borrowed_state));
                 return pull_from_bytes(state_to_write, &settings_path);
             };
             Ok(match stored? {
                 Some(stored) => {
                     let reference = stored.document;
                     let answer_follows_camera = viewport_camera_lacks_enum_types(&reference);
-                    let pulled_alignment = align_pulled_settings_documents_to_reference(
-                        reference,
-                        observed,
-                        &|| {
-                            encode_service_settings_binary_over(state_to_write, Some(&stored.bytes))
-                        },
-                        alignment_started,
-                        &stored.bytes,
-                    )
+                    let pulled_alignment = if dropped_state {
+                        align_pulled_settings_documents_without_state(
+                            reference,
+                            observed,
+                            alignment_started,
+                            &stored.bytes,
+                        )
+                    } else {
+                        let state_to_write = preserved_state
+                            .as_ref()
+                            .unwrap_or_else(|| state_ref(&owned_state, borrowed_state));
+                        align_pulled_settings_documents_to_reference(
+                            reference,
+                            observed,
+                            &|| {
+                                encode_service_settings_binary_over(
+                                    state_to_write,
+                                    Some(&stored.bytes),
+                                )
+                            },
+                            alignment_started,
+                            &stored.bytes,
+                        )
+                    }
                     .with_context(|| format!("Failed to align {}", settings_path.display()))?;
                     // The rows are those of the file only where it holds the
                     // state's document as the state itself encodes it.
@@ -1692,10 +1931,19 @@ fn write_service_settings_file(
                     }
                 }
                 // A store that is not there yet gets the captured state's own bytes.
-                None => Some(encode_service_settings_binary(state_to_write)?),
+                None => {
+                    let state_to_write = preserved_state
+                        .as_ref()
+                        .unwrap_or_else(|| state_ref(&owned_state, borrowed_state));
+                    Some(encode_service_settings_binary(state_to_write)?)
+                }
             })
         })();
         if cfg!(debug_assertions) {
+            let state_to_write = oracle_state
+                .as_ref()
+                .or(preserved_state.as_ref())
+                .unwrap_or_else(|| state_ref(&owned_state, borrowed_state));
             assert_pull_matches_the_byte_path(state_to_write, &settings_path, &aligned);
         }
         let aligned = aligned?;

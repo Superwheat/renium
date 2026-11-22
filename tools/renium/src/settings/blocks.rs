@@ -241,6 +241,7 @@ pub(crate) struct BlockStore<'a> {
     rows: usize,
     budget: DecodeBudget,
     read_pool: Vec<Mutex<Option<Arc<Vec<String>>>>>,
+    open_blocks: Vec<Mutex<Option<Arc<OpenBlock>>>>,
     /// The most a read of one frame reserved.
     #[cfg(test)]
     reserved: AtomicUsize,
@@ -403,16 +404,25 @@ pub(super) fn encode_with_lookup(
     block_rows: usize,
 ) -> Result<Vec<u8>> {
     let ranges = block_ranges(document.instances.len(), block_rows);
-    let (structure, prepared) = rayon::join(
+    let owned_entries = Mutex::new(BTreeMap::<[u8; 16], (usize, Option<String>)>::new());
+    let (structure, contents) = rayon::join(
         || structure_content(document, lookup),
         || {
             ranges
                 .par_iter()
-                .map(|range| prepared(&document.instances[range.clone()], lookup))
+                .map(|range| {
+                    let block = prepared(&document.instances[range.clone()], lookup)?;
+                    let content = block.content(lookup)?;
+                    record_owned_entries(&owned_entries, &block)?;
+                    Ok((block.rows, content))
+                })
                 .collect::<Result<Vec<_>>>()
         },
     );
-    encode_prepared(structure?, prepared?, lookup, previous)
+    let owned_entries = owned_entries
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner());
+    encode_contents(structure?, contents?, &owned_entries, previous)
 }
 
 /// The store of a captured state whose instances are `records`, with the
@@ -441,7 +451,8 @@ fn encode_state_in_blocks<'a>(
     block_rows: usize,
 ) -> Result<Vec<u8>> {
     let ranges = block_ranges(records.len(), block_rows);
-    let (structure, prepared) = rayon::join(
+    let owned_entries = Mutex::new(BTreeMap::<[u8; 16], (usize, Option<String>)>::new());
+    let (structure, contents) = rayon::join(
         || {
             let collected = collected_records(records, collect_settings_binary_record_strings);
             encode_prepared_service_payload(records, lookup, collected)
@@ -461,12 +472,99 @@ fn encode_state_in_blocks<'a>(
                             replaced,
                         )?;
                     }
-                    Prepared::of(range.len(), collected)
+                    let block = Prepared::of(range.len(), collected)?;
+                    let content = block.content(lookup)?;
+                    record_owned_entries(&owned_entries, &block)?;
+                    Ok((block.rows, content))
                 })
                 .collect::<Result<Vec<_>>>()
         },
     );
-    encode_prepared(structure?, prepared?, lookup, previous)
+    let owned_entries = owned_entries
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner());
+    encode_contents(structure?, contents?, &owned_entries, previous)
+}
+
+type OwnedPoolEntries = BTreeMap<[u8; 16], (usize, Option<String>)>;
+
+fn record_owned_entries(target: &Mutex<OwnedPoolEntries>, block: &Prepared<'_>) -> Result<()> {
+    let mut guard = target.lock_recover();
+    for (hash, text) in block.strings.pooled() {
+        let (count, held) = guard.entry(hash).or_default();
+        *count += 1;
+        anyhow::ensure!(
+            held.as_deref()
+                .zip(text)
+                .is_none_or(|(held, text)| held == text),
+            "Two strings of a store share a hash"
+        );
+        if held.is_none()
+            && let Some(text) = text
+        {
+            *held = Some(text.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn encode_contents(
+    structure: Vec<u8>,
+    contents: Vec<(usize, Vec<u8>)>,
+    owned_entries: &OwnedPoolEntries,
+    previous: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let entries: PoolEntries<'_> = owned_entries
+        .iter()
+        .map(|(&hash, (count, text))| (hash, (*count, text.as_deref())))
+        .collect();
+    let previous = previous
+        .and_then(|bytes| BlockStore::open(bytes).ok())
+        .filter(|store| store.writer == writer());
+    if let Some(store) = &previous
+        && let Ok(bytes) = written(&structure, &contents, &entries, Some(store))
+    {
+        return Ok(bytes);
+    }
+    written(&structure, &contents, &entries, None)
+}
+
+/// A provable lower bound on the compressed v12 file size of `records` and its
+/// pooled long strings: the sum of the compressed structure frame and the
+/// compressed pool frames (each included verbatim in the assembled v12 file).
+pub(super) fn min_encoded_file_bytes<'a>(
+    records: &'a [SettingsBinaryInstance<'a>],
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    long_strings: &[&'a str],
+) -> Result<usize> {
+    let _span = crate::app::profile::span("captured store lower bound");
+    let (structure_bytes, pool_bytes) = rayon::join(
+        || -> Result<usize> {
+            let collected = collected_records(records, collect_settings_binary_record_strings);
+            let raw = encode_prepared_service_payload(records, lookup, collected)?;
+            Ok(compressed(&raw)?.bytes.len())
+        },
+        || -> Result<usize> {
+            let mut entries = PoolEntries::new();
+            for &text in long_strings {
+                let hash = digest(&[text.as_bytes()]);
+                let (count, held) = entries.entry(hash).or_default();
+                *count += 1;
+                anyhow::ensure!(
+                    held.is_none_or(|prev| prev == text),
+                    "Two strings of a store share a hash"
+                );
+                *held = Some(text);
+            }
+            if entries.is_empty() {
+                return Ok(0);
+            }
+            let listed = listed(&entries, None)?;
+            let frames = pool_frames(&entries, &listed, None)?;
+            Ok(frames.iter().map(|frame| frame.bytes.len()).sum())
+        },
+    );
+    Ok(structure_bytes?.saturating_add(pool_bytes?))
 }
 
 /// The rows of each block of a store of `count` instances.
@@ -497,34 +595,6 @@ fn collected_records<'a, T: Sync>(
             merge_settings_binary_collection(&mut all, part);
             all
         })
-}
-
-/// The store file of a structure's content and the blocks `prepared`. Where
-/// `previous` is a v12 store this writer wrote, each frame that comes out as
-/// the one it holds at the same place is copied from it.
-fn encode_prepared(
-    structure: Vec<u8>,
-    prepared: Vec<Prepared<'_>>,
-    lookup: &SettingsBinaryInstanceLookup<'_>,
-    previous: Option<&[u8]>,
-) -> Result<Vec<u8>> {
-    let contents = prepared
-        .par_iter()
-        .map(|block| Ok((block.rows, block.content(lookup)?)))
-        .collect::<Result<Vec<_>>>()?;
-    let mut entries = PoolEntries::new();
-    for block in &prepared {
-        name_entries(&mut entries, block)?;
-    }
-    let previous = previous
-        .and_then(|bytes| BlockStore::open(bytes).ok())
-        .filter(|store| store.writer == writer());
-    if let Some(store) = &previous
-        && let Ok(bytes) = written(&structure, &contents, &entries, Some(store))
-    {
-        return Ok(bytes);
-    }
-    written(&structure, &contents, &entries, None)
 }
 
 /// The file of a structure's content, the blocks `contents` with their row
@@ -685,21 +755,6 @@ impl<'a> Prepared<'a> {
         )?;
         Ok(content)
     }
-}
-
-/// Counts `block` as a block that names each of its long strings, taking the
-/// text of each that is no marker.
-fn name_entries<'t>(entries: &mut PoolEntries<'t>, block: &'t Prepared<'_>) -> Result<()> {
-    for (hash, text) in block.strings.pooled() {
-        let (count, held) = entries.entry(hash).or_default();
-        *count += 1;
-        anyhow::ensure!(
-            held.zip(text).is_none_or(|(held, text)| held == text),
-            "Two strings of a store share a hash"
-        );
-        *held = held.or(text);
-    }
-    Ok(())
 }
 
 /// Each entry of `entries` by its hash, with the number of blocks that name
@@ -951,6 +1006,7 @@ impl<'a> BlockStore<'a> {
         // A store holds as much as a v11 store's one frame might.
         check_settings_payload_len(decoded, "Decoded")?;
         let read_pool = pool.iter().map(|_| Mutex::new(None)).collect();
+        let open_blocks = blocks.iter().map(|_| Mutex::new(None)).collect();
         let budget = DecodeBudget::for_file(bytes.len());
         Ok(Self {
             bytes,
@@ -965,6 +1021,7 @@ impl<'a> BlockStore<'a> {
             rows,
             budget,
             read_pool,
+            open_blocks,
             #[cfg(test)]
             reserved: AtomicUsize::new(0),
         })
@@ -1038,12 +1095,181 @@ impl<'a> BlockStore<'a> {
     }
 
     /// The whole document, as the v11 decode of the same document gives it.
+    /// Blocks are opened and decoded in bounded batches so temporary block
+    /// buffers and decoded column vectors stay bounded on very large stores.
     pub(crate) fn decode(&self) -> Result<SettingsBytecode> {
-        let (structure, opened) = rayon::join(
-            || self.content(self.structure),
-            || self.open_blocks(0..self.blocks.len()),
-        );
-        self.decode_opened(structure?, opened?)
+        const DECODE_BLOCKS_AT_ONCE: usize = 4;
+        let structure = self.content(self.structure)?;
+        #[cfg(test)]
+        WHOLE_DECODES.set(WHOLE_DECODES.get() + 1);
+        let mut document = self.structure_of(structure)?;
+        let mut chunks = self.split(&mut document.instances);
+        for (batch_idx, batch) in chunks.chunks_mut(DECODE_BLOCKS_AT_ONCE).enumerate() {
+            let first_block = batch_idx * DECODE_BLOCKS_AT_ONCE;
+            batch
+                .par_iter_mut()
+                .enumerate()
+                .try_for_each(|(offset, rows)| {
+                    let open = self.open_block(first_block + offset)?;
+                    self.block_into(&open, rows, |_| true, Texts::All)
+                })?;
+        }
+        Ok(document)
+    }
+
+    /// Streams the store block-by-block in bounded batches into a compact
+    /// representation suitable for streamed identity alignment without ever
+    /// holding all decoded properties in memory at once.
+    pub(crate) fn compact(
+        &self,
+    ) -> Result<(crate::settings::equivalence::CompactDocument, Vec<String>)> {
+        use crate::settings::equivalence::{
+            CompactDocument, CompactRowMeta, compact_row, stabilize_instance_references,
+        };
+        const COMPACT_BLOCKS_AT_ONCE: usize = 4;
+        let _span = crate::app::profile::span("store compact decode");
+        let structure = self.content(self.structure)?;
+        let mut document = self.structure_of(structure)?;
+        let ids: Vec<String> = document
+            .instances
+            .iter()
+            .map(|instance| instance.settings_id.clone())
+            .collect();
+        let count = document.instances.len();
+        let mut unique_ids: Vec<Option<Box<str>>> = vec![None; count];
+        let mut meta: Vec<CompactRowMeta> = vec![
+            CompactRowMeta {
+                exact_digest: [0; 16],
+                full_digest: [0; 16],
+                compared_digest: [0; 16],
+                unique_id_digest: [0; 16],
+                keys_hash: 0,
+                reflexive: true,
+                has_untyped_enum: false,
+                has_ref: false,
+            };
+            count
+        ];
+        let mut cameras: Vec<(usize, SettingsBytecodeInstance)> = Vec::new();
+        let mut inst_chunks = self.split(&mut document.instances);
+        let mut uid_chunks = self.split(&mut unique_ids);
+        let mut meta_chunks = self.split(&mut meta);
+        for (batch_idx, ((inst_batch, uid_batch), meta_batch)) in inst_chunks
+            .chunks_mut(COMPACT_BLOCKS_AT_ONCE)
+            .zip(uid_chunks.chunks_mut(COMPACT_BLOCKS_AT_ONCE))
+            .zip(meta_chunks.chunks_mut(COMPACT_BLOCKS_AT_ONCE))
+            .enumerate()
+        {
+            let first_block = batch_idx * COMPACT_BLOCKS_AT_ONCE;
+            let batch_cameras: Vec<Vec<(usize, SettingsBytecodeInstance)>> = inst_batch
+                .par_iter_mut()
+                .zip(uid_batch.par_iter_mut())
+                .zip(meta_batch.par_iter_mut())
+                .enumerate()
+                .map(|(offset, ((rows, uids), metas))| {
+                    let block_index = first_block + offset;
+                    let block_first = self.blocks[block_index].first;
+                    let open = self.open_block(block_index)?;
+                    self.block_into(&open, rows, |_| true, Texts::All)?;
+                    let mut local_cameras = Vec::new();
+                    for (row_offset, ((inst, uid_slot), meta_slot)) in rows
+                        .iter_mut()
+                        .zip(uids.iter_mut())
+                        .zip(metas.iter_mut())
+                        .enumerate()
+                    {
+                        stabilize_instance_references(inst, &ids);
+                        let (uid, row_meta, cam) = compact_row(inst);
+                        *uid_slot = uid;
+                        *meta_slot = row_meta;
+                        if let Some(cam) = cam {
+                            local_cameras.push((block_first + row_offset, cam));
+                        }
+                    }
+                    Ok(local_cameras)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for local in batch_cameras {
+                cameras.extend(local);
+            }
+        }
+        Ok((
+            CompactDocument {
+                document,
+                unique_ids,
+                meta,
+                cameras,
+            },
+            ids,
+        ))
+    }
+
+    fn open_block_cached(&self, index: usize) -> Result<Arc<OpenBlock>> {
+        let mut slot = self.open_blocks[index].lock_recover();
+        if let Some(open) = slot.as_ref() {
+            return Ok(Arc::clone(open));
+        }
+        let open = Arc::new(self.open_block(index)?);
+        *slot = Some(Arc::clone(&open));
+        Ok(open)
+    }
+
+    /// Decodes and stabilizes only the requested rows, reusing the store's
+    /// already-decoded bare structure records and a bounded cache of recently
+    /// opened blocks.
+    pub(crate) fn hydrate_rows(
+        &self,
+        bare: &[SettingsBytecodeInstance],
+        ids: &[String],
+        rows: &[usize],
+    ) -> Result<Vec<(usize, SettingsBytecodeInstance)>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.budget.renew(self.bytes.len());
+        let rows = self.chosen(rows)?;
+        let groups: Vec<&[usize]> = rows
+            .chunk_by(|left, right| self.block_of(*left) == self.block_of(*right))
+            .collect();
+        let read_group = |group: &[usize]| -> Result<Vec<(usize, SettingsBytecodeInstance)>> {
+            let block_index = self.block_of(group[0]);
+            let first = self.blocks[block_index].first;
+            let open = self.open_block_cached(block_index)?;
+            let mut values = (0..self.blocks[block_index].count)
+                .map(|_| DecodedRowValues::default())
+                .collect::<Vec<_>>();
+            let keep = |row: usize| group.binary_search(&(first + row)).is_ok();
+            self.block_into(&open, &mut values, keep, Texts::Resolved(&|_| true))?;
+            Ok(group
+                .iter()
+                .map(|&row| {
+                    let b = &bare[row];
+                    let row_vals = std::mem::take(&mut values[row - first]);
+                    let mut inst = SettingsBytecodeInstance {
+                        settings_id: b.settings_id.clone(),
+                        name: b.name.clone(),
+                        class_name: b.class_name.clone(),
+                        parent_index: b.parent_index,
+                        properties: row_vals.properties,
+                        attributes: row_vals.attributes,
+                    };
+                    crate::settings::equivalence::stabilize_instance_references(&mut inst, ids);
+                    (row, inst)
+                })
+                .collect())
+        };
+        let parts = if groups.len() >= 2 && rayon::current_num_threads() > 1 {
+            groups
+                .into_par_iter()
+                .map(read_group)
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            groups
+                .into_iter()
+                .map(read_group)
+                .collect::<Result<Vec<_>>>()?
+        };
+        Ok(parts.into_iter().flatten().collect())
     }
 
     /// The whole document of the structure's content and every block opened.
@@ -1586,15 +1812,74 @@ impl<'a> BlockStore<'a> {
         structure: Option<Vec<SettingsBytecodeInstance>>,
         plan: impl FnOnce(&[SettingsBytecodeInstance]) -> Option<(Option<usize>, Option<Moved>)>,
     ) -> Result<Option<StoreRows>> {
-        use super::captured::{
-            UNIQUE_ID, document_row_digest, value_digest, whole_document_row_digest,
-        };
-        let mut instances = match structure {
+        let instances = match structure {
             Some(instances) if instances.len() == self.rows => instances,
             _ => self.structure()?.instances,
         };
         let Some((kept, moved)) = plan(&instances) else {
             return Ok(None);
+        };
+        self.row_digests_of_instances(instances, whole, shared, kept, moved)
+            .map(Some)
+    }
+
+    /// Projects only the properties accepted by `names` onto an already-decoded
+    /// `instances` slice without re-decoding the store structure.
+    pub(crate) fn project_columns(
+        &self,
+        instances: &mut [SettingsBytecodeInstance],
+        names: impl Fn(&str) -> bool + Sync,
+        project: impl Fn(&SettingsBytecodeInstance, &str, Value) -> Option<Value>,
+    ) -> Result<()> {
+        let projected = |index: usize| -> Result<Vec<(usize, String, Value)>> {
+            let open = self.open_block(index)?;
+            let mut values = (0..self.blocks[index].count)
+                .map(|_| DecodedRowValues::default())
+                .collect::<Vec<_>>();
+            self.values(
+                &open,
+                &mut values,
+                |_| true,
+                |name, _| names(name),
+                Texts::Resolved(&|_| true),
+            )?;
+            Ok(self.blocks[index]
+                .rows()
+                .zip(values)
+                .flat_map(|(row, values)| {
+                    values
+                        .properties
+                        .into_iter()
+                        .map(move |(name, value)| (row, name, value))
+                })
+                .collect())
+        };
+        let blocks = (0..self.blocks.len())
+            .into_par_iter()
+            .map(projected)
+            .collect::<Result<Vec<_>>>()?;
+        for (row, name, value) in blocks.into_iter().flatten() {
+            let kept = project(&instances[row], &name, value);
+            let properties = &mut instances[row].properties;
+            if let Some(value) = kept {
+                properties.insert(name, value);
+            } else {
+                properties.remove(&name);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn row_digests_of_instances(
+        &self,
+        mut instances: Vec<SettingsBytecodeInstance>,
+        whole: bool,
+        shared: &[bool],
+        kept: Option<usize>,
+        moved: Option<Moved>,
+    ) -> Result<StoreRows> {
+        use super::captured::{
+            UNIQUE_ID, document_row_digest, value_digest, whole_document_row_digest,
         };
         let kept = kept.filter(|kept| *kept < instances.len());
         let digest_of: fn(&SettingsBytecodeInstance) -> ([u8; 16], [u8; 16]) = if whole {
@@ -1698,7 +1983,7 @@ impl<'a> BlockStore<'a> {
             let ids = instances.into_iter().map(|instance| instance.settings_id);
             (ids.collect(), Vec::new())
         };
-        Ok(Some(StoreRows {
+        Ok(StoreRows {
             digests,
             unique_ids,
             kept,
@@ -1706,7 +1991,7 @@ impl<'a> BlockStore<'a> {
             moved,
             instances,
             named,
-        }))
+        })
     }
 
     /// `rows` in rising order and each once, every one a row of the store.
@@ -2046,9 +2331,9 @@ impl<'a> BlockStore<'a> {
                 .map(|text| text.len())
                 .fold(0, usize::saturating_add),
         )?;
-        let strings = table.into_iter().map(Cow::into_owned).collect::<Vec<_>>();
+        let string_refs = table.iter().map(Cow::as_ref).collect::<Vec<_>>();
         let properties = (open.properties.iter())
-            .map(|id| strings[*id].clone())
+            .map(|id| string_refs[*id].to_string())
             .collect::<Vec<_>>();
         let mut reader = BytecodeReader::new(&open.content[open.rest..]);
         let specs = read_settings_property_groups(&mut reader, &properties)?;
@@ -2062,11 +2347,13 @@ impl<'a> BlockStore<'a> {
         // the store's own budget as it goes, so blocks read in parallel
         // together take no more than it holds.
         let marked = (!all).then(|| self.budget.not_holding());
-        let scope = ValueScope {
-            strings: &strings,
-            instance_count: self.rows,
-            budget: marked.as_ref().unwrap_or(&self.budget),
-        };
+        let budget = marked.as_ref().unwrap_or(&self.budget);
+        let held_ids = budget.holds_payloads.then(|| {
+            (0..string_refs.len())
+                .map(|_| std::sync::atomic::AtomicU64::new(u64::MAX))
+                .collect::<Vec<_>>()
+        });
+        let scope = ValueScope::from_borrowed(&string_refs, self.rows, budget, held_ids.as_deref());
         let held = rows.len();
         let groups = specs
             .par_iter()

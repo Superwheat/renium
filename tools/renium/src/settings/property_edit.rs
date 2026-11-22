@@ -100,11 +100,7 @@ pub(crate) fn decode_for_property_edit(
     for (name, ..) in &specs {
         *occurrences.entry(name.as_str()).or_default() += 1;
     }
-    let scope = ValueScope {
-        strings: &strings,
-        instance_count,
-        budget: &budget,
-    };
+    let scope = ValueScope::from_owned(&strings, instance_count, &budget);
     let groups = specs
         .par_iter()
         .map(|&(name, kind, count, body)| {
@@ -220,11 +216,7 @@ pub(crate) fn decode_rows(
     for (name, ..) in &specs {
         *occurrences.entry(name.as_str()).or_default() += 1;
     }
-    let scope = ValueScope {
-        strings: &strings,
-        instance_count,
-        budget: &budget,
-    };
+    let scope = ValueScope::from_owned(&strings, instance_count, &budget);
     let groups = specs
         .par_iter()
         .map(|&(name, kind, count, body)| {
@@ -403,11 +395,7 @@ fn row_digests_of(
     // A document holds an instance's properties by name.
     let mut names = occurrences.keys().copied().collect::<Vec<_>>();
     names.sort_unstable();
-    let scope = ValueScope {
-        strings: &strings,
-        instance_count,
-        budget: &budget,
-    };
+    let scope = ValueScope::from_owned(&strings, instance_count, &budget);
     let placed = moved.as_ref();
     let value_digest = |value: &Value| match placed.and_then(|moved| moved.value_in_state(value)) {
         Some(value) => value_digest(&value),
@@ -944,10 +932,6 @@ fn materialized_value(value: &NativeSettingsValue, kind: u8) -> Result<Value> {
     let mut bytes = Vec::with_capacity(48);
     write_native_value_payload(value, kind, &SettingsStringIdMap::default(), &mut bytes)?;
     let budget = DecodeBudget::new(usize::MAX);
-    let scope = ValueScope {
-        strings: &[],
-        instance_count: 0,
-        budget: &budget,
-    };
+    let scope = ValueScope::from_owned(&[], 0, &budget);
     decode_raw_value_payload(&mut BytecodeReader::new(&bytes), kind, scope, 0)
 }

@@ -128,9 +128,11 @@ fn release_now() {
 /// Returns the memory a finished phase of a command freed to the system
 /// before its next phase allocates as much again: the allocator keeps freed
 /// pages for reuse, and what one phase freed across many threads is not
-/// where the next one allocates.
+/// where the next one allocates. Runs synchronously across all Rayon worker
+/// threads so pages are actually returned before the next phase begins.
 pub(crate) fn release_between_phases() {
-    release_now();
+    rayon::broadcast(|_| collect_thread_heap());
+    collect_thread_heap();
 }
 
 fn collect_thread_heap() {

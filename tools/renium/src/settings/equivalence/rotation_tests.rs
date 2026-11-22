@@ -23,7 +23,8 @@ fn identity_radius_contains_nine_micro_rotation_boundary() {
         document.instances.push(instance);
     }
     let candidates = (0..80).collect::<Vec<_>>();
-    let index = IdentityCandidateIndex::build(&document, &candidates).unwrap();
+    let index =
+        IdentityCandidateIndex::build(RowSource::Full(&document.instances), &candidates).unwrap();
     for n in candidates {
         for drift in [-9e-6, -8.940696716308594e-6, 8.940696716308594e-6, 9e-6] {
             let mut observed = document.instances[n].clone();

@@ -19,28 +19,83 @@ pub(super) fn convert(state: &ServiceState) -> Result<SettingsBytecode> {
     let _span = crate::app::profile::span("captured store document");
     let records = collect_service_settings_binary_instances(state);
     let lookup = build_settings_binary_instance_lookup(state, &records);
-    let collected = collect_settings_binary_data(state, &lookup, &records, None)?;
-    // Every file gets at least this budget. Outside the proved bounds, the
-    // actual wire path decides acceptance and the exact first error.
-    match convert_prepared(
-        state,
-        &records,
-        &lookup,
-        &collected,
-        &DecodeBudget::for_file(0),
-    ) {
+    let summary = collect_settings_binary_summary(state, &lookup, &records)?;
+    let budget = if let Ok(extra_budget) = proven_budget(&records, &lookup, &summary) {
+        extra_budget
+    } else {
+        DecodeBudget::for_file(0)
+    };
+    match convert_prepared(state, &records, &lookup, &summary, &budget) {
         Ok(document) => Ok(document),
         Err(_) => {
             let _span = crate::app::profile::span("captured store exact limit check");
-            drop(collected);
-            decode_settings_bytecode(&blocks::encode_state(
-                state,
-                (&records, &lookup),
-                None,
-                None,
-            )?)
+            drop(summary);
+            if records.len() >= 32_768 {
+                crate::daemon::memory::release_between_phases();
+            }
+            let encoded = blocks::encode_state(state, (&records, &lookup), None, None)?;
+            if records.len() >= 32_768 {
+                crate::daemon::memory::release_between_phases();
+            }
+            decode_settings_bytecode_holding(&encoded)
         }
     }
+}
+
+/// Returns a `DecodeBudget` strictly bounded by what `decode_settings_bytecode`
+/// would allow on the encoded v12 file of `records` and `summary`, reserving
+/// headroom for block frames, pooled-string table copies, and shared payloads.
+/// Only computes the structure+pool compressed lower bound when `records` is
+/// large enough to potentially exceed `DecodeBudget::for_file(0)`.
+fn proven_budget(
+    records: &[SettingsBinaryInstance<'_>],
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    summary: &SettingsBinarySummary<'_>,
+) -> Result<DecodeBudget> {
+    let base = DecodeBudget::for_file(0).remaining.load(Ordering::Relaxed);
+    let estimated = records
+        .len()
+        .saturating_mul(INSTANCE_BYTES)
+        .saturating_add(summary.copied_string_bytes)
+        .saturating_add(
+            summary
+                .property_group_counts
+                .iter()
+                .filter(|((name, _), _)| !SETTINGS_RECORD_FIELDS.contains(name))
+                .map(|((name, kind), &count)| {
+                    count.saturating_mul(VALUE_SLOT_BYTES + name.len() + value_kind_bytes(*kind))
+                })
+                .fold(0usize, usize::saturating_add),
+        );
+    if estimated < (base / 10).saturating_mul(9) {
+        return Ok(DecodeBudget::new(base));
+    }
+    let long_strings = summary
+        .string_counts
+        .keys()
+        .map(Cow::as_ref)
+        .filter(|text| text.len() >= blocks::POOL_MIN_BYTES)
+        .collect::<Vec<_>>();
+    let pooled_bytes = long_strings
+        .iter()
+        .map(|text| text.len())
+        .fold(0usize, usize::saturating_add);
+    let block_count = records.len().div_ceil(blocks::BLOCK_ROWS);
+    let min_file_bytes = blocks::min_encoded_file_bytes(records, lookup, &long_strings)?;
+    let total_budget = DecodeBudget::for_file(min_file_bytes)
+        .remaining
+        .load(Ordering::Relaxed);
+    let short_bytes = summary
+        .string_counts
+        .keys()
+        .map(|text| text.len())
+        .filter(|&len| len < blocks::POOL_MIN_BYTES)
+        .fold(0usize, usize::saturating_add);
+    let reserve = MAX_SETTINGS_BYTECODE_BYTES
+        .saturating_add(block_count.saturating_mul(pooled_bytes))
+        .saturating_add(block_count.saturating_mul(short_bytes.min(MAX_SETTINGS_BYTECODE_BYTES)));
+    let proved = total_budget.saturating_sub(reserve);
+    Ok(DecodeBudget::new(proved.max(base)))
 }
 
 #[cfg(test)]
@@ -50,8 +105,8 @@ pub(super) fn convert_with_budget(
 ) -> Result<SettingsBytecode> {
     let records = collect_service_settings_binary_instances(state);
     let lookup = build_settings_binary_instance_lookup(state, &records);
-    let collected = collect_settings_binary_data(state, &lookup, &records, None)?;
-    convert_prepared(state, &records, &lookup, &collected, budget)
+    let summary = collect_settings_binary_summary(state, &lookup, &records)?;
+    convert_prepared(state, &records, &lookup, &summary, budget)
 }
 
 /// A digest of everything this state holds, except what its viewport camera
@@ -207,6 +262,64 @@ fn stand_alike(
 /// (`equivalence::settings_ids_told_alone`). Of the store only the instances
 /// with their UniqueIds, and the camera a root names, are read. `None` where
 /// the whole documents have to say.
+fn told_alone_with_reference(
+    reference: &SettingsBytecode,
+    state: &ServiceState,
+    records: &[SettingsBinaryInstance<'_>],
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+) -> Option<(Moved, Vec<String>)> {
+    let mut observed = skeleton(state, records, lookup).ok()?;
+    for (index, instance) in observed.instances.iter_mut().enumerate() {
+        if !instance.properties.contains_key(UNIQUE_ID)
+            && let Some(id) = captured_persistent_identity(state, index)
+        {
+            instance
+                .properties
+                .insert(UNIQUE_ID.into(), json!({"_type": "UniqueId", "value": id}));
+        }
+    }
+    let (ids, in_store) =
+        crate::settings::equivalence::settings_ids_told_alone(reference, &observed)?;
+    let mut in_state = vec![None; reference.instances.len()];
+    for (index, stored) in in_store.into_iter().enumerate() {
+        if let Some(stored) = stored {
+            in_state[stored] = Some(index);
+        }
+    }
+    Some((Moved::paired(in_state, records.len()), ids))
+}
+
+fn told_alone_in_block_store(
+    store: &blocks::BlockStore<'_>,
+    instances: &mut Vec<SettingsBytecodeInstance>,
+    state: &ServiceState,
+    records: &[SettingsBinaryInstance<'_>],
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+) -> Option<(Moved, Vec<String>)> {
+    let _span = crate::app::profile::span("store instances told alone");
+    let mut reference = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: std::mem::take(instances),
+    };
+    let projected = store.project_columns(
+        &mut reference.instances,
+        |name| name == UNIQUE_ID || name == "CurrentCamera",
+        |instance, name, value| {
+            (name == UNIQUE_ID || instance.parent_index.is_none()).then_some(value)
+        },
+    );
+    let result = projected
+        .ok()
+        .and_then(|()| told_alone_with_reference(&reference, state, records, lookup));
+    if result.is_some() {
+        for instance in &mut reference.instances {
+            instance.properties.clear();
+        }
+        *instances = reference.instances;
+    }
+    result
+}
+
 fn told_alone(
     stored: &[u8],
     state: &ServiceState,
@@ -225,25 +338,7 @@ fn told_alone(
             },
         )
         .ok()?;
-    let mut observed = skeleton(state, records, lookup).ok()?;
-    for (index, instance) in observed.instances.iter_mut().enumerate() {
-        if !instance.properties.contains_key(UNIQUE_ID)
-            && let Some(id) = captured_persistent_identity(state, index)
-        {
-            instance
-                .properties
-                .insert(UNIQUE_ID.into(), json!({"_type": "UniqueId", "value": id}));
-        }
-    }
-    let (ids, in_store) =
-        crate::settings::equivalence::settings_ids_told_alone(&reference, &observed)?;
-    let mut in_state = vec![None; reference.instances.len()];
-    for (index, stored) in in_store.into_iter().enumerate() {
-        if let Some(stored) = stored {
-            in_state[stored] = Some(index);
-        }
-    }
-    Some((Moved::paired(in_state, records.len()), ids))
+    told_alone_with_reference(&reference, state, records, lookup)
 }
 
 /// What a pull of `state` leaves of the stored file `stored` where no pull
@@ -272,8 +367,164 @@ pub(super) fn changed_document_rows(
     let (_reading, store_gate) = read_gate(stored, store_gate);
     let lookup = build_settings_binary_instance_lookup(state, &records);
     let mut told_ids = None;
-    let (stored_rows, captured_rows) = rayon::join(
-        || {
+    let (stored_rows, captured_rows) = if blocks::is_block_store(stored) {
+        let store = blocks::BlockStore::open(stored)?.holding();
+        let mut instances = store.structure()?.instances;
+        let moved = match Moved::between(&instances, &records) {
+            Some(None) if stand_alike(&instances, &records) => Some(None),
+            Some(Some(run)) => Some(Some(run)),
+            _ => told_alone_in_block_store(&store, &mut instances, state, &records, &lookup).map(
+                |(moved, ids)| {
+                    told_ids = Some(ids);
+                    Some(moved)
+                },
+            ),
+        };
+        let Some(moved) = moved else {
+            drop((instances, store));
+            if records.len() >= 32_768 {
+                crate::daemon::memory::release_between_phases();
+            }
+            return whole("nothing tells every instance of the store by itself among the state's");
+        };
+        let camera = match (now.viewport_camera, &moved) {
+            (Some(camera), Some(moved)) => match moved.in_store(camera) {
+                Some(in_store) => Some(in_store),
+                None => {
+                    return whole(
+                        "nothing tells every instance of the store by itself among the state's",
+                    );
+                }
+            },
+            (camera, _) => camera,
+        };
+        let own_ids = moved.is_none()
+            && told_ids.is_none()
+            && places
+                .ids
+                .iter()
+                .zip(&instances)
+                .all(|(id, inst)| id == &inst.settings_id);
+        if own_ids && !places.kept_under_their_ids() {
+            let unresolvable = namesakes(&records).is_some_and(|has_namesake| {
+                let mut stored_id_set: Option<AHashSet<&str>> = None;
+                has_namesake
+                    .iter()
+                    .enumerate()
+                    .any(|(index, &is_namesake)| {
+                        if !is_namesake || places.told_alone[index] {
+                            return false;
+                        }
+                        let id = places.ids[index].as_str();
+                        id.starts_with("debug:")
+                            || !stored_id_set
+                                .get_or_insert_with(|| {
+                                    instances.iter().map(|i| i.settings_id.as_str()).collect()
+                                })
+                                .contains(id)
+                    })
+            });
+            if unresolvable {
+                return whole("nothing tells every instance for the stored one at its place");
+            }
+        }
+        if records.len() >= 1_024 {
+            let mut probe_pairs: Vec<(usize, usize)> = records
+                .iter()
+                .enumerate()
+                .filter(|(index, record)| {
+                    record.parent_index.is_none() && now.viewport_camera != Some(*index)
+                })
+                .filter_map(|(index, _)| {
+                    let stored_idx = moved.as_ref().map_or(Some(index), |m| m.in_store(index))?;
+                    Some((index, stored_idx))
+                })
+                .collect();
+            if own_ids {
+                for index in 0..records.len().min(32) {
+                    if now.viewport_camera != Some(index)
+                        && !probe_pairs.iter().any(|&(o, _)| o == index)
+                    {
+                        probe_pairs.push((index, index));
+                    }
+                }
+            }
+            if !probe_pairs.is_empty() {
+                let stored_probe_indices: Vec<usize> =
+                    probe_pairs.iter().map(|&(_, s)| s).collect();
+                let budget = DecodeBudget::for_file(stored.len());
+                let scope = ConversionScope {
+                    lookup: &lookup,
+                    instance_count: records.len(),
+                    budget: &budget,
+                    string_ids: &SettingsStringIdMap::default(),
+                    wire_bytes: None,
+                };
+                let stored_probe_rows: AHashMap<usize, DecodedRowValues> =
+                    store.rows(&stored_probe_indices)?.into_iter().collect();
+                let mut root_differs = false;
+                let mut probed_renamed = false;
+                for &(obs_idx, stored_idx) in &probe_pairs {
+                    let Some(values) = stored_probe_rows.get(&stored_idx) else {
+                        continue;
+                    };
+                    let base = &instances[stored_idx];
+                    let mut stored_inst = SettingsBytecodeInstance {
+                        settings_id: base.settings_id.clone(),
+                        name: base.name.clone(),
+                        class_name: base.class_name.clone(),
+                        parent_index: base.parent_index,
+                        properties: values.properties.clone(),
+                        attributes: values.attributes.clone(),
+                    };
+                    if let Some(m) = moved.as_ref() {
+                        m.in_state_whole(&mut stored_inst);
+                    }
+                    let obs_inst =
+                        convert_chunk(state, std::slice::from_ref(&records[obs_idx]), scope)?
+                            .into_iter()
+                            .next()
+                            .context("Expected converted probed instance")?;
+                    let (stored_val, stored_uid) = document_row_digest(&stored_inst);
+                    let (obs_val, obs_uid) = document_row_digest(&obs_inst);
+                    if stored_val != obs_val {
+                        if records[obs_idx].parent_index.is_none() {
+                            root_differs = true;
+                            break;
+                        }
+                    } else if stored_uid != obs_uid {
+                        probed_renamed = true;
+                    }
+                }
+                if root_differs {
+                    return whole("a root differs");
+                }
+                if own_ids && probed_renamed {
+                    let in_place =
+                        told_alone_in_block_store(&store, &mut instances, state, &records, &lookup)
+                            .is_some_and(|(m, _)| {
+                                (0..records.len()).all(|i| m.in_store(i) == Some(i))
+                            });
+                    if !in_place {
+                        return whole(
+                            "nothing tells every instance for the stored one at its place",
+                        );
+                    }
+                }
+            }
+        }
+        let (stored_rows, captured_rows) = rayon::join(
+            || {
+                let _span = crate::app::profile::span("store instance digests");
+                store
+                    .row_digests_of_instances(instances, false, &[], camera, moved)
+                    .map(Some)
+            },
+            || document_row_digests(state, &records, &lookup, stored.len()),
+        );
+        (stored_rows?, captured_rows?)
+    } else {
+        let stored_rows =
             crate::settings::bytecode::property_edit::row_digests(stored, |instances| {
                 // Instances at other places than the state's, or more than
                 // one run apart, are paired each by itself.
@@ -293,11 +544,14 @@ pub(super) fn changed_document_rows(
                     (camera, _) => camera,
                 };
                 Some((camera, moved))
-            })
-        },
-        || document_row_digests(state, &records, &lookup, stored.len()),
-    );
-    let (Some(stored_rows), captured_rows) = (stored_rows?, captured_rows?) else {
+            })?;
+        let Some(stored_rows) = stored_rows else {
+            return whole("nothing tells every instance of the store by itself among the state's");
+        };
+        let captured_rows = document_row_digests(state, &records, &lookup, stored.len())?;
+        (Some(stored_rows), captured_rows)
+    };
+    let Some(stored_rows) = stored_rows else {
         return whole("nothing tells every instance of the store by itself among the state's");
     };
     let moved = stored_rows.moved;
@@ -305,7 +559,26 @@ pub(super) fn changed_document_rows(
     // Where the places alone do not say that each instance is the stored
     // one at its place, the alignment's own matching can.
     let file = stored;
+    let unresolvable_alone = namesakes(&records).is_some_and(|has_namesake| {
+        let mut stored_id_set: Option<AHashSet<&str>> = None;
+        has_namesake
+            .iter()
+            .enumerate()
+            .any(|(index, &is_namesake)| {
+                if !is_namesake || places.told_alone[index] {
+                    return false;
+                }
+                let id = places.ids[index].as_str();
+                id.starts_with("debug:")
+                    || !stored_id_set
+                        .get_or_insert_with(|| stored_rows.ids.iter().map(String::as_str).collect())
+                        .contains(id)
+            })
+    });
     let told_in_place = || {
+        if unresolvable_alone {
+            return false;
+        }
         let records = collect_service_settings_binary_instances(state);
         let lookup = build_settings_binary_instance_lookup(state, &records);
         told_alone(file, state, &records, &lookup).is_some_and(|(moved, _)| {
@@ -356,6 +629,295 @@ pub(super) fn changed_document_rows(
         changed_rows(state, now, rows, &changed, stored, store_gate)?
             .map(|alignment| (alignment, changed.is_empty() && !renamed && !paired)),
     )
+}
+
+/// Replaces stabilized `settingsId` references inside a saved viewport camera
+/// with dense 1-based `instanceIndex` references pointing into `aligned_ids`,
+/// and resolves any `held` handles so `blocks::encode_state` writes the exact
+/// bytes `encode_settings_bytecode_over` writes for that camera.
+fn prepare_camera_for_encode(
+    saved: &SettingsBytecodeInstance,
+    aligned_ids: &[String],
+    root_service: Option<&str>,
+) -> SettingsBytecodeInstance {
+    fn remap_refs(value: &mut Value, by_id: &AHashMap<&str, usize>, root_service: Option<&str>) {
+        match value {
+            Value::Object(map) => {
+                if map.get("_type").and_then(Value::as_str) == Some("Ref")
+                    && let Some(id) = map
+                        .get("settingsId")
+                        .or_else(|| map.get("instanceId"))
+                        .and_then(Value::as_str)
+                {
+                    let same_service = map
+                        .get("pathSegments")
+                        .and_then(Value::as_array)
+                        .and_then(|segs| segs.first())
+                        .and_then(Value::as_str)
+                        .is_none_or(|svc| root_service.is_none_or(|root| svc == root));
+                    if same_service && let Some(&obs_idx) = by_id.get(id) {
+                        map.clear();
+                        map.insert("_type".to_string(), Value::String("Ref".to_string()));
+                        map.insert("instanceIndex".to_string(), json!(obs_idx + 1));
+                        return;
+                    }
+                }
+                for child in map.values_mut() {
+                    remap_refs(child, by_id, root_service);
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    remap_refs(child, by_id, root_service);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut camera = saved.clone();
+    camera
+        .properties
+        .values_mut()
+        .for_each(crate::settings::held::resolve_all);
+    camera
+        .attributes
+        .values_mut()
+        .for_each(crate::settings::held::resolve_all);
+    let has_ref = camera
+        .properties
+        .values()
+        .chain(camera.attributes.values())
+        .any(crate::settings::equivalence::reconciliation_value_contains_reference);
+    if has_ref {
+        let by_id: AHashMap<&str, usize> = aligned_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .collect();
+        for value in camera.properties.values_mut() {
+            remap_refs(value, &by_id, root_service);
+        }
+        for value in camera.attributes.values_mut() {
+            remap_refs(value, &by_id, root_service);
+        }
+    }
+    camera
+}
+
+/// Streams a captured `ServiceState` in bounded batches into a compact
+/// representation for streamed alignment without allocating full documents.
+fn compact_captured_state(
+    state: &ServiceState,
+    records: &[SettingsBinaryInstance<'_>],
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+) -> Result<(crate::settings::equivalence::CompactDocument, Vec<String>)> {
+    use crate::settings::equivalence::{
+        CompactDocument, CompactRowMeta, compact_row, stabilize_instance_references,
+    };
+    const COMPACT_BATCH_ROWS: usize = 4_096;
+    const COMPACT_SUBCHUNK_ROWS: usize = 256;
+
+    let _span = crate::app::profile::span("captured store compact document");
+    let unlimited = DecodeBudget::new(usize::MAX);
+    let ids: Vec<String> = records
+        .iter()
+        .map(|record| Ok(bare_instance(record, &unlimited)?.settings_id))
+        .collect::<Result<Vec<_>>>()?;
+    let scope = ConversionScope {
+        lookup,
+        instance_count: records.len(),
+        budget: &unlimited,
+        string_ids: &SettingsStringIdMap::default(),
+        wire_bytes: None,
+    };
+    let count = records.len();
+    let mut instances = Vec::with_capacity(count);
+    let mut unique_ids: Vec<Option<Box<str>>> = Vec::with_capacity(count);
+    let mut meta: Vec<CompactRowMeta> = Vec::with_capacity(count);
+    let mut cameras: Vec<(usize, SettingsBytecodeInstance)> = Vec::new();
+
+    for (batch_idx, batch) in records.chunks(COMPACT_BATCH_ROWS).enumerate() {
+        let batch_base = batch_idx * COMPACT_BATCH_ROWS;
+        let subchunks: Vec<_> = batch
+            .par_chunks(COMPACT_SUBCHUNK_ROWS)
+            .enumerate()
+            .map(|(sub_idx, sub)| {
+                let sub_base = batch_base + sub_idx * COMPACT_SUBCHUNK_ROWS;
+                let mut converted = convert_chunk(state, sub, scope)?;
+                let mut local_uids = Vec::with_capacity(converted.len());
+                let mut local_meta = Vec::with_capacity(converted.len());
+                let mut local_cams = Vec::new();
+                for (offset, inst) in converted.iter_mut().enumerate() {
+                    stabilize_instance_references(inst, &ids);
+                    let (uid, row_meta, cam) = compact_row(inst);
+                    local_uids.push(uid);
+                    local_meta.push(row_meta);
+                    if let Some(cam) = cam {
+                        local_cams.push((sub_base + offset, cam));
+                    }
+                }
+                Ok((converted, local_uids, local_meta, local_cams))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (converted, local_uids, local_meta, local_cams) in subchunks {
+            instances.extend(converted);
+            unique_ids.extend(local_uids);
+            meta.extend(local_meta);
+            cameras.extend(local_cams);
+        }
+    }
+    validate_settings_hierarchy(&instances)?;
+    Ok((
+        CompactDocument {
+            document: SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances,
+            },
+            unique_ids,
+            meta,
+            cameras,
+        },
+        ids,
+    ))
+}
+
+fn hydrate_captured_rows(
+    state: &ServiceState,
+    records: &[SettingsBinaryInstance<'_>],
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    obs_ids: &[String],
+    rows: &[usize],
+) -> Result<Vec<(usize, SettingsBytecodeInstance)>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut sorted = rows.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let unlimited = DecodeBudget::new(usize::MAX);
+    let scope = ConversionScope {
+        lookup,
+        instance_count: records.len(),
+        budget: &unlimited,
+        string_ids: &SettingsStringIdMap::default(),
+        wire_bytes: None,
+    };
+    sorted
+        .par_chunks(64)
+        .map(|chunk| {
+            let batch: Vec<SettingsBinaryInstance<'_>> =
+                chunk.iter().map(|&row| records[row].clone()).collect();
+            let converted = convert_chunk(state, &batch, scope)?;
+            Ok(chunk
+                .iter()
+                .copied()
+                .zip(converted)
+                .map(|(row, mut inst)| {
+                    crate::settings::equivalence::stabilize_instance_references(&mut inst, obs_ids);
+                    (row, inst)
+                })
+                .collect::<Vec<_>>())
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.into_iter().flatten().collect())
+}
+
+pub(super) fn align_captured_store_streaming(
+    state: &ServiceState,
+    now: &PulledRows,
+    stored: &[u8],
+    store_gate: Option<&Mutex<()>>,
+    started: std::time::Instant,
+) -> Result<Option<(crate::settings::equivalence::PulledAlignment, bool)>> {
+    use crate::settings::equivalence::{PulledAlignment, StreamingAlignmentPlan};
+
+    if !blocks::is_block_store(stored) || !comparable_by_instance(state, now) {
+        return Ok(None);
+    }
+    let records = collect_service_settings_binary_instances(state);
+    if !written_where_they_stand(&records, now) {
+        return Ok(None);
+    }
+    let instance_count = records.len();
+    let lookup = build_settings_binary_instance_lookup(state, &records);
+    let root_service = lookup.root_service.clone();
+    let store = blocks::BlockStore::open(stored)?.holding();
+    let (ref_res, obs_res) = rayon::join(
+        || store.compact(),
+        || compact_captured_state(state, &records, &lookup),
+    );
+    let (ref_compact, ref_ids) = ref_res?;
+    let (obs_compact, obs_ids) = obs_res?;
+    let ref_bare: Vec<SettingsBytecodeInstance> = ref_compact
+        .document
+        .instances
+        .iter()
+        .map(SettingsBytecodeInstance::bare)
+        .collect();
+    let hydrate_ref = |rows: &[usize]| store.hydrate_rows(&ref_bare, &ref_ids, rows);
+    let hydrate_obs =
+        |rows: &[usize]| hydrate_captured_rows(state, &records, &lookup, &obs_ids, rows);
+    let plan = crate::settings::equivalence::plan_captured_store_streaming(
+        ref_compact,
+        obs_compact,
+        &hydrate_ref,
+        &hydrate_obs,
+        started,
+    )?;
+    drop((ref_bare, ref_ids, obs_ids, store, lookup, records));
+
+    match plan {
+        StreamingAlignmentPlan::Equivalent {
+            stored_as_observed,
+            answer_follows_camera,
+        } => Ok(Some((
+            PulledAlignment {
+                alignment: SettingsAlignment::Equivalent,
+                stored_as_observed,
+            },
+            answer_follows_camera,
+        ))),
+        StreamingAlignmentPlan::Changed {
+            aligned_ids,
+            kept_camera,
+            stored_as_observed,
+            answer_follows_camera,
+        } => {
+            let encode_started = std::time::Instant::now();
+            let _store_guard = store_gate.map(LockRecover::lock_recover);
+            let records = collect_service_settings_binary_instances(state);
+            let aligned_records = under_stored_ids(records, &aligned_ids);
+            let aligned_lookup = build_settings_binary_instance_lookup(state, &aligned_records);
+            let prepared_camera = kept_camera.map(|(idx, saved)| {
+                (
+                    idx,
+                    prepare_camera_for_encode(&saved, &aligned_ids, root_service.as_deref()),
+                )
+            });
+            let replaced = prepared_camera.as_ref().map(|(idx, cam)| ReplacedRow {
+                source_index: *idx,
+                instance: cam,
+            });
+            let aligned = blocks::encode_state(
+                state,
+                (&aligned_records, &aligned_lookup),
+                replaced,
+                Some(stored),
+            )?;
+            crate::app::profile::record(
+                &format!("settings alignment of {instance_count} instances: encode"),
+                encode_started,
+            );
+            Ok(Some((
+                PulledAlignment {
+                    alignment: SettingsAlignment::Changed(aligned),
+                    stored_as_observed,
+                },
+                answer_follows_camera,
+            )))
+        }
+    }
 }
 
 /// A stored file and, where a caller read the two documents already, what
@@ -815,10 +1377,54 @@ fn changed_rows<'a>(
         }
         stored_rows
     };
-    let mut batches = rows
+    let stored_at_index = |index: usize| moved.map_or(Some(index), |moved| moved.in_store(index));
+    let mut told_in_place_cached: Option<bool> = None;
+    let mut check_told_in_place = || {
+        if moved.is_some() {
+            return false;
+        }
+        *told_in_place_cached.get_or_insert_with(told_in_place)
+    };
+    let precheck_other_ids_namesakes = if !paired
+        && moved.is_none()
+        && let Some(read) = read.as_ref()
+    {
+        let own = places.ids == read.ids;
+        if own {
+            if (read.renamed || !places.kept_under_their_ids()) && !check_told_in_place() {
+                return whole("nothing tells every instance for the stored one at its place");
+            }
+            None
+        } else {
+            let can_keep_other = !read.renamed && places.kept_under_other_ids(&read.ids);
+            if can_keep_other {
+                None
+            } else {
+                let namesakes_vec = places
+                    .stored_identities_stand(&read.ids, read, stored_at_index)
+                    .then(|| namesakes(&records))
+                    .flatten();
+                if namesakes_vec.is_none() && !check_told_in_place() {
+                    return whole("nothing tells every instance for the stored one at its place");
+                }
+                namesakes_vec
+            }
+        }
+    } else {
+        None
+    };
+    let first_batch_len = if precheck_other_ids_namesakes.is_some() && changed.len() > 256 {
+        64.min(COMPARED_AT_ONCE)
+    } else {
+        COMPARED_AT_ONCE
+    };
+    let (first_rows, rest_rows) = rows.split_at(rows.len().min(first_batch_len));
+    let (first_stored_at, rest_stored_at) =
+        stored_at.split_at(stored_at.len().min(first_batch_len));
+    let first = (!first_rows.is_empty()).then_some((first_rows, first_stored_at));
+    let batches = rest_rows
         .chunks(COMPARED_AT_ONCE)
-        .zip(stored_at.chunks(COMPARED_AT_ONCE));
-    let first = batches.next();
+        .zip(rest_stored_at.chunks(COMPARED_AT_ONCE));
     // The store's instances are read once for all the batches.
     let mut stored_batches = None;
     let (first_stored, ids) = match (&mut read, first) {
@@ -858,11 +1464,14 @@ fn changed_rows<'a>(
     // for each changed instance whether its values are the stored ones as a
     // pull counts them.
     let mut pairs = Vec::with_capacity(rows.len() + 1);
-    let mut compared = Vec::with_capacity(changed.len());
+    let mut same_values = Vec::with_capacity(changed.len());
+    let mut same_under_todays_names = true;
     let mut last = None;
-    let mut compare = |rows: &[usize], mut stored_rows: Vec<SettingsBytecodeInstance>| {
+    let mut compare_batch = |batch_rows: &[usize],
+                             mut stored_rows: Vec<SettingsBytecodeInstance>|
+     -> Result<Option<&'static str>> {
         let converted = crate::app::profile::span("changed rows converted");
-        let mut captured_rows = rows
+        let mut captured_rows = batch_rows
             .par_iter()
             .map(|row| convert_chunk(state, std::slice::from_ref(&records[*row]), scope))
             .collect::<Result<Vec<_>>>()?
@@ -871,7 +1480,8 @@ fn changed_rows<'a>(
             .collect::<Vec<_>>();
         drop(converted);
         let _span = crate::app::profile::span("changed rows compared");
-        let unchanged = changed.len().saturating_sub(compared.len());
+        let base_pair = pairs.len();
+        let unchanged = changed.len().saturating_sub(same_values.len());
         let (said, values): (Vec<_>, Vec<_>) = stored_rows
             .par_iter()
             .zip(captured_rows.par_iter())
@@ -898,33 +1508,69 @@ fn changed_rows<'a>(
                 (pair, values)
             })
             .unzip();
-        pairs.extend(said);
-        compared.extend(values.into_iter().flatten());
         last = stored_rows.pop().zip(captured_rows.pop());
-        anyhow::Ok(())
+        for (offset, pair) in said.iter().enumerate() {
+            let index = base_pair + offset;
+            if !(pair.placed || paired && index < changed.len() && pair.same_class) {
+                return Ok(Some(
+                    "an instance stands under another name, class or parent than the stored one",
+                ));
+            }
+            if !pair.written_as_today {
+                return Ok(Some(
+                    "a stored instance is written another way than documents are today",
+                ));
+            }
+        }
+        let batch_changed = values.len().min(unchanged);
+        let mut stand_failed = false;
+        for (offset, (compared, pair)) in values
+            .into_iter()
+            .flatten()
+            .zip(said.iter().take(batch_changed))
+            .enumerate()
+        {
+            match compared? {
+                Some((as_held, as_named)) => {
+                    let same = as_held && pair.placed;
+                    same_values.push(same);
+                    same_under_todays_names &= as_named && pair.placed;
+                    if let Some(namesakes_vec) = precheck_other_ids_namesakes.as_ref() {
+                        let row = batch_rows[offset];
+                        if !same && (namesakes_vec[row] || pair.holds_reference) {
+                            stand_failed = true;
+                        }
+                    }
+                }
+                None => return Ok(Some("an enum item of a changed instance gains its type")),
+            }
+        }
+        pairs.extend(said);
+        if stand_failed && !check_told_in_place() {
+            return Ok(Some(
+                "nothing tells every instance for the stored one at its place",
+            ));
+        }
+        Ok(None)
     };
-    compare(first.map_or(&[], |(rows, _)| rows), first_stored)?;
-    for (rows, stored_at) in batches {
-        let stored_batches = stored_batches.as_ref().context("No store was opened")?;
-        compare(rows, in_state(stored_batches.read(stored_at)?))?;
+    if let Some(why) = compare_batch(first.map_or(&[], |(rows, _)| rows), first_stored)? {
+        return whole(why);
     }
-    if let (Some(camera), Some(row)) = (camera, now.viewport_camera) {
-        compare(&[row], vec![camera])?;
+    for (batch_rows, batch_stored_at) in batches {
+        let stored_batches = stored_batches.as_ref().context("No store was opened")?;
+        if let Some(why) =
+            compare_batch(batch_rows, in_state(stored_batches.read(batch_stored_at)?))?
+        {
+            return whole(why);
+        }
+    }
+    if let (Some(camera), Some(row)) = (camera, now.viewport_camera)
+        && let Some(why) = compare_batch(&[row], vec![camera])?
+    {
+        return whole(why);
     }
     // The camera's pair alone is held past its comparison.
     let camera_pair = last.filter(|_| now.viewport_camera.is_some());
-    // Each pair is one instance in one place: an instance under another
-    // name, class or parent is matched by the alignment.
-    // Paired each by itself, a changed instance is the stored one under
-    // whatever name and parent. The camera's pair is compared for its
-    // values alone, so it has to stand as the stored one does.
-    if pairs
-        .iter()
-        .enumerate()
-        .any(|(index, pair)| !(pair.placed || paired && index < changed.len() && pair.same_class))
-    {
-        return whole("an instance stands under another name, class or parent than the stored one");
-    }
     // A stored camera whose enum items can gain their types makes the answer
     // follow the captured camera, which no digest covers.
     if camera_pair
@@ -933,27 +1579,10 @@ fn changed_rows<'a>(
     {
         return whole("the stored viewport camera holds an enum item without its type");
     }
-    // A stored instance the encoder of documents would write another way
-    // (an older store's) is compared and kept by the alignment.
-    if pairs.iter().any(|pair| !pair.written_as_today) {
-        return whole("a stored instance is written another way than documents are today");
-    }
-    let compared = compared.into_iter().collect::<Result<Vec<_>>>()?;
-    let mut same_values = Vec::with_capacity(changed.len());
-    let mut same_under_todays_names = true;
-    for (compared, pair) in compared.into_iter().zip(&pairs) {
-        match compared {
-            Some((as_held, as_named)) => {
-                same_values.push(as_held && pair.placed);
-                same_under_todays_names &= as_named && pair.placed;
-            }
-            None => return whole("an enum item of a changed instance gains its type"),
-        }
-    }
     let changed_pairs = || pairs.iter().take(changed.len());
     let renamed = read.as_ref().is_some_and(|read| read.renamed)
         || changed_pairs().any(|pair| !pair.same_unique_id);
-    let stored_at = |index: usize| moved.map_or(Some(index), |moved| moved.in_store(index));
+    let stored_at = stored_at_index;
     let camera_holds_a_reference = camera_pair
         .as_ref()
         .is_some_and(|(stored, _)| holds_a_reference(stored));
@@ -998,18 +1627,29 @@ fn changed_rows<'a>(
         // it tells each instance by itself, which takes the stored UniqueIds.
         let stand_as_stored = read.as_ref().is_some_and(|read| {
             places.stored_identities_stand(&ids, read, stored_at)
-                && namesakes(&records).is_some_and(|namesakes| {
-                    changed_pairs()
-                        .zip(changed)
-                        .zip(&same_values)
-                        .all(|((pair, row), same)| {
-                            *same || !namesakes[*row] && !pair.holds_reference
+                && precheck_other_ids_namesakes.as_ref().map_or_else(
+                    || {
+                        namesakes(&records).is_some_and(|namesakes| {
+                            changed_pairs().zip(changed).zip(&same_values).all(
+                                |((pair, row), same)| {
+                                    *same || !namesakes[*row] && !pair.holds_reference
+                                },
+                            )
                         })
-                })
+                    },
+                    |namesakes| {
+                        changed_pairs()
+                            .zip(changed)
+                            .zip(&same_values)
+                            .all(|((pair, row), same)| {
+                                *same || !namesakes[*row] && !pair.holds_reference
+                            })
+                    },
+                )
         });
         stand_as_stored || !renamed && places.kept_under_other_ids(&ids)
     };
-    if !(kept || moved.is_none() && told_in_place()) {
+    if !(kept || check_told_in_place()) {
         return whole("nothing tells every instance for the stored one at its place");
     }
     // The alignment puts the stored camera back before it compares anything
@@ -1660,12 +2300,12 @@ fn convert_prepared(
     state: &ServiceState,
     records: &[SettingsBinaryInstance<'_>],
     lookup: &SettingsBinaryInstanceLookup<'_>,
-    collected: &SettingsBinaryCollection<'_>,
+    summary: &SettingsBinarySummary<'_>,
     budget: &DecodeBudget,
 ) -> Result<SettingsBytecode> {
     let document = SettingsBytecode {
         version: SETTINGS_BINARY_VERSION,
-        instances: convert_prepared_each(state, records, lookup, collected, budget, |instance| {
+        instances: convert_prepared_each(state, records, lookup, summary, budget, |instance| {
             instance
         })?,
     };
@@ -1679,12 +2319,12 @@ fn convert_prepared_each<T: Send>(
     state: &ServiceState,
     records: &[SettingsBinaryInstance<'_>],
     lookup: &SettingsBinaryInstanceLookup<'_>,
-    collected: &SettingsBinaryCollection<'_>,
+    summary: &SettingsBinarySummary<'_>,
     budget: &DecodeBudget,
     keep: impl Fn(SettingsBytecodeInstance) -> T + Sync,
 ) -> Result<Vec<T>> {
     let _span = crate::app::profile::span("captured store validated conversion");
-    let strings = collected
+    let strings = summary
         .string_counts
         .keys()
         .map(|text| Cow::Borrowed(text.as_ref()))
@@ -1695,7 +2335,7 @@ fn convert_prepared_each<T: Send>(
         .collect();
     let wire_bytes = AtomicUsize::new(validate_header(
         records,
-        collected,
+        summary,
         &strings,
         &string_ids,
         budget,
@@ -1764,7 +2404,7 @@ impl Write for SizeWriter {
 
 fn validate_header(
     records: &[SettingsBinaryInstance<'_>],
-    collected: &SettingsBinaryCollection<'_>,
+    summary: &SettingsBinarySummary<'_>,
     strings: &[SettingsString<'_>],
     string_ids: &SettingsStringIdMap<'_>,
     budget: &DecodeBudget,
@@ -1774,12 +2414,12 @@ fn validate_header(
     for text in strings {
         check_settings_string_len(text.len())?;
     }
-    let classes = collected
+    let classes = summary
         .class_counts
         .keys()
         .map(|text| Cow::Borrowed(text.as_ref()))
         .collect::<Vec<_>>();
-    let properties = collected
+    let properties = summary
         .property_counts
         .keys()
         .map(|text| Cow::Borrowed(text.as_ref()))
@@ -1791,7 +2431,7 @@ fn validate_header(
     }
     checked_settings_collection_len(records.len(), "instance count")?;
     budget.instances(records.len())?;
-    checked_settings_collection_len(collected.property_groups.len(), "property group count")?;
+    checked_settings_collection_len(summary.property_group_counts.len(), "property group count")?;
     let mut size = SizeWriter::default();
     write_settings_binary_header(
         &mut size,
@@ -1807,20 +2447,23 @@ fn validate_header(
         write_binary_string_id(&mut size, string_ids, record.class_name)?;
         write_var_u64(&mut size, encode_parent_index(record.parent_index, index)?)?;
     }
-    write_var_u64(&mut size, collected.property_groups.len() as u64)?;
-    for ((name, kind), values) in &collected.property_groups {
-        checked_settings_collection_len(values.len(), "property value count")?;
+    write_var_u64(&mut size, summary.property_group_counts.len() as u64)?;
+    for ((name, kind), &count) in &summary.property_group_counts {
+        checked_settings_collection_len(count, "property value count")?;
         if *kind == 16 {
             // A rotation table cannot contain more rotations than its values.
             // If that bound fails, the wire path checks the chosen table.
-            checked_cframe_rotation_count(values.len())?;
+            checked_cframe_rotation_count(count)?;
         }
         if !SETTINGS_RECORD_FIELDS.contains(name) {
-            budget.property_group(values.len(), name, *kind)?;
+            budget.property_group(count, name, *kind)?;
         }
         // Group header: property id, kind, count, byte length. All varints
         // fit ten bytes. A CFrame table is chosen only when smaller than inline.
         size.0 = size.0.saturating_add(31 + usize::from(*kind == 16));
+    }
+    if summary.copied_string_bytes > budget.remaining.load(Ordering::Relaxed) {
+        bail!("Settings bytecode decodes to more memory than a file of its size may take");
     }
     Ok(size.0)
 }
@@ -1834,6 +2477,8 @@ fn convert_chunk<'a>(
     let mut scratch = Vec::new();
     let mut wire = SizeWriter::default();
     let (mut table, mut groups) = (SettingsStringCounts::default(), AHashSet::new());
+    let mut seen_wire_shared = AHashSet::<usize>::new();
+    let mut held_shared_cache = AHashMap::<usize, Option<u64>>::new();
     let mut instances = Vec::with_capacity(records.len());
     for record in records {
         let mut instance = bare_instance(record, scope.budget)?;
@@ -1842,19 +2487,37 @@ fn convert_chunk<'a>(
             // ids. Instance/ref deltas also fit ten bytes, independent of order.
             if scope.wire_bytes.is_some() {
                 wire.0 = wire.0.saturating_add(10);
-                if kind == 17 {
-                    wire.0 = wire.0.saturating_add(10);
+                let shared = match &source {
+                    SettingsBinaryValueSource::Property(value) if kind == 8 => {
+                        shared_string_payload_text(value)
+                            .map(|text| (*value as *const Value as usize, text))
+                    }
+                    _ => None,
+                };
+                if let Some((ptr, text)) = shared {
+                    wire.0 = wire.0.saturating_add(43);
+                    add_count(&mut table, name);
+                    if seen_wire_shared.insert(ptr) {
+                        add_count(&mut table, "_type");
+                        add_count(&mut table, "SharedString");
+                        add_count(&mut table, "base64");
+                        add_count(&mut table, text);
+                    }
                 } else {
-                    write_binary_source_payload(
-                        &source,
-                        kind,
-                        scope.string_ids,
-                        scope.lookup,
-                        &mut wire,
-                    )?;
+                    if kind == 17 {
+                        wire.0 = wire.0.saturating_add(10);
+                    } else {
+                        write_binary_source_payload(
+                            &source,
+                            kind,
+                            scope.string_ids,
+                            scope.lookup,
+                            &mut wire,
+                        )?;
+                    }
+                    add_count(&mut table, name);
+                    collect_binary_source_strings(&source, scope.lookup, &mut table)?;
                 }
-                add_count(&mut table, name);
-                collect_binary_source_strings(&source, scope.lookup, &mut table)?;
                 groups.insert((name, kind));
             }
             // A decoder discards these columns, including native capture fields.
@@ -1880,6 +2543,27 @@ fn convert_chunk<'a>(
                     bail!("Expected decoded attributes");
                 };
                 instance.attributes = attributes;
+            } else if kind == 8
+                && let SettingsBinaryValueSource::Property(value) = &source
+                && let Some(text) = shared_string_payload_text(value)
+            {
+                check_settings_string_len(text.len())?;
+                scope.budget.take(
+                    2 * VALUE_SLOT_BYTES
+                        + "_type".len()
+                        + "SharedString".len()
+                        + "base64".len()
+                        + text.len(),
+                )?;
+                let ptr = *value as *const Value as usize;
+                let held_id = *held_shared_cache
+                    .entry(ptr)
+                    .or_insert_with(|| crate::settings::held::held_shared_string_id(text));
+                let stored = match held_id {
+                    Some(id) => crate::settings::held::handle_value(id),
+                    None => Value::clone(value),
+                };
+                instance.properties.insert(name.to_string(), stored);
             } else {
                 let value = normalize_source(&source, kind, scope, &mut scratch)?;
                 instance
@@ -1977,6 +2661,20 @@ fn property_value(
                 )?),
             )],
         )),
+        NESTED_ENUM_ITEM_KIND => {
+            let (enum_type, name) =
+                nested_enum_item(value).context("Expected nested enum binary settings value")?;
+            Ok(typed_object(
+                "EnumItem",
+                [
+                    (
+                        "enumType",
+                        Value::String(checked_string(enum_type, scope.budget)?),
+                    ),
+                    ("name", Value::String(checked_string(name, scope.budget)?)),
+                ],
+            ))
+        }
         9 | 21 => {
             let values = value
                 .as_array()
@@ -2125,11 +2823,7 @@ fn normalize_complex(
         .collect();
     scratch.clear();
     write_binary_source_payload(source, kind, &ids, scope.lookup, scratch)?;
-    let scope = ValueScope {
-        strings: &strings,
-        instance_count: scope.instance_count,
-        budget: scope.budget,
-    };
+    let scope = ValueScope::from_owned(&strings, scope.instance_count, scope.budget);
     let mut reader = BytecodeReader::new(scratch);
     let value = if attributes {
         Value::Object(decode_attributes_payload(&mut reader, scope)?)

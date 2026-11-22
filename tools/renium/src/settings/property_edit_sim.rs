@@ -200,11 +200,7 @@ fn property_edits_preserve_eager_encoder_bytes() {
                 let value = decode_raw_value_payload(
                     &mut BytecodeReader::new(&bytes),
                     kind,
-                    ValueScope {
-                        strings: &[],
-                        instance_count: count,
-                        budget: &budget,
-                    },
+                    ValueScope::from_owned(&[], count, &budget),
                     0,
                 )
                 .unwrap();

@@ -192,6 +192,18 @@ pub(crate) fn pulled_digest_from_service_state(state: &ServiceState) -> Result<P
     captured::pulled_digest(state)
 }
 
+/// Streamed whole-document alignment over a v12 block store and a captured
+/// `ServiceState` without materializing full documents in memory.
+pub(crate) fn pull_align_captured_store_streaming(
+    state: &ServiceState,
+    now: &PulledRows,
+    stored: &[u8],
+    store_gate: Option<&Mutex<()>>,
+    started: std::time::Instant,
+) -> Result<Option<(crate::settings::equivalence::PulledAlignment, bool)>> {
+    captured::align_captured_store_streaming(state, now, stored, store_gate, started)
+}
+
 const SETTINGS_BINARY_MAGIC: &[u8] = b"RBSSET\0";
 const SETTINGS_BINARY_MIN_VERSION: u8 = 10;
 /// The last version of a store in one frame (see `blocks` for the version
@@ -922,11 +934,7 @@ fn decode_settings_bytecode_payload(
     } = decode_settings_payload_header(reader, budget)?;
 
     let specs = read_settings_property_groups(reader, &properties)?;
-    let scope = ValueScope {
-        strings: &strings,
-        instance_count,
-        budget,
-    };
+    let scope = ValueScope::from_owned(&strings, instance_count, budget);
     let groups_span = crate::app::profile::span("store property columns decode");
     let decoded_groups = specs
         .par_iter()
@@ -1184,20 +1192,81 @@ fn apply_decoded_property_groups_in_range<T: DecodedPropertyTarget>(
     decoded_groups.into_par_iter().for_each(drop);
 }
 
+/// String table borrowed by `ValueScope`: either v11's owned `Vec<String>` or
+/// a v12 block's zero-copy `&[&str]` borrowing directly from the pool frames.
+#[derive(Clone, Copy)]
+enum ScopeStrings<'a> {
+    Owned(&'a [String]),
+    Borrowed(&'a [&'a str]),
+}
+
+impl<'a> ScopeStrings<'a> {
+    #[inline]
+    fn get(self, index: usize) -> Option<&'a str> {
+        match self {
+            Self::Owned(strings) => strings.get(index).map(String::as_str),
+            Self::Borrowed(strings) => strings.get(index).copied(),
+        }
+    }
+}
+
 /// What a value needs from its document: the string table, the instance
 /// count its indices must stay under, and the document's memory budget.
 #[derive(Clone, Copy)]
 struct ValueScope<'a> {
-    strings: &'a [String],
+    strings: ScopeStrings<'a>,
     instance_count: usize,
     budget: &'a DecodeBudget,
+    /// Optional per-block cache mapping a string-table index to its `held`
+    /// payload id (`u64::MAX` while uncached), avoiding repeated hashing and
+    /// lock lookups when hundreds of instances in one block share a payload.
+    held_ids: Option<&'a [std::sync::atomic::AtomicU64]>,
 }
 
-impl ValueScope<'_> {
+impl<'a> ValueScope<'a> {
+    fn from_owned(strings: &'a [String], instance_count: usize, budget: &'a DecodeBudget) -> Self {
+        Self {
+            strings: ScopeStrings::Owned(strings),
+            instance_count,
+            budget,
+            held_ids: None,
+        }
+    }
+
+    fn from_borrowed(
+        strings: &'a [&'a str],
+        instance_count: usize,
+        budget: &'a DecodeBudget,
+        held_ids: Option<&'a [std::sync::atomic::AtomicU64]>,
+    ) -> Self {
+        Self {
+            strings: ScopeStrings::Borrowed(strings),
+            instance_count,
+            budget,
+            held_ids,
+        }
+    }
+
+    /// The raw `&str` for the next string id in `reader`, without copying.
+    #[inline]
+    fn read_str_with_id(
+        &self,
+        reader: &mut BytecodeReader<'_>,
+        label: &str,
+    ) -> Result<(usize, &'a str)> {
+        let id = reader.read_len(label)?;
+        let text = self
+            .strings
+            .get(id)
+            .with_context(|| format!("Invalid {label} {id}"))?;
+        Ok((id, text))
+    }
+
     /// A copy of the string the next id names, charged to the budget: the
     /// table holds a string once, and every use of it is a copy.
     fn string(&self, reader: &mut BytecodeReader<'_>, label: &str) -> Result<String> {
-        self.budget.copied(reader.read_string(self.strings, label)?)
+        let (_, text) = self.read_str_with_id(reader, label)?;
+        self.budget.copied(text)
     }
 }
 
@@ -2297,6 +2366,13 @@ fn decode_object_payload(
     scope
         .budget
         .take(field_count.saturating_mul(VALUE_SLOT_BYTES))?;
+    if depth == 0 && scope.budget.holds_payloads && field_count == 2 {
+        let start = reader.position();
+        if let Some(handle) = try_decode_held_shared_string(reader, scope)? {
+            return Ok(handle);
+        }
+        reader.cursor.set_position(start as u64);
+    }
     let mut out = Map::new();
     for _ in 0..field_count {
         let key = scope.string(reader, "object key string id")?;
@@ -2308,6 +2384,67 @@ fn decode_object_payload(
         bail!("Settings bytecode holds the handle of a payload in place of the payload");
     }
     Ok(Value::Object(out))
+}
+
+fn try_decode_held_shared_string(
+    reader: &mut BytecodeReader<'_>,
+    scope: ValueScope<'_>,
+) -> Result<Option<Value>> {
+    let Ok((_, k1)) = scope.read_str_with_id(reader, "object key string id") else {
+        return Ok(None);
+    };
+    let Ok(kind1) = reader.read_u8() else {
+        return Ok(None);
+    };
+    if kind1 != 6 {
+        return Ok(None);
+    }
+    let Ok((v1_id, v1)) = scope.read_str_with_id(reader, "value string id") else {
+        return Ok(None);
+    };
+    let Ok((_, k2)) = scope.read_str_with_id(reader, "object key string id") else {
+        return Ok(None);
+    };
+    let Ok(kind2) = reader.read_u8() else {
+        return Ok(None);
+    };
+    if kind2 != 6 {
+        return Ok(None);
+    }
+    let Ok((v2_id, v2)) = scope.read_str_with_id(reader, "value string id") else {
+        return Ok(None);
+    };
+    let (base64_id, base64_text) = if k1 == "_type" && v1 == "SharedString" && k2 == "base64" {
+        (v2_id, v2)
+    } else if k2 == "_type" && v2 == "SharedString" && k1 == "base64" {
+        (v1_id, v1)
+    } else {
+        return Ok(None);
+    };
+    let cached = scope
+        .held_ids
+        .and_then(|cache| cache.get(base64_id))
+        .map(|slot| slot.load(Ordering::Relaxed))
+        .filter(|&id| id != u64::MAX);
+    let held_id = match cached {
+        Some(id) => id,
+        None => {
+            let Some(id) = crate::settings::held::held_shared_string_id(base64_text) else {
+                return Ok(None);
+            };
+            if let Some(slot) = scope.held_ids.and_then(|cache| cache.get(base64_id)) {
+                slot.store(id, Ordering::Relaxed);
+            }
+            id
+        }
+    };
+    let charged = k1
+        .len()
+        .saturating_add(v1.len())
+        .saturating_add(k2.len())
+        .saturating_add(v2.len());
+    scope.budget.take(charged)?;
+    Ok(Some(crate::settings::held::handle_value(held_id)))
 }
 
 fn decode_attributes_payload(
@@ -2603,6 +2740,7 @@ type SettingsPropertyGroups<'a> = AHashMap<(&'a str, u8), Vec<SettingsBinaryValu
 type SettingsStringIdMap<'a> = AHashMap<&'a str, u64>;
 type SettingsIndexMap<K> = AHashMap<K, usize>;
 
+#[derive(Clone)]
 struct SettingsBinaryInstance<'a> {
     source_index: usize,
     settings_id: SettingsBinaryId<'a>,
@@ -2611,6 +2749,7 @@ struct SettingsBinaryInstance<'a> {
     parent_index: Option<usize>,
 }
 
+#[derive(Clone)]
 enum SettingsBinaryId<'a> {
     Text(SettingsString<'a>),
     NumericDebug(u64),
@@ -2633,6 +2772,165 @@ struct CFrameRotationTable {
 struct CFrameTableValue {
     position: [u32; 3],
     rotation_index: usize,
+}
+
+#[derive(Default)]
+struct SettingsBinarySummary<'a> {
+    string_counts: SettingsStringCounts<'a>,
+    class_counts: SettingsStringCounts<'a>,
+    property_counts: SettingsStringCounts<'a>,
+    property_group_counts: AHashMap<(&'a str, u8), usize>,
+    /// Lower bound on string bytes that `convert_chunk` unconditionally copies
+    /// onto the decode budget, allowing `validate_header` to fail before
+    /// allocating chunks when the file-0 budget cannot cover them.
+    copied_string_bytes: usize,
+}
+
+fn shared_string_payload_text(value: &Value) -> Option<&str> {
+    let object = value.as_object()?;
+    if object.len() != 2 || object.get("_type")?.as_str()? != "SharedString" {
+        return None;
+    }
+    object.get("base64")?.as_str()
+}
+
+fn collect_settings_binary_summary_chunk<'a>(
+    state: &'a ServiceState,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    instances: &'a [SettingsBinaryInstance<'a>],
+) -> Result<SettingsBinarySummary<'a>> {
+    let mut out = SettingsBinarySummary::default();
+    let mut seen_shared_ptrs = AHashSet::<usize>::new();
+    for record in instances {
+        if let SettingsBinaryId::Text(settings_id) = &record.settings_id {
+            add_count(&mut out.string_counts, settings_id.as_ref());
+            out.copied_string_bytes = out.copied_string_bytes.saturating_add(settings_id.len());
+        } else if let SettingsBinaryId::NumericDebug(id) = &record.settings_id {
+            let digits = id.checked_ilog10().unwrap_or(0) as usize + 1;
+            out.copied_string_bytes = out.copied_string_bytes.saturating_add(8 + digits);
+        }
+        add_count(&mut out.string_counts, record.name);
+        add_count(&mut out.string_counts, record.class_name);
+        add_count(&mut out.class_counts, record.class_name);
+        out.copied_string_bytes = out
+            .copied_string_bytes
+            .saturating_add(record.name.len())
+            .saturating_add(record.class_name.len());
+        visit_settings_binary_properties(state, record, lookup, |name, kind, source| {
+            add_count(&mut out.string_counts, name);
+            add_count(&mut out.property_counts, name);
+            let shared_text = match &source {
+                SettingsBinaryValueSource::Property(value) if kind == 8 => {
+                    shared_string_payload_text(value)
+                        .map(|text| (*value as *const Value as usize, text))
+                }
+                _ => None,
+            };
+            if let Some((ptr, text)) = shared_text {
+                if seen_shared_ptrs.insert(ptr) {
+                    add_count(&mut out.string_counts, "_type");
+                    add_count(&mut out.string_counts, "SharedString");
+                    add_count(&mut out.string_counts, "base64");
+                    add_count(&mut out.string_counts, text);
+                }
+                if !SETTINGS_RECORD_FIELDS.contains(&name) {
+                    out.copied_string_bytes = out.copied_string_bytes.saturating_add(
+                        2 * VALUE_SLOT_BYTES
+                            + "_type".len()
+                            + "SharedString".len()
+                            + "base64".len()
+                            + text.len(),
+                    );
+                }
+            } else {
+                collect_binary_source_strings(&source, lookup, &mut out.string_counts)?;
+            }
+            *out.property_group_counts.entry((name, kind)).or_default() += 1;
+            if !SETTINGS_RECORD_FIELDS.contains(&name) && shared_text.is_none() {
+                match &source {
+                    SettingsBinaryValueSource::Native(
+                        NativeSettingsValue::String(text) | NativeSettingsValue::Enum(text),
+                    ) => {
+                        out.copied_string_bytes =
+                            out.copied_string_bytes.saturating_add(text.len());
+                    }
+                    SettingsBinaryValueSource::Property(value) if matches!(kind, 6 | 19) => {
+                        if let Some(text) = raw_string_payload(value) {
+                            out.copied_string_bytes =
+                                out.copied_string_bytes.saturating_add(text.len());
+                        }
+                    }
+                    SettingsBinaryValueSource::Settled(value) if matches!(kind, 6 | 19) => {
+                        if let Some(text) = raw_string_payload(value) {
+                            out.copied_string_bytes =
+                                out.copied_string_bytes.saturating_add(text.len());
+                        }
+                    }
+                    SettingsBinaryValueSource::Property(value) if kind == NESTED_ENUM_ITEM_KIND => {
+                        if let Some((enum_type, name)) = nested_enum_item(value) {
+                            out.copied_string_bytes = out
+                                .copied_string_bytes
+                                .saturating_add(enum_type.len())
+                                .saturating_add(name.len());
+                        }
+                    }
+                    SettingsBinaryValueSource::Settled(value) if kind == NESTED_ENUM_ITEM_KIND => {
+                        if let Some((enum_type, name)) = nested_enum_item(value) {
+                            out.copied_string_bytes = out
+                                .copied_string_bytes
+                                .saturating_add(enum_type.len())
+                                .saturating_add(name.len());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        })?;
+    }
+    Ok(out)
+}
+
+fn merge_settings_binary_summary<'a>(
+    target: &mut SettingsBinarySummary<'a>,
+    source: SettingsBinarySummary<'a>,
+) {
+    for (text, count) in source.string_counts {
+        add_count_key(&mut target.string_counts, text, count);
+    }
+    for (text, count) in source.class_counts {
+        add_count_key(&mut target.class_counts, text, count);
+    }
+    for (text, count) in source.property_counts {
+        add_count_key(&mut target.property_counts, text, count);
+    }
+    for (key, count) in source.property_group_counts {
+        *target.property_group_counts.entry(key).or_default() += count;
+    }
+    target.copied_string_bytes = target
+        .copied_string_bytes
+        .saturating_add(source.copied_string_bytes);
+}
+
+fn collect_settings_binary_summary<'a>(
+    state: &'a ServiceState,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    instances: &'a [SettingsBinaryInstance<'a>],
+) -> Result<SettingsBinarySummary<'a>> {
+    let _span = crate::app::profile::span("captured store columns collect");
+    if instances.len() < SETTINGS_BINARY_PARALLEL_MIN_INSTANCES || rayon::current_num_threads() <= 1
+    {
+        return collect_settings_binary_summary_chunk(state, lookup, instances);
+    }
+    let partials = instances
+        .par_chunks(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE)
+        .map(|records| collect_settings_binary_summary_chunk(state, lookup, records))
+        .collect::<Result<Vec<_>>>()?;
+    let mut out = SettingsBinarySummary::default();
+    for partial in partials {
+        merge_settings_binary_summary(&mut out, partial);
+    }
+    Ok(out)
 }
 
 #[derive(Default)]
@@ -2738,6 +3036,7 @@ fn visit_replaced_row<'a>(
     Ok(())
 }
 
+#[cfg(test)]
 fn collect_settings_binary_chunk<'a>(
     state: &'a ServiceState,
     lookup: &SettingsBinaryInstanceLookup<'_>,
@@ -2908,6 +3207,7 @@ fn merge_settings_binary_collection<'a>(
     }
 }
 
+#[cfg(test)]
 fn collect_settings_binary_data<'a>(
     state: &'a ServiceState,
     lookup: &SettingsBinaryInstanceLookup<'_>,
@@ -5414,16 +5714,22 @@ pub(crate) fn visit_reference_objects_mut(
 /// before the ones it holds.
 pub(crate) fn for_each_reference(value: &Value, visit: &mut impl FnMut(&Map<String, Value>)) {
     match value {
-        Value::Array(values) => values
-            .iter()
-            .for_each(|value| for_each_reference(value, visit)),
+        Value::Array(values) => {
+            for value in values {
+                if matches!(value, Value::Array(_) | Value::Object(_)) {
+                    for_each_reference(value, visit);
+                }
+            }
+        }
         Value::Object(object) => {
             if is_reference_object(object) {
                 visit(object);
             }
-            object
-                .values()
-                .for_each(|value| for_each_reference(value, visit));
+            for value in object.values() {
+                if matches!(value, Value::Array(_) | Value::Object(_)) {
+                    for_each_reference(value, visit);
+                }
+            }
         }
         _ => {}
     }
@@ -5435,16 +5741,22 @@ pub(crate) fn for_each_reference_mut(
     visit: &mut impl FnMut(&mut Map<String, Value>),
 ) {
     match value {
-        Value::Array(values) => values
-            .iter_mut()
-            .for_each(|value| for_each_reference_mut(value, visit)),
+        Value::Array(values) => {
+            for value in values {
+                if matches!(value, Value::Array(_) | Value::Object(_)) {
+                    for_each_reference_mut(value, visit);
+                }
+            }
+        }
         Value::Object(object) => {
             if is_reference_object(object) {
                 visit(object);
             }
-            object
-                .values_mut()
-                .for_each(|value| for_each_reference_mut(value, visit));
+            for value in object.values_mut() {
+                if matches!(value, Value::Array(_) | Value::Object(_)) {
+                    for_each_reference_mut(value, visit);
+                }
+            }
         }
         _ => {}
     }
@@ -5469,11 +5781,23 @@ pub(crate) fn stabilize_reference_objects(
     });
 }
 
+#[inline]
 pub(crate) fn is_reference_object(object: &Map<String, Value>) -> bool {
-    object.get("_type").and_then(Value::as_str) == Some("Ref")
-        || object.contains_key("settingsId")
-        || object.contains_key("instanceId")
-        || object.contains_key("instanceIndex")
+    if object.len() <= 8 {
+        for (key, value) in object {
+            match key.as_str() {
+                "_type" if value.as_str() == Some("Ref") => return true,
+                "settingsId" | "instanceId" | "instanceIndex" => return true,
+                _ => {}
+            }
+        }
+        false
+    } else {
+        object.get("_type").and_then(Value::as_str) == Some("Ref")
+            || object.contains_key("settingsId")
+            || object.contains_key("instanceId")
+            || object.contains_key("instanceIndex")
+    }
 }
 
 pub(crate) fn write_var_u64<W: Write + ?Sized>(writer: &mut W, mut value: u64) -> Result<()> {
@@ -5623,11 +5947,7 @@ mod tests {
             let decode = |bytes: &[u8], pool: &rayon::ThreadPool| {
                 pool.install(|| {
                     let budget = DecodeBudget::new(usize::MAX);
-                    let scope = ValueScope {
-                        strings: &[],
-                        instance_count: count * 4,
-                        budget: &budget,
-                    };
+                    let scope = ValueScope::from_owned(&[], count * 4, &budget);
                     decode_property_group_body(bytes, "Numeric", kind, count, scope)
                 })
             };
@@ -5933,11 +6253,7 @@ mod tests {
 
     fn group_body(body: &[u8], kind: u8, values: usize, budget: usize) -> Result<usize> {
         let budget = DecodeBudget::new(budget);
-        let scope = ValueScope {
-            strings: &[],
-            instance_count: 4,
-            budget: &budget,
-        };
+        let scope = ValueScope::from_owned(&[], 4, &budget);
         decode_property_group_body(body, "Value", kind, values, scope).map(|entries| entries.len())
     }
 

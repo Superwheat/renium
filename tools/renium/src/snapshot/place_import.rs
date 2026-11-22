@@ -46,13 +46,14 @@ pub(crate) fn import_place_file(mut args: ImportPlaceArgs) -> Result<()> {
     let mut flat = read_place(&args.input, &services)?;
     let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
     let paths = PlacePaths::referenced(&flat);
-    let subtrees = service_subtrees(&flat);
+    let mut subtrees = service_subtrees(&flat);
     let ExportExecutionSetup {
         project_stage,
         sourcemap_writer,
         direct_import_dispatcher,
-        export_services,
+        mut export_services,
     } = prepare_export_execution(&args.src_dir, &project_root, None, &services, total_started)?;
+    export_services.sort_by_key(|service| subtrees.get(service).map_or(0, Vec::len));
     // The stores the import is aligned with: the stage's copy of the project's.
     let stored_root = project_stage
         .import_project_root
@@ -60,16 +61,18 @@ pub(crate) fn import_place_file(mut args: ImportPlaceArgs) -> Result<()> {
     let copied = project_stage.copy_gate();
     let mut filters = HashMap::new();
     let mut imported = 0usize;
-    for service in &export_services {
+    let mut deferred_last: Option<(String, ExportedSnapshotParts)> = None;
+    let service_count = export_services.len();
+    for (idx, service) in export_services.iter().enumerate() {
         direct_import_dispatcher.check_error()?;
-        let parts = match subtrees.get(service) {
+        let parts = match subtrees.remove(service) {
             Some(indices) => {
                 imported += indices.len() - 1;
                 convert_service(
                     service,
                     &mut flat.instances,
                     (
-                        indices,
+                        &indices,
                         stored_service(&stored_root, service, copied.as_ref())?.as_ref(),
                     ),
                     &paths,
@@ -79,7 +82,16 @@ pub(crate) fn import_place_file(mut args: ImportPlaceArgs) -> Result<()> {
             }
             None => empty_service_parts(service),
         };
-        direct_import_dispatcher.enqueue_parts(service, parts)?;
+        if idx + 1 == service_count && parts.instances.len() >= 4_096 {
+            deferred_last = Some((service.clone(), parts));
+        } else {
+            direct_import_dispatcher.enqueue_parts(service, parts)?;
+        }
+    }
+    drop((flat, paths, subtrees, filters));
+    crate::daemon::memory::release_between_phases();
+    if let Some((service, parts)) = deferred_last {
+        direct_import_dispatcher.enqueue_parts(&service, parts)?;
     }
     finish_export_import(direct_import_dispatcher, sourcemap_writer)?;
     let (published, _) = finish_export_publication(
@@ -555,13 +567,14 @@ fn convert_service(
             .parent_index
             .and_then(|parent| local_by_global.get(&parent))
             .map(|parent| parent + 1);
+        let class_name = instance.class;
         converted.push(SnapshotInstance {
             name: if local == 0 {
                 service.to_string()
             } else {
-                instance.name.clone()
+                std::mem::take(&mut instances[global].name)
             },
-            class_name: instance.class,
+            class_name,
             properties,
             attributes,
             instance_index: Some(local + 1),
