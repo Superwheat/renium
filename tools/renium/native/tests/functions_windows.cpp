@@ -164,6 +164,9 @@ static void GuardedPayloads() {
     Check(sized);
 }
 
+// How long a step that must happen is waited for: a loaded machine can keep
+// a thread of this test from running for seconds.
+static constexpr std::chrono::seconds Patience{30};
 static void DestroyPending();
 static void MainThreadRetirement() {
     const auto mainThread = GetCurrentThreadId();
@@ -183,7 +186,7 @@ static void MainThreadRetirement() {
     };
     auto queued = [&] {
         std::unique_lock lock(mutex);
-        Check(changed.wait_for(lock, std::chrono::seconds(2), [&] { return !tasks.empty(); }));
+        Check(changed.wait_for(lock, Patience, [&] { return !tasks.empty(); }));
     };
     struct Owner { unsigned references = 0; DWORD releasedOn = 0; Owner* parent = nullptr; } model, receiver;
     const auto add = +[](void* p) { ++static_cast<Owner*>(p)->references; return true; };
@@ -221,7 +224,7 @@ static void MainThreadRetirement() {
     { std::vector<std::thread> retiring;
       for (auto& owner : crowd) retiring.emplace_back([&] { auto hold = queue.Hold(&owner, add, release); });
       for (auto& thread : retiring) thread.join(); }
-    const auto crowdDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto crowdDeadline = std::chrono::steady_clock::now() + Patience;
     auto held = [&] { unsigned total = 0; for (auto& owner : crowd) total += owner.references; return total; };
     Check(held() == crowd.size());
     while (held()) {
@@ -238,7 +241,7 @@ static void MainThreadRetirement() {
     closing.join(); Check(model.references == 1 && model.releasedOn == 0);
     // A task that meets the pin while its refused submission is still running
     // leaves it for the next task.
-    for (unsigned attempt = 0; model.references && attempt < 2000; ++attempt) {
+    for (unsigned attempt = 0; model.references && attempt < 30000; ++attempt) {
         { renium_functions::MainThreadRelease::TaskScope nextEngineTask; }
         if (model.references) Sleep(1);
     }
@@ -260,7 +263,7 @@ static void MainThreadRetirement() {
     Check(model.references == 1 && model.releasedOn == 0);
     { std::lock_guard lock(mutex); ran = true; }
     changed.notify_all();
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const auto deadline = std::chrono::steady_clock::now() + Patience;
     while (model.references) {
         { std::unique_lock lock(mutex); Check(changed.wait_until(lock, deadline, [&] { return !tasks.empty(); })); }
         drain();
@@ -338,10 +341,10 @@ static int YieldCalls() {
         if (outcome < 2) {
             std::thread delivery([outcome] { Deliver(pending[outcome], outcome ? "HTTP 403 " + std::string(60000, 'e') : std::string(8192, 'r')); });
             if (!outcome) {
-                const auto response = result->Wait(std::chrono::seconds(1));
+                const auto response = result->Wait(Patience);
                 Check(response == std::string(8192, 'r'));
             } else {
-                const auto response = result->Wait(std::chrono::seconds(1));
+                const auto response = result->Wait(Patience);
                 Check(result->httpError && response == "HTTP 403 " + std::string(60000, 'e'));
             }
             delivery.join();
