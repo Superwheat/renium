@@ -114,6 +114,41 @@ const RECORD_VERSION: u8 = 3;
 const SENTENCE_CONFLICTS_RECORD_VERSION: u8 = 2;
 const RECORD_DIR: &str = "reconcile";
 
+/// Leaves the project at `root` paired with a local file, as Live Sync does.
+#[cfg(test)]
+pub(crate) fn pair_local_file_for_test(root: &Path, file: &Path) {
+    let record = PairRecord {
+        version: RECORD_VERSION,
+        identity: PairIdentity {
+            experience: canonical_string(root).unwrap(),
+            project: canonical_string(root).unwrap(),
+            fingerprint: String::new(),
+            game_id: None,
+            place_id: None,
+            local_file: Some(canonical_string(file).unwrap()),
+        },
+        mode: PairMode::Reconcile,
+        conflict_preference: ConflictPreference::None,
+        runtime_settings: Map::new(),
+        baseline: None,
+        head: None,
+        conflicts: Vec::new(),
+        resolution_required: false,
+        last_runtime_id: None,
+        local_file_stamp: None,
+        local_file_digest: None,
+        studio_checkpoint: None,
+        differences: Vec::new(),
+    };
+    let records = root.join(".renium").join(RECORD_DIR);
+    fs::create_dir_all(&records).unwrap();
+    fs::write(
+        records.join("paired.rmp"),
+        rmp_serde::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+}
+
 fn log_reconcile_timing(label: &str, started: Instant) {
     crate::app::profile::record(label, started);
     log_global(

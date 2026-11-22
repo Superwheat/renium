@@ -498,9 +498,24 @@ pub(crate) fn verify_lease_ack(required: bool, response: &Value) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's lease registry, used in place of the user's on its thread.
+    pub(crate) static TEST_LEASES: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn place_leases() -> Result<lease::Registry> {
+    #[cfg(test)]
+    if let Some(root) = TEST_LEASES.with_borrow(Clone::clone) {
+        return Ok(lease::Registry::new(root));
+    }
+    lease::Registry::user()
+}
+
 pub(crate) fn verify_place_lease(place: Option<i64>, claim: Option<&lease::Claim>) -> Result<()> {
     match place.filter(|id| *id > 0) {
-        Some(id) => lease::Registry::user()?.verify(&format!("studio-place-{id}"), claim),
+        Some(id) => place_leases()?.verify(&format!("studio-place-{id}"), claim),
         None if claim.is_some() => {
             bail!("A leased Studio operation requires an explicit published place ID")
         }

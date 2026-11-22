@@ -66,6 +66,17 @@ pub(crate) fn apply_merged(cli: &mut Cli, matches: &clap::ArgMatches) -> Result<
     {
         cli.backtrace = value;
     }
+    crate::app::context::set_persistent_place_selector(
+        std::env::var("RENIUM_PLACE")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                object
+                    .get("place")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }),
+    );
     if let Some(place) = stored_unless_explicit(
         cli.place.as_deref(),
         std::env::var_os("RENIUM_PLACE"),

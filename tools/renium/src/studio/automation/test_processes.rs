@@ -198,6 +198,38 @@ pub(crate) fn edit_window_pids(processes: &[StudioProcess]) -> Vec<u32> {
         .collect()
 }
 
+/// The command lines of the Studio Edit windows.
+#[cfg(windows)]
+pub(crate) fn edit_window_command_lines() -> Vec<(u32, String)> {
+    edit_window_pids(&studio_process_table())
+        .into_iter()
+        .filter_map(|pid| Some((pid, crate::studio::performance::process_command_line(pid)?)))
+        .collect()
+}
+
+/// The command lines of the Studio Edit windows.
+#[cfg(target_os = "macos")]
+pub(crate) fn edit_window_command_lines() -> Vec<(u32, String)> {
+    let pids = edit_window_pids(&studio_process_table())
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>();
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-ww", "-o", "pid=,args=", "-p", &pids.join(",")])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(split_pid)
+        .map(|(pid, args)| (pid, args.to_string()))
+        .collect()
+}
+
 pub(crate) fn studio_descendants(processes: &[StudioProcess], root: u32) -> Vec<&StudioProcess> {
     let mut children = HashMap::<u32, Vec<&StudioProcess>>::new();
     for process in processes {

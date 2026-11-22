@@ -593,11 +593,11 @@ fn connection_verdict(observation: &Observation<'_>) -> String {
     }
     match bound {
         Some(bound) => format!(
-            "Studio has {} open, but this project is bound to {bound}; `rbx ro` opens it, or run from its project.",
+            "Studio has {} open, but this project's Live Sync place is {bound}; `rbx ro` opens it (with a --place id or file, that place), `rbx ro PLACE_ID` or `rbx ro FILE` another, or run from its project.",
             open_places.join(", ")
         ),
         None => format!(
-            "Studio has {} open, but no connected Studio matches this project; `rbx ro` reopens the project's place, or pass --place.",
+            "Studio has {} open, but no connected Studio matches this project; `rbx ro` reopens the project's place (`rbx ro --check` names it), or pass --place.",
             open_places.join(", ")
         ),
     }

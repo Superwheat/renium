@@ -103,8 +103,13 @@ pub(crate) struct StudioStatusArgs {
 
 #[derive(Args)]
 pub(crate) struct StudioReopenArgs {
-    #[arg(help = "Place file to open instead of the remembered one")]
+    #[arg(
+        value_name = "TARGET",
+        help = "Place file, PLACE_ID or UNIVERSE_ID:PLACE_ID. Without it, the --place id or file, else Live Sync's place, the project's bound ids, the place last opened or closed, Live Sync's paired file, then the project's place file"
+    )]
     file: Option<PathBuf>,
+    #[arg(help = "Report what would open and why without launching", long)]
+    check: bool,
     #[arg(
         help = "Return right after the launch instead of waiting for the place to connect",
         long
@@ -412,10 +417,15 @@ fn studio_status_result(args: &StudioStatusArgs, project: Option<&Path>) -> Resu
 }
 
 pub(crate) fn studio_reopen(args: StudioReopenArgs, project: Option<&Path>) -> Result<()> {
+    let parameters = reopen_parameters(args.file.as_deref(), project, args.check)?;
+    if args.check {
+        let result = reopen_check(project, parameters)?;
+        return app::output::emit_global_output(&result, &open_check_text(&result));
+    }
     let mut result = daemon_result(
         op::STUDIO_OPEN,
         project,
-        json!({ "file": args.file.as_deref().map(place_file_path) }),
+        parameters,
         true,
         Some(&args.bridge),
     )?;
@@ -423,6 +433,91 @@ pub(crate) fn studio_reopen(args: StudioReopenArgs, project: Option<&Path>) -> R
         wait_for_launched_studio(project, &mut result, args.bridge.wait_seconds)?;
     }
     app::output::print_json_output(&result, false)
+}
+
+/// What `ro --check` answers: a running daemon's answer, else what `ro`
+/// would open with no Studio connected, read from the project's files. It
+/// never starts a daemon.
+pub(crate) fn reopen_check(project: Option<&Path>, parameters: Value) -> Result<Value> {
+    let root = daemon_project_root(project).unwrap_or(Path::new("."));
+    match crate::daemon::try_scoped_daemon_control_request(
+        op::STUDIO_OPEN,
+        root,
+        parameters.clone(),
+    )? {
+        Some(answer) => Ok(answer),
+        None => crate::automation::runtime::offline_open_check(project, &parameters),
+    }
+}
+
+/// What `ro` asks the daemon to open: the given file or place, else the pin.
+/// The pin goes along with a given target, so the bind never takes the
+/// project's ids from it; the persistent pin names what later commands in
+/// this environment still carry.
+pub(super) fn reopen_parameters(
+    target: Option<&Path>,
+    project: Option<&Path>,
+    check: bool,
+) -> Result<Value> {
+    let mut parameters = json!({
+        "pin": place_pin(project),
+        "check": check,
+        "persistentPin": crate::app::context::persistent_place_selector(),
+    });
+    if let Some(target) = target {
+        match crate::automation::published_argument(target, target.is_file())? {
+            Some(_) => parameters["place"] = json!(target.to_string_lossy()),
+            None => parameters["file"] = json!(place_file_path(target)),
+        }
+    }
+    Ok(parameters)
+}
+
+/// The published place or existing place file the place pin (`--place`,
+/// RENIUM_PLACE or the stored setting) names for `so` and `ro`. Anything
+/// else, a place the experience configures included, selects as before and
+/// pins nothing here.
+pub(crate) fn place_pin(project: Option<&Path>) -> Option<String> {
+    let selector = crate::studio::target::place_filter()?;
+    let selector = selector.trim();
+    if crate::automation::published_place(selector).is_some() {
+        let start = project.unwrap_or(Path::new("."));
+        let configured = crate::project::experience::configures_place(start, selector);
+        return (!configured).then(|| selector.to_string());
+    }
+    let lower = selector.to_ascii_lowercase();
+    let file = place_file_path(Path::new(selector));
+    ((lower.ends_with(".rbxl") || lower.ends_with(".rbxlx")) && file.is_file())
+        .then(|| file.display().to_string())
+}
+
+/// What an open target names: its file, its place, or a place built from the
+/// project.
+pub(crate) fn target_name(target: &Value) -> String {
+    match (target["file"].as_str(), target["placeId"].as_i64()) {
+        (Some(file), _) => file.to_string(),
+        (None, Some(place)) => format!("place {place} of universe {}", target["gameId"]),
+        (None, None) => "a place built from the project".to_string(),
+    }
+}
+
+fn open_check_text(result: &Value) -> String {
+    let named = target_name(&result["target"]);
+    let reason = result["reason"].as_str().unwrap_or_default();
+    format!(
+        "Would open {named} ({reason}){}",
+        offline_check_line(result)
+    )
+}
+
+/// The line a check answered with no daemon running adds: it looked at no
+/// open Studio, which a real open may reuse or adopt.
+pub(crate) fn offline_check_line(answer: &Value) -> &'static str {
+    if answer["daemon"] == false {
+        "\nNo daemon is running, so no open Studio was considered; a real open may reuse or adopt one."
+    } else {
+        ""
+    }
 }
 
 pub(crate) fn studio_close(args: StudioCloseArgs, project: Option<&Path>) -> Result<()> {
@@ -1047,5 +1142,172 @@ mod native_summary_tests {
                 "orphans": [{"pid": 3}]
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod open_check_tests {
+    use super::*;
+
+    #[test]
+    fn check_names_the_target_and_the_reason() {
+        let place =
+            json!({"ok": true, "reason": "--place", "target": {"gameId": 4567, "placeId": 123}});
+        assert_eq!(
+            open_check_text(&place),
+            "Would open place 123 of universe 4567 (--place)"
+        );
+        let file = json!({"ok": true, "reason": "given", "target": {"file": "E:/a.rbxl"}});
+        assert_eq!(open_check_text(&file), "Would open E:/a.rbxl (given)");
+        let build = json!({"ok": true, "reason": "project file", "target": null});
+        assert_eq!(
+            open_check_text(&build),
+            "Would open a place built from the project (project file)"
+        );
+    }
+
+    #[test]
+    fn ro_asks_for_the_given_file_or_place_else_the_place_pin() {
+        let root = crate::tests::support::temp_dir("ro-parameters");
+        let file = root.join("Place.rbxl");
+        std::fs::write(&file, []).unwrap();
+        let asked = |pin: &str, target: Option<&Path>| {
+            let _selection = app::context::select_automation_for_thread(
+                None,
+                PathBuf::new(),
+                Some(pin.to_string()),
+            );
+            reopen_parameters(target, Some(root.as_path()), false)
+                .map_err(|error| error.to_string())
+        };
+        assert_eq!(
+            asked("123", Some(&file)),
+            Ok(
+                json!({ "file": place_file_path(&file), "pin": "123", "check": false, "persistentPin": null })
+            )
+        );
+        assert_eq!(
+            asked("10:123", Some(Path::new("4567:123"))),
+            Ok(
+                json!({ "place": "4567:123", "pin": "10:123", "check": false, "persistentPin": null })
+            )
+        );
+        assert!(
+            asked("123", Some(Path::new("+123")))
+                .is_err_and(|error| error.starts_with("\"+123\" is not a place"))
+        );
+        for pin in ["123", "4567:123"] {
+            assert_eq!(
+                asked(pin, None),
+                Ok(json!({ "pin": pin, "check": false, "persistentPin": null }))
+            );
+        }
+        for pin in [
+            "lobby",
+            "Place1 - Roblox Studio",
+            "Place1.rbxl",
+            "places/missing.rbxl",
+            "+123",
+            "99999999999999999999",
+        ] {
+            assert_eq!(
+                asked(pin, None),
+                Ok(json!({ "pin": null, "check": false, "persistentPin": null }))
+            );
+        }
+        assert!(
+            asked(&file.display().to_string(), None).is_ok_and(|asked| asked["pin"].is_string())
+        );
+        std::fs::create_dir_all(root.join("lobby")).unwrap();
+        std::fs::write(
+            root.join("renium.experience.json"),
+            json!({ "gameId": 4567, "places": { "lobby": { "root": "lobby", "placeId": 123 } } })
+                .to_string(),
+        )
+        .unwrap();
+        for (pin, asks) in [
+            ("123", None),
+            ("4567:123", None),
+            ("4567:9", Some("4567:9")),
+        ] {
+            assert_eq!(
+                asked(pin, None),
+                Ok(json!({ "pin": asks, "check": false, "persistentPin": null }))
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ro_check_answers_from_the_project_files_and_never_starts_a_daemon() {
+        let experience = crate::tests::support::temp_dir("ro-check-offline");
+        let root = experience.join("main");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".renium")).unwrap();
+        std::fs::create_dir_all(experience.join("lobby")).unwrap();
+        std::fs::write(
+            root.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+        )
+        .unwrap();
+        let places =
+            json!({ "main": { "root": "main" }, "lobby": { "root": "lobby", "placeId": 123 } });
+        std::fs::write(
+            experience.join("renium.experience.json"),
+            json!({ "gameId": 77, "places": places }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".renium/live-watch-state.enabled"),
+            json!({ "version": 1, "target": "published:77:5" }).to_string(),
+        )
+        .unwrap();
+        let _selection = app::context::select_automation_for_thread(
+            None,
+            root.join("renium.project.jsonc"),
+            None,
+        );
+        crate::daemon::TEST_DAEMON.set(Some(|_, _| Value::Null));
+        let check = |target: Option<&str>| {
+            let parameters = reopen_parameters(target.map(Path::new), Some(&root), true).unwrap();
+            reopen_check(Some(&root), parameters)
+                .map(|answer| (answer["reason"].clone(), answer["target"].clone()))
+                .map_err(|error| error.to_string())
+        };
+        let answers = [
+            check(None),
+            check(Some("123")),
+            check(Some("10:9")),
+            check(Some("9")),
+        ];
+        let offline = reopen_check(
+            Some(&root),
+            reopen_parameters(None, Some(&root), true).unwrap(),
+        )
+        .unwrap();
+        crate::daemon::TEST_DAEMON.set(None);
+        assert_eq!(
+            open_check_text(&offline),
+            "Would open place 5 of universe 77 (live sync)\nNo daemon is running, so no open Studio was considered; a real open may reuse or adopt one."
+        );
+        assert_eq!(offline["daemon"], false);
+        assert_eq!(
+            answers,
+            [
+                Ok((json!("live sync"), json!({ "gameId": 77, "placeId": 5 }))),
+                Ok((json!("given"), json!({ "gameId": 77, "placeId": 123 }))),
+                Ok((json!("given"), json!({ "gameId": 10, "placeId": 9 }))),
+                Err(
+                    "Renium does not know the universe of place 9; pass UNIVERSE_ID:9.".to_string()
+                ),
+            ]
+        );
+        for folder in [&experience, &root] {
+            assert!(
+                !folder.join("RENIUM.md").exists(),
+                "a check writes no project instructions"
+            );
+        }
+        std::fs::remove_dir_all(experience).unwrap();
     }
 }

@@ -46,6 +46,7 @@ impl Opcode {
         let flag = match self.id {
             op::PUSH => "verify",
             op::PLACE_PUBLISH => "dryRun",
+            op::STUDIO_OPEN => "check",
             _ => return false,
         };
         parameters.get(flag).and_then(Value::as_bool) == Some(true)
@@ -338,6 +339,57 @@ pub(crate) fn published_selector(selector: &str) -> Option<(i64, i64)> {
     (game > 0 && place > 0).then_some((game, place))
 }
 
+/// A published place written in digits as `PLACE_ID` or
+/// `UNIVERSE_ID:PLACE_ID`.
+pub(crate) fn published_place(text: &str) -> Option<(Option<i64>, i64)> {
+    let id = |text: &str| {
+        text.bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| text.parse::<i64>().ok().filter(|id| *id > 0))
+            .flatten()
+    };
+    match text.split_once(':') {
+        Some((game, place)) => Some((Some(id(game)?), id(place)?)),
+        None => Some((None, id(text)?)),
+    }
+}
+
+/// The published place a `so` or `ro` argument names. An existing file of
+/// that name stays a file; other text of digits, signs, colons and spaces
+/// must be a place.
+pub(crate) fn published_argument(
+    argument: &Path,
+    is_file: bool,
+) -> Result<Option<(Option<i64>, i64)>> {
+    let Some(text) = argument.to_str().filter(|text| {
+        !is_file
+            && text
+                .chars()
+                .all(|c| c.is_ascii_digit() || c.is_whitespace() || matches!(c, ':' | '+' | '-'))
+    }) else {
+        return Ok(None);
+    };
+    published_place(text).map(Some).with_context(|| {
+        let parts = text.split(':').collect::<Vec<_>>();
+        if parts.len() <= 2
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            let in_range = |part: &str| part.parse::<i64>().is_ok_and(|id| id > 0);
+            let out_of_range = match parts.as_slice() {
+                [universe, place] if !in_range(universe) && !in_range(place) => {
+                    "a universe id and a place id"
+                }
+                [universe, _] if !in_range(universe) => "a universe id",
+                _ => "a place id",
+            };
+            return format!("{text:?} is out of range for {out_of_range}.");
+        }
+        format!("{text:?} is not a place: write PLACE_ID or UNIVERSE_ID:PLACE_ID in digits only, as 123 or 4567:123.")
+    })
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StudioReopenTarget {
@@ -353,6 +405,31 @@ struct StudioLaunch {
     target: StudioReopenTarget,
     started: Instant,
     result: Value,
+}
+
+/// The launch record key of a target, under which every launch is found
+/// whichever project started it; a project's own launch is also keyed by its
+/// project file, which never starts with `{`.
+fn place_launch_key(target: &StudioReopenTarget) -> String {
+    serde_json::to_string(target).unwrap_or_default()
+}
+
+/// The universe a project's files record for a published place: Live Sync's
+/// place, the place last opened or closed, or a place its experience
+/// configures. What `rbx so` reads with no daemon running.
+pub(crate) fn stored_universe(root: &Path, place_id: i64) -> Option<i64> {
+    [
+        live::saved_studio_target_for_root(root).ok().flatten(),
+        studio_target_for_root(root),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|target| target.game_id.filter(|_| target.place_id == Some(place_id)))
+    .or_else(|| {
+        crate::project::experience::configured_universe(root, place_id)
+            .ok()
+            .flatten()
+    })
 }
 
 impl BoundContext {
@@ -523,7 +600,8 @@ impl State {
         });
         let launch = launches
             .get(&context.project)
-            .filter(|launch| &launch.target == target)?;
+            .filter(|launch| &launch.target == target)
+            .or_else(|| launches.get(&place_launch_key(target)))?;
         let mut result = launch.result.clone();
         if let Some(object) = result.as_object_mut() {
             object.insert("alreadyOpening".to_string(), Value::Bool(true));
@@ -553,6 +631,21 @@ impl State {
     ) {
         self.studio_launches.lock_recover().insert(
             context.project.clone(),
+            StudioLaunch {
+                target: target.clone(),
+                started: Instant::now(),
+                result: result.clone(),
+            },
+        );
+        self.remember_place_launch(target, result);
+    }
+
+    /// Records a launch by its target alone: it keeps a second open of that
+    /// target, from any project, from starting another Studio. A place that is
+    /// not the project's is recorded only so, leaving the project's slot free.
+    pub fn remember_place_launch(&self, target: StudioReopenTarget, result: Value) {
+        self.studio_launches.lock_recover().insert(
+            place_launch_key(&target),
             StudioLaunch {
                 target,
                 started: Instant::now(),
@@ -644,7 +737,11 @@ mod tests {
     #[test]
     fn read_only_review_exemptions_are_operation_specific() {
         for approved in [false, true] {
-            for (operation, flag) in [(op::PUSH, "verify"), (op::PLACE_PUBLISH, "dryRun")] {
+            for (operation, flag) in [
+                (op::PUSH, "verify"),
+                (op::PLACE_PUBLISH, "dryRun"),
+                (op::STUDIO_OPEN, "check"),
+            ] {
                 let opcode = opcode_by_id(operation).unwrap();
                 let mut parameters = json!({"destructive": true});
                 parameters[flag] = json!(true);
@@ -664,6 +761,36 @@ mod tests {
                 &json!({"destructive": true, "verifySources": true, "dryRun": true}),
                 approved
             ));
+        }
+    }
+
+    #[test]
+    fn a_published_place_argument_is_an_id_or_a_pair_unless_a_file_has_that_name() {
+        let parse = |text: &str, is_file| published_argument(Path::new(text), is_file);
+        assert_eq!(parse("123456", false).unwrap(), Some((None, 123456)));
+        assert_eq!(parse("4567:123", false).unwrap(), Some((Some(4567), 123)));
+        assert_eq!(parse("123456", true).unwrap(), None);
+        assert_eq!(parse("missing.rbxl", false).unwrap(), None);
+        for text in ["+123", "4567: 123", " 123", "-3", "4567:", "1:2:3"] {
+            assert_eq!(
+                parse(text, false).unwrap_err().to_string(),
+                format!(
+                    "{text:?} is not a place: write PLACE_ID or UNIVERSE_ID:PLACE_ID in digits only, as 123 or 4567:123."
+                )
+            );
+        }
+        for (text, ids) in [
+            ("0", "a place id"),
+            ("4567:0", "a place id"),
+            ("99999999999999999999", "a place id"),
+            ("0:123", "a universe id"),
+            ("99999999999999999999:123", "a universe id"),
+            ("0:99999999999999999999", "a universe id and a place id"),
+        ] {
+            assert_eq!(
+                parse(text, false).unwrap_err().to_string(),
+                format!("{text:?} is out of range for {ids}.")
+            );
         }
     }
 

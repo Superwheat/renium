@@ -839,11 +839,43 @@ fn push_daemon_endpoint(
     }
 }
 
-fn try_bind_daemon_context(
-    project_root: Option<&Path>,
-    project_only: bool,
-    experience_only: bool,
-) -> Result<Option<Value>> {
+/// What a request's bind asks besides its root. Opening a given file or
+/// place, or a place `--place` pins, binds the project alone, so it never
+/// selects a connected Studio, and leaves out a `--place` that pins the
+/// place it opens rather than the project's; beside a given file the pin
+/// stays, as the place the caller works on. The published place it opens is
+/// the place its resource lease is checked against, and a check writes
+/// nothing.
+pub(crate) fn bind_scope(operation: u16, parameters: &Value) -> Value {
+    let experience_only = matches!(
+        operation,
+        automation::op::PLACE_ADD | automation::op::PLACE_RENAME | automation::op::PLACE_REORDER
+    );
+    let opening = operation == automation::op::STUDIO_OPEN;
+    let text = |key: &str| {
+        parameters
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|_| opening)
+    };
+    let names = |key: &str| text(key).is_some();
+    let opens = match (text("file"), text("place"), text("pin")) {
+        (None, Some(place), _) => Some(place),
+        (None, None, Some(pin)) => automation::published_place(pin).map(|_| pin),
+        _ => None,
+    };
+    json!({
+        "place": place_filter().filter(|_| !names("pin") || names("file")),
+        "projectOnly": experience_only || names("file") || names("place") || names("pin"),
+        "experienceOnly": experience_only,
+        "opens": opens,
+        "check": opening && parameters.get("check").and_then(Value::as_bool) == Some(true),
+    })
+}
+
+/// The bind a request from this process sends: its scope with the project
+/// root, the `--project` override and the plugin's resource lease.
+pub(crate) fn bind_request(project_root: Option<&Path>, scope: &Value) -> Result<Value> {
     let resource_lease = crate::plugins::environment_claim()?;
     let project = crate::app::context::project_override().map(|path| absolutize_for_daemon(&path));
     let root = project_root
@@ -854,12 +886,22 @@ fn try_bind_daemon_context(
         )
         .display()
         .to_string();
+    let mut bind = scope.clone();
+    bind["root"] = json!(root);
+    bind["project"] = json!(project);
+    bind["resourceLease"] = json!(resource_lease);
+    Ok(bind)
+}
+
+fn try_bind_daemon_context(project_root: Option<&Path>, scope: &Value) -> Result<Option<Value>> {
+    let bind = bind_request(project_root, scope)?;
+    let leased = !bind["resourceLease"].is_null();
     let Some(bind) = try_send_request(&automation::Request {
         v: automation::PROTOCOL_VERSION,
         id: current_millis().min(u128::from(u64::MAX)) as u64,
         op: automation::op::BIND,
         cx: None,
-        p: json!({ "root": root, "project": project, "place": place_filter(), "resourceLease": resource_lease, "projectOnly": project_only, "experienceOnly": experience_only }),
+        p: bind,
     })?
     else {
         return Ok(None);
@@ -869,7 +911,7 @@ fn try_bind_daemon_context(
         return Err(automation::DaemonFailure::from(error).into());
     }
     let response = bind.r.context("Daemon bind response omitted its context")?;
-    crate::plugins::verify_lease_ack(resource_lease.is_some(), &response)?;
+    crate::plugins::verify_lease_ack(leased, &response)?;
     Ok(Some(response))
 }
 
@@ -1229,15 +1271,18 @@ fn ensure_shared_daemon_on(ports: &str, wait_seconds: f64, control_port: u16) ->
 }
 
 pub(crate) fn try_daemon_project_root(project_root: &Path) -> Result<Option<PathBuf>> {
-    try_bind_daemon_context(Some(project_root), false, false)?
-        .map(|context| {
-            context
-                .get("root")
-                .and_then(Value::as_str)
-                .map(PathBuf::from)
-                .context("Daemon bind response omitted the project root")
-        })
-        .transpose()
+    try_bind_daemon_context(
+        Some(project_root),
+        &bind_scope(automation::op::BIND, &json!({})),
+    )?
+    .map(|context| {
+        context
+            .get("root")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .context("Daemon bind response omitted the project root")
+    })
+    .transpose()
 }
 
 pub(super) fn try_daemon_control_request(
@@ -1255,7 +1300,8 @@ pub(crate) fn try_scoped_daemon_control_request(
     daemon_control_request_inner(operation, Some(root), parameters, false, false)
 }
 
-/// A test's answer to a daemon request, from its operation and parameters.
+/// A test's answer to a daemon request, from its operation and parameters;
+/// null when no daemon runs.
 #[cfg(test)]
 pub(crate) type TestAnswer = fn(u16, &Value) -> Value;
 
@@ -1273,10 +1319,6 @@ pub(crate) fn daemon_control_request(
     parameters: Value,
     approved: bool,
 ) -> Result<Value> {
-    #[cfg(test)]
-    if let Some(answer) = TEST_DAEMON.get() {
-        return Ok(answer(operation, &parameters));
-    }
     daemon_control_request_inner(operation, project_root, parameters, approved, true)?
         .context("Renium daemon did not accept the command")
 }
@@ -1288,7 +1330,12 @@ fn daemon_control_request_inner(
     approved: bool,
     required: bool,
 ) -> Result<Option<Value>> {
+    #[cfg(test)]
+    if let Some(answer) = TEST_DAEMON.get() {
+        return Ok(Some(answer(operation, &parameters)).filter(|answer| !answer.is_null()));
+    }
     let opcode = automation::opcode_by_id(operation)?;
+    let scope = bind_scope(operation, &parameters);
     let bridge_wait_seconds = parameters
         .get("bridgeWaitSeconds")
         .and_then(Value::as_f64)
@@ -1355,16 +1402,7 @@ fn daemon_control_request_inner(
             operation,
             automation::op::SET_PROPERTY | automation::op::REMOVE
         ) && object.get("editor").and_then(Value::as_bool) == Some(true);
-    // An explicit file is already the open target. Binding it must not first
-    // select some unrelated, already-connected runtime from this workspace.
-    let experience_only = matches!(
-        operation,
-        automation::op::PLACE_ADD | automation::op::PLACE_RENAME | automation::op::PLACE_REORDER
-    );
-    let project_only = experience_only
-        || operation == automation::op::STUDIO_OPEN
-            && object.get("file").and_then(Value::as_str).is_some();
-    let mut context = try_bind_daemon_context(project_root, project_only, experience_only)?;
+    let mut context = try_bind_daemon_context(project_root, &scope)?;
     let ready = |context: &Option<Value>| {
         context.as_ref().is_some_and(|context| {
             !needs_runtime || context.get("runtimeId").and_then(Value::as_str).is_some()
@@ -1373,7 +1411,7 @@ fn daemon_control_request_inner(
     let daemon_started = context.is_none() && (required || needs_runtime);
     if daemon_started {
         ensure_shared_daemon(&bridge_ports, bridge_wait_seconds)?;
-        context = try_bind_daemon_context(project_root, project_only, experience_only)?;
+        context = try_bind_daemon_context(project_root, &scope)?;
     }
     if needs_runtime && !ready(&context) && shared_daemon_available() {
         let reconnect_grace = if daemon_started {
@@ -1389,7 +1427,7 @@ fn daemon_control_request_inner(
         let mut empty_probes = 0;
         let mut no_studio = false;
         while !ready(&context) && Instant::now() < deadline {
-            match try_bind_daemon_context(project_root, project_only, experience_only) {
+            match try_bind_daemon_context(project_root, &scope) {
                 Ok(bound) => context = bound,
                 Err(error) => bind_error = Some(error),
             }

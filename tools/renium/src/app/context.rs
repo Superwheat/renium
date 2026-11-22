@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 static CLI_PROJECT: OnceLock<Option<PathBuf>> = OnceLock::new();
+static PERSISTENT_PLACE: OnceLock<Option<String>> = OnceLock::new();
 #[derive(Default)]
 struct SelectedContext {
     project: Option<PathBuf>,
@@ -108,6 +109,16 @@ pub(crate) fn set_place_selector(value: Option<String>) {
 
 pub(crate) fn place_selector() -> Option<String> {
     selected(|selected| selected.place.clone())
+}
+
+/// Records the place pin every command run in this environment carries:
+/// RENIUM_PLACE, else the stored `place` setting, whatever `--place` says.
+pub(crate) fn set_persistent_place_selector(value: Option<String>) {
+    let _ = PERSISTENT_PLACE.set(value.filter(|text| !text.trim().is_empty()));
+}
+
+pub(crate) fn persistent_place_selector() -> Option<String> {
+    PERSISTENT_PLACE.get().cloned().flatten()
 }
 
 pub(crate) fn set_automation_stdio(enabled: bool) {

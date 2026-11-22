@@ -11,7 +11,7 @@ rbx pn <PLACE_ID> lobby
 rbx po <PLACE_ID> <OTHER_PLACE_ID>
 ```
 
-`status` reads connection/play state. `ro` opens the remembered local file or published place; an explicit file overrides it. An already-open matching place is reused. Other places open in Studio belong to other work; never read or change them. With several Studio places open, bind a single-place project once: `rbx cfg set place GAME_ID:PLACE_ID`.
+`status` reads connection/play state. `ro` opens its FILE or `[UNIVERSE_ID:]PLACE_ID`, else the `--place` or remembered place; `--check` says which and starts no daemon. An open or starting matching place is reused. Opening a place that is not the project's, by id or `--place`, records nothing; but in a project without a place of its own a later plain `ro`, `sx` or `lon` adopts the one open Studio and records it. `so` opens an id only when given one. Other open places belong to other work; never read or change them. With several places open, bind a single-place project once: `rbx cfg set place GAME_ID:PLACE_ID`.
 
 Open Studio only with `rbx so FILE` or `rbx ro`. Renium starts it behind your windows without activation and blocks Studio's own foreground and focus calls while it loads and later (dialogs, Play windows), until the user selects it. A Studio started any other way (`Start-Process`, `Popen`, a double-click) is a child of the foreground app, so its self-activation after loading takes the foreground from the user; Renium cannot protect it. Keep the windows that matter restored, never minimized (capture guide).
 

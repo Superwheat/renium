@@ -191,7 +191,10 @@ mod daemon_target_tests {
 
 #[derive(Args)]
 pub struct StudioArgs {
-    #[arg(help = "Place file to open; the project's place when omitted")]
+    #[arg(
+        value_name = "TARGET",
+        help = "Place file, PLACE_ID or UNIVERSE_ID:PLACE_ID to open; the project's place when omitted"
+    )]
     pub file: Option<PathBuf>,
     #[arg(help = "Project file that owns the place", long)]
     pub project: Option<PathBuf>,
@@ -978,6 +981,19 @@ fn daemon_status_text(values: &[Value]) -> String {
 
 pub fn run_studio(args: StudioArgs, global_project: Option<&Path>) -> Result<()> {
     let project = args.project.as_deref().or(global_project);
+    let (place, file) = studio_target(args.file.as_deref(), project)?;
+    let project_file = match place {
+        Some(_) => config::try_resolve_project_path(project, None)?,
+        None => None,
+    };
+    let in_project = project_file.is_some();
+    let start = project_file
+        .as_deref()
+        .and_then(Path::parent)
+        .or(project)
+        .unwrap_or(Path::new("."));
+    let open =
+        |place: &StudioPlace, check: bool| open_place(place, project, in_project, check, start);
     if !args.check {
         // A Studio opened for a daemon other than the default one connects to
         // the default ports first. That daemon runs before the launch and is
@@ -992,11 +1008,19 @@ pub fn run_studio(args: StudioArgs, global_project: Option<&Path>) -> Result<()>
                 false,
             );
         }
-        let mut result = launch_studio(args.file.as_deref(), project)?;
+        let opened = place.as_ref().map(|place| open(place, false)).transpose()?;
+        let remember = opened.is_none();
+        let mut result = match opened {
+            Some(result) => result,
+            None => launch_studio(file.as_deref(), project)?,
+        };
         let already_open = result.get("alreadyOpen").and_then(Value::as_bool) == Some(true);
-        remember_launched_place(project, &result);
+        if remember {
+            remember_launched_place(project, &result);
+        }
         if other_daemon
             && !already_open
+            && !in_project
             && let Some(pid) = result.get("pid").and_then(Value::as_u64)
             && let Err(error) = crate::daemon::daemon_control_request(
                 crate::automation::op::STUDIOS,
@@ -1015,19 +1039,39 @@ pub fn run_studio(args: StudioArgs, global_project: Option<&Path>) -> Result<()>
         if !args.no_wait {
             crate::automation::commands::wait_for_launched_studio(project, &mut result, 0.0)?;
         }
-        let file = result
-            .get("file")
-            .and_then(Value::as_str)
-            .context("Studio launch result omitted the file")?;
-        let text = if already_open {
+        let file = match result["file"].as_str() {
+            Some(file) => file.to_string(),
+            None => {
+                crate::automation::commands::target_name(result.get("target").unwrap_or(&result))
+            }
+        };
+        let mut text = if already_open {
             format!("Studio already has {file} open")
         } else {
             format!("Opened {file} in Studio")
         };
+        if let Some(note) = result["note"].as_str() {
+            text = format!("{text}\n{note}");
+        }
         return crate::emit_global_output(&result, &text);
     }
     let executable = studio_executable()?;
-    let file = resolve_studio_file(args.file.as_deref(), project, false)?;
+    if let Some(place) = &place {
+        let answer = open(place, true)?;
+        let target = &answer["target"];
+        let text = format!(
+            "Would open {} with {}{}",
+            crate::automation::commands::target_name(target),
+            executable.display(),
+            crate::automation::commands::offline_check_line(&answer)
+        );
+        let mut result = json!({ "ok": true, "executable": executable, "target": target });
+        if let Some(daemon) = answer.get("daemon") {
+            result["daemon"] = daemon.clone();
+        }
+        return crate::emit_global_output(&result, &text);
+    }
+    let file = resolve_studio_file(file.as_deref(), project, false)?;
     let Some(file) = file else {
         let result = json!({
             "ok": false,
@@ -1047,10 +1091,312 @@ pub fn run_studio(args: StudioArgs, global_project: Option<&Path>) -> Result<()>
         "file": file,
         "exists": file.is_file(),
     });
-    crate::emit_global_output(
-        &result,
-        &format!("Studio is available at {}", executable.display()),
-    )
+    let text = format!(
+        "Would open {} with {}",
+        file.display(),
+        executable.display()
+    );
+    crate::emit_global_output(&result, &text)
+}
+
+/// A published place `so` was given, with its ids and what `rbx ro` would
+/// ask the daemon for it.
+struct StudioPlace {
+    parameters: Value,
+    ids: (Option<i64>, i64),
+}
+
+/// What `so` was given: a published place, asked for with the place pin as
+/// `rbx ro` asks, or a file. Without an argument both are `None` and `so`
+/// opens what it always opened, whatever the pin.
+fn studio_target(
+    argument: Option<&Path>,
+    project: Option<&Path>,
+) -> Result<(Option<StudioPlace>, Option<PathBuf>)> {
+    let Some(argument) = argument else {
+        return Ok((None, None));
+    };
+    let Some(ids) = crate::automation::published_argument(argument, argument.is_file())? else {
+        return Ok((None, Some(argument.to_path_buf())));
+    };
+    let parameters = json!({
+        "place": argument.to_string_lossy(),
+        "pin": crate::automation::commands::place_pin(project),
+        "persistentPin": crate::app::context::persistent_place_selector(),
+    });
+    Ok((Some(StudioPlace { parameters, ids }), None))
+}
+
+/// Opens, or with `check` names, the published place `so` was given. Inside
+/// a project the daemon opens it as `rbx ro` does, and a check answers as
+/// `rbx ro --check` does; otherwise the universe comes from the argument or
+/// the files at `start`, and a Studio that has the place open is reused.
+fn open_place(
+    place: &StudioPlace,
+    project: Option<&Path>,
+    in_project: bool,
+    check: bool,
+    start: &Path,
+) -> Result<Value> {
+    let mut parameters = place.parameters.clone();
+    parameters["check"] = json!(check);
+    if in_project && check {
+        return crate::automation::commands::reopen_check(project, parameters);
+    }
+    if in_project {
+        return crate::automation::commands::daemon_result(
+            crate::automation::op::STUDIO_OPEN,
+            project,
+            parameters,
+            true,
+            None,
+        );
+    }
+    let (game_id, place_id) = place.ids;
+    let game_id = game_id
+        .or_else(|| crate::automation::stored_universe(start, place_id))
+        .with_context(|| {
+            format!(
+                "Renium does not know the universe of place {place_id}; pass UNIVERSE_ID:{place_id}."
+            )
+        })?;
+    if check {
+        return Ok(json!({ "ok": true, "target": { "gameId": game_id, "placeId": place_id } }));
+    }
+    match running_published_studio(game_id, place_id) {
+        Some(running) => Ok(running),
+        None => launch_published_studio(game_id, place_id),
+    }
+}
+
+/// The Studio that has this published place open, as a running daemon sees
+/// it and `rbx ro` matches it, or the one still starting on it; no daemon
+/// starts for the question.
+fn running_published_studio(game_id: i64, place_id: i64) -> Option<Value> {
+    let studios =
+        crate::daemon::try_daemon_control_request(crate::automation::op::STUDIOS, json!({}))
+            .ok()
+            .flatten();
+    let clients = studios
+        .as_ref()
+        .and_then(|studios| studios["clients"].as_array())
+        .map_or(&[][..], Vec::as_slice);
+    if let Some(open) = connected_published_studio(clients, game_id, place_id) {
+        return Some(open);
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    if let Some(starting) = starting_published_studio(game_id, place_id, clients) {
+        return Some(starting);
+    }
+    None
+}
+
+fn connected_published_studio(clients: &[Value], game_id: i64, place_id: i64) -> Option<Value> {
+    let client = clients.iter().find(|client| {
+        client["role"] == "edit"
+            && client.get("localFile").is_none()
+            && client["gameId"] == game_id
+            && client["placeId"] == place_id
+    })?;
+    Some(json!({
+        "ok": true,
+        "alreadyOpen": true,
+        "pid": client.get("pid")?,
+        "runtimeId": client["runtimeId"],
+        "gameId": game_id,
+        "placeId": place_id,
+    }))
+}
+
+#[cfg(test)]
+mod studio_place_tests {
+    use super::*;
+
+    #[test]
+    fn so_opens_a_place_through_the_daemon_in_a_project_and_directly_outside_one() {
+        let outside = crate::tests::support::temp_dir("so-place");
+        let target = |argument: Option<&str>, pin: Option<&str>| {
+            let _selection = crate::app::context::select_automation_for_thread(
+                None,
+                PathBuf::new(),
+                pin.map(str::to_string),
+            );
+            studio_target(argument.map(Path::new), Some(outside.as_path())).unwrap()
+        };
+        let place = |argument: &str, pin: Option<&str>| target(Some(argument), pin).0.unwrap();
+        let pin_file = outside.join("Pinned.rbxl");
+        std::fs::write(&pin_file, []).unwrap();
+        for pin in [
+            Some(pin_file.display().to_string()),
+            Some("777".into()),
+            Some("10:5".into()),
+            None,
+        ] {
+            assert!(
+                matches!(target(None, pin.as_deref()), (None, None)),
+                "a bare so opens what it always opened, whatever the pin {pin:?}"
+            );
+        }
+        let (by_file, file) = target(Some(&pin_file.display().to_string()), Some("10:5"));
+        assert!(by_file.is_none() && file.is_some_and(|file| file.ends_with("Pinned.rbxl")));
+        assert_eq!(
+            place("4567:123", Some("10:123")).parameters,
+            json!({ "place": "4567:123", "pin": "10:123", "persistentPin": null })
+        );
+        crate::daemon::TEST_DAEMON.set(Some(|operation, parameters| {
+            if operation != crate::automation::op::STUDIOS {
+                return parameters.clone();
+            }
+            let client = |role: &str, place: i64, pid: u32| {
+                json!({ "role": role, "gameId": 10, "placeId": place, "pid": pid, "runtimeId": format!("r{pid}") })
+            };
+            let mut local = client("edit", 123, 1);
+            local["localFile"] = json!("E:/copy.rbxl");
+            json!({ "clients": [local, client("server", 123, 2), client("edit", 321, 3), client("edit", 123, 4)] })
+        }));
+        let asked = [
+            open_place(&place("123", Some("10:123")), None, true, false, &outside).unwrap(),
+            open_place(&place("123", None), None, true, true, &outside).unwrap(),
+        ];
+        let opened = open_place(&place("10:123", None), None, false, false, &outside).unwrap();
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            TEST_EDIT_WINDOWS.set(Some(|| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let line =
+                    |place: i64| format!("RobloxStudioBeta.exe --placeId {place} --universeId 10");
+                vec![(3, line(555), Some(now)), (77, line(556), Some(now))]
+            }));
+            let starting = [555, 556].map(|place| running_published_studio(10, place));
+            TEST_EDIT_WINDOWS.set(None);
+            assert_eq!(
+                starting,
+                [
+                    None,
+                    Some(
+                        json!({ "ok": true, "alreadyOpen": true, "pid": 77, "gameId": 10, "placeId": 556 })
+                    ),
+                ],
+                "a window the daemon shows connected with another place has moved on"
+            );
+        }
+        crate::daemon::TEST_DAEMON.set(Some(|_, _| Value::Null));
+        let project = outside.join("main");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+        )
+        .unwrap();
+        let checked = |argument: &str, in_project: bool| {
+            let _selection = crate::app::context::select_automation_for_thread(
+                None,
+                project.join("renium.project.jsonc"),
+                None,
+            );
+            let (project, start) = match in_project {
+                true => (Some(project.as_path()), project.as_path()),
+                false => (None, outside.as_path()),
+            };
+            open_place(&place(argument, None), project, in_project, true, start)
+                .map(|answer| answer["target"].clone())
+                .map_err(|error| error.to_string())
+        };
+        let mut answers = vec![checked("123", false), checked("123", true)];
+        let remembered = crate::automation::StudioReopenTarget {
+            file: None,
+            game_id: Some(4567),
+            place_id: Some(999),
+        };
+        for folder in [&outside, &project] {
+            crate::automation::write_studio_target_for_root(folder, &remembered).unwrap();
+        }
+        answers.extend([checked("999", false), checked("999", true)]);
+        let experience = |place: Value| {
+            let manifest = json!({ "gameId": 77, "places": { "main": place } });
+            std::fs::write(outside.join("renium.experience.json"), manifest.to_string()).unwrap();
+        };
+        experience(json!({ "root": "main", "placeId": 5 }));
+        answers.push(checked("123", false));
+        experience(json!({ "root": "main", "placeId": 123 }));
+        answers.extend([checked("123", false), checked("123", true)]);
+        crate::daemon::TEST_DAEMON.set(None);
+        assert_eq!(
+            asked,
+            [
+                json!({ "place": "123", "pin": "10:123", "persistentPin": null, "check": false }),
+                json!({ "place": "123", "pin": null, "persistentPin": null, "check": true }),
+            ]
+        );
+        assert_eq!(
+            opened,
+            json!({ "ok": true, "alreadyOpen": true, "pid": 4, "runtimeId": "r4", "gameId": 10, "placeId": 123 })
+        );
+        let refusal = Err(
+            "Renium does not know the universe of place 123; pass UNIVERSE_ID:123.".to_string(),
+        );
+        let expected = |game: i64, place: i64| Ok(json!({ "gameId": game, "placeId": place }));
+        assert_eq!(
+            answers,
+            [
+                refusal.clone(),
+                refusal.clone(),
+                expected(4567, 999),
+                expected(4567, 999),
+                refusal,
+                expected(77, 123),
+                expected(77, 123),
+            ]
+        );
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn a_published_place_starting_in_studio_is_not_launched_again() {
+        assert_eq!(
+            launched_place(
+                r#""C:\Roblox\RobloxStudioBeta.exe" --task EditPlace --placeId 123 --universeId 10"#
+            ),
+            Some((10, 123))
+        );
+        assert_eq!(launched_place("RobloxStudioBeta.exe E:/place.rbxl"), None);
+        TEST_EDIT_WINDOWS.set(Some(|| {
+            let started = |age: u64| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|now| now.as_secs() - age)
+            };
+            let window = |pid: u32, ids: &str, age: u64| {
+                let line = format!("RobloxStudioBeta.exe --task EditPlace {ids}");
+                (pid, line, started(age))
+            };
+            vec![
+                window(41, "--placeId 123 --universeId 99", 5),
+                window(42, "--placeId 123 --universeId 10", 5),
+                window(43, "--universeId 10 --placeId 321", 500),
+            ]
+        }));
+        let connected = |pid: u32, place: i64| json!({ "role": "edit", "pid": pid, "gameId": 10, "placeId": place });
+        let answers = [
+            starting_published_studio(10, 123, &[]),
+            starting_published_studio(10, 321, &[]),
+            starting_published_studio(10, 123, &[connected(42, 777)]),
+            starting_published_studio(10, 123, &[connected(42, 0)]),
+            starting_published_studio(10, 123, &[connected(42, 123)]),
+        ]
+        .map(|answer| answer.map(|answer| answer["pid"].clone()));
+        TEST_EDIT_WINDOWS.set(None);
+        assert_eq!(
+            answers,
+            [Some(json!(42)), None, None, None, Some(json!(42))],
+            "a window older than its connect time, or connected with another place or none, is launched beside"
+        );
+    }
 }
 
 pub fn launch_studio(file: Option<&Path>, project: Option<&Path>) -> Result<Value> {
@@ -1067,6 +1413,7 @@ fn launch_studio_inner(
 ) -> Result<Value> {
     #[cfg(not(target_os = "macos"))]
     let _ = sweep_orphans;
+    refuse_test_launch()?;
     let executable = studio_executable()?;
     let file = resolve_studio_file(file, project, true)?
         .context("No Studio file exists and one could not be built")?;
@@ -1081,16 +1428,14 @@ fn launch_studio_inner(
             "exists": file.is_file(),
         }));
     }
-    if let Some(name) = file.file_stem().and_then(OsStr::to_str) {
-        set_aside_recovery_files(name);
-    }
     #[cfg(target_os = "macos")]
     let closed_orphans = if sweep_orphans {
         close_orphaned_test_windows(&file)
     } else {
         Vec::new()
     };
-    let pid = spawn_studio(&executable, &[file.as_os_str()])?;
+    let name = file.file_stem().and_then(OsStr::to_str);
+    let pid = spawn_studio(&executable, &[file.as_os_str()], name)?;
     expect_launched_studio(pid);
     #[allow(unused_mut)]
     let mut result = json!({
@@ -1363,8 +1708,8 @@ pub fn launch_published_studio(game_id: i64, place_id: i64) -> Result<Value> {
         "--universeId",
         &game_id.to_string(),
     ];
-    set_aside_recovery_files(&place_id.to_string());
-    let pid = spawn_studio(&executable, &arguments.map(OsStr::new))?;
+    let name = place_id.to_string();
+    let pid = spawn_studio(&executable, &arguments.map(OsStr::new), Some(&name))?;
     expect_launched_studio(pid);
     Ok(json!({
         "ok": true,
@@ -1373,6 +1718,98 @@ pub fn launch_published_studio(game_id: i64, place_id: i64) -> Result<Value> {
         "gameId": game_id,
         "placeId": place_id,
     }))
+}
+
+/// A Studio Edit window: its pid, its command line and, when that names a
+/// published place, its start in Unix seconds.
+#[cfg(any(windows, target_os = "macos"))]
+type EditWindow = (u32, String, Option<u64>);
+
+/// A test's stand-in for the Studio Edit windows.
+#[cfg(all(test, any(windows, target_os = "macos")))]
+type EditWindows = fn() -> Vec<EditWindow>;
+
+#[cfg(all(test, any(windows, target_os = "macos")))]
+thread_local! {
+    /// The Edit-window stand-in of this test thread.
+    pub(crate) static TEST_EDIT_WINDOWS: std::cell::Cell<Option<EditWindows>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// How long after its start a Studio counts as opening the place its command
+/// line names: the time before its plugin connects.
+#[cfg(any(windows, target_os = "macos"))]
+const STARTING_STUDIO_SECONDS: u64 = 120;
+
+/// The Studio Edit window still starting on this published place, found by
+/// the ids on its command line, so a second open reuses it as a file open
+/// reuses a window by its file. A window `clients` shows connected with
+/// another place, or none, has moved on and never counts.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn starting_published_studio(
+    game_id: i64,
+    place_id: i64,
+    clients: &[Value],
+) -> Option<Value> {
+    #[cfg(test)]
+    let windows = TEST_EDIT_WINDOWS
+        .get()
+        .map_or_else(edit_windows, |windows| windows());
+    #[cfg(not(test))]
+    let windows = edit_windows();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let moved_on = |pid: u32| {
+        clients.iter().any(|client| {
+            client["role"] == "edit"
+                && client["pid"] == pid
+                && (client["gameId"] != game_id || client["placeId"] != place_id)
+        })
+    };
+    let (pid, ..) = windows.into_iter().find(|(pid, line, started)| {
+        launched_place(line) == Some((game_id, place_id))
+            && started.is_some_and(|started| now.saturating_sub(started) < STARTING_STUDIO_SECONDS)
+            && !moved_on(*pid)
+    })?;
+    Some(json!({
+        "ok": true,
+        "alreadyOpen": true,
+        "pid": pid,
+        "gameId": game_id,
+        "placeId": place_id,
+    }))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn edit_windows() -> Vec<EditWindow> {
+    crate::studio::automation::test_processes::edit_window_command_lines()
+        .into_iter()
+        .map(|(pid, line)| {
+            let started = launched_place(&line)
+                .and_then(|_| crate::studio::diagnosis::studio_process_started_unix(pid));
+            (pid, line, started)
+        })
+        .collect()
+}
+
+/// The universe and place a Studio command line opens with `--universeId`
+/// and `--placeId`, as a published place is launched.
+#[cfg(any(windows, target_os = "macos"))]
+fn launched_place(command_line: &str) -> Option<(i64, i64)> {
+    let mut tokens = command_line
+        .split_whitespace()
+        .map(|token| token.trim_matches('"'));
+    let (mut game, mut place) = (None, None);
+    while let Some(token) = tokens.next() {
+        let slot = match token.trim_start_matches('-').to_ascii_lowercase().as_str() {
+            "universeid" => &mut game,
+            "placeid" => &mut place,
+            _ => continue,
+        };
+        *slot = tokens.next().and_then(|id| id.parse::<i64>().ok());
+    }
+    game.zip(place)
 }
 
 pub fn launch_exact_studio(
@@ -1459,7 +1896,27 @@ fn space_studio_launches() {
     *last_launch = Some(Instant::now());
 }
 
-pub(crate) fn spawn_studio(executable: &Path, arguments: &[&OsStr]) -> Result<u32> {
+/// Refuses to start Studio from a test build. Every launch passes here before
+/// it builds the project, sets recovery files aside or closes orphaned test
+/// windows.
+pub(crate) fn refuse_test_launch() -> Result<()> {
+    if cfg!(test) {
+        bail!("A test never launches Studio");
+    }
+    Ok(())
+}
+
+/// Starts Studio, after a test build is refused and the recovery files of
+/// the place named `place` are set aside.
+pub(crate) fn spawn_studio(
+    executable: &Path,
+    arguments: &[&OsStr],
+    place: Option<&str>,
+) -> Result<u32> {
+    refuse_test_launch()?;
+    if let Some(place) = place {
+        set_aside_recovery_files(place);
+    }
     space_studio_launches();
     #[cfg(windows)]
     {
@@ -2978,7 +3435,7 @@ fn daemon_endpoint(daemon: &DaemonDiscovery) -> Result<SocketAddr> {
     Ok(address)
 }
 
-fn resolve_studio_file(
+pub(crate) fn resolve_studio_file(
     file: Option<&Path>,
     project: Option<&Path>,
     allow_build: bool,
@@ -2999,6 +3456,12 @@ fn resolve_studio_file(
                 .as_deref(),
             Some("rbxl" | "rbxlx" | "rbxm" | "rbxmx")
         ) {
+            let name = file.file_name().and_then(OsStr::to_str).unwrap_or_default();
+            if let Some((None, place_id)) = crate::automation::published_place(name) {
+                bail!(
+                    "Studio files must end in .rbxl, .rbxlx, .rbxm, or .rbxmx; to open place {place_id} rather than this file, pass UNIVERSE_ID:{place_id}"
+                );
+            }
             bail!("Studio files must end in .rbxl, .rbxlx, .rbxm, or .rbxmx");
         }
         return Ok(Some(file));

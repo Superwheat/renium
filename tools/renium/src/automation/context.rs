@@ -477,9 +477,73 @@ fn bootstrap(state: &State, root: &Path) -> std::result::Result<Value, Failure> 
         .map_err(|error| Failure::new("internal", error.to_string(), false, "bind"))
 }
 
+/// The place a project stores as its own: without a place in its manifest,
+/// the place last opened or closed; then Live Sync's place; with neither,
+/// its established pairing.
+fn stored_target(
+    state: &State,
+    project_path: &Path,
+    project_root: &Path,
+    experience: &Path,
+    manifest_place_id: Option<i64>,
+) -> Result<Option<StudioReopenTarget>> {
+    if manifest_place_id.is_none()
+        && let Some(opened) = state.studio_target_for_project(project_path, project_root)
+    {
+        return Ok(Some(opened));
+    }
+    let enabled_target = super::live::saved_studio_target_for_root(project_root)?;
+    if enabled_target.is_some() || manifest_place_id.is_some() {
+        return Ok(enabled_target);
+    }
+    // Stopping Live Sync removes its enabled marker, not the project's
+    // established pairing. Reuse that identity without starting sync.
+    super::reconcile::saved_studio_target_for_root(project_root, experience)
+}
+
+/// The project's own place: its manifest's place, else the place it stores.
+pub(super) fn own_place(
+    state: &State,
+    context: &BoundContext,
+) -> Result<Option<StudioReopenTarget>> {
+    let root = Path::new(&context.root);
+    let identity = resolve_experience_place(root, None)?;
+    if let Some(place) = identity.filter(|place| place.place_id.is_some()) {
+        return Ok(Some(StudioReopenTarget {
+            file: None,
+            game_id: place.game_id,
+            place_id: place.place_id,
+        }));
+    }
+    stored_target(
+        state,
+        Path::new(&context.project),
+        root,
+        Path::new(&context.experience),
+        None,
+    )
+}
+
 pub(super) fn bind(
     state: &State,
     bridge: &BridgeServer,
+    parameters: &Value,
+) -> std::result::Result<Value, Failure> {
+    bind_with(state, Some(bridge), parameters)
+}
+
+/// Binds as a daemon with no Studio connected would, for a check that runs
+/// no daemon.
+pub(super) fn bind_offline(
+    state: &State,
+    parameters: &Value,
+) -> std::result::Result<Value, Failure> {
+    bind_with(state, None, parameters)
+}
+
+fn bind_with(
+    state: &State,
+    bridge: Option<&BridgeServer>,
     parameters: &Value,
 ) -> std::result::Result<Value, Failure> {
     let object = object(parameters)?;
@@ -536,7 +600,8 @@ pub(super) fn bind(
         let selected = match resolve_experience_place(&root, requested_place.as_deref()) {
             Ok(place) => place,
             Err(error) if requested_place.is_none() => {
-                let mut connected = studio_candidates_from(&bridge.list_bridge_clients(), "");
+                let clients = bridge.map(BridgeServer::list_bridge_clients);
+                let mut connected = studio_candidates_from(&clients.unwrap_or_default(), "");
                 if let Some(runtime) = requested_runtime.as_deref() {
                     connected.retain(|entry| {
                         entry.get("runtimeId").and_then(Value::as_str) == Some(runtime)
@@ -622,7 +687,9 @@ pub(super) fn bind(
         || project_root.clone(),
         |place| place.experience_root.clone(),
     );
-    if let Err(error) = workflows::ensure_agent_instructions(&experience) {
+    if object.get("check").and_then(Value::as_bool) != Some(true)
+        && let Err(error) = workflows::ensure_agent_instructions(&experience)
+    {
         eprintln!(
             "[renium] warning: could not refresh project instructions in {}: {error:#}",
             experience.display()
@@ -630,20 +697,13 @@ pub(super) fn bind(
     }
     let manifest_game_id = identity.as_ref().and_then(|place| place.game_id);
     let manifest_place_id = identity.as_ref().and_then(|place| place.place_id);
-    let saved_target = (|| -> Result<Option<StudioReopenTarget>> {
-        if manifest_place_id.is_none()
-            && let Some(opened) = state.studio_target_for_project(&project_path, &project_root)
-        {
-            return Ok(Some(opened));
-        }
-        let enabled_target = super::live::saved_studio_target_for_root(&project_root)?;
-        if enabled_target.is_some() || manifest_place_id.is_some() {
-            return Ok(enabled_target);
-        }
-        // Stopping Live Sync removes its enabled marker, not the project's
-        // established pairing. Reuse that identity without starting sync.
-        super::reconcile::saved_studio_target_for_root(&project_root, &experience)
-    })()
+    let saved_target = stored_target(
+        state,
+        &project_path,
+        &project_root,
+        &experience,
+        manifest_place_id,
+    )
     .map_err(|error| {
         Failure::new(
             "no_project",
@@ -657,16 +717,19 @@ pub(super) fn bind(
         identity.as_ref(),
         saved_target.as_ref(),
     );
-    let mut candidates = if object.get("projectOnly").and_then(Value::as_bool) == Some(true) {
-        Vec::new()
-    } else {
-        studio_candidates(bridge, &selector)?
+    let local_file = |entry: &Value| bridge.and_then(|bridge| client_local_file(bridge, entry));
+    let mut candidates = match bridge {
+        Some(bridge) if object.get("projectOnly").and_then(Value::as_bool) != Some(true) => {
+            studio_candidates(bridge, &selector)?
+        }
+        _ => Vec::new(),
     };
     if let Some(runtime) = requested_runtime.as_deref() {
         candidates.retain(|entry| entry.get("runtimeId").and_then(Value::as_str) == Some(runtime));
     } else if requested_place.is_none()
         && manifest_place_id.is_none()
         && let Some(target) = saved_target.as_ref()
+        && let Some(bridge) = bridge
     {
         candidates.retain(|entry| client_matches_saved_target(bridge, entry, target));
     }
@@ -677,7 +740,7 @@ pub(super) fn bind(
             candidates,
             &project_root,
             requested_place.is_none(),
-            |entry| client_local_file(bridge, entry),
+            local_file,
         );
     }
     if candidates.len() > 1 {
@@ -689,7 +752,7 @@ pub(super) fn bind(
         .and_then(client_selector)
         .or_else(|| {
             candidate
-                .and_then(|entry| client_local_file(bridge, entry))
+                .and_then(local_file)
                 .map(|file| file.display().to_string())
         })
         .unwrap_or(selector);
@@ -700,14 +763,18 @@ pub(super) fn bind(
     let plugin_build = candidate
         .and_then(|entry| entry.get("bridgeBuildUnix"))
         .and_then(Value::as_i64);
-    let place_id = requested_place
-        .as_deref()
-        .and_then(|value| {
-            value
-                .rsplit_once(':')
-                .map_or(value, |(_, id)| id)
-                .parse::<i64>()
-                .ok()
+    let opened_place = string(object, "opens")
+        .and_then(|text| super::published_place(&text))
+        .map(|(_, place)| place);
+    let place_id = opened_place
+        .or_else(|| {
+            requested_place.as_deref().and_then(|value| {
+                value
+                    .rsplit_once(':')
+                    .map_or(value, |(_, id)| id)
+                    .parse::<i64>()
+                    .ok()
+            })
         })
         .or_else(|| {
             candidate
@@ -718,11 +785,22 @@ pub(super) fn bind(
         .or_else(|| saved_target.as_ref().and_then(|target| target.place_id));
     crate::plugins::verify_place_lease(place_id, resource_lease.as_ref())
         .map_err(|error| Failure::new("resource_owned", format!("{error:#}"), false, "bind"))?;
-    let game_id = candidate
-        .and_then(|entry| entry.get("gameId"))
-        .and_then(Value::as_i64)
-        .or(manifest_game_id)
-        .or_else(|| saved_target.as_ref().and_then(|target| target.game_id));
+    let candidate_id = |key: &str| candidate.and_then(|entry| entry.get(key)?.as_i64());
+    let own_place = place_id == manifest_place_id;
+    let game_id = [
+        requested_place
+            .as_deref()
+            .and_then(super::published_selector)
+            .map(|(game, place)| (Some(game), Some(place))),
+        Some((candidate_id("gameId"), candidate_id("placeId"))),
+        own_place.then_some((manifest_game_id, place_id)),
+        saved_target
+            .as_ref()
+            .map(|target| (target.game_id, target.place_id)),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|(game, place)| game.filter(|_| place == place_id));
     let fingerprint = fingerprint(&project_path, &experience).map_err(|error| {
         Failure::new(
             "no_project",
@@ -984,6 +1062,48 @@ mod tests {
         );
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0]["runtimeId"], expected);
+    }
+
+    #[test]
+    fn a_place_takes_a_universe_only_from_a_source_naming_both() {
+        let root = crate::tests::support::temp_dir("pinned-universe");
+        let main = root.join("main");
+        fs::create_dir_all(main.join("src")).unwrap();
+        fs::write(
+            main.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+        )
+        .unwrap();
+        let remembered = StudioReopenTarget {
+            file: None,
+            game_id: Some(777),
+            place_id: Some(5),
+        };
+        super::super::write_studio_target_for_root(&main, &remembered).unwrap();
+        let state = State::default();
+        let (bridge, _) =
+            BridgeServer::listen_with_initial_wait("127.0.0.1", &[0], 0.0, false).unwrap();
+        let bound = |place: Option<&str>| {
+            let result = bind(&state, &bridge, &json!({ "root": main, "place": place }))
+                .unwrap_or_else(|error| panic!("{}", error.0.m));
+            (result["gameId"].as_i64(), result["placeId"].as_i64())
+        };
+        assert_eq!(bound(Some("789")), (None, Some(789)));
+        assert_eq!(bound(Some("5")), (Some(777), Some(5)));
+        fs::write(
+            root.join("renium.experience.json"),
+            json!({ "gameId": 10, "places": { "main": { "root": "main" } } }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(bound(None), (Some(777), Some(5)));
+        fs::write(
+            root.join("renium.experience.json"),
+            json!({ "gameId": 10, "places": { "main": { "root": "main", "placeId": 5 } } })
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(bound(None), (Some(10), Some(5)));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

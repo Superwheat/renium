@@ -1162,61 +1162,242 @@ fn close_studio(
     bail!("Studio close is unsupported on this platform")
 }
 
+/// What `rbx ro` opens and why, first found: the given file or place, the
+/// file or place `--place` pins, Live Sync's place, the project's bound ids,
+/// the place last opened or closed, then Live Sync's paired file. `None`
+/// leaves the project's place file. `clients` are the Studios connected now.
+fn reopen_target(
+    context: &automation::BoundContext,
+    parameters: &Value,
+    state: &automation::State,
+    clients: &[Value],
+) -> Result<Option<(automation::StudioReopenTarget, &'static str)>> {
+    let text = |key: &str| parameters.get(key).and_then(Value::as_str);
+    let file_target = |file: &str| automation::StudioReopenTarget {
+        file: Some(crate::system::files::place_file_path(&bound_context::path(
+            context,
+            PathBuf::from(file),
+        ))),
+        game_id: None,
+        place_id: None,
+    };
+    let place_target = |place: &str,
+                        pass: &str|
+     -> Result<Option<automation::StudioReopenTarget>> {
+        let Some((game_id, place_id)) = automation::published_place(place) else {
+            return Ok(None);
+        };
+        let game_id = game_id
+            .or_else(|| known_universe(place_id, context, state, clients))
+            .with_context(|| {
+                format!(
+                    "Renium does not know the universe of place {place_id}; pass {pass}UNIVERSE_ID:{place_id}."
+                )
+            })?;
+        Ok(Some(automation::StudioReopenTarget {
+            file: None,
+            game_id: Some(game_id),
+            place_id: Some(place_id),
+        }))
+    };
+    let place_id = context.place_id.filter(|id| *id > 0);
+    let bound = match (context.game_id.filter(|id| *id > 0), place_id) {
+        (Some(game_id), Some(place_id)) => Some((game_id, place_id)),
+        _ => automation::published_selector(&context.selector)
+            .filter(|(_, selected)| place_id.is_none_or(|place_id| place_id == *selected)),
+    };
+    Ok(if let Some(file) = text("file") {
+        Some((file_target(file), "given"))
+    } else if let Some(place) = text("place") {
+        let target = place_target(place, "")?.context("Not a PLACE_ID or UNIVERSE_ID:PLACE_ID")?;
+        Some((target, "given"))
+    } else if let Some(pin) = text("pin") {
+        let target = place_target(pin, "--place ")?.unwrap_or_else(|| file_target(pin));
+        Some((target, "--place"))
+    } else if let Some(target) = state.live_sync().saved_studio_target(context)? {
+        Some((target, "live sync"))
+    } else if let Some((game_id, place_id)) = bound {
+        let target = automation::StudioReopenTarget {
+            file: None,
+            game_id: Some(game_id),
+            place_id: Some(place_id),
+        };
+        Some((target, "bound"))
+    } else if let Some(target) = state.studio_target(context) {
+        Some((target, "remembered"))
+    } else {
+        state.live_sync().saved_local_file(context)?.map(|file| {
+            let target = automation::StudioReopenTarget {
+                file: Some(file),
+                game_id: None,
+                place_id: None,
+            };
+            (target, "paired file")
+        })
+    })
+}
+
+/// What `ro --check` answers: the target `ro` would open and why, checked as
+/// an open checks it, with nothing opened.
+fn check_open(
+    context: &automation::BoundContext,
+    parameters: &Value,
+    state: &automation::State,
+    clients: &[Value],
+) -> Result<Value> {
+    let Some((target, reason)) = reopen_target(context, parameters, state, clients)? else {
+        let project = Path::new(&context.project);
+        let _selection =
+            crate::app::context::select_automation_for_thread(None, project.to_path_buf(), None);
+        let target = workflows::resolve_studio_file(None, Some(project), false)?.map(|file| {
+            automation::StudioReopenTarget {
+                file: Some(file),
+                game_id: None,
+                place_id: None,
+            }
+        });
+        return Ok(json!({ "ok": true, "target": target, "reason": "project file" }));
+    };
+    if let Some(file) = target.file.as_deref() {
+        workflows::resolve_studio_file(Some(file), None, false)?;
+    }
+    Ok(json!({ "ok": true, "target": target, "reason": reason }))
+}
+
+/// What `ro --check` answers when no daemon runs: what `ro` would open with
+/// no Studio connected, read from the project's files without writing any.
+/// `"daemon": false` says that no open Studio was considered.
+pub(crate) fn offline_open_check(project: Option<&Path>, parameters: &Value) -> Result<Value> {
+    let state = automation::State::default();
+    let scope = crate::daemon::bind_scope(op::STUDIO_OPEN, parameters);
+    let request = crate::daemon::bind_request(crate::daemon::daemon_project_root(project), &scope)?;
+    let bound = bound_context::bind_offline(&state, &request)
+        .map_err(|failure| automation::DaemonFailure::from(failure.0))?;
+    let context = bound["id"]
+        .as_u64()
+        .and_then(|id| state.context(id))
+        .context("The project bound without a context")?;
+    let mut answer = check_open(&context, parameters, &state, &[])?;
+    answer["daemon"] = json!(false);
+    Ok(answer)
+}
+
 fn open_studio(
     context: &automation::BoundContext,
     parameters: &Value,
     state: &automation::State,
     bridge: &BridgeServer,
 ) -> Result<Value> {
-    #[cfg(not(any(windows, target_os = "macos")))]
-    let _ = bridge;
-    let requested_file = parameters
-        .get("file")
-        .and_then(Value::as_str)
-        .map(PathBuf::from);
-    let selected = automation::published_selector(&context.selector);
-    let game_id = context
-        .game_id
-        .filter(|id| *id > 0)
-        .or(selected.map(|(game, _)| game));
-    let place_id = context
-        .place_id
-        .filter(|id| *id > 0)
-        .or(selected.map(|(_, place)| place));
+    let clients = bridge.list_bridge_clients();
+    if parameters.get("check").and_then(Value::as_bool) == Some(true) {
+        return check_open(context, parameters, state, &clients);
+    }
+    let Some((target, reason)) = reopen_target(context, parameters, state, &clients)? else {
+        let project = Path::new(&context.project);
+        let _selection =
+            crate::app::context::select_automation_for_thread(None, project.to_path_buf(), None);
+        return workflows::launch_studio(None, Some(project));
+    };
+    if let Some(file) = target.file.as_deref() {
+        workflows::resolve_studio_file(Some(file), None, false)?;
+    }
+    let own_place = bound_context::own_place(state, context)?;
+    let own = match (reason, target.file.as_deref()) {
+        ("given" | "--place", None) => own_place.as_ref().is_some_and(|own| {
+            own.file.is_none()
+                && own.place_id == target.place_id
+                && own.game_id.is_none_or(|game| target.game_id == Some(game))
+        }),
+        ("--place", Some(file)) => owns_file(context, state, file),
+        _ => true,
+    };
+    let mut result = reuse_or_launch(context, target.clone(), state, bridge, own)?;
     #[cfg(any(windows, target_os = "macos"))]
-    let connected = connected_edit_studios(bridge);
-    let target = if let Some(file) = requested_file {
-        let file = crate::system::files::place_file_path(&bound_context::path(context, file));
-        Some(automation::StudioReopenTarget {
-            file: Some(file),
-            game_id: None,
-            place_id: None,
-        })
-    } else if let Some(target) = state.live_sync().saved_studio_target(context)? {
-        Some(target)
-    } else if game_id.is_some() && place_id.is_some() {
-        Some(automation::StudioReopenTarget {
-            file: None,
-            game_id,
-            place_id,
-        })
-    } else if let Some(target) = state.studio_target(context) {
-        Some(target)
-    } else {
+    if own && universe_confirmed(&target, reason, own_place.as_ref(), &result) {
+        state.remember_studio_target(context, target.clone());
+    }
+    if let (false, "given", Some(game), Some(place)) =
+        (own, reason, target.game_id, target.place_id)
+    {
+        result["note"] = json!(open_note(parameters, own_place.is_some(), (game, place)));
+    }
+    Ok(result)
+}
+
+/// Whether a file `--place` pins is the project's own: a file anywhere under
+/// the project, or the file it remembers, Live Syncs or is paired with.
+fn owns_file(context: &automation::BoundContext, state: &automation::State, file: &Path) -> bool {
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let file = canonical(file);
+    if file.starts_with(canonical(Path::new(&context.root))) {
+        return true;
+    }
+    let stored = [
+        state.studio_target(context),
         state
             .live_sync()
-            .saved_local_file(context)?
-            .map(|file| automation::StudioReopenTarget {
-                file: Some(file),
-                game_id: None,
-                place_id: None,
-            })
+            .saved_studio_target(context)
+            .ok()
+            .flatten(),
+    ];
+    let paired = state.live_sync().saved_local_file(context).ok().flatten();
+    stored
+        .into_iter()
+        .flatten()
+        .filter_map(|target| target.file)
+        .chain(paired)
+        .any(|own| canonical(&own) == file)
+}
+
+/// Whether the universe of an opened target is known to be right: a file, a
+/// place the project stores, a universe its own place names, or a place a
+/// connected Studio has open. A universe typed or bound from `--place` alone
+/// is not stored before a Studio confirms it.
+#[cfg(any(windows, target_os = "macos"))]
+fn universe_confirmed(
+    target: &automation::StudioReopenTarget,
+    reason: &str,
+    own_place: Option<&automation::StudioReopenTarget>,
+    result: &Value,
+) -> bool {
+    target.file.is_some()
+        || !matches!(reason, "given" | "--place" | "bound")
+        || result["alreadyOpen"] == true && result["runtimeId"].is_string()
+        || own_place.is_some_and(|own| own.game_id.is_some() && own.game_id == target.game_id)
+}
+
+/// The note on a given place that is not the project's: what the project's
+/// next commands target instead.
+fn open_note(parameters: &Value, has_own_place: bool, (game, place): (i64, i64)) -> String {
+    let first = if has_own_place {
+        format!("Place {place} of universe {game} is not this project's")
+    } else {
+        "This project has no place of its own".to_string()
     };
-    let Some(target) = target else {
-        return workflows::launch_studio(None, Some(Path::new(&context.project)));
-    };
+    if let Some(pin) = parameters.get("persistentPin").and_then(Value::as_str) {
+        format!("{first}; commands run with the place pin {pin} keep targeting the pinned place.")
+    } else if has_own_place {
+        format!("{first}; the project's commands keep targeting its own place.")
+    } else {
+        format!(
+            "{first}; when more than one Studio is open, pass --place to choose the one its commands use."
+        )
+    }
+}
+
+/// Reuses a Studio that has the target open or is still starting on it, or
+/// launches one. Every launch is recorded by its target; only the project's
+/// own place also takes the project's launch slot.
+fn reuse_or_launch(
+    context: &automation::BoundContext,
+    target: automation::StudioReopenTarget,
+    state: &automation::State,
+    bridge: &BridgeServer,
+    own: bool,
+) -> Result<Value> {
     #[cfg(any(windows, target_os = "macos"))]
-    state.remember_studio_target(context, target.clone());
+    let connected = connected_edit_studios(bridge);
     #[cfg(any(windows, target_os = "macos"))]
     if let Some(studio) = connected.iter().find(|studio| studio.target == target) {
         return Ok(json!({
@@ -1259,6 +1440,45 @@ fn open_studio(
     if let Some(result) = state.recent_studio_launch(context, &target) {
         return Ok(result);
     }
+    #[cfg(any(windows, target_os = "macos"))]
+    if let (None, Some(game_id), Some(place_id)) = (&target.file, target.game_id, target.place_id)
+        && let Some(mut starting) =
+            workflows::starting_published_studio(game_id, place_id, &bridge.list_bridge_clients())
+    {
+        starting["target"] = json!(target);
+        return Ok(starting);
+    }
+    let result = launch_target(&target, bridge)?;
+    if own {
+        state.remember_studio_launch(context, target, result.clone());
+    } else {
+        state.remember_place_launch(target, result.clone());
+    }
+    Ok(result)
+}
+
+/// A test's stand-in for launching an open target: its answer is the
+/// launch's result.
+#[cfg(test)]
+type TestLaunch = fn(&automation::StudioReopenTarget) -> Value;
+
+#[cfg(test)]
+thread_local! {
+    /// The launch stand-in of this test thread. Without one a test's launch
+    /// is refused.
+    static TEST_LAUNCH: std::cell::Cell<Option<TestLaunch>> = const { std::cell::Cell::new(None) };
+}
+
+/// Launches Studio on the target, after the macOS test windows of a local
+/// place are closed.
+fn launch_target(target: &automation::StudioReopenTarget, bridge: &BridgeServer) -> Result<Value> {
+    #[cfg(test)]
+    if let Some(launch) = TEST_LAUNCH.get() {
+        return Ok(launch(target));
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = bridge;
+    workflows::refuse_test_launch()?;
     // Studio on macOS opens a window launched beside a running test server as
     // a client of that test, so the place's orphaned test windows go first.
     #[cfg(target_os = "macos")]
@@ -1289,8 +1509,41 @@ fn open_studio(
     if !closed_orphans.is_empty() {
         result["closedOrphans"] = json!(closed_orphans);
     }
-    state.remember_studio_launch(context, target, result.clone());
     Ok(result)
+}
+
+/// The universe of a published place, from a source that names both for that
+/// place: a connected Studio, Live Sync's or the remembered target, the
+/// bound project, or the experience's configured places.
+fn known_universe(
+    place_id: i64,
+    context: &automation::BoundContext,
+    state: &automation::State,
+    clients: &[Value],
+) -> Option<i64> {
+    let connected = clients
+        .iter()
+        .map(|client| (client["gameId"].as_i64(), client["placeId"].as_i64()));
+    let saved = [
+        state
+            .live_sync()
+            .saved_studio_target(context)
+            .ok()
+            .flatten(),
+        state.studio_target(context),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|target| (target.game_id, target.place_id));
+    connected
+        .chain(saved)
+        .chain([(context.game_id, context.place_id)])
+        .find_map(|(game, place)| game.filter(|game| *game > 0 && place == Some(place_id)))
+        .or_else(|| {
+            crate::project::experience::configured_universe(Path::new(&context.root), place_id)
+                .ok()
+                .flatten()
+        })
 }
 
 /// The part of the Live Sync status a reader of `rbx status` acts on:
@@ -4146,6 +4399,9 @@ fn automation_response(
                 })?;
         }
         strip_request_notices(&mut request.p);
+        if let Some(answer) = open_check(&request, state, bridge) {
+            return answer;
+        }
         // A destructive request without a review receipt is refused here,
         // before anything resolves or waits for a Studio window: the refusal
         // is the same whether or not a Studio is connected.
@@ -4213,6 +4469,26 @@ fn automation_response(
         }
     };
     response.with_update(state.available_update())
+}
+
+/// The answer to `ro --check`, given before the request queues: it reads the
+/// project's files and the connected Studios and changes nothing, so it waits
+/// for no gate, import or other project's push.
+fn open_check(
+    request: &automation::Request,
+    state: &automation::State,
+    bridge: &BridgeServer,
+) -> Option<std::result::Result<Value, automation::Failure>> {
+    let check = request.p.get("check").and_then(Value::as_bool) == Some(true);
+    let id = request
+        .cx
+        .filter(|_| check && request.op == op::STUDIO_OPEN)?;
+    Some(
+        bound_context::resolve_project(state, id).and_then(|context| {
+            check_open(&context, &request.p, state, &bridge.list_bridge_clients())
+                .map_err(automation_failure)
+        }),
+    )
 }
 
 /// Runs one request behind its gate: `None` runs unqueued, `Some(None)`
@@ -4728,6 +5004,810 @@ pub(crate) fn oversized_automation_request_response() -> automation::Response {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn reopen_check_reports_the_first_target_in_order_without_launching() {
+        let root = crate::tests::support::temp_dir("reopen-order");
+        std::fs::write(
+            root.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let place_file = root.join("name.rbxl");
+        std::fs::write(&place_file, []).unwrap();
+        let _selection = crate::app::context::select_automation_for_thread(
+            None,
+            root.join("renium.project.jsonc"),
+            None,
+        );
+        let state = automation::State::default();
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        let context = automation::BoundContext {
+            id: 0,
+            initialized: true,
+            project: root.join("renium.project.jsonc").display().to_string(),
+            root: root.display().to_string(),
+            experience: root.display().to_string(),
+            source: root.join("src").display().to_string(),
+            resource_lease: None,
+            place_id: None,
+            game_id: None,
+            selector: String::new(),
+            runtime_id: None,
+            plugin_build: None,
+            fingerprint: String::new(),
+        };
+        let check = |context: &automation::BoundContext, mut parameters: Value| {
+            parameters["check"] = json!(true);
+            open_studio(context, &parameters, &state, &bridge)
+        };
+        let answer = check(&context, json!({})).unwrap();
+        assert_eq!(answer["reason"], "project file");
+        assert!(
+            answer["target"]["file"]
+                .as_str()
+                .is_some_and(|file| file.ends_with("name.rbxl")),
+            "{answer}"
+        );
+
+        std::fs::create_dir_all(root.join(".renium")).unwrap();
+        let marker =
+            json!({"version": 1, "target": format!("local-file:{}", place_file.display())});
+        std::fs::write(
+            root.join(".renium/live-watch-state.enabled"),
+            marker.to_string(),
+        )
+        .unwrap();
+        automation::write_studio_target_for_root(
+            &root,
+            &automation::StudioReopenTarget {
+                file: None,
+                game_id: Some(4567),
+                place_id: Some(123),
+            },
+        )
+        .unwrap();
+        let answer = check(&context, json!({})).unwrap();
+        assert_eq!(
+            (answer["reason"].as_str(), &answer["target"]["file"]),
+            (Some("live sync"), &json!(place_file))
+        );
+        let answer = check(&context, json!({ "pin": "123" })).unwrap();
+        assert_eq!(
+            answer,
+            json!({"ok": true, "reason": "--place", "target": {"gameId": 4567, "placeId": 123}})
+        );
+        assert_eq!(
+            check(&context, json!({ "pin": "5" }))
+                .unwrap_err()
+                .to_string(),
+            "Renium does not know the universe of place 5; pass --place UNIVERSE_ID:5.",
+            "a pin whose universe nothing knows is refused, not passed over"
+        );
+        let answer = check(&context, json!({ "place": "99:5", "pin": "123" })).unwrap();
+        assert_eq!(answer["reason"], "given");
+        assert_eq!(answer["target"], json!({"gameId": 99, "placeId": 5}));
+        let unknown = check(&context, json!({ "place": "5" })).unwrap_err();
+        assert_eq!(
+            unknown.to_string(),
+            "Renium does not know the universe of place 5; pass UNIVERSE_ID:5."
+        );
+        let mixed = automation::BoundContext {
+            game_id: Some(10),
+            place_id: Some(123),
+            ..context.clone()
+        };
+        assert_eq!(
+            check(&mixed, json!({ "place": "123" })).unwrap()["target"],
+            json!({"gameId": 4567, "placeId": 123})
+        );
+        let missing = json!({ "file": root.join("missing.rbxl") });
+        let refusal = open_studio(&context, &missing, &state, &bridge).unwrap_err();
+        assert_eq!(
+            check(&context, missing).unwrap_err().to_string(),
+            refusal.to_string()
+        );
+        let stray = root.join("123");
+        std::fs::write(&stray, []).unwrap();
+        let stray = check(&context, json!({ "file": stray })).unwrap_err();
+        assert!(
+            stray.to_string().ends_with("pass UNIVERSE_ID:123"),
+            "{stray}"
+        );
+
+        std::fs::remove_file(root.join(".renium/live-watch-state.enabled")).unwrap();
+        let bound = automation::BoundContext {
+            game_id: Some(1),
+            place_id: Some(2),
+            ..context.clone()
+        };
+        assert_eq!(check(&bound, json!({})).unwrap()["reason"], "bound");
+        let selected = automation::BoundContext {
+            place_id: Some(5),
+            selector: "10:20".to_string(),
+            ..context.clone()
+        };
+        assert_eq!(check(&selected, json!({})).unwrap()["reason"], "remembered");
+        let answer = check(&context, json!({})).unwrap();
+        assert_eq!(
+            answer,
+            json!({"ok": true, "reason": "remembered", "target": {"gameId": 4567, "placeId": 123}})
+        );
+        #[cfg(any(windows, target_os = "macos"))]
+        let remembered = json!({"gameId": 4567, "placeId": 123});
+        #[cfg(any(windows, target_os = "macos"))]
+        assert_eq!(
+            json!(automation::studio_target_for_root(&root)),
+            remembered,
+            "neither a check nor a target that fails validation is remembered"
+        );
+
+        use crate::studio::bridge::routing_tests::{connect, edit_info};
+        let _studio = connect(&bridge, 0, edit_info("open-edit", 123));
+        assert_eq!(
+            check(&context, json!({ "place": "123" })).unwrap()["target"],
+            json!({"gameId": 10, "placeId": 123}),
+            "a connected Studio's universe wins over the remembered one"
+        );
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let answer =
+                open_studio(&context, &json!({ "place": "123" }), &state, &bridge).unwrap();
+            assert_eq!(
+                (answer["alreadyOpen"].as_bool(), answer["pid"].as_u64()),
+                (Some(true), Some(u64::from(std::process::id())))
+            );
+            assert_eq!(json!(automation::studio_target_for_root(&root)), remembered);
+        }
+
+        std::fs::remove_file(root.join(".renium/studio-target.json")).unwrap();
+        crate::automation::reconcile::pair_local_file_for_test(&root, &place_file);
+        let answer = check(&context, json!({})).unwrap();
+        assert_eq!(answer["reason"], "paired file");
+        assert!(
+            answer["target"]["file"]
+                .as_str()
+                .is_some_and(|file| file.ends_with("name.rbxl")),
+            "{answer}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A project folder with a place file, Live Synced with `live_sync` (a
+    /// marker target) when one is given.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn reopen_project(name: &str, live_sync: Option<&str>) -> PathBuf {
+        let root = crate::tests::support::temp_dir(name);
+        std::fs::write(
+            root.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join(".renium")).unwrap();
+        std::fs::write(root.join("name.rbxl"), []).unwrap();
+        if let Some(target) = live_sync {
+            std::fs::write(
+                root.join(".renium/live-watch-state.enabled"),
+                json!({"version": 1, "target": target}).to_string(),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    /// The project `main` of an experience whose manifest is `manifest`.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn experience_project(name: &str, manifest: Value) -> PathBuf {
+        let experience = crate::tests::support::temp_dir(name);
+        let main = experience.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(
+            main.join("renium.project.jsonc"),
+            r#"{"schemaVersion":1,"sourceRoot":"src","tree":{}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            experience.join("renium.experience.json"),
+            manifest.to_string(),
+        )
+        .unwrap();
+        main
+    }
+
+    /// Binds as the client binds a request of `operation` from `root`.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn try_bind_as_command(
+        state: &automation::State,
+        bridge: &BridgeServer,
+        root: &Path,
+        operation: u16,
+        request: &Value,
+    ) -> std::result::Result<automation::BoundContext, String> {
+        let mut parameters = crate::daemon::bind_scope(operation, request);
+        parameters["root"] = json!(root);
+        let bound = bound_context::bind(state, bridge, &parameters).map_err(|error| error.0.m)?;
+        Ok(state.context(bound["id"].as_u64().unwrap()).unwrap())
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn bind_as_command(
+        state: &automation::State,
+        bridge: &BridgeServer,
+        root: &Path,
+        operation: u16,
+        request: &Value,
+    ) -> automation::BoundContext {
+        try_bind_as_command(state, bridge, root, operation, request)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Runs `ro [target]` from `root` as the client asks and binds it, under
+    /// the place pin `pin`; `persistent` gives the pin as RENIUM_PLACE does.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn ro(
+        (state, bridge): (&automation::State, &BridgeServer),
+        root: &Path,
+        (pin, persistent): (Option<&str>, bool),
+        target: Option<&str>,
+    ) -> (automation::BoundContext, Value) {
+        let _pin = crate::app::context::select_automation_for_thread(
+            None,
+            root.join("renium.project.jsonc"),
+            pin.map(str::to_string),
+        );
+        let mut request =
+            automation::commands::reopen_parameters(target.map(Path::new), Some(root), false)
+                .unwrap();
+        if persistent {
+            request["persistentPin"] = json!(pin);
+        }
+        let context = bind_as_command(state, bridge, root, op::STUDIO_OPEN, &request);
+        let answer = open_studio(&context, &request, state, bridge)
+            .unwrap_or_else(|error| panic!("{error:#}"));
+        (context, answer)
+    }
+
+    /// Binds a push from `root` under the place pin `pin`.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn push(
+        (state, bridge): (&automation::State, &BridgeServer),
+        root: &Path,
+        pin: Option<&str>,
+    ) -> std::result::Result<automation::BoundContext, String> {
+        let _pin = crate::app::context::select_automation_for_thread(
+            None,
+            root.join("renium.project.jsonc"),
+            pin.map(str::to_string),
+        );
+        try_bind_as_command(state, bridge, root, op::PUSH, &json!({}))
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    thread_local! {
+        static LAUNCHED: std::cell::RefCell<Vec<automation::StudioReopenTarget>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Stands in for Studio on this thread: each launch is recorded and
+    /// answers with a live pid.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn record_launches() {
+        TEST_LAUNCH.set(Some(|target| {
+            LAUNCHED.with_borrow_mut(|launched| launched.push(target.clone()));
+            json!({ "ok": true, "pid": std::process::id(), "target": target })
+        }));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn published(game_id: i64, place_id: i64) -> automation::StudioReopenTarget {
+        automation::StudioReopenTarget {
+            file: None,
+            game_id: Some(game_id),
+            place_id: Some(place_id),
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn a_given_or_pinned_place_is_never_saved_as_the_project_place() {
+        use crate::studio::bridge::routing_tests::{connect, edit_info, fixture};
+        let root = reopen_project("given-pinned-place", Some("published:10:5"));
+        let state = automation::State::default();
+        let bridge = fixture();
+        let daemon = (&state, &bridge);
+        let _own = connect(&bridge, 0, edit_info("own", 5));
+        let _cloud = connect(&bridge, 0, edit_info("cloud", 123));
+        let not_ours = "Place 123 of universe 10 is not this project's";
+        for (persistent, target, note) in [
+            (
+                false,
+                Some("10:123"),
+                json!(format!(
+                    "{not_ours}; the project's commands keep targeting its own place."
+                )),
+            ),
+            (
+                false,
+                Some("123"),
+                json!(format!(
+                    "{not_ours}; the project's commands keep targeting its own place."
+                )),
+            ),
+            (false, None, Value::Null),
+            (
+                true,
+                Some("10:123"),
+                json!(format!(
+                    "{not_ours}; commands run with the place pin 10:123 keep targeting the pinned place."
+                )),
+            ),
+        ] {
+            let (_, answer) = ro(daemon, &root, (Some("10:123"), persistent), target);
+            assert_eq!(
+                (
+                    &answer["alreadyOpen"],
+                    &answer["runtimeId"],
+                    &answer["note"]
+                ),
+                (&json!(true), &json!("cloud"), &note),
+                "{target:?}"
+            );
+            assert_eq!(
+                automation::studio_target_for_root(&root),
+                None,
+                "{target:?}"
+            );
+        }
+        let unpinned = push(daemon, &root, None).unwrap();
+        assert_eq!(
+            (
+                unpinned.game_id,
+                unpinned.place_id,
+                unpinned.runtime_id.as_deref()
+            ),
+            (Some(10), Some(5), Some("own"))
+        );
+        let pinned = push(daemon, &root, Some("10:123")).unwrap();
+        assert_eq!(
+            (
+                pinned.game_id,
+                pinned.place_id,
+                pinned.runtime_id.as_deref()
+            ),
+            (Some(10), Some(123), Some("cloud")),
+            "a push that still carries the pin pushes into the pinned place"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn a_project_without_a_place_keeps_using_the_studio_that_is_open() {
+        use crate::studio::bridge::routing_tests::{connect, edit_info, fixture};
+        record_launches();
+        let root = reopen_project("place-less", None);
+        let state = automation::State::default();
+        let bridge = fixture();
+        let daemon = (&state, &bridge);
+        let _lone = connect(&bridge, 0, edit_info("lone", 123));
+        let note = json!(
+            "This project has no place of its own; when more than one Studio is open, pass --place to choose the one its commands use."
+        );
+        let (_, answer) = ro(daemon, &root, (None, false), Some("10:123"));
+        assert_eq!(
+            (&answer["alreadyOpen"], &answer["note"]),
+            (&json!(true), &note)
+        );
+        assert_eq!(automation::studio_target_for_root(&root), None);
+        let pushed = push(daemon, &root, None).unwrap();
+        assert_eq!(
+            (
+                pushed.game_id,
+                pushed.place_id,
+                pushed.runtime_id.as_deref()
+            ),
+            (Some(10), Some(123), Some("lone"))
+        );
+
+        let (_, launched) = ro(daemon, &root, (None, false), Some("10:777"));
+        assert_eq!(
+            (&launched["alreadyOpen"], &launched["note"]),
+            (&Value::Null, &note)
+        );
+
+        let (context, bare) = ro(daemon, &root, (None, false), None);
+        assert_eq!(context.runtime_id.as_deref(), Some("lone"));
+        assert_eq!(
+            (&bare["alreadyOpen"], &bare["runtimeId"]),
+            (&json!(true), &json!("lone"))
+        );
+        assert_eq!(
+            automation::studio_target_for_root(&root),
+            Some(published(10, 123)),
+            "`ro` with nothing given records the Studio it adopted, as before"
+        );
+
+        let other_root = reopen_project("place-less-other", None);
+        let _other = connect(&bridge, 0, edit_info("other", 321));
+        let (_, answer) = ro(daemon, &other_root, (None, false), Some("10:123"));
+        assert_eq!(answer["note"], note);
+        assert!(
+            push(daemon, &other_root, None)
+                .is_err_and(|error| error.starts_with("More than one Studio runtime matches")),
+        );
+
+        let alias = experience_project(
+            "place-less-alias",
+            json!({ "gameId": 10, "places": { "main": { "root": "main" } } }),
+        );
+        let (_, answer) = ro(daemon, &alias, (None, false), Some("10:123"));
+        assert_eq!(answer["note"], note);
+        for folder in [root, other_root, alias.parent().unwrap().to_path_buf()] {
+            std::fs::remove_dir_all(folder).unwrap();
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn a_launch_is_found_by_its_target_whichever_project_started_it() {
+        use crate::studio::bridge::routing_tests::fixture;
+        record_launches();
+        let state = automation::State::default();
+        let bridge = fixture();
+        let daemon = (&state, &bridge);
+        let owner = reopen_project("launch-owner", Some("published:10:5"));
+        let sharer = reopen_project("launch-sharer", Some("published:10:5"));
+        let stranger = reopen_project("launch-stranger", None);
+        let (owner_context, first) = ro(daemon, &owner, (None, false), None);
+        assert_eq!(
+            (&first["pid"], &first["alreadyOpening"]),
+            (&json!(std::process::id()), &Value::Null)
+        );
+        for (root, pin, target) in [
+            (&sharer, (None, false), Some("10:5")),
+            (&stranger, (None, false), Some("10:5")),
+            (&stranger, (Some("10:5"), true), None),
+        ] {
+            let (_, answer) = ro(daemon, root, pin, target);
+            assert_eq!(
+                answer["alreadyOpening"], true,
+                "{root:?} {pin:?} {target:?}"
+            );
+        }
+        let (stranger_context, _) = ro(daemon, &stranger, (None, false), Some("10:6"));
+        assert_eq!(
+            LAUNCHED.with_borrow(Clone::clone),
+            [published(10, 5), published(10, 6)]
+        );
+        assert!(state.studio_launch_in_progress(&owner_context));
+        assert!(!state.studio_launch_in_progress(&stranger_context));
+        for folder in [owner, sharer, stranger] {
+            std::fs::remove_dir_all(folder).unwrap();
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn the_projects_own_place_given_by_id_is_remembered_and_takes_its_launch_slot() {
+        use crate::studio::bridge::routing_tests::{connect, edit_info, fixture};
+        record_launches();
+        let state = automation::State::default();
+        let bridge = fixture();
+        let daemon = (&state, &bridge);
+        let synced = reopen_project("own-given-synced", Some("published:10:5"));
+        let manifest = experience_project(
+            "own-given-manifest",
+            json!({ "gameId": 10, "places": { "main": { "root": "main", "placeId": 6 } } }),
+        );
+        for (root, place) in [(&synced, 5), (&manifest, 6)] {
+            let (context, answer) = ro(daemon, root, (None, false), Some(&format!("10:{place}")));
+            assert_eq!(
+                (&answer["pid"], &answer["note"]),
+                (&json!(std::process::id()), &Value::Null)
+            );
+            assert_eq!(
+                automation::studio_target_for_root(root),
+                Some(published(10, place))
+            );
+            assert!(state.studio_launch_in_progress(&context), "{root:?}");
+        }
+
+        let placeless_universe = experience_project(
+            "own-given-typed",
+            json!({ "places": { "main": { "root": "main", "placeId": 7 } } }),
+        );
+        let (context, typed) = ro(daemon, &placeless_universe, (None, false), Some("1:7"));
+        assert_eq!(typed["pid"], json!(std::process::id()));
+        assert!(state.studio_launch_in_progress(&context));
+        assert_eq!(
+            automation::studio_target_for_root(&placeless_universe),
+            None,
+            "a typed universe no Studio confirmed is not stored"
+        );
+        assert_eq!(
+            open_studio(
+                &context,
+                &json!({ "place": "7", "check": true }),
+                &state,
+                &bridge
+            )
+            .unwrap_err()
+            .to_string(),
+            "Renium does not know the universe of place 7; pass UNIVERSE_ID:7."
+        );
+        let _seven = connect(&bridge, 0, edit_info("seven", 7));
+        let (_, confirmed) = ro(daemon, &placeless_universe, (None, false), Some("7"));
+        assert_eq!(confirmed["runtimeId"], "seven");
+        assert_eq!(
+            automation::studio_target_for_root(&placeless_universe),
+            Some(published(10, 7)),
+            "the ids the connected Studio reports are stored"
+        );
+        assert_eq!(
+            LAUNCHED.with_borrow(Clone::clone),
+            [published(10, 5), published(10, 6), published(1, 7)]
+        );
+        std::fs::remove_dir_all(synced).unwrap();
+        for main in [manifest, placeless_universe] {
+            std::fs::remove_dir_all(main.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn a_file_pin_inside_the_project_is_its_own() {
+        use crate::studio::bridge::routing_tests::fixture;
+        record_launches();
+        let state = automation::State::default();
+        let bridge = fixture();
+        let daemon = (&state, &bridge);
+        let root = reopen_project("file-pin", None);
+        let inside = root.join("places").join("x.rbxl");
+        std::fs::create_dir_all(inside.parent().unwrap()).unwrap();
+        std::fs::write(&inside, []).unwrap();
+        let elsewhere = crate::tests::support::temp_dir("file-pin-elsewhere");
+        let outside = elsewhere.join("y.rbxl");
+        std::fs::write(&outside, []).unwrap();
+        let canonical = |file: &Path| std::fs::canonicalize(file).unwrap();
+        let remembered = || {
+            automation::studio_target_for_root(&root)
+                .and_then(|target| target.file)
+                .map(|file| canonical(&file))
+        };
+        let (context, opened) = ro(
+            daemon,
+            &root,
+            (Some(&inside.display().to_string()), false),
+            None,
+        );
+        assert_eq!(opened["pid"], json!(std::process::id()));
+        assert_eq!(remembered(), Some(canonical(&inside)));
+        assert!(state.studio_launch_in_progress(&context));
+        state.clear_studio_launch(&context);
+        let (context, opened) = ro(
+            daemon,
+            &root,
+            (Some(&outside.display().to_string()), false),
+            None,
+        );
+        assert_eq!(opened["pid"], json!(std::process::id()));
+        assert_eq!(
+            remembered(),
+            Some(canonical(&inside)),
+            "a file elsewhere is not the project's"
+        );
+        assert!(!state.studio_launch_in_progress(&context));
+        assert_eq!(LAUNCHED.with_borrow(Vec::len), 2);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(elsewhere).unwrap();
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn a_pin_binds_the_project_alone_so_other_open_studios_leave_it_unambiguous() {
+        use crate::studio::bridge::routing_tests::{connect, edit_info, fixture};
+        let root = reopen_project("pin-alone", None);
+        let state = automation::State::default();
+        let bridge = fixture();
+        let _other = connect(&bridge, 0, edit_info("other", 321));
+        let _cloud = connect(&bridge, 0, edit_info("cloud", 123));
+        let (context, answer) = ro((&state, &bridge), &root, (Some("10:123"), false), None);
+        assert_eq!(context.runtime_id, None);
+        assert_eq!(
+            (&answer["alreadyOpen"], &answer["runtimeId"]),
+            (&json!(true), &json!("cloud"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn a_starting_studio_is_reused_only_while_it_still_starts_on_that_place() {
+        use crate::studio::bridge::routing_tests::{connect, edit_info, fixture};
+        record_launches();
+        let root = reopen_project("starting-studio", Some("published:10:5"));
+        let state = automation::State::default();
+        let bridge = fixture();
+        let _elsewhere = connect(&bridge, 0, edit_info("elsewhere", 777));
+        workflows::TEST_EDIT_WINDOWS.set(Some(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let window = |pid: u32, place: i64, age: u64| {
+                let line = format!("RobloxStudioBeta.exe --placeId {place} --universeId 10");
+                (pid, line, Some(now - age))
+            };
+            vec![
+                window(std::process::id(), 123, 5),
+                window(4242, 124, 5),
+                window(4243, 125, 500),
+            ]
+        }));
+        let answers = [123, 124, 125].map(|place| {
+            let target = format!("10:{place}");
+            let (_, answer) = ro((&state, &bridge), &root, (None, false), Some(&target));
+            (answer["alreadyOpen"].clone(), answer["pid"].clone())
+        });
+        workflows::TEST_EDIT_WINDOWS.set(None);
+        assert_eq!(
+            answers,
+            [
+                (Value::Null, json!(std::process::id())),
+                (json!(true), json!(4242)),
+                (Value::Null, json!(std::process::id())),
+            ]
+        );
+        assert_eq!(
+            LAUNCHED.with_borrow(Clone::clone),
+            [published(10, 123), published(10, 125)],
+            "a window connected with another place, or started long ago, is launched beside"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn a_place_leased_to_another_task_is_refused_and_its_holder_opens_it() {
+        use crate::studio::bridge::routing_tests::fixture;
+        use renium_plugin_sdk::lease;
+        record_launches();
+        let leases = crate::tests::support::temp_dir("place-leases");
+        crate::plugins::TEST_LEASES.set(Some(leases.clone()));
+        let claim = lease::Registry::new(leases.clone())
+            .acquire("studio-place-4321", "example", "task", &leases)
+            .unwrap()
+            .claim;
+        let state = automation::State::default();
+        let bridge = fixture();
+        let synced = reopen_project("lease-synced", Some("published:10:5"));
+        let placeless = reopen_project("lease-placeless", None);
+        let asked = |root: &Path, (pin, target, check): (Option<&str>, Option<&str>, bool)| {
+            let _pin = crate::app::context::select_automation_for_thread(
+                None,
+                root.join("renium.project.jsonc"),
+                pin.map(str::to_string),
+            );
+            automation::commands::reopen_parameters(target.map(Path::new), Some(root), check)
+                .unwrap()
+        };
+        let bind = |root: &Path, request: &Value, claim: Option<&lease::Claim>| {
+            let mut parameters = crate::daemon::bind_scope(op::STUDIO_OPEN, request);
+            parameters["root"] = json!(root);
+            parameters["resourceLease"] = json!(claim);
+            bound_context::bind(&state, &bridge, &parameters)
+                .map(|bound| state.context(bound["id"].as_u64().unwrap()).unwrap())
+                .map_err(|failure| failure.0.c)
+        };
+        for root in [synced.as_path(), placeless.as_path()] {
+            for (pin, target, check) in [
+                (Some("10:4321"), None, false),
+                (None, Some("10:4321"), false),
+                (Some("10:4321"), None, true),
+                (None, Some("4321"), true),
+            ] {
+                let request = asked(root, (pin, target, check));
+                assert_eq!(
+                    bind(root, &request, None).err().as_deref(),
+                    Some("resource_owned"),
+                    "{root:?} {pin:?} {target:?}"
+                );
+            }
+            let offline =
+                offline_open_check(Some(root), &asked(root, (None, Some("10:4321"), true)));
+            assert!(
+                offline.is_err_and(|error| error.to_string().contains("is owned by task task")),
+                "{root:?}"
+            );
+        }
+        for (pin, target) in [(None, Some("10:4321")), (Some("10:4321"), None)] {
+            let request = asked(placeless.as_path(), (pin, target, false));
+            let context = bind(placeless.as_path(), &request, Some(&claim)).unwrap();
+            assert_eq!(context.place_id, Some(4321));
+            bound_context::resolve_project(&state, context.id)
+                .map_err(|failure| failure.0.m)
+                .unwrap();
+            let opened = open_studio(&context, &request, &state, &bridge).unwrap();
+            assert_eq!(opened["target"], json!(published(10, 4321)));
+        }
+        let copy = placeless.join("Copy.rbxl");
+        std::fs::write(&copy, []).unwrap();
+        let copy = copy.display().to_string();
+        let beside = asked(placeless.as_path(), (Some("10:4321"), Some(&copy), false));
+        let pinned = crate::app::context::select_automation_for_thread(
+            None,
+            placeless.join("renium.project.jsonc"),
+            Some("10:4321".into()),
+        );
+        assert_eq!(
+            bind(placeless.as_path(), &beside, Some(&claim)).map(|context| context.place_id),
+            Ok(Some(4321)),
+            "the holder opens a file beside the place it pins"
+        );
+        drop(pinned);
+        crate::plugins::TEST_LEASES.set(None);
+        for folder in [synced, placeless, leases] {
+            std::fs::remove_dir_all(folder).unwrap();
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn a_check_through_the_daemon_neither_waits_nor_writes() {
+        use crate::automation::authorization::signed_fixture_request;
+        use crate::studio::bridge::routing_tests::fixture;
+        let root = reopen_project("check-unsettled", Some("published:10:5"));
+        let state = automation::State::default();
+        let bridge = Arc::new(fixture());
+        let check = json!({ "check": true });
+        let context = bind_as_command(&state, &bridge, &root, op::STUDIO_OPEN, &check);
+        assert!(
+            !root.join("RENIUM.md").exists(),
+            "a check's bind writes no project instructions"
+        );
+        let key = crate::system::files::exact_path_key(Path::new(&context.source));
+        let journal = root.join(".renium/import-settlement").join(format!(
+            "{:016x}",
+            crate::system::files::fnv1a(key.as_bytes())
+        ));
+        std::fs::create_dir_all(&journal).unwrap();
+        std::fs::write(journal.join("pending.rmp"), b"unfinished").unwrap();
+        assert!(automation::reconcile::import_settle::pending(&context));
+        let held = crate::system::project_access::try_acquire(&root)
+            .unwrap()
+            .unwrap();
+        let gate = bridge.acquire_request_gate();
+        let request = signed_fixture_request(
+            &state,
+            json!({ "v": 1, "id": 1, "op": op::STUDIO_OPEN, "cx": context.id, "p": check }),
+        );
+        let (state, bridge, request) = (&state, &bridge, &request);
+        let answer = std::thread::scope(|scope| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let response =
+                    automation_parse_response_with_lease(request, state, bridge, 1.0, None);
+                let _ = sender.send(response.r.ok_or(response.e.map(|error| error.m)));
+            });
+            let answer = receiver.recv_timeout(Duration::from_secs(10));
+            drop((held, gate));
+            answer
+        });
+        assert_eq!(
+            answer
+                .expect("the check waited behind the request gate or the import")
+                .unwrap()["reason"],
+            "live sync"
+        );
+        bind_as_command(state, bridge, &root, op::STUDIO_OPEN, &json!({}));
+        assert!(
+            root.join("RENIUM.md").exists(),
+            "an open's bind does write them"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn resolved_instance_paths_come_inline_or_as_arrays() {

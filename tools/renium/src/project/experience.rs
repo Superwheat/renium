@@ -362,6 +362,28 @@ pub(crate) fn resolve_experience_game_id(start: &Path) -> Result<Option<i64>> {
     Ok(load_experience(start)?.and_then(|layout| layout.game_id))
 }
 
+/// The universe of a place the experience around `start` configures by id.
+pub(crate) fn configured_universe(start: &Path, place_id: i64) -> Result<Option<i64>> {
+    Ok(load_experience(start)?.and_then(|layout| {
+        layout
+            .places
+            .into_iter()
+            .find(|place| place.place_id == Some(place_id))?
+            .game_id
+    }))
+}
+
+/// Whether `selector` names a place the experience around `start`
+/// configures, by alias, name or id.
+pub(crate) fn configures_place(start: &Path, selector: &str) -> bool {
+    load_experience(start).ok().flatten().is_some_and(|layout| {
+        layout
+            .places
+            .iter()
+            .any(|place| place.matches_selector(selector))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::set_top_level_member;

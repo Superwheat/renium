@@ -177,7 +177,7 @@ pub(crate) fn command(args: crate::cli::NativeProbeArgs) -> Result<()> {
             "Scratch place does not exist: {}",
             file.display()
         );
-        crate::project::workflows::spawn_studio(executable, &[file.as_os_str()])?
+        crate::project::workflows::spawn_studio(executable, &[file.as_os_str()], None)?
     } else {
         args.pid.expect("clap requires --pid or --launch")
     };
