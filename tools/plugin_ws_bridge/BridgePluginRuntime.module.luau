@@ -808,6 +808,7 @@ function BridgePluginRuntime.start(context)
 			or not instance:IsA("Player") and not instance:FindFirstAncestorWhichIsA("Player")
 	end
 	Config.includeExportInstance = includeExportInstance
+	Config.neverSerializedClasses = NEVER_SERIALIZED_CLASSES
 	-- includeExportInstance for every instance under a service at once, where
 	-- none of them can be a session lock or a player.
 	Config.exportInclusionUnder = function(serviceName: string, service: Instance): ((Instance, string) -> boolean)?
@@ -838,12 +839,18 @@ function BridgePluginRuntime.start(context)
 		nativeContentGenerationByService.Workspace += 1
 		nativeLastChangeByService.Workspace = "SmoothGrid"
 	end
+	local scopedTerrainProof: string? = nil
 	Config.captureTerrainProof = function(): string
+		if scopedTerrainProof ~= nil then
+			return scopedTerrainProof
+		end
 		local started = os.clock()
 		local payload = game:GetService("SerializationService"):SerializeInstancesAsync({ game:GetService("Workspace").Terrain })
 		ConnectionModule.profileStep("Terrain proof serialization", started, { instances = 1, bytes = buffer.len(payload) })
 		started = os.clock()
-		local digest = buffer.tostring(EncodingService:ComputeBufferHash(payload, Enum.HashAlgorithm.Blake3))
+		local digest = buffer.tostring(
+			EncodingService:Base64Encode(EncodingService:ComputeBufferHash(payload, Enum.HashAlgorithm.Blake3))
+		)
 		ConnectionModule.profileStep("Terrain proof hash", started, { bytes = buffer.len(payload) })
 		return digest
 	end
@@ -932,6 +939,15 @@ function BridgePluginRuntime.start(context)
 		end,
 		runtimeId = Config.bridgeRuntimeId,
 		allowedServices = ALLOWED_SERVICES,
+		setBulkExpectedProperties = Config.studioChanges.setBulkExpectedProperties,
+		captureTerrainProof = Config.captureTerrainProof,
+		noteBulkExportChange = function(serviceName: string, propertyName: string)
+			if nativeContentGenerationByService[serviceName] ~= nil then
+				nativeContentGenerationByService[serviceName] += 1
+				nativeLastChangeByService[serviceName] = propertyName
+				Config.studioChanges.noteBulkExportChange(serviceName)
+			end
+		end,
 		maxChangesPerRequest = 5000,
 		maxInstanceEntriesPerChange = 5000,
 		maxPathSegments = 128,
@@ -3341,6 +3357,7 @@ function BridgePluginRuntime.start(context)
 			exportAllProperties = EXPORT_ALL_PROPERTIES,
 			nativeRootTargetBatch = true,
 			nativeRootTargetIds = true,
+			bulkPropertyPatch = true,
 		}
 	end
 
@@ -4379,6 +4396,48 @@ function BridgePluginRuntime.start(context)
 			return editorSync.applyChanges(p)
 		end
 		return BridgePluginRuntime.withSuppression(Config.studioChanges, editorSync.applyChanges, p, p)
+	end
+
+	Config.bridgeMethodHandlers.applyEditorBulkProperties = function(p)
+		local transactionScoped = transactionExpectations[tostring(p.transactionId or "")] ~= nil
+		local result = if transactionScoped
+			then editorSync.applyBulkProperties(p)
+			else BridgePluginRuntime.withSuppression(Config.studioChanges, editorSync.applyBulkProperties, p, p)
+		local preTerrain = if type(result) == "table" then result._preTerrainDigest else nil
+		if type(result) == "table" then
+			result._preTerrainDigest = nil
+		end
+		if
+			p.commit == true
+			and transactionScoped
+			and type(result) == "table"
+			and result.ok == true
+			and result.fallbackFullCapture ~= true
+			and (tonumber(result.errors) or 0) == 0
+			and (type(result.protectedWrites) ~= "table" or #result.protectedWrites == 0)
+		then
+			if type(preTerrain) == "string" then
+				scopedTerrainProof = preTerrain
+			end
+			local okCommit, commitRes = pcall(editorSync.commitTransaction, {
+				transactionId = p.transactionId,
+			})
+			if okCommit and type(commitRes) == "table" then
+				result.commitResult = commitRes
+				if type(p.releaseTracking) == "table" and commitRes.state == "committed" then
+					local releaseParams = table.clone(p.releaseTracking)
+					if commitRes.verifiedPushProof ~= nil then
+						releaseParams.retainPushProof = commitRes.verifiedPushProof
+					end
+					local okRelease, releaseRes = pcall(Config.studioChanges.getState, releaseParams)
+					if okRelease and type(releaseRes) == "table" and releaseRes.ok == true then
+						result.releaseResult = releaseRes
+					end
+				end
+			end
+			scopedTerrainProof = nil
+		end
+		return result
 	end
 
 	Config.bridgeMethodHandlers.sampleStudioProperty = function(p)

@@ -545,7 +545,10 @@ pub(crate) fn instance_premise(
     now: &ProofScope,
     pulls: &BTreeMap<String, &StoreInstancePull>,
 ) -> ScopedPremise {
-    let ProofScope::Services { services, touched } = now else {
+    let ProofScope::Services {
+        services, touched, ..
+    } = now
+    else {
         return ScopedPremise::False;
     };
     let inside = services.iter().all(|service| {

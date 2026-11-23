@@ -115,26 +115,47 @@ pub(crate) fn is_property(class: &str, name: &str) -> bool {
         )
 }
 
+fn class_is_not_creatable(
+    database: &rbx_reflection::ReflectionDatabase<'_>,
+    class_name: &str,
+) -> bool {
+    matches!(class_name, "Player" | "Terrain" | "DataModel")
+        || database.classes.get(class_name).is_some_and(|class| {
+            class.tags.contains(&rbx_reflection::ClassTag::NotCreatable)
+                || class.tags.contains(&rbx_reflection::ClassTag::Service)
+        })
+}
+
 pub(crate) fn normalize_resets(changes: &mut super::types::EditorChangeSet) -> Result<()> {
+    let database = rbx_reflection_database::get()?;
     for change in &mut changes.property_changes {
+        let not_creatable = class_is_not_creatable(database, &change.class_name);
         let names = change
             .reset_properties
             .iter()
-            .filter(|name| is_property(&change.class_name, name))
+            .filter(|name| {
+                is_property(&change.class_name, name) || (not_creatable && name.as_str() != "Tags")
+            })
             .cloned()
             .collect::<Vec<_>>();
         for name in names {
-            // CollisionFidelity is encoded in cooked mesh data, so reflection
-            // has no serialized default. Studio can read its constructor default
-            // and queue the same verified native setter used for explicit values.
             if change.class_name == "MeshPart" && name == "CollisionFidelity" {
                 continue;
             }
-            // Service roots cannot be instantiated just to read a default in
-            // the plugin. Use the same reflection defaults as saved data.
-            let value = default_value(&change.class_name, &name)?;
-            change.properties.entry(name.clone()).or_insert(value);
-            change.reset_properties.retain(|other| other != &name);
+            if is_property(&change.class_name, &name) {
+                let value = default_value(&change.class_name, &name)?;
+                change.properties.entry(name.clone()).or_insert(value);
+                change.reset_properties.retain(|other| other != &name);
+            } else if let Some(value) =
+                crate::settings::equivalence::reflection_default_settings_value(
+                    database,
+                    &change.class_name,
+                    &name,
+                )
+            {
+                change.properties.entry(name.clone()).or_insert(value);
+                change.reset_properties.retain(|other| other != &name);
+            }
         }
     }
     Ok(())
@@ -1487,6 +1508,69 @@ mod tests {
         assert!(write.text().is_err());
         assert!(!is_property("MaterialService", "Use2022MaterialsXml"));
         assert!(!is_property("Folder", "Use2022Materials"));
+    }
+
+    #[test]
+    fn normalize_resets_resolves_non_creatable_and_service_defaults() {
+        let mut changes = super::super::types::EditorChangeSet {
+            property_changes: vec![
+                super::super::types::EditorPropertyChange {
+                    service: "Workspace".into(),
+                    settings_id: None,
+                    path_segments: vec!["Workspace".into(), "Terrain".into()],
+                    path_ordinals: vec![1, 1],
+                    class_name: "Terrain".into(),
+                    properties: Map::new(),
+                    reset_properties: vec!["WaterWaveSize".into(), "Tags".into()],
+                    attributes: Map::new(),
+                    deleted_attributes: vec![],
+                    attributes_complete: false,
+                },
+                super::super::types::EditorPropertyChange {
+                    service: "Workspace".into(),
+                    settings_id: None,
+                    path_segments: vec!["Workspace".into()],
+                    path_ordinals: vec![1],
+                    class_name: "Workspace".into(),
+                    properties: Map::new(),
+                    reset_properties: vec!["Gravity".into()],
+                    attributes: Map::new(),
+                    deleted_attributes: vec![],
+                    attributes_complete: false,
+                },
+                super::super::types::EditorPropertyChange {
+                    service: "Workspace".into(),
+                    settings_id: None,
+                    path_segments: vec!["Workspace".into(), "Part".into()],
+                    path_ordinals: vec![1, 1],
+                    class_name: "Part".into(),
+                    properties: Map::new(),
+                    reset_properties: vec!["Transparency".into()],
+                    attributes: Map::new(),
+                    deleted_attributes: vec![],
+                    attributes_complete: false,
+                },
+            ],
+            ..Default::default()
+        };
+        normalize_resets(&mut changes).unwrap();
+        assert!(
+            changes.property_changes[0]
+                .properties
+                .contains_key("WaterWaveSize")
+        );
+        assert_eq!(changes.property_changes[0].reset_properties, vec!["Tags"]);
+        assert!(
+            changes.property_changes[1]
+                .properties
+                .contains_key("Gravity")
+        );
+        assert!(changes.property_changes[1].reset_properties.is_empty());
+        assert!(changes.property_changes[2].properties.is_empty());
+        assert_eq!(
+            changes.property_changes[2].reset_properties,
+            vec!["Transparency"]
+        );
     }
 
     #[test]

@@ -54,6 +54,25 @@ pub(crate) fn prepare_project_replacement_from(
 /// (`imported_store`).
 pub(crate) type ImportedStores = std::sync::Mutex<HashSet<PathBuf>>;
 
+/// Stores whose entire difference is eligible plain scriptable properties and
+/// can be pushed directly through the compact columnar bulk property patch.
+pub(crate) type BulkPropertyPatches =
+    std::sync::Mutex<HashMap<PathBuf, crate::editor::types::EditorBulkPropertyPatch>>;
+
+/// Extracts the Roblox service name from a service settings path, supporting both
+/// `instances/<Service>.renium` and `src/<Service>/__roblox_sync_settings.renium`.
+pub(crate) fn settings_path_service_name(path: &Path) -> Option<&str> {
+    let stem = path.file_stem()?.to_str()?;
+    if stem != "__roblox_sync_settings" {
+        return Some(stem);
+    }
+    path.parent()?.file_name()?.to_str()
+}
+
+/// Minimum number of changed instances before switching from ordinary per-row
+/// JSON property edits to the compact columnar bulk plain-property path.
+pub(crate) const BULK_PROPERTY_MIN_INSTANCES: usize = 64;
+
 /// The services of the stores a push imports anew. Every instance of such a
 /// service is a new object, as in one `promote_heavy_deltas_to_replacement`
 /// replaces.
@@ -81,6 +100,24 @@ pub(crate) fn prepare_project_replacement_importing(
     read: StoresRead,
     imported: Option<&ImportedStores>,
 ) -> Result<HashSet<PathBuf>> {
+    prepare_project_replacement_with_bulk(desired, observed, paths, prepared, read, imported, None)
+}
+
+pub(crate) fn prepare_project_replacement_with_bulk(
+    desired: &ProjectSnapshot,
+    observed: &ProjectSnapshot,
+    paths: &HashSet<PathBuf>,
+    prepared: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
+    read: StoresRead,
+    imported: Option<&ImportedStores>,
+    bulk: Option<&BulkPropertyPatches>,
+) -> Result<HashSet<PathBuf>> {
+    enum PreparedSlot {
+        Unchanged,
+        Bulk,
+        Prepared(PreparedEditorSettingsChange),
+    }
+
     let documents = paths
         .par_iter()
         .filter(|path| {
@@ -91,7 +128,44 @@ pub(crate) fn prepare_project_replacement_importing(
         .map(|path| {
             // Byte-identical settings files decode to identical documents.
             if desired.entries.get(path) == observed.entries.get(path) {
-                return Ok((path.clone(), None));
+                return Ok((path.clone(), PreparedSlot::Unchanged));
+            }
+            if let Some(bulk_patches) = bulk
+                && read != StoresRead::Whole
+                && let (
+                    Some(SnapshotEntry::File(desired_bytes)),
+                    Some(SnapshotEntry::File(observed_bytes)),
+                ) = (desired.entries.get(path), observed.entries.get(path))
+                && let Some(service_name) = settings_path_service_name(path)
+            {
+                let bulk_started = std::time::Instant::now();
+                match crate::settings::bytecode::blocks::bulk_diff::diff_v12_bulk_plain_properties(
+                    desired_bytes,
+                    observed_bytes,
+                    service_name,
+                    BULK_PROPERTY_MIN_INSTANCES,
+                )? {
+                    crate::settings::bytecode::blocks::bulk_diff::BulkDiffOutcome::Unchanged => {
+                        return Ok((path.clone(), PreparedSlot::Unchanged));
+                    }
+                    crate::settings::bytecode::blocks::bulk_diff::BulkDiffOutcome::Patch(patch) => {
+                        crate::app::timing::log_timing(
+                            &format!(
+                                "columnar bulk property diff ({} instances, {} fields, {} tree nodes)",
+                                patch.instance_count,
+                                patch.field_count,
+                                patch.nodes.len()
+                            ),
+                            bulk_started,
+                        );
+                        bulk_patches
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(path.clone(), patch);
+                        return Ok((path.clone(), PreparedSlot::Bulk));
+                    }
+                    crate::settings::bytecode::blocks::bulk_diff::BulkDiffOutcome::Fallback => {}
+                }
             }
             let step_started = std::time::Instant::now();
             let changed = if read == StoresRead::Whole {
@@ -107,9 +181,9 @@ pub(crate) fn prepare_project_replacement_importing(
                 )?
             };
             let (decoded, bare) = match changed {
-                ChangedInstances::None => return Ok((path.clone(), None)),
+                ChangedInstances::None => return Ok((path.clone(), PreparedSlot::Unchanged)),
                 ChangedInstances::Prepared(change) => {
-                    return Ok((path.clone(), Some(*change)));
+                    return Ok((path.clone(), PreparedSlot::Prepared(*change)));
                 }
                 ChangedInstances::Whole(None) if read != StoresRead::Whole => (
                     None,
@@ -154,7 +228,7 @@ pub(crate) fn prepare_project_replacement_importing(
             let step_started = step("decode", step_started);
             if settings_documents_positionally_equivalent(&current, &previous) {
                 drop_settings_documents(current, previous);
-                return Ok((path.clone(), None));
+                return Ok((path.clone(), PreparedSlot::Unchanged));
             }
             let previous = if current.instances.is_empty() {
                 // An omitted store clears authored contents through the existing
@@ -196,7 +270,7 @@ pub(crate) fn prepare_project_replacement_importing(
                 let step_started = step("comparison", step_started);
                 if equivalent {
                     drop_settings_documents(current, previous);
-                    return Ok((path.clone(), None));
+                    return Ok((path.clone(), PreparedSlot::Unchanged));
                 }
                 let current_by_id = current
                     .instances
@@ -244,16 +318,20 @@ pub(crate) fn prepare_project_replacement_importing(
             }
             Ok((
                 path.clone(),
-                Some(PreparedEditorSettingsChange { previous, current }),
+                PreparedSlot::Prepared(PreparedEditorSettingsChange { previous, current }),
             ))
         })
         .collect::<Result<Vec<_>>>()?;
     let mut unchanged = HashSet::new();
-    for (path, change) in documents {
-        if let Some(change) = change {
-            prepared.insert(path, change);
-        } else {
-            unchanged.insert(path);
+    for (path, slot) in documents {
+        match slot {
+            PreparedSlot::Prepared(change) => {
+                prepared.insert(path, change);
+            }
+            PreparedSlot::Unchanged => {
+                unchanged.insert(path);
+            }
+            PreparedSlot::Bulk => {}
         }
     }
     Ok(unchanged)

@@ -4824,6 +4824,8 @@ fn pre_import_property(change: &EditorPropertyChange, name: &str, native_import:
 pub(crate) struct EditorBatchResult {
     pub(crate) summary: Map<String, Value>,
     pub(crate) individual_dispatches: usize,
+    pub(crate) commit_result: Option<Value>,
+    pub(crate) release_result: Option<Value>,
 }
 
 pub(crate) fn send_editor_change_batches(
@@ -4831,6 +4833,24 @@ pub(crate) fn send_editor_change_batches(
     changes: &EditorChangeSet,
     binary_import: Option<&EditorBinaryImport>,
     transaction_id: Option<&str>,
+) -> Result<EditorBatchResult> {
+    send_editor_change_batches_with_options(
+        bridge,
+        changes,
+        binary_import,
+        transaction_id,
+        false,
+        None,
+    )
+}
+
+pub(crate) fn send_editor_change_batches_with_options(
+    bridge: &BridgeServer,
+    changes: &EditorChangeSet,
+    binary_import: Option<&EditorBinaryImport>,
+    transaction_id: Option<&str>,
+    inline_commit: bool,
+    inline_release: Option<&Value>,
 ) -> Result<EditorBatchResult> {
     let mut summary = Map::new();
     summary.insert("ok".to_string(), Value::Bool(true));
@@ -4844,19 +4864,27 @@ pub(crate) fn send_editor_change_batches(
         "sourceQueued".to_string(),
         json!(changes.source_changes.len() as u64),
     );
+    let bulk_instances = changes
+        .bulk_property_patches
+        .iter()
+        .map(|patch| patch.instance_count)
+        .sum::<usize>();
     summary.insert(
         "propertyQueued".to_string(),
-        json!(changes.property_changes.len() as u64),
+        json!((changes.property_changes.len() + bulk_instances) as u64),
     );
 
     if changes.instance_changes.is_empty()
         && changes.source_changes.is_empty()
         && changes.property_changes.is_empty()
+        && changes.bulk_property_patches.is_empty()
     {
         summary.insert("noops".to_string(), json!(0));
         return Ok(EditorBatchResult {
             summary,
             individual_dispatches: 0,
+            commit_result: None,
+            release_result: None,
         });
     }
 
@@ -4919,6 +4947,7 @@ pub(crate) fn send_editor_change_batches(
 
     if binary_import.is_none()
         && pre_import_changes.is_empty()
+        && changes.bulk_property_patches.is_empty()
         && let Some(request) = combined_editor_change_batch(changes, transaction_id)?
     {
         let result = bridge.call("applyEditorChanges", request)?;
@@ -4947,11 +4976,14 @@ pub(crate) fn send_editor_change_batches(
             binary_import,
             transaction_id,
             &native_root_verification,
+            &std::collections::BTreeSet::new(),
             &mut summary,
         )?;
         return Ok(EditorBatchResult {
             summary,
             individual_dispatches: native_root_verification.completed_dispatches,
+            commit_result: None,
+            release_result: None,
         });
     }
 
@@ -5331,18 +5363,417 @@ pub(crate) fn send_editor_change_batches(
         summary.insert("nativeVerifiedServices".into(), json!(services));
         log_timing("native editor supplemental verification", started);
     }
+    let (bulk_verified_services, commit_result, release_result) =
+        if !changes.bulk_property_patches.is_empty() {
+            let started = Instant::now();
+            let (verified, commit_result, release_result) = send_bulk_property_patches(
+                bridge,
+                &changes.bulk_property_patches,
+                transaction_id,
+                inline_commit,
+                inline_release,
+                &mut summary,
+            )?;
+            log_timing("native editor bulk property patches", started);
+            (verified, commit_result, release_result)
+        } else {
+            (std::collections::BTreeSet::new(), None, None)
+        };
     verify_in_place_editor_fields(
         bridge,
         changes,
         binary_import,
         transaction_id,
         &native_root_verification,
+        &bulk_verified_services,
         &mut summary,
     )?;
     Ok(EditorBatchResult {
         summary,
         individual_dispatches: native_root_verification.completed_dispatches,
+        commit_result,
+        release_result,
     })
+}
+
+const BULK_PROPERTY_CHUNK_RAW_BYTES: usize = 3 * 1024 * 1024;
+const BULK_TREE_NODE_BYTES: usize = 16;
+
+fn encode_bulk_tree_nodes(nodes: &[crate::editor::types::BulkTreeNode]) -> String {
+    let mut bytes = Vec::with_capacity(nodes.len() * BULK_TREE_NODE_BYTES);
+    for node in nodes {
+        bytes.extend_from_slice(&node.parent.to_le_bytes());
+        bytes.extend_from_slice(&node.ordinal.to_le_bytes());
+        bytes.extend_from_slice(&node.name_idx.to_le_bytes());
+        bytes.extend_from_slice(&node.class_idx.to_le_bytes());
+    }
+    base64::encode(&bytes)
+}
+
+fn encode_u32_le(values: &[u32]) -> String {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for &value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    base64::encode(&bytes)
+}
+
+fn encode_bulk_column_slice(
+    column: &crate::editor::types::BulkPropertyColumn,
+    range: std::ops::Range<usize>,
+) -> Value {
+    use crate::editor::types::BulkPropertyValues;
+    let rows = encode_u32_le(&column.rows[range.clone()]);
+    let count = range.len();
+    match &column.values {
+        BulkPropertyValues::F32Const(value) => json!({
+            "propertyName": column.property_name,
+            "encoding": "f32_const",
+            "count": count,
+            "rows": rows,
+            "value": f64::from(*value),
+        }),
+        BulkPropertyValues::F64Const(value) => json!({
+            "propertyName": column.property_name,
+            "encoding": "f64_const",
+            "count": count,
+            "rows": rows,
+            "value": *value,
+        }),
+        BulkPropertyValues::BoolConst(value) => json!({
+            "propertyName": column.property_name,
+            "encoding": "bool_const",
+            "count": count,
+            "rows": rows,
+            "value": *value,
+        }),
+        BulkPropertyValues::F32(values) => {
+            let mut bytes = Vec::with_capacity(count * 4);
+            for &value in &values[range] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            json!({
+                "propertyName": column.property_name,
+                "encoding": "f32",
+                "count": count,
+                "rows": rows,
+                "values": base64::encode(&bytes),
+            })
+        }
+        BulkPropertyValues::F64(values) => {
+            let mut bytes = Vec::with_capacity(count * 8);
+            for &value in &values[range] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            json!({
+                "propertyName": column.property_name,
+                "encoding": "f64",
+                "count": count,
+                "rows": rows,
+                "values": base64::encode(&bytes),
+            })
+        }
+        BulkPropertyValues::Bool(values) => json!({
+            "propertyName": column.property_name,
+            "encoding": "bool",
+            "count": count,
+            "rows": rows,
+            "values": base64::encode(&values[range]),
+        }),
+        BulkPropertyValues::I32(values) => {
+            let mut bytes = Vec::with_capacity(count * 4);
+            for &value in &values[range] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            json!({
+                "propertyName": column.property_name,
+                "encoding": "i32",
+                "count": count,
+                "rows": rows,
+                "values": base64::encode(&bytes),
+            })
+        }
+        BulkPropertyValues::Vector3(values) => {
+            let mut bytes = Vec::with_capacity(count * 12);
+            for &[x, y, z] in &values[range] {
+                bytes.extend_from_slice(&x.to_le_bytes());
+                bytes.extend_from_slice(&y.to_le_bytes());
+                bytes.extend_from_slice(&z.to_le_bytes());
+            }
+            json!({
+                "propertyName": column.property_name,
+                "encoding": "vector3",
+                "count": count,
+                "rows": rows,
+                "values": base64::encode(&bytes),
+            })
+        }
+        BulkPropertyValues::Color3(values) => {
+            let mut bytes = Vec::with_capacity(count * 12);
+            for &[r, g, b] in &values[range] {
+                bytes.extend_from_slice(&r.to_le_bytes());
+                bytes.extend_from_slice(&g.to_le_bytes());
+                bytes.extend_from_slice(&b.to_le_bytes());
+            }
+            json!({
+                "propertyName": column.property_name,
+                "encoding": "color3",
+                "count": count,
+                "rows": rows,
+                "values": base64::encode(&bytes),
+            })
+        }
+        BulkPropertyValues::CFrame(values) => {
+            let mut bytes = Vec::with_capacity(count * 48);
+            for components in &values[range] {
+                for &c in components {
+                    bytes.extend_from_slice(&c.to_le_bytes());
+                }
+            }
+            json!({
+                "propertyName": column.property_name,
+                "encoding": "cframe",
+                "count": count,
+                "rows": rows,
+                "values": base64::encode(&bytes),
+            })
+        }
+        BulkPropertyValues::Indexed { palette, indices } => json!({
+            "propertyName": column.property_name,
+            "encoding": "indexed",
+            "count": count,
+            "rows": rows,
+            "palette": palette,
+            "indices": encode_u32_le(&indices[range]),
+        }),
+    }
+}
+
+fn bulk_column_row_bytes(values: &crate::editor::types::BulkPropertyValues) -> usize {
+    use crate::editor::types::BulkPropertyValues;
+    match values {
+        BulkPropertyValues::F32Const(_)
+        | BulkPropertyValues::F64Const(_)
+        | BulkPropertyValues::BoolConst(_) => 4,
+        BulkPropertyValues::Bool(_) => 5,
+        BulkPropertyValues::F32(_)
+        | BulkPropertyValues::I32(_)
+        | BulkPropertyValues::Indexed { .. } => 8,
+        BulkPropertyValues::F64(_) => 12,
+        BulkPropertyValues::Vector3(_) | BulkPropertyValues::Color3(_) => 16,
+        BulkPropertyValues::CFrame(_) => 52,
+    }
+}
+
+fn send_bulk_property_patches(
+    bridge: &BridgeServer,
+    patches: &[crate::editor::types::EditorBulkPropertyPatch],
+    transaction_id: Option<&str>,
+    inline_commit: bool,
+    inline_release: Option<&Value>,
+    summary: &mut Map<String, Value>,
+) -> Result<(
+    std::collections::BTreeSet<String>,
+    Option<Value>,
+    Option<Value>,
+)> {
+    let mut verified_services = std::collections::BTreeSet::new();
+    let mut sent_instances = 0_u64;
+    let mut commit_result = None;
+    let mut release_result = None;
+    let mut old_value_columns: Map<String, Value> = Map::new();
+    let mut fallback_full_capture = false;
+    for (patch_index, patch) in patches.iter().enumerate() {
+        let is_last_patch = patch_index + 1 == patches.len();
+        let string_table_bytes = patch.strings.join("\0");
+        let string_table_b64 = base64::encode(string_table_bytes.as_bytes());
+        let total_nodes = patch.nodes.len();
+        let tree_raw_bytes = total_nodes * BULK_TREE_NODE_BYTES + string_table_bytes.len();
+        let mut total_verified = 0_u64;
+        let mut protected_count = 0_usize;
+        let mut expected_terrain = patch.expected_terrain_digest.clone();
+        let mut service_old_columns: Vec<Value> = Vec::new();
+
+        let mut inline_tree = if tree_raw_bytes <= BULK_PROPERTY_CHUNK_RAW_BYTES {
+            Some(json!({
+                "strings": string_table_b64,
+                "stringCount": patch.strings.len(),
+                "nodeOffset": 0,
+                "nodeCount": total_nodes,
+                "totalNodes": total_nodes,
+                "nodes": encode_bulk_tree_nodes(&patch.nodes),
+            }))
+        } else {
+            let max_nodes = (BULK_PROPERTY_CHUNK_RAW_BYTES / BULK_TREE_NODE_BYTES).max(1);
+            let mut offset = 0;
+            while offset < total_nodes {
+                let end = (offset + max_nodes).min(total_nodes);
+                let mut tree_obj = json!({
+                    "nodeOffset": offset,
+                    "nodeCount": end - offset,
+                    "totalNodes": total_nodes,
+                    "nodes": encode_bulk_tree_nodes(&patch.nodes[offset..end]),
+                });
+                if offset == 0 {
+                    tree_obj["strings"] = json!(string_table_b64);
+                    tree_obj["stringCount"] = json!(patch.strings.len());
+                }
+                let result = bridge.call(
+                    "applyEditorBulkProperties",
+                    json!({
+                        "transactionId": transaction_id,
+                        "service": patch.service,
+                        "tree": tree_obj,
+                        "columns": [],
+                    }),
+                )?;
+                merge_editor_summary_checked(summary, &result)?;
+                offset = end;
+            }
+            None
+        };
+
+        let mut pending_columns: Vec<Value> = Vec::new();
+        let mut pending_raw_bytes = if inline_tree.is_some() {
+            tree_raw_bytes
+        } else {
+            0
+        };
+
+        let mut flush = |tree: &mut Option<Value>,
+                         columns: &mut Vec<Value>,
+                         raw_bytes: &mut usize,
+                         commit: bool|
+         -> Result<bool> {
+            if tree.is_none() && columns.is_empty() {
+                return Ok(false);
+            }
+            let has_columns = !columns.is_empty();
+            let mut request = json!({
+                "transactionId": transaction_id,
+                "service": patch.service,
+                "tree": tree.take(),
+                "columns": std::mem::take(columns),
+            });
+            if has_columns && let Some(digest) = expected_terrain.take() {
+                request["expectedTerrainDigest"] = Value::String(digest);
+            }
+            if has_columns && patch.return_old_values {
+                request["returnOldValues"] = Value::Bool(true);
+            }
+            if commit {
+                request["commit"] = Value::Bool(true);
+                if let Some(release) = inline_release {
+                    request["releaseTracking"] = release.clone();
+                }
+            }
+            *raw_bytes = 0;
+            let result = bridge.call("applyEditorBulkProperties", request)?;
+            if result.get("fallbackFullCapture") == Some(&Value::Bool(true)) {
+                return Ok(true);
+            }
+            if let Some(returned) = result.get("oldValueColumns").and_then(Value::as_array) {
+                service_old_columns.extend(returned.iter().cloned());
+            }
+            if commit {
+                if let Some(committed) = result.get("commitResult").cloned() {
+                    commit_result = Some(committed);
+                }
+                if let Some(released) = result.get("releaseResult").cloned() {
+                    release_result = Some(released);
+                }
+            }
+            merge_editor_summary_checked(summary, &result)?;
+            total_verified += result.get("verified").and_then(Value::as_u64).unwrap_or(0);
+            protected_count += result
+                .get("protectedWrites")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            Ok(false)
+        };
+
+        for column in &patch.columns {
+            let per_row = bulk_column_row_bytes(&column.values).max(1);
+            let total_rows = column.rows.len();
+            let mut start = 0;
+            while start < total_rows {
+                if pending_raw_bytes >= BULK_PROPERTY_CHUNK_RAW_BYTES
+                    && !pending_columns.is_empty()
+                    && flush(
+                        &mut inline_tree,
+                        &mut pending_columns,
+                        &mut pending_raw_bytes,
+                        false,
+                    )?
+                {
+                    fallback_full_capture = true;
+                    break;
+                }
+                let remaining_budget =
+                    BULK_PROPERTY_CHUNK_RAW_BYTES.saturating_sub(pending_raw_bytes);
+                let max_rows = (remaining_budget / per_row).max(1);
+                if pending_raw_bytes > 0
+                    && !pending_columns.is_empty()
+                    && remaining_budget < per_row * 64
+                {
+                    if flush(
+                        &mut inline_tree,
+                        &mut pending_columns,
+                        &mut pending_raw_bytes,
+                        false,
+                    )? {
+                        fallback_full_capture = true;
+                        break;
+                    }
+                    continue;
+                }
+                let end = (start + max_rows).min(total_rows);
+                pending_columns.push(encode_bulk_column_slice(column, start..end));
+                pending_raw_bytes += (end - start) * per_row;
+                start = end;
+            }
+            if fallback_full_capture {
+                break;
+            }
+        }
+        if !fallback_full_capture
+            && flush(
+                &mut inline_tree,
+                &mut pending_columns,
+                &mut pending_raw_bytes,
+                inline_commit && is_last_patch,
+            )?
+        {
+            fallback_full_capture = true;
+        }
+        if fallback_full_capture {
+            summary.insert("fallbackFullCapture".to_string(), Value::Bool(true));
+            return Ok((std::collections::BTreeSet::new(), None, None));
+        }
+        if !service_old_columns.is_empty() {
+            old_value_columns.insert(patch.service.clone(), Value::Array(service_old_columns));
+        }
+
+        sent_instances += patch.instance_count as u64;
+        if total_verified == patch.field_count as u64 && protected_count == 0 {
+            verified_services.insert(patch.service.clone());
+        }
+    }
+    if !old_value_columns.is_empty() {
+        summary.insert(
+            "_bulkOldValueColumns".to_string(),
+            Value::Object(old_value_columns),
+        );
+    }
+    let already_sent = summary
+        .get("propertySent")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    summary.insert(
+        "propertySent".to_string(),
+        json!(already_sent + sent_instances),
+    );
+    Ok((verified_services, commit_result, release_result))
 }
 
 fn verify_in_place_editor_fields(
@@ -5351,6 +5782,7 @@ fn verify_in_place_editor_fields(
     binary_import: Option<&EditorBinaryImport>,
     transaction_id: Option<&str>,
     native_roots: &crate::editor::native_roots::NativeRootVerification,
+    bulk_verified_services: &std::collections::BTreeSet<String>,
     summary: &mut Map<String, Value>,
 ) -> Result<()> {
     // Filtered plans can intentionally omit requested fields. Their remaining
@@ -5472,6 +5904,25 @@ fn verify_in_place_editor_fields(
         // readback without discarding complete proofs for other services.
         if verified == expected as u64 {
             verified_services.push(service);
+        }
+    }
+    for service in bulk_verified_services {
+        let has_other_changes = changes
+            .property_changes
+            .iter()
+            .any(|row| row.service == *service)
+            || changes
+                .instance_changes
+                .iter()
+                .any(|change| change.service == *service)
+            || changes
+                .source_changes
+                .iter()
+                .any(|change| change.service == *service && change.deleted)
+            || binary_import
+                .is_some_and(|import| import.groups.iter().any(|group| group.service == *service));
+        if !has_other_changes && !verified_services.contains(&service.as_str()) {
+            verified_services.push(service.as_str());
         }
     }
     if !verified_services.is_empty() {

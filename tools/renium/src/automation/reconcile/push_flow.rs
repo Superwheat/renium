@@ -86,14 +86,21 @@ fn reuse_verified_full_push(
     push_args: &PushEditorChangesArgs,
     eligible: bool,
 ) -> Result<VerifiedFullPushReuse> {
-    let mut candidate = if eligible {
+    let candidate = if eligible {
         take_verified_full_push(context, bridge, services, push_args)?
     } else {
         None
     };
-    if let Some(mut candidate) = candidate.take_if(|candidate| candidate.files_unchanged)
-        && verified_full_push_proof_matches(context, bridge, &candidate.cached.proof)?
+    if candidate
+        .as_ref()
+        .is_some_and(|candidate| candidate.files_unchanged)
+        && verified_full_push_proof_matches(
+            context,
+            bridge,
+            &candidate.as_ref().expect("checked above").cached.proof,
+        )?
     {
+        let mut candidate = candidate.expect("checked above");
         log_global(5, format_args!("[renium] baseline: full push unchanged"));
         if let Some(runtime) = context.runtime_id.as_deref() {
             candidate.cached.renew();
@@ -252,6 +259,573 @@ pub(super) fn plan_from_whole_stores(
     )
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+fn scoped_push_capture_services(
+    context: &BoundContext,
+    services: &[String],
+    eligible: bool,
+    scoped_baseline: Option<&ProjectSnapshot>,
+    initial_state: &Value,
+) -> Option<Vec<String>> {
+    let held_project = scoped_baseline.filter(|_| eligible)?;
+    let source = Path::new(&context.source);
+    let stores = crate::project::structural::service_store_paths(source)
+        .ok()?
+        .into_iter()
+        .map(|(service, path)| {
+            Some((
+                service,
+                path.strip_prefix(&context.root).ok()?.to_path_buf(),
+            ))
+        })
+        .collect::<Option<BTreeMap<_, _>>>()?;
+    let service_set: HashSet<&str> = services.iter().map(String::as_str).collect();
+    match super::coordinator::moved_services(
+        &ProofScope::parse(&initial_state["pushProofScope"]),
+        held_project,
+        &stores,
+    ) {
+        Ok(Ok(moved)) => {
+            let moved: Vec<String> = moved
+                .into_iter()
+                .filter(|service| service_set.contains(service.as_str()))
+                .collect();
+            (!moved.is_empty() && moved.len() < services.len()).then_some(moved)
+        }
+        Ok(Err(reason)) => {
+            log_global(
+                5,
+                format_args!("[renium] scoped push capture unavailable: {reason}"),
+            );
+            None
+        }
+        Err(error) => {
+            log_global(
+                5,
+                format_args!("[renium] scoped push capture error: {error:#}"),
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn scoped_push_capture_services(
+    _context: &BoundContext,
+    _services: &[String],
+    _eligible: bool,
+    _scoped_baseline: Option<&ProjectSnapshot>,
+    _initial_state: &Value,
+) -> Option<Vec<String>> {
+    None
+}
+
+fn capture_scoped_push_baseline(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    root: &Path,
+    moved: &[String],
+    stage: &ExportProjectStage,
+    mut baseline: ProjectSnapshot,
+) -> Result<ProjectSnapshot> {
+    log_global(
+        5,
+        format_args!(
+            "[renium] scoped push capture: services=[{}]",
+            moved.join(", ")
+        ),
+    );
+    let captured_moved =
+        capture_studio_services_in_memory_options(context, bridge, moved, stage, false, true)?;
+    let source = Path::new(&context.source)
+        .strip_prefix(root)
+        .context("Project source is outside its root")?;
+    let mut scopes = Vec::with_capacity(moved.len() * 2);
+    for service in moved {
+        scopes.push(source.join(service));
+        scopes.push(
+            service_settings_path(&Path::new(&context.source).join(service))
+                .strip_prefix(root)
+                .context("Scoped push capture store is outside its project root")?
+                .to_path_buf(),
+        );
+    }
+    let scope_set = ScopeSet::new(&scopes);
+    baseline.entries.retain(|path, _| !scope_set.contains(path));
+    baseline.entries.extend(captured_moved.entries);
+    Ok(baseline)
+}
+
+fn collect_delta_bulk_differences(
+    project: &ProjectSnapshot,
+    studio: &ProjectSnapshot,
+    stores_read: StoresRead,
+    prepared_settings: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
+    bulk_patches: &mut HashMap<PathBuf, crate::editor::types::EditorBulkPropertyPatch>,
+) -> Result<HashSet<PathBuf>> {
+    use crate::settings::bytecode::blocks::bulk_diff::{
+        BulkDiffOutcome, diff_v12_bulk_plain_properties,
+    };
+    let paths = project_replacement_paths(project, studio);
+    let mut non_bulk_project = project.clone();
+    let mut non_bulk_studio = studio.clone();
+    for path in &paths {
+        let is_store = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_service_settings_file_name);
+        if !is_store || project.entries.get(path) == studio.entries.get(path) {
+            continue;
+        }
+        let (Some(SnapshotEntry::File(desired_bytes)), Some(SnapshotEntry::File(observed_bytes))) =
+            (project.entries.get(path), studio.entries.get(path))
+        else {
+            continue;
+        };
+        let Some(service_name) = super::replacement::settings_path_service_name(path) else {
+            continue;
+        };
+        match diff_v12_bulk_plain_properties(
+            desired_bytes,
+            observed_bytes,
+            service_name,
+            super::replacement::BULK_PROPERTY_MIN_INSTANCES,
+        )? {
+            BulkDiffOutcome::Unchanged => {
+                non_bulk_project.entries.remove(path);
+                non_bulk_studio.entries.remove(path);
+            }
+            BulkDiffOutcome::Patch(patch) => {
+                bulk_patches.insert(path.clone(), patch);
+                non_bulk_project.entries.remove(path);
+                non_bulk_studio.entries.remove(path);
+            }
+            BulkDiffOutcome::Fallback => {}
+        }
+    }
+    let mut diffs = snapshot_differences_prepared(
+        &non_bulk_project,
+        &non_bulk_studio,
+        Some(prepared_settings),
+        stores_read == StoresRead::ChangedOfBoth,
+    )?;
+    diffs.extend(bulk_patches.keys().cloned());
+    Ok(diffs)
+}
+
+fn bulk_inline_release_tracking(
+    plan: &ReconcilePushPlan,
+    services: &[String],
+    guard: &StudioChangeGuard,
+    tracking_release: &StudioTrackingGuardRelease<'_>,
+    requires_stage: bool,
+    has_link_enforcement: bool,
+) -> Option<Value> {
+    if !plan.changed_paths.is_empty()
+        || !plan.target_settings_ids.is_empty()
+        || !plan.initial_native_services.is_empty()
+        || plan.bulk_property_patches.is_empty()
+        || requires_stage
+        || has_link_enforcement
+        || tracking_release.guard_id.is_none()
+    {
+        return None;
+    }
+    let retain = tracking_release
+        .retain_until
+        .map_or(BASELINE_IDLE, |until| {
+            until.saturating_duration_since(Instant::now())
+        });
+    Some(json!({
+        "services": services,
+        "ackSeq": guard.change_seq,
+        "runtimeId": guard.runtime_id,
+        "start": false,
+        "includeGenerations": true,
+        "releaseTrackingGuardId": tracking_release.guard_id,
+        "continuesPushProof": tracking_release.continues,
+        "retainSeconds": retain.as_secs(),
+    }))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+struct ZeroCaptureContext<'a> {
+    context: &'a BoundContext,
+    bridge: &'a BridgeServer,
+    services: &'a [String],
+    root: &'a Path,
+    src_dir: &'a Path,
+    source_paths: &'a [PathBuf],
+    stage: &'a ExportProjectStage,
+    guard: &'a StudioChangeGuard,
+    push_args: &'a PushEditorChangesArgs,
+    initial_state: &'a Value,
+    cache_input: Option<&'a Value>,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+struct ExtractedZeroCapture {
+    plan: ReconcilePushPlan,
+    service_rows: HashMap<String, (PathBuf, Vec<usize>)>,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn plan_zero_capture_bulk_restore(
+    zctx: &ZeroCaptureContext<'_>,
+    held_project: &ProjectSnapshot,
+) -> Result<Option<ExtractedZeroCapture>> {
+    use crate::settings::bytecode::blocks::bulk_diff::{
+        BulkExtractOutcome, extract_v12_bulk_properties,
+    };
+    let Some(scope) = ProofBulkScope::parse(&zctx.initial_state["pushProofScope"]) else {
+        return Ok(None);
+    };
+    if scope.services.is_empty() {
+        return Ok(None);
+    }
+    let service_set: HashSet<&str> = zctx.services.iter().map(String::as_str).collect();
+    if scope.services.iter().any(|svc| {
+        !service_set.contains(svc.as_str())
+            || !scope.values_only.contains(svc)
+            || !scope.changed_properties.contains_key(svc)
+    }) {
+        return Ok(None);
+    }
+    if scope.services.contains("Workspace") && scope.expected_terrain_digest.is_none() {
+        return Ok(None);
+    }
+    let stores = crate::project::structural::service_store_paths(Path::new(&zctx.context.source))?;
+    let mut plan = ReconcilePushPlan::default();
+    let mut service_rows = HashMap::new();
+    for service in &scope.services {
+        let Some(store_abs) = stores.get(service) else {
+            return Ok(None);
+        };
+        let Ok(store_rel) = store_abs.strip_prefix(zctx.root) else {
+            return Ok(None);
+        };
+        let Some(SnapshotEntry::File(desired_bytes)) = held_project.entries.get(store_rel) else {
+            return Ok(None);
+        };
+        let props = &scope.changed_properties[service];
+        let phase = Instant::now();
+        let outcome = extract_v12_bulk_properties(
+            desired_bytes,
+            service,
+            props,
+            super::replacement::BULK_PROPERTY_MIN_INSTANCES,
+        )?;
+        let BulkExtractOutcome::Patch(mut extracted) = outcome else {
+            return Ok(None);
+        };
+        log_reconcile_timing(
+            &format!(
+                "zero-capture bulk extract ({service}, {} instances, {} fields)",
+                extracted.patch.instance_count, extracted.patch.field_count
+            ),
+            phase,
+        );
+        if service == "Workspace" {
+            extracted.patch.expected_terrain_digest = scope.expected_terrain_digest.clone();
+        }
+        extracted.patch.return_old_values = true;
+        plan.bulk_property_paths.push(store_rel.to_path_buf());
+        plan.bulk_property_patches.push(extracted.patch);
+        service_rows.insert(
+            service.clone(),
+            (store_rel.to_path_buf(), extracted.node_to_row),
+        );
+    }
+    Ok(Some(ExtractedZeroCapture { plan, service_rows }))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn record_zero_capture_history(
+    zctx: &ZeroCaptureContext<'_>,
+    held_project: &ProjectSnapshot,
+    service_rows: &HashMap<String, (PathBuf, Vec<usize>)>,
+    old_columns_map: &Map<String, Value>,
+) -> Result<String> {
+    use crate::settings::bytecode::blocks::bulk_diff::{
+        decode_bulk_old_value_columns, patch_v12_bulk_old_values,
+    };
+    let phase = Instant::now();
+    let mut before_entries = BTreeMap::new();
+    let mut mutation_paths = HashSet::new();
+    for (service, (store_rel, node_to_row)) in service_rows {
+        let Some(SnapshotEntry::File(desired_bytes)) = held_project.entries.get(store_rel) else {
+            continue;
+        };
+        let updates = old_columns_map
+            .get(service)
+            .and_then(Value::as_array)
+            .map(|cols| decode_bulk_old_value_columns(cols, node_to_row))
+            .transpose()?
+            .unwrap_or_default();
+        let before_bytes = patch_v12_bulk_old_values(desired_bytes, &updates)?;
+        before_entries.insert(store_rel.clone(), SnapshotEntry::File(before_bytes));
+        mutation_paths.insert(store_rel.clone());
+    }
+    log_reconcile_timing("zero-capture history reconstruct", phase);
+    let before = ProjectSnapshot {
+        entries: before_entries,
+    };
+    let mut history =
+        history::SyncHistory::begin(zctx.root, zctx.src_dir, &before, &mutation_paths)?;
+    history.commit(held_project, &ProjectSnapshot::default())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn try_zero_capture_bulk_restore(
+    zctx: &ZeroCaptureContext<'_>,
+    held_project: &ProjectSnapshot,
+    tracking_release: &mut StudioTrackingGuardRelease<'_>,
+    #[cfg(windows)] native_relay: &mut Option<NativeRelay>,
+) -> Result<Option<Map<String, Value>>> {
+    if !(zctx.push_args.no_review || zctx.push_args.yes || crate::app::output::global_yes()) {
+        return Ok(None);
+    }
+    let Some(extracted) = plan_zero_capture_bulk_restore(zctx, held_project)? else {
+        return Ok(None);
+    };
+    let phase = Instant::now();
+    let mut args = zctx.push_args.clone();
+    args.inline_release_tracking = bulk_inline_release_tracking(
+        &extracted.plan,
+        zctx.services,
+        zctx.guard,
+        tracking_release,
+        false,
+        false,
+    );
+    let mut pushed = push_staged_project(
+        zctx.context,
+        zctx.stage,
+        zctx.bridge,
+        StagedPushRequest {
+            plan: extracted.plan,
+            prepared_documents: HashMap::new(),
+            guard: Some(zctx.guard),
+            args,
+            expected_project: Some(held_project),
+            later_edits_follow: false,
+        },
+    )?;
+    if pushed.summary.get("fallbackFullCapture") == Some(&Value::Bool(true)) {
+        log_global(
+            5,
+            format_args!(
+                "[renium] zero-capture bulk restore fell back to full capture (Terrain digest mismatch)"
+            ),
+        );
+        return Ok(None);
+    }
+    if let Some(release_result) = pushed.summary.remove("_inlineReleaseResult") {
+        apply_release_tracking_result(zctx.guard, tracking_release, &release_result);
+    }
+    let old_columns = pushed
+        .summary
+        .remove("_bulkOldValueColumns")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let updated = pushed
+        .summary
+        .get("propertyUpdated")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let (current, history_id) = std::thread::scope(|scope| {
+        let current = scope.spawn(|| capture_snapshot(zctx.root, zctx.stage.publish_paths()));
+        let history_id = if updated > 0.0 {
+            Some(record_zero_capture_history(
+                zctx,
+                held_project,
+                &extracted.service_rows,
+                &old_columns,
+            ))
+        } else {
+            None
+        };
+        (
+            current.join().expect("Post-push snapshot worker panicked"),
+            history_id,
+        )
+    });
+    if let Some(history_id) = history_id {
+        pushed
+            .summary
+            .insert("historyId".into(), Value::String(history_id?));
+    }
+    log_reconcile_timing("full push mutation", phase);
+    let current = current?;
+    if *held_project == current {
+        tracking_release.proof = pushed.summary.remove("verifiedPushProof");
+    } else {
+        tracking_release.retained_proof = None;
+    }
+    if tracking_release.guard_id.is_some() {
+        acknowledge_verified_push(zctx.bridge, zctx.services, zctx.guard, tracking_release)?;
+    }
+    retain_verified_full_push(
+        zctx.bridge,
+        zctx.cache_input,
+        zctx.source_paths,
+        held_project.clone(),
+        tracking_release,
+        #[cfg(windows)]
+        native_relay,
+    );
+    Ok(Some(pushed.summary))
+}
+
+fn prepare_replace_push_differences(
+    context: &BoundContext,
+    root: &Path,
+    stage: &ExportProjectStage,
+    (project, studio): (&ProjectSnapshot, &ProjectSnapshot),
+    (bulk_eligible, unenforced): (bool, bool),
+    prepared_settings: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
+    bulk_patches: &mut HashMap<PathBuf, crate::editor::types::EditorBulkPropertyPatch>,
+) -> Result<(HashSet<PathBuf>, HashSet<String>, StoresRead)> {
+    let paths = project_replacement_paths(project, studio);
+    let stores_read = stores_read_of(unenforced, &paths, project, studio);
+    let imported = ImportedStores::default();
+    let collected_bulk = BulkPropertyPatches::default();
+    let imports_heavy = !root.join("renium-link.json").exists();
+    let unchanged_settings = if bulk_eligible {
+        prepare_project_replacement_with_bulk(
+            project,
+            studio,
+            &paths,
+            prepared_settings,
+            stores_read,
+            imports_heavy.then_some(&imported),
+            Some(&collected_bulk),
+        )?
+    } else {
+        let (prepared, staged) = rayon::join(
+            || {
+                prepare_project_replacement_importing(
+                    project,
+                    studio,
+                    &paths,
+                    prepared_settings,
+                    stores_read,
+                    imports_heavy.then_some(&imported),
+                )
+            },
+            || stage_snapshot_paths(&stage.project_root, &paths, project),
+        );
+        staged?;
+        prepared?
+    };
+    *bulk_patches = collected_bulk
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let native_services = prepared_settings
+        .iter()
+        .filter(|(_, change)| {
+            !change.current.instances.is_empty()
+                && service_has_only_native_containers(&change.previous)
+                && !settings_documents_equivalent(&change.current, &change.previous)
+        })
+        .map(|(path, change)| settings_service_name(path, &change.current, &change.previous))
+        .collect::<Result<HashSet<_>>>()?;
+    let diff_paths = paths
+        .iter()
+        .filter(|path| {
+            if bulk_patches.contains_key(*path) {
+                return true;
+            }
+            if unchanged_settings.contains(*path) {
+                return false;
+            }
+            if let Some(change) = prepared_settings.get(*path) {
+                return !settings_documents_equivalent(&change.current, &change.previous);
+            }
+            let native = services_for_snapshot_paths(context, &HashSet::from([(*path).clone()]))
+                .iter()
+                .any(|service| native_services.contains(service));
+            native
+                || !entries_equivalent(path, studio.entries.get(*path), project.entries.get(*path))
+        })
+        .cloned()
+        .collect::<HashSet<_>>();
+    if bulk_eligible
+        && diff_paths
+            .iter()
+            .any(|path| !bulk_patches.contains_key(path))
+    {
+        stage_snapshot_paths(&stage.project_root, &paths, project)?;
+    }
+    prepared_settings.retain(|path, _| diff_paths.contains(path));
+    let promoted_services = imported_services(imported, prepared_settings)?;
+    Ok((diff_paths, promoted_services, stores_read))
+}
+
+fn collect_saved_field_differences(
+    context: &BoundContext,
+    guard: &StudioChangeGuard,
+    prepared_settings: &HashMap<PathBuf, PreparedEditorSettingsChange>,
+) -> Option<Arc<crate::editor::types::PushSavedFields>> {
+    let mut saved_fields = Vec::new();
+    for field in prepared_settings.values().flat_map(|change| {
+        crate::settings::equivalence::saved_field_differences(&change.current, &change.previous)
+    }) {
+        if !saved_fields.contains(&field) {
+            saved_fields.push(field);
+        }
+    }
+    (!saved_fields.is_empty()).then(|| {
+        Arc::new(crate::editor::types::PushSavedFields {
+            project: PathBuf::from(&context.root),
+            runtime: guard.runtime_id.clone(),
+            fields: saved_fields,
+        })
+    })
+}
+
+fn log_full_push_differences(differences: &HashSet<PathBuf>) {
+    if !crate::app::output::global_log_enabled(5) {
+        return;
+    }
+    let mut listed = differences
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    listed.sort();
+    log_global(
+        5,
+        format_args!(
+            "[renium] full push differences ({}): {}",
+            listed.len(),
+            listed.join(", ")
+        ),
+    );
+}
+
+fn log_full_push_plan(plan: &ReconcilePushPlan) {
+    if !crate::app::output::global_log_enabled(5) {
+        return;
+    }
+    log_global(
+        5,
+        format_args!(
+            "[renium] full push plan: paths=[{}] targets=[{}] native=[{}]",
+            plan.changed_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            plan.target_settings_ids.join(", "),
+            plan.initial_native_services
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
+}
+
 pub(crate) fn push_project(
     context: &BoundContext,
     bridge: &BridgeServer,
@@ -290,35 +864,50 @@ pub(crate) fn push_project(
     // own observer: stopping it earlier retires the proof, stopping it later
     // disarms the fresh observer.
     #[cfg(any(windows, target_os = "macos"))]
-    let (candidate_parts, mut previous_attributes) = match verified_candidate {
-        Some(candidate) => {
-            let VerifiedFullPushCandidate { cached, .. } = candidate;
-            #[cfg(windows)]
-            let previous = cached.relay;
-            #[cfg(not(windows))]
-            let previous = ();
-            (Some((cached.proof.clone(), cached.project)), previous)
-        }
-        None => {
-            #[cfg(windows)]
-            let previous = None;
-            #[cfg(not(windows))]
-            let previous = ();
-            (None, previous)
-        }
-    };
+    let (candidate_parts, candidate_files_unchanged, mut previous_attributes) =
+        match verified_candidate {
+            Some(candidate) => {
+                let VerifiedFullPushCandidate {
+                    cached,
+                    files_unchanged,
+                } = candidate;
+                #[cfg(windows)]
+                let previous = cached.relay;
+                #[cfg(not(windows))]
+                let previous = ();
+                (
+                    Some((cached.proof.clone(), cached.project)),
+                    files_unchanged,
+                    previous,
+                )
+            }
+            None => {
+                #[cfg(windows)]
+                let previous = None;
+                #[cfg(not(windows))]
+                let previous = ();
+                (None, false, previous)
+            }
+        };
     #[cfg(not(any(windows, target_os = "macos")))]
     let (candidate_parts, mut previous_attributes): (Option<(Value, ProjectSnapshot)>, ()) =
         (None, ());
     let candidate_proof = candidate_parts.as_ref().map(|(proof, _)| proof.clone());
+    #[cfg(windows)]
+    let continue_native_relay = previous_attributes
+        .as_ref()
+        .is_some_and(|relay| relay.ends > Instant::now() + Duration::from_secs(30));
+    #[cfg(not(windows))]
+    let continue_native_relay = false;
     let (mut guard, initial_state) = if let Some(guard) = guard {
         (guard.clone(), Value::Null)
     } else {
-        current_studio_change_guard_verifying(
+        current_studio_change_guard_verifying_continuing(
             context,
             bridge,
             (cfg!(any(windows, target_os = "macos")) && replace).then_some(services),
             candidate_proof.as_ref(),
+            continue_native_relay,
             |state| {
                 #[cfg(windows)]
                 arm_native_attribute_relay(
@@ -352,15 +941,15 @@ pub(crate) fn push_project(
     // The proof was checked inside the request that armed tracking, so a match
     // means every later Studio edit is caught by the transaction's generation
     // checks and the last verified files are a complete baseline.
-    let verified_baseline = match candidate_parts {
+    let (verified_baseline, scoped_baseline) = match candidate_parts {
         Some((_, project)) if initial_state["pushProofMatches"] == true => {
             log_global(
                 5,
                 format_args!("[renium] baseline: full push compared with the held files"),
             );
-            Some(project)
+            (Some(project), None)
         }
-        Some(_) => {
+        Some((_, project)) => {
             log_global(
                 5,
                 format_args!(
@@ -370,9 +959,9 @@ pub(crate) fn push_project(
                         .unwrap_or("Studio proof unavailable")
                 ),
             );
-            None
+            (None, Some(project))
         }
-        None => None,
+        None => (None, None),
     };
     let phase = Instant::now();
     // Declared before the tracking lease so unwinding releases Lua tracking
@@ -397,18 +986,69 @@ pub(crate) fn push_project(
         ExportProjectStage::create_for_comparison(&root, &src_dir, services)?
     };
     let source_paths = stage.publish_paths().to_vec();
+    let can_capture_in_memory = !requires_stage
+        && stage
+            .loaded
+            .as_ref()
+            .is_none_or(|loaded| loaded.project.adapters.is_empty());
+    let link_enforcement = super::staging::packing_link_enforcement(
+        Path::new(&context.root),
+        Path::new(&context.source),
+    )?;
+    let bulk_eligible = link_enforcement.is_none()
+        && !requires_stage
+        && crate::editor::sync::files_to_studio_filter_rules(&root)?.is_none()
+        && bridge
+            .cached_bridge_info_for_target(BridgeTarget::Edit)
+            .is_ok_and(|info| info.bulk_property_patch);
+    #[cfg(any(windows, target_os = "macos"))]
+    if replace
+        && bulk_eligible
+        && verified_baseline.is_none()
+        && candidate_files_unchanged
+        && can_capture_in_memory
+        && let Some(held_project) = scoped_baseline.as_ref()
+    {
+        let zctx = ZeroCaptureContext {
+            context,
+            bridge,
+            services,
+            root: &root,
+            src_dir: &src_dir,
+            source_paths: &source_paths,
+            stage: &stage,
+            guard: &guard,
+            push_args: &push_args,
+            initial_state: &initial_state,
+            cache_input: cache_input.as_ref(),
+        };
+        if let Some(summary) = try_zero_capture_bulk_restore(
+            &zctx,
+            held_project,
+            &mut tracking_release,
+            #[cfg(windows)]
+            &mut native_relay,
+        )? {
+            return Ok(summary);
+        }
+    }
+    let scoped_capture_services = scoped_push_capture_services(
+        context,
+        services,
+        verified_baseline.is_none() && can_capture_in_memory,
+        scoped_baseline.as_ref(),
+        &initial_state,
+    );
     // Source capture is read-only and independent of the private Studio stage.
     // Keep Studio calls on this thread, with its selected runtime and lease.
     let (captured, project) = std::thread::scope(|scope| {
         let project = scope.spawn(|| capture_snapshot(&root, &source_paths));
         let captured = if let Some(baseline) = verified_baseline {
             Ok((stage, baseline))
-        } else if !requires_stage
-            && stage
-                .loaded
-                .as_ref()
-                .is_none_or(|loaded| loaded.project.adapters.is_empty())
-        {
+        } else if let (Some(moved), Some(baseline)) = (scoped_capture_services, scoped_baseline) {
+            capture_scoped_push_baseline(context, bridge, &root, &moved, &stage, baseline)
+                .map(|studio| (stage, studio))
+        } else if can_capture_in_memory {
             capture_studio_services_in_memory(context, bridge, services, &stage, false)
                 .map(|studio| (stage, studio))
         } else {
@@ -421,10 +1061,6 @@ pub(crate) fn push_project(
     });
     let (stage, mut studio) = captured?;
     let project = project?;
-    let link_enforcement = super::staging::packing_link_enforcement(
-        Path::new(&context.root),
-        Path::new(&context.source),
-    )?;
     if let Some(enforcement) = &link_enforcement {
         super::staging::pack_read_only_link_scripts_with(
             enforcement,
@@ -436,77 +1072,41 @@ pub(crate) fn push_project(
     log_reconcile_timing("full push capture", phase);
     let phase = Instant::now();
     let mut prepared_settings = HashMap::new();
+    let mut bulk_patches = HashMap::new();
     let promoted_services;
     let stores_read;
     let differences = if replace {
-        let paths = project_replacement_paths(&project, &studio);
-        stores_read = stores_read_of(link_enforcement.is_none(), &paths, &project, &studio);
-        let imported = ImportedStores::default();
-        // A push that replaces has no filter rules, no instances Studio
-        // keeps unknown to the files and no temporary stage; a linked project
-        // keeps the packages an import would replace.
-        let imports_heavy = !root.join("renium-link.json").exists();
-        // Replacement writes the complete captured snapshot. Its private staging
-        // files do not depend on decoding or matching retained Studio objects.
-        let (prepared, staged) = rayon::join(
-            || {
-                prepare_project_replacement_importing(
-                    &project,
-                    &studio,
-                    &paths,
-                    &mut prepared_settings,
-                    stores_read,
-                    imports_heavy.then_some(&imported),
-                )
-            },
-            || stage_snapshot_paths(&stage.project_root, &paths, &project),
-        );
-        let unchanged_settings = prepared?;
-        staged?;
-        // A full push covers every service, but only replaces services whose
-        // authored contents cannot be reused. Unchanged script files still
-        // accompany native replacements so their external Source markers resolve.
-        let native_services = prepared_settings
-            .iter()
-            .filter(|(_, change)| {
-                !change.current.instances.is_empty()
-                    && service_has_only_native_containers(&change.previous)
-                    && !settings_documents_equivalent(&change.current, &change.previous)
-            })
-            .map(|(path, change)| settings_service_name(path, &change.current, &change.previous))
-            .collect::<Result<HashSet<_>>>()?;
-        let paths = paths
-            .into_iter()
-            .filter(|path| {
-                if unchanged_settings.contains(path) {
-                    return false;
-                }
-                if let Some(change) = prepared_settings.get(path) {
-                    return !settings_documents_equivalent(&change.current, &change.previous);
-                }
-                let native = services_for_snapshot_paths(context, &HashSet::from([path.clone()]))
-                    .iter()
-                    .any(|service| native_services.contains(service));
-                native
-                    || !entries_equivalent(
-                        path,
-                        studio.entries.get(path),
-                        project.entries.get(path),
-                    )
-            })
-            .collect::<HashSet<_>>();
-        prepared_settings.retain(|path, _| paths.contains(path));
-        promoted_services = imported_services(imported, &prepared_settings)?;
-        paths
+        let (diff_paths, promoted, read_mode) = prepare_replace_push_differences(
+            context,
+            &root,
+            &stage,
+            (&project, &studio),
+            (bulk_eligible, link_enforcement.is_none()),
+            &mut prepared_settings,
+            &mut bulk_patches,
+        )?;
+        stores_read = read_mode;
+        promoted_services = promoted;
+        diff_paths
     } else {
         stores_read =
             stores_compared_of(link_enforcement.is_none(), (&project, &studio), &push_args)?;
-        let mut differences = snapshot_differences_prepared(
-            &project,
-            &studio,
-            Some(&mut prepared_settings),
-            stores_read == StoresRead::ChangedOfBoth,
-        )?;
+        let mut differences = if bulk_eligible && stores_read != StoresRead::Whole {
+            collect_delta_bulk_differences(
+                &project,
+                &studio,
+                stores_read,
+                &mut prepared_settings,
+                &mut bulk_patches,
+            )?
+        } else {
+            snapshot_differences_prepared(
+                &project,
+                &studio,
+                Some(&mut prepared_settings),
+                stores_read == StoresRead::ChangedOfBoth,
+            )?
+        };
         promoted_services = promote_heavy_deltas_to_replacement(
             context,
             &project,
@@ -536,36 +1136,8 @@ pub(crate) fn push_project(
         },
         phase,
     );
-    if crate::app::output::global_log_enabled(5) {
-        let mut listed = differences
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>();
-        listed.sort();
-        log_global(
-            5,
-            format_args!(
-                "[renium] full push differences ({}): {}",
-                listed.len(),
-                listed.join(", ")
-            ),
-        );
-    }
-    let mut saved_fields = Vec::new();
-    for field in prepared_settings.values().flat_map(|change| {
-        crate::settings::equivalence::saved_field_differences(&change.current, &change.previous)
-    }) {
-        if !saved_fields.contains(&field) {
-            saved_fields.push(field);
-        }
-    }
-    push_args.saved_fields = (!saved_fields.is_empty()).then(|| {
-        Arc::new(crate::editor::types::PushSavedFields {
-            project: PathBuf::from(&context.root),
-            runtime: guard.runtime_id.clone(),
-            fields: saved_fields,
-        })
-    });
+    log_full_push_differences(&differences);
+    push_args.saved_fields = collect_saved_field_differences(context, &guard, &prepared_settings);
     if differences.is_empty() {
         tracking_release.proof = capture_push_proof(bridge, &guard)?;
         acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
@@ -582,10 +1154,15 @@ pub(crate) fn push_project(
         return Ok(Map::from_iter([("ok".to_string(), Value::Bool(true))]));
     }
     let phase = Instant::now();
+    let non_bulk_differences = differences
+        .iter()
+        .filter(|path| !bulk_patches.contains_key(*path))
+        .cloned()
+        .collect::<HashSet<_>>();
     let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
         &studio,
         &project,
-        &differences,
+        &non_bulk_differences,
         &prepared_settings,
         true,
         false,
@@ -593,9 +1170,15 @@ pub(crate) fn push_project(
     let mut plan = plan_from_whole_stores(
         (stores_read, replace, plan),
         (&project, &studio),
-        &differences,
+        &non_bulk_differences,
         &mut prepared_settings,
     )?;
+    let mut bulk_entries = bulk_patches.into_iter().collect::<Vec<_>>();
+    bulk_entries.sort_by(|left, right| left.0.cmp(&right.0));
+    for (path, patch) in bulk_entries {
+        plan.bulk_property_paths.push(path);
+        plan.bulk_property_patches.push(patch);
+    }
     extend_replaced_service_references(
         &project,
         &prepared_settings,
@@ -603,25 +1186,7 @@ pub(crate) fn push_project(
         &mut plan,
     )?;
     log_reconcile_timing("full push plan", phase);
-    if crate::app::output::global_log_enabled(5) {
-        log_global(
-            5,
-            format_args!(
-                "[renium] full push plan: paths=[{}] targets=[{}] native=[{}]",
-                plan.changed_paths
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                plan.target_settings_ids.join(", "),
-                plan.initial_native_services
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        );
-    }
+    log_full_push_plan(&plan);
     if plan.is_empty() {
         tracking_release.proof = capture_push_proof(bridge, &guard)?;
         acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
@@ -671,6 +1236,14 @@ pub(crate) fn push_project(
     #[cfg(any(windows, target_os = "macos"))]
     let can_settle_in_background =
         replace && import_settle::can_continue(&stage, requires_stage, link_enforcement.is_some());
+    push_args.inline_release_tracking = bulk_inline_release_tracking(
+        &plan,
+        services,
+        &guard,
+        &tracking_release,
+        requires_stage,
+        link_enforcement.is_some(),
+    );
     let saved_fields = push_args.saved_fields.clone();
     let mut pushed = push_staged_project(
         context,
@@ -685,6 +1258,9 @@ pub(crate) fn push_project(
             later_edits_follow: false,
         },
     )?;
+    if let Some(release_result) = pushed.summary.remove("_inlineReleaseResult") {
+        apply_release_tracking_result(&guard, &mut tracking_release, &release_result);
+    }
     if push_applied_nothing(&pushed.summary) {
         // Studio holds or skipped the whole push, so there is nothing to
         // record or read back; the summary carries the hold and its next step.
@@ -920,6 +1496,8 @@ pub(crate) fn push_project(
     {
         if project == current && !requires_stage && replacement.is_none() {
             tracking_release.proof = pushed.summary.remove("verifiedPushProof");
+        } else {
+            tracking_release.retained_proof = None;
         }
         std::thread::scope(|scope| {
             // No remaining readback consumes these trees. Release their large
@@ -937,7 +1515,11 @@ pub(crate) fn push_project(
                     });
                 drop(stage);
             });
-            acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)
+            if tracking_release.guard_id.is_some() {
+                acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)
+            } else {
+                Ok(())
+            }
         })?;
         #[cfg(any(windows, target_os = "macos"))]
         retain_verified_full_push(
@@ -1992,6 +2574,24 @@ pub(crate) fn capture_studio_services_in_memory(
     stage: &ExportProjectStage,
     preserve_saved_settings: bool,
 ) -> Result<ProjectSnapshot> {
+    capture_studio_services_in_memory_options(
+        context,
+        bridge,
+        services,
+        stage,
+        preserve_saved_settings,
+        false,
+    )
+}
+
+pub(crate) fn capture_studio_services_in_memory_options(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    services: &[String],
+    stage: &ExportProjectStage,
+    preserve_saved_settings: bool,
+    known_changed: bool,
+) -> Result<ProjectSnapshot> {
     #[cfg(all(test, any(windows, target_os = "macos")))]
     if let Some(result) = super::push_flow_tests::capture(context, services, &stage.project_root) {
         return result;
@@ -2017,8 +2617,13 @@ pub(crate) fn capture_studio_services_in_memory(
             None
         };
         let state = preserved.as_ref().unwrap_or(&state);
-        let projection =
-            service_projection_in_memory(state, &src_root, layout_src_root.as_deref(), service)?;
+        let projection = crate::snapshot::import::service_projection_in_memory_options(
+            state,
+            &src_root,
+            layout_src_root.as_deref(),
+            service,
+            known_changed,
+        )?;
         if let Some(writer) = &sourcemap {
             stage_captured_service_map(stage, service, state, &projection, writer)?;
         }

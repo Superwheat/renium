@@ -145,7 +145,8 @@ pub(crate) fn push_staged_project(
     }
     drop(supporting);
     let project_root = push_args.project.project_root.clone();
-    let planned_paths = plan.changed_paths.clone();
+    let mut planned_paths = plan.changed_paths.clone();
+    planned_paths.extend(plan.bulk_property_paths.iter().cloned());
     // Only the files this push sends matter here. Edits elsewhere in the
     // project stay pending in Live Sync and follow once this push lands.
     let validate_project = || -> Result<()> {
@@ -445,6 +446,9 @@ pub(crate) fn amend_reconciled_changes(
                 });
         }
     }
+    changes
+        .bulk_property_patches
+        .append(&mut plan.bulk_property_patches);
     Ok(())
 }
 

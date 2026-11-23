@@ -1257,5 +1257,6 @@ do
 	end
 end
 require("./native-root-workloads")
+require("./bulk-property-workloads")
 require("./publish-workloads")
 print("Renium plugin behavior tests passed")

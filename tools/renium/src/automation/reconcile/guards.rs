@@ -252,6 +252,15 @@ pub(crate) fn release_tracking_lease(
         Some(Duration::from_secs(10)),
     )?;
     ensure_plugin_api_ok(&result)?;
+    apply_release_tracking_result(guard, release, &result);
+    Ok(())
+}
+
+pub(crate) fn apply_release_tracking_result(
+    guard: &StudioChangeGuard,
+    release: &mut StudioTrackingGuardRelease<'_>,
+    result: &Value,
+) {
     release.guard_id = None;
     release.retained_proof = result
         .get("retainedPushProof")
@@ -259,8 +268,7 @@ pub(crate) fn release_tracking_lease(
         .cloned();
     release.retained_proof_local = result["retainedPushProofLocal"] == true;
     release.proof_continues = result["pushProofContinues"] == true;
-    release.studio_unchanged = generations_held(guard, &result);
-    Ok(())
+    release.studio_unchanged = generations_held(guard, result);
 }
 
 /// Whether no tracked change reached any synced service since `guard` was
@@ -293,6 +301,24 @@ pub(crate) fn current_studio_change_guard_verifying(
     verify_push_proof: Option<&Value>,
     arm_native: impl FnOnce(&Value) -> Result<()>,
 ) -> Result<(StudioChangeGuard, Value)> {
+    current_studio_change_guard_verifying_continuing(
+        context,
+        bridge,
+        native_attribute_services,
+        verify_push_proof,
+        false,
+        arm_native,
+    )
+}
+
+pub(crate) fn current_studio_change_guard_verifying_continuing(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    native_attribute_services: Option<&[String]>,
+    verify_push_proof: Option<&Value>,
+    continue_native_relay: bool,
+    arm_native: impl FnOnce(&Value) -> Result<()>,
+) -> Result<(StudioChangeGuard, Value)> {
     let runtime_id = context
         .runtime_id
         .as_deref()
@@ -317,6 +343,9 @@ pub(crate) fn current_studio_change_guard_verifying(
             "captureLocalPushProof": native_attribute_services.is_some(),
             "services": native_attribute_services,
             "verifyPushProof": verify_push_proof,
+            "scopePushProof": verify_push_proof.is_some(),
+            "continueNativeRelay": cfg!(windows) && continue_native_relay,
+            "skipTerrainIfWorkspaceOverflow": cfg!(windows) && continue_native_relay && verify_push_proof.is_some(),
         }),
         BridgeTarget::Edit,
         runtime_id,
@@ -339,6 +368,7 @@ pub(crate) fn current_studio_change_guard_verifying(
         ),
     );
     if state["nativeTrackingDeferred"] == true {
+        let initial_scope = state.get("pushProofScope").cloned();
         // The native handshake starts tracking with attribute observation already
         // armed. If discovery failed, this call starts ordinary local listeners.
         // In either case this is the initial, fully observed generation fence.
@@ -355,6 +385,9 @@ pub(crate) fn current_studio_change_guard_verifying(
         if verify_push_proof.is_some() {
             state["pushProofMatches"] = json!(false);
             state["pushProofMismatch"] = json!("tracking restarted");
+            if let Some(scope) = initial_scope {
+                state["pushProofScope"] = scope;
+            }
         }
     }
     let mut guard = studio_change_guard_from_state(context, &state)?;

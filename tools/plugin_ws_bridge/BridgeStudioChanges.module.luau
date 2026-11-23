@@ -442,6 +442,44 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if proof == verifiedPushProof and keptPushProof ~= nil and keptPushProof ~= proof then
 			noteTouched(keptPushProof, serviceName, instance, kind, field)
 		end
+		if
+			kind ~= "values"
+			or instance == nil
+			or field == "Name"
+			or field == "Parent"
+			or field == "Archivable"
+			or (field == "@attributes" and instance.Name == "__Renium_SessionLock")
+		then
+			proof.pathsMoved[serviceName] = true
+		end
+		if proof.changedPropsOverflow ~= nil and proof.changedPropsOverflow[serviceName] ~= true then
+			if
+				kind == "values"
+				and instance ~= nil
+				and type(field) == "string"
+				and field ~= ""
+				and string.sub(field, 1, 1) ~= "@"
+				and field ~= "Name"
+				and field ~= "Parent"
+				and field ~= "Archivable"
+			then
+				local props = proof.changedProps[serviceName]
+				if props == nil then
+					proof.changedProps[serviceName] = { count = 1, names = { [field] = true } }
+				elseif not props.names[field] then
+					if props.count >= 8 then
+						proof.changedPropsOverflow[serviceName] = true
+						proof.changedProps[serviceName] = nil
+					else
+						props.count += 1
+						props.names[field] = true
+					end
+				end
+			else
+				proof.changedPropsOverflow[serviceName] = true
+				proof.changedProps[serviceName] = nil
+			end
+		end
 		local touched = proof.touched[serviceName]
 		if touched == true then return end
 		if instance == nil then
@@ -619,6 +657,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		-- service since it: one entering a service again is a move, not an
 		-- arrival from outside.
 		proof.touched = {}
+		proof.pathsMoved = {}
+		proof.changedProps = {}
+		proof.changedPropsOverflow = {}
 		proof.departed = setmetatable({}, { __mode = "k" })
 		-- An instance created after this proof numbers above a probe made now.
 		-- The numbers must rise from proof to proof, or no arrival is new.
@@ -668,7 +709,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	-- What a later proof of `proof`'s observation would hold, read now. Only
 	-- observers that outlive tracking feed it once tracking stops: export
 	-- generations, the native relay, its tag and buffer listeners, Terrain.
-	local function proofStateNow(proof)
+	local function proofStateNow(proof, skipTerrainIfWorkspaceOverflow: boolean?)
 		local observation = proof.localObservation
 		local current = { attributes = api.nativeAttributeProof(), generations = {}, unplaced = proofLedger.unplaced,
 			attributeServices = proofLedger.attributes, tagServices = proofLedger.tags,
@@ -687,27 +728,33 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		for _, service in ipairs(proof.services) do
 			current.generations[service] = config.exportProofGeneration(service)
 		end
-		current.terrain = proofTerrain(proof.terrainRequired)
+		local skipTerrain = skipTerrainIfWorkspaceOverflow == true
+			and proof.touched ~= nil
+			and proof.touched.Workspace == true
+			and current.generations.Workspace ~= proof.generations.Workspace
+		current.terrainSkipped = skipTerrain
+		current.terrain = if skipTerrain then nil else proofTerrain(proof.terrainRequired)
 		return current
 	end
 	-- The services `current`, a later state of the same observation, differs
 	-- from `proof` in, with the instances whose open buffers or voxels differ.
 	-- Nil and why where a part no service answers for changed or the
 	-- observation ended.
-	local function proofDifference(proof, current): (any, any)
+	local function proofDifference(proof, current): (any, any, any, boolean?)
 		if proof.unplaced == nil then return nil, "the proof predates service answers" end
 		if current.localObservation ~= proof.localObservation then return nil, "local observation ended" end
 		if current.unplaced ~= proof.unplaced then
 			return nil, "an instance entered a service from outside the synced ones, or a tag was created or retired"
 		end
 		if current.documents == nil then return nil, "script editor documents unavailable" end
-		if current.terrain == nil then return nil, "Terrain unavailable" end
-		local differs, laid = {}, {}
+		if current.terrain == nil and current.terrainSkipped ~= true then return nil, "Terrain unavailable" end
+		local differs, laid, nonProp = {}, {}, {}
 		if proof.localObservation == nil then
 			if current.attributes == nil or current.attributes.id ~= proof.attributes.id then return nil, "native observation ended" end
 			for service, count in pairs(current.attributeServices) do
 				if proof.attributeServices[service] ~= count then
 					differs[service] = true
+					nonProp[service] = true
 				end
 			end
 		else
@@ -716,15 +763,18 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				if now == nil or now.observation ~= entry.observation then return nil, `{service} attribute observation ended` end
 				if now.generation ~= entry.generation then
 					differs[service] = true
+					nonProp[service] = true
 				end
 			end
 			if current.camera ~= proof.camera or current.cameraGeneration ~= proof.cameraGeneration then
 				differs.Workspace = true
+				nonProp.Workspace = true
 			end
 		end
 		for service, count in pairs(current.tagServices) do
 			if proof.tagServices[service] ~= count then
 				differs[service] = true
+				nonProp[service] = true
 			end
 		end
 		for service, generation in pairs(proof.generations) do
@@ -739,21 +789,42 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				local service = if sides[2][instance] ~= source then proofServiceOf(instance) else nil
 				if service ~= nil then
 					differs[service] = true
+					nonProp[service] = true
 					laid[instance] = service
 				end
 			end
 		end
-		if current.terrain ~= proof.terrain then
+		local terrainDiffers = current.terrainSkipped == true or current.terrain ~= proof.terrain
+		if current.terrainSkipped ~= true and current.terrain ~= proof.terrain then
 			differs.Workspace = true
 			if Workspace.Terrain ~= nil then
 				laid[Workspace.Terrain] = "Workspace"
 			end
 		end
-		return differs, laid
+		return differs, laid, nonProp, terrainDiffers
 	end
 	-- The answer for the services `proof` differs in: each with the instances
 	-- touched since the proof, by where they stand now, or "whole".
-	local function proofScopeAnswer(proof, differs, laid): { [string]: any }
+	local function proofScopeAnswer(proof, differs, laid, nonProp, terrainDiffers): { [string]: any }
+		local changedProperties = {}
+		for service in pairs(differs) do
+			if
+				proof.pathsMoved[service] ~= true
+				and (proof.changedPropsOverflow == nil or proof.changedPropsOverflow[service] ~= true)
+				and (nonProp == nil or nonProp[service] ~= true)
+				and proof.changedProps ~= nil
+				and proof.changedProps[service] ~= nil
+			then
+				local names = {}
+				for name in pairs(proof.changedProps[service].names) do
+					names[#names + 1] = name
+				end
+				table.sort(names)
+				if #names > 0 then
+					changedProperties[service] = names
+				end
+			end
+		end
 		for instance, service in pairs(laid) do
 			noteTouched(proof, service, instance, "values")
 		end
@@ -801,7 +872,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			end
 			return false
 		end
-		local services, touched = {}, {}
+		local services, touched, valuesOnly = {}, {}, {}
 		for service in pairs(differs) do
 			services[#services + 1] = service
 			local entries = proof.touched[service]
@@ -837,9 +908,23 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				end
 			end
 			touched[service] = if #list == 0 then "whole" else list
+			if entries ~= nil and proof.pathsMoved[service] ~= true then
+				valuesOnly[service] = true
+			end
 		end
 		table.sort(services)
-		return { services = services, touched = touched }
+		return {
+			services = services,
+			touched = touched,
+			valuesOnly = valuesOnly,
+			changedProperties = changedProperties,
+			terrainDiffers = terrainDiffers == true,
+			expectedTerrainDigest = if proof.terrainRequired
+					and type(proof.terrain) == "string"
+					and proof.terrain ~= ""
+				then proof.terrain
+				else nil,
+		}
 	end
 	-- An instance entering a service from outside every synced one may be one
 	-- another service's reference named while it was away, which that
@@ -900,12 +985,13 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	end
 	-- The services Studio differs from proof `id` in now, read without
 	-- tracking, or why it cannot say.
-	function api.pushProofScope(id: any): { [string]: any }
+	function api.pushProofScope(id: any, skipTerrainIfWorkspaceOverflow: boolean?): { [string]: any }
 		local proof = proofById(id)
 		if proof == nil then return { unknown = "proof retired" } end
-		local differs, laid = proofDifference(proof, proofStateNow(proof))
+		local differs, laid, nonProp, terrainDiffers =
+			proofDifference(proof, proofStateNow(proof, skipTerrainIfWorkspaceOverflow))
 		if differs == nil then return { unknown = laid } end
-		return proofScopeAnswer(proof, differs, laid)
+		return proofScopeAnswer(proof, differs, laid, nonProp, terrainDiffers)
 	end
 	local nativeAttributeConnection = { Disconnect = function(_self: any) end }
 	-- Native receipts already retain initial parent identities. Materialize a
@@ -941,6 +1027,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	local propertySignal: RBXScriptConnection? = nil
 	local exportStructureObserver: ((string, Instance) -> boolean?)? = nil
 	local exportPropertyObserver: ((Instance, any) -> ())? = nil
+	local bulkExpectedProperties: { [string]: { [Instance]: any } }? = nil
 	local propertyReadNamesByClass: { [string]: { [string]: string } } = {}
 	local propertyCacheKeysByClass: { [string]: { [string]: string } } = {}
 	local propertyPrimingPlansByClass: { [string]: PropertyPrimingPlan } = {}
@@ -3734,7 +3821,11 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
-	local function connectExistingDescendants(descendants: { Instance }, serviceName: string)
+	local function connectExistingDescendants(
+		descendants: { Instance },
+		serviceName: string,
+		sharedTagged: { [Instance]: boolean }?
+	)
 		local started = os.clock()
 		local bulk = nil
 		local service = state.serviceRoots[serviceName]
@@ -3742,17 +3833,77 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			then config.exportInclusionUnder(serviceName, service)
 			else nil
 		if included ~= nil then
-			local tagged = {}
-			for _, tag in ipairs(CollectionService:GetAllTags()) do
-				for _, instance in ipairs(CollectionService:GetTagged(tag)) do
-					tagged[instance] = true
+			local tagged = sharedTagged
+			if tagged == nil then
+				tagged = {}
+				for _, tag in ipairs(CollectionService:GetAllTags()) do
+					for _, instance in ipairs(CollectionService:GetTagged(tag)) do
+						tagged[instance] = true
+					end
 				end
 			end
 			bulk = { included = included, camera = Workspace.CurrentCamera, tagged = tagged, constraints = {} }
 		end
-		for _, descendant in ipairs(descendants) do
-			if not state.onlyCodeMode or hasLuaSourceDescendant(descendant) then
-				connectInstance(descendant, serviceName, nil, nil, nil, bulk)
+		local nativeAttributes = nativeAttributeRelay ~= nil and nativeAttributeRelay.ready
+			and nativeAttributeRelay.services[serviceName] == true
+		if bulk ~= nil and nativeAttributes and state.itemChangedAvailable and not state.onlyCodeMode then
+			local includedFn = bulk.included
+			local neverSerialized = if type(config.neverSerializedClasses) == "table"
+				then config.neverSerializedClasses
+				else nil
+			local taggedMap = bulk.tagged
+			local constraintsMap = bulk.constraints
+			local camera = bulk.camera
+			local connMap = state.instanceConnections
+			local serviceMap = state.connectionServiceByInstance
+			local tagMap = state.tagFingerprintByInstance
+			local lastParentMap = state.lastParentByInstance
+			local expectedFresh = state.expectedFreshInstances
+			local hasFresh = next(expectedFresh) ~= nil
+			local hasTagged = next(taggedMap) ~= nil
+			local freshStart = state.connectedInstanceCount == 0
+			local added = 0
+			for _, descendant in ipairs(descendants) do
+				if not freshStart and connMap[descendant] ~= nil then
+					if serviceMap[descendant] ~= serviceName then
+						connectInstance(descendant, serviceName, nil, nil, nil, bulk)
+					end
+					continue
+				end
+				if descendant == camera then
+					continue
+				end
+				local className = descendant.ClassName
+				if neverSerialized ~= nil then
+					if neverSerialized[className] == true then
+						continue
+					end
+				elseif not includedFn(descendant, className) then
+					continue
+				end
+				local constraint = constraintsMap[className]
+				if constraint == nil then
+					constraint = descendant:IsA("Constraint")
+					constraintsMap[className] = constraint
+				end
+				if constraint or (hasFresh and expectedFresh[descendant]) or (hasTagged and taggedMap[descendant]) then
+					connectInstance(descendant, serviceName, nil, nil, nil, bulk)
+				else
+					serviceMap[descendant] = serviceName
+					if not freshStart then
+						tagMap[descendant] = nil
+					end
+					lastParentMap[descendant] = descendant.Parent
+					connMap[descendant] = nativeAttributeConnection
+					added += 1
+				end
+			end
+			state.connectedInstanceCount += added
+		else
+			for _, descendant in ipairs(descendants) do
+				if not state.onlyCodeMode or hasLuaSourceDescendant(descendant) then
+					connectInstance(descendant, serviceName, nil, nil, nil, bulk)
+				end
 			end
 		end
 		if type(config.profileStep) == "function" then
@@ -3817,11 +3968,70 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
+	function api.setBulkExpectedProperties(expected: { [string]: { [Instance]: any } }?)
+		bulkExpectedProperties = expected
+	end
+
+	function api.noteBulkExportChange(serviceName: string)
+		local proof = verifiedPushProof
+		if proof ~= nil then
+			noteTouched(proof, serviceName, nil, "")
+		end
+	end
+
 	local function ensurePropertySignal(): boolean
 		if propertySignal ~= nil then return true end
 		local itemChanged = (game :: any).ItemChanged
 		if itemChanged == nil then return false end
 		propertySignal = itemChanged:Connect(function(instance: Instance, propertyName: any)
+			if bulkExpectedProperties ~= nil and typeof(instance) == "Instance" then
+				local lookupName = propertyName
+				local byInstance = bulkExpectedProperties[lookupName]
+				if byInstance == nil and (lookupName == "BrickColor" or lookupName == "Color3uint8") then
+					lookupName = "Color"
+					byInstance = bulkExpectedProperties.Color
+				elseif
+					byInstance == nil
+					and (lookupName == "Position" or lookupName == "Orientation" or lookupName == "Rotation")
+				then
+					lookupName = "CFrame"
+					byInstance = bulkExpectedProperties.CFrame
+				end
+				if byInstance ~= nil then
+					local expected = byInstance[instance]
+					if expected ~= nil then
+						local matched = false
+						local current: any = nil
+						local expectedType = type(expected)
+						if expectedType == "number" or expectedType == "boolean" then
+							current = (instance :: any)[lookupName]
+							matched = current == expected
+								or (expectedType == "number" and type(current) == "number" and BridgeValueEquality.valuesEqual(current, expected))
+						else
+							local okRead, readVal = pcall(readInstanceProperty, instance, lookupName)
+							current = readVal
+							matched = okRead and (current == expected or BridgeValueEquality.valuesEqual(current, expected))
+						end
+						if matched then
+							if lookupName == propertyName and lookupName ~= "Color" and lookupName ~= "CFrame" then
+								byInstance[instance] = nil
+							end
+							local cache = state.propertyFingerprintByInstance[instance]
+							if cache ~= nil then
+								cache[propertyCacheKey(instance, lookupName)] = nil
+							end
+							local baselines = state.propertyBaselineByInstance[instance]
+							if baselines ~= nil then
+								local slot = baselines[1][propertyCacheKey(instance, lookupName)]
+								if slot ~= nil then
+									baselines[slot] = if current == nil then NIL_PROPERTY_BASELINE else current
+								end
+							end
+							return
+						end
+					end
+				end
+			end
 			if exportPropertyObserver then
 				exportPropertyObserver(instance, propertyName)
 			end
@@ -3902,7 +4112,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
-	local function ensureService(serviceName: string)
+	local function ensureService(serviceName: string, sharedTagged: { [Instance]: boolean }?)
 		if state.watchedServices[serviceName] then
 			return
 		end
@@ -4077,7 +4287,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 
 		table.insert(connections, connectAttributeChanged(service, serviceName))
 		state.rootConnections[serviceName] = connections
-		connectExistingDescendants(descendants, serviceName)
+		connectExistingDescendants(descendants, serviceName, sharedTagged)
 	end
 
 	local function endObservationEpoch(serviceName: string)
@@ -4242,8 +4452,27 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if not state.started then
 			state.itemChangedAvailable = ensurePropertySignal()
 		end
+		local sharedTagged: { [Instance]: boolean }? = nil
+		if type(config.exportInclusionUnder) == "function" then
+			local anyUnwatched = false
+			for _, serviceName in ipairs(services) do
+				if not state.watchedServices[serviceName] then
+					anyUnwatched = true
+					break
+				end
+			end
+			if anyUnwatched then
+				local tagged: { [Instance]: boolean } = {}
+				for _, tag in ipairs(CollectionService:GetAllTags()) do
+					for _, instance in ipairs(CollectionService:GetTagged(tag)) do
+						tagged[instance] = true
+					end
+				end
+				sharedTagged = tagged
+			end
+		end
 		for _, serviceName in ipairs(services) do
-			ensureService(serviceName)
+			ensureService(serviceName, sharedTagged)
 		end
 		if not state.started then
 			observeTagDiscovery()
@@ -4639,9 +4868,15 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	function api.getState(params: { [string]: any }, leaseId: string?): { [string]: any }
 		-- Verifying inside the request that starts tracking leaves no gap in
 		-- which an edit could slip between the proof check and the new lease.
-		local pushProofMatches, pushProofMismatch = nil, nil
+		local pushProofMatches, pushProofMismatch, pushProofScope = nil, nil, nil
 		if params.verifyPushProof ~= nil then
 			pushProofMatches, pushProofMismatch = api.verifyPushProof(params.verifyPushProof)
+			if not pushProofMatches and params.scopePushProof == true then
+				pushProofScope = api.pushProofScope(
+					params.verifyPushProof,
+					params.skipTerrainIfWorkspaceOverflow == true
+				)
+			end
 			if params.start ~= true then
 				-- Each answer from a retained local proof keeps its listeners as
 				-- long again; a native proof lasts as long as its observer.
@@ -4651,8 +4886,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					acquireTrackingGuard(localPushObservation.guardId, retainSeconds)
 				end
 				return { ok = true, pushProofMatches = pushProofMatches, pushProofMismatch = pushProofMismatch,
-					pushProofScope = if not pushProofMatches and params.scopePushProof == true
-						then api.pushProofScope(params.verifyPushProof) else nil }
+					pushProofScope = pushProofScope }
 			end
 			-- A native proof's observers outlive tracking; a local proof ends with it.
 			if params.requirePushProof == true and not (pushProofMatches
@@ -4707,13 +4941,27 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			end
 		end
 		local continuedNativeRelay = false
+		local canContinueRelay = nativeAttributeRelay ~= nil
+			and nativeAttributeRelay.cached
+			and (pushProofMatches
+				or (params.continueNativeRelay == true
+					and nativeAttributeRelay.nativeArmed == true
+					and proofById(params.verifyPushProof) ~= nil))
 		if params.start ~= false and params.stop ~= true and params.releaseTrackingGuardId == nil
-			and nativeAttributeRelay and nativeAttributeRelay.cached and pushProofMatches then
+			and canContinueRelay then
 			-- The daemon that retained this proof continues the same lease: the
 			-- relay, its native worker and every listener stay armed. Its
 			-- observers outlive tracking, so a proof that still holds covers the
 			-- time Studio ran untracked, and tracking restarts on the relay
 			-- before anything can yield.
+			if not pushProofMatches then
+				local oldRetained = nativeAttributeRelay.retainedGuardId
+				if oldRetained ~= nil and state.trackingGuards[oldRetained] ~= nil then
+					state.trackingGuards[oldRetained] = nil
+				end
+				nativeAttributeRelay.retainedGuardId = nil
+				verifiedPushProof, keptPushProof = nil, nil
+			end
 			nativeAttributeRelay.cached = false
 			if not wasTracking then
 				nativeAttributeRelay.ready = not state.persistentTracking
@@ -4770,6 +5018,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					trackingStarted = true,
 					pushProofMatches = pushProofMatches,
 					pushProofMismatch = pushProofMismatch,
+					pushProofScope = pushProofScope,
 				}
 			end
 		end
@@ -4845,6 +5094,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		response.pushProofContinues = proofContinues
 		response.pushProofMatches = pushProofMatches
 		response.pushProofMismatch = pushProofMismatch
+		if pushProofScope ~= nil then
+			response.pushProofScope = pushProofScope
+		end
 		response.nativeRelayContinued = continuedNativeRelay
 		if params.capturePushProof == true then
 			-- Taken under one observation with the proof it follows, the new
@@ -4852,15 +5104,17 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			local held = proofById(params.scopeFrom)
 			response.verifiedPushProof = api.capturePushProof()
 			if params.scopeFrom ~= nil then
-				local differs, laid = nil, "proof retired"
+				local differs, laid, nonProp, terrainDiffers = nil, "proof retired", nil, false
 				if held == nil then
 					laid = "proof retired"
 				elseif response.verifiedPushProof == nil then
 					laid = "Studio gave no new proof"
 				else
-					differs, laid = proofDifference(held, verifiedPushProof)
+					differs, laid, nonProp, terrainDiffers = proofDifference(held, verifiedPushProof)
 				end
-				response.pushProofScope = if differs == nil then { unknown = laid } else proofScopeAnswer(held, differs, laid)
+				response.pushProofScope = if differs == nil
+					then { unknown = laid }
+					else proofScopeAnswer(held, differs, laid, nonProp, terrainDiffers)
 			end
 		end
 		if params.nativeTerrainRelay == true and state.started then
@@ -4921,6 +5175,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 
 	function api.stop()
 		verifiedPushProof, keptPushProof = nil, nil
+		bulkExpectedProperties = nil
 		if nativeAttributeRelay then
 			nativeAttributeRelay.cached = false
 		end

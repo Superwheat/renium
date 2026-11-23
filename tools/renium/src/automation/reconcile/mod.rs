@@ -57,6 +57,7 @@ use crate::snapshot::export::{
     ExportProjectStage, PublishEntryState, capture_exported_services,
     export_snapshots_with_warm_bridge,
 };
+#[cfg(test)]
 use crate::snapshot::import::service_projection_in_memory;
 use crate::snapshot::refs::{remap_record_reference_ids, settings_instance_path, store_service};
 use crate::studio::bridge::{BridgeServer, BridgeTarget};

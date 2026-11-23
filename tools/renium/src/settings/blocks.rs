@@ -73,6 +73,9 @@ use crate::settings::instance::remap_ref_indices_in_value;
 #[path = "blocks_sim.rs"]
 pub(crate) mod sim;
 
+#[path = "bulk_diff.rs"]
+pub(crate) mod bulk_diff;
+
 /// The rows of a value block; the last block holds what is left.
 pub(super) const BLOCK_ROWS: usize = 4096;
 /// From this length on a string is held in the pool, and below it in the

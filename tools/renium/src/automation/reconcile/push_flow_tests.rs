@@ -214,7 +214,7 @@ fn fixture_runtime(
             let params = &request["params"];
             let result = {
                 let mut state = tracker.lock().unwrap();
-                if params["scopePushProof"] == true {
+                if params["scopePushProof"] == true && params["start"] != true {
                     state.scopes += 1;
                 } else if params["verifyPushProof"]["test"] == true {
                     state.proofs += 1;

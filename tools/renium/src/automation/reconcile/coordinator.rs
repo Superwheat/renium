@@ -544,11 +544,19 @@ pub(super) fn moved_services(
     held: &ProjectSnapshot,
     stores: &BTreeMap<String, PathBuf>,
 ) -> Result<std::result::Result<BTreeSet<String>, String>> {
-    let (moved, touched) = match scope {
+    let (moved, touched, values_only) = match scope {
         ProofScope::Unknown(reason) => return Ok(Err(reason.clone())),
-        ProofScope::Services { services, touched } => (services, touched),
+        ProofScope::Services {
+            services,
+            touched,
+            values_only,
+        } => (services, touched, values_only),
     };
-    let referring = referring_services(held, stores, &paths_moved_in(moved, touched))?;
+    let referring = referring_services(
+        held,
+        stores,
+        &paths_moved_in_with(moved, touched, values_only),
+    )?;
     let services = moved.union(&referring).cloned().collect::<BTreeSet<_>>();
     if services.is_empty() {
         return Ok(Err("Studio moved in no service".to_string()));

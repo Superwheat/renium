@@ -2396,28 +2396,44 @@ impl SourceOutput {
 /// counts as a change), so that nothing is encoded or decoded to find the
 /// two alike, and the state's encoding anywhere else. A pull keeps the
 /// stored viewport camera, and so does this.
-fn captured_store_bytes(state: &ServiceState, stored: &Path) -> Result<Vec<u8>> {
-    if let Ok(bytes) = fs::read(stored) {
-        let remembered = remembered_pull(&Sha256::digest(&bytes).into());
+fn captured_store_bytes(
+    state: &ServiceState,
+    stored: &Path,
+    known_changed: bool,
+) -> Result<Vec<u8>> {
+    let previous = fs::read(stored).ok();
+    if !known_changed && let Some(bytes) = &previous {
+        let remembered = remembered_pull(&Sha256::digest(bytes).into());
         if remembered.is_some_and(|remembered| {
             remembered.rows.is_some()
                 && pulled_digest_from_service_state(state)
                     .is_ok_and(|pulled| pulled.digest == remembered.digest)
         }) {
-            return Ok(bytes);
+            return Ok(previous.unwrap());
         }
     }
-    encode_service_settings_binary(state)
+    encode_service_settings_binary_over(state, previous.as_deref())
 }
 
 /// Project the same settings, script names and directories as a fresh import,
 /// without touching disk or constructing the full editor sourcemap. Existing
 /// script files are looked for under `layout_src_root` (or `src_root`).
+#[cfg(test)]
 pub(crate) fn service_projection_in_memory(
     state: &ServiceState,
     src_root: &Path,
     layout_src_root: Option<&Path>,
     service: &str,
+) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>> {
+    service_projection_in_memory_options(state, src_root, layout_src_root, service, false)
+}
+
+pub(crate) fn service_projection_in_memory_options(
+    state: &ServiceState,
+    src_root: &Path,
+    layout_src_root: Option<&Path>,
+    service: &str,
+    known_changed: bool,
 ) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>> {
     let service_dir = src_root.join(sanitize_name(service));
     let layout_dir = layout_src_root.map_or_else(
@@ -2428,7 +2444,7 @@ pub(crate) fn service_projection_in_memory(
     let output = SourceOutput::Memory(Mutex::new(BTreeMap::new()));
     output.directory(&service_dir)?;
     let (settings, sources) = rayon::join(
-        || captured_store_bytes(state, &service_settings_path(&layout_dir)),
+        || captured_store_bytes(state, &service_settings_path(&layout_dir), known_changed),
         || {
             let visited = (0..state.instances.len())
                 .map(|_| AtomicBool::new(false))
@@ -3186,7 +3202,8 @@ mod projection_tests {
             thread::spawn(move || {
                 let store = service_settings_path(&source.join("Workspace"));
                 let alike = (0..10).all(|_| {
-                    pool.install(|| captured_store_bytes(&state, &store)).ok()
+                    pool.install(|| captured_store_bytes(&state, &store, false))
+                        .ok()
                         == fs::read(&store).ok()
                 });
                 let _ = done.send(alike);

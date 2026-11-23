@@ -2291,8 +2291,12 @@ fn scoped_pull_step(
             scoped_outcome(3);
             return Ok(scoped_whole_pull(rng, (studio, files), (counter, log)));
         }
-        ProofScope::Services { services, touched } => {
-            let paths_moved = paths_moved_in(&services, &touched);
+        ProofScope::Services {
+            services,
+            touched,
+            values_only,
+        } => {
+            let paths_moved = paths_moved_in_with(&services, &touched, &values_only);
             (services, paths_moved, touched)
         }
     };
@@ -2953,6 +2957,7 @@ fn a_change_a_store_outside_the_scope_refers_to_falsifies_the_premise() {
         let now = ProofScope::Services {
             services: BTreeSet::from([moved.to_string()]),
             touched: BTreeMap::new(),
+            values_only: BTreeSet::new(),
         };
         scoped_premise(&now, &scope, &tree.snapshot(None), &stores).unwrap()
     };
@@ -2975,6 +2980,7 @@ fn a_change_a_store_outside_the_scope_refers_to_falsifies_the_premise() {
         let now = ProofScope::Services {
             services: scope.clone(),
             touched: BTreeMap::from([("ServerStorage".to_string(), touched)]),
+            values_only: BTreeSet::new(),
         };
         scoped_premise(&now, &scope, &tree.snapshot(None), &stores).unwrap()
     };

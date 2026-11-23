@@ -9629,7 +9629,10 @@ fn a_scoped_answer_reads_its_services_their_touched_instances_and_unknowns() {
             "Workspace": "whole",
         },
     });
-    let ProofScope::Services { services, touched } = ProofScope::parse(&answer) else {
+    let ProofScope::Services {
+        services, touched, ..
+    } = ProofScope::parse(&answer)
+    else {
         panic!("a scoped answer read as unknown");
     };
     assert_eq!(

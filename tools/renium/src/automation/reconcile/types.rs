@@ -715,6 +715,7 @@ pub(crate) enum ProofScope {
     Services {
         services: BTreeSet<String>,
         touched: BTreeMap<String, Option<Vec<TouchedInstance>>>,
+        values_only: BTreeSet<String>,
     },
 }
 
@@ -743,6 +744,60 @@ pub(crate) struct TouchedFields {
 }
 
 #[cfg(any(windows, target_os = "macos"))]
+pub(crate) struct ProofBulkScope {
+    pub(crate) services: BTreeSet<String>,
+    pub(crate) values_only: BTreeSet<String>,
+    pub(crate) changed_properties: BTreeMap<String, Vec<String>>,
+    pub(crate) expected_terrain_digest: Option<String>,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl ProofBulkScope {
+    pub(crate) fn parse(answer: &Value) -> Option<Self> {
+        if answer.get("unknown").and_then(Value::as_str).is_some() {
+            return None;
+        }
+        let services = answer["services"]
+            .as_array()?
+            .iter()
+            .map(|value| value.as_str().map(str::to_string))
+            .collect::<Option<BTreeSet<_>>>()?;
+        let values_only = answer["valuesOnly"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, flag)| flag.as_bool() == Some(true))
+            .map(|(service, _)| service.clone())
+            .collect();
+        let mut changed_properties = BTreeMap::new();
+        if let Some(map) = answer["changedProperties"].as_object() {
+            for (service, list) in map {
+                let Some(arr) = list.as_array() else {
+                    continue;
+                };
+                let props = arr
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect::<Vec<_>>();
+                if !props.is_empty() {
+                    changed_properties.insert(service.clone(), props);
+                }
+            }
+        }
+        let expected_terrain_digest = answer["expectedTerrainDigest"]
+            .as_str()
+            .filter(|digest| !digest.is_empty())
+            .map(str::to_string);
+        Some(Self {
+            services,
+            values_only,
+            changed_properties,
+            expected_terrain_digest,
+        })
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 impl ProofScope {
     pub(crate) fn parse(answer: &Value) -> Self {
         if let Some(reason) = answer["unknown"].as_str() {
@@ -762,9 +817,17 @@ impl ProofScope {
             .flatten()
             .map(|(service, entries)| (service.clone(), touched_instances(entries)))
             .collect();
+        let values_only = answer["valuesOnly"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, flag)| flag.as_bool() == Some(true))
+            .map(|(service, _)| service.clone())
+            .collect();
         Self::Services {
             services: services.into_iter().map(str::to_string).collect(),
             touched,
+            values_only,
         }
     }
 }
@@ -929,26 +992,37 @@ pub(crate) enum ScopedPremise {
 /// parent or Archivable, attributes, tags, script buffers, voxels) move none,
 /// but for the attribute that makes a folder named as the session lock one,
 /// which leaves it out of the export.
+#[cfg(all(test, any(windows, target_os = "macos")))]
 pub(crate) fn paths_moved_in(
     services: &BTreeSet<String>,
     touched: &BTreeMap<String, Option<Vec<TouchedInstance>>>,
 ) -> BTreeSet<String> {
+    paths_moved_in_with(services, touched, &BTreeSet::new())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn paths_moved_in_with(
+    services: &BTreeSet<String>,
+    touched: &BTreeMap<String, Option<Vec<TouchedInstance>>>,
+    values_only: &BTreeSet<String>,
+) -> BTreeSet<String> {
     services
         .iter()
         .filter(|service| {
-            !touched
-                .get(*service)
-                .and_then(Option::as_ref)
-                .is_some_and(|instances| {
-                    !instances.is_empty()
-                        && instances.iter().all(|instance| {
-                            instance.kind == "values"
-                                && !instance
-                                    .path_segments
-                                    .iter()
-                                    .any(|segment| segment == "__Renium_SessionLock")
-                        })
-                })
+            !values_only.contains(*service)
+                && !touched
+                    .get(*service)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|instances| {
+                        !instances.is_empty()
+                            && instances.iter().all(|instance| {
+                                instance.kind == "values"
+                                    && !instance
+                                        .path_segments
+                                        .iter()
+                                        .any(|segment| segment == "__Renium_SessionLock")
+                            })
+                    })
         })
         .cloned()
         .collect()
@@ -963,13 +1037,22 @@ pub(crate) fn scoped_premise(
     project: &ProjectSnapshot,
     stores: &BTreeMap<String, PathBuf>,
 ) -> Result<ScopedPremise> {
-    let ProofScope::Services { services, touched } = now else {
+    let ProofScope::Services {
+        services,
+        touched,
+        values_only,
+    } = now
+    else {
         return Ok(ScopedPremise::False);
     };
     Ok(
         if services.is_subset(scope)
-            && referring_services(project, stores, &paths_moved_in(services, touched))?
-                .is_subset(scope)
+            && referring_services(
+                project,
+                stores,
+                &paths_moved_in_with(services, touched, values_only),
+            )?
+            .is_subset(scope)
         {
             ScopedPremise::Inside
         } else {
@@ -1063,9 +1146,13 @@ pub(crate) fn plan_scoped_pull(
             not_scoped(&reason);
             return Ok(None);
         }
-        ProofScope::Services { services, touched } => {
+        ProofScope::Services {
+            services,
+            touched,
+            values_only,
+        } => {
             log_touched(&touched);
-            let paths_moved = paths_moved_in(&services, &touched);
+            let paths_moved = paths_moved_in_with(&services, &touched, &values_only);
             (services, paths_moved, touched)
         }
     };
@@ -1336,6 +1423,8 @@ pub(crate) struct ReconcilePushPlan {
     pub(crate) attribute_only_instances: HashSet<(String, String)>,
     pub(crate) in_place_instances: HashSet<(String, String)>,
     pub(crate) unchanged_native_root_properties: HashMap<(String, String), Vec<String>>,
+    pub(crate) bulk_property_patches: Vec<crate::editor::types::EditorBulkPropertyPatch>,
+    pub(crate) bulk_property_paths: Vec<PathBuf>,
 }
 
 pub(crate) struct PreparedEditorSettingsChange {
@@ -1398,5 +1487,6 @@ impl ReconcilePushPlan {
             && self.previous_paths.is_empty()
             && self.instance_deletes.is_empty()
             && self.property_removals.is_empty()
+            && self.bulk_property_patches.is_empty()
     }
 }

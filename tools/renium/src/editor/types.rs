@@ -430,11 +430,62 @@ pub(crate) struct PreparedEditorDocuments {
     pub(crate) whole_instance_paths: HashSet<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct BulkTreeNode {
+    /// 0 for direct child of service root; 1-based index into `nodes` otherwise.
+    pub(crate) parent: u32,
+    /// 1-based ordinal among siblings with the same `(parent, name)`.
+    pub(crate) ordinal: u32,
+    /// 0-based index into `EditorBulkPropertyPatch::strings`.
+    pub(crate) name_idx: u32,
+    /// 0-based index into `EditorBulkPropertyPatch::strings`.
+    pub(crate) class_idx: u32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum BulkPropertyValues {
+    F32Const(f32),
+    F64Const(f64),
+    BoolConst(bool),
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+    Bool(Vec<u8>),
+    I32(Vec<i32>),
+    Vector3(Vec<[f32; 3]>),
+    Color3(Vec<[f32; 3]>),
+    CFrame(Vec<[f32; 12]>),
+    Indexed {
+        palette: Vec<Value>,
+        indices: Vec<u32>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BulkPropertyColumn {
+    pub(crate) property_name: String,
+    /// 1-based indices into `EditorBulkPropertyPatch::nodes` (0 = service root).
+    pub(crate) rows: Vec<u32>,
+    pub(crate) values: BulkPropertyValues,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EditorBulkPropertyPatch {
+    pub(crate) service: String,
+    pub(crate) strings: Vec<String>,
+    pub(crate) nodes: Vec<BulkTreeNode>,
+    pub(crate) columns: Vec<BulkPropertyColumn>,
+    pub(crate) field_count: usize,
+    pub(crate) instance_count: usize,
+    pub(crate) expected_terrain_digest: Option<String>,
+    pub(crate) return_old_values: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct EditorChangeSet {
     pub(crate) instance_changes: Vec<EditorInstanceChange>,
     pub(crate) source_changes: Vec<EditorSourceChange>,
     pub(crate) property_changes: Vec<EditorPropertyChange>,
+    pub(crate) bulk_property_patches: Vec<EditorBulkPropertyPatch>,
     pub(crate) history_entries: Vec<EditorHistoryEntry>,
     pub(crate) settings_writes: Vec<EditorSettingsWrite>,
     pub(crate) geometry_readbacks: Vec<super::native_geometry::GeometryReadback>,
@@ -465,6 +516,11 @@ impl EditorChangeSet {
                 self.property_changes
                     .iter()
                     .map(|change| change.service.as_str()),
+            )
+            .chain(
+                self.bulk_property_patches
+                    .iter()
+                    .map(|patch| patch.service.as_str()),
             )
     }
 }

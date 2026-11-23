@@ -2991,6 +2991,8 @@ pub(super) struct PushEditorChangesArgs {
     pub(crate) mutation_started: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[arg(skip)]
     pub(crate) saved_fields: Option<std::sync::Arc<crate::editor::types::PushSavedFields>>,
+    #[arg(skip)]
+    pub(crate) inline_release_tracking: Option<serde_json::Value>,
     #[arg(
         help = "Skip the Studio review and protected property writes (prefer --yes)",
         long
@@ -3041,6 +3043,7 @@ impl PushEditorChangesArgs {
             disable_service_reader: false,
             mutation_started: None,
             saved_fields: None,
+            inline_release_tracking: None,
             no_review: false,
             yes: false,
             review_report: false,

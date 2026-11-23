@@ -844,7 +844,67 @@ pub(crate) fn editor_review_payload(changes: &EditorChangeSet) -> (u64, Vec<Valu
             );
         }
     }
+    for patch in &changes.bulk_property_patches {
+        change_count += patch.field_count as u64;
+        append_bulk_property_review_entries(patch, &mut rows, &mut row_index_by_key);
+    }
     (change_count, rows)
+}
+
+fn append_bulk_property_review_entries(
+    patch: &crate::editor::types::EditorBulkPropertyPatch,
+    rows: &mut Vec<Value>,
+    row_index_by_key: &mut HashMap<String, usize>,
+) {
+    let mut paths: Vec<Option<(Vec<String>, Vec<usize>)>> = vec![None; patch.nodes.len() + 1];
+    paths[0] = Some((vec![patch.service.clone()], vec![1]));
+    for (idx, node) in patch.nodes.iter().enumerate() {
+        let Some((mut segs, mut ords)) = paths.get(node.parent as usize).and_then(Option::clone)
+        else {
+            continue;
+        };
+        let Some(name) = patch.strings.get(node.name_idx as usize) else {
+            continue;
+        };
+        segs.push(name.clone());
+        ords.push(node.ordinal as usize);
+        paths[idx + 1] = Some((segs, ords));
+    }
+    for column in &patch.columns {
+        for &node_id in &column.rows {
+            let Some(node) = node_id
+                .checked_sub(1)
+                .and_then(|idx| patch.nodes.get(idx as usize))
+            else {
+                continue;
+            };
+            let Some((path_segments, path_ordinals)) =
+                paths.get(node_id as usize).and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            let class_name = patch
+                .strings
+                .get(node.class_idx as usize)
+                .map_or("Instance", String::as_str);
+            let target = EditorReviewTarget {
+                service: &patch.service,
+                settings_id: None,
+                class_name,
+                path_segments,
+                path_ordinals,
+            };
+            append_editor_review_entry(
+                rows,
+                row_index_by_key,
+                target,
+                json!({
+                    "kind": "property",
+                    "name": &column.property_name,
+                }),
+            );
+        }
+    }
 }
 
 fn editor_review_chunks(rows: Vec<Value>, max_bytes: usize) -> Result<Vec<Vec<Value>>> {

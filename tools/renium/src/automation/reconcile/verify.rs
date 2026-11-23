@@ -370,6 +370,11 @@ pub(crate) fn written_services(context: &BoundContext, plan: &ReconcilePushPlan)
     let mut written =
         services_for_snapshot_paths(context, &plan.changed_paths.iter().cloned().collect());
     written.extend(plan.initial_native_services.iter().cloned());
+    written.extend(
+        plan.bulk_property_patches
+            .iter()
+            .map(|patch| patch.service.clone()),
+    );
     written
 }
 

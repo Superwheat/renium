@@ -4619,6 +4619,49 @@ function TransactionState.restoreMetadata(
 			end
 		end
 	end
+	local bulkProps = snapshot.bulkProperties
+	if type(bulkProps) == "table" and #bulkProps > 0 then
+		local bulkExpected = {}
+		if ctx.setBulkExpectedProperties then
+			ctx.setBulkExpectedProperties(bulkExpected)
+		end
+		local okBulkRestore, bulkRestoreErr = pcall(function()
+			for entryIndex = #bulkProps, 1, -1 do
+				local entry = bulkProps[entryIndex]
+				local propName = entry.propertyName
+				local instances = entry.instances
+				local oldValues = entry.oldValues
+				local expectedForProp = bulkExpected[propName]
+				if expectedForProp == nil then
+					expectedForProp = {}
+					bulkExpected[propName] = expectedForProp
+				end
+				for itemIndex = 1, #instances do
+					local instance = replacements[instances[itemIndex]] or instances[itemIndex]
+					local oldValue = oldValues[itemIndex]
+					if instance ~= nil and instance.Parent ~= nil then
+						local okRead, current = readProperty(instance, propName)
+						if not okRead or (current ~= oldValue and not propertyValuesEqual(instance, propName, current, oldValue)) then
+							expectedForProp[instance] = oldValue
+							local okWrite, writeError = pcall(function()
+								(instance :: any)[propName] = oldValue
+							end)
+							if not okWrite then
+								expectedForProp[instance] = nil
+								error(`Could not restore {instance:GetFullName()}.{propName}: {writeError}`)
+							end
+						end
+					end
+				end
+			end
+		end)
+		if ctx.setBulkExpectedProperties then
+			ctx.setBulkExpectedProperties(nil)
+		end
+		if not okBulkRestore then
+			error(bulkRestoreErr, 0)
+		end
+	end
 	for _, entry in ipairs(snapshot.sources or {}) do
 		local instance = replacements[entry.instance] or entry.instance
 		local okRead, currentSource = readScriptSource(instance)
@@ -5249,6 +5292,13 @@ function TransactionState.rollbackSession(session: { [string]: any }, ctx: { [st
 		-- Cancel emits inverse events. Freeze outside edits first and identify
 		-- those inverse writes so they cannot replace the change journal.
 		TransactionState.drainJournal(session, ctx)
+		if session.bulkExpectedProperties ~= nil then
+			if ctx.setBulkExpectedProperties then
+				ctx.setBulkExpectedProperties(nil)
+			end
+			session.bulkExpectedProperties = nil
+		end
+		session.bulkTrees = nil
 		-- Commit validation may already have drained the conflicting edits into
 		-- the session. Preserve those objects before native rollback removes them.
 		TransactionState.prepareJournalRollback(session, session.changeJournal or {}, ctx)
@@ -8068,6 +8118,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		setTrackedOperationPhase(operation, "commitFenceValidation")
 		assertCommitActive()
 		TransactionState.drainJournal(session, ctx)
+		if session.bulkExpectedProperties ~= nil then
+			if ctx.setBulkExpectedProperties then
+				ctx.setBulkExpectedProperties(nil)
+			end
+			session.bulkExpectedProperties = nil
+		end
+		session.bulkTrees = nil
 		assertStudioUnchanged()
 		setTrackedOperationPhase(operation, "journal")
 		local records = TransactionState.finishJournal(session, ctx)
@@ -10559,6 +10616,801 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		ctx.stats.errors += stats.errors
 		if not aborted and outerTransaction ~= nil and outerTransaction.mutated then
 			outerTransaction.state = "prepared"
+		end
+		ctx.updateStatus()
+		return stats
+	end
+
+	local function buildBulkChildLookup(parent: Instance): { [string]: any }
+		local children = parent:GetChildren()
+		local byName: { [string]: any } = {}
+		for _, child in ipairs(children) do
+			if child.ClassName == "PackageLink" then
+				error(`Bulk property patch encountered PackageLink under {parent:GetFullName()}`)
+			end
+			local name = child.Name
+			local existing = byName[name]
+			if existing == nil then
+				byName[name] = child
+			elseif typeof(existing) == "Instance" then
+				byName[name] = { existing, child }
+			else
+				existing[#existing + 1] = child
+			end
+		end
+		return byName
+	end
+
+	local function resolveBulkTreeChunk(
+		serviceName: string,
+		service: Instance,
+		tree: { [string]: any },
+		cache: { [string]: any },
+		yieldForBudget: () -> (),
+		assertActive: () -> ()
+	): { [number]: Instance }
+		local nodeOffset = tonumber(tree.nodeOffset) or 0
+		local nodeCount = tonumber(tree.nodeCount) or 0
+		local totalNodes = tonumber(tree.totalNodes) or nodeCount
+		if nodeOffset < 0 or nodeOffset % 1 ~= 0 or nodeCount < 0 or nodeCount % 1 ~= 0 or totalNodes < nodeOffset + nodeCount then
+			error("Invalid bulk property tree counts")
+		end
+		local state = cache[serviceName]
+		if nodeOffset == 0 then
+			local stringText = ""
+			if type(tree.strings) == "string" and #tree.strings > 0 then
+				stringText = buffer.tostring(EncodingService:Base64Decode(buffer.fromstring(tree.strings)))
+			end
+			local strings = if #stringText > 0 then string.split(stringText, "\0") else {}
+			state = {
+				strings = strings,
+				resolved = table.create(totalNodes),
+				childrenByParent = {},
+				terrainNodeId = nil,
+			}
+			cache[serviceName] = state
+		elseif state == nil then
+			error("Bulk property tree chunk arrived before tree header")
+		end
+		if nodeCount == 0 then
+			return state.resolved
+		end
+		if type(tree.nodes) ~= "string" then
+			error("Bulk property tree nodes must be base64")
+		end
+		local nodesBuf = EncodingService:Base64Decode(buffer.fromstring(tree.nodes))
+		if buffer.len(nodesBuf) ~= nodeCount * 16 then
+			error(`Bulk property tree buffer size mismatch: got {buffer.len(nodesBuf)}, expected {nodeCount * 16}`)
+		end
+		local terrainInst = if serviceName == "Workspace" then service:FindFirstChildOfClass("Terrain") else nil
+		local strings = state.strings
+		local resolved = state.resolved
+		local childrenByParent = state.childrenByParent
+		for index = 1, nodeCount do
+			if index % 512 == 0 then
+				if yieldForBudget() then
+					assertActive()
+				end
+			end
+			local offset = (index - 1) * 16
+			local parentIdx = buffer.readu32(nodesBuf, offset)
+			local ordinal = buffer.readu32(nodesBuf, offset + 4)
+			local nameIdx = buffer.readu32(nodesBuf, offset + 8)
+			local classIdx = buffer.readu32(nodesBuf, offset + 12)
+			local name = strings[nameIdx + 1]
+			local className = strings[classIdx + 1]
+			if type(name) ~= "string" or type(className) ~= "string" then
+				error(`Bulk property tree node {nodeOffset + index} references an invalid string`)
+			end
+			local parentInst = if parentIdx == 0 then service else resolved[parentIdx]
+			if parentInst == nil then
+				error(`Bulk property tree node {nodeOffset + index} references an unresolved parent {parentIdx}`)
+			end
+			local lookup = childrenByParent[parentInst]
+			if lookup == nil then
+				lookup = buildBulkChildLookup(parentInst)
+				childrenByParent[parentInst] = lookup
+			end
+			local entry = lookup[name]
+			local target: Instance? = nil
+			if typeof(entry) == "Instance" then
+				if ordinal == 1 then
+					target = entry
+				end
+			elseif type(entry) == "table" then
+				target = entry[ordinal]
+			end
+			if target == nil then
+				error(`Bulk property target not found: {parentInst:GetFullName()}.{name}[{ordinal}]`)
+			end
+			if target.ClassName ~= className then
+				error(`Bulk property target class mismatch at {target:GetFullName()}: expected {className}, got {target.ClassName}`)
+			end
+			if isProtectedWorkspaceCameraInstance(target) or target.ClassName == "PackageLink" then
+				error(`Bulk property target is protected: {target:GetFullName()}`)
+			end
+			local nodeId = nodeOffset + index
+			resolved[nodeId] = target
+			if terrainInst ~= nil and target == terrainInst then
+				state.terrainNodeId = nodeId
+			end
+		end
+		return resolved
+	end
+
+	function api.applyBulkProperties(params: { [string]: any }): { [string]: any }
+		local started = os.clock()
+		local operationCancellation = captureOperationCancellation()
+		assertSessionOwnership(operationCancellation)
+		local transactionId = tostring(params.transactionId or "")
+		if transactionId == "" then
+			error("Bulk property patch requires an active editor transaction")
+		end
+		local session = editorTransactions[transactionId]
+		if type(session) ~= "table" then
+			error("Unknown or expired editor transaction: " .. transactionId)
+		end
+		if retireInvalidatedTransaction(session) then
+			error("Editor transaction was invalidated by a Studio session change")
+		end
+		assertTransactionLease(session, false)
+		local serviceName = tostring(params.service or "")
+		if not ctx.allowedServices[serviceName] or not table.find(session.serviceNames or {}, serviceName) then
+			error("Bulk property patch targets an unauthorized service: " .. serviceName)
+		end
+		local service = game:GetService(serviceName)
+		local stats = {
+			ok = true,
+			propertyUpdated = 0,
+			noops = 0,
+			verified = 0,
+			expectedFields = 0,
+			errors = 0,
+			protectedWrites = {},
+			lastMs = 0,
+		}
+		local function assertActive()
+			assertSessionOwnership(operationCancellation)
+			assertTransactionLease(session, false)
+			if editorTransactions[transactionId] ~= session or session.state == "rolledBack" or session.state == "committed" then
+				error("Editor transaction is no longer active")
+			end
+		end
+		local yieldForBudget = BridgeParallel.newRequestBudget()
+		beginSessionOperation(session)
+		local okApply, applyErr = xpcall(function()
+			session.bulkTrees = session.bulkTrees or {}
+			local resolved: { [number]: Instance }? = nil
+			if type(params.tree) == "table" then
+				resolved = resolveBulkTreeChunk(serviceName, service, params.tree, session.bulkTrees, yieldForBudget, assertActive)
+			elseif session.bulkTrees[serviceName] ~= nil then
+				resolved = session.bulkTrees[serviceName].resolved
+			end
+			local columns = params.columns
+			if type(columns) ~= "table" or #columns == 0 then
+				return
+			end
+			if resolved == nil then
+				error("Bulk property patch has columns without a resolved tree")
+			end
+			session.snapshot.bulkProperties = session.snapshot.bulkProperties or {}
+			if session.bulkExpectedProperties == nil then
+				session.bulkExpectedProperties = {}
+				if ctx.setBulkExpectedProperties then
+					ctx.setBulkExpectedProperties(session.bulkExpectedProperties)
+				end
+			end
+			local bulkExpected = session.bulkExpectedProperties
+			local decodedColumns = {}
+			for _, column in ipairs(columns) do
+				local propName = tostring(column.propertyName or "")
+				local encoding = tostring(column.encoding or "")
+				local count = tonumber(column.count) or 0
+				if propName == "" or count < 0 or count % 1 ~= 0 then
+					error("Invalid bulk property column descriptor")
+				end
+				if count == 0 then
+					continue
+				end
+				stats.expectedFields += count
+				local rowsBuf = EncodingService:Base64Decode(buffer.fromstring(column.rows))
+				if buffer.len(rowsBuf) ~= count * 4 then
+					error(`Bulk property row buffer size mismatch for {propName}`)
+				end
+				local valBuf: buffer? = nil
+				local constValue: any = nil
+				local decodedPalette: { [number]: any }? = nil
+				local idxBuf: buffer? = nil
+				if encoding == "f32_const" or encoding == "f64_const" or encoding == "bool_const" then
+					constValue = column.value
+				elseif encoding == "f32" or encoding == "i32" then
+					valBuf = EncodingService:Base64Decode(buffer.fromstring(column.values))
+					if buffer.len(valBuf :: buffer) ~= count * 4 then
+						error(`Bulk property value buffer size mismatch for {propName}`)
+					end
+				elseif encoding == "f64" then
+					valBuf = EncodingService:Base64Decode(buffer.fromstring(column.values))
+					if buffer.len(valBuf :: buffer) ~= count * 8 then
+						error(`Bulk property value buffer size mismatch for {propName}`)
+					end
+				elseif encoding == "bool" then
+					valBuf = EncodingService:Base64Decode(buffer.fromstring(column.values))
+					if buffer.len(valBuf :: buffer) ~= count then
+						error(`Bulk property value buffer size mismatch for {propName}`)
+					end
+				elseif encoding == "vector3" or encoding == "color3" then
+					valBuf = EncodingService:Base64Decode(buffer.fromstring(column.values))
+					if buffer.len(valBuf :: buffer) ~= count * 12 then
+						error(`Bulk property value buffer size mismatch for {propName}`)
+					end
+				elseif encoding == "cframe" then
+					valBuf = EncodingService:Base64Decode(buffer.fromstring(column.values))
+					if buffer.len(valBuf :: buffer) ~= count * 48 then
+						error(`Bulk property value buffer size mismatch for {propName}`)
+					end
+				elseif encoding == "indexed" then
+					local rawPalette = column.palette
+					if type(rawPalette) ~= "table" then
+						error(`Bulk property indexed column missing palette for {propName}`)
+					end
+					idxBuf = EncodingService:Base64Decode(buffer.fromstring(column.indices))
+					if buffer.len(idxBuf :: buffer) ~= count * 4 then
+						error(`Bulk property index buffer size mismatch for {propName}`)
+					end
+					decodedPalette = table.create(#rawPalette)
+					for pIndex = 1, #rawPalette do
+						local okDecode, decoded = decodeValue(rawPalette[pIndex], propName)
+						if not okDecode then
+							error(`Failed to decode bulk property value for {propName}: {decoded}`)
+						end
+						(decodedPalette :: { [number]: any })[pIndex] = decoded
+					end
+				else
+					error(`Unsupported bulk property encoding {encoding}`)
+				end
+				decodedColumns[#decodedColumns + 1] = {
+					propName = propName,
+					encoding = encoding,
+					count = count,
+					rowsBuf = rowsBuf,
+					valBuf = valBuf,
+					constValue = constValue,
+					decodedPalette = decodedPalette,
+					idxBuf = idxBuf,
+					skipIdx = nil :: number?,
+					rollbackInstances = {},
+					rollbackOldValues = {},
+					rollbackNodeIds = {},
+					rollbackCount = 0,
+				}
+			end
+
+			local returnOldValues = params.returnOldValues == true
+			local expectedTerrainDigest = if type(params.expectedTerrainDigest) == "string"
+					and params.expectedTerrainDigest ~= ""
+				then params.expectedTerrainDigest
+				else nil
+
+			local function readColumnDesired(col: any, idx: number): any
+				local encoding = col.encoding
+				if encoding == "f32_const" or encoding == "f64_const" or encoding == "bool_const" then
+					return col.constValue
+				elseif encoding == "f32" then
+					return buffer.readf32(col.valBuf, (idx - 1) * 4)
+				elseif encoding == "f64" then
+					return buffer.readf64(col.valBuf, (idx - 1) * 8)
+				elseif encoding == "bool" then
+					return buffer.readu8(col.valBuf, idx - 1) ~= 0
+				elseif encoding == "i32" then
+					return buffer.readi32(col.valBuf, (idx - 1) * 4)
+				elseif encoding == "vector3" then
+					local vOff = (idx - 1) * 12
+					return Vector3.new(
+						buffer.readf32(col.valBuf, vOff),
+						buffer.readf32(col.valBuf, vOff + 4),
+						buffer.readf32(col.valBuf, vOff + 8)
+					)
+				elseif encoding == "color3" then
+					local cOff = (idx - 1) * 12
+					return Color3.new(
+						buffer.readf32(col.valBuf, cOff),
+						buffer.readf32(col.valBuf, cOff + 4),
+						buffer.readf32(col.valBuf, cOff + 8)
+					)
+				elseif encoding == "cframe" then
+					local cfOff = (idx - 1) * 48
+					return CFrame.new(
+						buffer.readf32(col.valBuf, cfOff),
+						buffer.readf32(col.valBuf, cfOff + 4),
+						buffer.readf32(col.valBuf, cfOff + 8),
+						buffer.readf32(col.valBuf, cfOff + 12),
+						buffer.readf32(col.valBuf, cfOff + 16),
+						buffer.readf32(col.valBuf, cfOff + 20),
+						buffer.readf32(col.valBuf, cfOff + 24),
+						buffer.readf32(col.valBuf, cfOff + 28),
+						buffer.readf32(col.valBuf, cfOff + 32),
+						buffer.readf32(col.valBuf, cfOff + 36),
+						buffer.readf32(col.valBuf, cfOff + 40),
+						buffer.readf32(col.valBuf, cfOff + 44)
+					)
+				else
+					local paletteIdx = buffer.readu32(col.idxBuf, (idx - 1) * 4)
+					return col.decodedPalette[paletteIdx + 1]
+				end
+			end
+
+			local preTerrainDigest: string? = nil
+			local noYieldUntil = 0
+			if (params.commit == true or expectedTerrainDigest ~= nil) and type(ctx.captureTerrainProof) == "function" then
+				local treeState = session.bulkTrees[serviceName]
+				local terrainNodeId = if treeState ~= nil then treeState.terrainNodeId else nil
+				local terrainWrites: { { col: any, instance: Instance, propName: string, oldValue: any } } = {}
+				if terrainNodeId ~= nil then
+					for _, col in ipairs(decodedColumns) do
+						local lo, hi = 1, col.count
+						local foundIdx: number? = nil
+						local rowsBuf = col.rowsBuf
+						while lo <= hi do
+							local mid = bit32.rshift(lo + hi, 1)
+							local nodeId = buffer.readu32(rowsBuf, (mid - 1) * 4)
+							if nodeId == terrainNodeId then
+								foundIdx = mid
+								break
+							elseif nodeId < terrainNodeId then
+								lo = mid + 1
+							else
+								hi = mid - 1
+							end
+						end
+						if foundIdx ~= nil then
+							local propName = col.propName
+							local expectedForProp = bulkExpected[propName]
+							if expectedForProp == nil then
+								expectedForProp = {}
+								bulkExpected[propName] = expectedForProp
+							end
+							if ctx.noteBulkExportChange then
+								ctx.noteBulkExportChange(serviceName, propName)
+							end
+							local instance = resolved[terrainNodeId]
+							local desiredValue = readColumnDesired(col, foundIdx)
+							local encoding = col.encoding
+							local isF32Approx = encoding == "f32_const" or encoding == "f32"
+							local isExactScalar = encoding == "f64_const" or encoding == "f64" or encoding == "i32" or encoding == "bool_const" or encoding == "bool"
+							local target: any = instance
+							local current = target[propName]
+							if
+								current == desiredValue
+								or (isF32Approx and type(current) == "number" and valuesEqual(current, desiredValue))
+								or (not isF32Approx and not isExactScalar and propertyValuesEqual(instance, propName, current, desiredValue))
+							then
+								stats.noops += 1
+								stats.verified += 1
+							else
+								col.rollbackCount += 1
+								col.rollbackInstances[col.rollbackCount] = instance
+								col.rollbackOldValues[col.rollbackCount] = current
+								if returnOldValues then
+									col.rollbackNodeIds[col.rollbackCount] = terrainNodeId
+								end
+								terrainWrites[#terrainWrites + 1] = {
+									col = col,
+									instance = instance,
+									propName = propName,
+									oldValue = current,
+								}
+								expectedForProp[instance] = desiredValue
+								target[propName] = desiredValue
+								session.mutated = true
+								stats.propertyUpdated += 1
+								local after = target[propName]
+								if
+									after == desiredValue
+									or (isF32Approx and type(after) == "number" and math.abs(after - desiredValue) <= 1e-6)
+									or (not isF32Approx and not isExactScalar and propertyValuesEqual(instance, propName, after, desiredValue))
+								then
+									stats.verified += 1
+								else
+									error(`Studio did not retain {propName} on {instance:GetFullName()}`)
+								end
+							end
+							col.skipIdx = foundIdx
+						end
+					end
+				end
+				local okT, digest = pcall(ctx.captureTerrainProof)
+				if expectedTerrainDigest ~= nil then
+					if not okT or type(digest) ~= "string" or digest ~= expectedTerrainDigest then
+						for index = #terrainWrites, 1, -1 do
+							local entry = terrainWrites[index]
+							local expectedForProp = bulkExpected[entry.propName]
+							if expectedForProp ~= nil then
+								expectedForProp[entry.instance] = entry.oldValue
+							end
+							(entry.instance :: any)[entry.propName] = entry.oldValue
+							entry.col.rollbackCount = 0
+							table.clear(entry.col.rollbackInstances)
+							table.clear(entry.col.rollbackOldValues)
+							table.clear(entry.col.rollbackNodeIds)
+						end
+						session.mutated = false
+						stats.propertyUpdated = 0
+						stats.noops = 0
+						stats.verified = 0
+						stats.fallbackFullCapture = true
+						return
+					end
+				end
+				if okT and type(digest) == "string" then
+					assertActive()
+					preTerrainDigest = digest
+					noYieldUntil = os.clock() + 0.50
+				end
+			end
+
+			for _, col in ipairs(decodedColumns) do
+				local propName = col.propName
+				local encoding = col.encoding
+				local count = col.count
+				local rowsBuf = col.rowsBuf
+				local valBuf: buffer? = col.valBuf
+				local constValue: any = col.constValue
+				local decodedPalette: { [number]: any }? = col.decodedPalette
+				local idxBuf: buffer? = col.idxBuf
+				local skipIdx = col.skipIdx
+
+				local expectedForProp = bulkExpected[propName]
+				if expectedForProp == nil then
+					expectedForProp = {}
+					bulkExpected[propName] = expectedForProp
+				end
+				if ctx.noteBulkExportChange then
+					ctx.noteBulkExportChange(serviceName, propName)
+				end
+
+				local rollbackInstances = col.rollbackInstances
+				local rollbackOldValues = col.rollbackOldValues
+				local rollbackNodeIds = col.rollbackNodeIds
+				local rollbackCount = col.rollbackCount
+				local isConst = encoding == "f32_const" or encoding == "f64_const" or encoding == "bool_const"
+				local isF32 = encoding == "f32"
+				local isF64 = encoding == "f64"
+				local isBool = encoding == "bool"
+				local isI32 = encoding == "i32"
+				local isVec3 = encoding == "vector3"
+				local isColor3 = encoding == "color3"
+				local isCFrame = encoding == "cframe"
+				local isF32Approx = encoding == "f32_const" or isF32
+				local isExactScalar = encoding == "f64_const" or isF64 or isI32 or encoding == "bool_const" or isBool
+				local updated = 0
+				local noops = 0
+				local verified = 0
+
+				if isCFrame then
+					local cfDesired = table.create(count)
+					local cfInstances = table.create(count)
+					for idx = 1, count do
+						local rowByteOffset = (idx - 1) * 4
+						local nodeId = buffer.readu32(rowsBuf, rowByteOffset)
+						local instance = if nodeId == 0 then service else resolved[nodeId]
+						if instance == nil then
+							error(`Bulk property column {propName} references missing tree node {nodeId}`)
+						end
+						local cfOff = (idx - 1) * 48
+						local desiredValue = CFrame.new(
+							buffer.readf32(valBuf :: buffer, cfOff),
+							buffer.readf32(valBuf :: buffer, cfOff + 4),
+							buffer.readf32(valBuf :: buffer, cfOff + 8),
+							buffer.readf32(valBuf :: buffer, cfOff + 12),
+							buffer.readf32(valBuf :: buffer, cfOff + 16),
+							buffer.readf32(valBuf :: buffer, cfOff + 20),
+							buffer.readf32(valBuf :: buffer, cfOff + 24),
+							buffer.readf32(valBuf :: buffer, cfOff + 28),
+							buffer.readf32(valBuf :: buffer, cfOff + 32),
+							buffer.readf32(valBuf :: buffer, cfOff + 36),
+							buffer.readf32(valBuf :: buffer, cfOff + 40),
+							buffer.readf32(valBuf :: buffer, cfOff + 44)
+						)
+						cfInstances[idx] = instance
+						cfDesired[idx] = desiredValue
+						expectedForProp[instance] = desiredValue
+					end
+					for idx = 1, count do
+						if idx == skipIdx then
+							continue
+						end
+						if idx % 2048 == 0 then
+							if preTerrainDigest ~= nil then
+								if os.clock() >= noYieldUntil then
+									preTerrainDigest = nil
+									if yieldForBudget() then
+										assertActive()
+									end
+								end
+							else
+								if yieldForBudget() then
+									assertActive()
+								end
+							end
+						end
+						local instance = cfInstances[idx]
+						local desiredValue = cfDesired[idx]
+						local target: any = instance
+						local current = target[propName]
+						if current == desiredValue or BridgeValueEquality.valuesEqual(current, desiredValue) then
+							noops += 1
+							continue
+						end
+						rollbackCount += 1
+						rollbackInstances[rollbackCount] = instance
+						rollbackOldValues[rollbackCount] = current
+						if returnOldValues then
+							rollbackNodeIds[rollbackCount] = buffer.readu32(rowsBuf, (idx - 1) * 4)
+						end
+						target[propName] = desiredValue
+						updated += 1
+					end
+					local retryIndices = {}
+					for idx = 1, count do
+						if idx == skipIdx then
+							continue
+						end
+						local instance = cfInstances[idx]
+						local desiredValue = cfDesired[idx]
+						local after = (instance :: any)[propName]
+						if after == desiredValue or BridgeValueEquality.valuesEqual(after, desiredValue) then
+							verified += 1
+						else
+							(instance :: any)[propName] = desiredValue
+							retryIndices[#retryIndices + 1] = idx
+						end
+					end
+					for _, idx in ipairs(retryIndices) do
+						local instance = cfInstances[idx]
+						local desiredValue = cfDesired[idx]
+						local after = (instance :: any)[propName]
+						if after == desiredValue or BridgeValueEquality.valuesEqual(after, desiredValue) then
+							verified += 1
+						else
+							error(`Studio did not retain {propName} on {instance:GetFullName()}`)
+						end
+					end
+				else
+					for idx = 1, count do
+						if idx == skipIdx then
+							continue
+						end
+						if idx % 2048 == 0 then
+							if preTerrainDigest ~= nil then
+								if os.clock() >= noYieldUntil then
+									preTerrainDigest = nil
+									if yieldForBudget() then
+										assertActive()
+									end
+								end
+							else
+								if yieldForBudget() then
+									assertActive()
+								end
+							end
+						end
+						local rowByteOffset = (idx - 1) * 4
+						local nodeId = buffer.readu32(rowsBuf, rowByteOffset)
+						local instance = if nodeId == 0 then service else resolved[nodeId]
+						if instance == nil then
+							error(`Bulk property column {propName} references missing tree node {nodeId}`)
+						end
+						local desiredValue: any
+						if isConst then
+							desiredValue = constValue
+						elseif isF32 then
+							desiredValue = buffer.readf32(valBuf :: buffer, rowByteOffset)
+						elseif isF64 then
+							desiredValue = buffer.readf64(valBuf :: buffer, (idx - 1) * 8)
+						elseif isBool then
+							desiredValue = buffer.readu8(valBuf :: buffer, idx - 1) ~= 0
+						elseif isI32 then
+							desiredValue = buffer.readi32(valBuf :: buffer, rowByteOffset)
+						elseif isVec3 then
+							local vOff = (idx - 1) * 12
+							desiredValue = Vector3.new(
+								buffer.readf32(valBuf :: buffer, vOff),
+								buffer.readf32(valBuf :: buffer, vOff + 4),
+								buffer.readf32(valBuf :: buffer, vOff + 8)
+							)
+						elseif isColor3 then
+							local cOff = (idx - 1) * 12
+							desiredValue = Color3.new(
+								buffer.readf32(valBuf :: buffer, cOff),
+								buffer.readf32(valBuf :: buffer, cOff + 4),
+								buffer.readf32(valBuf :: buffer, cOff + 8)
+							)
+						else
+							local paletteIdx = buffer.readu32(idxBuf :: buffer, rowByteOffset)
+							desiredValue = (decodedPalette :: { [number]: any })[paletteIdx + 1]
+						end
+
+						local target: any = instance
+						local current = target[propName]
+						if
+							current == desiredValue
+							or (isF32Approx and type(current) == "number" and valuesEqual(current, desiredValue))
+							or (not isF32Approx and not isExactScalar and propertyValuesEqual(instance, propName, current, desiredValue))
+						then
+							noops += 1
+							verified += 1
+							continue
+						end
+
+						rollbackCount += 1
+						rollbackInstances[rollbackCount] = instance
+						rollbackOldValues[rollbackCount] = current
+						if returnOldValues then
+							rollbackNodeIds[rollbackCount] = nodeId
+						end
+
+						expectedForProp[instance] = desiredValue
+						target[propName] = desiredValue
+						updated += 1
+
+						local after = target[propName]
+						if
+							after == desiredValue
+							or (isF32Approx and type(after) == "number" and math.abs(after - desiredValue) <= 1e-6)
+							or (not isF32Approx and not isExactScalar and propertyValuesEqual(instance, propName, after, desiredValue))
+						then
+							verified += 1
+						else
+							error(`Studio did not retain {propName} on {instance:GetFullName()}`)
+						end
+					end
+				end
+
+				col.rollbackCount = rollbackCount
+				if updated > 0 then
+					session.mutated = true
+				end
+				stats.propertyUpdated += updated
+				stats.noops += noops
+				stats.verified += verified
+
+				if rollbackCount > 0 then
+					local bulkSnapshots = session.snapshot.bulkProperties
+					bulkSnapshots[#bulkSnapshots + 1] = {
+						propertyName = propName,
+						instances = rollbackInstances,
+						oldValues = rollbackOldValues,
+					}
+				end
+			end
+			if returnOldValues then
+				local oldValueColumns = {}
+				for _, col in ipairs(decodedColumns) do
+					local rc = col.rollbackCount
+					if rc == 0 then
+						continue
+					end
+					local encoding = col.encoding
+					local nodeIds = col.rollbackNodeIds
+					local oldVals = col.rollbackOldValues
+					local outRows = buffer.create(rc * 4)
+					for i = 1, rc do
+						buffer.writeu32(outRows, (i - 1) * 4, nodeIds[i])
+					end
+					local rowsB64 = buffer.tostring(EncodingService:Base64Encode(outRows))
+					if encoding == "f32" or encoding == "f32_const" then
+						local outVals = buffer.create(rc * 4)
+						for i = 1, rc do
+							buffer.writef32(outVals, (i - 1) * 4, oldVals[i])
+						end
+						oldValueColumns[#oldValueColumns + 1] = {
+							propertyName = col.propName,
+							encoding = "f32",
+							count = rc,
+							rows = rowsB64,
+							values = buffer.tostring(EncodingService:Base64Encode(outVals)),
+						}
+					elseif encoding == "f64" or encoding == "f64_const" then
+						local outVals = buffer.create(rc * 8)
+						for i = 1, rc do
+							buffer.writef64(outVals, (i - 1) * 8, oldVals[i])
+						end
+						oldValueColumns[#oldValueColumns + 1] = {
+							propertyName = col.propName,
+							encoding = "f64",
+							count = rc,
+							rows = rowsB64,
+							values = buffer.tostring(EncodingService:Base64Encode(outVals)),
+						}
+					elseif encoding == "i32" then
+						local outVals = buffer.create(rc * 4)
+						for i = 1, rc do
+							buffer.writei32(outVals, (i - 1) * 4, oldVals[i])
+						end
+						oldValueColumns[#oldValueColumns + 1] = {
+							propertyName = col.propName,
+							encoding = "i32",
+							count = rc,
+							rows = rowsB64,
+							values = buffer.tostring(EncodingService:Base64Encode(outVals)),
+						}
+					elseif encoding == "bool" or encoding == "bool_const" then
+						local outVals = buffer.create(rc)
+						for i = 1, rc do
+							buffer.writeu8(outVals, i - 1, if oldVals[i] then 1 else 0)
+						end
+						oldValueColumns[#oldValueColumns + 1] = {
+							propertyName = col.propName,
+							encoding = "bool",
+							count = rc,
+							rows = rowsB64,
+							values = buffer.tostring(EncodingService:Base64Encode(outVals)),
+						}
+					elseif encoding == "vector3" then
+						local outVals = buffer.create(rc * 12)
+						for i = 1, rc do
+							local v = oldVals[i]
+							local off = (i - 1) * 12
+							buffer.writef32(outVals, off, v.X)
+							buffer.writef32(outVals, off + 4, v.Y)
+							buffer.writef32(outVals, off + 8, v.Z)
+						end
+						oldValueColumns[#oldValueColumns + 1] = {
+							propertyName = col.propName,
+							encoding = "vector3",
+							count = rc,
+							rows = rowsB64,
+							values = buffer.tostring(EncodingService:Base64Encode(outVals)),
+						}
+					elseif encoding == "color3" then
+						local outVals = buffer.create(rc * 12)
+						for i = 1, rc do
+							local c = oldVals[i]
+							local off = (i - 1) * 12
+							buffer.writef32(outVals, off, c.R)
+							buffer.writef32(outVals, off + 4, c.G)
+							buffer.writef32(outVals, off + 8, c.B)
+						end
+						oldValueColumns[#oldValueColumns + 1] = {
+							propertyName = col.propName,
+							encoding = "color3",
+							count = rc,
+							rows = rowsB64,
+							values = buffer.tostring(EncodingService:Base64Encode(outVals)),
+						}
+					else
+						local serialized = table.create(rc)
+						for i = 1, rc do
+							serialized[i] = ctx.serializeValue(oldVals[i])
+						end
+						oldValueColumns[#oldValueColumns + 1] = {
+							propertyName = col.propName,
+							encoding = "json",
+							count = rc,
+							rows = rowsB64,
+							values = serialized,
+						}
+					end
+				end
+				stats.oldValueColumns = oldValueColumns
+			end
+			if preTerrainDigest ~= nil then
+				stats._preTerrainDigest = preTerrainDigest
+			end
+		end, debug.traceback)
+		endSessionOperation(editorTransactions, transactionId, session)
+		if not okApply then
+			error(applyErr, 0)
+		end
+		stats.lastMs = math.floor((os.clock() - started) * 1000 + 0.5)
+		ctx.stats.requests += 1
+		ctx.stats.lastMs = stats.lastMs
+		ctx.stats.lastAtUnix = os.time()
+		ctx.stats.lastOk = true
+		ctx.stats.propertyUpdated += stats.propertyUpdated
+		ctx.stats.noops += stats.noops
+		if session.mutated then
+			session.state = "prepared"
 		end
 		ctx.updateStatus()
 		return stats

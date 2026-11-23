@@ -221,6 +221,7 @@ fn default_method_target(method: &str) -> BridgeTarget {
 fn bridge_response_timeout(method: &str) -> Duration {
     match method {
         "applyEditorChanges"
+        | "applyEditorBulkProperties"
         | "beginEditorTransaction"
         | "beginEditorTransactionUpload"
         | "appendEditorTransactionUpload"
@@ -501,6 +502,8 @@ pub(crate) struct BridgeInfoPayload {
     pub(crate) native_root_target_batch: bool,
     /// Batch rows include the queued instance's engine debug identity.
     pub(crate) native_root_target_ids: bool,
+    /// Compact columnar bulk plain-property writes inside an active transaction.
+    pub(crate) bulk_property_patch: bool,
 }
 
 /// One Studio registers once per bridge channel; a registration made before

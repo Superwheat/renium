@@ -871,6 +871,7 @@ impl<'a> EditorTransaction<'a> {
             "mutationRoots": mutation_roots,
             "mutationPackageTargets": editor_mutation_package_targets(changes, binary_import),
             "postCommitPropertyChanges": post_commit_property_changes,
+            "hasBulkPropertyPatches": !changes.bulk_property_patches.is_empty(),
             "nativeImport": native_import,
             "nativeImportServices": native_import_services,
             "expectedRuntimeId": guard.map(|guard| &guard.runtime_id),
@@ -4384,24 +4385,35 @@ fn push_with_reader_platform(
     )?;
     let result = (|| {
         log_timing("native editor transaction begin", phase_started);
-        let mut summary = {
+        let can_inline_commit = can_inline_bulk_commit(
+            transaction.is_some(),
+            &changes,
+            binary_import.is_some(),
+            !pre_routed_protected_writes.is_empty(),
+            rerouted_fields,
+            offline_route,
+        );
+        let (mut summary, mut inline_commit_result, mut inline_release_result) = {
             let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
             let phase_started = Instant::now();
-            let result = send_editor_change_batches(
+            let result = crate::studio::native::editor::send_editor_change_batches_with_options(
                 bridge,
                 &changes,
                 binary_import.as_ref(),
                 transaction_id,
+                can_inline_commit,
+                can_inline_commit
+                    .then_some(args.inline_release_tracking.as_ref())
+                    .flatten(),
             );
             log_timing("native editor change batches", phase_started);
-            result?.summary
+            let batch = result?;
+            (batch.summary, batch.commit_result, batch.release_result)
         };
-        {
-            let errors = summary.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
-            if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
-                bail!("Studio rejected or failed one or more editor push changes");
-            }
+        if handle_bulk_fallback_capture(&summary, transaction.as_mut()) {
+            return Ok(summary);
         }
+        ensure_editor_summary_succeeded(&summary)?;
         if args.verify_sources || summary.contains_key("nativeVerifiedServices") {
             verify_pushed_sources(
                 bridge,
@@ -4410,29 +4422,12 @@ fn push_with_reader_platform(
                 &mut summary,
             )?;
         }
-        if unchanged_sources > 0 {
-            summary.insert("sourceUnchanged".to_string(), json!(unchanged_sources));
-            if inexact_unchanged > 0 {
-                let inexact = summary
-                    .get("sourceInexact")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                summary.insert(
-                    "sourceInexact".to_string(),
-                    json!(inexact + inexact_unchanged as u64),
-                );
-            }
-            if args.verify_sources {
-                let verified = summary
-                    .get("sourceVerified")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                summary.insert(
-                    "sourceVerified".to_string(),
-                    json!(verified + unchanged_sources as u64),
-                );
-            }
-        }
+        record_unchanged_source_summary(
+            args.verify_sources,
+            unchanged_sources,
+            inexact_unchanged,
+            &mut summary,
+        );
         let phase_started = Instant::now();
         let pending = (place.pending)(
             bridge,
@@ -4464,7 +4459,9 @@ fn push_with_reader_platform(
         }
         log_timing("native editor protected write preparation", phase_started);
         let phase_started = Instant::now();
-        if let Some(validate_project) = validate_project {
+        if inline_commit_result.is_none()
+            && let Some(validate_project) = validate_project
+        {
             validate_project()?;
         }
         {
@@ -4525,7 +4522,12 @@ fn push_with_reader_platform(
                 summary.insert("verified".into(), json!(false));
             }
         } else if let Some(transaction) = transaction.as_mut() {
-            match transaction.commit() {
+            let commit_outcome = if let Some(inline_result) = inline_commit_result.take() {
+                transaction.commit_response(inline_result)
+            } else {
+                transaction.commit()
+            };
+            match commit_outcome {
                 Ok(status) => commit_status = Some(status),
                 Err(commit_error) => {
                     if !transaction.active {
@@ -4542,6 +4544,9 @@ fn push_with_reader_platform(
         }
         if let Some(status) = commit_status {
             add_editor_commit_status(&mut summary, status);
+            if let Some(release_result) = inline_release_result.take() {
+                summary.insert("_inlineReleaseResult".to_string(), release_result);
+            }
         }
         if protected.apply_offline {
             summary.remove("verifiedPushProof");
@@ -4605,6 +4610,82 @@ fn push_with_reader_platform(
         Ok(summary)
     })();
     EditorTransaction::finish(transaction.as_mut(), result)
+}
+
+fn record_unchanged_source_summary(
+    verify_sources: bool,
+    unchanged_sources: usize,
+    inexact_unchanged: usize,
+    summary: &mut Map<String, Value>,
+) {
+    if unchanged_sources == 0 {
+        return;
+    }
+    summary.insert("sourceUnchanged".to_string(), json!(unchanged_sources));
+    if inexact_unchanged > 0 {
+        let inexact = summary
+            .get("sourceInexact")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        summary.insert(
+            "sourceInexact".to_string(),
+            json!(inexact + inexact_unchanged as u64),
+        );
+    }
+    if verify_sources {
+        let verified = summary
+            .get("sourceVerified")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        summary.insert(
+            "sourceVerified".to_string(),
+            json!(verified + unchanged_sources as u64),
+        );
+    }
+}
+
+fn handle_bulk_fallback_capture(
+    summary: &Map<String, Value>,
+    transaction: Option<&mut EditorTransaction<'_>>,
+) -> bool {
+    if summary.get("fallbackFullCapture") != Some(&Value::Bool(true)) {
+        return false;
+    }
+    if let Some(tx) = transaction
+        && tx.active
+    {
+        let _ = tx.rollback();
+    }
+    true
+}
+
+fn ensure_editor_summary_succeeded(summary: &Map<String, Value>) -> Result<()> {
+    let errors = summary.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
+    if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
+        bail!("Studio rejected or failed one or more editor push changes");
+    }
+    Ok(())
+}
+
+fn can_inline_bulk_commit(
+    has_transaction: bool,
+    changes: &EditorChangeSet,
+    has_binary_import: bool,
+    has_pre_routed: bool,
+    rerouted_fields: usize,
+    offline_route: bool,
+) -> bool {
+    has_transaction
+        && !changes.bulk_property_patches.is_empty()
+        && changes.instance_changes.is_empty()
+        && changes.source_changes.is_empty()
+        && changes.property_changes.is_empty()
+        && changes.deferred_native_rows.is_empty()
+        && changes.settings_writes.is_empty()
+        && !has_binary_import
+        && !has_pre_routed
+        && rerouted_fields == 0
+        && !offline_route
 }
 
 /// The native setter finds its target by path from the service root, and an

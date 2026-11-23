@@ -877,6 +877,7 @@ fn a_change_since_the_proof_is_inside_only_under_what_the_pull_captures() {
         let now = ProofScope::Services {
             services: services.iter().map(|service| service.to_string()).collect(),
             touched: BTreeMap::from([("Workspace".to_string(), entries)]),
+            values_only: BTreeSet::new(),
         };
         instance_premise(&now, &pulls)
     };
