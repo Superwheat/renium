@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{Cursor, Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -95,19 +95,24 @@ fn values_encode_alike(
     root_service: Option<&str>,
 ) -> bool {
     !properties.contains_key("Attributes")
-        && attributes.values().all(|value| {
-            // An object without a type is one of the wrapped forms, whether
-            // the encoder of documents knows it or not.
-            value
-                .as_object()
-                .is_none_or(|object| object.contains_key("_type"))
-                && canonical_attribute_value(value).is_none()
-                && collect_attribute_value_strings(value, &mut SettingsStringCounts::default())
-                    .is_ok()
+        && attributes.values().all(|value| match value {
+            Value::Bool(_) | Value::Number(_) | Value::String(_) => true,
+            Value::Object(object) => {
+                object.contains_key("_type")
+                    && canonical_attribute_value(value).is_none()
+                    && collect_attribute_value_strings(value, &mut SettingsStringCounts::default())
+                        .is_ok()
+                    && references_alike(value, root_service)
+            }
+            _ => {
+                canonical_attribute_value(value).is_none()
+                    && collect_attribute_value_strings(value, &mut SettingsStringCounts::default())
+                        .is_ok()
+                    && references_alike(value, root_service)
+            }
         })
         && properties
             .values()
-            .chain(attributes.values())
             .all(|value| references_alike(value, root_service))
 }
 
@@ -122,6 +127,15 @@ fn references_alike(value: &Value, root_service: Option<&str>) -> bool {
             .iter()
             .all(|item| references_alike(item, root_service)),
         Value::Object(object) => {
+            if object.len() == 2
+                && let Some(ty) = object.get("_type").and_then(Value::as_str)
+                && matches!(
+                    ty,
+                    "SharedString" | "BinaryString" | "UniqueId" | "EnumItem"
+                )
+            {
+                return true;
+            }
             let named = SETTINGS_REFERENCE_SELECTOR_KEYS[1..]
                 .iter()
                 .any(|key| object.contains_key(*key));
@@ -985,25 +999,32 @@ fn decode_settings_instance_range(
     let mut reader = BytecodeReader::new(bytes);
     budget.instances(count)?;
     let mut instances = Vec::with_capacity(count);
+    let mut charged = 0_usize;
     for offset in 0..count {
         let instance_index = first_index + offset;
         let settings_id = read_compact_settings_id(&mut reader, strings)?;
-        budget.take(settings_id.len())?;
-        let name = budget.copied(reader.read_string(strings, "instance name")?)?;
+        let name_str = reader.read_string(strings, "instance name")?;
         let class_id = reader.read_len("instance class id")?;
-        let class_name = budget.copied(
-            classes
-                .get(class_id)
-                .with_context(|| format!("Invalid class id {class_id}"))?,
-        )?;
+        let class_str = classes
+            .get(class_id)
+            .map(String::as_str)
+            .with_context(|| format!("Invalid class id {class_id}"))?;
+        charged = charged.saturating_add(settings_id.len() + name_str.len() + class_str.len());
+        if charged >= 1 << 20 {
+            budget.take(charged)?;
+            charged = 0;
+        }
         let parent_raw = reader.read_len("parent index")?;
         let parent_index = decode_parent_index(parent_raw, instance_index, instance_count)?;
         instances.push(SettingsBytecodeInstance::new(
             settings_id,
-            name,
-            class_name,
+            name_str.to_string(),
+            class_str.to_string(),
             parent_index,
         ));
+    }
+    if charged > 0 {
+        budget.take(charged)?;
     }
     reader.finish()?;
     Ok(instances)
@@ -1379,7 +1400,25 @@ fn decode_property_group_body(
     value_count: usize,
     scope: ValueScope<'_>,
 ) -> Result<Vec<DecodedGroupEntry>> {
+    decode_property_group_body_filtered(body, property_name, kind, value_count, scope, None, |_| {
+        true
+    })
+}
+
+/// Like `decode_property_group_body`, but skips allocating JSON values for rows
+/// rejected by `keep`, and optionally enforces `instance_index < max_row` for
+/// block-local row indices.
+fn decode_property_group_body_filtered(
+    body: &[u8],
+    property_name: &str,
+    kind: u8,
+    value_count: usize,
+    scope: ValueScope<'_>,
+    max_row: Option<usize>,
+    keep: impl Fn(usize) -> bool + Sync,
+) -> Result<Vec<DecodedGroupEntry>> {
     let ValueScope { instance_count, .. } = scope;
+    let limit = max_row.unwrap_or(instance_count);
     scope
         .budget
         .property_group(value_count, property_name, kind)?;
@@ -1410,7 +1449,10 @@ fn decode_property_group_body(
                 reader.read_len("property instance index")?,
                 position,
             )?;
-            if instance_index >= instance_count {
+            if instance_index >= limit {
+                if max_row.is_some() {
+                    bail!("A value block gives a value to a row it does not hold");
+                }
                 bail!("Invalid property instance index {instance_index}");
             }
             let start = reader.position();
@@ -1418,7 +1460,9 @@ fn decode_property_group_body(
             if matches!(cframe_group_decoder, CFrameGroupDecoder::RotationTable(_)) {
                 reader.read_len("CFrame rotation index")?;
             }
-            values.push((instance_index, &body[start..reader.position()]));
+            if keep(instance_index) {
+                values.push((instance_index, &body[start..reader.position()]));
+            }
         }
         reader.finish()?;
         return values
@@ -1443,7 +1487,7 @@ fn decode_property_group_body(
     }
     let mut previous_instance_index = 0_usize;
     let mut previous_ref_target_index = 0_usize;
-    let mut entries = Vec::with_capacity(reader.capacity(value_count, 1));
+    let mut entries = Vec::new();
     for position in 0..value_count {
         let instance_index = next_group_instance(
             previous_instance_index,
@@ -1451,8 +1495,33 @@ fn decode_property_group_body(
             position,
         )?;
         previous_instance_index = instance_index;
-        if instance_index >= instance_count {
+        if instance_index >= limit {
+            if max_row.is_some() {
+                bail!("A value block gives a value to a row it does not hold");
+            }
             bail!("Invalid property instance index {instance_index}");
+        }
+        if !keep(instance_index) {
+            if skip_property_group_entry(
+                &mut reader,
+                property_name,
+                kind,
+                scope,
+                &cframe_group_decoder,
+                &mut previous_ref_target_index,
+            )? {
+                continue;
+            }
+            let _ = decode_property_group_entry(
+                &mut reader,
+                property_name,
+                kind,
+                instance_index,
+                scope,
+                &cframe_group_decoder,
+                &mut previous_ref_target_index,
+            )?;
+            continue;
         }
         entries.push(decode_property_group_entry(
             &mut reader,
@@ -1466,6 +1535,79 @@ fn decode_property_group_body(
     }
     reader.finish()?;
     Ok(entries)
+}
+
+/// Skips a wire value without allocating JSON for common scalar/fixed/ref kinds.
+/// Returns `Ok(true)` if skipped, `Ok(false)` if the caller should decode & discard.
+#[inline]
+fn skip_property_group_entry(
+    reader: &mut BytecodeReader<'_>,
+    property_name: &str,
+    kind: u8,
+    scope: ValueScope<'_>,
+    cframe: &CFrameGroupDecoder,
+    previous_ref_target: &mut usize,
+) -> Result<bool> {
+    if property_name == "Attributes" && kind == 8 {
+        return Ok(false);
+    }
+    match kind {
+        0..=2 => Ok(true),
+        3 | 4 => {
+            reader.read_var_u64()?;
+            Ok(true)
+        }
+        5 => {
+            reader.read_bytes(8)?;
+            Ok(true)
+        }
+        20 => {
+            reader.read_bytes(4)?;
+            Ok(true)
+        }
+        6 => {
+            let (_, text) = scope.read_str_with_id(reader, "value string id")?;
+            scope.budget.take(text.len())?;
+            Ok(true)
+        }
+        19 => {
+            let (_, text) = scope.read_str_with_id(reader, "enum item string id")?;
+            scope.budget.take(text.len())?;
+            Ok(true)
+        }
+        11 | 13 => {
+            reader.read_bytes(8)?;
+            Ok(true)
+        }
+        12 | 15 => {
+            reader.read_bytes(12)?;
+            Ok(true)
+        }
+        14 | 18 => {
+            reader.read_bytes(16)?;
+            Ok(true)
+        }
+        16 => {
+            match cframe {
+                CFrameGroupDecoder::Inline => {
+                    reader.read_bytes(48)?;
+                }
+                CFrameGroupDecoder::RotationTable(rotations) => {
+                    reader.read_bytes(12)?;
+                    let idx = reader.read_len("CFrame rotation index")?;
+                    if idx >= rotations.len() {
+                        bail!("Invalid CFrame rotation index {idx}");
+                    }
+                }
+            }
+            Ok(true)
+        }
+        17 => {
+            let _ = decode_resolved_ref_target(reader, scope.instance_count, previous_ref_target)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 // The shared value decoder for eager columns and bounded row materialization.
@@ -1600,63 +1742,81 @@ fn validate_settings_record_properties(instances: &[SettingsBytecodeInstance]) -
 }
 
 fn validate_settings_hierarchy(instances: &[SettingsBytecodeInstance]) -> Result<()> {
-    let mut settings_ids = AHashSet::with_capacity(instances.len());
-    for (index, instance) in instances.iter().enumerate() {
-        if instance.settings_id.is_empty() {
-            bail!("Settings bytecode instance {index} has an empty settings id");
+    let check_ids = || -> Result<()> {
+        let mut settings_ids = AHashSet::with_capacity(instances.len());
+        for (index, instance) in instances.iter().enumerate() {
+            if instance.settings_id.is_empty() {
+                bail!("Settings bytecode instance {index} has an empty settings id");
+            }
+            if !settings_ids.insert(instance.settings_id.as_str()) {
+                bail!(
+                    "Settings bytecode contains duplicate settings id {}",
+                    instance.settings_id
+                );
+            }
         }
-        if !settings_ids.insert(instance.settings_id.as_str()) {
-            bail!(
-                "Settings bytecode contains duplicate settings id {}",
-                instance.settings_id
-            );
-        }
-    }
-    let mut states = vec![0_u8; instances.len()];
-    let mut depths = vec![0_usize; instances.len()];
-
-    for start in 0..instances.len() {
-        if states[start] == 2 {
-            continue;
-        }
+        Ok(())
+    };
+    let check_tree = || -> Result<()> {
+        let mut states = vec![0_u8; instances.len()];
+        let mut depths = vec![0_usize; instances.len()];
         let mut path = Vec::new();
-        let mut current = Some(start);
-        let mut base_depth = 0_usize;
-        while let Some(index) = current {
-            if index >= instances.len() {
-                bail!("Invalid parent index {index}");
+        let mut root_count = 0_usize;
+
+        for start in 0..instances.len() {
+            if instances[start].parent_index.is_none() {
+                root_count += 1;
             }
-            match states[index] {
-                0 => {
-                    states[index] = 1;
-                    path.push(index);
-                    current = instances[index].parent_index;
+            if states[start] == 2 {
+                continue;
+            }
+            path.clear();
+            let mut current = Some(start);
+            let mut base_depth = 0_usize;
+            while let Some(index) = current {
+                if index >= instances.len() {
+                    bail!("Invalid parent index {index}");
                 }
-                1 => bail!("Settings bytecode hierarchy contains a parent cycle at index {index}"),
-                2 => {
-                    base_depth = depths[index];
-                    break;
+                match states[index] {
+                    0 => {
+                        states[index] = 1;
+                        path.push(index);
+                        current = instances[index].parent_index;
+                    }
+                    1 => bail!(
+                        "Settings bytecode hierarchy contains a parent cycle at index {index}"
+                    ),
+                    2 => {
+                        base_depth = depths[index];
+                        break;
+                    }
+                    _ => unreachable!("settings hierarchy state is internal"),
                 }
-                _ => unreachable!("settings hierarchy state is internal"),
+            }
+            if base_depth.saturating_add(path.len()) > MAX_SETTINGS_HIERARCHY_DEPTH {
+                bail!(
+                    "Settings bytecode hierarchy exceeds safe depth of {MAX_SETTINGS_HIERARCHY_DEPTH}"
+                );
+            }
+            while let Some(index) = path.pop() {
+                base_depth += 1;
+                depths[index] = base_depth;
+                states[index] = 2;
             }
         }
-        if base_depth.saturating_add(path.len()) > MAX_SETTINGS_HIERARCHY_DEPTH {
-            bail!(
-                "Settings bytecode hierarchy exceeds safe depth of {MAX_SETTINGS_HIERARCHY_DEPTH}"
-            );
+        if !instances.is_empty() && root_count != 1 {
+            bail!("Settings bytecode must contain exactly one root, found {root_count}");
         }
-        while let Some(index) = path.pop() {
-            base_depth += 1;
-            depths[index] = base_depth;
-            states[index] = 2;
-        }
-    }
-    let root_count = instances
-        .iter()
-        .filter(|instance| instance.parent_index.is_none())
-        .count();
-    if !instances.is_empty() && root_count != 1 {
-        bail!("Settings bytecode must contain exactly one root, found {root_count}");
+        Ok(())
+    };
+    if instances.len() >= SETTINGS_BINARY_PARALLEL_MIN_INSTANCES && rayon::current_num_threads() > 1
+    {
+        let (ids_res, tree_res) = rayon::join(check_ids, check_tree);
+        ids_res?;
+        tree_res?;
+    } else {
+        check_ids()?;
+        check_tree()?;
     }
     Ok(())
 }
@@ -1876,6 +2036,96 @@ fn compression_workers() -> u32 {
 #[cfg(test)]
 fn compress_store_payload(payload: &[u8], workers: u32) -> Result<Vec<u8>> {
     compress_store_frame(payload, workers, false)
+}
+
+/// Reusable per-worker zstd compression/decompression contexts and scratch buffers.
+/// Initialized once per Rayon worker via `map_init` and dropped when encoding finishes.
+pub(super) struct FrameCodec {
+    small_cctx: Option<zstd::bulk::Compressor<'static>>,
+    large_cctx: Option<zstd::zstd_safe::CCtx<'static>>,
+    dctx: Option<zstd::bulk::Decompressor<'static>>,
+    piece: Vec<u8>,
+    pub(super) body_scratch: Vec<u8>,
+}
+
+impl FrameCodec {
+    pub(super) fn new() -> Self {
+        Self {
+            small_cctx: None,
+            large_cctx: None,
+            dctx: None,
+            piece: Vec::new(),
+            body_scratch: Vec::new(),
+        }
+    }
+
+    pub(super) fn compress_frame(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        use zstd::zstd_safe::{
+            CCtx, CParameter, InBuffer, OutBuffer, ResetDirective, zstd_sys::ZSTD_EndDirective,
+        };
+        if payload.len() < LARGE_STORE_PAYLOAD_BYTES {
+            let compressor = match self.small_cctx.as_mut() {
+                Some(compressor) => compressor,
+                None => {
+                    let mut compressor = zstd::bulk::Compressor::new(STORE_COMPRESSION_LEVEL)?;
+                    compressor.set_parameter(CParameter::ChecksumFlag(true))?;
+                    self.small_cctx.insert(compressor)
+                }
+            };
+            let bound = zstd::zstd_safe::compress_bound(payload.len());
+            if self.piece.len() < bound {
+                self.piece.resize(bound, 0);
+            }
+            let written = compressor.compress_to_buffer(payload, &mut self.piece[..bound])?;
+            return Ok(self.piece[..written].to_vec());
+        }
+        let failed = |code| anyhow::anyhow!("{}", zstd::zstd_safe::get_error_name(code));
+        let context = match self.large_cctx.as_mut() {
+            Some(context) => {
+                context.reset(ResetDirective::SessionOnly).map_err(failed)?;
+                context
+            }
+            None => {
+                let mut context = CCtx::create();
+                for parameter in [
+                    CParameter::CompressionLevel(STORE_COMPRESSION_LEVEL),
+                    CParameter::EnableLongDistanceMatching(true),
+                    CParameter::WindowLog(STORE_WINDOW_LOG),
+                    CParameter::NbWorkers(1),
+                    CParameter::ChecksumFlag(true),
+                ] {
+                    context.set_parameter(parameter).map_err(failed)?;
+                }
+                self.large_cctx.insert(context)
+            }
+        };
+        context
+            .set_pledged_src_size(Some(payload.len() as u64))
+            .map_err(failed)?;
+        let mut input = InBuffer::around(payload);
+        if self.piece.len() < (1 << 20) {
+            self.piece.resize(1 << 20, 0);
+        }
+        let mut compressed = Vec::with_capacity(payload.len() / 4);
+        loop {
+            let mut output = OutBuffer::around(&mut self.piece[..1 << 20]);
+            let left = context
+                .compress_stream2(&mut output, &mut input, ZSTD_EndDirective::ZSTD_e_end)
+                .map_err(failed)?;
+            compressed.extend_from_slice(output.as_slice());
+            if left == 0 {
+                return Ok(compressed);
+            }
+        }
+    }
+
+    pub(super) fn decompress_exact(&mut self, bytes: &[u8], decoded: usize) -> Result<Vec<u8>> {
+        let decompressor = match self.dctx.as_mut() {
+            Some(d) => d,
+            None => self.dctx.insert(zstd::bulk::Decompressor::new()?),
+        };
+        Ok(decompressor.decompress(bytes, decoded)?)
+    }
 }
 
 /// `compress_store_payload`, with zstd's checksum of the content in the frame
@@ -2145,61 +2395,84 @@ fn collect_settings_reference_selectors(
 }
 
 struct BytecodeReader<'a> {
-    cursor: Cursor<&'a [u8]>,
+    bytes: &'a [u8],
+    pos: usize,
 }
 
 impl<'a> BytecodeReader<'a> {
+    #[inline]
     fn new(bytes: &'a [u8]) -> Self {
-        Self {
-            cursor: Cursor::new(bytes),
-        }
+        Self { bytes, pos: 0 }
     }
 
     fn read_magic(&mut self) -> Result<()> {
-        let mut magic = vec![0_u8; SETTINGS_BINARY_MAGIC.len()];
-        self.cursor
-            .read_exact(&mut magic)
+        let len = SETTINGS_BINARY_MAGIC.len();
+        let magic = self
+            .bytes
+            .get(self.pos..self.pos + len)
             .context("Missing settings bytecode magic")?;
+        self.pos += len;
         if magic != SETTINGS_BINARY_MAGIC {
             bail!("Invalid settings bytecode magic");
         }
         Ok(())
     }
 
+    #[inline]
     fn bytes(&self) -> &'a [u8] {
-        self.cursor.get_ref()
+        self.bytes
     }
 
+    #[inline]
     fn position(&self) -> usize {
-        self.cursor.position() as usize
+        self.pos
     }
 
+    #[inline]
+    fn set_position(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
+    #[inline]
     fn read_u8(&mut self) -> Result<u8> {
-        let mut buf = [0_u8; 1];
-        self.cursor.read_exact(&mut buf)?;
-        Ok(buf[0])
+        let Some(&b) = self.bytes.get(self.pos) else {
+            bail!("Unexpected end of settings bytecode");
+        };
+        self.pos += 1;
+        Ok(b)
     }
 
+    #[inline]
     fn read_bytes(&mut self, len: usize) -> Result<&'a [u8]> {
-        let start = self.cursor.position() as usize;
+        let start = self.pos;
         let end = start
             .checked_add(len)
             .context("Settings bytecode offset overflow")?;
-        let byte_len = self.cursor.get_ref().len();
-        if end > byte_len {
+        if end > self.bytes.len() {
             bail!("Unexpected end of settings bytecode");
         }
-        self.cursor.set_position(end as u64);
-        Ok(&self.cursor.get_ref()[start..end])
+        self.pos = end;
+        Ok(&self.bytes[start..end])
     }
 
+    #[inline]
     fn read_var_u64(&mut self) -> Result<u64> {
-        let mut value = 0_u64;
-        let mut shift = 0_u32;
-        for _ in 0..10 {
-            let byte = self.read_u8()?;
-            value |= ((byte & 0x7f) as u64) << shift;
-            if byte & 0x80 == 0 {
+        let Some(&first) = self.bytes.get(self.pos) else {
+            bail!("Unexpected end of settings bytecode");
+        };
+        self.pos += 1;
+        if first < 0x80 {
+            return Ok(u64::from(first));
+        }
+        let mut value = u64::from(first & 0x7f);
+        let mut shift = 7_u32;
+        for _ in 1..10 {
+            let Some(&byte) = self.bytes.get(self.pos) else {
+                bail!("Unexpected end of settings bytecode");
+            };
+            self.pos += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte < 0x80 {
                 return Ok(value);
             }
             shift += 7;
@@ -2207,6 +2480,7 @@ impl<'a> BytecodeReader<'a> {
         bail!("Invalid varint in settings bytecode")
     }
 
+    #[inline]
     fn read_len(&mut self, label: &str) -> Result<usize> {
         let raw = self
             .read_var_u64()
@@ -2217,16 +2491,19 @@ impl<'a> BytecodeReader<'a> {
     /// The room to reserve for `count` items that each take at least
     /// `item_bytes` of the remaining input: a count the input cannot hold
     /// reserves nothing beyond what it can.
+    #[inline]
     fn capacity(&self, count: usize, item_bytes: usize) -> usize {
-        let remaining = self.cursor.get_ref().len() - self.position();
+        let remaining = self.bytes.len().saturating_sub(self.pos);
         count.min(remaining / item_bytes.max(1))
     }
 
+    #[inline]
     fn read_collection_len(&mut self, label: &str) -> Result<usize> {
         let len = self.read_len(label)?;
         checked_settings_collection_len(len, label)
     }
 
+    #[inline]
     fn read_string<'b>(&mut self, strings: &'b [String], label: &str) -> Result<&'b str> {
         let id = self.read_len(label)?;
         strings
@@ -2235,11 +2512,11 @@ impl<'a> BytecodeReader<'a> {
             .with_context(|| format!("Invalid {label} {id}"))
     }
 
+    #[inline]
     fn finish(&self) -> Result<()> {
-        let position = self.cursor.position() as usize;
-        let len = self.cursor.get_ref().len();
-        if position != len {
-            bail!("Settings bytecode has {} trailing bytes", len - position);
+        let len = self.bytes.len();
+        if self.pos != len {
+            bail!("Settings bytecode has {} trailing bytes", len - self.pos);
         }
         Ok(())
     }
@@ -2371,7 +2648,7 @@ fn decode_object_payload(
         if let Some(handle) = try_decode_held_shared_string(reader, scope)? {
             return Ok(handle);
         }
-        reader.cursor.set_position(start as u64);
+        reader.pos = start;
     }
     let mut out = Map::new();
     for _ in 0..field_count {
@@ -3072,8 +3349,239 @@ fn collect_settings_binary_record_strings<'a>(
     add_count(&mut out.class_counts, record.class_name);
 }
 
-/// Collects a captured instance's values, or those of the row that replaces
-/// it, as the values of the row `instance_index`.
+struct BlockFastCollectCtx<'a, 'b> {
+    state: &'a ServiceState,
+    lookup: &'b SettingsBinaryInstanceLookup<'b>,
+    out: SettingsBinaryCollection<'a>,
+    unique_id_count: u64,
+    shared_cache: AHashMap<usize, (&'a Value, u8, u64)>,
+}
+
+impl<'a, 'b> BlockFastCollectCtx<'a, 'b> {
+    fn collect_native_property(
+        &mut self,
+        row: usize,
+        instance: &'a SnapshotInstance,
+        has_json_props: bool,
+        property: &'a crate::snapshot::types::NativeSettingsProperty,
+    ) -> Result<()> {
+        let property_name = property.name.as_str();
+        if (has_json_props && instance.properties.contains_key(property_name))
+            || (property_name == "RunContext" && instance.class_name != "Script")
+        {
+            return Ok(());
+        }
+        if !self.state.properties_default_elided
+            && let NativeSettingsValue::UniqueId(value) = &property.value
+            && should_skip_binary_property(
+                self.state,
+                instance,
+                property_name,
+                &serde_json::json!({"_type": "UniqueId", "value": value}),
+            )
+        {
+            return Ok(());
+        }
+        if let NativeSettingsValue::Shared(value) = &property.value {
+            return self.collect_shared_property(row, instance, property_name, value);
+        }
+        if SETTINGS_RECORD_FIELDS.contains(&property_name) {
+            return Ok(());
+        }
+        if let Some(settled) = nonfinite_native_settled(&property.value) {
+            let source = SettingsBinaryValueSource::Settled(Box::new(settled));
+            let kind = binary_source_value_kind(&source, self.lookup)?;
+            collect_binary_source_strings(&source, self.lookup, &mut self.out.string_counts)?;
+            self.push_group(row, property_name, kind, source);
+            return Ok(());
+        }
+        let kind = native_value_kind(&property.value);
+        match &property.value {
+            NativeSettingsValue::String(s) | NativeSettingsValue::Enum(s) => {
+                add_count(&mut self.out.string_counts, s.as_str());
+            }
+            NativeSettingsValue::UniqueId(s) => {
+                self.unique_id_count += 1;
+                add_count(&mut self.out.string_counts, s.as_str());
+            }
+            _ => {}
+        }
+        self.push_group(
+            row,
+            property_name,
+            kind,
+            SettingsBinaryValueSource::Native(&property.value),
+        );
+        Ok(())
+    }
+
+    fn collect_shared_property(
+        &mut self,
+        row: usize,
+        instance: &'a SnapshotInstance,
+        property_name: &'a str,
+        value: &'a Arc<Value>,
+    ) -> Result<()> {
+        if should_skip_binary_property(self.state, instance, property_name, value) {
+            return Ok(());
+        }
+        let ptr = std::sync::Arc::as_ptr(value) as usize;
+        if let Some(&mut (_, kind, ref mut count)) = self.shared_cache.get_mut(&ptr) {
+            *count += 1;
+            if kind != 0 {
+                self.push_group(
+                    row,
+                    property_name,
+                    kind,
+                    SettingsBinaryValueSource::Property(value),
+                );
+            }
+            return Ok(());
+        }
+        let source = SettingsBinaryValueSource::of_property(value);
+        let kind = binary_source_value_kind(&source, self.lookup)?;
+        if matches!(source, SettingsBinaryValueSource::Property(_)) {
+            self.shared_cache.insert(ptr, (value, kind, 1));
+            if kind != 0 {
+                self.push_group(row, property_name, kind, source);
+            }
+        } else if kind != 0 {
+            collect_binary_source_strings(&source, self.lookup, &mut self.out.string_counts)?;
+            self.push_group(row, property_name, kind, source);
+        }
+        Ok(())
+    }
+
+    fn push_group(
+        &mut self,
+        row: usize,
+        property_name: &'a str,
+        kind: u8,
+        source: SettingsBinaryValueSource<'a>,
+    ) {
+        self.out
+            .property_groups
+            .entry((property_name, kind))
+            .or_default()
+            .push(SettingsBinaryValue {
+                instance_index: row,
+                source,
+            });
+    }
+}
+
+fn nonfinite_native_settled(value: &NativeSettingsValue) -> Option<Value> {
+    match value {
+        NativeSettingsValue::Float32(v) if !v.is_finite() => {
+            Some(nonfinite_float_json(f64::from(*v)))
+        }
+        NativeSettingsValue::Float64(v) if !v.is_finite() => Some(nonfinite_float_json(*v)),
+        value
+            if native_fixed_components(value)
+                .is_some_and(|floats| floats.iter().any(|float| float.is_nan())) =>
+        {
+            captured::fixed_native_value(value)
+        }
+        _ => None,
+    }
+}
+
+fn collect_block_record_values_fast<'a>(
+    state: &'a ServiceState,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    records: &[SettingsBinaryInstance<'_>],
+    replaced: Option<ReplacedRow<'a>>,
+) -> Result<SettingsBinaryCollection<'a>> {
+    let mut ctx = BlockFastCollectCtx {
+        state,
+        lookup,
+        out: SettingsBinaryCollection {
+            string_counts: AHashMap::with_capacity(records.len().saturating_add(256)),
+            class_counts: AHashMap::new(),
+            property_counts: AHashMap::with_capacity(32),
+            property_groups: AHashMap::with_capacity(32),
+        },
+        unique_id_count: 0,
+        shared_cache: AHashMap::new(),
+    };
+    let native_rows = state.native_properties_by_instance.as_deref();
+
+    for (row, record) in records.iter().enumerate() {
+        if let Some(rep) = replaced.filter(|r| r.source_index == record.source_index) {
+            visit_replaced_row(rep.instance, lookup, |name, kind, source| {
+                collect_binary_source_strings(&source, lookup, &mut ctx.out.string_counts)?;
+                ctx.push_group(row, name, kind, source);
+                Ok(())
+            })?;
+            continue;
+        }
+
+        let instance = &state.instances[record.source_index];
+        let has_json_props = !instance.properties.is_empty();
+        if let Some(native_properties) = native_rows.and_then(|rows| rows.get(record.source_index))
+        {
+            for property in native_properties {
+                ctx.collect_native_property(row, instance, has_json_props, property)?;
+            }
+        }
+        if has_json_props {
+            for (property_name, raw_value) in &instance.properties {
+                if should_skip_binary_property(state, instance, property_name, raw_value) {
+                    continue;
+                }
+                let property_name = property_name.as_str();
+                let source = SettingsBinaryValueSource::of_property(raw_value);
+                let kind = binary_source_value_kind(&source, lookup)?;
+                if kind == 0 {
+                    continue;
+                }
+                collect_binary_source_strings(&source, lookup, &mut ctx.out.string_counts)?;
+                ctx.push_group(row, property_name, kind, source);
+            }
+        }
+        if !instance.attributes.is_empty() {
+            let source = SettingsBinaryValueSource::Attributes(&instance.attributes);
+            collect_binary_source_strings(&source, lookup, &mut ctx.out.string_counts)?;
+            ctx.push_group(row, "Attributes", 8, source);
+        }
+    }
+
+    if ctx.unique_id_count > 0 {
+        for text in ["_type", "UniqueId", "value"] {
+            add_count_key(
+                &mut ctx.out.string_counts,
+                Cow::Borrowed(text),
+                ctx.unique_id_count,
+            );
+        }
+    }
+    for (_, (value, kind, count)) in ctx.shared_cache {
+        if kind == 0 {
+            continue;
+        }
+        let mut local = SettingsStringCounts::default();
+        collect_raw_value_strings(value, lookup, &mut local)?;
+        for (text, per_value) in local {
+            add_count_key(&mut ctx.out.string_counts, text, per_value * count);
+        }
+    }
+    for (&(property_name, _), values) in &ctx.out.property_groups {
+        let count = values.len() as u64;
+        add_count_key(
+            &mut ctx.out.string_counts,
+            Cow::Borrowed(property_name),
+            count,
+        );
+        add_count_key(
+            &mut ctx.out.property_counts,
+            Cow::Borrowed(property_name),
+            count,
+        );
+    }
+    Ok(ctx.out)
+}
+
+#[cfg(test)]
 fn collect_settings_binary_record_values<'a>(
     out: &mut SettingsBinaryCollection<'a>,
     (state, lookup): (&'a ServiceState, &SettingsBinaryInstanceLookup<'_>),
@@ -3243,13 +3751,14 @@ fn collect_settings_binary_data<'a>(
 
 #[cfg(test)]
 pub(crate) fn write_service_settings_binary_file(path: &Path, state: &ServiceState) -> Result<()> {
-    write_service_settings_binary_file_inner(path, state, false)
+    let _ = write_service_settings_binary_file_inner(path, state, false)?;
+    Ok(())
 }
 
 pub(crate) fn write_fresh_service_settings_binary_file(
     path: &Path,
     state: &ServiceState,
-) -> Result<()> {
+) -> Result<[u8; 32]> {
     write_service_settings_binary_file_inner(path, state, true)
 }
 
@@ -3257,13 +3766,15 @@ fn write_service_settings_binary_file_inner(
     path: &Path,
     state: &ServiceState,
     fresh: bool,
-) -> Result<()> {
+) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
 
     let writer = encode_service_settings_binary(state)?;
+    let digest: [u8; 32] = Sha256::digest(&writer).into();
     if fresh {
         let mut file = OpenOptions::new()
             .write(true)
@@ -3275,7 +3786,7 @@ fn write_service_settings_binary_file_inner(
     } else {
         write_bytes_if_changed(path, &writer)?;
     }
-    Ok(())
+    Ok(digest)
 }
 
 pub(crate) fn encode_service_settings_binary(state: &ServiceState) -> Result<Vec<u8>> {
@@ -3756,6 +4267,350 @@ fn write_settings_binary_header<W: Write + ?Sized>(
     write_var_u64(writer, instance_count as u64)
 }
 
+#[inline]
+pub(super) fn push_var_u64(out: &mut Vec<u8>, mut value: u64) {
+    if value < 0x80 {
+        out.push(value as u8);
+        return;
+    }
+    while value >= 0x80 {
+        out.push(((value as u8) & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+/// Serializes all property groups of one value block serially into `writer`, reusing
+/// `body` across groups (no nested Rayon spawning or per-group Vec reallocations).
+fn write_settings_binary_property_groups_serial(
+    writer: &mut Vec<u8>,
+    groups: &[((&str, u8), Vec<SettingsBinaryValue<'_>>)],
+    property_ids: &SettingsStringIdMap<'_>,
+    string_ids: &SettingsStringIdMap<'_>,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    body: &mut Vec<u8>,
+) -> Result<()> {
+    let _span = crate::app::profile::span("store property columns encode");
+    push_var_u64(writer, groups.len() as u64);
+    for ((property_name, kind), values) in groups {
+        body.clear();
+        write_property_group_values_fast(values, *kind, string_ids, lookup, body)?;
+        let prop_id = *property_ids
+            .get(*property_name)
+            .with_context(|| format!("Missing binary property id for {property_name:?}"))?;
+        push_var_u64(writer, prop_id);
+        writer.push(*kind);
+        push_var_u64(writer, values.len() as u64);
+        push_var_u64(writer, body.len() as u64);
+        writer.extend_from_slice(body);
+    }
+    Ok(())
+}
+
+/// Fast serial encoder for a single block's property group directly into a `Vec<u8>`.
+fn write_property_group_values_fast(
+    values: &[SettingsBinaryValue<'_>],
+    kind: u8,
+    string_ids: &SettingsStringIdMap<'_>,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    body: &mut Vec<u8>,
+) -> Result<()> {
+    let mut prev_idx = 0_usize;
+    match kind {
+        1 | 2 => {
+            body.reserve(values.len() * 2);
+            for item in values {
+                if item.instance_index < prev_idx {
+                    bail!("Property group instance indices must be sorted for delta encoding");
+                }
+                push_var_u64(body, (item.instance_index - prev_idx) as u64);
+                prev_idx = item.instance_index;
+            }
+            return Ok(());
+        }
+        3 => {
+            body.reserve(values.len() * 4);
+            for item in values {
+                if item.instance_index < prev_idx {
+                    bail!("Property group instance indices must be sorted for delta encoding");
+                }
+                push_var_u64(body, (item.instance_index - prev_idx) as u64);
+                prev_idx = item.instance_index;
+                match &item.source {
+                    SettingsBinaryValueSource::Native(NativeSettingsValue::Int(v)) => {
+                        push_var_u64(body, zigzag_i64(*v));
+                    }
+                    _ => write_binary_source_payload(&item.source, kind, string_ids, lookup, body)?,
+                }
+            }
+            return Ok(());
+        }
+        5 => {
+            body.reserve(values.len() * 10);
+            for item in values {
+                if item.instance_index < prev_idx {
+                    bail!("Property group instance indices must be sorted for delta encoding");
+                }
+                push_var_u64(body, (item.instance_index - prev_idx) as u64);
+                prev_idx = item.instance_index;
+                match &item.source {
+                    SettingsBinaryValueSource::Native(NativeSettingsValue::Float64(v)) => {
+                        body.extend_from_slice(&v.to_le_bytes());
+                    }
+                    _ => write_binary_source_payload(&item.source, kind, string_ids, lookup, body)?,
+                }
+            }
+            return Ok(());
+        }
+        20 => {
+            body.reserve(values.len() * 6);
+            for item in values {
+                if item.instance_index < prev_idx {
+                    bail!("Property group instance indices must be sorted for delta encoding");
+                }
+                push_var_u64(body, (item.instance_index - prev_idx) as u64);
+                prev_idx = item.instance_index;
+                match &item.source {
+                    SettingsBinaryValueSource::Native(NativeSettingsValue::Float32(v)) => {
+                        body.extend_from_slice(&v.to_le_bytes());
+                    }
+                    SettingsBinaryValueSource::Native(NativeSettingsValue::Float64(v)) => {
+                        let v32 =
+                            exact_f32(*v).context("Expected exactly representable native f32")?;
+                        body.extend_from_slice(&v32.to_le_bytes());
+                    }
+                    _ => write_binary_source_payload(&item.source, kind, string_ids, lookup, body)?,
+                }
+            }
+            return Ok(());
+        }
+        6 | 19 => {
+            body.reserve(values.len() * 4);
+            for item in values {
+                if item.instance_index < prev_idx {
+                    bail!("Property group instance indices must be sorted for delta encoding");
+                }
+                push_var_u64(body, (item.instance_index - prev_idx) as u64);
+                prev_idx = item.instance_index;
+                match &item.source {
+                    SettingsBinaryValueSource::Native(
+                        NativeSettingsValue::String(s) | NativeSettingsValue::Enum(s),
+                    ) => {
+                        let id = *string_ids
+                            .get(s.as_str())
+                            .with_context(|| format!("Missing binary string id for {s:?}"))?;
+                        push_var_u64(body, id);
+                    }
+                    _ => write_binary_source_payload(&item.source, kind, string_ids, lookup, body)?,
+                }
+            }
+            return Ok(());
+        }
+        11..=15 | 18 => {
+            let fixed_bytes = match kind {
+                11 | 13 => 8,
+                12 | 15 => 12,
+                _ => 16,
+            };
+            body.reserve(values.len() * (fixed_bytes + 2));
+            for item in values {
+                if item.instance_index < prev_idx {
+                    bail!("Property group instance indices must be sorted for delta encoding");
+                }
+                push_var_u64(body, (item.instance_index - prev_idx) as u64);
+                prev_idx = item.instance_index;
+                match &item.source {
+                    SettingsBinaryValueSource::Native(native) => {
+                        let floats = native_fixed_components(native)
+                            .context("Expected fixed native settings value")?;
+                        for f in floats {
+                            body.extend_from_slice(&f.to_le_bytes());
+                        }
+                    }
+                    _ => write_binary_source_payload(&item.source, kind, string_ids, lookup, body)?,
+                }
+            }
+            return Ok(());
+        }
+        16 => {
+            if let Some(table) = build_cframe_rotation_table_inner(values, false)? {
+                body.reserve(1 + 4 + table.rotations.len() * 36 + values.len() * 16);
+                body.push(1);
+                push_var_u64(body, table.rotations.len() as u64);
+                for rotation in &table.rotations {
+                    for component in rotation {
+                        body.extend_from_slice(&component.to_le_bytes());
+                    }
+                }
+                for (item, table_value) in values.iter().zip(table.values.iter()) {
+                    if item.instance_index < prev_idx {
+                        bail!("Property group instance indices must be sorted for delta encoding");
+                    }
+                    push_var_u64(body, (item.instance_index - prev_idx) as u64);
+                    prev_idx = item.instance_index;
+                    for component in table_value.position {
+                        body.extend_from_slice(&component.to_le_bytes());
+                    }
+                    push_var_u64(body, table_value.rotation_index as u64);
+                }
+                return Ok(());
+            }
+            body.reserve(1 + values.len() * 50);
+            body.push(0);
+            for item in values {
+                if item.instance_index < prev_idx {
+                    bail!("Property group instance indices must be sorted for delta encoding");
+                }
+                push_var_u64(body, (item.instance_index - prev_idx) as u64);
+                prev_idx = item.instance_index;
+                match &item.source {
+                    SettingsBinaryValueSource::Native(NativeSettingsValue::CFrame(c)) => {
+                        for f in c.as_ref() {
+                            body.extend_from_slice(&f.to_le_bytes());
+                        }
+                    }
+                    _ => write_binary_source_payload(&item.source, kind, string_ids, lookup, body)?,
+                }
+            }
+            return Ok(());
+        }
+        17 => {
+            let mut prev_target = 0_usize;
+            body.reserve(values.len() * 4);
+            for item in values {
+                if item.instance_index < prev_idx {
+                    bail!("Property group instance indices must be sorted for delta encoding");
+                }
+                push_var_u64(body, (item.instance_index - prev_idx) as u64);
+                prev_idx = item.instance_index;
+                match &item.source {
+                    SettingsBinaryValueSource::Native(NativeSettingsValue::Ref(index)) => {
+                        let target = i64::try_from(*index)
+                            .context("Ref target index does not fit in i64")?;
+                        let previous = i64::try_from(prev_target)
+                            .context("Ref target index does not fit in i64")?;
+                        push_var_u64(body, zigzag_i64(target - previous));
+                        prev_target = *index;
+                    }
+                    _ => write_resolved_ref_group_payload(
+                        &item.source,
+                        lookup,
+                        &mut prev_target,
+                        body,
+                    )?,
+                }
+            }
+            return Ok(());
+        }
+        8 => {
+            let mut uid_prefix: Option<Vec<u8>> = None;
+            let mut bin_prefix: Option<Vec<u8>> = None;
+            let mut shared_str_prefix: Option<Vec<u8>> = None;
+            let mut shared_encoded: AHashMap<usize, Vec<u8>> = AHashMap::new();
+            for item in values {
+                if item.instance_index < prev_idx {
+                    bail!("Property group instance indices must be sorted for delta encoding");
+                }
+                push_var_u64(body, (item.instance_index - prev_idx) as u64);
+                prev_idx = item.instance_index;
+                match &item.source {
+                    SettingsBinaryValueSource::Native(NativeSettingsValue::UniqueId(val)) => {
+                        let prefix = match uid_prefix.as_ref() {
+                            Some(p) => p,
+                            None => {
+                                let mut p = Vec::with_capacity(16);
+                                push_var_u64(&mut p, 2);
+                                push_var_u64(
+                                    &mut p,
+                                    *string_ids.get("_type").context("Missing _type string id")?,
+                                );
+                                p.push(6);
+                                push_var_u64(
+                                    &mut p,
+                                    *string_ids
+                                        .get("UniqueId")
+                                        .context("Missing UniqueId string id")?,
+                                );
+                                push_var_u64(
+                                    &mut p,
+                                    *string_ids.get("value").context("Missing value string id")?,
+                                );
+                                p.push(6);
+                                uid_prefix.insert(p)
+                            }
+                        };
+                        body.extend_from_slice(prefix);
+                        let id = *string_ids
+                            .get(val.as_str())
+                            .with_context(|| format!("Missing binary string id for {val:?}"))?;
+                        push_var_u64(body, id);
+                    }
+                    SettingsBinaryValueSource::Property(value) => {
+                        let ptr = (*value) as *const Value as usize;
+                        if let Some(cached) = shared_encoded.get(&ptr) {
+                            body.extend_from_slice(cached);
+                        } else if let Some(o) = value.as_object()
+                            && o.len() == 2
+                            && let Some(ty) = o.get("_type").and_then(Value::as_str)
+                            && matches!(ty, "SharedString" | "BinaryString")
+                            && let Some(b64) = o.get("base64").and_then(Value::as_str)
+                        {
+                            let slot = if ty == "BinaryString" {
+                                &mut bin_prefix
+                            } else {
+                                &mut shared_str_prefix
+                            };
+                            let prefix = match slot.as_ref() {
+                                Some(p) => p,
+                                None => {
+                                    let mut p = Vec::with_capacity(16);
+                                    push_var_u64(&mut p, 2);
+                                    push_var_u64(
+                                        &mut p,
+                                        *string_ids
+                                            .get("_type")
+                                            .context("Missing _type string id")?,
+                                    );
+                                    p.push(6);
+                                    push_var_u64(
+                                        &mut p,
+                                        *string_ids
+                                            .get(ty)
+                                            .with_context(|| format!("Missing {ty} string id"))?,
+                                    );
+                                    push_var_u64(
+                                        &mut p,
+                                        *string_ids
+                                            .get("base64")
+                                            .context("Missing base64 string id")?,
+                                    );
+                                    p.push(6);
+                                    slot.insert(p)
+                                }
+                            };
+                            let start = body.len();
+                            body.extend_from_slice(prefix);
+                            let id = *string_ids
+                                .get(b64)
+                                .context("Missing binary string id for payload base64")?;
+                            push_var_u64(body, id);
+                            if ty == "SharedString" {
+                                shared_encoded.insert(ptr, body[start..].to_vec());
+                            }
+                        } else {
+                            write_raw_object_payload(value, string_ids, lookup, body)?;
+                        }
+                    }
+                    _ => write_binary_source_payload(&item.source, kind, string_ids, lookup, body)?,
+                }
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    write_property_group_values_serial(values, kind, string_ids, lookup, body)
+}
+
 fn write_settings_binary_property_groups(
     writer: &mut Vec<u8>,
     groups: &[((&str, u8), Vec<SettingsBinaryValue<'_>>)],
@@ -4152,11 +5007,19 @@ fn write_property_group_instance_index<W: Write + ?Sized>(
 fn build_cframe_rotation_table(
     values: &[SettingsBinaryValue<'_>],
 ) -> Result<Option<CFrameRotationTable>> {
-    let mut rotation_ids: HashMap<[u32; 9], usize> = HashMap::new();
+    build_cframe_rotation_table_inner(values, true)
+}
+
+fn build_cframe_rotation_table_inner(
+    values: &[SettingsBinaryValue<'_>],
+    allow_parallel: bool,
+) -> Result<Option<CFrameRotationTable>> {
+    let mut rotation_ids: AHashMap<[u32; 9], usize> = AHashMap::new();
     let mut rotations = Vec::new();
     let mut table_values = Vec::with_capacity(values.len());
 
-    let components = if values.len() >= SETTINGS_BINARY_PARALLEL_CHUNK_SIZE
+    let components = if allow_parallel
+        && values.len() >= SETTINGS_BINARY_PARALLEL_CHUNK_SIZE
         && rayon::current_num_threads() > 1
     {
         Some(
@@ -5605,12 +6468,30 @@ fn write_binary_string_id<W: Write + ?Sized>(
     write_var_u64(writer, *id)
 }
 
+/// Formats `"debug:0_{id}"` into an exact-capacity `String` without `core::fmt` overhead.
+#[inline]
+pub(super) fn format_debug_id(mut id: u64) -> String {
+    let mut buf = [0_u8; 28];
+    let mut idx = 28_usize;
+    loop {
+        idx -= 1;
+        buf[idx] = b'0' + (id % 10) as u8;
+        id /= 10;
+        if id == 0 {
+            break;
+        }
+    }
+    let start = idx - 8;
+    buf[start..idx].copy_from_slice(b"debug:0_");
+    unsafe { String::from_utf8_unchecked(buf[start..28].to_vec()) }
+}
+
 fn read_compact_settings_id(reader: &mut BytecodeReader<'_>, strings: &[String]) -> Result<String> {
     let token = reader
         .read_var_u64()
         .context("Missing compact instance settings id")?;
     if token & 1 == 1 {
-        return Ok(format!("debug:0_{}", token >> 1));
+        return Ok(format_debug_id(token >> 1));
     }
     let string_id = usize::try_from(token >> 1).context("Settings string id does not fit usize")?;
     strings
@@ -6527,6 +7408,28 @@ mod tests {
                 encode_settings_bytecode(&document(&[(name, untyped)])).unwrap(),
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn frame_codec_matches_compress_store_frame_across_small_and_large_payloads() {
+        let mut codec = FrameCodec::new();
+        let small1: Vec<u8> = (0..12_345_usize)
+            .map(|i| ((i * 31) ^ (i >> 3)) as u8)
+            .collect();
+        let small2: Vec<u8> = (0..98_765_usize)
+            .map(|i| ((i * 17) + (i >> 5)) as u8)
+            .collect();
+        let large1: Vec<u8> = (0..(LARGE_STORE_PAYLOAD_BYTES + 123_456))
+            .map(|i| ((i.wrapping_mul(131) >> 4) ^ (i & 0xff)) as u8)
+            .collect();
+        let large2: Vec<u8> = (0..(LARGE_STORE_PAYLOAD_BYTES + 345_678))
+            .map(|i| ((i.wrapping_mul(73) >> 3) + (i & 0x3f)) as u8)
+            .collect();
+        for payload in [&small1, &small2, &large1, &large2, &small1, &large1] {
+            let expected = compress_store_frame(payload, 1, true).unwrap();
+            let actual = codec.compress_frame(payload).unwrap();
+            assert_eq!(actual, expected, "payload len {}", payload.len());
         }
     }
 }

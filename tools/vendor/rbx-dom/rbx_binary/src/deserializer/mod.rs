@@ -252,10 +252,10 @@ impl<'db> Deserializer<'db> {
         let mut prop_chunks = Vec::new();
 
         loop {
-            let chunk = deserializer.next_chunk()?;
+            let raw_chunk = deserializer.next_raw_chunk()?;
 
-            if &chunk.name == b"PROP" {
-                prop_chunks.push(chunk);
+            if &raw_chunk.name == b"PROP" {
+                prop_chunks.push(raw_chunk);
                 continue;
             }
 
@@ -263,6 +263,7 @@ impl<'db> Deserializer<'db> {
                 deserializer.decode_prop_chunks_parallel(core::mem::take(&mut prop_chunks))?;
             }
 
+            let chunk = raw_chunk.decompress().map_err(crate::deserializer::error::InnerError::from)?;
             match &chunk.name {
                 b"META" => deserializer.decode_meta_chunk(&chunk.data)?,
                 b"SSTR" => deserializer.decode_sstr_chunk(&chunk.data)?,

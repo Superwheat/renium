@@ -826,6 +826,55 @@ fn log_full_push_plan(plan: &ReconcilePushPlan) {
     );
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+fn pre_push_settlement_proof(
+    bridge: &BridgeServer,
+    guard: &StudioChangeGuard,
+    held_pull: Option<(Box<SourcemapState>, Value)>,
+    held_sourcemap_fallback: Option<Box<SourcemapState>>,
+    eligible: bool,
+) -> Option<(Box<SourcemapState>, Value)> {
+    if held_pull.is_some() || !eligible {
+        return held_pull;
+    }
+    let sourcemap = held_sourcemap_fallback?;
+    let pre_push_proof = capture_push_proof_for_settlement(bridge, guard).ok()??;
+    Some((sourcemap, pre_push_proof))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn collect_prior_differing_services(
+    context: &BoundContext,
+    scoped_moved: Option<Vec<String>>,
+    prior_pull_project: Option<ProjectSnapshot>,
+    has_held_pull: bool,
+    studio: &ProjectSnapshot,
+) -> Vec<String> {
+    if let Some(moved) = scoped_moved {
+        drop(prior_pull_project);
+        return moved;
+    }
+    let Some(prior) = prior_pull_project else {
+        return Vec::new();
+    };
+    if !has_held_pull {
+        drop(prior);
+        return Vec::new();
+    }
+    let paths: BTreeSet<&PathBuf> = prior.entries.keys().chain(studio.entries.keys()).collect();
+    let differing: HashSet<PathBuf> = paths
+        .into_par_iter()
+        .filter(|path| prior.entries.get(*path) != studio.entries.get(*path))
+        .cloned()
+        .collect();
+    let mut changed = services_for_snapshot_paths(context, &differing)
+        .into_iter()
+        .collect::<Vec<_>>();
+    changed.sort();
+    drop(prior);
+    changed
+}
+
 pub(crate) fn push_project(
     context: &BoundContext,
     bridge: &BridgeServer,
@@ -935,13 +984,15 @@ pub(crate) fn push_project(
     // The held proof the lease verified as it began, over files a pull wrote:
     // the import settlement may skip services only from such a baseline.
     #[cfg(any(windows, target_os = "macos"))]
-    let held_pull = held_sourcemap
-        .filter(|_| initial_state["pushProofMatches"] == true)
-        .zip(candidate_proof);
+    let (held_pull, held_sourcemap_fallback) = if initial_state["pushProofMatches"] == true {
+        (held_sourcemap.zip(candidate_proof), None)
+    } else {
+        (None, held_sourcemap)
+    };
     // The proof was checked inside the request that armed tracking, so a match
     // means every later Studio edit is caught by the transaction's generation
     // checks and the last verified files are a complete baseline.
-    let (verified_baseline, scoped_baseline) = match candidate_parts {
+    let (verified_baseline, mut scoped_baseline) = match candidate_parts {
         Some((_, project)) if initial_state["pushProofMatches"] == true => {
             log_global(
                 5,
@@ -1039,13 +1090,24 @@ pub(crate) fn push_project(
         scoped_baseline.as_ref(),
         &initial_state,
     );
+    let scoped_moved = scoped_capture_services.clone();
+    #[cfg(any(windows, target_os = "macos"))]
+    let held_pull = pre_push_settlement_proof(
+        bridge,
+        &guard,
+        held_pull,
+        held_sourcemap_fallback,
+        replace && verified_baseline.is_none() && scoped_baseline.is_some(),
+    );
     // Source capture is read-only and independent of the private Studio stage.
     // Keep Studio calls on this thread, with its selected runtime and lease.
     let (captured, project) = std::thread::scope(|scope| {
         let project = scope.spawn(|| capture_snapshot(&root, &source_paths));
         let captured = if let Some(baseline) = verified_baseline {
             Ok((stage, baseline))
-        } else if let (Some(moved), Some(baseline)) = (scoped_capture_services, scoped_baseline) {
+        } else if let (Some(moved), Some(baseline)) =
+            (scoped_capture_services, scoped_baseline.take())
+        {
             capture_scoped_push_baseline(context, bridge, &root, &moved, &stage, baseline)
                 .map(|studio| (stage, studio))
         } else if can_capture_in_memory {
@@ -1061,6 +1123,19 @@ pub(crate) fn push_project(
     });
     let (stage, mut studio) = captured?;
     let project = project?;
+    #[cfg(any(windows, target_os = "macos"))]
+    let prior_differing_services = collect_prior_differing_services(
+        context,
+        scoped_moved,
+        scoped_baseline,
+        held_pull.is_some(),
+        &studio,
+    );
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        drop(scoped_moved);
+        drop(scoped_baseline);
+    }
     if let Some(enforcement) = &link_enforcement {
         super::staging::pack_read_only_link_scripts_with(
             enforcement,
@@ -1213,9 +1288,15 @@ pub(crate) fn push_project(
     )?;
     let settle_native_import = replace && !plan.initial_native_services.is_empty();
     #[cfg(any(windows, target_os = "macos"))]
-    let held_pull = held_pull
-        .filter(|_| replace)
-        .map(|held| (held, written_services(context, &plan)));
+    let held_pull = held_pull.filter(|_| replace).map(|held| {
+        let mut touched = written_services(context, &plan);
+        for service in prior_differing_services {
+            if !touched.contains(&service) {
+                touched.push(service);
+            }
+        }
+        (held, touched)
+    });
     if !replace {
         apply_snapshot_paths(&stage.project_root, &mutation_paths, &project)?;
     }

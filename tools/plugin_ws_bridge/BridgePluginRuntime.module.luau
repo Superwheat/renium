@@ -25,6 +25,7 @@ type ServiceState = {
 	nativeLuaSourceIndices: { number }?,
 	nativeNonArchivableIndices: { number }?,
 	nativeStructureGeneration: number?,
+	nativeArchivableGeneration: number?,
 	nativeContentGeneration: number?,
 	matchedSettingsIds: { { index: number, id: string } }?,
 	matchedSettingsIdVersion: number?,
@@ -606,7 +607,14 @@ function BridgePluginRuntime.start(context)
 	stateByService = {}
 	function Config.invalidateRuntimeExportCache(serviceName: string)
 		stateByService[serviceName] = nil
-		nativeStateByService[serviceName] = nil
+		local cached = nativeStateByService[serviceName]
+		if cached ~= nil then
+			table.clear(cached.batchCacheByKey)
+			table.clear(cached.batchCacheKeys)
+			table.clear(cached.sourceBatchCacheByKey)
+			table.clear(cached.sourceBatchCacheKeys)
+			cached.nativeContentGeneration = nil
+		end
 	end
 	local editorActions = {}
 	local editorActionCounter = 0
@@ -959,6 +967,7 @@ function BridgePluginRuntime.start(context)
 		end,
 		prepareNativeState = function(serviceName: string, scriptSourcesByInstance)
 			local structureGeneration = nativeStructureGenerationByService[serviceName] or 0
+			local archivableGeneration = nativeArchivableGenerationByService[serviceName] or 0
 			local contentGeneration = nativeExportGeneration(serviceName)
 			local cached = nativeStateByService[serviceName]
 			if cached ~= nil and cached.nativeStructureGeneration == structureGeneration then
@@ -978,23 +987,26 @@ function BridgePluginRuntime.start(context)
 						cached.scriptSourcesByIndex[instanceIndex] = source
 					end
 				end
-				local nonArchivableInstances = cached.nonArchivableInstances or {}
-				local nonArchivableIndices = cached.nativeNonArchivableIndices or {}
-				table.clear(nonArchivableInstances)
-				table.clear(nonArchivableIndices)
-				local nonArchivableInstance = nil
-				if Config.studioChanges.hasNonArchivable(serviceName) ~= false then
-					for instanceIndex, instance in ipairs(cached.instances) do
-						if not instance.Archivable then
-							nonArchivableInstance = nonArchivableInstance or instance
-							nonArchivableInstances[#nonArchivableInstances + 1] = instance
-							nonArchivableIndices[#nonArchivableIndices + 1] = instanceIndex
+				if cached.nativeArchivableGeneration ~= archivableGeneration then
+					local nonArchivableInstances = cached.nonArchivableInstances or {}
+					local nonArchivableIndices = cached.nativeNonArchivableIndices or {}
+					table.clear(nonArchivableInstances)
+					table.clear(nonArchivableIndices)
+					local nonArchivableInstance = nil
+					if Config.studioChanges.hasNonArchivable(serviceName) ~= false then
+						for instanceIndex, instance in ipairs(cached.instances) do
+							if not instance.Archivable then
+								nonArchivableInstance = nonArchivableInstance or instance
+								nonArchivableInstances[#nonArchivableInstances + 1] = instance
+								nonArchivableIndices[#nonArchivableIndices + 1] = instanceIndex
+							end
 						end
 					end
+					cached.nonArchivableInstance = nonArchivableInstance
+					cached.nonArchivableInstances = nonArchivableInstances
+					cached.nativeNonArchivableIndices = nonArchivableIndices
+					cached.nativeArchivableGeneration = archivableGeneration
 				end
-				cached.nonArchivableInstance = nonArchivableInstance
-				cached.nonArchivableInstances = nonArchivableInstances
-				cached.nativeNonArchivableIndices = nonArchivableIndices
 				if refreshMatchedSettingsIds(cached) then
 					table.clear(cached.batchCacheByKey)
 					table.clear(cached.batchCacheKeys)
@@ -1005,6 +1017,7 @@ function BridgePluginRuntime.start(context)
 			local trackedInstances = Config.studioChanges.exportInstances(serviceName)
 			local _, state = prepareService(serviceName, true, nil, scriptSourcesByInstance, trackedInstances)
 			state.nativeStructureGeneration = structureGeneration
+			state.nativeArchivableGeneration = archivableGeneration
 			state.nativeContentGeneration = contentGeneration
 			nativeStateByService[serviceName] = state
 			return state
@@ -1021,6 +1034,7 @@ function BridgePluginRuntime.start(context)
 		invalidateService = function(serviceName: string)
 			Config.studioChanges.invalidateExportCache(serviceName)
 			Config.invalidateRuntimeExportCache(serviceName)
+			nativeStateByService[serviceName] = nil
 		end,
 		updateStatus = Config.updateStatusText,
 		getSyncOptions = function()
@@ -3285,6 +3299,7 @@ function BridgePluginRuntime.start(context)
 			nativeLuaSourceIndices = nativeLuaSourceIndices,
 			nativeNonArchivableIndices = nativeNonArchivableIndices,
 			nativeStructureGeneration = nil,
+			nativeArchivableGeneration = nil,
 			matchedSettingsIds = nil,
 			matchedSettingsIdVersion = nil,
 			scriptInstancesByIndex = nil,

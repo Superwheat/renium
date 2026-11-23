@@ -3335,6 +3335,19 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		table.clear(incomingNotes)
 	end
 
+	local function armNativeAttributeRelay(relay)
+		if nativeAttributeRelay ~= relay or relay.nativeArmed then
+			return
+		end
+		relay.nativeArmed = true
+		local pendingTracking = relay.pendingTracking
+		relay.pendingTracking = nil
+		local startPending = pendingTracking ~= nil and state.trackingGuards[pendingTracking.guardId] ~= nil
+		relay.ready = not state.persistentTracking and (state.started or startPending)
+		if startPending then
+			ensureTracking(pendingTracking.services)
+		end
+	end
 	local function prepareNativeAttributeRelay(services: { string })
 		if nativeAttributeRelay then return nativeAttributeRelay.path end
 		if state.persistentTracking or state.onlyCodeMode or not state.syncbackProperties then return nil end
@@ -3350,14 +3363,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		relay.connection = notify.Changed:Connect(function(instance)
 			if nativeAttributeRelay ~= relay then return end
 			if instance == notify then
-				relay.nativeArmed = true
-				local pendingTracking = relay.pendingTracking
-				relay.pendingTracking = nil
-				local startPending = pendingTracking ~= nil and state.trackingGuards[pendingTracking.guardId] ~= nil
-				relay.ready = not state.persistentTracking and (state.started or startPending)
-				if startPending then
-					ensureTracking(pendingTracking.services)
-				end
+				armNativeAttributeRelay(relay)
 				return
 			elseif instance == nil then
 				relay.nativeArmed = false
@@ -5102,7 +5108,14 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			-- Taken under one observation with the proof it follows, the new
 			-- proof tells which services moved since the held one.
 			local held = proofById(params.scopeFrom)
+			if params.keepForSettlement == true and nativeAttributeRelay ~= nil and not nativeAttributeRelay.nativeArmed
+				and nativeAttributeRelay.notify.Value == nativeAttributeRelay.notify then
+				armNativeAttributeRelay(nativeAttributeRelay)
+			end
 			response.verifiedPushProof = api.capturePushProof()
+			if params.keepForSettlement == true and verifiedPushProof ~= nil then
+				keptPushProof = verifiedPushProof
+			end
 			if params.scopeFrom ~= nil then
 				local differs, laid, nonProp, terrainDiffers = nil, "proof retired", nil, false
 				if held == nil then

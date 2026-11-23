@@ -2595,10 +2595,448 @@ pub(crate) fn plan_captured_store_streaming(
 /// properties go by today, which is how it compares what it aligned. Their
 /// UniqueIds are the caller's to compare. `None` where an enum item gains
 /// its type, which takes the whole documents to say.
+/// Cached reflection default value for one-sided (default-elided) property comparison.
+#[derive(Clone)]
+pub(crate) enum FastDefaultVal {
+    Bool(bool),
+    Number { value: f64, uses_f32: bool },
+    Str(String),
+    Enum(String),
+    Vec2([f32; 2]),
+    Vec3([f32; 3]),
+    UDim([f32; 2]),
+    UDim2([f32; 4]),
+    Color3([f32; 3]),
+    Rect([f32; 4]),
+    CFrame([f64; 12]),
+    Other,
+}
+
+/// How a property present on only one side (stored or captured) affects reconciliation.
+#[derive(Clone)]
+pub(crate) enum OneSidedRule {
+    /// Engine state or unknown when absent: one-sided presence is ignored.
+    Ignored,
+    /// Property has a reflection default value (or `BaseScript.Enabled = true`).
+    Default(FastDefaultVal),
+    /// Property is compared when one-sided and has no reflection default.
+    NoDefault,
+}
+
+/// How `canonicalize_instances` affects a property on a given class.
+#[derive(Clone, Copy)]
+pub(crate) enum PropertyCanonical<'db> {
+    /// Property is not renamed, migrated, or content-URI-aliased.
+    Unchanged,
+    /// Property is renamed to a single canonical name (which itself is not migrated).
+    Renamed(&'db str),
+    /// Property is migrated to one or more canonical replacement names (or `BaseScript.Disabled` -> `Enabled`).
+    Migrated(&'db [&'db str]),
+    /// Chained rename+migration or missing reflection DB: fall back.
+    Complex,
+}
+
+struct ClassCacheEntry<'db> {
+    is_base_script: bool,
+    modern_uri: Option<(&'static str, &'static str)>,
+    canonical: AHashMap<String, PropertyCanonical<'db>>,
+    one_sided: AHashMap<String, OneSidedRule>,
+    verify_one_sided: AHashMap<String, OneSidedRule>,
+    uses_f32: AHashMap<String, bool>,
+    color3uint8: AHashMap<String, bool>,
+}
+
+/// Per-worker cache for property canonicalization, default-elision, and f32 tolerance checks.
+/// Avoids cloning instances and repeating reflection database lookups across thousands of rows.
+pub(crate) struct CanonicalizeCache<'db> {
+    database: Option<&'db rbx_reflection::ReflectionDatabase<'db>>,
+    classes: AHashMap<String, ClassCacheEntry<'db>>,
+}
+
+impl<'db> CanonicalizeCache<'db> {
+    pub(crate) fn new() -> Self {
+        Self {
+            database: rbx_reflection_database::get().ok(),
+            classes: AHashMap::new(),
+        }
+    }
+
+    fn class_entry(&mut self, class_name: &str) -> Option<&mut ClassCacheEntry<'db>> {
+        let database = self.database?;
+        if !self.classes.contains_key(class_name) {
+            let is_base_script =
+                crate::rbx::decode::rbx_reflection_class_is_a(database, class_name, "BaseScript");
+            let modern_uri = match class_name {
+                class if crate::roblox::schema::has_protected_texture_pack(class) => {
+                    Some(("TexturePackContent", "TexturePack"))
+                }
+                "PartOperation" | "UnionOperation" | "NegateOperation" | "IntersectOperation" => {
+                    Some(("Content", "AssetId"))
+                }
+                "Shirt" => Some(("ShirtTemplateContent", "ShirtTemplate")),
+                "Pants" => Some(("PantsTemplateContent", "PantsTemplate")),
+                _ => None,
+            };
+            self.classes.insert(
+                class_name.to_string(),
+                ClassCacheEntry {
+                    is_base_script,
+                    modern_uri,
+                    canonical: AHashMap::new(),
+                    one_sided: AHashMap::new(),
+                    verify_one_sided: AHashMap::new(),
+                    uses_f32: AHashMap::new(),
+                    color3uint8: AHashMap::new(),
+                },
+            );
+        }
+        self.classes.get_mut(class_name)
+    }
+
+    pub(crate) fn property_canonical(
+        &mut self,
+        class_name: &str,
+        name: &str,
+    ) -> PropertyCanonical<'db> {
+        let Some(database) = self.database else {
+            return PropertyCanonical::Complex;
+        };
+        let entry = self.class_entry(class_name).unwrap();
+        if let Some((modern, legacy)) = entry.modern_uri
+            && name == modern
+        {
+            return PropertyCanonical::Renamed(legacy);
+        }
+        if entry.is_base_script && name == "Disabled" {
+            return PropertyCanonical::Migrated(&["Enabled"]);
+        }
+        if let Some(&cached) = entry.canonical.get(name) {
+            return cached;
+        }
+        let info = if let Some(canonical) = serialized_only_logical_name(database, class_name, name)
+            .or_else(|| rbx_logical_property_name(database, class_name, name))
+            .filter(|canonical| *canonical != name)
+        {
+            if legacy_property_migration(database, class_name, canonical).is_some() {
+                PropertyCanonical::Complex
+            } else {
+                PropertyCanonical::Renamed(canonical)
+            }
+        } else if let Some((_, migration)) = legacy_property_migration(database, class_name, name) {
+            PropertyCanonical::Migrated(migration.new_property_names())
+        } else {
+            PropertyCanonical::Unchanged
+        };
+        entry.canonical.insert(name.to_string(), info);
+        info
+    }
+
+    pub(crate) fn property_uses_f32(&mut self, class_name: &str, name: &str) -> bool {
+        let Some(database) = self.database else {
+            return false;
+        };
+        let entry = self.class_entry(class_name).unwrap();
+        if let Some(&cached) = entry.uses_f32.get(name) {
+            return cached;
+        }
+        let is_f32 =
+            rbx_model_property_descriptor(database, class_name, name).is_some_and(|descriptor| {
+                matches!(
+                    descriptor.data_type,
+                    RbxDataType::Value(RbxVariantType::Float32)
+                )
+            });
+        entry.uses_f32.insert(name.to_string(), is_f32);
+        is_f32
+    }
+
+    pub(crate) fn property_is_color3uint8(&mut self, class_name: &str, name: &str) -> bool {
+        let Some(database) = self.database else {
+            return false;
+        };
+        let entry = self.class_entry(class_name).unwrap();
+        if let Some(&cached) = entry.color3uint8.get(name) {
+            return cached;
+        }
+        let is_byte_color =
+            rbx_model_property_descriptor(database, class_name, name).is_some_and(|descriptor| {
+                matches!(
+                    descriptor.data_type,
+                    RbxDataType::Value(RbxVariantType::Color3uint8)
+                )
+            });
+        entry.color3uint8.insert(name.to_string(), is_byte_color);
+        is_byte_color
+    }
+
+    /// Stricter one-sided rule for push verification (`expected_map_mismatch` /
+    /// `changed_map_mismatch`): only marks a property `Ignored` when it is metadata,
+    /// always-engine-state, `capture_may_omit`, or `studio_recomputed_value_is_absent_elsewhere`
+    /// (never `reconciliation_property_is_unknown_when_absent`).
+    pub(crate) fn verify_one_sided_rule(&mut self, class_name: &str, name: &str) -> OneSidedRule {
+        let Some(database) = self.database else {
+            return OneSidedRule::Default(FastDefaultVal::Other);
+        };
+        let is_f32 = self.property_uses_f32(class_name, name);
+        let entry = self.class_entry(class_name).unwrap();
+        if let Some(cached) = entry.verify_one_sided.get(name) {
+            return cached.clone();
+        }
+        let rule = if matches!(name, "UniqueId" | "CurrentCamera" | "HistoryId")
+            || reconciliation_property_is_always_engine_state(Some(database), class_name, name)
+            || capture_may_omit(class_name, name)
+            || studio_recomputed_value_is_absent_elsewhere(class_name, name)
+        {
+            OneSidedRule::Ignored
+        } else if entry.is_base_script && name == "Enabled" {
+            OneSidedRule::Default(FastDefaultVal::Bool(true))
+        } else {
+            match reflection_default_settings_value(database, class_name, name) {
+                None => OneSidedRule::NoDefault,
+                Some(default) => {
+                    let parsed = match &default {
+                        Value::Bool(b) => FastDefaultVal::Bool(*b),
+                        Value::Number(n) => match n.as_f64() {
+                            Some(v) if v.is_finite() => FastDefaultVal::Number {
+                                value: v,
+                                uses_f32: is_f32,
+                            },
+                            _ => FastDefaultVal::Other,
+                        },
+                        Value::String(s) => FastDefaultVal::Str(s.clone()),
+                        Value::Object(obj) => {
+                            let f = |k: &str| obj.get(k).and_then(Value::as_f64).map(|v| v as f32);
+                            match obj.get("_type").and_then(Value::as_str) {
+                                Some("EnumItem") => obj
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .map_or(FastDefaultVal::Other, |s| {
+                                        FastDefaultVal::Enum(s.to_string())
+                                    }),
+                                Some("Vector2") => match (f("x"), f("y")) {
+                                    (Some(x), Some(y)) => FastDefaultVal::Vec2([x, y]),
+                                    _ => FastDefaultVal::Other,
+                                },
+                                Some("Vector3") => match (f("x"), f("y"), f("z")) {
+                                    (Some(x), Some(y), Some(z)) => FastDefaultVal::Vec3([x, y, z]),
+                                    _ => FastDefaultVal::Other,
+                                },
+                                Some("UDim") => match (f("scale"), f("offset")) {
+                                    (Some(s), Some(o)) => FastDefaultVal::UDim([s, o]),
+                                    _ => FastDefaultVal::Other,
+                                },
+                                Some("UDim2") => {
+                                    match (f("xScale"), f("xOffset"), f("yScale"), f("yOffset")) {
+                                        (Some(xs), Some(xo), Some(ys), Some(yo)) => {
+                                            FastDefaultVal::UDim2([xs, xo, ys, yo])
+                                        }
+                                        _ => FastDefaultVal::Other,
+                                    }
+                                }
+                                Some("Color3") => match (f("r"), f("g"), f("b")) {
+                                    (Some(r), Some(g), Some(b)) => {
+                                        FastDefaultVal::Color3([r, g, b])
+                                    }
+                                    _ => FastDefaultVal::Other,
+                                },
+                                Some("Rect") => {
+                                    match (f("minX"), f("minY"), f("maxX"), f("maxY")) {
+                                        (Some(a), Some(b), Some(c), Some(d)) => {
+                                            FastDefaultVal::Rect([a, b, c, d])
+                                        }
+                                        _ => FastDefaultVal::Other,
+                                    }
+                                }
+                                Some("CFrame") => obj
+                                    .get("components")
+                                    .and_then(Value::as_array)
+                                    .filter(|c| c.len() == 12)
+                                    .and_then(|c| {
+                                        let mut out = [0.0_f64; 12];
+                                        for (i, v) in c.iter().enumerate() {
+                                            out[i] = v.as_f64()?;
+                                        }
+                                        Some(FastDefaultVal::CFrame(out))
+                                    })
+                                    .unwrap_or(FastDefaultVal::Other),
+                                _ => FastDefaultVal::Other,
+                            }
+                        }
+                        _ => FastDefaultVal::Other,
+                    };
+                    OneSidedRule::Default(parsed)
+                }
+            }
+        };
+        entry
+            .verify_one_sided
+            .insert(name.to_string(), rule.clone());
+        rule
+    }
+
+    pub(crate) fn one_sided_rule(&mut self, class_name: &str, name: &str) -> OneSidedRule {
+        let Some(database) = self.database else {
+            return OneSidedRule::Default(FastDefaultVal::Other);
+        };
+        let is_f32 = self.property_uses_f32(class_name, name);
+        let entry = self.class_entry(class_name).unwrap();
+        if let Some(cached) = entry.one_sided.get(name) {
+            return cached.clone();
+        }
+        let rule = if matches!(name, "UniqueId" | "CurrentCamera" | "HistoryId")
+            || reconciliation_property_is_always_engine_state(Some(database), class_name, name)
+            || reconciliation_property_is_unknown_when_absent(Some(database), class_name, name)
+        {
+            OneSidedRule::Ignored
+        } else if entry.is_base_script && name == "Enabled" {
+            OneSidedRule::Default(FastDefaultVal::Bool(true))
+        } else {
+            match reflection_default_settings_value(database, class_name, name) {
+                None => OneSidedRule::NoDefault,
+                Some(default) => {
+                    let parsed = match &default {
+                        Value::Bool(b) => FastDefaultVal::Bool(*b),
+                        Value::Number(n) => match n.as_f64() {
+                            Some(v) if v.is_finite() => FastDefaultVal::Number {
+                                value: v,
+                                uses_f32: is_f32,
+                            },
+                            _ => FastDefaultVal::Other,
+                        },
+                        Value::String(s) => FastDefaultVal::Str(s.clone()),
+                        Value::Object(obj) => {
+                            let f = |k: &str| obj.get(k).and_then(Value::as_f64).map(|v| v as f32);
+                            match obj.get("_type").and_then(Value::as_str) {
+                                Some("EnumItem") => obj
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .map_or(FastDefaultVal::Other, |s| {
+                                        FastDefaultVal::Enum(s.to_string())
+                                    }),
+                                Some("Vector2") => match (f("x"), f("y")) {
+                                    (Some(x), Some(y)) => FastDefaultVal::Vec2([x, y]),
+                                    _ => FastDefaultVal::Other,
+                                },
+                                Some("Vector3") => match (f("x"), f("y"), f("z")) {
+                                    (Some(x), Some(y), Some(z)) => FastDefaultVal::Vec3([x, y, z]),
+                                    _ => FastDefaultVal::Other,
+                                },
+                                Some("UDim") => match (f("scale"), f("offset")) {
+                                    (Some(s), Some(o)) => FastDefaultVal::UDim([s, o]),
+                                    _ => FastDefaultVal::Other,
+                                },
+                                Some("UDim2") => {
+                                    match (f("xScale"), f("xOffset"), f("yScale"), f("yOffset")) {
+                                        (Some(xs), Some(xo), Some(ys), Some(yo)) => {
+                                            FastDefaultVal::UDim2([xs, xo, ys, yo])
+                                        }
+                                        _ => FastDefaultVal::Other,
+                                    }
+                                }
+                                Some("Color3") => match (f("r"), f("g"), f("b")) {
+                                    (Some(r), Some(g), Some(b)) => {
+                                        FastDefaultVal::Color3([r, g, b])
+                                    }
+                                    _ => FastDefaultVal::Other,
+                                },
+                                Some("Rect") => {
+                                    match (f("minX"), f("minY"), f("maxX"), f("maxY")) {
+                                        (Some(a), Some(b), Some(c), Some(d)) => {
+                                            FastDefaultVal::Rect([a, b, c, d])
+                                        }
+                                        _ => FastDefaultVal::Other,
+                                    }
+                                }
+                                Some("CFrame") => obj
+                                    .get("components")
+                                    .and_then(Value::as_array)
+                                    .filter(|a| a.len() == 12)
+                                    .and_then(|a| {
+                                        let mut c = [0.0_f64; 12];
+                                        for (dst, v) in c.iter_mut().zip(a) {
+                                            *dst = v.as_f64().filter(|x| x.is_finite())?;
+                                        }
+                                        Some(FastDefaultVal::CFrame(c))
+                                    })
+                                    .unwrap_or(FastDefaultVal::Other),
+                                _ => FastDefaultVal::Other,
+                            }
+                        }
+                        _ => FastDefaultVal::Other,
+                    };
+                    OneSidedRule::Default(parsed)
+                }
+            }
+        };
+        entry.one_sided.insert(name.to_string(), rule.clone());
+        rule
+    }
+
+    fn needs_canonicalize(&mut self, instance: &SettingsBytecodeInstance) -> bool {
+        let Some(database) = self.database else {
+            return true;
+        };
+        let entry = self.class_entry(&instance.class_name).unwrap();
+        if let Some((modern, _)) = entry.modern_uri
+            && instance
+                .properties
+                .get(modern)
+                .map(typed_scalar)
+                .is_some_and(Value::is_string)
+        {
+            return true;
+        }
+        if entry.is_base_script && instance.properties.contains_key("Disabled") {
+            return true;
+        }
+        for name in instance.properties.keys() {
+            let info = if let Some(&cached) = entry.canonical.get(name.as_str()) {
+                cached
+            } else {
+                let computed = if let Some(canonical) =
+                    serialized_only_logical_name(database, &instance.class_name, name)
+                        .or_else(|| rbx_logical_property_name(database, &instance.class_name, name))
+                        .filter(|canonical| *canonical != name)
+                {
+                    if legacy_property_migration(database, &instance.class_name, canonical)
+                        .is_some()
+                    {
+                        PropertyCanonical::Complex
+                    } else {
+                        PropertyCanonical::Renamed(canonical)
+                    }
+                } else if let Some((_, migration)) =
+                    legacy_property_migration(database, &instance.class_name, name)
+                {
+                    PropertyCanonical::Migrated(migration.new_property_names())
+                } else {
+                    PropertyCanonical::Unchanged
+                };
+                entry.canonical.insert(name.clone(), computed);
+                computed
+            };
+            if !matches!(info, PropertyCanonical::Unchanged) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 pub(crate) fn pulled_instance_values_unchanged(
     reference: &SettingsBytecodeInstance,
     observed: &SettingsBytecodeInstance,
     service: Option<&str>,
+) -> Result<Option<(bool, bool)>> {
+    let mut cache = CanonicalizeCache::new();
+    pulled_instance_values_unchanged_with_cache(reference, observed, service, &mut cache)
+}
+
+pub(crate) fn pulled_instance_values_unchanged_with_cache(
+    reference: &SettingsBytecodeInstance,
+    observed: &SettingsBytecodeInstance,
+    service: Option<&str>,
+    cache: &mut CanonicalizeCache<'_>,
 ) -> Result<Option<(bool, bool)>> {
     if instance_adds_enum_types(reference, observed) {
         return Ok(None);
@@ -2623,11 +3061,14 @@ pub(crate) fn pulled_instance_values_unchanged(
             )
     };
     let as_held = unchanged(reference, observed);
+    if !cache.needs_canonicalize(reference) && !cache.needs_canonicalize(observed) {
+        return Ok(Some((as_held, as_held)));
+    }
     let mut named = SettingsBytecode {
         version: super::bytecode::SETTINGS_BINARY_VERSION,
         instances: vec![reference.clone(), observed.clone()],
     };
-    canonicalize_settings_property_names(&mut named)?;
+    canonicalize_instances(&mut named.instances)?;
     let as_named = if named.instances[0] == *reference && named.instances[1] == *observed {
         as_held
     } else {
@@ -2636,48 +3077,66 @@ pub(crate) fn pulled_instance_values_unchanged(
     Ok(Some((as_held, as_named)))
 }
 
-pub(super) fn digest_text(digest: &mut Sha256, text: &str) {
-    digest.update((text.len() as u64).to_le_bytes());
-    digest.update(text.as_bytes());
+pub(super) trait DigestSink {
+    fn update_bytes(&mut self, bytes: &[u8]);
+
+    #[inline]
+    fn update_text(&mut self, text: &str) {
+        self.update_bytes(&(text.len() as u64).to_le_bytes());
+        self.update_bytes(text.as_bytes());
+    }
 }
 
-pub(super) fn digest_map(digest: &mut Sha256, map: &Map<String, Value>) {
-    digest.update((map.len() as u64).to_le_bytes());
+impl DigestSink for Sha256 {
+    #[inline]
+    fn update_bytes(&mut self, bytes: &[u8]) {
+        self.update(bytes);
+    }
+}
+
+#[inline]
+pub(super) fn digest_text<D: DigestSink>(digest: &mut D, text: &str) {
+    digest.update_text(text);
+}
+
+#[inline]
+pub(super) fn digest_map<D: DigestSink>(digest: &mut D, map: &Map<String, Value>) {
+    digest.update_bytes(&(map.len() as u64).to_le_bytes());
     for (name, value) in map {
         digest_text(digest, name);
         digest_value(digest, value);
     }
 }
 
-pub(super) fn digest_value(digest: &mut Sha256, value: &Value) {
+pub(super) fn digest_value<D: DigestSink>(digest: &mut D, value: &Value) {
     match &*crate::settings::held::resolve(value) {
-        Value::Null => digest.update([0]),
-        Value::Bool(value) => digest.update([1, u8::from(*value)]),
+        Value::Null => digest.update_bytes(&[0]),
+        Value::Bool(value) => digest.update_bytes(&[1, u8::from(*value)]),
         Value::Number(number) => {
             if let Some(value) = number.as_u64() {
-                digest.update([2]);
-                digest.update(value.to_le_bytes());
+                digest.update_bytes(&[2]);
+                digest.update_bytes(&value.to_le_bytes());
             } else if let Some(value) = number.as_i64() {
-                digest.update([3]);
-                digest.update(value.to_le_bytes());
+                digest.update_bytes(&[3]);
+                digest.update_bytes(&value.to_le_bytes());
             } else {
-                digest.update([4]);
-                digest.update(number.as_f64().map_or(u64::MAX, f64::to_bits).to_le_bytes());
+                digest.update_bytes(&[4]);
+                digest.update_bytes(&number.as_f64().map_or(u64::MAX, f64::to_bits).to_le_bytes());
             }
         }
         Value::String(text) => {
-            digest.update([5]);
+            digest.update_bytes(&[5]);
             digest_text(digest, text);
         }
         Value::Array(values) => {
-            digest.update([6]);
-            digest.update((values.len() as u64).to_le_bytes());
+            digest.update_bytes(&[6]);
+            digest.update_bytes(&(values.len() as u64).to_le_bytes());
             for value in values {
                 digest_value(digest, value);
             }
         }
         Value::Object(map) => {
-            digest.update([7]);
+            digest.update_bytes(&[7]);
             digest_map(digest, map);
         }
     }
@@ -8504,6 +8963,31 @@ pub(crate) fn reconciliation_store_maps_equal(
     reconciliation_maps_equal_with_ids(class_name, left, right, ids)
 }
 
+/// Fast self-equality check for identical JSON values when no store-id
+/// remapping tables are active (`ids.left.is_empty() && ids.right.is_empty()`).
+#[inline]
+fn value_trivially_self_equal(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => true,
+        Value::Object(map) => match map.get("_type").and_then(Value::as_str) {
+            Some(
+                "Vector2" | "Vector3" | "Color3" | "UDim" | "UDim2" | "Rect" | "UniqueId"
+                | "SharedString" | "BinaryString" | "BrickColor" | "Ref",
+            ) => true,
+            Some("EnumItem") => map.get("name").and_then(Value::as_str).is_some(),
+            Some("CFrame") => {
+                map.get("components")
+                    .and_then(Value::as_array)
+                    .is_some_and(|components| {
+                        components.len() == 12 && components.iter().all(Value::is_number)
+                    })
+            }
+            _ => false,
+        },
+        Value::Array(_) => false,
+    }
+}
+
 fn reconciliation_maps_equal_with_ids(
     class_name: &str,
     left: &Map<String, Value>,
@@ -8511,6 +8995,7 @@ fn reconciliation_maps_equal_with_ids(
     ids: PairedStoreIds<'_>,
 ) -> bool {
     let database = rbx_reflection_database::get().ok();
+    let empty_ids = ids.left.is_empty() && ids.right.is_empty();
     let stable = |name: &str, value: &Value| {
         reconciliation_property_compares(
             database,
@@ -8522,10 +9007,18 @@ fn reconciliation_maps_equal_with_ids(
         )
     };
     for (name, value) in left {
+        let other = right.get(name);
+        if empty_ids
+            && let Some(other) = other
+            && value == other
+            && value_trivially_self_equal(value)
+        {
+            continue;
+        }
         if !stable(name, value) {
             continue;
         }
-        match right.get(name) {
+        match other {
             Some(other) if name == "Tags" && tags_equal(value, other) => {}
             Some(other) if solid_fidelities_match(class_name, name, value, other) => {}
             Some(other)
@@ -8553,8 +9046,8 @@ fn reconciliation_maps_equal_with_ids(
         }
     }
     right.iter().all(|(name, value)| {
-        !stable(name, value)
-            || left.contains_key(name)
+        left.contains_key(name)
+            || !stable(name, value)
             || reconciliation_property_value_is_default(class_name, name, value)
     })
 }
@@ -8598,6 +9091,122 @@ pub(crate) fn hull_fidelity_code(value: &Value) -> Option<u8> {
     // Studio 0.745 still cooks version 7 hulls for places saved by older
     // builds; the fidelity byte sits where versions 8 and up keep it.
     (version >= 7 && bytes.len() >= 12).then(|| bytes[10])
+}
+
+/// Sound one-sided numeric difference check: returns `true` only when two finite numbers
+/// exceed both exact equality and the approximate f32 tolerance used by reconciliation.
+#[inline]
+pub(crate) fn f32_values_definitely_differ(a: f64, b: f64) -> bool {
+    a.is_finite()
+        && b.is_finite()
+        && (a - b).abs() > 4.0 * f64::from(f32::EPSILON) * a.abs().max(b.abs()).max(1.0)
+}
+
+/// Returns `true` when two finite numbers match under f32 reconciliation tolerance.
+#[inline]
+pub(crate) fn f32_values_match(a: f64, b: f64) -> bool {
+    a == b
+        || (a.is_finite()
+            && b.is_finite()
+            && (a - b).abs() <= 4.0 * f64::from(f32::EPSILON) * a.abs().max(b.abs()).max(1.0))
+}
+
+/// Returns `true` when two finite CFrames match under either `reconciliation_values_equal_with_ids`
+/// or `cframes_match_when_rederived`.
+#[inline]
+pub(crate) fn cframes_match_reconciliation(a: &[f64; 12], b: &[f64; 12]) -> bool {
+    if a.iter().chain(b.iter()).any(|v| !v.is_finite()) {
+        return false;
+    }
+    let pos_ok = (0..3)
+        .all(|i| f32_values_match(a[i], b[i]) || (a[i] - b[i]).abs() <= CFRAME_POSITION_NOISE);
+    if !pos_ok {
+        return false;
+    }
+    let rot_tol = CFRAME_ROTATION_EPSILON.max(CFRAME_ROTATION_NOISE);
+    if (3..12).all(|i| (a[i] - b[i]).abs() <= rot_tol) {
+        return true;
+    }
+    if !(0..3).all(|i| (a[i] - b[i]).abs() <= CFRAME_POSITION_NOISE) {
+        return false;
+    }
+    let (Some(rot_a), Some(rot_b)) = (rederived_rotation(a), rederived_rotation(b)) else {
+        return false;
+    };
+    (third_axis_rewritten(a, &rot_a) || third_axis_rewritten(b, &rot_b))
+        && rot_a
+            .iter()
+            .zip(&rot_b)
+            .all(|(x, y)| (x - y).abs() <= CFRAME_ROTATION_NOISE)
+}
+
+/// Zero-allocation extraction of a cooked `CSGPHS` collision hull's fidelity byte (or v0 BLOCK placeholder)
+/// from its base64 text. Only decodes the first 16 base64 characters (12 bytes) for v7+ hulls.
+pub(crate) fn hull_fidelity_from_b64_prefix(b64: &str) -> Option<u8> {
+    if b64.len() < 16 {
+        return None;
+    }
+    let mut prefix = [0u8; 16];
+    let n =
+        base64::decode_config_slice(&b64.as_bytes()[..16], base64::STANDARD, &mut prefix).ok()?;
+    if n < 12 || &prefix[..6] != b"CSGPHS" {
+        return None;
+    }
+    let version = u32::from_le_bytes([prefix[6], prefix[7], prefix[8], prefix[9]]);
+    if version >= 7 {
+        return Some(prefix[10]);
+    }
+    if version == 0 && b64.len() <= 32 {
+        let bytes = base64::decode(b64).ok()?;
+        if bytes.ends_with(b"BLOCK") {
+            return Some(2);
+        }
+    }
+    None
+}
+
+/// Sound one-sided CFrame difference check: returns `true` only when two CFrames cannot
+/// match under either `reconciliation_values_equal_with_ids` or `cframes_match_when_rederived`.
+#[inline]
+pub(crate) fn cframes_definitely_differ(a: &[f64; 12], b: &[f64; 12]) -> bool {
+    if a.iter().chain(b.iter()).any(|v| !v.is_finite()) {
+        return false;
+    }
+    for i in 0..3 {
+        let diff = (a[i] - b[i]).abs();
+        let tol = CFRAME_POSITION_NOISE
+            .max(4.0 * f64::from(f32::EPSILON) * a[i].abs().max(b[i].abs()).max(1.0));
+        if diff > tol {
+            return true;
+        }
+    }
+    let rot_tol = CFRAME_ROTATION_EPSILON.max(CFRAME_ROTATION_NOISE);
+    let rot_differs = (3..12).any(|i| (a[i] - b[i]).abs() > rot_tol);
+    if !rot_differs {
+        return false;
+    }
+    let (Some(rot_a), Some(rot_b)) = (rederived_rotation(a), rederived_rotation(b)) else {
+        return true;
+    };
+    if !(third_axis_rewritten(a, &rot_a) || third_axis_rewritten(b, &rot_b)) {
+        return true;
+    }
+    rot_a
+        .iter()
+        .zip(&rot_b)
+        .any(|(x, y)| (x - y).abs() > CFRAME_ROTATION_NOISE)
+}
+
+/// Whether `value` contains any `EnumItem` object anywhere within it.
+pub(crate) fn value_contains_enum_item(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.get("_type").and_then(Value::as_str) == Some("EnumItem")
+                || map.values().any(value_contains_enum_item)
+        }
+        Value::Array(items) => items.iter().any(value_contains_enum_item),
+        _ => false,
+    }
 }
 
 /// Values Studio issues itself and rewrites on every save or load: the

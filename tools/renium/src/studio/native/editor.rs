@@ -984,70 +984,85 @@ fn native_capture_debug_ids(
         rows.len(),
         instances.len()
     );
-    let mut row_by_identity = AHashMap::with_capacity(instances.len());
-    let mut seen_ids = AHashSet::with_capacity(instances.len());
-    let mut seen_debug_ids = AHashSet::with_capacity(instances.len());
-    let mut captured = Vec::with_capacity(instances.len());
-    let mut ambiguous = AmbiguousCaptureUniqueIds {
-        nil: 0,
-        duplicates: 0,
-    };
-    for (index, row) in rows.chunks_exact(72).enumerate() {
-        let word = |offset| u32::from_le_bytes(row[offset..offset + 4].try_into().unwrap());
-        // The getter's native struct stores four LE words in display order,
-        // not a little-endian u64 followed by time/index.
-        let id = UniqueId::new(
-            word(12),
-            word(8),
-            ((u64::from(word(0)) << 32) | u64::from(word(4))) as i64,
-        );
-        if id.is_nil() {
-            ambiguous.nil += 1;
-        } else if !seen_ids.insert(id) {
-            ambiguous.duplicates += 1;
-        }
-        let text = &row[16..64];
-        let length = text
-            .iter()
-            .position(|byte| *byte == 0)
-            .context("Native debug identity is unterminated")?;
-        let debug_id =
-            std::str::from_utf8(&text[..length]).context("Native debug identity is not UTF-8")?;
-        anyhow::ensure!(
-            length > 0
-                && seen_debug_ids.insert(debug_id)
-                && text[length..].iter().all(|byte| *byte == 0),
-            "Native debug identity is empty, duplicated, or has invalid padding"
-        );
-        let parent = word(64);
-        anyhow::ensure!(
-            word(68) == 0 && (parent == u32::MAX || (parent as usize) < index),
-            "Native identity capture has an invalid parent or reserved field"
-        );
-        let parent = (parent != u32::MAX).then_some(parent as usize);
-        match row_by_identity.entry((id, parent)) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(Some(index));
+    let parsed_rows: Vec<(UniqueId, &str, Option<usize>)> = rows
+        .par_chunks_exact(72)
+        .enumerate()
+        .map(|(index, row)| {
+            let word = |offset| u32::from_le_bytes(row[offset..offset + 4].try_into().unwrap());
+            let id = UniqueId::new(
+                word(12),
+                word(8),
+                ((u64::from(word(0)) << 32) | u64::from(word(4))) as i64,
+            );
+            let text = &row[16..64];
+            let length = text
+                .iter()
+                .position(|byte| *byte == 0)
+                .context("Native debug identity is unterminated")?;
+            let debug_id = std::str::from_utf8(&text[..length])
+                .context("Native debug identity is not UTF-8")?;
+            anyhow::ensure!(
+                length > 0 && text[length..].iter().all(|byte| *byte == 0),
+                "Native debug identity is empty, duplicated, or has invalid padding"
+            );
+            let parent = word(64);
+            anyhow::ensure!(
+                word(68) == 0 && (parent == u32::MAX || (parent as usize) < index),
+                "Native identity capture has an invalid parent or reserved field"
+            );
+            let parent = (parent != u32::MAX).then_some(parent as usize);
+            Ok((id, debug_id, parent))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let ((row_by_identity, ambiguous), debug_ids_unique) = rayon::join(
+        || {
+            let mut row_by_identity = AHashMap::with_capacity(parsed_rows.len());
+            let mut seen_ids = AHashSet::with_capacity(parsed_rows.len());
+            let mut ambiguous = AmbiguousCaptureUniqueIds {
+                nil: 0,
+                duplicates: 0,
+            };
+            for (index, &(id, _, parent)) in parsed_rows.iter().enumerate() {
+                if id.is_nil() {
+                    ambiguous.nil += 1;
+                } else if !seen_ids.insert(id) {
+                    ambiguous.duplicates += 1;
+                }
+                match row_by_identity.entry((id, parent)) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(Some(index));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.insert(None);
+                    }
+                }
             }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                entry.insert(None);
-            }
-        }
-        captured.push(debug_id);
-    }
+            (row_by_identity, ambiguous)
+        },
+        || {
+            let mut seen_debug_ids = AHashSet::with_capacity(parsed_rows.len());
+            parsed_rows
+                .iter()
+                .all(|&(_, debug_id, _)| seen_debug_ids.insert(debug_id))
+        },
+    );
+    anyhow::ensure!(
+        debug_ids_unique,
+        "Native debug identity is empty, duplicated, or has invalid padding"
+    );
     crate::app::output::log_global(
         3,
         format_args!(
             "[renium] native identity join: {} captured, {} serialized, {} nil, {} duplicate instances beyond the first",
-            captured.len(),
+            parsed_rows.len(),
             instances.len(),
             ambiguous.nil,
             ambiguous.duplicates
         ),
     );
     let mut row_by_native_index = Vec::with_capacity(instances.len());
-    let mut seen_rows = vec![false; captured.len()];
-    let mut debug_ids = Vec::with_capacity(instances.len());
+    let mut seen_rows = vec![false; parsed_rows.len()];
     for instance in instances {
         let id = instance.properties.iter().find_map(|(name, value)| {
             if name.as_str() == "UniqueId"
@@ -1080,8 +1095,11 @@ fn native_capture_debug_ids(
             "Serialized snapshot repeats a captured identity"
         );
         row_by_native_index.push(row);
-        debug_ids.push(captured[row].to_string());
     }
+    let debug_ids = row_by_native_index
+        .par_iter()
+        .map(|&row| parsed_rows[row].1.to_string())
+        .collect();
     Ok(debug_ids)
 }
 
@@ -2163,6 +2181,91 @@ fn decode_native_service_dom(
     })
 }
 
+fn expected_batch_counts(
+    groups: &[&EditorBinaryExportGroup],
+    captured: bool,
+) -> Result<(usize, usize)> {
+    let expected_roots = groups.iter().try_fold(0_usize, |total, group| {
+        total
+            .checked_add(if captured {
+                1
+            } else {
+                native_serialized_root_count(group)?
+            })
+            .context("Native serialization batch root count overflowed")
+    })?;
+    let expected_instances = groups.iter().try_fold(0_usize, |total, group| {
+        total
+            .checked_add(if captured {
+                group.instance_count
+            } else {
+                native_serialized_instance_count(group)?
+            })
+            .context("Native serialization batch instance count overflowed")
+    })?;
+    Ok((expected_roots, expected_instances))
+}
+
+type CrossServicePaths = (HashMap<RbxRef, Vec<String>>, HashMap<RbxRef, Vec<usize>>);
+
+fn compute_cross_service_paths(
+    instances: &[rbx_binary::FlatInstance],
+    spans: &[(usize, usize, usize, usize)],
+    global_index_by_dense_ref: &[usize],
+    owner_by_dense_ref: &[usize],
+) -> CrossServicePaths {
+    let total_instances = instances.len();
+    let mut cross_service_targets = HashSet::new();
+    if spans.len() > 1 {
+        for (group_index, (start, end, _, _)) in spans.iter().copied().enumerate() {
+            for instance in &instances[start..end] {
+                for (_, value) in &instance.properties {
+                    let Some(dense_index) = rbx_variant_referent(value)
+                        .and_then(RbxRef::as_u128)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .and_then(|value| value.checked_sub(1))
+                        .filter(|value| *value < total_instances)
+                    else {
+                        continue;
+                    };
+                    if owner_by_dense_ref[dense_index] != group_index {
+                        cross_service_targets.insert(global_index_by_dense_ref[dense_index]);
+                    }
+                }
+            }
+        }
+    }
+    let mut path_segments_by_ref = HashMap::with_capacity(cross_service_targets.len());
+    let mut path_ordinals_by_ref = HashMap::with_capacity(cross_service_targets.len());
+    if !cross_service_targets.is_empty() {
+        let mut sibling_counts = AHashMap::<(Option<usize>, &str), usize>::new();
+        let mut ordinal_by_global_index = Vec::with_capacity(total_instances);
+        for instance in instances {
+            let key = (instance.parent_index, instance.name.as_str());
+            let ordinal = sibling_counts.entry(key).or_insert(0);
+            *ordinal += 1;
+            ordinal_by_global_index.push(*ordinal);
+        }
+        drop(sibling_counts);
+        for global_index in cross_service_targets {
+            let mut path_segments = Vec::new();
+            let mut path_ordinals = Vec::new();
+            let mut current_index = Some(global_index);
+            while let Some(index) = current_index {
+                let instance = &instances[index];
+                path_segments.push(instance.name.clone());
+                path_ordinals.push(ordinal_by_global_index[index]);
+                current_index = instance.parent_index;
+            }
+            path_segments.reverse();
+            path_ordinals.reverse();
+            path_segments_by_ref.insert(instances[global_index].referent, path_segments);
+            path_ordinals_by_ref.insert(instances[global_index].referent, path_ordinals);
+        }
+    }
+    (path_segments_by_ref, path_ordinals_by_ref)
+}
+
 fn decode_native_serialization_batch(
     bytes: Vec<u8>,
     batch: &EditorBinarySerializationBatch,
@@ -2190,24 +2293,8 @@ fn decode_native_serialization_batch(
                 })
         })
         .collect::<Result<Vec<_>>>()?;
-    let expected_roots = groups.iter().try_fold(0_usize, |total, group| {
-        total
-            .checked_add(if identity_rows.is_some() {
-                1
-            } else {
-                native_serialized_root_count(group)?
-            })
-            .context("Native serialization batch root count overflowed")
-    })?;
-    let expected_instances = groups.iter().try_fold(0_usize, |total, group| {
-        total
-            .checked_add(if identity_rows.is_some() {
-                group.instance_count
-            } else {
-                native_serialized_instance_count(group)?
-            })
-            .context("Native serialization batch instance count overflowed")
-    })?;
+    let captured = identity_rows.is_some();
+    let (expected_roots, expected_instances) = expected_batch_counts(&groups, captured)?;
     let decode_started = Instant::now();
     // Service roots keep their defaults: a saved field without a plugin API is
     // known only through this capture, so its default must arrive explicitly
@@ -2238,7 +2325,6 @@ fn decode_native_serialization_batch(
     // The flat decoder owns its values. Release the serialized copy before
     // identity joins and partition allocation overlap the overlay workers.
     drop(bytes);
-    let captured = identity_rows.is_some();
     if flat.root_indices.len() != expected_roots {
         bail!(
             "Studio native serialization batch {} contains {} roots; expected {}: Studio changed the place during native export; retry the sync",
@@ -2345,55 +2431,16 @@ fn decode_native_serialization_batch(
     if global_index_by_dense_ref.contains(&usize::MAX) {
         bail!("Native serialization batch has an incomplete dense referent map");
     }
-    let mut sibling_counts = HashMap::<(Option<usize>, &str), usize>::new();
-    let mut ordinal_by_global_index = Vec::with_capacity(total_instances);
-    for instance in &flat.instances {
-        let key = (instance.parent_index, instance.name.as_str());
-        let ordinal = sibling_counts.entry(key).or_insert(0);
-        *ordinal += 1;
-        ordinal_by_global_index.push(*ordinal);
-    }
-    drop(sibling_counts);
-    let mut cross_service_targets = HashSet::new();
-    for (group_index, (start, end, _, _)) in spans.iter().copied().enumerate() {
-        for instance in &flat.instances[start..end] {
-            for (_, value) in &instance.properties {
-                let Some(dense_index) = rbx_variant_referent(value)
-                    .and_then(RbxRef::as_u128)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .and_then(|value| value.checked_sub(1))
-                    .filter(|value| *value < total_instances)
-                else {
-                    continue;
-                };
-                if owner_by_dense_ref[dense_index] != group_index {
-                    cross_service_targets.insert(global_index_by_dense_ref[dense_index]);
-                }
-            }
-        }
-    }
-    let mut path_segments_by_ref = HashMap::with_capacity(cross_service_targets.len());
-    let mut path_ordinals_by_ref = HashMap::with_capacity(cross_service_targets.len());
-    for global_index in cross_service_targets {
-        let mut path_segments = Vec::new();
-        let mut path_ordinals = Vec::new();
-        let mut current_index = Some(global_index);
-        while let Some(index) = current_index {
-            let instance = &flat.instances[index];
-            path_segments.push(instance.name.clone());
-            path_ordinals.push(ordinal_by_global_index[index]);
-            current_index = instance.parent_index;
-        }
-        path_segments.reverse();
-        path_ordinals.reverse();
-        path_segments_by_ref.insert(flat.instances[global_index].referent, path_segments);
-        path_ordinals_by_ref.insert(flat.instances[global_index].referent, path_ordinals);
-    }
+    let (path_segments_by_ref, path_ordinals_by_ref) = compute_cross_service_paths(
+        &flat.instances,
+        &spans,
+        &global_index_by_dense_ref,
+        &owner_by_dense_ref,
+    );
     let path_segments_by_ref = Arc::new(path_segments_by_ref);
     let path_ordinals_by_ref = Arc::new(path_ordinals_by_ref);
     drop(global_index_by_dense_ref);
     drop(owner_by_dense_ref);
-    drop(ordinal_by_global_index);
     drop(references);
     let root_indices = flat.root_indices;
     let mut source_instances = flat.instances.into_iter();

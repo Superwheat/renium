@@ -1197,7 +1197,7 @@ fn changed_instances_placed(
     // digests with the instances bare.
     enum Files {
         Whole(SettingsBytecode, Vec<[u8; 16]>, Vec<bool>),
-        Rows(StoreRows),
+        Rows(Box<StoreRows>),
     }
     // Copies that hold as many instances are compared place by place.
     // Where they do not, Studio's instances are digested as they stand among
@@ -1256,7 +1256,10 @@ fn changed_instances_placed(
                 || whole_row_digests(observed_bytes, studio_structure, stand),
             )
         };
-        (observed_rows, Ok(files.ok().flatten().map(Files::Rows)))
+        (
+            observed_rows,
+            Ok(files.ok().flatten().map(Box::new).map(Files::Rows)),
+        )
     } else {
         rayon::join(
             || whole_row_digests(observed_bytes, studio_structure, stand),
@@ -2247,6 +2250,8 @@ pub(crate) fn apply_snapshot_paths(
 ) -> Result<()> {
     let mut paths = paths.iter().collect::<Vec<_>>();
     paths.sort();
+    let mut file_writes: Vec<(PathBuf, &[u8])> = Vec::new();
+    let mut parents_created = HashSet::<PathBuf>::new();
     for relative in paths {
         if derived_project_path(relative) {
             continue;
@@ -2254,15 +2259,22 @@ pub(crate) fn apply_snapshot_paths(
         let path = root.join(relative);
         match snapshot.entries.get(relative) {
             None => remove_path(&path)?,
-            Some(SnapshotEntry::Directory) => fs::create_dir_all(&path)
-                .with_context(|| format!("Failed to create {}", path.display()))?,
+            Some(SnapshotEntry::Directory) => {
+                if fs::symlink_metadata(&path)
+                    .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+                {
+                    continue;
+                }
+                fs::create_dir_all(&path)
+                    .with_context(|| format!("Failed to create {}", path.display()))?;
+            }
             Some(SnapshotEntry::File(bytes)) => {
-                remove_path(&path)?;
-                if let Some(parent) = path.parent() {
+                if let Some(parent) = path.parent()
+                    && parents_created.insert(parent.to_path_buf())
+                {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(&path, bytes)
-                    .with_context(|| format!("Failed to write {}", path.display()))?;
+                file_writes.push((path, bytes.as_slice()));
             }
             Some(SnapshotEntry::Symlink { target, directory }) => {
                 remove_path(&path)?;
@@ -2273,6 +2285,31 @@ pub(crate) fn apply_snapshot_paths(
             }
         }
     }
+    file_writes
+        .into_par_iter()
+        .try_for_each(|(path, bytes)| -> Result<()> {
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                    if meta.len() == bytes.len() as u64
+                        && fs::read(&path).ok().as_deref() == Some(bytes)
+                    {
+                        return Ok(());
+                    }
+                    fs::write(&path, bytes)
+                        .with_context(|| format!("Failed to write {}", path.display()))?;
+                    return Ok(());
+                }
+                Ok(_) => remove_path(&path)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to inspect {}", path.display()));
+                }
+            }
+            fs::write(&path, bytes)
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+            Ok(())
+        })?;
     Ok(())
 }
 

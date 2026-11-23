@@ -1350,6 +1350,129 @@ pub(crate) fn capture_snapshot(root: &Path, roots: &[PathBuf]) -> Result<Project
     Ok(ProjectSnapshot { entries })
 }
 
+/// Checks whether the files under `roots` on disk match `expected` byte for
+/// byte without allocating a full `ProjectSnapshot` copy of all file bytes.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn snapshot_matches_disk(
+    root: &Path,
+    roots: &[PathBuf],
+    expected: &ProjectSnapshot,
+) -> Result<bool> {
+    use std::io::Read;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut seen: HashSet<PathBuf> = HashSet::with_capacity(expected.entries.len());
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for relative_root in roots {
+        if derived_project_path(relative_root) {
+            continue;
+        }
+        let path = root.join(relative_root);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to inspect {}", path.display()));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            if !seen.insert(relative_root.clone()) {
+                continue;
+            }
+            let actual = SnapshotEntry::Symlink {
+                target: fs::read_link(&path)?,
+                directory: fs::metadata(&path).is_ok_and(|target| target.is_dir()),
+            };
+            if expected.entries.get(relative_root) != Some(&actual) {
+                return Ok(false);
+            }
+            continue;
+        }
+        if metadata.is_file() {
+            if !seen.insert(relative_root.clone()) {
+                continue;
+            }
+            let Some(SnapshotEntry::File(want)) = expected.entries.get(relative_root) else {
+                return Ok(false);
+            };
+            if metadata.len() != want.len() as u64 {
+                return Ok(false);
+            }
+            files.push((relative_root.clone(), path));
+            continue;
+        }
+        if !metadata.is_dir() {
+            bail!("Unsupported project entry {}", path.display());
+        }
+        for entry in WalkDir::new(&path).follow_links(false) {
+            let entry = entry?;
+            let relative = entry.path().strip_prefix(root)?.to_path_buf();
+            if derived_project_path(&relative) || !seen.insert(relative.clone()) {
+                continue;
+            }
+            if entry.file_type().is_dir() {
+                if expected.entries.get(&relative) != Some(&SnapshotEntry::Directory) {
+                    return Ok(false);
+                }
+            } else if entry.file_type().is_file() {
+                let Some(SnapshotEntry::File(want)) = expected.entries.get(&relative) else {
+                    return Ok(false);
+                };
+                if entry.metadata()?.len() != want.len() as u64 {
+                    return Ok(false);
+                }
+                files.push((relative, entry.into_path()));
+            } else if entry.file_type().is_symlink() {
+                let actual = SnapshotEntry::Symlink {
+                    target: fs::read_link(entry.path())?,
+                    directory: fs::metadata(entry.path()).is_ok_and(|target| target.is_dir()),
+                };
+                if expected.entries.get(&relative) != Some(&actual) {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    if seen.len() != expected.entries.len() {
+        return Ok(false);
+    }
+    let matched = AtomicBool::new(true);
+    files.into_par_iter().try_for_each_init(
+        || vec![0_u8; 64 * 1024],
+        |buf, (relative, path)| -> Result<()> {
+            if !matched.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let Some(SnapshotEntry::File(want)) = expected.entries.get(&relative) else {
+                matched.store(false, Ordering::Relaxed);
+                return Ok(());
+            };
+            let mut file = fs::File::open(&path)
+                .with_context(|| format!("Failed to open {}", path.display()))?;
+            let mut offset = 0_usize;
+            loop {
+                let read = file
+                    .read(buf)
+                    .with_context(|| format!("Failed to read {}", path.display()))?;
+                if read == 0 {
+                    break;
+                }
+                let end = offset + read;
+                if end > want.len() || buf[..read] != want[offset..end] {
+                    matched.store(false, Ordering::Relaxed);
+                    return Ok(());
+                }
+                offset = end;
+            }
+            if offset != want.len() {
+                matched.store(false, Ordering::Relaxed);
+            }
+            Ok(())
+        },
+    )?;
+    Ok(matched.load(Ordering::Relaxed))
+}
+
 #[cfg(test)]
 mod review_threshold_tests {
     use super::*;
@@ -1509,5 +1632,29 @@ mod review_threshold_tests {
         drop(bridge);
         plugin.join().unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn snapshot_matches_disk_handles_nested_roots_without_hiding_missing_files() -> Result<()> {
+        let root = crate::tests::support::temp_dir("nested-snapshot-matches-disk");
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        fs::create_dir_all(root.join("src/Workspace"))?;
+        fs::create_dir_all(root.join("src/ServerStorage"))?;
+        fs::write(root.join("src/Workspace/a.luau"), "return 1")?;
+        fs::write(root.join("src/ServerStorage/b.luau"), "return 2")?;
+        let expected = capture_snapshot(&root, &[PathBuf::from("src")])?;
+        fs::remove_dir_all(root.join("src/ServerStorage"))?;
+        assert!(
+            !snapshot_matches_disk(
+                &root,
+                &[PathBuf::from("src"), PathBuf::from("src/Workspace")],
+                &expected,
+            )?,
+            "nested roots must not double-count entries and hide missing files"
+        );
+        Ok(())
     }
 }

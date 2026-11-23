@@ -145,17 +145,44 @@ thread_local! {
 /// instances are read once for all the batches; an older file is read anew
 /// for each.
 pub(crate) enum RowBatches<'a> {
-    Blocks(super::blocks::RowBatches<'a>),
+    Blocks(Box<super::blocks::RowBatches<'a>>),
     Columns(&'a [u8]),
 }
 
 impl<'a> RowBatches<'a> {
-    pub(crate) fn open(bytes: &'a [u8]) -> Result<Self> {
+    pub(crate) fn open_holding(bytes: &'a [u8]) -> Result<Self> {
         if super::blocks::is_block_store(bytes) {
             let _span = crate::app::profile::span("store rows decode");
-            return Ok(Self::Blocks(super::blocks::RowBatches::open(bytes)?));
+            return Ok(Self::Blocks(Box::new(
+                super::blocks::RowBatches::open_holding(bytes)?,
+            )));
         }
         Ok(Self::Columns(bytes))
+    }
+
+    pub(crate) fn from_blocks(batches: super::blocks::RowBatches<'a>) -> Self {
+        Self::Blocks(Box::new(batches))
+    }
+
+    pub(crate) fn structure(&self) -> Option<&[SettingsBytecodeInstance]> {
+        match self {
+            Self::Blocks(batches) => Some(batches.structure()),
+            Self::Columns(_) => None,
+        }
+    }
+
+    pub(crate) fn into_block_store(self) -> Option<super::blocks::BlockStore<'a>> {
+        match self {
+            Self::Blocks(batches) => Some(batches.into_store()),
+            Self::Columns(_) => None,
+        }
+    }
+
+    pub(crate) fn as_blocks(&self) -> Option<&super::blocks::RowBatches<'a>> {
+        match self {
+            Self::Blocks(batches) => Some(batches),
+            Self::Columns(_) => None,
+        }
     }
 
     /// The first batch, with the id of every instance of the file.
@@ -266,10 +293,17 @@ pub(crate) struct StoreRows {
     pub(crate) digests: Vec<[u8; 16]>,
     /// The digest of the UniqueId of each instance, all zero without one.
     pub(crate) unique_ids: Vec<[u8; 16]>,
+    /// The digest of engine-state properties (not in `digests`) of each instance,
+    /// all zero without any; empty when not computed (v11 / whole digests).
+    pub(crate) engine_digests: Vec<[u8; 16]>,
     /// The instance asked for whole, where the store has one there.
     pub(crate) kept: Option<SettingsBytecodeInstance>,
     /// The id of each instance, from `row_digests`.
     pub(crate) ids: Vec<String>,
+    /// The bare instances of a v12 store without values, when kept for reuse.
+    pub(crate) structure: Option<Vec<SettingsBytecodeInstance>>,
+    /// The pool entry indices named by each block of a v12 store.
+    pub(crate) block_pool_entries: Vec<Vec<usize>>,
     /// How the instances stand in the state they were digested for.
     pub(crate) moved: Option<super::captured::Moved>,
     /// From `whole_row_digests`: every instance without its values but its
@@ -581,8 +615,11 @@ fn row_digests_of(
     Ok(Some(StoreRows {
         digests: rows,
         unique_ids,
+        engine_digests: Vec::new(),
         kept,
         ids,
+        structure: None,
+        block_pool_entries: Vec::new(),
         moved,
         instances,
         named,

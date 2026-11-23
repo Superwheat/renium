@@ -247,6 +247,25 @@ pub(crate) fn capture_push_proof(
         .cloned())
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn capture_push_proof_for_settlement(
+    bridge: &BridgeServer,
+    guard: &StudioChangeGuard,
+) -> Result<Option<Value>> {
+    let state = bridge.call_for_runtime_with_timeout(
+        "getStudioChangeState",
+        json!({ "start": false, "capturePushProof": true, "keepForSettlement": true }),
+        BridgeTarget::Edit,
+        &guard.runtime_id,
+        Some(Duration::from_secs(10)),
+    )?;
+    ensure_plugin_api_ok(&state)?;
+    Ok(state
+        .get("verifiedPushProof")
+        .filter(|value| !value.is_null())
+        .cloned())
+}
+
 /// Holds `entry` as the runtime's baseline, dropping expired ones and the
 /// oldest past eight.
 #[cfg(any(windows, target_os = "macos"))]
@@ -529,7 +548,7 @@ pub(crate) fn pull_baseline<'a>(
     let files_unchanged = match held.as_ref() {
         Some(entry) if entry.sourcemap.is_some() => {
             if sourcemap_as_left(&args.project_root, entry)? {
-                capture_snapshot(&args.project_root, &entry.paths)? == entry.project
+                snapshot_matches_disk(&args.project_root, &entry.paths, &entry.project)?
             } else {
                 log_global(
                     5,
@@ -1341,7 +1360,37 @@ impl ScopedPull {
             not_kept("the pull wrote outside the baseline's paths");
             return Ok(());
         }
-        let written = capture_snapshot(root, &published.publish_paths)?;
+        let expires = baseline_expiry(
+            #[cfg(windows)]
+            self.held.relay.as_ref(),
+        );
+        let retain = expires
+            .saturating_duration_since(Instant::now())
+            .min(BASELINE_IDLE);
+        let (written, state) = rayon::join(
+            || capture_snapshot(root, &published.publish_paths),
+            || {
+                bridge.call_for_runtime_with_timeout(
+                    "getStudioChangeState",
+                    json!({"start": false, "retainPushProof": self.proof, "retainSeconds": retain.as_secs()}),
+                    BridgeTarget::Edit,
+                    runtime,
+                    Some(Duration::from_secs(10)),
+                )
+            },
+        );
+        let state = state?;
+        ensure_plugin_api_ok(&state)?;
+        if state.get("retainedPushProof") != Some(&self.proof) {
+            not_kept("Studio changed during the pull");
+            return Ok(());
+        }
+        #[cfg(windows)]
+        if self.held.relay.is_none() && state["retainedPushProofLocal"] != true {
+            not_kept("no native attribute guard");
+            return Ok(());
+        }
+        let written = written?;
         let project = match scoped_baseline(
             std::mem::take(&mut self.held.project),
             written,
@@ -1354,30 +1403,6 @@ impl ScopedPull {
                 return Ok(());
             }
         };
-        let expires = baseline_expiry(
-            #[cfg(windows)]
-            self.held.relay.as_ref(),
-        );
-        let retain = expires
-            .saturating_duration_since(Instant::now())
-            .min(BASELINE_IDLE);
-        let state = bridge.call_for_runtime_with_timeout(
-            "getStudioChangeState",
-            json!({"start": false, "retainPushProof": self.proof, "retainSeconds": retain.as_secs()}),
-            BridgeTarget::Edit,
-            runtime,
-            Some(Duration::from_secs(10)),
-        )?;
-        ensure_plugin_api_ok(&state)?;
-        if state.get("retainedPushProof") != Some(&self.proof) {
-            not_kept("Studio changed during the pull");
-            return Ok(());
-        }
-        #[cfg(windows)]
-        if self.held.relay.is_none() && state["retainedPushProofLocal"] != true {
-            not_kept("no native attribute guard");
-            return Ok(());
-        }
         let entry = VerifiedFullPush {
             connections: bridge.runtime_connection_signature(runtime),
             input: self.held.input,

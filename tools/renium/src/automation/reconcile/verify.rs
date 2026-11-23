@@ -604,35 +604,47 @@ fn verify_snapshot_delta(
         .into_iter()
         .map(|path| (path, (prepared.remove(path), asked.contains(path))))
         .collect::<Vec<_>>();
-    // Services have independent identity graphs. Share the captured snapshots,
-    // but give each worker ownership of its already-prepared documents.
-    let results = jobs
+    let is_large_store = |path: &Path| {
+        const LARGE_STORE_BYTES: usize = 4 * 1024 * 1024;
+        settings_path(path)
+            && [desired.entries.get(path), observed.entries.get(path)]
+                .into_iter()
+                .flatten()
+                .any(|entry| matches!(entry, SnapshotEntry::File(bytes) if bytes.len() >= LARGE_STORE_BYTES))
+    };
+    let (large_jobs, small_jobs): (Vec<_>, Vec<_>) =
+        jobs.into_iter().partition(|(path, _)| is_large_store(path));
+    let verify_job = |path: &Path, prepared: (Option<PreparedPushVerification>, bool)| {
+        let desired_entry = desired.entries.get(path);
+        let result = if settings_path(path) {
+            settings_delta_verification(
+                path,
+                before.entries.get(path),
+                desired_entry,
+                observed.entries.get(path),
+                prepared,
+                policy,
+            )?
+        } else if entries_equivalent(path, observed.entries.get(path), desired_entry) {
+            SettingsVerification::default()
+        } else {
+            SettingsVerification {
+                mismatch: Some(format!(
+                    "{} differs from the requested value",
+                    path.display()
+                )),
+                accepted: None,
+            }
+        };
+        Ok::<_, anyhow::Error>(result)
+    };
+    let mut results = small_jobs
         .into_par_iter()
-        .map(|(path, prepared)| {
-            let desired_entry = desired.entries.get(path);
-            let result = if settings_path(path) {
-                settings_delta_verification(
-                    path,
-                    before.entries.get(path),
-                    desired_entry,
-                    observed.entries.get(path),
-                    prepared,
-                    policy,
-                )?
-            } else if entries_equivalent(path, observed.entries.get(path), desired_entry) {
-                SettingsVerification::default()
-            } else {
-                SettingsVerification {
-                    mismatch: Some(format!(
-                        "{} differs from the requested value",
-                        path.display()
-                    )),
-                    accepted: None,
-                }
-            };
-            Ok((path, result))
-        })
+        .map(|(path, prepared)| Ok((path, verify_job(path, prepared)?)))
         .collect::<Result<Vec<_>>>()?;
+    for (path, prepared) in large_jobs {
+        results.push((path, verify_job(path, prepared)?));
+    }
     let mut differences = Vec::new();
     let mut accepted = ProjectSnapshot::default();
     for (path, result) in results {
@@ -671,6 +683,56 @@ pub(crate) fn settings_delta_mismatch(
         Verification::default(),
     )?
     .mismatch)
+}
+
+fn decode_verification_documents(
+    before: Option<&SnapshotEntry>,
+    desired: Option<&SnapshotEntry>,
+    observed: Option<&SnapshotEntry>,
+    prepared: Option<PreparedPushVerification>,
+) -> Result<(SettingsBytecode, Arc<SettingsBytecode>, SettingsBytecode)> {
+    const LARGE_STORE_BYTES: usize = 4 * 1024 * 1024;
+    let large_store = [before, desired, observed].into_iter().flatten().any(
+        |entry| matches!(entry, SnapshotEntry::File(bytes) if bytes.len() >= LARGE_STORE_BYTES),
+    );
+    if large_store {
+        let (before, desired) = match prepared {
+            Some(prepared) => (
+                prepared.previous,
+                match prepared.desired {
+                    Some(desired) => desired,
+                    None => Arc::new(settings_document(desired)?),
+                },
+            ),
+            None => (
+                settings_document(before)?,
+                Arc::new(settings_document(desired)?),
+            ),
+        };
+        let observed = settings_document(observed)?;
+        return Ok((before, desired, observed));
+    }
+    let (requested, observed) = rayon::join(
+        || -> Result<_> {
+            Ok(match prepared {
+                Some(prepared) => (
+                    prepared.previous,
+                    match prepared.desired {
+                        Some(desired) => desired,
+                        None => Arc::new(settings_document(desired)?),
+                    },
+                ),
+                None => {
+                    let (before, desired) =
+                        rayon::join(|| settings_document(before), || settings_document(desired));
+                    (before?, Arc::new(desired?))
+                }
+            })
+        },
+        || settings_document(observed),
+    );
+    let (before, desired) = requested?;
+    Ok((before, desired, observed?))
 }
 
 fn settings_delta_verification(
@@ -726,29 +788,8 @@ fn settings_delta_verification(
     {
         return Ok(verified);
     }
-    // The three stores decode side by side: on a large service each takes a
-    // good part of a second.
-    let (requested, observed) = rayon::join(
-        || -> Result<_> {
-            Ok(match prepared {
-                Some(prepared) => (
-                    prepared.previous,
-                    match prepared.desired {
-                        Some(desired) => desired,
-                        None => Arc::new(settings_document(desired)?),
-                    },
-                ),
-                None => {
-                    let (before, desired) =
-                        rayon::join(|| settings_document(before), || settings_document(desired));
-                    (before?, Arc::new(desired?))
-                }
-            })
-        },
-        || settings_document(observed),
-    );
-    let (mut before, desired) = requested?;
-    let mut observed = observed?;
+    let (mut before, desired, mut observed) =
+        decode_verification_documents(before, desired, observed, prepared)?;
     // Documents read by their changed instances verify a push that left
     // every instance at its place. Where Studio's instances have to be
     // matched with the files' by what tells them apart, the whole documents
@@ -934,6 +975,14 @@ fn settings_delta_verification(
                 .map(|detail| format!("{name}.{detail}"))
         });
     }
+    rayon::join(
+        || drop_settings_document(before),
+        || {
+            if let Some(desired) = Arc::into_inner(desired) {
+                drop_settings_document(desired);
+            }
+        },
+    );
     let accepted = if policy.settle && mismatch.is_none() {
         if let Some(camera) = viewport {
             crate::settings::equivalence::keep_reference_viewport_camera(&camera, &mut observed);
@@ -942,14 +991,7 @@ fn settings_delta_verification(
     } else {
         None
     };
-    rayon::join(
-        || drop_settings_documents(before, observed),
-        || {
-            if let Some(desired) = Arc::into_inner(desired) {
-                drop_settings_document(desired);
-            }
-        },
-    );
+    drop_settings_document(observed);
     Ok(SettingsVerification { mismatch, accepted })
 }
 

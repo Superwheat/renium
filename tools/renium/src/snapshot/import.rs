@@ -1547,6 +1547,58 @@ fn write_service_settings_file(
     )
 }
 
+fn try_streamed_alignment(
+    state_to_write: &ServiceState,
+    settings_path: &Path,
+    stored_file: &Result<Option<StoredFile>>,
+    pulled: Option<&crate::settings::bytecode::PulledDigest>,
+    store_gate: Option<&Mutex<()>>,
+    alignment_started: Instant,
+) -> Option<
+    Result<(
+        crate::settings::equivalence::PulledAlignment,
+        bool,
+        [u8; 32],
+    )>,
+> {
+    if pull_aligns_whole_documents() || state_to_write.instances.len() < 4_096 {
+        return None;
+    }
+    let (Ok(Some((bytes, digest, _))), Some(pulled_ref)) = (stored_file, pulled) else {
+        return None;
+    };
+    match crate::settings::bytecode::pull_align_captured_store_streaming(
+        state_to_write,
+        &pulled_ref.rows,
+        bytes,
+        store_gate,
+        alignment_started,
+    ) {
+        Ok(Some((pulled_alignment, answer_follows_camera))) => {
+            Some(Ok((pulled_alignment, answer_follows_camera, *digest)))
+        }
+        Ok(None) => None,
+        Err(error) => Some(Err(
+            error.context(format!("Failed to align {}", settings_path.display()))
+        )),
+    }
+}
+
+fn read_stored_settings_file(service: &str, settings_path: &Path) -> Result<Option<StoredFile>> {
+    let _reading = profile::span(&format!("{service}: read stored file"));
+    let bytes = match fs::read(settings_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read {}", settings_path.display()));
+        }
+    };
+    let digest = <[u8; 32]>::from(Sha256::digest(&bytes));
+    let remembered = remembered_pull(&digest);
+    Ok(Some((bytes, digest, remembered)))
+}
+
 fn write_service_settings_file_owned(
     service: &str,
     mut owned_state: Option<ServiceState>,
@@ -1585,21 +1637,16 @@ fn write_service_settings_file_owned(
         // A fresh capture encodes every store while other services are still
         // converting. Bound those temporary buffers per export; scripts,
         // sourcemaps, comparisons of small stores and other places can proceed.
-        {
+        let written_digest = {
             let _store_guard = store_gate.map(LockRecover::lock_recover);
-            write_fresh_service_settings_binary_file(&settings_path, state)?;
-        }
+            write_fresh_service_settings_binary_file(&settings_path, state)?
+        };
         // The file holds this state's own bytes, so the next pull that
         // captures the same state leaves it alone without decoding it.
         if let Ok(observed) = pulled_digest_from_service_state(state)
             && !observed.viewport_camera_lacks_enum_types
-            && let Ok(bytes) = fs::read(&settings_path)
         {
-            remember_pull(
-                Sha256::digest(&bytes).into(),
-                observed.digest,
-                Some(observed.rows),
-            );
+            remember_pull(written_digest, observed.digest, Some(observed.rows));
         }
     } else {
         let lock_started = Instant::now();
@@ -1630,26 +1677,20 @@ fn write_service_settings_file_owned(
         // stored file is read, and the store is encoded once, after the two
         // are aligned.
         let alignment_started = Instant::now();
-        let stored_file = (|| -> Result<Option<StoredFile>> {
-            let _reading = profile::span(&format!("{service}: read stored file"));
-            let bytes = match fs::read(&settings_path) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("Failed to read {}", settings_path.display()));
-                }
-            };
-            let digest = <[u8; 32]>::from(Sha256::digest(&bytes));
-            let remembered = remembered_pull(&digest);
-            Ok(Some((bytes, digest, remembered)))
-        })();
-        // A digest of the captured state says whether it is the state a pull
-        // left this file alone with before. While nothing changed, no document
-        // of the captured store is built.
-        let pulled = matches!(&stored_file, Ok(Some(_)))
-            .then(|| pulled_digest_from_service_state(state_to_write).ok())
-            .flatten();
+        let has_stored_file = settings_path.is_file();
+        let (stored_file, pulled) = if has_stored_file {
+            rayon::join(
+                || read_stored_settings_file(service, &settings_path),
+                || pulled_digest_from_service_state(state_to_write).ok(),
+            )
+        } else {
+            (Ok(None), None)
+        };
+        let pulled = if matches!(&stored_file, Ok(Some(_))) {
+            pulled
+        } else {
+            None
+        };
         let unchanged_again = matches!(
             (&stored_file, &pulled),
             (Ok(Some((_, _, Some(remembered)))), Some(pulled)) if remembered.digest == pulled.digest
@@ -1695,27 +1736,15 @@ fn write_service_settings_file_owned(
             Ok(Some((_, digest, _))) => Some(*digest),
             _ => None,
         };
-        let streamed_alignment = if !unchanged_again
-            && changed_values.is_none()
-            && !pull_aligns_whole_documents()
-            && instance_count >= 4_096
-            && let (Ok(Some((bytes, digest, _))), Some(pulled_ref)) = (&stored_file, &pulled)
-        {
-            match crate::settings::bytecode::pull_align_captured_store_streaming(
+        let streamed_alignment = if !unchanged_again && changed_values.is_none() {
+            try_streamed_alignment(
                 state_to_write,
-                &pulled_ref.rows,
-                bytes,
+                &settings_path,
+                &stored_file,
+                pulled.as_ref(),
                 store_gate,
                 alignment_started,
-            ) {
-                Ok(Some((pulled_alignment, answer_follows_camera))) => {
-                    Some(Ok((pulled_alignment, answer_follows_camera, *digest)))
-                }
-                Ok(None) => None,
-                Err(error) => Some(Err(
-                    error.context(format!("Failed to align {}", settings_path.display()))
-                )),
-            }
+            )
         } else {
             None
         };

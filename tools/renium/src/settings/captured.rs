@@ -1,8 +1,10 @@
 use super::*;
-use crate::settings::equivalence::SettingsAlignment;
+use crate::settings::equivalence::{CanonicalizeCache, DigestSink, SettingsAlignment};
 use crate::snapshot::types::NativeSettingsProperty;
 use sha2::{Digest, Sha256};
+use std::hash::{BuildHasher, Hasher};
 use std::io;
+use std::sync::LazyLock;
 
 #[derive(Clone, Copy)]
 struct ConversionScope<'a, 'b> {
@@ -117,22 +119,182 @@ pub(super) fn convert_with_budget(
 /// whether this is a state a pull took before, and that pull decided whether
 /// its store may be written.
 pub(super) fn pulled_digest(state: &ServiceState) -> Result<PulledDigest> {
-    use crate::settings::equivalence::{
-        viewport_camera_lacks_enum_types, workspace_current_camera_index,
-    };
+    use crate::settings::equivalence::{instance_lacks_enum_types, workspace_current_camera_index};
 
     let _span = crate::app::profile::span("captured store digest");
     let records = collect_service_settings_binary_instances(state);
     let lookup = build_settings_binary_instance_lookup(state, &records);
-    let skeleton = skeleton(state, &records, &lookup)?;
-    let viewport_camera =
-        workspace_current_camera_index(&skeleton).map(|index| records[index].source_index);
+    let (viewport_camera, camera_lacks_enum_types) = validate_records_and_camera(
+        state,
+        &records,
+        &lookup,
+        workspace_current_camera_index,
+        instance_lacks_enum_types,
+    )?;
     let (digest, rows) = state_digests(state, viewport_camera);
     Ok(PulledDigest {
         digest,
-        viewport_camera_lacks_enum_types: viewport_camera_lacks_enum_types(&skeleton),
+        viewport_camera_lacks_enum_types: camera_lacks_enum_types,
         rows: Arc::new(rows),
     })
+}
+
+/// Validates `records` (string lengths, unique settings ids, hierarchy cycles/depth/single root)
+/// without allocating `SettingsBytecodeInstance`s for all 140k+ rows, and converts only the
+/// root and `Camera` instance(s) to find the viewport camera and check its enum types.
+fn validate_records_and_camera(
+    state: &ServiceState,
+    records: &[SettingsBinaryInstance<'_>],
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    camera_index_of: fn(&SettingsBytecode) -> Option<usize>,
+    lacks_enum_types: fn(&SettingsBytecodeInstance) -> bool,
+) -> Result<(Option<usize>, bool)> {
+    let mut prev_debug: Option<u64> = None;
+    let mut all_debug = true;
+    let mut strictly_inc = true;
+    let mut root_count = 0_usize;
+    for (index, record) in records.iter().enumerate() {
+        if record.parent_index.is_none() {
+            root_count += 1;
+        }
+        check_settings_string_len(record.name.len())?;
+        check_settings_string_len(record.class_name.len())?;
+        match &record.settings_id {
+            SettingsBinaryId::NumericDebug(id) => {
+                if prev_debug.is_some_and(|p| *id <= p) {
+                    strictly_inc = false;
+                }
+                prev_debug = Some(*id);
+            }
+            SettingsBinaryId::Text(text) => {
+                if text.is_empty() {
+                    bail!("Settings bytecode instance {index} has an empty settings id");
+                }
+                check_settings_string_len(text.len())?;
+                all_debug = false;
+                strictly_inc = false;
+            }
+        }
+    }
+    if !records.is_empty() && root_count != 1 {
+        bail!("Settings bytecode must contain exactly one root, found {root_count}");
+    }
+    if !strictly_inc {
+        if all_debug {
+            let mut seen = AHashSet::with_capacity(records.len());
+            for record in records {
+                if let SettingsBinaryId::NumericDebug(id) = record.settings_id
+                    && !seen.insert(id)
+                {
+                    bail!(
+                        "Settings bytecode contains duplicate settings id {}",
+                        format_debug_id(id)
+                    );
+                }
+            }
+        } else {
+            let mut seen = AHashSet::with_capacity(records.len());
+            for record in records {
+                let id: Cow<'_, str> = match &record.settings_id {
+                    SettingsBinaryId::Text(t) => Cow::Borrowed(t.as_ref()),
+                    SettingsBinaryId::NumericDebug(id) => Cow::Owned(format_debug_id(*id)),
+                };
+                if !seen.insert(id.clone()) {
+                    bail!("Settings bytecode contains duplicate settings id {id}");
+                }
+            }
+        }
+    }
+    let n = records.len();
+    let mut states = vec![0_u8; n];
+    let mut depths = vec![0_usize; n];
+    let mut path = Vec::new();
+    for start in 0..n {
+        if states[start] == 2 {
+            continue;
+        }
+        path.clear();
+        let mut current = Some(start);
+        let mut base_depth = 0_usize;
+        while let Some(index) = current {
+            if index >= n {
+                bail!("Invalid parent index {index}");
+            }
+            match states[index] {
+                0 => {
+                    states[index] = 1;
+                    path.push(index);
+                    current = records[index].parent_index;
+                }
+                1 => bail!("Settings bytecode hierarchy contains a parent cycle at index {index}"),
+                2 => {
+                    base_depth = depths[index];
+                    break;
+                }
+                _ => unreachable!(),
+            }
+        }
+        if base_depth.saturating_add(path.len()) > MAX_SETTINGS_HIERARCHY_DEPTH {
+            bail!(
+                "Settings bytecode hierarchy exceeds safe depth of {MAX_SETTINGS_HIERARCHY_DEPTH}"
+            );
+        }
+        while let Some(index) = path.pop() {
+            base_depth += 1;
+            depths[index] = base_depth;
+            states[index] = 2;
+        }
+    }
+    let budget = DecodeBudget::new(MAX_SETTINGS_BYTECODE_BYTES);
+    let scope = ConversionScope {
+        lookup,
+        instance_count: n,
+        budget: &budget,
+        string_ids: &SettingsStringIdMap::default(),
+        wire_bytes: None,
+    };
+    let mut root_idx = None;
+    let mut cameras: Vec<(usize, SettingsBytecodeInstance)> = Vec::new();
+    let mut root_inst = None;
+    for (idx, record) in records.iter().enumerate() {
+        if record.parent_index.is_none() {
+            let mut converted = convert_chunk(state, std::slice::from_ref(record), scope)?;
+            root_idx = Some(idx);
+            root_inst = converted.pop();
+        } else if record.class_name == "Camera" {
+            let mut converted = convert_chunk(state, std::slice::from_ref(record), scope)?;
+            if let Some(cam) = converted.pop() {
+                cameras.push((idx, cam));
+            }
+        }
+    }
+    let Some(root_inst) = root_inst else {
+        return Ok((None, false));
+    };
+    let Some(root_idx) = root_idx else {
+        return Ok((None, false));
+    };
+    if root_inst.class_name != "Workspace" || cameras.is_empty() {
+        let _ = (root_idx, camera_index_of);
+        return Ok((None, false));
+    }
+    if let Some(current_cam) = root_inst.properties.get("CurrentCamera")
+        && let Some(obj) = current_cam.as_object()
+        && obj.get("_type").and_then(Value::as_str) == Some("Ref")
+        && let Some(one_based) = obj.get("instanceIndex").and_then(Value::as_u64)
+        && let Some(cam_idx) = (one_based as usize).checked_sub(1)
+        && let Some((_, cam_inst)) = cameras.iter().find(|(idx, _)| *idx == cam_idx)
+        && records[cam_idx].parent_index == Some(root_idx)
+    {
+        return Ok((
+            Some(records[cam_idx].source_index),
+            lacks_enum_types(cam_inst),
+        ));
+    }
+    let skel = skeleton(state, records, lookup)?;
+    let cam = camera_index_of(&skel);
+    let lacks = cam.is_some_and(|i| lacks_enum_types(&skel.instances[i]));
+    Ok((cam.map(|i| records[i].source_index), lacks))
 }
 
 /// No answer from the instances alone: the pull aligns the whole documents,
@@ -156,15 +318,16 @@ const COMPARED_AT_ONCE: usize = if cfg!(test) { 3 } else { 4_096 };
 
 /// What a changed instance and the stored one at its place say of each
 /// other.
-struct ComparedPair {
+#[derive(Clone, Copy)]
+pub(super) struct ComparedPair {
     /// The two stand under one name, class and parent.
-    placed: bool,
-    same_class: bool,
+    pub(super) placed: bool,
+    pub(super) same_class: bool,
     /// The stored one is written as documents are today.
-    written_as_today: bool,
-    same_unique_id: bool,
+    pub(super) written_as_today: bool,
+    pub(super) same_unique_id: bool,
     /// One of the two holds a reference.
-    holds_reference: bool,
+    pub(super) holds_reference: bool,
 }
 
 pub(super) fn changed_values(
@@ -206,7 +369,7 @@ pub(super) fn changed_values(
         read: None,
     };
     let rows = (records, &places, &(|| false) as &dyn Fn() -> bool);
-    changed_rows(state, now, rows, &changed, stored, store_gate)
+    changed_rows(state, now, rows, &changed, stored, None, store_gate)
 }
 
 /// Reading a large store, for its digests or for the instances that changed,
@@ -366,14 +529,18 @@ pub(super) fn changed_document_rows(
     };
     let (_reading, store_gate) = read_gate(stored, store_gate);
     let lookup = build_settings_binary_instance_lookup(state, &records);
+    let opened_store = if blocks::is_block_store(stored) {
+        Some(blocks::BlockStore::open(stored)?.holding())
+    } else {
+        None
+    };
     let mut told_ids = None;
-    let (stored_rows, captured_rows) = if blocks::is_block_store(stored) {
-        let store = blocks::BlockStore::open(stored)?.holding();
+    let (stored_rows, (captured_rows, long_hashes)) = if let Some(store) = opened_store.as_ref() {
         let mut instances = store.structure()?.instances;
         let moved = match Moved::between(&instances, &records) {
             Some(None) if stand_alike(&instances, &records) => Some(None),
             Some(Some(run)) => Some(Some(run)),
-            _ => told_alone_in_block_store(&store, &mut instances, state, &records, &lookup).map(
+            _ => told_alone_in_block_store(store, &mut instances, state, &records, &lookup).map(
                 |(moved, ids)| {
                     told_ids = Some(ids);
                     Some(moved)
@@ -381,7 +548,8 @@ pub(super) fn changed_document_rows(
             ),
         };
         let Some(moved) = moved else {
-            drop((instances, store));
+            drop(instances);
+            drop(opened_store);
             if records.len() >= 32_768 {
                 crate::daemon::memory::release_between_phases();
             }
@@ -501,7 +669,7 @@ pub(super) fn changed_document_rows(
                 }
                 if own_ids && probed_renamed {
                     let in_place =
-                        told_alone_in_block_store(&store, &mut instances, state, &records, &lookup)
+                        told_alone_in_block_store(store, &mut instances, state, &records, &lookup)
                             .is_some_and(|(m, _)| {
                                 (0..records.len()).all(|i| m.in_store(i) == Some(i))
                             });
@@ -513,43 +681,39 @@ pub(super) fn changed_document_rows(
                 }
             }
         }
-        let (stored_rows, captured_rows) = rayon::join(
+        let (stored_rows, captured_res) = rayon::join(
             || {
                 let _span = crate::app::profile::span("store instance digests");
                 store
-                    .row_digests_of_instances(instances, false, &[], camera, moved)
+                    .row_digests_of_instances_with_structure(instances, false, &[], camera, moved)
                     .map(Some)
             },
             || document_row_digests(state, &records, &lookup, stored.len()),
         );
-        (stored_rows?, captured_rows?)
+        (stored_rows?, captured_res?)
     } else {
-        let stored_rows =
-            crate::settings::bytecode::property_edit::row_digests(stored, |instances| {
-                // Instances at other places than the state's, or more than
-                // one run apart, are paired each by itself.
-                let moved = match Moved::between(instances, &records) {
-                    Some(None) if stand_alike(instances, &records) => None,
-                    Some(Some(run)) => Some(run),
-                    _ => {
-                        let (moved, ids) = told_alone(stored, state, &records, &lookup)?;
-                        told_ids = Some(ids);
-                        Some(moved)
-                    }
-                };
-                // The stored camera is the one that stands where the state's
-                // does.
-                let camera = match (now.viewport_camera, &moved) {
-                    (Some(camera), Some(moved)) => Some(moved.in_store(camera)?),
-                    (camera, _) => camera,
-                };
-                Some((camera, moved))
-            })?;
-        let Some(stored_rows) = stored_rows else {
-            return whole("nothing tells every instance of the store by itself among the state's");
-        };
-        let captured_rows = document_row_digests(state, &records, &lookup, stored.len())?;
-        (Some(stored_rows), captured_rows)
+        let (stored_rows, captured_res) = rayon::join(
+            || {
+                crate::settings::bytecode::property_edit::row_digests(stored, |instances| {
+                    let moved = match Moved::between(instances, &records) {
+                        Some(None) if stand_alike(instances, &records) => None,
+                        Some(Some(run)) => Some(run),
+                        _ => {
+                            let (moved, ids) = told_alone(stored, state, &records, &lookup)?;
+                            told_ids = Some(ids);
+                            Some(moved)
+                        }
+                    };
+                    let camera = match (now.viewport_camera, &moved) {
+                        (Some(camera), Some(moved)) => Some(moved.in_store(camera)?),
+                        (camera, _) => camera,
+                    };
+                    Some((camera, moved))
+                })
+            },
+            || document_row_digests(state, &records, &lookup, stored.len()),
+        );
+        (stored_rows?, captured_res?)
     };
     let Some(stored_rows) = stored_rows else {
         return whole("nothing tells every instance of the store by itself among the state's");
@@ -587,7 +751,16 @@ pub(super) fn changed_document_rows(
     };
     let mut changed = Vec::new();
     let mut renamed = false;
-    for (index, (values, unique_id)) in captured_rows.iter().enumerate() {
+    let mut exact_row_match = if opened_store.is_some()
+        && moved.is_none()
+        && !paired
+        && stored_rows.engine_digests.len() == records.len()
+    {
+        Some(vec![true; records.len()])
+    } else {
+        None
+    };
+    for (index, (values, unique_id, engine)) in captured_rows.iter().enumerate() {
         if now.viewport_camera == Some(index) {
             continue;
         }
@@ -603,8 +776,17 @@ pub(super) fn changed_document_rows(
                 return whole("a root differs");
             }
             changed.push(index);
+            if let Some(exact) = exact_row_match.as_mut() {
+                exact[index] = false;
+            }
         } else {
-            renamed |= stored_rows.unique_ids[stored_index] != *unique_id;
+            let uid_diff = stored_rows.unique_ids[stored_index] != *unique_id;
+            renamed |= uid_diff;
+            if let Some(exact) = exact_row_match.as_mut()
+                && (uid_diff || stored_rows.engine_digests[stored_index] != *engine)
+            {
+                exact[index] = false;
+            }
         }
     }
     let stored = StoredRows {
@@ -615,20 +797,31 @@ pub(super) fn changed_document_rows(
             unique_ids: stored_rows.unique_ids,
             captured_unique_ids: captured_rows
                 .into_iter()
-                .map(|(_, unique_id)| unique_id)
+                .map(|(_, unique_id, _)| unique_id)
                 .collect(),
             renamed,
             moved,
             told_ids,
+            opened_store,
+            structure: stored_rows.structure,
+            block_pool_entries: stored_rows.block_pool_entries,
+            exact_row_match,
+            long_hashes: Some(long_hashes),
         }),
     };
     // A store kept with its instances at other places is not the state's
     // rows in their order.
     let rows = (records, &places, &told_in_place as &dyn Fn() -> bool);
-    Ok(
-        changed_rows(state, now, rows, &changed, stored, store_gate)?
-            .map(|alignment| (alignment, changed.is_empty() && !renamed && !paired)),
-    )
+    Ok(changed_rows(
+        state,
+        now,
+        rows,
+        &changed,
+        stored,
+        Some(&lookup),
+        store_gate,
+    )?
+    .map(|alignment| (alignment, changed.is_empty() && !renamed && !paired)))
 }
 
 /// Replaces stabilized `settingsId` references inside a saved viewport camera
@@ -924,11 +1117,16 @@ pub(super) fn align_captured_store_streaming(
 /// it read of them.
 struct StoredRows<'a> {
     file: &'a [u8],
-    read: Option<ReadStore>,
+    read: Option<ReadStore<'a>>,
 }
 
+pub(super) type LongHashMap = blocks::ShardedMap<(usize, usize), [u8; 16]>;
+type CapturedRowDigest = ([u8; 16], [u8; 16], [u8; 16]);
+type FastCompareEntry = Option<(ComparedPair, (bool, bool))>;
+type ComparedRowResult = Result<Option<(bool, bool)>>;
+
 /// What the digests of two documents say beside which instances differ.
-struct ReadStore {
+struct ReadStore<'a> {
     /// The stored viewport camera, where the store has one at that place.
     viewport_camera: Option<SettingsBytecodeInstance>,
     /// The id of each stored instance.
@@ -947,6 +1145,18 @@ struct ReadStore {
     /// The id the alignment gives each instance of the state, where `moved`
     /// pairs each by itself.
     told_ids: Option<Vec<String>>,
+    /// Already-opened v12 store with its pool cache, reused for row reading and encoding.
+    opened_store: Option<blocks::BlockStore<'a>>,
+    /// Already-decoded v12 bare structure, reused so `RowBatches` does not decode it again.
+    structure: Option<Vec<SettingsBytecodeInstance>>,
+    /// Pool entry indices named by each block of the v12 store.
+    block_pool_entries: Vec<Vec<usize>>,
+    /// When `moved.is_none() && !paired`, whether each non-camera row matches the stored row
+    /// in every digested property, UniqueId, and engine-state property.
+    exact_row_match: Option<Vec<bool>>,
+    /// Precomputed SHA-256 hashes of borrowed long strings (`>= POOL_MIN_BYTES`) in `state`,
+    /// reused by `fast_compare_changed` and `encode_state_streaming`.
+    long_hashes: Option<Arc<LongHashMap>>,
 }
 
 /// How the instances of a stored file stand in a state that holds other
@@ -1092,10 +1302,12 @@ impl Moved {
 
     /// The parent of a stored instance as the position it has in the state.
     /// A parent the state lacks is no position of the state's.
+    pub(super) fn parent_index_in_state(&self, parent_index: Option<usize>) -> Option<usize> {
+        parent_index.map(|parent| self.in_state(parent).unwrap_or(usize::MAX - 1))
+    }
+
     pub(super) fn parent_in_state(&self, instance: &mut SettingsBytecodeInstance) {
-        instance.parent_index = instance
-            .parent_index
-            .map(|parent| self.in_state(parent).unwrap_or(usize::MAX - 1));
+        instance.parent_index = self.parent_index_in_state(instance.parent_index);
     }
 
     /// A stored value with every reference by position at the position its
@@ -1188,18 +1400,371 @@ impl Moved {
     }
 }
 
-/// The instances each thread holds as a document while it digests them: few,
-/// since a document's instance takes a hundred times its digest.
-const DIGESTED_AT_ONCE: usize = 256;
+/// Fast deterministic 128-bit in-memory hasher (two independent keyed AHashers)
+/// for comparing document rows within a process. On-disk store digests in `blocks`
+/// continue to use SHA-256.
+const ROW_HASH_A: ahash::RandomState = ahash::RandomState::with_seeds(
+    0x243f_6a88_85a3_08d3,
+    0x1319_8a2e_0370_7344,
+    0xa409_3822_299f_31d0,
+    0x082e_fa98_ec4e_6c89,
+);
+const ROW_HASH_B: ahash::RandomState = ahash::RandomState::with_seeds(
+    0x4528_21e6_38d0_1377,
+    0xbe54_66cf_34e9_0c6c,
+    0xc0ac_29b7_c97c_50dd,
+    0x3f84_d5b5_b547_0917,
+);
 
-/// The digest of each instance of the state's document, chunk by chunk: the
-/// document is never whole in memory.
+pub(super) struct RowHasher(ahash::AHasher, ahash::AHasher);
+
+impl RowHasher {
+    #[inline]
+    pub(super) fn new() -> Self {
+        Self(ROW_HASH_A.build_hasher(), ROW_HASH_B.build_hasher())
+    }
+
+    #[inline]
+    pub(super) fn update(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+        self.1.write(bytes);
+    }
+
+    /// Feeds a long string (`>= blocks::POOL_MIN_BYTES`) by its 16-byte SHA-256 hash
+    /// (`blocks::digest`), prefixed with `u64::MAX` so it is domain-separated from all
+    /// short strings (whose length is `< POOL_MIN_BYTES < u64::MAX`).
+    #[inline]
+    pub(super) fn update_long_hash(&mut self, hash: &[u8; 16]) {
+        self.update(&u64::MAX.to_le_bytes());
+        self.update(hash);
+    }
+
+    #[inline]
+    pub(super) fn finish(self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&self.0.finish().to_le_bytes());
+        out[8..].copy_from_slice(&self.1.finish().to_le_bytes());
+        out
+    }
+}
+
+impl DigestSink for RowHasher {
+    #[inline]
+    fn update_bytes(&mut self, bytes: &[u8]) {
+        self.update(bytes);
+    }
+
+    #[inline]
+    fn update_text(&mut self, text: &str) {
+        if text.len() >= blocks::POOL_MIN_BYTES {
+            let hash = blocks::digest(&[text.as_bytes()]);
+            self.update_long_hash(&hash);
+        } else {
+            self.update(&(text.len() as u64).to_le_bytes());
+            self.update(text.as_bytes());
+        }
+    }
+}
+
+/// Either a short borrowed string or a precomputed 16-byte SHA-256 hash of a long/pooled string.
+#[derive(Clone, Copy)]
+pub(super) enum StrOrHash<'a> {
+    Text(&'a str),
+    Hash([u8; 16]),
+}
+
+#[inline]
+fn digest_str_or_hash_into(h: &mut RowHasher, item: StrOrHash<'_>) {
+    match item {
+        StrOrHash::Text(t) => crate::settings::equivalence::digest_text(h, t),
+        StrOrHash::Hash(hash) => h.update_long_hash(&hash),
+    }
+}
+
+#[inline]
+pub(super) fn digest_long_string_hash(hash: &[u8; 16]) -> [u8; 16] {
+    let mut h = RowHasher::new();
+    h.update(&[5]);
+    h.update_long_hash(hash);
+    h.finish()
+}
+
+#[inline]
+pub(super) fn digest_two_string_object_with_hashes(
+    k0: &str,
+    v0: StrOrHash<'_>,
+    k1: &str,
+    v1: StrOrHash<'_>,
+) -> [u8; 16] {
+    use crate::settings::equivalence::digest_text;
+    let mut h = RowHasher::new();
+    h.update(&[7]);
+    if k0 == k1 {
+        h.update(&1_u64.to_le_bytes());
+        digest_text(&mut h, k1);
+        h.update(&[5]);
+        digest_str_or_hash_into(&mut h, v1);
+    } else if k0 < k1 {
+        h.update(&2_u64.to_le_bytes());
+        digest_text(&mut h, k0);
+        h.update(&[5]);
+        digest_str_or_hash_into(&mut h, v0);
+        digest_text(&mut h, k1);
+        h.update(&[5]);
+        digest_str_or_hash_into(&mut h, v1);
+    } else {
+        h.update(&2_u64.to_le_bytes());
+        digest_text(&mut h, k1);
+        h.update(&[5]);
+        digest_str_or_hash_into(&mut h, v1);
+        digest_text(&mut h, k0);
+        h.update(&[5]);
+        digest_str_or_hash_into(&mut h, v0);
+    }
+    h.finish()
+}
+
+#[inline]
+pub(super) fn cached_long_hash(
+    text: &str,
+    long_hashes: &blocks::ShardedMap<(usize, usize), [u8; 16]>,
+) -> [u8; 16] {
+    let key = (text.as_ptr() as usize, text.len());
+    if let Some(cached) = long_hashes.get(&key) {
+        return cached;
+    }
+    let computed = blocks::digest(&[text.as_bytes()]);
+    long_hashes.insert(key, computed);
+    computed
+}
+
+pub(super) static EMPTY_ATTRIBUTES_DIGEST: LazyLock<[u8; 16]> =
+    LazyLock::new(|| attributes_digest(&Map::new()));
+pub(super) static NULL_VALUE_DIGEST: LazyLock<[u8; 16]> = LazyLock::new(|| {
+    let mut h = RowHasher::new();
+    h.update(&[0]);
+    h.finish()
+});
+pub(super) static BOOL_FALSE_DIGEST: LazyLock<[u8; 16]> = LazyLock::new(|| {
+    let mut h = RowHasher::new();
+    h.update(&[1, 0]);
+    h.finish()
+});
+pub(super) static BOOL_TRUE_DIGEST: LazyLock<[u8; 16]> = LazyLock::new(|| {
+    let mut h = RowHasher::new();
+    h.update(&[1, 1]);
+    h.finish()
+});
+
+#[inline]
+pub(super) fn row_digest_header(
+    name: &str,
+    class_name: &str,
+    parent_index: Option<usize>,
+) -> RowHasher {
+    use crate::settings::equivalence::digest_text;
+
+    let mut digest = RowHasher::new();
+    digest_text(&mut digest, name);
+    digest_text(&mut digest, class_name);
+    digest.update(
+        &parent_index
+            .map_or(0, |parent| parent as u64 + 1)
+            .to_le_bytes(),
+    );
+    digest
+}
+
+#[inline]
+pub(super) fn digest_i64_value(value: i64) -> [u8; 16] {
+    let mut h = RowHasher::new();
+    if value >= 0 {
+        h.update(&[2]);
+        h.update(&(value as u64).to_le_bytes());
+    } else {
+        h.update(&[3]);
+        h.update(&value.to_le_bytes());
+    }
+    h.finish()
+}
+
+#[inline]
+pub(super) fn digest_u64_value(value: u64) -> [u8; 16] {
+    let mut h = RowHasher::new();
+    h.update(&[2]);
+    h.update(&value.to_le_bytes());
+    h.finish()
+}
+
+#[inline]
+fn digest_f64_into(h: &mut RowHasher, value: f64) {
+    if value.is_finite() {
+        h.update(&[4]);
+        h.update(&value.to_bits().to_le_bytes());
+    } else {
+        crate::settings::equivalence::digest_value(h, &nonfinite_float_json(value));
+    }
+}
+
+#[inline]
+pub(super) fn digest_f64_value(value: f64) -> [u8; 16] {
+    let mut h = RowHasher::new();
+    digest_f64_into(&mut h, value);
+    h.finish()
+}
+
+#[inline]
+pub(super) fn digest_string_value(text: &str) -> [u8; 16] {
+    let mut h = RowHasher::new();
+    h.update(&[5]);
+    crate::settings::equivalence::digest_text(&mut h, text);
+    h.finish()
+}
+
+#[inline]
+pub(super) fn digest_two_string_object_value(k0: &str, v0: &str, k1: &str, v1: &str) -> [u8; 16] {
+    use crate::settings::equivalence::digest_text;
+    let mut h = RowHasher::new();
+    h.update(&[7]);
+    if k0 == k1 {
+        h.update(&1_u64.to_le_bytes());
+        digest_text(&mut h, k1);
+        h.update(&[5]);
+        digest_text(&mut h, v1);
+    } else if k0 < k1 {
+        h.update(&2_u64.to_le_bytes());
+        digest_text(&mut h, k0);
+        h.update(&[5]);
+        digest_text(&mut h, v0);
+        digest_text(&mut h, k1);
+        h.update(&[5]);
+        digest_text(&mut h, v1);
+    } else {
+        h.update(&2_u64.to_le_bytes());
+        digest_text(&mut h, k1);
+        h.update(&[5]);
+        digest_text(&mut h, v1);
+        digest_text(&mut h, k0);
+        h.update(&[5]);
+        digest_text(&mut h, v0);
+    }
+    h.finish()
+}
+
+#[inline]
+pub(super) fn digest_enum_value(name: &str) -> [u8; 16] {
+    digest_two_string_object_value("_type", "EnumItem", "name", name)
+}
+
+#[inline]
+pub(super) fn digest_unique_id_value(id: &str) -> [u8; 16] {
+    digest_two_string_object_value("_type", "UniqueId", "value", id)
+}
+
+#[inline]
+pub(super) fn digest_ref_one_based(one_based: u64) -> [u8; 16] {
+    use crate::settings::equivalence::digest_text;
+    let mut h = RowHasher::new();
+    h.update(&[7]);
+    h.update(&2_u64.to_le_bytes());
+    digest_text(&mut h, "_type");
+    h.update(&[5]);
+    digest_text(&mut h, "Ref");
+    digest_text(&mut h, "instanceIndex");
+    h.update(&[2]);
+    h.update(&one_based.to_le_bytes());
+    h.finish()
+}
+
+#[inline]
+pub(super) fn digest_ref_value(index: usize) -> [u8; 16] {
+    digest_ref_one_based(index as u64 + 1)
+}
+
+/// Digests a fixed numeric type directly in `serde_json::Map` (`BTreeMap`) alphabetical key order,
+/// producing the exact same `[u8; 16]` as `value_digest(&fixed_value(...))`.
+#[inline]
+pub(super) fn digest_fixed_floats_value(kind: u8, components: &[f32]) -> [u8; 16] {
+    use crate::settings::equivalence::digest_text;
+    let mut h = RowHasher::new();
+    h.update(&[7]);
+    if kind == 16 {
+        h.update(&2_u64.to_le_bytes());
+        digest_text(&mut h, "_type");
+        h.update(&[5]);
+        digest_text(&mut h, "CFrame");
+        digest_text(&mut h, "components");
+        h.update(&[6]);
+        h.update(&12_u64.to_le_bytes());
+        for &c in components {
+            digest_f64_into(&mut h, f64::from(c));
+        }
+        return h.finish();
+    }
+    let (type_name, fields): (&str, &[(&str, usize)]) = match kind {
+        11 => ("Vector2", &[("x", 0), ("y", 1)]),
+        12 => ("Vector3", &[("x", 0), ("y", 1), ("z", 2)]),
+        13 => ("UDim", &[("offset", 1), ("scale", 0)]),
+        14 => (
+            "UDim2",
+            &[("xOffset", 1), ("xScale", 0), ("yOffset", 3), ("yScale", 2)],
+        ),
+        15 => ("Color3", &[("b", 2), ("g", 1), ("r", 0)]),
+        18 => (
+            "Rect",
+            &[("maxX", 2), ("maxY", 3), ("minX", 0), ("minY", 1)],
+        ),
+        _ => unreachable!("unexpected fixed numeric kind {kind}"),
+    };
+    h.update(&((fields.len() + 1) as u64).to_le_bytes());
+    digest_text(&mut h, "_type");
+    h.update(&[5]);
+    digest_text(&mut h, type_name);
+    for &(field, idx) in fields {
+        digest_text(&mut h, field);
+        digest_f64_into(&mut h, f64::from(components[idx]));
+    }
+    h.finish()
+}
+
+/// Digests a CFrame with 3 f32 position components and 9 f64 rotation components (from a rotation table).
+#[inline]
+pub(super) fn digest_cframe_f64_value(pos: [f32; 3], rot: &[f64; 9]) -> [u8; 16] {
+    use crate::settings::equivalence::digest_text;
+    let mut h = RowHasher::new();
+    h.update(&[7]);
+    h.update(&2_u64.to_le_bytes());
+    digest_text(&mut h, "_type");
+    h.update(&[5]);
+    digest_text(&mut h, "CFrame");
+    digest_text(&mut h, "components");
+    h.update(&[6]);
+    h.update(&12_u64.to_le_bytes());
+    for c in pos {
+        digest_f64_into(&mut h, f64::from(c));
+    }
+    for &c in rot {
+        digest_f64_into(&mut h, c);
+    }
+    h.finish()
+}
+
+/// The instances each thread digests in one task.
+const DIGESTED_AT_ONCE: usize = 512;
+
+/// The digest of each instance of the state's document, chunk by chunk directly
+/// from `ServiceState` without allocating JSON trees for native/scalar values.
+/// Returns `((values_digest, unique_id_digest, engine_state_digest) per instance, shared long-string SHA-256 cache)`.
+#[allow(clippy::type_complexity)]
 fn document_row_digests(
     state: &ServiceState,
     records: &[SettingsBinaryInstance<'_>],
     lookup: &SettingsBinaryInstanceLookup<'_>,
     stored_len: usize,
-) -> Result<Vec<([u8; 16], [u8; 16])>> {
+) -> Result<(
+    Vec<([u8; 16], [u8; 16], [u8; 16])>,
+    Arc<blocks::ShardedMap<(usize, usize), [u8; 16]>>,
+)> {
     let _span = crate::app::profile::span("captured store instance digests");
     let budget = DecodeBudget::for_file(stored_len);
     let scope = ConversionScope {
@@ -1209,16 +1774,401 @@ fn document_row_digests(
         string_ids: &SettingsStringIdMap::default(),
         wire_bytes: None,
     };
+    let database = rbx_reflection_database::get().ok();
+    let long_hashes = Arc::new(blocks::ShardedMap::<(usize, usize), [u8; 16]>::new());
     let chunks = records
         .par_chunks(DIGESTED_AT_ONCE)
-        .map(|records| {
-            Ok(convert_chunk(state, records, scope)?
-                .iter()
-                .map(document_row_digest)
-                .collect::<Vec<_>>())
-        })
+        .map(|records| digest_captured_chunk(state, records, scope, database, &long_hashes))
         .collect::<Result<Vec<_>>>()?;
-    Ok(chunks.into_iter().flatten().collect())
+    let mut out = Vec::with_capacity(records.len());
+    for chunk in chunks {
+        out.extend(chunk);
+    }
+    Ok((out, long_hashes))
+}
+
+/// Fast zero-allocation digest for simple attributes (`Bool`, finite `Number`, `String`,
+/// fixed-numeric typed objects). Returns `None` if any attribute requires `normalize_complex`.
+fn try_digest_simple_attributes(
+    attributes: &Map<String, Value>,
+    long_hashes: &blocks::ShardedMap<(usize, usize), [u8; 16]>,
+    charged: &mut usize,
+) -> Result<Option<[u8; 16]>> {
+    use crate::settings::equivalence::digest_text;
+
+    let mut h = RowHasher::new();
+    h.update(&(attributes.len() as u64).to_le_bytes());
+    let mut cost = attributes.len().saturating_mul(VALUE_SLOT_BYTES);
+    for (name, value) in attributes {
+        check_settings_string_len(name.len())?;
+        cost = cost.saturating_add(name.len());
+        digest_text(&mut h, name);
+        match value {
+            Value::Bool(b) => h.update(&[1, u8::from(*b)]),
+            Value::Number(n) => {
+                if let Some(u) = n.as_u64() {
+                    h.update(&[2]);
+                    h.update(&u.to_le_bytes());
+                } else if let Some(i) = n.as_i64() {
+                    h.update(&[3]);
+                    h.update(&i.to_le_bytes());
+                } else if let Some(f) = n.as_f64().filter(|f| f.is_finite()) {
+                    digest_f64_into(&mut h, f);
+                } else {
+                    return Ok(None);
+                }
+            }
+            Value::String(s) => {
+                check_settings_string_len(s.len())?;
+                h.update(&[5]);
+                if s.len() >= blocks::POOL_MIN_BYTES {
+                    let hash = cached_long_hash(s, long_hashes);
+                    h.update_long_hash(&hash);
+                    cost = cost.saturating_add(16);
+                } else {
+                    digest_text(&mut h, s);
+                    cost = cost.saturating_add(s.len());
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+    *charged = charged.saturating_add(cost);
+    Ok(Some(h.finish()))
+}
+
+fn digest_captured_chunk<'a>(
+    state: &'a ServiceState,
+    records: &[SettingsBinaryInstance<'a>],
+    scope: ConversionScope<'_, '_>,
+    database: Option<&rbx_reflection::ReflectionDatabase<'_>>,
+    long_hashes: &LongHashMap,
+) -> Result<Vec<CapturedRowDigest>> {
+    use crate::settings::equivalence::digest_text;
+
+    let mut sources: Vec<(&'a str, u8, SettingsBinaryValueSource<'a>)> = Vec::new();
+    let mut scratch = Vec::new();
+    let mut shared_digests = AHashMap::<usize, [u8; 16]>::new();
+    let mut out = Vec::with_capacity(records.len());
+    let mut charged = 0_usize;
+    let empty_attr = *EMPTY_ATTRIBUTES_DIGEST;
+
+    for record in records {
+        let id_len = match &record.settings_id {
+            SettingsBinaryId::Text(text) => {
+                check_settings_string_len(text.len())?;
+                text.len()
+            }
+            SettingsBinaryId::NumericDebug(id) => 8 + decimal_digits(*id),
+        };
+        check_settings_string_len(record.name.len())?;
+        check_settings_string_len(record.class_name.len())?;
+        charged = charged.saturating_add(id_len + record.name.len() + record.class_name.len());
+
+        sources.clear();
+        visit_settings_binary_properties(state, record, scope.lookup, |name, kind, source| {
+            if !SETTINGS_RECORD_FIELDS.contains(&name) {
+                sources.push((name, kind, source));
+            }
+            Ok(())
+        })?;
+        sources.sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        if sources
+            .windows(2)
+            .any(|pair| (pair[0].0, pair[0].1) == (pair[1].0, pair[1].1))
+        {
+            next_group_instance(0, 0, 1)?;
+        }
+
+        let mut row_hash = row_digest_header(record.name, record.class_name, record.parent_index);
+        let mut engine_hash: Option<RowHasher> = None;
+        let mut unique_id = [0u8; 16];
+        let mut attr_digest = empty_attr;
+
+        let len = sources.len();
+        for idx in 0..len {
+            let (name, kind, ref source) = sources[idx];
+            if name == "Attributes" && kind == 8 {
+                if let SettingsBinaryValueSource::Attributes(attrs) = source
+                    && let Some(fast) =
+                        try_digest_simple_attributes(attrs, long_hashes, &mut charged)?
+                {
+                    attr_digest = fast;
+                    continue;
+                }
+                let Value::Object(attributes) =
+                    normalize_complex(source, kind, true, scope, &mut scratch)?
+                else {
+                    bail!("Expected decoded attributes");
+                };
+                attr_digest = attributes_digest(&attributes);
+                continue;
+            }
+            let overwritten = idx + 1 < len
+                && sources[idx + 1].0 == name
+                && !(sources[idx + 1].0 == "Attributes" && sources[idx + 1].1 == 8);
+            let digest = digest_captured_source(
+                source,
+                kind,
+                scope,
+                &mut scratch,
+                &mut charged,
+                &mut shared_digests,
+                long_hashes,
+            )?;
+            if overwritten {
+                continue;
+            }
+            if name == UNIQUE_ID {
+                unique_id = digest;
+            } else if is_digested_with_db(database, record.class_name, name) {
+                row_hash.update(&[1]);
+                digest_text(&mut row_hash, name);
+                row_hash.update(&digest);
+            } else {
+                let eh = engine_hash.get_or_insert_with(RowHasher::new);
+                eh.update(&[1]);
+                digest_text(eh, name);
+                eh.update(&digest);
+            }
+        }
+        row_hash.update(&[0]);
+        row_hash.update(&attr_digest);
+        out.push((
+            row_hash.finish(),
+            unique_id,
+            engine_hash.map_or([0; 16], RowHasher::finish),
+        ));
+    }
+    scope.budget.take(charged)?;
+    Ok(out)
+}
+
+#[inline]
+fn decimal_digits(mut n: u64) -> usize {
+    let mut d = 1;
+    while n >= 10 {
+        n /= 10;
+        d += 1;
+    }
+    d
+}
+
+fn digest_captured_source(
+    source: &SettingsBinaryValueSource<'_>,
+    kind: u8,
+    scope: ConversionScope<'_, '_>,
+    scratch: &mut Vec<u8>,
+    charged: &mut usize,
+    shared_digests: &mut AHashMap<usize, [u8; 16]>,
+    long_hashes: &blocks::ShardedMap<(usize, usize), [u8; 16]>,
+) -> Result<[u8; 16]> {
+    match source {
+        SettingsBinaryValueSource::Native(native) => match native {
+            NativeSettingsValue::Bool(false) => Ok(*BOOL_FALSE_DIGEST),
+            NativeSettingsValue::Bool(true) => Ok(*BOOL_TRUE_DIGEST),
+            NativeSettingsValue::Int(v) => Ok(digest_i64_value(*v)),
+            NativeSettingsValue::Float32(v) => Ok(digest_f64_value(f64::from(*v))),
+            NativeSettingsValue::Float64(v) => Ok(digest_f64_value(*v)),
+            NativeSettingsValue::String(s) => {
+                check_settings_string_len(s.len())?;
+                if s.len() >= blocks::POOL_MIN_BYTES {
+                    *charged = charged.saturating_add(16);
+                    let hash = cached_long_hash(s, long_hashes);
+                    Ok(digest_long_string_hash(&hash))
+                } else {
+                    *charged = charged.saturating_add(s.len());
+                    Ok(digest_string_value(s))
+                }
+            }
+            NativeSettingsValue::Enum(s) => {
+                check_settings_string_len(s.len())?;
+                *charged = charged.saturating_add(s.len());
+                Ok(digest_enum_value(s))
+            }
+            NativeSettingsValue::UniqueId(s) => {
+                check_settings_string_len(s.len())?;
+                *charged = charged.saturating_add(
+                    2 * VALUE_SLOT_BYTES
+                        + "_type".len()
+                        + "UniqueId".len()
+                        + "value".len()
+                        + s.len(),
+                );
+                Ok(digest_unique_id_value(s))
+            }
+            NativeSettingsValue::Ref(index) => {
+                check_resolved_ref_index(*index, scope.instance_count)?;
+                Ok(digest_ref_value(*index))
+            }
+            NativeSettingsValue::Vector2(c) => Ok(digest_fixed_floats_value(11, c)),
+            NativeSettingsValue::Vector3(c) => Ok(digest_fixed_floats_value(12, c)),
+            NativeSettingsValue::UDim(c) => Ok(digest_fixed_floats_value(13, c)),
+            NativeSettingsValue::UDim2(c) => Ok(digest_fixed_floats_value(14, c)),
+            NativeSettingsValue::Color3(c) => Ok(digest_fixed_floats_value(15, c)),
+            NativeSettingsValue::CFrame(c) => Ok(digest_fixed_floats_value(16, c.as_ref())),
+            NativeSettingsValue::Rect(c) => Ok(digest_fixed_floats_value(18, c)),
+            NativeSettingsValue::Shared(arc) => {
+                let ptr = Arc::as_ptr(arc) as usize;
+                if let Some(&digest) = shared_digests.get(&ptr) {
+                    return Ok(digest);
+                }
+                let digest = if let Some(obj) = arc.as_object()
+                    && obj.len() == 2
+                    && let Some(ty) = obj.get("_type").and_then(Value::as_str)
+                    && matches!(ty, "SharedString" | "BinaryString")
+                    && let Some(b64) = obj.get("base64").and_then(Value::as_str)
+                {
+                    let v1 = if b64.len() >= blocks::POOL_MIN_BYTES {
+                        StrOrHash::Hash(cached_long_hash(b64, long_hashes))
+                    } else {
+                        StrOrHash::Text(b64)
+                    };
+                    digest_two_string_object_with_hashes("_type", StrOrHash::Text(ty), "base64", v1)
+                } else {
+                    value_digest(arc)
+                };
+                shared_digests.insert(ptr, digest);
+                Ok(digest)
+            }
+        },
+        SettingsBinaryValueSource::Property(_) | SettingsBinaryValueSource::Settled(_) => {
+            let (value, is_borrowed_property): (&Value, bool) = match source {
+                SettingsBinaryValueSource::Property(value) => (value, true),
+                SettingsBinaryValueSource::Settled(value) => (value.as_ref(), false),
+                _ => unreachable!(),
+            };
+            match kind {
+                0 => Ok(*NULL_VALUE_DIGEST),
+                1 => Ok(*BOOL_FALSE_DIGEST),
+                2 => Ok(*BOOL_TRUE_DIGEST),
+                3..=5 | 20 => Ok(value_digest(value)),
+                6 => {
+                    let text = raw_string_payload(value)
+                        .context("Expected string binary settings value")?;
+                    check_settings_string_len(text.len())?;
+                    if text.len() >= blocks::POOL_MIN_BYTES {
+                        *charged = charged.saturating_add(16);
+                        let hash = cached_long_hash(text, long_hashes);
+                        Ok(digest_long_string_hash(&hash))
+                    } else {
+                        *charged = charged.saturating_add(text.len());
+                        Ok(digest_string_value(text))
+                    }
+                }
+                19 => {
+                    let text =
+                        raw_string_payload(value).context("Expected enum binary settings value")?;
+                    check_settings_string_len(text.len())?;
+                    *charged = charged.saturating_add(text.len());
+                    Ok(digest_enum_value(text))
+                }
+                17 => {
+                    let reference =
+                        ref_payload_object(value).context("Expected Ref binary settings value")?;
+                    let index = resolve_ref_index(reference, scope.lookup)?
+                        .context("Expected resolved Ref binary settings value")?;
+                    check_resolved_ref_index(index, scope.instance_count)?;
+                    Ok(digest_ref_value(index))
+                }
+                11..=16 | 18 => {
+                    if kind == 16 {
+                        let bits = cframe_component_bits(value)?;
+                        return Ok(digest_fixed_floats_value(16, &bits.map(f32::from_bits)));
+                    }
+                    let fixed =
+                        fixed_numeric_kind_from_tag(kind).context("Expected fixed numeric kind")?;
+                    let fields = fixed_fields(fixed).1;
+                    let object = value
+                        .as_object()
+                        .context("Expected fixed numeric binary settings value")?;
+                    let mut components = [0_f32; 4];
+                    for (index, field) in fields.iter().enumerate() {
+                        components[index] = fixed_numeric_component_f32(
+                            settings_number(object.get(*field).unwrap_or(&Value::Null))
+                                .with_context(|| format!("Expected numeric field {field}"))?,
+                        );
+                    }
+                    Ok(digest_fixed_floats_value(kind, &components[..fields.len()]))
+                }
+                7 => {
+                    if let Some(items) = value.as_array()
+                        && items.iter().all(Value::is_string)
+                    {
+                        let mut h = RowHasher::new();
+                        h.update(&[6]);
+                        h.update(&(items.len() as u64).to_le_bytes());
+                        let mut cost = items.len().saturating_mul(VALUE_SLOT_BYTES);
+                        for item in items {
+                            let s = item.as_str().unwrap();
+                            check_settings_string_len(s.len())?;
+                            h.update(&[5]);
+                            if s.len() >= blocks::POOL_MIN_BYTES {
+                                let hash = cached_long_hash(s, long_hashes);
+                                h.update_long_hash(&hash);
+                                cost = cost.saturating_add(16);
+                            } else {
+                                crate::settings::equivalence::digest_text(&mut h, s);
+                                cost = cost.saturating_add(s.len());
+                            }
+                        }
+                        *charged = charged.saturating_add(cost);
+                        return Ok(h.finish());
+                    }
+                    let val = normalize_complex(source, kind, false, scope, scratch)?;
+                    Ok(value_digest(&val))
+                }
+                8 if is_borrowed_property => {
+                    if let Some(obj) = value.as_object()
+                        && obj.len() == 2
+                        && let Some(ty) = obj.get("_type").and_then(Value::as_str)
+                        && matches!(ty, "SharedString" | "BinaryString")
+                        && let Some(b64) = obj.get("base64").and_then(Value::as_str)
+                    {
+                        let ptr = value as *const Value as usize;
+                        let slot_cost = 2 * VALUE_SLOT_BYTES
+                            + "_type".len()
+                            + ty.len()
+                            + "base64".len()
+                            + if b64.len() >= blocks::POOL_MIN_BYTES {
+                                16
+                            } else {
+                                b64.len()
+                            };
+                        if let Some(&digest) = shared_digests.get(&ptr) {
+                            *charged = charged.saturating_add(slot_cost);
+                            return Ok(digest);
+                        }
+                        check_settings_string_len(b64.len())?;
+                        let v1 = if b64.len() >= blocks::POOL_MIN_BYTES {
+                            StrOrHash::Hash(cached_long_hash(b64, long_hashes))
+                        } else {
+                            StrOrHash::Text(b64)
+                        };
+                        let digest = digest_two_string_object_with_hashes(
+                            "_type",
+                            StrOrHash::Text(ty),
+                            "base64",
+                            v1,
+                        );
+                        shared_digests.insert(ptr, digest);
+                        *charged = charged.saturating_add(slot_cost);
+                        return Ok(digest);
+                    }
+                    let val = normalize_complex(source, kind, false, scope, scratch)?;
+                    Ok(value_digest(&val))
+                }
+                _ => {
+                    let val = property_value(value, source, kind, scope, scratch)?;
+                    Ok(value_digest(&val))
+                }
+            }
+        }
+        SettingsBinaryValueSource::Attributes(_) => {
+            let val = normalize_complex(source, kind, true, scope, scratch)?;
+            Ok(value_digest(&val))
+        }
+    }
 }
 
 /// The digest of one instance of a document: its name, class and parent, and
@@ -1239,6 +2189,7 @@ pub(super) fn whole_document_row_digest(
 }
 
 fn instance_digest(instance: &SettingsBytecodeInstance, whole: bool) -> ([u8; 16], [u8; 16]) {
+    let database = rbx_reflection_database::get().ok();
     (
         row_digest(
             instance,
@@ -1246,10 +2197,15 @@ fn instance_digest(instance: &SettingsBytecodeInstance, whole: bool) -> ([u8; 16
                 .properties
                 .iter()
                 .filter(|(name, _)| {
-                    whole && name.as_str() != UNIQUE_ID || is_digested(&instance.class_name, name)
+                    whole && name.as_str() != UNIQUE_ID
+                        || is_digested_with_db(database, &instance.class_name, name)
                 })
                 .map(|(name, value)| (name.as_str(), value_digest(value))),
-            attributes_digest(&instance.attributes),
+            if instance.attributes.is_empty() {
+                *EMPTY_ATTRIBUTES_DIGEST
+            } else {
+                attributes_digest(&instance.attributes)
+            },
         ),
         instance
             .properties
@@ -1262,11 +2218,18 @@ fn instance_digest(instance: &SettingsBytecodeInstance, whole: bool) -> ([u8; 16
 /// and not what the engine alone sets, which Studio computes anew whenever
 /// it loads the instance and no comparison looks at.
 pub(super) fn is_digested(class_name: &str, name: &str) -> bool {
+    is_digested_with_db(rbx_reflection_database::get().ok(), class_name, name)
+}
+
+#[inline]
+pub(super) fn is_digested_with_db(
+    database: Option<&rbx_reflection::ReflectionDatabase<'_>>,
+    class_name: &str,
+    name: &str,
+) -> bool {
     name != UNIQUE_ID
         && !crate::settings::equivalence::reconciliation_property_is_always_engine_state(
-            rbx_reflection_database::get().ok(),
-            class_name,
-            name,
+            database, class_name, name,
         )
 }
 
@@ -1282,39 +2245,36 @@ pub(super) fn row_digest<'a>(
 ) -> [u8; 16] {
     use crate::settings::equivalence::digest_text;
 
-    let mut digest = Sha256::new();
-    digest_text(&mut digest, &instance.name);
-    digest_text(&mut digest, &instance.class_name);
-    digest.update(
-        instance
-            .parent_index
-            .map_or(0, |parent| parent as u64 + 1)
-            .to_le_bytes(),
-    );
+    let mut digest = row_digest_header(&instance.name, &instance.class_name, instance.parent_index);
     for (name, value) in properties {
-        digest.update([1]);
+        digest.update(&[1]);
         digest_text(&mut digest, name);
-        digest.update(value);
+        digest.update(&value);
     }
-    digest.update([0]);
-    digest.update(attributes);
-    half_digest(digest)
+    digest.update(&[0]);
+    digest.update(&attributes);
+    digest.finish()
 }
 
 /// A payload held once is digested once for the process.
 pub(super) fn value_digest(value: &Value) -> [u8; 16] {
     let of = |value: &Value| {
-        let mut digest = Sha256::new();
+        let mut digest = RowHasher::new();
         crate::settings::equivalence::digest_value(&mut digest, value);
-        half_digest(digest)
+        digest.finish()
     };
     crate::settings::held::digest_once(value, of).unwrap_or_else(|| of(value))
 }
 
 pub(super) fn attributes_digest(attributes: &Map<String, Value>) -> [u8; 16] {
-    let mut digest = Sha256::new();
+    if attributes.is_empty() {
+        let mut digest = RowHasher::new();
+        crate::settings::equivalence::digest_map(&mut digest, attributes);
+        return digest.finish();
+    }
+    let mut digest = RowHasher::new();
     crate::settings::equivalence::digest_map(&mut digest, attributes);
-    half_digest(digest)
+    digest.finish()
 }
 
 pub(super) fn half_digest(digest: Sha256) -> [u8; 16] {
@@ -1322,21 +2282,229 @@ pub(super) fn half_digest(digest: Sha256) -> [u8; 16] {
     <[u8; 16]>::try_from(&whole[..16]).unwrap()
 }
 
+fn split_fast_fallback(
+    fast_results: Option<&[FastCompareEntry]>,
+    changed: &[usize],
+    rows: &[usize],
+    stored_at: &[usize],
+) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let Some(fast) = fast_results else {
+        return (Vec::new(), rows.to_vec(), stored_at.to_vec());
+    };
+    let mut fpos = Vec::new();
+    let mut frows = Vec::new();
+    let mut fstored = Vec::new();
+    for (pos, res) in fast.iter().enumerate() {
+        if res.is_none() {
+            fpos.push(pos);
+            frows.push(changed[pos]);
+            fstored.push(changed[pos]);
+        }
+    }
+    (fpos, frows, fstored)
+}
+
+fn plan_compare_batches(
+    fallback_rows: &[usize],
+    fallback_stored_at: &[usize],
+    blocks_ref: Option<&blocks::RowBatches<'_>>,
+) -> Vec<std::ops::Range<usize>> {
+    if fallback_rows.is_empty() {
+        return Vec::new();
+    }
+    let batch_size = COMPARED_AT_ONCE;
+    if let Some(blocks_ref) = blocks_ref
+        && fallback_stored_at.windows(2).all(|w| w[0] < w[1])
+    {
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        while start < fallback_stored_at.len() {
+            let mut end = start;
+            let mut last_block = blocks_ref.block_of(fallback_stored_at[start]);
+            let mut last_boundary = start;
+            while end < fallback_stored_at.len() && end - start < batch_size {
+                let blk = blocks_ref.block_of(fallback_stored_at[end]);
+                if blk != last_block {
+                    last_boundary = end;
+                    last_block = blk;
+                }
+                end += 1;
+            }
+            let cut = if end < fallback_stored_at.len()
+                && blocks_ref.block_of(fallback_stored_at[end]) == last_block
+                && last_boundary > start
+            {
+                last_boundary
+            } else {
+                end
+            };
+            ranges.push(start..cut);
+            start = cut;
+        }
+        return ranges;
+    }
+    (0..fallback_rows.len())
+        .step_by(batch_size)
+        .map(|start| start..(start + batch_size).min(fallback_rows.len()))
+        .collect()
+}
+
+fn merge_fast_compare_results(
+    fast_results: Option<Vec<FastCompareEntry>>,
+    fallback_pos: Vec<usize>,
+    fallback_pairs: Vec<ComparedPair>,
+    fallback_compared: Vec<ComparedRowResult>,
+) -> (Vec<ComparedPair>, Vec<ComparedRowResult>) {
+    let Some(fast) = fast_results else {
+        return (fallback_pairs, fallback_compared);
+    };
+    let mut pairs: Vec<Option<ComparedPair>> = Vec::with_capacity(fast.len());
+    let mut compared: Vec<ComparedRowResult> = Vec::with_capacity(fast.len());
+    for item in fast {
+        match item {
+            Some((pair, flags)) => {
+                pairs.push(Some(pair));
+                compared.push(Ok(Some(flags)));
+            }
+            None => {
+                pairs.push(None);
+                compared.push(Ok(None));
+            }
+        }
+    }
+    for ((pos, pair), cmp) in fallback_pos
+        .into_iter()
+        .zip(fallback_pairs)
+        .zip(fallback_compared)
+    {
+        pairs[pos] = Some(pair);
+        compared[pos] = cmp;
+    }
+    (
+        pairs
+            .into_iter()
+            .map(|p| p.expect("every changed row resolved"))
+            .collect(),
+        compared,
+    )
+}
+
 /// The answer for a store whose instances are the stored ones but for
 /// `changed`, which hold other values, and for the viewport camera.
 /// `told_in_place` says whether the alignment's matching takes each instance
 /// for the stored one at its place, and is asked where the places do not.
+fn plan_unchanged_blocks(
+    structure_unchanged: bool,
+    record_count: usize,
+    exact_row_match: Option<&[bool]>,
+    from_remembered: bool,
+    changed: &[usize],
+    viewport_camera: Option<usize>,
+) -> Option<Vec<bool>> {
+    if !structure_unchanged || record_count == 0 {
+        return None;
+    }
+    let num_blocks = record_count.div_ceil(blocks::BLOCK_ROWS);
+    let mut unchanged = if let Some(exact) = exact_row_match {
+        (0..num_blocks)
+            .map(|b| {
+                let start = b * blocks::BLOCK_ROWS;
+                let end = (start + blocks::BLOCK_ROWS).min(record_count);
+                exact[start..end].iter().all(|&m| m)
+            })
+            .collect::<Vec<_>>()
+    } else if from_remembered {
+        let mut u = vec![true; num_blocks];
+        for &row in changed {
+            u[row / blocks::BLOCK_ROWS] = false;
+        }
+        u
+    } else {
+        vec![false; num_blocks]
+    };
+    if let Some(cam) = viewport_camera {
+        unchanged[cam / blocks::BLOCK_ROWS] = false;
+    }
+    Some(unchanged)
+}
+
+fn build_camera_compared_pair(
+    stored: &SettingsBytecodeInstance,
+    captured: &SettingsBytecodeInstance,
+    root_service: Option<&str>,
+) -> ComparedPair {
+    use crate::settings::equivalence::reconciliation_value_contains_reference as holds_reference;
+    let holds_a_reference = |instance: &SettingsBytecodeInstance| {
+        instance
+            .properties
+            .values()
+            .chain(instance.attributes.values())
+            .any(holds_reference)
+    };
+    ComparedPair {
+        placed: stored.name == captured.name
+            && stored.class_name == captured.class_name
+            && stored.parent_index == captured.parent_index,
+        same_class: stored.class_name == captured.class_name,
+        written_as_today: !crate::settings::equivalence::forced_property_differs(
+            &stored.properties,
+        ) && values_encode_alike(
+            &stored.properties,
+            &stored.attributes,
+            root_service,
+        ),
+        same_unique_id: stored.properties.get(UNIQUE_ID) == captured.properties.get(UNIQUE_ID),
+        holds_reference: holds_a_reference(stored) || holds_a_reference(captured),
+    }
+}
+
+fn precheck_namesakes_in_place(
+    paired: bool,
+    moved: Option<&crate::settings::bytecode::property_edit::Moved>,
+    read: Option<&ReadStore<'_>>,
+    places: &Places,
+    records: &[SettingsBinaryInstance<'_>],
+    stored_at_index: impl Fn(usize) -> Option<usize>,
+    check_told_in_place: &mut impl FnMut() -> bool,
+) -> Option<Option<Vec<bool>>> {
+    if paired || moved.is_some() {
+        return Some(None);
+    }
+    let Some(read) = read else {
+        return Some(None);
+    };
+    if places.ids == read.ids {
+        if (read.renamed || !places.kept_under_their_ids()) && !check_told_in_place() {
+            return None;
+        }
+        return Some(None);
+    }
+    if !read.renamed && places.kept_under_other_ids(&read.ids) {
+        return Some(None);
+    }
+    let namesakes_vec = places
+        .stored_identities_stand(&read.ids, read, stored_at_index)
+        .then(|| namesakes(records))
+        .flatten();
+    if namesakes_vec.is_none() && !check_told_in_place() {
+        return None;
+    }
+    Some(namesakes_vec)
+}
+
 fn changed_rows<'a>(
     state: &'a ServiceState,
     now: &PulledRows,
     (records, places, told_in_place): (Vec<SettingsBinaryInstance<'a>>, &Places, &dyn Fn() -> bool),
     changed: &[usize],
     stored: StoredRows<'_>,
+    existing_lookup: Option<&SettingsBinaryInstanceLookup<'_>>,
     store_gate: Option<&Mutex<()>>,
 ) -> Result<Option<SettingsAlignment>> {
     use crate::settings::bytecode::property_edit::RowBatches;
     use crate::settings::equivalence::{
         instance_lacks_enum_types, pulled_instance_values_unchanged,
+        pulled_instance_values_unchanged_with_cache,
         reconciliation_value_contains_reference as holds_reference,
     };
 
@@ -1385,54 +2553,43 @@ fn changed_rows<'a>(
         }
         *told_in_place_cached.get_or_insert_with(told_in_place)
     };
-    let precheck_other_ids_namesakes = if !paired
-        && moved.is_none()
-        && let Some(read) = read.as_ref()
-    {
-        let own = places.ids == read.ids;
-        if own {
-            if (read.renamed || !places.kept_under_their_ids()) && !check_told_in_place() {
-                return whole("nothing tells every instance for the stored one at its place");
-            }
-            None
-        } else {
-            let can_keep_other = !read.renamed && places.kept_under_other_ids(&read.ids);
-            if can_keep_other {
-                None
-            } else {
-                let namesakes_vec = places
-                    .stored_identities_stand(&read.ids, read, stored_at_index)
-                    .then(|| namesakes(&records))
-                    .flatten();
-                if namesakes_vec.is_none() && !check_told_in_place() {
-                    return whole("nothing tells every instance for the stored one at its place");
-                }
-                namesakes_vec
-            }
+    let precheck_other_ids_namesakes = match precheck_namesakes_in_place(
+        paired,
+        moved,
+        read.as_ref(),
+        places,
+        &records,
+        stored_at_index,
+        &mut check_told_in_place,
+    ) {
+        Some(namesakes) => namesakes,
+        None => return whole("nothing tells every instance for the stored one at its place"),
+    };
+    let preopened = read.as_mut().and_then(|read| {
+        let store = read.opened_store.take()?;
+        let structure = read.structure.take()?;
+        Some(blocks::RowBatches::from_opened(store, structure))
+    });
+    let mut stored_batches = preopened.map(RowBatches::from_blocks);
+    let mut first_stored_from_legacy: Option<Vec<SettingsBytecodeInstance>> = None;
+    let can_fast_compare = moved.is_none() && !paired && !rows.is_empty();
+    let ids = if let Some(read) = read.as_mut() {
+        std::mem::take(&mut read.ids)
+    } else {
+        if stored_batches.is_none() {
+            stored_batches = Some(RowBatches::open_holding(file)?);
         }
-    } else {
-        None
-    };
-    let first_batch_len = if precheck_other_ids_namesakes.is_some() && changed.len() > 256 {
-        64.min(COMPARED_AT_ONCE)
-    } else {
-        COMPARED_AT_ONCE
-    };
-    let (first_rows, rest_rows) = rows.split_at(rows.len().min(first_batch_len));
-    let (first_stored_at, rest_stored_at) =
-        stored_at.split_at(stored_at.len().min(first_batch_len));
-    let first = (!first_rows.is_empty()).then_some((first_rows, first_stored_at));
-    let batches = rest_rows
-        .chunks(COMPARED_AT_ONCE)
-        .zip(rest_stored_at.chunks(COMPARED_AT_ONCE));
-    // The store's instances are read once for all the batches.
-    let mut stored_batches = None;
-    let (first_stored, ids) = match (&mut read, first) {
-        (Some(read), None) => (Vec::new(), std::mem::take(&mut read.ids)),
-        (_, first) => {
-            let opened = stored_batches.insert(RowBatches::open(file)?);
-            let (stored_rows, ids) = opened.first(first.map_or(&[], |(_, stored_at)| stored_at))?;
-            (in_state(stored_rows), ids)
+        match stored_batches.as_ref().unwrap() {
+            RowBatches::Blocks(blocks_batches) => blocks_batches.ids(),
+            RowBatches::Columns(_) => {
+                let first_end = rows.len().min(COMPARED_AT_ONCE);
+                let (stored_rows, ids) = stored_batches
+                    .as_ref()
+                    .unwrap()
+                    .first(&stored_at[..first_end])?;
+                first_stored_from_legacy = Some(in_state(stored_rows));
+                ids
+            }
         }
     };
     // A pull leaves each instance the id its store holds it under.
@@ -1444,9 +2601,17 @@ fn changed_rows<'a>(
     } else {
         under_stored_ids(records, written_ids)
     };
-    let lookup = build_settings_binary_instance_lookup(state, &records);
+    let rebuilt_lookup = if own_ids && existing_lookup.is_some() {
+        None
+    } else {
+        Some(build_settings_binary_instance_lookup(state, &records))
+    };
+    let lookup = rebuilt_lookup
+        .as_ref()
+        .or(existing_lookup)
+        .expect("lookup available");
     let scope = ConversionScope {
-        lookup: &lookup,
+        lookup,
         instance_count: records.len(),
         budget: &budget,
         string_ids: &SettingsStringIdMap::default(),
@@ -1460,117 +2625,215 @@ fn changed_rows<'a>(
             .chain(instance.attributes.values())
             .any(holds_reference)
     };
-    // What each pair says, the camera's last where the state has one, and
-    // for each changed instance whether its values are the stored ones as a
-    // pull counts them.
-    let mut pairs = Vec::with_capacity(rows.len() + 1);
-    let mut same_values = Vec::with_capacity(changed.len());
-    let mut same_under_todays_names = true;
+    let long_hashes = read.as_mut().and_then(|r| r.long_hashes.take());
+    let fast_results: Option<Vec<FastCompareEntry>> = if can_fast_compare
+        && !changed.is_empty()
+        && let Some(blocks_batches) = stored_batches.as_ref().and_then(RowBatches::as_blocks)
+    {
+        Some(blocks_batches.fast_compare_changed(
+            state,
+            &records,
+            lookup,
+            changed,
+            root_service,
+            long_hashes.as_deref(),
+        )?)
+    } else {
+        None
+    };
+
+    if let (Some(fast), Some(namesakes_vec)) = (
+        fast_results.as_deref(),
+        precheck_other_ids_namesakes.as_ref(),
+    ) && fast.iter().zip(changed).any(|(entry, &row)| {
+        entry.as_ref().is_some_and(|(pair, (as_held, _))| {
+            !(*as_held && pair.placed) && (namesakes_vec[row] || pair.holds_reference)
+        })
+    }) && !check_told_in_place()
+    {
+        return whole("nothing tells every instance for the stored one at its place");
+    }
+
+    let (fallback_pos, fallback_rows, fallback_stored_at) =
+        split_fast_fallback(fast_results.as_deref(), changed, &rows, &stored_at);
+    let batch_ranges = plan_compare_batches(
+        &fallback_rows,
+        &fallback_stored_at,
+        stored_batches.as_ref().and_then(RowBatches::as_blocks),
+    );
+
+    let mut fallback_pairs = Vec::with_capacity(fallback_rows.len());
+    let mut fallback_compared = Vec::with_capacity(fallback_rows.len());
     let mut last = None;
-    let mut compare_batch = |batch_rows: &[usize],
-                             mut stored_rows: Vec<SettingsBytecodeInstance>|
-     -> Result<Option<&'static str>> {
-        let converted = crate::app::profile::span("changed rows converted");
-        let mut captured_rows = batch_rows
-            .par_iter()
-            .map(|row| convert_chunk(state, std::slice::from_ref(&records[*row]), scope))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        drop(converted);
+    let compare_limit = if fast_results.is_some() {
+        fallback_rows.len()
+    } else {
+        changed.len()
+    };
+    let mut compare_pair_batch = |mut stored_rows: Vec<SettingsBytecodeInstance>,
+                                  mut captured_rows: Vec<SettingsBytecodeInstance>,
+                                  out_pairs: &mut Vec<ComparedPair>,
+                                  out_compared: &mut Vec<ComparedRowResult>,
+                                  keep_last: bool| {
         let _span = crate::app::profile::span("changed rows compared");
-        let base_pair = pairs.len();
-        let unchanged = changed.len().saturating_sub(same_values.len());
+        let unchanged = compare_limit.saturating_sub(out_compared.len());
         let (said, values): (Vec<_>, Vec<_>) = stored_rows
             .par_iter()
             .zip(captured_rows.par_iter())
             .enumerate()
-            .map(|(index, (stored, captured))| {
-                let pair = ComparedPair {
-                    placed: stored.name == captured.name
-                        && stored.class_name == captured.class_name
-                        && stored.parent_index == captured.parent_index,
-                    same_class: stored.class_name == captured.class_name,
-                    written_as_today: !crate::settings::equivalence::forced_property_differs(
-                        &stored.properties,
-                    ) && values_encode_alike(
-                        &stored.properties,
-                        &stored.attributes,
-                        root_service,
-                    ),
-                    same_unique_id: stored.properties.get(UNIQUE_ID)
-                        == captured.properties.get(UNIQUE_ID),
-                    holds_reference: holds_a_reference(stored) || holds_a_reference(captured),
-                };
-                let values = (index < unchanged)
-                    .then(|| pulled_instance_values_unchanged(stored, captured, root_service));
-                (pair, values)
-            })
+            .map_init(
+                CanonicalizeCache::new,
+                |cache, (index, (stored, captured))| {
+                    let pair = ComparedPair {
+                        placed: stored.name == captured.name
+                            && stored.class_name == captured.class_name
+                            && stored.parent_index == captured.parent_index,
+                        same_class: stored.class_name == captured.class_name,
+                        written_as_today: !crate::settings::equivalence::forced_property_differs(
+                            &stored.properties,
+                        ) && values_encode_alike(
+                            &stored.properties,
+                            &stored.attributes,
+                            root_service,
+                        ),
+                        same_unique_id: stored.properties.get(UNIQUE_ID)
+                            == captured.properties.get(UNIQUE_ID),
+                        holds_reference: holds_a_reference(stored) || holds_a_reference(captured),
+                    };
+                    let values = (index < unchanged).then(|| {
+                        pulled_instance_values_unchanged_with_cache(
+                            stored,
+                            captured,
+                            root_service,
+                            cache,
+                        )
+                    });
+                    (pair, values)
+                },
+            )
             .unzip();
-        last = stored_rows.pop().zip(captured_rows.pop());
-        for (offset, pair) in said.iter().enumerate() {
-            let index = base_pair + offset;
-            if !(pair.placed || paired && index < changed.len() && pair.same_class) {
-                return Ok(Some(
-                    "an instance stands under another name, class or parent than the stored one",
-                ));
-            }
-            if !pair.written_as_today {
-                return Ok(Some(
-                    "a stored instance is written another way than documents are today",
-                ));
-            }
+        out_pairs.extend(said);
+        out_compared.extend(values.into_iter().flatten());
+        if keep_last {
+            last = stored_rows.pop().zip(captured_rows.pop());
         }
-        let batch_changed = values.len().min(unchanged);
-        let mut stand_failed = false;
-        for (offset, (compared, pair)) in values
-            .into_iter()
-            .flatten()
-            .zip(said.iter().take(batch_changed))
-            .enumerate()
-        {
-            match compared? {
-                Some((as_held, as_named)) => {
-                    let same = as_held && pair.placed;
-                    same_values.push(same);
-                    same_under_todays_names &= as_named && pair.placed;
-                    if let Some(namesakes_vec) = precheck_other_ids_namesakes.as_ref() {
-                        let row = batch_rows[offset];
-                        if !same && (namesakes_vec[row] || pair.holds_reference) {
-                            stand_failed = true;
-                        }
-                    }
-                }
-                None => return Ok(Some("an enum item of a changed instance gains its type")),
-            }
+        if stored_rows.len() >= 256 {
+            rayon::join(
+                || stored_rows.into_par_iter().for_each(drop),
+                || captured_rows.into_par_iter().for_each(drop),
+            );
         }
-        pairs.extend(said);
-        if stand_failed && !check_told_in_place() {
-            return Ok(Some(
-                "nothing tells every instance for the stored one at its place",
-            ));
-        }
-        Ok(None)
+        anyhow::Ok(())
     };
-    if let Some(why) = compare_batch(first.map_or(&[], |(rows, _)| rows), first_stored)? {
-        return whole(why);
-    }
-    for (batch_rows, batch_stored_at) in batches {
-        let stored_batches = stored_batches.as_ref().context("No store was opened")?;
-        if let Some(why) =
-            compare_batch(batch_rows, in_state(stored_batches.read(batch_stored_at)?))?
-        {
-            return whole(why);
+
+    let keep_last = fast_results.is_none();
+    if !batch_ranges.is_empty() {
+        if stored_batches.is_none() {
+            stored_batches = Some(RowBatches::open_holding(file)?);
+        }
+        let stored_batches_ref = stored_batches.as_ref().context("No store was opened")?;
+        let mut batches = batch_ranges.iter().map(|range| {
+            (
+                &fallback_rows[range.clone()],
+                &fallback_stored_at[range.clone()],
+            )
+        });
+        if let Some(first_stored) = first_stored_from_legacy {
+            let (first_rows, _) = batches.next().unwrap();
+            let converted = crate::app::profile::span("changed rows converted");
+            let first_captured = convert_rows_parallel(state, &records, first_rows, scope)?;
+            drop(converted);
+            compare_pair_batch(
+                first_stored,
+                first_captured,
+                &mut fallback_pairs,
+                &mut fallback_compared,
+                keep_last,
+            )?;
+        }
+        for (batch_rows, batch_stored_at) in batches {
+            let (stored_rows, captured_rows) = rayon::join(
+                || stored_batches_ref.read(batch_stored_at).map(&in_state),
+                || {
+                    let _converted = crate::app::profile::span("changed rows converted");
+                    convert_rows_parallel(state, &records, batch_rows, scope)
+                },
+            );
+            compare_pair_batch(
+                stored_rows?,
+                captured_rows?,
+                &mut fallback_pairs,
+                &mut fallback_compared,
+                keep_last,
+            )?;
         }
     }
-    if let (Some(camera), Some(row)) = (camera, now.viewport_camera)
-        && let Some(why) = compare_batch(&[row], vec![camera])?
+
+    let used_fast = fast_results.is_some();
+    let (mut pairs, compared) = merge_fast_compare_results(
+        fast_results,
+        fallback_pos,
+        fallback_pairs,
+        fallback_compared,
+    );
+
+    let camera_pair = if used_fast {
+        if let Some(cam_row) = now.viewport_camera {
+            let stored_cam = match camera {
+                Some(c) => c,
+                None => {
+                    let stored_batches_ref =
+                        stored_batches.as_ref().context("No store was opened")?;
+                    let mut read_cam = stored_batches_ref.read(&[cam_row])?;
+                    read_cam.pop().context("Missing viewport camera row")?
+                }
+            };
+            let converted = crate::app::profile::span("changed rows converted");
+            let mut captured_cam = convert_rows_parallel(state, &records, &[cam_row], scope)?;
+            drop(converted);
+            let captured = captured_cam.pop().expect("single camera row converted");
+            pairs.push(build_camera_compared_pair(
+                &stored_cam,
+                &captured,
+                root_service,
+            ));
+            Some((stored_cam, captured))
+        } else {
+            None
+        }
+    } else {
+        if let (Some(camera), Some(row)) = (camera, now.viewport_camera) {
+            let converted = crate::app::profile::span("changed rows converted");
+            let mut captured_cam = convert_rows_parallel(state, &records, &[row], scope)?;
+            drop(converted);
+            let captured = captured_cam.pop().expect("single camera row converted");
+            pairs.push(build_camera_compared_pair(&camera, &captured, root_service));
+            last = Some((camera, captured));
+        }
+        last.filter(|_| now.viewport_camera.is_some())
+    };
+    if pairs
+        .iter()
+        .enumerate()
+        .any(|(index, pair)| !(pair.placed || paired && index < changed.len() && pair.same_class))
     {
-        return whole(why);
+        return whole("an instance stands under another name, class or parent than the stored one");
     }
-    // The camera's pair alone is held past its comparison.
-    let camera_pair = last.filter(|_| now.viewport_camera.is_some());
+    if pairs.iter().any(|pair| !pair.written_as_today) {
+        return whole("a stored instance is written another way than documents are today");
+    }
+    let compared = compared.into_iter().collect::<Result<Vec<_>>>()?;
+    let mut same_values = Vec::with_capacity(changed.len());
+    let mut same_under_todays_names = true;
+    for (compared, pair) in compared.into_iter().zip(&pairs) {
+        match compared {
+            Some((as_held, as_named)) => {
+                same_values.push(as_held && pair.placed);
+                same_under_todays_names &= as_named && pair.placed;
+            }
+            None => return whole("an enum item of a changed instance gains its type"),
+        }
+    }
     // A stored camera whose enum items can gain their types makes the answer
     // follow the captured camera, which no digest covers.
     if camera_pair
@@ -1663,7 +2926,8 @@ fn changed_rows<'a>(
     if !camera_by_id
         && camera_holds_a_reference
         && let Some((stored, captured)) = &camera_pair
-        && (stored.properties != captured.properties || stored.attributes != captured.attributes)
+        && (!crate::settings::held::same_properties(&stored.properties, &captured.properties)
+            || stored.attributes != captured.attributes)
     {
         return whole("the stored viewport camera holds a reference and differs");
     }
@@ -1694,13 +2958,45 @@ fn changed_rows<'a>(
     // A pull keeps the stored viewport camera whatever the captured one says.
     let kept_camera_index = now.viewport_camera.filter(|_| {
         camera_pair.as_ref().is_some_and(|(stored, captured)| {
-            stored.properties != captured.properties || stored.attributes != captured.attributes
+            !crate::settings::held::same_properties(&stored.properties, &captured.properties)
+                || stored.attributes != captured.attributes
         })
     });
-    // Comparison is finished. Only the old camera can participate in the
-    // encoding.
     let kept_camera = kept_camera_index.zip(camera_pair.map(|(stored, _)| stored));
+    let exact_row_match = read.as_mut().and_then(|r| r.exact_row_match.take());
+    let block_pool_entries = read
+        .as_mut()
+        .map(|r| std::mem::take(&mut r.block_pool_entries))
+        .unwrap_or_default();
+    let from_remembered = read.is_none();
+    let structure_stands = if moved.is_none() && !paired {
+        if !from_remembered {
+            true
+        } else {
+            stored_batches
+                .as_ref()
+                .and_then(|b| b.structure())
+                .is_some_and(|s| stand_alike(s, &records))
+        }
+    } else {
+        false
+    };
+    let prev_store = stored_batches.and_then(|b| b.into_block_store());
     drop(read);
+
+    let structure_unchanged = structure_stands
+        && prev_store
+            .as_ref()
+            .is_some_and(|s| s.of_this_writer() && s.cut_whole());
+    let unchanged_blocks = plan_unchanged_blocks(
+        structure_unchanged,
+        records.len(),
+        exact_row_match.as_deref(),
+        from_remembered,
+        changed,
+        now.viewport_camera,
+    );
+
     let kept_camera = kept_camera.as_ref().map(|(camera, stored)| ReplacedRow {
         source_index: *camera,
         instance: stored,
@@ -1708,12 +3004,16 @@ fn changed_rows<'a>(
     // Comparisons run in parallel. Only the new store's columns and compressed
     // output share the export's allocation gate with other encoders.
     let _store_guard = store_gate.map(LockRecover::lock_recover);
-    Ok(Some(SettingsAlignment::Changed(blocks::encode_state(
-        state,
-        (&records, &lookup),
-        kept_camera,
-        Some(file),
-    )?)))
+    let hint = blocks::EncodeStateHint {
+        previous: prev_store.as_ref(),
+        structure_unchanged,
+        unchanged_blocks: unchanged_blocks.as_deref(),
+        block_pool_entries: (!block_pool_entries.is_empty()).then_some(&block_pool_entries),
+        long_hashes: long_hashes.as_deref(),
+    };
+    Ok(Some(SettingsAlignment::Changed(
+        blocks::encode_state_with_hint(state, (&records, lookup), kept_camera, Some(file), hint)?,
+    )))
 }
 
 /// Where the alignment leaves the instances of a state, as far as the state
@@ -1757,22 +3057,184 @@ impl Places {
         records: &[SettingsBinaryInstance<'_>],
         stored_len: usize,
     ) -> Result<Option<Self>> {
+        let _span = crate::app::profile::span("captured store places");
         let budget = DecodeBudget::for_file(stored_len);
-        let ids = records
-            .iter()
-            .map(|record| Ok(bare_instance(record, &budget)?.settings_id))
-            .collect::<Result<Vec<_>>>()?;
-        if ids.iter().collect::<AHashSet<_>>().len() != ids.len() {
-            return Ok(None);
-        }
-        let mut unique = AHashMap::with_capacity(records.len());
-        for index in 0..state.instances.len() {
-            if let Some(id) = captured_persistent_identity(state, index) {
-                unique
-                    .entry(id)
-                    .and_modify(|at| *at = None)
-                    .or_insert(Some(index));
+        let (ids, charged): (Vec<String>, usize) = if records.len()
+            >= SETTINGS_BINARY_PARALLEL_MIN_INSTANCES
+            && rayon::current_num_threads() > 1
+        {
+            let chunks = records
+                .par_chunks(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE)
+                .map(|chunk| -> Result<(Vec<String>, usize)> {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    let mut bytes = 0_usize;
+                    for record in chunk {
+                        let id = match &record.settings_id {
+                            SettingsBinaryId::Text(text) => {
+                                check_settings_string_len(text.len())?;
+                                text.to_string()
+                            }
+                            SettingsBinaryId::NumericDebug(id) => format_debug_id(*id),
+                        };
+                        check_settings_string_len(record.name.len())?;
+                        check_settings_string_len(record.class_name.len())?;
+                        bytes = bytes
+                            .saturating_add(id.len() + record.name.len() + record.class_name.len());
+                        out.push(id);
+                    }
+                    Ok((out, bytes))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut ids = Vec::with_capacity(records.len());
+            let mut total = 0_usize;
+            for (chunk_ids, bytes) in chunks {
+                ids.extend(chunk_ids);
+                total = total.saturating_add(bytes);
             }
+            (ids, total)
+        } else {
+            let mut ids = Vec::with_capacity(records.len());
+            let mut total = 0_usize;
+            for record in records {
+                let id = match &record.settings_id {
+                    SettingsBinaryId::Text(text) => {
+                        check_settings_string_len(text.len())?;
+                        text.to_string()
+                    }
+                    SettingsBinaryId::NumericDebug(id) => format_debug_id(*id),
+                };
+                check_settings_string_len(record.name.len())?;
+                check_settings_string_len(record.class_name.len())?;
+                total =
+                    total.saturating_add(id.len() + record.name.len() + record.class_name.len());
+                ids.push(id);
+            }
+            (ids, total)
+        };
+        budget.take(charged)?;
+
+        let check_unique_ids = || -> bool {
+            let mut prev_debug: Option<u64> = None;
+            let mut all_debug = true;
+            let mut strictly_inc = true;
+            for record in records {
+                match record.settings_id {
+                    SettingsBinaryId::NumericDebug(id) => {
+                        if prev_debug.is_some_and(|p| id <= p) {
+                            strictly_inc = false;
+                        }
+                        prev_debug = Some(id);
+                    }
+                    SettingsBinaryId::Text(_) => {
+                        all_debug = false;
+                        strictly_inc = false;
+                        break;
+                    }
+                }
+            }
+            if strictly_inc {
+                return true;
+            }
+            if all_debug {
+                let mut seen = AHashSet::with_capacity(records.len());
+                return records.iter().all(|r| match r.settings_id {
+                    SettingsBinaryId::NumericDebug(id) => seen.insert(id),
+                    SettingsBinaryId::Text(_) => unreachable!(),
+                });
+            }
+            let mut seen = AHashSet::with_capacity(ids.len());
+            ids.iter().all(|id| seen.insert(id.as_str()))
+        };
+        let build_told_alone = || -> Vec<bool> {
+            let mut told_alone = vec![false; records.len()];
+            let n = state.instances.len();
+            if n >= SETTINGS_BINARY_PARALLEL_MIN_INSTANCES && rayon::current_num_threads() > 1 {
+                const PARTS: usize = 16;
+                let chunk_count = n.div_ceil(SETTINGS_BINARY_PARALLEL_CHUNK_SIZE);
+                let chunk_buckets: Vec<[Vec<(&str, usize)>; PARTS]> = (0..chunk_count)
+                    .into_par_iter()
+                    .map(|chunk_idx| {
+                        let start = chunk_idx * SETTINGS_BINARY_PARALLEL_CHUNK_SIZE;
+                        let end = (start + SETTINGS_BINARY_PARALLEL_CHUNK_SIZE).min(n);
+                        let mut buckets: [Vec<(&str, usize)>; PARTS] =
+                            std::array::from_fn(|_| Vec::new());
+                        for index in start..end {
+                            if let Some(id) = captured_persistent_identity(state, index) {
+                                let mut h = ROW_HASH_A.build_hasher();
+                                h.write(id.as_bytes());
+                                let b = (h.finish() as usize) & (PARTS - 1);
+                                buckets[b].push((id, index));
+                            }
+                        }
+                        buckets
+                    })
+                    .collect();
+                let unique_indices: Vec<Vec<usize>> = (0..PARTS)
+                    .into_par_iter()
+                    .map(|part| {
+                        let total: usize = chunk_buckets.iter().map(|c| c[part].len()).sum();
+                        let mut seen: AHashMap<&str, Option<usize>> =
+                            AHashMap::with_capacity(total);
+                        for chunk in &chunk_buckets {
+                            for &(id, index) in &chunk[part] {
+                                seen.entry(id)
+                                    .and_modify(|prev| *prev = None)
+                                    .or_insert(Some(index));
+                            }
+                        }
+                        seen.into_values().flatten().collect()
+                    })
+                    .collect();
+                for indices in unique_indices {
+                    for index in indices {
+                        if index < told_alone.len() {
+                            told_alone[index] = true;
+                        }
+                    }
+                }
+            } else {
+                let mut unique: AHashMap<&str, Option<usize>> =
+                    AHashMap::with_capacity(records.len());
+                for index in 0..n {
+                    if let Some(id) = captured_persistent_identity(state, index) {
+                        match unique.entry(id) {
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(Some(index));
+                                if index < told_alone.len() {
+                                    told_alone[index] = true;
+                                }
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                if let Some(prev) = entry.get_mut().take()
+                                    && prev < told_alone.len()
+                                {
+                                    told_alone[prev] = false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(cam) = now.viewport_camera
+                && cam < told_alone.len()
+            {
+                told_alone[cam] = true;
+            }
+            told_alone
+        };
+
+        let (all_unique, told_alone) = if records.len() >= SETTINGS_BINARY_PARALLEL_MIN_INSTANCES
+            && rayon::current_num_threads() > 1
+        {
+            rayon::join(check_unique_ids, build_told_alone)
+        } else {
+            if !check_unique_ids() {
+                return Ok(None);
+            }
+            (true, build_told_alone())
+        };
+        if !all_unique {
+            return Ok(None);
         }
         let mut roots = records
             .iter()
@@ -1780,13 +3242,6 @@ impl Places {
             .filter(|(_, record)| record.parent_index.is_none())
             .map(|(index, _)| index);
         let sole_root = roots.next().filter(|_| roots.next().is_none());
-        let told_alone = (0..records.len())
-            .map(|index| {
-                now.viewport_camera == Some(index)
-                    || captured_persistent_identity(state, index)
-                        .is_some_and(|id| unique[id] == Some(index))
-            })
-            .collect();
         Ok(Some(Self {
             ids,
             told_alone,
@@ -2002,7 +3457,7 @@ fn state_digests(state: &ServiceState, viewport_camera: Option<usize>) -> ([u8; 
         properties_default_elided,
         dense_index_topology,
     } = state;
-    let shared = Mutex::new(AHashMap::new());
+    let shared = SharedValueDigests::new();
     let root_service = instances
         .get(*service_root_index)
         .map(|instance| instance.name.as_str());
@@ -2110,32 +3565,36 @@ fn instance_encodes_as_its_document(
 
 /// The digests of the values many instances share, by where each value is
 /// held: one is digested once however many instances hold it.
-type SharedValueDigests = Mutex<AHashMap<usize, [u8; 32]>>;
+type SharedValueDigests = blocks::ShardedMap<usize, [u8; 16]>;
 
 /// A task reuses its recent digests without a shared lock. Misses still
 /// consult the invocation's shared cache before hashing a potentially large
 /// payload; neither cache survives the immutable state being digested.
 struct SharedValueCache<'a> {
     shared: &'a SharedValueDigests,
-    local: AHashMap<usize, [u8; 32]>,
+    local: AHashMap<usize, [u8; 16]>,
 }
 
 impl SharedValueCache<'_> {
-    fn digest(&mut self, value: &Arc<Value>) -> [u8; 32] {
-        let held_at = Arc::as_ptr(value) as usize;
+    fn digest_ptr(&mut self, value: &Value) -> [u8; 16] {
+        let held_at = value as *const Value as usize;
         if let Some(known) = self.local.get(&held_at) {
             return *known;
         }
-        let known = self.shared.lock_recover().get(&held_at).copied();
-        let known = known.unwrap_or_else(|| {
-            let mut of_value = Sha256::new();
-            crate::settings::equivalence::digest_value(&mut of_value, value);
-            let of_value = <[u8; 32]>::from(of_value.finalize());
-            self.shared.lock_recover().insert(held_at, of_value);
-            of_value
-        });
-        self.local.insert(held_at, known);
-        known
+        if let Some(d) = self.shared.get(&held_at) {
+            self.local.insert(held_at, d);
+            return d;
+        }
+        let mut of_value = RowHasher::new();
+        crate::settings::equivalence::digest_value(&mut of_value, value);
+        let d = of_value.finish();
+        self.shared.insert(held_at, d);
+        self.local.insert(held_at, d);
+        d
+    }
+
+    fn digest(&mut self, value: &Arc<Value>) -> [u8; 16] {
+        self.digest_ptr(value.as_ref())
     }
 }
 
@@ -2164,9 +3623,9 @@ fn instance_state_digest(
         instance_index,
         parent_index,
     } = instance;
-    let mut digest = Sha256::new();
+    let mut digest = RowHasher::new();
     digest_text(&mut digest, path);
-    digest.update((path_segments.len() as u64).to_le_bytes());
+    digest.update(&(path_segments.len() as u64).to_le_bytes());
     for segment in path_segments {
         digest_text(&mut digest, segment);
     }
@@ -2183,14 +3642,14 @@ fn instance_state_digest(
     ] {
         match text {
             Some(text) => {
-                digest.update([1]);
+                digest.update(&[1]);
                 digest_text(&mut digest, text);
             }
-            None => digest.update([0]),
+            None => digest.update(&[0]),
         }
     }
     for index in [instance_index, parent_index] {
-        digest.update(index.map_or(0, |index| index as u64 + 1).to_le_bytes());
+        digest.update(&index.map_or(0, |index| index as u64 + 1).to_le_bytes());
     }
     // The UniqueId says which stored instance this is, like an id.
     if let Some(unique) = properties.get("UniqueId") {
@@ -2201,35 +3660,31 @@ fn instance_state_digest(
             digest_native_value(&mut digest, &property.value, shared);
         }
     }
-    let half = |digest: Sha256| {
-        let whole = <[u8; 32]>::from(digest.finalize());
-        <[u8; 16]>::try_from(&whole[..16]).unwrap()
-    };
-    let placed = half(digest);
-    let mut digest = Sha256::new();
+    let placed = digest.finish();
+    let mut digest = RowHasher::new();
     if viewport_camera {
         return PulledRow {
             placed,
-            values: half(digest),
+            values: digest.finish(),
         };
     }
-    digest.update([1]);
+    digest.update(&[1]);
     // A store holds none of the record's own properties, so their values are
     // no part of its document: a script's text changes without its store.
     // Their presence is, since a property the instance holds hides the typed
     // one of its name.
-    digest.update((properties.len() as u64).to_le_bytes());
+    digest.update(&(properties.len() as u64).to_le_bytes());
     for (name, value) in properties {
         digest_text(&mut digest, name);
         if is_record_property(name) {
-            digest.update([0xfe]);
+            digest.update(&[0xfe]);
         } else {
             crate::settings::equivalence::digest_value(&mut digest, value);
         }
     }
     digest_map(&mut digest, attributes);
     digest.update(
-        native
+        &native
             .map_or(0, |values| values.len() as u64 + 1)
             .to_le_bytes(),
     );
@@ -2240,43 +3695,43 @@ fn instance_state_digest(
     }
     PulledRow {
         placed,
-        values: half(digest),
+        values: digest.finish(),
     }
 }
 
 fn digest_native_value(
-    digest: &mut Sha256,
+    digest: &mut RowHasher,
     value: &NativeSettingsValue,
     shared: &mut SharedValueCache<'_>,
 ) {
-    let floats = |digest: &mut Sha256, kind: u8, values: &[f32]| {
-        digest.update([kind]);
+    let floats = |digest: &mut RowHasher, kind: u8, values: &[f32]| {
+        digest.update(&[kind]);
         for value in values {
-            digest.update(value.to_bits().to_le_bytes());
+            digest.update(&value.to_bits().to_le_bytes());
         }
     };
     match value {
-        NativeSettingsValue::Bool(value) => digest.update([1, u8::from(*value)]),
+        NativeSettingsValue::Bool(value) => digest.update(&[1, u8::from(*value)]),
         NativeSettingsValue::Int(value) => {
-            digest.update([2]);
-            digest.update(value.to_le_bytes());
+            digest.update(&[2]);
+            digest.update(&value.to_le_bytes());
         }
         NativeSettingsValue::Float32(value) => floats(digest, 3, &[*value]),
         NativeSettingsValue::Float64(value) => {
-            digest.update([4]);
-            digest.update(value.to_bits().to_le_bytes());
+            digest.update(&[4]);
+            digest.update(&value.to_bits().to_le_bytes());
         }
         NativeSettingsValue::String(value) => {
-            digest.update([5]);
+            digest.update(&[5]);
             crate::settings::equivalence::digest_text(digest, value);
         }
         NativeSettingsValue::UniqueId(value) => {
-            digest.update([16]);
+            digest.update(&[16]);
             crate::settings::equivalence::digest_text(digest, value);
         }
         NativeSettingsValue::Ref(index) => {
-            digest.update([6]);
-            digest.update((*index as u64).to_le_bytes());
+            digest.update(&[6]);
+            digest.update(&(*index as u64).to_le_bytes());
         }
         NativeSettingsValue::Vector2(values) => floats(digest, 7, values),
         NativeSettingsValue::Vector3(values) => floats(digest, 8, values),
@@ -2286,12 +3741,12 @@ fn digest_native_value(
         NativeSettingsValue::CFrame(values) => floats(digest, 12, values.as_ref()),
         NativeSettingsValue::Rect(values) => floats(digest, 13, values),
         NativeSettingsValue::Enum(value) => {
-            digest.update([14]);
+            digest.update(&[14]);
             crate::settings::equivalence::digest_text(digest, value);
         }
         NativeSettingsValue::Shared(value) => {
-            digest.update([15]);
-            digest.update(shared.digest(value));
+            digest.update(&[15]);
+            digest.update(&shared.digest(value));
         }
     }
 }
@@ -2468,6 +3923,77 @@ fn validate_header(
     Ok(size.0)
 }
 
+/// Converts the rows at `row_indices` in parallel chunks, reusing scratch buffers
+/// across rows instead of allocating fresh buffers per single row.
+fn convert_rows_parallel<'a>(
+    state: &'a ServiceState,
+    records: &[SettingsBinaryInstance<'a>],
+    row_indices: &[usize],
+    scope: ConversionScope<'_, '_>,
+) -> Result<Vec<SettingsBytecodeInstance>> {
+    if row_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    const CHUNK: usize = 128;
+    if row_indices.len() <= CHUNK {
+        return convert_selected_rows(state, records, row_indices, scope);
+    }
+    let chunks = row_indices
+        .par_chunks(CHUNK)
+        .map(|chunk| convert_selected_rows(state, records, chunk, scope))
+        .collect::<Result<Vec<_>>>()?;
+    let mut out = Vec::with_capacity(row_indices.len());
+    for chunk in chunks {
+        out.extend(chunk);
+    }
+    Ok(out)
+}
+
+fn convert_selected_rows<'a>(
+    state: &'a ServiceState,
+    records: &[SettingsBinaryInstance<'a>],
+    row_indices: &[usize],
+    scope: ConversionScope<'_, '_>,
+) -> Result<Vec<SettingsBytecodeInstance>> {
+    let mut sources = Vec::new();
+    let mut scratch = Vec::new();
+    let mut instances = Vec::with_capacity(row_indices.len());
+    for &row in row_indices {
+        let record = &records[row];
+        let mut instance = bare_instance(record, scope.budget)?;
+        visit_settings_binary_properties(state, record, scope.lookup, |name, kind, source| {
+            if !SETTINGS_RECORD_FIELDS.contains(&name) {
+                sources.push((name, kind, source));
+            }
+            Ok(())
+        })?;
+        sources.sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        if sources
+            .windows(2)
+            .any(|pair| (pair[0].0, pair[0].1) == (pair[1].0, pair[1].1))
+        {
+            next_group_instance(0, 0, 1)?;
+        }
+        for (name, kind, source) in sources.drain(..) {
+            if name == "Attributes" && kind == 8 {
+                let Value::Object(attributes) =
+                    normalize_complex(&source, kind, true, scope, &mut scratch)?
+                else {
+                    bail!("Expected decoded attributes");
+                };
+                instance.attributes = attributes;
+            } else {
+                let value = normalize_source(&source, kind, scope, &mut scratch)?;
+                instance
+                    .properties
+                    .insert(name.to_string(), crate::settings::held::held(value));
+            }
+        }
+        instances.push(instance);
+    }
+    Ok(instances)
+}
+
 fn convert_chunk<'a>(
     state: &'a ServiceState,
     records: &[SettingsBinaryInstance<'a>],
@@ -2600,7 +4126,11 @@ fn bare_instance(
 ) -> Result<SettingsBytecodeInstance> {
     let id = match &record.settings_id {
         SettingsBinaryId::Text(text) => checked_string(text, budget)?,
-        SettingsBinaryId::NumericDebug(id) => budget.copied(&format!("debug:0_{id}"))?,
+        SettingsBinaryId::NumericDebug(id) => {
+            let formatted = format_debug_id(*id);
+            budget.take(formatted.len())?;
+            formatted
+        }
     };
     Ok(SettingsBytecodeInstance::new(
         id,
@@ -2622,8 +4152,14 @@ fn normalize_source(
     scratch: &mut Vec<u8>,
 ) -> Result<Value> {
     match source {
-        SettingsBinaryValueSource::Native(NativeSettingsValue::UniqueId(_)) => {
-            normalize_complex(source, kind, false, scope, scratch)
+        SettingsBinaryValueSource::Native(NativeSettingsValue::UniqueId(value)) => {
+            scope
+                .budget
+                .take(2 * VALUE_SLOT_BYTES + "_type".len() + "UniqueId".len() + "value".len())?;
+            Ok(typed_object(
+                "UniqueId",
+                [("value", Value::String(checked_string(value, scope.budget)?))],
+            ))
         }
         SettingsBinaryValueSource::Native(value) => native_value(value, scope),
         SettingsBinaryValueSource::Property(value) => {
@@ -2832,4 +4368,40 @@ fn normalize_complex(
     };
     reader.finish()?;
     Ok(value)
+}
+
+#[cfg(test)]
+mod batch_planning_tests {
+    use super::*;
+
+    #[test]
+    fn plan_compare_batches_aligns_to_block_boundaries_in_tests() -> Result<()> {
+        let mut instances = vec![SettingsBytecodeInstance::new(
+            "ws".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        )];
+        for index in 1..8 {
+            let mut part = SettingsBytecodeInstance::new(
+                format!("p{index}"),
+                "Part".into(),
+                format!("P{index}"),
+                Some(0),
+            );
+            part.properties.insert("Transparency".into(), json!(0.1));
+            instances.push(part);
+        }
+        let document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances,
+        };
+        let lookup = document_reference_lookup(&document, false);
+        let bytes = blocks::encode_with_lookup(&document, &lookup, None, 2)?;
+        let batches = blocks::RowBatches::open_holding(&bytes)?;
+        let rows = [0, 1, 2, 3, 4, 5];
+        let planned = plan_compare_batches(&rows, &rows, Some(&batches));
+        assert_eq!(planned, vec![0..2, 2..4, 4..6]);
+        Ok(())
+    }
 }

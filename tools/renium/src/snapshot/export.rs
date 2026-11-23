@@ -406,8 +406,12 @@ impl ExportProjectStage {
         for relative in &clone_paths {
             let source = project_root.join(relative);
             let destination = staged_root.join(relative);
+            let is_store = relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_service_settings_file_name);
             match fs::symlink_metadata(&source) {
-                Ok(metadata) if background_copy && metadata.is_dir() => {
+                Ok(metadata) if background_copy && (metadata.is_dir() || is_store) => {
                     deferred.push((source, destination));
                 }
                 Ok(_) => copy_isolated_path(&source, &destination)?,
@@ -792,15 +796,17 @@ impl ExportProjectStage {
             );
         };
         let phase = Instant::now();
-        let mut current = collect_publish_hashes(project_root, &self.publish_paths)?;
-        log_phase("current hashes", phase);
+        let (current, staged) = rayon::join(
+            || collect_publish_hashes(project_root, &self.publish_paths),
+            || collect_publish_hashes(&self.project_root, &self.publish_paths),
+        );
+        let mut current = current?;
+        let mut staged = staged?;
+        log_phase("current+staged hashes", phase);
         ensure_publish_entries_unchanged(&self.publish_baseline, &current, &self.publish_paths)?;
         let backup_root = self.container.join("previous");
         fs::create_dir_all(&backup_root)
             .with_context(|| format!("Failed to create {}", backup_root.display()))?;
-        let phase = Instant::now();
-        let mut staged = collect_publish_hashes(&self.project_root, &self.publish_paths)?;
-        log_phase("staged hashes", phase);
         let settings_candidates = current
             .keys()
             .filter(|path| {
@@ -848,7 +854,11 @@ impl ExportProjectStage {
         refresh_publish_hashes(project_root, &mut current, &repaired)?;
         log_phase("reference repair", phase);
         let phase = Instant::now();
-        let mut refreshed = settings_candidates;
+        let mut refreshed = if self.settings_already_aligned {
+            Vec::new()
+        } else {
+            settings_candidates
+        };
         refreshed.extend(repaired);
         refresh_publish_hashes(&self.project_root, &mut staged, &refreshed)?;
         if self.keep_local_only_scripts {
@@ -1665,10 +1675,15 @@ impl IncompleteRollback {
 }
 
 pub(crate) fn file_publish_state(bytes: &[u8]) -> PublishEntryState {
+    let (sha256, hash) = if bytes.len() >= 512 * 1024 {
+        rayon::join(|| sha256_hex(bytes), || fnv1a(bytes))
+    } else {
+        (sha256_hex(bytes), fnv1a(bytes))
+    };
     PublishEntryState::File {
-        sha256: sha256_hex(bytes),
+        sha256,
         length: bytes.len() as u64,
-        hash: fnv1a(bytes),
+        hash,
     }
 }
 

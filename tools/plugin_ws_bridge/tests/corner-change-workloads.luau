@@ -2956,7 +2956,42 @@ do
 		deferNativeTracking = true })
 	local retired = context.observer.getState({ start = false, capturePushProof = true, scopeFrom = context.proof })
 	assert(retired.pushProofScope.unknown == "proof retired", "a new relay retires the kept proof")
-	context.observer.stop()
+	context.observer.stop();
+	(function()
+		testGame.ItemChanged = signal()
+		local generations = { ReplicatedStorage = 0, Workspace = 0 }
+		dependencies.BridgeScriptDocuments.capture = function()
+			return { { instance = localScript, source = "original" } }
+		end
+		local cfg = table.clone(trackerConfig)
+		cfg.exportProofGeneration = function(service) return generations[service] end
+		cfg.observeProofDocuments = function() return {} end
+		cfg.captureTerrainProof = function() return "voxels" end
+		local observer = scopedModule.create(cfg, { ReplicatedStorage = true, Workspace = true })
+		observer.observeExports(function(service)
+			generations[service] += 1
+			return true
+		end, function(item, property)
+			local service = serviceOf(item)
+			generations[service] += 1
+			observer.noteExportChange(service, item, property)
+		end)
+		observer.configurePropertyCandidates({ Part = { "Transparency" } })
+		observer.getState({ start = true, services = watched, trackingGuardId = "push", nativeAttributeRelay = true,
+			deferNativeTracking = true })
+		local relay = createdRelays[#createdRelays]
+		relay.Value = relay
+		local prePush = observer.getState({ start = false, capturePushProof = true, keepForSettlement = true })
+		local settlementProof = assert(prePush.verifiedPushProof, "keepForSettlement took no proof")
+		beamTagged = true
+		tagAdded:Fire(beam)
+		local checked = observer.getState({ start = false, verifyPushProof = settlementProof, scopePushProof = true })
+		beamTagged = false
+		assert(checked.pushProofMatches ~= true, "Studio tag edit before deferred Changed went unseen")
+		assert(checked.pushProofScope ~= nil and named(checked.pushProofScope) == "ReplicatedStorage",
+			"settlement proof missed the tag-edited service before deferred Changed")
+		observer.stop()
+	end)()
 	collection.GetTags = savedGetTags
 	print("Edit lease: the kept proof answers across a Renium edit's lease and commit")
 

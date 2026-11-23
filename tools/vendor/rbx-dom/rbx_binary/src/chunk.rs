@@ -18,55 +18,86 @@ pub struct Chunk {
     pub data: Vec<u8>,
 }
 
-impl Chunk {
-    /// Reads and decodes a `Chunk` from the given reader.
-    pub fn decode<R: Read>(mut reader: R) -> io::Result<Chunk> {
-        let header = decode_chunk_header(&mut reader)?;
+/// A chunk read from the binary stream before decompression.
+#[derive(Debug)]
+pub(crate) struct RawChunk {
+    pub name: [u8; 4],
+    compressed_len: u32,
+    len: u32,
+    raw_data: Vec<u8>,
+}
 
-        log::trace!("{header}");
-
-        let data = if header.compressed_len == 0 {
+impl RawChunk {
+    pub(crate) fn decompress(self) -> io::Result<Chunk> {
+        let data = if self.compressed_len == 0 {
             log::trace!("No compression");
-            let mut data = Vec::new();
-            reader.take(header.len as u64).read_to_end(&mut data)?;
-            data
+            self.raw_data
         } else {
-            let mut compressed_data = Vec::new();
-            reader
-                .take(header.compressed_len as u64)
-                .read_to_end(&mut compressed_data)?;
-            if compressed_data.len() != header.compressed_len as usize {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Truncated compressed chunk",
-                ));
-            }
-
+            let compressed_data = self.raw_data;
             if compressed_data.starts_with(ZSTD_MAGIC_NUMBER) {
                 log::trace!("ZSTD compression");
-                zstd::bulk::decompress(&compressed_data, header.len as usize)?
+                zstd::bulk::decompress(&compressed_data, self.len as usize)?
             } else {
                 log::trace!("LZ4 compression");
-                lz4_flex::block::decompress(&compressed_data, header.len as usize)
+                lz4_flex::block::decompress(&compressed_data, self.len as usize)
                     .map_err(io::Error::other)?
             }
         };
 
-        if data.len() != header.len as usize {
+        if data.len() != self.len as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "Chunk length mismatch: expected {} bytes, got {}",
-                    header.len,
+                    self.len,
                     data.len()
                 ),
             ));
         }
 
         Ok(Chunk {
-            name: header.name,
+            name: self.name,
             data,
         })
+    }
+}
+
+impl Chunk {
+    /// Reads one chunk's header and raw (possibly compressed) payload.
+    pub(crate) fn read_raw<R: Read>(mut reader: R) -> io::Result<RawChunk> {
+        let header = decode_chunk_header(&mut reader)?;
+
+        log::trace!("{header}");
+
+        let to_read = if header.compressed_len == 0 {
+            header.len as usize
+        } else {
+            header.compressed_len as usize
+        };
+        let mut raw_data = Vec::new();
+        reader.take(to_read as u64).read_to_end(&mut raw_data)?;
+        if raw_data.len() != to_read {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                if header.compressed_len == 0 {
+                    "Truncated chunk"
+                } else {
+                    "Truncated compressed chunk"
+                },
+            ));
+        }
+
+        Ok(RawChunk {
+            name: header.name,
+            compressed_len: header.compressed_len,
+            len: header.len,
+            raw_data,
+        })
+    }
+
+    /// Reads and decodes a `Chunk` from the given reader.
+    pub fn decode<R: Read>(reader: R) -> io::Result<Chunk> {
+        Self::read_raw(reader)?.decompress()
     }
 }
 

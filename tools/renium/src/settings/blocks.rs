@@ -131,7 +131,11 @@ fn marker(hash: &[u8; 16]) -> String {
 }
 
 /// The hash of the pool entry `text` stands for, where it is a marker.
+#[inline]
 fn marked(text: &str) -> Option<[u8; 16]> {
+    if text.as_bytes().first() != Some(&1) {
+        return None;
+    }
     let hex = text.strip_prefix(MARK.as_str())?;
     (hex.len() == 32)
         .then(|| u128::from_str_radix(hex, 16).ok())
@@ -170,13 +174,258 @@ pub(crate) fn is_block_store(bytes: &[u8]) -> bool {
 }
 
 /// The first half of the SHA-256 of `parts`, one after another.
-fn digest(parts: &[&[u8]]) -> [u8; 16] {
+pub(super) fn digest(parts: &[&[u8]]) -> [u8; 16] {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
     for part in parts {
         digest.update(part);
     }
     half_digest(digest)
+}
+
+const SHARDED_MAP_SHARDS: usize = 64;
+const SHARDED_MAP_HASHER: ahash::RandomState = ahash::RandomState::with_seeds(
+    0x517c_c1b7_2722_0a95,
+    0x9e37_79b9_7f4a_7c15,
+    0xbf58_476d_1ce4_e5b9,
+    0x94d0_49bb_1331_11eb,
+);
+
+pub(super) struct ShardedMap<K, V> {
+    shards: [std::sync::RwLock<AHashMap<K, V>>; SHARDED_MAP_SHARDS],
+}
+
+impl<K: Eq + std::hash::Hash, V: Copy> ShardedMap<K, V> {
+    pub(super) fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| std::sync::RwLock::new(AHashMap::new())),
+        }
+    }
+
+    #[inline]
+    fn shard(&self, key: &K) -> &std::sync::RwLock<AHashMap<K, V>> {
+        &self.shards[(SHARDED_MAP_HASHER.hash_one(key) as usize) & (SHARDED_MAP_SHARDS - 1)]
+    }
+
+    #[inline]
+    pub(super) fn get(&self, key: &K) -> Option<V> {
+        self.shard(key).read().unwrap().get(key).copied()
+    }
+
+    #[inline]
+    pub(super) fn insert(&self, key: K, value: V) {
+        self.shard(&key).write().unwrap().insert(key, value);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DigestBlockOpts<'a> {
+    whole: bool,
+    kept: Option<usize>,
+    moved: Option<&'a Moved>,
+    database: Option<&'a rbx_reflection::ReflectionDatabase<'a>>,
+}
+
+type StreamedRowDigest = ([u8; 16], [u8; 16], [u8; 16], Option<usize>);
+type BlockGroupSpec<'a> = (&'a str, u8, usize, &'a [u8]);
+type FastCompareOutcome = Option<(super::captured::ComparedPair, (bool, bool))>;
+
+struct StreamDigestState {
+    hashers: Vec<super::captured::RowHasher>,
+    unique_ids: Vec<[u8; 16]>,
+    attr_digests: Vec<[u8; 16]>,
+    engine_hashers: Vec<Option<super::captured::RowHasher>>,
+    named_flags: Vec<bool>,
+    multi_slot: Vec<Option<[u8; 16]>>,
+    string_digests: Vec<Option<[u8; 16]>>,
+    enum_digests: Vec<Option<[u8; 16]>>,
+    pair_obj_digests: AHashMap<(usize, usize, usize, usize), [u8; 16]>,
+}
+
+fn parse_block_group_specs<'a>(
+    open: &'a OpenBlock,
+    prop_names: &[&'a str],
+) -> Result<(Vec<BlockGroupSpec<'a>>, Vec<usize>, Vec<usize>)> {
+    let mut reader = BytecodeReader::new(&open.content[open.rest..]);
+    let group_count = reader.read_collection_len("property group count")?;
+    let mut specs: Vec<BlockGroupSpec<'a>> = Vec::with_capacity(reader.capacity(group_count, 4));
+    for _ in 0..group_count {
+        let property_id = reader.read_len("property id")?;
+        let property_name = *prop_names
+            .get(property_id)
+            .with_context(|| format!("Invalid property id {property_id}"))?;
+        let kind = reader.read_u8().context("Missing property kind")?;
+        let value_count = reader.read_collection_len("property value count")?;
+        let body_len = reader.read_len("property group byte length")?;
+        let body = reader.read_bytes(body_len)?;
+        if !SETTINGS_RECORD_FIELDS.contains(&property_name) {
+            specs.push((property_name, kind, value_count, body));
+        }
+    }
+    reader.finish()?;
+    let mut attr_groups = Vec::new();
+    let mut prop_order = Vec::with_capacity(specs.len());
+    for (idx, &(name, kind, ..)) in specs.iter().enumerate() {
+        if name == "Attributes" && kind == 8 {
+            attr_groups.push(idx);
+        } else {
+            prop_order.push(idx);
+        }
+    }
+    prop_order.sort_unstable_by(|&a, &b| specs[a].0.cmp(specs[b].0).then_with(|| a.cmp(&b)));
+    Ok((specs, attr_groups, prop_order))
+}
+
+fn record_row_property_digest(
+    state: &mut StreamDigestState,
+    row: usize,
+    class_name: &str,
+    name: &str,
+    is_unique_id: bool,
+    val_digest: [u8; 16],
+    opts: DigestBlockOpts<'_>,
+) {
+    use super::captured::{RowHasher, is_digested_with_db};
+    use crate::settings::equivalence::digest_text;
+    if is_unique_id {
+        state.unique_ids[row] = val_digest;
+    } else if opts.whole || is_digested_with_db(opts.database, class_name, name) {
+        state.hashers[row].update(&[1]);
+        digest_text(&mut state.hashers[row], name);
+        state.hashers[row].update(&val_digest);
+    } else {
+        let eh = state.engine_hashers[row].get_or_insert_with(RowHasher::new);
+        eh.update(&[1]);
+        digest_text(eh, name);
+        eh.update(&val_digest);
+    }
+}
+
+fn try_digest_string_array_wire(
+    reader: &mut BytecodeReader<'_>,
+    str_items: &[super::captured::StrOrHash<'_>],
+    charged: &mut usize,
+) -> Option<[u8; 16]> {
+    use super::captured::{RowHasher, StrOrHash};
+    use crate::settings::equivalence::digest_text;
+    let arr_len = reader.read_collection_len("array length").ok()?;
+    let mut h = RowHasher::new();
+    h.update(&[6]);
+    h.update(&(arr_len as u64).to_le_bytes());
+    let mut cost = arr_len.saturating_mul(VALUE_SLOT_BYTES);
+    for _ in 0..arr_len {
+        if reader.read_u8().ok()? != 6 {
+            return None;
+        }
+        let id = reader.read_len("value string id").ok()?;
+        let item = *str_items.get(id)?;
+        h.update(&[5]);
+        match item {
+            StrOrHash::Text(t) => {
+                digest_text(&mut h, t);
+                cost = cost.saturating_add(t.len());
+            }
+            StrOrHash::Hash(hash) => {
+                h.update_long_hash(&hash);
+                cost = cost.saturating_add(16);
+            }
+        }
+    }
+    *charged = charged.saturating_add(cost);
+    Some(h.finish())
+}
+
+fn try_digest_two_string_object_wire(
+    reader: &mut BytecodeReader<'_>,
+    str_items: &[super::captured::StrOrHash<'_>],
+    whole: bool,
+    charged: &mut usize,
+    pair_obj_digests: &mut AHashMap<(usize, usize, usize, usize), [u8; 16]>,
+) -> Option<[u8; 16]> {
+    use super::captured::{StrOrHash, digest_two_string_object_with_hashes};
+    let field_count = reader.read_collection_len("object field count").ok()?;
+    if field_count != 2 {
+        return None;
+    }
+    let k0_id = reader.read_len("object key string id").ok()?;
+    if reader.read_u8().ok()? != 6 {
+        return None;
+    }
+    let v0_id = reader.read_len("value string id").ok()?;
+    let k1_id = reader.read_len("object key string id").ok()?;
+    if reader.read_u8().ok()? != 6 {
+        return None;
+    }
+    let v1_id = reader.read_len("value string id").ok()?;
+    let StrOrHash::Text(k0) = *str_items.get(k0_id)? else {
+        return None;
+    };
+    let StrOrHash::Text(k1) = *str_items.get(k1_id)? else {
+        return None;
+    };
+    let v0 = *str_items.get(v0_id)?;
+    let v1 = *str_items.get(v1_id)?;
+    if whole
+        && (matches!(k0, "settingsId" | "instanceId" | "debugId")
+            || matches!(k1, "settingsId" | "instanceId" | "debugId"))
+    {
+        return None;
+    }
+    let v0_len = match v0 {
+        StrOrHash::Text(t) => t.len(),
+        StrOrHash::Hash(_) => 16,
+    };
+    let v1_len = match v1 {
+        StrOrHash::Text(t) => t.len(),
+        StrOrHash::Hash(_) => 16,
+    };
+    *charged = charged.saturating_add(2 * VALUE_SLOT_BYTES + k0.len() + v0_len + k1.len() + v1_len);
+    Some(
+        *pair_obj_digests
+            .entry((k0_id, v0_id, k1_id, v1_id))
+            .or_insert_with(|| digest_two_string_object_with_hashes(k0, v0, k1, v1)),
+    )
+}
+
+fn skip_group_value_fast(
+    reader: &mut BytecodeReader<'_>,
+    kind: u8,
+    cframe: &CFrameGroupDecoder,
+    total_rows: usize,
+    prev_ref: &mut usize,
+) -> Result<()> {
+    match kind {
+        0..=2 => {}
+        3 | 4 | 6 | 19 => {
+            reader.read_var_u64()?;
+        }
+        5 | 11 | 13 => {
+            reader.read_bytes(8)?;
+        }
+        20 => {
+            reader.read_bytes(4)?;
+        }
+        12 | 15 => {
+            reader.read_bytes(12)?;
+        }
+        14 | 18 => {
+            reader.read_bytes(16)?;
+        }
+        16 => match cframe {
+            CFrameGroupDecoder::Inline => {
+                reader.read_bytes(48)?;
+            }
+            CFrameGroupDecoder::RotationTable(_) => {
+                reader.read_bytes(12)?;
+                reader.read_var_u64()?;
+            }
+        },
+        17 => {
+            let _ = decode_resolved_ref_target(reader, total_rows, prev_ref)?;
+        }
+        _ => skip_raw_value_payload_fast(reader, kind, 0)?,
+    }
+    Ok(())
 }
 
 /// The bucket of the pool that holds the entry of hash `hash`.
@@ -428,6 +677,17 @@ pub(super) fn encode_with_lookup(
     encode_contents(structure?, contents?, &owned_entries, previous)
 }
 
+/// Optional hints from `changed_rows` so `encode_state_with_hint` can reuse the
+/// already-opened previous store, copy unchanged structure/value blocks verbatim,
+/// and avoid re-decompressing unchanged blocks just to count their pool entries.
+pub(super) struct EncodeStateHint<'a> {
+    pub(super) previous: Option<&'a BlockStore<'a>>,
+    pub(super) structure_unchanged: bool,
+    pub(super) unchanged_blocks: Option<&'a [bool]>,
+    pub(super) block_pool_entries: Option<&'a [Vec<usize>]>,
+    pub(super) long_hashes: Option<&'a ShardedMap<(usize, usize), [u8; 16]>>,
+}
+
 /// The store of a captured state whose instances are `records`, with the
 /// values of `replaced` in place of its instance's, over `previous` where the
 /// store's file holds that.
@@ -440,12 +700,26 @@ pub(super) fn encode_state<'a>(
     replaced: Option<ReplacedRow<'a>>,
     previous: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    encode_state_in_blocks(state, records, replaced, previous, BLOCK_ROWS)
+    encode_state_in_blocks_with_hint(state, records, replaced, previous, None, BLOCK_ROWS)
 }
 
+pub(super) fn encode_state_with_hint<'a>(
+    state: &'a ServiceState,
+    records: (
+        &'a [SettingsBinaryInstance<'a>],
+        &SettingsBinaryInstanceLookup<'_>,
+    ),
+    replaced: Option<ReplacedRow<'a>>,
+    previous: Option<&[u8]>,
+    hint: EncodeStateHint<'_>,
+) -> Result<Vec<u8>> {
+    encode_state_in_blocks_with_hint(state, records, replaced, previous, Some(hint), BLOCK_ROWS)
+}
+
+#[cfg(test)]
 fn encode_state_in_blocks<'a>(
     state: &'a ServiceState,
-    (records, lookup): (
+    records: (
         &'a [SettingsBinaryInstance<'a>],
         &SettingsBinaryInstanceLookup<'_>,
     ),
@@ -453,40 +727,223 @@ fn encode_state_in_blocks<'a>(
     previous: Option<&[u8]>,
     block_rows: usize,
 ) -> Result<Vec<u8>> {
+    encode_state_in_blocks_with_hint(state, records, replaced, previous, None, block_rows)
+}
+
+fn encode_state_in_blocks_with_hint<'a>(
+    state: &'a ServiceState,
+    (records, lookup): (
+        &'a [SettingsBinaryInstance<'a>],
+        &SettingsBinaryInstanceLookup<'_>,
+    ),
+    replaced: Option<ReplacedRow<'a>>,
+    previous: Option<&[u8]>,
+    hint: Option<EncodeStateHint<'_>>,
+    block_rows: usize,
+) -> Result<Vec<u8>> {
+    let owned_prev = if hint.as_ref().and_then(|h| h.previous).is_some() {
+        None
+    } else {
+        previous
+            .and_then(|bytes| BlockStore::open(bytes).ok())
+            .filter(|store| store.writer == writer())
+    };
+    let prev_store = hint
+        .as_ref()
+        .and_then(|h| h.previous)
+        .filter(|store| store.writer == writer())
+        .or(owned_prev.as_ref());
+
+    if let Some(store) = prev_store
+        && let Ok(bytes) = encode_state_streaming(
+            state,
+            (records, lookup),
+            replaced,
+            Some(store),
+            hint.as_ref(),
+            block_rows,
+        )
+    {
+        return Ok(bytes);
+    }
+    encode_state_streaming(state, (records, lookup), replaced, None, None, block_rows)
+}
+
+type BlockEncoded<'a, 's> = (
+    usize,
+    Section<'s>,
+    Vec<([u8; 16], Option<SettingsString<'a>>)>,
+);
+
+/// Streams `encode_state` block by block: each block collects, builds its table,
+/// serializes its content, drops its intermediate tables, and compresses/copies its
+/// frame before moving on, bounding peak memory and reusing zstd contexts per worker.
+fn encode_state_streaming<'a, 's>(
+    state: &'a ServiceState,
+    (records, lookup): (
+        &'a [SettingsBinaryInstance<'a>],
+        &SettingsBinaryInstanceLookup<'_>,
+    ),
+    replaced: Option<ReplacedRow<'a>>,
+    previous: Option<&'s BlockStore<'s>>,
+    hint: Option<&EncodeStateHint<'_>>,
+    block_rows: usize,
+) -> Result<Vec<u8>> {
+    let _total_span = crate::app::profile::span("encode_state total");
     let ranges = block_ranges(records.len(), block_rows);
-    let owned_entries = Mutex::new(BTreeMap::<[u8; 16], (usize, Option<String>)>::new());
-    let (structure, contents) = rayon::join(
-        || {
-            let collected = collected_records(records, collect_settings_binary_record_strings);
-            encode_prepared_service_payload(records, lookup, collected)
-        },
-        || {
-            ranges
-                .par_iter()
-                .map(|range| {
-                    let mut collected = SettingsBinaryCollection::default();
-                    for (row, record) in records[range.clone()].iter().enumerate() {
-                        let source = (state, lookup);
-                        collect_settings_binary_record_values(
-                            &mut collected,
-                            source,
-                            row,
-                            record,
-                            replaced,
-                        )?;
-                    }
-                    let block = Prepared::of(range.len(), collected)?;
-                    let content = block.content(lookup)?;
-                    record_owned_entries(&owned_entries, &block)?;
-                    Ok((block.rows, content))
-                })
-                .collect::<Result<Vec<_>>>()
-        },
-    );
-    let owned_entries = owned_entries
-        .into_inner()
-        .unwrap_or_else(|e| e.into_inner());
-    encode_contents(structure?, contents?, &owned_entries, previous)
+    let structure_unchanged = previous.is_some() && hint.is_some_and(|h| h.structure_unchanged);
+    let unchanged_blocks = previous
+        .filter(|_| hint.is_some())
+        .and_then(|_| hint.and_then(|h| h.unchanged_blocks));
+    let block_pool_entries = hint.and_then(|h| h.block_pool_entries);
+    let owned_long_hashes;
+    let long_hashes: &ShardedMap<(usize, usize), [u8; 16]> = match hint.and_then(|h| h.long_hashes)
+    {
+        Some(existing) => existing,
+        None => {
+            owned_long_hashes = ShardedMap::new();
+            &owned_long_hashes
+        }
+    };
+
+    let encode_blocks = || -> Result<Vec<BlockEncoded<'a, 's>>> {
+        ranges
+            .par_iter()
+            .enumerate()
+            .map_init(FrameCodec::new, |codec, (at, range)| {
+                if let Some(store) = previous
+                    && unchanged_blocks.and_then(|u| u.get(at).copied()) == Some(true)
+                    && let Some(prev_block) = store.blocks.get(at)
+                    && prev_block.rows() == *range
+                {
+                    let section = store.raw(prev_block.frame)?;
+                    let pooled = if let Some(entries) = block_pool_entries.and_then(|e| e.get(at)) {
+                        entries
+                            .iter()
+                            .map(|&entry| (store.hashes[entry], None))
+                            .collect()
+                    } else if store.hashes.is_empty() {
+                        Vec::new()
+                    } else {
+                        let open = store.open_block(at)?;
+                        open.pool_entries()
+                            .map(|entry| (store.hashes[entry], None))
+                            .collect()
+                    };
+                    return Ok((range.len(), section, pooled));
+                }
+
+                let collected = collect_block_record_values_fast(
+                    state,
+                    lookup,
+                    &records[range.clone()],
+                    replaced,
+                )?;
+                let properties = Table::of_with_cache(collected.property_counts, long_hashes)?;
+                let property_ids = properties.ids();
+                let groups =
+                    sorted_settings_property_groups(collected.property_groups, &property_ids);
+                let strings = Table::of_with_cache(collected.string_counts, long_hashes)?;
+                let string_ids = strings.ids();
+
+                let mut content = Vec::with_capacity(range.len().saturating_mul(64));
+                push_var_u64(&mut content, strings.texts.len() as u64);
+                for text in &strings.texts[..strings.short] {
+                    push_var_u64(&mut content, (text.len() as u64) << 1);
+                    content.extend_from_slice(text.as_bytes());
+                }
+                for hash in &strings.hashes {
+                    push_var_u64(&mut content, 1);
+                    content.extend_from_slice(hash);
+                }
+                push_var_u64(&mut content, properties.texts.len() as u64);
+                for name in &properties.texts {
+                    let id = *string_ids
+                        .get(name.as_ref())
+                        .with_context(|| format!("Missing binary string id for {name:?}"))?;
+                    push_var_u64(&mut content, id);
+                }
+                write_settings_binary_property_groups_serial(
+                    &mut content,
+                    &groups,
+                    &property_ids,
+                    &string_ids,
+                    lookup,
+                    &mut codec.body_scratch,
+                )?;
+
+                drop(string_ids);
+                drop(property_ids);
+                drop(properties);
+                drop(groups);
+                let pooled = strings
+                    .texts
+                    .into_iter()
+                    .skip(strings.short)
+                    .zip(strings.hashes)
+                    .map(|(text, hash)| {
+                        let held = marked(&text).is_none().then_some(text);
+                        (hash, held)
+                    })
+                    .collect::<Vec<_>>();
+
+                let held = previous.and_then(|store| Some((store, store.blocks.get(at)?.frame)));
+                let section = framed_with(&content, held, codec)?;
+                drop(content);
+                Ok((range.len(), section, pooled))
+            })
+            .collect()
+    };
+
+    let (structure_section, encoded_blocks) = if structure_unchanged {
+        let store = previous.expect("structure_unchanged requires previous store");
+        (store.raw(store.structure), encode_blocks())
+    } else {
+        rayon::join(
+            || -> Result<Section<'s>> {
+                let collected = collected_records(records, collect_settings_binary_record_strings);
+                let content = encode_prepared_service_payload(records, lookup, collected)?;
+                let mut codec = FrameCodec::new();
+                framed_with(
+                    &content,
+                    previous.map(|store| (store, store.structure)),
+                    &mut codec,
+                )
+            },
+            encode_blocks,
+        )
+    };
+    let structure_section = structure_section?;
+    let encoded_blocks = encoded_blocks?;
+
+    let _pool_span = crate::app::profile::span("encode_state pool+assemble");
+    let mut owned_entries: BTreeMap<[u8; 16], (usize, Option<SettingsString<'a>>)> =
+        BTreeMap::new();
+    let mut blocks = Vec::with_capacity(encoded_blocks.len());
+    for (rows, section, pooled) in encoded_blocks {
+        for (hash, text) in pooled {
+            let (count, held) = owned_entries.entry(hash).or_default();
+            *count += 1;
+            anyhow::ensure!(
+                held.as_deref()
+                    .zip(text.as_deref())
+                    .is_none_or(|(held, text)| held == text),
+                "Two strings of a store share a hash"
+            );
+            if held.is_none() {
+                *held = text;
+            }
+        }
+        blocks.push((rows, section));
+    }
+
+    let entries: PoolEntries<'_> = owned_entries
+        .iter()
+        .map(|(hash, (count, text))| (*hash, (*count, text.as_deref())))
+        .collect();
+    let listed = listed(&entries, previous)?;
+    let pool = pool_frames(&entries, &listed, previous)?;
+    assemble(structure_section, &listed, &pool, &blocks)
 }
 
 type OwnedPoolEntries = BTreeMap<[u8; 16], (usize, Option<String>)>;
@@ -631,6 +1088,38 @@ fn written(
 }
 
 /// `content` as a frame: the frame `held` of its store where that holds the
+/// same content, else compressed, reusing `codec`'s zstd contexts and avoiding
+/// a duplicate SHA-256 verification when copying `held`.
+fn framed_with<'s>(
+    content: &[u8],
+    held: Option<(&'s BlockStore<'_>, Frame)>,
+    codec: &mut FrameCodec,
+) -> Result<Section<'s>> {
+    if let Some((store, frame)) = held
+        && frame.decoded == content.len()
+        && let Some(bytes) = store.matches_content_with(frame, content, codec)?
+    {
+        return Ok(Section {
+            decoded: frame.decoded,
+            digest: frame.digest,
+            bytes: Cow::Borrowed(bytes),
+        });
+    }
+    compressed_with(content, codec)
+}
+
+fn compressed_with(content: &[u8], codec: &mut FrameCodec) -> Result<Section<'static>> {
+    let _span = crate::app::profile::span("frame compressed");
+    check_settings_payload_len(content.len(), "Decoded")?;
+    let bytes = codec.compress_frame(content)?;
+    Ok(Section {
+        decoded: content.len(),
+        digest: digest(&[&bytes]),
+        bytes: Cow::Owned(bytes),
+    })
+}
+
+/// `content` as a frame: the frame `held` of its store where that holds the
 /// same content, else compressed.
 fn framed<'s>(content: &[u8], held: Option<(&'s BlockStore<'_>, Frame)>) -> Result<Section<'s>> {
     if let Some((store, frame)) = held
@@ -668,11 +1157,39 @@ impl<'a> Table<'a> {
     /// The table of the texts `counts` counts. Two texts of one hash are the
     /// same string: one of them a marker, or else the store is refused.
     fn of(counts: SettingsStringCounts<'a>) -> Result<Self> {
-        let mut short = Vec::new();
+        Self::of_inner(counts, None)
+    }
+
+    fn of_with_cache(
+        counts: SettingsStringCounts<'a>,
+        long_hashes: &ShardedMap<(usize, usize), [u8; 16]>,
+    ) -> Result<Self> {
+        Self::of_inner(counts, Some(long_hashes))
+    }
+
+    fn of_inner(
+        counts: SettingsStringCounts<'a>,
+        long_hashes: Option<&ShardedMap<(usize, usize), [u8; 16]>>,
+    ) -> Result<Self> {
+        let mut short = Vec::with_capacity(counts.len());
         let mut long = BTreeMap::<[u8; 16], Vec<SettingsString<'a>>>::new();
         for (text, count) in counts {
-            let hash = marked(&text)
-                .or_else(|| (text.len() >= POOL_MIN_BYTES).then(|| digest(&[text.as_bytes()])));
+            let hash = marked(&text).or_else(|| {
+                (text.len() >= POOL_MIN_BYTES).then(|| {
+                    if let Some(cache) = long_hashes
+                        && let Cow::Borrowed(borrowed) = text
+                    {
+                        let key = (borrowed.as_ptr() as usize, borrowed.len());
+                        if let Some(cached) = cache.get(&key) {
+                            return cached;
+                        }
+                        let computed = digest(&[borrowed.as_bytes()]);
+                        cache.insert(key, computed);
+                        return computed;
+                    }
+                    digest(&[text.as_bytes()])
+                })
+            });
             match hash {
                 Some(hash) => long.entry(hash).or_default().push(text),
                 None => short.push((text, count)),
@@ -792,7 +1309,7 @@ fn pool_frames<'s>(
     let alone = listed.iter().map(|(.., alone)| *alone).collect::<Vec<_>>();
     frame_plan(&hashes, &alone)
         .into_par_iter()
-        .map(|planned| {
+        .map_init(FrameCodec::new, |codec, planned| {
             let held = previous.and_then(|store| {
                 let (frame, _) = store.slots[store.entry_of(&hashes[planned[0]]).ok()?];
                 let frame = &store.pool[frame];
@@ -814,22 +1331,26 @@ fn pool_frames<'s>(
                     (None, None) => bail!("A pool entry has no text to write"),
                 }
             }
-            compressed(&content)
+            compressed_with(&content, codec)
         })
         .collect()
 }
 
 /// Appends a pool entry of `text` to a pool frame's content.
 fn write_pool_entry(content: &mut Vec<u8>, text: &str) -> Result<()> {
-    match base64::decode(text) {
-        Ok(bytes) if base64::encode(&bytes) == text => {
-            write_var_u64(content, ((bytes.len() as u64) << 1) | 1)?;
-            content.extend_from_slice(&bytes);
-        }
-        _ => {
-            write_var_u64(content, (text.len() as u64) << 1)?;
-            content.extend_from_slice(text.as_bytes());
-        }
+    let looks_base64 = text.len().is_multiple_of(4)
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='));
+    if looks_base64
+        && let Ok(bytes) = base64::decode(text)
+        && base64::encode(&bytes) == text
+    {
+        write_var_u64(content, ((bytes.len() as u64) << 1) | 1)?;
+        content.extend_from_slice(&bytes);
+    } else {
+        write_var_u64(content, (text.len() as u64) << 1)?;
+        content.extend_from_slice(text.as_bytes());
     }
     Ok(())
 }
@@ -1305,7 +1826,11 @@ impl<'a> BlockStore<'a> {
             .map(|rows| {
                 let index = self.block_of(rows[0]);
                 let first = self.blocks[index].first;
-                let keep = |row: usize| rows.binary_search(&(first + row)).is_ok();
+                let mut mask = vec![false; self.blocks[index].count];
+                for &row in rows {
+                    mask[row - first] = true;
+                }
+                let keep = |row: usize| mask[row];
                 let mut values = self.block_values(index, keep, Texts::Resolved(&|_| true))?;
                 Ok(rows
                     .iter()
@@ -1815,6 +2340,17 @@ impl<'a> BlockStore<'a> {
         structure: Option<Vec<SettingsBytecodeInstance>>,
         plan: impl FnOnce(&[SettingsBytecodeInstance]) -> Option<(Option<usize>, Option<Moved>)>,
     ) -> Result<Option<StoreRows>> {
+        self.row_digests_inner(whole, false, shared, structure, plan)
+    }
+
+    fn row_digests_inner(
+        &self,
+        whole: bool,
+        keep_structure: bool,
+        shared: &[bool],
+        structure: Option<Vec<SettingsBytecodeInstance>>,
+        plan: impl FnOnce(&[SettingsBytecodeInstance]) -> Option<(Option<usize>, Option<Moved>)>,
+    ) -> Result<Option<StoreRows>> {
         let instances = match structure {
             Some(instances) if instances.len() == self.rows => instances,
             _ => self.structure()?.instances,
@@ -1822,7 +2358,7 @@ impl<'a> BlockStore<'a> {
         let Some((kept, moved)) = plan(&instances) else {
             return Ok(None);
         };
-        self.row_digests_of_instances(instances, whole, shared, kept, moved)
+        self.row_digests_of_instances_inner(instances, whole, keep_structure, shared, kept, moved)
             .map(Some)
     }
 
@@ -1873,10 +2409,22 @@ impl<'a> BlockStore<'a> {
         Ok(())
     }
 
-    pub(crate) fn row_digests_of_instances(
+    pub(crate) fn row_digests_of_instances_with_structure(
+        &self,
+        instances: Vec<SettingsBytecodeInstance>,
+        whole: bool,
+        shared: &[bool],
+        kept: Option<usize>,
+        moved: Option<Moved>,
+    ) -> Result<StoreRows> {
+        self.row_digests_of_instances_inner(instances, whole, true, shared, kept, moved)
+    }
+
+    fn row_digests_of_instances_inner(
         &self,
         mut instances: Vec<SettingsBytecodeInstance>,
         whole: bool,
+        keep_structure: bool,
         shared: &[bool],
         kept: Option<usize>,
         moved: Option<Moved>,
@@ -1896,6 +2444,7 @@ impl<'a> BlockStore<'a> {
         if shared.contains(&true) {
             (self.pool.par_iter()).try_for_each(|pool| self.frame_bytes(pool.frame).map(drop))?;
         }
+        let database = rbx_reflection_database::get().ok();
         let blocks = crate::app::profile::span("store blocks digested");
         let digested = self
             .split(&mut instances)
@@ -1904,6 +2453,11 @@ impl<'a> BlockStore<'a> {
             .enumerate()
             .map(|(index, (rows, block))| {
                 let open = self.open_block(index)?;
+                let pool_entries = if keep_structure {
+                    open.pool_entries().collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
                 if whole && kept.is_none() && moved.is_none() && shared.get(index) == Some(&true) {
                     self.values(
                         &open,
@@ -1912,16 +2466,31 @@ impl<'a> BlockStore<'a> {
                         |name, _| name == UNIQUE_ID,
                         Texts::Marked,
                     )?;
-                    return Ok((0_u64..)
+                    let block_rows = (0_u64..)
                         .zip(rows)
                         .map(|(place, instance)| {
                             (
                                 digest(&[&block.frame.digest, &place.to_le_bytes()]),
                                 (instance.properties.get(UNIQUE_ID)).map_or([0; 16], value_digest),
+                                [0u8; 16],
                                 None,
                             )
                         })
-                        .collect());
+                        .collect();
+                    return Ok((block_rows, pool_entries));
+                }
+                if let Some(streamed) = self.digest_block_streaming(
+                    &open,
+                    block,
+                    rows,
+                    DigestBlockOpts {
+                        whole,
+                        kept,
+                        moved: moved.as_ref(),
+                        database,
+                    },
+                )? {
+                    return Ok((streamed, pool_entries));
                 }
                 self.block_into(&open, rows, |_| true, Texts::All)?;
                 let mut digests = Vec::with_capacity(rows.len());
@@ -1932,10 +2501,9 @@ impl<'a> BlockStore<'a> {
                             .values()
                             .chain(instance.attributes.values())
                             .any(names_an_instance_by_id);
-                    let (sum, unique_id) = match &moved {
+                    let orig_parent = instance.parent_index;
+                    let (sum, unique_id, engine) = match &moved {
                         Some(moved) => {
-                            // The instance as the state places it, its values
-                            // that name one by its place given for the digest.
                             moved.parent_in_state(instance);
                             let (properties, attributes) = (
                                 moved.values_in_state(&instance.properties),
@@ -1945,18 +2513,34 @@ impl<'a> BlockStore<'a> {
                                 .map(|placed| std::mem::replace(&mut instance.properties, placed));
                             let attributes = attributes
                                 .map(|placed| std::mem::replace(&mut instance.attributes, placed));
-                            let digests = digest_of(instance);
+                            let (sum, uid) = digest_of(instance);
+                            let engine = if whole {
+                                [0; 16]
+                            } else {
+                                engine_state_digest(database, instance)
+                            };
                             if let Some(properties) = properties {
                                 instance.properties = properties;
                             }
                             if let Some(attributes) = attributes {
                                 instance.attributes = attributes;
                             }
-                            digests
+                            if !whole {
+                                instance.parent_index = orig_parent;
+                            }
+                            (sum, uid, engine)
                         }
-                        None => digest_of(instance),
+                        None => {
+                            let (sum, uid) = digest_of(instance);
+                            let engine = if whole {
+                                [0; 16]
+                            } else {
+                                engine_state_digest(database, instance)
+                            };
+                            (sum, uid, engine)
+                        }
                     };
-                    digests.push((sum, unique_id, named.then_some(row)));
+                    digests.push((sum, unique_id, engine, named.then_some(row)));
                     if kept == Some(row) {
                         instance
                             .properties
@@ -1969,31 +2553,640 @@ impl<'a> BlockStore<'a> {
                         instance.attributes.clear();
                     }
                 }
-                Ok(digests)
+                Ok((digests, pool_entries))
             })
             .collect::<Result<Vec<_>>>()?;
         drop(blocks);
-        let (mut digests, mut unique_ids, mut named) = (Vec::new(), Vec::new(), Vec::new());
-        for (sum, unique_id, row) in digested.into_iter().flatten() {
-            digests.push(sum);
-            unique_ids.push(unique_id);
-            named.extend(row);
+        let mut digests = Vec::with_capacity(self.rows);
+        let mut unique_ids = Vec::with_capacity(self.rows);
+        let mut engine_digests = if whole {
+            Vec::new()
+        } else {
+            Vec::with_capacity(self.rows)
+        };
+        let mut named = Vec::new();
+        let mut block_pool_entries = if keep_structure {
+            Vec::with_capacity(self.blocks.len())
+        } else {
+            Vec::new()
+        };
+        for (block_rows, pool_entries) in digested {
+            if keep_structure {
+                block_pool_entries.push(pool_entries);
+            }
+            for (sum, unique_id, engine, row) in block_rows {
+                digests.push(sum);
+                unique_ids.push(unique_id);
+                if !whole {
+                    engine_digests.push(engine);
+                }
+                named.extend(row);
+            }
         }
-        let kept = kept.map(|kept| instances[kept].clone());
-        let (ids, instances) = if whole {
-            (Vec::new(), instances)
+        let kept = kept.map(|kept| {
+            let mut instance = instances[kept].clone();
+            if !whole && let Some(moved) = &moved {
+                moved.parent_in_state(&mut instance);
+            }
+            if keep_structure && !whole {
+                instances[kept].properties.clear();
+                instances[kept].attributes.clear();
+            }
+            instance
+        });
+        let (ids, instances, retained_structure) = if whole {
+            (Vec::new(), instances, None)
+        } else if keep_structure {
+            let ids = if instances.len() >= SETTINGS_BINARY_PARALLEL_MIN_INSTANCES {
+                instances
+                    .par_iter()
+                    .map(|instance| instance.settings_id.clone())
+                    .collect()
+            } else {
+                instances
+                    .iter()
+                    .map(|instance| instance.settings_id.clone())
+                    .collect()
+            };
+            (ids, Vec::new(), Some(instances))
         } else {
             let ids = instances.into_iter().map(|instance| instance.settings_id);
-            (ids.collect(), Vec::new())
+            (ids.collect(), Vec::new(), None)
         };
         Ok(StoreRows {
             digests,
             unique_ids,
+            engine_digests,
             kept,
             ids,
+            structure: retained_structure,
+            block_pool_entries,
             moved,
             instances,
             named,
+        })
+    }
+
+    fn digest_block_streaming(
+        &self,
+        open: &OpenBlock,
+        block: &Block,
+        rows: &mut [SettingsBytecodeInstance],
+        opts: DigestBlockOpts<'_>,
+    ) -> Result<Option<Vec<StreamedRowDigest>>> {
+        use super::captured::{
+            EMPTY_ATTRIBUTES_DIGEST, RowHasher, StrOrHash, UNIQUE_ID, row_digest_header,
+        };
+
+        let eager_pool: std::cell::OnceCell<PoolRead> = std::cell::OnceCell::new();
+        let prop_pool_read = self.load_digest_prop_pool(open, opts.whole, &eager_pool)?;
+
+        let mut str_items: Vec<StrOrHash<'_>> = Vec::with_capacity(open.strings.len());
+        let mut table_bytes = 0_usize;
+        for string in &open.strings {
+            match string {
+                BlockString::Own(text) => {
+                    table_bytes = table_bytes.saturating_add(text.len());
+                    str_items.push(StrOrHash::Text(text.as_str()));
+                }
+                BlockString::Pool(entry) => {
+                    table_bytes = table_bytes.saturating_add(16);
+                    str_items.push(StrOrHash::Hash(self.hashes[*entry]));
+                }
+            }
+        }
+        let mut prop_names: Vec<&str> = Vec::with_capacity(open.properties.len());
+        for &id in &open.properties {
+            let text = match &open.strings[id] {
+                BlockString::Own(text) => text.as_str(),
+                BlockString::Pool(entry) => {
+                    let pool = eager_pool
+                        .get()
+                        .or(prop_pool_read.as_ref())
+                        .expect("pool loaded for pooled property name");
+                    self.entry(pool, *entry)?
+                }
+            };
+            table_bytes = table_bytes.saturating_add(text.len());
+            prop_names.push(text);
+        }
+        self.budget.take(table_bytes)?;
+
+        let (specs, attr_groups, prop_order) = parse_block_group_specs(open, &prop_names)?;
+        let count = rows.len();
+        let mut hashers: Vec<RowHasher> = Vec::with_capacity(count);
+        for instance in rows.iter_mut() {
+            let parent = match opts.moved {
+                Some(m) => {
+                    let placed = m.parent_index_in_state(instance.parent_index);
+                    if opts.whole {
+                        instance.parent_index = placed;
+                    }
+                    placed
+                }
+                None => instance.parent_index,
+            };
+            hashers.push(row_digest_header(
+                &instance.name,
+                &instance.class_name,
+                parent,
+            ));
+        }
+
+        let mut state = StreamDigestState {
+            unique_ids: vec![[0u8; 16]; count],
+            attr_digests: vec![*EMPTY_ATTRIBUTES_DIGEST; count],
+            engine_hashers: if opts.whole {
+                Vec::new()
+            } else {
+                (0..count).map(|_| None).collect()
+            },
+            named_flags: if opts.whole {
+                vec![false; count]
+            } else {
+                Vec::new()
+            },
+            multi_slot: Vec::new(),
+            string_digests: vec![None; str_items.len()],
+            enum_digests: vec![None; str_items.len()],
+            pair_obj_digests: AHashMap::new(),
+            hashers,
+        };
+
+        let resolved_str_refs: std::cell::OnceCell<Vec<&str>> = std::cell::OnceCell::new();
+        let get_resolved_refs = || -> Result<&[&str]> {
+            if let Some(refs) = resolved_str_refs.get() {
+                return Ok(refs.as_slice());
+            }
+            let pool = match eager_pool.get() {
+                Some(p) => p,
+                None => {
+                    let loaded = self.pool_read(open.pool_entries())?;
+                    let _ = eager_pool.set(loaded);
+                    eager_pool.get().unwrap()
+                }
+            };
+            let refs: Vec<&str> = open
+                .strings
+                .iter()
+                .map(|s| match s {
+                    BlockString::Own(t) => Ok(t.as_str()),
+                    BlockString::Pool(entry) => self.entry(pool, *entry),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let _ = resolved_str_refs.set(refs);
+            Ok(resolved_str_refs.get().unwrap().as_slice())
+        };
+        let kept_local = opts
+            .kept
+            .and_then(|k| k.checked_sub(block.first).filter(|&l| l < count));
+
+        if !attr_groups.is_empty() {
+            self.digest_attr_groups(
+                (open, &specs, &attr_groups),
+                rows,
+                &mut state,
+                (opts, kept_local),
+                &get_resolved_refs,
+            )?;
+        }
+
+        let mut run_start = 0_usize;
+        while run_start < prop_order.len() {
+            let name = specs[prop_order[run_start]].0;
+            let mut run_end = run_start + 1;
+            while run_end < prop_order.len() && specs[prop_order[run_end]].0 == name {
+                run_end += 1;
+            }
+            let multi = run_end - run_start > 1;
+            if multi && state.multi_slot.len() != count {
+                state.multi_slot.resize(count, None);
+            }
+            let is_unique_id = name == UNIQUE_ID;
+
+            for &group_idx in &prop_order[run_start..run_end] {
+                self.digest_property_group(
+                    specs[group_idx],
+                    rows,
+                    &str_items,
+                    &mut state,
+                    (opts, kept_local, multi, is_unique_id),
+                    &get_resolved_refs,
+                )?;
+            }
+
+            if multi {
+                for (row, instance) in rows.iter().enumerate() {
+                    if let Some(val_digest) = state.multi_slot[row].take() {
+                        record_row_property_digest(
+                            &mut state,
+                            row,
+                            &instance.class_name,
+                            name,
+                            is_unique_id,
+                            val_digest,
+                            opts,
+                        );
+                    }
+                }
+            }
+            run_start = run_end;
+        }
+
+        if let Some(local) = kept_local {
+            rows[local]
+                .properties
+                .values_mut()
+                .for_each(crate::settings::held::resolve_all);
+        }
+
+        let mut digests = Vec::with_capacity(count);
+        for row in 0..count {
+            let mut h = std::mem::replace(&mut state.hashers[row], RowHasher::new());
+            h.update(&[0]);
+            h.update(&state.attr_digests[row]);
+            let engine = if opts.whole {
+                [0; 16]
+            } else {
+                state.engine_hashers[row]
+                    .take()
+                    .map_or([0; 16], RowHasher::finish)
+            };
+            let named_row = (opts.whole && state.named_flags[row]).then_some(block.first + row);
+            digests.push((h.finish(), state.unique_ids[row], engine, named_row));
+        }
+        Ok(Some(digests))
+    }
+
+    fn load_digest_prop_pool(
+        &self,
+        open: &OpenBlock,
+        whole: bool,
+        eager_pool: &std::cell::OnceCell<PoolRead>,
+    ) -> Result<Option<PoolRead>> {
+        if whole {
+            let _ = eager_pool.set(self.pool_read(open.pool_entries())?);
+            return Ok(None);
+        }
+        let prop_pool: Vec<usize> = open
+            .properties
+            .iter()
+            .filter_map(|&id| match open.strings[id] {
+                BlockString::Pool(entry) => Some(entry),
+                BlockString::Own(_) => None,
+            })
+            .collect();
+        if prop_pool.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(self.pool_read(prop_pool)?))
+        }
+    }
+
+    fn digest_attr_groups<'b>(
+        &self,
+        (open, specs, attr_groups): (&OpenBlock, &[BlockGroupSpec<'_>], &[usize]),
+        rows: &mut [SettingsBytecodeInstance],
+        state: &mut StreamDigestState,
+        (opts, kept_local): (DigestBlockOpts<'_>, Option<usize>),
+        get_resolved_refs: &dyn Fn() -> Result<&'b [&'b str]>,
+    ) -> Result<()> {
+        use super::captured::attributes_digest;
+
+        let count = rows.len();
+        let mut full_needed = opts.whole || kept_local.is_some();
+        if !full_needed {
+            let marked_table: Vec<Cow<'_, str>> = open
+                .strings
+                .iter()
+                .map(|s| match s {
+                    BlockString::Own(t) => Cow::Borrowed(t.as_str()),
+                    BlockString::Pool(entry) => Cow::Owned(marker(&self.hashes[*entry])),
+                })
+                .collect();
+            let marked_refs: Vec<&str> = marked_table.iter().map(Cow::as_ref).collect();
+            let scope = ValueScope::from_borrowed(&marked_refs, self.rows, &self.budget, None);
+            'marked: for &group_idx in attr_groups {
+                let (name, kind, value_count, body) = specs[group_idx];
+                self.budget.property_group(value_count, name, kind)?;
+                let mut reader = BytecodeReader::new(body);
+                let _ = decode_cframe_group_header(kind, &mut reader)?;
+                let mut prev_row = 0_usize;
+                for position in 0..value_count {
+                    let row = next_group_instance(
+                        prev_row,
+                        reader.read_len("property instance index")?,
+                        position,
+                    )?;
+                    prev_row = row;
+                    anyhow::ensure!(
+                        row < count,
+                        "A value block gives a value to a row it does not hold"
+                    );
+                    let attributes = decode_attributes_payload(&mut reader, scope)?;
+                    if attributes.values().any(holds_marker)
+                        || attributes.keys().any(|k| marked(k).is_some())
+                    {
+                        full_needed = true;
+                        break 'marked;
+                    }
+                    state.attr_digests[row] =
+                        match opts.moved.and_then(|m| m.values_in_state(&attributes)) {
+                            Some(placed) => attributes_digest(&placed),
+                            None => attributes_digest(&attributes),
+                        };
+                }
+                reader.finish()?;
+            }
+        }
+        if !full_needed {
+            return Ok(());
+        }
+        let str_refs = get_resolved_refs()?;
+        let scope = ValueScope::from_borrowed(str_refs, self.rows, &self.budget, None);
+        for &group_idx in attr_groups {
+            let (name, kind, value_count, body) = specs[group_idx];
+            self.budget.property_group(value_count, name, kind)?;
+            let mut reader = BytecodeReader::new(body);
+            let _ = decode_cframe_group_header(kind, &mut reader)?;
+            let mut prev_row = 0_usize;
+            for position in 0..value_count {
+                let row = next_group_instance(
+                    prev_row,
+                    reader.read_len("property instance index")?,
+                    position,
+                )?;
+                prev_row = row;
+                anyhow::ensure!(
+                    row < count,
+                    "A value block gives a value to a row it does not hold"
+                );
+                let attributes = decode_attributes_payload(&mut reader, scope)?;
+                if opts.whole && attributes.values().any(names_an_instance_by_id) {
+                    state.named_flags[row] = true;
+                }
+                state.attr_digests[row] =
+                    match opts.moved.and_then(|m| m.values_in_state(&attributes)) {
+                        Some(placed) => attributes_digest(&placed),
+                        None => attributes_digest(&attributes),
+                    };
+                if kept_local == Some(row) {
+                    rows[row].attributes = attributes;
+                }
+            }
+            reader.finish()?;
+        }
+        Ok(())
+    }
+
+    fn digest_property_group<'b>(
+        &self,
+        (name, kind, value_count, body): BlockGroupSpec<'_>,
+        rows: &mut [SettingsBytecodeInstance],
+        str_items: &[super::captured::StrOrHash<'_>],
+        state: &mut StreamDigestState,
+        (opts, kept_local, multi, is_unique_id): (DigestBlockOpts<'_>, Option<usize>, bool, bool),
+        get_resolved_refs: &dyn Fn() -> Result<&'b [&'b str]>,
+    ) -> Result<()> {
+        use super::captured::value_digest;
+
+        let count = rows.len();
+        self.budget.property_group(value_count, name, kind)?;
+        let mut reader = BytecodeReader::new(body);
+        let cframe = decode_cframe_group_header(kind, &mut reader)?;
+        let mut prev_row = 0_usize;
+        let mut prev_ref = 0_usize;
+        let mut charged = 0_usize;
+
+        for position in 0..value_count {
+            let row = next_group_instance(
+                prev_row,
+                reader.read_len("property instance index")?,
+                position,
+            )?;
+            prev_row = row;
+            anyhow::ensure!(
+                row < count,
+                "A value block gives a value to a row it does not hold"
+            );
+            let keep_value = kept_local == Some(row) || (opts.whole && is_unique_id);
+            let val_digest = if keep_value {
+                let str_refs = get_resolved_refs()?;
+                let scope = ValueScope::from_borrowed(str_refs, self.rows, &self.budget, None);
+                let entry = decode_property_group_entry(
+                    &mut reader,
+                    name,
+                    kind,
+                    row,
+                    scope,
+                    &cframe,
+                    &mut prev_ref,
+                )?;
+                let DecodedGroupEntry::Property(_, value) = entry else {
+                    unreachable!("non-Attributes group decoded as Attributes");
+                };
+                if opts.whole && names_an_instance_by_id(&value) {
+                    state.named_flags[row] = true;
+                }
+                let d = match opts.moved.and_then(|m| m.value_in_state(&value)) {
+                    Some(placed) => value_digest(&placed),
+                    None => value_digest(&value),
+                };
+                rows[row].properties.insert(name.to_string(), value);
+                d
+            } else {
+                self.digest_wire_value_fast(
+                    &mut reader,
+                    (kind, row, &cframe, &mut prev_ref),
+                    str_items,
+                    state,
+                    (&mut charged, opts),
+                    get_resolved_refs,
+                )?
+            };
+
+            if multi {
+                state.multi_slot[row] = Some(val_digest);
+            } else {
+                record_row_property_digest(
+                    state,
+                    row,
+                    &rows[row].class_name,
+                    name,
+                    is_unique_id,
+                    val_digest,
+                    opts,
+                );
+            }
+        }
+        self.budget.take(charged)?;
+        reader.finish()?;
+        Ok(())
+    }
+
+    fn digest_wire_value_fast<'b>(
+        &self,
+        reader: &mut BytecodeReader<'_>,
+        (kind, row, cframe, prev_ref): (u8, usize, &CFrameGroupDecoder, &mut usize),
+        str_items: &[super::captured::StrOrHash<'_>],
+        state: &mut StreamDigestState,
+        (charged, opts): (&mut usize, DigestBlockOpts<'_>),
+        get_resolved_refs: &dyn Fn() -> Result<&'b [&'b str]>,
+    ) -> Result<[u8; 16]> {
+        use super::captured::{
+            BOOL_FALSE_DIGEST, BOOL_TRUE_DIGEST, NULL_VALUE_DIGEST, StrOrHash,
+            digest_cframe_f64_value, digest_enum_value, digest_f64_value,
+            digest_fixed_floats_value, digest_i64_value, digest_long_string_hash,
+            digest_ref_one_based, digest_string_value, digest_two_string_object_with_hashes,
+            digest_u64_value, value_digest,
+        };
+
+        match kind {
+            0 => Ok(*NULL_VALUE_DIGEST),
+            1 => Ok(*BOOL_FALSE_DIGEST),
+            2 => Ok(*BOOL_TRUE_DIGEST),
+            3 => Ok(digest_i64_value(unzigzag_i64(reader.read_var_u64()?))),
+            4 => Ok(digest_u64_value(reader.read_var_u64()?)),
+            5 => Ok(digest_f64_value(read_f64(reader)?)),
+            20 => Ok(digest_f64_value(f64::from(read_f32(reader)?))),
+            6 => {
+                let id = reader.read_len("value string id")?;
+                let item = *str_items
+                    .get(id)
+                    .with_context(|| format!("Invalid value string id {id}"))?;
+                Ok(match item {
+                    StrOrHash::Text(text) => {
+                        *charged = charged.saturating_add(text.len());
+                        *state.string_digests[id].get_or_insert_with(|| digest_string_value(text))
+                    }
+                    StrOrHash::Hash(hash) => {
+                        *charged = charged.saturating_add(16);
+                        *state.string_digests[id]
+                            .get_or_insert_with(|| digest_long_string_hash(&hash))
+                    }
+                })
+            }
+            19 => {
+                let id = reader.read_len("enum item string id")?;
+                let item = *str_items
+                    .get(id)
+                    .with_context(|| format!("Invalid enum item string id {id}"))?;
+                Ok(match item {
+                    StrOrHash::Text(text) => {
+                        *charged = charged.saturating_add(text.len());
+                        *state.enum_digests[id].get_or_insert_with(|| digest_enum_value(text))
+                    }
+                    StrOrHash::Hash(hash) => {
+                        *charged = charged.saturating_add(16);
+                        *state.enum_digests[id].get_or_insert_with(|| {
+                            digest_two_string_object_with_hashes(
+                                "_type",
+                                StrOrHash::Text("EnumItem"),
+                                "name",
+                                StrOrHash::Hash(hash),
+                            )
+                        })
+                    }
+                })
+            }
+            11 | 13 => Ok(digest_fixed_floats_value(
+                kind,
+                &[read_f32(reader)?, read_f32(reader)?],
+            )),
+            12 | 15 => Ok(digest_fixed_floats_value(
+                kind,
+                &[read_f32(reader)?, read_f32(reader)?, read_f32(reader)?],
+            )),
+            14 | 18 => Ok(digest_fixed_floats_value(
+                kind,
+                &[
+                    read_f32(reader)?,
+                    read_f32(reader)?,
+                    read_f32(reader)?,
+                    read_f32(reader)?,
+                ],
+            )),
+            16 => match cframe {
+                CFrameGroupDecoder::Inline => {
+                    let mut c = [0.0_f32; 12];
+                    for slot in &mut c {
+                        *slot = read_f32(reader)?;
+                    }
+                    Ok(digest_fixed_floats_value(16, &c))
+                }
+                CFrameGroupDecoder::RotationTable(rotations) => {
+                    let pos = [read_f32(reader)?, read_f32(reader)?, read_f32(reader)?];
+                    let rot_idx = reader.read_len("CFrame rotation index")?;
+                    let rot = rotations
+                        .get(rot_idx)
+                        .with_context(|| format!("Invalid CFrame rotation index {rot_idx}"))?;
+                    Ok(digest_cframe_f64_value(pos, rot))
+                }
+            },
+            17 => {
+                let target = decode_resolved_ref_target(reader, self.rows, prev_ref)?;
+                let one_based = match opts.moved {
+                    Some(m) => m.in_state(target).map_or(0, |idx| idx as u64 + 1),
+                    None => target as u64 + 1,
+                };
+                Ok(digest_ref_one_based(one_based))
+            }
+            7 => {
+                let save_pos = reader.position();
+                if let Some(d) = try_digest_string_array_wire(reader, str_items, charged) {
+                    return Ok(d);
+                }
+                reader.set_position(save_pos);
+                self.digest_fallback_wire_value(reader, 7, row, state, opts, get_resolved_refs)
+            }
+            8 => {
+                let save_pos = reader.position();
+                if let Some(d) = try_digest_two_string_object_wire(
+                    reader,
+                    str_items,
+                    opts.whole,
+                    charged,
+                    &mut state.pair_obj_digests,
+                ) {
+                    return Ok(d);
+                }
+                reader.set_position(save_pos);
+                self.digest_fallback_wire_value(reader, 8, row, state, opts, get_resolved_refs)
+            }
+            _ => {
+                let str_refs = get_resolved_refs()?;
+                let scope = ValueScope::from_borrowed(str_refs, self.rows, &self.budget, None);
+                let value = decode_raw_value_payload(reader, kind, scope, 0)?;
+                if opts.whole && names_an_instance_by_id(&value) {
+                    state.named_flags[row] = true;
+                }
+                Ok(match opts.moved.and_then(|m| m.value_in_state(&value)) {
+                    Some(placed) => value_digest(&placed),
+                    None => value_digest(&value),
+                })
+            }
+        }
+    }
+
+    fn digest_fallback_wire_value<'b>(
+        &self,
+        reader: &mut BytecodeReader<'_>,
+        kind: u8,
+        row: usize,
+        state: &mut StreamDigestState,
+        opts: DigestBlockOpts<'_>,
+        get_resolved_refs: &dyn Fn() -> Result<&'b [&'b str]>,
+    ) -> Result<[u8; 16]> {
+        use super::captured::value_digest;
+        let str_refs = get_resolved_refs()?;
+        let scope = ValueScope::from_borrowed(str_refs, self.rows, &self.budget, None);
+        let value = decode_raw_value_payload(reader, kind, scope, 0)?;
+        if opts.whole && names_an_instance_by_id(&value) {
+            state.named_flags[row] = true;
+        }
+        Ok(match opts.moved.and_then(|m| m.value_in_state(&value)) {
+            Some(placed) => value_digest(&placed),
+            None => value_digest(&value),
         })
     }
 
@@ -2041,6 +3234,57 @@ impl<'a> BlockStore<'a> {
             digest: frame.digest,
             bytes: Cow::Borrowed(self.frame_bytes(frame)?),
         })
+    }
+
+    /// Verifies `frame` once and returns its raw compressed bytes if its decoded content
+    /// equals `expected`, reusing `codec`'s zstd decompressor.
+    fn matches_content_with(
+        &self,
+        frame: Frame,
+        expected: &[u8],
+        codec: &mut FrameCodec,
+    ) -> Result<Option<&[u8]>> {
+        let bytes = self.frame_bytes(frame)?;
+        anyhow::ensure!(
+            zstd::zstd_safe::find_frame_compressed_size(bytes) == Ok(bytes.len()),
+            "A frame of the block store is not one zstd frame"
+        );
+        anyhow::ensure!(
+            bytes[..4] == ZSTD_MAGIC && bytes[4] & 4 != 0,
+            "A frame of the block store carries no checksum of its content"
+        );
+        anyhow::ensure!(
+            matches!(
+                zstd::zstd_safe::get_frame_content_size(bytes),
+                Ok(Some(size)) if size == frame.decoded as u64
+            ),
+            "A frame of the block store does not state the length its head gives"
+        );
+        #[cfg(test)]
+        DECOMPRESSED.fetch_add(frame.decoded, Ordering::Relaxed);
+        self.budget.take(frame.decoded)?;
+        let most = FRAME_READ_START.max(bytes.len().saturating_mul(FRAME_READ_RATIO));
+        let content = if frame.decoded <= most {
+            codec.decompress_exact(bytes, frame.decoded)?
+        } else {
+            let mut content = Vec::new();
+            content.reserve_exact(most);
+            zstd::stream::read::Decoder::with_buffer(bytes).and_then(|decoder| {
+                let mut decoder = decoder.take(frame.decoded as u64 + 1);
+                decoder.read_to_end(&mut content).map(drop)
+            })?;
+            content
+        };
+        #[cfg(test)]
+        self.reserved
+            .fetch_max(content.capacity(), Ordering::Relaxed);
+        anyhow::ensure!(
+            content.len() == frame.decoded,
+            "A frame of the block store holds {} bytes, not the {} its head gives",
+            content.len(),
+            frame.decoded
+        );
+        Ok((content == expected).then_some(bytes))
     }
 
     /// What a frame holds, charged to the store's budget. A frame that does
@@ -2349,8 +3593,8 @@ impl<'a> BlockStore<'a> {
         // the markers of the rows read have their texts. The decode charges
         // the store's own budget as it goes, so blocks read in parallel
         // together take no more than it holds.
-        let marked = (!all).then(|| self.budget.not_holding());
-        let budget = marked.as_ref().unwrap_or(&self.budget);
+        let marked_budget = (!all).then(|| self.budget.not_holding());
+        let budget = marked_budget.as_ref().unwrap_or(&self.budget);
         let held_ids = budget.holds_payloads.then(|| {
             (0..string_refs.len())
                 .map(|_| std::sync::atomic::AtomicU64::new(u64::MAX))
@@ -2361,24 +3605,18 @@ impl<'a> BlockStore<'a> {
         let groups = specs
             .par_iter()
             .map(|&(name, kind, count, body)| {
-                let mut entries = decode_property_group_body(body, name, kind, count, scope)?;
-                anyhow::ensure!(
-                    entries
-                        .last()
-                        .is_none_or(|entry| entry.instance_index() < held),
-                    "A value block gives a value to a row it does not hold"
-                );
-                entries.retain(|entry| keep(entry.instance_index()));
-                Ok(entries)
+                decode_property_group_body_filtered(
+                    body,
+                    name,
+                    kind,
+                    count,
+                    scope,
+                    Some(held),
+                    &keep,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
-        apply_decoded_property_groups_in_range(
-            rows,
-            0,
-            &specs,
-            groups,
-            SETTINGS_BINARY_PARALLEL_CHUNK_SIZE,
-        );
+        apply_decoded_property_groups_in_range(rows, 0, &specs, groups, 256);
         if all {
             return Ok(());
         }
@@ -2390,24 +3628,62 @@ impl<'a> BlockStore<'a> {
             }
             self.pool_text(&hash).map(Some)
         };
-        // Each row takes its texts by itself; the payloads are held in the
-        // order of the rows, which gives each its handle.
-        if open.pool_entries().next().is_some() {
+        let has_pool = open.pool_entries().next().is_some();
+        if has_pool || self.budget.holds_payloads {
+            let resolve_shared =
+                has_pool && matches!(texts, Texts::Resolved(_)) && self.budget.holds_payloads;
+            let shared_handles: Mutex<AHashMap<[u8; 16], Value>> = Mutex::new(AHashMap::new());
             (rows.par_iter_mut().enumerate())
                 .filter(|(row, _)| keep(*row))
                 .try_for_each(|(_, row)| {
                     let (properties, attributes) = row.maps();
-                    unmark(properties, &text)?;
-                    unmark(attributes, &text)
+                    if has_pool {
+                        if resolve_shared {
+                            for value in properties.values_mut() {
+                                if let Some(obj) = value.as_object()
+                                    && obj.len() == 2
+                                    && obj.get("_type").and_then(Value::as_str)
+                                        == Some("SharedString")
+                                    && let Some(b64) = obj.get("base64").and_then(Value::as_str)
+                                    && let Some(hash) = marked(b64)
+                                    && matches!(texts, Texts::Resolved(real) if real(&hash))
+                                {
+                                    let cached = shared_handles.lock_recover().get(&hash).cloned();
+                                    let handle = match cached {
+                                        Some(h) => h,
+                                        None => {
+                                            let real = self.pool_text(&hash)?;
+                                            let h = self.budget.property(json!({
+                                                "_type": "SharedString",
+                                                "base64": real,
+                                            }));
+                                            shared_handles.lock_recover().insert(hash, h.clone());
+                                            h
+                                        }
+                                    };
+                                    *value = handle;
+                                    continue;
+                                }
+                                unmark_value(value, &text)?;
+                            }
+                        } else {
+                            unmark(properties, &text)?;
+                        }
+                        unmark(attributes, &text)?;
+                    }
+                    if self.budget.holds_payloads {
+                        for value in properties.values_mut() {
+                            if let Some(obj) = value.as_object()
+                                && obj.len() == 2
+                                && !crate::settings::held::is_handle(obj)
+                                && obj.get("_type").and_then(Value::as_str) == Some("SharedString")
+                            {
+                                *value = self.budget.property(std::mem::take(value));
+                            }
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(())
                 })?;
-        }
-        if self.budget.holds_payloads {
-            for row in rows.iter_mut().enumerate().filter(|(row, _)| keep(*row)) {
-                let (properties, _) = row.1.maps();
-                for value in properties.values_mut() {
-                    *value = self.budget.property(std::mem::take(value));
-                }
-            }
         }
         Ok(())
     }
@@ -2637,7 +3913,6 @@ fn rows_of(
         attributes,
         ..structure[row].bare()
     };
-    // Rows asked in rising order come back as asked.
     if rows.windows(2).all(|pair| pair[0] < pair[1]) {
         let read = read.into_iter();
         return Ok(read
@@ -2657,28 +3932,3179 @@ fn rows_of(
         .collect())
 }
 
-/// `decode_rows` of one v12 file a batch of rows at a time: its instances
-/// are read once for all the batches, and each batch on a budget of its own.
+/// `decode_rows` of one v12 file a batch of rows at a time: its head, pool cache,
+/// and instances are kept across all batches, and each batch runs on a renewed budget.
 pub(crate) struct RowBatches<'a> {
-    bytes: &'a [u8],
+    store: BlockStore<'a>,
     structure: Vec<SettingsBytecodeInstance>,
 }
 
 impl<'a> RowBatches<'a> {
-    pub(crate) fn open(bytes: &'a [u8]) -> Result<Self> {
-        let structure = BlockStore::open(bytes)?.structure()?.instances;
-        Ok(Self { bytes, structure })
+    pub(crate) fn open_holding(bytes: &'a [u8]) -> Result<Self> {
+        let store = BlockStore::open(bytes)?.holding();
+        let structure = store.structure()?.instances;
+        Ok(Self { store, structure })
+    }
+
+    pub(crate) fn from_opened(
+        store: BlockStore<'a>,
+        structure: Vec<SettingsBytecodeInstance>,
+    ) -> Self {
+        Self { store, structure }
+    }
+
+    pub(crate) fn block_of(&self, row: usize) -> usize {
+        self.store.block_of(row)
+    }
+
+    pub(crate) fn structure(&self) -> &[SettingsBytecodeInstance] {
+        &self.structure
+    }
+
+    pub(crate) fn into_store(self) -> BlockStore<'a> {
+        let Self { store, structure } = self;
+        if structure.len() >= SETTINGS_BINARY_PARALLEL_MIN_INSTANCES {
+            structure.into_par_iter().for_each(drop);
+        }
+        store
     }
 
     /// The id of every instance of the file.
     pub(crate) fn ids(&self) -> Vec<String> {
-        let rows = self.structure.iter();
-        rows.map(|row| row.settings_id.clone()).collect()
+        if self.structure.len() >= SETTINGS_BINARY_PARALLEL_MIN_INSTANCES {
+            self.structure
+                .par_iter()
+                .map(|row| row.settings_id.clone())
+                .collect()
+        } else {
+            self.structure
+                .iter()
+                .map(|row| row.settings_id.clone())
+                .collect()
+        }
     }
 
     pub(crate) fn read(&self, rows: &[usize]) -> Result<Vec<SettingsBytecodeInstance>> {
-        rows_of(&BlockStore::open(self.bytes)?, &self.structure, rows)
+        self.store.budget.renew(self.store.bytes.len());
+        rows_of(&self.store, &self.structure, rows)
     }
+
+    pub(super) fn fast_compare_changed(
+        &self,
+        state: &ServiceState,
+        records: &[SettingsBinaryInstance<'_>],
+        lookup: &SettingsBinaryInstanceLookup<'_>,
+        changed: &[usize],
+        root_service: Option<&str>,
+        long_hashes: Option<&super::captured::LongHashMap>,
+    ) -> Result<Vec<FastCompareOutcome>> {
+        self.store.budget.renew(self.store.bytes.len());
+        self.store.fast_compare_changed(FastCompareInput {
+            structure: &self.structure,
+            state,
+            records,
+            lookup,
+            changed,
+            root_service,
+            long_hashes,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FastCapVal<'a> {
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Str(&'a str),
+    Enum(&'a str),
+    Vec2([f32; 2]),
+    Vec3([f32; 3]),
+    UDim([f32; 2]),
+    UDim2([f32; 4]),
+    Color3([f32; 3]),
+    Rect([f32; 4]),
+    CFrame(&'a [f32; 12]),
+    Ref(usize),
+    Payload { ty: &'a str, b64: &'a str },
+    Tags(&'a [Value]),
+    SkipCompare,
+}
+
+#[inline]
+fn is_known_default_fast(name: &str, val: FastCapVal<'_>) -> bool {
+    matches!(
+        (name, val),
+        ("Archivable" | "CharacterAutoLoads", FastCapVal::Bool(true))
+            | ("Sandboxed", FastCapVal::Bool(false))
+    )
+}
+
+fn compare_number_default(
+    a: f64,
+    value: f64,
+    uses_f32: bool,
+    allow_nonfinite: bool,
+) -> Option<bool> {
+    use crate::settings::equivalence::{f32_values_definitely_differ, f32_values_match};
+    if a == value || (uses_f32 && f32_values_match(a, value)) {
+        Some(true)
+    } else if f32_values_definitely_differ(a, value)
+        || (!uses_f32 && (allow_nonfinite || a.is_finite()))
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn compare_f32_slice_default(a: &[f32], b: &[f32]) -> Option<bool> {
+    use crate::settings::equivalence::{f32_values_definitely_differ, f32_values_match};
+    if a.iter()
+        .zip(b)
+        .all(|(&x, &y)| f32_values_match(f64::from(x), f64::from(y)))
+    {
+        Some(true)
+    } else if a
+        .iter()
+        .zip(b)
+        .any(|(&x, &y)| f32_values_definitely_differ(f64::from(x), f64::from(y)))
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn fast_val_matches_one_sided(
+    name: &str,
+    val: FastCapVal<'_>,
+    rule: &crate::settings::equivalence::OneSidedRule,
+) -> Option<bool> {
+    use crate::settings::equivalence::{
+        FastDefaultVal, OneSidedRule, cframes_definitely_differ, cframes_match_reconciliation,
+        f32_values_definitely_differ, f32_values_match,
+    };
+
+    if matches!(val, FastCapVal::SkipCompare) {
+        return matches!(rule, OneSidedRule::Ignored).then_some(true);
+    }
+    match rule {
+        OneSidedRule::Ignored => Some(true),
+        OneSidedRule::NoDefault => Some(is_known_default_fast(name, val)),
+        OneSidedRule::Default(def) => {
+            if is_known_default_fast(name, val) {
+                return Some(true);
+            }
+            match (val, def) {
+                (FastCapVal::Bool(a), FastDefaultVal::Bool(b)) => Some(a == *b),
+                (FastCapVal::F64(a), FastDefaultVal::Number { value, uses_f32 }) => {
+                    compare_number_default(a, *value, *uses_f32, false)
+                }
+                (FastCapVal::I64(a), FastDefaultVal::Number { value, uses_f32 }) => {
+                    compare_number_default(a as f64, *value, *uses_f32, true)
+                }
+                (FastCapVal::U64(a), FastDefaultVal::Number { value, uses_f32 }) => {
+                    compare_number_default(a as f64, *value, *uses_f32, true)
+                }
+                (FastCapVal::Str(a), FastDefaultVal::Str(b)) => Some(a == b.as_str()),
+                (FastCapVal::Enum(a), FastDefaultVal::Enum(b)) => {
+                    if a == b.as_str() {
+                        Some(true)
+                    } else if a.parse::<u64>().is_err() && b.parse::<u64>().is_err() {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                (FastCapVal::Vec2(a), FastDefaultVal::Vec2(b)) => compare_f32_slice_default(&a, b),
+                (FastCapVal::Vec3(a), FastDefaultVal::Vec3(b)) => compare_f32_slice_default(&a, b),
+                (FastCapVal::Rect(a), FastDefaultVal::Rect(b)) => compare_f32_slice_default(&a, b),
+                (FastCapVal::UDim(a), FastDefaultVal::UDim(b)) => {
+                    if f32_values_match(f64::from(a[0]), f64::from(b[0])) && a[1] == b[1] {
+                        Some(true)
+                    } else if f32_values_definitely_differ(f64::from(a[0]), f64::from(b[0]))
+                        || f32_values_definitely_differ(f64::from(a[1]), f64::from(b[1]))
+                    {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                (FastCapVal::UDim2(a), FastDefaultVal::UDim2(b)) => {
+                    if f32_values_match(f64::from(a[0]), f64::from(b[0]))
+                        && a[1] == b[1]
+                        && f32_values_match(f64::from(a[2]), f64::from(b[2]))
+                        && a[3] == b[3]
+                    {
+                        Some(true)
+                    } else if (0..4)
+                        .any(|i| f32_values_definitely_differ(f64::from(a[i]), f64::from(b[i])))
+                    {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                (FastCapVal::Color3(a), FastDefaultVal::Color3(b)) => {
+                    if (0..3).all(|i| f32_values_match(f64::from(a[i]), f64::from(b[i]))) {
+                        Some(true)
+                    } else if (0..3).any(|i| {
+                        f32_values_definitely_differ(f64::from(a[i]), f64::from(b[i]))
+                            && (a[i].clamp(0.0, 1.0) * 255.0).round() as u8
+                                != (b[i].clamp(0.0, 1.0) * 255.0).round() as u8
+                    }) {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                (FastCapVal::CFrame(a), FastDefaultVal::CFrame(b)) => {
+                    let a64 = a.map(f64::from);
+                    if cframes_match_reconciliation(&a64, b) {
+                        Some(true)
+                    } else if cframes_definitely_differ(&a64, b) {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+fn skip_raw_value_payload_fast(
+    reader: &mut BytecodeReader<'_>,
+    kind: u8,
+    depth: usize,
+) -> Result<()> {
+    if depth > MAX_SETTINGS_VALUE_DEPTH {
+        bail!("Settings bytecode value nesting exceeds safe depth of {MAX_SETTINGS_VALUE_DEPTH}");
+    }
+    match kind {
+        0..=2 => Ok(()),
+        3 | 4 | 6 | 17 | 19 => {
+            reader.read_var_u64()?;
+            Ok(())
+        }
+        5 => {
+            reader.read_bytes(8)?;
+            Ok(())
+        }
+        20 => {
+            reader.read_bytes(4)?;
+            Ok(())
+        }
+        11 | 13 => {
+            reader.read_bytes(8)?;
+            Ok(())
+        }
+        12 | 15 => {
+            reader.read_bytes(12)?;
+            Ok(())
+        }
+        14 | 18 => {
+            reader.read_bytes(16)?;
+            Ok(())
+        }
+        16 => {
+            reader.read_bytes(48)?;
+            Ok(())
+        }
+        9 => {
+            let len = reader.read_len("numeric array length")?;
+            let bytes = len
+                .checked_mul(8)
+                .context("Numeric array byte length overflow")?;
+            reader.read_bytes(bytes)?;
+            Ok(())
+        }
+        21 => {
+            let len = reader.read_len("f32 numeric array length")?;
+            let bytes = len
+                .checked_mul(4)
+                .context("f32 numeric array byte length overflow")?;
+            reader.read_bytes(bytes)?;
+            Ok(())
+        }
+        NESTED_ENUM_ITEM_KIND => {
+            reader.read_var_u64()?;
+            reader.read_var_u64()?;
+            Ok(())
+        }
+        7 => {
+            let len = reader.read_collection_len("array length")?;
+            for _ in 0..len {
+                let item_kind = reader.read_u8().context("Missing value kind")?;
+                skip_raw_value_payload_fast(reader, item_kind, depth + 1)?;
+            }
+            Ok(())
+        }
+        8 => {
+            let len = reader.read_collection_len("object field count")?;
+            for _ in 0..len {
+                reader.read_var_u64()?;
+                let val_kind = reader.read_u8().context("Missing value kind")?;
+                skip_raw_value_payload_fast(reader, val_kind, depth + 1)?;
+            }
+            Ok(())
+        }
+        10 => {
+            let flags = reader.read_u8().context("Missing ref fallback flags")?;
+            if flags & 1 != 0 {
+                reader.read_var_u64()?;
+            }
+            if flags & 2 != 0 {
+                reader.read_var_u64()?;
+            }
+            if flags & 4 != 0 {
+                let len = reader.read_collection_len("ref path segment count")?;
+                for _ in 0..len {
+                    reader.read_var_u64()?;
+                }
+            }
+            if flags & 8 != 0 {
+                reader.read_var_u64()?;
+            }
+            if flags & 16 != 0 {
+                reader.read_var_u64()?;
+            }
+            if flags & 32 != 0 {
+                let len = reader.read_collection_len("ref path ordinal count")?;
+                for _ in 0..len {
+                    reader.read_var_u64()?;
+                }
+            }
+            Ok(())
+        }
+        _ => bail!("Unknown settings value kind {kind}"),
+    }
+}
+
+/// Scans a stored wire value payload in `fast_compare_changed` without allocating JSON.
+/// Always consumes the complete payload from `reader` and returns `true` only when the
+/// value is proven to contain no references, no `EnumItem`s, and nothing that fails
+/// `values_encode_alike` (`references_alike`).
+fn stored_value_is_safe(
+    reader: &mut BytecodeReader<'_>,
+    kind: u8,
+    str_opts: &[Option<&str>],
+    depth: usize,
+) -> Result<bool> {
+    if depth > MAX_SETTINGS_VALUE_DEPTH {
+        bail!("Settings bytecode value nesting exceeds safe depth of {MAX_SETTINGS_VALUE_DEPTH}");
+    }
+    match kind {
+        0..=2 => Ok(true),
+        3 | 4 | 6 => {
+            reader.read_var_u64()?;
+            Ok(true)
+        }
+        5 | 11 | 13 => {
+            reader.read_bytes(8)?;
+            Ok(true)
+        }
+        20 => {
+            reader.read_bytes(4)?;
+            Ok(true)
+        }
+        12 | 15 => {
+            reader.read_bytes(12)?;
+            Ok(true)
+        }
+        14 | 18 => {
+            reader.read_bytes(16)?;
+            Ok(true)
+        }
+        16 => {
+            reader.read_bytes(48)?;
+            Ok(true)
+        }
+        9 => {
+            let len = reader.read_len("numeric array length")?;
+            let bytes = len
+                .checked_mul(8)
+                .context("Numeric array byte length overflow")?;
+            reader.read_bytes(bytes)?;
+            Ok(true)
+        }
+        21 => {
+            let len = reader.read_len("f32 numeric array length")?;
+            let bytes = len
+                .checked_mul(4)
+                .context("f32 numeric array byte length overflow")?;
+            reader.read_bytes(bytes)?;
+            Ok(true)
+        }
+        10 | 17 | 19 | NESTED_ENUM_ITEM_KIND => {
+            skip_raw_value_payload_fast(reader, kind, depth)?;
+            Ok(false)
+        }
+        7 => {
+            let len = reader.read_collection_len("array length")?;
+            let mut safe = true;
+            for _ in 0..len {
+                let item_kind = reader.read_u8().context("Missing value kind")?;
+                if !stored_value_is_safe(reader, item_kind, str_opts, depth + 1)? {
+                    safe = false;
+                }
+            }
+            Ok(safe)
+        }
+        8 => {
+            let len = reader.read_collection_len("object field count")?;
+            let mut safe = true;
+            for _ in 0..len {
+                let key_id = reader.read_len("object key string id")?;
+                let key = str_opts.get(key_id).copied().flatten();
+                let val_kind = reader.read_u8().context("Missing value kind")?;
+                match key {
+                    Some(k) => {
+                        if k == "Ref" || SETTINGS_REFERENCE_SELECTOR_KEYS[1..].contains(&k) {
+                            safe = false;
+                            skip_raw_value_payload_fast(reader, val_kind, depth + 1)?;
+                        } else if k == "_type" {
+                            if val_kind == 6 {
+                                let val_id = reader.read_len("value string id")?;
+                                match str_opts.get(val_id).copied().flatten() {
+                                    Some(t) if t != "Ref" && t != "EnumItem" => {}
+                                    _ => safe = false,
+                                }
+                            } else {
+                                safe = false;
+                                skip_raw_value_payload_fast(reader, val_kind, depth + 1)?;
+                            }
+                        } else if !stored_value_is_safe(reader, val_kind, str_opts, depth + 1)? {
+                            safe = false;
+                        }
+                    }
+                    None => {
+                        safe = false;
+                        skip_raw_value_payload_fast(reader, val_kind, depth + 1)?;
+                    }
+                }
+            }
+            Ok(safe)
+        }
+        _ => bail!("Unknown settings value kind {kind}"),
+    }
+}
+
+struct FastCompareInput<'a> {
+    structure: &'a [SettingsBytecodeInstance],
+    state: &'a ServiceState,
+    records: &'a [SettingsBinaryInstance<'a>],
+    lookup: &'a SettingsBinaryInstanceLookup<'a>,
+    changed: &'a [usize],
+    root_service: Option<&'a str>,
+    long_hashes: Option<&'a super::captured::LongHashMap>,
+}
+
+struct FastCompareBlockState<'a> {
+    row_to_slot: Vec<u32>,
+    eligible: Vec<bool>,
+    found_diff: Vec<bool>,
+    all_same: Vec<bool>,
+    holds_ref: Vec<bool>,
+    stored_had_attrs: Vec<bool>,
+    cap_unique_id: Vec<Option<&'a str>>,
+    stored_unique_id_matched: Vec<Option<bool>>,
+    cap_props: Vec<(&'a str, FastCapVal<'a>, bool)>,
+    cap_ranges: Vec<(usize, usize)>,
+    cap_canon_targets: AHashMap<usize, Vec<&'a str>>,
+}
+
+struct FastCompareShared<'a> {
+    input: FastCompareInput<'a>,
+    database: Option<&'a rbx_reflection::ReflectionDatabase<'a>>,
+    long_hashes: &'a super::captured::LongHashMap,
+    hull_fidelities: &'a ShardedMap<usize, Option<u8>>,
+}
+
+struct FastCompareGroupMeta<'r, 'b> {
+    str_opts: &'r [Option<&'b str>],
+    str_pool_entry: &'r [Option<usize>],
+    block_prop_names: &'r AHashSet<&'b str>,
+    count: usize,
+}
+
+struct FastCompareGroupMut<'r, 'a, 'b> {
+    st: &'r mut FastCompareBlockState<'a>,
+    cap_seen: &'r mut [bool],
+    cursors: &'r mut [usize],
+    stored_canon_targets: &'r mut AHashMap<usize, Vec<&'a str>>,
+    scratch: &'r mut FastComparePropScratch<'a, 'b>,
+}
+
+#[derive(Default)]
+struct FastComparePropScratch<'a, 'b> {
+    class_engine_state: AHashMap<&'a str, bool>,
+    class_asset_ref: AHashMap<&'a str, bool>,
+    tag_left_buf: Vec<&'b str>,
+    tag_right_buf: Vec<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+struct FastPropFlags {
+    is_unique_id: bool,
+    is_forced: bool,
+    is_hull_prop: bool,
+    is_meta_name: bool,
+    is_source: bool,
+    is_special: bool,
+}
+
+impl FastPropFlags {
+    fn of(name: &str) -> Self {
+        let is_unique_id = name == super::captured::UNIQUE_ID;
+        let is_forced = name == "TextScaled" || name == "TextWrapped";
+        let is_hull_prop = name == crate::rbx::encode::COLLISION_HULL_PROPERTY;
+        let is_meta_name = matches!(name, "UniqueId" | "CurrentCamera" | "HistoryId");
+        let is_source = name == "Source";
+        let is_special = is_unique_id
+            || is_forced
+            || name == "Attributes"
+            || is_meta_name
+            || is_source
+            || matches!(
+                name,
+                "Tags" | "CollisionFidelity" | "PhysicsGrid" | "TexturePack" | "TriangleCount"
+            )
+            || is_hull_prop;
+        Self {
+            is_unique_id,
+            is_forced,
+            is_hull_prop,
+            is_meta_name,
+            is_source,
+            is_special,
+        }
+    }
+}
+
+fn fast_compare_skip_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "PackageLink" | "AnimationRigData" | "Terrain" | "HumanoidDescription" | "Lighting"
+    )
+}
+
+fn fast_cap_val_from_source<'a>(
+    name: &str,
+    kind: u8,
+    source: &SettingsBinaryValueSource<'a>,
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+    shared_safe: &mut AHashMap<usize, bool>,
+) -> Option<(FastCapVal<'a>, bool)> {
+    if kind == 17 {
+        let ref_val = match source {
+            SettingsBinaryValueSource::Native(NativeSettingsValue::Ref(idx)) => {
+                FastCapVal::Ref(*idx)
+            }
+            SettingsBinaryValueSource::Property(v) => ref_payload_object(v)
+                .and_then(|r| resolve_ref_index(r, lookup).ok().flatten())
+                .map_or(FastCapVal::SkipCompare, FastCapVal::Ref),
+            _ => FastCapVal::SkipCompare,
+        };
+        return Some((ref_val, true));
+    }
+    if matches!(kind, 10 | NESTED_ENUM_ITEM_KIND) {
+        return None;
+    }
+    if matches!(kind, 9 | 21) {
+        return Some((FastCapVal::SkipCompare, false));
+    }
+    if kind == 7 {
+        return fast_cap_val_array(name, source).map(|v| (v, false));
+    }
+    if kind == 8 {
+        return fast_cap_val_object(source, shared_safe).map(|v| (v, false));
+    }
+    fast_cap_val_scalar(kind, source).map(|v| (v, false))
+}
+
+fn fast_cap_val_array<'a>(
+    name: &str,
+    source: &SettingsBinaryValueSource<'a>,
+) -> Option<FastCapVal<'a>> {
+    use crate::settings::equivalence::{
+        reconciliation_value_contains_reference as holds_reference, value_contains_enum_item,
+    };
+    match source {
+        SettingsBinaryValueSource::Property(v)
+            if !holds_reference(v) && !value_contains_enum_item(v) =>
+        {
+            if name == "Tags"
+                && let Some(items) = v.as_array()
+                && items.iter().all(Value::is_string)
+            {
+                Some(FastCapVal::Tags(items.as_slice()))
+            } else {
+                Some(FastCapVal::SkipCompare)
+            }
+        }
+        SettingsBinaryValueSource::Settled(v)
+            if !holds_reference(v) && !value_contains_enum_item(v) =>
+        {
+            Some(FastCapVal::SkipCompare)
+        }
+        _ => None,
+    }
+}
+
+fn fast_cap_val_object<'a>(
+    source: &SettingsBinaryValueSource<'a>,
+    shared_safe: &mut AHashMap<usize, bool>,
+) -> Option<FastCapVal<'a>> {
+    use crate::settings::equivalence::{
+        reconciliation_value_contains_reference as holds_reference, value_contains_enum_item,
+    };
+    match source {
+        SettingsBinaryValueSource::Native(NativeSettingsValue::Shared(arc)) => {
+            let ptr = std::sync::Arc::as_ptr(arc) as usize;
+            let safe = *shared_safe
+                .entry(ptr)
+                .or_insert_with(|| !holds_reference(arc) && !value_contains_enum_item(arc));
+            if !safe {
+                return None;
+            }
+            Some(
+                extract_payload_from_value(arc).map_or(FastCapVal::SkipCompare, |(ty, b64)| {
+                    FastCapVal::Payload { ty, b64 }
+                }),
+            )
+        }
+        SettingsBinaryValueSource::Property(v) => {
+            if let Some((ty, b64)) = extract_payload_from_value(v) {
+                Some(FastCapVal::Payload { ty, b64 })
+            } else if !holds_reference(v) && !value_contains_enum_item(v) {
+                Some(FastCapVal::SkipCompare)
+            } else {
+                None
+            }
+        }
+        SettingsBinaryValueSource::Settled(v)
+            if !holds_reference(v) && !value_contains_enum_item(v) =>
+        {
+            Some(FastCapVal::SkipCompare)
+        }
+        _ => None,
+    }
+}
+
+fn extract_payload_from_value(v: &Value) -> Option<(&str, &str)> {
+    let o = v.as_object()?;
+    if o.len() != 2 {
+        return None;
+    }
+    let ty = o.get("_type").and_then(Value::as_str)?;
+    if !matches!(ty, "SharedString" | "BinaryString") {
+        return None;
+    }
+    let b64 = o.get("base64").and_then(Value::as_str)?;
+    Some((ty, b64))
+}
+
+fn fast_cap_val_scalar<'a>(
+    kind: u8,
+    source: &SettingsBinaryValueSource<'a>,
+) -> Option<FastCapVal<'a>> {
+    match source {
+        SettingsBinaryValueSource::Native(n) => match n {
+            NativeSettingsValue::Bool(b) => Some(FastCapVal::Bool(*b)),
+            NativeSettingsValue::Int(i) => Some(FastCapVal::I64(*i)),
+            NativeSettingsValue::Float32(f) => Some(FastCapVal::F64(f64::from(*f))),
+            NativeSettingsValue::Float64(f) => Some(FastCapVal::F64(*f)),
+            NativeSettingsValue::String(s) => Some(FastCapVal::Str(s.as_str())),
+            NativeSettingsValue::Enum(s) => Some(FastCapVal::Enum(s.as_str())),
+            NativeSettingsValue::Vector2(v) => Some(FastCapVal::Vec2(*v)),
+            NativeSettingsValue::Vector3(v) => Some(FastCapVal::Vec3(*v)),
+            NativeSettingsValue::UDim(v) => Some(FastCapVal::UDim(*v)),
+            NativeSettingsValue::UDim2(v) => Some(FastCapVal::UDim2(*v)),
+            NativeSettingsValue::Color3(v) => Some(FastCapVal::Color3(*v)),
+            NativeSettingsValue::Rect(v) => Some(FastCapVal::Rect(*v)),
+            NativeSettingsValue::CFrame(cf) => Some(FastCapVal::CFrame(cf.as_ref())),
+            NativeSettingsValue::Shared(_) => Some(FastCapVal::SkipCompare),
+            NativeSettingsValue::UniqueId(_) | NativeSettingsValue::Ref(_) => None,
+        },
+        SettingsBinaryValueSource::Property(v) => match kind {
+            0 | 11..=16 | 18 => Some(FastCapVal::SkipCompare),
+            1 => Some(FastCapVal::Bool(false)),
+            2 => Some(FastCapVal::Bool(true)),
+            3 => Some(v.as_i64().map_or(FastCapVal::SkipCompare, FastCapVal::I64)),
+            4 => Some(v.as_u64().map_or(FastCapVal::SkipCompare, FastCapVal::U64)),
+            5 | 20 => Some(settings_number(v).map_or(FastCapVal::SkipCompare, FastCapVal::F64)),
+            6 => Some(raw_string_payload(v).map_or(FastCapVal::SkipCompare, FastCapVal::Str)),
+            19 => Some(raw_string_payload(v).map_or(FastCapVal::SkipCompare, FastCapVal::Enum)),
+            _ => None,
+        },
+        SettingsBinaryValueSource::Settled(v) => match kind {
+            0 | 6 | 19 | 11..=16 | 18 => Some(FastCapVal::SkipCompare),
+            1 => Some(FastCapVal::Bool(false)),
+            2 => Some(FastCapVal::Bool(true)),
+            3 => Some(v.as_i64().map_or(FastCapVal::SkipCompare, FastCapVal::I64)),
+            4 => Some(v.as_u64().map_or(FastCapVal::SkipCompare, FastCapVal::U64)),
+            5 | 20 => Some(settings_number(v).map_or(FastCapVal::SkipCompare, FastCapVal::F64)),
+            _ => None,
+        },
+        SettingsBinaryValueSource::Attributes(_) => None,
+    }
+}
+
+fn decode_stored_scalar_val<'a>(
+    reader: &mut BytecodeReader<'_>,
+    kind: u8,
+    str_opts: &[Option<&'a str>],
+) -> Result<Option<Option<FastCapVal<'a>>>> {
+    let val = match kind {
+        0 => None,
+        1 => Some(FastCapVal::Bool(false)),
+        2 => Some(FastCapVal::Bool(true)),
+        3 => Some(FastCapVal::I64(unzigzag_i64(reader.read_var_u64()?))),
+        4 => Some(FastCapVal::U64(reader.read_var_u64()?)),
+        5 => Some(FastCapVal::F64(read_f64(reader)?)),
+        20 => Some(FastCapVal::F64(f64::from(read_f32(reader)?))),
+        6 => {
+            let id = reader.read_len("value string id")?;
+            let entry = *str_opts
+                .get(id)
+                .with_context(|| format!("Invalid value string id {id}"))?;
+            entry.map(FastCapVal::Str)
+        }
+        19 => {
+            let id = reader.read_len("enum item string id")?;
+            let entry = *str_opts
+                .get(id)
+                .with_context(|| format!("Invalid enum item string id {id}"))?;
+            match entry {
+                Some(s) => Some(FastCapVal::Enum(s)),
+                None => return Ok(None),
+            }
+        }
+        11 => Some(FastCapVal::Vec2([read_f32(reader)?, read_f32(reader)?])),
+        12 => Some(FastCapVal::Vec3([
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+        ])),
+        13 => Some(FastCapVal::UDim([read_f32(reader)?, read_f32(reader)?])),
+        14 => Some(FastCapVal::UDim2([
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+        ])),
+        15 => Some(FastCapVal::Color3([
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+        ])),
+        18 => Some(FastCapVal::Rect([
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+        ])),
+        _ => return Ok(None),
+    };
+    Ok(Some(val))
+}
+
+fn decode_cframe_f64(
+    reader: &mut BytecodeReader<'_>,
+    cframe: &CFrameGroupDecoder,
+) -> Result<[f64; 12]> {
+    match cframe {
+        CFrameGroupDecoder::Inline => {
+            let mut c = [0.0_f64; 12];
+            for x in &mut c {
+                *x = f64::from(read_f32(reader)?);
+            }
+            Ok(c)
+        }
+        CFrameGroupDecoder::RotationTable(rotations) => {
+            let p0 = f64::from(read_f32(reader)?);
+            let p1 = f64::from(read_f32(reader)?);
+            let p2 = f64::from(read_f32(reader)?);
+            let rot_idx = reader.read_len("CFrame rotation index")?;
+            let rot = rotations
+                .get(rot_idx)
+                .with_context(|| format!("Invalid CFrame rotation index {rot_idx}"))?;
+            Ok([
+                p0, p1, p2, rot[0], rot[1], rot[2], rot[3], rot[4], rot[5], rot[6], rot[7], rot[8],
+            ])
+        }
+    }
+}
+
+fn compare_f32_slices_pair(a: &[f32], b: &[f32], can_prove_diff: bool) -> (bool, bool) {
+    use crate::settings::equivalence::{f32_values_definitely_differ, f32_values_match};
+    if a.iter()
+        .zip(b)
+        .all(|(&x, &y)| f32_values_match(f64::from(x), f64::from(y)))
+    {
+        return (true, false);
+    }
+    let diff = can_prove_diff
+        && a.iter()
+            .zip(b)
+            .any(|(&x, &y)| f32_values_definitely_differ(f64::from(x), f64::from(y)));
+    (false, diff)
+}
+
+#[derive(Clone, Copy)]
+enum FastNum {
+    I64(i64),
+    U64(u64),
+    F64(f64),
+}
+
+impl FastNum {
+    fn as_f64(self) -> f64 {
+        match self {
+            Self::I64(x) => x as f64,
+            Self::U64(x) => x as f64,
+            Self::F64(x) => x,
+        }
+    }
+}
+
+fn exact_fast_numbers_equal(left: FastNum, right: FastNum) -> bool {
+    match (left, right) {
+        (FastNum::I64(a), FastNum::I64(b)) => a == b,
+        (FastNum::U64(a), FastNum::U64(b)) => a == b,
+        (FastNum::I64(a), FastNum::U64(b)) | (FastNum::U64(b), FastNum::I64(a)) => {
+            i128::from(a) == i128::from(b)
+        }
+        (FastNum::F64(a), FastNum::F64(b)) => a == b,
+        (FastNum::F64(f), FastNum::I64(i)) | (FastNum::I64(i), FastNum::F64(f)) => {
+            f.is_finite() && f.fract() == 0.0 && i128::from(i) == (f as i128)
+        }
+        (FastNum::F64(f), FastNum::U64(u)) | (FastNum::U64(u), FastNum::F64(f)) => {
+            f.is_finite() && f.fract() == 0.0 && f >= 0.0 && i128::from(u) == (f as i128)
+        }
+    }
+}
+
+fn compare_fast_pair_values(
+    class_name: &str,
+    name: &str,
+    (sv, cv): (FastCapVal<'_>, FastCapVal<'_>),
+    (can_prove_diff, is_asset): (bool, bool),
+    cache: &mut crate::settings::equivalence::CanonicalizeCache,
+) -> (bool, bool) {
+    use crate::settings::equivalence::{
+        canonical_asset_text, f32_values_definitely_differ, f32_values_match,
+    };
+
+    if name == "TriangleCount"
+        && matches!(
+            class_name,
+            "UnionOperation" | "NegateOperation" | "IntersectOperation"
+        )
+        && matches!(
+            sv,
+            FastCapVal::I64(_) | FastCapVal::U64(_) | FastCapVal::F64(_)
+        )
+        && matches!(
+            cv,
+            FastCapVal::I64(_) | FastCapVal::U64(_) | FastCapVal::F64(_)
+        )
+    {
+        return (true, false);
+    }
+    if name == "CollisionFidelity"
+        && crate::rbx::encode::is_solid_model_operation(class_name)
+        && let (FastCapVal::Enum(a), FastCapVal::Enum(b)) = (sv, cv)
+        && matches!(a, "Box" | "Default")
+        && matches!(b, "Box" | "Default")
+    {
+        return (true, false);
+    }
+    match (sv, cv) {
+        (FastCapVal::Bool(a), FastCapVal::Bool(b)) => (a == b, a != b && can_prove_diff),
+        (
+            FastCapVal::I64(_) | FastCapVal::U64(_) | FastCapVal::F64(_),
+            FastCapVal::I64(_) | FastCapVal::U64(_) | FastCapVal::F64(_),
+        ) => {
+            let to_num = |v| match v {
+                FastCapVal::I64(x) => FastNum::I64(x),
+                FastCapVal::U64(x) => FastNum::U64(x),
+                FastCapVal::F64(x) => FastNum::F64(x),
+                _ => unreachable!(),
+            };
+            let (left, right) = (to_num(sv), to_num(cv));
+            let (a, b) = (left.as_f64(), right.as_f64());
+            if exact_fast_numbers_equal(left, right) {
+                (true, false)
+            } else if can_prove_diff && f32_values_definitely_differ(a, b) {
+                (false, true)
+            } else if cache.property_uses_f32(class_name, name) && f32_values_match(a, b) {
+                (true, false)
+            } else {
+                (false, false)
+            }
+        }
+        (FastCapVal::Str(a), FastCapVal::Str(b)) => {
+            if a == b || (is_asset && canonical_asset_text(a) == canonical_asset_text(b)) {
+                (true, false)
+            } else {
+                (false, can_prove_diff)
+            }
+        }
+        (FastCapVal::Enum(a), FastCapVal::Enum(b)) => {
+            if a == b {
+                (true, false)
+            } else {
+                (
+                    false,
+                    can_prove_diff && a.parse::<u64>().is_err() && b.parse::<u64>().is_err(),
+                )
+            }
+        }
+        (FastCapVal::Vec2(a), FastCapVal::Vec2(b)) => {
+            compare_f32_slices_pair(&a, &b, can_prove_diff)
+        }
+        (FastCapVal::Vec3(a), FastCapVal::Vec3(b)) => {
+            compare_f32_slices_pair(&a, &b, can_prove_diff)
+        }
+        (FastCapVal::Rect(a), FastCapVal::Rect(b)) => {
+            compare_f32_slices_pair(&a, &b, can_prove_diff)
+        }
+        (FastCapVal::UDim(a), FastCapVal::UDim(b)) => {
+            if f32_values_match(f64::from(a[0]), f64::from(b[0])) && a[1] == b[1] {
+                (true, false)
+            } else {
+                let diff = can_prove_diff
+                    && (f32_values_definitely_differ(f64::from(a[0]), f64::from(b[0]))
+                        || f32_values_definitely_differ(f64::from(a[1]), f64::from(b[1])));
+                (false, diff)
+            }
+        }
+        (FastCapVal::UDim2(a), FastCapVal::UDim2(b)) => {
+            if f32_values_match(f64::from(a[0]), f64::from(b[0]))
+                && a[1] == b[1]
+                && f32_values_match(f64::from(a[2]), f64::from(b[2]))
+                && a[3] == b[3]
+            {
+                (true, false)
+            } else {
+                let diff = can_prove_diff
+                    && (0..4)
+                        .any(|i| f32_values_definitely_differ(f64::from(a[i]), f64::from(b[i])));
+                (false, diff)
+            }
+        }
+        (FastCapVal::Color3(a), FastCapVal::Color3(b)) => {
+            if (0..3).all(|i| f32_values_match(f64::from(a[i]), f64::from(b[i]))) {
+                (true, false)
+            } else {
+                let diff = can_prove_diff
+                    && (0..3).any(|i| {
+                        f32_values_definitely_differ(f64::from(a[i]), f64::from(b[i]))
+                            && (a[i].clamp(0.0, 1.0) * 255.0).round() as u8
+                                != (b[i].clamp(0.0, 1.0) * 255.0).round() as u8
+                    });
+                (false, diff)
+            }
+        }
+        _ => (false, false),
+    }
+}
+
+fn read_two_string_object_header<'a>(
+    reader: &mut BytecodeReader<'_>,
+    str_opts: &[Option<&'a str>],
+) -> Option<(&'a str, usize, &'a str, usize)> {
+    if reader.read_collection_len("object field count").ok()? != 2 {
+        return None;
+    }
+    let k0_id = reader.read_len("object key string id").ok()?;
+    if reader.read_u8().ok()? != 6 {
+        return None;
+    }
+    let v0_id = reader.read_len("value string id").ok()?;
+    let k1_id = reader.read_len("object key string id").ok()?;
+    if reader.read_u8().ok()? != 6 {
+        return None;
+    }
+    let v1_id = reader.read_len("value string id").ok()?;
+    Some((
+        (*str_opts.get(k0_id)?)?,
+        v0_id,
+        (*str_opts.get(k1_id)?)?,
+        v1_id,
+    ))
+}
+
+fn check_stored_prop_canonical<'a, 'b>(
+    cache: &mut crate::settings::equivalence::CanonicalizeCache<'a>,
+    class_name: &str,
+    name: &'b str,
+    is_forced: bool,
+    (slot, block_prop_names): (usize, &AHashSet<&'b str>),
+    st: &mut FastCompareBlockState<'a>,
+    stored_canon_targets: &mut AHashMap<usize, Vec<&'a str>>,
+) -> bool {
+    use crate::settings::equivalence::PropertyCanonical;
+    if is_forced || name == "Attributes" {
+        st.eligible[slot] = false;
+        return false;
+    }
+    match cache.property_canonical(class_name, name) {
+        PropertyCanonical::Unchanged => {
+            if st
+                .cap_canon_targets
+                .get(&slot)
+                .is_some_and(|ts| ts.contains(&name))
+            {
+                st.eligible[slot] = false;
+            }
+            false
+        }
+        PropertyCanonical::Renamed(target) => {
+            let (cs, ce) = st.cap_ranges[slot];
+            let conflict = block_prop_names.contains(target)
+                || st.cap_props[cs..ce]
+                    .binary_search_by_key(&target, |p| p.0)
+                    .is_ok();
+            let ts = stored_canon_targets.entry(slot).or_default();
+            if conflict || ts.contains(&target) {
+                st.eligible[slot] = false;
+                false
+            } else {
+                ts.push(target);
+                true
+            }
+        }
+        PropertyCanonical::Migrated(targets) => {
+            let (cs, ce) = st.cap_ranges[slot];
+            let conflict = targets.iter().any(|target| {
+                block_prop_names.contains(target)
+                    || st.cap_props[cs..ce]
+                        .binary_search_by_key(target, |p| p.0)
+                        .is_ok()
+            });
+            let ts = stored_canon_targets.entry(slot).or_default();
+            if conflict || targets.iter().any(|t| ts.contains(t)) {
+                st.eligible[slot] = false;
+                false
+            } else {
+                ts.extend_from_slice(targets);
+                true
+            }
+        }
+        PropertyCanonical::Complex => {
+            st.eligible[slot] = false;
+            false
+        }
+    }
+}
+
+fn advance_cap_cursor<'a>(
+    st: &FastCompareBlockState<'a>,
+    cap_seen: &mut [bool],
+    cursors: &mut [usize],
+    slot: usize,
+    name: &str,
+) -> Option<(FastCapVal<'a>, bool)> {
+    let end = st.cap_ranges[slot].1;
+    let mut c = cursors[slot];
+    while c < end && st.cap_props[c].0 < name {
+        c += 1;
+    }
+    cursors[slot] = c;
+    if c < end && st.cap_props[c].0 == name {
+        cap_seen[c] = true;
+        Some((st.cap_props[c].1, st.cap_props[c].2))
+    } else {
+        None
+    }
+}
+
+fn compare_stored_array_value<'a, 'b>(
+    reader: &mut BytecodeReader<'_>,
+    str_opts: &[Option<&'b str>],
+    (slot, name, is_unique_id): (usize, &str, bool),
+    cap_match: Option<(FastCapVal<'a>, bool)>,
+    (st, scratch): (
+        &mut FastCompareBlockState<'a>,
+        &mut FastComparePropScratch<'a, 'b>,
+    ),
+) -> Result<()> {
+    if is_unique_id {
+        st.eligible[slot] = false;
+        skip_raw_value_payload_fast(reader, 7, 0)?;
+        return Ok(());
+    }
+    if name == "Tags"
+        && let Some((FastCapVal::Tags(cap_tags), _)) = cap_match
+    {
+        let save_pos = reader.position();
+        let tags_ok = (|| -> Option<bool> {
+            let arr_len = reader.read_collection_len("array length").ok()?;
+            scratch.tag_left_buf.clear();
+            for _ in 0..arr_len {
+                if reader.read_u8().ok()? != 6 {
+                    return None;
+                }
+                let id = reader.read_len("value string id").ok()?;
+                scratch.tag_left_buf.push((*str_opts.get(id)?)?);
+            }
+            scratch.tag_right_buf.clear();
+            for v in cap_tags {
+                scratch.tag_right_buf.push(v.as_str()?);
+            }
+            scratch.tag_left_buf.sort_unstable();
+            scratch.tag_left_buf.dedup();
+            scratch.tag_right_buf.sort_unstable();
+            scratch.tag_right_buf.dedup();
+            Some(scratch.tag_left_buf == scratch.tag_right_buf)
+        })();
+        match tags_ok {
+            Some(true) => return Ok(()),
+            Some(false) => {
+                st.found_diff[slot] = true;
+                st.all_same[slot] = false;
+                return Ok(());
+            }
+            None => reader.set_position(save_pos),
+        }
+    }
+    if !stored_value_is_safe(reader, 7, str_opts, 0)? {
+        st.eligible[slot] = false;
+    } else {
+        st.all_same[slot] = false;
+    }
+    Ok(())
+}
+
+fn extract_two_field_unique_id<'a>(
+    str_opts: &[Option<&'a str>],
+    k0: &str,
+    v0_id: usize,
+    k1: &str,
+    v1_id: usize,
+) -> Option<&'a str> {
+    if k0 == "_type" && str_opts.get(v0_id).copied().flatten() == Some("UniqueId") && k1 == "value"
+    {
+        str_opts.get(v1_id).copied().flatten()
+    } else if k1 == "_type"
+        && str_opts.get(v1_id).copied().flatten() == Some("UniqueId")
+        && k0 == "value"
+    {
+        str_opts.get(v0_id).copied().flatten()
+    } else {
+        None
+    }
+}
+
+fn extract_two_field_payload_id<'a>(
+    str_opts: &[Option<&'a str>],
+    k0: &str,
+    v0_id: usize,
+    k1: &str,
+    v1_id: usize,
+) -> Option<(&'a str, usize)> {
+    let (ty_id, b64_id) = if k0 == "_type" && k1 == "base64" {
+        (v0_id, v1_id)
+    } else if k1 == "_type" && k0 == "base64" {
+        (v1_id, v0_id)
+    } else {
+        return None;
+    };
+    str_opts
+        .get(ty_id)
+        .copied()
+        .flatten()
+        .filter(|t| matches!(*t, "SharedString" | "BinaryString"))
+        .map(|ty| (ty, b64_id))
+}
+
+fn compare_stored_cframe_value(
+    cache: &mut crate::settings::equivalence::CanonicalizeCache,
+    (slot, class_name, name, is_special, is_stored_canon): (usize, &str, &str, bool, bool),
+    a: &[f64; 12],
+    cap_match: Option<(FastCapVal<'_>, bool)>,
+    st: &mut FastCompareBlockState<'_>,
+) {
+    use crate::settings::equivalence::{
+        FastDefaultVal, OneSidedRule, cframes_definitely_differ, cframes_match_reconciliation,
+    };
+    match cap_match {
+        Some((FastCapVal::CFrame(b), _)) => {
+            let b64 = b.map(f64::from);
+            if !is_special && !is_stored_canon && cframes_definitely_differ(a, &b64) {
+                st.found_diff[slot] = true;
+                st.all_same[slot] = false;
+            } else if !cframes_match_reconciliation(a, &b64) {
+                st.all_same[slot] = false;
+            }
+        }
+        None if !is_stored_canon => match cache.one_sided_rule(class_name, name) {
+            OneSidedRule::Ignored => {}
+            OneSidedRule::Default(FastDefaultVal::CFrame(ref def)) => {
+                if !is_special && cframes_definitely_differ(a, def) {
+                    st.found_diff[slot] = true;
+                    st.all_same[slot] = false;
+                } else if !cframes_match_reconciliation(a, def) {
+                    st.all_same[slot] = false;
+                }
+            }
+            OneSidedRule::NoDefault => {
+                if !is_special {
+                    st.found_diff[slot] = true;
+                }
+                st.all_same[slot] = false;
+            }
+            _ => st.all_same[slot] = false,
+        },
+        _ => st.all_same[slot] = false,
+    }
+}
+
+fn apply_fast_scalar_comparison(
+    cache: &mut crate::settings::equivalence::CanonicalizeCache,
+    (slot, class_name, name, is_special, is_stored_canon, is_asset): (
+        usize,
+        &str,
+        &str,
+        bool,
+        bool,
+        bool,
+    ),
+    (stored_val, cap_match): (Option<FastCapVal<'_>>, Option<(FastCapVal<'_>, bool)>),
+    st: &mut FastCompareBlockState<'_>,
+) {
+    match (stored_val, cap_match) {
+        (Some(sv), Some((cv, _))) => {
+            let can_prove_diff = !is_special && !is_stored_canon && !is_asset;
+            let (same, diff) = compare_fast_pair_values(
+                class_name,
+                name,
+                (sv, cv),
+                (can_prove_diff, is_asset),
+                cache,
+            );
+            if !same {
+                st.all_same[slot] = false;
+            }
+            if diff {
+                st.found_diff[slot] = true;
+            }
+        }
+        (Some(sv), None) => {
+            if is_stored_canon {
+                st.all_same[slot] = false;
+            } else {
+                let rule = cache.one_sided_rule(class_name, name);
+                match fast_val_matches_one_sided(name, sv, &rule) {
+                    Some(true) => {}
+                    Some(false) => {
+                        st.all_same[slot] = false;
+                        if !is_special && !is_asset {
+                            st.found_diff[slot] = true;
+                        }
+                    }
+                    None => st.all_same[slot] = false,
+                }
+            }
+        }
+        (None, _) => st.all_same[slot] = false,
+    }
+}
+
+fn check_unmatched_captured_props(
+    shared: &FastCompareShared<'_>,
+    cache: &mut crate::settings::equivalence::CanonicalizeCache,
+    block_items: &[(usize, usize)],
+    st: &mut FastCompareBlockState<'_>,
+    cap_seen: &[bool],
+) {
+    use crate::settings::equivalence::is_asset_reference_property;
+    for (slot, &(_, global)) in block_items.iter().enumerate() {
+        if !st.eligible[slot] {
+            continue;
+        }
+        let class_name = shared.input.records[global].class_name;
+        let (start, end) = st.cap_ranges[slot];
+        for (idx, &seen) in cap_seen.iter().enumerate().take(end).skip(start) {
+            if seen {
+                continue;
+            }
+            let (name, val, is_canon) = st.cap_props[idx];
+            if is_canon {
+                st.all_same[slot] = false;
+                continue;
+            }
+            if name == "Source"
+                && matches!(
+                    val,
+                    FastCapVal::Str(crate::settings::EXTERNAL_SOURCE_MARKER)
+                )
+            {
+                continue;
+            }
+            let rule = cache.one_sided_rule(class_name, name);
+            match fast_val_matches_one_sided(name, val, &rule) {
+                Some(true) => {}
+                Some(false) => {
+                    st.all_same[slot] = false;
+                    let is_special = matches!(
+                        name,
+                        "CurrentCamera"
+                            | "HistoryId"
+                            | "Source"
+                            | "Tags"
+                            | "CollisionFidelity"
+                            | "PhysicsGrid"
+                            | "TexturePack"
+                            | "TriangleCount"
+                    ) || name == crate::rbx::encode::COLLISION_HULL_PROPERTY
+                        || is_asset_reference_property(class_name, name);
+                    if !is_special {
+                        st.found_diff[slot] = true;
+                    }
+                }
+                None => st.all_same[slot] = false,
+            }
+        }
+    }
+}
+
+impl BlockStore<'_> {
+    fn pool_hull_fidelity(
+        &self,
+        entry: usize,
+        cache: &ShardedMap<usize, Option<u8>>,
+    ) -> Result<Option<u8>> {
+        if let Some(cached) = cache.get(&entry) {
+            return Ok(cached);
+        }
+        let (frame, place) = self.slots[entry];
+        let texts = self.pool_frame(frame)?;
+        let code = crate::settings::equivalence::hull_fidelity_from_b64_prefix(&texts[place]);
+        cache.insert(entry, code);
+        Ok(code)
+    }
+
+    fn fast_compare_changed(&self, input: FastCompareInput<'_>) -> Result<Vec<FastCompareOutcome>> {
+        use crate::settings::equivalence::CanonicalizeCache;
+
+        let _span = crate::app::profile::span("changed rows fast compare");
+        if input.changed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let database = rbx_reflection_database::get().ok();
+        let indexed: Vec<(usize, usize)> = input.changed.iter().copied().enumerate().collect();
+        let by_block: Vec<&[(usize, usize)]> = indexed
+            .chunk_by(|a, b| self.block_of(a.1) == self.block_of(b.1))
+            .collect();
+        let owned_long_hashes;
+        let long_hashes = match input.long_hashes {
+            Some(existing) => existing,
+            None => {
+                owned_long_hashes = ShardedMap::new();
+                &owned_long_hashes
+            }
+        };
+        let hull_fidelities = ShardedMap::<usize, Option<u8>>::new();
+        let shared = FastCompareShared {
+            input,
+            database,
+            long_hashes,
+            hull_fidelities: &hull_fidelities,
+        };
+
+        let block_results = by_block
+            .into_par_iter()
+            .map_init(CanonicalizeCache::new, |cache, block_items| {
+                self.fast_compare_block(&shared, cache, block_items)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut out = vec![None; shared.input.changed.len()];
+        for block in block_results {
+            for (pos, pair) in block {
+                out[pos] = pair;
+            }
+        }
+        Ok(out)
+    }
+
+    fn fast_compare_block<'a>(
+        &self,
+        shared: &FastCompareShared<'a>,
+        cache: &mut crate::settings::equivalence::CanonicalizeCache<'a>,
+        block_items: &[(usize, usize)],
+    ) -> Result<Vec<(usize, FastCompareOutcome)>> {
+        use super::captured::ComparedPair;
+        use crate::settings::equivalence::is_engine_managed_attribute;
+
+        let block_idx = self.block_of(block_items[0].1);
+        let block = &self.blocks[block_idx];
+        let mut st = self.fast_compare_collect_captured(shared, cache, block, block_items)?;
+        if !st.eligible.iter().any(|&e| e) {
+            return Ok(block_items.iter().map(|&(pos, _)| (pos, None)).collect());
+        }
+
+        let open = self.open_block(block_idx)?;
+        let Some((str_opts, str_pool_entry, prop_names)) = build_block_string_meta(&open) else {
+            return Ok(block_items.iter().map(|&(pos, _)| (pos, None)).collect());
+        };
+        let (specs, attr_groups, prop_order) = parse_block_group_specs(&open, &prop_names)?;
+        if !attr_groups.is_empty() {
+            self.fast_compare_attr_groups(
+                shared,
+                &open,
+                &specs,
+                &attr_groups,
+                block_items,
+                &mut st,
+            )?;
+        }
+        let m = block_items.len();
+        for (slot, &(_, global)) in block_items.iter().enumerate() {
+            if st.eligible[slot] && !st.stored_had_attrs[slot] {
+                let cap_attrs = &shared.input.state.instances
+                    [shared.input.records[global].source_index]
+                    .attributes;
+                if cap_attrs.keys().any(|k| !is_engine_managed_attribute(k)) {
+                    st.found_diff[slot] = true;
+                    st.all_same[slot] = false;
+                }
+            }
+        }
+
+        let mut cap_seen = vec![false; st.cap_props.len()];
+        let block_prop_names: AHashSet<&str> = prop_names.iter().copied().collect();
+        self.fast_compare_prop_groups(
+            shared,
+            cache,
+            (&str_opts, &str_pool_entry, &block_prop_names),
+            (&specs, &prop_order, block.count),
+            block_items,
+            (&mut st, &mut cap_seen),
+        )?;
+        check_unmatched_captured_props(shared, cache, block_items, &mut st, &cap_seen);
+
+        Ok((0..m)
+            .map(|slot| {
+                let pos = block_items[slot].0;
+                let resolved = if !st.eligible[slot] {
+                    None
+                } else if st.found_diff[slot] || st.all_same[slot] {
+                    let flags = if st.found_diff[slot] {
+                        (false, false)
+                    } else {
+                        (true, true)
+                    };
+                    Some((
+                        ComparedPair {
+                            placed: true,
+                            same_class: true,
+                            written_as_today: true,
+                            same_unique_id: st.stored_unique_id_matched[slot]
+                                .unwrap_or(st.cap_unique_id[slot].is_none()),
+                            holds_reference: st.holds_ref[slot],
+                        },
+                        flags,
+                    ))
+                } else {
+                    None
+                };
+                (pos, resolved)
+            })
+            .collect())
+    }
+
+    fn fast_compare_collect_captured<'a>(
+        &self,
+        shared: &FastCompareShared<'a>,
+        cache: &mut crate::settings::equivalence::CanonicalizeCache<'a>,
+        block: &Block,
+        block_items: &[(usize, usize)],
+    ) -> Result<FastCompareBlockState<'a>> {
+        use super::captured::UNIQUE_ID;
+        use crate::settings::equivalence::{
+            PropertyCanonical, reconciliation_value_contains_reference as holds_reference,
+        };
+
+        let m = block_items.len();
+        let mut st = FastCompareBlockState {
+            row_to_slot: vec![u32::MAX; block.count],
+            eligible: vec![true; m],
+            found_diff: vec![false; m],
+            all_same: vec![true; m],
+            holds_ref: vec![false; m],
+            stored_had_attrs: vec![false; m],
+            cap_unique_id: vec![None; m],
+            stored_unique_id_matched: vec![None; m],
+            cap_props: Vec::with_capacity(m * 16),
+            cap_ranges: Vec::with_capacity(m),
+            cap_canon_targets: AHashMap::new(),
+        };
+        let mut slot_targets: Vec<&str> = Vec::new();
+        let mut shared_safe: AHashMap<usize, bool> = AHashMap::new();
+
+        for (slot, &(_, global)) in block_items.iter().enumerate() {
+            st.row_to_slot[global - block.first] = slot as u32;
+            let row = &shared.input.structure[global];
+            let rec = &shared.input.records[global];
+            if row.name != rec.name
+                || row.class_name != rec.class_name
+                || row.parent_index != rec.parent_index
+                || fast_compare_skip_class(rec.class_name)
+            {
+                st.eligible[slot] = false;
+                st.cap_ranges.push((0, 0));
+                continue;
+            }
+
+            let start = st.cap_props.len();
+            slot_targets.clear();
+            let mut ok = true;
+            visit_settings_binary_properties(
+                shared.input.state,
+                rec,
+                shared.input.lookup,
+                |name, kind, source| {
+                    if !ok || SETTINGS_RECORD_FIELDS.contains(&name) {
+                        return Ok(());
+                    }
+                    if name == "TextScaled" || name == "TextWrapped" {
+                        ok = false;
+                        return Ok(());
+                    }
+                    if name == "Attributes" {
+                        if kind != 8
+                            || shared.input.state.instances[rec.source_index]
+                                .attributes
+                                .values()
+                                .any(holds_reference)
+                        {
+                            ok = false;
+                        }
+                        return Ok(());
+                    }
+                    let is_canon = match cache.property_canonical(rec.class_name, name) {
+                        PropertyCanonical::Unchanged => false,
+                        PropertyCanonical::Renamed(target) => {
+                            if slot_targets.contains(&target) {
+                                ok = false;
+                                return Ok(());
+                            }
+                            slot_targets.push(target);
+                            true
+                        }
+                        PropertyCanonical::Migrated(targets) => {
+                            for &target in targets {
+                                if slot_targets.contains(&target) {
+                                    ok = false;
+                                    return Ok(());
+                                }
+                                slot_targets.push(target);
+                            }
+                            true
+                        }
+                        PropertyCanonical::Complex => {
+                            ok = false;
+                            return Ok(());
+                        }
+                    };
+                    if name == UNIQUE_ID {
+                        if st.cap_unique_id[slot].is_some() {
+                            ok = false;
+                            return Ok(());
+                        }
+                        let uid = match source {
+                            SettingsBinaryValueSource::Native(NativeSettingsValue::UniqueId(s)) => {
+                                Some(s.as_str())
+                            }
+                            SettingsBinaryValueSource::Property(v) => v
+                                .as_object()
+                                .filter(|o| {
+                                    o.len() == 2
+                                        && o.get("_type").and_then(Value::as_str)
+                                            == Some("UniqueId")
+                                })
+                                .and_then(|o| o.get("value").and_then(Value::as_str)),
+                            _ => None,
+                        };
+                        match uid {
+                            Some(s) => st.cap_unique_id[slot] = Some(s),
+                            None => ok = false,
+                        }
+                        return Ok(());
+                    }
+                    match fast_cap_val_from_source(
+                        name,
+                        kind,
+                        &source,
+                        shared.input.lookup,
+                        &mut shared_safe,
+                    ) {
+                        Some((val, is_ref)) => {
+                            if is_ref {
+                                st.holds_ref[slot] = true;
+                            }
+                            st.cap_props.push((name, val, is_canon));
+                        }
+                        None => ok = false,
+                    }
+                    Ok(())
+                },
+            )?;
+
+            let end = st.cap_props.len();
+            if ok {
+                st.cap_props[start..end].sort_unstable_by(|a, b| a.0.cmp(b.0));
+                if st.cap_props[start..end]
+                    .windows(2)
+                    .any(|w| w[0].0 == w[1].0)
+                {
+                    ok = false;
+                } else if !slot_targets.is_empty() {
+                    if slot_targets.iter().any(|target| {
+                        st.cap_props[start..end]
+                            .binary_search_by_key(target, |p| p.0)
+                            .is_ok()
+                    }) {
+                        ok = false;
+                    } else {
+                        st.cap_canon_targets.insert(slot, slot_targets.clone());
+                    }
+                }
+            }
+            st.eligible[slot] = ok;
+            st.cap_ranges.push((start, end));
+        }
+        Ok(st)
+    }
+
+    fn fast_compare_attr_groups(
+        &self,
+        shared: &FastCompareShared<'_>,
+        open: &OpenBlock,
+        specs: &[BlockGroupSpec<'_>],
+        attr_groups: &[usize],
+        block_items: &[(usize, usize)],
+        st: &mut FastCompareBlockState<'_>,
+    ) -> Result<()> {
+        use crate::settings::equivalence::{
+            reconciliation_store_values_map_equal,
+            reconciliation_value_contains_reference as holds_reference, value_contains_enum_item,
+        };
+
+        let marked_strings: Vec<Cow<'_, str>> = open
+            .strings
+            .iter()
+            .map(|s| match s {
+                BlockString::Own(text) => Cow::Borrowed(text.as_str()),
+                BlockString::Pool(entry) => Cow::Owned(marker(&self.hashes[*entry])),
+            })
+            .collect();
+        let marked_refs: Vec<&str> = marked_strings.iter().map(Cow::as_ref).collect();
+        let scope = ValueScope::from_borrowed(&marked_refs, self.rows, &self.budget, None);
+        let empty_props = Map::new();
+        let count = st.row_to_slot.len();
+        for &group_idx in attr_groups {
+            let (_, kind, value_count, body) = specs[group_idx];
+            let mut reader = BytecodeReader::new(body);
+            let _ = decode_cframe_group_header(kind, &mut reader)?;
+            let mut prev_row = 0_usize;
+            for position in 0..value_count {
+                let row = next_group_instance(
+                    prev_row,
+                    reader.read_len("property instance index")?,
+                    position,
+                )?;
+                prev_row = row;
+                anyhow::ensure!(
+                    row < count,
+                    "A value block gives a value to a row it does not hold"
+                );
+                let slot_raw = st.row_to_slot[row];
+                if slot_raw == u32::MAX || !st.eligible[slot_raw as usize] {
+                    skip_raw_value_payload_fast(&mut reader, 8, 0)?;
+                    continue;
+                }
+                let slot = slot_raw as usize;
+                if st.stored_had_attrs[slot] {
+                    st.eligible[slot] = false;
+                    skip_raw_value_payload_fast(&mut reader, 8, 0)?;
+                    continue;
+                }
+                let attributes = decode_attributes_payload(&mut reader, scope)?;
+                if attributes
+                    .values()
+                    .any(|v| holds_marker(v) || holds_reference(v) || value_contains_enum_item(v))
+                    || !values_encode_alike(&empty_props, &attributes, shared.input.root_service)
+                {
+                    st.eligible[slot] = false;
+                    continue;
+                }
+                st.stored_had_attrs[slot] = true;
+                let cap_attrs = &shared.input.state.instances
+                    [shared.input.records[block_items[slot].1].source_index]
+                    .attributes;
+                if !reconciliation_store_values_map_equal(
+                    shared.input.root_service,
+                    &attributes,
+                    cap_attrs,
+                ) {
+                    st.found_diff[slot] = true;
+                    st.all_same[slot] = false;
+                }
+            }
+            reader.finish()?;
+        }
+        Ok(())
+    }
+
+    fn fast_compare_prop_groups<'a, 'b>(
+        &self,
+        shared: &FastCompareShared<'a>,
+        cache: &mut crate::settings::equivalence::CanonicalizeCache<'a>,
+        (str_opts, str_pool_entry, block_prop_names): (
+            &[Option<&'b str>],
+            &[Option<usize>],
+            &AHashSet<&'b str>,
+        ),
+        (specs, prop_order, count): (&[BlockGroupSpec<'b>], &[usize], usize),
+        block_items: &[(usize, usize)],
+        (st, cap_seen): (&mut FastCompareBlockState<'a>, &mut [bool]),
+    ) -> Result<()> {
+        let m = block_items.len();
+        let mut cursors: Vec<usize> = st.cap_ranges.iter().map(|&(s, _)| s).collect();
+        let mut stored_canon_targets: AHashMap<usize, Vec<&str>> = AHashMap::new();
+        let mut seen_in_run: Vec<u32> = Vec::new();
+        let mut run_id: u32 = 0;
+        let mut scratch = FastComparePropScratch::default();
+
+        let mut run_start = 0_usize;
+        while run_start < prop_order.len() {
+            let name = specs[prop_order[run_start]].0;
+            let mut run_end = run_start + 1;
+            while run_end < prop_order.len() && specs[prop_order[run_end]].0 == name {
+                run_end += 1;
+            }
+            let multi = run_end - run_start > 1;
+            if multi {
+                if seen_in_run.len() != m {
+                    seen_in_run.resize(m, 0);
+                }
+                run_id += 1;
+            }
+            scratch.class_engine_state.clear();
+            scratch.class_asset_ref.clear();
+
+            let meta = FastCompareGroupMeta {
+                str_opts,
+                str_pool_entry,
+                block_prop_names,
+                count,
+            };
+            for &group_idx in &prop_order[run_start..run_end] {
+                let mut state = FastCompareGroupMut {
+                    st,
+                    cap_seen,
+                    cursors: &mut cursors,
+                    stored_canon_targets: &mut stored_canon_targets,
+                    scratch: &mut scratch,
+                };
+                self.fast_compare_single_group(
+                    shared,
+                    cache,
+                    specs[group_idx],
+                    &meta,
+                    (block_items, multi, run_id, &mut seen_in_run),
+                    &mut state,
+                )?;
+            }
+            run_start = run_end;
+        }
+        Ok(())
+    }
+
+    fn fast_compare_single_group<'a, 'b>(
+        &self,
+        shared: &FastCompareShared<'a>,
+        cache: &mut crate::settings::equivalence::CanonicalizeCache<'a>,
+        (name, kind, value_count, body): BlockGroupSpec<'b>,
+        meta: &FastCompareGroupMeta<'_, 'b>,
+        (block_items, multi, run_id, seen_in_run): (&[(usize, usize)], bool, u32, &mut [u32]),
+        state: &mut FastCompareGroupMut<'_, 'a, 'b>,
+    ) -> Result<()> {
+        use crate::settings::equivalence::{
+            is_asset_reference_property, reconciliation_property_is_always_engine_state,
+        };
+
+        let flags = FastPropFlags::of(name);
+        let mut reader = BytecodeReader::new(body);
+        let cframe = decode_cframe_group_header(kind, &mut reader)?;
+        let mut prev_row = 0_usize;
+        let mut prev_ref = 0_usize;
+
+        for position in 0..value_count {
+            let row = next_group_instance(
+                prev_row,
+                reader.read_len("property instance index")?,
+                position,
+            )?;
+            prev_row = row;
+            anyhow::ensure!(
+                row < meta.count,
+                "A value block gives a value to a row it does not hold"
+            );
+            let slot_raw = state.st.row_to_slot[row];
+            if slot_raw == u32::MAX || !state.st.eligible[slot_raw as usize] {
+                skip_group_value_fast(&mut reader, kind, &cframe, self.rows, &mut prev_ref)?;
+                continue;
+            }
+            let slot = slot_raw as usize;
+            if multi {
+                if seen_in_run[slot] == run_id {
+                    state.st.eligible[slot] = false;
+                } else {
+                    seen_in_run[slot] = run_id;
+                }
+            }
+            let class_name = shared.input.records[block_items[slot].1].class_name;
+            let is_stored_canon = check_stored_prop_canonical(
+                cache,
+                class_name,
+                name,
+                flags.is_forced,
+                (slot, meta.block_prop_names),
+                state.st,
+                state.stored_canon_targets,
+            );
+            if !state.st.eligible[slot] || matches!(kind, 10 | NESTED_ENUM_ITEM_KIND) {
+                state.st.eligible[slot] = false;
+                skip_group_value_fast(&mut reader, kind, &cframe, self.rows, &mut prev_ref)?;
+                continue;
+            }
+
+            let cap_match = if flags.is_unique_id {
+                None
+            } else {
+                advance_cap_cursor(state.st, state.cap_seen, state.cursors, slot, name)
+            };
+            if kind == 17 {
+                self.fast_compare_ref_value(
+                    &mut reader,
+                    &mut prev_ref,
+                    shared,
+                    (slot, class_name, name, flags.is_meta_name, is_stored_canon),
+                    cap_match,
+                    (state.st, state.scratch),
+                )?;
+                continue;
+            }
+            if matches!(kind, 9 | 21) {
+                skip_raw_value_payload_fast(&mut reader, kind, 0)?;
+                state.st.all_same[slot] = false;
+                continue;
+            }
+            if kind == 7 {
+                compare_stored_array_value(
+                    &mut reader,
+                    meta.str_opts,
+                    (slot, name, flags.is_unique_id),
+                    cap_match,
+                    (state.st, state.scratch),
+                )?;
+                continue;
+            }
+            if kind == 8 {
+                self.fast_compare_object_value(
+                    (&mut reader, cache),
+                    shared,
+                    meta,
+                    (slot, class_name, name, flags, is_stored_canon),
+                    cap_match,
+                    (state.st, state.scratch),
+                )?;
+                continue;
+            }
+            if flags.is_unique_id {
+                state.st.eligible[slot] = false;
+                skip_raw_value_payload_fast(&mut reader, kind, 0)?;
+                continue;
+            }
+            let is_engine = flags.is_meta_name
+                || *state
+                    .scratch
+                    .class_engine_state
+                    .entry(class_name)
+                    .or_insert_with(|| {
+                        reconciliation_property_is_always_engine_state(
+                            shared.database,
+                            class_name,
+                            name,
+                        )
+                    });
+            if kind == 16 {
+                let a = decode_cframe_f64(&mut reader, &cframe)?;
+                if !is_engine {
+                    compare_stored_cframe_value(
+                        cache,
+                        (slot, class_name, name, flags.is_special, is_stored_canon),
+                        &a,
+                        cap_match,
+                        state.st,
+                    );
+                }
+                continue;
+            }
+            let Some(stored_val) = decode_stored_scalar_val(&mut reader, kind, meta.str_opts)?
+            else {
+                state.st.eligible[slot] = false;
+                if kind != 19 {
+                    skip_raw_value_payload_fast(&mut reader, kind, 0)?;
+                }
+                continue;
+            };
+            if is_engine || !state.st.eligible[slot] {
+                continue;
+            }
+            if flags.is_source {
+                let stored_ext = matches!(
+                    stored_val,
+                    Some(FastCapVal::Str(crate::settings::EXTERNAL_SOURCE_MARKER))
+                );
+                let cap_ext = matches!(
+                    cap_match,
+                    Some((FastCapVal::Str(crate::settings::EXTERNAL_SOURCE_MARKER), _))
+                );
+                if stored_ext && (cap_match.is_none() || cap_ext) {
+                    continue;
+                }
+                if stored_ext || cap_ext {
+                    state.st.all_same[slot] = false;
+                    continue;
+                }
+            }
+            let is_asset = *state
+                .scratch
+                .class_asset_ref
+                .entry(class_name)
+                .or_insert_with(|| is_asset_reference_property(class_name, name));
+            apply_fast_scalar_comparison(
+                cache,
+                (
+                    slot,
+                    class_name,
+                    name,
+                    flags.is_special,
+                    is_stored_canon,
+                    is_asset,
+                ),
+                (stored_val, cap_match),
+                state.st,
+            );
+        }
+        reader.finish()?;
+        Ok(())
+    }
+
+    fn fast_compare_ref_value<'a, 'b>(
+        &self,
+        reader: &mut BytecodeReader<'_>,
+        prev_ref: &mut usize,
+        shared: &FastCompareShared<'a>,
+        (slot, class_name, name, is_meta_name, is_stored_canon): (usize, &'a str, &str, bool, bool),
+        cap_match: Option<(FastCapVal<'a>, bool)>,
+        (st, scratch): (
+            &mut FastCompareBlockState<'a>,
+            &mut FastComparePropScratch<'a, 'b>,
+        ),
+    ) -> Result<()> {
+        use crate::settings::equivalence::reconciliation_property_is_always_engine_state;
+        let target = decode_resolved_ref_target(reader, self.rows, prev_ref)?;
+        st.holds_ref[slot] = true;
+        if is_meta_name {
+            return Ok(());
+        }
+        let is_engine = *scratch
+            .class_engine_state
+            .entry(class_name)
+            .or_insert_with(|| {
+                reconciliation_property_is_always_engine_state(shared.database, class_name, name)
+            });
+        if is_engine {
+            return Ok(());
+        }
+        match cap_match {
+            Some((FastCapVal::Ref(cap_target), _)) if target == cap_target => {}
+            Some((FastCapVal::Ref(_), _)) => {
+                st.all_same[slot] = false;
+                if !is_stored_canon {
+                    st.found_diff[slot] = true;
+                }
+            }
+            _ => st.all_same[slot] = false,
+        }
+        Ok(())
+    }
+
+    fn fast_compare_object_value<'a, 'b>(
+        &self,
+        (reader, cache): (
+            &mut BytecodeReader<'_>,
+            &mut crate::settings::equivalence::CanonicalizeCache<'a>,
+        ),
+        shared: &FastCompareShared<'a>,
+        meta: &FastCompareGroupMeta<'_, 'b>,
+        (slot, class_name, name, flags, is_stored_canon): (
+            usize,
+            &'a str,
+            &str,
+            FastPropFlags,
+            bool,
+        ),
+        cap_match: Option<(FastCapVal<'a>, bool)>,
+        (st, scratch): (
+            &mut FastCompareBlockState<'a>,
+            &mut FastComparePropScratch<'a, 'b>,
+        ),
+    ) -> Result<()> {
+        let (str_opts, str_pool_entry) = (meta.str_opts, meta.str_pool_entry);
+        use super::captured::cached_long_hash;
+        use crate::settings::equivalence::{
+            OneSidedRule, hull_fidelity_from_b64_prefix,
+            reconciliation_property_is_always_engine_state,
+        };
+
+        let save_pos = reader.position();
+        if let Some((k0, v0_id, k1, v1_id)) = read_two_string_object_header(reader, str_opts) {
+            if flags.is_unique_id {
+                let uid = extract_two_field_unique_id(str_opts, k0, v0_id, k1, v1_id);
+                match uid {
+                    Some(s) => {
+                        st.stored_unique_id_matched[slot] = Some(st.cap_unique_id[slot] == Some(s))
+                    }
+                    None => st.eligible[slot] = false,
+                }
+                return Ok(());
+            }
+            if let Some((stored_ty, b64_id)) =
+                extract_two_field_payload_id(str_opts, k0, v0_id, k1, v1_id)
+            {
+                let is_engine =
+                    *scratch
+                        .class_engine_state
+                        .entry(class_name)
+                        .or_insert_with(|| {
+                            reconciliation_property_is_always_engine_state(
+                                shared.database,
+                                class_name,
+                                name,
+                            )
+                        });
+                if !is_engine && st.all_same[slot] {
+                    match cap_match {
+                        Some((
+                            FastCapVal::Payload {
+                                ty: cap_ty,
+                                b64: cap_b64,
+                            },
+                            _,
+                        )) if stored_ty == cap_ty => {
+                            let same_payload =
+                                if let Some(stored_b64) = str_opts.get(b64_id).copied().flatten() {
+                                    stored_b64 == cap_b64
+                                } else if let Some(entry) =
+                                    str_pool_entry.get(b64_id).copied().flatten()
+                                {
+                                    cap_b64.len() >= POOL_MIN_BYTES
+                                        && self.hashes[entry]
+                                            == cached_long_hash(cap_b64, shared.long_hashes)
+                                } else {
+                                    false
+                                };
+                            if !same_payload {
+                                let hull_ok = flags.is_hull_prop
+                                    && self.payload_hull_matches(
+                                        cap_b64,
+                                        str_opts.get(b64_id).copied().flatten(),
+                                        str_pool_entry.get(b64_id).copied().flatten(),
+                                        shared.hull_fidelities,
+                                        hull_fidelity_from_b64_prefix,
+                                    )?;
+                                if !hull_ok {
+                                    st.all_same[slot] = false;
+                                }
+                            }
+                        }
+                        None if !is_stored_canon
+                            && matches!(
+                                cache.one_sided_rule(class_name, name),
+                                OneSidedRule::Ignored
+                            ) => {}
+                        _ => st.all_same[slot] = false,
+                    }
+                }
+                return Ok(());
+            }
+        }
+        reader.set_position(save_pos);
+        if flags.is_unique_id || !stored_value_is_safe(reader, 8, str_opts, 0)? {
+            st.eligible[slot] = false;
+        } else {
+            st.all_same[slot] = false;
+        }
+        Ok(())
+    }
+
+    fn payload_hull_matches(
+        &self,
+        cap_b64: &str,
+        stored_b64: Option<&str>,
+        pool_entry: Option<usize>,
+        hull_fidelities: &ShardedMap<usize, Option<u8>>,
+        parse_fidelity: fn(&str) -> Option<u8>,
+    ) -> Result<bool> {
+        let cap_code = parse_fidelity(cap_b64);
+        let stored_code = if let Some(b64) = stored_b64 {
+            parse_fidelity(b64)
+        } else if let Some(entry) = pool_entry {
+            self.pool_hull_fidelity(entry, hull_fidelities)?
+        } else {
+            None
+        };
+        Ok(cap_code.is_some() && cap_code == stored_code)
+    }
+}
+
+struct VerifyObsAttrBlocks<'a> {
+    blocks_used: &'a [usize],
+    opens: &'a [Arc<OpenBlock>],
+    maps: &'a [Vec<u32>],
+    specs: &'a [Vec<BlockGroupSpec<'a>>],
+    attr_groups: &'a [Vec<usize>],
+}
+
+#[derive(Clone, Copy)]
+enum FastVerifyVal<'a> {
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Str(&'a str),
+    PoolStr(usize),
+    Enum(&'a str),
+    Vec2([f32; 2]),
+    Vec3([f32; 3]),
+    UDim([f32; 2]),
+    UDim2([f32; 4]),
+    Color3([f32; 3]),
+    Rect([f32; 4]),
+    CFrame(usize),
+    Ref(usize),
+    Payload {
+        ty: &'a str,
+        own: Option<&'a str>,
+        pool: Option<usize>,
+    },
+    Tags(usize, usize),
+    Unsupported,
+}
+
+#[inline]
+fn color3_byte_round(c: f32) -> u8 {
+    (c.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+#[inline]
+fn verify_cframes_within_assembly_tolerance(a: &[f64; 12], b: &[f64; 12]) -> bool {
+    (0..12).all(|i| {
+        let tol = if i < 3 { 1e-3 } else { 1e-4 };
+        a[i].is_finite() && b[i].is_finite() && (a[i] - b[i]).abs() <= tol
+    })
+}
+
+fn verify_val_matches_default(
+    val: FastVerifyVal<'_>,
+    def: &crate::settings::equivalence::FastDefaultVal,
+    cframes: &[[f64; 12]],
+) -> bool {
+    use crate::settings::equivalence::{
+        FastDefaultVal, cframes_match_reconciliation, f32_values_match,
+    };
+    match (val, def) {
+        (FastVerifyVal::Bool(a), FastDefaultVal::Bool(b)) => a == *b,
+        (
+            FastVerifyVal::I64(_) | FastVerifyVal::U64(_) | FastVerifyVal::F64(_),
+            FastDefaultVal::Number { value, uses_f32 },
+        ) => {
+            let a = match val {
+                FastVerifyVal::I64(x) => x as f64,
+                FastVerifyVal::U64(x) => x as f64,
+                FastVerifyVal::F64(x) => x,
+                _ => unreachable!(),
+            };
+            a == *value || (*uses_f32 && f32_values_match(a, *value))
+        }
+        (FastVerifyVal::Str(a), FastDefaultVal::Str(b)) => a == b.as_str(),
+        (FastVerifyVal::Enum(a), FastDefaultVal::Enum(b)) => a == b.as_str(),
+        (FastVerifyVal::Vec2(a), FastDefaultVal::Vec2(b)) => {
+            (0..2).all(|i| f32_values_match(f64::from(a[i]), f64::from(b[i])))
+        }
+        (FastVerifyVal::Vec3(a), FastDefaultVal::Vec3(b)) => {
+            (0..3).all(|i| f32_values_match(f64::from(a[i]), f64::from(b[i])))
+        }
+        (FastVerifyVal::UDim(a), FastDefaultVal::UDim(b)) => {
+            f32_values_match(f64::from(a[0]), f64::from(b[0])) && a[1] == b[1]
+        }
+        (FastVerifyVal::UDim2(a), FastDefaultVal::UDim2(b)) => {
+            f32_values_match(f64::from(a[0]), f64::from(b[0]))
+                && a[1] == b[1]
+                && f32_values_match(f64::from(a[2]), f64::from(b[2]))
+                && a[3] == b[3]
+        }
+        (FastVerifyVal::Color3(a), FastDefaultVal::Color3(b)) => {
+            (0..3).all(|i| f32_values_match(f64::from(a[i]), f64::from(b[i])))
+        }
+        (FastVerifyVal::Rect(a), FastDefaultVal::Rect(b)) => {
+            (0..4).all(|i| f32_values_match(f64::from(a[i]), f64::from(b[i])))
+        }
+        (FastVerifyVal::CFrame(idx), FastDefaultVal::CFrame(b)) => {
+            cframes_match_reconciliation(&cframes[idx], b)
+        }
+        _ => false,
+    }
+}
+
+type BlockStringMeta<'a> = (Vec<Option<&'a str>>, Vec<Option<usize>>, Vec<&'a str>);
+
+fn build_block_string_meta(open: &OpenBlock) -> Option<BlockStringMeta<'_>> {
+    let str_opts: Vec<Option<&str>> = open
+        .strings
+        .iter()
+        .map(|s| match s {
+            BlockString::Own(t) => Some(t.as_str()),
+            BlockString::Pool(_) => None,
+        })
+        .collect();
+    let str_pool: Vec<Option<usize>> = open
+        .strings
+        .iter()
+        .map(|s| match s {
+            BlockString::Own(_) => None,
+            BlockString::Pool(e) => Some(*e),
+        })
+        .collect();
+    let mut prop_names: Vec<&str> = Vec::with_capacity(open.properties.len());
+    for &id in &open.properties {
+        prop_names.push(str_opts[id]?);
+    }
+    Some((str_opts, str_pool, prop_names))
+}
+
+struct VerifyGroupSource<'a> {
+    row_count: usize,
+    total_rows: usize,
+    str_opts: &'a [Option<&'a str>],
+    str_pool: &'a [Option<usize>],
+    row_map: Option<&'a [u32]>,
+}
+
+struct VerifyGroupBuffers<'a, 'b> {
+    vals: &'b mut [Option<FastVerifyVal<'a>>],
+    cframes: &'b mut Vec<[f64; 12]>,
+    tags: &'b mut Vec<&'a str>,
+    touched: &'b mut Vec<usize>,
+    touched_mark: &'b mut [u32],
+    mark_id: u32,
+}
+
+fn decode_verify_group_into<'a>(
+    (name, kind, value_count, body): BlockGroupSpec<'a>,
+    src: &VerifyGroupSource<'a>,
+    ok: &[bool],
+    buf: &mut VerifyGroupBuffers<'a, '_>,
+) -> Result<()> {
+    let mut reader = BytecodeReader::new(body);
+    let cframe = decode_cframe_group_header(kind, &mut reader)?;
+    let mut prev_row = 0_usize;
+    let mut prev_ref = 0_usize;
+    for position in 0..value_count {
+        let raw_row = next_group_instance(
+            prev_row,
+            reader.read_len("property instance index")?,
+            position,
+        )?;
+        prev_row = raw_row;
+        anyhow::ensure!(
+            raw_row < src.row_count,
+            "A value block gives a value to a row it does not hold"
+        );
+        let mapped = match src.row_map {
+            Some(map) => {
+                let target = map[raw_row];
+                (target != u32::MAX).then_some(target as usize)
+            }
+            None => Some(raw_row),
+        };
+        let Some(row) = mapped.filter(|&r| ok[r]) else {
+            skip_group_value_fast(&mut reader, kind, &cframe, src.total_rows, &mut prev_ref)?;
+            continue;
+        };
+        let val = decode_verify_wire_val(
+            &mut reader,
+            (name, kind, &cframe, &mut prev_ref),
+            src,
+            buf.cframes,
+            buf.tags,
+        )?;
+        if buf.touched_mark[row] != buf.mark_id {
+            buf.touched_mark[row] = buf.mark_id;
+            buf.touched.push(row);
+        }
+        buf.vals[row] = Some(val);
+    }
+    reader.finish()?;
+    Ok(())
+}
+
+fn decode_verify_wire_val<'a>(
+    reader: &mut BytecodeReader<'_>,
+    (name, kind, cframe, prev_ref): (&str, u8, &CFrameGroupDecoder, &mut usize),
+    src: &VerifyGroupSource<'a>,
+    cframes: &mut Vec<[f64; 12]>,
+    tags: &mut Vec<&'a str>,
+) -> Result<FastVerifyVal<'a>> {
+    let val = match kind {
+        0 => FastVerifyVal::Unsupported,
+        1 => FastVerifyVal::Bool(false),
+        2 => FastVerifyVal::Bool(true),
+        3 => FastVerifyVal::I64(unzigzag_i64(reader.read_var_u64()?)),
+        4 => FastVerifyVal::U64(reader.read_var_u64()?),
+        5 => FastVerifyVal::F64(read_f64(reader)?),
+        20 => FastVerifyVal::F64(f64::from(read_f32(reader)?)),
+        6 => {
+            let id = reader.read_len("value string id")?;
+            if let Some(s) = src.str_opts.get(id).copied().flatten() {
+                FastVerifyVal::Str(s)
+            } else if let Some(entry) = src.str_pool.get(id).copied().flatten() {
+                FastVerifyVal::PoolStr(entry)
+            } else {
+                bail!("Invalid value string id {id}");
+            }
+        }
+        19 => {
+            let id = reader.read_len("enum item string id")?;
+            match src.str_opts.get(id).copied().flatten() {
+                Some(s) => FastVerifyVal::Enum(s),
+                None => FastVerifyVal::Unsupported,
+            }
+        }
+        11 => FastVerifyVal::Vec2([read_f32(reader)?, read_f32(reader)?]),
+        12 => FastVerifyVal::Vec3([read_f32(reader)?, read_f32(reader)?, read_f32(reader)?]),
+        13 => FastVerifyVal::UDim([read_f32(reader)?, read_f32(reader)?]),
+        14 => FastVerifyVal::UDim2([
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+        ]),
+        15 => FastVerifyVal::Color3([read_f32(reader)?, read_f32(reader)?, read_f32(reader)?]),
+        18 => FastVerifyVal::Rect([
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+        ]),
+        16 => {
+            let idx = cframes.len();
+            cframes.push(decode_cframe_f64(reader, cframe)?);
+            FastVerifyVal::CFrame(idx)
+        }
+        17 => FastVerifyVal::Ref(decode_resolved_ref_target(
+            reader,
+            src.total_rows,
+            prev_ref,
+        )?),
+        7 if name == "Tags" => {
+            let save = reader.position();
+            let start = tags.len();
+            let parsed = (|| -> Option<()> {
+                let arr_len = reader.read_collection_len("array length").ok()?;
+                for _ in 0..arr_len {
+                    if reader.read_u8().ok()? != 6 {
+                        return None;
+                    }
+                    let id = reader.read_len("value string id").ok()?;
+                    tags.push((*src.str_opts.get(id)?)?);
+                }
+                Some(())
+            })();
+            if parsed.is_some() {
+                FastVerifyVal::Tags(start, tags.len())
+            } else {
+                tags.truncate(start);
+                reader.set_position(save);
+                skip_raw_value_payload_fast(reader, 7, 0)?;
+                FastVerifyVal::Unsupported
+            }
+        }
+        8 => {
+            let save = reader.position();
+            let parsed = read_two_string_object_header(reader, src.str_opts).and_then(
+                |(k0, v0_id, k1, v1_id)| {
+                    let (ty, b64_id) =
+                        extract_two_field_payload_id(src.str_opts, k0, v0_id, k1, v1_id)?;
+                    let own = src.str_opts.get(b64_id).copied().flatten();
+                    let pool = src.str_pool.get(b64_id).copied().flatten();
+                    (own.is_some() || pool.is_some()).then_some(FastVerifyVal::Payload {
+                        ty,
+                        own,
+                        pool,
+                    })
+                },
+            );
+            match parsed {
+                Some(v) => v,
+                None => {
+                    reader.set_position(save);
+                    skip_raw_value_payload_fast(reader, 8, 0)?;
+                    FastVerifyVal::Unsupported
+                }
+            }
+        }
+        _ => {
+            skip_raw_value_payload_fast(reader, kind, 0)?;
+            FastVerifyVal::Unsupported
+        }
+    };
+    Ok(val)
+}
+
+pub(crate) struct FastVerifyInput<'a> {
+    pub(crate) desired_bytes: &'a [u8],
+    pub(crate) observed_bytes: &'a [u8],
+    pub(crate) desired_instances: &'a [SettingsBytecodeInstance],
+    pub(crate) observed_instances: &'a [SettingsBytecodeInstance],
+    pub(crate) places: &'a [usize],
+    pub(crate) by_order: &'a [bool],
+    pub(crate) skip: &'a [bool],
+    pub(crate) has_before: bool,
+}
+
+struct FastVerifyStores<'a> {
+    input: &'a FastVerifyInput<'a>,
+    des: BlockStore<'a>,
+    obs: BlockStore<'a>,
+    database: Option<&'a rbx_reflection::ReflectionDatabase<'a>>,
+    des_hulls: ShardedMap<usize, Option<u8>>,
+    obs_hulls: ShardedMap<usize, Option<u8>>,
+    obs_opened: Vec<Mutex<Option<Arc<OpenBlock>>>>,
+}
+
+impl<'s> FastVerifyStores<'s> {
+    fn open_obs_block(&self, idx: usize) -> Result<Arc<OpenBlock>> {
+        let mut slot = self.obs_opened[idx].lock_recover();
+        if let Some(open) = slot.as_ref() {
+            return Ok(Arc::clone(open));
+        }
+        let opened = Arc::new(self.obs.open_block(idx)?);
+        *slot = Some(Arc::clone(&opened));
+        Ok(opened)
+    }
+
+    fn verify_block(
+        &self,
+        cache: &mut crate::settings::equivalence::CanonicalizeCache,
+        block_idx: usize,
+    ) -> Result<Vec<bool>> {
+        let block = &self.des.blocks[block_idx];
+        let first = block.first;
+        let count = block.count;
+        let (mut ok, obs_blocks_used) = self.eligible_rows_and_obs_blocks(first, count);
+        if obs_blocks_used.is_empty() || obs_blocks_used.len() > 4 {
+            return Ok(vec![false; count]);
+        }
+
+        let des_open = self.des.open_block(block_idx)?;
+        let Some((des_str_opts, des_str_pool, des_prop_names)) = build_block_string_meta(&des_open)
+        else {
+            return Ok(vec![false; count]);
+        };
+        let mut obs_opens: Vec<Arc<OpenBlock>> = Vec::with_capacity(obs_blocks_used.len());
+        for &ob in &obs_blocks_used {
+            obs_opens.push(self.open_obs_block(ob)?);
+        }
+        let mut obs_metas = Vec::with_capacity(obs_opens.len());
+        for open in &obs_opens {
+            let Some(meta) = build_block_string_meta(open) else {
+                return Ok(vec![false; count]);
+            };
+            obs_metas.push(meta);
+        }
+
+        let obs_maps = self.build_obs_row_maps(first, &ok, &obs_blocks_used);
+        let (des_specs, des_attr_groups, des_prop_order) =
+            parse_block_group_specs(&des_open, &des_prop_names)?;
+        let mut obs_specs_all: Vec<Vec<BlockGroupSpec<'_>>> = Vec::with_capacity(obs_opens.len());
+        let mut obs_attr_groups_all: Vec<Vec<usize>> = Vec::with_capacity(obs_opens.len());
+        let mut obs_prop_orders_all: Vec<Vec<usize>> = Vec::with_capacity(obs_opens.len());
+        let mut any_obs_attrs = false;
+        for (k, open) in obs_opens.iter().enumerate() {
+            let (specs, attr_groups, prop_order) = parse_block_group_specs(open, &obs_metas[k].2)?;
+            any_obs_attrs |= !attr_groups.is_empty();
+            obs_specs_all.push(specs);
+            obs_attr_groups_all.push(attr_groups);
+            obs_prop_orders_all.push(prop_order);
+        }
+
+        if !des_attr_groups.is_empty() || any_obs_attrs {
+            self.verify_block_attrs(
+                first,
+                (&des_open, &des_specs, &des_attr_groups),
+                &VerifyObsAttrBlocks {
+                    blocks_used: &obs_blocks_used,
+                    opens: &obs_opens,
+                    maps: &obs_maps,
+                    specs: &obs_specs_all,
+                    attr_groups: &obs_attr_groups_all,
+                },
+                &mut ok,
+            )?;
+        }
+
+        let mut all_names: Vec<&str> = Vec::with_capacity(des_prop_order.len() + 32);
+        for &idx in &des_prop_order {
+            all_names.push(des_specs[idx].0);
+        }
+        for (k, order) in obs_prop_orders_all.iter().enumerate() {
+            for &idx in order {
+                all_names.push(obs_specs_all[k][idx].0);
+            }
+        }
+        all_names.sort_unstable();
+        all_names.dedup();
+
+        let mut scratch = VerifyBlockScratch::new(count);
+        let mut di = 0_usize;
+        let mut ois: Vec<usize> = vec![0; obs_opens.len()];
+        let des_src = VerifyGroupSource {
+            row_count: count,
+            total_rows: self.des.rows,
+            str_opts: &des_str_opts,
+            str_pool: &des_str_pool,
+            row_map: None,
+        };
+
+        for name in all_names {
+            let des_start = di;
+            while di < des_prop_order.len() && des_specs[des_prop_order[di]].0 == name {
+                di += 1;
+            }
+            scratch.next_property();
+            for &gidx in &des_prop_order[des_start..di] {
+                let mut buf = VerifyGroupBuffers {
+                    vals: &mut scratch.des_vals,
+                    cframes: &mut scratch.des_cframes,
+                    tags: &mut scratch.des_tags,
+                    touched: &mut scratch.touched,
+                    touched_mark: &mut scratch.touched_mark,
+                    mark_id: scratch.mark_id,
+                };
+                decode_verify_group_into(des_specs[gidx], &des_src, &ok, &mut buf)?;
+            }
+            for k in 0..obs_opens.len() {
+                let order = &obs_prop_orders_all[k];
+                let specs = &obs_specs_all[k];
+                let start = ois[k];
+                while ois[k] < order.len() && specs[order[ois[k]]].0 == name {
+                    ois[k] += 1;
+                }
+                if start == ois[k] {
+                    continue;
+                }
+                let obs_src = VerifyGroupSource {
+                    row_count: self.obs.blocks[obs_blocks_used[k]].count,
+                    total_rows: self.obs.rows,
+                    str_opts: &obs_metas[k].0,
+                    str_pool: &obs_metas[k].1,
+                    row_map: Some(&obs_maps[k]),
+                };
+                for &gidx in &order[start..ois[k]] {
+                    let mut buf = VerifyGroupBuffers {
+                        vals: &mut scratch.obs_vals,
+                        cframes: &mut scratch.obs_cframes,
+                        tags: &mut scratch.obs_tags,
+                        touched: &mut scratch.touched,
+                        touched_mark: &mut scratch.touched_mark,
+                        mark_id: scratch.mark_id,
+                    };
+                    decode_verify_group_into(specs[gidx], &obs_src, &ok, &mut buf)?;
+                }
+            }
+            self.verify_property_rows(cache, first, name, &mut scratch, &mut ok)?;
+        }
+        Ok(ok)
+    }
+
+    fn eligible_rows_and_obs_blocks(&self, first: usize, count: usize) -> (Vec<bool>, Vec<usize>) {
+        let mut ok = vec![false; count];
+        let mut obs_blocks_used: Vec<usize> = Vec::new();
+        for (row, slot) in ok.iter_mut().enumerate() {
+            let global = first + row;
+            if self.input.skip[global] {
+                continue;
+            }
+            let obs_global = self.input.places[global];
+            let ds = &self.input.desired_instances[global];
+            let os = &self.input.observed_instances[obs_global];
+            if ds.parent_index.is_some()
+                && os.parent_index.is_some()
+                && ds.name == os.name
+                && ds.class_name == os.class_name
+                && ds.parent_index.map(|p| self.input.places[p]) == os.parent_index
+                && !fast_compare_skip_class(ds.class_name.as_str())
+            {
+                *slot = true;
+                let ob = self.obs.block_of(obs_global);
+                if !obs_blocks_used.contains(&ob) {
+                    obs_blocks_used.push(ob);
+                }
+            }
+        }
+        obs_blocks_used.sort_unstable();
+        (ok, obs_blocks_used)
+    }
+
+    fn build_obs_row_maps(
+        &self,
+        first: usize,
+        ok: &[bool],
+        obs_blocks_used: &[usize],
+    ) -> Vec<Vec<u32>> {
+        let mut obs_maps: Vec<Vec<u32>> = obs_blocks_used
+            .iter()
+            .map(|&ob| vec![u32::MAX; self.obs.blocks[ob].count])
+            .collect();
+        for (row, &eligible) in ok.iter().enumerate() {
+            if !eligible {
+                continue;
+            }
+            let obs_global = self.input.places[first + row];
+            let ob = self.obs.block_of(obs_global);
+            let pos = obs_blocks_used
+                .binary_search(&ob)
+                .expect("obs block recorded");
+            obs_maps[pos][obs_global - self.obs.blocks[ob].first] = row as u32;
+        }
+        obs_maps
+    }
+
+    fn verify_block_attrs(
+        &self,
+        first: usize,
+        (des_open, des_specs, des_attr_groups): (&OpenBlock, &[BlockGroupSpec<'_>], &[usize]),
+        obs: &VerifyObsAttrBlocks<'_>,
+        ok: &mut [bool],
+    ) -> Result<()> {
+        use crate::settings::equivalence::{
+            is_engine_managed_attribute, reconciliation_values_equal,
+        };
+
+        let count = ok.len();
+        let mut des_attrs: Vec<Option<Map<String, Value>>> = (0..count).map(|_| None).collect();
+        let mut obs_attrs: Vec<Option<Map<String, Value>>> = (0..count).map(|_| None).collect();
+        if !des_attr_groups.is_empty() {
+            decode_verify_attrs_groups(
+                &self.des,
+                des_open,
+                des_specs,
+                des_attr_groups,
+                (count, None),
+                ok,
+                &mut des_attrs,
+            )?;
+        }
+        for (k, attr_groups) in obs.attr_groups.iter().enumerate() {
+            if !attr_groups.is_empty() {
+                decode_verify_attrs_groups(
+                    &self.obs,
+                    &obs.opens[k],
+                    &obs.specs[k],
+                    attr_groups,
+                    (
+                        self.obs.blocks[obs.blocks_used[k]].count,
+                        Some(&obs.maps[k]),
+                    ),
+                    ok,
+                    &mut obs_attrs,
+                )?;
+            }
+        }
+        for (row, slot) in ok.iter_mut().enumerate() {
+            if !*slot {
+                continue;
+            }
+            let global = first + row;
+            let by_ord = self.input.by_order[global];
+            let has_before = self.input.has_before;
+            let matched = match (&des_attrs[row], &obs_attrs[row]) {
+                (None, None) => true,
+                (Some(da), Some(oa)) => {
+                    !(by_ord && oa.keys().any(|k| !da.contains_key(k))
+                        || has_before
+                            && oa
+                                .keys()
+                                .any(|k| !da.contains_key(k) && !is_engine_managed_attribute(k)))
+                        && da.iter().all(|(k, dv)| {
+                            is_engine_managed_attribute(k)
+                                || oa.get(k) == Some(dv)
+                                || oa
+                                    .get(k)
+                                    .is_some_and(|ov| reconciliation_values_equal(dv, ov, false))
+                        })
+                }
+                (Some(da), None) => da.keys().all(|k| is_engine_managed_attribute(k)),
+                (None, Some(oa)) => {
+                    !(by_ord && !oa.is_empty()
+                        || has_before && oa.keys().any(|k| !is_engine_managed_attribute(k)))
+                }
+            };
+            if !matched {
+                *slot = false;
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_property_rows<'a>(
+        &self,
+        cache: &mut crate::settings::equivalence::CanonicalizeCache,
+        first: usize,
+        name: &str,
+        scratch: &mut VerifyBlockScratch<'a>,
+        ok: &mut [bool],
+    ) -> Result<()>
+    where
+        's: 'a,
+    {
+        use crate::settings::equivalence::{
+            OneSidedRule, PropertyCanonical, reconciliation_property_is_always_engine_state,
+            reconciliation_property_is_derived,
+        };
+
+        let is_unsupported_prop = matches!(
+            name,
+            "Attributes" | "TextScaled" | "TextWrapped" | "CurrentCamera" | "PhysicsGrid"
+        );
+        let is_skipped_meta = matches!(name, "UniqueId" | "HistoryId" | "ScriptGuid")
+            || reconciliation_property_is_derived(name);
+        scratch.class_engine.clear();
+        scratch.class_asset.clear();
+
+        for idx in 0..scratch.touched.len() {
+            let row = scratch.touched[idx];
+            let dv = scratch.des_vals[row].take();
+            let ov = scratch.obs_vals[row].take();
+            if !ok[row] {
+                continue;
+            }
+            if is_unsupported_prop {
+                ok[row] = false;
+                continue;
+            }
+            let global = first + row;
+            let class_name = self.input.desired_instances[global].class_name.as_str();
+            if !matches!(
+                cache.property_canonical(class_name, name),
+                PropertyCanonical::Unchanged
+            ) {
+                ok[row] = false;
+                continue;
+            }
+            let skip_prop = is_skipped_meta
+                || (name == "Source" && crate::editor::sync::is_lua_source_class(class_name))
+                || *scratch.class_engine.entry(class_name).or_insert_with(|| {
+                    reconciliation_property_is_always_engine_state(self.database, class_name, name)
+                });
+            if skip_prop {
+                if dv.is_none() && ov.is_some() && self.input.by_order[global] {
+                    ok[row] = false;
+                }
+                continue;
+            }
+            let matched = match (dv, ov) {
+                (Some(d), Some(o)) => {
+                    self.verify_values_pair_match(cache, class_name, name, (d, o), scratch)?
+                }
+                (Some(d), None) => match cache.verify_one_sided_rule(class_name, name) {
+                    OneSidedRule::Ignored => true,
+                    OneSidedRule::Default(ref def) => {
+                        verify_val_matches_default(d, def, &scratch.des_cframes)
+                    }
+                    OneSidedRule::NoDefault => false,
+                },
+                (None, Some(_)) => !self.input.by_order[global] && !self.input.has_before,
+                (None, None) => true,
+            };
+            if !matched {
+                ok[row] = false;
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_values_pair_match<'a>(
+        &self,
+        cache: &mut crate::settings::equivalence::CanonicalizeCache,
+        class_name: &'a str,
+        name: &str,
+        (d, o): (FastVerifyVal<'a>, FastVerifyVal<'a>),
+        scratch: &mut VerifyBlockScratch<'a>,
+    ) -> Result<bool> {
+        use crate::settings::equivalence::{
+            canonical_asset_text, cframes_match_reconciliation, f32_values_match,
+            hull_fidelity_from_b64_prefix, is_asset_reference_property,
+        };
+
+        if matches!(d, FastVerifyVal::Unsupported) || matches!(o, FastVerifyVal::Unsupported) {
+            return Ok(false);
+        }
+        if matches!(
+            name,
+            "Velocity" | "RotVelocity" | "AssemblyLinearVelocity" | "AssemblyAngularVelocity"
+        ) {
+            return Ok(true);
+        }
+        if name == crate::roblox::schema::TEXTURE_PACK_PROPERTY
+            && crate::roblox::schema::has_protected_texture_pack(class_name)
+            && match o {
+                FastVerifyVal::Str(s) => !s.is_empty(),
+                FastVerifyVal::PoolStr(_) => true,
+                _ => false,
+            }
+        {
+            return Ok(true);
+        }
+        if name == "TriangleCount"
+            && matches!(
+                class_name,
+                "UnionOperation" | "NegateOperation" | "IntersectOperation"
+            )
+            && matches!(
+                d,
+                FastVerifyVal::I64(_) | FastVerifyVal::U64(_) | FastVerifyVal::F64(_)
+            )
+            && matches!(
+                o,
+                FastVerifyVal::I64(_) | FastVerifyVal::U64(_) | FastVerifyVal::F64(_)
+            )
+        {
+            return Ok(true);
+        }
+        if name == "CollisionFidelity"
+            && crate::rbx::encode::is_solid_model_operation(class_name)
+            && let (FastVerifyVal::Enum(a), FastVerifyVal::Enum(b)) = (d, o)
+            && matches!(a, "Box" | "Default")
+            && matches!(b, "Box" | "Default")
+        {
+            return Ok(true);
+        }
+
+        let matched = match (d, o) {
+            (FastVerifyVal::Bool(a), FastVerifyVal::Bool(b)) => a == b,
+            (
+                FastVerifyVal::I64(_) | FastVerifyVal::U64(_) | FastVerifyVal::F64(_),
+                FastVerifyVal::I64(_) | FastVerifyVal::U64(_) | FastVerifyVal::F64(_),
+            ) => {
+                let to_num = |v| match v {
+                    FastVerifyVal::I64(x) => FastNum::I64(x),
+                    FastVerifyVal::U64(x) => FastNum::U64(x),
+                    FastVerifyVal::F64(x) => FastNum::F64(x),
+                    _ => unreachable!(),
+                };
+                let (left, right) = (to_num(d), to_num(o));
+                exact_fast_numbers_equal(left, right)
+                    || (cache.property_uses_f32(class_name, name)
+                        && f32_values_match(left.as_f64(), right.as_f64()))
+            }
+            (FastVerifyVal::Str(a), FastVerifyVal::Str(b)) => {
+                a == b
+                    || (*scratch
+                        .class_asset
+                        .entry(class_name)
+                        .or_insert_with(|| is_asset_reference_property(class_name, name))
+                        && canonical_asset_text(a) == canonical_asset_text(b))
+            }
+            (FastVerifyVal::PoolStr(e1), FastVerifyVal::PoolStr(e2)) => {
+                self.des.hashes[e1] == self.obs.hashes[e2]
+            }
+            (FastVerifyVal::Enum(a), FastVerifyVal::Enum(b)) => a == b,
+            (FastVerifyVal::Vec2(a), FastVerifyVal::Vec2(b)) => {
+                (0..2).all(|i| f32_values_match(f64::from(a[i]), f64::from(b[i])))
+            }
+            (FastVerifyVal::Vec3(a), FastVerifyVal::Vec3(b)) => {
+                (0..3).all(|i| f32_values_match(f64::from(a[i]), f64::from(b[i])))
+            }
+            (FastVerifyVal::UDim(a), FastVerifyVal::UDim(b)) => {
+                f32_values_match(f64::from(a[0]), f64::from(b[0])) && a[1] == b[1]
+            }
+            (FastVerifyVal::UDim2(a), FastVerifyVal::UDim2(b)) => {
+                f32_values_match(f64::from(a[0]), f64::from(b[0]))
+                    && a[1] == b[1]
+                    && f32_values_match(f64::from(a[2]), f64::from(b[2]))
+                    && a[3] == b[3]
+            }
+            (FastVerifyVal::Color3(a), FastVerifyVal::Color3(b)) => {
+                (0..3).all(|i| f32_values_match(f64::from(a[i]), f64::from(b[i])))
+                    || (cache.property_is_color3uint8(class_name, name)
+                        && (0..3).all(|i| color3_byte_round(a[i]) == color3_byte_round(b[i])))
+            }
+            (FastVerifyVal::Rect(a), FastVerifyVal::Rect(b)) => {
+                (0..4).all(|i| f32_values_match(f64::from(a[i]), f64::from(b[i])))
+            }
+            (FastVerifyVal::CFrame(di), FastVerifyVal::CFrame(oi)) => {
+                let da = &scratch.des_cframes[di];
+                let oa = &scratch.obs_cframes[oi];
+                cframes_match_reconciliation(da, oa)
+                    || (name == "CFrame" && verify_cframes_within_assembly_tolerance(da, oa))
+            }
+            (FastVerifyVal::Ref(t1), FastVerifyVal::Ref(t2)) => self.input.places[t1] == t2,
+            (
+                FastVerifyVal::Payload {
+                    ty: t1,
+                    own: o1,
+                    pool: p1,
+                },
+                FastVerifyVal::Payload {
+                    ty: t2,
+                    own: o2,
+                    pool: p2,
+                },
+            ) if t1 == t2 => {
+                let exact = match (o1, p1, o2, p2) {
+                    (Some(a), _, Some(b), _) => a == b,
+                    (_, Some(e1), _, Some(e2)) => self.des.hashes[e1] == self.obs.hashes[e2],
+                    _ => false,
+                };
+                if exact {
+                    true
+                } else if name == crate::rbx::encode::COLLISION_HULL_PROPERTY {
+                    let dc = match (o1, p1) {
+                        (Some(s), _) => hull_fidelity_from_b64_prefix(s),
+                        (_, Some(e)) => self.des.pool_hull_fidelity(e, &self.des_hulls)?,
+                        _ => None,
+                    };
+                    let oc = match (o2, p2) {
+                        (Some(s), _) => hull_fidelity_from_b64_prefix(s),
+                        (_, Some(e)) => self.obs.pool_hull_fidelity(e, &self.obs_hulls)?,
+                        _ => None,
+                    };
+                    dc.is_some() && dc == oc
+                } else {
+                    false
+                }
+            }
+            (FastVerifyVal::Tags(ds, de), FastVerifyVal::Tags(os, oe)) => {
+                scratch.tag_left_buf.clear();
+                scratch
+                    .tag_left_buf
+                    .extend_from_slice(&scratch.des_tags[ds..de]);
+                scratch.tag_left_buf.sort_unstable();
+                scratch.tag_left_buf.dedup();
+                scratch.tag_right_buf.clear();
+                scratch
+                    .tag_right_buf
+                    .extend_from_slice(&scratch.obs_tags[os..oe]);
+                scratch.tag_right_buf.sort_unstable();
+                scratch.tag_right_buf.dedup();
+                scratch.tag_left_buf == scratch.tag_right_buf
+            }
+            _ => false,
+        };
+        Ok(matched)
+    }
+}
+
+struct VerifyBlockScratch<'a> {
+    des_vals: Vec<Option<FastVerifyVal<'a>>>,
+    obs_vals: Vec<Option<FastVerifyVal<'a>>>,
+    des_cframes: Vec<[f64; 12]>,
+    obs_cframes: Vec<[f64; 12]>,
+    des_tags: Vec<&'a str>,
+    obs_tags: Vec<&'a str>,
+    tag_left_buf: Vec<&'a str>,
+    tag_right_buf: Vec<&'a str>,
+    touched: Vec<usize>,
+    touched_mark: Vec<u32>,
+    mark_id: u32,
+    class_engine: AHashMap<&'a str, bool>,
+    class_asset: AHashMap<&'a str, bool>,
+}
+
+impl<'a> VerifyBlockScratch<'a> {
+    fn new(count: usize) -> Self {
+        Self {
+            des_vals: vec![None; count],
+            obs_vals: vec![None; count],
+            des_cframes: Vec::new(),
+            obs_cframes: Vec::new(),
+            des_tags: Vec::new(),
+            obs_tags: Vec::new(),
+            tag_left_buf: Vec::new(),
+            tag_right_buf: Vec::new(),
+            touched: Vec::with_capacity(count),
+            touched_mark: vec![0; count],
+            mark_id: 0,
+            class_engine: AHashMap::new(),
+            class_asset: AHashMap::new(),
+        }
+    }
+
+    fn next_property(&mut self) {
+        self.mark_id = self.mark_id.wrapping_add(1);
+        if self.mark_id == 0 {
+            self.touched_mark.fill(0);
+            self.mark_id = 1;
+        }
+        self.touched.clear();
+        self.des_cframes.clear();
+        self.obs_cframes.clear();
+        self.des_tags.clear();
+        self.obs_tags.clear();
+    }
+}
+
+fn decode_verify_attrs_groups(
+    store: &BlockStore<'_>,
+    open: &OpenBlock,
+    specs: &[BlockGroupSpec<'_>],
+    attr_groups: &[usize],
+    (row_count, row_map): (usize, Option<&[u32]>),
+    ok: &mut [bool],
+    out_attrs: &mut [Option<Map<String, Value>>],
+) -> Result<()> {
+    use crate::settings::equivalence::{
+        reconciliation_value_contains_reference as holds_reference, value_contains_enum_item,
+    };
+    let marked_strings: Vec<Cow<'_, str>> = open
+        .strings
+        .iter()
+        .map(|s| match s {
+            BlockString::Own(t) => Cow::Borrowed(t.as_str()),
+            BlockString::Pool(e) => Cow::Owned(marker(&store.hashes[*e])),
+        })
+        .collect();
+    let refs: Vec<&str> = marked_strings.iter().map(Cow::as_ref).collect();
+    let scope = ValueScope::from_borrowed(&refs, store.rows, &store.budget, None);
+    for &gidx in attr_groups {
+        let (_, kind, vc, body) = specs[gidx];
+        let mut r = BytecodeReader::new(body);
+        let _ = decode_cframe_group_header(kind, &mut r)?;
+        let mut prev_row = 0_usize;
+        for pos in 0..vc {
+            let raw_row =
+                next_group_instance(prev_row, r.read_len("property instance index")?, pos)?;
+            prev_row = raw_row;
+            anyhow::ensure!(raw_row < row_count, "Row out of block bounds");
+            let mapped = match row_map {
+                Some(map) => {
+                    let target = map[raw_row];
+                    (target != u32::MAX).then_some(target as usize)
+                }
+                None => Some(raw_row),
+            };
+            let Some(row) = mapped.filter(|&row| ok[row]) else {
+                skip_raw_value_payload_fast(&mut r, 8, 0)?;
+                continue;
+            };
+            if out_attrs[row].is_some() {
+                ok[row] = false;
+                skip_raw_value_payload_fast(&mut r, 8, 0)?;
+                continue;
+            }
+            let attrs = decode_attributes_payload(&mut r, scope)?;
+            if attrs.keys().any(|k| marked(k).is_some())
+                || attrs
+                    .values()
+                    .any(|v| holds_marker(v) || holds_reference(v) || value_contains_enum_item(v))
+            {
+                ok[row] = false;
+            } else {
+                out_attrs[row] = Some(attrs);
+            }
+        }
+        r.finish()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn fast_verify_aligned_v12_rows(
+    input: FastVerifyInput<'_>,
+) -> Result<Option<Vec<bool>>> {
+    use crate::settings::equivalence::CanonicalizeCache;
+
+    let _span = crate::app::profile::span("fast verify aligned v12 rows");
+    if !is_block_store(input.desired_bytes) || !is_block_store(input.observed_bytes) {
+        return Ok(None);
+    }
+    let des = BlockStore::open(input.desired_bytes)?;
+    let obs = BlockStore::open(input.observed_bytes)?;
+    if des.rows != obs.rows
+        || des.rows != input.desired_instances.len()
+        || des.rows != input.observed_instances.len()
+        || des.rows != input.places.len()
+    {
+        return Ok(None);
+    }
+
+    let obs_opened = (0..obs.blocks.len()).map(|_| Mutex::new(None)).collect();
+    let stores = FastVerifyStores {
+        input: &input,
+        des,
+        obs,
+        database: rbx_reflection_database::get().ok(),
+        des_hulls: ShardedMap::new(),
+        obs_hulls: ShardedMap::new(),
+        obs_opened,
+    };
+
+    let block_results = (0..stores.des.blocks.len())
+        .into_par_iter()
+        .map_init(CanonicalizeCache::new, |cache, block_idx| {
+            stores.verify_block(cache, block_idx)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut verified = Vec::with_capacity(stores.des.rows);
+    for block_ok in block_results {
+        verified.extend(block_ok);
+    }
+    Ok(Some(verified))
+}
+
+/// Digest of the engine-state properties (skipped by `document_row_digest`) of an instance.
+fn engine_state_digest(
+    database: Option<&rbx_reflection::ReflectionDatabase<'_>>,
+    instance: &SettingsBytecodeInstance,
+) -> [u8; 16] {
+    use super::captured::{RowHasher, UNIQUE_ID, is_digested_with_db, value_digest};
+    use crate::settings::equivalence::digest_text;
+    let mut eh: Option<RowHasher> = None;
+    for (name, value) in &instance.properties {
+        if name.as_str() != UNIQUE_ID && !is_digested_with_db(database, &instance.class_name, name)
+        {
+            let h = eh.get_or_insert_with(RowHasher::new);
+            h.update(&[1]);
+            digest_text(h, name);
+            h.update(&value_digest(value));
+        }
+    }
+    eh.map_or([0; 16], RowHasher::finish)
 }
 
 /// A v12 store that an edit reads and writes for `RetainedPropertyColumns`:
@@ -3303,6 +7729,218 @@ impl RowReader {
                 document.instances[row].attributes = attributes;
             }
             visited?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fast_path_regression_tests {
+    use super::*;
+    use crate::settings::equivalence::SettingsAlignment;
+    use crate::snapshot::import::build_service_state_from_instances;
+    use crate::snapshot::types::SnapshotInstance;
+
+    fn snapshot_instance(
+        id: &str,
+        class_name: &str,
+        name: &str,
+        instance_index: usize,
+        parent_index: Option<usize>,
+        properties: Map<String, Value>,
+    ) -> SnapshotInstance {
+        let (path, path_segments, parent_path) = if parent_index.is_some() {
+            (
+                format!("Workspace.{name}"),
+                vec!["Workspace".to_string(), name.to_string()],
+                Some("Workspace".to_string()),
+            )
+        } else {
+            (name.to_string(), vec![name.to_string()], None)
+        };
+        SnapshotInstance {
+            path,
+            path_segments,
+            name: name.to_string(),
+            class_name: class_name.into(),
+            properties,
+            parent_path,
+            debug_id: Some(format!("debug:{instance_index}")),
+            transported_settings_id: Some(id.to_string()),
+            instance_index: Some(instance_index + 1),
+            parent_index: parent_index.map(|parent| parent + 1),
+            ..Default::default()
+        }
+    }
+
+    fn doc_instance(
+        id: &str,
+        class_name: &str,
+        name: &str,
+        parent_index: Option<usize>,
+        properties: Map<String, Value>,
+    ) -> SettingsBytecodeInstance {
+        let mut instance = SettingsBytecodeInstance::new(
+            id.to_string(),
+            name.to_string(),
+            class_name.to_string(),
+            parent_index,
+        );
+        instance.properties = properties;
+        instance
+    }
+
+    #[test]
+    fn fast_compare_and_verify_distinguish_large_int64_values() -> Result<()> {
+        let uid = json!({"_type": "UniqueId", "value": "00000000000000000000000000000001"});
+        let stored_value: i64 = 9_007_199_254_740_992;
+        let changed_value: i64 = 9_007_199_254_740_993;
+
+        let stored_doc = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                doc_instance("1", "Workspace", "Workspace", None, Map::new()),
+                doc_instance(
+                    "iv",
+                    "IntValue",
+                    "Big",
+                    Some(0),
+                    Map::from_iter([
+                        ("UniqueId".into(), uid.clone()),
+                        ("Value".into(), json!(stored_value)),
+                    ]),
+                ),
+            ],
+        };
+        let changed_doc = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                doc_instance("1", "Workspace", "Workspace", None, Map::new()),
+                doc_instance(
+                    "iv",
+                    "IntValue",
+                    "Big",
+                    Some(0),
+                    Map::from_iter([
+                        ("UniqueId".into(), uid.clone()),
+                        ("Value".into(), json!(changed_value)),
+                    ]),
+                ),
+            ],
+        };
+        let stored_bytes = encode_document(&stored_doc, false, None)?;
+        let changed_bytes = encode_document(&changed_doc, false, None)?;
+
+        let mut state = build_service_state_from_instances(
+            "Workspace",
+            None,
+            vec![
+                snapshot_instance("ws", "Workspace", "Workspace", 0, None, Map::new()),
+                snapshot_instance(
+                    "iv",
+                    "IntValue",
+                    "Big",
+                    1,
+                    Some(0),
+                    Map::from_iter([
+                        ("UniqueId".into(), uid),
+                        ("Value".into(), json!(changed_value)),
+                    ]),
+                ),
+            ],
+            HashMap::new(),
+            true,
+        )?;
+        state.dense_index_topology = true;
+        let pulled = super::super::pulled_digest_from_service_state(&state)?;
+        let (alignment, _) = super::super::captured::changed_document_rows(
+            &state,
+            &pulled.rows,
+            &stored_bytes,
+            None,
+        )?
+        .expect("changed_document_rows should compare single changed IntValue row");
+        assert!(
+            matches!(alignment, SettingsAlignment::Changed(_)),
+            "fast compare dropped an Int64 change above 2^53"
+        );
+
+        let verified = fast_verify_aligned_v12_rows(FastVerifyInput {
+            desired_bytes: &stored_bytes,
+            observed_bytes: &changed_bytes,
+            desired_instances: &stored_doc.instances,
+            observed_instances: &changed_doc.instances,
+            places: &[0, 1],
+            by_order: &[false, false],
+            skip: &[true, false],
+            has_before: true,
+        })?
+        .expect("fast verify should handle aligned v12 stores");
+        assert!(
+            !verified[1],
+            "fast verify accepted a different Int64 above 2^53"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fast_compare_detects_changed_inline_source_property() -> Result<()> {
+        let uid = json!({"_type": "UniqueId", "value": "00000000000000000000000000000002"});
+        let stored_doc = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                doc_instance("1", "Workspace", "Workspace", None, Map::new()),
+                doc_instance(
+                    "sc",
+                    "Script",
+                    "Main",
+                    Some(0),
+                    Map::from_iter([
+                        ("UniqueId".into(), uid.clone()),
+                        ("Source".into(), json!("return 1")),
+                    ]),
+                ),
+            ],
+        };
+        let stored_bytes = encode_document(&stored_doc, false, None)?;
+
+        for captured_source in [
+            json!("return 2"),
+            json!(crate::settings::EXTERNAL_SOURCE_MARKER),
+        ] {
+            let mut state = build_service_state_from_instances(
+                "Workspace",
+                None,
+                vec![
+                    snapshot_instance("ws", "Workspace", "Workspace", 0, None, Map::new()),
+                    snapshot_instance(
+                        "sc",
+                        "Script",
+                        "Main",
+                        1,
+                        Some(0),
+                        Map::from_iter([
+                            ("UniqueId".into(), uid.clone()),
+                            ("Source".into(), captured_source.clone()),
+                        ]),
+                    ),
+                ],
+                HashMap::new(),
+                true,
+            )?;
+            state.dense_index_topology = true;
+            let pulled = super::super::pulled_digest_from_service_state(&state)?;
+            let (alignment, _) = super::super::captured::changed_document_rows(
+                &state,
+                &pulled.rows,
+                &stored_bytes,
+                None,
+            )?
+            .expect("changed_document_rows should compare Script row");
+            assert!(
+                matches!(alignment, SettingsAlignment::Changed(_)),
+                "fast compare treated inline Source as metadata for captured={captured_source}"
+            );
         }
         Ok(())
     }

@@ -21,7 +21,7 @@ use rbx_dom_weak::{
 use rbx_reflection::{ClassDescriptor, PropertyKind, PropertySerialization, ReflectionDatabase};
 
 use crate::{
-    chunk::Chunk,
+    chunk::{Chunk, RawChunk},
     core::{find_property_descriptors, RbxReadExt},
     types::Type,
 };
@@ -465,6 +465,10 @@ impl<'db, R: Read> DeserializerState<'db, R> {
 
     pub(super) fn next_chunk(&mut self) -> Result<Chunk, InnerError> {
         Ok(Chunk::decode(&mut self.input)?)
+    }
+
+    pub(super) fn next_raw_chunk(&mut self) -> Result<RawChunk, InnerError> {
+        Ok(Chunk::read_raw(&mut self.input)?)
     }
 
     #[profiling::function]
@@ -1837,8 +1841,20 @@ rbx-dom may require changes to fully support this property. Please open an issue
     #[profiling::function]
     pub(super) fn decode_prop_chunks_parallel(
         &mut self,
-        chunks: Vec<Chunk>,
+        raw_chunks: Vec<RawChunk>,
     ) -> Result<(), InnerError> {
+        let chunks: Vec<Chunk> = if raw_chunks.len() >= 2 && rayon::current_num_threads() > 1 {
+            raw_chunks
+                .into_par_iter()
+                .map(|raw| raw.decompress().map_err(InnerError::from))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            raw_chunks
+                .into_iter()
+                .map(|raw| raw.decompress().map_err(InnerError::from))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
         let mut type_ids = Vec::with_capacity(chunks.len());
         let mut distinct_type_ids = HashSet::new();
 
@@ -1935,7 +1951,7 @@ rbx-dom may require changes to fully support this property. Please open an issue
                 flat: true,
             };
 
-            for chunk in &job.chunks {
+            for chunk in core::mem::take(&mut job.chunks) {
                 if let Err(error) = state.decode_prop_chunk(&chunk.data) {
                     job.error = Some((chunk.index, error));
                     break;
