@@ -1343,7 +1343,7 @@ def config_scope_precedence(ctx: Context):
     ctx.expect(merged.get("value") == "verify" and Path(merged.get("origin") or "") == place, f"merged: {merged}")
     _run(ctx, "cfg", "unset", key, "--scope", "place", env=env, timeout=60)
     after = _setting(_run(ctx, "cfg", "list", "--origins", env=env, timeout=60), key)
-    user = Path(env["APPDATA"]) / "Renium" / "config.json" if os.name == "nt" else Path(env["HOME"]) / "Library" / "Application Support" / "Renium" / "config.json"
+    user = Path(env["USERPROFILE"]) / ".renium" / "config.json" if os.name == "nt" else Path(env["HOME"]) / "Library" / "Application Support" / "Renium" / "config.json"
     ctx.expect(after.get("value") == "reconcile" and Path(after.get("origin") or "") == user, f"after unset: {after}")
     ctx.expect(_run(ctx, "cfg", "get", key, env=env, timeout=60).json == "reconcile", "get after unset")
 
@@ -1379,7 +1379,7 @@ def config_validation(ctx: Context):
     for args, message in cases:
         ctx.expect_in(message, _run(ctx, *args, env=env, ok=False, timeout=60).error, " ".join(args))
     ctx.expect(not (ctx.root / ".renium" / "config.json").exists(), "place config untouched")
-    ctx.expect(not (Path(env["APPDATA"]) / "Renium" / "config.json").exists(), "user config untouched")
+    ctx.expect(not (Path(env["USERPROFILE"]) / ".renium" / "config.json").exists(), "user config untouched")
 
 
 def config_edit(ctx: Context):

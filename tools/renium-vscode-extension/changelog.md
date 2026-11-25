@@ -37,6 +37,7 @@
 
 ### Bug fixes
 
+- On Windows the user-wide settings (`rbx cfg --scope user`, the mode of `rbx audio --global`) are kept in `.renium\config.json` under the user profile and no longer under AppData. A packaged app can give its processes a private copy of AppData, and a setting an agent saved from inside one never reached Studio audio: every `--global` audio command answered "did not acknowledge the setting". The first save moves the old file; reading the settings moves nothing. An older Renium still in use reads its defaults after that, and one `--global` audio command can time out once right after the update.
 - `-w SECONDS` waits for a Studio connection as long as asked, up to ten minutes. The wait was cut to 30 seconds whatever `-w` said, so a Studio still opening a large place could not be waited for.
 - A place that did not open because the PC was offline is reported as that. Studio asks for the place once, logs no failure and stays at its start page; the answer said the Studio had not connected yet.
 - A push no longer treats a store as changed when it differs from Studio only in the player capacity, which Roblox takes from Game Settings and no push writes. Such a push answers `unchanged`.

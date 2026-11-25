@@ -39,7 +39,7 @@ loader._load = (request, parent, isMain) => {
     };
   }
   if (request === "./sharedConfig") {
-    return { userConfigPath: () => "user-config.json", userStudioAudioMode: () => shared };
+    return { userConfigFiles: () => ["user-config.json"], userStudioAudioMode: () => shared };
   }
   return original.call(loader, request, parent, isMain);
 };

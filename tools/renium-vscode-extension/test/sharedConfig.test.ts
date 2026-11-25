@@ -10,7 +10,7 @@ import {
   sharedConfigValue,
 } from "../src/sharedConfig";
 
-function restoreEnvironment(name: "APPDATA" | "XDG_CONFIG_HOME", value: string | undefined): void {
+function restoreEnvironment(name: "APPDATA" | "USERPROFILE" | "XDG_CONFIG_HOME", value: string | undefined): void {
   if (value === undefined) {
     delete process.env[name];
   } else {
@@ -21,8 +21,10 @@ function restoreEnvironment(name: "APPDATA" | "XDG_CONFIG_HOME", value: string |
 test("shared config accepts comments and trailing commas without changing string contents", () => {
   const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "renium-shared-config-"));
   const appData = process.env.APPDATA;
+  const userProfile = process.env.USERPROFILE;
   const xdgConfigHome = process.env.XDG_CONFIG_HOME;
   process.env.APPDATA = path.join(projectRoot, "user-config");
+  process.env.USERPROFILE = path.join(projectRoot, "user-config");
   process.env.XDG_CONFIG_HOME = path.join(projectRoot, "user-config");
   fs.mkdirSync(path.join(projectRoot, ".git"));
   fs.writeFileSync(path.join(projectRoot, "renium.project.jsonc"), `{
@@ -49,6 +51,7 @@ test("shared config accepts comments and trailing commas without changing string
     );
   } finally {
     restoreEnvironment("APPDATA", appData);
+    restoreEnvironment("USERPROFILE", userProfile);
     restoreEnvironment("XDG_CONFIG_HOME", xdgConfigHome);
     fs.rmSync(projectRoot, { recursive: true, force: true });
   }

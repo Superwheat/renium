@@ -2114,7 +2114,7 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
         }
         ConfigCommand::Set(args) => {
             ensure_writable_scope(args.scope)?;
-            let path = config_scope_path(args.scope, &args.root)?;
+            let path = writable_config_scope_path(args.scope, &args.root)?;
             let mut value = read_json_object_or_empty(&path)?;
             let parsed = if args.string {
                 Value::String(args.value)
@@ -2140,7 +2140,7 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
         }
         ConfigCommand::Unset(args) => {
             ensure_writable_scope(args.scope)?;
-            let path = config_scope_path(args.scope, &args.root)?;
+            let path = writable_config_scope_path(args.scope, &args.root)?;
             let mut value = read_json_object_or_empty(&path)?;
             if !remove_dotted(&mut value, &args.key)? {
                 bail!(
@@ -2159,7 +2159,7 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
         }
         ConfigCommand::Reset(args) => {
             ensure_writable_scope(args.scope)?;
-            let path = config_scope_path(args.scope, &args.root)?;
+            let path = writable_config_scope_path(args.scope, &args.root)?;
             validate_config_scope_change(args.scope, &args.root, &path, &json!({}))?;
             remove_config_scope(&path)?;
             apply_user_audio_change(args.scope, None)?;
@@ -2171,7 +2171,7 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
         ConfigCommand::List(args) => list_config_settings(args),
         ConfigCommand::Edit(args) => {
             ensure_writable_scope(args.scope)?;
-            let path = config_scope_path(args.scope, &args.root)?;
+            let path = writable_config_scope_path(args.scope, &args.root)?;
             if !path.exists() {
                 write_json(&path, &json!({ "schemaVersion": 1 }))?;
             }
@@ -2602,12 +2602,11 @@ pub(crate) fn user_studio_audio_mode() -> Result<Value> {
 }
 
 pub(crate) fn set_user_studio_audio_mode(mode: Value) -> Result<()> {
-    let path = user_config_path()?;
-    let mut value = read_json_object_or_empty(&path)?;
+    let mut value = read_json_object_or_empty(&user_config_path()?)?;
     if value.get("studioAudioMode") != Some(&mode) {
         value["studioAudioMode"] = mode;
         validate_merged_config(&value)?;
-        write_json(&path, &value)?;
+        write_json(&writable_user_config_path()?, &value)?;
     }
     Ok(())
 }
@@ -3290,6 +3289,13 @@ fn load_config_scope(scope: ConfigScope, root: &Path) -> Result<Value> {
     read_json_object_or_empty(&path)
 }
 
+fn writable_config_scope_path(scope: ConfigScope, root: &Path) -> Result<PathBuf> {
+    if scope == ConfigScope::User {
+        return writable_user_config_path();
+    }
+    config_scope_path(scope, root)
+}
+
 fn config_scope_path(scope: ConfigScope, root: &Path) -> Result<PathBuf> {
     match scope {
         ConfigScope::User => user_config_path(),
@@ -3331,10 +3337,65 @@ fn nearest_project_marker(root: &Path) -> Option<PathBuf> {
     }
 }
 
+/// A packaged Windows app can give its processes a private copy of AppData,
+/// and a setting saved there from inside one never reaches a Renium process
+/// outside it. The profile folder is not redirected.
+fn windows_user_config_path() -> Result<PathBuf> {
+    let home = env::var_os("USERPROFILE").context("USERPROFILE is not set")?;
+    Ok(PathBuf::from(home).join(".renium").join("config.json"))
+}
+
+/// Where an earlier version kept the user's settings on Windows.
+fn earlier_user_config_path() -> Option<PathBuf> {
+    let base = env::var_os("APPDATA").filter(|_| cfg!(windows))?;
+    Some(PathBuf::from(base).join("Renium").join("config.json"))
+}
+
+/// The file to read: `earlier` until a save has moved it to `path`.
+fn current_user_config(path: PathBuf, earlier: Option<PathBuf>) -> PathBuf {
+    match earlier {
+        Some(earlier) if !path.exists() && earlier.is_file() => earlier,
+        _ => path,
+    }
+}
+
+/// Moves the settings file an earlier version kept at `earlier` to `path`.
+fn carry_user_config(path: &Path, earlier: &Path) -> Result<()> {
+    if path.exists() || !earlier.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    if fs::rename(earlier, path).is_err() && earlier.is_file() {
+        fs::copy(earlier, path).with_context(|| {
+            format!("Failed to move {} to {}", earlier.display(), path.display())
+        })?;
+        let _ = fs::remove_file(earlier);
+    }
+    Ok(())
+}
+
+/// The user settings file a save goes to. Only a save moves an earlier
+/// version's file, so reading the settings changes nothing on disk.
+fn writable_user_config_path() -> Result<PathBuf> {
+    if !cfg!(windows) {
+        return user_config_path();
+    }
+    let path = windows_user_config_path()?;
+    if let Some(earlier) = earlier_user_config_path() {
+        carry_user_config(&path, &earlier)?;
+    }
+    Ok(path)
+}
+
 fn user_config_path() -> Result<PathBuf> {
     if cfg!(windows) {
-        let base = env::var_os("APPDATA").context("APPDATA is not set")?;
-        return Ok(PathBuf::from(base).join("Renium").join("config.json"));
+        return Ok(current_user_config(
+            windows_user_config_path()?,
+            earlier_user_config_path(),
+        ));
     }
     if cfg!(target_os = "macos") {
         let home = env::var_os("HOME").context("HOME is not set")?;
@@ -3691,6 +3752,54 @@ mod tests {
             .unwrap();
         assert_eq!(found, root.join(PROJECT_FILE_NAME));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn user_settings_stay_out_of_app_data() {
+        let path = windows_user_config_path().unwrap();
+        for name in ["APPDATA", "LOCALAPPDATA"] {
+            let base = PathBuf::from(env::var_os(name).unwrap());
+            assert!(
+                !path.starts_with(&base),
+                "{} is under {name}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn earlier_user_settings_are_read_in_place_and_moved_by_a_save() -> Result<()> {
+        let root = crate::tests::support::temp_dir("carry-user-config");
+        let earlier = root.join("earlier").join("config.json");
+        let path = root.join("shared").join("config.json");
+        let read = || current_user_config(path.clone(), Some(earlier.clone()));
+        assert_eq!(read(), path);
+        carry_user_config(&path, &earlier)?;
+        assert!(!path.exists());
+
+        fs::create_dir_all(earlier.parent().unwrap())?;
+        fs::write(&earlier, r#"{"studioAudioMode":"auto"}"#)?;
+        assert_eq!(read(), earlier);
+        assert!(!path.exists());
+
+        carry_user_config(&path, &earlier)?;
+        assert_eq!(fs::read_to_string(&path)?, r#"{"studioAudioMode":"auto"}"#);
+        assert!(!earlier.exists());
+        assert_eq!(read(), path);
+
+        remove_config_scope(&path)?;
+        carry_user_config(&path, &earlier)?;
+        assert!(!path.exists());
+
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(&path, r#"{"studioAudioMode":"mute"}"#)?;
+        fs::write(&earlier, r#"{"studioAudioMode":"auto"}"#)?;
+        carry_user_config(&path, &earlier)?;
+        assert_eq!(fs::read_to_string(&path)?, r#"{"studioAudioMode":"mute"}"#);
+        assert_eq!(read(), path);
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]

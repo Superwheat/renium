@@ -630,9 +630,19 @@ function projectFilePath(projectRoot: string): string {
   return hasJson ? json : jsonc;
 }
 
+/** Where the CLI saves user settings, and where an earlier version kept them on Windows. */
+export function userConfigFiles(): string[] {
+  if (process.platform !== "win32") { return [userConfigPath()]; }
+  return [
+    path.join(os.homedir(), ".renium", "config.json"),
+    path.join(process.env.APPDATA ?? path.join(os.homedir(), "AppData", "Roaming"), "Renium", "config.json"),
+  ];
+}
+
 export function userConfigPath(): string {
   if (process.platform === "win32") {
-    return path.join(process.env.APPDATA ?? path.join(os.homedir(), "AppData", "Roaming"), "Renium", "config.json");
+    const [current, earlier] = userConfigFiles();
+    return !fs.existsSync(current) && fs.existsSync(earlier) ? earlier : current;
   }
   if (process.platform === "darwin") {
     return path.join(os.homedir(), "Library", "Application Support", "Renium", "config.json");

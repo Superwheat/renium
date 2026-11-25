@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as vscode from "vscode";
-import { userConfigPath, userStudioAudioMode } from "./sharedConfig";
+import { userConfigFiles, userStudioAudioMode } from "./sharedConfig";
 
 export function watchStudioAudioSettings(
   apply: (mode: string) => Promise<void>,
@@ -29,13 +29,13 @@ export function watchStudioAudioSettings(
   const configuration = vscode.workspace.onDidChangeConfiguration(event => {
     if (event.affectsConfiguration("renium.studioAudioMode")) { synchronize("editor"); }
   });
-  const file = userConfigPath();
+  const files = userConfigFiles();
   const changed = (): void => synchronize("file");
-  fs.watchFile(file, { interval: 1000, persistent: false }, changed);
+  for (const file of files) { fs.watchFile(file, { interval: 1000, persistent: false }, changed); }
   synchronize("startup");
   return new vscode.Disposable(() => {
     disposed = true;
     configuration.dispose();
-    fs.unwatchFile(file, changed);
+    for (const file of files) { fs.unwatchFile(file, changed); }
   });
 }
