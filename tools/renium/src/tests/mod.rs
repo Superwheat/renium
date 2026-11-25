@@ -3843,6 +3843,8 @@ fn vc_init_writes_policy_files_idempotently() {
     let renium_ignore = fs::read_to_string(dir.join(".renium").join(".gitignore")).unwrap();
     assert!(renium_ignore.contains("custom-state/"));
     assert!(renium_ignore.contains("editor-history/"));
+    assert!(renium_ignore.contains("reconcile/"));
+    assert!(renium_ignore.contains("studio-target.json"));
 
     vc_init(VcInitArgs {
         project_root: dir.clone(),
