@@ -39,11 +39,15 @@ loader._load = (request, parent, isMain) => {
     };
   }
   if (request === "./sharedConfig") {
-    return { userConfigFiles: () => ["user-config.json"], userStudioAudioMode: () => shared };
+    return {
+      userConfigFiles: () => ["user-config.json"],
+      userStudioAudioMode: () => shared,
+      userStudioFpsMode: () => shared,
+    };
   }
   return original.call(loader, request, parent, isMain);
 };
-const { watchStudioAudioSettings } = require("../src/studioAudioSettings") as typeof import("../src/studioAudioSettings");
+const { watchStudioAudioSettings, watchStudioFpsSettings } = require("../src/studioAudioSettings") as typeof import("../src/studioAudioSettings");
 loader._load = original;
 const settle = async (): Promise<void> => {
   for (let index = 0; index < 4; index++) { await new Promise(resolve => setImmediate(resolve)); }
@@ -89,6 +93,31 @@ test("saved global audio wins over stale editor settings and resumes on activati
   await settle();
   assert.equal(editor, "auto");
   assert.deepEqual(applied, ["auto"]);
+  assert.deepEqual(errors, []);
+  binding.dispose();
+});
+
+test("global FPS settings synchronize editor and user config changes without feedback writes", async () => {
+  shared = editor = undefined;
+  updates.length = 0;
+  const applied: string[] = [];
+  const errors: unknown[] = [];
+  const binding = watchStudioFpsSettings(async mode => {
+    applied.push(mode);
+    shared = mode;
+    fileChanged?.();
+  }, error => errors.push(error));
+  await settle();
+  assert.deepEqual(applied, []);
+  editor = "unlock";
+  change();
+  await settle();
+  assert.deepEqual(applied, ["unlock"]);
+  shared = "default";
+  fileChanged?.();
+  await settle();
+  assert.equal(editor, "default");
+  assert.deepEqual(applied, ["unlock"]);
   assert.deepEqual(errors, []);
   binding.dispose();
 });

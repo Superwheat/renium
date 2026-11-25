@@ -6,6 +6,12 @@ Performance diagnostics need no protected-property mode or per-property approval
 
 Select the intended place and Edit/server/client runtime. Reuse existing sessions; profiling is not a reason to start Play when the data needed is already captured. Keep raw captures tied to their runtime, build and timestamps. Report measured frame times and supporting scopes, not guessed causes or sums of overlapping work. Record the render quality with the numbers (`rbx gfx`, `--player N` for a client): frame times at level 21 and at automatic are different measurements. Change it only when the task names a level, and `rbx gfx restore` afterwards.
 
+## Frame rate of an unfocused Studio
+
+Studio renders one frame in four while its window is not the active one (240 FPS becomes 60), so frame rates measured in a window nobody focuses are held there. On Windows, `rbx fps unlock` removes that hold for the selected Studio process: an unfocused or covered Edit, Play solo or local-test window renders at the rate it has when focused. Studio's frame cap stays, and a focused window is unchanged. `rbx fps default` restores Studio's behaviour and removes Renium's hook; `rbx fps status` reads mode, focus and throttle state. Target a test process with `--player 1`, `--server` or `--pid PID`. Keep the window restored, not minimized, and say with any frame rate whether the hold was on.
+
+`--global` keeps the mode as a user setting for every Studio window and Play process, now and later, without a project or connection: `rbx fps unlock|default|status --global`. The same setting is **Renium: Studio FPS Mode** in the editor and `rbx cfg set studioFpsMode unlock --scope user` (`default`, `unlock`; project overrides are rejected). A command for one window overrides the global mode until the next global change. No Studio file is changed; if the controlling Renium process exits, the hold returns within 5 seconds.
+
 ## Renium frame counters
 
 ```powershell

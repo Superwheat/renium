@@ -79,6 +79,7 @@
     { "id": 107, "name": "place-publish", "review": true, "runtime": true },
     { "id": 108, "name": "studio-audio", "runtime": true },
     { "id": 109, "name": "place-snapshot", "runtime": true },
-    { "id": 110, "name": "render-quality", "runtime": true }
+    { "id": 110, "name": "render-quality", "runtime": true },
+    { "id": 111, "name": "studio-fps", "runtime": true }
   ]
 }

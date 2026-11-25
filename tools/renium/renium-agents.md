@@ -32,7 +32,7 @@ With Live Sync on, trust file edits: no push, poll or Play after each save; `lst
 
 ## Guides
 
-When the recipes do not cover the task, read the guide once; reread after a reported update. `RENIUM/data.md` stores and scripts; `RENIUM/data-properties.md` bulk, protected properties; `RENIUM/data-inspect.md` file queries; `RENIUM/configuration.md`; `RENIUM/sync.md` push, pull, Live Sync, conflicts; `RENIUM/playtest.md`; `RENIUM/runtime.md` live Luau, consoles; `RENIUM/network.md`; `RENIUM/input.md` UI, input, movement; `RENIUM/capture-device.md`; `RENIUM/performance.md`; `RENIUM/performance-profiler.md`; `RENIUM/projects.md` models, places; `RENIUM/links.md` Git, collaboration; `RENIUM/opencloud.md`; `RENIUM/opencloud-resources.md`; `RENIUM/opencloud-assets.md`; `RENIUM/advanced.md` Studio lifecycle, audio; `RENIUM/publishing.md`; `RENIUM/plugins.md`; `RENIUM/native-compatibility.md`.
+When the recipes do not cover the task, read the guide once; reread after a reported update. `RENIUM/data.md` stores and scripts; `RENIUM/data-properties.md` bulk, protected properties; `RENIUM/data-inspect.md` file queries; `RENIUM/configuration.md`; `RENIUM/sync.md` push, pull, Live Sync, conflicts; `RENIUM/playtest.md`; `RENIUM/runtime.md` live Luau, consoles; `RENIUM/network.md`; `RENIUM/input.md` UI, input, movement; `RENIUM/capture-device.md`; `RENIUM/performance.md` frame times, unfocused FPS; `RENIUM/performance-profiler.md`; `RENIUM/projects.md` models, places; `RENIUM/links.md` Git, collaboration; `RENIUM/opencloud.md`; `RENIUM/opencloud-resources.md`; `RENIUM/opencloud-assets.md`; `RENIUM/advanced.md` Studio lifecycle, audio; `RENIUM/publishing.md`; `RENIUM/plugins.md`; `RENIUM/native-compatibility.md`.
 
 ## Targeting
 

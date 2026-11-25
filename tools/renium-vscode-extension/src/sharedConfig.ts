@@ -38,6 +38,7 @@ const NUMBER_CONFIG_KEYS = new Set([
 const STRING_ARRAY_CONFIG_KEYS = new Set(["services", "gitSync.stagePaths"]);
 const ENUM_CONFIG_KEYS = new Map<string, readonly string[]>([
   ["studioAudioMode", ["off", "auto", "mute"]],
+  ["studioFpsMode", ["default", "unlock"]],
   ["logLevel", ["off", "error", "warn", "info", "debug", "trace"]],
   ["color", ["auto", "always", "never"]],
   ["outputMode", ["text", "json", "pretty"]],
@@ -659,6 +660,15 @@ export function userStudioAudioMode(): string | undefined {
   return value;
 }
 
+export function userStudioFpsMode(): string | undefined {
+  const value = readObject(userConfigPath()).studioFpsMode;
+  if (value === undefined) { return undefined; }
+  if (value !== "default" && value !== "unlock") {
+    throw new Error("studioFpsMode must be default or unlock");
+  }
+  return value;
+}
+
 export function loadSharedConfig(workspaceRoot: string, projectRoot: string): SharedConfig {
   const workspace = findAncestor(projectRoot, [".git"]) ?? path.resolve(workspaceRoot);
   const experience = findAncestor(projectRoot, ["renium.experience.json"]) ?? path.resolve(projectRoot);
@@ -686,6 +696,9 @@ export function loadSharedConfig(workspaceRoot: string, projectRoot: string): Sh
     if (filePath !== files[0] && config.studioAudioMode !== undefined) {
       throw new Error("studioAudioMode is global; set it in User settings, not the project");
     }
+    if (filePath !== files[0] && config.studioFpsMode !== undefined) {
+      throw new Error("studioFpsMode is global; set it in User settings, not the project");
+    }
     merge(merged, config);
   }
   const project = readObject(files[files.length - 1]);
@@ -693,6 +706,9 @@ export function loadSharedConfig(workspaceRoot: string, projectRoot: string): Sh
   if (settings && typeof settings === "object" && !Array.isArray(settings)) {
     if ((settings as SharedConfig).studioAudioMode !== undefined) {
       throw new Error("studioAudioMode is global; set it in User settings, not the project");
+    }
+    if ((settings as SharedConfig).studioFpsMode !== undefined) {
+      throw new Error("studioFpsMode is global; set it in User settings, not the project");
     }
     merge(merged, settings as SharedConfig);
   }

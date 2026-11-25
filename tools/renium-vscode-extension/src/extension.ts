@@ -101,7 +101,7 @@ import {
 } from "./syncConfig";
 import { AUTOMATION_OP } from "./automationProtocol.generated";
 import { CollaborationController } from "./collaboration";
-import { watchStudioAudioSettings } from "./studioAudioSettings";
+import { watchStudioAudioSettings, watchStudioFpsSettings } from "./studioAudioSettings";
 
 const RENIUM_OPEN_PACKAGE_SCRIPT_TABS_STATE_KEY = "renium.openPackageScriptTabs";
 const RENIUM_ACTIVE_EXPERIENCE_PLACES_STATE_KEY = "renium.activeExperiencePlaces";
@@ -1239,6 +1239,12 @@ class RobloxSyncController {
   public async applyGlobalStudioAudio(mode: string): Promise<void> {
     const result = await this.runCommand(this.updateCli(), ["audio", mode, "--global"],
       this.context.extensionPath, "audio", 2, { quietLog: true, timeoutMs: 15000 });
+    if (result.code !== 0) { throw new Error(result.output); }
+  }
+
+  public async applyGlobalStudioFps(mode: string): Promise<void> {
+    const result = await this.runCommand(this.updateCli(), ["fps", mode, "--global"],
+      this.context.extensionPath, "fps", 2, { quietLog: true, timeoutMs: 15000 });
     if (result.code !== 0) { throw new Error(result.output); }
   }
 
@@ -4930,6 +4936,12 @@ export function activate(context: vscode.ExtensionContext): void {
     mode => controller.applyGlobalStudioAudio(mode),
     error => { void vscode.window.showErrorMessage(`Studio audio: ${String(error)}`); },
   ));
+  if (process.platform === "win32") {
+    context.subscriptions.push(watchStudioFpsSettings(
+      mode => controller.applyGlobalStudioFps(mode),
+      error => { void vscode.window.showErrorMessage(`Studio FPS: ${String(error)}`); },
+    ));
+  }
   activeController = controller;
   controller.scheduleAutomaticUpdateCheck();
   void (async () => {

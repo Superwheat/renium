@@ -63,6 +63,9 @@ pub(super) fn probe_operation(
             }
             Ok(json!({"contract":"process-local Core Audio interface","sessions":status.sessions}))
         }
+        NativeOperation::FpsUnlock => {
+            bail!("Studio FPS unlock is supported on Windows")
+        }
         NativeOperation::Input => {
             bail!("Native PID-scoped input is not implemented on macOS; use Studio bridge input")
         }

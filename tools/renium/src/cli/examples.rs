@@ -8,6 +8,10 @@ pub(super) const COMMAND_EXAMPLES: &[(&str, &str)] = &[
         "Examples:\n  rbx audio auto --global\n  rbx audio status --global\n  rbx audio off --global\n  rbx audio mute\n  rbx audio unmute\n  rbx audio auto\n  rbx audio off\n  rbx audio status",
     ),
     (
+        "fps",
+        "Examples:\n  rbx fps unlock --global\n  rbx fps status --global\n  rbx fps default --global\n  rbx fps unlock\n  rbx fps unlock --player 1\n  rbx fps unlock --server\n  rbx fps default\n  rbx fps status",
+    ),
+    (
         "publish",
         "Examples:\n  rbx publish --dry-run\n  rbx --place lobby publish\n  rbx publish --open-cloud\n  rbx publish --open-cloud --file build.rbxl --universe 123 --place-id 456",
     ),

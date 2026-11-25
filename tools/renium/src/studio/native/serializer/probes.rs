@@ -26,12 +26,13 @@ pub(crate) enum NativeOperation {
     PackageActions,
     StudioActions,
     AudioGate,
+    FpsUnlock,
     Input,
     ViewportCapture,
 }
 
 impl NativeOperation {
-    pub(crate) const ALL: [Self; 16] = [
+    pub(crate) const ALL: [Self; 17] = [
         Self::Snapshot,
         Self::Capture,
         Self::ServiceReader,
@@ -46,6 +47,7 @@ impl NativeOperation {
         Self::PackageActions,
         Self::StudioActions,
         Self::AudioGate,
+        Self::FpsUnlock,
         Self::Input,
         Self::ViewportCapture,
     ];
@@ -68,6 +70,7 @@ impl NativeOperation {
             Self::PackageActions => "plugin package actions where supported",
             Self::StudioActions => "bridge commands where supported",
             Self::AudioGate => "audible output",
+            Self::FpsUnlock => "Studio default frame rate pacing",
             Self::Input => "bridge input",
             Self::ViewportCapture => "bridge capture",
         }

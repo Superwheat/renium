@@ -30,6 +30,8 @@ use anyhow::{Context, Result, bail};
 use memchr::memmem;
 #[path = "windows_audio.rs"]
 mod audio;
+#[path = "windows_fps.rs"]
+mod fps;
 #[path = "windows_image.rs"]
 mod image;
 #[path = "windows_import.rs"]
@@ -46,6 +48,7 @@ mod properties;
 #[path = "windows_undo_selection.rs"]
 mod undo_selection;
 pub(crate) use audio::AudioOutputGate;
+pub(crate) use fps::{FpsController, helper_loaded as fps_helper_loaded};
 pub(crate) use import::{CREATED_ROW, read_service_payload};
 pub(crate) use observation::{AttributeGuard, begin_attribute_guard, begin_attribute_relay};
 pub(crate) use package_notice::suppress_package_notices;
@@ -208,6 +211,12 @@ impl ProcessMemory {
     fn open_for_windows_audio(pid: u32) -> Result<Self> {
         let memory = Self::open_with_access(pid, 0)?;
         memory.authorize(NativeOperation::AudioGate, "")?;
+        Ok(memory)
+    }
+
+    fn open_for_windows_fps(pid: u32) -> Result<Self> {
+        let memory = Self::open_with_access(pid, 0)?;
+        memory.authorize(NativeOperation::FpsUnlock, "")?;
         Ok(memory)
     }
 
@@ -1700,8 +1709,10 @@ fn refresh_active_data_model(
 
 pub(crate) fn prepare_context(pid: u32, title: &str) -> Result<()> {
     // Existing background connection preparation records each independent result.
-    // Nothing in this sweep writes memory or loads a helper.
     for operation in NativeOperation::ALL {
+        if operation == NativeOperation::FpsUnlock {
+            continue;
+        }
         let _ = super::probes::run(pid, title, operation);
     }
     Ok(())

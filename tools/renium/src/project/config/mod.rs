@@ -2133,6 +2133,7 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
             validate_config_scope_change(args.scope, &args.root, &path, &value)?;
             write_json(&path, &value)?;
             apply_user_audio_change(args.scope, Some(&args.key))?;
+            apply_user_fps_change(args.scope, Some(&args.key))?;
             crate::app::output::emit_global_output(
                 &json!({ "ok": true, "key": args.key, "value": parsed }),
                 &format!("{}={}", args.key, config_value_text(&parsed)?),
@@ -2152,6 +2153,7 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
             validate_config_scope_change(args.scope, &args.root, &path, &value)?;
             write_config_scope(&path, &value)?;
             apply_user_audio_change(args.scope, Some(&args.key))?;
+            apply_user_fps_change(args.scope, Some(&args.key))?;
             crate::app::output::emit_global_output(
                 &json!({ "ok": true, "action": "unset", "key": args.key, "path": path }),
                 &format!("Removed {} from {}", args.key, path.display()),
@@ -2163,6 +2165,7 @@ pub fn run_config(args: ConfigArgs) -> Result<()> {
             validate_config_scope_change(args.scope, &args.root, &path, &json!({}))?;
             remove_config_scope(&path)?;
             apply_user_audio_change(args.scope, None)?;
+            apply_user_fps_change(args.scope, None)?;
             crate::app::output::emit_global_output(
                 &json!({ "ok": true, "action": "reset", "path": path }),
                 &format!("Reset {}", path.display()),
@@ -2630,6 +2633,48 @@ fn validate_audio_scope(scope: ConfigScope, value: &Value) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn user_studio_fps_mode() -> Result<Value> {
+    let config = read_json_object_or_empty(&user_config_path()?)?;
+    Ok(config
+        .get("studioFpsMode")
+        .cloned()
+        .unwrap_or(json!("default")))
+}
+
+pub(crate) fn set_user_studio_fps_mode(mode: Value) -> Result<()> {
+    let mut value = read_json_object_or_empty(&user_config_path()?)?;
+    if value.get("studioFpsMode") != Some(&mode) {
+        value["studioFpsMode"] = mode;
+        validate_merged_config(&value)?;
+        write_json(&writable_user_config_path()?, &value)?;
+    }
+    Ok(())
+}
+
+fn apply_user_fps_change(scope: ConfigScope, key: Option<&str>) -> Result<()> {
+    if cfg!(windows) && scope == ConfigScope::User && key.is_none_or(|key| key == "studioFpsMode") {
+        if crate::studio::fps::helpers_disabled()
+            && (key.is_none() || user_studio_fps_mode().ok() == Some(json!("default")))
+        {
+            return Ok(());
+        }
+        let status = crate::studio::fps::global::command(crate::studio::fps::Action::Status)?;
+        anyhow::ensure!(
+            status["ok"] == true,
+            "Studio FPS setting was saved, but some windows could not apply it: {status}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_fps_scope(scope: ConfigScope, value: &Value) -> Result<()> {
+    anyhow::ensure!(
+        scope == ConfigScope::User || value.get("studioFpsMode").is_none(),
+        "studioFpsMode is global; use `rbx cfg set studioFpsMode MODE --scope user`"
+    );
+    Ok(())
+}
+
 fn load_merged_config_with_override(
     root: &Path,
     scope_override: Option<(&Path, &Value)>,
@@ -2646,10 +2691,12 @@ fn load_merged_config_with_override(
             && absolute_path(override_path) == absolute_path(&path)
         {
             validate_audio_scope(scope, override_value)?;
+            validate_fps_scope(scope, override_value)?;
             merge_json(&mut merged, override_value.clone());
         } else if path.is_file() {
             let value = read_json_object_or_empty(&path)?;
             validate_audio_scope(scope, &value)?;
+            validate_fps_scope(scope, &value)?;
             merge_json(&mut merged, value);
         }
     }
@@ -2657,6 +2704,7 @@ fn load_merged_config_with_override(
         let project = load_project(None, Some(root))?;
         if project.project.settings.is_object() {
             validate_audio_scope(ConfigScope::Place, &project.project.settings)?;
+            validate_fps_scope(ConfigScope::Place, &project.project.settings)?;
             merge_json(&mut merged, project.project.settings);
         }
     }
@@ -2744,6 +2792,11 @@ fn validate_merged_config(value: &Value) -> Result<()> {
                     &path,
                     "off, mute, or auto",
                     matches!(value.as_str(), Some("off" | "mute" | "auto")),
+                )?,
+                "studioFpsMode" => require_kind(
+                    &path,
+                    "default or unlock",
+                    matches!(value.as_str(), Some("default" | "unlock")),
                 )?,
                 "color" => require_kind(
                     &path,
@@ -3936,6 +3989,25 @@ mod tests {
         }
         assert!(validate_merged_config(&json!({"studioAudioMode": true})).is_err());
         assert!(validate_merged_config(&json!({"studioAudioMode": "status"})).is_err());
+    }
+
+    #[test]
+    fn studio_fps_setting_is_validated_and_user_only() {
+        for mode in ["default", "unlock"] {
+            let value = json!({"studioFpsMode": mode});
+            validate_merged_config(&value).unwrap();
+            validate_fps_scope(ConfigScope::User, &value).unwrap();
+            for scope in [
+                ConfigScope::Place,
+                ConfigScope::Workspace,
+                ConfigScope::Experience,
+            ] {
+                assert!(validate_fps_scope(scope, &value).is_err());
+            }
+        }
+        assert!(validate_merged_config(&json!({"studioFpsMode": true})).is_err());
+        assert!(validate_merged_config(&json!({"studioFpsMode": "status"})).is_err());
+        assert!(validate_merged_config(&json!({"studioFpsMode": "off"})).is_err());
     }
 
     #[test]

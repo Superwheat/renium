@@ -2032,6 +2032,33 @@ fn automation_dispatch_operation(
             )?;
             crate::studio::audio::command(pid, action)
         }
+        op::STUDIO_FPS => {
+            let server = parameters
+                .get("server")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let player = match parameters.get("player") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(player)) if !player.trim().is_empty() => Some(player.as_str()),
+                _ => bail!("FPS player must be a non-empty client name or index"),
+            };
+            anyhow::ensure!(
+                !(server && player.is_some()),
+                "FPS cannot target both --server and --player"
+            );
+            let target = if server {
+                BridgeTarget::Server
+            } else if player.is_some() {
+                BridgeTarget::Client
+            } else {
+                BridgeTarget::Edit
+            };
+            let pid = bridge.studio_pid_for_selector(target, player)?;
+            let action = serde_json::from_value(
+                parameters.get("action").cloned().unwrap_or(json!("status")),
+            )?;
+            crate::studio::fps::command(pid, action)
+        }
         op::PULL => {
             automation_pull_operation(context, parameters, bridge, bridge_wait_seconds, Vec::new())
         }
@@ -3977,6 +4004,21 @@ fn automation_execute_request_inner(
             })()
             .map_err(automation_failure)
         }
+        op::STUDIO_FPS if request.p.get("global").and_then(Value::as_bool) == Some(true) => {
+            (|| -> Result<Value> {
+                anyhow::ensure!(
+                    request.p.get("player").is_none_or(Value::is_null)
+                        && request.p.get("pid").is_none_or(Value::is_null)
+                        && request.p.get("server").and_then(Value::as_bool) != Some(true),
+                    "Global FPS cannot be combined with a PID, player, or server target"
+                );
+                let action = serde_json::from_value(
+                    request.p.get("action").cloned().unwrap_or(json!("status")),
+                )?;
+                crate::studio::fps::global::command(action)
+            })()
+            .map_err(automation_failure)
+        }
         op::BIND => bound_context::bind(state, bridge, &request.p),
         op::COLLAB_START
         | op::COLLAB_JOIN
@@ -4381,7 +4423,9 @@ fn automation_response(
     // the review times out.
     let unqueued_exception = match request.op {
         op::REVIEW_APPLY => is_studio_review_decision(&request),
-        op::STUDIO_AUDIO => request.p.get("global").and_then(Value::as_bool) == Some(true),
+        op::STUDIO_AUDIO | op::STUDIO_FPS => {
+            request.p.get("global").and_then(Value::as_bool) == Some(true)
+        }
         op::PERFORMANCE_MONITOR => crate::studio::automation::monitor::is_edit_request(&request.p),
         _ => false,
     };

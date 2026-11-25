@@ -505,6 +505,14 @@
           "scope": "application",
           "description": "Global Studio audio mode, including newly opened windows. Shared with rbx cfg set studioAudioMode MODE --scope user. Does not change game sounds or system volume."
         },
+        "renium.studioFpsMode": {
+          "type": "string",
+          "default": "default",
+          "enum": ["default", "unlock"],
+          "enumDescriptions": ["Restore Studio default focus-loss render throttling.", "Keep Studio's focused frame rate regardless of window focus or covering across all Studio windows."],
+          "scope": "application",
+          "description": "Global Studio frame rate mode, including newly opened windows and Play processes. Shared with rbx cfg set studioFpsMode MODE --scope user. Does not modify Studio settings files or raise Studio's frame rate cap."
+        },
         "renium.cliPath": {
           "type": "string",
           "default": "",

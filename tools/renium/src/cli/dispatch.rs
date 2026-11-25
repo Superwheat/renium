@@ -112,6 +112,9 @@ pub(crate) fn dispatch(command: Commands, project: Option<&Path>) -> Result<()> 
         Commands::StudioAudio(args) => crate::studio::audio::run(args, project),
         Commands::AudioWorker(args) => crate::studio::audio::run_worker(args),
         Commands::AudioGlobalWorker => crate::studio::audio::global::run_worker(),
+        Commands::StudioFps(args) => crate::studio::fps::run(args, project),
+        Commands::FpsWorker(args) => crate::studio::fps::run_worker(args),
+        Commands::FpsGlobalWorker => crate::studio::fps::global::run_worker(),
         Commands::PerformanceWorker => crate::studio::performance::run_worker(),
         Commands::PerformanceHolder(args) => {
             crate::studio::performance::run_holder(args.pid, &args.identity, &args.locator)

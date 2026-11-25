@@ -310,16 +310,19 @@ fn run_cli() -> Result<()> {
         refresh_agent_instructions(cli.project.as_deref());
     }
 
-    if daemon::is_default_daemon()
-        && resumes_global_audio(&cli.command)
-        && let Err(error) = studio::audio::global::resume()
-    {
-        // Resuming is housekeeping for a Studio that may not be there; a
-        // sandboxed or Studio-less run must not see it in the output.
-        log_global(
-            5,
-            format_args!("[renium] Global Studio audio could not resume: {error:#}"),
-        );
+    if daemon::is_default_daemon() && resumes_global_studio_controls(&cli.command) {
+        if let Err(error) = studio::audio::global::resume() {
+            log_global(
+                5,
+                format_args!("[renium] Global Studio audio could not resume: {error:#}"),
+            );
+        }
+        if let Err(error) = studio::fps::global::resume() {
+            log_global(
+                5,
+                format_args!("[renium] Global Studio FPS could not resume: {error:#}"),
+            );
+        }
     }
     let project = cli.project.clone();
     let dispatched = app::profile::span("command");
@@ -337,13 +340,15 @@ fn run_cli() -> Result<()> {
     result
 }
 
-/// Offline commands never touch Studio audio: a syntax check, a bug report
-/// or a plugin call has no Studio to resume.
-fn resumes_global_audio(command: &Commands) -> bool {
+/// Offline commands never touch Studio audio or FPS controls: a syntax check,
+/// a bug report, or a plugin call has no Studio to resume.
+fn resumes_global_studio_controls(command: &Commands) -> bool {
     !matches!(
         command,
         Commands::AudioWorker(_)
             | Commands::AudioGlobalWorker
+            | Commands::FpsWorker(_)
+            | Commands::FpsGlobalWorker
             | Commands::UpdateHelper(_)
             | Commands::NativeProbe(_)
             | Commands::BridgeDaemon(_)
@@ -373,6 +378,8 @@ fn checks_agent_update(command: &Commands) -> bool {
             | Commands::PerformanceWorker
             | Commands::AudioWorker(_)
             | Commands::AudioGlobalWorker
+            | Commands::FpsWorker(_)
+            | Commands::FpsGlobalWorker
             | Commands::PerformanceHolder(_)
             | Commands::CursorPoll(_)
     )
@@ -444,6 +451,8 @@ fn checks_agent_instructions(command: &Commands) -> bool {
             | Commands::PerformanceWorker
             | Commands::AudioWorker(_)
             | Commands::AudioGlobalWorker
+            | Commands::FpsWorker(_)
+            | Commands::FpsGlobalWorker
             | Commands::PerformanceHolder(_)
             | Commands::CursorPoll(_)
     )

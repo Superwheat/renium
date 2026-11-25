@@ -147,7 +147,7 @@ Agents read the same guides, starting from the [agent guide](renium-agents.md).
 | Play, live Luau, consoles, network simulation | [Playtests](renium-guides/playtest.md) |
 | UI, input, movement | [Input](renium-guides/input.md) |
 | Screenshots, recordings, device simulation | [Capture](renium-guides/capture-device.md) |
-| Lag spikes, MicroProfiler, resource limits | [Performance](renium-guides/performance.md) |
+| Lag spikes, MicroProfiler, resource limits, frame rate of an unfocused Studio | [Performance](renium-guides/performance.md) |
 | Open Cloud, API keys, creator assets | [Cloud](renium-guides/opencloud.md) |
 | Studio lifecycle, places, audio, publishing | [Advanced](renium-guides/advanced.md) |
 | Using and writing plugins | [Plugins](renium-guides/plugins.md) |

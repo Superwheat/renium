@@ -1,8 +1,11 @@
 import * as fs from "fs";
 import * as vscode from "vscode";
-import { userConfigFiles, userStudioAudioMode } from "./sharedConfig";
+import { userConfigFiles, userStudioAudioMode, userStudioFpsMode } from "./sharedConfig";
 
-export function watchStudioAudioSettings(
+function watchGlobalUserMode(
+  settingKey: string,
+  defaultMode: string,
+  readShared: () => string | undefined,
   apply: (mode: string) => Promise<void>,
   report: (error: unknown) => void,
 ): vscode.Disposable {
@@ -12,22 +15,22 @@ export function watchStudioAudioSettings(
     queue = queue.then(async () => {
       if (disposed) { return; }
       const config = vscode.workspace.getConfiguration("renium");
-      const editor = config.inspect<string>("studioAudioMode")?.globalValue;
-      const shared = userStudioAudioMode();
+      const editor = config.inspect<string>(settingKey)?.globalValue;
+      const shared = readShared();
       if (source === "editor" || (source === "startup" && shared === undefined && editor !== undefined)) {
-        const mode = editor ?? "off";
-        if (mode !== (shared ?? "off")) { await apply(mode); }
+        const mode = editor ?? defaultMode;
+        if (mode !== (shared ?? defaultMode)) { await apply(mode); }
       } else {
-        const mode = shared ?? "off";
-        if (mode !== (editor ?? "off")) {
-          await config.update("studioAudioMode", mode, vscode.ConfigurationTarget.Global);
+        const mode = shared ?? defaultMode;
+        if (mode !== (editor ?? defaultMode)) {
+          await config.update(settingKey, mode, vscode.ConfigurationTarget.Global);
         }
-        if (source === "startup" && mode !== "off") { await apply(mode); }
+        if (source === "startup" && mode !== defaultMode) { await apply(mode); }
       }
     }).catch(report);
   };
   const configuration = vscode.workspace.onDidChangeConfiguration(event => {
-    if (event.affectsConfiguration("renium.studioAudioMode")) { synchronize("editor"); }
+    if (event.affectsConfiguration(`renium.${settingKey}`)) { synchronize("editor"); }
   });
   const files = userConfigFiles();
   const changed = (): void => synchronize("file");
@@ -38,4 +41,18 @@ export function watchStudioAudioSettings(
     configuration.dispose();
     for (const file of files) { fs.unwatchFile(file, changed); }
   });
+}
+
+export function watchStudioAudioSettings(
+  apply: (mode: string) => Promise<void>,
+  report: (error: unknown) => void,
+): vscode.Disposable {
+  return watchGlobalUserMode("studioAudioMode", "off", userStudioAudioMode, apply, report);
+}
+
+export function watchStudioFpsSettings(
+  apply: (mode: string) => Promise<void>,
+  report: (error: unknown) => void,
+): vscode.Disposable {
+  return watchGlobalUserMode("studioFpsMode", "default", userStudioFpsMode, apply, report);
 }

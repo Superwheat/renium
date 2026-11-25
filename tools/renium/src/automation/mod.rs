@@ -117,7 +117,7 @@ impl Request {
             self.op,
             op::PACKAGE_DESYNC | op::PACKAGE_PUBLISH | op::PACKAGE_UPDATE
         ) && self.p.get("pid").and_then(Value::as_u64).is_some();
-        let global_audio = self.op == op::STUDIO_AUDIO
+        let global_studio = matches!(self.op, op::STUDIO_AUDIO | op::STUDIO_FPS)
             && self.p.get("global").and_then(Value::as_bool) == Some(true);
         if !matches!(
             self.op,
@@ -132,7 +132,7 @@ impl Request {
                 | op::COLLAB_STATUS
                 | op::COLLAB_AWARENESS
         ) && !direct_package
-            && !global_audio
+            && !global_studio
             && self.cx.is_none()
         {
             return Err(Failure::new("bad_req", "cx is required", false, "bind"));

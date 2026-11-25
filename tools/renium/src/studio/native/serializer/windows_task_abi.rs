@@ -12,6 +12,7 @@ pub(super) fn from_report(
         NativeOperation::UndoSelection
             | NativeOperation::PackageNotices
             | NativeOperation::AudioGate
+            | NativeOperation::FpsUnlock
             | NativeOperation::StudioActions
             | NativeOperation::Input
             | NativeOperation::ViewportCapture

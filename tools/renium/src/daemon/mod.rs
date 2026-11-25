@@ -172,11 +172,12 @@ pub(super) fn bridge_daemon(args: BridgeDaemonArgs) -> Result<()> {
     if let Ok(dir) = crate::app::update::user_data_dir() {
         let _ = std::fs::remove_dir_all(dir.join("cache").join("play-teleport"));
     }
-    let mut audio_check = Instant::now();
+    let mut studio_control_check = Instant::now();
     while bridge.alive.load(Ordering::Relaxed) {
-        if is_default_daemon() && audio_check.elapsed() >= Duration::from_secs(2) {
+        if is_default_daemon() && studio_control_check.elapsed() >= Duration::from_secs(2) {
             let _ = crate::studio::audio::global::resume();
-            audio_check = Instant::now();
+            let _ = crate::studio::fps::global::resume();
+            studio_control_check = Instant::now();
         }
         memory::release_when_idle();
         thread::sleep(Duration::from_millis(250));
@@ -1389,8 +1390,10 @@ fn daemon_control_request_inner(
             | automation::op::COLLAB_STATUS
             | automation::op::COLLAB_AWARENESS
     ) || direct_package
-        || operation == automation::op::STUDIO_AUDIO
-            && object.get("global").and_then(Value::as_bool) == Some(true)
+        || matches!(
+            operation,
+            automation::op::STUDIO_AUDIO | automation::op::STUDIO_FPS
+        ) && object.get("global").and_then(Value::as_bool) == Some(true)
     {
         let request = automation::Request {
             v: automation::PROTOCOL_VERSION,

@@ -21,7 +21,10 @@ pub(crate) mod probes;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub(crate) use windows::{AudioOutputGate, keep_selection_across_undo, suppress_package_notices};
+pub(crate) use windows::{
+    AudioOutputGate, FpsController, fps_helper_loaded, keep_selection_across_undo,
+    suppress_package_notices,
+};
 
 use std::time::Duration;
 

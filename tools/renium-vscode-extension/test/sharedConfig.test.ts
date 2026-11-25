@@ -84,3 +84,36 @@ test("shared config reports unterminated strings and block comments consistently
     }
   }
 });
+
+test("shared config accepts studioFpsMode in user config and rejects it in project config", () => {
+  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "renium-fps-config-"));
+  const appData = process.env.APPDATA;
+  const userProfile = process.env.USERPROFILE;
+  const xdgConfigHome = process.env.XDG_CONFIG_HOME;
+  const userHome = path.join(projectRoot, "user-home");
+  process.env.APPDATA = path.join(userHome, "AppData", "Roaming");
+  process.env.USERPROFILE = userHome;
+  process.env.XDG_CONFIG_HOME = path.join(userHome, ".config");
+  fs.mkdirSync(path.join(projectRoot, ".git"));
+  fs.mkdirSync(path.join(userHome, ".renium"), { recursive: true });
+  fs.writeFileSync(path.join(userHome, ".renium", "config.json"), '{"studioFpsMode":"unlock"}\n', "utf8");
+  fs.writeFileSync(path.join(projectRoot, "renium.project.jsonc"), '{"settings":{}}\n', "utf8");
+  try {
+    const config = loadSharedConfig(projectRoot, projectRoot);
+    assert.equal(sharedConfigValue(config, "studioFpsMode"), "unlock");
+    fs.writeFileSync(
+      path.join(projectRoot, "renium.project.jsonc"),
+      '{"settings":{"studioFpsMode":"unlock"}}\n',
+      "utf8",
+    );
+    assert.throws(
+      () => loadSharedConfig(projectRoot, projectRoot),
+      /studioFpsMode is global/,
+    );
+  } finally {
+    restoreEnvironment("APPDATA", appData);
+    restoreEnvironment("USERPROFILE", userProfile);
+    restoreEnvironment("XDG_CONFIG_HOME", xdgConfigHome);
+    fs.rmSync(projectRoot, { recursive: true, force: true });
+  }
+});

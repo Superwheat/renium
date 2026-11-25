@@ -509,6 +509,15 @@ pub(super) enum Commands {
     AudioWorker(crate::studio::audio::WorkerArgs),
     #[command(hide = true)]
     AudioGlobalWorker,
+    #[command(
+        name = "fps",
+        about = "Unlock Studio frame rate regardless of focus, or restore Studio defaults"
+    )]
+    StudioFps(crate::studio::fps::FpsArgs),
+    #[command(hide = true)]
+    FpsWorker(crate::studio::fps::WorkerArgs),
+    #[command(hide = true)]
+    FpsGlobalWorker,
     #[command(hide = true)]
     PerformanceWorker,
     #[command(hide = true)]

@@ -107,6 +107,25 @@ fn build_windows(out_dir: &Path) {
         println!("cargo:rerun-if-changed={}", source.display());
     }
     println!("cargo:rerun-if-changed=native/renium_audio_policy.h");
+    let fps_source = PathBuf::from("native/renium_fps_windows.cpp");
+    let fps_test = PathBuf::from("native/tests/fps_windows.cpp");
+    for (source, name, library) in [
+        (&fps_source, "renium-fps.dll", true),
+        (&fps_test, "renium-fps-test.exe", false),
+    ] {
+        let mut command = compiler.to_command();
+        command.args(["/nologo", "/O2", "/EHsc", "/std:c++20", "/MT"]);
+        if library {
+            command.arg("/LD");
+        }
+        command.arg(source);
+        command.arg(format!("/Fo{}\\", out_dir.display()));
+        command.arg(format!("/Fe{}", out_dir.join(name).display()));
+        command.args(["/link", "/INCREMENTAL:NO", "/Brepro", "user32.lib"]);
+        run(&mut command, "Windows Studio FPS helper build");
+        println!("cargo:rerun-if-changed={}", source.display());
+    }
+    println!("cargo:rerun-if-changed=native/renium_fps_policy.h");
     let launch_test = PathBuf::from("native/tests/launch_policy_windows.cpp");
     let mut test_command = compiler.to_command();
     test_command.args([

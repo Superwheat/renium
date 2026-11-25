@@ -26,6 +26,7 @@ pub(super) fn check(
         NativeOperation::UndoSelection => return undo_selection::probe(memory, studio),
         NativeOperation::PackageNotices => return package_notice::probe(memory, studio),
         NativeOperation::AudioGate => return audio_probe(memory, &loaded),
+        NativeOperation::FpsUnlock => return fps::probe(memory, studio),
         NativeOperation::StudioActions => return action_probe(memory, pid, title, &loaded),
         NativeOperation::Input | NativeOperation::ViewportCapture => {
             let (window, _) = capture_window(pid, title)?;
