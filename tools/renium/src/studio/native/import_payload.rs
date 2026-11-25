@@ -19,7 +19,7 @@ mod memory_tests;
 // Each engine read finalizes the loaded scene. Hundreds of tiny reads repeat
 // that work over an ever larger place; retain bounded chunks without doing a
 // whole engine load for every small subtree.
-pub(super) const NATIVE_IMPORT_BATCH_INSTANCES: usize = 32768;
+pub(super) const NATIVE_IMPORT_BATCH_INSTANCES: usize = 32_768;
 
 // Fixed-width tree rows avoid repeating full paths for every descendant.
 // Each row is (parent row, sibling/root ordinal, name, class, settings id).
@@ -35,9 +35,11 @@ pub(super) fn instance_identities(
         return Ok(None);
     }
     let tree_profile = crate::app::profile::span("native import identity tree rows");
-    let mut strings = Vec::new();
-    let mut indices = AHashMap::new();
-    let mut nodes = Vec::new();
+    let mut strings = Vec::with_capacity(roots.len().saturating_mul(3).max(64));
+    let mut indices = AHashMap::with_capacity(roots.len().saturating_mul(3).max(64));
+    let mut nodes = Vec::with_capacity(roots.len().saturating_mul(20));
+    let mut ordinals: AHashMap<&str, usize> = AHashMap::new();
+    let mut children: Vec<(RbxRef, u32, usize)> = Vec::new();
     let mut pending = roots
         .iter()
         .enumerate()
@@ -64,17 +66,20 @@ pub(super) fn instance_identities(
             });
             nodes.extend_from_slice(&index.to_le_bytes());
         }
-        let mut ordinals = AHashMap::new();
-        let mut children = Vec::with_capacity(instance.children().len());
-        for child in instance.children() {
-            let node = dom
-                .get_by_ref(*child)
-                .context("Import identity lost a child")?;
-            let ordinal = ordinals.entry(node.name.as_str()).or_insert(0usize);
-            *ordinal += 1;
-            children.push((*child, row, *ordinal));
+        let child_refs = instance.children();
+        if !child_refs.is_empty() {
+            ordinals.clear();
+            children.clear();
+            for child in child_refs {
+                let node = dom
+                    .get_by_ref(*child)
+                    .context("Import identity lost a child")?;
+                let ordinal = ordinals.entry(node.name.as_str()).or_insert(0usize);
+                *ordinal += 1;
+                children.push((*child, row, *ordinal));
+            }
+            pending.extend(children.drain(..).rev());
         }
-        pending.extend(children.into_iter().rev());
     }
     drop(tree_profile);
     let _encode = crate::app::profile::span("native import identity base64 encoding");
@@ -272,8 +277,8 @@ fn import_identity_tree_covers_a_subtree_across_native_batches() -> Result<()> {
     let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
     let service = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
     let root = dom.insert(service, RbxInstanceBuilder::new("Folder").with_name("Bulk"));
+    assert_eq!(NATIVE_IMPORT_BATCH_INSTANCES, 32_768);
     let count = NATIVE_IMPORT_BATCH_INSTANCES + 100;
-    assert!(count > NATIVE_IMPORT_BATCH_INSTANCES);
     let names = (0..count)
         .map(|index| format!("Part{index:05}{}", "x".repeat(91)))
         .collect::<Vec<_>>();
@@ -465,24 +470,11 @@ fn record_cross_batch_properties(
     }
 }
 
-pub(super) fn encode_services(
-    dom: &mut RbxWeakDom,
+fn collect_requested_bindings(
+    dom: &RbxWeakDom,
     service_roots: &[(String, RbxRef)],
-    settings_ids: &HashMap<RbxRef, String>,
-    groups: Vec<PendingEditorBinaryGroup>,
-    package_plans: Vec<EditorPackageGroupPlan>,
-    post_apply: &mut HashMap<String, HashSet<String>>,
-) -> Result<(
-    Vec<u8>,
-    Vec<EditorBinaryImportGroup>,
-    EditorNativeReplacement,
-)> {
-    let trim_profile =
-        crate::app::profile::span("native encode retained bindings and excluded children");
-    anyhow::ensure!(
-        groups.len() == package_plans.len(),
-        "Native import plans differ"
-    );
+    groups: &[PendingEditorBinaryGroup],
+) -> Result<(HashMap<RbxRef, InstanceBindingMode>, HashSet<RbxRef>)> {
     let mut requested = HashMap::new();
     let mut included = service_roots
         .iter()
@@ -491,7 +483,7 @@ pub(super) fn encode_services(
     for (_, root) in service_roots {
         requested.insert(*root, InstanceBindingMode::ReferenceOnly);
     }
-    for group in &groups {
+    for group in groups {
         let target = rbx_dom_instance_by_path_unique(dom, &group.target_path, &[])?;
         included.insert(target);
         included.extend(group.roots.iter().copied());
@@ -518,13 +510,35 @@ pub(super) fn encode_services(
             requested.insert(referent, InstanceBindingMode::ReferenceOnly);
         }
     }
+    Ok((requested, included))
+}
+
+pub(super) fn encode_services(
+    dom: &mut RbxWeakDom,
+    service_roots: &[(String, RbxRef)],
+    settings_ids: &HashMap<RbxRef, String>,
+    groups: Vec<PendingEditorBinaryGroup>,
+    package_plans: Vec<EditorPackageGroupPlan>,
+    post_apply: &mut HashMap<String, HashSet<String>>,
+) -> Result<(
+    Vec<u8>,
+    Vec<EditorBinaryImportGroup>,
+    EditorNativeReplacement,
+)> {
+    let trim_profile =
+        crate::app::profile::span("native encode retained bindings and excluded children");
+    anyhow::ensure!(
+        groups.len() == package_plans.len(),
+        "Native import plans differ"
+    );
+    let (requested, included) = collect_requested_bindings(dom, service_roots, &groups)?;
     remove_excluded_children(dom, &requested, &included)?;
     let database = rbx_reflection_database::get()?;
     filter_retained_properties(dom, &requested, post_apply, database)?;
     drop(trim_profile);
     let tree_profile = crate::app::profile::span("native encode subtree sizes and traversal order");
-    let limit = NATIVE_IMPORT_BATCH_INSTANCES;
     let mut preorder = Vec::new();
+    let mut postorder_nodes = Vec::new();
     let mut subtree_sizes = AHashMap::<RbxRef, usize>::new();
     let mut postorder = AHashMap::<RbxRef, usize>::new();
     for (_, root) in service_roots {
@@ -540,7 +554,7 @@ pub(super) fn encode_services(
                     .map(|child| subtree_sizes[child])
                     .sum::<usize>();
                 subtree_sizes.insert(referent, size);
-                postorder.insert(referent, postorder.len());
+                postorder_nodes.push(referent);
             } else {
                 preorder.push(referent);
                 stack.push((referent, true));
@@ -549,124 +563,166 @@ pub(super) fn encode_services(
         }
     }
     drop(tree_profile);
-    let partition_profile =
-        crate::app::profile::span("native encode partitions and primary ownership");
-    let mut partitions = Vec::<Vec<RbxRef>>::new();
-    let mut members = Vec::new();
-    let mut cursor = 0;
-    while cursor < preorder.len() {
-        let size = subtree_sizes[&preorder[cursor]];
-        let take = if limit == 0 || size <= limit { size } else { 1 };
-        if limit > 0 && !members.is_empty() && members.len() + take > limit {
-            partitions.push(std::mem::take(&mut members));
+    let limit = NATIVE_IMPORT_BATCH_INSTANCES;
+    let single_batch = preorder.len() <= limit;
+    let (partitions, primary, repeated, schema) = if single_batch {
+        let partitions = if postorder_nodes.is_empty() {
+            Vec::new()
+        } else {
+            vec![postorder_nodes]
+        };
+        (
+            partitions,
+            AHashMap::<RbxRef, usize>::new(),
+            HashSet::<RbxRef>::new(),
+            HashMap::<rbx_dom_weak::Ustr, HashMap<rbx_dom_weak::Ustr, &RbxVariant>>::new(),
+        )
+    } else {
+        for (rank, referent) in postorder_nodes.into_iter().enumerate() {
+            postorder.insert(referent, rank);
         }
-        members.extend_from_slice(&preorder[cursor..cursor + take]);
-        cursor += take;
-    }
-    if !members.is_empty() {
-        partitions.push(members);
-    }
-    let primary = partitions
-        .iter()
-        .enumerate()
-        .flat_map(|(index, members)| members.iter().map(move |referent| (*referent, index)))
-        .collect::<AHashMap<_, _>>();
-    drop(partition_profile);
-    let reference_profile =
-        crate::app::profile::span("native encode ancestor anchors and crossing references");
-    let batch_references = partitions
-        .par_iter_mut()
-        .enumerate()
-        .map(|(index, members)| {
-            let mut repeated = Vec::new();
-            let mut selected = members.iter().copied().collect::<AHashSet<_>>();
-            // A repeated ancestor is only an identity anchor. Its properties load
-            // once, in its first batch; children never duplicate their ancestors.
-            for referent in members.clone() {
-                let mut parent = dom.get_by_ref(referent).unwrap().parent();
-                while parent != dom.root_ref() && selected.insert(parent) {
-                    members.push(parent);
-                    repeated.push(parent);
-                    parent = dom
-                        .get_by_ref(parent)
-                        .context("Native batch ancestor disappeared")?
-                        .parent();
-                }
+        let partition_profile =
+            crate::app::profile::span("native encode partitions and primary ownership");
+        let mut partitions = Vec::<Vec<RbxRef>>::new();
+        let mut members = Vec::new();
+        let mut cursor = 0;
+        while cursor < preorder.len() {
+            let size = subtree_sizes[&preorder[cursor]];
+            let take = if size <= limit { size } else { 1 };
+            if !members.is_empty() && members.len() + take > limit {
+                partitions.push(std::mem::take(&mut members));
             }
-            members.sort_unstable_by_key(|referent| postorder[referent]);
-            let mut crossing = Vec::new();
-            for referent in members.iter() {
-                if primary[referent] != index {
-                    continue;
-                }
-                let instance = dom
-                    .get_by_ref(*referent)
-                    .context("Native import member disappeared")?;
-                for (name, value) in &instance.properties {
-                    if rbx_variant_referent(value).is_some_and(|target| {
-                        primary.contains_key(&target) && !selected.contains(&target)
-                    }) {
-                        crossing.push((*referent, *name));
+            members.extend_from_slice(&preorder[cursor..cursor + take]);
+            cursor += take;
+        }
+        if !members.is_empty() {
+            partitions.push(members);
+        }
+        let primary = partitions
+            .iter()
+            .enumerate()
+            .flat_map(|(index, members)| members.iter().map(move |referent| (*referent, index)))
+            .collect::<AHashMap<_, _>>();
+        drop(partition_profile);
+        let reference_profile =
+            crate::app::profile::span("native encode ancestor anchors and crossing references");
+        let batch_references = partitions
+            .par_iter_mut()
+            .enumerate()
+            .map(|(index, members)| {
+                let mut repeated = Vec::new();
+                let mut selected = members.iter().copied().collect::<AHashSet<_>>();
+                for referent in members.clone() {
+                    let mut parent = dom.get_by_ref(referent).unwrap().parent();
+                    while parent != dom.root_ref() && selected.insert(parent) {
+                        members.push(parent);
+                        repeated.push(parent);
+                        parent = dom
+                            .get_by_ref(parent)
+                            .context("Native batch ancestor disappeared")?
+                            .parent();
                     }
                 }
+                members.sort_unstable_by_key(|referent| postorder[referent]);
+                let crossing = if members.len() >= 8192 {
+                    members
+                        .par_chunks(4096)
+                        .map(|chunk| {
+                            let mut found = Vec::new();
+                            for referent in chunk {
+                                if primary[referent] != index {
+                                    continue;
+                                }
+                                let instance = dom
+                                    .get_by_ref(*referent)
+                                    .context("Native import member disappeared")?;
+                                for (name, value) in &instance.properties {
+                                    if rbx_variant_referent(value).is_some_and(|target| {
+                                        primary.contains_key(&target) && !selected.contains(&target)
+                                    }) {
+                                        found.push((*referent, *name));
+                                    }
+                                }
+                            }
+                            Ok(found)
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                } else {
+                    let mut crossing = Vec::new();
+                    for referent in members.iter() {
+                        if primary[referent] != index {
+                            continue;
+                        }
+                        let instance = dom
+                            .get_by_ref(*referent)
+                            .context("Native import member disappeared")?;
+                        for (name, value) in &instance.properties {
+                            if rbx_variant_referent(value).is_some_and(|target| {
+                                primary.contains_key(&target) && !selected.contains(&target)
+                            }) {
+                                crossing.push((*referent, *name));
+                            }
+                        }
+                    }
+                    crossing
+                };
+                Ok((repeated, crossing))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        record_cross_batch_properties(
+            dom,
+            batch_references
+                .iter()
+                .flat_map(|(_, crossing)| crossing.iter().copied()),
+            post_apply,
+            database,
+        );
+        let mut repeated = HashSet::new();
+        for (anchors, crossing) in batch_references {
+            repeated.extend(anchors);
+            for (referent, name) in crossing {
+                dom.get_by_ref_mut(referent)
+                    .unwrap()
+                    .properties
+                    .remove(&name);
             }
-            Ok((repeated, crossing))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    // Every worker reads the same DOM. Remove cross-batch properties only after
-    // all selections are complete, then encode against one shared schema.
-    record_cross_batch_properties(
-        dom,
-        batch_references
-            .iter()
-            .flat_map(|(_, crossing)| crossing.iter().copied()),
-        post_apply,
-        database,
-    );
-    let mut repeated = HashSet::new();
-    for (anchors, crossing) in batch_references {
-        repeated.extend(anchors);
-        for (referent, name) in crossing {
-            dom.get_by_ref_mut(referent)
-                .unwrap()
-                .properties
-                .remove(&name);
         }
-    }
-    // A property present in only one batch must still emit its default in the
-    // others. Studio constructor defaults can differ from serialized defaults.
-    // Merge class schemas, not all instance property maps, on the coordinator.
-    // Workers retain references into the same immutable DOM.
-    drop(reference_profile);
-    let schema_profile = crate::app::profile::span("native encode shared class schema");
-    let schemas = preorder
-        .par_chunks(4096)
-        .map(|members| {
-            let mut schema =
-                HashMap::<rbx_dom_weak::Ustr, HashMap<rbx_dom_weak::Ustr, &RbxVariant>>::new();
-            for referent in members {
-                if requested.get(referent) == Some(&InstanceBindingMode::ReferenceOnly) {
-                    continue;
+        drop(reference_profile);
+        let schema_profile = crate::app::profile::span("native encode shared class schema");
+        let schemas = preorder
+            .par_chunks(4096)
+            .map(|members| {
+                let mut schema =
+                    HashMap::<rbx_dom_weak::Ustr, HashMap<rbx_dom_weak::Ustr, &RbxVariant>>::new();
+                for referent in members {
+                    if requested.get(referent) == Some(&InstanceBindingMode::ReferenceOnly) {
+                        continue;
+                    }
+                    let instance = dom.get_by_ref(*referent).unwrap();
+                    let properties = schema.entry(instance.class).or_default();
+                    for (name, value) in &instance.properties {
+                        properties.entry(*name).or_insert(value);
+                    }
                 }
-                let instance = dom.get_by_ref(*referent).unwrap();
-                let properties = schema.entry(instance.class).or_default();
-                for (name, value) in &instance.properties {
-                    properties.entry(*name).or_insert(value);
+                schema
+            })
+            .collect::<Vec<_>>();
+        let mut schema =
+            HashMap::<rbx_dom_weak::Ustr, HashMap<rbx_dom_weak::Ustr, &RbxVariant>>::new();
+        for chunk in schemas {
+            for (class, properties) in chunk {
+                let target = schema.entry(class).or_default();
+                for (name, value) in properties {
+                    target.entry(name).or_insert(value);
                 }
-            }
-            schema
-        })
-        .collect::<Vec<_>>();
-    let mut schema = HashMap::<rbx_dom_weak::Ustr, HashMap<rbx_dom_weak::Ustr, &RbxVariant>>::new();
-    for chunk in schemas {
-        for (class, properties) in chunk {
-            let target = schema.entry(class).or_default();
-            for (name, value) in properties {
-                target.entry(name).or_insert(value);
             }
         }
-    }
-    drop(schema_profile);
+        drop(schema_profile);
+        (partitions, primary, repeated, schema)
+    };
     let workers_profile = crate::app::profile::span("native encode parallel batches");
     let encoded = partitions
         .par_iter()
@@ -679,21 +735,25 @@ pub(super) fn encode_services(
             let bindings_profile = crate::app::profile::span(&format!(
                 "native encode batch {index}: binding selection"
             ));
-            let bindings = members
-                .iter()
-                .filter_map(|referent| {
-                    let mode = if primary[referent] != index {
-                        Some(InstanceBindingMode::ReferenceOnly)
-                    } else {
-                        requested.get(referent).copied().or_else(|| {
-                            repeated
-                                .contains(referent)
-                                .then_some(InstanceBindingMode::Replace)
-                        })
-                    };
-                    mode.map(|mode| (*referent, mode))
-                })
-                .collect::<HashMap<_, _>>();
+            let bindings = if single_batch {
+                requested.clone()
+            } else {
+                members
+                    .iter()
+                    .filter_map(|referent| {
+                        let mode = if primary[referent] != index {
+                            Some(InstanceBindingMode::ReferenceOnly)
+                        } else {
+                            requested.get(referent).copied().or_else(|| {
+                                repeated
+                                    .contains(referent)
+                                    .then_some(InstanceBindingMode::Replace)
+                            })
+                        };
+                        mode.map(|mode| (*referent, mode))
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
             drop(bindings_profile);
             let serialize_profile = crate::app::profile::span(&format!(
                 "native encode batch {index}: binary serialization"
@@ -714,25 +774,35 @@ pub(super) fn encode_services(
                         .contains(&rbx_reflection::ClassTag::Service)
                 })
                 .collect::<Vec<_>>();
-            let mut counts = std::collections::BTreeMap::<String, u32>::new();
+            let tags_key = rbx_dom_weak::Ustr::from("Tags");
+            let mut counts = AHashMap::<rbx_dom_weak::Ustr, (u32, bool)>::new();
             for referent in members {
                 let instance = dom.get_by_ref(*referent).unwrap();
-                let class = database
-                    .classes
-                    .get(instance.class.as_str())
-                    .context("Native reader class is absent from reflection metadata")?;
-                if !class.tags.contains(&rbx_reflection::ClassTag::Service) {
-                    *counts.entry(instance.class.to_string()).or_default() += 1;
+                let entry = counts.entry(instance.class).or_insert((0, false));
+                entry.0 += 1;
+                if single_batch
+                    && !entry.1
+                    && requested.get(referent) != Some(&InstanceBindingMode::ReferenceOnly)
+                    && instance.properties.contains_key(&tags_key)
+                {
+                    entry.1 = true;
                 }
             }
-            let classes = counts
-                .into_iter()
-                .map(|(name, count)| EditorNativeClass {
-                    name,
-                    count,
-                    tags_absent: false,
-                })
-                .collect::<Vec<_>>();
+            let mut classes = Vec::with_capacity(counts.len());
+            for (class_ustr, (count, has_tags)) in counts {
+                let class = database
+                    .classes
+                    .get(class_ustr.as_str())
+                    .context("Native reader class is absent from reflection metadata")?;
+                if !class.tags.contains(&rbx_reflection::ClassTag::Service) {
+                    classes.push(EditorNativeClass {
+                        name: class_ustr.to_string(),
+                        count,
+                        tags_absent: !has_tags,
+                    });
+                }
+            }
+            classes.sort_unstable_by(|a, b| a.name.cmp(&b.name));
             Ok((bytes, receipts, classes))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -740,22 +810,26 @@ pub(super) fn encode_services(
     let _combine =
         crate::app::profile::span("native encode join payloads, identities and receipt plans");
     let combine_classes = crate::app::profile::span("native encode merge class counts");
-    let mut counts = std::collections::BTreeMap::<String, u32>::new();
+    let mut counts = std::collections::BTreeMap::<String, (u32, bool)>::new();
     for (_, _, classes) in &encoded {
         for class in classes {
-            *counts.entry(class.name.clone()).or_default() += class.count;
+            let entry = counts.entry(class.name.clone()).or_insert((0, true));
+            entry.0 += class.count;
+            entry.1 &= class.tags_absent;
         }
     }
     let classes = counts
         .into_iter()
-        .map(|(name, count)| {
-            // The shared schema includes every payload instance, not just a
-            // representative. Absence therefore proves an empty initial tag set.
-            let tags_absent = schema
-                .get(&rbx_dom_weak::Ustr::from(name.as_str()))
-                .is_none_or(|properties| {
-                    !properties.contains_key(&rbx_dom_weak::Ustr::from("Tags"))
-                });
+        .map(|(name, (count, batch_tags_absent))| {
+            let tags_absent = if single_batch {
+                batch_tags_absent
+            } else {
+                schema
+                    .get(&rbx_dom_weak::Ustr::from(name.as_str()))
+                    .is_none_or(|properties| {
+                        !properties.contains_key(&rbx_dom_weak::Ustr::from("Tags"))
+                    })
+            };
             EditorNativeClass {
                 name,
                 count,

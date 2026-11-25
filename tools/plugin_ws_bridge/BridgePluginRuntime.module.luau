@@ -9,6 +9,7 @@ type ServiceState = {
 	nonArchivableInstances: { Instance },
 	originalNonArchivableInstances: { [Instance]: boolean }?,
 	nativeDebugIdBuffer: buffer?,
+	exportCacheKey: { Instance }?,
 	nativeRootPropertyValues: { [string]: any }?,
 	classNames: { string },
 	classIdByName: { [string]: number },
@@ -896,16 +897,14 @@ function BridgePluginRuntime.start(context)
 					nativeArchivableGenerationByService[serviceName] = (nativeArchivableGenerationByService[serviceName] or 0) + 1
 				else
 					nativeContentGenerationByService[serviceName] += 1
-					if propertyName == "Parent" then
-						-- Reparenting within a service changes serializer order without
-						-- firing that service's DescendantAdded/Removing signals.
+					if propertyName == "Parent" or propertyName == "Name" then
 						nativeStructureGenerationByService[serviceName] += 1
 						Config.studioChanges.invalidateExportCache(serviceName)
 					end
 				end
 			end
 		end
-	end)
+	end, exportPropertyRelevant)
 
 	function Config.updateStatusText()
 		local statusState = {
@@ -948,6 +947,11 @@ function BridgePluginRuntime.start(context)
 		runtimeId = Config.bridgeRuntimeId,
 		allowedServices = ALLOWED_SERVICES,
 		setBulkExpectedProperties = Config.studioChanges.setBulkExpectedProperties,
+		isItemChangedActive = Config.studioChanges.isItemChangedActive,
+		hasBulkSideEffectObserved = Config.studioChanges.hasBulkSideEffectObserved,
+		structureGeneration = function(serviceName: string): number
+			return nativeStructureGenerationByService[serviceName] or 0
+		end,
 		captureTerrainProof = Config.captureTerrainProof,
 		noteBulkExportChange = function(serviceName: string, propertyName: string)
 			if nativeContentGenerationByService[serviceName] ~= nil then
@@ -1031,8 +1035,10 @@ function BridgePluginRuntime.start(context)
 		getEnumValueNames = function(enumType: string)
 			return Config.getEditorBinaryEnumValueNames(enumType)
 		end,
-		invalidateService = function(serviceName: string)
-			Config.studioChanges.invalidateExportCache(serviceName)
+		invalidateService = function(serviceName: string, keepStructure: boolean?)
+			if keepStructure ~= true then
+				Config.studioChanges.invalidateExportCache(serviceName)
+			end
 			Config.invalidateRuntimeExportCache(serviceName)
 			nativeStateByService[serviceName] = nil
 		end,
@@ -3076,13 +3082,14 @@ function BridgePluginRuntime.start(context)
 		nativeScriptSourcesOverride: { [Instance]: string }?,
 		nativeInstancesOverride: { Instance }?
 	): ({ [string]: any }?, ServiceState)
-		local yieldForBudget = ParallelModule.newWorkBudget()
+		local nativeExport = nativeExportOnly == true
+		local yieldForBudget = if nativeExport and type(ParallelModule.newRequestBudget) == "function"
+			then ParallelModule.newRequestBudget()
+			else ParallelModule.newWorkBudget()
 		if not ALLOWED_SERVICES[serviceName] then
 			error("Unsupported service: " .. tostring(serviceName))
 		end
 		local service = game:GetService(serviceName)
-
-		local nativeExport = nativeExportOnly == true
 		local generation = Config.studioChanges.serviceGeneration(serviceName)
 		local snapshotInstances = if nativeExport and nativeSnapshot then nativeSnapshot.instances else nil
 		local providedInstances = snapshotInstances
@@ -3176,18 +3183,61 @@ function BridgePluginRuntime.start(context)
 				nativeNonArchivableIndices[1] = 1
 			end
 		end
+		local cachedDebugIdBuffer = if nativeExport
+				and not nativeSnapshot
+				and providedInstances == nativeInstancesOverride
+				and type(Config.studioChanges.exportDebugIdBuffer) == "function"
+			then Config.studioChanges.exportDebugIdBuffer(serviceName)
+			else nil
+		local cachedDebugIds = if cachedDebugIdBuffer == nil
+				and nativeExport
+				and not nativeSnapshot
+				and providedInstances == nativeInstancesOverride
+				and type(Config.studioChanges.exportDebugIds) == "function"
+			then Config.studioChanges.exportDebugIds(serviceName)
+			else nil
+		local cachedClassNames = if nativeExport
+				and not nativeSnapshot
+				and providedInstances == nativeInstancesOverride
+				and type(Config.studioChanges.exportClassNames) == "function"
+			then Config.studioChanges.exportClassNames(serviceName)
+			else nil
+		local cachedNonArchivableIndices = if nativeExport
+				and not nativeSnapshot
+				and providedInstances == nativeInstancesOverride
+				and type(Config.studioChanges.exportNonArchivableIndices) == "function"
+			then Config.studioChanges.exportNonArchivableIndices(serviceName)
+			else nil
+		if cachedDebugIds ~= nil and #cachedDebugIds ~= expectedCount then
+			cachedDebugIds = nil
+			cachedNonArchivableIndices = nil
+		end
+		if cachedClassNames ~= nil and #cachedClassNames ~= expectedCount then
+			cachedClassNames = nil
+		end
+		if cachedNonArchivableIndices ~= nil then
+			descendantsAreArchivable = true
+			for _, nonArchIndex in ipairs(cachedNonArchivableIndices) do
+				if nonArchIndex > 1 and nonArchIndex <= expectedCount then
+					local inst = providedInstances[nonArchIndex]
+					nonArchivableInstance = nonArchivableInstance or inst
+					nonArchivableInstances[#nonArchivableInstances + 1] = inst
+					if nativeNonArchivableIndices then
+						nativeNonArchivableIndices[#nativeNonArchivableIndices + 1] = nonArchIndex
+					end
+				end
+			end
+		end
 		local nativeDebugIdData = if nativeSnapshot
 			then nativeSnapshot.debugIdBuffer
-			elseif nativeExport then table.create(expectedCount)
+			elseif cachedDebugIdBuffer ~= nil then cachedDebugIdBuffer
+			elseif cachedDebugIds ~= nil then buffer.fromstring(table.concat(cachedDebugIds, "\0"))
 			else nil
 		instanceIdByInstance[stateRoot] = 1
 		nameByIndex[1] = serviceName
 		classNameByIndex[1] = serviceClassName
 		classValueByIndex[1] = 0
 		parentIndexByIndex[1] = false
-		if nativeDebugIdData and not nativeSnapshot then
-			Config.writeNativeOverlayDebugId(service, nativeDebugIdData, 1)
-		end
 
 		if serviceIsLuaSourceContainer and not nativeExport then
 			scriptCount += 1
@@ -3196,18 +3246,17 @@ function BridgePluginRuntime.start(context)
 
 		local firstDescendant = if providedInstances then 2 else 1
 		for descendantIndex = firstDescendant, #descendants do
-			yieldForBudget()
+			if not nativeExport or descendantIndex % 1024 == 0 then
+				yieldForBudget()
+			end
 			local inst = descendants[descendantIndex]
 			instanceCount += 1
 			instances[instanceCount] = inst
 			if not nativeExport then
 				instanceIdByInstance[inst] = instanceCount
 			end
-			if nativeDebugIdData and not nativeSnapshot then
-				Config.writeNativeOverlayDebugId(inst, nativeDebugIdData, instanceCount)
-			end
 
-			local className = inst.ClassName
+			local className = if cachedClassNames ~= nil then cachedClassNames[instanceCount] else inst.ClassName
 			if classIdByName[className] == nil then
 				classNames[#classNames + 1] = className
 				classIdByName[className] = #classNames - 1
@@ -3249,8 +3298,19 @@ function BridgePluginRuntime.start(context)
 				end
 			end
 		end
-		if nativeDebugIdData and not nativeSnapshot and typeof(nativeDebugIdData) ~= "buffer" then
-			nativeDebugIdData = buffer.fromstring(table.concat(nativeDebugIdData, "\0"))
+		if
+			nativeExport
+			and not nativeSnapshot
+			and providedInstances ~= nil
+			and providedInstances == nativeInstancesOverride
+			and type(Config.studioChanges.rememberExportMetadata) == "function"
+		then
+			Config.studioChanges.rememberExportMetadata(
+				serviceName,
+				providedInstances,
+				if cachedDebugIdBuffer == nil then nativeDebugIdData else nil,
+				if cachedClassNames == nil then classNameByIndex else nil
+			)
 		end
 
 		-- Native debug ids are positional; a snapshot taken against a tree
@@ -3279,6 +3339,9 @@ function BridgePluginRuntime.start(context)
 			nonArchivableInstance = nonArchivableInstance,
 			nonArchivableInstances = nonArchivableInstances,
 			nativeDebugIdBuffer = nativeDebugIdData,
+			exportCacheKey = if nativeExport and not nativeSnapshot and providedInstances == nativeInstancesOverride
+				then providedInstances
+				else nil,
 			nativeRootPropertyValues = if nativeSnapshot then nativeSnapshot.rootPropertyValues else nil,
 			classNames = classNames,
 			classIdByName = classIdByName,
@@ -3636,11 +3699,19 @@ function BridgePluginRuntime.start(context)
 		stateOverride: ServiceState?
 	): (string, number)
 		local observeWait = nil
-		local yieldForBudget = ParallelModule.newWorkBudget(nil, function(started)
-			if observeWait then
-				observeWait(started)
-			end
-		end)
+		local yieldForBudget = if type(overlayPropertiesByClass) == "table"
+				and type(ParallelModule.newRequestBudget) == "function"
+			then (function()
+				local requestBudget = ParallelModule.newRequestBudget()
+				return function()
+					return requestBudget(observeWait)
+				end
+			end)()
+			else ParallelModule.newWorkBudget(nil, function(started)
+				if observeWait then
+					observeWait(started)
+				end
+			end)
 		local generation = Config.studioChanges.serviceGeneration(serviceName)
 		local state = stateOverride or getState(serviceName)
 		local includeStableIds = not not stableIdsEnabled
@@ -3735,7 +3806,9 @@ function BridgePluginRuntime.start(context)
 				end
 			elseif nativeDebugIdData and not precomputedNativeDebugIds then
 				for offset = 1, count do
-					yieldForBudget()
+					if offset % 1024 == 0 then
+						yieldForBudget()
+					end
 					Config.writeNativeOverlayDebugId(instances[startPos + offset - 1], nativeDebugIdData, offset)
 				end
 			end
@@ -3821,6 +3894,26 @@ function BridgePluginRuntime.start(context)
 			if overlayHotSchemaByClass then
 				local classGroups = Config.groupNativeOverlayItems(items, count)
 				local debugIdBuffer, debugIdBufferBytes = Config.finishNativeOverlayDebugIds(nativeDebugIdData)
+				if
+					debugIdBuffer ~= nil
+					and not precomputedNativeDebugIds
+					and not snapshotDebugIds
+					and startPos == 1
+					and count == total
+				then
+					state.nativeDebugIdBuffer = debugIdBuffer
+					if
+						state.exportCacheKey ~= nil
+						and type(Config.studioChanges.rememberExportMetadata) == "function"
+					then
+						Config.studioChanges.rememberExportMetadata(
+							serviceName,
+							state.exportCacheKey,
+							debugIdBuffer,
+							nil
+						)
+					end
+				end
 				return {
 					format = "native-overlay-v3",
 					codecVersion = CODEC_VERSION,
@@ -4418,6 +4511,9 @@ function BridgePluginRuntime.start(context)
 		local result = if transactionScoped
 			then editorSync.applyBulkProperties(p)
 			else BridgePluginRuntime.withSuppression(Config.studioChanges, editorSync.applyBulkProperties, p, p)
+		if not transactionScoped and type(result) == "table" then
+			result.exactRetained = false
+		end
 		local preTerrain = if type(result) == "table" then result._preTerrainDigest else nil
 		if type(result) == "table" then
 			result._preTerrainDigest = nil

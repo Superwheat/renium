@@ -9316,12 +9316,31 @@ fn a_pushed_store_verified_by_its_rows_is_verified_as_its_whole_documents_verify
         // A store the push asked nothing of: Studio held it as the files do.
         let unasked = settle && seed % 5 == 4;
         let outcome = |whole_documents: bool| {
-            let prepared = match unasked {
-                true => None,
-                false => match prepared()? {
-                    Some(prepared) => Some(prepared),
-                    None => return Ok(None),
-                },
+            let prepared = if unasked {
+                None
+            } else {
+                let Some(mut prep) = prepared()? else {
+                    return Ok(None);
+                };
+                if !whole_documents {
+                    let both_sparse = prep
+                        .desired
+                        .as_deref()
+                        .is_some_and(crate::settings::equivalence::holds_unread_instances)
+                        && crate::settings::equivalence::holds_unread_instances(&prep.previous);
+                    let small_previous =
+                        prep.previous.instances.len() < super::verify::rows::MIN_ROWS;
+                    if !both_sparse && !small_previous && seed % 2 == 1 {
+                        None
+                    } else if !both_sparse && small_previous {
+                        prep.desired = None;
+                        Some(prep)
+                    } else {
+                        Some(prep)
+                    }
+                } else {
+                    Some(prep)
+                }
             };
             super::verify::settings_delta_outcome(
                 &path,
@@ -9720,6 +9739,7 @@ fn a_baseline_answers_a_pull_only_while_the_sourcemap_is_as_its_pull_left_it() -
         proof: Value::Null,
         expires: Instant::now(),
         sourcemap: settled_sourcemap(&published, None),
+        pushed_from_pull: None,
         #[cfg(windows)]
         relay: None,
     };

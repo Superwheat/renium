@@ -1015,36 +1015,79 @@ fn native_capture_debug_ids(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let ((row_by_identity, ambiguous), debug_ids_unique) = rayon::join(
+    const SHARDS: usize = 16;
+    let shard_of_uid = |id: &UniqueId| -> usize {
+        let mut h = id.index() as u64 ^ ((id.time() as u64) << 16) ^ (id.random() as u64);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51afd7ed558ccd);
+        ((h >> 32) as usize) & (SHARDS - 1)
+    };
+    let shard_of_str = |s: &str| -> usize {
+        let bytes = s.as_bytes();
+        let mut h = bytes.len() as u64;
+        for &b in bytes {
+            h = h.wrapping_mul(0x100000001b3) ^ u64::from(b);
+        }
+        ((h >> 8) as usize) & (SHARDS - 1)
+    };
+    let ((unique_shards, ambiguous), debug_ids_unique) = rayon::join(
         || {
-            let mut row_by_identity = AHashMap::with_capacity(parsed_rows.len());
-            let mut seen_ids = AHashSet::with_capacity(parsed_rows.len());
-            let mut ambiguous = AmbiguousCaptureUniqueIds {
-                nil: 0,
-                duplicates: 0,
-            };
-            for (index, &(id, _, parent)) in parsed_rows.iter().enumerate() {
+            let mut uid_buckets: Vec<Vec<(UniqueId, usize)>> = (0..SHARDS)
+                .map(|_| Vec::with_capacity(parsed_rows.len() / SHARDS + 64))
+                .collect();
+            let mut nil_count = 0usize;
+            for (index, &(id, _, _)) in parsed_rows.iter().enumerate() {
                 if id.is_nil() {
-                    ambiguous.nil += 1;
-                } else if !seen_ids.insert(id) {
-                    ambiguous.duplicates += 1;
-                }
-                match row_by_identity.entry((id, parent)) {
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(Some(index));
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        entry.insert(None);
-                    }
+                    nil_count += 1;
+                } else {
+                    uid_buckets[shard_of_uid(&id)].push((id, index));
                 }
             }
-            (row_by_identity, ambiguous)
+            let shard_results: Vec<(AHashMap<UniqueId, Option<usize>>, usize)> = uid_buckets
+                .into_par_iter()
+                .map(|bucket| {
+                    let mut map: AHashMap<UniqueId, Option<usize>> =
+                        AHashMap::with_capacity(bucket.len());
+                    let mut dupes = 0usize;
+                    for (id, index) in bucket {
+                        match map.entry(id) {
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                e.insert(Some(index));
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut e) => {
+                                dupes += 1;
+                                e.insert(None);
+                            }
+                        }
+                    }
+                    (map, dupes)
+                })
+                .collect();
+            let mut maps = Vec::with_capacity(SHARDS);
+            let mut dupes = 0usize;
+            for (map, d) in shard_results {
+                maps.push(map);
+                dupes += d;
+            }
+            (
+                maps,
+                AmbiguousCaptureUniqueIds {
+                    nil: nil_count,
+                    duplicates: dupes,
+                },
+            )
         },
         || {
-            let mut seen_debug_ids = AHashSet::with_capacity(parsed_rows.len());
-            parsed_rows
-                .iter()
-                .all(|&(_, debug_id, _)| seen_debug_ids.insert(debug_id))
+            let mut dbg_buckets: Vec<Vec<&str>> = (0..SHARDS)
+                .map(|_| Vec::with_capacity(parsed_rows.len() / SHARDS + 64))
+                .collect();
+            for &(_, debug_id, _) in &parsed_rows {
+                dbg_buckets[shard_of_str(debug_id)].push(debug_id);
+            }
+            dbg_buckets.into_par_iter().all(|bucket| {
+                let mut seen = AHashSet::with_capacity(bucket.len());
+                bucket.into_iter().all(|s| seen.insert(s))
+            })
         },
     );
     anyhow::ensure!(
@@ -1061,41 +1104,101 @@ fn native_capture_debug_ids(
             ambiguous.duplicates
         ),
     );
-    let mut row_by_native_index = Vec::with_capacity(instances.len());
-    let mut seen_rows = vec![false; parsed_rows.len()];
-    for instance in instances {
-        let id = instance.properties.iter().find_map(|(name, value)| {
-            if name.as_str() == "UniqueId"
-                && let RbxVariant::UniqueId(id) = value
-            {
-                return Some(*id);
-            }
-            None
-        });
-        // Flat decoding visits parents first. Qualify the ID by the parent's
-        // proven capture row, including nil (the omitted property default).
-        // This is exact only when the complete native child set has one such
-        // ID. Never break ties by names, class, or sibling/traversal order.
-        let parent = instance
-            .parent_index
-            .map(|parent| {
-                row_by_native_index
-                    .get(parent)
-                    .copied()
-                    .context("Native serialized parent is not before its child")
+    let row_by_native_index = if ambiguous.nil == 0 && ambiguous.duplicates == 0 {
+        let matched: Vec<usize> = instances
+            .par_iter()
+            .map(|instance| {
+                let id = instance
+                    .properties
+                    .iter()
+                    .find_map(|(name, value)| {
+                        if name.as_str() == "UniqueId"
+                            && let RbxVariant::UniqueId(id) = value
+                        {
+                            return Some(*id);
+                        }
+                        None
+                    })
+                    .unwrap_or_else(UniqueId::nil);
+                match unique_shards[shard_of_uid(&id)].get(&id) {
+                    Some(Some(row)) => Ok(*row),
+                    Some(None) => Err(AmbiguousCaptureUniqueIds {
+                        nil: ambiguous.nil,
+                        duplicates: ambiguous.duplicates,
+                    }
+                    .into()),
+                    None => bail!("Serialized identity or parent is absent from native capture"),
+                }
             })
-            .transpose()?;
-        let row = match row_by_identity.get(&(id.unwrap_or_else(UniqueId::nil), parent)) {
-            Some(Some(row)) => *row,
-            Some(None) => return Err(ambiguous.into()),
-            None => bail!("Serialized identity or parent is absent from native capture"),
-        };
-        anyhow::ensure!(
-            !std::mem::replace(&mut seen_rows[row], true),
-            "Serialized snapshot repeats a captured identity"
-        );
-        row_by_native_index.push(row);
-    }
+            .collect::<Result<Vec<_>>>()?;
+        let mut seen_rows = vec![false; parsed_rows.len()];
+        for (native_index, (instance, &row)) in instances.iter().zip(&matched).enumerate() {
+            let expected_parent = match instance.parent_index {
+                Some(parent) => {
+                    anyhow::ensure!(
+                        parent < native_index,
+                        "Native serialized parent is not before its child"
+                    );
+                    Some(matched[parent])
+                }
+                None => None,
+            };
+            anyhow::ensure!(
+                parsed_rows[row].2 == expected_parent,
+                "Serialized identity or parent is absent from native capture"
+            );
+            anyhow::ensure!(
+                !std::mem::replace(&mut seen_rows[row], true),
+                "Serialized snapshot repeats a captured identity"
+            );
+        }
+        matched
+    } else {
+        drop(unique_shards);
+        let mut row_by_identity = AHashMap::with_capacity(parsed_rows.len());
+        for (index, &(id, _, parent)) in parsed_rows.iter().enumerate() {
+            match row_by_identity.entry((id, parent)) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(index));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+            }
+        }
+        let mut row_by_native_index = Vec::with_capacity(instances.len());
+        let mut seen_rows = vec![false; parsed_rows.len()];
+        for instance in instances {
+            let id = instance.properties.iter().find_map(|(name, value)| {
+                if name.as_str() == "UniqueId"
+                    && let RbxVariant::UniqueId(id) = value
+                {
+                    return Some(*id);
+                }
+                None
+            });
+            let parent = instance
+                .parent_index
+                .map(|parent| {
+                    row_by_native_index
+                        .get(parent)
+                        .copied()
+                        .context("Native serialized parent is not before its child")
+                })
+                .transpose()?;
+            let row = match row_by_identity.get(&(id.unwrap_or_else(UniqueId::nil), parent)) {
+                Some(Some(row)) => *row,
+                Some(None) => return Err(ambiguous.into()),
+                None => bail!("Serialized identity or parent is absent from native capture"),
+            };
+            anyhow::ensure!(
+                !std::mem::replace(&mut seen_rows[row], true),
+                "Serialized snapshot repeats a captured identity"
+            );
+            row_by_native_index.push(row);
+        }
+        row_by_native_index
+    };
     let debug_ids = row_by_native_index
         .par_iter()
         .map(|&row| parsed_rows[row].1.to_string())
@@ -2828,139 +2931,171 @@ fn convert_native_service_output(
     drop(prepare);
     let conversion_started = Instant::now();
     let shared_values = crate::snapshot::native_values::NativeValuePool::default();
-    let (instances, native_properties_by_instance): (Vec<SnapshotInstance>, Vec<Vec<NativeSettingsProperty>>) = native_instances
-        .into_par_iter()
-        .zip(overlay_by_index.into_par_iter())
-        .zip(debug_ids.into_par_iter())
-        .zip(settings_id_by_index.into_par_iter())
-        .enumerate()
-        .map_init(
-            || shared_values.local(),
-            |shared_values, (index, (((rbx_instance, overlay), debug_id), transported_settings_id))| -> Result<_> {
-                let parent_index = rbx_instance.parent_index.map(|parent| parent + 1);
-                let native_filter = dependencies.native_filters.get(rbx_instance.class.as_str());
-                let unscriptable_root_fields = if index == 0 {
-                    crate::rbx::decode::native_unscriptable_root_fields(
-                        rbx_instance.class.as_str(),
-                        rbx_instance
-                            .properties
-                            .iter()
-                            .map(|(property_name, variant)| (property_name, variant)),
-                        dependencies.database,
-                        &refs,
-                    )
-                } else {
-                    Map::new()
-                };
-                let (mut native_properties, mut properties, mut attributes, source) =
-                    rbx_properties_to_native_settings_records(
-                        rbx_instance.class.as_str(),
-                        rbx_instance
-                            .properties
-                            .iter()
-                            .map(|(property_name, variant)| (property_name, variant)),
-                        dependencies.database,
-                        &refs,
-                        native_filter,
+    type NativeOverlayZipItem = (
+        (
+            (rbx_binary::FlatInstance, Option<NativeOverlayItem>),
+            Option<String>,
+        ),
+        Option<String>,
+    );
+    let convert_one =
+        |shared_values: &mut crate::snapshot::native_values::NativeValueCache<'_>,
+         (index, (((rbx_instance, overlay), debug_id), transported_settings_id)): (
+            usize,
+            NativeOverlayZipItem,
+        )|
+         -> Result<(SnapshotInstance, Vec<NativeSettingsProperty>)> {
+            let parent_index = rbx_instance.parent_index.map(|parent| parent + 1);
+            let native_filter = dependencies.native_filters.get(rbx_instance.class.as_str());
+            let unscriptable_root_fields = if index == 0 {
+                crate::rbx::decode::native_unscriptable_root_fields(
+                    rbx_instance.class.as_str(),
+                    rbx_instance
+                        .properties
+                        .iter()
+                        .map(|(property_name, variant)| (property_name, variant)),
+                    dependencies.database,
+                    &refs,
+                )
+            } else {
+                Map::new()
+            };
+            let (mut native_properties, mut properties, mut attributes, source) =
+                rbx_properties_to_native_settings_records(
+                    rbx_instance.class.as_str(),
+                    rbx_instance
+                        .properties
+                        .iter()
+                        .map(|(property_name, variant)| (property_name, variant)),
+                    dependencies.database,
+                    &refs,
+                    native_filter,
+                );
+            if native_filter.is_some_and(|filter| filter.reconstruct_decal_color_map) {
+                let value = properties
+                    .get("TextureContent")
+                    .cloned()
+                    .unwrap_or_else(|| Value::String(String::new()));
+                properties.insert("ColorMapContent".to_string(), value);
+            }
+            if native_filter.is_some_and(|filter| filter.reconstruct_weld_enabled)
+                && let Some(raw_state) = properties.remove("State")
+            {
+                let state =
+                    json_i64(&raw_state).context("WeldConstraint.State was not an integer")?;
+                native_properties.push(NativeSettingsProperty {
+                    name: "State".into(),
+                    value: NativeSettingsValue::Int(state),
+                });
+                if state == 0 {
+                    properties.insert("Enabled".to_string(), Value::Bool(false));
+                }
+            }
+            if index == 0 {
+                native_properties.clear();
+                attributes.retain(|name, _| !name.starts_with("RBX"));
+                let tags = properties.remove("Tags");
+                properties.clone_from(&root_properties);
+                if let Some(tags) = tags {
+                    properties.insert("Tags".to_string(), tags);
+                }
+                for (name, value) in unscriptable_root_fields {
+                    properties.entry(name).or_insert(value);
+                }
+            }
+            if let Some(source) = source {
+                properties.insert("Source".to_string(), Value::String(source));
+            }
+            if let Some(overlay) = overlay {
+                let overlay_class = group
+                    .class_names
+                    .get(overlay.class_index)
+                    .context("Native overlay class index is out of range")?;
+                if overlay_class.as_str() != rbx_instance.class.as_str() {
+                    let native_unique_id = rbx_instance
+                        .properties
+                        .iter()
+                        .find(|(name, _)| name.as_str() == "UniqueId")
+                        .map(|(_, value)| format!("{value:?}"));
+                    bail!(
+                        "Native snapshot and overlay disagree at {} flat instance {}: native class {}, overlay class {}, overlay instance {}, native unique id {:?}, overlay debug id {:?}",
+                        group.service,
+                        index + 1,
+                        rbx_instance.class,
+                        overlay_class,
+                        overlay.instance_index,
+                        native_unique_id,
+                        debug_id,
                     );
-                if native_filter.is_some_and(|filter| filter.reconstruct_decal_color_map) {
-                    let value = properties
-                        .get("TextureContent")
-                        .cloned()
-                        .unwrap_or_else(|| Value::String(String::new()));
-                    properties.insert("ColorMapContent".to_string(), value);
                 }
-                if native_filter.is_some_and(|filter| filter.reconstruct_weld_enabled)
-                    && let Some(raw_state) = properties.remove("State")
-                {
-                    let state =
-                        json_i64(&raw_state).context("WeldConstraint.State was not an integer")?;
-                    native_properties.push(NativeSettingsProperty {
-                        name: "State".into(),
-                        value: NativeSettingsValue::Int(state),
-                    });
-                    if state == 0 {
-                        properties.insert("Enabled".to_string(), Value::Bool(false));
-                    }
-                }
-                if index == 0 {
-                    native_properties.clear();
-                    // Native place capture includes engine migration metadata.
-                    // Match the existing service snapshot marker's attribute policy.
-                    attributes.retain(|name, _| !name.starts_with("RBX"));
-                    let tags = properties.remove("Tags");
-                    properties.clone_from(&root_properties);
-                    if let Some(tags) = tags {
-                        properties.insert("Tags".to_string(), tags);
-                    }
-                    for (name, value) in unscriptable_root_fields {
-                        properties.entry(name).or_insert(value);
-                    }
-                }
-                if let Some(source) = source {
-                    properties.insert("Source".to_string(), Value::String(source));
-                }
-                if let Some(overlay) = overlay {
-                    let overlay_class = group
-                        .class_names
-                        .get(overlay.class_index)
-                        .context("Native overlay class index is out of range")?;
-                    if overlay_class.as_str() != rbx_instance.class.as_str() {
-                        let native_unique_id = rbx_instance
-                            .properties
-                            .iter()
-                            .find(|(name, _)| name.as_str() == "UniqueId")
-                            .map(|(_, value)| format!("{value:?}"));
-                        bail!(
-                            "Native snapshot and overlay disagree at {} flat instance {}: native class {}, overlay class {}, overlay instance {}, native unique id {:?}, overlay debug id {:?}",
-                            group.service,
-                            index + 1,
-                            rbx_instance.class,
-                            overlay_class,
-                            overlay.instance_index,
-                            native_unique_id,
-                            debug_id,
-                        );
-                    }
-                    let mut overlay_properties = overlay.properties;
-                    overlay_properties.remove("Source");
-                    if !overlay_properties.is_empty() {
-                        native_properties.retain(|property| {
-                            !overlay_properties.contains_key(property.name.as_str())
-                        });
-                    }
-                    properties.extend(overlay_properties);
-                    attributes.extend(overlay.attributes);
-                }
-                if non_archivable_by_index[index] {
-                    native_properties.retain(|property| property.name != "Archivable");
-                    properties.insert("Archivable".to_string(), Value::Bool(false));
-                }
-                if index != 0 {
-                    shared_values.compact(&mut properties, &mut native_properties, |name| {
-                        crate::rbx::decode::native_property_keeps_json(
-                            rbx_instance.class.as_str(), name, native_filter,
-                        )
+                let mut overlay_properties = overlay.properties;
+                overlay_properties.remove("Source");
+                if !overlay_properties.is_empty() {
+                    native_properties.retain(|property| {
+                        !overlay_properties.contains_key(property.name.as_str())
                     });
                 }
-                native_properties.shrink_to_fit();
-                Ok((
-                    SnapshotInstance {
-                        name: rbx_instance.name,
-                        class_name: rbx_instance.class,
-                        properties,
-                        attributes,
-                        debug_id: debug_id.filter(|value| !value.is_empty()),
-                        transported_settings_id,
-                        instance_index: Some(index + 1),
-                        parent_index,
-                        ..Default::default()
-                    },
-                    native_properties,
-                ))
-            },
-        )
-        .collect::<Result<_>>()?;
+                properties.extend(overlay_properties);
+                attributes.extend(overlay.attributes);
+            }
+            if non_archivable_by_index[index] {
+                native_properties.retain(|property| property.name != "Archivable");
+                properties.insert("Archivable".to_string(), Value::Bool(false));
+            }
+            if index != 0 {
+                shared_values.compact(&mut properties, &mut native_properties, |name| {
+                    crate::rbx::decode::native_property_keeps_json(
+                        rbx_instance.class.as_str(),
+                        name,
+                        native_filter,
+                    )
+                });
+            }
+            native_properties.shrink_to_fit();
+            Ok((
+                SnapshotInstance {
+                    name: rbx_instance.name,
+                    class_name: rbx_instance.class,
+                    properties,
+                    attributes,
+                    debug_id: debug_id.filter(|value| !value.is_empty()),
+                    transported_settings_id,
+                    instance_index: Some(index + 1),
+                    parent_index,
+                    ..Default::default()
+                },
+                native_properties,
+            ))
+        };
+    let (instances, native_properties_by_instance): (
+        Vec<SnapshotInstance>,
+        Vec<Vec<NativeSettingsProperty>>,
+    ) = if native_instances.len() < 1024 {
+        let mut local = shared_values.local();
+        let mut instances = Vec::with_capacity(native_instances.len());
+        let mut native_properties_by_instance = Vec::with_capacity(native_instances.len());
+        for item in native_instances
+            .into_iter()
+            .zip(overlay_by_index)
+            .zip(debug_ids)
+            .zip(settings_id_by_index)
+            .enumerate()
+        {
+            let (inst, props) = convert_one(&mut local, item)?;
+            instances.push(inst);
+            native_properties_by_instance.push(props);
+        }
+        (instances, native_properties_by_instance)
+    } else {
+        native_instances
+            .into_par_iter()
+            .zip(overlay_by_index.into_par_iter())
+            .zip(debug_ids.into_par_iter())
+            .zip(settings_id_by_index.into_par_iter())
+            .enumerate()
+            .map_init(|| shared_values.local(), convert_one)
+            .collect::<Result<_>>()?
+    };
     log_timing(
         &format!("{}: native instance conversion", group.service),
         conversion_started,
@@ -3231,6 +3366,7 @@ fn editor_binary_export_parts_once<'a>(
     } else {
         worker_count
     };
+    let requested_groups_empty = requested_groups.is_empty();
     let priority_groups = requested_groups
         .iter()
         .take(priority_worker_count)
@@ -3243,7 +3379,26 @@ fn editor_binary_export_parts_once<'a>(
             .collect::<VecDeque<_>>(),
     );
     let priority_gate = NativePriorityWorkerGate::new(priority_worker_count == worker_count);
+    #[cfg(windows)]
+    let capture_serialized = CaptureSignal::new(!native_capture || requested_groups_empty);
+    let dispatch_overlay = |(group, sender): (
+        &EditorBinaryExportGroup,
+        mpsc::SyncSender<Result<NativeOverlayFetch>>,
+    )| {
+        let _ = sender.send(fetch_overlay(group));
+    };
     thread::scope(|overlay_scope| {
+        #[cfg_attr(not(windows), allow(clippy::let_unit_value))]
+        let _capture_signal_guard = begin_capture_overlay_workers(
+            overlay_scope,
+            native_capture,
+            requested_groups_empty,
+            worker_count,
+            #[cfg(windows)]
+            &capture_serialized,
+            &overlay_queue,
+            &dispatch_overlay,
+        );
         // Identity and binary reads share the existing export fence. Start both
         // before waiting so a queued native identity read does not idle all the
         // binary/overlay workers. A verified-unavailable locator or a validated
@@ -3259,21 +3414,6 @@ fn editor_binary_export_parts_once<'a>(
             serializer::capture_identities(pid, &title, requested_services, Duration::from_secs(3))
                 .map_err(|error| capture_join_error(pid, 1, error))
         });
-        if native_capture {
-            for _ in 0..worker_count {
-                let overlay_queue = &overlay_queue;
-                let fetch_overlay = &fetch_overlay;
-                overlay_scope.spawn(move || {
-                    loop {
-                        let next = overlay_queue.lock_recover().pop_front();
-                        let Some((group, sender)) = next else {
-                            break;
-                        };
-                        let _ = sender.send(fetch_overlay(group));
-                    }
-                });
-            }
-        }
         let fetch_overlay = &fetch_overlay;
         let overlay_receivers = &overlay_receivers;
         let conditional_ref_schema = &conditional_ref_schema;
@@ -3291,6 +3431,8 @@ fn editor_binary_export_parts_once<'a>(
         let captured_native_services = &captured_native_services;
         #[cfg(windows)]
         let capture_attempts = &capture_attempts;
+        #[cfg(windows)]
+        let capture_serialized = &capture_serialized;
         let serialization_complete_signal = &serialization_complete_signal;
         let service_groups = &export.groups;
         let finish_dependencies = &finish_dependencies;
@@ -3353,6 +3495,7 @@ fn editor_binary_export_parts_once<'a>(
                                                         Arc::clone(native_decode_filter),
                                                         serialization_complete_signal,
                                                         capture_attempts,
+                                                        capture_serialized,
                                                     )
                                                     .map_err(Arc::new)
                                                 });
@@ -3673,14 +3816,117 @@ fn shared_capture_error(error: &anyhow::Error) -> anyhow::Error {
 }
 
 #[cfg(windows)]
+struct CaptureSignal {
+    ready: Mutex<bool>,
+    cvar: std::sync::Condvar,
+}
+
+#[cfg(windows)]
+impl CaptureSignal {
+    fn new(initially_ready: bool) -> Self {
+        Self {
+            ready: Mutex::new(initially_ready),
+            cvar: std::sync::Condvar::new(),
+        }
+    }
+
+    fn signal(&self) {
+        let mut ready = self.ready.lock_recover();
+        if !*ready {
+            *ready = true;
+            self.cvar.notify_all();
+        }
+    }
+
+    fn wait(&self) {
+        let mut ready = self.ready.lock_recover();
+        while !*ready {
+            ready = self.cvar.wait(ready).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn guard(&self) -> CaptureSignalGuard<'_> {
+        CaptureSignalGuard(self)
+    }
+}
+
+#[cfg(windows)]
+struct CaptureSignalGuard<'a>(&'a CaptureSignal);
+
+#[cfg(windows)]
+impl Drop for CaptureSignalGuard<'_> {
+    fn drop(&mut self) {
+        self.0.signal();
+    }
+}
+
+fn should_spawn_overlay_workers(native_capture: bool, requested_groups_empty: bool) -> bool {
+    native_capture && !requested_groups_empty
+}
+
+#[cfg(windows)]
+fn begin_capture_overlay_workers<'scope, 'env, T: Send + 'env>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    native_capture: bool,
+    requested_groups_empty: bool,
+    worker_count: usize,
+    capture_serialized: &'env CaptureSignal,
+    overlay_queue: &'env Mutex<VecDeque<T>>,
+    fetch: &'env (impl Fn(T) + Sync),
+) -> CaptureSignalGuard<'env> {
+    let guard = capture_serialized.guard();
+    if should_spawn_overlay_workers(native_capture, requested_groups_empty) {
+        for _ in 0..worker_count {
+            scope.spawn(move || {
+                capture_serialized.wait();
+                loop {
+                    let next = overlay_queue.lock_recover().pop_front();
+                    let Some(item) = next else {
+                        break;
+                    };
+                    fetch(item);
+                }
+            });
+        }
+    }
+    guard
+}
+
+#[cfg(not(windows))]
+fn begin_capture_overlay_workers<'scope, 'env, T: Send + 'env>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    native_capture: bool,
+    requested_groups_empty: bool,
+    worker_count: usize,
+    overlay_queue: &'env Mutex<VecDeque<T>>,
+    fetch: &'env (impl Fn(T) + Sync),
+) {
+    if should_spawn_overlay_workers(native_capture, requested_groups_empty) {
+        for _ in 0..worker_count {
+            scope.spawn(move || {
+                loop {
+                    let next = overlay_queue.lock_recover().pop_front();
+                    let Some(item) = next else {
+                        break;
+                    };
+                    fetch(item);
+                }
+            });
+        }
+    }
+}
+
+#[cfg(windows)]
 fn capture_native_export(
     bridge: &BridgeServer,
     groups: &[EditorBinaryExportGroup],
     filter: Arc<HashMap<String, HashSet<String>>>,
     serialization_complete: &AtomicBool,
     attempts: &std::sync::atomic::AtomicUsize,
+    capture_serialized: &CaptureSignal,
 ) -> Result<Mutex<HashMap<String, NativeServiceDom>>> {
     let _profile = crate::app::profile::span("native capture pipeline");
+    let mut notify_overlays = OnDrop::new(|| capture_serialized.signal());
     let info = bridge.cached_bridge_info_for_target(crate::studio::bridge::BridgeTarget::Edit)?;
     let pid = bridge
         .studio_pid_for_runtime(crate::studio::bridge::BridgeTarget::Edit, &info.runtime_id)?;
@@ -3693,6 +3939,7 @@ fn capture_native_export(
         serializer::capture_live_services(pid, &title, &services, Duration::from_secs(15))?;
     attempts.store(captured.attempts, Ordering::Release);
     serialization_complete.store(true, Ordering::Release);
+    notify_overlays.run();
     let batch = EditorBinarySerializationBatch {
         id: "native-capture".into(),
         services,
@@ -4556,11 +4803,20 @@ pub(crate) fn wait_for_editor_review_decision(
     Ok(false)
 }
 
+#[derive(Default)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct InlinePostImport<'a> {
+    properties: Option<&'a [EditorPropertyChange]>,
+    verify_properties: Option<&'a [EditorPropertyChange]>,
+    verify_source_selectors: Option<&'a [Value]>,
+}
+
 fn send_editor_binary_import(
     bridge: &BridgeServer,
     binary_import: &EditorBinaryImport,
     transaction_id: &str,
     container_settings: &[EditorPropertyChange],
+    inline: InlinePostImport<'_>,
 ) -> Result<Value> {
     #[cfg(windows)]
     if binary_import.native_replacement.is_some() {
@@ -4569,9 +4825,10 @@ fn send_editor_binary_import(
             binary_import,
             transaction_id,
             container_settings,
+            inline,
         );
     }
-    let _ = container_settings;
+    let _ = (container_settings, inline);
     const RAW_CHUNK_BYTES: usize = 2 * 1024 * 1024;
     let import_id = format!("{}-{}", current_millis(), fnv1a_hex(&binary_import.bytes));
     let total_chunks = binary_import.bytes.len().div_ceil(RAW_CHUNK_BYTES);
@@ -4644,6 +4901,7 @@ fn send_editor_service_replacement(
     import: &EditorBinaryImport,
     transaction_id: &str,
     container_settings: &[EditorPropertyChange],
+    inline: InlinePostImport<'_>,
 ) -> Result<Value> {
     let plan = import
         .native_replacement
@@ -4708,30 +4966,47 @@ fn send_editor_service_replacement(
         let import_step_started = Instant::now();
         // Keep the binary batches, but share one native task and factory scope.
         // Its creation ordinals already match the transaction-wide identity plan.
-        let (created, outcome) = match serializer::read_service_payload(
-            pid,
-            &title,
-            &import.bytes,
-            plan,
-            held,
-            Duration::from_secs(20),
-            &mut invoked,
-        ) {
-            Ok(receipt) => (
-                receipt.created,
-                (receipt.status, receipt.state, receipt.error),
-            ),
-            // Nothing ran: disarm the native phase so ordinary rollback can run.
-            Err(error) if !invoked => (Vec::new(), (1, 8, error.to_string())),
-            // An unknown native outcome must not be retried or blindly cancelled.
-            Err(error) => {
-                return Err(error.context(format!(
+        let (created, engine_removed, engine_created, outcome) =
+            match serializer::read_service_payload(
+                pid,
+                &title,
+                &import.bytes,
+                plan,
+                held,
+                Duration::from_secs(20),
+                &mut invoked,
+            ) {
+                Ok(receipt) => (
+                    receipt.created,
+                    receipt.engine_removed,
+                    receipt.engine_created,
+                    (receipt.status, receipt.state, receipt.error),
+                ),
+                Err(error) if !invoked => (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    (1, 8, error.to_string()),
+                ),
+                Err(error) => {
+                    return Err(error.context(format!(
                     "Native insertion outcome is unknown (transaction {transaction_id}, import {import_id}); rollback remains blocked because a native write may still be running. Restart Studio to clear this operation"
                 )));
-            }
-        };
+                }
+            };
         log_timing("native import load", import_step_started);
         let import_step_started = Instant::now();
+        let mut engine_removed_debug_ids = Vec::with_capacity(engine_removed.len());
+        for &idx in &engine_removed {
+            let start = (idx as usize) * serializer::CREATED_ROW;
+            if let Some(row) = created.get(start..start + serializer::CREATED_ROW)
+                && let Some(end) = row[8..].iter().position(|byte| *byte == 0)
+                && end > 0
+            {
+                engine_removed_debug_ids
+                    .push(String::from_utf8_lossy(&row[8..8 + end]).into_owned());
+            }
+        }
         // The helper's fixed-width ABI is not the bridge's wire format. Keep
         // exact identities/ordinals, without transporting 48-byte padded strings.
         let mut chunks = vec![Vec::new()];
@@ -4756,40 +5031,81 @@ fn send_editor_service_replacement(
             chunk.push(length as u8);
             chunk.extend_from_slice(&row[8..8 + length]);
         }
-        // The last receipt and its completion are one ordered operation. Older
-        // plugins keep the explicit upload request; the begin reply negotiates it.
         let inline_receipt =
             begin.get("nativeInlineReceipt").and_then(Value::as_bool) == Some(true);
+        let inline_receipt_chunks = begin
+            .get("nativeInlineReceiptChunks")
+            .and_then(Value::as_bool)
+            == Some(true);
+        let inline_post_import = begin
+            .get("nativeInlinePostImportProperties")
+            .and_then(Value::as_bool)
+            == Some(true);
         let mut final_receipt = None;
+        let mut final_receipt_chunks = None;
         let chunks = chunks
             .iter()
             .filter(|chunk| !chunk.is_empty())
             .collect::<Vec<_>>();
-        for (index, chunk) in chunks.iter().enumerate() {
-            let receipt = json!({ "index": index + 1, "data": base64::encode(chunk) });
-            if inline_receipt && index + 1 == chunks.len() {
-                final_receipt = Some(receipt);
-                break;
+        let total_receipt_bytes: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+        if inline_receipt_chunks && chunks.len() > 1 && total_receipt_bytes <= 8 * 1024 * 1024 {
+            final_receipt_chunks = Some(
+                chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, chunk)| {
+                        json!({ "index": index + 1, "data": base64::encode(chunk) })
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        } else {
+            for (index, chunk) in chunks.iter().enumerate() {
+                let receipt = json!({ "index": index + 1, "data": base64::encode(chunk) });
+                if inline_receipt && index + 1 == chunks.len() {
+                    final_receipt = Some(receipt);
+                    break;
+                }
+                bridge.call(
+                    "appendEditorBinaryImport",
+                    json!({
+                        "importId": &import_id, "nativeReceipt": true, "index": index + 1,
+                        "data": receipt["data"],
+                    }),
+                )?;
             }
-            bridge.call(
-                "appendEditorBinaryImport",
-                json!({
-                    "importId": &import_id, "nativeReceipt": true, "index": index + 1,
-                    "data": receipt["data"],
-                }),
-            )?;
         }
         log_timing("native import receipt upload", import_step_started);
         let import_step_started = Instant::now();
-        let response = bridge.call(
-            "finishEditorBinaryImport",
-            json!({
-                "importId": &import_id, "nativePhase": "complete",
-                "nativeStatus": outcome.0, "nativeState": outcome.1, "nativeError": outcome.2,
-                "nativeCreated": created.len() / serializer::CREATED_ROW,
-                "nativeReceiptChunk": final_receipt,
-            }),
-        );
+        let mut finish_params = json!({
+            "importId": &import_id, "nativePhase": "complete",
+            "nativeStatus": outcome.0, "nativeState": outcome.1, "nativeError": outcome.2,
+            "nativeCreated": created.len() / serializer::CREATED_ROW,
+            "nativeReceiptChunk": final_receipt,
+        });
+        if !engine_removed_debug_ids.is_empty() {
+            finish_params["nativeEngineRemoved"] = json!(engine_removed_debug_ids);
+        }
+        if !engine_created.is_empty() {
+            finish_params["nativeEngineCreated"] = json!(engine_created);
+        }
+        if let Some(chunks) = final_receipt_chunks {
+            finish_params["nativeReceiptChunks"] = Value::Array(chunks);
+        }
+        if inline_post_import {
+            if let Some(props) = inline.properties {
+                finish_params["postImportPropertyChanges"] = serde_json::to_value(props)?;
+                finish_params["nativeRootTargetIds"] = json!(cfg!(target_os = "macos"));
+                if let Some(verify_rows) = inline.verify_properties {
+                    finish_params["verifyPropertyChanges"] = serde_json::to_value(verify_rows)?;
+                }
+            }
+            if let Some(selectors) = inline.verify_source_selectors
+                && !selectors.is_empty()
+            {
+                finish_params["verifySourceSelectors"] = Value::Array(selectors.to_vec());
+            }
+        }
+        let response = bridge.call("finishEditorBinaryImport", finish_params);
         log_timing("native import complete", import_step_started);
         let response = response?;
         if let Some(timings) = response.get("nativeCompleteTimings") {
@@ -4865,7 +5181,198 @@ fn pre_import_property(change: &EditorPropertyChange, name: &str, native_import:
             && matches!(
                 (change.class_name.as_str(), name),
                 ("Lighting", "LightingStyle" | "PrioritizeLightingQuality")
+                    | (
+                        "Workspace",
+                        "StreamingEnabled"
+                            | "StreamingIntegrityMode"
+                            | "StreamOutBehavior"
+                            | "ModelStreamingBehavior"
+                            | "StreamingTargetRadius"
+                            | "StreamingMinRadius"
+                    )
             ))
+}
+
+fn collect_post_import_property_changes(
+    changes: &EditorChangeSet,
+    binary_import: Option<&EditorBinaryImport>,
+    native_import: bool,
+) -> Vec<EditorPropertyChange> {
+    let mut property_changes = Vec::new();
+    for change in &changes.property_changes {
+        let imported = binary_import.is_some_and(|import| {
+            import.imports_path(
+                &change.service,
+                &change.path_segments,
+                &change.path_ordinals,
+            )
+        });
+        if imported
+            && binary_import.is_some_and(|import| {
+                import.retains_path(
+                    &change.service,
+                    &change.path_segments,
+                    &change.path_ordinals,
+                )
+            })
+        {
+            continue;
+        }
+        let payload_container = imported
+            && binary_import.is_some_and(|import| {
+                import.carries_container_settings(&change.service, &change.path_segments)
+            });
+        let send_all =
+            !imported || property_change_needs_post_native_apply(change) && !payload_container;
+        if send_all {
+            let mut remaining = change.clone();
+            remaining
+                .properties
+                .retain(|name, _| !pre_import_property(change, name, native_import));
+            if !remaining.properties.is_empty()
+                || !remaining.reset_properties.is_empty()
+                || !remaining.attributes.is_empty()
+                || !remaining.deleted_attributes.is_empty()
+            {
+                property_changes.push(remaining);
+            }
+            continue;
+        }
+        let class_names = binary_import.and_then(|import| {
+            import
+                .post_apply_properties_by_class
+                .get(&change.class_name)
+        });
+        let path_names = binary_import.and_then(|import| {
+            import
+                .post_apply_properties_by_path
+                .get(&instance_path_parts_key(
+                    &change.path_segments,
+                    &change.path_ordinals,
+                ))
+        });
+        let retained_name = |name: &str| {
+            class_names.is_some_and(|names| names.contains(name))
+                || path_names.is_some_and(|names| names.contains(name))
+        };
+        if payload_container {
+            let mut remaining = change.clone();
+            remaining.properties.retain(|name, _| {
+                crate::editor::native_roots::is_property(&change.class_name, name)
+                    || retained_name(name)
+            });
+            remaining
+                .properties
+                .retain(|name, _| !pre_import_property(change, name, native_import));
+            if !remaining.properties.is_empty()
+                || !remaining.reset_properties.is_empty()
+                || !remaining.attributes.is_empty()
+                || !remaining.deleted_attributes.is_empty()
+            {
+                property_changes.push(remaining);
+            }
+            continue;
+        }
+        if class_names.is_none() && path_names.is_none() {
+            continue;
+        }
+        let properties = change
+            .properties
+            .iter()
+            .filter(|(name, _)| {
+                !(change.class_name == "Model" && name.as_str() == "WorldPivot")
+                    && retained_name(name)
+            })
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Map<_, _>>();
+        if properties.is_empty() {
+            continue;
+        }
+        let mut post_apply = change.clone();
+        post_apply.properties = properties;
+        post_apply.attributes.clear();
+        post_apply.deleted_attributes.clear();
+        property_changes.push(post_apply);
+    }
+    property_changes
+}
+
+fn has_post_import_instance_or_source_changes(
+    changes: &EditorChangeSet,
+    import: &EditorBinaryImport,
+) -> bool {
+    let has_instances = changes.instance_changes.iter().any(|change| {
+        if import.imports_service(&change.service) {
+            return false;
+        }
+        if change.mode != "upsertInstances" {
+            return true;
+        }
+        change.instances.iter().any(|instance| {
+            !import.imports_path(
+                &change.service,
+                &instance.path_segments,
+                &instance.path_ordinals,
+            )
+        })
+    });
+    if has_instances {
+        return true;
+    }
+    changes.source_changes.iter().any(|change| {
+        !import.imports_path(
+            &change.service,
+            &change.path_segments,
+            &change.path_ordinals,
+        )
+    })
+}
+
+fn build_inline_verify_rows(
+    container_settings: &[EditorPropertyChange],
+    property_changes: &[EditorPropertyChange],
+    pre_import_verification: &crate::editor::native_roots::NativeRootVerification,
+) -> Option<Vec<EditorPropertyChange>> {
+    let total = container_settings.len() + property_changes.len();
+    if total == 0 || total > PROPERTY_BATCH_MAX_ITEMS {
+        return None;
+    }
+    let mut rows = Vec::with_capacity(total);
+    for row in container_settings.iter().chain(property_changes.iter()) {
+        let mut row = row.clone();
+        pre_import_verification.remove_verified_properties(&mut row);
+        rows.push(row);
+    }
+    Some(rows)
+}
+
+const INLINE_VERIFY_SOURCE_MAX_ITEMS: usize = 2_000;
+const INLINE_VERIFY_SOURCE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+fn build_inline_verify_source_selectors(changes: &EditorChangeSet) -> Option<Vec<Value>> {
+    let mut selectors = Vec::new();
+    let mut total_bytes = 0usize;
+    for (index, change) in changes.source_changes.iter().enumerate() {
+        if change.deleted {
+            continue;
+        }
+        let Some(source) = change.source.as_ref() else {
+            continue;
+        };
+        if selectors.len() >= INLINE_VERIFY_SOURCE_MAX_ITEMS
+            || (!selectors.is_empty()
+                && total_bytes.saturating_add(source.len()) > INLINE_VERIFY_SOURCE_MAX_BYTES)
+        {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(source.len());
+        selectors.push(json!({
+            "index": index,
+            "pathSegments": &change.path_segments,
+            "pathOrdinals": &change.path_ordinals,
+        }));
+    }
+    (!selectors.is_empty()).then_some(selectors)
 }
 
 pub(crate) struct EditorBatchResult {
@@ -4873,6 +5380,7 @@ pub(crate) struct EditorBatchResult {
     pub(crate) individual_dispatches: usize,
     pub(crate) commit_result: Option<Value>,
     pub(crate) release_result: Option<Value>,
+    pub(crate) post_import_sources: Option<Value>,
 }
 
 pub(crate) fn send_editor_change_batches(
@@ -4932,6 +5440,7 @@ pub(crate) fn send_editor_change_batches_with_options(
             individual_dispatches: 0,
             commit_result: None,
             release_result: None,
+            post_import_sources: None,
         });
     }
 
@@ -4973,15 +5482,69 @@ pub(crate) fn send_editor_change_batches_with_options(
         log_timing("native editor pre-import root apply", started);
     }
 
+    let property_changes =
+        collect_post_import_property_changes(changes, binary_import, native_import);
     let mut payload_verified_services = std::collections::BTreeSet::new();
+    let mut inline_property_summary = None;
+    let mut inline_verify_summary = None;
+    let mut inline_native_root_targets = None;
+    let mut inline_post_import_sources = None;
+    let mut inline_verify_rows_kept = None;
+    let mut inline_verify_rows_sent = false;
     if let Some(binary_import) = binary_import {
         let transaction_id =
             transaction_id.context("Native editor import requires an active transaction")?;
         let container_settings = container_setting_rows(changes, binary_import);
-        let result =
-            send_editor_binary_import(bridge, binary_import, transaction_id, &container_settings)?;
-        payload_verified_services = verified_payload_services(binary_import, &result);
-        merge_editor_summary_checked(&mut summary, &result)?;
+        let no_post_import_instances_or_sources =
+            !has_post_import_instance_or_source_changes(changes, binary_import);
+        let can_inline_properties = binary_import.native_replacement.is_some()
+            && no_post_import_instances_or_sources
+            && !property_changes.is_empty()
+            && property_changes.len() <= PROPERTY_BATCH_MAX_ITEMS;
+        let inline_verify_rows = if can_inline_properties {
+            build_inline_verify_rows(
+                &container_settings,
+                &property_changes,
+                &pre_import_verification,
+            )
+        } else {
+            None
+        };
+        let inline_verify_source_selectors =
+            if binary_import.native_replacement.is_some() && no_post_import_instances_or_sources {
+                build_inline_verify_source_selectors(changes)
+            } else {
+                None
+            };
+        inline_verify_rows_sent = inline_verify_rows.is_some();
+        let mut response = send_editor_binary_import(
+            bridge,
+            binary_import,
+            transaction_id,
+            &container_settings,
+            InlinePostImport {
+                properties: can_inline_properties.then_some(property_changes.as_slice()),
+                verify_properties: inline_verify_rows.as_deref(),
+                verify_source_selectors: inline_verify_source_selectors.as_deref(),
+            },
+        )?;
+        inline_verify_rows_kept = inline_verify_rows;
+        if let Some(object) = response.as_object_mut() {
+            inline_property_summary = object
+                .remove("postImportPropertySummary")
+                .filter(|value| !value.is_null());
+            inline_verify_summary = object
+                .remove("postImportVerifySummary")
+                .filter(|value| !value.is_null());
+            inline_native_root_targets = object
+                .remove("postImportNativeRootTargets")
+                .filter(|value| !value.is_null());
+            inline_post_import_sources = object
+                .remove("postImportSources")
+                .filter(|value| !value.is_null());
+        }
+        payload_verified_services = verified_payload_services(binary_import, &response);
+        merge_editor_summary_checked(&mut summary, &response)?;
         summary.insert(
             "binaryBytes".to_string(),
             json!(binary_import.bytes.len() as u64),
@@ -5031,6 +5594,7 @@ pub(crate) fn send_editor_change_batches_with_options(
             individual_dispatches: native_root_verification.completed_dispatches,
             commit_result: None,
             release_result: None,
+            post_import_sources: None,
         });
     }
 
@@ -5201,127 +5765,56 @@ pub(crate) fn send_editor_change_batches_with_options(
         merge_editor_summary_checked(&mut summary, &result)?;
     }
 
-    let mut property_changes = Vec::new();
-    for change in &changes.property_changes {
-        let imported = binary_import.is_some_and(|import| {
-            import.imports_path(
-                &change.service,
-                &change.path_segments,
-                &change.path_ordinals,
-            )
-        });
-        if imported
-            && binary_import.is_some_and(|import| {
-                import.retains_path(
-                    &change.service,
-                    &change.path_segments,
-                    &change.path_ordinals,
-                )
-            })
-        {
-            continue;
-        }
-        let payload_container = imported
-            && binary_import.is_some_and(|import| {
-                import.carries_container_settings(&change.service, &change.path_segments)
-            });
-        let send_all =
-            !imported || property_change_needs_post_native_apply(change) && !payload_container;
-        if send_all {
-            let mut remaining = change.clone();
-            remaining
-                .properties
-                .retain(|name, _| !pre_import_property(change, name, native_import));
-            if !remaining.properties.is_empty()
-                || !remaining.reset_properties.is_empty()
-                || !remaining.attributes.is_empty()
-                || !remaining.deleted_attributes.is_empty()
-            {
-                property_changes.push(remaining);
-            }
-            continue;
-        }
-        let class_names = binary_import.and_then(|import| {
-            import
-                .post_apply_properties_by_class
-                .get(&change.class_name)
-        });
-        let path_names = binary_import.and_then(|import| {
-            import
-                .post_apply_properties_by_path
-                .get(&instance_path_parts_key(
-                    &change.path_segments,
-                    &change.path_ordinals,
-                ))
-        });
-        let retained_name = |name: &str| {
-            class_names.is_some_and(|names| names.contains(name))
-                || path_names.is_some_and(|names| names.contains(name))
-        };
-        if payload_container {
-            // Studio's reader applies a retained container's properties from the
-            // payload but not its attributes, so those are written afterwards.
-            let mut remaining = change.clone();
-            remaining.properties.retain(|name, _| {
-                crate::editor::native_roots::is_property(&change.class_name, name)
-                    || retained_name(name)
-            });
-            remaining
-                .properties
-                .retain(|name, _| !pre_import_property(change, name, native_import));
-            if !remaining.properties.is_empty()
-                || !remaining.reset_properties.is_empty()
-                || !remaining.attributes.is_empty()
-                || !remaining.deleted_attributes.is_empty()
-            {
-                property_changes.push(remaining);
-            }
-            continue;
-        }
-        if class_names.is_none() && path_names.is_none() {
-            continue;
-        }
-        let properties = change
-            .properties
-            .iter()
-            .filter(|(name, _)| {
-                !(change.class_name == "Model" && name.as_str() == "WorldPivot")
-                    && retained_name(name)
-            })
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect::<Map<_, _>>();
-        if properties.is_empty() {
-            continue;
-        }
-        let mut post_apply = change.clone();
-        post_apply.properties = properties;
-        post_apply.attributes.clear();
-        post_apply.deleted_attributes.clear();
-        property_changes.push(post_apply);
-    }
     summary.insert(
         "propertySent".to_string(),
         json!((property_changes.len() + pre_import_changes.len()) as u64),
     );
     let started = Instant::now();
-    send_property_batches(bridge, &property_changes, transaction_id, &mut summary)?;
+    if let Some(prop_summary) = inline_property_summary {
+        merge_editor_summary_checked(&mut summary, &prop_summary)?;
+        if let Some(targets) = inline_native_root_targets {
+            summary.insert("nativeRootTargets".to_string(), targets);
+        }
+    } else {
+        send_property_batches(bridge, &property_changes, transaction_id, &mut summary)?;
+    }
     log_timing("native editor property batches", started);
 
     let started = Instant::now();
     // Native mesh writes rebuild geometry, which moves welded neighbours and
     // resizes the part, so the rows written before them are applied again.
-    let mesh_writes = summary
-        .get("nativeRootWrites")
-        .and_then(Value::as_array)
-        .is_some_and(|rows| rows.iter().any(|row| row["className"] == "MeshPart"));
-    let root_writes = summary
-        .get("nativeRootWrites")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    let geometry_writes = summary
-        .get("nativeGeometryWrites")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
+    let post_writes = NativePostWriteCounts::from_summary(&summary);
+    let mesh_writes = post_writes.mesh;
+    let root_writes = post_writes.root;
+    let geometry_writes = post_writes.geometry;
+    let reusable_inline_verify = post_writes.select_inline_verify_summary(
+        inline_verify_summary.as_ref(),
+        inline_verify_rows_sent,
+        binary_import.is_some_and(|import| import.native_replacement.is_some()),
+    );
+    #[cfg(any(windows, target_os = "macos"))]
+    let pre_verified_unreadable = if let (Some(verify_rows), Some(verify_summary)) =
+        (inline_verify_rows_kept.as_deref(), reusable_inline_verify)
+        && verify_summary["ok"] == true
+        && verify_summary["verifyOnly"] == true
+        && verify_summary["errors"].as_f64() == Some(0.0)
+        && verify_summary["verifyMismatches"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    {
+        Some(verify_unreadable_properties(
+            bridge,
+            verify_rows,
+            verify_summary,
+        )?)
+    } else {
+        None
+    };
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let pre_verified_unreadable: Option<u64> = {
+        let _ = &inline_verify_rows_kept;
+        None
+    };
     let mut native_root_verification =
         crate::editor::native_roots::apply(bridge, &mut summary, transaction_id)?;
     native_root_verification.extend(pre_import_verification);
@@ -5369,13 +5862,24 @@ pub(crate) fn send_editor_change_batches_with_options(
             rows.extend(pre_import_changes);
             rows.retain(|row| payload_verified_services.contains(&row.service));
         }
-        let verified_fields = verify_native_property_rows(
-            bridge,
-            &rows,
-            transaction_id.context("Native verification requires a transaction")?,
-            &native_root_verification,
-            &mut summary,
-        )?;
+        let verified_fields = if let Some(verify_summary) = reusable_inline_verify {
+            verify_inline_native_property_rows(
+                bridge,
+                &rows,
+                verify_summary,
+                &native_root_verification,
+                pre_verified_unreadable,
+                &mut summary,
+            )?
+        } else {
+            verify_native_property_rows(
+                bridge,
+                &rows,
+                transaction_id.context("Native verification requires a transaction")?,
+                &native_root_verification,
+                &mut summary,
+            )?
+        };
         let expected_fields = rows
             .iter()
             .map(|row| row.properties.len() + row.attributes.len() + row.deleted_attributes.len())
@@ -5440,10 +5944,11 @@ pub(crate) fn send_editor_change_batches_with_options(
         individual_dispatches: native_root_verification.completed_dispatches,
         commit_result,
         release_result,
+        post_import_sources: inline_post_import_sources,
     })
 }
 
-const BULK_PROPERTY_CHUNK_RAW_BYTES: usize = 3 * 1024 * 1024;
+const BULK_PROPERTY_CHUNK_RAW_BYTES: usize = 8 * 1024 * 1024;
 const BULK_TREE_NODE_BYTES: usize = 16;
 
 fn encode_bulk_tree_nodes(nodes: &[crate::editor::types::BulkTreeNode]) -> String {
@@ -5469,10 +5974,10 @@ fn encode_bulk_column_slice(
     column: &crate::editor::types::BulkPropertyColumn,
     range: std::ops::Range<usize>,
 ) -> Value {
-    use crate::editor::types::BulkPropertyValues;
+    use crate::editor::types::{BulkColumnKind, BulkPropertyValues};
     let rows = encode_u32_le(&column.rows[range.clone()]);
     let count = range.len();
-    match &column.values {
+    let mut encoded = match &column.values {
         BulkPropertyValues::F32Const(value) => json!({
             "propertyName": column.property_name,
             "encoding": "f32_const",
@@ -5593,7 +6098,26 @@ fn encode_bulk_column_slice(
             "palette": palette,
             "indices": encode_u32_le(&indices[range]),
         }),
+    };
+    match column.kind {
+        BulkColumnKind::Property => {}
+        BulkColumnKind::Attribute => {
+            encoded["kind"] = Value::String("attribute".to_string());
+        }
+        BulkColumnKind::AttributesReplace => {
+            encoded["kind"] = Value::String("attributes_replace".to_string());
+        }
+        BulkColumnKind::Tag => {
+            encoded["kind"] = Value::String("tag".to_string());
+        }
+        BulkColumnKind::AssertModelScale => {
+            encoded["kind"] = Value::String("assert_model_scale".to_string());
+        }
+        BulkColumnKind::AssertModelPivot => {
+            encoded["kind"] = Value::String("assert_model_pivot".to_string());
+        }
     }
+    encoded
 }
 
 fn bulk_column_row_bytes(values: &crate::editor::types::BulkPropertyValues) -> usize {
@@ -5630,14 +6154,45 @@ fn send_bulk_property_patches(
     let mut release_result = None;
     let mut old_value_columns: Map<String, Value> = Map::new();
     let mut fallback_full_capture = false;
-    for (patch_index, patch) in patches.iter().enumerate() {
-        let is_last_patch = patch_index + 1 == patches.len();
+    let mut fallback_reason: Option<String> = None;
+    let mut exact_retained = true;
+    let mut patch_order: Vec<usize> = (0..patches.len()).collect();
+    patch_order.sort_by_key(|&idx| {
+        let p = &patches[idx];
+        let has_precheck = p.expected_terrain_digest.is_some()
+            || p.columns.iter().any(|c| {
+                matches!(
+                    c.kind,
+                    crate::editor::types::BulkColumnKind::AssertModelScale
+                        | crate::editor::types::BulkColumnKind::AssertModelPivot
+                )
+            });
+        (!has_precheck, idx)
+    });
+    for (order_pos, &patch_index) in patch_order.iter().enumerate() {
+        let patch = &patches[patch_index];
+        let is_last_patch = order_pos + 1 == patch_order.len();
         let string_table_bytes = patch.strings.join("\0");
         let string_table_b64 = base64::encode(string_table_bytes.as_bytes());
         let total_nodes = patch.nodes.len();
         let tree_raw_bytes = total_nodes * BULK_TREE_NODE_BYTES + string_table_bytes.len();
+        let tree_cache_key = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(patch.service.as_bytes());
+            hasher.update((total_nodes as u64).to_le_bytes());
+            hasher.update(string_table_bytes.as_bytes());
+            for node in &patch.nodes {
+                hasher.update(node.parent.to_le_bytes());
+                hasher.update(node.ordinal.to_le_bytes());
+                hasher.update(node.name_idx.to_le_bytes());
+                hasher.update(node.class_idx.to_le_bytes());
+            }
+            format!("{:x}", hasher.finalize())
+        };
         let mut total_verified = 0_u64;
         let mut protected_count = 0_usize;
+        let mut service_side_effect_observed = false;
         let mut expected_terrain = patch.expected_terrain_digest.clone();
         let mut service_old_columns: Vec<Value> = Vec::new();
 
@@ -5648,6 +6203,7 @@ fn send_bulk_property_patches(
                 "nodeOffset": 0,
                 "nodeCount": total_nodes,
                 "totalNodes": total_nodes,
+                "cacheKey": tree_cache_key,
                 "nodes": encode_bulk_tree_nodes(&patch.nodes),
             }))
         } else {
@@ -5664,6 +6220,7 @@ fn send_bulk_property_patches(
                 if offset == 0 {
                     tree_obj["strings"] = json!(string_table_b64);
                     tree_obj["stringCount"] = json!(patch.strings.len());
+                    tree_obj["cacheKey"] = json!(tree_cache_key);
                 }
                 let result = bridge.call(
                     "applyEditorBulkProperties",
@@ -5672,9 +6229,13 @@ fn send_bulk_property_patches(
                         "service": patch.service,
                         "tree": tree_obj,
                         "columns": [],
+                        "hasPackageTargets": !patch.package_targets.is_empty(),
                     }),
                 )?;
                 merge_editor_summary_checked(summary, &result)?;
+                if result.get("treeCacheHit") == Some(&Value::Bool(true)) {
+                    break;
+                }
                 offset = end;
             }
             None
@@ -5702,6 +6263,9 @@ fn send_bulk_property_patches(
                 "tree": tree.take(),
                 "columns": std::mem::take(columns),
             });
+            if !patch.package_targets.is_empty() {
+                request["hasPackageTargets"] = Value::Bool(true);
+            }
             if has_columns && let Some(digest) = expected_terrain.take() {
                 request["expectedTerrainDigest"] = Value::String(digest);
             }
@@ -5717,7 +6281,18 @@ fn send_bulk_property_patches(
             *raw_bytes = 0;
             let result = bridge.call("applyEditorBulkProperties", request)?;
             if result.get("fallbackFullCapture") == Some(&Value::Bool(true)) {
+                fallback_reason = result
+                    .get("fallbackReason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 return Ok(true);
+            }
+            if has_columns && result.get("exactRetained") != Some(&Value::Bool(true)) {
+                exact_retained = false;
+            }
+            if result.get("sideEffectObserved") == Some(&Value::Bool(true)) {
+                exact_retained = false;
+                service_side_effect_observed = true;
             }
             if let Some(returned) = result.get("oldValueColumns").and_then(Value::as_array) {
                 service_old_columns.extend(returned.iter().cloned());
@@ -5795,6 +6370,9 @@ fn send_bulk_property_patches(
         }
         if fallback_full_capture {
             summary.insert("fallbackFullCapture".to_string(), Value::Bool(true));
+            if let Some(reason) = fallback_reason {
+                summary.insert("fallbackReason".to_string(), Value::String(reason));
+            }
             return Ok((std::collections::BTreeSet::new(), None, None));
         }
         if !service_old_columns.is_empty() {
@@ -5802,9 +6380,15 @@ fn send_bulk_property_patches(
         }
 
         sent_instances += patch.instance_count as u64;
-        if total_verified == patch.field_count as u64 && protected_count == 0 {
+        if total_verified == patch.field_count as u64
+            && protected_count == 0
+            && !service_side_effect_observed
+        {
             verified_services.insert(patch.service.clone());
         }
+    }
+    if !patches.is_empty() {
+        summary.insert("exactRetained".to_string(), Value::Bool(exact_retained));
     }
     if !old_value_columns.is_empty() {
         summary.insert(
@@ -6030,6 +6614,69 @@ fn container_setting_rows(
             row
         })
         .collect()
+}
+
+fn verify_inline_native_property_rows(
+    bridge: &BridgeServer,
+    rows: &[EditorPropertyChange],
+    result: &Value,
+    native_roots: &crate::editor::native_roots::NativeRootVerification,
+    pre_verified_unreadable: Option<u64>,
+    summary: &mut Map<String, Value>,
+) -> Result<u64> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    anyhow::ensure!(
+        result["ok"] == true
+            && result["verifyOnly"] == true
+            && result["errors"].as_f64() == Some(0.0),
+        "Studio did not complete read-only native property verification: {result}"
+    );
+    let mut verified = rows
+        .iter()
+        .map(|row| native_roots.verified_fields(row))
+        .sum::<u64>();
+    verified += result["verified"]
+        .as_u64()
+        .context("Studio omitted the verified property count")?;
+    let mut mismatches = Vec::new();
+    for mismatch in result["verifyMismatches"]
+        .as_array()
+        .context("Studio omitted container verification results")?
+    {
+        mismatches.push(
+            mismatch
+                .as_str()
+                .context("Invalid container verification result")?
+                .to_string(),
+        );
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    if mismatches.is_empty() {
+        if let Some(count) = pre_verified_unreadable {
+            verified += count;
+        } else {
+            let remaining = rows
+                .iter()
+                .cloned()
+                .map(|mut row| {
+                    native_roots.remove_verified_properties(&mut row);
+                    row
+                })
+                .collect::<Vec<_>>();
+            verified += verify_unreadable_properties(bridge, &remaining, result)?;
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let _ = (bridge, pre_verified_unreadable);
+    anyhow::ensure!(
+        mismatches.is_empty(),
+        "Studio did not retain native supplemental properties: {}",
+        mismatches.join(", ")
+    );
+    summary.insert("nativePropertiesVerified".to_string(), json!(verified));
+    Ok(verified)
 }
 
 fn verify_native_property_rows(
@@ -6809,12 +7456,154 @@ fn send_property_batches(
     Ok(())
 }
 
+struct NativePostWriteCounts {
+    root: usize,
+    geometry: usize,
+    mesh: bool,
+}
+
+impl NativePostWriteCounts {
+    fn from_summary(summary: &Map<String, Value>) -> Self {
+        let root_rows = summary.get("nativeRootWrites").and_then(Value::as_array);
+        let root = root_rows.map_or(0, Vec::len);
+        let mesh =
+            root_rows.is_some_and(|rows| rows.iter().any(|row| row["className"] == "MeshPart"));
+        let geometry = summary
+            .get("nativeGeometryWrites")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        Self {
+            root,
+            geometry,
+            mesh,
+        }
+    }
+
+    fn select_inline_verify_summary<'a>(
+        &self,
+        inline_verify_summary: Option<&'a Value>,
+        inline_verify_rows_sent: bool,
+        has_native_replacement: bool,
+    ) -> Option<&'a Value> {
+        (self.root == 0 && self.geometry == 0 && inline_verify_rows_sent && has_native_replacement)
+            .then_some(inline_verify_summary)
+            .flatten()
+    }
+}
+
 #[cfg(test)]
 mod export_worker_tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use super::run_workers_and_drain;
+    use super::{NativePostWriteCounts, run_workers_and_drain};
+
+    #[test]
+    fn inline_native_verify_is_rejected_when_root_or_geometry_writes_follow() {
+        let ok_verify = serde_json::json!({
+            "ok": true,
+            "verifyOnly": true,
+            "errors": 0,
+            "verifyMismatches": [],
+        });
+        let empty = serde_json::Map::new();
+        let with_root = serde_json::Map::from_iter([(
+            "nativeRootWrites".into(),
+            serde_json::json!([{ "className": "MeshPart" }]),
+        )]);
+        let with_geometry = serde_json::Map::from_iter([(
+            "nativeGeometryWrites".into(),
+            serde_json::json!([{ "className": "UnionOperation" }]),
+        )]);
+        let with_both = serde_json::Map::from_iter([
+            (
+                "nativeRootWrites".into(),
+                serde_json::json!([{ "className": "MeshPart" }]),
+            ),
+            (
+                "nativeGeometryWrites".into(),
+                serde_json::json!([{ "className": "UnionOperation" }]),
+            ),
+        ]);
+        assert!(
+            NativePostWriteCounts::from_summary(&empty)
+                .select_inline_verify_summary(Some(&ok_verify), true, true)
+                .is_some()
+        );
+        assert!(
+            NativePostWriteCounts::from_summary(&with_root)
+                .select_inline_verify_summary(Some(&ok_verify), true, true)
+                .is_none()
+        );
+        assert!(
+            NativePostWriteCounts::from_summary(&with_geometry)
+                .select_inline_verify_summary(Some(&ok_verify), true, true)
+                .is_none()
+        );
+        assert!(
+            NativePostWriteCounts::from_summary(&with_both)
+                .select_inline_verify_summary(Some(&ok_verify), true, true)
+                .is_none()
+        );
+        assert!(
+            NativePostWriteCounts::from_summary(&empty)
+                .select_inline_verify_summary(Some(&ok_verify), false, true)
+                .is_none()
+        );
+        assert!(
+            NativePostWriteCounts::from_summary(&empty)
+                .select_inline_verify_summary(Some(&ok_verify), true, false)
+                .is_none()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn empty_native_export_does_not_deadlock_overlay_workers() {
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let empty_signal = super::CaptureSignal::new(false);
+            let empty_queue: std::sync::Mutex<std::collections::VecDeque<usize>> =
+                std::sync::Mutex::new(std::collections::VecDeque::new());
+            let fetched = std::sync::atomic::AtomicUsize::new(0);
+            let count_fetch = |_: usize| {
+                fetched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            };
+            std::thread::scope(|scope| {
+                let guard = super::begin_capture_overlay_workers(
+                    scope,
+                    true,
+                    true,
+                    2,
+                    &empty_signal,
+                    &empty_queue,
+                    &count_fetch,
+                );
+                std::mem::forget(guard);
+            });
+            assert_eq!(fetched.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+            let early_exit_signal = super::CaptureSignal::new(false);
+            let queue: std::sync::Mutex<std::collections::VecDeque<usize>> =
+                std::sync::Mutex::new(std::collections::VecDeque::from([1usize, 2usize]));
+            std::thread::scope(|scope| {
+                let _guard = super::begin_capture_overlay_workers(
+                    scope,
+                    true,
+                    false,
+                    2,
+                    &early_exit_signal,
+                    &queue,
+                    &count_fetch,
+                );
+            });
+            assert_eq!(fetched.load(std::sync::atomic::Ordering::Relaxed), 2);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("begin_capture_overlay_workers deadlocked on empty export or early exit");
+    }
 
     #[test]
     fn export_workers_finish_when_the_caller_holds_the_only_pool_thread() {

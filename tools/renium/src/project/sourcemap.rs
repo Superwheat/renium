@@ -286,6 +286,7 @@ fn build_full_sourcemap_children<I: SourcemapInstance + Sync>(
     project_root: &Path,
     parent_dir: &Path,
     scripts_below: &[bool],
+    known_files: Option<&std::collections::HashSet<PathBuf>>,
 ) -> Vec<SourcemapNode> {
     if child_indices.is_empty() {
         return Vec::new();
@@ -324,14 +325,28 @@ fn build_full_sourcemap_children<I: SourcemapInstance + Sync>(
                 ),
             };
         }
-        let source_path = project_script_path(
-            parent_dir,
-            fs_stem,
-            !child_indices.is_empty(),
-            instance.class_name(),
-            instance.properties(),
-        )
-        .filter(|path| path.is_file());
+        let source_path = match known_files {
+            Some(files) => crate::editor::paths::project_script_path_with_lookup(
+                parent_dir,
+                fs_stem,
+                !child_indices.is_empty(),
+                instance.class_name(),
+                instance.properties(),
+                |path| {
+                    path.strip_prefix(project_root)
+                        .ok()
+                        .is_some_and(|rel| files.contains(rel))
+                },
+            ),
+            None => project_script_path(
+                parent_dir,
+                fs_stem,
+                !child_indices.is_empty(),
+                instance.class_name(),
+                instance.properties(),
+            )
+            .filter(|path| path.is_file()),
+        };
         SourcemapNode {
             name: instance.name().to_string(),
             class_name: instance.class_name().to_string(),
@@ -349,6 +364,7 @@ fn build_full_sourcemap_children<I: SourcemapInstance + Sync>(
                     project_root,
                     &parent_dir.join(fs_stem),
                     scripts_below,
+                    known_files,
                 )
             },
         }
@@ -366,6 +382,7 @@ fn build_full_service_sourcemap<I: SourcemapInstance + Sync>(
     service_root_index: usize,
     project_root: &Path,
     service_dir: &Path,
+    known_files: Option<&std::collections::HashSet<PathBuf>>,
 ) -> SourcemapNode {
     let root = &instances[service_root_index];
     let child_indices = children_by_parent
@@ -382,6 +399,7 @@ fn build_full_service_sourcemap<I: SourcemapInstance + Sync>(
             project_root,
             service_dir,
             &scripts_at_or_below(instances, children_by_parent, service_root_index),
+            known_files,
         ),
     }
 }
@@ -397,6 +415,23 @@ pub(crate) fn build_service_sourcemap_from_state(
         state.service_root_index,
         project_root,
         service_dir,
+        None,
+    )
+}
+
+pub(crate) fn build_service_sourcemap_from_state_with_files(
+    state: &ServiceState,
+    project_root: &Path,
+    service_dir: &Path,
+    known_files: &std::collections::HashSet<PathBuf>,
+) -> SourcemapNode {
+    build_full_service_sourcemap(
+        &state.instances,
+        &state.children_by_index,
+        state.service_root_index,
+        project_root,
+        service_dir,
+        Some(known_files),
     )
 }
 
@@ -415,6 +450,7 @@ fn build_service_sourcemap_from_settings(
         root_index,
         project_root,
         service_dir,
+        None,
     ))
 }
 
@@ -1020,6 +1056,7 @@ mod tests {
                 0,
                 &project_root,
                 &service_dir,
+                None,
             );
             let expected = expected(&project_root);
             let _ = std::fs::remove_dir_all(&project_root);

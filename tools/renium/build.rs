@@ -147,6 +147,7 @@ fn build_windows(out_dir: &Path) {
     println!("cargo:rerun-if-changed={}", capture_test.display());
     println!("cargo:rerun-if-changed=native/renium_capture_context.h");
     println!("cargo:rerun-if-changed=native/renium_capture_roots.h");
+    println!("cargo:rerun-if-changed=native/renium_reader_mutations.h");
     let function_test = PathBuf::from("native/tests/functions_windows.cpp");
     let mut function_test_command = compiler.to_command();
     function_test_command.args(["/nologo", "/O2", "/EHsc", "/std:c++20", "/MT"]);

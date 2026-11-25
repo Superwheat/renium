@@ -5,7 +5,6 @@ use anyhow::Result;
 use rbx_dom_weak::{WeakDom, types::Ref};
 use sha2::{Digest, Sha256};
 
-use crate::editor::types::IMPORT_MODEL_PIVOT;
 use crate::settings::bytecode::{SettingsBytecode, SettingsBytecodeInstance};
 
 /// A small subtree is indivisible in both payload routes. With no retained live
@@ -57,6 +56,30 @@ pub(crate) fn reference_scopes(
         }
     }
     scopes
+}
+
+pub(crate) fn has_selected_raw_property(
+    class: &str,
+    properties: &[(&str, crate::settings::bytecode::RawBlockValue<'_>)],
+    names: Option<&HashSet<String>>,
+) -> Result<bool> {
+    let Some(names) = names else { return Ok(false) };
+    let database = rbx_reflection_database::get()?;
+    let matched = properties.iter().any(|(name, _)| {
+        let logical =
+            crate::settings::equivalence::serialized_only_logical_name(database, class, name)
+                .or_else(|| crate::rbx::encode::rbx_logical_property_name(database, class, name))
+                .unwrap_or(name);
+        names.contains(logical)
+    });
+    if matched {
+        return Ok(true);
+    }
+    let mut map = serde_json::Map::with_capacity(properties.len());
+    for (name, value) in properties {
+        map.insert((*name).to_string(), value.to_json());
+    }
+    has_selected_property(class, &map, Some(names))
 }
 
 pub(crate) fn has_selected_property(
@@ -162,7 +185,6 @@ impl ImportRowCandidates {
         classes: &HashMap<String, HashSet<String>>,
         omitted_paths: &HashMap<String, HashSet<String>>,
     ) -> Result<HashMap<String, KeptImportRows>> {
-        let pivot = HashSet::from([IMPORT_MODEL_PIVOT.1.to_string()]);
         self.services
             .into_iter()
             .map(|(service, (identity, rows))| {
@@ -175,13 +197,7 @@ impl ImportRowCandidates {
                             .and_then(|path| omitted_paths.get(path));
                         let selected =
                             has_selected_property(&row.class_name, &row.properties, class)?
-                                || has_selected_property(&row.class_name, &row.properties, path)?
-                                || (row.class_name == IMPORT_MODEL_PIVOT.0
-                                    && has_selected_property(
-                                        &row.class_name,
-                                        &row.properties,
-                                        Some(&pivot),
-                                    )?);
+                                || has_selected_property(&row.class_name, &row.properties, path)?;
                         Ok(selected.then_some((index, row)))
                     })
                     .collect::<Result<Vec<_>>>()?

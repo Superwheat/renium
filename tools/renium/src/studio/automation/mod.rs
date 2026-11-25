@@ -2233,6 +2233,7 @@ pub(crate) fn studio_change_state_result(
             "clearPending": false,
             "start": !args.no_start,
             "stop": args.stop,
+            "keepCachedProof": args.stop,
             "ackSeq": args.ack_seq,
             "ackRuntimeSettingsSeq": args.ack_runtime_settings_seq,
             "ackEditorActions": args.ack_actions,

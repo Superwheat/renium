@@ -152,6 +152,29 @@ pub(crate) fn project_script_file_names_in_layout(
     class_name: &str,
     properties: &Map<String, Value>,
 ) -> Option<ProjectScriptFileNames> {
+    project_script_file_names_with_lookup(
+        parent_dir,
+        layout_dir,
+        fs_stem,
+        has_children,
+        class_name,
+        properties,
+        |path| path.is_file(),
+        |path| path.is_dir(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_script_file_names_with_lookup(
+    parent_dir: &Path,
+    layout_dir: &Path,
+    fs_stem: &str,
+    has_children: bool,
+    class_name: &str,
+    properties: &Map<String, Value>,
+    is_file: impl Fn(&Path) -> bool,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Option<ProjectScriptFileNames> {
     let naming = config::cached_script_naming(parent_dir);
     let policy = naming.extension;
     let suffix = project_script_suffix(naming, class_name, properties)?;
@@ -162,21 +185,15 @@ pub(crate) fn project_script_file_names_in_layout(
     };
     if !has_children {
         for extension in extensions {
-            if layout_dir
-                .join(format!("{fs_stem}{suffix}.{extension}"))
-                .is_file()
-            {
+            if is_file(&layout_dir.join(format!("{fs_stem}{suffix}.{extension}"))) {
                 return Some(ProjectScriptFileNames::new(&suffix, extension, false));
             }
         }
     }
     let script_dir = layout_dir.join(fs_stem);
-    if script_dir.is_dir() {
+    if is_dir(&script_dir) {
         for extension in extensions {
-            if script_dir
-                .join(format!("init{suffix}.{extension}"))
-                .is_file()
-            {
+            if is_file(&script_dir.join(format!("init{suffix}.{extension}"))) {
                 return Some(ProjectScriptFileNames::new(&suffix, extension, true));
             }
         }
@@ -186,6 +203,37 @@ pub(crate) fn project_script_file_names_in_layout(
         default_script_extension(policy),
         has_children,
     ))
+}
+
+pub(crate) fn project_script_path_with_lookup(
+    parent_dir: &Path,
+    fs_stem: &str,
+    has_children: bool,
+    class_name: &str,
+    properties: &Map<String, Value>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let naming = config::cached_script_naming(parent_dir);
+    let policy = naming.extension;
+    let suffix = project_script_suffix(naming, class_name, properties)?;
+    let extensions: &[&str] = match policy {
+        config::ScriptExtensionPolicy::Lua => &["lua"],
+        config::ScriptExtensionPolicy::Luau => &["luau"],
+        config::ScriptExtensionPolicy::Preserve => &["luau", "lua"],
+    };
+    for extension in extensions {
+        let candidate = if has_children {
+            parent_dir
+                .join(fs_stem)
+                .join(format!("init{suffix}.{extension}"))
+        } else {
+            parent_dir.join(format!("{fs_stem}{suffix}.{extension}"))
+        };
+        if is_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 pub(crate) fn project_script_path(

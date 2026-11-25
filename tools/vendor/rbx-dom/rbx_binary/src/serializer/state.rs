@@ -607,6 +607,117 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
         postorder: &[Ref],
         schema: &std::collections::HashMap<Ustr, std::collections::HashMap<Ustr, &Variant>>,
     ) -> Result<(), InnerError> {
+        if postorder.len() >= 2048 {
+            use rayon::prelude::*;
+            self.relevant_instances.reserve(postorder.len());
+            for referent in postorder {
+                let instance =
+                    self.dom
+                        .get_by_ref(*referent)
+                        .ok_or(InnerError::InvalidInstanceId {
+                            referent: *referent,
+                        })?;
+                self.relevant_instances.push(*referent);
+                let binding = self.bindings.and_then(|bindings| bindings.get(referent));
+                let reference_only = binding == Some(&InstanceBindingMode::ReferenceOnly);
+                if matches!(
+                    binding,
+                    Some(InstanceBindingMode::Properties | InstanceBindingMode::ReferenceOnly)
+                ) {
+                    self.preserved_parent_count += 1;
+                }
+                let type_info = self
+                    .type_infos
+                    .get_or_create(instance.class, reference_only);
+                type_info.instances.push(instance);
+            }
+            let database = self.serializer.database;
+            let mut work: Vec<(Ustr, &mut TypeInfo<'dom, 'db>)> = self
+                .type_infos
+                .values
+                .iter_mut()
+                .filter_map(|((type_name, reference_only), type_info)| {
+                    (!*reference_only).then_some((*type_name, type_info))
+                })
+                .collect();
+            work.sort_unstable_by(|a, b| b.1.instances.len().cmp(&a.1.instances.len()));
+            let per_class_sstrs = work
+                .into_par_iter()
+                .map(|(type_name, type_info)| {
+                    let mut local_sstrs: Vec<SharedString> = Vec::new();
+                    let mut local_seen: HashMap<SharedString, ()> = HashMap::new();
+                    let mut push_sstr = |variant: &Variant| {
+                        let shared = match variant {
+                            Variant::SharedString(value) => Some(value),
+                            Variant::NetAssetRef(value) => Some(value.as_ref()),
+                            _ => None,
+                        };
+                        if let Some(value) = shared {
+                            if !local_seen.contains_key(value) {
+                                local_seen.insert(value.clone(), ());
+                                local_sstrs.push(value.clone());
+                            }
+                        }
+                    };
+                    if let Some(properties) = schema.get(&type_name) {
+                        for (name, sample) in properties {
+                            type_info.resolve_visited_property(
+                                &mut push_sstr,
+                                database,
+                                type_name,
+                                *name,
+                                sample,
+                            )?;
+                        }
+                    }
+                    let mut deferred_migrations: Vec<(Vec<usize>, &Variant)> = Vec::new();
+                    let instance_count = type_info.instances.len();
+                    for desired_len in 0..instance_count {
+                        let instance = type_info.instances[desired_len];
+                        deferred_migrations.clear();
+                        for (prop_name, prop_value) in &instance.properties {
+                            let resolved_property = type_info.resolve_visited_property(
+                                &mut push_sstr,
+                                database,
+                                type_name,
+                                *prop_name,
+                                prop_value,
+                            )?;
+                            match resolved_property {
+                                PropInfoResolution::DoesNotSerialize => {}
+                                PropInfoResolution::MigratesTo(prop_info_indices) => {
+                                    push_sstr(prop_value);
+                                    deferred_migrations
+                                        .push((prop_info_indices.clone(), prop_value));
+                                }
+                                &PropInfoResolution::SerializesTo(prop_info_index) => {
+                                    push_sstr(prop_value);
+                                    type_info.properties[prop_info_index]
+                                        .push_value_for_instance(desired_len, prop_value);
+                                }
+                            }
+                        }
+                        for (prop_info_indices, prop_value) in &deferred_migrations {
+                            for &prop_info_index in prop_info_indices {
+                                type_info.properties[prop_info_index]
+                                    .push_value_for_instance(desired_len, prop_value);
+                            }
+                        }
+                    }
+                    Ok(local_sstrs)
+                })
+                .collect::<Result<Vec<_>, InnerError>>()?;
+            for sstrs in per_class_sstrs {
+                for sstr in sstrs {
+                    if !self.shared_string_ids.contains_key(&sstr) {
+                        self.shared_string_ids.insert(sstr.clone(), 0);
+                        self.shared_strings.push(sstr);
+                    }
+                }
+            }
+            self.finish_discovery();
+            return Ok(());
+        }
         let mut seeded = std::collections::HashSet::new();
         for referent in postorder {
             let instance = self
@@ -937,91 +1048,115 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
         log::trace!("Writing properties");
 
         let name_ustr = rbx_dom_weak::ustr("Name");
+        enum PropChunkJob<'a, 'dom> {
+            Prop(&'a mut PropInfo<'dom>),
+            Name,
+        }
+        let mut jobs: Vec<(usize, u32, Ustr, &[&'dom Instance], PropChunkJob<'_, 'dom>)> =
+            Vec::new();
+        let mut total_instances = 0usize;
         for ((type_name, reference_only), type_info) in &mut self.type_infos.values {
             if *reference_only {
                 continue;
             }
-            // Sort logical properties by canonical name
             type_info
                 .properties
                 .sort_by_key(|prop_info| prop_info.canonical_name);
 
-            // Locate the index where "Name" could be inserted
             let name_location = type_info
                 .properties
                 .binary_search_by_key(&name_ustr, |prop_info| prop_info.canonical_name);
 
             let (properties_before_name, properties_after_name) = match name_location {
-                // Split properties at the sort location of "Name"
                 Err(name_insert_index) => type_info.properties.split_at_mut(name_insert_index),
-                // "Name" logical property exists.  Ignore it.
                 Ok(name_index) => {
                     log::warn!("Name property should not exist in Instance.properties. Use Instance.name instead. Property was ignored.");
 
                     let (properties_before_name, properties_after_name) =
                         type_info.properties.split_at_mut(name_index);
 
-                    // Skip "Name" logical property
                     (properties_before_name, &mut properties_after_name[1..])
                 }
             };
 
+            let type_id = type_info.type_id;
+            let instances = type_info.instances.as_slice();
+            total_instances += instances.len();
             for prop_info in properties_before_name {
-                let mut chunk = ChunkBuilder::new(b"PROP", self.serializer.compression);
-
-                chunk.write_le_u32(type_info.type_id)?;
-                chunk.write_string(&prop_info.serialized_name)?;
-                chunk.write_u8(prop_info.prop_type as u8)?;
-
-                write_prop_info(
-                    prop_info,
-                    &mut chunk,
-                    self.dom,
-                    &self.id_to_referent,
-                    &self.shared_string_ids,
-                    &type_info.instances,
-                    type_name,
-                )?;
-
-                chunk.dump(&mut self.output)?;
+                let order = jobs.len();
+                jobs.push((order, type_id, *type_name, instances, PropChunkJob::Prop(prop_info)));
             }
-
-            // Write name properties as a special case
-            {
-                let mut chunk = ChunkBuilder::new(b"PROP", self.serializer.compression);
-
-                chunk.write_le_u32(type_info.type_id)?;
-                chunk.write_string("Name")?;
-                chunk.write_u8(Type::String as u8)?;
-
-                for &instance in &type_info.instances {
-                    chunk.write_string(&instance.name)?;
-                }
-
-                chunk.dump(&mut self.output)?;
-            }
-
+            let order = jobs.len();
+            jobs.push((order, type_id, *type_name, instances, PropChunkJob::Name));
             for prop_info in properties_after_name {
-                let mut chunk = ChunkBuilder::new(b"PROP", self.serializer.compression);
+                let order = jobs.len();
+                jobs.push((order, type_id, *type_name, instances, PropChunkJob::Prop(prop_info)));
+            }
+        }
 
-                chunk.write_le_u32(type_info.type_id)?;
-                chunk.write_string(&prop_info.serialized_name)?;
-                chunk.write_u8(prop_info.prop_type as u8)?;
+        let compression = self.serializer.compression;
+        let dom = self.dom;
+        let id_to_referent = &self.id_to_referent;
+        let shared_string_ids = &self.shared_string_ids;
 
-                write_prop_info(
-                    prop_info,
-                    &mut chunk,
-                    self.dom,
-                    &self.id_to_referent,
-                    &self.shared_string_ids,
-                    &type_info.instances,
-                    type_name,
-                )?;
+        let build_chunk = |type_id: u32,
+                           type_name: Ustr,
+                           instances: &[&'dom Instance],
+                           job: PropChunkJob<'_, 'dom>|
+         -> Result<ChunkBuilder, InnerError> {
+            let mut chunk = ChunkBuilder::new(b"PROP", compression);
+            chunk.write_le_u32(type_id)?;
+            match job {
+                PropChunkJob::Name => {
+                    chunk.write_string("Name")?;
+                    chunk.write_u8(Type::String as u8)?;
+                    for &instance in instances {
+                        chunk.write_string(&instance.name)?;
+                    }
+                }
+                PropChunkJob::Prop(prop_info) => {
+                    chunk.write_string(&prop_info.serialized_name)?;
+                    chunk.write_u8(prop_info.prop_type as u8)?;
+                    write_prop_info(
+                        prop_info,
+                        &mut chunk,
+                        dom,
+                        id_to_referent,
+                        shared_string_ids,
+                        instances,
+                        &type_name,
+                    )?;
+                }
+            }
+            Ok(chunk)
+        };
 
+        if total_instances >= 2048 && jobs.len() >= 2 {
+            use rayon::prelude::*;
+            jobs.sort_unstable_by(|a, b| b.3.len().cmp(&a.3.len()));
+            let mut encoded: Vec<(usize, Result<Vec<u8>, InnerError>)> = jobs
+                .into_par_iter()
+                .map(|(order, type_id, type_name, instances, job)| {
+                    let result = build_chunk(type_id, type_name, instances, job).and_then(|chunk| {
+                        let mut bytes = Vec::new();
+                        chunk.dump(&mut bytes)?;
+                        Ok(bytes)
+                    });
+                    (order, result)
+                })
+                .collect();
+            encoded.sort_unstable_by_key(|(order, _)| *order);
+            for (_, bytes) in encoded {
+                self.output.write_all(&bytes?)?;
+            }
+        } else {
+            for (_, type_id, type_name, instances, job) in jobs {
+                let chunk = build_chunk(type_id, type_name, instances, job)?;
                 chunk.dump(&mut self.output)?;
             }
+        }
 
-            fn write_prop_info<'dom>(
+        fn write_prop_info<'dom>(
                 prop_info: &mut PropInfo<'dom>,
                 chunk: &mut ChunkBuilder,
                 dom: &'dom WeakDom,
@@ -1749,7 +1884,6 @@ impl<'dom, 'db: 'dom, W: Write> SerializerState<'dom, 'db, W> {
                 }
                 Ok(())
             }
-        }
 
         Ok(())
     }

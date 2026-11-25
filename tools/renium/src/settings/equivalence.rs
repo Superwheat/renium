@@ -245,9 +245,59 @@ pub(crate) struct CompactRowMeta {
     pub(crate) compared_digest: [u8; 16],
     pub(crate) unique_id_digest: [u8; 16],
     pub(crate) keys_hash: u64,
+    pub(crate) strict_digest: u64,
     pub(crate) reflexive: bool,
     pub(crate) has_untyped_enum: bool,
     pub(crate) has_ref: bool,
+}
+
+struct CompactHasher {
+    lo: ahash::AHasher,
+    hi: ahash::AHasher,
+}
+
+impl CompactHasher {
+    fn new() -> Self {
+        use std::hash::BuildHasher as _;
+        Self {
+            lo: ahash::RandomState::with_seeds(
+                0x243f_6a88_85a3_08d3,
+                0x1319_8a2e_0370_7344,
+                0xa409_3822_299f_31d0,
+                0x082e_fa98_ec4e_6c89,
+            )
+            .build_hasher(),
+            hi: ahash::RandomState::with_seeds(
+                0x4528_21e6_38d0_1377,
+                0xbe54_66cf_34e9_0c6c,
+                0xc0ac_29b7_c97c_50dd,
+                0x3f84_d5b5_b547_0917,
+            )
+            .build_hasher(),
+        }
+    }
+
+    #[inline]
+    fn update(&mut self, bytes: &[u8]) {
+        use std::hash::Hasher as _;
+        self.lo.write(bytes);
+        self.hi.write(bytes);
+    }
+
+    #[inline]
+    fn update_str(&mut self, text: &str) {
+        self.update(&(text.len() as u64).to_le_bytes());
+        self.update(text.as_bytes());
+    }
+
+    #[inline]
+    fn finish(self) -> [u8; 16] {
+        use std::hash::Hasher as _;
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&self.lo.finish().to_le_bytes());
+        out[8..].copy_from_slice(&self.hi.finish().to_le_bytes());
+        out
+    }
 }
 
 /// Compact representation of a store document for streamed alignment: bare
@@ -270,12 +320,12 @@ pub(crate) fn stabilize_instance_references(
 }
 
 fn digest_exact_value_and_check(
-    digest: &mut Sha256,
+    digest: &mut CompactHasher,
     value: &Value,
     mut reflexive: Option<&mut bool>,
     has_untyped_enum: &mut bool,
 ) {
-    if let Value::Object(map) = value
+    if let Value::Object(_) = value
         && let Some(held_digest) = crate::settings::held::digest_once(value, |resolved| {
             let mut sub = Sha256::new();
             digest_value(&mut sub, resolved);
@@ -283,21 +333,20 @@ fn digest_exact_value_and_check(
             <[u8; 16]>::try_from(&whole[..16]).unwrap()
         })
     {
-        let _ = map;
-        digest.update([8]);
-        digest.update(held_digest);
+        digest.update(&[8]);
+        digest.update(&held_digest);
         return;
     }
     match value {
-        Value::Null => digest.update([0]),
-        Value::Bool(flag) => digest.update([1, u8::from(*flag)]),
+        Value::Null => digest.update(&[0]),
+        Value::Bool(flag) => digest.update(&[1, u8::from(*flag)]),
         Value::Number(number) => {
             if let Some(v) = number.as_u64() {
-                digest.update([2]);
-                digest.update(v.to_le_bytes());
+                digest.update(&[2]);
+                digest.update(&v.to_le_bytes());
             } else if let Some(v) = number.as_i64() {
-                digest.update([3]);
-                digest.update(v.to_le_bytes());
+                digest.update(&[3]);
+                digest.update(&v.to_le_bytes());
             } else {
                 let f = number.as_f64().unwrap_or(f64::NAN);
                 let bits = if f == 0.0 {
@@ -305,17 +354,17 @@ fn digest_exact_value_and_check(
                 } else {
                     f.to_bits()
                 };
-                digest.update([4]);
-                digest.update(bits.to_le_bytes());
+                digest.update(&[4]);
+                digest.update(&bits.to_le_bytes());
             }
         }
         Value::String(text) => {
-            digest.update([5]);
-            digest_text(digest, text);
+            digest.update(&[5]);
+            digest.update_str(text);
         }
         Value::Array(items) => {
-            digest.update([6]);
-            digest.update((items.len() as u64).to_le_bytes());
+            digest.update(&[6]);
+            digest.update(&(items.len() as u64).to_le_bytes());
             for item in items {
                 digest_exact_value_and_check(
                     digest,
@@ -326,8 +375,8 @@ fn digest_exact_value_and_check(
             }
         }
         Value::Object(map) => {
-            digest.update([7]);
-            digest.update((map.len() as u64).to_le_bytes());
+            digest.update(&[7]);
+            digest.update(&(map.len() as u64).to_le_bytes());
             let check_refl = reflexive.as_deref().is_some_and(|r| *r);
             let mut need_cframe_components = false;
             let mut saw_cframe_components = false;
@@ -374,7 +423,7 @@ fn digest_exact_value_and_check(
                         saw_enum_field = true;
                     }
                 }
-                digest_text(digest, k);
+                digest.update_str(k);
                 digest_exact_value_and_check(digest, v, reflexive.as_deref_mut(), has_untyped_enum);
             }
             if check_refl
@@ -507,11 +556,12 @@ pub(crate) fn compact_row(
     let database = rbx_reflection_database::get().ok();
     let camera = (instance.class_name == "Camera").then(|| instance.clone());
     let unique_id = persistent_identity(instance).map(Box::<str>::from);
-    let mut exact = Sha256::new();
-    let mut full = Sha256::new();
-    let mut compared = Sha256::new();
+    let mut exact = CompactHasher::new();
+    let mut full = CompactHasher::new();
+    let mut compared = CompactHasher::new();
     let mut unique_id_digest = [0u8; 16];
     let mut keys_hasher = fixed_identity_hasher();
+    let mut strict_hasher = fixed_identity_hasher();
     let mut reflexive = true;
     let mut has_untyped_enum = false;
     let mut has_ref = false;
@@ -519,10 +569,11 @@ pub(crate) fn compact_row(
     let mut kept_props = Map::new();
     let mut kept_attrs = Map::new();
 
-    exact.update([0x11]);
-    full.update([0x11]);
-    compared.update([0x11]);
+    exact.update(&[0x11]);
+    full.update(&[0x11]);
+    compared.update(&[0x11]);
     0x11u8.hash(&mut keys_hasher);
+    0x11u8.hash(&mut strict_hasher);
     for (name, value) in std::mem::take(&mut instance.properties) {
         let contains_ref = matches!(value, Value::Array(_) | Value::Object(_))
             && reconciliation_value_contains_reference(&value);
@@ -534,7 +585,7 @@ pub(crate) fn compact_row(
             kept_props.insert(name, value);
             continue;
         }
-        let mut entry_digest = Sha256::new();
+        let mut entry_digest = CompactHasher::new();
         let stable = property_name_is_stable_no_ref(&name, &value);
         let mut prop_untyped = false;
         digest_exact_value_and_check(
@@ -544,23 +595,35 @@ pub(crate) fn compact_row(
             &mut prop_untyped,
         );
         has_untyped_enum |= prop_untyped;
-        let val_hash = <[u8; 32]>::from(entry_digest.finalize());
+        let val_hash = entry_digest.finish();
         if name == "UniqueId" {
-            unique_id_digest.copy_from_slice(&val_hash[..16]);
+            unique_id_digest = val_hash;
         } else {
-            full.update([1]);
-            digest_text(&mut full, &name);
-            full.update(&val_hash[..16]);
+            full.update(&[1]);
+            full.update_str(&name);
+            full.update(&val_hash);
         }
         if !reconciliation_property_is_engine_state(database, &instance.class_name, &name, &value) {
-            compared.update([1]);
-            digest_text(&mut compared, &name);
-            compared.update(&val_hash[..16]);
+            compared.update(&[1]);
+            compared.update_str(&name);
+            compared.update(&val_hash);
+            if matches!(value, Value::Bool(_) | Value::String(_))
+                && name != "Tags"
+                && !is_asset_reference_property(&instance.class_name, &name)
+                && !reconciliation_property_is_unknown_when_absent(
+                    database,
+                    &instance.class_name,
+                    &name,
+                )
+            {
+                name.hash(&mut strict_hasher);
+                val_hash.hash(&mut strict_hasher);
+            }
         }
         if stable {
-            exact.update([1]);
-            digest_text(&mut exact, &name);
-            exact.update(&val_hash[..16]);
+            exact.update(&[1]);
+            exact.update_str(&name);
+            exact.update(&val_hash);
             name.hash(&mut keys_hasher);
             hash_strict_identity_value(&value, &mut keys_hasher);
         }
@@ -569,10 +632,11 @@ pub(crate) fn compact_row(
         }
     }
 
-    exact.update([0x22]);
-    full.update([0x22]);
-    compared.update([0x22]);
+    exact.update(&[0x22]);
+    full.update(&[0x22]);
+    compared.update(&[0x22]);
     0x22u8.hash(&mut keys_hasher);
+    0x22u8.hash(&mut strict_hasher);
     for (name, value) in std::mem::take(&mut instance.attributes) {
         let contains_ref = matches!(value, Value::Array(_) | Value::Object(_))
             && reconciliation_value_contains_reference(&value);
@@ -584,7 +648,7 @@ pub(crate) fn compact_row(
             kept_attrs.insert(name, value);
             continue;
         }
-        let mut entry_digest = Sha256::new();
+        let mut entry_digest = CompactHasher::new();
         let mut attr_untyped = false;
         digest_exact_value_and_check(
             &mut entry_digest,
@@ -593,33 +657,35 @@ pub(crate) fn compact_row(
             &mut attr_untyped,
         );
         has_untyped_enum |= attr_untyped;
-        let val_hash = <[u8; 32]>::from(entry_digest.finalize());
-        full.update([1]);
-        digest_text(&mut full, &name);
-        full.update(&val_hash[..16]);
+        let val_hash = entry_digest.finish();
+        full.update(&[1]);
+        full.update_str(&name);
+        full.update(&val_hash);
         if !is_engine_managed_attribute(&name) {
-            compared.update([1]);
-            digest_text(&mut compared, &name);
-            compared.update(&val_hash[..16]);
+            compared.update(&[1]);
+            compared.update_str(&name);
+            compared.update(&val_hash);
+            if matches!(value, Value::Bool(_) | Value::String(_)) {
+                name.hash(&mut strict_hasher);
+                val_hash.hash(&mut strict_hasher);
+            }
         }
-        exact.update([1]);
-        digest_text(&mut exact, &name);
-        exact.update(&val_hash[..16]);
+        exact.update(&[1]);
+        exact.update_str(&name);
+        exact.update(&val_hash);
         name.hash(&mut keys_hasher);
         hash_strict_identity_value(&value, &mut keys_hasher);
     }
 
     instance.properties = kept_props;
     instance.attributes = kept_attrs;
-    let exact_full = <[u8; 32]>::from(exact.finalize());
-    let full_full = <[u8; 32]>::from(full.finalize());
-    let compared_full = <[u8; 32]>::from(compared.finalize());
     let meta = CompactRowMeta {
-        exact_digest: <[u8; 16]>::try_from(&exact_full[..16]).unwrap(),
-        full_digest: <[u8; 16]>::try_from(&full_full[..16]).unwrap(),
-        compared_digest: <[u8; 16]>::try_from(&compared_full[..16]).unwrap(),
+        exact_digest: exact.finish(),
+        full_digest: full.finish(),
+        compared_digest: compared.finish(),
         unique_id_digest,
         keys_hash: keys_hasher.finish(),
+        strict_digest: strict_hasher.finish(),
         reflexive,
         has_untyped_enum,
         has_ref,
@@ -1209,6 +1275,108 @@ struct CompactRefBearingBatch {
     obs_indices: Vec<usize>,
 }
 
+enum RepKeysBucket {
+    SingleReflexive([u8; 16], Vec<usize>),
+    Many(Vec<usize>),
+}
+
+struct RepKeysIndex {
+    by_keys: AHashMap<u64, RepKeysBucket>,
+}
+
+impl RepKeysIndex {
+    fn build(representatives: &[usize], ref_meta: &[CompactRowMeta]) -> Self {
+        let mut by_keys: AHashMap<u64, RepKeysBucket> =
+            AHashMap::with_capacity(representatives.len());
+        for &rep in representatives {
+            let m = ref_meta[rep];
+            by_keys
+                .entry(m.keys_hash)
+                .and_modify(|bucket| match bucket {
+                    RepKeysBucket::SingleReflexive(digest, reps) => {
+                        reps.push(rep);
+                        if !(m.reflexive && m.exact_digest == *digest) {
+                            let all = std::mem::take(reps);
+                            *bucket = RepKeysBucket::Many(all);
+                        }
+                    }
+                    RepKeysBucket::Many(reps) => reps.push(rep),
+                })
+                .or_insert_with(|| {
+                    if m.reflexive {
+                        RepKeysBucket::SingleReflexive(m.exact_digest, vec![rep])
+                    } else {
+                        RepKeysBucket::Many(vec![rep])
+                    }
+                });
+        }
+        Self { by_keys }
+    }
+
+    fn is_obs_ambiguous(&self, obs_m: CompactRowMeta) -> bool {
+        match self.by_keys.get(&obs_m.keys_hash) {
+            None => false,
+            Some(RepKeysBucket::SingleReflexive(digest, _)) => *digest != obs_m.exact_digest,
+            Some(RepKeysBucket::Many(_)) => true,
+        }
+    }
+
+    fn collect_ambiguous_reps(
+        &self,
+        obs_m: CompactRowMeta,
+        added_buckets: &mut AHashSet<u64>,
+        seen_ref: &mut AHashSet<usize>,
+        need_ref: &mut Vec<usize>,
+    ) -> bool {
+        let reps = match self.by_keys.get(&obs_m.keys_hash) {
+            None => return false,
+            Some(RepKeysBucket::SingleReflexive(digest, _)) if *digest == obs_m.exact_digest => {
+                return false;
+            }
+            Some(RepKeysBucket::SingleReflexive(_, reps) | RepKeysBucket::Many(reps)) => reps,
+        };
+        if added_buckets.insert(obs_m.keys_hash) {
+            for &rep in reps {
+                if seen_ref.insert(rep) {
+                    need_ref.push(rep);
+                }
+            }
+        }
+        true
+    }
+
+    fn all_ambiguous_cached(
+        &self,
+        fallback: &[(usize, usize)],
+        obs_meta: &[CompactRowMeta],
+        ref_rows: &AHashMap<usize, SettingsBytecodeInstance>,
+        obs_rows: &AHashMap<usize, SettingsBytecodeInstance>,
+    ) -> bool {
+        let mut checked_buckets: AHashSet<u64> = AHashSet::new();
+        for &(_, o) in fallback {
+            let obs_m = obs_meta[o];
+            let reps = match self.by_keys.get(&obs_m.keys_hash) {
+                None => continue,
+                Some(RepKeysBucket::SingleReflexive(digest, _))
+                    if *digest == obs_m.exact_digest =>
+                {
+                    continue;
+                }
+                Some(RepKeysBucket::SingleReflexive(_, reps) | RepKeysBucket::Many(reps)) => reps,
+            };
+            if !obs_rows.contains_key(&o) {
+                return false;
+            }
+            if checked_buckets.insert(obs_m.keys_hash)
+                && !reps.iter().all(|r| ref_rows.contains_key(r))
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 struct CompactRefBearingCache<'a> {
     compact: &'a CompactMatching<'a>,
     batches: std::collections::VecDeque<CompactRefBearingBatch>,
@@ -1236,25 +1404,20 @@ impl<'a> CompactRefBearingCache<'a> {
                 compact.ref_meta,
                 candidates,
             );
+            let rep_index = RepKeysIndex::build(&representatives, compact.ref_meta);
             let mut need_ref = Vec::new();
             let mut need_obs = Vec::new();
             let mut seen_ref = AHashSet::new();
+            let mut added_many = AHashSet::new();
             let mut any_unref_ambiguous = false;
             for &obs_idx in observed_slice {
                 let obs_m = compact.obs_meta[obs_idx];
-                let mut obs_ambiguous = false;
-                for &rep in &representatives {
-                    let ref_m = compact.ref_meta[rep];
-                    if ref_m.keys_hash == obs_m.keys_hash
-                        && !(ref_m.reflexive && ref_m.exact_digest == obs_m.exact_digest)
-                    {
-                        obs_ambiguous = true;
-                        if seen_ref.insert(rep) {
-                            need_ref.push(rep);
-                        }
-                    }
-                }
-                if obs_ambiguous {
+                if rep_index.collect_ambiguous_reps(
+                    obs_m,
+                    &mut added_many,
+                    &mut seen_ref,
+                    &mut need_ref,
+                ) {
                     need_obs.push(obs_idx);
                     if !inputs.observed_graph.has_edges(obs_idx) {
                         any_unref_ambiguous = true;
@@ -1362,17 +1525,12 @@ fn log_slow_identity_group(
 
 fn compact_group_has_ambiguous_pair(
     fallback: &[(usize, usize)],
-    representatives: &[usize],
+    rep_index: &RepKeysIndex,
     compact: &CompactMatching<'_>,
 ) -> bool {
-    fallback.iter().any(|&(_, obs_idx)| {
-        let obs_m = compact.obs_meta[obs_idx];
-        representatives.iter().any(|&rep| {
-            let ref_m = compact.ref_meta[rep];
-            ref_m.keys_hash == obs_m.keys_hash
-                && !(ref_m.reflexive && ref_m.exact_digest == obs_m.exact_digest)
-        })
-    })
+    fallback
+        .iter()
+        .any(|&(_, obs_idx)| rep_index.is_obs_ambiguous(compact.obs_meta[obs_idx]))
 }
 
 fn score_compact_with_content_check(
@@ -1382,9 +1540,9 @@ fn score_compact_with_content_check(
     inputs: &ScoreInputs<'_, '_>,
     (assigned_reference, assigned_observed): (&[Option<usize>], &[Option<usize>]),
     results: &mut [Option<usize>],
-    content_matches_fn: impl Fn(usize, usize) -> bool,
+    content_matches_fn: impl Fn(usize, usize) -> bool + Sync,
 ) {
-    for &(pos, obs_idx) in fallback {
+    let score_one = |&(pos, obs_idx): &(usize, usize)| {
         let mut best = None;
         let mut best_candidate = None;
         let mut tied = false;
@@ -1426,9 +1584,16 @@ fn score_compact_with_content_check(
                 _ => {}
             }
         }
-        if let Some(candidate) = best_candidate.filter(|_| !tied) {
-            results[pos] = Some(candidate);
-        }
+        best_candidate.filter(|_| !tied).map(|cand| (pos, cand))
+    };
+    let resolved: Vec<(usize, usize)> = if fallback.len() >= 32 && rayon::current_num_threads() > 1
+    {
+        fallback.par_iter().filter_map(score_one).collect()
+    } else {
+        fallback.iter().filter_map(score_one).collect()
+    };
+    for (pos, candidate) in resolved {
+        results[pos] = Some(candidate);
     }
 }
 
@@ -1439,8 +1604,9 @@ fn try_score_compact_from_cache(
     inputs: &ScoreInputs<'_, '_>,
     assignments: (&[Option<usize>], &[Option<usize>]),
     compact: &CompactMatching<'_>,
-    cache: &CompactRefBearingCache<'_>,
+    cache: (&CompactRefBearingCache<'_>, &RepKeysIndex),
 ) -> Option<Vec<(usize, usize)>> {
+    let (cache, rep_index) = cache;
     let use_index = representatives.len() >= 32
         && fallback
             .iter()
@@ -1450,24 +1616,10 @@ fn try_score_compact_from_cache(
             .iter()
             .all(|r| cache.ref_rows.contains_key(r))
             && fallback.iter().all(|&(_, o)| {
-                let obs_m = compact.obs_meta[o];
-                let needs = representatives.iter().any(|&r| {
-                    let ref_m = compact.ref_meta[r];
-                    ref_m.keys_hash == obs_m.keys_hash
-                        && !(ref_m.reflexive && ref_m.exact_digest == obs_m.exact_digest)
-                });
-                !needs || cache.obs_rows.contains_key(&o)
+                !rep_index.is_obs_ambiguous(compact.obs_meta[o]) || cache.obs_rows.contains_key(&o)
             })
     } else {
-        fallback.iter().all(|&(_, o)| {
-            let obs_m = compact.obs_meta[o];
-            representatives.iter().all(|&r| {
-                let ref_m = compact.ref_meta[r];
-                !(ref_m.keys_hash == obs_m.keys_hash
-                    && !(ref_m.reflexive && ref_m.exact_digest == obs_m.exact_digest))
-                    || (cache.ref_rows.contains_key(&r) && cache.obs_rows.contains_key(&o))
-            })
-        })
+        rep_index.all_ambiguous_cached(fallback, compact.obs_meta, &cache.ref_rows, &cache.obs_rows)
     };
     if !all_cached_present {
         return None;
@@ -1579,7 +1731,8 @@ fn score_compact_single_group(
         compact.ref_meta,
         candidates,
     );
-    if !compact_group_has_ambiguous_pair(&fallback, &representatives, compact) {
+    let rep_index = RepKeysIndex::build(&representatives, compact.ref_meta);
+    if !compact_group_has_ambiguous_pair(&fallback, &rep_index, compact) {
         score_compact_with_content_check(
             &fallback,
             &representatives,
@@ -1604,7 +1757,7 @@ fn score_compact_single_group(
             inputs,
             assignments,
             compact,
-            cache,
+            (cache, &rep_index),
         ) {
             for (pos, candidate) in resolved {
                 results[pos] = Some(candidate);
@@ -2024,7 +2177,8 @@ fn compact_positional_values_equivalent(
         right: &observed_ids,
     };
 
-    let mut need_hydrate: Vec<usize> = Vec::new();
+    let mut high_prio: Vec<usize> = Vec::new();
+    let mut low_prio: Vec<usize> = Vec::new();
     for i in 0..count {
         let ref_inst = &reference.document.instances[i];
         let obs_inst = &observed.document.instances[i];
@@ -2049,11 +2203,13 @@ fn compact_positional_values_equivalent(
             continue;
         }
         if is_kept_cam {
-            need_hydrate.push(i);
+            high_prio.push(i);
             continue;
         }
-        if reference.meta[i].compared_digest == observed.meta[i].compared_digest {
-            if !reference.meta[i].has_ref && !observed.meta[i].has_ref {
+        let ref_m = reference.meta[i];
+        let obs_m = observed.meta[i];
+        if ref_m.compared_digest == obs_m.compared_digest {
+            if !ref_m.has_ref && !obs_m.has_ref {
                 continue;
             }
             if reconciliation_maps_equal_with_ids(
@@ -2069,14 +2225,18 @@ fn compact_positional_values_equivalent(
                 continue;
             }
         }
-        need_hydrate.push(i);
+        if ref_m.has_ref != obs_m.has_ref || ref_m.strict_digest != obs_m.strict_digest {
+            high_prio.push(i);
+        } else {
+            low_prio.push(i);
+        }
     }
 
-    let check_chunk = |chunk: &[usize]| -> Result<bool> {
+    let check_chunk = |chunk: &[usize]| -> Result<Option<usize>> {
         let (ref_res, obs_res) = rayon::join(|| hydrate_ref(chunk), || hydrate_obs(chunk));
         let ref_rows: AHashMap<usize, SettingsBytecodeInstance> = ref_res?.into_iter().collect();
         let obs_rows: AHashMap<usize, SettingsBytecodeInstance> = obs_res?.into_iter().collect();
-        Ok(chunk.par_iter().all(|&i| {
+        Ok(chunk.par_iter().copied().find_any(|&i| {
             let ref_inst = &ref_rows[&i];
             let obs_inst = match kept_camera {
                 Some((cam_idx, saved)) if cam_idx == i => saved,
@@ -2085,9 +2245,9 @@ fn compact_positional_values_equivalent(
             if !preserve_viewport
                 && ref_inst.properties.get("UniqueId") != obs_inst.properties.get("UniqueId")
             {
-                return false;
+                return true;
             }
-            reconciliation_maps_equal_with_ids(
+            !(reconciliation_maps_equal_with_ids(
                 &ref_inst.class_name,
                 &ref_inst.properties,
                 &obs_inst.properties,
@@ -2096,25 +2256,49 @@ fn compact_positional_values_equivalent(
                 &ref_inst.attributes,
                 &obs_inst.attributes,
                 ids,
-            )
+            ))
         }))
     };
 
-    if need_hydrate.len() > 512 {
-        let sample_len = 256usize;
-        let step = need_hydrate.len() / sample_len;
-        let sample: Vec<usize> = (0..sample_len).map(|k| need_hydrate[k * step]).collect();
-        if !check_chunk(&sample)? {
-            return Ok(false);
+    let check_slice = |rows: &[usize], label: &str| -> Result<bool> {
+        if rows.len() > 512 {
+            let sample_len = 256usize;
+            let step = rows.len() / sample_len;
+            let sample: Vec<usize> = (0..sample_len).map(|k| rows[k * step]).collect();
+            if let Some(row) = check_chunk(&sample)? {
+                log_global(
+                    4,
+                    format_args!(
+                        "[renium] positional check mismatch ({label} sample): high={} low={} row={row} class={}",
+                        high_prio.len(),
+                        low_prio.len(),
+                        reference.document.instances[row].class_name,
+                    ),
+                );
+                return Ok(false);
+            }
         }
-    }
+        for chunk in rows.chunks(COMPACT_HYDRATE_BATCH) {
+            if let Some(row) = check_chunk(chunk)? {
+                log_global(
+                    4,
+                    format_args!(
+                        "[renium] positional check mismatch ({label}): high={} low={} row={row} class={}",
+                        high_prio.len(),
+                        low_prio.len(),
+                        reference.document.instances[row].class_name,
+                    ),
+                );
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
 
-    for chunk in need_hydrate.chunks(COMPACT_HYDRATE_BATCH) {
-        if !check_chunk(chunk)? {
-            return Ok(false);
-        }
+    if !check_slice(&high_prio, "high")? {
+        return Ok(false);
     }
-    Ok(true)
+    check_slice(&low_prio, "low")
 }
 
 fn compact_positions_add_enum_types(
@@ -2586,6 +2770,58 @@ pub(crate) fn plan_captured_store_streaming(
         stored_as_observed: stored_as_observed_on_change,
         answer_follows_camera,
     })
+}
+
+/// Aligns two already-open v12 `BlockStore`s using compact row metadata and
+/// on-demand row hydration without decoding whole documents into memory.
+#[allow(clippy::type_complexity)]
+pub(crate) fn match_opened_block_stores_compact(
+    ref_store: &crate::settings::bytecode::blocks::BlockStore<'_>,
+    obs_store: &crate::settings::bytecode::blocks::BlockStore<'_>,
+) -> Result<Option<(Vec<String>, Vec<Option<usize>>)>> {
+    let (ref_res, obs_res) = rayon::join(|| ref_store.compact(), || obs_store.compact());
+    let ((ref_compact, ref_ids), (obs_compact, obs_ids)) = (ref_res?, obs_res?);
+    let hydrate_ref =
+        |rows: &[usize]| ref_store.hydrate_rows(&ref_compact.document.instances, &ref_ids, rows);
+    let hydrate_obs =
+        |rows: &[usize]| obs_store.hydrate_rows(&obs_compact.document.instances, &obs_ids, rows);
+    let compact = CompactMatching {
+        ref_unique_ids: &ref_compact.unique_ids,
+        obs_unique_ids: &obs_compact.unique_ids,
+        ref_meta: &ref_compact.meta,
+        obs_meta: &obs_compact.meta,
+        hydrate_ref: &hydrate_ref,
+        hydrate_obs: &hydrate_obs,
+    };
+    let matched = match_settings_ids_with_compact(
+        &ref_compact.document,
+        &obs_compact.document,
+        false,
+        false,
+        Some(&compact),
+    )?;
+    Ok(matched.map(|(ids, places, _)| (ids, places)))
+}
+
+/// Aligns two v12 block stores using compact row metadata and on-demand row
+/// hydration without decoding whole documents into memory. Returns the aligned
+/// settings ids and reference-index mapping for each observed row, or `None`
+/// if either input is not a v12 block store or identity matching is ambiguous.
+#[allow(clippy::type_complexity)]
+pub(crate) fn match_block_stores_compact(
+    desired_bytes: &[u8],
+    observed_bytes: &[u8],
+) -> Result<Option<(Vec<String>, Vec<Option<usize>>)>> {
+    use crate::settings::bytecode::blocks::{BlockStore, is_block_store};
+
+    if !is_block_store(desired_bytes) || !is_block_store(observed_bytes) {
+        return Ok(None);
+    }
+    let (ref_store, obs_store) = (
+        BlockStore::open(desired_bytes)?.holding(),
+        BlockStore::open(observed_bytes)?.holding(),
+    );
+    match_opened_block_stores_compact(&ref_store, &obs_store)
 }
 
 /// Whether a pull holds the values of the observed instance for the stored
@@ -7355,6 +7591,24 @@ pub(crate) fn settings_ids_told_alone(
     match_settings_ids(reference, observed, true, false).map(|(ids, places, _)| (ids, places))
 }
 
+pub(crate) fn settings_ids_told_alone_with_unique_ids(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+    ref_unique_ids: &[Option<Box<str>>],
+    obs_unique_ids: &[Option<Box<str>>],
+) -> Option<(Vec<String>, Vec<Option<usize>>)> {
+    match_settings_ids_inner(
+        reference,
+        observed,
+        true,
+        false,
+        None,
+        Some((ref_unique_ids, obs_unique_ids)),
+    )
+    .expect("in-memory identity matching cannot fail")
+    .map(|(ids, places, _)| (ids, places))
+}
+
 /// `settings_ids_told_alone` where namesakes under one parent that nothing
 /// else tells apart are paired by their order, and with it the observed
 /// instances taken so. Such a pair is one instance only where both hold the
@@ -7452,6 +7706,18 @@ fn match_settings_ids_with_compact(
     in_order: bool,
     compact: Option<&CompactMatching<'_>>,
 ) -> Result<Option<(Vec<String>, Vec<Option<usize>>, Vec<(usize, ByOrder)>)>> {
+    match_settings_ids_inner(reference, observed, told_alone, in_order, compact, None)
+}
+
+#[allow(clippy::type_complexity)]
+fn match_settings_ids_inner(
+    reference: &SettingsBytecode,
+    observed: &SettingsBytecode,
+    told_alone: bool,
+    in_order: bool,
+    compact: Option<&CompactMatching<'_>>,
+    unique_ids_override: Option<(&[Option<Box<str>>], &[Option<Box<str>>])>,
+) -> Result<Option<(Vec<String>, Vec<Option<usize>>, Vec<(usize, ByOrder)>)>> {
     let preparation_started = Instant::now();
     let cameras = (
         workspace_current_camera_index(reference),
@@ -7478,6 +7744,12 @@ fn match_settings_ids_with_compact(
                 .collect::<AHashSet<_>>(),
         )
     });
+    let ref_uids_slice = unique_ids_override
+        .map(|(r, _)| r)
+        .or_else(|| compact.map(|c| c.ref_unique_ids));
+    let obs_uids_slice = unique_ids_override
+        .map(|(_, o)| o)
+        .or_else(|| compact.map(|c| c.obs_unique_ids));
     let ((reference_by_id, reference_groups), (reference_by_unique_id, observed_by_unique_id)) =
         rayon::join(
             || {
@@ -7524,16 +7796,12 @@ fn match_settings_ids_with_compact(
             },
             || {
                 rayon::join(
-                    || match compact {
-                        Some(compact) => {
-                            persistent_identity_index_from_slice(compact.ref_unique_ids)
-                        }
+                    || match ref_uids_slice {
+                        Some(uids) => persistent_identity_index_from_slice(uids),
                         None => persistent_identity_index(reference),
                     },
-                    || match compact {
-                        Some(compact) => {
-                            persistent_identity_index_from_slice(compact.obs_unique_ids)
-                        }
+                    || match obs_uids_slice {
+                        Some(uids) => persistent_identity_index_from_slice(uids),
                         None => persistent_identity_index(observed),
                     },
                 )
@@ -7557,11 +7825,7 @@ fn match_settings_ids_with_compact(
     } else {
         None
     };
-    state.run_exact(
-        &lookup,
-        initial_camera_ref,
-        compact.map(|compact| compact.obs_unique_ids),
-    );
+    state.run_exact(&lookup, initial_camera_ref, obs_uids_slice);
     drop(lookup);
     state.run_unique(&reference_groups);
     log_global(
@@ -10389,7 +10653,7 @@ pub(crate) fn reconciliation_property_values_equal(
 /// `reconciliation_property_values_equal` for two values of one property of
 /// an instance of the store of `service`, as
 /// `reconciliation_store_maps_equal` compares records.
-fn reconciliation_store_property_values_equal(
+pub(crate) fn reconciliation_store_property_values_equal(
     service: Option<&str>,
     class_name: &str,
     name: &str,

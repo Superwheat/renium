@@ -63,35 +63,40 @@ pub(crate) fn pack_read_only_link_scripts_with(
         else {
             continue;
         };
-        let editor_doc = decode_settings_bytecode(editor_bytes)
-            .with_context(|| format!("Could not read the store {}", path.display()))?;
-        let service = settings_service_name(&path, &editor_doc, &editor_doc)?;
-        let editor_paths = crate::editor::paths::build_editor_instance_paths(&editor_doc, &service);
-        let packed = editor_doc
-            .instances
-            .iter()
-            .zip(&editor_paths)
-            .filter(|(instance, _)| is_lua_source_class(&instance.class_name))
-            .filter_map(|(instance, instance_path)| {
-                let text = instance.properties.get("Source")?.as_str()?;
-                if text == crate::settings::EXTERNAL_SOURCE_MARKER {
-                    return None;
-                }
-                let instance_path = instance_path.as_ref()?;
-                enforcement.read_only_package_for_path(
-                    &service,
-                    &instance_path.path_segments,
-                    &instance_path.path_ordinals,
-                )?;
-                Some((
-                    (
-                        instance_path.path_segments.clone(),
-                        instance_path.path_ordinals.clone(),
-                    ),
-                    text.to_string(),
-                ))
-            })
-            .collect::<HashMap<_, _>>();
+        let packed = {
+            let editor_doc = decode_settings_bytecode(editor_bytes)
+                .with_context(|| format!("Could not read the store {}", path.display()))?;
+            let service = settings_service_name(&path, &editor_doc, &editor_doc)?;
+            let editor_paths =
+                crate::editor::paths::build_editor_instance_paths(&editor_doc, &service);
+            let packed = editor_doc
+                .instances
+                .iter()
+                .zip(&editor_paths)
+                .filter(|(instance, _)| is_lua_source_class(&instance.class_name))
+                .filter_map(|(instance, instance_path)| {
+                    let text = instance.properties.get("Source")?.as_str()?;
+                    if text == crate::settings::EXTERNAL_SOURCE_MARKER {
+                        return None;
+                    }
+                    let instance_path = instance_path.as_ref()?;
+                    enforcement.read_only_package_for_path(
+                        &service,
+                        &instance_path.path_segments,
+                        &instance_path.path_ordinals,
+                    )?;
+                    Some((
+                        (
+                            instance_path.path_segments.clone(),
+                            instance_path.path_ordinals.clone(),
+                        ),
+                        text.to_string(),
+                    ))
+                })
+                .collect::<HashMap<_, _>>();
+            (service, packed)
+        };
+        let (service, packed) = packed;
         if packed.is_empty() {
             continue;
         }
@@ -171,29 +176,26 @@ fn drop_stripped_package_links(
         let Some(SnapshotEntry::File(studio_bytes)) = studio.entries.get(&path) else {
             continue;
         };
-        let mut studio_doc = decode_settings_bytecode(studio_bytes)
-            .with_context(|| format!("Could not read Studio's copy of {}", path.display()))?;
-        let service = settings_service_name(&path, &studio_doc, &studio_doc)?;
-        let editor_doc = match editor.entries.get(&path) {
-            Some(SnapshotEntry::File(bytes)) => Some(
-                decode_settings_bytecode(bytes)
-                    .with_context(|| format!("Could not read the store {}", path.display()))?,
-            ),
-            _ => None,
-        };
-        let editor_link_parents = editor_doc
-            .as_ref()
-            .map(|document| {
-                let paths = crate::editor::paths::build_editor_instance_paths(document, &service);
-                document
+        let editor_link_parents = match editor.entries.get(&path) {
+            Some(SnapshotEntry::File(bytes)) => {
+                let editor_doc = decode_settings_bytecode(bytes)
+                    .with_context(|| format!("Could not read the store {}", path.display()))?;
+                let service = settings_service_name(&path, &editor_doc, &editor_doc)?;
+                let paths =
+                    crate::editor::paths::build_editor_instance_paths(&editor_doc, &service);
+                editor_doc
                     .instances
                     .iter()
                     .filter(|instance| instance.class_name == "PackageLink")
                     .filter_map(|instance| paths[instance.parent_index?].clone())
                     .map(|parent| (parent.path_segments, parent.path_ordinals))
                     .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
+            }
+            _ => HashSet::new(),
+        };
+        let mut studio_doc = decode_settings_bytecode(studio_bytes)
+            .with_context(|| format!("Could not read Studio's copy of {}", path.display()))?;
+        let service = settings_service_name(&path, &studio_doc, &studio_doc)?;
         let studio_paths = crate::editor::paths::build_editor_instance_paths(&studio_doc, &service);
         let stripped = studio_doc
             .instances

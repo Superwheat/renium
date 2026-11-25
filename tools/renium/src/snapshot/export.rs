@@ -178,6 +178,7 @@ pub(crate) struct ExportProjectStage {
     pub(crate) import_src_dir: PathBuf,
     publish_paths: Vec<PathBuf>,
     publish_baseline: BTreeMap<PathBuf, PublishEntryState>,
+    virtual_scripts: Option<Arc<crate::snapshot::import::VirtualScriptStage>>,
     pub(crate) loaded: Option<config::LoadedProject>,
     pub(crate) projection: Option<config::ProjectionStage>,
     settings_already_aligned: bool,
@@ -202,6 +203,8 @@ pub(crate) struct ExportProjectStage {
 pub(crate) enum PublicationStep {
     /// The settlement journal does not yet hold what recovery needs.
     BeforeRecord,
+    /// Before the second disk scan that guards the swap window.
+    BeforeConcurrencyCheck,
     /// The path is about to be moved aside.
     MoveAside(PathBuf),
     /// The path is moved aside, and its replacement still staged.
@@ -289,6 +292,7 @@ impl ExportProjectStage {
     /// paths taken from `baseline` instead of hashing the files again, for a
     /// caller that has just read them. Publication still compares the files
     /// on disk with it, so a baseline older than the copy fails closed.
+    #[cfg(any(windows, target_os = "macos"))]
     pub(crate) fn create_with_baseline(
         project_root: &Path,
         src_dir: &Path,
@@ -296,6 +300,15 @@ impl ExportProjectStage {
         baseline: PublishBaseline<'_>,
     ) -> Result<Self> {
         Self::create_inner(project_root, src_dir, services, true, false, Some(baseline))
+    }
+
+    pub(crate) fn create_with_baseline_background(
+        project_root: &Path,
+        src_dir: &Path,
+        services: &[String],
+        baseline: PublishBaseline<'_>,
+    ) -> Result<Self> {
+        Self::create_inner(project_root, src_dir, services, true, true, Some(baseline))
     }
 
     /// Like `create`, but copies existing files in the background. Only callers
@@ -314,8 +327,14 @@ impl ExportProjectStage {
             .map(|copy| Arc::new(move || copy.wait()) as crate::snapshot::import::ImportReadyGate)
     }
 
-    fn wait_for_copy(&self) -> Result<()> {
+    pub(crate) fn wait_for_copy(&self) -> Result<()> {
         self.copy.as_ref().map_or(Ok(()), StageCopy::wait)
+    }
+
+    pub(crate) fn virtual_scripts(
+        &self,
+    ) -> Option<&Arc<crate::snapshot::import::VirtualScriptStage>> {
+        self.virtual_scripts.as_ref()
     }
 
     pub(crate) fn create_for_comparison(
@@ -388,7 +407,9 @@ impl ExportProjectStage {
         let publish_baseline = match baseline {
             _ if !clone_project_data => BTreeMap::new(),
             Some(baseline) => baseline(&publish_paths)?,
-            None => collect_publish_hashes(project_root, &publish_paths)?,
+            None => {
+                collect_publish_entries(project_root, &publish_paths, Some(SystemTime::now()))?.0
+            }
         };
         // Loading the staged project below reads its configuration files, and a
         // temporary projection, tree nodes or mounts can read staged data too.
@@ -402,6 +423,28 @@ impl ExportProjectStage {
                         && !config::project_requires_temporary_stage(loaded)?,
                 )
             })?;
+        let mut virtual_service_dirs: Vec<PathBuf> = services
+            .iter()
+            .map(|service| src_dir.join(sanitize_name(service)))
+            .collect();
+        normalize_owned_paths(&mut virtual_service_dirs);
+        let virtual_service_dir_set: HashSet<PathBuf> = virtual_service_dirs.into_iter().collect();
+        let has_covering_parent_clone = clone_paths.iter().any(|rel| {
+            virtual_service_dir_set
+                .iter()
+                .any(|vdir| vdir != rel && vdir.starts_with(rel))
+        });
+        let use_virtual_scripts = background_copy
+            && clone_project_data
+            && !virtual_service_dir_set.is_empty()
+            && !has_covering_parent_clone
+            && !project_root.join("renium-link.json").exists()
+            && loaded
+                .as_ref()
+                .is_none_or(|loaded| loaded.project.adapters.is_empty())
+            && !publish_baseline
+                .values()
+                .any(|state| matches!(state, PublishEntryState::Symlink(_)));
         let mut deferred = Vec::new();
         for relative in &clone_paths {
             let source = project_root.join(relative);
@@ -411,6 +454,25 @@ impl ExportProjectStage {
                 .and_then(|name| name.to_str())
                 .is_some_and(is_service_settings_file_name);
             match fs::symlink_metadata(&source) {
+                Ok(metadata)
+                    if use_virtual_scripts
+                        && metadata.is_dir()
+                        && virtual_service_dir_set.contains(relative) =>
+                {
+                    fs::create_dir_all(&destination)
+                        .with_context(|| format!("Failed to create {}", destination.display()))?;
+                    for store_rel in publish_baseline.keys() {
+                        if store_rel.starts_with(relative)
+                            && store_rel
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(is_service_settings_file_name)
+                        {
+                            deferred
+                                .push((project_root.join(store_rel), staged_root.join(store_rel)));
+                        }
+                    }
+                }
                 Ok(metadata) if background_copy && (metadata.is_dir() || is_store) => {
                     deferred.push((source, destination));
                 }
@@ -459,6 +521,13 @@ impl ExportProjectStage {
         } else {
             Some(StageCopy::spawn(deferred)?)
         };
+        let virtual_scripts = use_virtual_scripts.then(|| {
+            Arc::new(crate::snapshot::import::VirtualScriptStage::new(
+                project_root.to_path_buf(),
+                staged_root.clone(),
+                Arc::new(publish_baseline.clone()),
+            ))
+        });
         cleanup.disarm();
         drop(cleanup);
         let stage = Self {
@@ -469,6 +538,7 @@ impl ExportProjectStage {
             import_src_dir,
             publish_paths,
             publish_baseline,
+            virtual_scripts,
             loaded: staged_loaded,
             projection,
             settings_already_aligned: false,
@@ -494,7 +564,8 @@ impl ExportProjectStage {
     /// The project's source root a capture into this stage keeps the script
     /// file layout of, when the stage carries no copy of the project's files.
     pub(crate) fn layout_src_root(&self, project_root: &Path) -> Option<PathBuf> {
-        (!self.holds_project_files && self.import_project_root == self.project_root)
+        ((!self.holds_project_files || self.virtual_scripts.is_some())
+            && self.import_project_root == self.project_root)
             .then(|| project_root.join(&self.import_src_dir))
     }
 
@@ -796,12 +867,46 @@ impl ExportProjectStage {
             );
         };
         let phase = Instant::now();
+        let virtual_scripts = self.virtual_scripts.take();
+        let non_virtual_staged_paths: Vec<PathBuf> = match &virtual_scripts {
+            Some(vs) => {
+                let roots = vs.virtual_roots.lock_recover();
+                let mut paths: Vec<PathBuf> = self
+                    .publish_paths
+                    .iter()
+                    .filter(|path| !roots.iter().any(|root| path.starts_with(root)))
+                    .cloned()
+                    .collect();
+                for root in roots.iter() {
+                    let dir = self.project_root.join(root);
+                    if let Ok(entries) = fs::read_dir(&dir) {
+                        for entry in entries.flatten() {
+                            if entry
+                                .file_name()
+                                .to_str()
+                                .is_some_and(is_service_settings_file_name)
+                            {
+                                paths.push(root.join(entry.file_name()));
+                            }
+                        }
+                    }
+                }
+                paths
+            }
+            None => self.publish_paths.clone(),
+        };
         let (current, staged) = rayon::join(
             || collect_publish_hashes(project_root, &self.publish_paths),
-            || collect_publish_hashes(&self.project_root, &self.publish_paths),
+            || collect_publish_hashes(&self.project_root, &non_virtual_staged_paths),
         );
         let mut current = current?;
         let mut staged = staged?;
+        if let Some(vs) = &virtual_scripts {
+            let entries = vs.staged_entries.lock_recover();
+            for (path, state) in entries.iter() {
+                staged.insert(path.clone(), state.clone());
+            }
+        }
         log_phase("current+staged hashes", phase);
         ensure_publish_entries_unchanged(&self.publish_baseline, &current, &self.publish_paths)?;
         let backup_root = self.container.join("previous");
@@ -876,7 +981,7 @@ impl ExportProjectStage {
             &current,
             &staged,
         );
-        let directory_swaps = publish_directory_swaps(
+        let mut directory_swaps = publish_directory_swaps(
             project_root,
             &self.project_root,
             &self.publish_paths,
@@ -884,6 +989,9 @@ impl ExportProjectStage {
             &staged,
             &operation_paths,
         )?;
+        if let Some(vs) = &virtual_scripts {
+            directory_swaps.retain(|dir| !vs.has_skipped_under(dir));
+        }
         let mut write_paths = operation_paths
             .iter()
             .map(|path| {
@@ -902,6 +1010,8 @@ impl ExportProjectStage {
             .filter(|path| path.as_path() != Path::new("sourcemap.json"))
             .cloned()
             .collect::<Vec<_>>();
+        #[cfg(test)]
+        publication_step(PublicationStep::BeforeConcurrencyCheck);
         let (latest, stamps) =
             collect_publish_entries(project_root, &concurrency_paths, Some(SystemTime::now()))?;
         ensure_publish_entries_unchanged(&current, &latest, &concurrency_paths)?;
@@ -1026,6 +1136,8 @@ impl ExportProjectStage {
             publish_paths: std::mem::take(&mut self.publish_paths),
             #[cfg(any(windows, target_os = "macos"))]
             settled: staged,
+            #[cfg(any(windows, target_os = "macos"))]
+            after_snapshot: None,
         })
     }
 
@@ -1393,12 +1505,47 @@ pub(crate) struct PublishedProjectChanges {
     /// paths it preserved.
     #[cfg(any(windows, target_os = "macos"))]
     pub(crate) settled: BTreeMap<PathBuf, PublishEntryState>,
+    #[cfg(any(windows, target_os = "macos"))]
+    pub(crate) after_snapshot: Option<Box<AfterPullSnapshotSlot>>,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) type AfterPullSnapshotSlot =
+    Mutex<Option<crate::automation::reconcile::ProjectSnapshot>>;
+
+#[cfg(any(windows, target_os = "macos"))]
+impl PublishedProjectChanges {
+    pub(crate) fn take_after_snapshot(
+        &self,
+    ) -> Option<crate::automation::reconcile::ProjectSnapshot> {
+        self.after_snapshot
+            .as_ref()
+            .and_then(|slot| slot.lock_recover().take())
+    }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum ExportPurpose {
     Pull,
+    #[cfg(any(windows, target_os = "macos"))]
+    PullKeepingSnapshot,
     Readback,
+}
+
+impl ExportPurpose {
+    fn is_pull(self) -> bool {
+        match self {
+            Self::Pull => true,
+            #[cfg(any(windows, target_os = "macos"))]
+            Self::PullKeepingSnapshot => true,
+            Self::Readback => false,
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn retain_after_snapshot(self) -> bool {
+        matches!(self, Self::PullKeepingSnapshot)
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -1449,51 +1596,48 @@ fn collect_publish_entries(
             continue;
         };
         if metadata.file_type().is_symlink() {
-            candidates.push((relative.clone(), path, PublishEntryKind::Symlink));
+            candidates.push((relative.clone(), path, PublishEntryKind::Symlink, None));
             continue;
         }
         if metadata.is_file() {
-            candidates.push((relative.clone(), path, PublishEntryKind::File));
+            candidates.push((
+                relative.clone(),
+                path,
+                PublishEntryKind::File,
+                file_stamp(&metadata),
+            ));
             continue;
         }
         if !metadata.is_dir() {
             continue;
         }
-        for entry in WalkDir::new(&path).follow_links(false) {
-            let entry = entry?;
-            let entry_relative = entry.path().strip_prefix(root)?.to_path_buf();
-            let kind = if entry.file_type().is_symlink() {
-                PublishEntryKind::Symlink
-            } else if entry.file_type().is_dir() {
-                PublishEntryKind::Directory
-            } else if entry.file_type().is_file() {
-                PublishEntryKind::File
-            } else {
-                continue;
-            };
-            candidates.push((entry_relative, entry.path().to_path_buf(), kind));
-        }
+        candidates.extend(walk_publish_dir_parallel(root, &path)?);
     }
-    let entries = candidates
-        .into_par_iter()
-        .map(|(relative, path, kind)| {
-            let (state, stamp) = match (kind, stamped_at) {
-                (PublishEntryKind::Directory, _) => (PublishEntryState::Directory, None),
-                (PublishEntryKind::Symlink, _) => {
-                    (PublishEntryState::Symlink(fs::read_link(path)?), None)
-                }
-                (PublishEntryKind::File, Some(read_at)) => {
-                    let mut file = fs::File::open(&path)?;
-                    let stamp = settled_stamp(&file.metadata()?, read_at);
-                    let mut bytes = Vec::new();
-                    std::io::Read::read_to_end(&mut file, &mut bytes)?;
-                    (file_publish_state(&bytes), stamp)
-                }
-                (PublishEntryKind::File, None) => (file_publish_state(&fs::read(path)?), None),
-            };
-            Ok((relative, state, stamp))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let entries = crate::snapshot::import::script_io_pool().install(|| {
+        candidates
+            .into_par_iter()
+            .map(|(relative, path, kind, quick_stamp)| {
+                let (state, stamp) = match (kind, stamped_at) {
+                    (PublishEntryKind::Directory, _) => (PublishEntryState::Directory, None),
+                    (PublishEntryKind::Symlink, _) => {
+                        (PublishEntryState::Symlink(fs::read_link(path)?), None)
+                    }
+                    (PublishEntryKind::File, Some(read_at)) => {
+                        let bytes = fs::read(&path)?;
+                        let stamp = quick_stamp.filter(|(len, modified)| {
+                            *len == bytes.len() as u64
+                                && read_at
+                                    .duration_since(*modified)
+                                    .is_ok_and(|age| age > STAMP_SETTLES)
+                        });
+                        (file_publish_state(&bytes), stamp)
+                    }
+                    (PublishEntryKind::File, None) => (file_publish_state(&fs::read(path)?), None),
+                };
+                Ok((relative, state, stamp))
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
     let mut states = BTreeMap::new();
     let mut stamps = BTreeMap::new();
     for (relative, state, stamp) in entries {
@@ -1505,18 +1649,57 @@ fn collect_publish_entries(
     Ok((states, stamps))
 }
 
-fn file_stamp(metadata: &fs::Metadata) -> Option<FileStamp> {
-    Some((metadata.len(), metadata.modified().ok()?))
+type PublishCandidate = (PathBuf, PathBuf, PublishEntryKind, Option<FileStamp>);
+
+fn walk_publish_dir_parallel(root: &Path, dir: &Path) -> Result<Vec<PublishCandidate>> {
+    let mut results = Vec::new();
+    let root_rel = dir.strip_prefix(root)?.to_path_buf();
+    results.push((
+        root_rel,
+        dir.to_path_buf(),
+        PublishEntryKind::Directory,
+        None,
+    ));
+    let mut frontier = vec![dir.to_path_buf()];
+    while !frontier.is_empty() {
+        let level = crate::snapshot::import::script_io_pool().install(|| {
+            frontier
+                .par_iter()
+                .map(|folder| -> Result<(Vec<PublishCandidate>, Vec<PathBuf>)> {
+                    let mut entries = Vec::new();
+                    let mut subdirs = Vec::new();
+                    for entry in fs::read_dir(folder)? {
+                        let entry = entry?;
+                        let path = entry.path();
+                        let relative = path.strip_prefix(root)?.to_path_buf();
+                        let file_type = entry.file_type()?;
+                        if file_type.is_symlink() {
+                            entries.push((relative, path, PublishEntryKind::Symlink, None));
+                        } else if file_type.is_dir() {
+                            subdirs.push(path.clone());
+                            entries.push((relative, path, PublishEntryKind::Directory, None));
+                        } else if file_type.is_file() {
+                            let stamp = fs::symlink_metadata(&path)
+                                .ok()
+                                .and_then(|meta| file_stamp(&meta));
+                            entries.push((relative, path, PublishEntryKind::File, stamp));
+                        }
+                    }
+                    Ok((entries, subdirs))
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        frontier = Vec::new();
+        for (mut entries, subdirs) in level {
+            results.append(&mut entries);
+            frontier.extend(subdirs);
+        }
+    }
+    Ok(results)
 }
 
-/// The stamp of a file read at `read_at`, where its last write is old enough
-/// that a write after the read changes it.
-fn settled_stamp(metadata: &fs::Metadata, read_at: SystemTime) -> Option<FileStamp> {
-    file_stamp(metadata).filter(|(_, modified)| {
-        read_at
-            .duration_since(*modified)
-            .is_ok_and(|age| age > STAMP_SETTLES)
-    })
+fn file_stamp(metadata: &fs::Metadata) -> Option<FileStamp> {
+    Some((metadata.len(), metadata.modified().ok()?))
 }
 
 /// Checks that what was moved aside to `relative` under `backup_root` is
@@ -2277,11 +2460,13 @@ pub(crate) fn prepare_export_execution(
     );
     let workers = resolve_direct_import_workers();
     println!("[renium] direct import workers during export: {workers}");
+    let virtual_scripts = project_stage.virtual_scripts.clone();
     let direct_import_dispatcher = DirectImportDispatcher::start(
         DirectImportRoots {
             project_root: import_project_root.clone(),
             src_dir: import_src_dir,
             layout_src_root: layout_src_root.map(Path::to_path_buf),
+            virtual_scripts,
         },
         workers,
         workers,
@@ -2374,6 +2559,7 @@ fn export_snapshots_core(
     purpose: ExportPurpose,
     before_publish: &mut dyn FnMut() -> Result<()>,
 ) -> Result<PublishedProjectChanges> {
+    let _deferred_state_drops = crate::snapshot::import::DeferredDropGuard::enter();
     let ExportPrelude {
         total_started,
         project_root,
@@ -2408,7 +2594,7 @@ fn export_snapshots_core(
         &services,
         total_started,
     )?;
-    if matches!(purpose, ExportPurpose::Pull) {
+    if purpose.is_pull() {
         project_stage.prepare_read_only_links(&project_root, &args.src_dir, &services)?;
         project_stage.preserve_project_paths(args.preserve_paths.clone());
         project_stage.keep_local_only_scripts(args.keep_local_only_scripts);
@@ -2454,11 +2640,12 @@ fn export_snapshots_core(
         dispatcher_drain_ms,
         sourcemap_finalize_ms,
     } = finish_export_import(direct_import_dispatcher, sourcemap_writer)?;
-    let (published, sync_completion_ms) = finish_export_publication(
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(unused_mut))]
+    let (mut published, sync_completion_ms) = finish_export_publication(
         Some(project_stage),
         &project_root,
         repair_reference_paths,
-        matches!(purpose, ExportPurpose::Pull).then_some(args.src_dir.as_path()),
+        purpose.is_pull().then_some(args.src_dir.as_path()),
         move || {
             if let Some(mut guard) = native_finish_guard.take() {
                 finish_native_export(&mut guard)?;
@@ -2467,6 +2654,8 @@ fn export_snapshots_core(
         },
         || record_bridge_sync_completion(bridge),
     )?;
+    #[cfg(any(windows, target_os = "macos"))]
+    finalize_published_after_snapshot(&mut published, purpose);
 
     let total_run_ms = elapsed_ms(total_started);
     let handshake_ms = all_channels_connected_to_bridge_info_ms;
@@ -2505,6 +2694,16 @@ fn export_snapshots_core(
     Ok(published)
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+fn finalize_published_after_snapshot(
+    published: &mut PublishedProjectChanges,
+    purpose: ExportPurpose,
+) {
+    if !purpose.retain_after_snapshot() {
+        published.after_snapshot = None;
+    }
+}
+
 /// A pull that cannot record its undo entry keeps the replaced files in the
 /// export's recovery folder and says so, instead of failing after the write.
 fn record_pull_undo_history(
@@ -2512,13 +2711,19 @@ fn record_pull_undo_history(
     source: &Path,
     published: &mut PublishedProjectChanges,
 ) {
-    let error = match crate::automation::reconcile::history::record_published_files(
+    let error = match crate::automation::reconcile::history::record_published_files_with_snapshot(
         project_root,
         source,
         published,
     ) {
-        Ok(id) => {
+        Ok((id, snapshot)) => {
             published.history_id = id;
+            #[cfg(any(windows, target_os = "macos"))]
+            if let Some(snapshot) = snapshot {
+                published.after_snapshot = Some(Box::new(Mutex::new(Some(snapshot))));
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
+            let _ = snapshot;
             return;
         }
         Err(error) => error,
@@ -4076,6 +4281,550 @@ mod publication_tests {
         assert_eq!(
             workspace.instances[1].properties["Value"],
             reference("Renamed")
+        );
+    }
+
+    #[test]
+    fn export_virtual_script_stage_skips_unchanged_and_publishes_changes() {
+        use crate::snapshot::import::import_service_state_with_sourcemap_virtual;
+        use crate::snapshot::types::SnapshotInstance;
+        let mut fixture = Fixture::new();
+        drop(fixture.stage.take());
+        let service_dir = fixture.root.join("src/ReplicatedStorage");
+        fs::write(service_dir.join("Keep.luau"), "return 'same'\n").unwrap();
+        fs::write(service_dir.join("Edit.luau"), "return 'before'\n").unwrap();
+        fs::write(service_dir.join("Gone.luau"), "return 'gone'\n").unwrap();
+
+        let make_state = || {
+            let module = |id: usize, name: &str, source: &str| SnapshotInstance {
+                name: name.into(),
+                class_name: "ModuleScript".into(),
+                instance_index: Some(id),
+                parent_index: Some(1),
+                properties: serde_json::Map::from_iter([("Source".into(), json!(source))]),
+                ..Default::default()
+            };
+            build_service_state_from_instances(
+                "ReplicatedStorage",
+                None,
+                vec![
+                    SnapshotInstance {
+                        name: "ReplicatedStorage".into(),
+                        class_name: "ReplicatedStorage".into(),
+                        instance_index: Some(1),
+                        ..Default::default()
+                    },
+                    module(2, "Keep", "return 'same'\n"),
+                    module(3, "Edit", "return 'after'\n"),
+                    module(4, "Added", "return 'added'\n"),
+                ],
+                HashMap::new(),
+                true,
+            )
+            .unwrap()
+        };
+
+        let store_gate = Mutex::new(());
+        let stage = ExportProjectStage::create_with_background_copy(
+            &fixture.root,
+            Path::new("src"),
+            &["ReplicatedStorage".into()],
+        )
+        .unwrap();
+        stage.wait_for_copy().unwrap();
+        let vs = stage
+            .virtual_scripts
+            .clone()
+            .expect("plain layout must use VirtualScriptStage");
+        let stage_src = stage.import_project_root.join(&stage.import_src_dir);
+        import_service_state_with_sourcemap_virtual(
+            make_state(),
+            &stage.import_project_root,
+            &stage_src,
+            Some(&fixture.root.join("src")),
+            "ReplicatedStorage",
+            &store_gate,
+            Some(&vs),
+        )
+        .unwrap();
+
+        let keep_rel = PathBuf::from("src/ReplicatedStorage/Keep.luau");
+        assert!(
+            vs.skipped_paths.lock_recover().contains(&keep_rel),
+            "unchanged script must be skipped by VirtualScriptStage"
+        );
+        assert!(
+            !stage.project_root.join(&keep_rel).exists(),
+            "unchanged script must not be materialized in stage"
+        );
+
+        let published = stage.publish(&fixture.root, false).unwrap();
+        assert!(
+            fixture
+                .root
+                .join("instances/ReplicatedStorage.renium")
+                .is_file(),
+            "configured settings store must be published under VirtualScriptStage"
+        );
+        assert_eq!(
+            fs::read_to_string(service_dir.join("Keep.luau")).unwrap(),
+            "return 'same'\n"
+        );
+        assert_eq!(
+            fs::read_to_string(service_dir.join("Edit.luau")).unwrap(),
+            "return 'after'\n"
+        );
+        assert_eq!(
+            fs::read_to_string(service_dir.join("Added.luau")).unwrap(),
+            "return 'added'\n"
+        );
+        assert!(!service_dir.join("Gone.luau").exists());
+        assert!(!published.changed_roots.contains(&keep_rel));
+
+        fs::remove_file(fixture.root.join("renium.project.jsonc")).unwrap();
+        let stage_inline = ExportProjectStage::create_with_background_copy(
+            &fixture.root,
+            Path::new("src"),
+            &["ReplicatedStorage".into()],
+        )
+        .unwrap();
+        stage_inline.wait_for_copy().unwrap();
+        let vs_inline = stage_inline.virtual_scripts.clone().unwrap();
+        let stage_inline_src = stage_inline
+            .import_project_root
+            .join(&stage_inline.import_src_dir);
+        import_service_state_with_sourcemap_virtual(
+            make_state(),
+            &stage_inline.import_project_root,
+            &stage_inline_src,
+            Some(&fixture.root.join("src")),
+            "ReplicatedStorage",
+            &store_gate,
+            Some(&vs_inline),
+        )
+        .unwrap();
+        stage_inline.publish(&fixture.root, false).unwrap();
+        assert!(
+            service_dir.join("__roblox_sync_settings.renium").is_file(),
+            "inline settings file must be published under VirtualScriptStage"
+        );
+        assert!(
+            vs_inline.skipped_paths.lock_recover().contains(&keep_rel),
+            "unchanged script must still be skipped in inline settings layout"
+        );
+
+        let stage2 = ExportProjectStage::create_with_background_copy(
+            &fixture.root,
+            Path::new("src"),
+            &["ReplicatedStorage".into()],
+        )
+        .unwrap();
+        stage2.wait_for_copy().unwrap();
+        let vs2 = stage2.virtual_scripts.clone().unwrap();
+        let stage2_src = stage2.import_project_root.join(&stage2.import_src_dir);
+        import_service_state_with_sourcemap_virtual(
+            make_state(),
+            &stage2.import_project_root,
+            &stage2_src,
+            Some(&fixture.root.join("src")),
+            "ReplicatedStorage",
+            &store_gate,
+            Some(&vs2),
+        )
+        .unwrap();
+        fs::write(service_dir.join("Keep.luau"), "return 'concurrent'\n").unwrap();
+        let err = stage2
+            .publish(&fixture.root, false)
+            .err()
+            .expect("concurrent edit must fail publication");
+        assert!(
+            err.to_string().contains("Project files changed"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn preserved_path_and_same_size_mtime_replacement_are_detected_on_next_pull() {
+        use crate::snapshot::import::import_service_state_with_sourcemap_virtual;
+        use crate::snapshot::types::SnapshotInstance;
+        let mut fixture = Fixture::new();
+        drop(fixture.stage.take());
+        let service_dir = fixture.root.join("src").join("ReplicatedStorage");
+        fs::create_dir_all(&service_dir).unwrap();
+        let kept_rel = PathBuf::from("src/ReplicatedStorage/LocalOnly.luau");
+        let kept_abs = fixture.root.join(&kept_rel);
+        fs::write(&kept_abs, "return 'local-v1'\n").unwrap();
+        let old_time = SystemTime::now() - Duration::from_secs(10);
+        let f = fs::OpenOptions::new().write(true).open(&kept_abs).unwrap();
+        f.set_modified(old_time).unwrap();
+        drop(f);
+
+        let make_state = |body: &str| {
+            build_service_state_from_instances(
+                "ReplicatedStorage",
+                None,
+                vec![
+                    SnapshotInstance {
+                        name: "ReplicatedStorage".into(),
+                        class_name: "ReplicatedStorage".into(),
+                        instance_index: Some(1),
+                        ..Default::default()
+                    },
+                    SnapshotInstance {
+                        name: "LocalOnly".into(),
+                        class_name: "ModuleScript".into(),
+                        instance_index: Some(2),
+                        parent_index: Some(1),
+                        properties: serde_json::Map::from_iter([("Source".into(), json!(body))]),
+                        ..Default::default()
+                    },
+                ],
+                HashMap::new(),
+                true,
+            )
+            .unwrap()
+        };
+
+        let store_gate = Mutex::new(());
+        for round in 1..=2 {
+            let mut stage = ExportProjectStage::create_with_background_copy(
+                &fixture.root,
+                Path::new("src"),
+                &["ReplicatedStorage".into()],
+            )
+            .unwrap();
+            stage.preserve_project_paths(vec![kept_rel.clone()]);
+            stage.wait_for_copy().unwrap();
+            let vs = stage.virtual_scripts.clone().unwrap();
+            let stage_src = stage.import_project_root.join(&stage.import_src_dir);
+            import_service_state_with_sourcemap_virtual(
+                make_state("return 'studio-v1'\n"),
+                &stage.import_project_root,
+                &stage_src,
+                Some(&fixture.root.join("src")),
+                "ReplicatedStorage",
+                &store_gate,
+                Some(&vs),
+            )
+            .unwrap();
+            let published = stage.publish(&fixture.root, false).unwrap();
+            assert!(
+                published.preserved.contains(&kept_rel),
+                "R3 round {round}: kept-back path must still be reported in preserved"
+            );
+            assert_eq!(
+                fs::read_to_string(&kept_abs).unwrap(),
+                "return 'local-v1'\n"
+            );
+        }
+
+        let stage = ExportProjectStage::create_with_background_copy(
+            &fixture.root,
+            Path::new("src"),
+            &["ReplicatedStorage".into()],
+        )
+        .unwrap();
+        stage.wait_for_copy().unwrap();
+        let vs = stage.virtual_scripts.clone().unwrap();
+        let stage_src = stage.import_project_root.join(&stage.import_src_dir);
+        import_service_state_with_sourcemap_virtual(
+            make_state("return 'studio-v1'\n"),
+            &stage.import_project_root,
+            &stage_src,
+            Some(&fixture.root.join("src")),
+            "ReplicatedStorage",
+            &store_gate,
+            Some(&vs),
+        )
+        .unwrap();
+        fs::write(&kept_abs, "return 'local-v2'\n").unwrap();
+        let f = fs::OpenOptions::new().write(true).open(&kept_abs).unwrap();
+        f.set_modified(old_time).unwrap();
+        drop(f);
+        let Err(err) = stage.publish(&fixture.root, false) else {
+            panic!(
+                "#8/R7: same-size + same-mtime concurrent edit before swap must make publish refuse"
+            );
+        };
+        assert!(
+            format!("{err:#}").contains("changed while Studio export was running")
+                || format!("{err:#}").contains("changed while Studio export was publishing"),
+            "#8/R7: unexpected publish refusal error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn virtual_script_stage_handles_dot_source_root_deletions_and_windows_case_only_names() {
+        use crate::snapshot::import::import_service_state_with_sourcemap_virtual;
+        use crate::snapshot::types::SnapshotInstance;
+        let mut fixture = Fixture::new();
+        drop(fixture.stage.take());
+        let _ = fs::remove_file(fixture.root.join("renium.project.jsonc"));
+        let service_dir = fixture.root.join("ReplicatedStorage");
+        fs::create_dir_all(&service_dir).unwrap();
+        fs::write(service_dir.join("Keep.luau"), "return 'keep'\n").unwrap();
+        fs::write(service_dir.join("Deleted.luau"), "return 'gone'\n").unwrap();
+
+        let stage = ExportProjectStage::create_with_background_copy(
+            &fixture.root,
+            Path::new("."),
+            &["ReplicatedStorage".into()],
+        )
+        .unwrap();
+        stage.wait_for_copy().unwrap();
+        let vs = stage.virtual_scripts.clone().unwrap();
+        let stage_src = stage.import_project_root.join(&stage.import_src_dir);
+        let state = build_service_state_from_instances(
+            "ReplicatedStorage",
+            None,
+            vec![
+                SnapshotInstance {
+                    name: "ReplicatedStorage".into(),
+                    class_name: "ReplicatedStorage".into(),
+                    instance_index: Some(1),
+                    ..Default::default()
+                },
+                SnapshotInstance {
+                    name: "Keep".into(),
+                    class_name: "ModuleScript".into(),
+                    instance_index: Some(2),
+                    parent_index: Some(1),
+                    properties: serde_json::Map::from_iter([(
+                        "Source".into(),
+                        json!("return 'keep'\n"),
+                    )]),
+                    ..Default::default()
+                },
+            ],
+            HashMap::new(),
+            true,
+        )
+        .unwrap();
+        let store_gate = Mutex::new(());
+        import_service_state_with_sourcemap_virtual(
+            state,
+            &stage.import_project_root,
+            &stage_src,
+            Some(&fixture.root),
+            "ReplicatedStorage",
+            &store_gate,
+            Some(&vs),
+        )
+        .unwrap();
+        stage.publish(&fixture.root, false).unwrap();
+        assert!(service_dir.join("Keep.luau").is_file());
+        assert!(
+            !service_dir.join("Deleted.luau").exists(),
+            "R4: source root '.' must delete files removed in Studio instead of putting them back"
+        );
+
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let mut case_fixture = Fixture::new();
+            drop(case_fixture.stage.take());
+            let case_dir = case_fixture.root.join("src/ReplicatedStorage");
+            fs::create_dir_all(&case_dir).unwrap();
+            fs::write(case_dir.join("foo.luau"), "return 1\n").unwrap();
+            let stage = ExportProjectStage::create_with_background_copy(
+                &case_fixture.root,
+                Path::new("src"),
+                &["ReplicatedStorage".to_string()],
+            )
+            .unwrap();
+            stage.wait_for_copy().unwrap();
+            let vs = stage.virtual_scripts.clone().unwrap();
+            let stage_src = stage.import_project_root.join(&stage.import_src_dir);
+            let state = build_service_state_from_instances(
+                "ReplicatedStorage",
+                None,
+                vec![
+                    SnapshotInstance {
+                        name: "ReplicatedStorage".into(),
+                        class_name: "ReplicatedStorage".into(),
+                        instance_index: Some(1),
+                        ..Default::default()
+                    },
+                    SnapshotInstance {
+                        name: "Foo".into(),
+                        class_name: "ModuleScript".into(),
+                        instance_index: Some(2),
+                        parent_index: Some(1),
+                        properties: serde_json::Map::from_iter([(
+                            "Source".into(),
+                            json!("return 1\n"),
+                        )]),
+                        ..Default::default()
+                    },
+                ],
+                HashMap::new(),
+                true,
+            )
+            .unwrap();
+            let store_gate = Mutex::new(());
+            import_service_state_with_sourcemap_virtual(
+                state,
+                &stage.import_project_root,
+                &stage_src,
+                Some(&case_fixture.root),
+                "ReplicatedStorage",
+                &store_gate,
+                Some(&vs),
+            )
+            .unwrap();
+            let published = stage.publish(&case_fixture.root, false).unwrap();
+            assert!(
+                case_dir.join("foo.luau").is_file() || case_dir.join("Foo.luau").is_file(),
+                "R4: case-only script difference must not delete the file during publish"
+            );
+            assert!(
+                !published
+                    .changed_roots
+                    .iter()
+                    .any(|p| p.ends_with("foo.luau") || p.ends_with("Foo.luau")),
+                "R4: unchanged case-only match on case-insensitive FS must not emit add+delete"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_detects_same_size_and_same_mtime_file_replacement_between_stage_and_publish() {
+        let mut fixture = Fixture::new();
+        drop(fixture.stage.take());
+        let service_dir = fixture.root.join("src/ReplicatedStorage");
+        fs::create_dir_all(&service_dir).unwrap();
+        let script_path = service_dir.join("Main.luau");
+        fs::write(&script_path, "return 1\n").unwrap();
+        let fixed_time = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(&script_path)
+            .unwrap();
+        f.set_modified(fixed_time).unwrap();
+        drop(f);
+
+        let stage = ExportProjectStage::create(
+            &fixture.root,
+            Path::new("src"),
+            &["ReplicatedStorage".to_string()],
+        )
+        .unwrap();
+        fs::write(
+            stage.project_root.join("src/ReplicatedStorage/Main.luau"),
+            "return 999\n",
+        )
+        .unwrap();
+        fs::write(&script_path, "return 2\n").unwrap();
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(&script_path)
+            .unwrap();
+        f.set_modified(fixed_time).unwrap();
+        drop(f);
+
+        let result = stage.publish(&fixture.root, false);
+        assert!(
+            result.is_err(),
+            "Reconcile 1/R7: publish must reject same-size same-mtime replacement made after stage creation"
+        );
+        assert_eq!(
+            fs::read_to_string(&script_path).unwrap(),
+            "return 2\n",
+            "user's same-size same-mtime replacement must be preserved"
+        );
+    }
+
+    #[test]
+    fn publish_runs_second_concurrency_scan_before_swap_even_without_aligned_entries() {
+        let mut fixture = Fixture::new();
+        drop(fixture.stage.take());
+        let service_dir = fixture.root.join("src/ReplicatedStorage");
+        fs::create_dir_all(&service_dir).unwrap();
+        let script_path = service_dir.join("Race.luau");
+        let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        fs::write(&script_path, "return 'before1'\n").unwrap();
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(&script_path)
+            .unwrap();
+        f.set_modified(fixed_time).unwrap();
+        drop(f);
+
+        let stage = ExportProjectStage::create(
+            &fixture.root,
+            Path::new("src"),
+            &["ReplicatedStorage".to_string()],
+        )
+        .unwrap();
+        fs::write(
+            stage.project_root.join("src/ReplicatedStorage/Race.luau"),
+            "return 'staged!'\n",
+        )
+        .unwrap();
+
+        let race_path = script_path.clone();
+        let mut injected = false;
+        let _hook = hook_publication_steps(Box::new(move |step: &PublicationStep| {
+            if *step == PublicationStep::BeforeConcurrencyCheck && !injected {
+                injected = true;
+                fs::write(&race_path, "return 'before2'\n").unwrap();
+                let f = fs::OpenOptions::new().write(true).open(&race_path).unwrap();
+                f.set_modified(fixed_time).unwrap();
+                drop(f);
+            }
+        }));
+        let Err(err) = stage.publish(&fixture.root, false) else {
+            panic!(
+                "#8: same-size same-mtime edit right before second scan must make publish refuse"
+            );
+        };
+        assert!(
+            err.downcast_ref::<ProjectFilesChanged>().is_some()
+                || format!("{err:#}").contains("changed"),
+            "#8: unexpected error: {err:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&script_path).unwrap(),
+            "return 'before2'\n",
+            "#8: user's concurrent edit must remain intact on disk"
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn export_purpose_retains_after_snapshot_only_for_pull_keeping_snapshot() {
+        let make_published = || PublishedProjectChanges {
+            changed_roots: Vec::new(),
+            expected: BTreeMap::new(),
+            read_only_links_restored: Vec::new(),
+            studio_overrides: BTreeMap::new(),
+            preserved: Vec::new(),
+            history_id: None,
+            previous: None,
+            publish_paths: Vec::new(),
+            settled: BTreeMap::new(),
+            after_snapshot: Some(Box::new(Mutex::new(Some(
+                crate::automation::reconcile::ProjectSnapshot::default(),
+            )))),
+        };
+        let mut pull = make_published();
+        finalize_published_after_snapshot(&mut pull, ExportPurpose::Pull);
+        assert!(
+            pull.after_snapshot.is_none(),
+            "R11: Pull must drop after_snapshot"
+        );
+
+        let mut readback = make_published();
+        finalize_published_after_snapshot(&mut readback, ExportPurpose::Readback);
+        assert!(
+            readback.after_snapshot.is_none(),
+            "R11: Readback must drop after_snapshot"
+        );
+
+        let mut keep = make_published();
+        finalize_published_after_snapshot(&mut keep, ExportPurpose::PullKeepingSnapshot);
+        assert!(
+            keep.after_snapshot.is_some(),
+            "R11: PullKeepingSnapshot must keep after_snapshot"
         );
     }
 }

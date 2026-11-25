@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -418,6 +418,131 @@ pub(crate) struct EditorSourcePathSpec {
 }
 
 #[derive(Default)]
+pub(crate) struct VirtualStageFiles {
+    stage_root_keys: Vec<String>,
+    files: HashMap<String, Vec<u8>>,
+    dirs: HashSet<String>,
+}
+
+impl VirtualStageFiles {
+    fn normalized_root_key(path: &Path) -> String {
+        let stripped = crate::system::files::strip_extended_prefix(path.to_path_buf());
+        crate::system::files::path_key(&stripped)
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    fn normalized_rel_key(rel: &Path) -> String {
+        crate::system::files::path_key(rel)
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    pub(crate) fn new(stage_root: &Path) -> Self {
+        let mut stage_root_keys = Vec::with_capacity(2);
+        let raw_key = Self::normalized_root_key(stage_root);
+        if !raw_key.is_empty() {
+            stage_root_keys.push(raw_key);
+        }
+        if let Ok(canonical) = crate::system::files::canonical_path(stage_root) {
+            let canon_key = Self::normalized_root_key(&canonical);
+            if !canon_key.is_empty() && !stage_root_keys.contains(&canon_key) {
+                stage_root_keys.push(canon_key);
+            }
+        }
+        Self {
+            stage_root_keys,
+            files: HashMap::new(),
+            dirs: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn insert_file(&mut self, rel: &Path, bytes: Vec<u8>) {
+        self.files.insert(Self::normalized_rel_key(rel), bytes);
+    }
+
+    pub(crate) fn insert_dir(&mut self, rel: &Path) {
+        self.dirs.insert(Self::normalized_rel_key(rel));
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.dirs.is_empty()
+    }
+
+    pub(crate) fn relative_key(&self, path: &Path) -> Option<String> {
+        let stripped = crate::system::files::strip_extended_prefix(path.to_path_buf());
+        let key = crate::system::files::path_key(&stripped);
+        let trimmed = key.trim_end_matches('/');
+        for root_key in &self.stage_root_keys {
+            if let Some(rest) = trimmed.strip_prefix(root_key.as_str())
+                && let Some(after) = rest.strip_prefix('/')
+                && !after.is_empty()
+            {
+                return Some(after.to_string());
+            }
+        }
+        None
+    }
+
+    pub(crate) fn is_dir_key(&self, rel_key: &str) -> bool {
+        self.dirs.contains(rel_key)
+    }
+
+    pub(crate) fn file_bytes_by_key(&self, rel_key: &str) -> Option<&[u8]> {
+        self.files.get(rel_key).map(Vec::as_slice)
+    }
+
+    pub(crate) fn file_bytes(&self, path: &Path) -> Option<&[u8]> {
+        let rel = self.relative_key(path)?;
+        self.files.get(&rel).map(Vec::as_slice)
+    }
+
+    pub(crate) fn read_to_string(&self, path: &Path) -> Option<anyhow::Result<String>> {
+        let bytes = self.file_bytes(path)?;
+        Some(
+            String::from_utf8(bytes.to_vec())
+                .with_context(|| format!("File {} is not valid UTF-8", path.display())),
+        )
+    }
+}
+
+#[cfg(test)]
+mod virtual_stage_files_tests {
+    use super::*;
+
+    #[test]
+    fn virtual_stage_files_matches_extended_prefix_separators_and_dirs() {
+        let dir =
+            crate::system::files::create_unique_directory(&std::env::temp_dir(), "renium-vf-test-")
+                .unwrap();
+        let mut vf = VirtualStageFiles::new(&dir);
+        vf.insert_dir(Path::new("src/ReplicatedStorage/Sub"));
+        vf.insert_file(
+            Path::new("src/ReplicatedStorage/Sub/init.server.luau"),
+            b"print(1)".to_vec(),
+        );
+        let joined = dir
+            .join("src")
+            .join("ReplicatedStorage")
+            .join("Sub")
+            .join("init.server.luau");
+        assert_eq!(vf.file_bytes(&joined), Some(b"print(1)".as_slice()));
+        let dir_path = dir.join("src").join("ReplicatedStorage").join("Sub");
+        let dir_key = vf.relative_key(&dir_path).expect("dir key");
+        assert!(vf.is_dir_key(&dir_key));
+        #[cfg(windows)]
+        {
+            let ext = PathBuf::from(format!(r"\\?\{}", joined.display()));
+            assert_eq!(vf.file_bytes(&ext), Some(b"print(1)".as_slice()));
+            let upper = PathBuf::from(joined.to_string_lossy().to_uppercase());
+            assert_eq!(vf.file_bytes(&upper), Some(b"print(1)".as_slice()));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[derive(Default)]
 pub(crate) struct PreparedEditorDocuments {
     pub(crate) documents: HashMap<String, Arc<SettingsBytecode>>,
     pub(crate) native_services: HashSet<String>,
@@ -428,6 +553,9 @@ pub(crate) struct PreparedEditorDocuments {
     /// Of those, the instances a file defines in full: what Studio holds
     /// below one and the file does not make is removed with the push.
     pub(crate) whole_instance_paths: HashSet<String>,
+    /// Script files and directories kept in memory instead of copied onto the
+    /// temporary push stage on disk.
+    pub(crate) virtual_files: Option<Arc<VirtualStageFiles>>,
 }
 
 #[derive(Clone, Debug)]
@@ -460,12 +588,32 @@ pub(crate) enum BulkPropertyValues {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BulkColumnKind {
+    Property,
+    Attribute,
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    AttributesReplace,
+    Tag,
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    AssertModelScale,
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    AssertModelPivot,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct BulkPropertyColumn {
+    pub(crate) kind: BulkColumnKind,
     pub(crate) property_name: String,
     /// 1-based indices into `EditorBulkPropertyPatch::nodes` (0 = service root).
     pub(crate) rows: Vec<u32>,
     pub(crate) values: BulkPropertyValues,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BulkPackageTarget {
+    pub(crate) path_segments: Vec<String>,
+    pub(crate) path_ordinals: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -478,6 +626,7 @@ pub(crate) struct EditorBulkPropertyPatch {
     pub(crate) instance_count: usize,
     pub(crate) expected_terrain_digest: Option<String>,
     pub(crate) return_old_values: bool,
+    pub(crate) package_targets: Vec<BulkPackageTarget>,
 }
 
 #[derive(Default)]
@@ -500,6 +649,7 @@ pub(crate) struct EditorChangeSet {
     /// The push creates and updates what the file makes; what Studio holds
     /// below such an instance beyond that is found and removed before it runs.
     pub(crate) whole_instances: Vec<(String, EditorInstancePath)>,
+    pub(crate) virtual_files: Option<Arc<VirtualStageFiles>>,
 }
 
 impl EditorChangeSet {
@@ -779,14 +929,11 @@ pub(crate) fn import_property_omissions(
     mut omitted: HashMap<String, HashSet<String>>,
     native_reader: bool,
 ) -> HashMap<String, HashSet<String>> {
-    omitted
-        .entry(IMPORT_MODEL_PIVOT.0.into())
-        .or_default()
-        .insert(IMPORT_MODEL_PIVOT.1.into());
-    // Plugin deserialization omits RobloxSecurity texture packs. The native
-    // full-place reader carries them in its payload, without per-instance
-    // protected setters after the bulk import. Keep genuine encoder omissions.
     if !native_reader {
+        omitted
+            .entry(IMPORT_MODEL_PIVOT.0.into())
+            .or_default()
+            .insert(IMPORT_MODEL_PIVOT.1.into());
         omitted
             .entry("SurfaceAppearance".into())
             .or_default()

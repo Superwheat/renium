@@ -746,6 +746,10 @@ fn settings_delta_verification(
     let entries = (before, desired, observed);
     let before_aligned = prepared.is_some();
     use crate::settings::equivalence::{holds_unread_instances, read_unread_instances};
+    let before_bytes = match before {
+        Some(SnapshotEntry::File(bytes)) => Some(bytes.as_slice()),
+        _ => None,
+    };
     let mut prepared = prepared;
     if let (
         Some(prepared),
@@ -758,9 +762,11 @@ fn settings_delta_verification(
             && let Some(verified) = rows::verified_by_rows(
                 path,
                 Some(&prepared.previous),
+                before_bytes,
                 desired_bytes,
                 observed_bytes,
                 policy,
+                false,
             )?
         {
             return Ok(verified);
@@ -775,16 +781,19 @@ fn settings_delta_verification(
             read_unread_instances(Arc::make_mut(desired), desired_bytes)?;
         }
     }
-    // A settle reads every store Studio's capture holds, most of which the
-    // push asked nothing of and prepared no documents for.
-    if !asked
-        && prepared.is_none()
-        && policy.settle
+    if prepared.is_none()
         && policy.by_rows()
         && let (Some(SnapshotEntry::File(desired_bytes)), Some(SnapshotEntry::File(observed_bytes))) =
             (desired, observed)
-        && let Some(verified) =
-            rows::verified_by_rows(path, None, desired_bytes, observed_bytes, policy)?
+        && let Some(verified) = rows::verified_by_rows(
+            path,
+            None,
+            before_bytes,
+            desired_bytes,
+            observed_bytes,
+            policy,
+            asked,
+        )?
     {
         return Ok(verified);
     }
@@ -2055,5 +2064,413 @@ pub(crate) fn retained_settings_document(document: &SettingsBytecode) -> Setting
                 instance
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod row_verify_tests {
+    use super::*;
+    use crate::settings::bytecode::{
+        SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
+        encode_settings_bytecode,
+    };
+
+    fn large_workspace_doc(count: usize) -> SettingsBytecode {
+        let mut instances = Vec::with_capacity(count + 1);
+        instances.push(SettingsBytecodeInstance::new(
+            "ws".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        ));
+        for i in 0..count {
+            let mut inst = SettingsBytecodeInstance::new(
+                format!("p-{i}"),
+                format!("P{i}"),
+                "Part".into(),
+                Some(0),
+            );
+            inst.properties.insert("Transparency".into(), json!(0.0));
+            instances.push(inst);
+        }
+        SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances,
+        }
+    }
+
+    #[test]
+    fn unprepared_asked_store_catches_extra_property_attribute_and_tag_kept_by_studio() {
+        let path = Path::new("instances/Workspace.renium");
+        let pending: Vec<PendingImportFields> = Vec::new();
+        let no_values = NewInstanceValues::default();
+        let policy = Verification::of(false, &pending, &no_values);
+
+        let mut before_doc = large_workspace_doc(4_100);
+        before_doc.instances[500]
+            .properties
+            .insert("Reflectance".into(), json!(0.5));
+        before_doc.instances[501]
+            .attributes
+            .insert("DropAttr".into(), json!("stale"));
+        before_doc.instances[502]
+            .properties
+            .insert("Tags".into(), json!(["DropTag"]));
+        let before_bytes = encode_settings_bytecode(&before_doc).unwrap();
+        let desired_doc = large_workspace_doc(4_100);
+        let desired_bytes = encode_settings_bytecode(&desired_doc).unwrap();
+
+        let mut obs_prop = desired_doc.clone();
+        obs_prop.instances[500]
+            .properties
+            .insert("Reflectance".into(), json!(0.5));
+        let obs_prop_bytes = encode_settings_bytecode(&obs_prop).unwrap();
+        let res = rows::verified_by_rows(
+            path,
+            None,
+            Some(&before_bytes),
+            &desired_bytes,
+            &obs_prop_bytes,
+            policy,
+            true,
+        )
+        .unwrap()
+        .expect("#1: large store must verify by rows without falling back to whole");
+        assert!(
+            res.mismatch
+                .as_deref()
+                .is_some_and(|m| m.contains("Reflectance")),
+            "#1: dropped property kept by Studio must be reported (got {:?})",
+            res.mismatch
+        );
+
+        let mut obs_attr = desired_doc.clone();
+        obs_attr.instances[501]
+            .attributes
+            .insert("DropAttr".into(), json!("stale"));
+        let obs_attr_bytes = encode_settings_bytecode(&obs_attr).unwrap();
+        let res = rows::verified_by_rows(
+            path,
+            None,
+            Some(&before_bytes),
+            &desired_bytes,
+            &obs_attr_bytes,
+            policy,
+            true,
+        )
+        .unwrap()
+        .expect("#1: large store must verify by rows without falling back to whole");
+        assert!(
+            res.mismatch
+                .as_deref()
+                .is_some_and(|m| m.contains("DropAttr")),
+            "#1: dropped attribute kept by Studio must be reported (got {:?})",
+            res.mismatch
+        );
+
+        let mut obs_tag = desired_doc.clone();
+        obs_tag.instances[502]
+            .properties
+            .insert("Tags".into(), json!(["DropTag"]));
+        let obs_tag_bytes = encode_settings_bytecode(&obs_tag).unwrap();
+        let res = rows::verified_by_rows(
+            path,
+            None,
+            Some(&before_bytes),
+            &desired_bytes,
+            &obs_tag_bytes,
+            policy,
+            true,
+        )
+        .unwrap()
+        .expect("#1: large store must verify by rows without falling back to whole");
+        assert!(
+            res.mismatch.as_deref().is_some_and(|m| m.contains("Tags")),
+            "#1: dropped tag kept by Studio must be reported (got {:?})",
+            res.mismatch
+        );
+    }
+
+    #[test]
+    fn large_store_unhappy_paths_verify_by_rows_without_whole_fallback() {
+        let path = Path::new("instances/Workspace.renium");
+        let pending: Vec<PendingImportFields> = Vec::new();
+        let no_values = NewInstanceValues::default();
+        let before_doc = large_workspace_doc(4_100);
+        let before_bytes = encode_settings_bytecode(&before_doc).unwrap();
+        let mut desired_doc = before_doc.clone();
+        desired_doc.instances[2_500]
+            .properties
+            .insert("Transparency".into(), json!(0.5));
+        let desired_bytes = encode_settings_bytecode(&desired_doc).unwrap();
+
+        let mut obs_diff = desired_doc.clone();
+        obs_diff.instances[2_500]
+            .properties
+            .insert("Transparency".into(), json!(0.75));
+        let obs_diff_bytes = encode_settings_bytecode(&obs_diff).unwrap();
+        let res_diff = rows::verified_by_rows(
+            path,
+            None,
+            Some(&before_bytes),
+            &desired_bytes,
+            &obs_diff_bytes,
+            Verification::of(false, &pending, &no_values),
+            false,
+        )
+        .unwrap()
+        .expect("#2(a): differing row must verify by rows without returning None");
+        assert!(
+            res_diff
+                .mismatch
+                .as_deref()
+                .is_some_and(|m| m.contains("P2499") && m.contains("Transparency")),
+            "#2(a): expected mismatch on P2499.Transparency, got {:?}",
+            res_diff.mismatch
+        );
+
+        let mut obs_extra = desired_doc.clone();
+        obs_extra.instances.push(SettingsBytecodeInstance::new(
+            "eng-extra".into(),
+            "EngineExtra".into(),
+            "Part".into(),
+            Some(0),
+        ));
+        let obs_extra_bytes = encode_settings_bytecode(&obs_extra).unwrap();
+        let res_extra = rows::verified_by_rows(
+            path,
+            None,
+            Some(&before_bytes),
+            &desired_bytes,
+            &obs_extra_bytes,
+            Verification::of(true, &pending, &no_values),
+            false,
+        )
+        .unwrap()
+        .expect("#2(b): differing row count with extra Studio instance must verify by rows without returning None");
+        assert!(
+            res_extra.mismatch.is_none() && res_extra.accepted.is_some(),
+            "#2(b): extra Studio instance must settle cleanly (mismatch={:?})",
+            res_extra.mismatch
+        );
+
+        let mut obs_removed = desired_doc.clone();
+        obs_removed.instances.remove(3_000);
+        let obs_removed_bytes = encode_settings_bytecode(&obs_removed).unwrap();
+        let res_disappeared = rows::verified_by_rows(
+            path,
+            None,
+            Some(&before_bytes),
+            &desired_bytes,
+            &obs_removed_bytes,
+            Verification::of(true, &pending, &no_values),
+            false,
+        )
+        .unwrap()
+        .expect("#2(c): missing row must verify by rows without returning None");
+        assert!(
+            res_disappeared
+                .mismatch
+                .as_deref()
+                .is_some_and(|m| m.contains("P2999") && m.contains("disappeared from Studio")),
+            "#2(c): expected disappeared from Studio mismatch, got {:?}",
+            res_disappeared.mismatch
+        );
+
+        let mut sparse_before = before_doc.clone();
+        for inst in sparse_before.instances.iter_mut().skip(1) {
+            if inst.settings_id != "p-2499" {
+                crate::settings::held::stand_unchanged(&mut inst.properties);
+            }
+        }
+        let pending_one = vec![PendingImportFields {
+            service: "Workspace".into(),
+            settings_id: Some("p-2499".into()),
+            class_name: "Part".into(),
+            path_segments: vec!["Workspace".into(), "P2499".into()],
+            path_ordinals: vec![1, 1],
+            properties: Map::from_iter([("Transparency".into(), json!(0.5))]),
+        }];
+        let res_sparse_pending = rows::verified_by_rows(
+            path,
+            Some(&sparse_before),
+            Some(&before_bytes),
+            &desired_bytes,
+            &obs_diff_bytes,
+            Verification::of(false, &pending_one, &no_values),
+            false,
+        )
+        .unwrap()
+        .expect("sparse before + pending must verify by rows without returning None");
+        assert!(
+            res_sparse_pending.mismatch.is_none(),
+            "sparse before + pending must mask pending Transparency (got {:?})",
+            res_sparse_pending.mismatch
+        );
+
+        let mut obs_reordered = desired_doc.clone();
+        obs_reordered.instances.swap(10, 11);
+        let obs_reordered_bytes = encode_settings_bytecode(&obs_reordered).unwrap();
+        let res_sparse_reordered = rows::verified_by_rows(
+            path,
+            Some(&sparse_before),
+            Some(&before_bytes),
+            &desired_bytes,
+            &obs_reordered_bytes,
+            Verification::of(true, &pending, &no_values),
+            false,
+        )
+        .unwrap()
+        .expect("sparse before + reordered settle must verify by rows without returning None");
+        assert!(
+            res_sparse_reordered.mismatch.is_none() && res_sparse_reordered.accepted.is_some(),
+            "sparse before + reordered settle must succeed (got {:?})",
+            res_sparse_reordered.mismatch
+        );
+
+        let big_before = large_workspace_doc(8_220);
+        let big_before_bytes = encode_settings_bytecode(&big_before).unwrap();
+        let mut big_desired = big_before.clone();
+        let mut big_sparse_before = big_before.clone();
+        for i in 1..big_desired.instances.len() {
+            if i <= 8_205 {
+                big_desired.instances[i]
+                    .properties
+                    .insert("Transparency".into(), json!(0.25));
+            } else {
+                crate::settings::held::stand_unchanged(
+                    &mut big_sparse_before.instances[i].properties,
+                );
+            }
+        }
+        let big_desired_bytes = encode_settings_bytecode(&big_desired).unwrap();
+        let res_sparse_many = rows::verified_by_rows(
+            path,
+            Some(&big_sparse_before),
+            Some(&big_before_bytes),
+            &big_desired_bytes,
+            &big_desired_bytes,
+            Verification::of(true, &pending, &no_values),
+            false,
+        )
+        .unwrap()
+        .expect(
+            "sparse before + >ROWS_AT_A_TIME settle must verify by rows without returning None",
+        );
+        assert!(
+            res_sparse_many.mismatch.is_none() && res_sparse_many.accepted.is_some(),
+            "sparse before + >ROWS_AT_A_TIME settle must succeed (got {:?})",
+            res_sparse_many.mismatch
+        );
+    }
+
+    #[test]
+    fn verify_general_by_rows_continues_past_cleared_new_instance_value_in_same_chunk() {
+        let path = Path::new("instances/Workspace.renium");
+        let pending: Vec<PendingImportFields> = Vec::new();
+        let before_doc = large_workspace_doc(4);
+        let before_bytes = encode_settings_bytecode(&before_doc).unwrap();
+        let mut desired_doc = before_doc.clone();
+        desired_doc.instances[1]
+            .properties
+            .insert("CastShadow".into(), json!(false));
+        desired_doc.instances[2]
+            .properties
+            .insert("Transparency".into(), json!(0.25));
+        let desired_bytes = encode_settings_bytecode(&desired_doc).unwrap();
+
+        let mut obs_doc = desired_doc.clone();
+        obs_doc.instances[1].properties.remove("CastShadow");
+        obs_doc.instances[2]
+            .properties
+            .insert("Transparency".into(), json!(0.9));
+        obs_doc.instances.push(SettingsBytecodeInstance::new(
+            "obs-extra".into(),
+            "Extra".into(),
+            "Part".into(),
+            Some(0),
+        ));
+        let obs_bytes = encode_settings_bytecode(&obs_doc).unwrap();
+
+        let values = NewInstanceValues::knowing("Part", "CastShadow", json!(false));
+        let policy = Verification::of(true, &pending, &values);
+        let res = rows::verified_by_rows(
+            path,
+            None,
+            Some(&before_bytes),
+            &desired_bytes,
+            &obs_bytes,
+            policy,
+            true,
+        )
+        .unwrap()
+        .expect("A1: must verify by rows without whole fallback");
+        assert!(
+            res.mismatch
+                .as_deref()
+                .is_some_and(|m| m.contains("P1") && m.contains("Transparency")),
+            "A1: clearing P0 (CastShadow=false) via NewInstanceValues must still catch P1.Transparency in same chunk (got {:?})",
+            res.mismatch
+        );
+    }
+
+    #[test]
+    fn align_skeleton_hydrates_namesakes_with_unique_id_on_only_one_side() {
+        let path = Path::new("instances/Workspace.renium");
+        let pending: Vec<PendingImportFields> = Vec::new();
+        let no_values = NewInstanceValues::default();
+        let mut desired = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance::new(
+                "ws".into(),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            )],
+        };
+        for (sid, tr) in [("t-a", 0.25), ("t-b", 0.75)] {
+            let mut inst =
+                SettingsBytecodeInstance::new(sid.into(), "Twin".into(), "Part".into(), Some(0));
+            inst.properties.insert("Transparency".into(), json!(tr));
+            desired.instances.push(inst);
+        }
+        let desired_bytes = encode_settings_bytecode(&desired).unwrap();
+
+        let mut observed = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance::new(
+                "obs-ws".into(),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            )],
+        };
+        for (sid, uid, tr) in [
+            ("obs-1", "fresh-uid-1", 0.75),
+            ("obs-2", "fresh-uid-2", 0.25),
+        ] {
+            let mut inst =
+                SettingsBytecodeInstance::new(sid.into(), "Twin".into(), "Part".into(), Some(0));
+            inst.properties.insert("UniqueId".into(), json!(uid));
+            inst.properties.insert("Transparency".into(), json!(tr));
+            observed.instances.push(inst);
+        }
+        observed.instances.push(SettingsBytecodeInstance::new(
+            "obs-extra".into(),
+            "Extra".into(),
+            "Part".into(),
+            Some(0),
+        ));
+        let obs_bytes = encode_settings_bytecode(&observed).unwrap();
+        let policy = Verification::of(true, &pending, &no_values);
+        let res =
+            rows::verified_by_rows(path, None, None, &desired_bytes, &obs_bytes, policy, false)
+                .unwrap()
+                .expect("A2: must verify by rows");
+        assert!(
+            res.mismatch.is_none(),
+            "A2: swapped namesakes with one-sided UniqueIds must align by value, got {:?}",
+            res.mismatch
+        );
     }
 }

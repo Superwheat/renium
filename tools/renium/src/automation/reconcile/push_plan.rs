@@ -85,6 +85,7 @@ fn editor_acknowledgment_uses_captured_and_generated_bytes_including_deletions()
 pub(crate) struct StagedPushRequest<'a> {
     pub(crate) plan: ReconcilePushPlan,
     pub(crate) prepared_documents: HashMap<String, Arc<SettingsBytecode>>,
+    pub(crate) virtual_files: Option<Arc<crate::editor::types::VirtualStageFiles>>,
     pub(crate) guard: Option<&'a StudioChangeGuard>,
     pub(crate) args: PushEditorChangesArgs,
     pub(crate) expected_project: Option<&'a ProjectSnapshot>,
@@ -102,6 +103,7 @@ pub(crate) fn push_staged_project(
     let StagedPushRequest {
         plan,
         prepared_documents,
+        virtual_files,
         guard,
         args: mut push_args,
         expected_project,
@@ -153,18 +155,9 @@ pub(crate) fn push_staged_project(
         let Some(expected_project) = expected_project.filter(|_| !later_edits_follow) else {
             return Ok(());
         };
-        let current = capture_snapshot(&project_root, &planned_paths)?;
-        let planned = ScopeSet::new(&planned_paths);
-        let expected = ProjectSnapshot {
-            entries: expected_project
-                .entries
-                .iter()
-                .filter(|(path, _)| planned.contains(path))
-                .map(|(path, entry)| (path.clone(), entry.clone()))
-                .collect(),
-        };
-        let differences = snapshot_differences(&expected, &current)?;
-        if let Some(changed) = differences.iter().next() {
+        if let Some(changed) =
+            snapshot_paths_match_disk(&project_root, &planned_paths, expected_project)?
+        {
             bail!(
                 "Project file {} changed while its Studio update was being prepared; retry the sync",
                 project_root.join(changed).display()
@@ -214,6 +207,7 @@ pub(crate) fn push_staged_project(
         PreparedEditorDocuments {
             documents: prepared_documents,
             native_services: plan.initial_native_services.clone(),
+            virtual_files,
             ..PreparedEditorDocuments::default()
         },
         |changes| {
@@ -446,6 +440,9 @@ pub(crate) fn amend_reconciled_changes(
                 });
         }
     }
+    changes
+        .property_changes
+        .append(&mut plan.extra_property_changes);
     changes
         .bulk_property_patches
         .append(&mut plan.bulk_property_patches);
@@ -1286,6 +1283,391 @@ pub(crate) fn move_escaping_instances_before_deletes(
     *instance_changes = escapes;
 }
 
+fn file_bytes_equal(path: &Path, expected: &[u8]) -> Result<bool> {
+    use std::io::Read;
+    let mut file =
+        fs::File::open(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let mut buf = [0_u8; 64 * 1024];
+    let mut offset = 0_usize;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        if n == 0 {
+            return Ok(offset == expected.len());
+        }
+        let end = offset + n;
+        if end > expected.len() || buf[..n] != expected[offset..end] {
+            return Ok(false);
+        }
+        offset = end;
+    }
+}
+
+/// Checks whether the disk entries under `roots` still equal the corresponding
+/// entries in `expected`, without allocating full file copies into RAM.
+/// Returns `Ok(Some(first_diff_path))` on mismatch, `Ok(None)` when identical.
+pub(crate) fn snapshot_paths_match_disk<'a>(
+    root: &Path,
+    roots: &[PathBuf],
+    expected: &'a ProjectSnapshot,
+) -> Result<Option<PathBuf>> {
+    let planned = ScopeSet::new(roots);
+    let mut expected_count = 0_usize;
+    for path in expected.entries.keys() {
+        if planned.contains(path) {
+            expected_count += 1;
+        }
+    }
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut to_verify: Vec<(PathBuf, PathBuf, &[u8])> = Vec::new();
+    let check_file = |seen: &mut BTreeSet<PathBuf>,
+                      to_verify: &mut Vec<(PathBuf, PathBuf, &'a [u8])>,
+                      relative: PathBuf,
+                      path: PathBuf,
+                      metadata: &fs::Metadata|
+     -> Result<Option<PathBuf>> {
+        if !seen.insert(relative.clone()) {
+            return Ok(None);
+        }
+        let Some(SnapshotEntry::File(expected_bytes)) = expected.entries.get(&relative) else {
+            return Ok(Some(relative));
+        };
+        let len = metadata.len();
+        if len != expected_bytes.len() as u64 {
+            return Ok(Some(relative));
+        }
+        to_verify.push((relative, path, expected_bytes.as_slice()));
+        Ok(None)
+    };
+    let root_entries: Vec<(PathBuf, Option<fs::Metadata>)> = if roots.len() >= 64 {
+        crate::snapshot::import::script_io_pool().install(|| {
+            roots
+                .par_iter()
+                .filter(|relative_root| !derived_project_path(relative_root))
+                .map(|relative_root| {
+                    let path = root.join(relative_root);
+                    match fs::symlink_metadata(&path) {
+                        Ok(metadata) => Ok((relative_root.clone(), Some(metadata))),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            Ok((relative_root.clone(), None))
+                        }
+                        Err(error) => Err(error)
+                            .with_context(|| format!("Failed to inspect {}", path.display())),
+                    }
+                })
+                .collect::<Result<Vec<_>>>()
+        })?
+    } else {
+        roots
+            .iter()
+            .filter(|relative_root| !derived_project_path(relative_root))
+            .map(|relative_root| {
+                let path = root.join(relative_root);
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata) => Ok((relative_root.clone(), Some(metadata))),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        Ok((relative_root.clone(), None))
+                    }
+                    Err(error) => {
+                        Err(error).with_context(|| format!("Failed to inspect {}", path.display()))
+                    }
+                }
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    for (relative_root, metadata) in root_entries {
+        let Some(metadata) = metadata else {
+            continue;
+        };
+        let path = root.join(&relative_root);
+        if metadata.file_type().is_symlink() {
+            if seen.insert(relative_root.clone()) {
+                let entry = SnapshotEntry::Symlink {
+                    target: fs::read_link(&path)?,
+                    directory: fs::metadata(&path).is_ok_and(|target| target.is_dir()),
+                };
+                if expected.entries.get(&relative_root) != Some(&entry) {
+                    return Ok(Some(relative_root));
+                }
+            }
+            continue;
+        }
+        if metadata.is_file() {
+            if let Some(diff) =
+                check_file(&mut seen, &mut to_verify, relative_root, path, &metadata)?
+            {
+                return Ok(Some(diff));
+            }
+            continue;
+        }
+        if !metadata.is_dir() {
+            bail!("Unsupported project entry {}", path.display());
+        }
+        for entry in WalkDir::new(&path).follow_links(false) {
+            let entry = entry?;
+            let relative = entry.path().strip_prefix(root)?.to_path_buf();
+            if derived_project_path(&relative) {
+                continue;
+            }
+            if entry.file_type().is_dir() {
+                if seen.insert(relative.clone())
+                    && expected.entries.get(&relative) != Some(&SnapshotEntry::Directory)
+                {
+                    return Ok(Some(relative));
+                }
+            } else if entry.file_type().is_file() {
+                let meta = fs::symlink_metadata(entry.path())?;
+                if let Some(diff) = check_file(
+                    &mut seen,
+                    &mut to_verify,
+                    relative,
+                    entry.into_path(),
+                    &meta,
+                )? {
+                    return Ok(Some(diff));
+                }
+            } else if entry.file_type().is_symlink() && seen.insert(relative.clone()) {
+                let sym = SnapshotEntry::Symlink {
+                    target: fs::read_link(entry.path())?,
+                    directory: fs::metadata(entry.path()).is_ok_and(|target| target.is_dir()),
+                };
+                if expected.entries.get(&relative) != Some(&sym) {
+                    return Ok(Some(relative));
+                }
+            }
+        }
+    }
+    if seen.len() != expected_count {
+        for path in expected.entries.keys() {
+            if planned.contains(path) && !seen.contains(path) {
+                return Ok(Some(path.clone()));
+            }
+        }
+    }
+    let mismatch = crate::snapshot::import::script_io_pool().install(|| {
+        to_verify
+            .into_par_iter()
+            .map(
+                |(relative, path, expected_bytes)| -> Result<Option<PathBuf>> {
+                    Ok((!file_bytes_equal(&path, expected_bytes)?).then_some(relative))
+                },
+            )
+            .try_reduce(|| None, |a, b| Ok(a.or(b)))
+    })?;
+    Ok(mismatch)
+}
+
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+enum WalkedEntryKind {
+    Directory,
+    File(u64),
+    Symlink,
+}
+
+struct WalkedEntry {
+    relative: PathBuf,
+    path: PathBuf,
+    kind: WalkedEntryKind,
+}
+
+fn walk_dir_entries_parallel(root: &Path, dir: &Path) -> Result<Vec<WalkedEntry>> {
+    let mut results = Vec::new();
+    let root_rel = dir.strip_prefix(root)?.to_path_buf();
+    if !derived_project_path(&root_rel) {
+        results.push(WalkedEntry {
+            relative: root_rel,
+            path: dir.to_path_buf(),
+            kind: WalkedEntryKind::Directory,
+        });
+    }
+    let mut frontier = vec![dir.to_path_buf()];
+    while !frontier.is_empty() {
+        let level = crate::snapshot::import::script_io_pool().install(|| {
+            frontier
+                .par_iter()
+                .map(|folder| -> Result<(Vec<WalkedEntry>, Vec<PathBuf>)> {
+                    let mut entries = Vec::new();
+                    let mut subdirs = Vec::new();
+                    for entry in fs::read_dir(folder)
+                        .with_context(|| format!("Failed to read directory {}", folder.display()))?
+                    {
+                        let entry = entry?;
+                        let path = entry.path();
+                        let relative = path.strip_prefix(root)?.to_path_buf();
+                        if derived_project_path(&relative) {
+                            continue;
+                        }
+                        let file_type = entry.file_type()?;
+                        if file_type.is_symlink() {
+                            entries.push(WalkedEntry {
+                                relative,
+                                path,
+                                kind: WalkedEntryKind::Symlink,
+                            });
+                        } else if file_type.is_dir() {
+                            subdirs.push(path.clone());
+                            entries.push(WalkedEntry {
+                                relative,
+                                path,
+                                kind: WalkedEntryKind::Directory,
+                            });
+                        } else if file_type.is_file() {
+                            let meta = fs::symlink_metadata(&path)?;
+                            entries.push(WalkedEntry {
+                                relative,
+                                path,
+                                kind: WalkedEntryKind::File(meta.len()),
+                            });
+                        }
+                    }
+                    Ok((entries, subdirs))
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        frontier = Vec::new();
+        for (mut entries, subdirs) in level {
+            results.append(&mut entries);
+            frontier.extend(subdirs);
+        }
+    }
+    Ok(results)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn snapshot_matches_disk(
+    root: &Path,
+    roots: &[PathBuf],
+    expected: &ProjectSnapshot,
+) -> Result<bool> {
+    snapshot_matches_disk_entries(root, roots, expected, expected.entries.len())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn snapshot_matches_disk_subset(
+    root: &Path,
+    roots: &[PathBuf],
+    expected: &ProjectSnapshot,
+) -> Result<bool> {
+    let scope = ScopeSet::new(roots);
+    let expected_count = expected
+        .entries
+        .keys()
+        .filter(|path| scope.contains(path))
+        .count();
+    snapshot_matches_disk_entries(root, roots, expected, expected_count)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn snapshot_matches_disk_entries(
+    root: &Path,
+    roots: &[PathBuf],
+    expected: &ProjectSnapshot,
+    expected_count: usize,
+) -> Result<bool> {
+    let mut seen: HashSet<PathBuf> = HashSet::with_capacity(expected.entries.len());
+    let mut seen_non_file = 0_usize;
+    let mut to_verify: Vec<(PathBuf, &[u8])> = Vec::new();
+    let mut check_file =
+        |seen: &mut HashSet<PathBuf>, relative: PathBuf, path: PathBuf, len: u64| -> Result<bool> {
+            if !seen.insert(relative.clone()) {
+                return Ok(true);
+            }
+            let Some(SnapshotEntry::File(expected_bytes)) = expected.entries.get(&relative) else {
+                return Ok(false);
+            };
+            if len != expected_bytes.len() as u64 {
+                return Ok(false);
+            }
+            to_verify.push((path, expected_bytes.as_slice()));
+            Ok(true)
+        };
+    for relative_root in roots {
+        if derived_project_path(relative_root) {
+            continue;
+        }
+        let path = root.join(relative_root);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to inspect {}", path.display()));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            if !seen.insert(relative_root.clone()) {
+                continue;
+            }
+            let entry = SnapshotEntry::Symlink {
+                target: fs::read_link(&path)?,
+                directory: fs::metadata(&path).is_ok_and(|target| target.is_dir()),
+            };
+            if expected.entries.get(relative_root) != Some(&entry) {
+                return Ok(false);
+            }
+            seen_non_file += 1;
+            continue;
+        }
+        if metadata.is_file() {
+            if !check_file(&mut seen, relative_root.clone(), path, metadata.len())? {
+                return Ok(false);
+            }
+            continue;
+        }
+        if !metadata.is_dir() {
+            bail!("Unsupported project entry {}", path.display());
+        }
+        for entry in walk_dir_entries_parallel(root, &path)? {
+            match entry.kind {
+                WalkedEntryKind::Directory => {
+                    if !seen.insert(entry.relative.clone()) {
+                        continue;
+                    }
+                    if expected.entries.get(&entry.relative) != Some(&SnapshotEntry::Directory) {
+                        return Ok(false);
+                    }
+                    seen_non_file += 1;
+                }
+                WalkedEntryKind::File(len) => {
+                    if !check_file(&mut seen, entry.relative, entry.path, len)? {
+                        return Ok(false);
+                    }
+                }
+                WalkedEntryKind::Symlink => {
+                    if !seen.insert(entry.relative.clone()) {
+                        continue;
+                    }
+                    let sym = SnapshotEntry::Symlink {
+                        target: fs::read_link(&entry.path)?,
+                        directory: fs::metadata(&entry.path).is_ok_and(|target| target.is_dir()),
+                    };
+                    if expected.entries.get(&entry.relative) != Some(&sym) {
+                        return Ok(false);
+                    }
+                    seen_non_file += 1;
+                }
+            }
+        }
+    }
+    if seen_non_file + to_verify.len() != expected_count {
+        return Ok(false);
+    }
+    crate::snapshot::import::script_io_pool().install(|| {
+        to_verify
+            .into_par_iter()
+            .try_fold(
+                || true,
+                |acc, (path, expected_bytes)| -> Result<bool> {
+                    if !acc {
+                        return Ok(false);
+                    }
+                    file_bytes_equal(&path, expected_bytes)
+                },
+            )
+            .try_reduce(|| true, |a, b| Ok(a && b))
+    })
+}
+
 pub(crate) fn capture_snapshot(root: &Path, roots: &[PathBuf]) -> Result<ProjectSnapshot> {
     let mut entries = BTreeMap::new();
     let mut files = Vec::new();
@@ -1318,159 +1700,35 @@ pub(crate) fn capture_snapshot(root: &Path, roots: &[PathBuf]) -> Result<Project
         if !metadata.is_dir() {
             bail!("Unsupported project entry {}", path.display());
         }
-        for entry in WalkDir::new(&path).follow_links(false) {
-            let entry = entry?;
-            let relative = entry.path().strip_prefix(root)?.to_path_buf();
-            if derived_project_path(&relative) {
-                continue;
-            }
-            let value = if entry.file_type().is_dir() {
-                SnapshotEntry::Directory
-            } else if entry.file_type().is_file() {
-                files.push((relative, entry.into_path()));
-                continue;
-            } else if entry.file_type().is_symlink() {
-                SnapshotEntry::Symlink {
-                    target: fs::read_link(entry.path())?,
-                    directory: fs::metadata(entry.path()).is_ok_and(|target| target.is_dir()),
+        for entry in walk_dir_entries_parallel(root, &path)? {
+            match entry.kind {
+                WalkedEntryKind::Directory => {
+                    entries.insert(entry.relative, SnapshotEntry::Directory);
                 }
-            } else {
-                continue;
-            };
-            entries.insert(relative, value);
+                WalkedEntryKind::File(_) => {
+                    files.push((entry.relative, entry.path));
+                }
+                WalkedEntryKind::Symlink => {
+                    entries.insert(
+                        entry.relative,
+                        SnapshotEntry::Symlink {
+                            target: fs::read_link(&entry.path)?,
+                            directory: fs::metadata(&entry.path)
+                                .is_ok_and(|target| target.is_dir()),
+                        },
+                    );
+                }
+            }
         }
     }
-    // Opening each file dominates, especially under antivirus scanning, so
-    // the reads run in parallel.
-    let contents = files
-        .into_par_iter()
-        .map(|(relative, path)| Ok((relative, SnapshotEntry::File(fs::read(path)?))))
-        .collect::<Result<Vec<_>>>()?;
+    let contents = crate::snapshot::import::script_io_pool().install(|| {
+        files
+            .into_par_iter()
+            .map(|(relative, path)| Ok((relative, SnapshotEntry::File(fs::read(path)?))))
+            .collect::<Result<Vec<_>>>()
+    })?;
     entries.extend(contents);
     Ok(ProjectSnapshot { entries })
-}
-
-/// Checks whether the files under `roots` on disk match `expected` byte for
-/// byte without allocating a full `ProjectSnapshot` copy of all file bytes.
-#[cfg(any(windows, target_os = "macos"))]
-pub(crate) fn snapshot_matches_disk(
-    root: &Path,
-    roots: &[PathBuf],
-    expected: &ProjectSnapshot,
-) -> Result<bool> {
-    use std::io::Read;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    let mut seen: HashSet<PathBuf> = HashSet::with_capacity(expected.entries.len());
-    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for relative_root in roots {
-        if derived_project_path(relative_root) {
-            continue;
-        }
-        let path = root.join(relative_root);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error).with_context(|| format!("Failed to inspect {}", path.display()));
-            }
-        };
-        if metadata.file_type().is_symlink() {
-            if !seen.insert(relative_root.clone()) {
-                continue;
-            }
-            let actual = SnapshotEntry::Symlink {
-                target: fs::read_link(&path)?,
-                directory: fs::metadata(&path).is_ok_and(|target| target.is_dir()),
-            };
-            if expected.entries.get(relative_root) != Some(&actual) {
-                return Ok(false);
-            }
-            continue;
-        }
-        if metadata.is_file() {
-            if !seen.insert(relative_root.clone()) {
-                continue;
-            }
-            let Some(SnapshotEntry::File(want)) = expected.entries.get(relative_root) else {
-                return Ok(false);
-            };
-            if metadata.len() != want.len() as u64 {
-                return Ok(false);
-            }
-            files.push((relative_root.clone(), path));
-            continue;
-        }
-        if !metadata.is_dir() {
-            bail!("Unsupported project entry {}", path.display());
-        }
-        for entry in WalkDir::new(&path).follow_links(false) {
-            let entry = entry?;
-            let relative = entry.path().strip_prefix(root)?.to_path_buf();
-            if derived_project_path(&relative) || !seen.insert(relative.clone()) {
-                continue;
-            }
-            if entry.file_type().is_dir() {
-                if expected.entries.get(&relative) != Some(&SnapshotEntry::Directory) {
-                    return Ok(false);
-                }
-            } else if entry.file_type().is_file() {
-                let Some(SnapshotEntry::File(want)) = expected.entries.get(&relative) else {
-                    return Ok(false);
-                };
-                if entry.metadata()?.len() != want.len() as u64 {
-                    return Ok(false);
-                }
-                files.push((relative, entry.into_path()));
-            } else if entry.file_type().is_symlink() {
-                let actual = SnapshotEntry::Symlink {
-                    target: fs::read_link(entry.path())?,
-                    directory: fs::metadata(entry.path()).is_ok_and(|target| target.is_dir()),
-                };
-                if expected.entries.get(&relative) != Some(&actual) {
-                    return Ok(false);
-                }
-            }
-        }
-    }
-    if seen.len() != expected.entries.len() {
-        return Ok(false);
-    }
-    let matched = AtomicBool::new(true);
-    files.into_par_iter().try_for_each_init(
-        || vec![0_u8; 64 * 1024],
-        |buf, (relative, path)| -> Result<()> {
-            if !matched.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            let Some(SnapshotEntry::File(want)) = expected.entries.get(&relative) else {
-                matched.store(false, Ordering::Relaxed);
-                return Ok(());
-            };
-            let mut file = fs::File::open(&path)
-                .with_context(|| format!("Failed to open {}", path.display()))?;
-            let mut offset = 0_usize;
-            loop {
-                let read = file
-                    .read(buf)
-                    .with_context(|| format!("Failed to read {}", path.display()))?;
-                if read == 0 {
-                    break;
-                }
-                let end = offset + read;
-                if end > want.len() || buf[..read] != want[offset..end] {
-                    matched.store(false, Ordering::Relaxed);
-                    return Ok(());
-                }
-                offset = end;
-            }
-            if offset != want.len() {
-                matched.store(false, Ordering::Relaxed);
-            }
-            Ok(())
-        },
-    )?;
-    Ok(matched.load(Ordering::Relaxed))
 }
 
 #[cfg(test)]
@@ -1599,6 +1857,7 @@ mod review_threshold_tests {
             StagedPushRequest {
                 plan,
                 prepared_documents: HashMap::new(),
+                virtual_files: None,
                 guard: None,
                 args,
                 expected_project: None,

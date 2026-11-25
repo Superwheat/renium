@@ -19,8 +19,22 @@ pub(crate) fn record_published_files(
     source: &Path,
     published: &crate::snapshot::export::PublishedProjectChanges,
 ) -> Result<Option<String>> {
+    Ok(record_published_files_with_snapshot(root, source, published)?.0)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+type RecordedPullResult = (Option<String>, Option<ProjectSnapshot>);
+
+#[cfg(not(any(windows, target_os = "macos")))]
+type RecordedPullResult = (Option<String>, Option<()>);
+
+pub(crate) fn record_published_files_with_snapshot(
+    root: &Path,
+    source: &Path,
+    published: &crate::snapshot::export::PublishedProjectChanges,
+) -> Result<RecordedPullResult> {
     let Some(backups) = published.previous.as_ref() else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let scopes = published
         .changed_roots
@@ -29,14 +43,28 @@ pub(crate) fn record_published_files(
         .cloned()
         .collect::<HashSet<_>>();
     if scopes.is_empty() {
-        return Ok(None);
+        return Ok((None, None));
     }
     let roots = scopes.iter().cloned().collect::<Vec<_>>();
     let before = capture_snapshot(backups.root(), &roots)?;
     let after = capture_snapshot(root, &roots)?;
     ensure_published_state(published, &after)?;
     let mut history = SyncHistory::begin(root, source, &before, &scopes)?;
-    Ok(Some(history.commit(&after, &ProjectSnapshot::default())?))
+    let id = history.commit(&after, &ProjectSnapshot::default())?;
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let covered = ScopeSet::new(&roots);
+        let covers_all = published
+            .publish_paths
+            .iter()
+            .filter(|path| !derived_project_path(path))
+            .all(|path| covered.contains(path));
+        Ok((Some(id), covers_all.then_some(after)))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Ok((Some(id), None))
+    }
 }
 
 /// The after-state the entry blesses must be what the publish wrote. A save
@@ -47,11 +75,13 @@ pub(crate) fn ensure_published_state(
     after: &ProjectSnapshot,
 ) -> Result<()> {
     use crate::snapshot::export::PublishEntryState;
-    for (path, expected) in &published.expected {
-        if derived_project_path(path) {
-            continue;
-        }
-        let matches = match (expected, after.entries.get(path)) {
+    let items: Vec<_> = published
+        .expected
+        .iter()
+        .filter(|(path, _)| !derived_project_path(path))
+        .collect();
+    items.par_iter().try_for_each(|(path, expected)| {
+        let matches = match (expected, after.entries.get(*path)) {
             (None, None) => true,
             (Some(PublishEntryState::Directory), Some(SnapshotEntry::Directory)) => true,
             (Some(PublishEntryState::File { sha256, .. }), Some(SnapshotEntry::File(bytes))) => {
@@ -66,8 +96,8 @@ pub(crate) fn ensure_published_state(
                 path.display()
             );
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[derive(Serialize, Deserialize)]

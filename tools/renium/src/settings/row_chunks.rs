@@ -445,11 +445,18 @@ impl RetainedRowColumns {
         Ok(())
     }
 
-    /// Gives the rows marked in `wanted` their maps, all in one pass over the
-    /// columns, with the values of every other row dropped as they are
-    /// decoded. No range may have been read before.
-    pub(crate) fn materialize_selected(
-        mut self,
+    pub(crate) fn block_store(&self) -> Option<&super::super::blocks::BlockStore<'static>> {
+        self.blocks
+            .as_ref()
+            .map(super::super::blocks::RowBlocks::store)
+    }
+
+    pub(crate) fn into_block_store(self) -> Option<super::super::blocks::BlockStore<'static>> {
+        self.blocks.map(super::super::blocks::RowBlocks::into_store)
+    }
+
+    pub(crate) fn materialize_selected_in_place(
+        &mut self,
         document: &mut SettingsBytecode,
         wanted: &[bool],
     ) -> Result<()> {
@@ -490,6 +497,17 @@ impl RetainedRowColumns {
             .collect::<Vec<_>>();
         apply_decoded_property_groups(&mut document.instances, &specs, groups);
         Ok(())
+    }
+
+    /// Gives the rows marked in `wanted` their maps, all in one pass over the
+    /// columns, with the values of every other row dropped as they are
+    /// decoded. No range may have been read before.
+    pub(crate) fn materialize_selected(
+        mut self,
+        document: &mut SettingsBytecode,
+        wanted: &[bool],
+    ) -> Result<()> {
+        self.materialize_selected_in_place(document, wanted)
     }
 
     pub(crate) fn finish(mut self) -> Result<()> {

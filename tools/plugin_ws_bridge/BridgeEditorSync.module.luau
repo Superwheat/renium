@@ -676,46 +676,74 @@ end
 -- first filled with those additions by parent and name (false for a name two
 -- of them share); the service's other groups reuse it.
 local function prepareImportedIdentities(group: any, budget: (((number) -> ())?) -> boolean,
-	additions: { [Instance]: Instance }?, byParent: { [Instance]: { [string]: Instance | false } }?)
+	additions: { [Instance]: Instance }?, byParent: { [Instance]: { [string]: any } }?, orderedByParent: boolean?,
+	classByInstance: { [Instance]: string }?)
 	local identities = group.instanceIdentities
 	if identities == nil then return end
 	local nodes, strings = identities.nodes, identities.strings
 	local bytes = buffer.len(nodes)
+	local readu32 = buffer.readu32
 	local instances, childrenByParent, seen, repeated = table.create(bytes // 20), {}, {}, {}
-	for offset = 4, bytes - 16, 20 do
-		if buffer.readu32(nodes, offset) > 1 then
-			local parent = buffer.readu32(nodes, offset - 4)
-			local names = repeated[parent] or {}
-			repeated[parent] = names
-			names[buffer.readu32(nodes, offset + 4)] = true
+	if not orderedByParent then
+		for offset = 4, bytes - 16, 20 do
+			if readu32(nodes, offset) > 1 then
+				local parent = readu32(nodes, offset - 4)
+				local names = repeated[parent] or {}
+				repeated[parent] = names
+				names[readu32(nodes, offset + 4)] = true
+			end
 		end
 	end
 	local started = os.clock()
 	local childCalls, arrived = 0, 0
 	local observeWait, finishWork = BridgeConnection.profileWaitObserver(
 		"import live identities: scheduler yield", "import live identities: validation work")
-	if byParent ~= nil and next(byParent) == nil then
+	if not orderedByParent and byParent ~= nil and next(byParent) == nil then
 		for addition, parent in pairs(additions or {}) do
 			budget(observeWait)
-			local named = byParent[parent] or {}
-			byParent[parent] = named
+			local named = byParent[parent]
+			if named == nil then
+				named = {}
+				byParent[parent] = named
+			end
 			local additionName = addition.Name
 			named[additionName] = if named[additionName] == nil then addition else false
 		end
 	end
+	local yielded = false
 	for offset = 0, bytes - 20, 20 do
-		budget(observeWait)
-		local parent, ordinal = buffer.readu32(nodes, offset), buffer.readu32(nodes, offset + 4)
-		local nameIndex = buffer.readu32(nodes, offset + 8)
-		local name, class = strings[nameIndex + 1], strings[buffer.readu32(nodes, offset + 12) + 1]
+		if budget(observeWait) then
+			yielded = true
+		end
+		local parent, ordinal = readu32(nodes, offset), readu32(nodes, offset + 4)
+		local nameIndex = readu32(nodes, offset + 8)
+		local name, class = strings[nameIndex + 1], strings[readu32(nodes, offset + 12) + 1]
 		local instance = nil
-		local named = if parent ~= 0 and byParent ~= nil and not (repeated[parent] and repeated[parent][nameIndex])
-			then byParent[instances[parent]] else nil
-		local candidate = if named ~= nil then named[name] else nil
-		if candidate and not seen[candidate] and candidate.Name == name and candidate.ClassName == class
-			and candidate.Parent == instances[parent] then
-			instance = candidate
-			arrived += 1
+		if parent ~= 0 and byParent ~= nil then
+			if orderedByParent then
+				local named = byParent[instances[parent]]
+				local siblings = if named ~= nil then named[name] else nil
+				local candidate = if typeof(siblings) == "Instance"
+					then (if ordinal == 1 then siblings else nil)
+					elseif siblings ~= nil then siblings[ordinal]
+					else nil
+				if candidate ~= nil and not seen[candidate]
+					and (if classByInstance ~= nil then classByInstance[candidate] or candidate.ClassName else candidate.ClassName) == class
+					and (not yielded or candidate.Parent == instances[parent])
+				then
+					instance = candidate
+					arrived += 1
+				end
+			else
+				local repeatedParent = repeated[parent]
+				local named = if not (repeatedParent ~= nil and repeatedParent[nameIndex])
+					then byParent[instances[parent]] else nil
+				local candidate = if named ~= nil then named[name] else nil
+				if candidate and not seen[candidate] and candidate.ClassName == class and candidate.Parent == instances[parent] then
+					instance = candidate
+					arrived += 1
+				end
+			end
 		end
 		if instance == nil then
 			if parent == 0 then
@@ -770,9 +798,15 @@ local function rememberImportedIdentities(prepared: { any }, ctx: { [string]: an
 	budget: (((number) -> ())?) -> boolean)
 	local observeWait, finishWork = BridgeConnection.profileWaitObserver(
 		"import identity registration: scheduler yield", "import identity registration: binding work")
+	local readu32 = buffer.readu32
+	local strByte = string.byte
+	local strSub = string.sub
+	local yielded = false
 	for _, group in ipairs(prepared) do
 		for index, settingsId in ipairs(group.rootSettingsIds or {}) do
-			budget(observeWait)
+			if budget(observeWait) then
+				yielded = true
+			end
 			local instance = group.incomingByPayloadIndex[index]
 			if settingsId ~= "" and instance ~= nil then
 				rememberMatchedSettingsInstance(group.serviceName, settingsId, if aliases then aliases[instance] or instance else instance, ctx)
@@ -802,34 +836,42 @@ local function rememberImportedIdentities(prepared: { any }, ctx: { [string]: an
 		end
 		readTables()
 		local nodes, strings = group.instanceIdentities.nodes, group.instanceIdentities.strings
+		local versionBumps = 0
 		for index, instance in ipairs(imported) do
+			if not instance then
+				continue
+			end
 			if budget(observeWait) then
+				yielded = true
 				readTables()
 			end
-			local raw = strings[buffer.readu32(nodes, (index - 1) * 20 + 16) + 1]
-			local first, last = string.byte(raw, 1), string.byte(raw, -1)
+			local raw = strings[readu32(nodes, (index - 1) * 20 + 16) + 1]
+			local first, last = strByte(raw, 1), strByte(raw, -1)
 			if first == nil then
 				continue
 			end
-			local settingsId = if first ~= 32 and (first < 9 or first > 13) and last ~= 32 and (last < 9 or last > 13)
+			local settingsId = if first > 32 and last > 32
 				then raw else settingsIdText(raw)
 			local target = if aliases then aliases[instance] or instance else instance
-			if settingsId == nil or liveInstance(target) == nil then
+			if settingsId == nil or ((yielded or aliases ~= nil) and liveInstance(target) == nil) then
 				continue
 			end
 			local previous = serviceMatches[settingsId]
 			if previous ~= nil and previous ~= target and byInstance[previous] == settingsId and liveInstance(previous) ~= nil then
 				byInstance[previous] = nil
-				ctx.matchedSettingsIdVersion = (tonumber(ctx.matchedSettingsIdVersion) or 0) + 1
+				versionBumps += 1
 			end
 			serviceMatches[settingsId] = target
-			if settingsId ~= "1" and string.sub(settingsId, 1, 6) ~= "debug:" and byInstance[target] ~= settingsId then
+			if settingsId ~= "1" and (first ~= 100 or strSub(settingsId, 1, 6) ~= "debug:") and byInstance[target] ~= settingsId then
 				byInstance[target] = settingsId
-				ctx.matchedSettingsIdVersion = (tonumber(ctx.matchedSettingsIdVersion) or 0) + 1
+				versionBumps += 1
 			end
 			if lookup then
 				lookup[settingsId] = target
 			end
+		end
+		if versionBumps > 0 then
+			ctx.matchedSettingsIdVersion = (tonumber(ctx.matchedSettingsIdVersion) or 0) + versionBumps
 		end
 	end
 	if finishWork then
@@ -1548,19 +1590,28 @@ local function sortedIdList(text: string): string
 end
 
 local function colorBytesEqual(a: Color3, b: Color3): boolean
-	-- The engine keeps part colors as bytes and truncates: 0.3 becomes 76/255,
-	-- not 77/255, so a channel may land one byte off the rounded value.
-	local function byte(channel: number): number
-		return math.round(math.clamp(channel, 0, 1) * 255)
+	local function channelMatches(actual: number, expected: number): boolean
+		local actualByte = math.round(math.clamp(actual, 0, 1) * 255)
+		local scaled = math.clamp(expected, 0, 1) * 255
+		local nearest = math.round(scaled)
+		if math.abs(scaled - nearest) <= 1e-3 then
+			return actualByte == nearest
+		end
+		return actualByte == math.floor(scaled) or actualByte == nearest
 	end
-	return math.abs(byte(a.R) - byte(b.R)) <= 1
-		and math.abs(byte(a.G) - byte(b.G)) <= 1
-		and math.abs(byte(a.B) - byte(b.B)) <= 1
+	return channelMatches(a.R, b.R)
+		and channelMatches(a.G, b.G)
+		and channelMatches(a.B, b.B)
 end
 
 local function propertyValuesEqual(instance: Instance, name: string, current: any, expected: any): boolean
-	-- A part's color is kept in bytes: 0.667 written reads back as 170/255.
-	if typeof(current) == "Color3" and typeof(expected) == "Color3" and colorBytesEqual(current, expected) then
+	if
+		name == "Color"
+		and instance:IsA("BasePart")
+		and typeof(current) == "Color3"
+		and typeof(expected) == "Color3"
+		and colorBytesEqual(current, expected)
+	then
 		return true
 	end
 	if type(current) == "string" and type(expected) == "string" then
@@ -4621,40 +4672,169 @@ function TransactionState.restoreMetadata(
 	end
 	local bulkProps = snapshot.bulkProperties
 	if type(bulkProps) == "table" and #bulkProps > 0 then
-		local bulkExpected = {}
+		local bulkExpected: { [string]: any } = {}
+		local activeBulkWrite: { any } = { nil, nil, nil, nil }
 		if ctx.setBulkExpectedProperties then
-			ctx.setBulkExpectedProperties(bulkExpected)
+			ctx.setBulkExpectedProperties(bulkExpected, activeBulkWrite)
 		end
 		local okBulkRestore, bulkRestoreErr = pcall(function()
 			for entryIndex = #bulkProps, 1, -1 do
 				local entry = bulkProps[entryIndex]
+				local entryKind = entry.kind or "property"
 				local propName = entry.propertyName
 				local instances = entry.instances
 				local oldValues = entry.oldValues
-				local expectedForProp = bulkExpected[propName]
-				if expectedForProp == nil then
-					expectedForProp = {}
-					bulkExpected[propName] = expectedForProp
-				end
-				for itemIndex = 1, #instances do
-					local instance = replacements[instances[itemIndex]] or instances[itemIndex]
-					local oldValue = oldValues[itemIndex]
-					if instance ~= nil and instance.Parent ~= nil then
-						local okRead, current = readProperty(instance, propName)
-						if not okRead or (current ~= oldValue and not propertyValuesEqual(instance, propName, current, oldValue)) then
-							expectedForProp[instance] = oldValue
-							local okWrite, writeError = pcall(function()
-								(instance :: any)[propName] = oldValue
-							end)
-							if not okWrite then
-								expectedForProp[instance] = nil
-								error(`Could not restore {instance:GetFullName()}.{propName}: {writeError}`)
+				local nilSentinel = entry.nilSentinel
+				local itemCount = entry.count or #instances
+				if entryKind == "tag" then
+					local bulkTags = bulkExpected["@tags"]
+					if bulkTags == nil then
+						bulkTags = {}
+						bulkExpected["@tags"] = bulkTags
+					end
+					local expectedForTag = bulkTags[propName]
+					if expectedForTag == nil then
+						expectedForTag = {}
+						bulkTags[propName] = expectedForTag
+					end
+					for itemIndex = 1, itemCount do
+						local instance = replacements[instances[itemIndex]] or instances[itemIndex]
+						local oldHas = oldValues[itemIndex] == true
+						if instance ~= nil and instance.Parent ~= nil then
+							if CollectionService:HasTag(instance, propName) ~= oldHas then
+								expectedForTag[instance] = oldHas
+								if oldHas then
+									CollectionService:AddTag(instance, propName)
+								else
+									CollectionService:RemoveTag(instance, propName)
+								end
+							end
+						end
+					end
+				elseif entryKind == "attribute" then
+					if not isEngineManagedAttribute(propName) then
+						local expectedAttrs = bulkExpected["@attributes"]
+						if expectedAttrs == nil then
+							expectedAttrs = {}
+							bulkExpected["@attributes"] = expectedAttrs
+						end
+						for itemIndex = 1, itemCount do
+							local instance = replacements[instances[itemIndex]] or instances[itemIndex]
+							local rawOld = oldValues[itemIndex]
+							local oldVal = if rawOld == nilSentinel then nil else rawOld
+							if instance ~= nil and instance.Parent ~= nil then
+								local perInst = expectedAttrs[instance]
+								if perInst == nil then
+									perInst = { keys = {}, relayPending = 0, relaySnapshot = nil, nilSentinel = nilSentinel }
+									expectedAttrs[instance] = perInst
+								end
+								if perInst.relaySnapshot == nil then
+									perInst.relaySnapshot = instance:GetAttributes()
+								end
+								perInst.keys[propName] = if oldVal == nil then nilSentinel else oldVal
+								activeBulkWrite[1] = instance
+								activeBulkWrite[2] = "@attribute"
+								activeBulkWrite[3] = propName
+								activeBulkWrite[4] = oldVal
+								activeBulkWrite[5] = false
+								instance:SetAttribute(propName, oldVal)
+								local syncRelayConsumed = activeBulkWrite[5] == true
+								activeBulkWrite[1] = nil
+								perInst.relaySnapshot[propName] = oldVal
+								if not syncRelayConsumed then
+									perInst.relayPending += 1
+								end
+							end
+						end
+					end
+				elseif entryKind == "attributes_replace" then
+					local expectedAttrs = bulkExpected["@attributes"]
+					if expectedAttrs == nil then
+						expectedAttrs = {}
+						bulkExpected["@attributes"] = expectedAttrs
+					end
+					for itemIndex = 1, itemCount do
+						local instance = replacements[instances[itemIndex]] or instances[itemIndex]
+						local oldMap = oldValues[itemIndex]
+						if instance ~= nil and instance.Parent ~= nil and type(oldMap) == "table" then
+							local perInst = expectedAttrs[instance]
+							if perInst == nil then
+								perInst = { keys = {}, relayPending = 0, relaySnapshot = nil, nilSentinel = nilSentinel }
+								expectedAttrs[instance] = perInst
+							end
+							local curAttrs = instance:GetAttributes()
+							if perInst.relaySnapshot == nil then
+								perInst.relaySnapshot = table.clone(curAttrs)
+							end
+							local asyncWrites = 0
+							for key in pairs(curAttrs) do
+								if not isEngineManagedAttribute(key) and oldMap[key] == nil then
+									perInst.keys[key] = nilSentinel
+									activeBulkWrite[1] = instance
+									activeBulkWrite[2] = "@attribute"
+									activeBulkWrite[3] = key
+									activeBulkWrite[4] = nil
+									activeBulkWrite[5] = false
+									instance:SetAttribute(key, nil)
+									if activeBulkWrite[5] ~= true then
+										asyncWrites += 1
+									end
+									activeBulkWrite[1] = nil
+									perInst.relaySnapshot[key] = nil
+								end
+							end
+							for key, val in pairs(oldMap) do
+								if not isEngineManagedAttribute(key) and not exactValuesEqual(curAttrs[key], val) then
+									perInst.keys[key] = val
+									activeBulkWrite[1] = instance
+									activeBulkWrite[2] = "@attribute"
+									activeBulkWrite[3] = key
+									activeBulkWrite[4] = val
+									activeBulkWrite[5] = false
+									instance:SetAttribute(key, val)
+									if activeBulkWrite[5] ~= true then
+										asyncWrites += 1
+									end
+									activeBulkWrite[1] = nil
+									perInst.relaySnapshot[key] = val
+								end
+							end
+							if asyncWrites > 0 then
+								perInst.relayPending += asyncWrites
+							end
+						end
+					end
+				else
+					local expectedForProp = bulkExpected[propName]
+					if expectedForProp == nil then
+						expectedForProp = {}
+						bulkExpected[propName] = expectedForProp
+					end
+					for itemIndex = 1, itemCount do
+						local instance = replacements[instances[itemIndex]] or instances[itemIndex]
+						local oldValue = oldValues[itemIndex]
+						if instance ~= nil and instance.Parent ~= nil then
+							local okRead, current = readProperty(instance, propName)
+							if not okRead or (current ~= oldValue and not propertyValuesEqual(instance, propName, current, oldValue)) then
+								expectedForProp[instance] = oldValue
+								activeBulkWrite[1] = instance
+								activeBulkWrite[2] = propName
+								activeBulkWrite[3] = oldValue
+								local okWrite, writeError = pcall(function()
+									(instance :: any)[propName] = oldValue
+								end)
+								activeBulkWrite[1] = nil
+								if not okWrite then
+									expectedForProp[instance] = nil
+									error(`Could not restore {instance:GetFullName()}.{propName}: {writeError}`)
+								end
 							end
 						end
 					end
 				end
 			end
 		end)
+		activeBulkWrite[1] = nil
 		if ctx.setBulkExpectedProperties then
 			ctx.setBulkExpectedProperties(nil)
 		end
@@ -4928,6 +5108,26 @@ function TransactionState.instanceWillBeRemovedByRollback(instance: Instance, se
 	return false
 end
 
+function TransactionState.isCreatedByTransaction(instance: Instance, session: { [string]: any }): boolean
+	if session.nativeUndo ~= nil then
+		for _, group in ipairs(session.nativeUndo.prepared) do
+			for _, root in ipairs(group.incoming) do
+				if instance == root or instance:IsDescendantOf(root) then
+					return true
+				end
+			end
+		end
+		for _, merge in ipairs(session.nativeUndo.packageMerges or {}) do
+			for _, root in ipairs(merge.incoming or {}) do
+				if instance == root or instance:IsDescendantOf(root) then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+
 function TransactionState.prepareJournalRollback(session: { [string]: any }, records: { any }, ctx: { [string]: any })
 	local baseline = {}
 	for _, instance in pairs(session.snapshot.originalByPath or {}) do
@@ -4944,13 +5144,30 @@ function TransactionState.prepareJournalRollback(session: { [string]: any }, rec
 			baseline[replacement] = true
 		end
 	end
+	local engineCreatedById = session.nativeEngineCreatedById
 	local candidates = {}
 	for _, record in ipairs(records) do
 		local instance = record.currentInstance
+		if instance ~= nil then
+			record.instanceExistedBeforeTransaction = baseline[instance] == true
+		end
+		if
+			instance ~= nil
+			and engineCreatedById ~= nil
+			and record.parent ~= nil
+			and not baseline[record.parent]
+			and TransactionState.isCreatedByTransaction(record.parent, session)
+		then
+			local okId, dbgId = pcall(instance.GetDebugId, instance, 32)
+			if okId and type(dbgId) == "string" and engineCreatedById[dbgId] == true then
+				record.engineCreatedUnderTransaction = true
+			end
+		end
 		if
 			instance ~= nil
 			and instance.Parent ~= nil
 			and not baseline[instance]
+			and not record.engineCreatedUnderTransaction
 			and TransactionState.instanceWillBeRemovedByRollback(instance, session)
 		then
 			candidates[instance] = true
@@ -4978,13 +5195,21 @@ function TransactionState.prepareJournalRollback(session: { [string]: any }, rec
 	end
 end
 
+function TransactionState.isJournalParentLive(parent: Instance?, serviceName: string): boolean
+	if parent == nil then
+		return false
+	end
+	return parent == game:GetService(serviceName)
+		or (parent.Parent ~= nil and parent:IsDescendantOf(game))
+end
+
 function TransactionState.resolveJournalParent(record: { [string]: any }, replacements: { [Instance]: Instance }): Instance?
 	-- A recorded removal must stay a removal, even if an older path is retained.
 	if record.parent == nil then
 		return nil
 	end
 	local parent = resolveReplacement(record.parent, replacements)
-	if parent ~= nil and (parent.Parent ~= nil or parent == game:GetService(record.service)) then
+	if TransactionState.isJournalParentLive(parent, record.service) then
 		return parent
 	end
 	local pathSegments = record.parentPathSegments
@@ -5015,6 +5240,20 @@ function TransactionState.replayJournalPlacement(
 	local instance = resolveReplacement(record.currentInstance, replacements)
 	if instance == nil then
 		return false
+	end
+	if
+		record.parent ~= nil
+		and record.engineCreatedUnderTransaction == true
+		and record.instanceExistedBeforeTransaction ~= true
+	then
+		local resolvedParent = resolveReplacement(record.parent, replacements)
+		if not TransactionState.isJournalParentLive(resolvedParent, record.service) then
+			if instance.Parent ~= nil then
+				setParentForSync(instance, nil, ctx)
+			end
+			TransactionState.destroyOwned(instance, ctx)
+			return false
+		end
 	end
 	local okParent, parent = pcall(TransactionState.resolveJournalParent, record, replacements)
 	if not okParent then
@@ -6095,9 +6334,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	local filterCandidateSnapshotCounter = 0
 	local filterCandidateSnapshotTtlSeconds = 15
 	local maxFilterCandidateSnapshots = 8
-	local function invalidateEditorService(serviceName: string)
+	local function invalidateEditorService(serviceName: string, keepStructure: boolean?)
 		NativeSerialization.invalidateProofs(serviceName)
-		ctx.invalidateService(serviceName)
+		ctx.invalidateService(serviceName, keepStructure)
 	end
 
 	local function pruneFilterCandidateSnapshots()
@@ -6514,9 +6753,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end)
 			end
 		end
+		local keepStructure = state == "committed"
 		for _, serviceName in ipairs(session.serviceNames) do
 			TransactionState.cleanupStep(session, "recovery invalidate " .. serviceName, function()
-				invalidateEditorService(serviceName)
+				invalidateEditorService(serviceName, keepStructure)
 			end)
 		end
 		recovery.outcome.cleanupErrors = session.cleanupErrors
@@ -8031,19 +8271,35 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		assertCommitActive()
 		setTrackedOperationPhase(operation, "postCommitProperties")
 		if not session.commitPrepared then
+			local releasedAnchored = false
 			for instance in pairs(session.heldAnchored) do
 				if instance.Parent ~= nil then
 					local okWrite, writeError = writePropertyForSync(instance, "Anchored", false, ctx)
 					if not okWrite then
 						error(`Failed to write Anchored on {instance:GetFullName()}: {writeError}`)
 					end
+					releasedAnchored = true
 				end
 			end
 			table.clear(session.heldAnchored)
+			if releasedAnchored and #session.postCommitPropertyChanges == 0 and task.defer ~= nil then
+				local flushed = false
+				local thread = coroutine.running()
+				task.defer(function()
+					flushed = true
+					if coroutine.status(thread) == "suspended" then
+						task.spawn(thread)
+					end
+				end)
+				if not flushed then
+					coroutine.yield()
+				end
+			end
 		end
 		local postCommitPropertyChanges = session.postCommitPropertyChanges
 		if #postCommitPropertyChanges > 0 and not session.commitPrepared then
 			local updated = 0
+			local pivotStarted = os.clock()
 			RunService.Heartbeat:Wait()
 			assertCommitActive()
 			-- The loop does not yield, and a write clears the index before any
@@ -8097,6 +8353,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 			end)
 			ctx.resolveChildIndex = nil
+			BridgeConnection.profileStep("postCommitProperties: pivots", pivotStarted, {
+				instances = #postCommitPropertyChanges,
+				calls = updated,
+			})
 			if not okPivots then
 				error(pivotError, 0)
 			end
@@ -8113,7 +8373,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local verifiedPushProof, pushProofUnavailable = nil, nil
 		setTrackedOperationPhase(operation, "verifiedPushProof")
 		if ctx.capturePushProof then
-			verifiedPushProof, pushProofUnavailable = ctx.capturePushProof()
+			verifiedPushProof, pushProofUnavailable = ctx.capturePushProof(params.deferTerrainProof == true)
 		end
 		setTrackedOperationPhase(operation, "commitFenceValidation")
 		assertCommitActive()
@@ -8242,9 +8502,30 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 
 	function api.beginBinaryExport(params: { [string]: any }): { [string]: any }
 		local profileStarted = os.clock()
+		if type(editorTransactions) == "table" then
+			for _, activeSession in pairs(editorTransactions) do
+				retireInvalidatedTransaction(activeSession)
+			end
+			pruneExpiredSessions(editorTransactions)
+		end
 		pruneExpiredSessions(binaryExports)
 		local operationCancellation = captureOperationCancellation()
 		assertSessionOwnership(operationCancellation)
+		if type(editorTransactions) == "table" then
+			local exportLeaseId = currentRequestLeaseId()
+			for _, active in pairs(editorTransactions) do
+				if active.pendingNativeRootWrite and active.invalidatedGeneration
+					or active.nativeServiceImport and active.nativeServiceImport.invocationAuthorized and not active.nativeServiceImport.readerFinished then
+					error(`{NATIVE_UNKNOWN_REASON} (transaction {active.transactionId})`)
+				end
+				if active.rollbackFailed ~= nil then
+					error("An earlier editor transaction has a failed rollback retained for recovery; cleanup retries at two-minute idle intervals")
+				end
+				if active.mutated == true or active.leaseId ~= exportLeaseId then
+					error("Another editor transaction is already active; wait for its current operation to finish")
+				end
+			end
+		end
 		local exportId = tostring(params.exportId or "")
 		local partitioned = params.partitioned == true
 		local metadataOnly = params.metadataOnly == true
@@ -9557,7 +9838,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		return { ok = true, importId = importId, nativeTargets = nativeTargets,
 			nativeHandoff = if wholeServices then 1 else nil,
 			nativeReceiptFormat = if wholeServices then 2 else nil,
-			nativeInlineReceipt = if wholeServices then true else nil }
+			nativeInlineReceipt = if wholeServices then true else nil,
+			nativeInlineReceiptChunks = if wholeServices then true else nil,
+			nativeInlinePostImportProperties = if wholeServices then true else nil }
 	end
 
 	function api.appendBinaryImport(params: { [string]: any }): { [string]: any }
@@ -9608,30 +9891,41 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				error("Native creation receipt has an invalid size")
 			end
 			local offset, rows = 0, 0
+			local readu16 = buffer.readu16
+			local readu32 = buffer.readu32
+			local readu8 = buffer.readu8
+			local writeu8 = buffer.writeu8
+			local readstring = buffer.readstring
+			local rshift = bit32.rshift
+			local lshift = bit32.lshift
+			local band = bit32.band
+			local btest = bit32.btest
+			local bor = bit32.bor
+			local classes = native.classes
+			local createdById = native.createdById
+			local expectedCreated = native.expectedCreated
+			local baseReceived = native.receivedCreated
 			while offset < bytes do
-				if bytes - offset < 8 or native.receivedCreated + rows >= native.expectedCreated then
+				if bytes - offset < 8 or baseReceived + rows >= expectedCreated then
 					error("Native creation receipt is truncated or contains excess rows")
 				end
-				local classIndex, ordinal = buffer.readu16(decoded, offset), buffer.readu32(decoded, offset + 2)
-				local length = buffer.readu8(decoded, offset + 6)
-				local class = native.classes[classIndex + 1]
+				local classIndex, ordinal = readu16(decoded, offset), readu32(decoded, offset + 2)
+				local length = readu8(decoded, offset + 6)
+				local class = classes[classIndex + 1]
 				if class == nil or ordinal >= class.count then
 					error("Native creation receipt contains an unplanned class or ordinal")
 				end
 				if length == 0 or length >= 48 or offset + 7 + length > bytes then
 					error("Native creation receipt contains an invalid identity")
 				end
-				-- A wrong id, one holding NUL included, is no object's debug id and
-				-- leaves the object it stands for unreceipted. That refuses the
-				-- commit only while change tracking is started.
-				local id = buffer.readstring(decoded, offset + 7, length)
-				local byteIndex, bit = math.floor(ordinal / 8), bit32.lshift(1, ordinal % 8)
-				local used = buffer.readu8(class.used, byteIndex)
-				if native.createdById[id] ~= nil or bit32.btest(used, bit) then
+				local id = readstring(decoded, offset + 7, length)
+				local byteIndex, bit = rshift(ordinal, 3), lshift(1, band(ordinal, 7))
+				local used = readu8(class.used, byteIndex)
+				if createdById[id] ~= nil or btest(used, bit) then
 					error("Native creation receipt contains a duplicate or retained identity")
 				end
-				buffer.writeu8(class.used, byteIndex, bit32.bor(used, bit))
-				native.createdById[id] = class.name
+				writeu8(class.used, byteIndex, bor(used, bit))
+				createdById[id] = class.name
 				offset += 7 + length
 				rows += 1
 			end
@@ -9742,7 +10036,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			end
 			transaction.nativeSettingTokens = {}
 			expectContainerSettings(native.containerSettings, ctx, transaction.nativeSettingTokens)
-			ctx.beginNativeImportObservations(transaction.transactionId, native.untaggedClasses)
+			local wholeReplacedServices = {}
+			for _, group in ipairs(prepared) do
+				if not group.additive then
+					wholeReplacedServices[group.serviceName] = true
+				end
+			end
+			ctx.beginNativeImportObservations(transaction.transactionId, native.untaggedClasses, wholeReplacedServices)
 			native.started = os.clock()
 			native.importId = params.importId
 			native.prepareDeadline = os.clock() + NATIVE_PREPARE_SECONDS
@@ -9801,7 +10101,27 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			BridgeConnection.profileStep(`import complete: {name}`, phaseStarted)
 			phaseStarted = now
 		end
-		local additions = ctx.finishNativeImportObservations(transaction.transactionId, native.createdById)
+		local function stringIdSet(list: any): { [string]: boolean }?
+			if type(list) ~= "table" or #list == 0 then
+				return nil
+			end
+			local set: { [string]: boolean } = {}
+			for _, id in ipairs(list) do
+				if type(id) == "string" and id ~= "" then
+					set[id] = true
+				end
+			end
+			return set
+		end
+		local engineRemovedById = stringIdSet(params.nativeEngineRemoved)
+		local engineCreatedById = stringIdSet(params.nativeEngineCreated)
+		transaction.nativeEngineCreatedById = engineCreatedById
+		local additions, orderedByParentByService, classByInstanceByService = ctx.finishNativeImportObservations(
+			transaction.transactionId,
+			native.createdById,
+			engineRemovedById,
+			engineCreatedById
+		)
 		finishPhase("observations")
 		transaction.assertOwnership()
 		native.readerFinished = true
@@ -9859,9 +10179,15 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				error("Native insertion returned unexpected roots")
 			end
 			group.incoming = ordered
-			local byParent = byParentByService[group.serviceName] or {}
-			byParentByService[group.serviceName] = byParent
-			prepareImportedIdentities(group, budget, additions[group.serviceName], byParent)
+			local orderedByParent = if orderedByParentByService ~= nil then orderedByParentByService[group.serviceName] else nil
+			if orderedByParent ~= nil then
+				local classByInstance = if classByInstanceByService ~= nil then classByInstanceByService[group.serviceName] else nil
+				prepareImportedIdentities(group, budget, additions[group.serviceName], orderedByParent, true, classByInstance)
+			else
+				local byParent = byParentByService[group.serviceName] or {}
+				byParentByService[group.serviceName] = byParent
+				prepareImportedIdentities(group, budget, additions[group.serviceName], byParent)
+			end
 		end
 		finishPhase("identityValidation")
 		transaction.assertOwnership()
@@ -9876,8 +10202,72 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		transaction.nativeStats = {
 			requests = 1, instanceCreated = native.receivedCreated, lastMs = (os.clock() - native.started) * 1000,
 		}
+		local postImportPropertySummary = nil
+		local postImportVerifySummary = nil
+		local postImportNativeRootTargets = nil
+		local postImportSources = nil
+		if type(params.postImportPropertyChanges) == "table" and #params.postImportPropertyChanges > 0 then
+			postImportPropertySummary = api.applyChanges({
+				instanceChanges = {},
+				sourceChanges = {},
+				propertyChanges = params.postImportPropertyChanges,
+				transactionId = transaction.transactionId,
+			})
+			finishPhase("postImportProperties")
+			if
+				postImportPropertySummary.ok == true
+				and (tonumber(postImportPropertySummary.errors) or 0) == 0
+				and type(postImportPropertySummary.nativeRootWrites) == "table"
+				and #postImportPropertySummary.nativeRootWrites > 0
+			then
+				local rootIndices = table.create(#postImportPropertySummary.nativeRootWrites)
+				for idx, write in ipairs(postImportPropertySummary.nativeRootWrites) do
+					rootIndices[idx] = write.index
+				end
+				local okTargets, describedTargets = pcall(
+					describeNativeRootTargets,
+					transaction,
+					rootIndices,
+					params.nativeRootTargetIds == true
+				)
+				if okTargets and type(describedTargets) == "table" then
+					postImportNativeRootTargets = describedTargets
+				end
+			end
+			if
+				type(params.verifyPropertyChanges) == "table"
+				and #params.verifyPropertyChanges > 0
+				and postImportPropertySummary.ok == true
+				and (tonumber(postImportPropertySummary.errors) or 0) == 0
+				and (type(postImportPropertySummary.nativeRootWrites) ~= "table" or #postImportPropertySummary.nativeRootWrites == 0)
+				and (type(postImportPropertySummary.nativeGeometryWrites) ~= "table" or #postImportPropertySummary.nativeGeometryWrites == 0)
+			then
+				postImportVerifySummary = api.applyChanges({
+					verifyOnly = true,
+					instanceChanges = {},
+					sourceChanges = {},
+					propertyChanges = params.verifyPropertyChanges,
+					transactionId = transaction.transactionId,
+				})
+				finishPhase("postImportVerify")
+			end
+		end
+		if type(params.verifySourceSelectors) == "table" and #params.verifySourceSelectors > 0 then
+			local okSources, sourceResult = pcall(api.getLiveSourceBatch, {
+				selectors = params.verifySourceSelectors,
+				transactionId = transaction.transactionId,
+			})
+			if okSources and type(sourceResult) == "table" then
+				postImportSources = sourceResult
+			end
+			finishPhase("postImportSources")
+		end
 		return { ok = true, requests = 1, instanceCreated = native.receivedCreated,
-			binaryBytes = session.totalBytes, nativeInserted = true, nativeCompleteTimings = timings }
+			binaryBytes = session.totalBytes, nativeInserted = true, nativeCompleteTimings = timings,
+			postImportPropertySummary = postImportPropertySummary,
+			postImportVerifySummary = postImportVerifySummary,
+			postImportNativeRootTargets = postImportNativeRootTargets,
+			postImportSources = postImportSources }
 	end
 
 	function api.finishBinaryImport(params: { [string]: any }): { [string]: any }
@@ -9914,6 +10304,18 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		armSessionExpiry(binaryImports, importId, session)
 		armSessionExpiry(editorTransactions, transactionId, transaction)
 		if session.nativeHeld ~= nil then
+			if params.nativeReceiptChunks ~= nil then
+				if params.nativePhase ~= "complete" or type(params.nativeReceiptChunks) ~= "table" then
+					error("Native creation receipts can only accompany completion")
+				end
+				for _, chunk in ipairs(params.nativeReceiptChunks) do
+					if type(chunk) ~= "table" then
+						error("Invalid native creation receipt chunk")
+					end
+					api.appendBinaryImport({ importId = importId, nativeReceipt = true,
+						index = chunk.index, data = chunk.data })
+				end
+			end
 			if params.nativeReceiptChunk ~= nil then
 				if params.nativePhase ~= "complete" or type(params.nativeReceiptChunk) ~= "table" then
 					error("Native creation receipts can only accompany completion")
@@ -10587,8 +10989,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		end
 		restoreExplorerSelection(explorerSelection, restoredSelectionReplacements)
 		stats.lastMs = (os.clock() - started) * 1000
+		local keepStructure = stats.errors == 0 and #(params.instanceChanges or {}) == 0
 		for serviceName in pairs(touchedServices) do
-			invalidateEditorService(serviceName)
+			invalidateEditorService(serviceName, keepStructure)
 		end
 		ctx.resolveCache = previousResolveCache
 		ctx.settingsIdLookupByService = previousSettingsIdLookupByService
@@ -10621,12 +11024,17 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		return stats
 	end
 
-	local function buildBulkChildLookup(parent: Instance): { [string]: any }
+	local function buildBulkChildLookup(parent: Instance, allowPackageLinks: boolean): ({ [string]: any }, boolean)
 		local children = parent:GetChildren()
 		local byName: { [string]: any } = {}
+		local sawPackageLink = false
 		for _, child in ipairs(children) do
 			if child.ClassName == "PackageLink" then
-				error(`Bulk property patch encountered PackageLink under {parent:GetFullName()}`)
+				if not allowPackageLinks then
+					error(`Bulk property patch encountered PackageLink under {parent:GetFullName()}`)
+				end
+				sawPackageLink = true
+				continue
 			end
 			local name = child.Name
 			local existing = byName[name]
@@ -10638,7 +11046,44 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				existing[#existing + 1] = child
 			end
 		end
-		return byName
+		return byName, sawPackageLink
+	end
+
+	local persistentBulkTreeCache: {
+		[string]: {
+			structureGen: number,
+			cacheKey: string,
+			totalNodes: number,
+			expiresAt: number?,
+			resolved: { [number]: Instance },
+			childrenByParent: { [Instance]: { [string]: any } }?,
+			terrainNodeId: number?,
+			sawPackageLink: boolean?,
+		},
+	} = {}
+
+	local bulkTreePruneScheduled = false
+	local function pruneExpiredBulkTreeCache()
+		bulkTreePruneScheduled = false
+		local now = os.clock()
+		local nextExpiry: number? = nil
+		for svc, entry in pairs(persistentBulkTreeCache) do
+			local curGen: number? = if type(ctx.structureGeneration) == "function"
+				then ctx.structureGeneration(svc)
+				else nil
+			if
+				(entry.expiresAt ~= nil and now >= entry.expiresAt)
+				or (curGen ~= nil and entry.structureGen ~= curGen)
+			then
+				persistentBulkTreeCache[svc] = nil
+			elseif entry.expiresAt ~= nil and (nextExpiry == nil or entry.expiresAt < nextExpiry) then
+				nextExpiry = entry.expiresAt
+			end
+		end
+		if nextExpiry ~= nil then
+			bulkTreePruneScheduled = true
+			task.delay(math.max(1, nextExpiry - now + 0.5), pruneExpiredBulkTreeCache)
+		end
 	end
 
 	local function resolveBulkTreeChunk(
@@ -10647,16 +11092,53 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		tree: { [string]: any },
 		cache: { [string]: any },
 		yieldForBudget: () -> (),
-		assertActive: () -> ()
-	): { [number]: Instance }
+		assertActive: () -> (),
+		noYieldUntil: number?,
+		allowPackageLinks: boolean?
+	): ({ [number]: Instance }, boolean)
 		local nodeOffset = tonumber(tree.nodeOffset) or 0
 		local nodeCount = tonumber(tree.nodeCount) or 0
 		local totalNodes = tonumber(tree.totalNodes) or nodeCount
 		if nodeOffset < 0 or nodeOffset % 1 ~= 0 or nodeCount < 0 or nodeCount % 1 ~= 0 or totalNodes < nodeOffset + nodeCount then
 			error("Invalid bulk property tree counts")
 		end
+		local cacheKey = if type(tree.cacheKey) == "string" and #tree.cacheKey > 0 then tree.cacheKey else nil
+		local curGen: number? = if type(ctx.structureGeneration) == "function"
+			then ctx.structureGeneration(serviceName)
+			else nil
+		local allowPkgs = allowPackageLinks == true
 		local state = cache[serviceName]
 		if nodeOffset == 0 then
+			local reusedChildrenByParent: { [Instance]: { [string]: any } }? = nil
+			if curGen ~= nil then
+				local cached = persistentBulkTreeCache[serviceName]
+				if cached ~= nil and (cached.structureGen ~= curGen or (cached.expiresAt ~= nil and os.clock() > cached.expiresAt)) then
+					persistentBulkTreeCache[serviceName] = nil
+					cached = nil
+				end
+				if cached ~= nil and cached.structureGen == curGen and (allowPkgs or cached.sawPackageLink ~= true) then
+					if
+						cacheKey ~= nil
+						and cached.cacheKey == cacheKey
+						and cached.totalNodes == totalNodes
+						and (totalNodes == 0 or (cached.resolved[1] ~= nil and cached.resolved[1]:IsDescendantOf(service)))
+					then
+						cache[serviceName] = {
+							strings = {},
+							resolved = cached.resolved,
+							childrenByParent = cached.childrenByParent or {},
+							reusedChildren = false,
+							terrainNodeId = cached.terrainNodeId,
+							sawPackageLink = cached.sawPackageLink == true,
+							cachedHit = true,
+						}
+						return cached.resolved, true
+					end
+					if cached.childrenByParent ~= nil then
+						reusedChildrenByParent = cached.childrenByParent
+					end
+				end
+			end
 			local stringText = ""
 			if type(tree.strings) == "string" and #tree.strings > 0 then
 				stringText = buffer.tostring(EncodingService:Base64Decode(buffer.fromstring(tree.strings)))
@@ -10665,15 +11147,22 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			state = {
 				strings = strings,
 				resolved = table.create(totalNodes),
-				childrenByParent = {},
+				childrenByParent = reusedChildrenByParent or {},
+				reusedChildren = reusedChildrenByParent ~= nil,
 				terrainNodeId = nil,
+				sawPackageLink = false,
+				cacheKey = cacheKey,
+				structureGen = curGen,
+				cachedHit = false,
 			}
 			cache[serviceName] = state
 		elseif state == nil then
 			error("Bulk property tree chunk arrived before tree header")
+		elseif state.cachedHit == true then
+			return state.resolved, true
 		end
 		if nodeCount == 0 then
-			return state.resolved
+			return state.resolved, false
 		end
 		if type(tree.nodes) ~= "string" then
 			error("Bulk property tree nodes must be base64")
@@ -10686,10 +11175,16 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local strings = state.strings
 		local resolved = state.resolved
 		local childrenByParent = state.childrenByParent
+		local reusedChildren = state.reusedChildren == true
+		local prevParentIdx = -1
+		local prevParentInst: Instance? = nil
+		local prevLookup: any = nil
 		for index = 1, nodeCount do
-			if index % 512 == 0 then
-				if yieldForBudget() then
-					assertActive()
+			if index % 2048 == 0 then
+				if noYieldUntil == nil or os.clock() >= noYieldUntil then
+					if yieldForBudget() then
+						assertActive()
+					end
 				end
 			end
 			local offset = (index - 1) * 16
@@ -10702,14 +11197,28 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			if type(name) ~= "string" or type(className) ~= "string" then
 				error(`Bulk property tree node {nodeOffset + index} references an invalid string`)
 			end
-			local parentInst = if parentIdx == 0 then service else resolved[parentIdx]
-			if parentInst == nil then
-				error(`Bulk property tree node {nodeOffset + index} references an unresolved parent {parentIdx}`)
-			end
-			local lookup = childrenByParent[parentInst]
-			if lookup == nil then
-				lookup = buildBulkChildLookup(parentInst)
-				childrenByParent[parentInst] = lookup
+			local parentInst: Instance?
+			local lookup: any
+			if parentIdx == prevParentIdx then
+				parentInst = prevParentInst
+				lookup = prevLookup
+			else
+				parentInst = if parentIdx == 0 then service else resolved[parentIdx]
+				if parentInst == nil then
+					error(`Bulk property tree node {nodeOffset + index} references an unresolved parent {parentIdx}`)
+				end
+				lookup = childrenByParent[parentInst]
+				if lookup == nil then
+					local sawPkg: boolean
+					lookup, sawPkg = buildBulkChildLookup(parentInst, allowPkgs)
+					if sawPkg then
+						state.sawPackageLink = true
+					end
+					childrenByParent[parentInst] = lookup
+				end
+				prevParentIdx = parentIdx
+				prevParentInst = parentInst
+				prevLookup = lookup
 			end
 			local entry = lookup[name]
 			local target: Instance? = nil
@@ -10720,13 +11229,32 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			elseif type(entry) == "table" then
 				target = entry[ordinal]
 			end
+			if reusedChildren and (target == nil or target.Parent ~= parentInst or target.Name ~= name) then
+				local sawPkg: boolean
+				lookup, sawPkg = buildBulkChildLookup(parentInst :: Instance, allowPkgs)
+				if sawPkg then
+					state.sawPackageLink = true
+				end
+				childrenByParent[parentInst :: Instance] = lookup
+				prevLookup = lookup
+				entry = lookup[name]
+				target = nil
+				if typeof(entry) == "Instance" then
+					if ordinal == 1 then
+						target = entry
+					end
+				elseif type(entry) == "table" then
+					target = entry[ordinal]
+				end
+			end
 			if target == nil then
-				error(`Bulk property target not found: {parentInst:GetFullName()}.{name}[{ordinal}]`)
+				error(`Bulk property target not found: {(parentInst :: Instance):GetFullName()}.{name}[{ordinal}]`)
 			end
-			if target.ClassName ~= className then
-				error(`Bulk property target class mismatch at {target:GetFullName()}: expected {className}, got {target.ClassName}`)
+			local targetClass = target.ClassName
+			if targetClass ~= className then
+				error(`Bulk property target class mismatch at {target:GetFullName()}: expected {className}, got {targetClass}`)
 			end
-			if isProtectedWorkspaceCameraInstance(target) or target.ClassName == "PackageLink" then
+			if (targetClass == "Camera" and isProtectedWorkspaceCameraInstance(target)) or targetClass == "PackageLink" then
 				error(`Bulk property target is protected: {target:GetFullName()}`)
 			end
 			local nodeId = nodeOffset + index
@@ -10735,7 +11263,29 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				state.terrainNodeId = nodeId
 			end
 		end
-		return resolved
+		if
+			nodeOffset + nodeCount == totalNodes
+			and state.cacheKey ~= nil
+			and state.structureGen ~= nil
+			and type(ctx.structureGeneration) == "function"
+			and ctx.structureGeneration(serviceName) == state.structureGen
+		then
+			persistentBulkTreeCache[serviceName] = {
+				structureGen = state.structureGen,
+				cacheKey = state.cacheKey,
+				totalNodes = totalNodes,
+				expiresAt = os.clock() + 60,
+				resolved = resolved,
+				childrenByParent = childrenByParent,
+				terrainNodeId = state.terrainNodeId,
+				sawPackageLink = state.sawPackageLink == true,
+			}
+			if not bulkTreePruneScheduled then
+				bulkTreePruneScheduled = true
+				task.delay(61, pruneExpiredBulkTreeCache)
+			end
+		end
+		return resolved, false
 	end
 
 	function api.applyBulkProperties(params: { [string]: any }): { [string]: any }
@@ -10766,6 +11316,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			verified = 0,
 			expectedFields = 0,
 			errors = 0,
+			exactRetained = if ctx.isItemChangedActive then ctx.isItemChangedActive() else false,
+			sideEffectObserved = false,
 			protectedWrites = {},
 			lastMs = 0,
 		}
@@ -10779,10 +11331,32 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		local yieldForBudget = BridgeParallel.newRequestBudget()
 		beginSessionOperation(session)
 		local okApply, applyErr = xpcall(function()
+			local expectedTerrainDigest = if type(params.expectedTerrainDigest) == "string"
+					and params.expectedTerrainDigest ~= ""
+				then params.expectedTerrainDigest
+				else nil
+			local initialNoYieldUntil: number? = if params.commit == true or expectedTerrainDigest ~= nil
+				then os.clock() + 0.50
+				else nil
 			session.bulkTrees = session.bulkTrees or {}
 			local resolved: { [number]: Instance }? = nil
+			local stepStarted = os.clock()
 			if type(params.tree) == "table" then
-				resolved = resolveBulkTreeChunk(serviceName, service, params.tree, session.bulkTrees, yieldForBudget, assertActive)
+				local treeCacheHit: boolean
+				resolved, treeCacheHit = resolveBulkTreeChunk(
+					serviceName,
+					service,
+					params.tree,
+					session.bulkTrees,
+					yieldForBudget,
+					assertActive,
+					initialNoYieldUntil,
+					params.hasPackageTargets == true
+				)
+				if treeCacheHit then
+					stats.treeCacheHit = true
+				end
+				BridgeConnection.profileStep("bulk: resolve tree", stepStarted)
 			elseif session.bulkTrees[serviceName] ~= nil then
 				resolved = session.bulkTrees[serviceName].resolved
 			end
@@ -10796,13 +11370,24 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			session.snapshot.bulkProperties = session.snapshot.bulkProperties or {}
 			if session.bulkExpectedProperties == nil then
 				session.bulkExpectedProperties = {}
+				session.activeBulkWrite = { nil, nil, nil, nil }
 				if ctx.setBulkExpectedProperties then
-					ctx.setBulkExpectedProperties(session.bulkExpectedProperties)
+					ctx.setBulkExpectedProperties(session.bulkExpectedProperties, session.activeBulkWrite)
+				end
+			elseif session.activeBulkWrite == nil then
+				session.activeBulkWrite = { nil, nil, nil, nil }
+				if ctx.setBulkExpectedProperties then
+					ctx.setBulkExpectedProperties(session.bulkExpectedProperties, session.activeBulkWrite)
 				end
 			end
 			local bulkExpected = session.bulkExpectedProperties
+			local activeBulkWrite = session.activeBulkWrite
+			local ATTR_NIL = {}
+			local returnOldValues = params.returnOldValues == true
+			stepStarted = os.clock()
 			local decodedColumns = {}
 			for _, column in ipairs(columns) do
+				local colKind = if type(column.kind) == "string" and column.kind ~= "" then column.kind else "property"
 				local propName = tostring(column.propertyName or "")
 				local encoding = tostring(column.encoding or "")
 				local count = tonumber(column.count) or 0
@@ -10812,7 +11397,10 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				if count == 0 then
 					continue
 				end
-				stats.expectedFields += count
+				local isAssertColumn = colKind == "assert_model_scale" or colKind == "assert_model_pivot"
+				if not isAssertColumn then
+					stats.expectedFields += count
+				end
 				local rowsBuf = EncodingService:Base64Decode(buffer.fromstring(column.rows))
 				if buffer.len(rowsBuf) ~= count * 4 then
 					error(`Bulk property row buffer size mismatch for {propName}`)
@@ -10820,6 +11408,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				local valBuf: buffer? = nil
 				local constValue: any = nil
 				local decodedPalette: { [number]: any }? = nil
+				local isEnumPalette = false
 				local idxBuf: buffer? = nil
 				if encoding == "f32_const" or encoding == "f64_const" or encoding == "bool_const" then
 					constValue = column.value
@@ -10858,17 +11447,52 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						error(`Bulk property index buffer size mismatch for {propName}`)
 					end
 					decodedPalette = table.create(#rawPalette)
-					for pIndex = 1, #rawPalette do
-						local okDecode, decoded = decodeValue(rawPalette[pIndex], propName)
-						if not okDecode then
-							error(`Failed to decode bulk property value for {propName}: {decoded}`)
+					if colKind == "attributes_replace" then
+						for pIndex = 1, #rawPalette do
+							local rawMap = rawPalette[pIndex]
+							local decodedMap: { [string]: any } = {}
+							if type(rawMap) == "table" then
+								for attrKey, rawAttrVal in pairs(rawMap) do
+									local okDecode, decoded = decodeValue(rawAttrVal, tostring(attrKey))
+									if not okDecode then
+										error(`Failed to decode bulk attribute value for {attrKey}: {decoded}`)
+									end
+									decodedMap[tostring(attrKey)] = decoded
+								end
+							end
+							(decodedPalette :: { [number]: any })[pIndex] = decodedMap
 						end
-						(decodedPalette :: { [number]: any })[pIndex] = decoded
+					elseif colKind == "attribute" then
+						for pIndex = 1, #rawPalette do
+							local rawVal = rawPalette[pIndex]
+							if rawVal == nil or (type(rawVal) == "table" and rawVal._type == "AttributeDelete") then
+								(decodedPalette :: { [number]: any })[pIndex] = ATTR_NIL
+							else
+								local okDecode, decoded = decodeValue(rawVal, propName)
+								if not okDecode then
+									error(`Failed to decode bulk attribute value for {propName}: {decoded}`)
+								end
+								(decodedPalette :: { [number]: any })[pIndex] = decoded
+							end
+						end
+					else
+						isEnumPalette = #rawPalette > 0
+						for pIndex = 1, #rawPalette do
+							local okDecode, decoded = decodeValue(rawPalette[pIndex], propName)
+							if not okDecode then
+								error(`Failed to decode bulk property value for {propName}: {decoded}`)
+							end
+							if typeof(decoded) ~= "EnumItem" then
+								isEnumPalette = false
+							end
+							(decodedPalette :: { [number]: any })[pIndex] = decoded
+						end
 					end
 				else
 					error(`Unsupported bulk property encoding {encoding}`)
 				end
 				decodedColumns[#decodedColumns + 1] = {
+					kind = colKind,
 					propName = propName,
 					encoding = encoding,
 					count = count,
@@ -10876,20 +11500,16 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					valBuf = valBuf,
 					constValue = constValue,
 					decodedPalette = decodedPalette,
+					isEnumPalette = isEnumPalette,
 					idxBuf = idxBuf,
 					skipIdx = nil :: number?,
-					rollbackInstances = {},
-					rollbackOldValues = {},
-					rollbackNodeIds = {},
+					rollbackInstances = table.create(count),
+					rollbackOldValues = table.create(count),
+					rollbackNodeIds = if returnOldValues then table.create(count) else {},
 					rollbackCount = 0,
 				}
 			end
-
-			local returnOldValues = params.returnOldValues == true
-			local expectedTerrainDigest = if type(params.expectedTerrainDigest) == "string"
-					and params.expectedTerrainDigest ~= ""
-				then params.expectedTerrainDigest
-				else nil
+			BridgeConnection.profileStep("bulk: decode columns", stepStarted)
 
 			local function readColumnDesired(col: any, idx: number): any
 				local encoding = col.encoding
@@ -10939,14 +11559,180 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 			end
 
+			local abs = math.abs
+			local readu32 = buffer.readu32
+			local readf32 = buffer.readf32
+			local readf64 = buffer.readf64
+			local readi32 = buffer.readi32
+			local readu8 = buffer.readu8
+			local Vec3New = Vector3.new
+			local Color3New = Color3.new
+			local CFrameNew = CFrame.new
+			local FLOAT32_EPSILON = 2 ^ -23
+
+			local function f32NumbersEqual(a: number, b: number): boolean
+				if a == b then
+					return true
+				end
+				if a ~= a and b ~= b then
+					return true
+				end
+				return abs(a) < math.huge
+					and abs(b) < math.huge
+					and abs(a - b) <= 4 * FLOAT32_EPSILON * math.max(1, abs(a), abs(b))
+			end
+
+			local function cframesClose(a: any, b: CFrame): boolean
+				if a == b then
+					return true
+				end
+				if typeof(a) ~= "CFrame" then
+					return false
+				end
+				local ax, ay, az = a.X, a.Y, a.Z
+				local bx, by, bz = b.X, b.Y, b.Z
+				if
+					(abs(ax - bx) > 2e-4 and not f32NumbersEqual(ax, bx))
+					or (abs(ay - by) > 2e-4 and not f32NumbersEqual(ay, by))
+					or (abs(az - bz) > 2e-4 and not f32NumbersEqual(az, bz))
+				then
+					return false
+				end
+				return BridgeValueEquality.valuesEqual(a, b)
+			end
+
+			local function attrValuesEqual(a: any, b: any): boolean
+				if a == b then
+					return true
+				end
+				if a == nil or b == nil then
+					return false
+				end
+				return exactValuesEqual(a, b)
+			end
+
+			local function attrMapsEqual(cur: { [string]: any }, desired: { [string]: any }): boolean
+				for k, v in pairs(cur) do
+					if not isEngineManagedAttribute(k) then
+						local dv = desired[k]
+						if dv == nil or not attrValuesEqual(v, dv) then
+							return false
+						end
+					end
+				end
+				for k in pairs(desired) do
+					if not isEngineManagedAttribute(k) and cur[k] == nil then
+						return false
+					end
+				end
+				return true
+			end
+
+			local function ensureColumnSnapshotEntry(col: any)
+				local entry = col.snapshotEntry
+				if entry == nil then
+					entry = {
+						kind = col.kind,
+						propertyName = col.propName,
+						instances = col.rollbackInstances,
+						oldValues = col.rollbackOldValues,
+						nilSentinel = ATTR_NIL,
+						count = 0,
+					}
+					col.snapshotEntry = entry
+					local bulkSnapshots = session.snapshot.bulkProperties
+					bulkSnapshots[#bulkSnapshots + 1] = entry
+				end
+				return entry
+			end
+
+			for _, col in ipairs(decodedColumns) do
+				local colKind = col.kind
+				if colKind == "assert_model_scale" then
+					local count = col.count
+					local rowsBuf = col.rowsBuf
+					local isF32Const = col.encoding == "f32_const"
+					local constScale: number = if isF32Const then col.constValue else 1
+					local vb = col.valBuf :: buffer
+					for idx = 1, count do
+						local rowOff = (idx - 1) * 4
+						local nodeId = readu32(rowsBuf, rowOff)
+						local instance = if nodeId == 0 then service else resolved[nodeId]
+						if instance == nil then
+							error(`Bulk assert_model_scale references missing tree node {nodeId}`)
+						end
+						local expectedScale = if isF32Const then constScale else readf32(vb, rowOff)
+						local okScale, actualScale = pcall((instance :: any).GetScale, instance)
+						if not okScale or type(actualScale) ~= "number" or not f32NumbersEqual(actualScale, expectedScale) then
+							stats.fallbackFullCapture = true
+							stats.fallbackReason = "model_scale"
+							return
+						end
+					end
+				elseif colKind == "assert_model_pivot" then
+					local count = col.count
+					local rowsBuf = col.rowsBuf
+					if col.propName == "WorldPivotUnset" then
+						session.unsetPivotChecks = session.unsetPivotChecks or {}
+						local checks = session.unsetPivotChecks
+						for idx = 1, count do
+							local nodeId = readu32(rowsBuf, (idx - 1) * 4)
+							local instance = if nodeId == 0 then service else resolved[nodeId]
+							if instance == nil then
+								error(`Bulk assert_model_pivot references missing tree node {nodeId}`)
+							end
+							checks[#checks + 1] = {
+								model = instance,
+								prePivot = (instance :: any).WorldPivot,
+							}
+						end
+					else
+						local vb = col.valBuf :: buffer
+						for idx = 1, count do
+							local nodeId = readu32(rowsBuf, (idx - 1) * 4)
+							local instance = if nodeId == 0 then service else resolved[nodeId]
+							if instance == nil then
+								error(`Bulk assert_model_pivot references missing tree node {nodeId}`)
+							end
+							local cfOff = (idx - 1) * 48
+							local expectedPivot = CFrameNew(
+								readf32(vb, cfOff),
+								readf32(vb, cfOff + 4),
+								readf32(vb, cfOff + 8),
+								readf32(vb, cfOff + 12),
+								readf32(vb, cfOff + 16),
+								readf32(vb, cfOff + 20),
+								readf32(vb, cfOff + 24),
+								readf32(vb, cfOff + 28),
+								readf32(vb, cfOff + 32),
+								readf32(vb, cfOff + 36),
+								readf32(vb, cfOff + 40),
+								readf32(vb, cfOff + 44)
+							)
+							local actualPivot = (instance :: any).WorldPivot
+							if not cframesClose(actualPivot, expectedPivot) then
+								stats.fallbackFullCapture = true
+								stats.fallbackReason = "model_pivot"
+								return
+							end
+						end
+					end
+				end
+			end
+
 			local preTerrainDigest: string? = nil
 			local noYieldUntil = 0
 			if (params.commit == true or expectedTerrainDigest ~= nil) and type(ctx.captureTerrainProof) == "function" then
 				local treeState = session.bulkTrees[serviceName]
 				local terrainNodeId = if treeState ~= nil then treeState.terrainNodeId else nil
+				local prevMutated = session.mutated
+				local preTerrainSnapshotStart = #session.snapshot.bulkProperties
 				local terrainWrites: { { col: any, instance: Instance, propName: string, oldValue: any } } = {}
 				if terrainNodeId ~= nil then
 					for _, col in ipairs(decodedColumns) do
+						if col.kind ~= "property" then
+							continue
+						end
 						local lo, hi = 1, col.count
 						local foundIdx: number? = nil
 						local rowsBuf = col.rowsBuf
@@ -10981,15 +11767,17 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 							local current = target[propName]
 							if
 								current == desiredValue
-								or (isF32Approx and type(current) == "number" and valuesEqual(current, desiredValue))
+								or (isF32Approx and type(current) == "number" and f32NumbersEqual(current, desiredValue))
 								or (not isF32Approx and not isExactScalar and propertyValuesEqual(instance, propName, current, desiredValue))
 							then
 								stats.noops += 1
 								stats.verified += 1
 							else
+								local snapEntry = ensureColumnSnapshotEntry(col)
 								col.rollbackCount += 1
 								col.rollbackInstances[col.rollbackCount] = instance
 								col.rollbackOldValues[col.rollbackCount] = current
+								snapEntry.count = col.rollbackCount
 								if returnOldValues then
 									col.rollbackNodeIds[col.rollbackCount] = terrainNodeId
 								end
@@ -10999,14 +11787,14 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 									propName = propName,
 									oldValue = current,
 								}
+								session.mutated = true
 								expectedForProp[instance] = desiredValue
 								target[propName] = desiredValue
-								session.mutated = true
 								stats.propertyUpdated += 1
 								local after = target[propName]
 								if
 									after == desiredValue
-									or (isF32Approx and type(after) == "number" and math.abs(after - desiredValue) <= 1e-6)
+									or (isF32Approx and type(after) == "number" and f32NumbersEqual(after, desiredValue))
 									or (not isF32Approx and not isExactScalar and propertyValuesEqual(instance, propName, after, desiredValue))
 								then
 									stats.verified += 1
@@ -11029,15 +11817,21 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 							end
 							(entry.instance :: any)[entry.propName] = entry.oldValue
 							entry.col.rollbackCount = 0
+							entry.col.snapshotEntry = nil
 							table.clear(entry.col.rollbackInstances)
 							table.clear(entry.col.rollbackOldValues)
 							table.clear(entry.col.rollbackNodeIds)
 						end
-						session.mutated = false
+						local bulkSnapshots = session.snapshot.bulkProperties
+						for snapIdx = #bulkSnapshots, preTerrainSnapshotStart + 1, -1 do
+							bulkSnapshots[snapIdx] = nil
+						end
+						session.mutated = prevMutated
 						stats.propertyUpdated = 0
 						stats.noops = 0
 						stats.verified = 0
 						stats.fallbackFullCapture = true
+						stats.fallbackReason = "terrain_digest"
 						return
 					end
 				end
@@ -11048,7 +11842,34 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				end
 			end
 
+			local function maybeYield()
+				if noYieldUntil > 0 then
+					if os.clock() >= noYieldUntil then
+						preTerrainDigest = nil
+						noYieldUntil = 0
+						if yieldForBudget() then
+							assertActive()
+						end
+					end
+				else
+					if yieldForBudget() then
+						assertActive()
+					end
+				end
+			end
+
+			stepStarted = os.clock()
+			if preTerrainDigest ~= nil or (initialNoYieldUntil ~= nil and os.clock() < initialNoYieldUntil) then
+				if noYieldUntil == 0 and initialNoYieldUntil ~= nil then
+					noYieldUntil = initialNoYieldUntil
+				end
+			end
+
 			for _, col in ipairs(decodedColumns) do
+				local colKind = col.kind
+				if colKind == "assert_model_scale" or colKind == "assert_model_pivot" then
+					continue
+				end
 				local propName = col.propName
 				local encoding = col.encoding
 				local count = col.count
@@ -11059,248 +11880,834 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				local idxBuf: buffer? = col.idxBuf
 				local skipIdx = col.skipIdx
 
-				local expectedForProp = bulkExpected[propName]
-				if expectedForProp == nil then
-					expectedForProp = {}
-					bulkExpected[propName] = expectedForProp
-				end
-				if ctx.noteBulkExportChange then
-					ctx.noteBulkExportChange(serviceName, propName)
-				end
-
 				local rollbackInstances = col.rollbackInstances
 				local rollbackOldValues = col.rollbackOldValues
 				local rollbackNodeIds = col.rollbackNodeIds
 				local rollbackCount = col.rollbackCount
-				local isConst = encoding == "f32_const" or encoding == "f64_const" or encoding == "bool_const"
-				local isF32 = encoding == "f32"
-				local isF64 = encoding == "f64"
-				local isBool = encoding == "bool"
-				local isI32 = encoding == "i32"
-				local isVec3 = encoding == "vector3"
-				local isColor3 = encoding == "color3"
-				local isCFrame = encoding == "cframe"
-				local isF32Approx = encoding == "f32_const" or isF32
-				local isExactScalar = encoding == "f64_const" or isF64 or isI32 or encoding == "bool_const" or isBool
+				local snapEntry = col.snapshotEntry
 				local updated = 0
 				local noops = 0
 				local verified = 0
 
-				if isCFrame then
-					local cfDesired = table.create(count)
-					local cfInstances = table.create(count)
+				if colKind == "tag" then
+					local bulkTags = bulkExpected["@tags"]
+					if bulkTags == nil then
+						bulkTags = {}
+						bulkExpected["@tags"] = bulkTags
+					end
+					local expectedForTag = bulkTags[propName]
+					if expectedForTag == nil then
+						expectedForTag = {}
+						bulkTags[propName] = expectedForTag
+					end
+					if ctx.noteBulkExportChange then
+						ctx.noteBulkExportChange(serviceName, "Tags")
+					end
+					local isBoolConst = encoding == "bool_const"
+					local constBool = constValue == true
+					local vb = valBuf :: buffer
 					for idx = 1, count do
-						local rowByteOffset = (idx - 1) * 4
-						local nodeId = buffer.readu32(rowsBuf, rowByteOffset)
+						if idx % 2048 == 0 then
+							maybeYield()
+						end
+						local nodeId = readu32(rowsBuf, (idx - 1) * 4)
 						local instance = if nodeId == 0 then service else resolved[nodeId]
 						if instance == nil then
-							error(`Bulk property column {propName} references missing tree node {nodeId}`)
+							error(`Bulk tag column {propName} references missing tree node {nodeId}`)
 						end
-						local cfOff = (idx - 1) * 48
-						local desiredValue = CFrame.new(
-							buffer.readf32(valBuf :: buffer, cfOff),
-							buffer.readf32(valBuf :: buffer, cfOff + 4),
-							buffer.readf32(valBuf :: buffer, cfOff + 8),
-							buffer.readf32(valBuf :: buffer, cfOff + 12),
-							buffer.readf32(valBuf :: buffer, cfOff + 16),
-							buffer.readf32(valBuf :: buffer, cfOff + 20),
-							buffer.readf32(valBuf :: buffer, cfOff + 24),
-							buffer.readf32(valBuf :: buffer, cfOff + 28),
-							buffer.readf32(valBuf :: buffer, cfOff + 32),
-							buffer.readf32(valBuf :: buffer, cfOff + 36),
-							buffer.readf32(valBuf :: buffer, cfOff + 40),
-							buffer.readf32(valBuf :: buffer, cfOff + 44)
-						)
-						cfInstances[idx] = instance
-						cfDesired[idx] = desiredValue
-						expectedForProp[instance] = desiredValue
-					end
-					for idx = 1, count do
-						if idx == skipIdx then
-							continue
-						end
-						if idx % 2048 == 0 then
-							if preTerrainDigest ~= nil then
-								if os.clock() >= noYieldUntil then
-									preTerrainDigest = nil
-									if yieldForBudget() then
-										assertActive()
-									end
-								end
-							else
-								if yieldForBudget() then
-									assertActive()
-								end
-							end
-						end
-						local instance = cfInstances[idx]
-						local desiredValue = cfDesired[idx]
-						local target: any = instance
-						local current = target[propName]
-						if current == desiredValue or BridgeValueEquality.valuesEqual(current, desiredValue) then
-							noops += 1
-							continue
-						end
-						rollbackCount += 1
-						rollbackInstances[rollbackCount] = instance
-						rollbackOldValues[rollbackCount] = current
-						if returnOldValues then
-							rollbackNodeIds[rollbackCount] = buffer.readu32(rowsBuf, (idx - 1) * 4)
-						end
-						target[propName] = desiredValue
-						updated += 1
-					end
-					local retryIndices = {}
-					for idx = 1, count do
-						if idx == skipIdx then
-							continue
-						end
-						local instance = cfInstances[idx]
-						local desiredValue = cfDesired[idx]
-						local after = (instance :: any)[propName]
-						if after == desiredValue or BridgeValueEquality.valuesEqual(after, desiredValue) then
-							verified += 1
-						else
-							(instance :: any)[propName] = desiredValue
-							retryIndices[#retryIndices + 1] = idx
-						end
-					end
-					for _, idx in ipairs(retryIndices) do
-						local instance = cfInstances[idx]
-						local desiredValue = cfDesired[idx]
-						local after = (instance :: any)[propName]
-						if after == desiredValue or BridgeValueEquality.valuesEqual(after, desiredValue) then
-							verified += 1
-						else
-							error(`Studio did not retain {propName} on {instance:GetFullName()}`)
-						end
-					end
-				else
-					for idx = 1, count do
-						if idx == skipIdx then
-							continue
-						end
-						if idx % 2048 == 0 then
-							if preTerrainDigest ~= nil then
-								if os.clock() >= noYieldUntil then
-									preTerrainDigest = nil
-									if yieldForBudget() then
-										assertActive()
-									end
-								end
-							else
-								if yieldForBudget() then
-									assertActive()
-								end
-							end
-						end
-						local rowByteOffset = (idx - 1) * 4
-						local nodeId = buffer.readu32(rowsBuf, rowByteOffset)
-						local instance = if nodeId == 0 then service else resolved[nodeId]
-						if instance == nil then
-							error(`Bulk property column {propName} references missing tree node {nodeId}`)
-						end
-						local desiredValue: any
-						if isConst then
-							desiredValue = constValue
-						elseif isF32 then
-							desiredValue = buffer.readf32(valBuf :: buffer, rowByteOffset)
-						elseif isF64 then
-							desiredValue = buffer.readf64(valBuf :: buffer, (idx - 1) * 8)
-						elseif isBool then
-							desiredValue = buffer.readu8(valBuf :: buffer, idx - 1) ~= 0
-						elseif isI32 then
-							desiredValue = buffer.readi32(valBuf :: buffer, rowByteOffset)
-						elseif isVec3 then
-							local vOff = (idx - 1) * 12
-							desiredValue = Vector3.new(
-								buffer.readf32(valBuf :: buffer, vOff),
-								buffer.readf32(valBuf :: buffer, vOff + 4),
-								buffer.readf32(valBuf :: buffer, vOff + 8)
-							)
-						elseif isColor3 then
-							local cOff = (idx - 1) * 12
-							desiredValue = Color3.new(
-								buffer.readf32(valBuf :: buffer, cOff),
-								buffer.readf32(valBuf :: buffer, cOff + 4),
-								buffer.readf32(valBuf :: buffer, cOff + 8)
-							)
-						else
-							local paletteIdx = buffer.readu32(idxBuf :: buffer, rowByteOffset)
-							desiredValue = (decodedPalette :: { [number]: any })[paletteIdx + 1]
-						end
-
-						local target: any = instance
-						local current = target[propName]
-						if
-							current == desiredValue
-							or (isF32Approx and type(current) == "number" and valuesEqual(current, desiredValue))
-							or (not isF32Approx and not isExactScalar and propertyValuesEqual(instance, propName, current, desiredValue))
-						then
+						local desired = if isBoolConst then constBool else readu8(vb, idx - 1) ~= 0
+						local hasTag = CollectionService:HasTag(instance, propName)
+						if hasTag == desired then
 							noops += 1
 							verified += 1
 							continue
 						end
-
+						if snapEntry == nil then
+							snapEntry = ensureColumnSnapshotEntry(col)
+						end
 						rollbackCount += 1
 						rollbackInstances[rollbackCount] = instance
-						rollbackOldValues[rollbackCount] = current
+						rollbackOldValues[rollbackCount] = hasTag
+						col.rollbackCount = rollbackCount
+						snapEntry.count = rollbackCount
 						if returnOldValues then
 							rollbackNodeIds[rollbackCount] = nodeId
 						end
-
-						expectedForProp[instance] = desiredValue
-						target[propName] = desiredValue
+						session.mutated = true
+						expectedForTag[instance] = desired
+						activeBulkWrite[1] = instance
+						activeBulkWrite[2] = "Tags"
+						activeBulkWrite[3] = nil
+						if desired then
+							CollectionService:AddTag(instance, propName)
+						else
+							CollectionService:RemoveTag(instance, propName)
+						end
+						activeBulkWrite[1] = nil
 						updated += 1
-
-						local after = target[propName]
-						if
-							after == desiredValue
-							or (isF32Approx and type(after) == "number" and math.abs(after - desiredValue) <= 1e-6)
-							or (not isF32Approx and not isExactScalar and propertyValuesEqual(instance, propName, after, desiredValue))
-						then
+						if CollectionService:HasTag(instance, propName) == desired then
 							verified += 1
 						else
-							error(`Studio did not retain {propName} on {instance:GetFullName()}`)
+							error(`Studio did not retain tag {propName} on {instance:GetFullName()}`)
+						end
+					end
+				elseif colKind == "attribute" then
+					if isEngineManagedAttribute(propName) then
+						noops += count
+						verified += count
+					else
+						local expectedAttrs = bulkExpected["@attributes"]
+						if expectedAttrs == nil then
+							expectedAttrs = {}
+							bulkExpected["@attributes"] = expectedAttrs
+						end
+						if ctx.noteBulkExportChange then
+							ctx.noteBulkExportChange(serviceName, "Attributes")
+						end
+						local palette = decodedPalette :: { [number]: any }
+						local ib = idxBuf :: buffer
+						for idx = 1, count do
+							if idx % 2048 == 0 then
+								maybeYield()
+							end
+							local rowOff = (idx - 1) * 4
+							local nodeId = readu32(rowsBuf, rowOff)
+							local instance = if nodeId == 0 then service else resolved[nodeId]
+							if instance == nil then
+								error(`Bulk attribute column {propName} references missing tree node {nodeId}`)
+							end
+							local rawDesired = palette[readu32(ib, rowOff) + 1]
+							local desired = if rawDesired == ATTR_NIL then nil else rawDesired
+							local current = instance:GetAttribute(propName)
+							if attrValuesEqual(current, desired) then
+								noops += 1
+								verified += 1
+								continue
+							end
+							if snapEntry == nil then
+								snapEntry = ensureColumnSnapshotEntry(col)
+							end
+							rollbackCount += 1
+							rollbackInstances[rollbackCount] = instance
+							rollbackOldValues[rollbackCount] = if current == nil then ATTR_NIL else current
+							col.rollbackCount = rollbackCount
+							snapEntry.count = rollbackCount
+							if returnOldValues then
+								rollbackNodeIds[rollbackCount] = nodeId
+							end
+							session.mutated = true
+							local perInst = expectedAttrs[instance]
+							if perInst == nil then
+								perInst = { keys = {}, relayPending = 0, relaySnapshot = nil, nilSentinel = ATTR_NIL }
+								expectedAttrs[instance] = perInst
+							end
+							if perInst.relaySnapshot == nil then
+								perInst.relaySnapshot = instance:GetAttributes()
+							end
+							perInst.keys[propName] = if desired == nil then ATTR_NIL else desired
+							activeBulkWrite[1] = instance
+							activeBulkWrite[2] = "@attribute"
+							activeBulkWrite[3] = propName
+							activeBulkWrite[4] = desired
+							activeBulkWrite[5] = false
+							instance:SetAttribute(propName, desired)
+							local syncRelayConsumed = activeBulkWrite[5] == true
+							activeBulkWrite[1] = nil
+							perInst.relaySnapshot[propName] = desired
+							if not syncRelayConsumed then
+								perInst.relayPending += 1
+							end
+							updated += 1
+							local after = instance:GetAttribute(propName)
+							if attrValuesEqual(after, desired) then
+								verified += 1
+							else
+								error(`Studio did not retain attribute {propName} on {instance:GetFullName()}`)
+							end
+						end
+					end
+				elseif colKind == "attributes_replace" then
+					local expectedAttrs = bulkExpected["@attributes"]
+					if expectedAttrs == nil then
+						expectedAttrs = {}
+						bulkExpected["@attributes"] = expectedAttrs
+					end
+					if ctx.noteBulkExportChange then
+						ctx.noteBulkExportChange(serviceName, "Attributes")
+					end
+					local palette = decodedPalette :: { [number]: any }
+					local ib = idxBuf :: buffer
+					for idx = 1, count do
+						if idx % 2048 == 0 then
+							maybeYield()
+						end
+						local rowOff = (idx - 1) * 4
+						local nodeId = readu32(rowsBuf, rowOff)
+						local instance = if nodeId == 0 then service else resolved[nodeId]
+						if instance == nil then
+							error(`Bulk attributes column references missing tree node {nodeId}`)
+						end
+						local desiredMap = palette[readu32(ib, rowOff) + 1] :: { [string]: any }
+						local cur = instance:GetAttributes()
+						if attrMapsEqual(cur, desiredMap) then
+							noops += 1
+							verified += 1
+							continue
+						end
+						if snapEntry == nil then
+							snapEntry = ensureColumnSnapshotEntry(col)
+						end
+						rollbackCount += 1
+						rollbackInstances[rollbackCount] = instance
+						rollbackOldValues[rollbackCount] = cur
+						col.rollbackCount = rollbackCount
+						snapEntry.count = rollbackCount
+						if returnOldValues then
+							rollbackNodeIds[rollbackCount] = nodeId
+						end
+						session.mutated = true
+						local perInst = expectedAttrs[instance]
+						if perInst == nil then
+							perInst = { keys = {}, relayPending = 0, relaySnapshot = nil, nilSentinel = ATTR_NIL }
+							expectedAttrs[instance] = perInst
+						end
+						if perInst.relaySnapshot == nil then
+							perInst.relaySnapshot = table.clone(cur)
+						end
+						local asyncWrites = 0
+						for k in pairs(cur) do
+							if not isEngineManagedAttribute(k) and desiredMap[k] == nil then
+								perInst.keys[k] = ATTR_NIL
+								activeBulkWrite[1] = instance
+								activeBulkWrite[2] = "@attribute"
+								activeBulkWrite[3] = k
+								activeBulkWrite[4] = nil
+								activeBulkWrite[5] = false
+								instance:SetAttribute(k, nil)
+								if activeBulkWrite[5] ~= true then
+									asyncWrites += 1
+								end
+								activeBulkWrite[1] = nil
+								perInst.relaySnapshot[k] = nil
+							end
+						end
+						for k, v in pairs(desiredMap) do
+							if not isEngineManagedAttribute(k) and not attrValuesEqual(cur[k], v) then
+								perInst.keys[k] = v
+								activeBulkWrite[1] = instance
+								activeBulkWrite[2] = "@attribute"
+								activeBulkWrite[3] = k
+								activeBulkWrite[4] = v
+								activeBulkWrite[5] = false
+								instance:SetAttribute(k, v)
+								if activeBulkWrite[5] ~= true then
+									asyncWrites += 1
+								end
+								activeBulkWrite[1] = nil
+								perInst.relaySnapshot[k] = v
+							end
+						end
+						if asyncWrites > 0 then
+							perInst.relayPending += asyncWrites
+						end
+						updated += 1
+						if attrMapsEqual(instance:GetAttributes(), desiredMap) then
+							verified += 1
+						else
+							error(`Studio did not retain attributes on {instance:GetFullName()}`)
+						end
+					end
+				else
+					local expectedForProp = bulkExpected[propName]
+					if expectedForProp == nil then
+						expectedForProp = {}
+						bulkExpected[propName] = expectedForProp
+					end
+					if ctx.noteBulkExportChange then
+						ctx.noteBulkExportChange(serviceName, propName)
+					end
+					local isF32Const = encoding == "f32_const"
+					local isF64Const = encoding == "f64_const"
+					local isBoolConst = encoding == "bool_const"
+					local isF32 = encoding == "f32"
+					local isF64 = encoding == "f64"
+					local isBool = encoding == "bool"
+					local isI32 = encoding == "i32"
+					local isVec3 = encoding == "vector3"
+					local isColor3 = encoding == "color3"
+					local isCFrame = encoding == "cframe"
+
+					if isCFrame then
+						local vb = valBuf :: buffer
+						local cfDesired = table.create(count)
+						local cfInstances = table.create(count)
+						for idx = 1, count do
+							if idx % 2048 == 0 then
+								maybeYield()
+							end
+							local rowByteOffset = (idx - 1) * 4
+							local nodeId = readu32(rowsBuf, rowByteOffset)
+							local instance = if nodeId == 0 then service else resolved[nodeId]
+							if instance == nil then
+								error(`Bulk property column {propName} references missing tree node {nodeId}`)
+							end
+							local cfOff = (idx - 1) * 48
+							local desiredValue = CFrameNew(
+								readf32(vb, cfOff),
+								readf32(vb, cfOff + 4),
+								readf32(vb, cfOff + 8),
+								readf32(vb, cfOff + 12),
+								readf32(vb, cfOff + 16),
+								readf32(vb, cfOff + 20),
+								readf32(vb, cfOff + 24),
+								readf32(vb, cfOff + 28),
+								readf32(vb, cfOff + 32),
+								readf32(vb, cfOff + 36),
+								readf32(vb, cfOff + 40),
+								readf32(vb, cfOff + 44)
+							)
+							cfInstances[idx] = instance
+							cfDesired[idx] = desiredValue
+							expectedForProp[instance] = desiredValue
+						end
+						for idx = 1, count do
+							if idx == skipIdx then
+								continue
+							end
+							if idx % 2048 == 0 then
+								maybeYield()
+							end
+							local instance = cfInstances[idx]
+							local desiredValue = cfDesired[idx]
+							local target: any = instance
+							local current = target[propName]
+							if cframesClose(current, desiredValue) then
+								noops += 1
+								continue
+							end
+							if snapEntry == nil then
+								snapEntry = ensureColumnSnapshotEntry(col)
+							end
+							rollbackCount += 1
+							rollbackInstances[rollbackCount] = instance
+							rollbackOldValues[rollbackCount] = current
+							col.rollbackCount = rollbackCount
+							snapEntry.count = rollbackCount
+							if returnOldValues then
+								rollbackNodeIds[rollbackCount] = readu32(rowsBuf, (idx - 1) * 4)
+							end
+							session.mutated = true
+							expectedForProp[instance] = desiredValue
+							activeBulkWrite[1] = instance
+							activeBulkWrite[2] = propName
+							activeBulkWrite[3] = desiredValue
+							target[propName] = desiredValue
+							activeBulkWrite[1] = nil
+							updated += 1
+						end
+						if updated == 0 then
+							verified += count - (if skipIdx ~= nil then 1 else 0)
+						else
+							local retryIndices = {}
+							for idx = 1, count do
+								if idx == skipIdx then
+									continue
+								end
+								if idx % 2048 == 0 then
+									maybeYield()
+								end
+								local instance = cfInstances[idx]
+								local desiredValue = cfDesired[idx]
+								local target: any = instance
+								local after = target[propName]
+								if cframesClose(after, desiredValue) then
+									verified += 1
+								else
+									expectedForProp[instance] = desiredValue
+									activeBulkWrite[1] = instance
+									activeBulkWrite[2] = propName
+									activeBulkWrite[3] = desiredValue
+									target[propName] = desiredValue
+									activeBulkWrite[1] = nil
+									retryIndices[#retryIndices + 1] = idx
+								end
+							end
+							for _, idx in ipairs(retryIndices) do
+								local instance = cfInstances[idx]
+								local desiredValue = cfDesired[idx]
+								local target: any = instance
+								local after = target[propName]
+								if cframesClose(after, desiredValue) then
+									verified += 1
+								else
+									error(`Studio did not retain {propName} on {instance:GetFullName()}`)
+								end
+							end
+						end
+					elseif isF32Const or isF32 then
+						local vb = valBuf :: buffer
+						for idx = 1, count do
+							if idx == skipIdx then
+								continue
+							end
+							if idx % 2048 == 0 then
+								maybeYield()
+							end
+							local rowOff = (idx - 1) * 4
+							local nodeId = readu32(rowsBuf, rowOff)
+							local instance = if nodeId == 0 then service else resolved[nodeId]
+							if instance == nil then
+								error(`Bulk property column {propName} references missing tree node {nodeId}`)
+							end
+							local desiredValue: number = if isF32Const then constValue else readf32(vb, rowOff)
+							local target: any = instance
+							local current = target[propName]
+							if current == desiredValue or (type(current) == "number" and f32NumbersEqual(current, desiredValue)) then
+								noops += 1
+								verified += 1
+								continue
+							end
+							if snapEntry == nil then
+								snapEntry = ensureColumnSnapshotEntry(col)
+							end
+							rollbackCount += 1
+							rollbackInstances[rollbackCount] = instance
+							rollbackOldValues[rollbackCount] = current
+							col.rollbackCount = rollbackCount
+							snapEntry.count = rollbackCount
+							if returnOldValues then
+								rollbackNodeIds[rollbackCount] = nodeId
+							end
+							session.mutated = true
+							expectedForProp[instance] = desiredValue
+							activeBulkWrite[1] = instance
+							activeBulkWrite[2] = propName
+							activeBulkWrite[3] = desiredValue
+							target[propName] = desiredValue
+							activeBulkWrite[1] = nil
+							updated += 1
+							local after = target[propName]
+							if after == desiredValue or (type(after) == "number" and f32NumbersEqual(after, desiredValue)) then
+								verified += 1
+							else
+								error(`Studio did not retain {propName} on {instance:GetFullName()}`)
+							end
+						end
+					elseif isBoolConst or isBool then
+						local vb = valBuf :: buffer
+						for idx = 1, count do
+							if idx == skipIdx then
+								continue
+							end
+							if idx % 2048 == 0 then
+								maybeYield()
+							end
+							local nodeId = readu32(rowsBuf, (idx - 1) * 4)
+							local instance = if nodeId == 0 then service else resolved[nodeId]
+							if instance == nil then
+								error(`Bulk property column {propName} references missing tree node {nodeId}`)
+							end
+							local desiredValue: boolean = if isBoolConst then constValue else readu8(vb, idx - 1) ~= 0
+							local target: any = instance
+							local current = target[propName]
+							if current == desiredValue then
+								noops += 1
+								verified += 1
+								continue
+							end
+							if snapEntry == nil then
+								snapEntry = ensureColumnSnapshotEntry(col)
+							end
+							rollbackCount += 1
+							rollbackInstances[rollbackCount] = instance
+							rollbackOldValues[rollbackCount] = current
+							col.rollbackCount = rollbackCount
+							snapEntry.count = rollbackCount
+							if returnOldValues then
+								rollbackNodeIds[rollbackCount] = nodeId
+							end
+							session.mutated = true
+							expectedForProp[instance] = desiredValue
+							activeBulkWrite[1] = instance
+							activeBulkWrite[2] = propName
+							activeBulkWrite[3] = desiredValue
+							target[propName] = desiredValue
+							activeBulkWrite[1] = nil
+							updated += 1
+							if target[propName] == desiredValue then
+								verified += 1
+							else
+								error(`Studio did not retain {propName} on {instance:GetFullName()}`)
+							end
+						end
+					elseif isVec3 then
+						local vb = valBuf :: buffer
+						for idx = 1, count do
+							if idx == skipIdx then
+								continue
+							end
+							if idx % 2048 == 0 then
+								maybeYield()
+							end
+							local nodeId = readu32(rowsBuf, (idx - 1) * 4)
+							local instance = if nodeId == 0 then service else resolved[nodeId]
+							if instance == nil then
+								error(`Bulk property column {propName} references missing tree node {nodeId}`)
+							end
+							local vOff = (idx - 1) * 12
+							local dx = readf32(vb, vOff)
+							local dy = readf32(vb, vOff + 4)
+							local dz = readf32(vb, vOff + 8)
+							local target: any = instance
+							local current = target[propName]
+							if
+								f32NumbersEqual(current.X, dx)
+								and f32NumbersEqual(current.Y, dy)
+								and f32NumbersEqual(current.Z, dz)
+							then
+								noops += 1
+								verified += 1
+								continue
+							end
+							local desiredValue = Vec3New(dx, dy, dz)
+							if snapEntry == nil then
+								snapEntry = ensureColumnSnapshotEntry(col)
+							end
+							rollbackCount += 1
+							rollbackInstances[rollbackCount] = instance
+							rollbackOldValues[rollbackCount] = current
+							col.rollbackCount = rollbackCount
+							snapEntry.count = rollbackCount
+							if returnOldValues then
+								rollbackNodeIds[rollbackCount] = nodeId
+							end
+							session.mutated = true
+							expectedForProp[instance] = desiredValue
+							activeBulkWrite[1] = instance
+							activeBulkWrite[2] = propName
+							activeBulkWrite[3] = desiredValue
+							target[propName] = desiredValue
+							activeBulkWrite[1] = nil
+							updated += 1
+							local after = target[propName]
+							if
+								after == desiredValue
+								or (f32NumbersEqual(after.X, dx) and f32NumbersEqual(after.Y, dy) and f32NumbersEqual(after.Z, dz))
+							then
+								verified += 1
+							else
+								error(`Studio did not retain {propName} on {instance:GetFullName()}`)
+							end
+						end
+					elseif isColor3 then
+						local vb = valBuf :: buffer
+						local mayBeByteColor = propName == "Color"
+						for idx = 1, count do
+							if idx == skipIdx then
+								continue
+							end
+							if idx % 2048 == 0 then
+								maybeYield()
+							end
+							local nodeId = readu32(rowsBuf, (idx - 1) * 4)
+							local instance = if nodeId == 0 then service else resolved[nodeId]
+							if instance == nil then
+								error(`Bulk property column {propName} references missing tree node {nodeId}`)
+							end
+							local cOff = (idx - 1) * 12
+							local dr = readf32(vb, cOff)
+							local dg = readf32(vb, cOff + 4)
+							local db = readf32(vb, cOff + 8)
+							local target: any = instance
+							local current = target[propName]
+							if
+								f32NumbersEqual(current.R, dr)
+								and f32NumbersEqual(current.G, dg)
+								and f32NumbersEqual(current.B, db)
+							then
+								noops += 1
+								verified += 1
+								continue
+							end
+							local desiredValue = Color3New(dr, dg, db)
+							if snapEntry == nil then
+								snapEntry = ensureColumnSnapshotEntry(col)
+							end
+							rollbackCount += 1
+							rollbackInstances[rollbackCount] = instance
+							rollbackOldValues[rollbackCount] = current
+							col.rollbackCount = rollbackCount
+							snapEntry.count = rollbackCount
+							if returnOldValues then
+								rollbackNodeIds[rollbackCount] = nodeId
+							end
+							session.mutated = true
+							expectedForProp[instance] = desiredValue
+							activeBulkWrite[1] = instance
+							activeBulkWrite[2] = propName
+							activeBulkWrite[3] = desiredValue
+							target[propName] = desiredValue
+							activeBulkWrite[1] = nil
+							updated += 1
+							local after = target[propName]
+							if
+								after == desiredValue
+								or (f32NumbersEqual(after.R, dr) and f32NumbersEqual(after.G, dg) and f32NumbersEqual(after.B, db))
+							then
+								verified += 1
+							elseif mayBeByteColor and instance:IsA("BasePart") and colorBytesEqual(after, desiredValue) then
+								stats.exactRetained = false
+								verified += 1
+							else
+								error(`Studio did not retain {propName} on {instance:GetFullName()}`)
+							end
+						end
+					else
+						local isExactScalar = isF64Const or isF64 or isI32 or col.isEnumPalette == true
+						local vb = valBuf :: buffer
+						local ib = idxBuf :: buffer
+						local palette = decodedPalette :: { [number]: any }
+						for idx = 1, count do
+							if idx == skipIdx then
+								continue
+							end
+							if idx % 2048 == 0 then
+								maybeYield()
+							end
+							local rowOff = (idx - 1) * 4
+							local nodeId = readu32(rowsBuf, rowOff)
+							local instance = if nodeId == 0 then service else resolved[nodeId]
+							if instance == nil then
+								error(`Bulk property column {propName} references missing tree node {nodeId}`)
+							end
+							local desiredValue: any
+							if isF64Const then
+								desiredValue = constValue
+							elseif isF64 then
+								desiredValue = readf64(vb, (idx - 1) * 8)
+							elseif isI32 then
+								desiredValue = readi32(vb, rowOff)
+							else
+								desiredValue = palette[readu32(ib, rowOff) + 1]
+							end
+							local target: any = instance
+							local current = target[propName]
+							local sameBefore = current == desiredValue
+							if not sameBefore and not isExactScalar then
+								sameBefore = propertyValuesEqual(instance, propName, current, desiredValue)
+							end
+							if sameBefore then
+								noops += 1
+								verified += 1
+								continue
+							end
+							if snapEntry == nil then
+								snapEntry = ensureColumnSnapshotEntry(col)
+							end
+							rollbackCount += 1
+							rollbackInstances[rollbackCount] = instance
+							rollbackOldValues[rollbackCount] = current
+							col.rollbackCount = rollbackCount
+							snapEntry.count = rollbackCount
+							if returnOldValues then
+								rollbackNodeIds[rollbackCount] = nodeId
+							end
+							session.mutated = true
+							expectedForProp[instance] = desiredValue
+							activeBulkWrite[1] = instance
+							activeBulkWrite[2] = propName
+							activeBulkWrite[3] = desiredValue
+							target[propName] = desiredValue
+							activeBulkWrite[1] = nil
+							updated += 1
+							local after = target[propName]
+							local sameAfter = after == desiredValue
+							if not sameAfter and not isExactScalar then
+								sameAfter = propertyValuesEqual(instance, propName, after, desiredValue)
+							end
+							if sameAfter then
+								verified += 1
+							else
+								error(`Studio did not retain {propName} on {instance:GetFullName()}`)
+							end
 						end
 					end
 				end
 
 				col.rollbackCount = rollbackCount
-				if updated > 0 then
-					session.mutated = true
-				end
 				stats.propertyUpdated += updated
 				stats.noops += noops
 				stats.verified += verified
-
-				if rollbackCount > 0 then
-					local bulkSnapshots = session.snapshot.bulkProperties
-					bulkSnapshots[#bulkSnapshots + 1] = {
-						propertyName = propName,
-						instances = rollbackInstances,
-						oldValues = rollbackOldValues,
-					}
+			end
+			if stats.propertyUpdated > 0 and type(session.unsetPivotChecks) == "table" then
+				for _, entry in ipairs(session.unsetPivotChecks) do
+					local model = entry.model
+					if model ~= nil and model.Parent ~= nil and (model :: any).PrimaryPart == nil then
+						local postPivot = (model :: any).WorldPivot
+						if cframesClose(postPivot, entry.prePivot) then
+							local okBB, bb = pcall((model :: any).GetBoundingBox, model)
+							if okBB and typeof(bb) == "CFrame" and not cframesClose(postPivot, bb) then
+								stats.fallbackFullCapture = true
+								stats.fallbackReason = "model_pivot"
+								return
+							end
+						end
+					end
 				end
 			end
+			BridgeConnection.profileStep("bulk: apply loop", stepStarted)
 			if returnOldValues then
+				local NAN_SENTINEL = {}
+				local NIL_SENTINEL = {}
+				local function canonicalSerializedKey(val: any): string
+					local t = type(val)
+					if val == nil then
+						return "n"
+					elseif t == "boolean" then
+						return if val then "b1" else "b0"
+					elseif t == "number" then
+						if val ~= val then
+							return "fnan"
+						end
+						return "f" .. string.format("%.17g", val)
+					elseif t == "string" then
+						return "s" .. tostring(#val) .. ":" .. val
+					elseif t == "table" then
+						local keyList = {}
+						for k in pairs(val) do
+							keyList[#keyList + 1] = tostring(k)
+						end
+						table.sort(keyList)
+						local parts = table.create(#keyList)
+						for idx = 1, #keyList do
+							local ks = keyList[idx]
+							local rawV = val[ks]
+							if rawV == nil then
+								local numK = tonumber(ks)
+								if numK ~= nil then
+									rawV = val[numK]
+								end
+							end
+							parts[idx] = "k" .. tostring(#ks) .. ":" .. ks .. "=" .. canonicalSerializedKey(rawV)
+						end
+						return "t{" .. table.concat(parts, ";") .. "}"
+					end
+					local text = tostring(val)
+					return "o" .. typeof(val) .. ":" .. tostring(#text) .. ":" .. text
+				end
+				stepStarted = os.clock()
 				local oldValueColumns = {}
 				for _, col in ipairs(decodedColumns) do
 					local rc = col.rollbackCount
 					if rc == 0 then
 						continue
 					end
+					maybeYield()
+					local colKind = col.kind
 					local encoding = col.encoding
 					local nodeIds = col.rollbackNodeIds
 					local oldVals = col.rollbackOldValues
 					local outRows = buffer.create(rc * 4)
 					for i = 1, rc do
+						if i % 2048 == 0 then
+							maybeYield()
+						end
 						buffer.writeu32(outRows, (i - 1) * 4, nodeIds[i])
 					end
 					local rowsB64 = buffer.tostring(EncodingService:Base64Encode(outRows))
-					if encoding == "f32" or encoding == "f32_const" then
+					if colKind == "tag" then
+						local outVals = buffer.create(rc)
+						for i = 1, rc do
+							if i % 2048 == 0 then
+								maybeYield()
+							end
+							buffer.writeu8(outVals, i - 1, if oldVals[i] then 1 else 0)
+						end
+						oldValueColumns[#oldValueColumns + 1] = {
+							kind = "tag",
+							propertyName = col.propName,
+							encoding = "bool",
+							count = rc,
+							rows = rowsB64,
+							values = buffer.tostring(EncodingService:Base64Encode(outVals)),
+						}
+					elseif colKind == "attribute" then
+						local palette = {}
+						local paletteIndexByValue: { [any]: number } = {}
+						local outIndices = buffer.create(rc * 4)
+						for i = 1, rc do
+							if i % 2048 == 0 then
+								maybeYield()
+							end
+							local v = oldVals[i]
+							local key = if v == nil then NIL_SENTINEL elseif v ~= v then NAN_SENTINEL else v
+							local pIdx = paletteIndexByValue[key]
+							if pIdx == nil then
+								pIdx = #palette
+								palette[pIdx + 1] = if v == ATTR_NIL
+									then { _type = "AttributeDelete" }
+									else ctx.serializeValue(v)
+								paletteIndexByValue[key] = pIdx
+							end
+							buffer.writeu32(outIndices, (i - 1) * 4, pIdx)
+						end
+						oldValueColumns[#oldValueColumns + 1] = {
+							kind = "attribute",
+							propertyName = col.propName,
+							encoding = "indexed",
+							count = rc,
+							rows = rowsB64,
+							palette = palette,
+							indices = buffer.tostring(EncodingService:Base64Encode(outIndices)),
+						}
+					elseif colKind == "attributes_replace" then
+						local palette = {}
+						local paletteIndexByKey: { [string]: number } = {}
+						local outIndices = buffer.create(rc * 4)
+						for i = 1, rc do
+							if i % 2048 == 0 then
+								maybeYield()
+							end
+							local oldMap = oldVals[i] :: { [string]: any }
+							local serializedMap: { [string]: any } = {}
+							local keys = {}
+							for k in pairs(oldMap) do
+								if not isEngineManagedAttribute(k) then
+									keys[#keys + 1] = k
+								end
+							end
+							table.sort(keys)
+							local keyParts = table.create(#keys)
+							for kIdx = 1, #keys do
+								local k = keys[kIdx]
+								local sv = ctx.serializeValue(oldMap[k])
+								serializedMap[k] = sv
+								keyParts[kIdx] = "k" .. tostring(#k) .. ":" .. k .. "=" .. canonicalSerializedKey(sv)
+							end
+							local mapKey = table.concat(keyParts, ";")
+							local pIdx = paletteIndexByKey[mapKey]
+							if pIdx == nil then
+								pIdx = #palette
+								palette[pIdx + 1] = serializedMap
+								paletteIndexByKey[mapKey] = pIdx
+							end
+							buffer.writeu32(outIndices, (i - 1) * 4, pIdx)
+						end
+						oldValueColumns[#oldValueColumns + 1] = {
+							kind = "attributes_replace",
+							propertyName = "@attributes",
+							encoding = "indexed",
+							count = rc,
+							rows = rowsB64,
+							palette = palette,
+							indices = buffer.tostring(EncodingService:Base64Encode(outIndices)),
+						}
+					elseif encoding == "f32" or encoding == "f32_const" then
 						local outVals = buffer.create(rc * 4)
 						for i = 1, rc do
+							if i % 2048 == 0 then
+								maybeYield()
+							end
 							buffer.writef32(outVals, (i - 1) * 4, oldVals[i])
 						end
 						oldValueColumns[#oldValueColumns + 1] = {
@@ -11313,6 +12720,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					elseif encoding == "f64" or encoding == "f64_const" then
 						local outVals = buffer.create(rc * 8)
 						for i = 1, rc do
+							if i % 2048 == 0 then
+								maybeYield()
+							end
 							buffer.writef64(outVals, (i - 1) * 8, oldVals[i])
 						end
 						oldValueColumns[#oldValueColumns + 1] = {
@@ -11325,6 +12735,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					elseif encoding == "i32" then
 						local outVals = buffer.create(rc * 4)
 						for i = 1, rc do
+							if i % 2048 == 0 then
+								maybeYield()
+							end
 							buffer.writei32(outVals, (i - 1) * 4, oldVals[i])
 						end
 						oldValueColumns[#oldValueColumns + 1] = {
@@ -11337,6 +12750,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					elseif encoding == "bool" or encoding == "bool_const" then
 						local outVals = buffer.create(rc)
 						for i = 1, rc do
+							if i % 2048 == 0 then
+								maybeYield()
+							end
 							buffer.writeu8(outVals, i - 1, if oldVals[i] then 1 else 0)
 						end
 						oldValueColumns[#oldValueColumns + 1] = {
@@ -11349,6 +12765,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					elseif encoding == "vector3" then
 						local outVals = buffer.create(rc * 12)
 						for i = 1, rc do
+							if i % 2048 == 0 then
+								maybeYield()
+							end
 							local v = oldVals[i]
 							local off = (i - 1) * 12
 							buffer.writef32(outVals, off, v.X)
@@ -11365,6 +12784,9 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					elseif encoding == "color3" then
 						local outVals = buffer.create(rc * 12)
 						for i = 1, rc do
+							if i % 2048 == 0 then
+								maybeYield()
+							end
 							local c = oldVals[i]
 							local off = (i - 1) * 12
 							buffer.writef32(outVals, off, c.R)
@@ -11378,9 +12800,66 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 							rows = rowsB64,
 							values = buffer.tostring(EncodingService:Base64Encode(outVals)),
 						}
+					elseif encoding == "cframe" then
+						local outVals = buffer.create(rc * 48)
+						for i = 1, rc do
+							if i % 2048 == 0 then
+								maybeYield()
+							end
+							local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = oldVals[i]:GetComponents()
+							local off = (i - 1) * 48
+							buffer.writef32(outVals, off, x)
+							buffer.writef32(outVals, off + 4, y)
+							buffer.writef32(outVals, off + 8, z)
+							buffer.writef32(outVals, off + 12, r00)
+							buffer.writef32(outVals, off + 16, r01)
+							buffer.writef32(outVals, off + 20, r02)
+							buffer.writef32(outVals, off + 24, r10)
+							buffer.writef32(outVals, off + 28, r11)
+							buffer.writef32(outVals, off + 32, r12)
+							buffer.writef32(outVals, off + 36, r20)
+							buffer.writef32(outVals, off + 40, r21)
+							buffer.writef32(outVals, off + 44, r22)
+						end
+						oldValueColumns[#oldValueColumns + 1] = {
+							propertyName = col.propName,
+							encoding = "cframe",
+							count = rc,
+							rows = rowsB64,
+							values = buffer.tostring(EncodingService:Base64Encode(outVals)),
+						}
+					elseif encoding == "indexed" then
+						local palette = {}
+						local paletteIndexByValue: { [any]: number } = {}
+						local outIndices = buffer.create(rc * 4)
+						for i = 1, rc do
+							if i % 2048 == 0 then
+								maybeYield()
+							end
+							local v = oldVals[i]
+							local key = if v == nil then NIL_SENTINEL elseif v ~= v then NAN_SENTINEL else v
+							local pIdx = paletteIndexByValue[key]
+							if pIdx == nil then
+								pIdx = #palette
+								palette[pIdx + 1] = ctx.serializeValue(v)
+								paletteIndexByValue[key] = pIdx
+							end
+							buffer.writeu32(outIndices, (i - 1) * 4, pIdx)
+						end
+						oldValueColumns[#oldValueColumns + 1] = {
+							propertyName = col.propName,
+							encoding = "indexed",
+							count = rc,
+							rows = rowsB64,
+							palette = palette,
+							indices = buffer.tostring(EncodingService:Base64Encode(outIndices)),
+						}
 					else
 						local serialized = table.create(rc)
 						for i = 1, rc do
+							if i % 2048 == 0 then
+								maybeYield()
+							end
 							serialized[i] = ctx.serializeValue(oldVals[i])
 						end
 						oldValueColumns[#oldValueColumns + 1] = {
@@ -11393,14 +12872,24 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 					end
 				end
 				stats.oldValueColumns = oldValueColumns
+				BridgeConnection.profileStep("bulk: encode old values", stepStarted)
 			end
 			if preTerrainDigest ~= nil then
 				stats._preTerrainDigest = preTerrainDigest
 			end
 		end, debug.traceback)
+		if session.activeBulkWrite ~= nil then
+			session.activeBulkWrite[1] = nil
+		end
 		endSessionOperation(editorTransactions, transactionId, session)
 		if not okApply then
 			error(applyErr, 0)
+		end
+		if ctx.hasBulkSideEffectObserved and ctx.hasBulkSideEffectObserved() then
+			stats.sideEffectObserved = true
+			stats.exactRetained = false
+		elseif ctx.isItemChangedActive and not ctx.isItemChangedActive() then
+			stats.exactRetained = false
 		end
 		stats.lastMs = math.floor((os.clock() - started) * 1000 + 0.5)
 		ctx.stats.requests += 1
@@ -11421,6 +12910,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 	end
 
 	function api.cleanup()
+		table.clear(persistentBulkTreeCache)
 		local activeTransactions = {}
 		for transactionId, session in pairs(editorTransactions) do
 			if type(session) == "table" and session.snapshot ~= nil then

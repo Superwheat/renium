@@ -140,7 +140,7 @@ local services = {
 }
 function testGame:GetService(name) return assert(services[name], name) end
 local codec = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeValueCodec.module.luau"), { environment = { game = testGame } })()
-local dependencies = { BridgeScriptDocuments = { readSource = function(instance) return true, instance.Source end }, BridgeValueCodec = codec, BridgeValueEquality = require("../BridgeValueEquality.module"),
+local dependencies = { BridgeScriptDocuments = { readSource = function(instance) return true, instance.Source end, capture = function() return {} end }, BridgeValueCodec = codec, BridgeValueEquality = require("../BridgeValueEquality.module"),
 	BridgeIdentity = require("../BridgeIdentity.module"),
 	BridgeContent = require("../BridgeContent.module"),
 	RbxDom = { getContentPropertyAliases = contentAliases,
@@ -1346,6 +1346,7 @@ do
 			.. "\nreturn propertyReadNameForEvent", { environment = {
 			state = {}, api = api, propertyReadNamesByClass = names, propertyCacheKeysByClass = keys,
 			propertyPrimingPlansByClass = plans, propertyEventRelevanceByClass = relevance,
+			rawPropIgnoredByClass = {},
 			refreshValuePropertySignals = function() end,
 			ATTRIBUTE_EVENT_PROPERTIES = {}, DECAL_COLOR_MAP_PROPERTIES = {},
 			exportPropertyNameForEvent = function(_, name) return name end,
@@ -2991,6 +2992,109 @@ do
 		assert(checked.pushProofScope ~= nil and named(checked.pushProofScope) == "ReplicatedStorage",
 			"settlement proof missed the tag-edited service before deferred Changed")
 		observer.stop()
+	end)();
+	(function()
+		testGame.ItemChanged = signal()
+		local attrMap: { [string]: any } = { Score = 1 }
+		local bulkTarget = instance("Part", "SyncRelayPart", storage)
+		function bulkTarget:GetAttribute(name) return attrMap[name] end
+		function bulkTarget:GetAttributes() return table.clone(attrMap) end
+		local cfg = table.clone(trackerConfig)
+		cfg.exportProofGeneration = function() return 0 end
+		cfg.observeProofDocuments = function() return {} end
+		cfg.captureTerrainProof = function() return "voxels" end
+		local observer = scopedModule.create(cfg, { ReplicatedStorage = true, Workspace = true })
+		observer.getState({ start = true, services = watched, trackingGuardId = "bulk-sync-relay", nativeAttributeRelay = true,
+			deferNativeTracking = true })
+		local relay = createdRelays[#createdRelays]
+		relay.Changed:Fire(relay)
+		local obs = assert(observer.attributeObservation("ReplicatedStorage"), "attributeObservation must be active")
+		observer.beginChangeJournal("tx-sync-relay", { "ReplicatedStorage" })
+		local activeWrite: { any } = { bulkTarget, "@attribute", "Score", 42, false }
+		observer.setBulkExpectedProperties({ ["@attributes"] = { [bulkTarget] = { keys = { Score = 42 }, relayPending = 0 } } }, activeWrite)
+		local beforeGen = obs.generation
+		attrMap.Score = 42
+		relay.Changed:Fire(bulkTarget)
+		assert(activeWrite[5] == true, "synchronous nativeAttributeRelay must mark activeBulkWrite[5] = true")
+		assert(obs.generation == beforeGen, "synchronous own bulk attribute write must not bump attributeObservation")
+		assert(#observer.drainChangeJournal("tx-sync-relay") == 0, "synchronous own bulk attribute write must not journal a conflict")
+		observer.setBulkExpectedProperties({ ["@attributes"] = { [bulkTarget] = { keys = { Score = 42 }, relayPending = 0 } } }, nil)
+		attrMap.Score = 99
+		relay.Changed:Fire(bulkTarget)
+		assert(obs.generation == beforeGen + 1, "outside attribute edit must bump attributeObservation")
+		assert(#observer.drainChangeJournal("tx-sync-relay") > 0, "outside attribute edit must record a journal conflict")
+		observer.finishChangeJournal("tx-sync-relay")
+		observer.setBulkExpectedProperties(nil, nil)
+		observer.stop()
+		remove(bulkTarget)
+	end)();
+	(function()
+		local lazyPart = instance("Part", "LazyAttrTarget", storage)
+		local attrMap = { Tag = "old" }
+		lazyPart.GetAttributes = function() return table.clone(attrMap) end
+		lazyPart.GetAttribute = function(_, k) return attrMap[k] end
+		local config = table.clone(trackerConfig)
+		config.exportProofGeneration = function() return 0 end
+		config.observeProofDocuments = function() return {} end
+		config.captureTerrainProof = function() return "terrain" end
+		local observer = scopedModule.create(config, { ReplicatedStorage = true })
+		local deferred = observer.getState({
+			start = true,
+			services = { "ReplicatedStorage" },
+			trackingGuardId = "lazy-attr-guard",
+			nativeAttributeRelay = true,
+			deferNativeTracking = true,
+			lazyTracking = true,
+			syncbackProperties = true,
+		})
+		assert(deferred.nativeTrackingDeferred == true, "lazy attr test expects deferred tracking")
+		local relay = createdRelays[#createdRelays]
+		assert(relay ~= nil, "native attribute relay missing")
+		relay.Changed:Fire(relay)
+		observer.getState({
+			start = true,
+			services = { "ReplicatedStorage" },
+			trackingGuardId = "lazy-attr-guard",
+			lazyTracking = true,
+		})
+		assert(observer.reviewState.lazyObservedServices.ReplicatedStorage == true, "service should remain lazy")
+		assert(observer.reviewState.instanceConnections[lazyPart] == nil, "lazy part starts without Lua connection")
+		observer.beginChangeJournal("tx-lazy-attr", { "ReplicatedStorage" })
+		observer.beginSuppress()
+		local beforeGen = observer.serviceGeneration("ReplicatedStorage")
+		local token = observer.expectAttributeEvent(lazyPart, "Tag", "new")
+		assert(observer.reviewState.instanceConnections[lazyPart] ~= nil, "expectAttributeEvent must promote lazy instance")
+		attrMap.Tag = "new"
+		relay.Changed:Fire(lazyPart)
+		lazyPart.AttributeChanged:Fire("Tag")
+		observer.cancelExpectedEvent(token)
+		observer.endSuppress(0)
+		assert(observer.serviceGeneration("ReplicatedStorage") == beforeGen, "promoted lazy own attribute write must not dirty service")
+		assert(#observer.drainChangeJournal("tx-lazy-attr") == 0, "promoted lazy own attribute write must not journal conflict")
+		attrMap.Tag = "outside"
+		relay.Changed:Fire(lazyPart)
+		lazyPart.AttributeChanged:Fire("Tag")
+		assert(observer.serviceGeneration("ReplicatedStorage") == beforeGen + 1, "outside attribute edit after lazy promotion must dirty service")
+		assert(#observer.drainChangeJournal("tx-lazy-attr") == 1, "outside attribute edit after lazy promotion must journal conflict")
+		observer.finishChangeJournal("tx-lazy-attr")
+		observer.stop()
+		remove(lazyPart)
+	end)();
+	(function()
+		context = start()
+		local observer = context.observer
+		observer.getState({ stop = true, keepCachedProof = true })
+		local resumed = observer.getState({
+			start = true,
+			services = watched,
+			trackingGuardId = "after-live-stop",
+			nativeAttributeRelay = true,
+			deferNativeTracking = true,
+			verifyPushProof = context.proof,
+		})
+		assert(resumed.pushProofMatches == true and resumed.nativeRelayContinued == true,
+			`keepCachedProof must preserve the retained proof across live-stop ({tostring(resumed.pushProofMismatch)})`)
+		observer.stop()
 	end)()
 	collection.GetTags = savedGetTags
 	print("Edit lease: the kept proof answers across a Renium edit's lease and commit")
@@ -3066,3 +3170,290 @@ do
 	testGame.ItemChanged = savedItemChanged
 end
 print("Tracking start: a service tracked at once holds what instance by instance tracking holds, reading tags of tagged instances alone")
+
+do
+	local observer = trackerModule.create(trackerConfig, { ReplicatedStorage = true })
+	observer.getState({ services = { "ReplicatedStorage" }, reset = true })
+	local list = assert(observer.exportInstances("ReplicatedStorage"))
+	local buf = buffer.fromstring("cached-ids")
+	local classes = table.create(#list, "Part")
+	observer.rememberExportMetadata("ReplicatedStorage", list, buf, classes)
+	assert(observer.exportDebugIdBuffer("ReplicatedStorage") == buf, "export debug id buffer must be cached for matching instance list")
+	assert(observer.exportClassNames("ReplicatedStorage") == classes, "export class names must be cached for matching instance list")
+	assert(observer.exportNonArchivableIndices("ReplicatedStorage") ~= nil, "non-archivable indices must be populated on rebuild")
+	local staleList = table.clone(list)
+	observer.rememberExportMetadata("ReplicatedStorage", staleList, buffer.fromstring("stale"), table.create(#list, "Folder"))
+	assert(observer.exportDebugIdBuffer("ReplicatedStorage") == buf, "stale instance list must not overwrite debug id buffer")
+	local added = instance("Part", "MetaAdded")
+	add(added, storage)
+	assert(observer.exportDebugIdBuffer("ReplicatedStorage") == nil, "DescendantAdded must clear cached debug id buffer")
+	assert(observer.exportClassNames("ReplicatedStorage") == nil, "DescendantAdded must clear cached class names")
+	assert(observer.exportNonArchivableIndices("ReplicatedStorage") == nil, "DescendantAdded must clear cached non-archivable indices")
+	remove(added)
+	observer.stop()
+end
+print("Export metadata cache: pointer-matched caching and structural invalidation passed")
+
+do
+	local collection = services.CollectionService
+	local savedCollection = table.clone(collection)
+	local savedItemChanged = testGame.ItemChanged
+	testGame.ItemChanged = signal()
+	local holder = instance("Folder", "LazyTagHolder", storage)
+	local tagged = instance("Part", "LazyTagged", holder)
+	local getTagsCalls = 0
+	collection.GetTags = function(_, target)
+		if target == tagged then
+			getTagsCalls += 1
+			return { "Beta", "Alpha" }
+		end
+		return {}
+	end
+	collection.GetAllTags = function() return { "Beta", "Alpha" } end
+	collection.GetTagged = function(_, tag)
+		if tag == "Alpha" or tag == "Beta" then
+			return { tagged }
+		end
+		return {}
+	end
+	local relayConfig = table.clone(trackerConfig)
+	relayConfig.exportProofGeneration = function() return 0 end
+	relayConfig.observeProofDocuments = function() return {} end
+	relayConfig.captureTerrainProof = function() return "terrain" end
+	local observer = trackerModule.create(relayConfig, { ReplicatedStorage = true, Workspace = true })
+	local deferred = observer.getState({
+		start = true,
+		services = { "ReplicatedStorage", "Workspace" },
+		trackingGuardId = "lazy-tag-guard",
+		nativeAttributeRelay = true,
+		deferNativeTracking = true,
+		lazyTracking = true,
+		syncbackProperties = true,
+	})
+	assert(deferred.nativeTrackingDeferred == true, "lazy tag test must defer tracking until relay arms")
+	local relay = createdRelays[#createdRelays]
+	assert(relay ~= nil, "lazy tag test must create native attribute relay")
+	relay.Changed:Fire(relay)
+	observer.getState({
+		start = true,
+		services = { "ReplicatedStorage", "Workspace" },
+		trackingGuardId = "lazy-tag-guard",
+		lazyTracking = true,
+	})
+	assert(
+		observer.reviewState.lazyObservedServices["ReplicatedStorage"] == true,
+		"lazy tag test must keep ReplicatedStorage in lazyObservedServices"
+	)
+	assert(observer.reviewState.tagFingerprintByInstance[tagged] == "Alpha\0Beta", "lazy tracking must build sorted tag fingerprint directly")
+	assert(getTagsCalls == 0, `lazy tracking must not call GetTags per tagged instance (got {getTagsCalls})`)
+	observer.stop()
+	remove(holder)
+	table.clear(collection)
+	for key, value in pairs(savedCollection) do collection[key] = value end
+	testGame.ItemChanged = savedItemChanged
+end
+print("Lazy tag startup: single-pass sorted tag fingerprint without per-instance GetTags passed")
+
+do
+	local savedItemChanged = testGame.ItemChanged
+	testGame.ItemChanged = signal()
+	local relayConfig = table.clone(trackerConfig)
+	relayConfig.exportProofGeneration = function() return 0 end
+	relayConfig.observeProofDocuments = function() return {} end
+	relayConfig.captureTerrainProof = function() return "terrain" end
+	relayConfig.exportInclusionUnder = function() return function() return true end end
+
+	local observer = trackerModule.create(relayConfig, { Workspace = true })
+	observer.getState({ start = true, services = { "Workspace" }, trackingGuardId = "rig-deferred-guard" })
+	observer.beginChangeJournal("rig-deferred", { "Workspace" })
+	observer.beginNativeImportObservations("rig-deferred", nil, { Workspace = true })
+	local beforeGen = observer.serviceGeneration("Workspace")
+
+	local function makeArbitraryEngineNode(prefix, className, nodeName)
+		local folder = instance("Folder", prefix .. "Folder", workspace)
+		local node = instance(className, nodeName, folder)
+		for idx, obj in ipairs({ folder, node }) do
+			local id = prefix .. "-id-" .. tostring(idx)
+			function obj:GetDebugId() return id end
+		end
+		return folder, node
+	end
+
+	local ownedFolder, ownedNode = makeArbitraryEngineNode("owned", "Attachment", "ArbitraryEngineAnchor")
+	local engineAdded = instance("Motor6D", "ArbitraryEngineJoint", ownedFolder)
+	function engineAdded:GetDebugId() return "engine-created-id-1" end
+	workspace.DescendantAdded:Fire(ownedFolder)
+	workspace.DescendantAdded:Fire(ownedNode)
+	workspace.DescendantAdded:Fire(engineAdded)
+	ownedNode.Parent = nil
+	workspace.DescendantRemoving:Fire(ownedNode)
+	assert(
+		observer.serviceGeneration("Workspace") == beforeGen,
+		"pending native removal must wait for lock-time engineRemovedById receipt"
+	)
+	local createdById = {
+		[ownedFolder:GetDebugId()] = "Folder",
+		[ownedNode:GetDebugId()] = "Attachment",
+	}
+	observer.finishNativeImportObservations(
+		"rig-deferred",
+		createdById,
+		{ [ownedNode:GetDebugId()] = true },
+		{ [engineAdded:GetDebugId()] = true }
+	)
+	assert(
+		observer.serviceGeneration("Workspace") == beforeGen,
+		"proven lock-time engine-removed and engine-created instances (any class/name) must stay clean"
+	)
+
+	local unownedFolder, unownedNode = makeArbitraryEngineNode("unowned", "Weld", "AccessoryWeld")
+	unownedNode.Parent = nil
+	workspace.DescendantRemoving:Fire(unownedNode)
+	assert(
+		observer.serviceGeneration("Workspace") > beforeGen,
+		"removal not in lock-time engineRemovedById must mark Workspace dirty"
+	)
+	observer.finishChangeJournal("rig-deferred")
+	remove(ownedFolder)
+	remove(unownedFolder)
+
+	observer.beginChangeJournal("user-edit-during-import", { "Workspace" })
+	observer.beginNativeImportObservations("user-edit-during-import", nil, { Workspace = true })
+	local beforeUserRemoveGen = observer.serviceGeneration("Workspace")
+	local userDelFolder, userDelNode = makeArbitraryEngineNode("userdel", "Weld", "AccessoryWeld")
+	workspace.DescendantAdded:Fire(userDelFolder)
+	workspace.DescendantAdded:Fire(userDelNode)
+	userDelNode.Parent = nil
+	workspace.DescendantRemoving:Fire(userDelNode)
+	observer.finishNativeImportObservations(
+		"user-edit-during-import",
+		{ [userDelFolder:GetDebugId()] = "Folder", [userDelNode:GetDebugId()] = "Weld" },
+		nil,
+		nil
+	)
+	assert(
+		observer.serviceGeneration("Workspace") > beforeUserRemoveGen,
+		"user removal during native import without lock-time engineRemovedById must mark Workspace dirty"
+	)
+	observer.finishChangeJournal("user-edit-during-import")
+	remove(userDelFolder)
+
+	observer.beginChangeJournal("user-insert-during-import", { "Workspace" })
+	observer.beginNativeImportObservations("user-insert-during-import", nil, { Workspace = true })
+	local beforeUserInsertGen = observer.serviceGeneration("Workspace")
+	local userAddFolder, userAddNode = makeArbitraryEngineNode("useradd", "Weld", "HeadWeld")
+	workspace.DescendantAdded:Fire(userAddFolder)
+	workspace.DescendantAdded:Fire(userAddNode)
+	observer.finishNativeImportObservations(
+		"user-insert-during-import",
+		{ [userAddFolder:GetDebugId()] = "Folder" },
+		nil,
+		nil
+	)
+	assert(
+		observer.serviceGeneration("Workspace") > beforeUserInsertGen,
+		"user insertion during native import without lock-time engineCreatedById must mark Workspace dirty"
+	)
+	observer.finishChangeJournal("user-insert-during-import")
+	remove(userAddFolder)
+	observer.stop()
+
+	local savedDebugIds = {}
+	local function ensureDebugId(obj, id)
+		if obj.GetDebugId == nil then
+			savedDebugIds[obj] = true
+			function obj:GetDebugId() return id end
+		end
+	end
+	ensureDebugId(workspace, "ws-root-debug-id")
+	for idx, desc in ipairs(workspace:GetDescendants()) do
+		ensureDebugId(desc, "ws-pre-" .. tostring(idx))
+	end
+	local suspObserver = trackerModule.create(relayConfig, { Workspace = true })
+	suspObserver.getState({
+		start = true,
+		services = { "Workspace" },
+		trackingGuardId = "susp-engine-guard",
+		nativeAttributeRelay = true,
+		deferNativeTracking = true,
+		syncbackProperties = true,
+	})
+	local suspRelay = createdRelays[#createdRelays]
+	assert(suspRelay ~= nil, "suspended scan test must create native attribute relay")
+	suspRelay.Changed:Fire(suspRelay)
+	suspObserver.beginChangeJournal("susp-engine-ok", { "Workspace" })
+	suspObserver.beginNativeImportObservations("susp-engine-ok", nil, { Workspace = true })
+	local beforeSuspOk = suspObserver.serviceGeneration("Workspace")
+	local suspFolder, suspEngineNode = makeArbitraryEngineNode("suspok", "Motor6D", "ArbitraryEngineJoint")
+	suspObserver.finishNativeImportObservations(
+		"susp-engine-ok",
+		{ [suspFolder:GetDebugId()] = "Folder" },
+		nil,
+		{ [suspEngineNode:GetDebugId()] = true }
+	)
+	assert(
+		suspObserver.serviceGeneration("Workspace") == beforeSuspOk,
+		"suspended scan must accept lock-time engine-created instance of any class/name"
+	)
+	suspObserver.finishChangeJournal("susp-engine-ok")
+	remove(suspFolder)
+
+	suspObserver.beginChangeJournal("susp-user-insert", { "Workspace" })
+	suspObserver.beginNativeImportObservations("susp-user-insert", nil, { Workspace = true })
+	local beforeSuspBad = suspObserver.serviceGeneration("Workspace")
+	local suspBadFolder, suspBadNode = makeArbitraryEngineNode("suspbad", "Weld", "HeadWeld")
+	suspObserver.finishNativeImportObservations(
+		"susp-user-insert",
+		{ [suspBadFolder:GetDebugId()] = "Folder" },
+		nil,
+		nil
+	)
+	assert(
+		suspObserver.serviceGeneration("Workspace") > beforeSuspBad,
+		"suspended scan must reject user insertion absent from engineCreatedById"
+	)
+	suspObserver.finishChangeJournal("susp-user-insert")
+	remove(suspBadFolder)
+	suspObserver.stop()
+	for obj in pairs(savedDebugIds) do
+		obj.GetDebugId = nil
+	end
+
+	local holder = instance("Folder", "ExpiryHolder", storage)
+	local part = instance("Part", "ExpiryPart", holder)
+	local expiryObserver = trackerModule.create(relayConfig, { ReplicatedStorage = true, Workspace = true })
+	expiryObserver.getState({
+		start = true,
+		services = { "ReplicatedStorage", "Workspace" },
+		trackingGuardId = "expiry-guard",
+		nativeAttributeRelay = true,
+		deferNativeTracking = true,
+		lazyTracking = true,
+		syncbackProperties = true,
+	})
+	local relay = createdRelays[#createdRelays]
+	assert(relay ~= nil, "expiry test must create native attribute relay")
+	relay.Changed:Fire(relay)
+	local proofId = assert(expiryObserver.capturePushProof())
+	expiryObserver.getState({
+		start = false,
+		services = { "ReplicatedStorage", "Workspace" },
+		releaseTrackingGuardId = "expiry-guard",
+		retainPushProof = proofId,
+		retainSeconds = 60,
+	})
+	assert(part.AttributeChanged:Count() == 0, "lazy part must not have local AttributeChanged before expiry")
+	local promotedCount = 0
+	local origConnect = part.AttributeChanged.Connect
+	part.AttributeChanged.Connect = function(self, cb)
+		promotedCount += 1
+		return origConnect(self, cb)
+	end
+	relay.Changed:Fire(nil)
+	assert(promotedCount == 0, `cached relay expiry must not promote AttributeChanged connections (got {promotedCount})`)
+	assert(expiryObserver.reviewState.started == false, "cached relay expiry with sole retained guard must stop tracking")
+	remove(holder)
+	expiryObserver.stop()
+	testGame.ItemChanged = savedItemChanged
+end
+print("Lock-time engine mutation receipt (unlisted class/name + user edit rejection) and cached relay expiry without promotion passed")

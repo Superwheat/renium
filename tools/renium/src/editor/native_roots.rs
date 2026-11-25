@@ -525,12 +525,30 @@ struct PreparedRootWrites {
 
 #[cfg(any(windows, target_os = "macos"))]
 impl PreparedRootWrites {
-    fn new(bridge: &BridgeServer, transaction_id: &str, writes: &[RootWrite]) -> Result<Self> {
+    fn new(
+        bridge: &BridgeServer,
+        transaction_id: &str,
+        writes: &[RootWrite],
+        inline_targets: Option<Value>,
+    ) -> Result<Self> {
         use crate::studio::{bridge::BridgeTarget, native::serializer};
         let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
         let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
         let title = serializer::target_name(pid, &info.place_name)?;
-        let mut targets = describe_root_batch(bridge, &info, transaction_id, writes)?;
+        let inline = inline_targets
+            .filter(|_| {
+                supports_target_batch(&info, cfg!(target_os = "macos"))
+                    && (!cfg!(target_os = "macos")
+                        || identity_batch_scope_supported(writes, cfg!(target_arch = "aarch64"))
+                            .unwrap_or(false))
+            })
+            .and_then(|targets| {
+                prepared_targets(serde_json::json!({ "nativeRootTargets": targets }), writes).ok()
+            });
+        let mut targets = match inline {
+            Some(targets) => targets,
+            None => describe_root_batch(bridge, &info, transaction_id, writes)?,
+        };
         #[cfg(target_os = "macos")]
         let identities = prepare_identity_batch(&mut targets, |services| {
             capture_target_identities(pid, &title, services)
@@ -750,11 +768,13 @@ pub(crate) fn apply(
     transaction_id: Option<&str>,
 ) -> Result<NativeRootVerification> {
     let mut verified = NativeRootVerification::default();
+    let inline_targets = summary.remove("nativeRootTargets");
     let Some(rows) = summary.remove("nativeRootWrites") else {
         return Ok(verified);
     };
-    let writes: Vec<RootWrite> =
+    let mut writes: Vec<RootWrite> =
         serde_json::from_value(rows).context("Invalid native root writes")?;
+    writes.sort_by_key(|write| write.class_name == "Terrain" && write.name == "SmoothGrid");
     let transaction_id = transaction_id.context("Native root writes require a transaction")?;
     let texts = writes
         .iter()
@@ -768,10 +788,15 @@ pub(crate) fn apply(
     let mut prepared = if writes.is_empty() || mocked {
         None
     } else {
-        Some(PreparedRootWrites::new(bridge, transaction_id, &writes)?)
+        Some(PreparedRootWrites::new(
+            bridge,
+            transaction_id,
+            &writes,
+            inline_targets,
+        )?)
     };
     #[cfg(not(any(windows, target_os = "macos")))]
-    let _ = mocked;
+    let _ = (mocked, inline_targets);
     for (write, text) in writes.into_iter().zip(texts) {
         #[cfg(test)]
         if record_test_write(&write) {

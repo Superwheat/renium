@@ -775,14 +775,26 @@ This may cause unexpected or broken behavior in your final results if you rely o
 
         let canonical_type = property.ty;
 
+        let can_elide_default = property.migration.is_none();
+
         match binary_type {
             Type::String => match canonical_type {
                 VariantType::String => {
+                    let default_bytes = match property.default_value {
+                        Some(Variant::String(default)) => Some(default.as_bytes()),
+                        _ => None,
+                    };
                     for instance in instances {
-                        let binary_string = chunk.read_binary_string()?;
-                        let value = match String::from_utf8(binary_string) {
-                            Ok(value) => value,
-                            Err(error) => {
+                        let slice = read_binary_slice(&mut chunk)?;
+                        if can_elide_default
+                            && !instance.record_elided_defaults
+                            && default_bytes == Some(slice)
+                        {
+                            continue;
+                        }
+                        let value = match str::from_utf8(slice) {
+                            Ok(value) => value.to_owned(),
+                            Err(_) => {
                                 log::warn!(
                             "Performing lossy string conversion on property {}.{} because it did not contain UTF-8.
 This may cause unexpected or broken behavior in your final results if you rely on this property being non UTF-8.",
@@ -790,7 +802,7 @@ This may cause unexpected or broken behavior in your final results if you rely o
                                     property.name
                                 );
 
-                                String::from_utf8_lossy(error.as_bytes()).into_owned()
+                                String::from_utf8_lossy(slice).into_owned()
                             }
                         };
 
@@ -798,22 +810,57 @@ This may cause unexpected or broken behavior in your final results if you rely o
                     }
                 }
                 VariantType::ContentId => {
+                    let default_bytes = match property.default_value {
+                        Some(Variant::ContentId(default)) => Some(default.as_str().as_bytes()),
+                        _ => None,
+                    };
                     for instance in instances {
-                        let value = chunk.read_string()?;
+                        let slice = read_binary_slice(&mut chunk)?;
+                        if can_elide_default
+                            && !instance.record_elided_defaults
+                            && default_bytes == Some(slice)
+                        {
+                            continue;
+                        }
+                        let value = str::from_utf8(slice)
+                            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+                            .to_owned();
                         add_property(instance, &property, ContentId::from(value).into());
                     }
                 }
                 VariantType::BinaryString => {
+                    let default_bytes = match property.default_value {
+                        Some(Variant::BinaryString(default)) => Some(default.as_ref()),
+                        _ => None,
+                    };
                     for instance in instances {
-                        let value: BinaryString = chunk.read_binary_string()?.into();
+                        let slice = read_binary_slice(&mut chunk)?;
+                        if can_elide_default
+                            && !instance.record_elided_defaults
+                            && default_bytes == Some(slice)
+                        {
+                            continue;
+                        }
+                        let value: BinaryString = slice.to_vec().into();
                         add_property(instance, &property, value.into());
                     }
                 }
                 VariantType::Tags => {
+                    let default_empty = matches!(
+                        property.default_value,
+                        Some(Variant::Tags(default)) if default.is_empty()
+                    );
                     for instance in instances {
-                        let buffer = chunk.read_binary_string()?;
+                        let buffer = read_binary_slice(&mut chunk)?;
+                        if can_elide_default
+                            && buffer.is_empty()
+                            && default_empty
+                            && !instance.record_elided_defaults
+                        {
+                            continue;
+                        }
 
-                        let value = Tags::decode(buffer.as_ref()).map_err(|_| {
+                        let value = Tags::decode(buffer).map_err(|_| {
                             InnerError::InvalidPropData {
                                 type_name: type_name.to_string(),
                                 prop_name: prop_name.clone(),
@@ -826,10 +873,21 @@ This may cause unexpected or broken behavior in your final results if you rely o
                     }
                 }
                 VariantType::Attributes => {
+                    let default_empty = matches!(
+                        property.default_value,
+                        Some(Variant::Attributes(default)) if default.is_empty()
+                    );
                     for instance in instances {
-                        let buffer = chunk.read_binary_string()?;
+                        let buffer = read_binary_slice(&mut chunk)?;
+                        if can_elide_default
+                            && buffer.is_empty()
+                            && default_empty
+                            && !instance.record_elided_defaults
+                        {
+                            continue;
+                        }
 
-                        match Attributes::from_reader(buffer.as_slice()) {
+                        match Attributes::from_reader(buffer) {
                             Ok(value) => {
                                 add_property(instance, &property, value.into());
                             }
@@ -845,7 +903,7 @@ rbx-dom may require changes to fully support this property. Please open an issue
                                 add_property(
                                     instance,
                                     &property,
-                                    BinaryString::from(buffer).into(),
+                                    BinaryString::from(buffer.to_vec()).into(),
                                 );
                             }
                         }
@@ -853,8 +911,8 @@ rbx-dom may require changes to fully support this property. Please open an issue
                 }
                 VariantType::MaterialColors => {
                     for instance in instances {
-                        let buffer = chunk.read_binary_string()?;
-                        match MaterialColors::decode(&buffer) {
+                        let buffer = read_binary_slice(&mut chunk)?;
+                        match MaterialColors::decode(buffer) {
                             Ok(value) => add_property(instance, &property, value.into()),
                             Err(err) => {
                                 log::warn!(
@@ -868,7 +926,7 @@ rbx-dom may require changes to fully support this property. Please open an issue
                                 add_property(
                                     instance,
                                     &property,
-                                    BinaryString::from(buffer).into(),
+                                    BinaryString::from(buffer.to_vec()).into(),
                                 );
                             }
                         }
@@ -2130,25 +2188,25 @@ rbx-dom may require changes to fully support this property. Please open an issue
         }
     }
 
-    pub(super) fn finish_flat(self) -> FlatDom {
+    pub(super) fn finish_flat(mut self) -> FlatDom {
         let mut instances = Vec::with_capacity(self.instances.len());
         let mut root_indices = Vec::with_capacity(self.root_instances.len());
         let mut stack = Vec::with_capacity(self.root_instances.len());
         for (_, instance_key) in self.root_instances.iter().rev() {
             stack.push((*instance_key, None));
         }
-        let mut source_instances = self.instances.into_iter().map(Some).collect::<Vec<_>>();
         while let Some((instance_key, parent_index)) = stack.pop() {
-            let instance = source_instances[instance_key]
-                .take()
-                .unwrap_or_else(|| Instance {
+            let instance = core::mem::replace(
+                &mut self.instances[instance_key],
+                Instance {
                     builder: InstanceBuilder::empty_without_referent(),
                     children: Vec::new(),
                     has_name: false,
                     record_elided_defaults: false,
                     elided_defaults: Vec::new(),
                     bare: false,
-                });
+                },
+            );
             let index = instances.len();
             if parent_index.is_none() {
                 root_indices.push(index);
@@ -2175,4 +2233,17 @@ rbx-dom may require changes to fully support this property. Please open an issue
             instances,
         }
     }
+}
+
+fn read_binary_slice<'a>(chunk: &mut &'a [u8]) -> Result<&'a [u8], io::Error> {
+    let length = chunk.read_le_u32()? as usize;
+    if chunk.len() < length {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "unexpected EOF while reading binary string",
+        ));
+    }
+    let (bytes, rest) = chunk.split_at(length);
+    *chunk = rest;
+    Ok(bytes)
 }

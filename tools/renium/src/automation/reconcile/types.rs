@@ -65,6 +65,78 @@ impl NativeRelay {
 }
 
 #[cfg(any(windows, target_os = "macos"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StructuralPathChange {
+    WholeService,
+    Children {
+        parent: Vec<String>,
+        child_names: Option<BTreeSet<String>>,
+    },
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+impl StructuralPathChange {
+    pub(crate) fn matches_ref_path(&self, service: &str, segments: &[String]) -> bool {
+        if segments.first().map(String::as_str) != Some(service) {
+            return false;
+        }
+        match self {
+            Self::WholeService => true,
+            Self::Children {
+                parent,
+                child_names,
+            } => {
+                if segments.len() <= parent.len() || segments[..parent.len()] != parent[..] {
+                    return false;
+                }
+                match child_names {
+                    None => true,
+                    Some(names) => names.contains(&segments[parent.len()]),
+                }
+            }
+        }
+    }
+
+    fn append_needles(&self, service: &str, needles: &mut Vec<Vec<String>>) {
+        match self {
+            Self::WholeService => needles.push(vec![service.to_string()]),
+            Self::Children {
+                parent,
+                child_names,
+            } => {
+                if parent.is_empty() {
+                    needles.push(vec![service.to_string()]);
+                    return;
+                }
+                match child_names {
+                    Some(names) if !names.is_empty() && names.len() <= 64 => {
+                        for name in names {
+                            let mut needle = Vec::with_capacity(parent.len() + 1);
+                            needle.extend(parent.iter().cloned());
+                            needle.push(name.clone());
+                            needles.push(needle);
+                        }
+                    }
+                    _ => needles.push(parent.clone()),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) type StructuralChanges = BTreeMap<String, Vec<StructuralPathChange>>;
+
+#[cfg(any(windows, target_os = "macos"))]
+#[derive(Clone)]
+pub(crate) struct PushedFromPull {
+    pub(crate) sourcemap: SourcemapState,
+    pub(crate) services: BTreeSet<String>,
+    pub(crate) paths_moved: BTreeSet<String>,
+    pub(crate) structural: StructuralChanges,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) struct VerifiedFullPush {
     pub(crate) connections: Vec<usize>,
     pub(crate) input: Value,
@@ -82,6 +154,7 @@ pub(crate) struct VerifiedFullPush {
     /// only where it changed script sources alone, each held by Studio in
     /// its file's bytes.
     pub(crate) sourcemap: Option<Box<SourcemapState>>,
+    pub(crate) pushed_from_pull: Option<Box<PushedFromPull>>,
     #[cfg(windows)]
     pub(crate) relay: Option<NativeRelay>,
 }
@@ -188,7 +261,7 @@ pub(crate) fn take_verified_full_push(
         return Ok(None);
     };
     let files_unchanged =
-        cached.project == capture_snapshot(&args.project.project_root, &cached.paths)?;
+        snapshot_matches_disk(&args.project.project_root, &cached.paths, &cached.project)?;
     Ok(Some(VerifiedFullPushCandidate {
         cached,
         files_unchanged,
@@ -201,6 +274,16 @@ pub(crate) fn verified_full_push_proof_matches(
     bridge: &BridgeServer,
     proof: &Value,
 ) -> Result<bool> {
+    verified_full_push_proof_matches_with_options(context, bridge, proof, false)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn verified_full_push_proof_matches_with_options(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    proof: &Value,
+    defer_terrain_proof: bool,
+) -> Result<bool> {
     let runtime = context
         .runtime_id
         .as_deref()
@@ -208,7 +291,12 @@ pub(crate) fn verified_full_push_proof_matches(
     pin_edit_runtime(context, bridge)?;
     let state = bridge.call_for_runtime_with_timeout(
         "getStudioChangeState",
-        json!({"start": false, "verifyPushProof": proof, "retainSeconds": BASELINE_IDLE.as_secs()}),
+        json!({
+            "start": false,
+            "verifyPushProof": proof,
+            "deferTerrainProof": defer_terrain_proof,
+            "retainSeconds": BASELINE_IDLE.as_secs(),
+        }),
         BridgeTarget::Edit,
         runtime,
         Some(Duration::from_secs(10)),
@@ -330,15 +418,43 @@ pub(crate) fn retain_verified_full_push(
     );
 }
 
-/// Like `retain_verified_full_push`, for files that are what a pull writes
-/// where `sourcemap` is Some: those a settlement published from its
-/// readback.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) struct RetainedPushScope {
+    pub(crate) project: ProjectSnapshot,
+    pub(crate) sourcemap: Option<Box<SourcemapState>>,
+    pub(crate) pushed_from_pull: Option<Box<PushedFromPull>>,
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn retain_full_push(
     bridge: &BridgeServer,
     input: Option<&Value>,
     paths: &[PathBuf],
     (project, sourcemap): (ProjectSnapshot, Option<Box<SourcemapState>>),
+    release: &StudioTrackingGuardRelease<'_>,
+    #[cfg(windows)] relay: &mut Option<NativeRelay>,
+) {
+    retain_full_push_scoped(
+        bridge,
+        input,
+        paths,
+        RetainedPushScope {
+            project,
+            sourcemap,
+            pushed_from_pull: None,
+        },
+        release,
+        #[cfg(windows)]
+        relay,
+    );
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn retain_full_push_scoped(
+    bridge: &BridgeServer,
+    input: Option<&Value>,
+    paths: &[PathBuf],
+    retained: RetainedPushScope,
     release: &StudioTrackingGuardRelease<'_>,
     #[cfg(windows)] relay: &mut Option<NativeRelay>,
 ) {
@@ -370,20 +486,18 @@ pub(crate) fn retain_full_push(
         );
         return;
     }
-    // Studio held the commit's proof at the release, and no tracked change
-    // reached a synced service between the lease and the release: Studio
-    // holds what the push verified, which is these files.
     let entry = VerifiedFullPush {
         connections: bridge.runtime_connection_signature(&release.runtime_id),
         input: input.clone(),
-        project,
+        project: retained.project,
         paths: paths.to_vec(),
         proof: proof.clone(),
         expires: baseline_expiry(
             #[cfg(windows)]
             relay.as_ref(),
         ),
-        sourcemap,
+        sourcemap: retained.sourcemap,
+        pushed_from_pull: retained.pushed_from_pull,
         #[cfg(windows)]
         relay,
     };
@@ -462,9 +576,14 @@ pub(crate) fn sourcemap_as_left(root: &Path, held: &VerifiedFullPush) -> Result<
     let Some(left) = held.sourcemap.as_ref() else {
         return Ok(false);
     };
+    sourcemap_state_as_left(root, left)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn sourcemap_state_as_left(root: &Path, left: &SourcemapState) -> Result<bool> {
     Ok(
         crate::snapshot::export::collect_publish_hashes(root, &[PathBuf::from(SOURCEMAP)])?
-            == **left,
+            == *left,
     )
 }
 
@@ -545,10 +664,13 @@ pub(crate) fn pull_baseline<'a>(
     let input = plain_push_input(&PushEditorChangesArgs::new(project, args.bridge.clone()))?;
     let mut held = take_baseline(context, bridge, &input);
     // Only files a pull would write, still as they were, answer a pull.
-    let files_unchanged = match held.as_ref() {
+    let (files_unchanged, has_unsettled_push) = match held.as_ref() {
         Some(entry) if entry.sourcemap.is_some() => {
             if sourcemap_as_left(&args.project_root, entry)? {
-                snapshot_matches_disk(&args.project_root, &entry.paths, &entry.project)?
+                (
+                    snapshot_matches_disk(&args.project_root, &entry.paths, &entry.project)?,
+                    false,
+                )
             } else {
                 log_global(
                     5,
@@ -556,17 +678,39 @@ pub(crate) fn pull_baseline<'a>(
                         "[renium] baseline: pull whole: sourcemap.json is not as the last pull left it"
                     ),
                 );
-                false
+                (false, false)
             }
         }
-        _ => false,
+        Some(entry) if entry.pushed_from_pull.is_some() => {
+            let sm_ok = entry.pushed_from_pull.as_ref().is_some_and(|p| {
+                sourcemap_state_as_left(&args.project_root, &p.sourcemap).unwrap_or(false)
+            });
+            if sm_ok {
+                (
+                    snapshot_matches_disk(&args.project_root, &entry.paths, &entry.project)?,
+                    true,
+                )
+            } else {
+                log_global(
+                    5,
+                    format_args!(
+                        "[renium] baseline: pull whole: sourcemap.json is not as the last pull left it"
+                    ),
+                );
+                (false, false)
+            }
+        }
+        _ => (false, false),
     };
     if files_unchanged {
         let unchanged = match held.as_ref() {
             Some(entry) => verified_full_push_proof_matches(context, bridge, &entry.proof)?,
             None => false,
         };
-        if unchanged && let Some(mut entry) = held.take() {
+        if unchanged
+            && !has_unsettled_push
+            && let Some(mut entry) = held.take()
+        {
             // Studio still holds the proof it held when it and these files
             // were one, and the files are still those files: a capture would
             // find nothing to write.
@@ -578,13 +722,24 @@ pub(crate) fn pull_baseline<'a>(
                 .insert(runtime.to_string(), entry);
             return Ok(Some(PullBaseline::Unchanged));
         }
-        match plan_scoped_pull(context, bridge, args, &mut held) {
-            Ok(Some(scoped)) => return Ok(Some(PullBaseline::Scoped(Box::new(scoped)))),
-            Ok(None) => {}
-            Err(error) => log_global(
-                5,
-                format_args!("[renium] baseline: pull not scoped: {error:#}"),
-            ),
+        if unchanged && has_unsettled_push {
+            match plan_scoped_pull_after_push(args, &mut held) {
+                Ok(Some(scoped)) => return Ok(Some(PullBaseline::Scoped(Box::new(scoped)))),
+                Ok(None) => {}
+                Err(error) => log_global(
+                    5,
+                    format_args!("[renium] baseline: pull not scoped: {error:#}"),
+                ),
+            }
+        } else {
+            match plan_scoped_pull(context, bridge, args, &mut held) {
+                Ok(Some(scoped)) => return Ok(Some(PullBaseline::Scoped(Box::new(scoped)))),
+                Ok(None) => {}
+                Err(error) => log_global(
+                    5,
+                    format_args!("[renium] baseline: pull not scoped: {error:#}"),
+                ),
+            }
         }
     }
     let services = sync_services();
@@ -659,7 +814,11 @@ impl PullLease<'_> {
             not_kept("the pull kept files back");
             return Ok(());
         }
-        let project = capture_snapshot(&self.root, &published.publish_paths)?;
+        let project = if let Some(cached) = published.take_after_snapshot() {
+            cached
+        } else {
+            capture_snapshot(&self.root, &published.publish_paths)?
+        };
         if !publish_settled(&project, &published.settled) {
             not_kept("the files changed after the pull wrote them");
             return Ok(());
@@ -689,6 +848,7 @@ impl PullLease<'_> {
                 self.relay.as_ref(),
             ),
             sourcemap: settled_sourcemap(published, None),
+            pushed_from_pull: None,
             #[cfg(windows)]
             relay: self.relay,
         };
@@ -766,7 +926,7 @@ pub(crate) struct TouchedFields {
 pub(crate) struct ProofBulkScope {
     pub(crate) services: BTreeSet<String>,
     pub(crate) values_only: BTreeSet<String>,
-    pub(crate) changed_properties: BTreeMap<String, Vec<String>>,
+    pub(crate) changed_class_properties: BTreeMap<String, Vec<(String, String)>>,
     pub(crate) expected_terrain_digest: Option<String>,
 }
 
@@ -788,18 +948,25 @@ impl ProofBulkScope {
             .filter(|(_, flag)| flag.as_bool() == Some(true))
             .map(|(service, _)| service.clone())
             .collect();
-        let mut changed_properties = BTreeMap::new();
-        if let Some(map) = answer["changedProperties"].as_object() {
-            for (service, list) in map {
-                let Some(arr) = list.as_array() else {
+        let mut changed_class_properties = BTreeMap::new();
+        if let Some(map) = answer["changedClassProps"].as_object() {
+            for (service, class_map) in map {
+                let Some(obj) = class_map.as_object() else {
                     continue;
                 };
-                let props = arr
-                    .iter()
-                    .filter_map(|value| value.as_str().map(str::to_string))
-                    .collect::<Vec<_>>();
-                if !props.is_empty() {
-                    changed_properties.insert(service.clone(), props);
+                let mut pairs = Vec::new();
+                for (class_name, list) in obj {
+                    let Some(arr) = list.as_array() else {
+                        continue;
+                    };
+                    for value in arr {
+                        if let Some(prop) = value.as_str() {
+                            pairs.push((class_name.clone(), prop.to_string()));
+                        }
+                    }
+                }
+                if !pairs.is_empty() {
+                    changed_class_properties.insert(service.clone(), pairs);
                 }
             }
         }
@@ -810,7 +977,7 @@ impl ProofBulkScope {
         Some(Self {
             services,
             values_only,
-            changed_properties,
+            changed_class_properties,
             expected_terrain_digest,
         })
     }
@@ -925,30 +1092,56 @@ fn project_store_paths(root: &Path, src_dir: &Path) -> Result<BTreeMap<String, P
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-/// The services outside `moved` whose store in `project` refers to an
-/// instance of one of them. A whole pull writes such a reference from where
-/// its target stands now, so a pull scoped to `moved` captures them too. A
-/// reference without a path stays in its own store.
 pub(crate) fn referring_services(
     project: &ProjectSnapshot,
     stores: &BTreeMap<String, PathBuf>,
     moved: &BTreeSet<String>,
 ) -> Result<BTreeSet<String>> {
-    // No store refers to none of them, and a search for no name reads every
-    // store whole.
-    if moved.is_empty() {
+    let changes = moved
+        .iter()
+        .map(|service| (service.clone(), vec![StructuralPathChange::WholeService]))
+        .collect();
+    referring_services_for_changes(project, stores, &changes)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn merge_structural_changes(dst: &mut StructuralChanges, src: StructuralChanges) {
+    for (service, changes) in src {
+        let entry = dst.entry(service).or_default();
+        if entry.contains(&StructuralPathChange::WholeService) {
+            continue;
+        }
+        if changes.contains(&StructuralPathChange::WholeService) {
+            *entry = vec![StructuralPathChange::WholeService];
+        } else {
+            entry.extend(changes);
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn referring_services_for_changes(
+    project: &ProjectSnapshot,
+    stores: &BTreeMap<String, PathBuf>,
+    changes: &StructuralChanges,
+) -> Result<BTreeSet<String>> {
+    if changes.is_empty() {
         return Ok(BTreeSet::new());
     }
-    let needles = moved
-        .iter()
-        .map(|service| vec![service.clone()])
-        .collect::<Vec<_>>();
+    let mut needles = Vec::new();
+    for (service, service_changes) in changes {
+        for change in service_changes {
+            change.append_needles(service, &mut needles);
+        }
+    }
+    if needles.is_empty() {
+        return Ok(BTreeSet::new());
+    }
     let referring = stores
         .par_iter()
-        .filter(|(service, _)| !moved.contains(*service))
+        .filter(|(service, _)| !changes.contains_key(*service))
         .map(|(service, path)| {
             let Some(SnapshotEntry::File(bytes)) = project.entries.get(path) else {
-                // A store the baseline does not hold cannot be shown not to.
                 return Ok(Some(service.clone()));
             };
             let Some(document) =
@@ -964,12 +1157,30 @@ pub(crate) fn referring_services(
                     .chain(instance.attributes.values())
             }) {
                 crate::settings::bytecode::for_each_reference(value, &mut |reference| {
-                    refers |= reference
+                    if refers {
+                        return;
+                    }
+                    let Some(segments) = reference
                         .get("pathSegments")
                         .and_then(Value::as_array)
-                        .and_then(|segments| segments.first())
-                        .and_then(Value::as_str)
-                        .is_some_and(|service| moved.contains(service));
+                        .and_then(|segs| {
+                            segs.iter()
+                                .map(|s| s.as_str().map(str::to_string))
+                                .collect::<Option<Vec<_>>>()
+                        })
+                    else {
+                        return;
+                    };
+                    let Some(target_service) = segments.first() else {
+                        return;
+                    };
+                    if let Some(service_changes) = changes.get(target_service)
+                        && service_changes
+                            .iter()
+                            .any(|change| change.matches_ref_path(target_service, &segments))
+                    {
+                        refers = true;
+                    }
                 });
                 if refers {
                     return Ok(Some(service.clone()));
@@ -979,6 +1190,292 @@ pub(crate) fn referring_services(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(referring.into_iter().flatten().collect())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn build_structure_children(doc: &SettingsBytecode) -> (Vec<usize>, Vec<Vec<usize>>) {
+    let mut children = vec![Vec::new(); doc.instances.len()];
+    let mut roots = Vec::new();
+    for (idx, inst) in doc.instances.iter().enumerate() {
+        if let Some(parent) = inst.parent_index.filter(|&p| p < doc.instances.len()) {
+            children[parent].push(idx);
+        } else {
+            roots.push(idx);
+        }
+    }
+    (roots, children)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+type UniqueIdSlice<'a> = Option<&'a [Option<Box<str>>]>;
+
+#[cfg(any(windows, target_os = "macos"))]
+fn diff_structure_children<'a>(
+    before: &'a SettingsBytecode,
+    after: &'a SettingsBytecode,
+    (b_children, a_children): (&[Vec<usize>], &[Vec<usize>]),
+    (b_uids, a_uids): (UniqueIdSlice<'_>, UniqueIdSlice<'_>),
+    (b_node, a_node): (usize, usize),
+    path: &mut Vec<&'a str>,
+    out: &mut Vec<StructuralPathChange>,
+) -> bool {
+    let bc = &b_children[b_node];
+    let ac = &a_children[a_node];
+    let same_node = |bi: usize, ai: usize| {
+        let b = &before.instances[bi];
+        let a = &after.instances[ai];
+        b.name == a.name
+            && b.class_name == a.class_name
+            && b.settings_id == a.settings_id
+            && match (b_uids, a_uids) {
+                (Some(bu), Some(au)) => bu.get(bi) == au.get(ai),
+                _ => true,
+            }
+    };
+    if bc.len() == ac.len() && bc.iter().zip(ac.iter()).all(|(&bi, &ai)| same_node(bi, ai)) {
+        for (&bi, &ai) in bc.iter().zip(ac.iter()) {
+            path.push(before.instances[bi].name.as_str());
+            let ok = diff_structure_children(
+                before,
+                after,
+                (b_children, a_children),
+                (b_uids, a_uids),
+                (bi, ai),
+                path,
+                out,
+            );
+            path.pop();
+            if !ok {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    let mut b_by_name: ahash::AHashMap<&'a str, Vec<usize>> = ahash::AHashMap::new();
+    for &bi in bc {
+        b_by_name
+            .entry(before.instances[bi].name.as_str())
+            .or_default()
+            .push(bi);
+    }
+    let mut a_by_name: ahash::AHashMap<&'a str, Vec<usize>> = ahash::AHashMap::new();
+    for &ai in ac {
+        a_by_name
+            .entry(after.instances[ai].name.as_str())
+            .or_default()
+            .push(ai);
+    }
+    let mut changed_names = BTreeSet::new();
+    let mut matched_pairs: Vec<(&'a str, usize, usize)> = Vec::new();
+    for (&name, b_list) in &b_by_name {
+        let Some(a_list) = a_by_name.get(name) else {
+            changed_names.insert(name.to_string());
+            continue;
+        };
+        let dup_unsafe = b_list.len() > 1
+            && (b_uids.is_none() || a_uids.is_none())
+            && b_list
+                .iter()
+                .any(|&bi| before.instances[bi].settings_id.is_empty());
+        if b_list.len() != a_list.len()
+            || dup_unsafe
+            || !b_list
+                .iter()
+                .zip(a_list.iter())
+                .all(|(&bi, &ai)| same_node(bi, ai))
+        {
+            changed_names.insert(name.to_string());
+        } else {
+            for (&bi, &ai) in b_list.iter().zip(a_list.iter()) {
+                matched_pairs.push((name, bi, ai));
+            }
+        }
+    }
+    for &name in a_by_name.keys() {
+        if !b_by_name.contains_key(name) {
+            changed_names.insert(name.to_string());
+        }
+    }
+    if !changed_names.is_empty() {
+        out.push(StructuralPathChange::Children {
+            parent: path.iter().map(|s| (*s).to_string()).collect(),
+            child_names: Some(changed_names),
+        });
+    }
+    for (name, bi, ai) in matched_pairs {
+        path.push(name);
+        let ok = diff_structure_children(
+            before,
+            after,
+            (b_children, a_children),
+            (b_uids, a_uids),
+            (bi, ai),
+            path,
+            out,
+        );
+        path.pop();
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn diff_store_bytes_structure(
+    service: &str,
+    before_bytes: &[u8],
+    after_bytes: &[u8],
+) -> Vec<StructuralPathChange> {
+    if before_bytes == after_bytes {
+        return Vec::new();
+    }
+    let (Ok(mut before_doc), Ok(mut after_doc)) = rayon::join(
+        || SettingsBytecode::decode_structure(before_bytes),
+        || SettingsBytecode::decode_structure(after_bytes),
+    ) else {
+        return vec![StructuralPathChange::WholeService];
+    };
+    let (b_uids, a_uids) = rayon::join(
+        || {
+            crate::settings::bytecode::blocks::BlockStore::open(before_bytes)
+                .ok()
+                .and_then(|s| {
+                    s.extract_unique_ids_and_root_camera(&mut before_doc.instances)
+                        .ok()
+                })
+        },
+        || {
+            crate::settings::bytecode::blocks::BlockStore::open(after_bytes)
+                .ok()
+                .and_then(|s| {
+                    s.extract_unique_ids_and_root_camera(&mut after_doc.instances)
+                        .ok()
+                })
+        },
+    );
+    let (b_roots, b_children) = build_structure_children(&before_doc);
+    let (a_roots, a_children) = build_structure_children(&after_doc);
+    if b_roots.len() != a_roots.len() {
+        return vec![StructuralPathChange::WholeService];
+    }
+    let mut changes = Vec::new();
+    for (&br, &ar) in b_roots.iter().zip(a_roots.iter()) {
+        let b = &before_doc.instances[br];
+        let a = &after_doc.instances[ar];
+        if b.name != a.name || b.class_name != a.class_name || b.settings_id != a.settings_id {
+            return vec![StructuralPathChange::WholeService];
+        }
+        let mut path = vec![service];
+        if !diff_structure_children(
+            &before_doc,
+            &after_doc,
+            (&b_children, &a_children),
+            (b_uids.as_deref(), a_uids.as_deref()),
+            (br, ar),
+            &mut path,
+            &mut changes,
+        ) {
+            return vec![StructuralPathChange::WholeService];
+        }
+    }
+    changes
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn structural_changes_between_snapshots(
+    context: &BoundContext,
+    services: &BTreeSet<String>,
+    before: &ProjectSnapshot,
+    after: &ProjectSnapshot,
+    generated: Option<&ProjectSnapshot>,
+) -> StructuralChanges {
+    let root = Path::new(&context.root);
+    let source = Path::new(&context.source);
+    let Ok(rel_source) = source.strip_prefix(root) else {
+        return services
+            .iter()
+            .map(|s| (s.clone(), vec![StructuralPathChange::WholeService]))
+            .collect();
+    };
+    let after_entry = |path: &PathBuf| {
+        generated
+            .and_then(|g| g.entries.get(path))
+            .or_else(|| after.entries.get(path))
+    };
+    let mut out = StructuralChanges::new();
+    for service in services {
+        let mut service_changes = Vec::new();
+        let mut whole = false;
+        let folder = source.join(service);
+        let Ok(store_rel) = service_settings_path(&folder)
+            .strip_prefix(root)
+            .map(Path::to_path_buf)
+        else {
+            out.insert(service.clone(), vec![StructuralPathChange::WholeService]);
+            continue;
+        };
+        let b_store = before.entries.get(&store_rel);
+        let a_store = after_entry(&store_rel);
+        if b_store != a_store {
+            match (b_store, a_store) {
+                (Some(SnapshotEntry::File(b_bytes)), Some(SnapshotEntry::File(a_bytes))) => {
+                    let store_diff = diff_store_bytes_structure(service, b_bytes, a_bytes);
+                    if store_diff.contains(&StructuralPathChange::WholeService) {
+                        whole = true;
+                    } else {
+                        service_changes.extend(store_diff);
+                    }
+                }
+                _ => whole = true,
+            }
+        }
+        if !whole {
+            let service_prefix = rel_source.join(service);
+            let mut extra_paths = before
+                .entries
+                .keys()
+                .chain(after.entries.keys())
+                .chain(generated.into_iter().flat_map(|g| g.entries.keys()))
+                .filter(|path| path.starts_with(&service_prefix) && **path != store_rel)
+                .collect::<Vec<_>>();
+            extra_paths.sort();
+            extra_paths.dedup();
+            for path in extra_paths {
+                let b_has = before.entries.contains_key(path);
+                let a_has = after_entry(path).is_some();
+                if b_has == a_has {
+                    continue;
+                }
+                let Ok(rel_in_service) = path.strip_prefix(&service_prefix) else {
+                    whole = true;
+                    break;
+                };
+                let comps = rel_in_service
+                    .components()
+                    .filter_map(|c| c.as_os_str().to_str().map(str::to_string))
+                    .collect::<Vec<_>>();
+                if comps.is_empty() {
+                    continue;
+                }
+                let is_init = comps.last().is_some_and(|name| name.starts_with("init."));
+                let mut parent = vec![service.clone()];
+                let drop_tail = if is_init && comps.len() >= 2 { 2 } else { 1 };
+                parent.extend(comps[..comps.len() - drop_tail].iter().cloned());
+                service_changes.push(StructuralPathChange::Children {
+                    parent,
+                    child_names: None,
+                });
+            }
+        }
+        if whole {
+            out.insert(service.clone(), vec![StructuralPathChange::WholeService]);
+        } else if !service_changes.is_empty() {
+            out.insert(service.clone(), service_changes);
+        }
+    }
+    out
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -1134,6 +1631,54 @@ pub(crate) struct ScopedPull {
     touched: BTreeMap<String, Option<Vec<TouchedInstance>>>,
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+fn plan_scoped_pull_after_push(
+    args: &crate::cli::PullArgs,
+    held: &mut Option<VerifiedFullPush>,
+) -> Result<Option<ScopedPull>> {
+    let Some(entry) = held.as_ref() else {
+        return Ok(None);
+    };
+    let Some(pushed) = entry.pushed_from_pull.as_ref() else {
+        return Ok(None);
+    };
+    let stores = project_store_paths(&args.project_root, &args.src_dir)?;
+    let referring = referring_services_for_changes(&entry.project, &stores, &pushed.structural)?;
+    let services = pushed
+        .services
+        .union(&referring)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if services.len() >= sync_services().len() {
+        log_global(
+            5,
+            format_args!("[renium] baseline: pull not scoped: it covers every service"),
+        );
+        return Ok(None);
+    }
+    let list =
+        |services: &BTreeSet<String>| services.iter().cloned().collect::<Vec<_>>().join(", ");
+    log_global(
+        5,
+        format_args!(
+            "[renium] baseline: pull scoped to [{}]: pushed [{}], stores referring to the rest [{}]",
+            list(&services),
+            list(&pushed.services),
+            list(&referring)
+        ),
+    );
+    Ok(held.take().map(|held| {
+        let proof = held.proof.clone();
+        ScopedPull {
+            held,
+            proof,
+            services,
+            stores,
+            touched: BTreeMap::new(),
+        }
+    }))
+}
+
 /// Has Studio take a new proof under the held proof's observation and, where
 /// it can say which services moved between the two, plans a pull of those.
 #[cfg(any(windows, target_os = "macos"))]
@@ -1160,21 +1705,34 @@ pub(crate) fn plan_scoped_pull(
             format_args!("[renium] baseline: pull not scoped: {reason}"),
         );
     };
-    let (moved, paths_moved, touched) = match ProofScope::parse(&state["pushProofScope"]) {
-        ProofScope::Unknown(reason) => {
-            not_scoped(&reason);
-            return Ok(None);
+    let (mut moved, mut paths_moved, mut touched) =
+        match ProofScope::parse(&state["pushProofScope"]) {
+            ProofScope::Unknown(reason) => {
+                not_scoped(&reason);
+                return Ok(None);
+            }
+            ProofScope::Services {
+                services,
+                touched,
+                values_only,
+            } => {
+                log_touched(&touched);
+                let paths_moved = paths_moved_in_with(&services, &touched, &values_only);
+                (services, paths_moved, touched)
+            }
+        };
+    let mut structural_changes: StructuralChanges = paths_moved
+        .iter()
+        .map(|s| (s.clone(), vec![StructuralPathChange::WholeService]))
+        .collect();
+    if let Some(pushed) = entry.pushed_from_pull.as_ref() {
+        moved.extend(pushed.services.iter().cloned());
+        paths_moved.extend(pushed.paths_moved.iter().cloned());
+        merge_structural_changes(&mut structural_changes, pushed.structural.clone());
+        for service in &pushed.services {
+            touched.insert(service.clone(), None);
         }
-        ProofScope::Services {
-            services,
-            touched,
-            values_only,
-        } => {
-            log_touched(&touched);
-            let paths_moved = paths_moved_in_with(&services, &touched, &values_only);
-            (services, paths_moved, touched)
-        }
-    };
+    }
     let Some(proof) = state
         .get("verifiedPushProof")
         .filter(|value| !value.is_null())
@@ -1184,7 +1742,7 @@ pub(crate) fn plan_scoped_pull(
         return Ok(None);
     };
     let stores = project_store_paths(&args.project_root, &args.src_dir)?;
-    let referring = referring_services(&entry.project, &stores, &paths_moved)?;
+    let referring = referring_services_for_changes(&entry.project, &stores, &structural_changes)?;
     let services = moved.union(&referring).cloned().collect::<BTreeSet<_>>();
     if services.len() >= sync_services().len() {
         not_scoped("it covers every service");
@@ -1403,6 +1961,10 @@ impl ScopedPull {
                 return Ok(());
             }
         };
+        let prior_sourcemap = self
+            .held
+            .sourcemap
+            .or_else(|| self.held.pushed_from_pull.map(|p| Box::new(p.sourcemap)));
         let entry = VerifiedFullPush {
             connections: bridge.runtime_connection_signature(runtime),
             input: self.held.input,
@@ -1410,7 +1972,8 @@ impl ScopedPull {
             paths: self.held.paths,
             proof: self.proof,
             expires,
-            sourcemap: settled_sourcemap(published, self.held.sourcemap),
+            sourcemap: settled_sourcemap(published, prior_sourcemap),
+            pushed_from_pull: None,
             #[cfg(windows)]
             relay: self.held.relay,
         };
@@ -1450,6 +2013,7 @@ pub(crate) struct ReconcilePushPlan {
     pub(crate) unchanged_native_root_properties: HashMap<(String, String), Vec<String>>,
     pub(crate) bulk_property_patches: Vec<crate::editor::types::EditorBulkPropertyPatch>,
     pub(crate) bulk_property_paths: Vec<PathBuf>,
+    pub(crate) extra_property_changes: Vec<EditorPropertyChange>,
 }
 
 pub(crate) struct PreparedEditorSettingsChange {
@@ -1513,5 +2077,198 @@ impl ReconcilePushPlan {
             && self.instance_deletes.is_empty()
             && self.property_removals.is_empty()
             && self.bulk_property_patches.is_empty()
+            && self.extra_property_changes.is_empty()
+    }
+}
+
+#[cfg(all(test, any(windows, target_os = "macos")))]
+mod structural_diff_tests {
+    use super::*;
+    use crate::settings::bytecode::{
+        SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode,
+    };
+
+    #[test]
+    fn structural_changes_between_snapshots_roots_renamed_service_at_canonical_key() {
+        let root = crate::tests::support::temp_dir("r9-renamed-service-diff");
+        let source = root.join("src");
+        let context = BoundContext {
+            id: 1,
+            initialized: true,
+            root: root.display().to_string(),
+            project: root.join("renium.project.json").display().to_string(),
+            experience: "test".into(),
+            source: source.display().to_string(),
+            resource_lease: None,
+            place_id: None,
+            game_id: None,
+            selector: String::new(),
+            runtime_id: None,
+            plugin_build: None,
+            fingerprint: String::new(),
+        };
+        let before_doc = SettingsBytecode {
+            version: 12,
+            instances: vec![SettingsBytecodeInstance::new(
+                "ws-0".into(),
+                "RenamedWorld".into(),
+                "Workspace".into(),
+                None,
+            )],
+        };
+        let mut after_doc = before_doc.clone();
+        after_doc.instances.push(SettingsBytecodeInstance::new(
+            "part-1".into(),
+            "Spawn".into(),
+            "Part".into(),
+            Some(0),
+        ));
+        let store_rel = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        let before = ProjectSnapshot {
+            entries: BTreeMap::from([(
+                store_rel.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(&before_doc).unwrap()),
+            )]),
+        };
+        let after = ProjectSnapshot {
+            entries: BTreeMap::from([(
+                store_rel,
+                SnapshotEntry::File(encode_settings_bytecode(&after_doc).unwrap()),
+            )]),
+        };
+        let services = BTreeSet::from(["Workspace".to_string()]);
+        let diff = structural_changes_between_snapshots(&context, &services, &before, &after, None);
+        let ws_changes = diff
+            .get("Workspace")
+            .expect("Workspace structural change must be recorded");
+        let target_segments = vec!["Workspace".to_string(), "Spawn".to_string()];
+        assert!(
+            ws_changes
+                .iter()
+                .any(|change| change.matches_ref_path("Workspace", &target_segments)),
+            "R9: renamed service diff must root at canonical service key 'Workspace', got {ws_changes:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn plan_scoped_pull_after_push_scopes_to_pushed_and_referring_services() {
+        let root = crate::tests::support::temp_dir("r10-scoped-pull-after-push");
+        let src = root.join("src");
+        fs::create_dir_all(src.join("Workspace")).unwrap();
+        fs::create_dir_all(src.join("ReplicatedStorage")).unwrap();
+        fs::create_dir_all(src.join("ServerStorage")).unwrap();
+
+        let ws_doc = SettingsBytecode {
+            version: 12,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "ws-0".into(),
+                    "Workspace".into(),
+                    "Workspace".into(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new("p-1".into(), "Spawn".into(), "Part".into(), Some(0)),
+            ],
+        };
+        let mut rep_doc = SettingsBytecode {
+            version: 12,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "rs-0".into(),
+                    "ReplicatedStorage".into(),
+                    "ReplicatedStorage".into(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new(
+                    "ov-1".into(),
+                    "Link".into(),
+                    "ObjectValue".into(),
+                    Some(0),
+                ),
+            ],
+        };
+        rep_doc.instances[1].properties.insert(
+            "Value".into(),
+            json!({"_type": "Ref", "pathSegments": ["Workspace", "Spawn"], "pathOrdinals": [1, 1]}),
+        );
+        let ss_doc = SettingsBytecode {
+            version: 12,
+            instances: vec![SettingsBytecodeInstance::new(
+                "ss-0".into(),
+                "ServerStorage".into(),
+                "ServerStorage".into(),
+                None,
+            )],
+        };
+
+        let ws_bytes = encode_settings_bytecode(&ws_doc).unwrap();
+        let rep_bytes = encode_settings_bytecode(&rep_doc).unwrap();
+        let ss_bytes = encode_settings_bytecode(&ss_doc).unwrap();
+        let ws_rel = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        let rep_rel = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
+        let ss_rel = PathBuf::from("src/ServerStorage/__roblox_sync_settings.renium");
+        fs::write(root.join(&ws_rel), &ws_bytes).unwrap();
+        fs::write(root.join(&rep_rel), &rep_bytes).unwrap();
+        fs::write(root.join(&ss_rel), &ss_bytes).unwrap();
+        let entries = BTreeMap::from([
+            (ws_rel, SnapshotEntry::File(ws_bytes)),
+            (rep_rel, SnapshotEntry::File(rep_bytes)),
+            (ss_rel, SnapshotEntry::File(ss_bytes)),
+        ]);
+        let mut structural = StructuralChanges::new();
+        structural.insert(
+            "Workspace".into(),
+            vec![StructuralPathChange::Children {
+                parent: vec!["Workspace".into()],
+                child_names: Some(BTreeSet::from(["Spawn".into()])),
+            }],
+        );
+        let entry = VerifiedFullPush {
+            connections: Vec::new(),
+            input: json!({}),
+            project: ProjectSnapshot { entries },
+            paths: vec![PathBuf::from("src")],
+            proof: json!({"id": "proof-1"}),
+            expires: Instant::now() + Duration::from_secs(60),
+            sourcemap: None,
+            pushed_from_pull: Some(Box::new(PushedFromPull {
+                sourcemap: BTreeMap::new(),
+                services: BTreeSet::from(["Workspace".into()]),
+                paths_moved: BTreeSet::from(["Workspace".into()]),
+                structural,
+            })),
+            #[cfg(windows)]
+            relay: None,
+        };
+        let mut held = Some(entry);
+        let args = crate::cli::PullArgs {
+            project_root: root.clone(),
+            src_dir: PathBuf::from("src"),
+            services: String::new(),
+            bridge: crate::cli::BridgeConnectionArgs::default_connection(),
+            export_all_properties: false,
+            quiet_timings: true,
+            preserve_paths: Vec::new(),
+            keep_local_only_scripts: false,
+            layout_src_root: None,
+        };
+        let scoped = plan_scoped_pull_after_push(&args, &mut held)
+            .unwrap()
+            .expect("must return scoped pull plan");
+        assert!(
+            scoped.services.contains("Workspace"),
+            "pushed service must be captured"
+        );
+        assert!(
+            scoped.services.contains("ReplicatedStorage"),
+            "service referring to moved Workspace.Spawn must be captured"
+        );
+        assert!(
+            !scoped.services.contains("ServerStorage"),
+            "unrelated ServerStorage must NOT be captured"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

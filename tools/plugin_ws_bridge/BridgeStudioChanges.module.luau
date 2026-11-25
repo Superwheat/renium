@@ -183,6 +183,7 @@ type State = {
 	ordinalFrameConnection: RBXScriptConnection?,
 	lastParentByInstance: { [Instance]: Instance? },
 	watchedServices: { [string]: boolean },
+	lazyObservedServices: { [string]: boolean },
 	serviceRoots: { [string]: Instance },
 	serviceNameByRoot: { [Instance]: string },
 	rootConnections: { [string]: { RBXScriptConnection } },
@@ -222,6 +223,10 @@ type State = {
 	archivableByInstance: { [Instance]: boolean },
 	nonArchivableCountByService: { [string]: number },
 	exportInstancesByService: { [string]: { Instance } },
+	exportDebugIdsByService: { [string]: { string } },
+	exportDebugIdBufferByService: { [string]: buffer },
+	exportClassNamesByService: { [string]: { string } },
+	exportNonArchivableIndicesByService: { [string]: { number } },
 	changeJournal: any?,
 }
 
@@ -318,6 +323,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		ordinalFrameConnection = nil,
 		lastParentByInstance = setmetatable({}, { __mode = "k" }) :: any,
 		watchedServices = {},
+		lazyObservedServices = {},
 		serviceRoots = {},
 		serviceNameByRoot = {},
 		rootConnections = {},
@@ -360,6 +366,10 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		archivableByInstance = setmetatable({}, { __mode = "k" }) :: any,
 		nonArchivableCountByService = {},
 		exportInstancesByService = {},
+		exportDebugIdsByService = {},
+		exportDebugIdBufferByService = {},
+		exportClassNamesByService = {},
+		exportNonArchivableIndicesByService = {},
 		changeJournal = nil,
 	}
 
@@ -369,6 +379,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	local nativeTerrainRelay = nil
 	local rawTagGeneration = 0
 	local rawDocumentGeneration = 0
+	local recentBulkTagExpectations: {
+		[string]: {
+			instances: { [Instance]: boolean },
+			expiresAt: number,
+		},
+	} = {}
 	local tagDiscoveryConnections = {}
 	function api.tagGeneration(): number
 		return rawTagGeneration
@@ -453,26 +469,59 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			proof.pathsMoved[serviceName] = true
 		end
 		if proof.changedPropsOverflow ~= nil and proof.changedPropsOverflow[serviceName] ~= true then
-			if
-				kind == "values"
+			local isAttrField = field == "@attributes"
 				and instance ~= nil
-				and type(field) == "string"
+				and instance.Name ~= "__Renium_SessionLock"
+				and instance ~= Workspace.CurrentCamera
+			local isTagField = type(field) == "string" and string.sub(field, 1, 5) == "@tag:" and #field > 5
+			local isPlainPropField = type(field) == "string"
 				and field ~= ""
 				and string.sub(field, 1, 1) ~= "@"
 				and field ~= "Name"
 				and field ~= "Parent"
 				and field ~= "Archivable"
-			then
+			if kind == "values" and instance ~= nil and (isPlainPropField or isAttrField or isTagField) then
+				local className = instance.ClassName
+				local trackField = field :: string
 				local props = proof.changedProps[serviceName]
 				if props == nil then
-					proof.changedProps[serviceName] = { count = 1, names = { [field] = true } }
-				elseif not props.names[field] then
-					if props.count >= 8 then
+					proof.changedProps[serviceName] = {
+						count = 1,
+						names = { [trackField] = true },
+						pairCount = 1,
+						byClass = { [className] = { [trackField] = true } },
+					}
+				else
+					local overflow = false
+					if not props.names[trackField] then
+						if props.count >= 32 then
+							overflow = true
+						else
+							props.count += 1
+							props.names[trackField] = true
+						end
+					end
+					if not overflow then
+						local byClass = props.byClass[className]
+						if byClass == nil then
+							if props.pairCount >= 256 then
+								overflow = true
+							else
+								props.pairCount += 1
+								props.byClass[className] = { [trackField] = true }
+							end
+						elseif not byClass[trackField] then
+							if props.pairCount >= 256 then
+								overflow = true
+							else
+								props.pairCount += 1
+								byClass[trackField] = true
+							end
+						end
+					end
+					if overflow then
 						proof.changedPropsOverflow[serviceName] = true
 						proof.changedProps[serviceName] = nil
-					else
-						props.count += 1
-						props.names[field] = true
 					end
 				end
 			else
@@ -491,14 +540,15 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			proof.touched[serviceName] = touched
 		end
 		if kind == "values" then
+			local touchedField = if type(field) == "string" and string.sub(field, 1, 5) == "@tag:" then "@tags" else field
 			local fields = touched.fields[instance]
-			if field == nil or fields == false or fields ~= nil and fields.count >= PROOF_FIELD_LIMIT and not fields.names[field] then
+			if touchedField == nil or fields == false or fields ~= nil and fields.count >= PROOF_FIELD_LIMIT and not fields.names[touchedField] then
 				touched.fields[instance] = false
 			elseif fields == nil then
-				touched.fields[instance] = { count = 1, names = { [field] = true } }
-			elseif not fields.names[field] then
+				touched.fields[instance] = { count = 1, names = { [touchedField] = true } }
+			elseif not fields.names[touchedField] then
 				fields.count += 1
-				fields.names[field] = true
+				fields.names[touchedField] = true
 			end
 		end
 		local previous = touched.kinds[instance]
@@ -581,7 +631,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local ok, digest = pcall(config.captureTerrainProof)
 		return if ok then digest else nil
 	end
-	function api.capturePushProof(): (number?, string?)
+	function api.capturePushProof(deferTerrainProof: boolean?): (number?, string?)
 		local attributes = api.nativeAttributeProof()
 		if config.exportProofGeneration == nil or config.observeProofDocuments == nil
 			or CollectionService.TagAdded == nil or CollectionService.TagRemoved == nil then return nil, "proof observers unavailable" end
@@ -645,10 +695,13 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			localObservation = localObservation, camera = Workspace.CurrentCamera, cameraGeneration = relay.cameraGeneration,
 			attributeServices = table.clone(proofLedger.attributes), tagServices = table.clone(proofLedger.tags),
 			unplaced = proofLedger.unplaced }
-		proof.terrain = proofTerrain(proof.terrainRequired)
-		-- The serializer yields. All other state must remain unchanged across
-		-- that interval, including open-buffer changes that later cancel out.
-		if proof.terrain == nil then return nil, "Terrain proof unavailable" end
+		if deferTerrainProof == true and proof.terrainRequired then
+			proof.terrain = nil
+			proof.terrainPending = true
+		else
+			proof.terrain = proofTerrain(proof.terrainRequired)
+			if proof.terrain == nil then return nil, "Terrain proof unavailable" end
+		end
 		local matches, reason = matchesPushState(proof)
 		if not matches then return nil, reason end
 		nextPushProof += 1
@@ -679,6 +732,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	-- no event tracks (Terrain voxels, open script buffers, the viewport
 	-- camera's attributes) is as the other saw it.
 	local function continuesPushProof(previous, proof): boolean
+		if previous.terrainPending == true or proof.terrainPending == true then return false end
 		if previous.terrain ~= proof.terrain or previous.localObservation ~= proof.localObservation then return false end
 		for instance, source in pairs(previous.documents) do
 			if proof.documents[instance] ~= source then return false end
@@ -694,15 +748,25 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		return true
 	end
-	function api.verifyPushProof(id: any): (boolean, string?)
+	function api.verifyPushProof(id: any, deferTerrainProof: boolean?): (boolean, string?)
 		local proof = verifiedPushProof
 		if proof == nil or proof.id ~= id then
 			return false, if proofById(id) ~= nil then "a later proof followed it" else "proof retired"
 		end
 		local matches, reason = matchesPushState(proof)
 		if not matches then return false, reason end
+		if deferTerrainProof == true and proof.terrainPending == true then
+			return true, nil
+		end
 		local terrain = proofTerrain(proof.terrainRequired)
 		if terrain == nil then return false, "Terrain unavailable" end
+		if proof.terrainPending == true then
+			local stillMatches, stillReason = matchesPushState(proof)
+			if not stillMatches then return false, stillReason end
+			proof.terrain = terrain
+			proof.terrainPending = nil
+			return true, nil
+		end
 		if terrain ~= proof.terrain then return false, "Terrain changed" end
 		return matchesPushState(proof)
 	end
@@ -741,6 +805,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	-- Nil and why where a part no service answers for changed or the
 	-- observation ended.
 	local function proofDifference(proof, current): (any, any, any, boolean?)
+		if proof.terrainPending == true then return nil, "Terrain proof pending" end
 		if proof.unplaced == nil then return nil, "the proof predates service answers" end
 		if current.localObservation ~= proof.localObservation then return nil, "local observation ended" end
 		if current.unplaced ~= proof.unplaced then
@@ -754,7 +819,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			for service, count in pairs(current.attributeServices) do
 				if proof.attributeServices[service] ~= count then
 					differs[service] = true
-					nonProp[service] = true
 				end
 			end
 		else
@@ -763,7 +827,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				if now == nil or now.observation ~= entry.observation then return nil, `{service} attribute observation ended` end
 				if now.generation ~= entry.generation then
 					differs[service] = true
-					nonProp[service] = true
 				end
 			end
 			if current.camera ~= proof.camera or current.cameraGeneration ~= proof.cameraGeneration then
@@ -774,7 +837,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		for service, count in pairs(current.tagServices) do
 			if proof.tagServices[service] ~= count then
 				differs[service] = true
-				nonProp[service] = true
 			end
 		end
 		for service, generation in pairs(proof.generations) do
@@ -807,6 +869,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	-- touched since the proof, by where they stand now, or "whole".
 	local function proofScopeAnswer(proof, differs, laid, nonProp, terrainDiffers): { [string]: any }
 		local changedProperties = {}
+		local changedClassProps = {}
 		for service in pairs(differs) do
 			if
 				proof.pathsMoved[service] ~= true
@@ -822,6 +885,22 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				table.sort(names)
 				if #names > 0 then
 					changedProperties[service] = names
+				end
+				local classMap = {}
+				local hasClass = false
+				for className, fieldMap in pairs(proof.changedProps[service].byClass) do
+					local fields = {}
+					for fieldName in pairs(fieldMap) do
+						fields[#fields + 1] = fieldName
+					end
+					table.sort(fields)
+					if #fields > 0 then
+						classMap[className] = fields
+						hasClass = true
+					end
+				end
+				if hasClass then
+					changedClassProps[service] = classMap
 				end
 			end
 		end
@@ -918,6 +997,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			touched = touched,
 			valuesOnly = valuesOnly,
 			changedProperties = changedProperties,
+			changedClassProps = changedClassProps,
 			terrainDiffers = terrainDiffers == true,
 			expectedTerrainDigest = if proof.terrainRequired
 					and type(proof.terrain) == "string"
@@ -931,7 +1011,10 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	-- service's store then holds as no value; no service answers for it. One
 	-- created since the proof cannot be: nothing referred to it before it
 	-- existed, and a reference set since moved its holder's service.
+	local exportCacheEpochByService: { [string]: number } = {}
+
 	local function noteStructure(serviceName: string, instance: Instance, included: boolean?, added: boolean)
+		exportCacheEpochByService[serviceName] = (exportCacheEpochByService[serviceName] or 0) + 1
 		if included == false then return end
 		local proof = verifiedPushProof
 		if not added then
@@ -1006,11 +1089,33 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		return nil
 	end
+	local function activeNativeSuspendedServices(journal: any): { [string]: any }?
+		if journal == nil then
+			return nil
+		end
+		return journal.nativeSuspendedServices or journal.nativeScanningServices
+	end
+	local function isNativePreExisting(journal: any, serviceName: string, instance: Instance): boolean
+		local pre = if journal ~= nil and journal.nativePreExisting ~= nil
+			then journal.nativePreExisting[serviceName]
+			else nil
+		return pre ~= nil and pre[instance] == true
+	end
 	local function nativeIncomingTree(instance: Instance): boolean
 		if #nativeParentReceipts == 0 then return false end
+		local activeJournal = state.changeJournal
+		local suspended = activeNativeSuspendedServices(activeJournal)
 		local current: Instance? = instance
 		local depth = 0
 		while current ~= nil and current ~= game and depth < 256 do
+			if suspended ~= nil and current ~= instance then
+				local svc = state.serviceNameByRoot[current]
+				if svc ~= nil and suspended[svc] ~= nil then
+					if not isNativePreExisting(activeJournal, svc, instance) then
+						return true
+					end
+				end
+			end
 			for index = #nativeParentReceipts, 1, -1 do
 				for _, instances in pairs(nativeParentReceipts[index]) do
 					if instances[current] then return true end
@@ -1022,15 +1127,23 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return false
 	end
 	local promoteAttributeConnection: (Instance) -> ()
-	local ensureTracking: ({ string }) -> ()
+	local ensureTracking: ({ string }, boolean?) -> ()
+	local materializeLazyService: (string) -> ()
+	local materializeAllLazyServices: () -> ()
 	local serviceSignals: { [string]: { connections: { RBXScriptConnection }, added: ((Instance, boolean?) -> ())?, removing: ((Instance) -> ())? } } = {}
 	local propertySignal: RBXScriptConnection? = nil
 	local exportStructureObserver: ((string, Instance) -> boolean?)? = nil
 	local exportPropertyObserver: ((Instance, any) -> ())? = nil
+	local exportPropertyRelevant: ((string, string) -> boolean)? = nil
 	local bulkExpectedProperties: { [string]: { [Instance]: any } }? = nil
+	local activeBulkWrite: { any }? = nil
+	local bulkSideEffectObserved = false
+	local canonicalBulkPropByClass: { [string]: { [string]: string } } = {}
+	local rawPropIgnoredByClass: { [string]: { [string]: boolean } } = {}
 	local propertyReadNamesByClass: { [string]: { [string]: string } } = {}
 	local propertyCacheKeysByClass: { [string]: { [string]: string } } = {}
 	local propertyPrimingPlansByClass: { [string]: PropertyPrimingPlan } = {}
+	local refPrimingPlansByClass: { [string]: any } = {}
 	local valuePropertySignalNamesByClass: { [string]: { string } } = {}
 	local propertyEventRelevanceByClass: { [string]: { [string]: boolean } } = {}
 	local leasedWaits: { [BindableEvent]: { leaseId: string, cancel: () -> () } } = {}
@@ -1528,6 +1641,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if not api.isTracking(serviceName) or state.onlyCodeMode then
 			return nil
 		end
+		materializeLazyService(serviceName)
 		local observation = state.attributeObservations[serviceName]
 		if observation == nil or not observation.active then
 			observation = { active = true, generation = 0, connections = state.connectionServiceByInstance }
@@ -1554,6 +1668,51 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			instances = rebuildExportInstances(state.serviceRoots[serviceName], serviceName)
 		end
 		return instances
+	end
+
+	function api.exportDebugIds(serviceName: string): { string }?
+		if not api.isTracking(serviceName) then
+			return nil
+		end
+		return state.exportDebugIdsByService[serviceName]
+	end
+
+	function api.exportDebugIdBuffer(serviceName: string): buffer?
+		if not api.isTracking(serviceName) then
+			return nil
+		end
+		return state.exportDebugIdBufferByService[serviceName]
+	end
+
+	function api.exportClassNames(serviceName: string): { string }?
+		if not api.isTracking(serviceName) then
+			return nil
+		end
+		return state.exportClassNamesByService[serviceName]
+	end
+
+	function api.exportNonArchivableIndices(serviceName: string): { number }?
+		if not api.isTracking(serviceName) then
+			return nil
+		end
+		return state.exportNonArchivableIndicesByService[serviceName]
+	end
+
+	function api.rememberExportMetadata(
+		serviceName: string,
+		instances: { Instance }?,
+		debugIdBuffer: buffer?,
+		classNames: { string }?
+	)
+		if not api.isTracking(serviceName) or instances == nil or state.exportInstancesByService[serviceName] ~= instances then
+			return
+		end
+		if debugIdBuffer ~= nil then
+			state.exportDebugIdBufferByService[serviceName] = debugIdBuffer
+		end
+		if classNames ~= nil and #classNames == #instances then
+			state.exportClassNamesByService[serviceName] = classNames
+		end
 	end
 
 	function api.beginChangeJournal(transactionId: string, services: { string })
@@ -1611,11 +1770,42 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return retired.records
 	end
 
+	local connectDescendantAdded: (Instance, string, any) -> RBXScriptConnection
+	local scanSuspendedNativeService: (
+		string,
+		Instance,
+		{ [Instance]: boolean },
+		{ [Instance]: Instance },
+		{ [string]: string }?,
+		{ [string]: boolean }?,
+		{ [Instance]: boolean },
+		(Instance, string) -> boolean,
+		Instance?,
+		boolean
+	) -> (number, Instance?, { [Instance]: { [string]: any } }, { [Instance]: string })
+
+	local function restoreSuspendedNativeSignals(journal: any)
+		local suspended = if journal ~= nil then journal.nativeSuspendedServices else nil
+		if suspended == nil then
+			return
+		end
+		journal.nativeSuspendedServices = nil
+		for serviceName, service in pairs(suspended) do
+			local signals = serviceSignals[serviceName]
+			if signals ~= nil and signals.connections[1] == nil then
+				signals.connections[1] = connectDescendantAdded(service, serviceName, signals)
+			end
+		end
+	end
+
 	function api.retireChangeJournal(transactionId: string): { any }
 		-- Ownership changed. Hand off local records/observers without replay,
 		-- native receipt processing or touching a newer active journal.
 		local journal = state.changeJournal
 		if journal ~= nil and journal.id == transactionId then
+			journal.nativeScanningServices = nil
+			journal.nativePreExisting = nil
+			restoreSuspendedNativeSignals(journal)
 			retiringJournals[transactionId] = { records = journal.records, journal = journal }
 			state.changeJournal = nil
 		end
@@ -1634,6 +1824,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		retiringJournals[transactionId] = nil
 		if journal ~= nil then
+			journal.nativeScanningServices = nil
+			journal.nativePreExisting = nil
+			restoreSuspendedNativeSignals(journal)
 			releaseJournalObservers(journal)
 		end
 	end
@@ -1921,17 +2114,59 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		signalTrackedChange()
 	end
 
-	function api.beginNativeImportObservations(transactionId: string, untaggedClasses: { [string]: boolean }?)
+	function api.beginNativeImportObservations(transactionId: string, untaggedClasses: { [string]: boolean }?, wholeReplacedServices: { [string]: boolean }?)
 		local journal = state.changeJournal
 		if journal == nil or journal.id ~= transactionId or journal.nativeAdditions ~= nil then
 			error("Native import observation requires its exclusive editor transaction")
 		end
 		local additions = {}
+		local fastInclusion = {}
+		local includedClasses = {}
+		local directServices = {}
+		local suspendedServices = {}
+		local preExisting = {}
+		local directConnect = nativeAttributeRelay ~= nil and nativeAttributeRelay.ready and state.itemChangedAvailable
+		local canSuspend = verifiedPushProof == nil and not state.onlyCodeMode and directConnect
 		for serviceName in pairs(journal.services) do
+			materializeLazyService(serviceName)
 			additions[serviceName] = {}
+			includedClasses[serviceName] = {}
+			local isDirect = directConnect
+				and nativeAttributeRelay ~= nil
+				and nativeAttributeRelay.services[serviceName] == true
+			directServices[serviceName] = isDirect
+			local service = state.serviceRoots[serviceName]
+			if type(config.exportInclusionUnder) == "function" and service ~= nil then
+				local included = config.exportInclusionUnder(serviceName, service)
+				if included ~= nil then
+					fastInclusion[serviceName] = included
+					if canSuspend and isDirect and wholeReplacedServices ~= nil and wholeReplacedServices[serviceName] == true then
+						local signals = serviceSignals[serviceName]
+						if signals ~= nil and signals.added ~= nil and signals.connections[1] ~= nil then
+							local existing = service:GetDescendants()
+							local existingSet = { [service] = true }
+							for _, item in ipairs(existing) do
+								existingSet[item] = true
+							end
+							signals.connections[1]:Disconnect()
+							signals.connections[1] = nil
+							suspendedServices[serviceName] = service
+							preExisting[serviceName] = existingSet
+						end
+					end
+				end
+			end
 		end
 		journal.nativeAdditions = additions
 		journal.nativeUntaggedClasses = untaggedClasses
+		journal.nativeFastInclusion = fastInclusion
+		journal.nativeIncludedClasses = includedClasses
+		journal.nativeDirectService = directServices
+		journal.nativeCurrentCamera = Workspace.CurrentCamera
+		journal.nativeDirtyExportServices = {}
+		journal.nativeDirectConnect = directConnect
+		journal.nativeSuspendedServices = if next(suspendedServices) ~= nil then suspendedServices else nil
+		journal.nativePreExisting = if next(preExisting) ~= nil then preExisting else nil
 		nativeParentReceipts[#nativeParentReceipts + 1] = additions
 	end
 
@@ -2280,24 +2515,176 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return relay.path, true
 	end
 
-	function api.finishNativeImportObservations(transactionId: string, createdById: { [string]: string }?): { [string]: { [Instance]: Instance } }
+	local function isEngineMutationById(instance: Instance, idMap: { [string]: any }?, expected: any?): boolean
+		if idMap == nil then
+			return false
+		end
+		local okId, dbgId = pcall(instance.GetDebugId, instance, 32)
+		if not okId or type(dbgId) ~= "string" then
+			return false
+		end
+		return idMap[dbgId] == (if expected ~= nil then expected else true)
+	end
+
+	function api.finishNativeImportObservations(
+		transactionId: string,
+		createdById: { [string]: string }?,
+		engineRemovedById: { [string]: boolean }?,
+		engineCreatedById: { [string]: boolean }?
+	): ({ [string]: { [Instance]: Instance } }, { [string]: { [Instance]: { [string]: any } } }?, { [string]: { [Instance]: string } }?)
 		local journal = state.changeJournal
 		if journal == nil then
-			return {}
+			return {}, nil, nil
 		end
 		if journal.id ~= transactionId then
 			error("Native import observation belongs to another transaction")
 		end
 		local additions = journal.nativeAdditions
 		if additions == nil then
-			return {}
+			restoreSuspendedNativeSignals(journal)
+			return {}, nil, nil
 		end
+		local dirtyExportServices = journal.nativeDirtyExportServices
+		local addedCount = 0
+		local suspendedServices = journal.nativeSuspendedServices
+		local preExisting = journal.nativePreExisting
+		local fastInclusion = journal.nativeFastInclusion
+		local currentCamera = journal.nativeCurrentCamera
+		local obsStarted = os.clock()
 		journal.nativeAdditions = nil
 		journal.nativeUntaggedClasses = nil
+		journal.nativeFastInclusion = nil
+		journal.nativeIncludedClasses = nil
+		journal.nativeDirectService = nil
+		journal.nativeCurrentCamera = nil
+		journal.nativeDirtyExportServices = nil
+		journal.nativeDirectConnect = nil
+		journal.nativeEngineRemovedById = engineRemovedById
+		journal.nativeEngineCreatedById = engineCreatedById
+		local pendingRemovals = journal.pendingNativeRemovals
+		journal.pendingNativeRemovals = nil
+		journal.pendingNativeRemovalSet = nil
+		if pendingRemovals ~= nil then
+			for _, entry in ipairs(pendingRemovals) do
+				if not isEngineMutationById(entry.instance, engineRemovedById) then
+					local details = changeDetailsForInstance(entry.instance, "removed", nil, nil, "descendant removing")
+					details.reason = `unowned removal during native import: {entry.instance.Name} ({entry.instance.ClassName})`
+					markDirty(entry.serviceName, details)
+				end
+			end
+		end
+		local pendingDetached = journal.pendingNativeDetachedAdditions
+		journal.pendingNativeDetachedAdditions = nil
+		if pendingDetached ~= nil then
+			for inst, serviceName in pairs(pendingDetached) do
+				if
+					not isEngineMutationById(inst, createdById, inst.ClassName)
+					and not isEngineMutationById(inst, engineCreatedById)
+					and not isEngineMutationById(inst, engineRemovedById)
+				then
+					local details = changeDetailsForInstance(inst, "added", nil, nil, "descendant added")
+					details.reason = `unowned detached insertion during native import: {inst.Name} ({inst.ClassName})`
+					markDirty(serviceName, details)
+				end
+			end
+		end
+		journal.nativeScanningServices = suspendedServices
+		restoreSuspendedNativeSignals(journal)
+		local orderedByParentByService: { [string]: { [Instance]: { [string]: any } } }? = nil
+		local classByInstanceByService: { [string]: { [Instance]: string } }? = nil
+		if suspendedServices ~= nil then
+			local okScan, scanErr = pcall(function()
+				local orderedMap: { [string]: { [Instance]: { [string]: any } } } = {}
+				local classMap: { [string]: { [Instance]: string } } = {}
+				orderedByParentByService = orderedMap
+				classByInstanceByService = classMap
+				local taggedInstances: { [Instance]: boolean } = {}
+				local needTaggedScan = false
+				for serviceName in pairs(suspendedServices) do
+					local signals = serviceSignals[serviceName]
+					if signals ~= nil and signals.added ~= nil and not state.lazyObservedServices[serviceName] then
+						needTaggedScan = true
+						break
+					end
+				end
+				if needTaggedScan then
+					for _, tag in ipairs(CollectionService:GetAllTags()) do
+						for _, tagged in ipairs(CollectionService:GetTagged(tag)) do
+							taggedInstances[tagged] = true
+						end
+					end
+				end
+				for serviceName, service in pairs(suspendedServices) do
+					local signals = serviceSignals[serviceName]
+					local hasAdded = signals ~= nil and signals.added ~= nil
+					local count, sample, byParent, classByInstance = scanSuspendedNativeService(
+						serviceName,
+						service,
+						preExisting and preExisting[serviceName] or {},
+						additions[serviceName],
+						createdById,
+						engineCreatedById,
+						taggedInstances,
+						fastInclusion[serviceName],
+						currentCamera,
+						hasAdded
+					)
+					addedCount += count
+					if sample ~= nil then
+						if dirtyExportServices == nil then
+							dirtyExportServices = {}
+						end
+						dirtyExportServices[serviceName] = sample
+					end
+					orderedMap[serviceName] = byParent
+					classMap[serviceName] = classByInstance
+				end
+			end)
+			journal.nativeScanningServices = nil
+			journal.nativePreExisting = nil
+			if not okScan then
+				error(scanErr, 0)
+			end
+		end
+		if dirtyExportServices ~= nil then
+			local anyDirty = false
+			for serviceName, sampleInstance in pairs(dirtyExportServices) do
+				anyDirty = true
+				if suspendedServices == nil or suspendedServices[serviceName] == nil then
+					state.exportInstancesByService[serviceName] = nil
+					state.exportDebugIdsByService[serviceName] = nil
+					state.exportDebugIdBufferByService[serviceName] = nil
+					state.exportClassNamesByService[serviceName] = nil
+					state.exportNonArchivableIndicesByService[serviceName] = nil
+				end
+				if exportStructureObserver then
+					exportStructureObserver(serviceName, sampleInstance)
+				end
+				proofLedger.unplaced += 1
+			end
+			if anyDirty then
+				state.ordinalUnobserved += 1
+			end
+		end
 		for serviceName, instances in pairs(additions) do
-			for instance, parent in pairs(instances) do
-				local class = if createdById then createdById[BridgeIdentity.getDebugId(instance)] else nil
-				if class ~= instance.ClassName then
+			if suspendedServices ~= nil and suspendedServices[serviceName] ~= nil then
+				continue
+			end
+			if createdById ~= nil then
+				for instance, parent in pairs(instances) do
+					local debugId = instance:GetDebugId(32)
+					local class = if type(debugId) == "string" and #debugId > 0 then createdById[debugId] else nil
+					if class ~= instance.ClassName then
+						if not isEngineMutationById(instance, engineCreatedById) then
+							local details = changeDetailsForInstance(instance, "added", nil, nil, "descendant added")
+							details.reason = `unowned native insertion: {instance.Name} ({instance.ClassName}), parent {tostring(parent)}`
+							markDirty(serviceName, details)
+						end
+						instances[instance] = nil
+					end
+				end
+			else
+				for instance, parent in pairs(instances) do
 					local details = changeDetailsForInstance(instance, "added", nil, nil, "descendant added")
 					details.reason = `unowned native insertion: {instance.Name} ({instance.ClassName}), parent {tostring(parent)}`
 					markDirty(serviceName, details)
@@ -2305,7 +2692,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				end
 			end
 		end
-		return additions
+		if type(config.profileStep) == "function" then
+			config.profileStep("native observations: signals", obsStarted, {
+				instances = addedCount,
+			})
+		end
+		return additions, orderedByParentByService, classByInstanceByService
 	end
 
 	local function markDirectValue(
@@ -2318,6 +2710,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		journalValueCaptured: boolean?,
 		journalValue: any
 	): boolean
+		if not state.started then
+			return true
+		end
 		local pathSegments, pathOrdinals = pathSegmentsAndOrdinalsForInstance(instance)
 		if pathSegments == nil or pathOrdinals == nil or #pathSegments == 0 or pathSegments[1] ~= serviceName then
 			-- Structural events own removals and cross-service moves. Late property
@@ -2503,7 +2898,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			count += 1
 		end
 		state.archivableByInstance[instance] = if current then nil else false
+		exportCacheEpochByService[serviceName] = (exportCacheEpochByService[serviceName] or 0) + 1
 		state.nonArchivableCountByService[serviceName] = count
+		state.exportNonArchivableIndicesByService[serviceName] = nil
 	end
 
 	local function removeTrackedArchivable(instance: Instance, serviceName: string)
@@ -2520,19 +2917,31 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		descendants: { Instance }?
 	): { Instance }
 		local instances = { service }
+		local classNames = { service.ClassName }
+		local nonArchivableIndices = {}
 		local count = 0
+		if not service.Archivable then
+			nonArchivableIndices[1] = 1
+		end
 		for _, instance in ipairs(descendants or service:GetDescendants()) do
 			if includeExportInstance(serviceName, instance) then
-				instances[#instances + 1] = instance
+				local idx = #instances + 1
+				instances[idx] = instance
+				classNames[idx] = instance.ClassName
 				local archivable = instance.Archivable
 				state.archivableByInstance[instance] = if archivable then nil else false
 				if not archivable then
 					count += 1
+					nonArchivableIndices[#nonArchivableIndices + 1] = idx
 				end
 			end
 		end
 		state.nonArchivableCountByService[serviceName] = count
 		state.exportInstancesByService[serviceName] = instances
+		state.exportDebugIdsByService[serviceName] = nil
+		state.exportDebugIdBufferByService[serviceName] = nil
+		state.exportClassNamesByService[serviceName] = classNames
+		state.exportNonArchivableIndicesByService[serviceName] = nonArchivableIndices
 		return instances
 	end
 
@@ -2540,7 +2949,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if not allowedServices[serviceName] then
 			return
 		end
+		exportCacheEpochByService[serviceName] = (exportCacheEpochByService[serviceName] or 0) + 1
 		state.exportInstancesByService[serviceName] = nil
+		state.exportDebugIdsByService[serviceName] = nil
+		state.exportDebugIdBufferByService[serviceName] = nil
+		state.exportClassNamesByService[serviceName] = nil
+		state.exportNonArchivableIndicesByService[serviceName] = nil
 	end
 
 	local function isLuaSourceInstance(instance: Instance): boolean
@@ -2697,12 +3111,49 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return table.concat(tags, "\0")
 	end
 
+	local function isExpectedBulkTagEvent(instance: Instance?, tag: string, added: boolean): boolean
+		if bulkExpectedProperties ~= nil then
+			local bulkTags = bulkExpectedProperties["@tags"]
+			if type(bulkTags) == "table" then
+				local expectedForTag = bulkTags[tag]
+				if type(expectedForTag) == "table" then
+					if instance == nil then
+						return true
+					end
+					if expectedForTag[instance] == added then
+						return true
+					end
+				end
+			end
+		end
+		local recent = recentBulkTagExpectations[tag]
+		if recent ~= nil then
+			if os.clock() > recent.expiresAt then
+				recentBulkTagExpectations[tag] = nil
+				return false
+			end
+			if instance == nil then
+				return true
+			end
+			if recent.instances[instance] == added then
+				recent.instances[instance] = nil
+				return true
+			end
+		end
+		return false
+	end
+
 	local function markTagChange(instance: Instance, tag: string, added: boolean)
+		if isExpectedBulkTagEvent(instance, tag, added) then
+			local fp = tagFingerprint(instance)
+			state.tagFingerprintByInstance[instance] = if fp == "" then nil else fp
+			return
+		end
 		rawTagGeneration += 1
 		local proofService = proofServiceOf(instance)
 		if proofService ~= nil then
 			proofLedger.tags[proofService] = (proofLedger.tags[proofService] or 0) + 1
-			noteTouched(verifiedPushProof, proofService, instance, "values", "@tags")
+			noteTouched(verifiedPushProof, proofService, instance, "values", "@tag:" .. tag)
 		end
 		if nativeAttributeRelay and nativeAttributeRelay.cached and (not state.started or heldOnlyByRetainedProofs()) then
 			return
@@ -2718,11 +3169,25 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if journal ~= nil and (nativeIncomingTree(instance)
 			or journal.nativeAdditions ~= nil and previous == nil
 			and state.connectionServiceByInstance[instance] == nil
+			and state.serviceNameByRoot[instance] == nil
 			and journal.nativeAdditions[serviceNameForTrackedInstance(instance) or ""] ~= nil) then
 			state.tagFingerprintByInstance[instance] = if fingerprint == "" then nil else fingerprint
 			return
 		end
-		if previous == nil and (state.connectionServiceByInstance[instance] ~= nil or state.serviceNameByRoot[instance] ~= nil) then
+		if
+			previous == nil
+			and (
+				state.connectionServiceByInstance[instance] ~= nil
+				or state.serviceNameByRoot[instance] ~= nil
+				or (
+					next(state.lazyObservedServices) ~= nil
+					and (function()
+						local svc = serviceNameForTrackedInstance(instance)
+						return svc ~= nil and state.lazyObservedServices[svc] == true
+					end)()
+				)
+			)
+		then
 			previous = ""
 		end
 		state.tagFingerprintByInstance[instance] = if fingerprint == "" then nil else fingerprint
@@ -2754,14 +3219,24 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		)
 	end
 
-	local function connectTag(tag: string, markExisting: boolean)
+	local tagSeenInSyncedService: { [string]: boolean } = {}
+
+	local function connectTag(tag: string, markExisting: boolean): (number, boolean)
 		if state.tagConnections[tag] ~= nil then
-			return
+			return 0, true
 		end
 		local tracked = setmetatable({}, { __mode = "k" }) :: any
 		state.taggedInstancesByTag[tag] = tracked
+		local memberCount = 0
+		local allPlaced = true
 		for _, instance in ipairs(CollectionService:GetTagged(tag)) do
+			memberCount += 1
 			tracked[instance] = true
+			if proofServiceOf(instance) ~= nil then
+				tagSeenInSyncedService[tag] = true
+			else
+				allPlaced = false
+			end
 			if markExisting then
 				markTagChange(instance, tag, true)
 			end
@@ -2770,18 +3245,25 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			CollectionService:GetInstanceAddedSignal(tag):Connect(function(instance: Instance)
 				if not tracked[instance] then
 					tracked[instance] = true
+					if proofServiceOf(instance) ~= nil then
+						tagSeenInSyncedService[tag] = true
+					end
 					markTagChange(instance, tag, true)
 				end
 			end),
 			CollectionService:GetInstanceRemovedSignal(tag):Connect(function(instance: Instance)
 				if tracked[instance] then
 					tracked[instance] = nil
+					if proofServiceOf(instance) ~= nil then
+						tagSeenInSyncedService[tag] = true
+					end
 					markTagChange(instance, tag, false)
 				end
 			end),
 		}
 		state.tagConnections[tag] = connections
 		state.tagSignalsAvailable = true
+		return memberCount, allPlaced
 	end
 
 	local function discoverTags(markExisting: boolean)
@@ -2800,6 +3282,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				end
 				state.tagConnections[tag] = nil
 				state.taggedInstancesByTag[tag] = nil
+				tagSeenInSyncedService[tag] = nil
 			end
 		end
 	end
@@ -2808,24 +3291,40 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		if #tagDiscoveryConnections > 0 then return end
 		tagDiscoveryConnections = {
 			CollectionService.TagAdded:Connect(function(tag: string)
-				rawTagGeneration += 1
-				proofLedger.unplaced += 1
-				connectTag(tag, true)
+				local bulkExpected = isExpectedBulkTagEvent(nil, tag, true)
+				if not bulkExpected then
+					rawTagGeneration += 1
+				end
+				local alreadyWatched = state.tagConnections[tag] ~= nil
+				local memberCount, allPlaced = connectTag(tag, true)
+				if not bulkExpected and not alreadyWatched and (memberCount == 0 or not allPlaced) then
+					proofLedger.unplaced += 1
+				end
 			end),
 			CollectionService.TagRemoved:Connect(function(tag: string)
-				rawTagGeneration += 1
-				proofLedger.unplaced += 1
+				local bulkExpected = isExpectedBulkTagEvent(nil, tag, false)
+				if not bulkExpected then
+					rawTagGeneration += 1
+				end
+				local sawSynced = tagSeenInSyncedService[tag] == true
 				-- The last membership and the global tag removal may be delivered
 				-- in either order. Record the live fingerprint before retiring the
 				-- membership listeners; duplicate notifications remain no-ops.
 				for instance in pairs(state.taggedInstancesByTag[tag] or {}) do
+					if proofServiceOf(instance) ~= nil then
+						sawSynced = true
+					end
 					markTagChange(instance, tag, false)
+				end
+				if not sawSynced and not bulkExpected then
+					proofLedger.unplaced += 1
 				end
 				for _, connection in ipairs(state.tagConnections[tag] or {}) do
 					connection:Disconnect()
 				end
 				state.tagConnections[tag] = nil
 				state.taggedInstancesByTag[tag] = nil
+				tagSeenInSyncedService[tag] = nil
 			end),
 		}
 	end
@@ -3022,6 +3521,10 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			return nil
 		end
 		return propertyValueFingerprint(instance, readName, value)
+	end
+
+	local function readRawProperty(instance: Instance, propertyName: string): any
+		return (instance :: any)[propertyName]
 	end
 
 	local function readInstanceProperty(instance: Instance, propertyName: string): any
@@ -3250,8 +3753,79 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		return previous == nil or previous ~= fingerprint, directOk, directValue, fingerprint, true, value
 	end
 
+	local function trackedOrLazyService(instance: Instance): string?
+		local tracked = state.connectionServiceByInstance[instance]
+		if tracked ~= nil then
+			return tracked
+		end
+		if next(state.lazyObservedServices) ~= nil then
+			local candidate = serviceNameForTrackedInstance(instance)
+			if
+				candidate ~= nil
+				and state.lazyObservedServices[candidate]
+				and not shouldIgnoreInstance(instance, candidate)
+			then
+				return candidate
+			end
+		end
+		return nil
+	end
+
+	local function attrMapsMatchExact(cur: { [string]: any }, expected: { [string]: any }): boolean
+		for k, v in pairs(cur) do
+			if string.sub(k, 1, 4) ~= "RBX_" then
+				local ev = expected[k]
+				if ev == nil or not BridgeValueEquality.exactValuesEqual(v, ev) then
+					return false
+				end
+			end
+		end
+		for k in pairs(expected) do
+			if string.sub(k, 1, 4) ~= "RBX_" and cur[k] == nil then
+				return false
+			end
+		end
+		return true
+	end
+
 	local function connectAttributeChanged(instance: Instance, serviceName: string): RBXScriptConnection
 		return instance.AttributeChanged:Connect(function(attributeName: string)
+			if bulkExpectedProperties ~= nil then
+				if
+					activeBulkWrite ~= nil
+					and activeBulkWrite[1] == instance
+					and activeBulkWrite[2] == "@attribute"
+					and activeBulkWrite[3] == attributeName
+				then
+					local expectedAttrs = bulkExpectedProperties["@attributes"]
+					local perInst = if type(expectedAttrs) == "table" then expectedAttrs[instance] else nil
+					if type(perInst) == "table" and type(perInst.keys) == "table" then
+						perInst.keys[attributeName] = nil
+					end
+					local cache = state.propertyFingerprintByInstance[instance]
+					if cache ~= nil then
+						cache["attribute:" .. tostring(attributeName)] = stableValueString(instance:GetAttribute(attributeName))
+					end
+					return
+				end
+				local expectedAttrs = bulkExpectedProperties["@attributes"]
+				local perInst = if type(expectedAttrs) == "table" then expectedAttrs[instance] else nil
+				if type(perInst) == "table" and type(perInst.keys) == "table" then
+					local rawExpected = perInst.keys[attributeName]
+					if rawExpected ~= nil then
+						local expectedVal = if rawExpected == perInst.nilSentinel then nil else rawExpected
+						local currentVal = instance:GetAttribute(attributeName)
+						if BridgeValueEquality.exactValuesEqual(currentVal, expectedVal) then
+							perInst.keys[attributeName] = nil
+							local cache = state.propertyFingerprintByInstance[instance]
+							if cache ~= nil then
+								cache["attribute:" .. tostring(attributeName)] = stableValueString(currentVal)
+							end
+							return
+						end
+					end
+				end
+			end
 			-- Export guards need raw events, including expected writes and events
 			-- excluded from Live Sync. Never reuse the filtered dirty generation.
 			local observation = state.attributeObservations[serviceName]
@@ -3306,8 +3880,21 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	end
 
 	promoteAttributeConnection = function(instance: Instance)
-		if state.instanceConnections[instance] ~= nativeAttributeConnection then return end
-		local serviceName = state.connectionServiceByInstance[instance]
+		local existing = state.instanceConnections[instance]
+		local serviceName: string? = nil
+		local addedNew = false
+		if existing == nativeAttributeConnection then
+			serviceName = state.connectionServiceByInstance[instance]
+		elseif existing == nil and next(state.lazyObservedServices) ~= nil then
+			local candidate = serviceNameForTrackedInstance(instance)
+			if candidate ~= nil and state.lazyObservedServices[candidate] then
+				serviceName = candidate
+				state.connectionServiceByInstance[instance] = candidate
+				addedNew = true
+			end
+		else
+			return
+		end
 		if serviceName == nil then return end
 		local fingerprints = state.propertyFingerprintByInstance[instance] or {}
 		for name, value in pairs(instance:GetAttributes()) do
@@ -3315,12 +3902,16 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		state.propertyFingerprintByInstance[instance] = fingerprints
 		state.instanceConnections[instance] = connectAttributeChanged(instance, serviceName)
+		if addedNew then
+			state.connectedInstanceCount += 1
+		end
 	end
 
 	local function promoteNativeAttributeConnections()
 		if nativeAttributeRelay then
 			nativeAttributeRelay.ready = false
 		end
+		materializeAllLazyServices()
 		for instance, connection in pairs(state.instanceConnections) do
 			local parent = nativeInitialParent(instance)
 			if parent then
@@ -3345,7 +3936,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local startPending = pendingTracking ~= nil and state.trackingGuards[pendingTracking.guardId] ~= nil
 		relay.ready = not state.persistentTracking and (state.started or startPending)
 		if startPending then
-			ensureTracking(pendingTracking.services)
+			ensureTracking(pendingTracking.services, pendingTracking.lazy == true)
 		end
 	end
 	local function prepareNativeAttributeRelay(services: { string })
@@ -3367,9 +3958,6 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				return
 			elseif instance == nil then
 				relay.nativeArmed = false
-				-- A host timeout or cancellation restores local observation before
-				-- the native subscription is disconnected under the DataModel lock.
-				promoteNativeAttributeConnections()
 				if relay.cached then
 					local retainedGuardId = relay.retainedGuardId
 					verifiedPushProof, keptPushProof = nil, nil
@@ -3383,9 +3971,15 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 						state.trackingGuards[retainedGuardId] = nil
 						if not state.persistentTracking and next(state.trackingGuards) == nil then
 							stopTracking()
+							return
 						end
 					end
+					if state.started then
+						promoteNativeAttributeConnections()
+					end
+					return
 				end
+				promoteNativeAttributeConnections()
 				return
 			end
 			relay.attributeGeneration += 1
@@ -3395,11 +3989,55 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				noteTouched(verifiedPushProof, proofService, instance, "values", "@attributes")
 			end
 			if relay.cached then return end
+			if bulkExpectedProperties ~= nil then
+				if
+					activeBulkWrite ~= nil
+					and activeBulkWrite[1] == instance
+					and activeBulkWrite[2] == "@attribute"
+				then
+					local attrName = activeBulkWrite[3]
+					local expectedVal = activeBulkWrite[4]
+					if type(attrName) == "string" and BridgeValueEquality.exactValuesEqual(instance:GetAttribute(attrName), expectedVal) then
+						activeBulkWrite[5] = true
+						return
+					end
+				end
+				local expectedAttrs = bulkExpectedProperties["@attributes"]
+				local perInst = if type(expectedAttrs) == "table" then expectedAttrs[instance] else nil
+				if
+					type(perInst) == "table"
+					and (perInst.relayPending or 0) > 0
+					and type(perInst.relaySnapshot) == "table"
+				then
+					if attrMapsMatchExact(instance:GetAttributes(), perInst.relaySnapshot) then
+						perInst.relayPending -= 1
+						return
+					end
+					perInst.relayPending = 0
+				end
+			end
 			local connection = state.instanceConnections[instance]
 			if connection ~= nil and connection ~= nativeAttributeConnection then return end
 			local journal = state.changeJournal
-			if connection == nil and (journal == nil or journal.nativeAdditions == nil) then return end
-			local serviceName = state.connectionServiceByInstance[instance] or serviceNameForTrackedInstance(instance)
+			local suspended = activeNativeSuspendedServices(journal)
+			local candidateService = if connection == nil
+					and (next(state.lazyObservedServices) ~= nil or suspended ~= nil)
+				then serviceNameForTrackedInstance(instance)
+				else nil
+			if
+				connection == nil
+				and (
+					candidateService == nil
+					or not (
+						state.lazyObservedServices[candidateService]
+						or (suspended ~= nil and suspended[candidateService] ~= nil)
+					)
+				)
+				and (journal == nil or journal.nativeAdditions == nil)
+			then
+				return
+			end
+			local serviceName = state.connectionServiceByInstance[instance] or candidateService or serviceNameForTrackedInstance(instance)
 			if serviceName == nil or shouldIgnoreInstance(instance, serviceName) then return end
 			local observation = state.attributeObservations[serviceName]
 			if observation and observation.active then
@@ -3465,7 +4103,13 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	local function invalidateParentOrdinals(instance: Instance)
 		local parent = instance.Parent
 		local previous = state.lastParentByInstance[instance] or nativeInitialParent(instance)
-		invalidateSiblingOrdinals(previous)
+		if previous == nil and next(state.lazyObservedServices) ~= nil then
+			for cachedParent in pairs(state.ordinalCacheByParent) do
+				invalidateSiblingOrdinals(cachedParent)
+			end
+		else
+			invalidateSiblingOrdinals(previous)
+		end
 		invalidateSiblingOrdinals(parent)
 		state.lastParentByInstance[instance] = parent
 	end
@@ -3538,13 +4182,52 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	end
 
 	function api.samplePropertyChange(instance: Instance, propertyName: string)
-		local serviceName = state.connectionServiceByInstance[instance]
+		local serviceName = trackedOrLazyService(instance)
 		if serviceName ~= nil and isRelevantInstanceProperty(instance, propertyName) then
 			recordInstancePropertyChange(instance, serviceName, propertyName, true)
 		end
 	end
 
+	local function canonicalDerivedPropertyAlias(
+		instance: Instance,
+		className: string,
+		propertyName: string
+	): string?
+		local lowered = string.lower(propertyName)
+		if lowered == "enabled" and instance:IsA("BaseScript") then
+			return "Disabled"
+		end
+		if className == "Camera" and CAMERA_FOV_PROPERTIES[lowered] then
+			return "FieldOfView"
+		end
+		if (propertyName == "BrickColor" or propertyName == "Color3uint8") and instance:IsA("BasePart") then
+			return "Color"
+		end
+		if
+			(propertyName == "Position" or propertyName == "Orientation" or propertyName == "Rotation")
+			and (instance:IsA("BasePart") or instance:IsA("Attachment"))
+		then
+			return "CFrame"
+		end
+		return nil
+	end
+
 	local function observePropertyChange(instance: Instance, serviceName: string, propertyName: string)
+		local activeJournal = state.changeJournal
+		if activeJournal ~= nil then
+			if
+				activeJournal.pendingNativeRemovalSet ~= nil
+				and activeJournal.pendingNativeRemovalSet[instance]
+			then
+				return
+			end
+			if
+				activeJournal.nativeEngineRemovedById ~= nil
+				and isEngineMutationById(instance, activeJournal.nativeEngineRemovedById)
+			then
+				return
+			end
+		end
 		if string.lower(propertyName) == "archivable" then
 			updateTrackedArchivable(instance, serviceName)
 		end
@@ -3552,11 +4235,10 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			invalidateParentOrdinals(instance)
 		end
 		-- CornerRadius aliases TopLeftRadius; record one canonical value.
-		local property = if instance.ClassName == "UICorner" and propertyName == "CornerRadius"
+		local className = instance.ClassName
+		local property = if className == "UICorner" and propertyName == "CornerRadius"
 			then "TopLeftRadius"
-			else if instance.ClassName == "Camera" and CAMERA_FOV_PROPERTIES[string.lower(propertyName)] then "FieldOfView"
-			else if (propertyName == "BrickColor" or propertyName == "Color3uint8") and instance:IsA("BasePart") then "Color"
-			else propertyName
+			else canonicalDerivedPropertyAlias(instance, className, propertyName) or propertyName
 		if not isRelevantInstanceProperty(instance, property) then
 			return
 		end
@@ -3565,7 +4247,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			-- Box only signals before its value changes. Keep the immediate conflict
 			-- sample, then read after the setter without polling other properties.
 			task.defer(function()
-				if state.connectionServiceByInstance[instance] == serviceName then
+				if trackedOrLazyService(instance) == serviceName then
 					recordInstancePropertyChange(instance, serviceName, property)
 				end
 			end)
@@ -3655,8 +4337,15 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 
 	local function retainDetachedObserver(instance: Instance, serviceName: string)
 		local journal = state.changeJournal
-		if journal == nil or not journal.services[serviceName]
-			or state.connectionServiceByInstance[instance] ~= serviceName then return end
+		if journal == nil or not journal.services[serviceName] then return end
+		if state.connectionServiceByInstance[instance] ~= serviceName then
+			if not state.lazyObservedServices[serviceName] or shouldIgnoreInstance(instance, serviceName) then
+				return
+			end
+			state.connectionServiceByInstance[instance] = serviceName
+			state.instanceConnections[instance] = nativeAttributeConnection
+			state.connectedInstanceCount += 1
+		end
 		journal.detachedInstances[instance] = serviceName
 		promoteAttributeConnection(instance)
 		-- DataModel.ItemChanged stops observing an object outside the DataModel.
@@ -3684,6 +4373,10 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
+	local constraintByClass: { [string]: boolean } = {}
+	local refPropsByClass: { [string]: { string } | false } = {}
+	local simpleNativeClassCache: { [string]: boolean } = {}
+
 	-- `bulk` holds what is the same for every instance of one service: which
 	-- of them a capture leaves out, which bear tags, which classes are constraints.
 	local function connectInstance(instance: Instance, serviceName: string, primeCurrentValues: boolean?, nativeInsertion: boolean?, serializedInsertion: boolean?, bulk: any?)
@@ -3694,9 +4387,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			end
 			disconnectInstance(instance, connectedServiceName)
 		end
+		local className = instance.ClassName
 		local constraint
 		if bulk ~= nil then
-			local className = instance.ClassName
 			if instance == bulk.camera or not bulk.included(instance, className) then
 				return
 			end
@@ -3709,7 +4402,11 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			if not nativeInsertion and shouldIgnoreInstance(instance, serviceName) then
 				return
 			end
-			constraint = instance:IsA("Constraint")
+			constraint = constraintByClass[className]
+			if constraint == nil then
+				constraint = instance:IsA("Constraint")
+				constraintByClass[className] = constraint
+			end
 		end
 		local nativeAttributes = nativeAttributeRelay ~= nil and nativeAttributeRelay.ready
 			and nativeAttributeRelay.services[serviceName] == true
@@ -3724,14 +4421,22 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			-- Constraint references can notify again when the loaded hierarchy
 			-- becomes live. Compare against their loaded identities so those
 			-- notifications stay no-ops while real reference edits are journaled.
-			for _, propertyName in ipairs(RbxDomModule.getReferencePropertyNames(instance.ClassName)) do
-				primeExpectedProperty(instance, propertyName)
+			local refProps = refPropsByClass[className]
+			if refProps == nil then
+				local names = RbxDomModule.getReferencePropertyNames(className)
+				refProps = if #names > 0 then names else false
+				refPropsByClass[className] = refProps
+			end
+			if refProps ~= false then
+				for _, propertyName in ipairs(refProps) do
+					primeExpectedProperty(instance, propertyName)
+				end
 			end
 		end
 		if nativeInsertion and nativeAttributes and state.itemChangedAvailable then
 			-- Shared property/attribute signals are already armed. No tag scan or
 			-- duplicate parent maps are needed for a proved untagged native class.
-			if not (journal and journal.nativeUntaggedClasses and journal.nativeUntaggedClasses[instance.ClassName]) then
+			if not (journal and journal.nativeUntaggedClasses and journal.nativeUntaggedClasses[className]) then
 				local tags = tagFingerprint(instance)
 				state.tagFingerprintByInstance[instance] = if tags == "" then nil else tags
 			end
@@ -3777,6 +4482,223 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		state.instanceConnections[instance] = if nativeAttributes then nativeAttributeConnection
 			else connectAttributeChanged(instance, serviceName)
 		state.connectedInstanceCount += 1
+	end
+
+	scanSuspendedNativeService = function(
+		serviceName: string,
+		service: Instance,
+		pre: { [Instance]: boolean },
+		serviceAdditions: { [Instance]: Instance },
+		createdById: { [string]: string }?,
+		engineCreatedById: { [string]: boolean }?,
+		taggedInstances: { [Instance]: boolean },
+		fastInclude: (Instance, string) -> boolean,
+		currentCamera: Instance?,
+		hasAdded: boolean
+	): (number, Instance?, { [Instance]: { [string]: any } }, { [Instance]: string })
+		local startEpoch = exportCacheEpochByService[serviceName] or 0
+		local descendants = service:GetDescendants()
+		local count = #descendants
+		local exportList = table.create(count + 1)
+		local exportDebugIds = table.create(count + 1)
+		local exportClassNames = table.create(count + 1)
+		local exportNonArchivableIndices = {}
+		exportList[1] = service
+		exportDebugIds[1] = service:GetDebugId(32)
+		exportClassNames[1] = service.ClassName
+		if not service.Archivable then
+			exportNonArchivableIndices[1] = 1
+		end
+		local exportCount = 1
+		local nonArchivableCount = 0
+		local addedCount = 0
+		local connectedAdded = 0
+		local sampleInstance: Instance? = nil
+		local byParent: { [Instance]: { [string]: any } } = {}
+		local classByInstance: { [Instance]: string } = {}
+		local classCache: { [string]: boolean } = {}
+		local connService = state.connectionServiceByInstance
+		local instConns = state.instanceConnections
+		local archivableMap = state.archivableByInstance
+		local baselineMap = state.propertyBaselineByInstance
+		local fingerprintMap = state.propertyFingerprintByInstance
+		local unowned = false
+		local cacheValid = true
+		local nextYieldAt = os.clock() + 0.015
+		for i = 1, count do
+			if i % 2048 == 0 and os.clock() >= nextYieldAt then
+				task.wait()
+				nextYieldAt = os.clock() + 0.015
+			end
+			local instance = descendants[i]
+			local parent = instance.Parent
+			if parent == nil or not instance:IsDescendantOf(service) then
+				cacheValid = false
+				continue
+			end
+			local className = instance.ClassName
+			local exportIncluded = classCache[className]
+			if exportIncluded == nil then
+				exportIncluded = fastInclude(instance, className)
+				classCache[className] = exportIncluded
+			end
+			if not exportIncluded then
+				continue
+			end
+			local debugId = instance:GetDebugId(32)
+			exportCount += 1
+			exportList[exportCount] = instance
+			exportDebugIds[exportCount] = debugId
+			exportClassNames[exportCount] = className
+			if not instance.Archivable then
+				nonArchivableCount += 1
+				archivableMap[instance] = false
+				exportNonArchivableIndices[#exportNonArchivableIndices + 1] = exportCount
+			else
+				archivableMap[instance] = nil
+			end
+			if pre[instance] or instance == currentCamera then
+				continue
+			end
+			if createdById == nil or createdById[debugId] ~= className then
+				if engineCreatedById ~= nil and engineCreatedById[debugId] == true then
+					if hasAdded and not state.lazyObservedServices[serviceName] then
+						connectInstance(instance, serviceName, true, true)
+					end
+					continue
+				end
+				unowned = true
+				local details = changeDetailsForInstance(instance, "added", nil, nil, "descendant added")
+				details.reason = `unowned native insertion: {instance.Name} ({className}), parent {tostring(parent)}`
+				markDirty(serviceName, details)
+				continue
+			end
+			serviceAdditions[instance] = parent
+			classByInstance[instance] = className
+			addedCount += 1
+			if sampleInstance == nil then
+				sampleInstance = instance
+			end
+			local named = byParent[parent]
+			if named == nil then
+				named = {}
+				byParent[parent] = named
+			end
+			local childName = instance.Name
+			local existing = named[childName]
+			if existing == nil then
+				named[childName] = instance
+			elseif typeof(existing) == "Instance" then
+				named[childName] = { existing, instance }
+			else
+				existing[#existing + 1] = instance
+			end
+			if hasAdded and not state.lazyObservedServices[serviceName] then
+				local simple = simpleNativeClassCache[className]
+				if simple == nil then
+					local isConstraint = constraintByClass[className]
+					if isConstraint == nil then
+						isConstraint = instance:IsA("Constraint")
+						constraintByClass[className] = isConstraint
+					end
+					local refProps = refPropsByClass[className]
+					if refProps == nil then
+						local names = RbxDomModule.getReferencePropertyNames(className)
+						refProps = if #names > 0 then names else false
+						refPropsByClass[className] = refProps
+					end
+					simple = (not isConstraint) and (refProps == false)
+					simpleNativeClassCache[className] = simple
+				end
+				if not taggedInstances[instance] then
+					if simple then
+						connService[instance] = serviceName
+						instConns[instance] = nativeAttributeConnection
+						connectedAdded += 1
+					elseif not constraintByClass[className] then
+						local refProps = refPropsByClass[className]
+						if refProps ~= false then
+							local refPlan = refPrimingPlansByClass[className]
+							if refPlan == nil then
+								local slots = {}
+								local built: any = { slots = slots }
+								for _, propertyName in ipairs(refProps) do
+									local key = propertyCacheKey(instance, propertyName)
+									if slots[key] == nil then
+										local readName = propertyReadNameForEvent(instance, propertyName)
+										local ok = pcall(readRawProperty, instance, readName)
+										if not ok and readName ~= propertyName then
+											readName = propertyName
+											ok = pcall(readRawProperty, instance, readName)
+										end
+										if ok then
+											local idx = #built + 1
+											built[idx] = { propertyName, readName, key }
+											slots[key] = idx + 1
+										end
+									end
+								end
+								refPrimingPlansByClass[className] = built
+								refPlan = built
+							end
+							local baselines = baselineMap[instance]
+							local fingerprints = fingerprintMap[instance]
+							local refSlots = refPlan.slots
+							local planLen = #refPlan
+							for slotIndex = 1, planLen do
+								local entry = refPlan[slotIndex]
+								local key = entry[3]
+								if (fingerprints ~= nil and fingerprints[key] ~= nil)
+									or (baselines ~= nil and baselines[1][key] ~= nil and baselines[baselines[1][key]] ~= nil)
+								then
+									continue
+								end
+								local value = (instance :: any)[entry[2]]
+								if baselines == nil then
+									baselines = table.create(planLen + 1)
+									baselines[1] = refSlots
+									baselineMap[instance] = baselines
+									baselines[slotIndex + 1] = if value == nil then NIL_PROPERTY_BASELINE else value
+								elseif baselines[1] == refSlots then
+									baselines[slotIndex + 1] = if value == nil then NIL_PROPERTY_BASELINE else value
+								else
+									if fingerprints == nil then
+										fingerprints = {}
+										fingerprintMap[instance] = fingerprints
+									end
+									fingerprints[key] = propertyValueFingerprint(instance, entry[2], value)
+								end
+							end
+						end
+						connService[instance] = serviceName
+						instConns[instance] = nativeAttributeConnection
+						connectedAdded += 1
+					else
+						connectInstance(instance, serviceName, true, true)
+					end
+				else
+					connectInstance(instance, serviceName, true, true)
+				end
+			end
+		end
+		if connectedAdded > 0 then
+			state.connectedInstanceCount += connectedAdded
+		end
+		if cacheValid and not unowned and (exportCacheEpochByService[serviceName] or 0) == startEpoch then
+			state.nonArchivableCountByService[serviceName] = nonArchivableCount
+			state.exportInstancesByService[serviceName] = exportList
+			state.exportDebugIdsByService[serviceName] = exportDebugIds
+			state.exportDebugIdBufferByService[serviceName] = nil
+			state.exportClassNamesByService[serviceName] = exportClassNames
+			state.exportNonArchivableIndicesByService[serviceName] = exportNonArchivableIndices
+		else
+			state.exportInstancesByService[serviceName] = nil
+			state.exportDebugIdsByService[serviceName] = nil
+			state.exportDebugIdBufferByService[serviceName] = nil
+			state.exportClassNamesByService[serviceName] = nil
+			state.exportNonArchivableIndicesByService[serviceName] = nil
+		end
+		return addedCount, sampleInstance, byParent, classByInstance
 	end
 
 	prepareParentObservers = function(instances: { Instance }, nextParent: Instance?, token: any, serializedInsertion: boolean?)
@@ -3867,10 +4789,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			local expectedFresh = state.expectedFreshInstances
 			local hasFresh = next(expectedFresh) ~= nil
 			local hasTagged = next(taggedMap) ~= nil
-			local freshStart = state.connectedInstanceCount == 0
 			local added = 0
 			for _, descendant in ipairs(descendants) do
-				if not freshStart and connMap[descendant] ~= nil then
+				if connMap[descendant] ~= nil then
 					if serviceMap[descendant] ~= serviceName then
 						connectInstance(descendant, serviceName, nil, nil, nil, bulk)
 					end
@@ -3896,9 +4817,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					connectInstance(descendant, serviceName, nil, nil, nil, bulk)
 				else
 					serviceMap[descendant] = serviceName
-					if not freshStart then
-						tagMap[descendant] = nil
-					end
+					tagMap[descendant] = nil
 					lastParentMap[descendant] = descendant.Parent
 					connMap[descendant] = nativeAttributeConnection
 					added += 1
@@ -3936,13 +4855,78 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
-	local function ensureServiceSignals(serviceName: string)
-		local signals = serviceSignals[serviceName]
-		if signals ~= nil then return signals end
-		signals = { connections = {} }
-		serviceSignals[serviceName] = signals
-		local service = game:GetService(serviceName)
-		signals.connections[1] = service.DescendantAdded:Connect(function(instance)
+	connectDescendantAdded = function(service: Instance, serviceName: string, signals: any): RBXScriptConnection
+		return service.DescendantAdded:Connect(function(instance)
+			local journal = state.changeJournal
+			local nativeAdditions = if journal then journal.nativeAdditions else nil
+			if nativeAdditions ~= nil and verifiedPushProof == nil and not state.onlyCodeMode then
+				local additions = nativeAdditions[serviceName]
+				if additions ~= nil and additions[instance] == nil
+					and state.connectionServiceByInstance[instance] == nil
+					and state.expectedStructuralByInstance[instance] == nil
+				then
+					local fastInclude = journal.nativeFastInclusion and journal.nativeFastInclusion[serviceName]
+					local className = instance.ClassName
+					local currentCamera = journal.nativeCurrentCamera
+					local included
+					if fastInclude ~= nil then
+						if instance == currentCamera then
+							included = false
+						else
+							local cache = journal.nativeIncludedClasses[serviceName]
+							local cached = cache[className]
+							if cached == nil then
+								cached = fastInclude(instance, className)
+								cache[className] = cached
+							end
+							included = cached
+						end
+					else
+						included = not shouldIgnoreInstance(instance, serviceName, nil)
+					end
+					if included then
+						local parent = instance.Parent
+						if parent ~= nil and (parent == service or additions[parent] ~= nil or instance:IsDescendantOf(service)) then
+							additions[instance] = parent
+							journal.nativeDirtyExportServices[serviceName] = instance
+							if signals.added ~= nil then
+								if not instance.Archivable then
+									updateTrackedArchivable(instance, serviceName, true)
+								end
+								local simple = simpleNativeClassCache[className]
+								if simple == nil then
+									local isConstraint = constraintByClass[className]
+									if isConstraint == nil then
+										isConstraint = instance:IsA("Constraint")
+										constraintByClass[className] = isConstraint
+									end
+									local refProps = refPropsByClass[className]
+									if refProps == nil then
+										local names = RbxDomModule.getReferencePropertyNames(className)
+										refProps = if #names > 0 then names else false
+										refPropsByClass[className] = refProps
+									end
+									simple = (not isConstraint) and (refProps == false)
+									simpleNativeClassCache[className] = simple
+								end
+								if simple and journal.nativeDirectService[serviceName]
+									and journal.nativeUntaggedClasses ~= nil
+									and journal.nativeUntaggedClasses[className] == true
+								then
+									state.connectionServiceByInstance[instance] = serviceName
+									state.instanceConnections[instance] = nativeAttributeConnection
+									state.connectedInstanceCount += 1
+									return
+								end
+								connectInstance(instance, serviceName, true, true)
+							end
+							return
+						end
+					elseif instance ~= currentCamera then
+						return
+					end
+				end
+			end
 			local included = if exportStructureObserver then exportStructureObserver(serviceName, instance) else nil
 			noteStructure(serviceName, instance, included, true)
 			if signals.added then
@@ -3951,6 +4935,15 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				recordUntrackedNativeAddition(service, serviceName, instance, included)
 			end
 		end)
+	end
+
+	local function ensureServiceSignals(serviceName: string)
+		local signals = serviceSignals[serviceName]
+		if signals ~= nil then return signals end
+		signals = { connections = {} }
+		serviceSignals[serviceName] = signals
+		local service = game:GetService(serviceName)
+		signals.connections[1] = connectDescendantAdded(service, serviceName, signals)
 		signals.connections[2] = service.DescendantRemoving:Connect(function(instance)
 			local included = if exportStructureObserver then exportStructureObserver(serviceName, instance) else nil
 			noteStructure(serviceName, instance, included, false)
@@ -3967,15 +4960,116 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		signals.added = nil
 		signals.removing = nil
 		if exportStructureObserver == nil then
-			for _, connection in ipairs(signals.connections) do
+			for _, connection in pairs(signals.connections) do
 				connection:Disconnect()
 			end
 			serviceSignals[serviceName] = nil
 		end
 	end
 
-	function api.setBulkExpectedProperties(expected: { [string]: { [Instance]: any } }?)
+	function api.setBulkExpectedProperties(expected: { [string]: { [Instance]: any } }?, activeWrite: { any }?)
+		if expected ~= bulkExpectedProperties then
+			bulkSideEffectObserved = false
+		end
+		if expected == nil and bulkExpectedProperties ~= nil then
+			local bulkTags = bulkExpectedProperties["@tags"]
+			if type(bulkTags) == "table" then
+				local expiresAt = os.clock() + 0.5
+				for tag, instMap in pairs(bulkTags) do
+					if type(tag) == "string" and type(instMap) == "table" then
+						recentBulkTagExpectations[tag] = {
+							instances = instMap,
+							expiresAt = expiresAt,
+						}
+					end
+				end
+			end
+		elseif expected ~= nil then
+			table.clear(recentBulkTagExpectations)
+		end
 		bulkExpectedProperties = expected
+		activeBulkWrite = activeWrite
+	end
+
+	function api.hasBulkSideEffectObserved(): boolean
+		return bulkSideEffectObserved
+	end
+
+	function api.isItemChangedActive(): boolean
+		return state.itemChangedAvailable and propertySignal ~= nil
+	end
+
+	local function isPureDerivedBulkAlias(
+		instance: Instance,
+		className: string,
+		propStr: string,
+		activeProp: any
+	): boolean
+		if type(activeProp) ~= "string" then
+			return false
+		end
+		if activeProp == "@attribute" and (propStr == "Attributes" or propStr == "AttributesSerialize") then
+			return true
+		end
+		return canonicalDerivedPropertyAlias(instance, className, propStr) == activeProp
+	end
+
+	local ensurePropertySignal: () -> boolean
+
+	local function canonicalBulkPropName(instance: Instance, className: string, propertyName: string): string
+		local byProp = canonicalBulkPropByClass[className]
+		if byProp == nil then
+			byProp = {}
+			canonicalBulkPropByClass[className] = byProp
+		end
+		local cached = byProp[propertyName]
+		if cached ~= nil then
+			return cached
+		end
+		local result = propertyName
+		local alias = RbxDomModule.getContentPropertyAliases(className)[string.lower(propertyName)]
+		if alias ~= nil then
+			result = alias
+		else
+			local derived = canonicalDerivedPropertyAlias(instance, className, propertyName)
+			if derived ~= nil then
+				result = derived
+			elseif string.lower(propertyName) == "ignoreguiinset" and instance:IsA("ScreenGui") then
+				result = "ScreenInsets"
+			elseif className == "UICorner" and propertyName == "CornerRadius" then
+				result = "TopLeftRadius"
+			end
+		end
+		byProp[propertyName] = result
+		return result
+	end
+
+	local function isRawPropertyIgnoredFast(instance: Instance, className: string, propStr: string): boolean
+		if
+			state.onlyCodeMode
+			or not state.syncbackProperties
+			or state.propertyNamesByClass == nil
+			or (exportPropertyObserver ~= nil and exportPropertyRelevant == nil)
+			or propStr == "Tags"
+			or propStr == "Archivable"
+			or propStr == "Parent"
+			or propStr == "Name"
+		then
+			return false
+		end
+		local byProp = rawPropIgnoredByClass[className]
+		if byProp == nil then
+			byProp = {}
+			rawPropIgnoredByClass[className] = byProp
+		end
+		local cached = byProp[propStr]
+		if cached ~= nil then
+			return cached
+		end
+		local ignored = not isRelevantInstanceProperty(instance, propStr)
+			and (exportPropertyObserver == nil or not (exportPropertyRelevant :: (string, string) -> boolean)(className, propStr))
+		byProp[propStr] = ignored
+		return ignored
 	end
 
 	function api.noteBulkExportChange(serviceName: string)
@@ -3985,23 +5079,67 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
-	local function ensurePropertySignal(): boolean
+	local function updateExpectedPropertyCache(instance: Instance, propKey: any, value: any)
+		local cache = state.propertyFingerprintByInstance[instance]
+		if cache ~= nil then
+			cache[propertyCacheKey(instance, propKey)] = nil
+		end
+		local baselines = state.propertyBaselineByInstance[instance]
+		if baselines ~= nil then
+			local slot = baselines[1][propertyCacheKey(instance, propKey)]
+			if slot ~= nil then
+				baselines[slot] = if value == nil then NIL_PROPERTY_BASELINE else value
+			end
+		end
+	end
+
+	ensurePropertySignal = function(): boolean
 		if propertySignal ~= nil then return true end
 		local itemChanged = (game :: any).ItemChanged
 		if itemChanged == nil then return false end
 		propertySignal = itemChanged:Connect(function(instance: Instance, propertyName: any)
-			if bulkExpectedProperties ~= nil and typeof(instance) == "Instance" then
-				local lookupName = propertyName
+			local isInst = typeof(instance) == "Instance"
+			local propStr = if type(propertyName) == "string" then propertyName else tostring(propertyName)
+			local className: string? = if isInst then instance.ClassName else nil
+			if isInst and isRawPropertyIgnoredFast(instance, className :: string, propStr) then
+				return
+			end
+			if bulkExpectedProperties ~= nil and isInst then
+				local instClass = className :: string
+				local activeSideEffectCandidate = false
+				if activeBulkWrite ~= nil and activeBulkWrite[1] ~= nil then
+					if activeBulkWrite[1] == instance then
+						local activeProp = activeBulkWrite[2]
+						if
+							propStr == activeProp
+							or isPureDerivedBulkAlias(instance, instClass, propStr, activeProp)
+							or not isRelevantInstanceProperty(instance, propStr)
+						then
+							updateExpectedPropertyCache(instance, activeProp, activeBulkWrite[3])
+							return
+						end
+						if
+							type(activeProp) == "string"
+							and canonicalBulkPropName(instance, instClass, propStr)
+								== canonicalBulkPropName(instance, instClass, activeProp)
+						then
+							bulkSideEffectObserved = true
+							updateExpectedPropertyCache(instance, activeProp, activeBulkWrite[3])
+							return
+						end
+						activeSideEffectCandidate = true
+					elseif isRelevantInstanceProperty(instance, propStr) then
+						activeSideEffectCandidate = true
+					end
+				end
+				local lookupName = propStr
 				local byInstance = bulkExpectedProperties[lookupName]
-				if byInstance == nil and (lookupName == "BrickColor" or lookupName == "Color3uint8") then
-					lookupName = "Color"
-					byInstance = bulkExpectedProperties.Color
-				elseif
-					byInstance == nil
-					and (lookupName == "Position" or lookupName == "Orientation" or lookupName == "Rotation")
-				then
-					lookupName = "CFrame"
-					byInstance = bulkExpectedProperties.CFrame
+				if byInstance == nil then
+					local canonical = canonicalBulkPropName(instance, instClass, propStr)
+					if canonical ~= propStr then
+						lookupName = canonical
+						byInstance = bulkExpectedProperties[lookupName]
+					end
 				end
 				if byInstance ~= nil then
 					local expected = byInstance[instance]
@@ -4019,23 +5157,19 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 							matched = okRead and (current == expected or BridgeValueEquality.valuesEqual(current, expected))
 						end
 						if matched then
+							if lookupName ~= propStr and not isPureDerivedBulkAlias(instance, instClass, propStr, lookupName) then
+								bulkSideEffectObserved = true
+							end
 							if lookupName == propertyName and lookupName ~= "Color" and lookupName ~= "CFrame" then
 								byInstance[instance] = nil
 							end
-							local cache = state.propertyFingerprintByInstance[instance]
-							if cache ~= nil then
-								cache[propertyCacheKey(instance, lookupName)] = nil
-							end
-							local baselines = state.propertyBaselineByInstance[instance]
-							if baselines ~= nil then
-								local slot = baselines[1][propertyCacheKey(instance, lookupName)]
-								if slot ~= nil then
-									baselines[slot] = if current == nil then NIL_PROPERTY_BASELINE else current
-								end
-							end
+							updateExpectedPropertyCache(instance, lookupName, current)
 							return
 						end
 					end
+				end
+				if activeSideEffectCandidate then
+					bulkSideEffectObserved = true
 				end
 			end
 			if exportPropertyObserver then
@@ -4044,6 +5178,24 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			if state.itemChangedAvailable and typeof(instance) == "Instance" then
 				local property = string.lower(tostring(propertyName or ""))
 				local trackedService = state.connectionServiceByInstance[instance]
+				if trackedService == nil then
+					local activeJournal = state.changeJournal
+					local suspended = activeNativeSuspendedServices(activeJournal)
+					if next(state.lazyObservedServices) ~= nil or suspended ~= nil then
+						local candidate = serviceNameForTrackedInstance(instance)
+						if
+							candidate ~= nil
+							and (state.lazyObservedServices[candidate] or (suspended ~= nil and suspended[candidate] ~= nil))
+							and not shouldIgnoreInstance(instance, candidate)
+						then
+							local isSuspendedNative = suspended ~= nil and suspended[candidate] ~= nil
+							local isPreExisting = isNativePreExisting(activeJournal, candidate, instance)
+							if not (property == "parent" and isSuspendedNative and not isPreExisting) then
+								trackedService = candidate
+							end
+						end
+					end
+				end
 				if trackedService ~= nil then
 					observePropertyChange(instance, trackedService, tostring(propertyName))
 				elseif property == "parent" or property == "name" then
@@ -4070,9 +5222,15 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 
 	-- Export invalidation remains active when Live Sync/transaction tracking stops.
 	-- Sharing the engine subscriptions avoids dispatching each event into Lua twice.
-	function api.observeExports(structure: (string, Instance) -> boolean?, property: (Instance, any) -> ())
+	function api.observeExports(
+		structure: (string, Instance) -> boolean?,
+		property: (Instance, any) -> (),
+		propertyRelevant: ((string, string) -> boolean)?
+	)
 		exportStructureObserver = structure
 		exportPropertyObserver = property
+		exportPropertyRelevant = propertyRelevant
+		table.clear(rawPropIgnoredByClass)
 		for serviceName in pairs(allowedServices) do
 			ensureServiceSignals(serviceName)
 		end
@@ -4118,8 +5276,36 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 	end
 
-	local function ensureService(serviceName: string, sharedTagged: { [Instance]: boolean }?)
+	materializeLazyService = function(serviceName: string)
+		if not state.lazyObservedServices[serviceName] then
+			return
+		end
+		state.lazyObservedServices[serviceName] = nil
+		local service = state.serviceRoots[serviceName]
+		if service == nil then
+			return
+		end
+		connectExistingDescendants(service:GetDescendants(), serviceName, nil)
+	end
+
+	materializeAllLazyServices = function()
+		if next(state.lazyObservedServices) == nil then
+			return
+		end
+		local lazyServices = {}
+		for serviceName in pairs(state.lazyObservedServices) do
+			lazyServices[#lazyServices + 1] = serviceName
+		end
+		for _, serviceName in ipairs(lazyServices) do
+			materializeLazyService(serviceName)
+		end
+	end
+
+	local function ensureService(serviceName: string, sharedTagged: { [Instance]: boolean }?, lazy: boolean?)
 		if state.watchedServices[serviceName] then
+			if not lazy then
+				materializeLazyService(serviceName)
+			end
 			return
 		end
 		local service = game:GetService(serviceName)
@@ -4128,14 +5314,47 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		state.serviceNameByRoot[service] = serviceName
 		local tags = tagFingerprint(service)
 		state.tagFingerprintByInstance[service] = if tags == "" then nil else tags
-		local descendants = service:GetDescendants()
-		if state.onlyCodeMode then
+		local nativeAttributes = nativeAttributeRelay ~= nil
+			and nativeAttributeRelay.ready
+			and nativeAttributeRelay.services[serviceName] == true
+		local useLazy = lazy == true
+			and nativeAttributes
+			and state.itemChangedAvailable
+			and not state.onlyCodeMode
+		local descendants = if useLazy then nil else service:GetDescendants()
+		if state.onlyCodeMode and descendants ~= nil then
 			rebuildLuaSourceCounts(service, descendants)
 		end
 
 		local connections: { RBXScriptConnection } = {
 			service.Changed:Connect(function(propertyName: string)
 				local property = tostring(propertyName)
+				if bulkExpectedProperties ~= nil then
+					if activeBulkWrite ~= nil and activeBulkWrite[1] == service then
+						if activeBulkWrite[2] == property then
+							local cache = state.propertyFingerprintByInstance[service]
+							if cache ~= nil then
+								cache[propertyCacheKey(service, property)] = nil
+							end
+							return
+						elseif not shouldIgnoreRootProperty(service, serviceName, property) then
+							bulkSideEffectObserved = true
+						end
+					end
+					local byInstance = bulkExpectedProperties[property]
+					if byInstance ~= nil and byInstance[service] ~= nil then
+						local expected = byInstance[service]
+						local okRead, current = pcall(readInstanceProperty, service, property)
+						if okRead and (current == expected or BridgeValueEquality.valuesEqual(current, expected)) then
+							byInstance[service] = nil
+							local cache = state.propertyFingerprintByInstance[service]
+							if cache ~= nil then
+								cache[propertyCacheKey(service, property)] = nil
+							end
+							return
+						end
+					end
+				end
 				if not shouldIgnoreRootProperty(service, serviceName, property) then
 					local shouldRecord, directOk, directValue, fingerprint, valueCaptured, value =
 						shouldRecordPropertyDirty(service, property)
@@ -4177,17 +5396,23 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		signals.added = function(instance: Instance, exportIncluded: boolean?)
 			local journal = state.changeJournal
 			state.exportInstancesByService[serviceName] = nil
+			state.exportDebugIdsByService[serviceName] = nil
+			state.exportDebugIdBufferByService[serviceName] = nil
+			state.exportClassNamesByService[serviceName] = nil
+			state.exportNonArchivableIndicesByService[serviceName] = nil
 			updateTrackedArchivable(instance, serviceName, exportIncluded)
 			local additions = if journal and journal.nativeAdditions then journal.nativeAdditions[serviceName] else nil
-			local included = not shouldIgnoreInstance(instance, serviceName, exportIncluded)
+			local fastInclude = if additions ~= nil and journal and journal.nativeFastInclusion
+				then journal.nativeFastInclusion[serviceName]
+				else nil
+			local included = if fastInclude ~= nil
+				then instance ~= Workspace.CurrentCamera and fastInclude(instance, instance.ClassName)
+				else not shouldIgnoreInstance(instance, serviceName, exportIncluded)
 			if additions ~= nil and included and not state.onlyCodeMode
 				and additions[instance] == nil and state.connectionServiceByInstance[instance] == nil
 				and state.expectedStructuralByInstance[instance] == nil then
-				-- Bulk replacement is not a sequence of incremental edits. Keep
-				-- only its identity/parent receipt and arm future edit signals.
-				-- Reattachments and pre-observed objects take the normal path.
 				local parent = instance.Parent
-				if parent ~= nil and instance:IsDescendantOf(service) then
+				if parent ~= nil and (parent == service or additions[parent] ~= nil or instance:IsDescendantOf(service)) then
 					additions[instance] = parent
 					invalidateSiblingOrdinals(parent)
 					connectInstance(instance, serviceName, true, true)
@@ -4201,12 +5426,17 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				nil,
 				instance.Parent
 			)
-			if included and not expected and additions ~= nil and additions[instance] == nil and instance.Parent ~= nil then
-				-- Only the first addition waits for the factory receipt. A
-				-- second add/remove follows the ordinary journal immediately;
-				-- property and attribute listeners are never suppressed here.
-				additions[instance] = instance.Parent
-				expected = true
+			if included and not expected and additions ~= nil and additions[instance] == nil then
+				if instance.Parent ~= nil then
+					additions[instance] = instance.Parent
+					expected = true
+				else
+					if journal.pendingNativeDetachedAdditions == nil then
+						journal.pendingNativeDetachedAdditions = {}
+					end
+					journal.pendingNativeDetachedAdditions[instance] = serviceName
+					expected = true
+				end
 			end
 			if state.onlyCodeMode then
 				if isLuaSourceInstance(instance) then
@@ -4228,26 +5458,77 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					reconcileAncestorConnections(instance, service, serviceName)
 				end
 				if not expected then
-					markDirty(
-						serviceName,
-						changeDetailsForInstance(instance, "added", nil, nil, "descendant added")
-					)
+					local activeJournal = state.changeJournal
+					if
+						not (
+							activeJournal ~= nil
+							and activeJournal.nativeEngineCreatedById ~= nil
+							and isEngineMutationById(instance, activeJournal.nativeEngineCreatedById)
+						)
+					then
+						markDirty(
+							serviceName,
+							changeDetailsForInstance(instance, "added", nil, nil, "descendant added")
+						)
+					end
 				end
 			end
 		end
 		signals.removing = function(instance: Instance)
 			state.exportInstancesByService[serviceName] = nil
-			retainDetachedObserver(instance, serviceName)
+			state.exportDebugIdsByService[serviceName] = nil
+			state.exportDebugIdBufferByService[serviceName] = nil
+			state.exportClassNamesByService[serviceName] = nil
+			state.exportNonArchivableIndicesByService[serviceName] = nil
 			local removingParent = instance.Parent
-			removeTrackedArchivable(instance, serviceName)
-			local expected = consumeExpectedInstanceEvent(
-				state.expectedStructuralByInstance,
-				instance,
-				"removed",
-				nil,
-				instance.Parent
-			)
+			local ignored = shouldIgnoreInstance(instance, serviceName)
 			local wasCodeRelevant = not state.onlyCodeMode or hasLuaSourceDescendant(instance)
+			local activeJournal = state.changeJournal
+			local engineRemoved = false
+			if not ignored and wasCodeRelevant and activeJournal ~= nil and activeJournal.services[serviceName] then
+				if activeJournal.nativeAdditions ~= nil then
+					local pre = if activeJournal.nativePreExisting ~= nil
+						then activeJournal.nativePreExisting[serviceName]
+						else nil
+					local svcAdditions = activeJournal.nativeAdditions[serviceName]
+					local maybeEngineRemoval = (pre ~= nil and not pre[instance])
+						or (
+							pre == nil
+							and (
+								(svcAdditions ~= nil and svcAdditions[instance] ~= nil)
+								or state.connectionServiceByInstance[instance] == nil
+							)
+						)
+					if maybeEngineRemoval and state.expectedStructuralByInstance[instance] == nil then
+						if activeJournal.pendingNativeRemovals == nil then
+							activeJournal.pendingNativeRemovals = {}
+							activeJournal.pendingNativeRemovalSet = {}
+						end
+						if not activeJournal.pendingNativeRemovalSet[instance] then
+							activeJournal.pendingNativeRemovalSet[instance] = true
+							activeJournal.pendingNativeRemovals[#activeJournal.pendingNativeRemovals + 1] = {
+								instance = instance,
+								serviceName = serviceName,
+							}
+						end
+						engineRemoved = true
+					end
+				elseif activeJournal.nativeEngineRemovedById ~= nil then
+					engineRemoved = isEngineMutationById(instance, activeJournal.nativeEngineRemovedById)
+				end
+			end
+			if not engineRemoved then
+				retainDetachedObserver(instance, serviceName)
+			end
+			removeTrackedArchivable(instance, serviceName)
+			local expected = engineRemoved
+				or consumeExpectedInstanceEvent(
+					state.expectedStructuralByInstance,
+					instance,
+					"removed",
+					nil,
+					instance.Parent
+				)
 			if state.onlyCodeMode and isLuaSourceInstance(instance) then
 				adjustLuaSourceAncestors(instance, -1)
 			end
@@ -4260,7 +5541,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 				end
 			end
 			invalidateSiblingOrdinals(instance.Parent, "removal")
-			if not expected and not shouldIgnoreInstance(instance, serviceName) and wasCodeRelevant then
+			if not expected and not ignored and wasCodeRelevant then
 				markDirty(
 					serviceName,
 					changeDetailsForInstance(instance, "removed", nil, nil, "descendant removing")
@@ -4293,7 +5574,11 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 
 		table.insert(connections, connectAttributeChanged(service, serviceName))
 		state.rootConnections[serviceName] = connections
-		connectExistingDescendants(descendants, serviceName, sharedTagged)
+		if useLazy then
+			state.lazyObservedServices[serviceName] = true
+		else
+			connectExistingDescendants(descendants :: { Instance }, serviceName, sharedTagged)
+		end
 	end
 
 	local function endObservationEpoch(serviceName: string)
@@ -4338,7 +5623,12 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		state.nonArchivableCountByService[serviceName] = nil
 		state.exportInstancesByService[serviceName] = nil
+		state.exportDebugIdsByService[serviceName] = nil
+		state.exportDebugIdBufferByService[serviceName] = nil
+		state.exportClassNamesByService[serviceName] = nil
+		state.exportNonArchivableIndicesByService[serviceName] = nil
 		state.watchedServices[serviceName] = nil
+		state.lazyObservedServices[serviceName] = nil
 		state.serviceRoots[serviceName] = nil
 		state.serviceNameByRoot[service] = nil
 		if not preservePending then
@@ -4363,6 +5653,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		localPushProofRequested = false
 		state.started = false
 		table.clear(nativeParentReceipts)
+		table.clear(incomingNotes)
 		if nativeAttributeRelay and nativeAttributeRelay.cached then
 			nativeAttributeRelay.ready = false
 		elseif nativeAttributeRelay then
@@ -4382,7 +5673,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			end
 		end
 		for _, connection in pairs(state.instanceConnections) do
-			connection:Disconnect()
+			if connection ~= nativeAttributeConnection then
+				connection:Disconnect()
+			end
 		end
 		for _, connections in pairs(state.fallbackPropertyConnections) do
 			for _, connection in ipairs(connections) do
@@ -4405,12 +5698,17 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		table.clear(state.lastParentByInstance)
 		table.clear(state.expectedFreshInstances)
 		table.clear(state.watchedServices)
+		table.clear(state.lazyObservedServices)
 		table.clear(state.serviceRoots)
 		table.clear(state.serviceNameByRoot)
 		table.clear(state.luaSourceDescendantCounts)
 		table.clear(state.archivableByInstance)
 		table.clear(state.nonArchivableCountByService)
 		table.clear(state.exportInstancesByService)
+		table.clear(state.exportDebugIdsByService)
+		table.clear(state.exportDebugIdBufferByService)
+		table.clear(state.exportClassNamesByService)
+		table.clear(state.exportNonArchivableIndicesByService)
 		state.connectedInstanceCount = 0
 		if exportPropertyObserver == nil and propertySignal ~= nil then
 			propertySignal:Disconnect()
@@ -4451,7 +5749,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end)
 	end
 
-	ensureTracking = function(services: { string })
+	ensureTracking = function(services: { string }, lazy: boolean?)
 		if config.bridgeRole ~= "edit" then
 			return
 		end
@@ -4459,26 +5757,71 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			state.itemChangedAvailable = ensurePropertySignal()
 		end
 		local sharedTagged: { [Instance]: boolean }? = nil
-		if type(config.exportInclusionUnder) == "function" then
+		local lazyTagFingerprints: { [Instance]: string }? = nil
+		local newlyUnwatched: { [string]: boolean }? = nil
+		if type(config.exportInclusionUnder) == "function" or lazy == true then
 			local anyUnwatched = false
 			for _, serviceName in ipairs(services) do
 				if not state.watchedServices[serviceName] then
 					anyUnwatched = true
-					break
+					if lazy == true then
+						if newlyUnwatched == nil then
+							newlyUnwatched = {}
+						end
+						newlyUnwatched[serviceName] = true
+					end
 				end
 			end
 			if anyUnwatched then
+				local allTags = CollectionService:GetAllTags()
+				if lazy == true then
+					table.sort(allTags)
+				end
 				local tagged: { [Instance]: boolean } = {}
-				for _, tag in ipairs(CollectionService:GetAllTags()) do
+				local fingerprints: { [Instance]: string }? = if lazy == true then {} else nil
+				for _, tag in ipairs(allTags) do
 					for _, instance in ipairs(CollectionService:GetTagged(tag)) do
 						tagged[instance] = true
+						if fingerprints ~= nil then
+							local existing = fingerprints[instance]
+							fingerprints[instance] = if existing == nil then tag else existing .. "\0" .. tag
+						end
 					end
 				end
 				sharedTagged = tagged
+				lazyTagFingerprints = fingerprints
 			end
 		end
 		for _, serviceName in ipairs(services) do
-			ensureService(serviceName, sharedTagged)
+			ensureService(serviceName, sharedTagged, lazy)
+		end
+		if lazyTagFingerprints ~= nil and newlyUnwatched ~= nil then
+			local anyNewlyLazy = false
+			for serviceName in pairs(newlyUnwatched) do
+				if state.lazyObservedServices[serviceName] then
+					anyNewlyLazy = true
+					break
+				end
+			end
+			if anyNewlyLazy then
+				local byRoot = state.serviceNameByRoot
+				local roots = state.serviceRoots
+				local lazyServices = state.lazyObservedServices
+				local targetMap = state.tagFingerprintByInstance
+				for taggedInst, fp in pairs(lazyTagFingerprints) do
+					local current = taggedInst.Parent
+					while current ~= nil and current ~= game do
+						local svc = byRoot[current]
+						if svc ~= nil then
+							if newlyUnwatched[svc] and lazyServices[svc] and taggedInst ~= roots[svc] then
+								targetMap[taggedInst] = fp
+							end
+							break
+						end
+						current = current.Parent
+					end
+				end
+			end
 		end
 		if not state.started then
 			observeTagDiscovery()
@@ -4490,9 +5833,13 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	function api.configurePropertyCandidates(rawCandidatesByClass: any): { [string]: any }
 		local previousCandidates = state.propertyNamesByClass
 		table.clear(propertyEventRelevanceByClass)
+		table.clear(rawPropIgnoredByClass)
 		table.clear(propertyReadNamesByClass)
 		table.clear(propertyCacheKeysByClass)
 		table.clear(propertyPrimingPlansByClass)
+		if refPrimingPlansByClass ~= nil then
+			table.clear(refPrimingPlansByClass)
+		end
 		if type(rawCandidatesByClass) ~= "table" then
 			state.propertyNamesByClass = nil
 			state.propertyFilterClassCount = 0
@@ -4546,8 +5893,11 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		if type(rawOptions.syncbackProperties) == "boolean" then
 			state.syncbackProperties = rawOptions.syncbackProperties
+			table.clear(rawPropIgnoredByClass)
 		end
 		if type(rawOptions.onlyCodeMode) == "boolean" and state.onlyCodeMode ~= rawOptions.onlyCodeMode then
+			table.clear(rawPropIgnoredByClass)
+			materializeAllLazyServices()
 			state.onlyCodeMode = rawOptions.onlyCodeMode
 			table.clear(state.luaSourceDescendantCounts)
 			for serviceName, service in pairs(state.serviceRoots) do
@@ -4876,14 +6226,17 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		-- which an edit could slip between the proof check and the new lease.
 		local pushProofMatches, pushProofMismatch, pushProofScope = nil, nil, nil
 		if params.verifyPushProof ~= nil then
-			pushProofMatches, pushProofMismatch = api.verifyPushProof(params.verifyPushProof)
+			pushProofMatches, pushProofMismatch = api.verifyPushProof(
+				params.verifyPushProof,
+				params.deferTerrainProof == true
+			)
 			if not pushProofMatches and params.scopePushProof == true then
 				pushProofScope = api.pushProofScope(
 					params.verifyPushProof,
 					params.skipTerrainIfWorkspaceOverflow == true
 				)
 			end
-			if params.start ~= true then
+			if params.start ~= true and params.retainPushProof == nil then
 				-- Each answer from a retained local proof keeps its listeners as
 				-- long again; a native proof lasts as long as its observer.
 				local retainSeconds = tonumber(params.retainSeconds)
@@ -4905,7 +6258,15 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			localPushProofRequested = params.captureLocalPushProof == true
 		end
 		local retainedProof, retainedProofLocal, proofContinues = nil, false, false
-		if params.retainPushProof ~= nil and api.verifyPushProof(params.retainPushProof) then
+		local retainMatches = false
+		if params.retainPushProof ~= nil then
+			if params.retainPushProof == params.verifyPushProof then
+				retainMatches = pushProofMatches == true
+			else
+				retainMatches = api.verifyPushProof(params.retainPushProof)
+			end
+		end
+		if retainMatches then
 			local retainSeconds = tonumber(params.retainSeconds) or 60
 			proofContinues = continuedPushProof ~= nil and continuedPushProof.id == params.continuesPushProof
 				and continuesPushProof(continuedPushProof, verifiedPushProof)
@@ -5006,6 +6367,9 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					stopTracking()
 				end
 			end
+			if state.started then
+				promoteNativeAttributeConnections()
+			end
 			wasTracking = state.started
 		end
 		if params.deferNativeTracking == true and params.nativeAttributeRelay == true
@@ -5016,7 +6380,11 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			local path = prepareNativeAttributeRelay(services)
 			if path ~= nil then
 				acquireTrackingGuard(params.trackingGuardId)
-				nativeAttributeRelay.pendingTracking = { guardId = params.trackingGuardId, services = services }
+				nativeAttributeRelay.pendingTracking = {
+					guardId = params.trackingGuardId,
+					services = services,
+					lazy = params.lazyTracking == true,
+				}
 				return {
 					ok = true,
 					nativeTrackingDeferred = true,
@@ -5029,8 +6397,15 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			end
 		end
 		if params.stop == true then
+			local keepCached = params.keepCachedProof == true
+				and nativeAttributeRelay ~= nil
+				and nativeAttributeRelay.cached == true
 			if nativeAttributeRelay then
-				nativeAttributeRelay.cached = false
+				if keepCached then
+					nativeAttributeRelay.retainedGuardId = nil
+				else
+					nativeAttributeRelay.cached = false
+				end
 			end
 			state.persistentTracking = false
 			table.clear(state.trackingGuards)
@@ -5064,7 +6439,30 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 					unwatchService(serviceName)
 				end
 			end
-			ensureTracking(services)
+			local useLazyTracking = false
+			if params.lazyTracking == true and not state.persistentTracking then
+				if continuedNativeRelay then
+					if pushProofMatches == true then
+						useLazyTracking = true
+					elseif
+						type(pushProofScope) == "table"
+						and pushProofScope.unknown == nil
+						and type(pushProofScope.services) == "table"
+						and type(pushProofScope.valuesOnly) == "table"
+					then
+						useLazyTracking = true
+						for _, changedSvc in ipairs(pushProofScope.services) do
+							if pushProofScope.valuesOnly[changedSvc] ~= true then
+								useLazyTracking = false
+								break
+							end
+						end
+					end
+				elseif nativeAttributeRelay ~= nil and nativeAttributeRelay.ready then
+					useLazyTracking = true
+				end
+			end
+			ensureTracking(services, useLazyTracking)
 			if nativeAttributeRelay then
 				nativeAttributeRelay.pendingTracking = nil
 			end
@@ -5189,6 +6587,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	function api.stop()
 		verifiedPushProof, keptPushProof = nil, nil
 		bulkExpectedProperties = nil
+		activeBulkWrite = nil
+		bulkSideEffectObserved = false
 		if nativeAttributeRelay then
 			nativeAttributeRelay.cached = false
 		end

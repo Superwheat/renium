@@ -1720,6 +1720,8 @@ pub(crate) struct PlaceImportProperties {
     /// The selected reader is known after preflight; its existing supplemental
     /// policy decides whether serializer-only exceptions need original rows.
     pub(crate) native_reader: bool,
+    /// Optional in-memory staged script files avoiding temporary disk copies.
+    pub(crate) virtual_files: Option<Arc<crate::editor::types::VirtualStageFiles>>,
 }
 
 impl From<bool> for PlaceImportProperties {
@@ -1730,6 +1732,7 @@ impl From<bool> for PlaceImportProperties {
             unread_rows: HashMap::new(),
             reference_subtree_limit: None,
             native_reader: false,
+            virtual_files: None,
         }
     }
 }
@@ -1742,6 +1745,7 @@ impl PlaceImportProperties {
             unread_rows: HashMap::new(),
             reference_subtree_limit: None,
             native_reader: false,
+            virtual_files: None,
         }
     }
 }
@@ -1762,11 +1766,8 @@ pub(crate) struct PlaceBuildTuning {
 impl Default for PlaceBuildTuning {
     fn default() -> Self {
         Self {
-            // One active column set and two bounded row ranges. Parallelize
-            // decoding/conversion within them, rather than retaining another
-            // service's string table beside all completed output and originals.
-            rows: std::num::NonZeroUsize::new(4096).unwrap(),
-            services: std::num::NonZeroUsize::new(1).unwrap(),
+            rows: std::num::NonZeroUsize::new(8192).unwrap(),
+            services: std::num::NonZeroUsize::new(2).unwrap(),
             prefetch: true,
         }
     }
@@ -2228,6 +2229,7 @@ pub(crate) fn prepare_rbx_place<'a>(
                             BytecodeRbxBuildOptions {
                                 omitted_properties: capture_logical_properties.then_some(&mut omitted_properties),
                                 source_path: source_paths.get(index).and_then(Option::as_deref),
+                                virtual_files: import_properties.virtual_files.as_deref(),
                                 omitted_properties_by_class: allow_unrepresentable_properties
                                     .then_some(&mut omitted_properties_by_class),
                                 logical_omitted_properties: capture_logical_properties
@@ -2303,7 +2305,193 @@ pub(crate) fn prepare_rbx_place<'a>(
                 .collect::<Result<Vec<_>>>()
         };
         let mut service_chunks = Vec::new();
-        if let Some(columns) = columns.as_mut() {
+        if let Some(store) = columns
+            .as_ref()
+            .and_then(|c| c.block_store())
+            .is_some()
+            .then(|| columns.take().unwrap().into_block_store().unwrap())
+        {
+            let batch_blocks = tuning.rows.get().div_ceil(2048).clamp(2, 8);
+            let block_indices = (0..store.block_count()).collect::<Vec<_>>();
+            for batch in block_indices.chunks(batch_blocks) {
+                store.renew_budget();
+                let batch_results = batch
+                    .par_iter()
+                    .map(|&block_index| {
+                        let _span = crate::app::profile::span("place raw block conversion");
+                        let build_result: Result<ServiceBuild> = store
+                            .visit_block_raw(block_index, |first, row_props, row_attrs| {
+                                Ok((|| -> Result<ServiceBuild> {
+                                    let mut instances = Vec::with_capacity(row_props.len());
+                                    let mut kept_rows = Vec::new();
+                                    let mut omitted_properties_by_ref = HashMap::new();
+                                    let mut omitted_properties_by_class = HashMap::new();
+                                    let mut logical_properties_by_ref = HashMap::new();
+                                    let mut unresolved_reference_properties_by_ref = HashMap::new();
+                                    let mut metadata = BytecodeExportMetadata::new();
+                                    let mut mesh_classes = AHashMap::<&str, bool>::new();
+                                    let mut shared_cache = AHashMap::new();
+                                    let mut encoder = BytecodeRbxEncoder::new(
+                                        &document,
+                                        database,
+                                        &mut metadata,
+                                        &refs,
+                                    );
+                                    for local in 0..row_props.len() {
+                                        let index = first + local;
+                                        let Some(&referent) = refs.by_index.get(&index) else {
+                                            continue;
+                                        };
+                                        let parent_ref = if index == root_index {
+                                            None
+                                        } else {
+                                            let parent_index = document.instances[index]
+                                                .parent_index
+                                                .ok_or_else(|| {
+                                                    anyhow::anyhow!(
+                                                        "Export subtree contains a detached child"
+                                                    )
+                                                })?;
+                                            Some(*refs.by_index.get(&parent_index).ok_or_else(
+                                                || {
+                                                    anyhow::anyhow!(
+                                                        "Export subtree is missing parent referent"
+                                                    )
+                                                },
+                                            )?)
+                                        };
+                                        let instance = &document.instances[index];
+                                        let mesh = *mesh_classes
+                                            .entry(instance.class_name.as_str())
+                                            .or_insert_with(|| {
+                                                crate::rbx::decode::rbx_reflection_class_is_a(
+                                                    database,
+                                                    &instance.class_name,
+                                                    "TriangleMeshPart",
+                                                )
+                                            });
+                                        let initial_size =
+                                            crate::rbx::encode::synthesized_mesh_initial_size_from_raw(
+                                                &row_props[local],
+                                                mesh,
+                                                || ancestor_scales[index],
+                                            );
+                                        let mut omitted_properties = HashSet::new();
+                                        let mut logical_properties = HashMap::new();
+                                        let mut unresolved_reference_properties = HashSet::new();
+                                        let builder = encoder.build_with_raw(
+                                            index,
+                                            &row_props[local],
+                                            row_attrs[local].as_ref(),
+                                            initial_size,
+                                            &mut shared_cache,
+                                            BytecodeRbxBuildOptions {
+                                                omitted_properties: capture_logical_properties
+                                                    .then_some(&mut omitted_properties),
+                                                source_path: source_paths
+                                                    .get(index)
+                                                    .and_then(Option::as_deref),
+                                                virtual_files: import_properties
+                                                    .virtual_files
+                                                    .as_deref(),
+                                                omitted_properties_by_class:
+                                                    allow_unrepresentable_properties
+                                                        .then_some(&mut omitted_properties_by_class),
+                                                logical_omitted_properties:
+                                                    capture_logical_properties
+                                                        .then_some(&mut logical_properties),
+                                                unresolved_reference_properties:
+                                                    capture_logical_properties
+                                                        .then_some(&mut unresolved_reference_properties),
+                                            },
+                                        )?;
+                                        let built = builder.build_leaf(children[index].len());
+                                        let keep = retain_rows
+                                            && unread_rows.is_none_or(|rows| rows.contains(index))
+                                            && (!omitted_properties.is_empty()
+                                                || !unresolved_reference_properties.is_empty()
+                                                || built
+                                                    .properties
+                                                    .values()
+                                                    .chain(logical_properties.values())
+                                                    .any(|value| {
+                                                        crate::studio::native::editor::rbx_variant_referent(
+                                                            value,
+                                                        )
+                                                        .is_some_and(|target| {
+                                                            target.is_some()
+                                                                && reference_scopes
+                                                                    .get(&referent)
+                                                                    .is_none_or(|scope| {
+                                                                        reference_scopes.get(&target)
+                                                                            != Some(scope)
+                                                                    })
+                                                        })
+                                                    })
+                                                || crate::rbx::import_rows::has_selected_raw_property(
+                                                    &instance.class_name,
+                                                    &row_props[local],
+                                                    omitted_properties_by_class
+                                                        .get(&instance.class_name),
+                                                )?
+                                                || crate::rbx::import_rows::has_selected_raw_property(
+                                                    &instance.class_name,
+                                                    &row_props[local],
+                                                    extra_omissions.get(&instance.class_name),
+                                                )?);
+                                        if keep {
+                                            let mut row = SettingsBytecodeInstance::new(
+                                                instance.settings_id.clone(),
+                                                instance.name.clone(),
+                                                instance.class_name.clone(),
+                                                instance.parent_index,
+                                            );
+                                            row.properties =
+                                                Map::with_capacity(row_props[local].len());
+                                            for (name, val) in &row_props[local] {
+                                                row.properties
+                                                    .insert((*name).to_string(), val.to_json());
+                                            }
+                                            if let Some(attrs) = &row_attrs[local] {
+                                                row.attributes = attrs.clone();
+                                            }
+                                            kept_rows.push((referent, index, row));
+                                        }
+                                        if !omitted_properties.is_empty() {
+                                            omitted_properties_by_ref
+                                                .insert(referent, omitted_properties);
+                                        }
+                                        if !logical_properties.is_empty() {
+                                            logical_properties_by_ref
+                                                .insert(referent, logical_properties);
+                                        }
+                                        if !unresolved_reference_properties.is_empty() {
+                                            unresolved_reference_properties_by_ref
+                                                .insert(referent, unresolved_reference_properties);
+                                        }
+                                        instances.push((index, parent_ref, built));
+                                    }
+                                    Ok(ServiceBuild {
+                                        instances,
+                                        rows: kept_rows,
+                                        omitted_properties_by_ref,
+                                        omitted_properties_by_class,
+                                        logical_properties_by_ref,
+                                        unresolved_reference_properties_by_ref,
+                                    })
+                                })())
+                            })
+                            .with_context(|| {
+                                format!(
+                                    "Failed to decode {service} store block {block_index}; repair or refresh this store before retrying the import"
+                                )
+                            })?;
+                        build_result
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                service_chunks.extend(batch_results);
+            }
+        } else if let Some(columns) = columns.as_mut() {
             let read = |columns: &mut crate::settings::bytecode::property_edit::RetainedRowColumns, start: usize| {
                 let end = start
                     .saturating_add(tuning.rows.get())

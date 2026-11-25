@@ -477,14 +477,14 @@ end
 do
 	local state = {}
 	local service = {}
-	local missing = { Name = "AntiRoll" }
-	local exact = { Parent = service }
+	local missing = { Name = "AntiRoll", IsDescendantOf = function() return false end }
+	local exact = { Parent = service, IsDescendantOf = function() return true end }
 	local record = { service = "ServerStorage", parent = missing,
 		parentPathSegments = { "ServerStorage", "Public", "Cars", "Car", "AntiRoll" },
 		parentPathOrdinals = { 1, 1, 1, 2, 1 } }
 	local calls = 0
 	local available = false
-	local resolve = extract("function TransactionState.resolveJournalParent(", "function TransactionState.markJournalServices(", {
+	local resolve = extract("function TransactionState.isJournalParentLive(", "function TransactionState.markJournalServices(", {
 		TransactionState = state,
 		resolveReplacement = function(value, replacements) return replacements[value] or value end,
 		game = { GetService = function() return service end },
@@ -501,7 +501,7 @@ do
 	assert(calls == 0, "Rollback must resolve parent identity without guessing a path")
 	available = true
 	assert(not pcall(resolve, record, {}), "A same-path replacement is not proof of parent identity")
-	local moved = { Parent = exact }
+	local moved = { Parent = exact, IsDescendantOf = function() return true end }
 	assert(resolve(record, { [missing] = moved }) == moved, "Mapped identity must win over old paths")
 	record.parent = service
 	assert(resolve(record, {}) == service, "Real service-root children must remain valid")

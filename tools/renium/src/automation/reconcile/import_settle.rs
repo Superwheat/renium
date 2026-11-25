@@ -531,8 +531,9 @@ pub(super) fn settle(
     let covered = ScopeSet::new(&work.paths);
     let baseline =
         |paths: &[PathBuf]| super::push_flow::publish_baseline(root, &files, &covered, paths);
-    let stage_of =
-        |services| ExportProjectStage::create_with_baseline(root, &source, services, &baseline);
+    let stage_of = |services| {
+        ExportProjectStage::create_with_baseline_background(root, &source, services, &baseline)
+    };
     let mut services = narrowed.as_ref().map_or(full, |narrowed| narrowed.services);
     let mut stage = stage_of(services)?;
     // The services it skips keep their entries of the sourcemap it stages.
@@ -599,7 +600,11 @@ pub(super) fn settle(
             verified_full_push_proof_matches(context, bridge, proof)?,
             "Studio changed during import settlement; the committed import was not repeated"
         );
-        ensure_original_or_accepted_files(root, &work.paths).map(drop)
+        if snapshot_matches_disk(root, &work.paths, &work.expected)? {
+            return Ok(());
+        }
+        ensure_original_or_accepted_files(root, &work.paths)?;
+        Ok(())
     };
     let published = publish_checked(
         stage,
@@ -697,7 +702,22 @@ fn publish_checked(
     crate::snapshot::export::PublishedProjectChanges,
 )> {
     let scopes = ScopeSet::new(stage.publish_paths());
-    let staged = capture_snapshot(&stage.project_root, paths)?;
+    let mut staged = capture_snapshot(&stage.project_root, paths)?;
+    if let Some(vs) = stage.virtual_scripts() {
+        for (rel, state) in vs.staged_entries.lock_recover().iter() {
+            if matches!(state, crate::snapshot::export::PublishEntryState::Directory) {
+                staged
+                    .entries
+                    .entry(rel.clone())
+                    .or_insert(SnapshotEntry::Directory);
+            }
+        }
+        for rel in vs.skipped_paths.lock_recover().iter() {
+            if let Some(entry) = held.entries.get(rel) {
+                staged.entries.insert(rel.clone(), entry.clone());
+            }
+        }
+    }
     let accepted_files = || {
         let unsettled = held
             .entries
@@ -748,10 +768,13 @@ fn publish_checked(
             error
         }
     })?;
+    let expected_snapshot = ProjectSnapshot {
+        entries: accepted_files()
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect(),
+    };
     let current = capture_snapshot(root, paths)?;
-    if current.entries.len() != accepted_files().count()
-        || !accepted_files().all(|(path, entry)| current.entries.get(path) == Some(entry))
-    {
+    if current != expected_snapshot {
         return Err(NewerProjectFiles { written: true }.into());
     }
     history::ensure_published_state(&published, &current)?;
@@ -2485,6 +2508,7 @@ mod tests {
             let at = |path: &str| PathBuf::from(path);
             for step in [
                 PublicationStep::BeforeRecord,
+                PublicationStep::BeforeConcurrencyCheck,
                 PublicationStep::MovedAside(at(MAP)),
                 PublicationStep::PublishedIn(at(MAP)),
                 PublicationStep::MovedAside(at(SWAPPED[0])),
@@ -2498,7 +2522,7 @@ mod tests {
             ] {
                 assert!(walked.contains(&step), "no kill at {step:?}: {walked:?}");
             }
-            assert_eq!(walked.len(), 18, "{walked:?}");
+            assert_eq!(walked.len(), 19, "{walked:?}");
         }
         Ok(())
     }

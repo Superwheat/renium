@@ -464,19 +464,54 @@ fn told_alone_in_block_store(
         version: SETTINGS_BINARY_VERSION,
         instances: std::mem::take(instances),
     };
-    let projected = store.project_columns(
-        &mut reference.instances,
-        |name| name == UNIQUE_ID || name == "CurrentCamera",
-        |instance, name, value| {
-            (name == UNIQUE_ID || instance.parent_index.is_none()).then_some(value)
+    let (ref_uids, obs_pair) = rayon::join(
+        || store.extract_unique_ids_and_root_camera(&mut reference.instances),
+        || {
+            let observed = skeleton_parallel(state, records, lookup).ok()?;
+            let obs_uids: Vec<Option<Box<str>>> = (0..records.len())
+                .into_par_iter()
+                .map(|index| {
+                    let instance = &observed.instances[index];
+                    if let Some(uid) = instance.properties.get(UNIQUE_ID).and_then(|v| {
+                        v.as_object()
+                            .filter(|o| o.get("_type").and_then(Value::as_str) == Some("UniqueId"))
+                            .and_then(|o| o.get("value").and_then(Value::as_str))
+                    }) {
+                        let trimmed = uid.trim();
+                        if !trimmed.is_empty() && !trimmed.chars().all(|c| c == '0') {
+                            return Some(trimmed.into());
+                        }
+                    }
+                    captured_persistent_identity(state, index)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && !s.chars().all(|c| c == '0'))
+                        .map(Box::<str>::from)
+                })
+                .collect();
+            Some((observed, obs_uids))
         },
     );
-    let result = projected
+    let result = ref_uids
         .ok()
-        .and_then(|()| told_alone_with_reference(&reference, state, records, lookup));
+        .zip(obs_pair)
+        .and_then(|(ref_uids, (observed, obs_uids))| {
+            let (ids, in_store) =
+                crate::settings::equivalence::settings_ids_told_alone_with_unique_ids(
+                    &reference, &observed, &ref_uids, &obs_uids,
+                )?;
+            let mut in_state = vec![None; reference.instances.len()];
+            for (index, stored) in in_store.into_iter().enumerate() {
+                if let Some(stored) = stored {
+                    in_state[stored] = Some(index);
+                }
+            }
+            Some((Moved::paired(in_state, records.len()), ids))
+        });
     if result.is_some() {
         for instance in &mut reference.instances {
-            instance.properties.clear();
+            if !instance.properties.is_empty() {
+                instance.properties.clear();
+            }
         }
         *instances = reference.instances;
     }
@@ -2298,7 +2333,7 @@ fn split_fast_fallback(
         if res.is_none() {
             fpos.push(pos);
             frows.push(changed[pos]);
-            fstored.push(changed[pos]);
+            fstored.push(stored_at[pos]);
         }
     }
     (fpos, frows, fstored)
@@ -2572,7 +2607,7 @@ fn changed_rows<'a>(
     });
     let mut stored_batches = preopened.map(RowBatches::from_blocks);
     let mut first_stored_from_legacy: Option<Vec<SettingsBytecodeInstance>> = None;
-    let can_fast_compare = moved.is_none() && !paired && !rows.is_empty();
+    let can_fast_compare = !changed.is_empty();
     let ids = if let Some(read) = read.as_mut() {
         std::mem::take(&mut read.ids)
     } else {
@@ -2634,7 +2669,7 @@ fn changed_rows<'a>(
             state,
             &records,
             lookup,
-            changed,
+            (changed, &stored_at[..changed.len()], moved),
             root_service,
             long_hashes.as_deref(),
         )?)
@@ -2782,9 +2817,10 @@ fn changed_rows<'a>(
             let stored_cam = match camera {
                 Some(c) => c,
                 None => {
+                    let stored_cam_row = stored_at[changed.len()];
                     let stored_batches_ref =
                         stored_batches.as_ref().context("No store was opened")?;
-                    let mut read_cam = stored_batches_ref.read(&[cam_row])?;
+                    let mut read_cam = in_state(stored_batches_ref.read(&[stored_cam_row])?);
                     read_cam.pop().context("Missing viewport camera row")?
                 }
             };
@@ -3001,8 +3037,6 @@ fn changed_rows<'a>(
         source_index: *camera,
         instance: stored,
     });
-    // Comparisons run in parallel. Only the new store's columns and compressed
-    // output share the export's allocation gate with other encoders.
     let _store_guard = store_gate.map(LockRecover::lock_recover);
     let hint = blocks::EncodeStateHint {
         previous: prev_store.as_ref(),
@@ -3403,6 +3437,40 @@ fn under_stored_ids<'a>(
 /// class and parent. Only a service root, whose values name the viewport
 /// camera, and the cameras, whose values say whether their enum items carry
 /// their types, hold what the document gives them.
+fn skeleton_parallel(
+    state: &ServiceState,
+    records: &[SettingsBinaryInstance<'_>],
+    lookup: &SettingsBinaryInstanceLookup<'_>,
+) -> Result<SettingsBytecode> {
+    let budget = DecodeBudget::new(MAX_SETTINGS_BYTECODE_BYTES);
+    let scope = ConversionScope {
+        lookup,
+        instance_count: records.len(),
+        budget: &budget,
+        string_ids: &SettingsStringIdMap::default(),
+        wire_bytes: None,
+    };
+    let unlimited = DecodeBudget::new(usize::MAX);
+    let instances = records
+        .par_iter()
+        .map(|record| {
+            if record.parent_index.is_none() || record.class_name == "Camera" {
+                convert_chunk(state, std::slice::from_ref(record), scope)?
+                    .into_iter()
+                    .next()
+                    .context("Missing converted skeleton instance")
+            } else {
+                bare_instance(record, &unlimited)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_settings_hierarchy(&instances)?;
+    Ok(SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances,
+    })
+}
+
 fn skeleton(
     state: &ServiceState,
     records: &[SettingsBinaryInstance<'_>],

@@ -2,11 +2,13 @@
 // and transaction authorization belong to Rust; this scope owns engine objects
 // and restores its factory interception before returning to the caller.
 #include <algorithm>
+#include <array>
 #include <intrin.h>
 #include <memory_resource>
 #include <unordered_map>
 #include <unordered_set>
 #include "renium_batch_pacer.h"
+#include "renium_reader_mutations.h"
 
 namespace renium_reader {
 using Create = SharedInstance*(__fastcall*)(void*, SharedInstance*, void*, bool);
@@ -36,14 +38,15 @@ struct CreatedWire
 };
 struct Response
 {
-    std::uint32_t magic = 0x52494E52, version = 7, status = 1, count = 0;
+    std::uint32_t magic = 0x52494E52, version = 8, status = 1, count = 0;
     std::uint64_t queueMicros = 0, readMicros = 0, identityMicros = 0;
     std::uint64_t historySkipped = 0;
     std::uint32_t state = 0, batchCount = 0;
     char error[256]{};
+    std::uint32_t engineRemovedCount = 0, engineCreatedCount = 0;
 };
 static_assert(sizeof(CreatedWire) == 56);
-static_assert(sizeof(Response) == 312);
+static_assert(sizeof(Response) == 320);
 enum class ReaderPhase : unsigned {
     Setup, DispatchQueue, TargetAndHookSetup, EngineRead, ValidateRestore,
     IdentityRelease, ResponseWrite, CompletionHandoff, Pacing, Producer, Count
@@ -341,6 +344,12 @@ public:
     ~Scope() { Restore(); }
 
     const std::vector<Created>& CreatedInstances() const { return created; }
+    void CollectAnchors(std::vector<void*>& out) const
+    {
+        for (const auto& [factory, entry] : entries)
+            for (const auto& [ordinal, anchor] : entry.anchors)
+                if (anchor.instance) out.push_back(anchor.instance);
+    }
     std::uint64_t HistorySkipped() const { return historySkipped; }
     std::uint64_t FactoryTicks() const { return factoryTicks; }
     std::uint64_t ConstructorTicks() const { return constructorTicks; }
@@ -507,6 +516,7 @@ struct Parameters
     std::uint32_t batchCount, reserved;
     HistoryContract history;
     std::uint32_t aliasCount, batchPauseMs;
+    std::uint32_t parentOffset, pad0;
 };
 struct ClassWire { char name[256]; std::uint32_t count, script; };
 struct TargetWire
@@ -516,7 +526,7 @@ struct TargetWire
     char debugId[48];
     std::uint32_t ordinal, roles; // bit 0: retained snapshot container.
 };
-static_assert(sizeof(Parameters) == 1480);
+static_assert(sizeof(Parameters) == 1488);
 static_assert(sizeof(Alias) == 12);
 static_assert(sizeof(ClassWire) == 264);
 static_assert(sizeof(TargetWire) == 80);
@@ -537,6 +547,9 @@ struct Task
     ReniumSerializerParams identityResult{};
     RunState identity{};
     std::vector<CreatedWire> receipt;
+    BatchMutationTracker mutations;
+    std::vector<std::uint32_t> engineRemovedIndices;
+    std::vector<std::array<char, 48>> engineCreatedIds;
     HANDLE output = INVALID_HANDLE_VALUE;
     std::uint64_t identityMicros = 0;
     std::uint32_t phaseState = 0;
@@ -571,17 +584,78 @@ struct Task
         destination[text.size] = 0;
         DestroyDebugString(&identity);
     }
+    std::pair<const SharedInstance*, std::size_t> ChildrenOf(void* container) const
+    {
+        const auto children = *reinterpret_cast<const SharedVector* const*>(
+            static_cast<const unsigned char*>(container) + result.childrenOffset);
+        const auto count = CaptureChildCount(children);
+        return {count ? children->begin : nullptr, count};
+    }
+    void* ParentOf(void* instance) const
+    {
+        return *reinterpret_cast<void* const*>(
+            static_cast<const unsigned char*>(instance) + result.parentOffset);
+    }
+    SharedInstance SelfOf(void* instance) const
+    {
+        return *reinterpret_cast<const SharedInstance*>(
+            static_cast<const unsigned char*>(instance) + result.selfOffset);
+    }
+    void SnapshotBatchPreState()
+    {
+        std::vector<void*> anchors;
+        scope.CollectAnchors(anchors);
+        mutations.SnapshotBatchPreState(
+            targets,
+            result.history.target,
+            [](const TargetWire& t) { return t.target.instance; },
+            anchors,
+            [this](void* container) { return ChildrenOf(container); });
+    }
+    void ScanBatchEngineMutations(std::size_t batchStart, std::size_t batchEnd)
+    {
+        mutations.ScanBatchEngineMutations(
+            targets,
+            result.history.target,
+            [](const TargetWire& t) { return t.target.instance; },
+            scope.CreatedInstances(),
+            batchStart,
+            batchEnd,
+            [](const Created& c) { return c.target.instance; },
+            reinterpret_cast<void*>(result.dataModel),
+            [this](void* instance) { return ParentOf(instance); },
+            [this](void* instance) { return SelfOf(instance); },
+            [this](void* container) { return ChildrenOf(container); },
+            [](void* owner) { return AddOwnerReference(owner); });
+    }
+    void ReleaseEngineCreated() noexcept
+    {
+        mutations.ReleaseEngineCreated([](void* owner) { ReleaseOwnerReference(owner); });
+    }
     void CaptureCreated()
     {
         LARGE_INTEGER begin{}, end{}, frequency{};
         QueryPerformanceFrequency(&frequency);
         QueryPerformanceCounter(&begin);
-        receipt.reserve(scope.CreatedInstances().size());
-        for (const auto& created : scope.CreatedInstances())
+        const auto& allCreated = scope.CreatedInstances();
+        receipt.reserve(allCreated.size());
+        engineRemovedIndices.clear();
+        for (std::size_t idx = 0; idx < allCreated.size(); ++idx)
         {
+            const auto& created = allCreated[idx];
             CreatedWire row{created.classIndex, created.ordinal, {}};
             ReadIdentity(created.target.instance, row.debugId);
             receipt.push_back(row);
+            if (idx < mutations.createdRemoved.size() && mutations.createdRemoved[idx] != 0)
+                engineRemovedIndices.push_back(static_cast<std::uint32_t>(idx));
+        }
+        engineCreatedIds.clear();
+        engineCreatedIds.reserve(mutations.engineCreated.size());
+        for (const auto& item : mutations.engineCreated)
+        {
+            std::array<char, 48> id{};
+            ReadIdentity(item.instance, *reinterpret_cast<char(*)[48]>(id.data()));
+            engineCreatedIds.push_back(id);
         }
         QueryPerformanceCounter(&end);
         identityMicros = ElapsedMicros(begin, end, frequency);
@@ -598,6 +672,8 @@ struct Task
         response.historySkipped = scope.HistorySkipped();
         response.state = phaseState;
         response.batchCount = static_cast<std::uint32_t>(batchMicros.size());
+        response.engineRemovedCount = static_cast<std::uint32_t>(engineRemovedIndices.size());
+        response.engineCreatedCount = static_cast<std::uint32_t>(engineCreatedIds.size());
         strncpy_s(response.error, result.error, _TRUNCATE);
         DWORD written = 0;
         if (!WriteFile(output, &response, sizeof(response), &written, nullptr) || written != sizeof(response))
@@ -608,6 +684,12 @@ struct Task
         const auto timingBytes = static_cast<DWORD>(batchMicros.size() * sizeof(std::uint64_t));
         if (!WriteFile(output, batchMicros.data(), timingBytes, &written, nullptr) || written != timingBytes)
             throw std::runtime_error("Cannot publish native import batch timings");
+        const auto removedBytes = static_cast<DWORD>(engineRemovedIndices.size() * sizeof(std::uint32_t));
+        if (removedBytes && (!WriteFile(output, engineRemovedIndices.data(), removedBytes, &written, nullptr) || written != removedBytes))
+            throw std::runtime_error("Cannot publish native import engine-removed indices");
+        const auto createdBytes = static_cast<DWORD>(engineCreatedIds.size() * 48);
+        if (createdBytes && (!WriteFile(output, engineCreatedIds.data(), createdBytes, &written, nullptr) || written != createdBytes))
+            throw std::runtime_error("Cannot publish native import engine-created identities");
     }
     void ValidateTargets()
     {
@@ -660,10 +742,13 @@ inline void ExecuteFinally(Task* task)
         }
         LARGE_INTEGER begin{}, end{}, frequency{};
         QueryPerformanceFrequency(&frequency);
+        const std::size_t batchStart = task->scope.CreatedInstances().size();
+        task->SnapshotBatchPreState();
         task->phaseState |= 2;
         task->clock.Next(ReaderPhase::EngineRead);
         QueryPerformanceCounter(&begin);
         task->scope.Read(reinterpret_cast<void*>(task->result.dataModel), task->inputs[task->inputIndex]);
+        task->ScanBatchEngineMutations(batchStart, task->scope.CreatedInstances().size());
         QueryPerformanceCounter(&end);
         task->batchMicros[task->inputIndex] = ElapsedMicros(begin, end, frequency);
         if (task->inputIndex + 1 == task->inputs.size()) task->phaseState |= 4;
@@ -679,6 +764,7 @@ inline void CaptureCreatedFinally(Task* task)
     __try { task->CaptureCreated(); }
     __finally
     {
+        task->ReleaseEngineCreated();
         task->scope.ReleaseCreated();
         task->scope.ReleaseBindings();
         task->owners.clear();
@@ -717,6 +803,7 @@ inline DWORD Queue(Parameters* parameters)
         || parameters->inputLength < 32 || parameters->inputLength > CaptureMaxBytes
         || parameters->childrenOffset > 0x200 || parameters->childrenOffset % 8
         || parameters->selfOffset > 0x80 || parameters->selfOffset % 8
+        || !parameters->parentOffset || parameters->parentOffset > 0x200 || parameters->parentOffset % 8
         || !parameters->outputPath[0]
         || wmemchr(parameters->outputPath, 0, 520) == nullptr)
         throw std::runtime_error("Invalid native import parameters");

@@ -168,38 +168,61 @@ pub(crate) fn prepare_project_replacement_with_bulk(
                 }
             }
             let step_started = std::time::Instant::now();
-            let changed = if read == StoresRead::Whole {
-                ChangedInstances::Whole(None)
+            let replaced_fast = if read != StoresRead::Whole
+                && let (
+                    Some(SnapshotEntry::File(desired_bytes)),
+                    Some(SnapshotEntry::File(observed_bytes)),
+                ) = (desired.entries.get(path), observed.entries.get(path))
+                && desired_bytes.len() >= CHANGED_INSTANCES_MIN_BYTES
+                && store_payload_len(observed_bytes).saturating_mul(4)
+                    < store_payload_len(desired_bytes)
+                && crate::settings::bytecode::blocks::instance_count(observed_bytes)
+                    .zip(crate::settings::bytecode::blocks::instance_count(desired_bytes))
+                    .is_some_and(|(obs_rows, des_rows)| obs_rows.saturating_mul(4) < des_rows)
+            {
+                replaced_store_alone(desired.entries.get(path), observed.entries.get(path))?
             } else {
-                changed_instances_alone(
-                    path,
-                    desired.entries.get(path),
-                    observed.entries.get(path),
-                    read == StoresRead::ChangedOfBoth,
-                    imported.is_some(),
-                    true,
-                )?
+                None
             };
-            let (decoded, bare) = match changed {
-                ChangedInstances::None => return Ok((path.clone(), PreparedSlot::Unchanged)),
-                ChangedInstances::Prepared(change) => {
-                    return Ok((path.clone(), PreparedSlot::Prepared(*change)));
-                }
-                ChangedInstances::Whole(None) if read != StoresRead::Whole => (
-                    None,
-                    replaced_store_alone(desired.entries.get(path), observed.entries.get(path))?,
-                ),
-                ChangedInstances::Whole(current) | ChangedInstances::Apart(current) => {
-                    (current, None)
-                }
-                ChangedInstances::Imported(copies) => {
-                    if let Some(imported) = imported {
-                        imported
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(path.clone());
+            let (decoded, bare) = if let Some(bare) = replaced_fast {
+                (None, Some(bare))
+            } else {
+                let changed = if read == StoresRead::Whole {
+                    ChangedInstances::Whole(None)
+                } else {
+                    changed_instances_alone(
+                        path,
+                        desired.entries.get(path),
+                        observed.entries.get(path),
+                        read == StoresRead::ChangedOfBoth,
+                        imported.is_some(),
+                        true,
+                    )?
+                };
+                match changed {
+                    ChangedInstances::None => return Ok((path.clone(), PreparedSlot::Unchanged)),
+                    ChangedInstances::Prepared(change) => {
+                        return Ok((path.clone(), PreparedSlot::Prepared(*change)));
                     }
-                    (None, Some(*copies))
+                    ChangedInstances::Whole(None) if read != StoresRead::Whole => (
+                        None,
+                        replaced_store_alone(
+                            desired.entries.get(path),
+                            observed.entries.get(path),
+                        )?,
+                    ),
+                    ChangedInstances::Whole(current) | ChangedInstances::Apart(current) => {
+                        (current, None)
+                    }
+                    ChangedInstances::Imported(copies) => {
+                        if let Some(imported) = imported {
+                            imported
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(path.clone());
+                        }
+                        (None, Some(*copies))
+                    }
                 }
             };
             let (current, previous) = match bare {
@@ -845,9 +868,36 @@ fn changed_instances_compared(
     };
     let paired = |mut told: Told| {
         let structures = told.structures.take();
+        let had_by_order = !told.by_order.is_empty();
         Ok(
             match changed_instances_placed(desired, observed, how, Some(told), structures)? {
-                ChangedInstances::Apart(current) => ChangedInstances::Whole(current),
+                ChangedInstances::Apart(current) => {
+                    if had_by_order
+                        && let Some((files, studio)) = copies
+                        && let Some(compact_told) = told_compact(files, studio)?
+                    {
+                        match changed_instances_placed(
+                            desired,
+                            observed,
+                            how,
+                            Some(compact_told),
+                            None,
+                        )? {
+                            ChangedInstances::Apart(compact_current) => {
+                                ChangedInstances::Whole(compact_current.or(current))
+                            }
+                            changed => {
+                                #[cfg(test)]
+                                if matches!(changed, ChangedInstances::Prepared(_)) {
+                                    TOLD_ALONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                changed
+                            }
+                        }
+                    } else {
+                        ChangedInstances::Whole(current)
+                    }
+                }
                 changed => {
                     #[cfg(test)]
                     if matches!(changed, ChangedInstances::Prepared(_)) {
@@ -862,18 +912,24 @@ fn changed_instances_compared(
         && apart.lock_recover().contains(path)
     {
         match told_alone(files, studio, None) {
-            Some((told, true)) => {
+            Some((told, as_many_apart)) => {
+                if !as_many_apart {
+                    apart.lock_recover().remove(path);
+                }
                 #[cfg(test)]
-                PAIRED_FIRST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if as_many_apart {
+                    PAIRED_FIRST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 return paired(told);
             }
-            _ => {
+            None => {
                 apart.lock_recover().remove(path);
+                if let Some(told) = told_compact(files, studio)? {
+                    return paired(told);
+                }
             }
         }
     }
-    // Copies whose structures stand apart are paired without a comparison by
-    // place, which would read every value of both to say so.
     let structures = match (desired, observed) {
         (Some(SnapshotEntry::File(files)), Some(SnapshotEntry::File(studio))) => {
             structures_of(files, studio)
@@ -886,18 +942,30 @@ fn changed_instances_compared(
         {
             (None, Some((files, studio)))
         }
+        Some((files, studio))
+            if copies.is_some()
+                && files.instances.len() != studio.instances.len()
+                && Moved::between_copies(&studio.instances, &files.instances)
+                    .flatten()
+                    .is_none() =>
+        {
+            (None, Some((files, studio)))
+        }
         structures => match changed_instances_placed(desired, observed, how, None, structures)? {
             ChangedInstances::Apart(current) => (current, None),
             changed => return Ok(changed),
         },
     };
-    if let Some((files, studio)) = copies
-        && let Some((told, as_many_apart)) = told_alone(files, studio, structures)
-    {
-        if as_many_apart {
-            apart.lock_recover().insert(path.to_path_buf());
+    if let Some((files, studio)) = copies {
+        if let Some((told, as_many_apart)) = told_alone(files, studio, structures) {
+            if as_many_apart {
+                apart.lock_recover().insert(path.to_path_buf());
+            }
+            return paired(told);
         }
-        return paired(told);
+        if let Some(told) = told_compact(files, studio)? {
+            return paired(told);
+        }
     }
     Ok(ChangedInstances::Whole(current))
 }
@@ -1011,6 +1079,29 @@ fn told_alone(
     ))
 }
 
+/// Bounded-memory fallback for `told_alone` when UniqueIds do not uniquely pair
+/// ambiguous twins (for example after a native import): runs compact streamed
+/// identity matching on the v12 block stores without decoding whole documents.
+fn told_compact(desired_bytes: &[u8], observed_bytes: &[u8]) -> Result<Option<Told>> {
+    if !compared_by_instances(desired_bytes, observed_bytes) {
+        return Ok(None);
+    }
+    let Some(files_count) = crate::settings::bytecode::blocks::instance_count(desired_bytes) else {
+        return Ok(None);
+    };
+    let Some((ids, places)) =
+        crate::settings::equivalence::match_block_stores_compact(desired_bytes, observed_bytes)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Told {
+        moved: Moved::paired(places, files_count),
+        ids,
+        by_order: Vec::new(),
+        structures: None,
+    }))
+}
+
 /// Whether two copies of a store are compared by their instances: a small
 /// store file is read whole, and so is a store Studio holds nearly empty, or
 /// holds far more of.
@@ -1024,9 +1115,8 @@ fn compared_by_instances(desired_bytes: &[u8], observed_bytes: &[u8]) -> bool {
         && desired_len.saturating_mul(4) >= observed_len
 }
 
-/// The instances of two v12 copies of a store that hold as many, without
-/// their values, where the two are compared by their instances. Their
-/// digests read them.
+/// The instances of two v12 copies of a store, without their values, where the
+/// two are compared by their instances. Their digests and pairing reuse them.
 fn structures_of(
     desired_bytes: &[u8],
     observed_bytes: &[u8],
@@ -1036,7 +1126,7 @@ fn structures_of(
         instance_count(desired_bytes),
         instance_count(observed_bytes),
     );
-    if !matches!(counts, (Some(files), Some(studio)) if files == studio)
+    if !matches!(counts, (Some(_), Some(_)))
         || !compared_by_instances(desired_bytes, observed_bytes)
     {
         return None;
@@ -1162,6 +1252,44 @@ fn names_one_taken_by_order(
             .any(|index| names(&files.instances[*index], &files_ids, &of_files))
 }
 
+fn precompute_moved_run(
+    told: Option<&Told>,
+    structures: Option<&(SettingsBytecode, SettingsBytecode)>,
+    as_many: bool,
+) -> Option<Option<Moved>> {
+    if told.is_some() || as_many {
+        return Some(None);
+    }
+    let Some((files, studio)) = structures else {
+        return Some(None);
+    };
+    let moved = Moved::between_copies(&studio.instances, &files.instances).flatten()?;
+    Some(Some(moved))
+}
+
+fn moved_for_placed(
+    told: Option<&Told>,
+    precomputed: Option<&Moved>,
+    as_many: bool,
+    desired_bytes: &[u8],
+    studio: &[SettingsBytecodeInstance],
+) -> Option<Option<Moved>> {
+    if let Some(told) = told {
+        return Some(Some(told.moved.clone()));
+    }
+    if let Some(moved) = precomputed {
+        return Some(Some(moved.clone()));
+    }
+    if as_many {
+        return Some(None);
+    }
+    let moved = crate::settings::bytecode::property_edit::decode_for_row_chunks(desired_bytes)
+        .ok()
+        .and_then(|(files, _)| Moved::between_copies(studio, &files.instances))
+        .flatten()?;
+    Some(Some(moved))
+}
+
 /// `changed_instances_alone` for copies whose instances stand at the same
 /// places, one run apart, or as `told` pairs them. `as_stored` is for two
 /// copies of the files' own (`edited_store_alone`). `structures` are the
@@ -1176,7 +1304,7 @@ fn changed_instances_placed(
 ) -> Result<ChangedInstances> {
     use crate::settings::bytecode::blocks::instance_count;
     use crate::settings::bytecode::property_edit::{
-        StoreRows, decode_for_row_chunks, decode_rows, names_an_instance_by_id, whole_row_digests,
+        StoreRows, decode_rows, names_an_instance_by_id, whole_row_digests,
         whole_row_digests_of_both,
     };
     use crate::settings::equivalence::{
@@ -1211,16 +1339,19 @@ fn changed_instances_placed(
     };
     // The digests place the parents of Studio's instances among the files';
     // its document holds them where Studio has them.
+    let Some(precomputed_moved) = precompute_moved_run(told.as_ref(), structures.as_ref(), as_many)
+    else {
+        return Ok(ChangedInstances::Apart(None));
+    };
     let own_parents = std::sync::OnceLock::new();
     let stand = |studio: &[SettingsBytecodeInstance]| {
-        let moved = match &told {
-            Some(told) => Some(told.moved.clone()),
-            None => (!as_many)
-                .then(|| decode_for_row_chunks(desired_bytes).ok())
-                .flatten()
-                .and_then(|(files, _)| Moved::between_copies(studio, &files.instances))
-                .flatten(),
-        };
+        let moved = moved_for_placed(
+            told.as_ref(),
+            precomputed_moved.as_ref(),
+            as_many,
+            desired_bytes,
+            studio,
+        )?;
         if moved.is_some() {
             let parents = studio.iter().map(|instance| instance.parent_index);
             let _ = own_parents.set(parents.collect::<Vec<_>>());
@@ -1602,7 +1733,7 @@ fn replaced_store_alone(
         Some(_) => return Ok(None),
     };
     if desired_bytes.len() < CHANGED_INSTANCES_MIN_BYTES
-        || !cfg!(test) && observed_bytes.saturating_mul(4) >= store_payload_len(desired_bytes)
+        || observed_bytes.saturating_mul(4) >= store_payload_len(desired_bytes)
     {
         return Ok(None);
     }
@@ -1631,6 +1762,11 @@ fn replaced_store_beside(
         is_block_store(desired_bytes)
             && (instances.iter()).all(|instance| instance.properties.values().all(plain))
     };
+    let unique_ids = previous
+        .instances
+        .iter()
+        .filter_map(|instance| instance.properties.get("UniqueId"))
+        .collect::<Vec<_>>();
     let read = match files.filter(|instances| as_read(instances)) {
         Some(instances) => retained_row_columns(desired_bytes).ok().map(|columns| {
             let version = SETTINGS_BINARY_VERSION;
@@ -1639,9 +1775,14 @@ fn replaced_store_beside(
         None => decode_for_row_chunks(desired_bytes)
             .ok()
             .and_then(|(mut structure, columns)| {
+                if unique_ids.is_empty() {
+                    return Some((structure, columns));
+                }
                 let unique = |name: &str| name == "UniqueId";
                 let projected =
-                    columns.project_properties(&mut structure, unique, |_, _, value| Some(value));
+                    columns.project_properties(&mut structure, unique, |_, _, value| {
+                        unique_ids.contains(&&value).then_some(value)
+                    });
                 projected.ok().map(|()| (structure, columns))
             }),
     };
@@ -1667,66 +1808,71 @@ fn replaced_store_beside(
         .iter()
         .map(|instance| (instance.name.as_str(), instance.class_name.as_str()))
         .collect::<HashSet<_>>();
-    let unique_ids = previous
-        .instances
-        .iter()
-        .filter_map(|instance| instance.properties.get("UniqueId"))
-        .collect::<Vec<_>>();
-    let mut read = skeleton
-        .iter()
-        .map(|instance| {
-            let Some(parent) = instance.parent_index else {
-                return true;
-            };
-            ids.contains(instance.settings_id.as_str())
-                || named.contains(&(instance.name.as_str(), instance.class_name.as_str()))
-                || instance
-                    .properties
-                    .get("UniqueId")
-                    .is_some_and(|unique_id| unique_ids.contains(&unique_id))
-                || instance.class_name == "Camera"
-                || crate::editor::sync::is_lua_source_class(&instance.class_name)
-                || skeleton.get(parent).is_some_and(|parent| {
-                    parent.parent_index.is_none()
-                        && crate::roblox::services::is_engine_managed_container(
-                            &parent.class_name,
-                            &instance.class_name,
-                        )
-                })
-        })
-        .collect::<Vec<_>>();
-    for index in 0..count {
-        if !read[index] {
+    let mut match_read = vec![false; count];
+    let mut script_read = vec![false; count];
+    for (index, instance) in skeleton.iter().enumerate() {
+        let Some(parent) = instance.parent_index else {
+            match_read[index] = true;
             continue;
+        };
+        if ids.contains(instance.settings_id.as_str())
+            || named.contains(&(instance.name.as_str(), instance.class_name.as_str()))
+            || instance
+                .properties
+                .get("UniqueId")
+                .is_some_and(|unique_id| unique_ids.contains(&unique_id))
+            || instance.class_name == "Camera"
+            || skeleton.get(parent).is_some_and(|parent| {
+                parent.parent_index.is_none()
+                    && crate::roblox::services::is_engine_managed_container(
+                        &parent.class_name,
+                        &instance.class_name,
+                    )
+            })
+        {
+            match_read[index] = true;
         }
-        let mut parent = skeleton[index].parent_index;
-        let mut steps = 0;
-        while let Some(at) = parent.filter(|at| *at < count && !read[*at]) {
-            read[at] = true;
-            parent = skeleton[at].parent_index;
-            steps += 1;
-            if steps > count {
-                break;
-            }
+        if crate::editor::sync::is_lua_source_class(&instance.class_name) {
+            script_read[index] = true;
         }
     }
+    let mark_ancestors = |flags: &mut [bool]| {
+        for index in 0..count {
+            if !flags[index] {
+                continue;
+            }
+            let mut parent = skeleton[index].parent_index;
+            let mut steps = 0;
+            while let Some(at) = parent.filter(|at| *at < count && !flags[*at]) {
+                flags[at] = true;
+                parent = skeleton[at].parent_index;
+                steps += 1;
+                if steps > count {
+                    break;
+                }
+            }
+        }
+    };
+    mark_ancestors(&mut match_read);
+    mark_ancestors(&mut script_read);
     let namesakes = (0..count)
-        .filter(|&index| read[index])
+        .filter(|&index| match_read[index])
         .map(|index| (skeleton[index].parent_index, skeleton[index].name.as_str()))
         .collect::<HashSet<_>>();
     // The import returns the rows for all post-import fields, including pivots.
-    let read = (0..count)
-        .filter(|&index| {
-            namesakes.contains(&(skeleton[index].parent_index, skeleton[index].name.as_str()))
-        })
-        .collect::<Vec<_>>();
-    drop(namesakes);
-    if read.len() == count {
-        return Ok(None);
-    }
     let mut wanted = vec![false; count];
-    for index in read {
-        wanted[index] = true;
+    let mut wanted_count = 0usize;
+    for index in 0..count {
+        if script_read[index]
+            || namesakes.contains(&(skeleton[index].parent_index, skeleton[index].name.as_str()))
+        {
+            wanted[index] = true;
+            wanted_count += 1;
+        }
+    }
+    drop(namesakes);
+    if wanted_count == count {
+        return Ok(None);
     }
     drop(chosen);
     if columns.materialize_selected(&mut current, &wanted).is_err() {
@@ -1791,6 +1937,28 @@ pub(crate) fn edited_store_alone(
     }
 }
 
+fn replaced_store_for_diff(
+    (_path, left, right): (&Path, Option<&SnapshotEntry>, Option<&SnapshotEntry>),
+    prepared: Option<&mut Option<PreparedEditorSettingsChange>>,
+) -> Result<Option<bool>> {
+    let Some((mut current, mut previous)) = replaced_store_alone(left, right)? else {
+        return Ok(None);
+    };
+    if !align_settings_ids_to_reference(&current, &mut previous) {
+        return Ok(None);
+    }
+    read_where_paired(&mut current, &previous, left)?;
+    if settings_documents_equivalent(&current, &previous) {
+        return Ok(Some(true));
+    }
+    if let Some(prepared) = prepared {
+        crate::settings::equivalence::inherit_workspace_viewport_reference(&mut current, &previous);
+        align_equivalent_values(&current, &mut previous);
+        *prepared = Some(PreparedEditorSettingsChange { previous, current });
+    }
+    Ok(Some(false))
+}
+
 /// Whether two copies of a store are equivalent, by the instances that
 /// differ (`changed_instances_alone`), with the change where they are not
 /// and `prepared` takes one. `None` where the whole documents have to say
@@ -1808,6 +1976,9 @@ fn store_copies_by_changed(
                     *prepared = Some(*change);
                 }
                 Some(false)
+            }
+            ChangedInstances::Whole(None) => {
+                return replaced_store_for_diff((path, left, right), prepared);
             }
             _ => None,
         },
@@ -1837,14 +2008,15 @@ pub(crate) fn snapshot_differences_prepared(
         .map(|path| {
             let mut settings = None;
             let (ours, theirs) = (left.entries.get(&path), right.entries.get(&path));
-            let store = by_changed
-                && ours != theirs
+            let is_store = ours != theirs
                 && path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(is_service_settings_file_name);
-            let told = if store {
+            let told = if by_changed && is_store {
                 store_copies_by_changed((&path, ours, theirs), prepare.then_some(&mut settings))?
+            } else if !by_changed && prepare && is_store {
+                replaced_store_for_diff((&path, ours, theirs), Some(&mut settings))?
             } else {
                 None
             };
@@ -2491,5 +2663,89 @@ mod heavy_delta_tests {
             serde_json::json!("http://www.roblox.com/asset/?id=12345"),
         );
         assert_eq!(delta_weight(&current, &previous).native_writes, 0);
+    }
+
+    #[test]
+    fn replaced_store_alone_enforces_size_ratio_in_tests() {
+        let large = document(80, "Part");
+        let small = document(1, "Part");
+        let medium = document(40, "Part");
+        let large_bytes = crate::settings::bytecode::encode_settings_bytecode(&large).unwrap();
+        let small_bytes = crate::settings::bytecode::encode_settings_bytecode(&small).unwrap();
+        let medium_bytes = crate::settings::bytecode::encode_settings_bytecode(&medium).unwrap();
+
+        let desired = SnapshotEntry::File(large_bytes);
+        let tiny_obs = SnapshotEntry::File(small_bytes);
+        let half_obs = SnapshotEntry::File(medium_bytes);
+
+        let result = replaced_store_alone(Some(&desired), Some(&tiny_obs)).unwrap();
+        assert!(result.is_some());
+        let refused = replaced_store_alone(Some(&desired), Some(&half_obs)).unwrap();
+        assert!(refused.is_none());
+    }
+
+    #[test]
+    fn prepare_project_replacement_with_bulk_emits_bulk_patch_without_promoting_service() {
+        let root = crate::tests::support::temp_dir("r10-replacement-bulk-branch");
+        let src = root.join("src");
+        let ws_dir = src.join("ReplicatedStorage");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let store_rel = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
+
+        let count = BULK_PROPERTY_MIN_INSTANCES;
+        let mut studio_doc = document(count, "Part");
+        let mut desired_doc = document(count, "Part");
+        for i in 1..=count {
+            studio_doc.instances[i]
+                .properties
+                .insert("Transparency".into(), serde_json::json!(0.0));
+            desired_doc.instances[i]
+                .properties
+                .insert("Transparency".into(), serde_json::json!(0.5));
+        }
+        let studio_bytes =
+            crate::settings::bytecode::encode_settings_bytecode(&studio_doc).unwrap();
+        let desired_bytes =
+            crate::settings::bytecode::encode_settings_bytecode(&desired_doc).unwrap();
+
+        let studio = ProjectSnapshot {
+            entries: std::collections::BTreeMap::from([(
+                store_rel.clone(),
+                SnapshotEntry::File(studio_bytes),
+            )]),
+        };
+        let desired = ProjectSnapshot {
+            entries: std::collections::BTreeMap::from([(
+                store_rel.clone(),
+                SnapshotEntry::File(desired_bytes),
+            )]),
+        };
+        let paths = HashSet::from([store_rel.clone()]);
+        let mut prepared = HashMap::new();
+        let bulk_patches = std::sync::Mutex::new(HashMap::new());
+        let unchanged = prepare_project_replacement_with_bulk(
+            &desired,
+            &studio,
+            &paths,
+            &mut prepared,
+            StoresRead::ChangedOfBoth,
+            None,
+            Some(&bulk_patches),
+        )
+        .unwrap();
+        assert!(
+            prepared.is_empty(),
+            "plain property edit must not promote Workspace to prepared/native replacement"
+        );
+        assert!(
+            unchanged.is_empty(),
+            "modified Workspace must not be marked unchanged"
+        );
+        let patches = bulk_patches.into_inner().unwrap();
+        assert!(
+            patches.contains_key(&store_rel),
+            "R10: prepare_project_replacement_with_bulk must populate bulk_patches for Workspace"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

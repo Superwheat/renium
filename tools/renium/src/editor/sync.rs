@@ -587,6 +587,20 @@ fn editor_mutation_package_targets(
             }
         }
     }
+    for patch in &changes.bulk_property_patches {
+        if native_services.contains(patch.service.as_str()) {
+            continue;
+        }
+        for package_root in &patch.package_targets {
+            add(
+                &patch.service,
+                &package_root.path_segments,
+                &package_root.path_ordinals,
+                true,
+                "bulk",
+            );
+        }
+    }
     targets
 }
 
@@ -1331,10 +1345,15 @@ impl<'a> EditorTransaction<'a> {
     }
 
     fn commit(&mut self) -> Result<EditorCommitStatus> {
-        let commit_result = self.bridge.call(
-            "commitEditorTransaction",
-            json!({ "transactionId": &self.id }),
-        );
+        self.commit_with_options(false)
+    }
+
+    fn commit_with_options(&mut self, defer_terrain_proof: bool) -> Result<EditorCommitStatus> {
+        let mut params = json!({ "transactionId": &self.id });
+        if defer_terrain_proof {
+            params["deferTerrainProof"] = Value::Bool(true);
+        }
+        let commit_result = self.bridge.call("commitEditorTransaction", params);
         let result = match commit_result {
             Ok(result) => result,
             Err(commit_error) => {
@@ -2049,7 +2068,7 @@ pub(crate) fn push_reconciled_editor_changes_with_warm_bridge<F, G, H>(
 ) -> Result<serde_json::Map<String, Value>>
 where
     F: FnOnce(&mut EditorChangeSet) -> Result<()>,
-    G: Fn() -> Result<()>,
+    G: Fn() -> Result<()> + Sync,
     H: FnMut(&mut EditorChangeSet) -> Result<()>,
 {
     let started = Instant::now();
@@ -2891,6 +2910,9 @@ fn attach_ignore_unknown_preserves(
         .filter(|change| change.mode == "reconcileService" && change.allow_deletes)
         .map(|change| change.service.clone())
         .collect::<BTreeSet<_>>();
+    if reconciled_services.is_empty() {
+        return Ok(());
+    }
     let targets =
         files_to_studio_ignore_unknown_targets(&args.project.project_root, &reconciled_services)?;
     if targets.is_empty() {
@@ -3645,9 +3667,11 @@ fn verify_pushed_sources(
     bridge: &BridgeServer,
     changes: &EditorChangeSet,
     transaction_id: Option<&str>,
+    prefetched: Option<Value>,
     summary: &mut Map<String, Value>,
 ) -> Result<()> {
-    let mut verification = verify_editor_source_changes(bridge, changes, transaction_id)?;
+    let mut verification =
+        verify_editor_source_changes_with_prefetched(bridge, changes, transaction_id, prefetched)?;
     if !verification.failed_indexes.is_empty() {
         let retry_changes = EditorChangeSet {
             source_changes: verification
@@ -4069,7 +4093,7 @@ struct CollectedPushOptions<'a> {
     projection: Option<&'a config::ProjectionStage>,
     prepared_binary_import: Option<EditorBinaryImport>,
     guard: Option<&'a StudioChangeGuard>,
-    validate_project: Option<&'a dyn Fn() -> Result<()>>,
+    validate_project: Option<&'a (dyn Fn() -> Result<()> + Sync)>,
     finalize_settings: Option<&'a mut SettingsFinalizer<'a>>,
 }
 
@@ -4373,15 +4397,13 @@ fn push_with_reader_platform(
         let current = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
         saved.validate(review_project_root(&args), &current.runtime_id)?;
     }
-    if let Some(validate_project) = validate_project {
-        validate_project()?;
-    }
-    let mut transaction = EditorTransaction::begin(
+    let mut transaction = validate_and_begin_editor_transaction(
         bridge,
         &changes,
         binary_import.as_ref(),
         guard,
         args.mutation_started.as_deref(),
+        validate_project,
     )?;
     let result = (|| {
         log_timing("native editor transaction begin", phase_started);
@@ -4393,7 +4415,7 @@ fn push_with_reader_platform(
             rerouted_fields,
             offline_route,
         );
-        let (mut summary, mut inline_commit_result, mut inline_release_result) = {
+        let (mut summary, mut inline_commit_result, mut inline_release_result, post_import_sources) = {
             let transaction_id = transaction.as_ref().map(|value| value.id.as_str());
             let phase_started = Instant::now();
             let result = crate::studio::native::editor::send_editor_change_batches_with_options(
@@ -4408,9 +4430,14 @@ fn push_with_reader_platform(
             );
             log_timing("native editor change batches", phase_started);
             let batch = result?;
-            (batch.summary, batch.commit_result, batch.release_result)
+            (
+                batch.summary,
+                batch.commit_result,
+                batch.release_result,
+                batch.post_import_sources,
+            )
         };
-        if handle_bulk_fallback_capture(&summary, transaction.as_mut()) {
+        if handle_bulk_fallback_capture(&summary, transaction.as_mut())? {
             return Ok(summary);
         }
         ensure_editor_summary_succeeded(&summary)?;
@@ -4419,6 +4446,7 @@ fn push_with_reader_platform(
                 bridge,
                 &changes,
                 transaction.as_ref().map(|value| value.id.as_str()),
+                post_import_sources,
                 &mut summary,
             )?;
         }
@@ -4525,7 +4553,10 @@ fn push_with_reader_platform(
             let commit_outcome = if let Some(inline_result) = inline_commit_result.take() {
                 transaction.commit_response(inline_result)
             } else {
-                transaction.commit()
+                let defer_terrain_proof = binary_import
+                    .as_ref()
+                    .is_some_and(|import| import.native_replacement.is_some());
+                transaction.commit_with_options(defer_terrain_proof)
             };
             match commit_outcome {
                 Ok(status) => commit_status = Some(status),
@@ -4587,14 +4618,18 @@ fn push_with_reader_platform(
         if binary_import.is_some() {
             summary.insert("supplementalImportWrites".into(), json!(supplemental));
         }
-        log_global(
-            5,
-            format_args!(
-                "[renium] editor push done: elapsed_ms={:.1}, summary={}",
-                elapsed_ms(started),
-                Value::Object(summary.clone())
-            ),
-        );
+        if crate::app::output::global_log_enabled(5) {
+            let mut logged_summary = summary.clone();
+            logged_summary.remove("_bulkOldValueColumns");
+            log_global(
+                5,
+                format_args!(
+                    "[renium] editor push done: elapsed_ms={:.1}, summary={}",
+                    elapsed_ms(started),
+                    Value::Object(logged_summary)
+                ),
+            );
+        }
         let errors = summary.get("errors").and_then(Value::as_f64).unwrap_or(0.0);
         if summary.get("ok").and_then(Value::as_bool) == Some(false) || errors > 0.0 {
             bail!("Studio rejected or failed one or more editor push changes");
@@ -4644,19 +4679,33 @@ fn record_unchanged_source_summary(
     }
 }
 
+fn validate_and_begin_editor_transaction<'a>(
+    bridge: &'a BridgeServer,
+    changes: &EditorChangeSet,
+    binary_import: Option<&EditorBinaryImport>,
+    guard: Option<&StudioChangeGuard>,
+    mutation_started: Option<&'a std::sync::atomic::AtomicBool>,
+    validate_project: Option<&(dyn Fn() -> Result<()> + Sync)>,
+) -> Result<Option<EditorTransaction<'a>>> {
+    if let Some(validate_project) = validate_project {
+        validate_project()?;
+    }
+    EditorTransaction::begin(bridge, changes, binary_import, guard, mutation_started)
+}
+
 fn handle_bulk_fallback_capture(
     summary: &Map<String, Value>,
     transaction: Option<&mut EditorTransaction<'_>>,
-) -> bool {
+) -> Result<bool> {
     if summary.get("fallbackFullCapture") != Some(&Value::Bool(true)) {
-        return false;
+        return Ok(false);
     }
     if let Some(tx) = transaction
         && tx.active
     {
-        let _ = tx.rollback();
+        tx.rollback()?;
     }
-    true
+    Ok(true)
 }
 
 fn ensure_editor_summary_succeeded(summary: &Map<String, Value>) -> Result<()> {
@@ -4677,6 +4726,10 @@ fn can_inline_bulk_commit(
 ) -> bool {
     has_transaction
         && !changes.bulk_property_patches.is_empty()
+        && changes
+            .bulk_property_patches
+            .iter()
+            .all(|patch| patch.package_targets.is_empty())
         && changes.instance_changes.is_empty()
         && changes.source_changes.is_empty()
         && changes.property_changes.is_empty()
@@ -5574,7 +5627,7 @@ struct LiveSource {
 
 // Batches are bounded by the Source bytes the files expect. Studio's replies
 // are limited to 16 MiB of JSON, so a batch that still outgrows that is split.
-const LIVE_SOURCE_BATCH_ITEMS: usize = 512;
+const LIVE_SOURCE_BATCH_ITEMS: usize = 2_000;
 const LIVE_SOURCE_BATCH_BYTES: usize = 2 * 1024 * 1024;
 
 fn fetch_live_editor_sources(
@@ -5779,10 +5832,42 @@ fn drop_unchanged_source_changes(
     Ok((unchanged.len(), inexact))
 }
 
+fn parse_live_source_batch_rows(
+    batch: &[usize],
+    response: LiveSourceBatch,
+) -> HashMap<usize, std::result::Result<LiveSource, String>> {
+    let batch_indexes = batch.iter().copied().collect::<HashSet<_>>();
+    let mut sources = HashMap::with_capacity(response.rows.len().min(batch.len()));
+    for row in response.rows {
+        if !batch_indexes.contains(&row.index) || sources.contains_key(&row.index) {
+            continue;
+        }
+        let value = match (row.source, row.error) {
+            (Some(source), _) => Ok(LiveSource {
+                source,
+                class_name: row.class_name,
+            }),
+            (None, Some(error)) => Err(error),
+            (None, None) => Err("Studio did not return the script Source".to_string()),
+        };
+        sources.insert(row.index, value);
+    }
+    sources
+}
+
 fn verify_editor_source_changes(
     bridge: &BridgeServer,
     changes: &EditorChangeSet,
     transaction_id: Option<&str>,
+) -> Result<EditorSourceVerification> {
+    verify_editor_source_changes_with_prefetched(bridge, changes, transaction_id, None)
+}
+
+fn verify_editor_source_changes_with_prefetched(
+    bridge: &BridgeServer,
+    changes: &EditorChangeSet,
+    transaction_id: Option<&str>,
+    mut prefetched: Option<Value>,
 ) -> Result<EditorSourceVerification> {
     let mut pending = changes
         .source_changes
@@ -5803,17 +5888,31 @@ fn verify_editor_source_changes(
         if !delay.is_zero() {
             std::thread::sleep(delay);
         }
-        let sources = match fetch_live_editor_sources(bridge, changes, &pending, transaction_id) {
-            Ok(sources) => sources,
-            Err(error) if attempt + 1 < retry_delays.len() => {
-                crate::log_global(
-                    3,
-                    format_args!("Studio source verification read will retry: {error:#}"),
-                );
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
+        let mut sources = prefetched
+            .take()
+            .and_then(|value| serde_json::from_value::<LiveSourceBatch>(value).ok())
+            .map(|batch| parse_live_source_batch_rows(&pending, batch))
+            .unwrap_or_default();
+        let remaining = pending
+            .iter()
+            .copied()
+            .filter(|index| !sources.contains_key(index))
+            .collect::<Vec<_>>();
+        if !remaining.is_empty() {
+            let fetched =
+                match fetch_live_editor_sources(bridge, changes, &remaining, transaction_id) {
+                    Ok(fetched) => fetched,
+                    Err(error) if attempt + 1 < retry_delays.len() => {
+                        crate::log_global(
+                            3,
+                            format_args!("Studio source verification read will retry: {error:#}"),
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+            sources.extend(fetched);
+        }
         pending.retain(|index| {
             let change = &changes.source_changes[*index];
             let expected = change.source.as_deref().unwrap_or_default();
@@ -6595,20 +6694,28 @@ fn finish_editor_change_collection(
     link_enforcement: &LinkEnforcement,
 ) -> Result<EditorChangeSet> {
     let phase_started = Instant::now();
-    let validated = services
-        .settings
-        .union(&services.read_only)
-        .cloned()
-        .collect::<HashSet<_>>();
-    let mut scopes = if !property_filter.has_target_ids() {
-        services.scopes.clone()
-    } else {
-        target_filter_scopes(documents, property_filter, &services.scopes)
-    };
-    for service in &services.reconcile {
-        scopes.insert(service.clone(), vec![(Vec::new(), Vec::new())]);
+    if !link_enforcement.read_only_packages.is_empty() {
+        let validated = services
+            .settings
+            .union(&services.read_only)
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut scopes = if !property_filter.has_target_ids() {
+            services.scopes.clone()
+        } else {
+            target_filter_scopes(documents, property_filter, &services.scopes)
+        };
+        for service in &services.reconcile {
+            scopes.insert(service.clone(), vec![(Vec::new(), Vec::new())]);
+        }
+        validate_read_only_service_changes(
+            link_enforcement,
+            &validated,
+            &scopes,
+            documents,
+            src_root,
+        )?;
     }
-    validate_read_only_service_changes(link_enforcement, &validated, &scopes, documents, src_root)?;
     log_editor_collection_timing("package validation", phase_started);
     for service in sorted_services(services.dirty) {
         if let Some(document) = documents.get(&service).and_then(Option::as_ref) {
@@ -6622,6 +6729,16 @@ fn finish_editor_change_collection(
         }
     }
     for service in sorted_services(services.reconcile) {
+        if changes.native_property_documents.contains_key(&service) {
+            changes.instance_changes.push(EditorInstanceChange {
+                service,
+                mode: "reconcileService".into(),
+                allow_deletes: true,
+                instances: Vec::new(),
+                preserve_instances: Vec::new(),
+            });
+            continue;
+        }
         let document = documents
             .get(&service)
             .and_then(Option::as_ref)
@@ -6797,9 +6914,8 @@ fn read_imported_documents_whole(
 
 /// For each document that left instances in its store file, the document
 /// the fields a push writes beside the import are made of: with the
-/// instances of a class or at a path the import names, and the models, whose
-/// pivot is written after it. A service the import does not take whole is
-/// read whole.
+/// instances of a class or at a path the import names. A service the import
+/// does not take whole is read whole.
 fn supplemental_documents(
     changes: &EditorChangeSet,
     import: Option<&mut EditorBinaryImport>,
@@ -6965,6 +7081,86 @@ fn unique_editor_canonical_path(
     Some((absolute_path, service))
 }
 
+fn filter_virtual_native_script_paths(
+    project_root: &Path,
+    src_root: &Path,
+    link_enforcement: &LinkEnforcement,
+    explicit_targets: &EditorPropertyFilter,
+    prepared_documents: &PreparedEditorDocuments,
+    enforced_changed_paths: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    let Some(virtual_files) = prepared_documents.virtual_files.as_deref() else {
+        return Ok(enforced_changed_paths);
+    };
+    let can_skip_mapped = link_enforcement.read_only_packages.is_empty()
+        && !explicit_targets.has_target_ids()
+        && !prepared_documents.native_services.is_empty();
+    let mapped_native_scripts: HashSet<String> = if can_skip_mapped {
+        let native_docs: Vec<(&String, &Arc<SettingsBytecode>)> = prepared_documents
+            .native_services
+            .iter()
+            .filter_map(|service| {
+                prepared_documents
+                    .documents
+                    .get(service)
+                    .map(|doc| (service, doc))
+            })
+            .collect();
+        native_docs
+            .par_iter()
+            .flat_map(|(service, doc)| {
+                let children = settings_children_by_parent(doc);
+                crate::editor::paths::build_editor_source_paths_by_index_with_children(
+                    doc,
+                    service,
+                    &src_root.join(service),
+                    &children,
+                )
+                .into_iter()
+                .flatten()
+                .map(|path| {
+                    virtual_files.relative_key(&path).unwrap_or_else(|| {
+                        path_key(&crate::system::files::strip_extended_prefix(path))
+                    })
+                })
+                .collect::<Vec<_>>()
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let mut kept = Vec::with_capacity(enforced_changed_paths.len());
+    let mut to_materialize: Vec<(PathBuf, &[u8])> = Vec::new();
+    let mut dirs_to_materialize: Vec<PathBuf> = Vec::new();
+    for changed_path in enforced_changed_paths {
+        let abs = absolutize_under(project_root, &changed_path);
+        if let Some(rel_key) = virtual_files.relative_key(&abs) {
+            if virtual_files.is_dir_key(&rel_key) {
+                if can_skip_mapped {
+                    continue;
+                }
+                dirs_to_materialize.push(abs);
+            } else if let Some(bytes) = virtual_files.file_bytes_by_key(&rel_key) {
+                if can_skip_mapped && mapped_native_scripts.contains(&rel_key) {
+                    continue;
+                }
+                to_materialize.push((abs, bytes));
+            }
+        }
+        kept.push(changed_path);
+    }
+    for dir in dirs_to_materialize {
+        fs::create_dir_all(&dir)?;
+    }
+    for (abs, bytes) in to_materialize {
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&abs, bytes)?;
+    }
+    Ok(kept)
+}
+
 fn collect_editor_changes_with_link_enforcement_and_documents(
     args: &PushEditorChangesArgs,
     project_root: &Path,
@@ -6986,6 +7182,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                     .map(|document| (service.clone(), Arc::clone(document)))
             })
             .collect(),
+        virtual_files: prepared_documents.virtual_files.clone(),
         ..EditorChangeSet::default()
     };
     let mut documents: HashMap<String, Option<Arc<SettingsBytecode>>> = HashMap::new();
@@ -7004,8 +7201,16 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
     if full_reconcile {
         changed_paths = collect_editor_full_paths(src_root)?;
     }
-    let mut enforced_changed_paths =
+    let enforced_changed_paths =
         apply_link_enforcement_to_changed_paths(project_root, link_enforcement, changed_paths)?;
+    let mut enforced_changed_paths = filter_virtual_native_script_paths(
+        project_root,
+        src_root,
+        link_enforcement,
+        &explicit_targets,
+        prepared_documents,
+        enforced_changed_paths,
+    )?;
     order_init_files_before_their_siblings(&mut enforced_changed_paths);
     // Each path needs a canonical form, its metadata and, for scripts, its
     // contents. Those file system calls dominate a large push, so they run in
@@ -7734,6 +7939,95 @@ mod sync_tests {
     }
 
     #[test]
+    fn prefetched_post_import_sources_verify_without_extra_bridge_calls() -> anyhow::Result<()> {
+        use super::{EditorChangeSet, verify_editor_source_changes_with_prefetched};
+        use crate::editor::types::EditorSourceChange;
+        use crate::studio::bridge::routing_tests;
+        use serde_json::{Value, json};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tungstenite::{Message, WebSocket, protocol::Role};
+
+        let bridge = routing_tests::fixture();
+        let stream = routing_tests::connect(&bridge, 0, routing_tests::edit_info("prefetched", 21));
+        let rpc_calls = Arc::new(AtomicUsize::new(0));
+        let rpc_calls_worker = Arc::clone(&rpc_calls);
+        let plugin = std::thread::spawn(move || {
+            let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
+            while let Ok(Message::Text(text)) = socket.read() {
+                rpc_calls_worker.fetch_add(1, Ordering::Relaxed);
+                let request: Value = serde_json::from_str(&text).unwrap();
+                let rows = request["params"]["selectors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|selector| {
+                        let index = selector["index"].as_u64().unwrap();
+                        json!({"index": index, "source": format!("return {index}"), "className": "ModuleScript"})
+                    })
+                    .collect::<Vec<_>>();
+                let reply = json!({"id": request["id"], "ok": true, "result": {"rows": rows}});
+                if socket
+                    .send(Message::Text(reply.to_string().into()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let changes = EditorChangeSet {
+            source_changes: (0..3)
+                .map(|index| EditorSourceChange {
+                    service: "ServerStorage".into(),
+                    settings_id: None,
+                    path_segments: vec!["ServerStorage".into(), format!("Script{index}")],
+                    path_ordinals: vec![1, 1],
+                    class_name: "ModuleScript".into(),
+                    source: Some(format!("return {index}")),
+                    deleted: false,
+                })
+                .collect(),
+            ..EditorChangeSet::default()
+        };
+        let all_prefetched = json!({
+            "rows": [
+                {"index": 0, "source": "return 0", "className": "ModuleScript"},
+                {"index": 1, "source": "return 1", "className": "ModuleScript"},
+                {"index": 2, "source": "return 2", "className": "ModuleScript"},
+            ]
+        });
+        let verified_all = verify_editor_source_changes_with_prefetched(
+            &bridge,
+            &changes,
+            None,
+            Some(all_prefetched),
+        )?;
+        assert_eq!(verified_all.verified, 3);
+        assert!(verified_all.failed.is_empty());
+        assert_eq!(rpc_calls.load(Ordering::Relaxed), 0);
+
+        let partial_prefetched = json!({
+            "rows": [
+                {"index": 0, "source": "return 0", "className": "ModuleScript"},
+                {"index": 2, "source": "return 2", "className": "ModuleScript"},
+            ]
+        });
+        let verified_partial = verify_editor_source_changes_with_prefetched(
+            &bridge,
+            &changes,
+            None,
+            Some(partial_prefetched),
+        )?;
+        assert_eq!(verified_partial.verified, 3);
+        assert!(verified_partial.failed.is_empty());
+        assert_eq!(rpc_calls.load(Ordering::Relaxed), 1);
+
+        drop(bridge);
+        let _ = plugin.join();
+        Ok(())
+    }
+
+    #[test]
     fn supplemental_write_limit_counts_fields_and_names_the_reason_before_commit() {
         let row = EditorPropertyChange {
             class_name: "Example".into(),
@@ -7829,6 +8123,8 @@ mod sync_tests {
             .insert("WholeRow".into(), json!(true));
         let bytes = crate::settings::bytecode::encode_settings_bytecode(&document)?;
         let document = crate::settings::bytecode::decode_settings_bytecode_holding(&bytes)?;
+        let omitted_classes =
+            HashMap::from([("Model".into(), HashSet::from(["WorldPivot".into()]))]);
         let candidates = || {
             ImportRowCandidates {
                 services: HashMap::from([(
@@ -7843,7 +8139,7 @@ mod sync_tests {
                     ),
                 )]),
             }
-            .finish(&HashMap::new(), &HashMap::new(), &HashMap::new())
+            .finish(&HashMap::new(), &omitted_classes, &HashMap::new())
         };
         let mut sparse = document.clone();
         for row in sparse.instances.iter_mut().skip(1) {
@@ -10590,5 +10886,100 @@ mod named_script_tests {
         fs::write(&marked, "\u{feff}return 1\n").unwrap();
         assert!(crate::cli::syntax::ensure_script_files_parse(&[marked]).is_ok());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn handle_bulk_fallback_capture_propagates_rollback_error() {
+        let mut summary = Map::new();
+        summary.insert("fallbackFullCapture".into(), Value::Bool(true));
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        let mut tx = EditorTransaction {
+            mutation_started: None,
+            bridge: &bridge,
+            id: "tx-fail-rb".into(),
+            plugin_session_id: None,
+            active: true,
+            package_mutation: false,
+            package_dialog: None,
+            auto_desynced_packages: Vec::new(),
+            auto_desynced_package_targets: Vec::new(),
+            package_runtime: None,
+            auto_desync_confirmed: false,
+        };
+        let err = handle_bulk_fallback_capture(&summary, Some(&mut tx))
+            .expect_err("rollback failure must propagate instead of being discarded");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn rollback_response_returns_error_on_rollback_failed_reply() {
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        let mut tx = EditorTransaction {
+            mutation_started: None,
+            bridge: &bridge,
+            id: "tx-rb-failed-reply".into(),
+            plugin_session_id: None,
+            active: true,
+            package_mutation: false,
+            package_dialog: None,
+            auto_desynced_packages: Vec::new(),
+            auto_desynced_package_targets: Vec::new(),
+            package_runtime: None,
+            auto_desync_confirmed: false,
+        };
+        let err = tx
+            .rollback_response(
+                json!({
+                    "ok": false,
+                    "state": "rollbackFailed",
+                    "rolledBack": false,
+                    "error": "Studio could not restore property"
+                }),
+                None,
+            )
+            .expect_err("rollbackFailed reply must return an error");
+        assert!(
+            err.to_string()
+                .contains("did not roll the transaction back"),
+            "unexpected error: {err:#}"
+        );
+        tx.active = false;
+    }
+
+    #[test]
+    fn failing_validate_project_does_not_open_studio_transaction() {
+        let root = crate::tests::support::temp_dir("r6-validate-before-begin");
+        let script_dir = root.join("src").join("ReplicatedStorage");
+        fs::create_dir_all(&script_dir).unwrap();
+        let script = script_dir.join("Mod.luau");
+        fs::write(&script, "return 1\n").unwrap();
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        let mut args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            BridgeConnectionArgs::default_connection(),
+        );
+        args.no_review = true;
+        args.changed_paths = vec![script];
+        let (changes, _) = collect_pushed_editor_changes(&args).unwrap();
+        let fail_validate = || anyhow::bail!("Project file changed before beginEditorTransaction");
+        let err = validate_and_begin_editor_transaction(
+            &bridge,
+            &changes,
+            None,
+            None,
+            None,
+            Some(&fail_validate),
+        )
+        .err()
+        .expect("failing validate_project must abort push before beginEditorTransaction");
+        assert!(
+            err.to_string()
+                .contains("Project file changed before beginEditorTransaction"),
+            "R6: validate_project error must win before EditorTransaction::begin talks to Studio; got: {err:#}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

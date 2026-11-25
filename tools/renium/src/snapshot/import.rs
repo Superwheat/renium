@@ -269,6 +269,210 @@ pub(crate) struct DirectImportRoots {
     pub(crate) project_root: PathBuf,
     pub(crate) src_dir: PathBuf,
     pub(crate) layout_src_root: Option<PathBuf>,
+    pub(crate) virtual_scripts: Option<Arc<VirtualScriptStage>>,
+}
+
+/// Tracks staged script entries in memory for plain layouts so unchanged
+/// scripts are neither copied into the stage nor written or re-hashed on disk.
+pub(crate) struct VirtualScriptStage {
+    #[cfg(target_os = "macos")]
+    project_root: PathBuf,
+    pub(crate) stage_root: PathBuf,
+    pub(crate) baseline: Arc<BTreeMap<PathBuf, crate::snapshot::export::PublishEntryState>>,
+    #[cfg(any(windows, target_os = "macos"))]
+    baseline_ci: HashMap<String, PathBuf>,
+    pub(crate) baseline_empty: bool,
+    pub(crate) staged_entries: Mutex<BTreeMap<PathBuf, crate::snapshot::export::PublishEntryState>>,
+    pub(crate) virtual_roots: Mutex<HashSet<PathBuf>>,
+    pub(crate) skipped_paths: Mutex<HashSet<PathBuf>>,
+}
+
+fn normalize_stage_relative(rel: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in rel.components() {
+        if !matches!(component, std::path::Component::CurDir) {
+            out.push(component);
+        }
+    }
+    out
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn case_insensitive_path_key(rel: &Path) -> String {
+    rel.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
+impl VirtualScriptStage {
+    pub(crate) fn new(
+        project_root: PathBuf,
+        stage_root: PathBuf,
+        baseline: Arc<BTreeMap<PathBuf, crate::snapshot::export::PublishEntryState>>,
+    ) -> Self {
+        #[cfg(not(target_os = "macos"))]
+        let _ = project_root;
+        let baseline_empty = baseline.is_empty();
+        #[cfg(any(windows, target_os = "macos"))]
+        let baseline_ci = baseline
+            .keys()
+            .map(|rel| (case_insensitive_path_key(rel), rel.clone()))
+            .collect();
+        Self {
+            #[cfg(target_os = "macos")]
+            project_root,
+            stage_root,
+            baseline,
+            #[cfg(any(windows, target_os = "macos"))]
+            baseline_ci,
+            baseline_empty,
+            staged_entries: Mutex::new(BTreeMap::new()),
+            virtual_roots: Mutex::new(HashSet::new()),
+            skipped_paths: Mutex::new(HashSet::new()),
+        }
+    }
+
+    pub(crate) fn resolve_baseline_entry<'a>(
+        &'a self,
+        rel: &'a Path,
+    ) -> Option<(&'a Path, &'a crate::snapshot::export::PublishEntryState)> {
+        if let Some((key, state)) = self.baseline.get_key_value(rel) {
+            return Some((key.as_path(), state));
+        }
+        #[cfg(any(windows, target_os = "macos"))]
+        if let Some(existing_key) = self.baseline_ci.get(&case_insensitive_path_key(rel))
+            && let Some((key, state)) = self.baseline.get_key_value(existing_key)
+        {
+            #[cfg(target_os = "macos")]
+            {
+                let disk_path = self.project_root.join(rel);
+                let exists = match state {
+                    crate::snapshot::export::PublishEntryState::Directory => disk_path.is_dir(),
+                    _ => disk_path.is_file(),
+                };
+                if !exists {
+                    return None;
+                }
+            }
+            return Some((key.as_path(), state));
+        }
+        None
+    }
+
+    pub(crate) fn has_baseline_file(&self, stage_path: &Path) -> bool {
+        let Ok(raw_rel) = stage_path.strip_prefix(&self.stage_root) else {
+            return false;
+        };
+        let rel = normalize_stage_relative(raw_rel);
+        self.resolve_baseline_entry(&rel).is_some_and(|(_, entry)| {
+            matches!(
+                entry,
+                crate::snapshot::export::PublishEntryState::File { .. }
+            )
+        })
+    }
+
+    pub(crate) fn has_baseline_dir(&self, stage_path: &Path) -> bool {
+        let Ok(raw_rel) = stage_path.strip_prefix(&self.stage_root) else {
+            return false;
+        };
+        let rel = normalize_stage_relative(raw_rel);
+        self.resolve_baseline_entry(&rel).is_some_and(|(_, entry)| {
+            matches!(entry, crate::snapshot::export::PublishEntryState::Directory)
+        })
+    }
+
+    pub(crate) fn has_skipped_under(&self, dir: &Path) -> bool {
+        self.skipped_paths
+            .lock_recover()
+            .iter()
+            .any(|path| path.starts_with(dir))
+    }
+
+    fn record_service_root(&self, service_dir: &Path) {
+        if let Ok(raw_rel) = service_dir.strip_prefix(&self.stage_root) {
+            let rel = normalize_stage_relative(raw_rel);
+            self.staged_entries.lock_recover().insert(
+                rel.clone(),
+                crate::snapshot::export::PublishEntryState::Directory,
+            );
+            self.virtual_roots.lock_recover().insert(rel);
+        }
+    }
+}
+
+pub(crate) fn script_io_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map_or(8, |n| n.get().clamp(4, 12));
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|idx| format!("renium-script-io-{idx}"))
+            .build()
+            .expect("Failed to create script I/O thread pool")
+    })
+}
+
+static DEFERRED_STATE_DROP: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
+static DEFERRED_DROP_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) struct DeferredDropGuard;
+
+impl DeferredDropGuard {
+    pub(crate) fn enter() -> Self {
+        DEFERRED_DROP_DEPTH.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for DeferredDropGuard {
+    fn drop(&mut self) {
+        if DEFERRED_DROP_DEPTH.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let handle = DEFERRED_STATE_DROP
+                .get_or_init(|| Mutex::new(None))
+                .lock_recover()
+                .take();
+            if let Some(handle) = handle {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+fn par_drop_service_state(mut state: ServiceState) {
+    let instances = std::mem::take(&mut state.instances);
+    let native = state.native_properties_by_instance.take();
+    rayon::join(
+        || instances.into_par_iter().for_each(drop),
+        || {
+            if let Some(native) = native {
+                native.into_par_iter().for_each(drop);
+            }
+        },
+    );
+    drop(state);
+}
+
+fn finish_optional_service_state_drop(state: &mut Option<ServiceState>) {
+    if let Some(state) = state.take() {
+        finish_service_state_drop(state);
+    }
+}
+
+fn finish_service_state_drop(state: ServiceState) {
+    if state.instances.len() >= 4_096 && DEFERRED_DROP_DEPTH.load(Ordering::Acquire) > 0 {
+        let prev = DEFERRED_STATE_DROP
+            .get_or_init(|| Mutex::new(None))
+            .lock_recover()
+            .take();
+        if let Some(handle) = prev {
+            let _ = handle.join();
+        }
+        let handle = thread::spawn(move || par_drop_service_state(state));
+        *DEFERRED_STATE_DROP
+            .get_or_init(|| Mutex::new(None))
+            .lock_recover() = Some(handle);
+        return;
+    }
+    par_drop_service_state(state);
 }
 
 #[derive(Clone)]
@@ -328,13 +532,14 @@ impl DirectImportWorker {
                     let _waiting = profile::span(&format!("{service}: wait for the stage"));
                     ready()?;
                 }
-                import_service_state_with_sourcemap(
+                import_service_state_with_sourcemap_virtual(
                     state,
                     &self.roots.project_root,
                     &src_root,
                     self.roots.layout_src_root.as_deref(),
                     &service,
                     &self.store_gate,
+                    self.roots.virtual_scripts.as_ref(),
                 )
             });
         match result {
@@ -508,13 +713,14 @@ impl Drop for DirectImportDispatcher {
     }
 }
 
-pub(crate) fn import_service_state_with_sourcemap(
+pub(crate) fn import_service_state_with_sourcemap_virtual(
     state: ServiceState,
     project_root: &Path,
     src_root: &Path,
     layout_src_root: Option<&Path>,
     service: &str,
     store_gate: &Mutex<()>,
+    virtual_scripts: Option<&Arc<VirtualScriptStage>>,
 ) -> Result<SourcemapNode> {
     let import_started = Instant::now();
     let write_tree_started = Instant::now();
@@ -525,6 +731,7 @@ pub(crate) fn import_service_state_with_sourcemap(
         layout_src_root,
         service,
         Some(store_gate),
+        virtual_scripts,
     )?;
     log_timing(&format!("{service}: write src tree"), write_tree_started);
     log_timing(&format!("{service}: import service total"), import_started);
@@ -1269,7 +1476,20 @@ fn import_service_tree(
         layout_src_root,
         service,
         None,
+        None,
     )
+}
+
+fn existing_settings_is_block_store(service_dir: &Path) -> bool {
+    use std::io::Read as _;
+    let Ok(mut file) = fs::File::open(service_settings_path(service_dir)) else {
+        return false;
+    };
+    let mut head = [0u8; 16];
+    let Ok(n) = file.read(&mut head) else {
+        return false;
+    };
+    crate::settings::bytecode::blocks::is_block_store(&head[..n])
 }
 
 fn import_service_tree_owned_with_store_gate(
@@ -1279,9 +1499,12 @@ fn import_service_tree_owned_with_store_gate(
     layout_src_root: Option<&Path>,
     service: &str,
     store_gate: Option<&Mutex<()>>,
+    virtual_scripts: Option<&Arc<VirtualScriptStage>>,
 ) -> Result<SourcemapNode> {
-    if state.instances.len() >= 4_096 {
-        let service_dir = src_root.join(sanitize_name(service));
+    let service_dir = src_root.join(sanitize_name(service));
+    if state.instances.len() >= 4_096
+        && (pull_aligns_whole_documents() || !existing_settings_is_block_store(&service_dir))
+    {
         let layout_dir = layout_src_root.map_or_else(
             || service_dir.clone(),
             |root| root.join(sanitize_name(service)),
@@ -1290,28 +1513,64 @@ fn import_service_tree_owned_with_store_gate(
         let fresh_service_dir = !cleanup_required;
         let expected_paths = Arc::new(ImportPathSets::default());
         track_expected_dir(&expected_paths, &service_dir);
+        if let Some(vs) = virtual_scripts {
+            vs.record_service_root(&service_dir);
+        }
 
-        let visited = (0..state.instances.len())
-            .map(|_| AtomicBool::new(false))
-            .collect::<Vec<_>>();
-        mark_visited(&visited, state.service_root_index);
-        let root_children = child_indices_for_instance(&state, state.service_root_index);
-        let emitting = profile::span(&format!("{service}: write script files"));
-        let expected_batch = emit_children_indices(
-            &state,
-            root_children,
-            &service_dir,
-            &layout_dir,
-            &SourceOutput::Files {
-                fresh: fresh_service_dir,
-            },
-            &visited,
-        )?;
-        expected_batch.merge_into(&expected_paths);
-        drop(emitting);
+        let has_scripts = state
+            .source_in_subtree
+            .get(state.service_root_index)
+            .copied()
+            .unwrap_or(false);
+        let known_files = if has_scripts {
+            let visited = (0..state.instances.len())
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>();
+            mark_visited(&visited, state.service_root_index);
+            let root_children = child_indices_for_instance(&state, state.service_root_index);
+            let emitting = profile::span(&format!("{service}: write script files"));
+            let output = match virtual_scripts {
+                Some(vs) => SourceOutput::VirtualFiles {
+                    stage: Arc::clone(vs),
+                },
+                None => SourceOutput::Files {
+                    fresh: fresh_service_dir,
+                },
+            };
+            let mut expected_batch = script_io_pool().install(|| {
+                emit_children_indices(
+                    &state,
+                    root_children,
+                    &service_dir,
+                    &layout_dir,
+                    &output,
+                    &visited,
+                )
+            })?;
+            let service_files = virtual_scripts.map(|vs| {
+                let mut files = HashSet::with_capacity(expected_batch.virtual_files.len());
+                expected_batch.merge_virtual(vs, &mut files);
+                files
+            });
+            expected_batch.merge_into(&expected_paths);
+            drop(emitting);
+            service_files
+        } else {
+            virtual_scripts.map(|_| HashSet::new())
+        };
 
         let mapping = profile::span(&format!("{service}: build sourcemap"));
-        let node = build_service_sourcemap_from_state(&state, project_root, &service_dir);
+        let node = match &known_files {
+            Some(files) => {
+                crate::project::sourcemap::build_service_sourcemap_from_state_with_files(
+                    &state,
+                    project_root,
+                    &service_dir,
+                    files,
+                )
+            }
+            None => build_service_sourcemap_from_state(&state, project_root, &service_dir),
+        };
         drop(mapping);
 
         write_service_settings_file_owned(
@@ -1328,7 +1587,7 @@ fn import_service_tree_owned_with_store_gate(
             &format!("{service}: expected-path tracking"),
             expected_path_tracking_ms(&expected_paths),
         );
-        if cleanup_required {
+        if cleanup_required && virtual_scripts.is_none() {
             let _cleaning = profile::span(&format!("{service}: remove files Studio dropped"));
             let cleanup_handle =
                 spawn_cleanup_service_dir(service_dir.clone(), Arc::clone(&expected_paths));
@@ -1344,12 +1603,9 @@ fn import_service_tree_owned_with_store_gate(
         layout_src_root,
         service,
         store_gate,
+        virtual_scripts,
     );
-    if state.instances.len() >= 4_096 {
-        drop(state);
-    } else {
-        rayon::spawn(move || drop(state));
-    }
+    finish_service_state_drop(state);
     node
 }
 
@@ -1360,6 +1616,7 @@ fn import_service_tree_with_store_gate(
     layout_src_root: Option<&Path>,
     service: &str,
     store_gate: Option<&Mutex<()>>,
+    virtual_scripts: Option<&Arc<VirtualScriptStage>>,
 ) -> Result<SourcemapNode> {
     let service_dir = src_root.join(sanitize_name(service));
     let layout_dir = layout_src_root.map_or_else(
@@ -1370,6 +1627,9 @@ fn import_service_tree_with_store_gate(
     let fresh_service_dir = !cleanup_required;
     let expected_paths = Arc::new(ImportPathSets::default());
     track_expected_dir(&expected_paths, &service_dir);
+    if let Some(vs) = virtual_scripts {
+        vs.record_service_root(&service_dir);
+    }
     thread::scope(|scope| -> Result<SourcemapNode> {
         let settings_task = scope.spawn(|| {
             write_service_settings_file(
@@ -1382,25 +1642,62 @@ fn import_service_tree_with_store_gate(
             )
         });
 
-        let visited = (0..state.instances.len())
-            .map(|_| AtomicBool::new(false))
-            .collect::<Vec<_>>();
-        mark_visited(&visited, state.service_root_index);
+        let has_scripts = state
+            .source_in_subtree
+            .get(state.service_root_index)
+            .copied()
+            .unwrap_or(false);
+        let known_files = if has_scripts {
+            let visited = (0..state.instances.len())
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>();
+            mark_visited(&visited, state.service_root_index);
 
-        let root_children = child_indices_for_instance(state, state.service_root_index);
-        let emitting = profile::span(&format!("{service}: write script files"));
-        let expected_batch = emit_children_indices(
-            state,
-            root_children,
-            &service_dir,
-            &layout_dir,
-            &SourceOutput::Files {
-                fresh: fresh_service_dir,
-            },
-            &visited,
-        )?;
-        expected_batch.merge_into(&expected_paths);
-        drop(emitting);
+            let root_children = child_indices_for_instance(state, state.service_root_index);
+            let emitting = profile::span(&format!("{service}: write script files"));
+            let output = match virtual_scripts {
+                Some(vs) => SourceOutput::VirtualFiles {
+                    stage: Arc::clone(vs),
+                },
+                None => SourceOutput::Files {
+                    fresh: fresh_service_dir,
+                },
+            };
+            let mut expected_batch = script_io_pool().install(|| {
+                emit_children_indices(
+                    state,
+                    root_children,
+                    &service_dir,
+                    &layout_dir,
+                    &output,
+                    &visited,
+                )
+            })?;
+            let service_files = virtual_scripts.map(|vs| {
+                let mut files = HashSet::with_capacity(expected_batch.virtual_files.len());
+                expected_batch.merge_virtual(vs, &mut files);
+                files
+            });
+            expected_batch.merge_into(&expected_paths);
+            drop(emitting);
+            service_files
+        } else {
+            virtual_scripts.map(|_| HashSet::new())
+        };
+
+        let mapping = profile::span(&format!("{service}: build sourcemap"));
+        let node = match &known_files {
+            Some(files) => {
+                crate::project::sourcemap::build_service_sourcemap_from_state_with_files(
+                    state,
+                    project_root,
+                    &service_dir,
+                    files,
+                )
+            }
+            None => build_service_sourcemap_from_state(state, project_root, &service_dir),
+        };
+        drop(mapping);
 
         match settings_task.join() {
             Ok(result) => result?,
@@ -1412,19 +1709,14 @@ fn import_service_tree_with_store_gate(
             expected_path_tracking_ms(&expected_paths),
         );
 
-        if cleanup_required {
+        if cleanup_required && virtual_scripts.is_none() {
             let _cleaning = profile::span(&format!("{service}: remove files Studio dropped"));
             let cleanup_handle =
                 spawn_cleanup_service_dir(service_dir.clone(), Arc::clone(&expected_paths));
             join_cleanup_handle(service, cleanup_handle)?;
         }
 
-        let _mapping = profile::span(&format!("{service}: build sourcemap"));
-        Ok(build_service_sourcemap_from_state(
-            state,
-            project_root,
-            &service_dir,
-        ))
+        Ok(node)
     })
 }
 
@@ -1439,6 +1731,9 @@ struct ImportPathSets {
 struct ExpectedPathBatch {
     files: Vec<String>,
     dirs: Vec<String>,
+    virtual_entries: Vec<(PathBuf, crate::snapshot::export::PublishEntryState)>,
+    virtual_files: Vec<PathBuf>,
+    virtual_skipped: Vec<PathBuf>,
 }
 
 impl ExpectedPathBatch {
@@ -1453,6 +1748,27 @@ impl ExpectedPathBatch {
     fn extend(&mut self, mut other: ExpectedPathBatch) {
         self.files.append(&mut other.files);
         self.dirs.append(&mut other.dirs);
+        self.virtual_entries.append(&mut other.virtual_entries);
+        self.virtual_files.append(&mut other.virtual_files);
+        self.virtual_skipped.append(&mut other.virtual_skipped);
+    }
+
+    fn merge_virtual(&mut self, stage: &VirtualScriptStage, service_files: &mut HashSet<PathBuf>) {
+        if !self.virtual_entries.is_empty() {
+            let mut entries = stage.staged_entries.lock_recover();
+            for (rel, state) in self.virtual_entries.drain(..) {
+                entries.insert(rel, state);
+            }
+        }
+        if !self.virtual_skipped.is_empty() {
+            let mut skipped = stage.skipped_paths.lock_recover();
+            for rel in self.virtual_skipped.drain(..) {
+                skipped.insert(rel);
+            }
+        }
+        for rel in self.virtual_files.drain(..) {
+            service_files.insert(rel);
+        }
     }
 
     fn merge_into(self, expected_paths: &ImportPathSets) {
@@ -1988,7 +2304,10 @@ fn write_service_settings_file_owned(
             &format!("{service}: publish settings file"),
             publish_started,
         );
+        finish_optional_service_state_drop(&mut preserved_state);
+        finish_optional_service_state_drop(&mut oracle_state);
     }
+    finish_optional_service_state_drop(&mut owned_state);
     log_timing(&format!("{service}: write settings file"), started);
     Ok(())
 }
@@ -2374,14 +2693,36 @@ fn collect_stale_paths(
 
 enum SourceOutput {
     Files { fresh: bool },
+    VirtualFiles { stage: Arc<VirtualScriptStage> },
     Memory(Mutex<BTreeMap<PathBuf, Option<Vec<u8>>>>),
 }
 
 impl SourceOutput {
-    fn directory(&self, path: &Path) -> Result<()> {
+    fn directory(&self, path: &Path, batch: &mut ExpectedPathBatch) -> Result<()> {
         match self {
             Self::Files { .. } => fs::create_dir_all(path)
                 .with_context(|| format!("Failed to create {}", path.display())),
+            Self::VirtualFiles { stage } => {
+                let rel = normalize_stage_relative(path.strip_prefix(&stage.stage_root)?);
+                let (effective_rel, existed) = if !stage.baseline_empty
+                    && let Some((existing_rel, entry)) = stage.resolve_baseline_entry(&rel)
+                    && matches!(entry, crate::snapshot::export::PublishEntryState::Directory)
+                {
+                    (existing_rel.to_path_buf(), true)
+                } else {
+                    (rel, false)
+                };
+                if !existed {
+                    let target = stage.stage_root.join(&effective_rel);
+                    fs::create_dir_all(&target)
+                        .with_context(|| format!("Failed to create {}", target.display()))?;
+                }
+                batch.virtual_entries.push((
+                    effective_rel,
+                    crate::snapshot::export::PublishEntryState::Directory,
+                ));
+                Ok(())
+            }
             Self::Memory(entries) => {
                 let mut entries = entries.lock_recover();
                 let entry = entries.entry(path.to_owned()).or_insert(None);
@@ -2395,9 +2736,69 @@ impl SourceOutput {
         }
     }
 
-    fn source(&self, path: &Path, source: &str) -> Result<()> {
+    fn source(&self, path: &Path, source: &str, batch: &mut ExpectedPathBatch) -> Result<()> {
         match self {
             Self::Files { fresh } => write_script_source_file(path, source, *fresh),
+            Self::VirtualFiles { stage } => {
+                let raw_rel = normalize_stage_relative(path.strip_prefix(&stage.stage_root)?);
+                let existing_baseline = (!stage.baseline_empty)
+                    .then(|| stage.resolve_baseline_entry(&raw_rel))
+                    .flatten();
+                let rel = existing_baseline
+                    .map(|(existing_rel, _)| existing_rel.to_path_buf())
+                    .unwrap_or_else(|| raw_rel.clone());
+                let target_path = stage.stage_root.join(&rel);
+                batch.virtual_files.push(rel.clone());
+                if source == EXTERNAL_SOURCE_MARKER {
+                    if let Some((_, existing)) = existing_baseline
+                        && matches!(
+                            existing,
+                            crate::snapshot::export::PublishEntryState::File { .. }
+                        )
+                    {
+                        println!(
+                            "[renium] warning: missing fetched Source for {}; keeping the existing file",
+                            target_path.display()
+                        );
+                        batch.virtual_entries.push((rel.clone(), existing.clone()));
+                        batch.virtual_skipped.push(rel);
+                        return Ok(());
+                    }
+                    println!(
+                        "[renium] warning: missing fetched Source for {}; writing an empty script",
+                        target_path.display()
+                    );
+                    if !stage.baseline_empty
+                        && let Some(parent) = target_path.parent()
+                    {
+                        fs::create_dir_all(parent)
+                            .with_context(|| format!("Failed to create {}", parent.display()))?;
+                    }
+                    write_import_source_file(&target_path, b"", true)?;
+                    batch
+                        .virtual_entries
+                        .push((rel, crate::snapshot::export::file_publish_state(b"")));
+                    return Ok(());
+                }
+                let bytes = source.as_bytes();
+                let state = crate::snapshot::export::file_publish_state(bytes);
+                if let Some((_, existing)) = existing_baseline
+                    && existing == &state
+                {
+                    batch.virtual_entries.push((rel.clone(), state));
+                    batch.virtual_skipped.push(rel);
+                    return Ok(());
+                }
+                if !stage.baseline_empty
+                    && let Some(parent) = target_path.parent()
+                {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("Failed to create {}", parent.display()))?;
+                }
+                write_import_source_file(&target_path, bytes, true)?;
+                batch.virtual_entries.push((rel, state));
+                Ok(())
+            }
             Self::Memory(entries) => {
                 // Verification cannot manufacture an empty script for missing Source.
                 anyhow::ensure!(
@@ -2471,10 +2872,18 @@ pub(crate) fn service_projection_in_memory_options(
     );
     let settings_path = service_settings_path(&service_dir);
     let output = SourceOutput::Memory(Mutex::new(BTreeMap::new()));
-    output.directory(&service_dir)?;
+    output.directory(&service_dir, &mut ExpectedPathBatch::default())?;
     let (settings, sources) = rayon::join(
         || captured_store_bytes(state, &service_settings_path(&layout_dir), known_changed),
         || {
+            if !state
+                .source_in_subtree
+                .get(state.service_root_index)
+                .copied()
+                .unwrap_or(false)
+            {
+                return Ok(ExpectedPathBatch::default());
+            }
             let visited = (0..state.instances.len())
                 .map(|_| AtomicBool::new(false))
                 .collect::<Vec<_>>();
@@ -2517,14 +2926,29 @@ fn emit_node_index(
     let class_name = instance.class_name.as_str();
     let mut expected = ExpectedPathBatch::default();
 
-    if let Some(names) = project_script_file_names_in_layout(
-        parent_dir,
-        layout_dir,
-        fs_stem,
-        has_children,
-        class_name,
-        &instance.properties,
-    ) {
+    let script_names = match output {
+        SourceOutput::VirtualFiles { stage, .. } => {
+            crate::editor::paths::project_script_file_names_with_lookup(
+                parent_dir,
+                parent_dir,
+                fs_stem,
+                has_children,
+                class_name,
+                &instance.properties,
+                |path| stage.has_baseline_file(path),
+                |path| stage.has_baseline_dir(path),
+            )
+        }
+        _ => project_script_file_names_in_layout(
+            parent_dir,
+            layout_dir,
+            fs_stem,
+            has_children,
+            class_name,
+            &instance.properties,
+        ),
+    };
+    if let Some(names) = script_names {
         let source = instance
             .properties
             .get("Source")
@@ -2533,10 +2957,10 @@ fn emit_node_index(
 
         if names.directory {
             let dir_path = parent_dir.join(fs_stem);
-            output.directory(&dir_path)?;
+            output.directory(&dir_path, &mut expected)?;
             expected.track_dir(&dir_path);
             let source_path = dir_path.join(names.source_file_name);
-            output.source(&source_path, source)?;
+            output.source(&source_path, source, &mut expected)?;
             expected.track_file(&source_path);
 
             let child_expected = emit_children_indices(
@@ -2552,7 +2976,7 @@ fn emit_node_index(
         }
 
         let script_path = parent_dir.join(format!("{fs_stem}{}", names.leaf_suffix));
-        output.source(&script_path, source)?;
+        output.source(&script_path, source, &mut expected)?;
         expected.track_file(&script_path);
 
         return Ok(expected);
@@ -2563,7 +2987,7 @@ fn emit_node_index(
     }
 
     let dir_path = parent_dir.join(fs_stem);
-    output.directory(&dir_path)?;
+    output.directory(&dir_path, &mut expected)?;
     expected.track_dir(&dir_path);
 
     let child_expected = emit_children_indices(
@@ -2590,7 +3014,14 @@ fn emit_children_indices(
     let named_children = name_child_indices(state, child_indices);
 
     const PARALLEL_CHILD_THRESHOLD: usize = 8;
-    if named_children.len() >= PARALLEL_CHILD_THRESHOLD && rayon::current_num_threads() > 1 {
+    let has_subtrees = named_children.len() >= 2
+        && named_children.iter().any(|(idx, _)| {
+            !child_indices_for_instance(state, *idx).is_empty()
+                && state.source_in_subtree.get(*idx).copied().unwrap_or(false)
+        });
+    if (named_children.len() >= PARALLEL_CHILD_THRESHOLD || has_subtrees)
+        && rayon::current_num_threads() > 1
+    {
         let built = named_children
             .par_iter()
             .map(|(child_index, child_stem)| {
@@ -2685,6 +3116,7 @@ mod projection_tests {
                 project_root,
                 src_dir: "src".into(),
                 layout_src_root: None,
+                virtual_scripts: None,
             },
             first_error: Arc::new(Mutex::new(None)),
             service_nodes: Arc::new(Mutex::new(HashMap::new())),
@@ -3495,9 +3927,10 @@ mod projection_tests {
         assert_eq!(projected, observed);
         let collision = SourceOutput::Memory(Mutex::new(BTreeMap::new()));
         let file = source.join("collision.luau");
-        collision.source(&file, "return true")?;
-        assert!(collision.directory(&file).is_err());
-        assert!(collision.source(&file, "return false").is_err());
+        let mut batch = ExpectedPathBatch::default();
+        collision.source(&file, "return true", &mut batch)?;
+        assert!(collision.directory(&file, &mut batch).is_err());
+        assert!(collision.source(&file, "return false", &mut batch).is_err());
         state.instances[1]
             .properties
             .insert("Source".into(), json!(EXTERNAL_SOURCE_MARKER));
@@ -3637,5 +4070,51 @@ mod projection_tests {
         assert!(unaligned.contains_key(&packages.join("Promise.luau")));
         assert!(unaligned.contains_key(&promise_dir.with_extension("luau")));
         Ok(())
+    }
+
+    #[test]
+    fn case_insensitive_path_key_normalizes_mixed_case_on_all_platforms() {
+        assert_eq!(
+            case_insensitive_path_key(Path::new("src/ReplicatedStorage/Foo.luau")),
+            case_insensitive_path_key(Path::new("src/ReplicatedStorage/foo.luau"))
+        );
+        assert_eq!(
+            case_insensitive_path_key(Path::new(r"src\Workspace\Bar.server.luau")),
+            "src/workspace/bar.server.luau"
+        );
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let root = crate::tests::support::temp_dir("ci-baseline-resolve");
+            let rel = PathBuf::from("src/ReplicatedStorage/Foo.luau");
+            let file_path = root.join(&rel);
+            fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+            fs::write(&file_path, b"return 1\n").unwrap();
+            let mut baseline = BTreeMap::new();
+            baseline.insert(
+                rel.clone(),
+                crate::snapshot::export::PublishEntryState::File {
+                    sha256: String::new(),
+                    length: 9,
+                    hash: 0,
+                },
+            );
+            let stage =
+                VirtualScriptStage::new(root.clone(), root.join("stage"), Arc::new(baseline));
+            let expected_ci_key = case_insensitive_path_key(&rel);
+            assert_eq!(expected_ci_key, "src/replicatedstorage/foo.luau");
+            assert_eq!(
+                stage
+                    .baseline_ci
+                    .get(&expected_ci_key)
+                    .map(PathBuf::as_path),
+                Some(rel.as_path()),
+                "#9: baseline_ci must index mixed-case paths under ASCII-folded key independently of platform path_key"
+            );
+            let resolved = stage
+                .resolve_baseline_entry(Path::new("src/ReplicatedStorage/foo.luau"))
+                .expect("#9: resolve_baseline_entry must match mixed-case path via baseline_ci");
+            assert_eq!(resolved.0, rel.as_path());
+            let _ = fs::remove_dir_all(&root);
+        }
     }
 }

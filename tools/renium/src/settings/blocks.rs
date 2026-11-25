@@ -493,7 +493,6 @@ pub(crate) struct BlockStore<'a> {
     rows: usize,
     budget: DecodeBudget,
     read_pool: Vec<Mutex<Option<Arc<Vec<String>>>>>,
-    open_blocks: Vec<Mutex<Option<Arc<OpenBlock>>>>,
     /// The most a read of one frame reserved.
     #[cfg(test)]
     reserved: AtomicUsize,
@@ -1436,6 +1435,9 @@ fn read_digest(reader: &mut BytecodeReader<'_>) -> Result<[u8; 16]> {
     Ok(reader.read_bytes(16)?.try_into()?)
 }
 
+type BlockUniqueIds = (Vec<Option<Box<str>>>, Vec<(usize, Value)>);
+type BlockCompareRun<'a> = (&'a [(usize, usize, usize)], bool, u32, &'a mut [u32]);
+
 impl<'a> BlockStore<'a> {
     pub(crate) fn open(bytes: impl Into<Cow<'a, [u8]>>) -> Result<Self> {
         let bytes = bytes.into();
@@ -1530,7 +1532,6 @@ impl<'a> BlockStore<'a> {
         // A store holds as much as a v11 store's one frame might.
         check_settings_payload_len(decoded, "Decoded")?;
         let read_pool = pool.iter().map(|_| Mutex::new(None)).collect();
-        let open_blocks = blocks.iter().map(|_| Mutex::new(None)).collect();
         let budget = DecodeBudget::for_file(bytes.len());
         Ok(Self {
             bytes,
@@ -1545,7 +1546,6 @@ impl<'a> BlockStore<'a> {
             rows,
             budget,
             read_pool,
-            open_blocks,
             #[cfg(test)]
             reserved: AtomicUsize::new(0),
         })
@@ -1652,6 +1652,7 @@ impl<'a> BlockStore<'a> {
         };
         const COMPACT_BLOCKS_AT_ONCE: usize = 4;
         let _span = crate::app::profile::span("store compact decode");
+        self.budget.renew(self.bytes.len());
         let structure = self.content(self.structure)?;
         let mut document = self.structure_of(structure)?;
         let ids: Vec<String> = document
@@ -1668,6 +1669,7 @@ impl<'a> BlockStore<'a> {
                 compared_digest: [0; 16],
                 unique_id_digest: [0; 16],
                 keys_hash: 0,
+                strict_digest: 0,
                 reflexive: true,
                 has_untyped_enum: false,
                 has_ref: false,
@@ -1728,19 +1730,9 @@ impl<'a> BlockStore<'a> {
         ))
     }
 
-    fn open_block_cached(&self, index: usize) -> Result<Arc<OpenBlock>> {
-        let mut slot = self.open_blocks[index].lock_recover();
-        if let Some(open) = slot.as_ref() {
-            return Ok(Arc::clone(open));
-        }
-        let open = Arc::new(self.open_block(index)?);
-        *slot = Some(Arc::clone(&open));
-        Ok(open)
-    }
-
     /// Decodes and stabilizes only the requested rows, reusing the store's
-    /// already-decoded bare structure records and a bounded cache of recently
-    /// opened blocks.
+    /// already-decoded bare structure records and opening each needed block on
+    /// demand.
     pub(crate) fn hydrate_rows(
         &self,
         bare: &[SettingsBytecodeInstance],
@@ -1758,7 +1750,7 @@ impl<'a> BlockStore<'a> {
         let read_group = |group: &[usize]| -> Result<Vec<(usize, SettingsBytecodeInstance)>> {
             let block_index = self.block_of(group[0]);
             let first = self.blocks[block_index].first;
-            let open = self.open_block_cached(block_index)?;
+            let open = self.open_block(block_index)?;
             let mut values = (0..self.blocks[block_index].count)
                 .map(|_| DecodedRowValues::default())
                 .collect::<Vec<_>>();
@@ -1907,7 +1899,7 @@ impl<'a> BlockStore<'a> {
                 compressed(&structure_content(&settled, &edit.dense)?)
             }
         };
-        let (written, structure) = match whole || kept {
+        let (written, structure) = match whole || (kept && settled.instances.len() < 4096) {
             true => (self.rewritten_blocks(&edit), structure()),
             false => rayon::join(|| self.rewritten_blocks(&edit), structure),
         };
@@ -2029,12 +2021,14 @@ impl<'a> BlockStore<'a> {
             return Ok(None);
         }
         let named = open.pool_entries().map(|entry| self.hashes[entry]);
+        let section = self.raw(self.blocks[index].frame)?;
+        let now = (named.collect::<AHashSet<_>>().into_iter())
+            .map(|hash| (hash, None))
+            .collect();
         Ok(Some(Some(Written {
-            section: self.raw(self.blocks[index].frame)?,
+            section,
             before: Vec::new(),
-            now: (named.collect::<AHashSet<_>>().into_iter())
-                .map(|hash| (hash, None))
-                .collect(),
+            now,
         })))
     }
 
@@ -2362,51 +2356,130 @@ impl<'a> BlockStore<'a> {
             .map(Some)
     }
 
-    /// Projects only the properties accepted by `names` onto an already-decoded
-    /// `instances` slice without re-decoding the store structure.
-    pub(crate) fn project_columns(
+    pub(crate) fn extract_unique_ids_and_root_camera(
         &self,
         instances: &mut [SettingsBytecodeInstance],
-        names: impl Fn(&str) -> bool + Sync,
-        project: impl Fn(&SettingsBytecodeInstance, &str, Value) -> Option<Value>,
-    ) -> Result<()> {
-        let projected = |index: usize| -> Result<Vec<(usize, String, Value)>> {
+    ) -> Result<Vec<Option<Box<str>>>> {
+        use super::captured::UNIQUE_ID;
+
+        let extract_block = |index: usize| -> Result<BlockUniqueIds> {
+            let block = &self.blocks[index];
             let open = self.open_block(index)?;
-            let mut values = (0..self.blocks[index].count)
-                .map(|_| DecodedRowValues::default())
-                .collect::<Vec<_>>();
-            self.values(
-                &open,
-                &mut values,
-                |_| true,
-                |name, _| names(name),
-                Texts::Resolved(&|_| true),
-            )?;
-            Ok(self.blocks[index]
-                .rows()
-                .zip(values)
-                .flat_map(|(row, values)| {
-                    values
-                        .properties
-                        .into_iter()
-                        .map(move |(name, value)| (row, name, value))
-                })
-                .collect())
+            let mut uids: Vec<Option<Box<str>>> = vec![None; block.count];
+            let mut root_cameras: Vec<(usize, Value)> = Vec::new();
+            let has_root = instances[block.rows()]
+                .iter()
+                .any(|inst| inst.parent_index.is_none());
+            if has_root {
+                let mut values = (0..block.count)
+                    .map(|_| DecodedRowValues::default())
+                    .collect::<Vec<_>>();
+                self.values(
+                    &open,
+                    &mut values,
+                    |local| instances[block.first + local].parent_index.is_none(),
+                    |name, _| name == "CurrentCamera",
+                    Texts::Resolved(&|_| true),
+                )?;
+                for (local, mut row_vals) in values.into_iter().enumerate() {
+                    if let Some(cam) = row_vals.properties.remove("CurrentCamera") {
+                        root_cameras.push((block.first + local, cam));
+                    }
+                }
+            }
+            let Some((str_opts, _, prop_names)) = build_block_string_meta(&open) else {
+                return self.extract_block_unique_ids_fallback(index, &open, root_cameras);
+            };
+            let (specs, _, _) = parse_block_group_specs(&open, &prop_names)?;
+            for (name, kind, value_count, body) in specs {
+                if name != UNIQUE_ID {
+                    continue;
+                }
+                if kind != 8 {
+                    return self.extract_block_unique_ids_fallback(index, &open, root_cameras);
+                }
+                let mut grp = BytecodeReader::new(body);
+                let mut prev_row = 0_usize;
+                for position in 0..value_count {
+                    let local = next_group_instance(
+                        prev_row,
+                        grp.read_len("property instance index")?,
+                        position,
+                    )?;
+                    prev_row = local;
+                    anyhow::ensure!(
+                        local < block.count,
+                        "A value block gives a value to a row it does not hold"
+                    );
+                    let Some((k0, v0_id, k1, v1_id)) =
+                        read_two_string_object_header(&mut grp, &str_opts)
+                    else {
+                        return self.extract_block_unique_ids_fallback(index, &open, root_cameras);
+                    };
+                    let Some(uid) = extract_two_field_unique_id(&str_opts, k0, v0_id, k1, v1_id)
+                    else {
+                        return self.extract_block_unique_ids_fallback(index, &open, root_cameras);
+                    };
+                    let trimmed = uid.trim();
+                    if !trimmed.is_empty() && !trimmed.chars().all(|c| c == '0') {
+                        uids[local] = Some(trimmed.into());
+                    }
+                }
+                grp.finish()?;
+            }
+            Ok((uids, root_cameras))
         };
+
         let blocks = (0..self.blocks.len())
             .into_par_iter()
-            .map(projected)
+            .map(extract_block)
             .collect::<Result<Vec<_>>>()?;
-        for (row, name, value) in blocks.into_iter().flatten() {
-            let kept = project(&instances[row], &name, value);
-            let properties = &mut instances[row].properties;
-            if let Some(value) = kept {
-                properties.insert(name, value);
-            } else {
-                properties.remove(&name);
+        let mut all_uids = Vec::with_capacity(self.rows);
+        for (uids, cams) in blocks {
+            all_uids.extend(uids);
+            for (row, cam) in cams {
+                instances[row]
+                    .properties
+                    .insert("CurrentCamera".into(), cam);
             }
         }
-        Ok(())
+        Ok(all_uids)
+    }
+
+    fn extract_block_unique_ids_fallback(
+        &self,
+        index: usize,
+        open: &OpenBlock,
+        root_cameras: Vec<(usize, Value)>,
+    ) -> Result<BlockUniqueIds> {
+        use super::captured::UNIQUE_ID;
+
+        let mut values = (0..self.blocks[index].count)
+            .map(|_| DecodedRowValues::default())
+            .collect::<Vec<_>>();
+        self.values(
+            open,
+            &mut values,
+            |_| true,
+            |name, _| name == UNIQUE_ID,
+            Texts::Resolved(&|_| true),
+        )?;
+        let uids = values
+            .into_iter()
+            .map(|vals| {
+                vals.properties
+                    .get(UNIQUE_ID)
+                    .and_then(|v| {
+                        v.as_object()
+                            .filter(|o| o.get("_type").and_then(Value::as_str) == Some("UniqueId"))
+                            .and_then(|o| o.get("value").and_then(Value::as_str))
+                    })
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && !s.chars().all(|c| c == '0'))
+                    .map(Box::<str>::from)
+            })
+            .collect();
+        Ok((uids, root_cameras))
     }
 
     pub(crate) fn row_digests_of_instances_with_structure(
@@ -3542,6 +3615,94 @@ impl<'a> BlockStore<'a> {
         }))
     }
 
+    pub(crate) fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub(crate) fn visit_block_raw<R>(
+        &self,
+        index: usize,
+        visit: impl FnOnce(
+            usize,
+            &[Vec<(&str, RawBlockValue<'_>)>],
+            &[Option<Map<String, Value>>],
+        ) -> Result<R>,
+    ) -> Result<R> {
+        let block = &self.blocks[index];
+        let open = self.open_block(index)?;
+        let read = self.pool_read(open.pool_entries())?;
+        let table = open
+            .strings
+            .iter()
+            .map(|string| match string {
+                BlockString::Own(text) => Ok(text.as_str()),
+                BlockString::Pool(entry) => self.entry(&read, *entry),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let property_names = open.properties.iter().map(|id| table[*id]);
+        self.budget.take(
+            table
+                .iter()
+                .copied()
+                .chain(property_names)
+                .map(str::len)
+                .fold(0, usize::saturating_add),
+        )?;
+        let properties = open
+            .properties
+            .iter()
+            .map(|id| table[*id].to_string())
+            .collect::<Vec<_>>();
+        let mut reader = BytecodeReader::new(&open.content[open.rest..]);
+        let specs = read_settings_property_groups(&mut reader, &properties)?;
+        reader.finish()?;
+        let scope = ValueScope::from_borrowed(&table, self.rows, &self.budget, None);
+        let mut row_props: Vec<Vec<(&str, RawBlockValue<'_>)>> =
+            (0..block.count).map(|_| Vec::new()).collect();
+        let mut row_attrs: Vec<Option<Map<String, Value>>> =
+            (0..block.count).map(|_| None).collect();
+        let mut seen_names = AHashSet::with_capacity(specs.len());
+        let mut has_dup = false;
+        for &(name, ..) in &specs {
+            if !seen_names.insert(name.as_str()) {
+                has_dup = true;
+                break;
+            }
+        }
+        for &(name, kind, count, body) in &specs {
+            let prop_name = name.as_str();
+            match decode_property_group_raw(body, prop_name, kind, count, block.count, scope)? {
+                DecodedRawGroup::Properties(name, entries) => {
+                    if has_dup {
+                        for (row, value) in entries {
+                            if let Some(existing) =
+                                row_props[row].iter_mut().find(|(k, _)| *k == name)
+                            {
+                                existing.1 = value;
+                            } else {
+                                row_props[row].push((name, value));
+                            }
+                        }
+                    } else {
+                        for (row, value) in entries {
+                            row_props[row].push((name, value));
+                        }
+                    }
+                }
+                DecodedRawGroup::Attributes(entries) => {
+                    for (row, attrs) in entries {
+                        row_attrs[row] = Some(attrs);
+                    }
+                }
+            }
+        }
+        visit(block.first, &row_props, &row_attrs)
+    }
+
+    pub(crate) fn renew_budget(&self) {
+        self.budget.renew(self.bytes.len());
+    }
+
     /// Gives `rows`, the rows of one block in order, the values the block
     /// holds for the rows `keep` takes of the property groups `groups` takes
     /// by name and kind, with `texts` for the pool entries they name; a
@@ -3994,7 +4155,7 @@ impl<'a> RowBatches<'a> {
         state: &ServiceState,
         records: &[SettingsBinaryInstance<'_>],
         lookup: &SettingsBinaryInstanceLookup<'_>,
-        changed: &[usize],
+        (changed, stored_at, moved): (&[usize], &[usize], Option<&super::captured::Moved>),
         root_service: Option<&str>,
         long_hashes: Option<&super::captured::LongHashMap>,
     ) -> Result<Vec<FastCompareOutcome>> {
@@ -4005,6 +4166,8 @@ impl<'a> RowBatches<'a> {
             records,
             lookup,
             changed,
+            stored_at,
+            moved,
             root_service,
             long_hashes,
         })
@@ -4028,6 +4191,7 @@ enum FastCapVal<'a> {
     CFrame(&'a [f32; 12]),
     Ref(usize),
     Payload { ty: &'a str, b64: &'a str },
+    Json(&'a Value),
     Tags(&'a [Value]),
     SkipCompare,
 }
@@ -4399,6 +4563,8 @@ struct FastCompareInput<'a> {
     records: &'a [SettingsBinaryInstance<'a>],
     lookup: &'a SettingsBinaryInstanceLookup<'a>,
     changed: &'a [usize],
+    stored_at: &'a [usize],
+    moved: Option<&'a super::captured::Moved>,
     root_service: Option<&'a str>,
     long_hashes: Option<&'a super::captured::LongHashMap>,
 }
@@ -4571,17 +4737,16 @@ fn fast_cap_val_object<'a>(
             if !safe {
                 return None;
             }
-            Some(
-                extract_payload_from_value(arc).map_or(FastCapVal::SkipCompare, |(ty, b64)| {
-                    FastCapVal::Payload { ty, b64 }
-                }),
-            )
+            Some(extract_payload_from_value(arc).map_or_else(
+                || FastCapVal::Json(arc.as_ref()),
+                |(ty, b64)| FastCapVal::Payload { ty, b64 },
+            ))
         }
         SettingsBinaryValueSource::Property(v) => {
             if let Some((ty, b64)) = extract_payload_from_value(v) {
                 Some(FastCapVal::Payload { ty, b64 })
             } else if !holds_reference(v) && !value_contains_enum_item(v) {
-                Some(FastCapVal::SkipCompare)
+                Some(FastCapVal::Json(v))
             } else {
                 None
             }
@@ -4915,6 +5080,227 @@ fn compare_fast_pair_values(
     }
 }
 
+fn read_inline_number(reader: &mut BytecodeReader<'_>, kind: u8) -> Option<f64> {
+    match kind {
+        3 => Some(unzigzag_i64(reader.read_var_u64().ok()?) as f64),
+        4 => Some(reader.read_var_u64().ok()? as f64),
+        5 => read_f64(reader).ok(),
+        20 => read_f32(reader).ok().map(f64::from),
+        _ => None,
+    }
+}
+
+fn compare_inline_physical_properties(
+    reader: &mut BytecodeReader<'_>,
+    str_opts: &[Option<&str>],
+    cap_obj: &Map<String, Value>,
+) -> Option<bool> {
+    use crate::settings::equivalence::{f32_values_definitely_differ, f32_values_match};
+
+    let cap_vals = [
+        cap_obj.get("density")?.as_f64()?,
+        cap_obj.get("friction")?.as_f64()?,
+        cap_obj.get("elasticity")?.as_f64()?,
+        cap_obj.get("frictionWeight")?.as_f64()?,
+        cap_obj.get("elasticityWeight")?.as_f64()?,
+    ];
+    let mut is_pp = false;
+    let mut seen = 0u8;
+    let mut stored_vals = [0.0f64; 5];
+    for _ in 0..6 {
+        let key_id = reader.read_len("object key string id").ok()?;
+        let key = (*str_opts.get(key_id)?)?;
+        let vk = reader.read_u8().ok()?;
+        match key {
+            "_type" if vk == 6 => {
+                let sid = reader.read_len("value string id").ok()?;
+                if (*str_opts.get(sid)?)? != "PhysicalProperties" {
+                    return None;
+                }
+                is_pp = true;
+            }
+            "density" => {
+                stored_vals[0] = read_inline_number(reader, vk)?;
+                seen |= 1;
+            }
+            "friction" => {
+                stored_vals[1] = read_inline_number(reader, vk)?;
+                seen |= 2;
+            }
+            "elasticity" => {
+                stored_vals[2] = read_inline_number(reader, vk)?;
+                seen |= 4;
+            }
+            "frictionWeight" => {
+                stored_vals[3] = read_inline_number(reader, vk)?;
+                seen |= 8;
+            }
+            "elasticityWeight" => {
+                stored_vals[4] = read_inline_number(reader, vk)?;
+                seen |= 16;
+            }
+            _ => return None,
+        }
+    }
+    if !is_pp || seen != 31 {
+        return None;
+    }
+    if (0..5).all(|i| f32_values_match(stored_vals[i], cap_vals[i])) {
+        Some(true)
+    } else if (0..5).any(|i| f32_values_definitely_differ(stored_vals[i], cap_vals[i])) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn compare_inline_brick_color(
+    reader: &mut BytecodeReader<'_>,
+    str_opts: &[Option<&str>],
+    cap_obj: &Map<String, Value>,
+) -> Option<bool> {
+    let cap_num = cap_obj.get("number")?.as_i64()?;
+    let mut is_bc = false;
+    let mut stored_num: Option<i64> = None;
+    for _ in 0..2 {
+        let key_id = reader.read_len("object key string id").ok()?;
+        let key = (*str_opts.get(key_id)?)?;
+        let vk = reader.read_u8().ok()?;
+        match key {
+            "_type" if vk == 6 => {
+                let sid = reader.read_len("value string id").ok()?;
+                if (*str_opts.get(sid)?)? != "BrickColor" {
+                    return None;
+                }
+                is_bc = true;
+            }
+            "number" => {
+                stored_num = match vk {
+                    3 => Some(unzigzag_i64(reader.read_var_u64().ok()?)),
+                    4 => i64::try_from(reader.read_var_u64().ok()?).ok(),
+                    _ => return None,
+                };
+            }
+            _ => return None,
+        }
+    }
+    if !is_bc {
+        return None;
+    }
+    Some(stored_num? == cap_num)
+}
+
+fn compare_inline_typed_object(
+    reader: &mut BytecodeReader<'_>,
+    str_opts: &[Option<&str>],
+    cap_val: &Value,
+) -> Option<bool> {
+    let cap_obj = cap_val.as_object()?;
+    let cap_ty = cap_obj.get("_type").and_then(Value::as_str)?;
+    let len = reader.read_collection_len("object field count").ok()?;
+    match cap_ty {
+        "PhysicalProperties" if len == 6 => {
+            compare_inline_physical_properties(reader, str_opts, cap_obj)
+        }
+        "BrickColor" if len == 2 => compare_inline_brick_color(reader, str_opts, cap_obj),
+        _ => None,
+    }
+}
+
+fn decode_inline_fast_object(
+    reader: &mut BytecodeReader<'_>,
+    str_opts: &[Option<&str>],
+    depth: usize,
+) -> Result<Option<Value>> {
+    if depth > MAX_SETTINGS_VALUE_DEPTH {
+        return Ok(None);
+    }
+    let len = reader.read_collection_len("object field count")?;
+    let mut map = Map::with_capacity(len);
+    for _ in 0..len {
+        let key_id = reader.read_len("object key string id")?;
+        let Some(key) = str_opts.get(key_id).copied().flatten() else {
+            return Ok(None);
+        };
+        let val_kind = reader.read_u8().context("Missing value kind")?;
+        let Some(val) = decode_inline_fast_value(reader, val_kind, str_opts, depth + 1)? else {
+            return Ok(None);
+        };
+        map.insert(key.to_string(), val);
+    }
+    Ok(Some(Value::Object(map)))
+}
+
+fn decode_inline_fast_value(
+    reader: &mut BytecodeReader<'_>,
+    kind: u8,
+    str_opts: &[Option<&str>],
+    depth: usize,
+) -> Result<Option<Value>> {
+    if depth > MAX_SETTINGS_VALUE_DEPTH {
+        return Ok(None);
+    }
+    let val = match kind {
+        0 => Value::Null,
+        1 => Value::Bool(false),
+        2 => Value::Bool(true),
+        3 => json!(unzigzag_i64(reader.read_var_u64()?)),
+        4 => json!(reader.read_var_u64()?),
+        5 => json_number_f64(read_f64(reader)?),
+        20 => json_number_f64(f64::from(read_f32(reader)?)),
+        6 => {
+            let id = reader.read_len("value string id")?;
+            let Some(s) = str_opts.get(id).copied().flatten() else {
+                return Ok(None);
+            };
+            Value::String(s.to_string())
+        }
+        7 => {
+            let len = reader.read_collection_len("array length")?;
+            let mut items = Vec::with_capacity(len);
+            for _ in 0..len {
+                let item_kind = reader.read_u8().context("Missing array item kind")?;
+                let Some(item) = decode_inline_fast_value(reader, item_kind, str_opts, depth + 1)?
+                else {
+                    return Ok(None);
+                };
+                items.push(item);
+            }
+            Value::Array(items)
+        }
+        8 => return decode_inline_fast_object(reader, str_opts, depth),
+        9 => {
+            let len = reader.read_len("numeric array length")?;
+            let mut items = Vec::with_capacity(len);
+            for _ in 0..len {
+                items.push(json_number_f64(read_f64(reader)?));
+            }
+            Value::Array(items)
+        }
+        21 => {
+            let len = reader.read_len("f32 numeric array length")?;
+            let mut items = Vec::with_capacity(len);
+            for _ in 0..len {
+                items.push(json_number_f64(f64::from(read_f32(reader)?)));
+            }
+            Value::Array(items)
+        }
+        11 => decode_fixed_numeric_payload(reader, "Vector2", &["x", "y"])?,
+        12 => decode_fixed_numeric_payload(reader, "Vector3", &["x", "y", "z"])?,
+        13 => decode_fixed_numeric_payload(reader, "UDim", &["scale", "offset"])?,
+        14 => decode_fixed_numeric_payload(
+            reader,
+            "UDim2",
+            &["xScale", "xOffset", "yScale", "yOffset"],
+        )?,
+        15 => decode_fixed_numeric_payload(reader, "Color3", &["r", "g", "b"])?,
+        16 => decode_cframe_payload(reader)?,
+        18 => decode_fixed_numeric_payload(reader, "Rect", &["minX", "minY", "maxX", "maxY"])?,
+        _ => return Ok(None),
+    };
+    Ok(Some(val))
+}
+
 fn read_two_string_object_header<'a>(
     reader: &mut BytecodeReader<'_>,
     str_opts: &[Option<&'a str>],
@@ -5040,38 +5426,63 @@ fn compare_stored_array_value<'a, 'b>(
         skip_raw_value_payload_fast(reader, 7, 0)?;
         return Ok(());
     }
-    if name == "Tags"
-        && let Some((FastCapVal::Tags(cap_tags), _)) = cap_match
-    {
-        let save_pos = reader.position();
-        let tags_ok = (|| -> Option<bool> {
-            let arr_len = reader.read_collection_len("array length").ok()?;
-            scratch.tag_left_buf.clear();
-            for _ in 0..arr_len {
-                if reader.read_u8().ok()? != 6 {
-                    return None;
+    if name == "Tags" {
+        if let Some((FastCapVal::Tags(cap_tags), _)) = cap_match {
+            let save_pos = reader.position();
+            let tags_ok = (|| -> Option<bool> {
+                let arr_len = reader.read_collection_len("array length").ok()?;
+                scratch.tag_left_buf.clear();
+                for _ in 0..arr_len {
+                    if reader.read_u8().ok()? != 6 {
+                        return None;
+                    }
+                    let id = reader.read_len("value string id").ok()?;
+                    scratch.tag_left_buf.push((*str_opts.get(id)?)?);
                 }
-                let id = reader.read_len("value string id").ok()?;
-                scratch.tag_left_buf.push((*str_opts.get(id)?)?);
+                scratch.tag_right_buf.clear();
+                for v in cap_tags {
+                    scratch.tag_right_buf.push(v.as_str()?);
+                }
+                scratch.tag_left_buf.sort_unstable();
+                scratch.tag_left_buf.dedup();
+                scratch.tag_right_buf.sort_unstable();
+                scratch.tag_right_buf.dedup();
+                Some(scratch.tag_left_buf == scratch.tag_right_buf)
+            })();
+            match tags_ok {
+                Some(true) => return Ok(()),
+                Some(false) => {
+                    st.found_diff[slot] = true;
+                    st.all_same[slot] = false;
+                    return Ok(());
+                }
+                None => reader.set_position(save_pos),
             }
-            scratch.tag_right_buf.clear();
-            for v in cap_tags {
-                scratch.tag_right_buf.push(v.as_str()?);
+        } else if cap_match.is_none() {
+            let save_pos = reader.position();
+            let non_empty_string_tags = (|| -> Option<bool> {
+                let arr_len = reader.read_collection_len("array length").ok()?;
+                for _ in 0..arr_len {
+                    if reader.read_u8().ok()? != 6 {
+                        return None;
+                    }
+                    let id = reader.read_len("value string id").ok()?;
+                    let _ = (*str_opts.get(id)?)?;
+                }
+                Some(arr_len > 0)
+            })();
+            match non_empty_string_tags {
+                Some(true) => {
+                    st.found_diff[slot] = true;
+                    st.all_same[slot] = false;
+                    return Ok(());
+                }
+                Some(false) => {
+                    st.all_same[slot] = false;
+                    return Ok(());
+                }
+                None => reader.set_position(save_pos),
             }
-            scratch.tag_left_buf.sort_unstable();
-            scratch.tag_left_buf.dedup();
-            scratch.tag_right_buf.sort_unstable();
-            scratch.tag_right_buf.dedup();
-            Some(scratch.tag_left_buf == scratch.tag_right_buf)
-        })();
-        match tags_ok {
-            Some(true) => return Ok(()),
-            Some(false) => {
-                st.found_diff[slot] = true;
-                st.all_same[slot] = false;
-                return Ok(());
-            }
-            None => reader.set_position(save_pos),
         }
     }
     if !stored_value_is_safe(reader, 7, str_opts, 0)? {
@@ -5220,16 +5631,16 @@ fn apply_fast_scalar_comparison(
 fn check_unmatched_captured_props(
     shared: &FastCompareShared<'_>,
     cache: &mut crate::settings::equivalence::CanonicalizeCache,
-    block_items: &[(usize, usize)],
+    block_items: &[(usize, usize, usize)],
     st: &mut FastCompareBlockState<'_>,
     cap_seen: &[bool],
 ) {
     use crate::settings::equivalence::is_asset_reference_property;
-    for (slot, &(_, global)) in block_items.iter().enumerate() {
+    for (slot, &(_, obs_row, _)) in block_items.iter().enumerate() {
         if !st.eligible[slot] {
             continue;
         }
-        let class_name = shared.input.records[global].class_name;
+        let class_name = shared.input.records[obs_row].class_name;
         let (start, end) = st.cap_ranges[slot];
         for (idx, &seen) in cap_seen.iter().enumerate().take(end).skip(start) {
             if seen {
@@ -5248,7 +5659,46 @@ fn check_unmatched_captured_props(
             {
                 continue;
             }
+            if name == "Tags"
+                && let FastCapVal::Tags(items) = val
+            {
+                st.all_same[slot] = false;
+                if !items.is_empty() {
+                    st.found_diff[slot] = true;
+                }
+                continue;
+            }
             let rule = cache.one_sided_rule(class_name, name);
+            if matches!(rule, crate::settings::equivalence::OneSidedRule::Ignored) {
+                continue;
+            }
+            if let FastCapVal::Json(cap_val) = val {
+                let is_special = matches!(
+                    name,
+                    "CurrentCamera"
+                        | "HistoryId"
+                        | "Source"
+                        | "Tags"
+                        | "CollisionFidelity"
+                        | "PhysicsGrid"
+                        | "TexturePack"
+                        | "TriangleCount"
+                ) || name == crate::rbx::encode::COLLISION_HULL_PROPERTY
+                    || is_asset_reference_property(class_name, name);
+                if !is_special
+                    && crate::settings::equivalence::reconciliation_store_property_values_equal(
+                        shared.input.root_service,
+                        class_name,
+                        name,
+                        None,
+                        Some(cap_val),
+                    )
+                {
+                    continue;
+                }
+                st.all_same[slot] = false;
+                continue;
+            }
             match fast_val_matches_one_sided(name, val, &rule) {
                 Some(true) => {}
                 Some(false) => {
@@ -5299,9 +5749,19 @@ impl BlockStore<'_> {
             return Ok(Vec::new());
         }
         let database = rbx_reflection_database::get().ok();
-        let indexed: Vec<(usize, usize)> = input.changed.iter().copied().enumerate().collect();
-        let by_block: Vec<&[(usize, usize)]> = indexed
-            .chunk_by(|a, b| self.block_of(a.1) == self.block_of(b.1))
+        let mut indexed: Vec<(usize, usize, usize)> = input
+            .changed
+            .iter()
+            .copied()
+            .zip(input.stored_at.iter().copied())
+            .enumerate()
+            .map(|(pos, (obs_row, stored_row))| (pos, obs_row, stored_row))
+            .collect();
+        if !indexed.is_sorted_by_key(|&(_, _, stored_row)| stored_row) {
+            indexed.sort_unstable_by_key(|&(_, _, stored_row)| stored_row);
+        }
+        let by_block: Vec<&[(usize, usize, usize)]> = indexed
+            .chunk_by(|a, b| self.block_of(a.2) == self.block_of(b.2))
             .collect();
         let owned_long_hashes;
         let long_hashes = match input.long_hashes {
@@ -5339,21 +5799,21 @@ impl BlockStore<'_> {
         &self,
         shared: &FastCompareShared<'a>,
         cache: &mut crate::settings::equivalence::CanonicalizeCache<'a>,
-        block_items: &[(usize, usize)],
+        block_items: &[(usize, usize, usize)],
     ) -> Result<Vec<(usize, FastCompareOutcome)>> {
         use super::captured::ComparedPair;
         use crate::settings::equivalence::is_engine_managed_attribute;
 
-        let block_idx = self.block_of(block_items[0].1);
+        let block_idx = self.block_of(block_items[0].2);
         let block = &self.blocks[block_idx];
         let mut st = self.fast_compare_collect_captured(shared, cache, block, block_items)?;
         if !st.eligible.iter().any(|&e| e) {
-            return Ok(block_items.iter().map(|&(pos, _)| (pos, None)).collect());
+            return Ok(block_items.iter().map(|&(pos, _, _)| (pos, None)).collect());
         }
 
         let open = self.open_block(block_idx)?;
         let Some((str_opts, str_pool_entry, prop_names)) = build_block_string_meta(&open) else {
-            return Ok(block_items.iter().map(|&(pos, _)| (pos, None)).collect());
+            return Ok(block_items.iter().map(|&(pos, _, _)| (pos, None)).collect());
         };
         let (specs, attr_groups, prop_order) = parse_block_group_specs(&open, &prop_names)?;
         if !attr_groups.is_empty() {
@@ -5367,10 +5827,10 @@ impl BlockStore<'_> {
             )?;
         }
         let m = block_items.len();
-        for (slot, &(_, global)) in block_items.iter().enumerate() {
+        for (slot, &(_, obs_row, _)) in block_items.iter().enumerate() {
             if st.eligible[slot] && !st.stored_had_attrs[slot] {
                 let cap_attrs = &shared.input.state.instances
-                    [shared.input.records[global].source_index]
+                    [shared.input.records[obs_row].source_index]
                     .attributes;
                 if cap_attrs.keys().any(|k| !is_engine_managed_attribute(k)) {
                     st.found_diff[slot] = true;
@@ -5426,7 +5886,7 @@ impl BlockStore<'_> {
         shared: &FastCompareShared<'a>,
         cache: &mut crate::settings::equivalence::CanonicalizeCache<'a>,
         block: &Block,
-        block_items: &[(usize, usize)],
+        block_items: &[(usize, usize, usize)],
     ) -> Result<FastCompareBlockState<'a>> {
         use super::captured::UNIQUE_ID;
         use crate::settings::equivalence::{
@@ -5450,13 +5910,18 @@ impl BlockStore<'_> {
         let mut slot_targets: Vec<&str> = Vec::new();
         let mut shared_safe: AHashMap<usize, bool> = AHashMap::new();
 
-        for (slot, &(_, global)) in block_items.iter().enumerate() {
-            st.row_to_slot[global - block.first] = slot as u32;
-            let row = &shared.input.structure[global];
-            let rec = &shared.input.records[global];
+        for (slot, &(_, obs_row, stored_row)) in block_items.iter().enumerate() {
+            st.row_to_slot[stored_row - block.first] = slot as u32;
+            let row = &shared.input.structure[stored_row];
+            let rec = &shared.input.records[obs_row];
+            let stored_parent = match (row.parent_index, shared.input.moved) {
+                (Some(parent), Some(moved)) => moved.in_state(parent),
+                (parent, None) => parent,
+                (None, Some(_)) => None,
+            };
             if row.name != rec.name
                 || row.class_name != rec.class_name
-                || row.parent_index != rec.parent_index
+                || stored_parent != rec.parent_index
                 || fast_compare_skip_class(rec.class_name)
             {
                 st.eligible[slot] = false;
@@ -5591,7 +6056,7 @@ impl BlockStore<'_> {
         open: &OpenBlock,
         specs: &[BlockGroupSpec<'_>],
         attr_groups: &[usize],
-        block_items: &[(usize, usize)],
+        block_items: &[(usize, usize, usize)],
         st: &mut FastCompareBlockState<'_>,
     ) -> Result<()> {
         use crate::settings::equivalence::{
@@ -5675,7 +6140,7 @@ impl BlockStore<'_> {
             &AHashSet<&'b str>,
         ),
         (specs, prop_order, count): (&[BlockGroupSpec<'b>], &[usize], usize),
-        block_items: &[(usize, usize)],
+        block_items: &[(usize, usize, usize)],
         (st, cap_seen): (&mut FastCompareBlockState<'a>, &mut [bool]),
     ) -> Result<()> {
         let m = block_items.len();
@@ -5736,7 +6201,7 @@ impl BlockStore<'_> {
         cache: &mut crate::settings::equivalence::CanonicalizeCache<'a>,
         (name, kind, value_count, body): BlockGroupSpec<'b>,
         meta: &FastCompareGroupMeta<'_, 'b>,
-        (block_items, multi, run_id, seen_in_run): (&[(usize, usize)], bool, u32, &mut [u32]),
+        (block_items, multi, run_id, seen_in_run): BlockCompareRun<'_>,
         state: &mut FastCompareGroupMut<'_, 'a, 'b>,
     ) -> Result<()> {
         use crate::settings::equivalence::{
@@ -5939,8 +6404,12 @@ impl BlockStore<'_> {
         if is_engine {
             return Ok(());
         }
+        let target_in_state = match shared.input.moved {
+            Some(moved) => moved.in_state(target),
+            None => Some(target),
+        };
         match cap_match {
-            Some((FastCapVal::Ref(cap_target), _)) if target == cap_target => {}
+            Some((FastCapVal::Ref(cap_target), _)) if target_in_state == Some(cap_target) => {}
             Some((FastCapVal::Ref(_), _)) => {
                 st.all_same[slot] = false;
                 if !is_stored_canon {
@@ -6055,9 +6524,107 @@ impl BlockStore<'_> {
         reader.set_position(save_pos);
         if flags.is_unique_id || !stored_value_is_safe(reader, 8, str_opts, 0)? {
             st.eligible[slot] = false;
-        } else {
-            st.all_same[slot] = false;
+            return Ok(());
         }
+        let end_pos = reader.position();
+        if cap_match.is_none()
+            && !is_stored_canon
+            && matches!(
+                cache.one_sided_rule(class_name, name),
+                OneSidedRule::Ignored
+            )
+        {
+            return Ok(());
+        }
+        self.compare_inline_object_value(
+            reader,
+            (save_pos, end_pos),
+            (shared, str_opts),
+            (slot, class_name, name, flags, is_stored_canon),
+            cap_match,
+            (st, scratch),
+        )
+    }
+
+    fn compare_inline_object_value<'a, 'b>(
+        &self,
+        reader: &mut BytecodeReader<'_>,
+        (save_pos, end_pos): (usize, usize),
+        (shared, str_opts): (&FastCompareShared<'a>, &[Option<&'b str>]),
+        (slot, class_name, name, flags, is_stored_canon): (
+            usize,
+            &'a str,
+            &str,
+            FastPropFlags,
+            bool,
+        ),
+        cap_match: Option<(FastCapVal<'a>, bool)>,
+        (st, scratch): (
+            &mut FastCompareBlockState<'a>,
+            &mut FastComparePropScratch<'a, 'b>,
+        ),
+    ) -> Result<()> {
+        use crate::settings::equivalence::{
+            is_asset_reference_property, reconciliation_property_is_always_engine_state,
+            reconciliation_store_property_values_equal,
+        };
+        let is_engine = flags.is_meta_name
+            || *scratch
+                .class_engine_state
+                .entry(class_name)
+                .or_insert_with(|| {
+                    reconciliation_property_is_always_engine_state(
+                        shared.database,
+                        class_name,
+                        name,
+                    )
+                });
+        if is_engine {
+            return Ok(());
+        }
+        let is_asset = *scratch
+            .class_asset_ref
+            .entry(class_name)
+            .or_insert_with(|| is_asset_reference_property(class_name, name));
+        let cap_obj = match cap_match {
+            Some((FastCapVal::Json(v), false)) => Some(v),
+            _ => None,
+        };
+        if !st.found_diff[slot]
+            && !flags.is_special
+            && !is_stored_canon
+            && !is_asset
+            && let Some(cap_obj) = cap_obj
+        {
+            reader.set_position(save_pos);
+            let fast = compare_inline_typed_object(reader, str_opts, cap_obj);
+            reader.set_position(end_pos);
+            if let Some(eq) = fast {
+                if !eq {
+                    st.all_same[slot] = false;
+                    st.found_diff[slot] = true;
+                }
+                return Ok(());
+            }
+            reader.set_position(save_pos);
+            let decoded = decode_inline_fast_object(reader, str_opts, 0)?;
+            reader.set_position(end_pos);
+            if let Some(stored_val) = decoded {
+                let eq = reconciliation_store_property_values_equal(
+                    shared.input.root_service,
+                    class_name,
+                    name,
+                    Some(&stored_val),
+                    Some(cap_obj),
+                );
+                if !eq {
+                    st.all_same[slot] = false;
+                    st.found_diff[slot] = true;
+                }
+                return Ok(());
+            }
+        }
+        st.all_same[slot] = false;
         Ok(())
     }
 
@@ -7110,6 +7677,44 @@ fn engine_state_digest(
 /// A v12 store that an edit reads and writes for `RetainedPropertyColumns`:
 /// the instances it makes complete come from their blocks, and only the
 /// blocks the edit changes are written anew.
+impl BlockStore<'static> {
+    pub(crate) fn settle_ids_and_rows(
+        self,
+        records: Vec<SettingsBytecodeInstance>,
+        ids: &[String],
+        written: &BTreeMap<usize, SettingsBytecodeInstance>,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            records.len() == ids.len(),
+            "A captured store changed while it was verified; retry the sync"
+        );
+        let mut document = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: records.clone(),
+        };
+        for (instance, id) in document.instances.iter_mut().zip(ids) {
+            instance.settings_id.clone_from(id);
+        }
+        let mut complete = vec![false; records.len()];
+        for (index, verified) in written {
+            let instance = &mut document.instances[*index];
+            instance.properties.clone_from(&verified.properties);
+            instance.attributes.clone_from(&verified.attributes);
+            complete[*index] = true;
+        }
+        let edited = EditedStore {
+            store: self,
+            records,
+            given: AHashMap::new(),
+            complete,
+            standing: true,
+        };
+        let encoded = edited.encode(&document);
+        rayon::spawn(move || drop((document, edited)));
+        encoded
+    }
+}
+
 pub(crate) struct EditedStore {
     store: BlockStore<'static>,
     /// The instances as the store holds them, without values.
@@ -7415,6 +8020,14 @@ impl RowBlocks {
         self.store.rows
     }
 
+    pub(crate) fn store(&self) -> &BlockStore<'static> {
+        &self.store
+    }
+
+    pub(crate) fn into_store(self) -> BlockStore<'static> {
+        self.store
+    }
+
     /// `RetainedRowColumns::materialize_references` of this store: the rows
     /// `wanted` marks get the values of each property some block holds a
     /// value of one of `kinds` for, and their attributes where some block
@@ -7498,7 +8111,10 @@ impl RowBlocks {
                 let next = block..self.store.blocks.len().min(block + READ_AHEAD_BLOCKS);
                 self.read = next
                     .into_par_iter()
-                    .map(|at| Ok((at, self.store.block_values(at, |_| true, Texts::All)?)))
+                    .map(|at| {
+                        let values = self.store.block_values(at, |_| true, Texts::All)?;
+                        Ok((at, values))
+                    })
                     .collect::<Result<_>>()?;
             }
             let (_, values) = self.read.front_mut().context("No block was read")?;
@@ -7519,7 +8135,8 @@ impl RowBlocks {
         names: impl Fn(&str) -> bool + Sync,
         project: impl Fn(&SettingsBytecodeInstance, &str, Value) -> Option<Value>,
     ) -> Result<()> {
-        let store = BlockStore::open(&*self.store.bytes)?.holding();
+        let store = &self.store;
+        store.budget.renew(store.bytes.len());
         anyhow::ensure!(
             document.instances.len() == store.rows,
             "Store structure changed during row decoding; restart the store read"
@@ -7555,6 +8172,7 @@ impl RowBlocks {
                 None => document.instances[row].properties.remove(&name),
             };
         }
+        store.budget.renew(store.bytes.len());
         Ok(())
     }
 
@@ -7942,6 +8560,192 @@ mod fast_path_regression_tests {
                 "fast compare treated inline Source as metadata for captured={captured_source}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn fast_compare_honours_one_sided_rules_for_inline_object_values() -> Result<()> {
+        let uid = json!({"_type": "UniqueId", "value": "00000000000000000000000000000009"});
+        let obj_val = json!({"_type": "NumberRange", "min": 1.0, "max": 2.0});
+
+        let stored_doc = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                doc_instance("1", "Workspace", "Workspace", None, Map::new()),
+                doc_instance(
+                    "p1",
+                    "Part",
+                    "P",
+                    Some(0),
+                    Map::from_iter([("UniqueId".into(), uid.clone())]),
+                ),
+            ],
+        };
+        let stored_bytes = encode_document(&stored_doc, false, None)?;
+        let mut cap_state = build_service_state_from_instances(
+            "Workspace",
+            None,
+            vec![
+                snapshot_instance("ws", "Workspace", "Workspace", 0, None, Map::new()),
+                snapshot_instance(
+                    "p1",
+                    "Part",
+                    "P",
+                    1,
+                    Some(0),
+                    Map::from_iter([
+                        ("UniqueId".into(), uid.clone()),
+                        ("FutureUnknownObjectProp".into(), obj_val.clone()),
+                    ]),
+                ),
+            ],
+            HashMap::new(),
+            true,
+        )?;
+        cap_state.dense_index_topology = true;
+        let pulled = super::super::pulled_digest_from_service_state(&cap_state)?;
+        let (alignment, _) = super::super::captured::changed_document_rows(
+            &cap_state,
+            &pulled.rows,
+            &stored_bytes,
+            None,
+        )?
+        .expect("changed_document_rows must compare Part row");
+        assert!(
+            matches!(alignment, SettingsAlignment::Equivalent),
+            "Settings 1: captured-only unknown object-typed property must compare Equivalent"
+        );
+
+        let stored_with_obj = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                doc_instance("1", "Workspace", "Workspace", None, Map::new()),
+                doc_instance(
+                    "p1",
+                    "Part",
+                    "P",
+                    Some(0),
+                    Map::from_iter([
+                        ("UniqueId".into(), uid.clone()),
+                        ("FutureUnknownObjectProp".into(), obj_val),
+                    ]),
+                ),
+            ],
+        };
+        let stored_obj_bytes = encode_document(&stored_with_obj, false, None)?;
+        let mut cap_empty = build_service_state_from_instances(
+            "Workspace",
+            None,
+            vec![
+                snapshot_instance("ws", "Workspace", "Workspace", 0, None, Map::new()),
+                snapshot_instance(
+                    "p1",
+                    "Part",
+                    "P",
+                    1,
+                    Some(0),
+                    Map::from_iter([("UniqueId".into(), uid)]),
+                ),
+            ],
+            HashMap::new(),
+            true,
+        )?;
+        cap_empty.dense_index_topology = true;
+        let pulled_empty = super::super::pulled_digest_from_service_state(&cap_empty)?;
+        let (alignment_b, _) = super::super::captured::changed_document_rows(
+            &cap_empty,
+            &pulled_empty.rows,
+            &stored_obj_bytes,
+            None,
+        )?
+        .expect("changed_document_rows must compare Part row");
+        assert!(
+            matches!(alignment_b, SettingsAlignment::Equivalent),
+            "Settings 1: stored-only unknown object-typed property must compare Equivalent"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compact_renews_decode_budget_and_matches_non_twin_refs() -> Result<()> {
+        let ref_doc = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                doc_instance("ws", "Workspace", "Workspace", None, Map::new()),
+                doc_instance(
+                    "t1",
+                    "Part",
+                    "Twin",
+                    Some(0),
+                    Map::from_iter([("Transparency".into(), json!(0.25))]),
+                ),
+                doc_instance(
+                    "t2",
+                    "Part",
+                    "Twin",
+                    Some(0),
+                    Map::from_iter([("Transparency".into(), json!(0.25))]),
+                ),
+                doc_instance(
+                    "w",
+                    "WeldConstraint",
+                    "Weld",
+                    Some(0),
+                    Map::from_iter([("Part0".into(), json!({"_type": "Ref", "settingsId": "t1"}))]),
+                ),
+            ],
+        };
+        let obs_doc = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                doc_instance("o_ws", "Workspace", "Workspace", None, Map::new()),
+                doc_instance(
+                    "o_t2",
+                    "Part",
+                    "Twin",
+                    Some(0),
+                    Map::from_iter([("Transparency".into(), json!(0.25))]),
+                ),
+                doc_instance(
+                    "o_t1",
+                    "Part",
+                    "Twin",
+                    Some(0),
+                    Map::from_iter([("Transparency".into(), json!(0.25))]),
+                ),
+                doc_instance(
+                    "o_w",
+                    "WeldConstraint",
+                    "Weld",
+                    Some(0),
+                    Map::from_iter([(
+                        "Part0".into(),
+                        json!({"_type": "Ref", "settingsId": "o_t1"}),
+                    )]),
+                ),
+            ],
+        };
+        let ref_bytes = encode_document(&ref_doc, false, None)?;
+        let obs_bytes = encode_document(&obs_doc, false, None)?;
+        let ref_store = BlockStore::open(&ref_bytes)?;
+        let obs_store = BlockStore::open(&obs_bytes)?;
+
+        for step in [1024 * 1024, 1024, 1] {
+            while ref_store.budget.take(step).is_ok() {}
+        }
+        assert!(
+            ref_store.budget.take(1).is_err(),
+            "decode budget must be exhausted before testing compact() renewal"
+        );
+        let (compact_ref, ids_ref) = ref_store.compact()?;
+        assert_eq!(compact_ref.meta.len(), 4);
+        assert_eq!(ids_ref, vec!["ws", "t1", "t2", "w"]);
+
+        let (aligned_ids, _) = crate::settings::equivalence::match_opened_block_stores_compact(
+            &ref_store, &obs_store,
+        )?
+        .expect("compact matcher must align identical twins via non-twin Part0 ref");
+        assert_eq!(aligned_ids, vec!["ws", "t2", "t1", "w"]);
         Ok(())
     }
 }

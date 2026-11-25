@@ -72,7 +72,117 @@ pub(super) fn arm_native_attribute_relay(
 #[cfg(any(windows, target_os = "macos"))]
 enum VerifiedFullPushReuse {
     Unchanged(Map<String, Value>),
-    Continue(Option<VerifiedFullPushCandidate>),
+    Continue(Option<Box<VerifiedFullPushCandidate>>),
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn is_whole_project_push(
+    services: &[String],
+    push_args: &PushEditorChangesArgs,
+    guard: Option<&StudioChangeGuard>,
+    replace: bool,
+) -> Result<bool> {
+    if guard.is_some() {
+        return Ok(false);
+    }
+    if replace {
+        return Ok(true);
+    }
+    let all_services = sync_services();
+    if services.len() != all_services.len()
+        || !services
+            .iter()
+            .all(|service| all_services.contains(service))
+        || !push_args.changed_paths.is_empty()
+        || !push_args.changed_paths_files.is_empty()
+        || !push_args.target_settings_ids.is_empty()
+        || !push_args.target_settings_id_files.is_empty()
+        || !push_args.target_properties.is_empty()
+        || push_args.upsert_instances_only
+    {
+        return Ok(false);
+    }
+    crate::editor::sync::project_pushes_stores_as_held(push_args)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn reuse_verified_subset_push(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    services: &[String],
+    push_args: &PushEditorChangesArgs,
+) -> Result<Option<Map<String, Value>>> {
+    if services.is_empty()
+        || !push_args.target_settings_ids.is_empty()
+        || !push_args.target_settings_id_files.is_empty()
+        || !push_args.target_properties.is_empty()
+        || push_args.upsert_instances_only
+    {
+        return Ok(None);
+    }
+    let all_services = sync_services();
+    if !services
+        .iter()
+        .all(|service| all_services.contains(service))
+    {
+        return Ok(None);
+    }
+    if !crate::editor::sync::project_pushes_stores_as_held(push_args).unwrap_or(false) {
+        return Ok(None);
+    }
+    let Ok(plain_input) = plain_push_input(push_args) else {
+        return Ok(None);
+    };
+    let Some(mut cached) = take_baseline(context, bridge, &plain_input) else {
+        return Ok(None);
+    };
+    let check = (|| -> Result<bool> {
+        let stage = ExportProjectStage::create_for_comparison(
+            &push_args.project.project_root,
+            &push_args.project.src_root,
+            services,
+        )?;
+        let files_unchanged = snapshot_matches_disk_subset(
+            &push_args.project.project_root,
+            stage.publish_paths(),
+            &cached.project,
+        )?;
+        Ok(files_unchanged && verified_full_push_proof_matches(context, bridge, &cached.proof)?)
+    })();
+    let reinsert_baseline = |cached: VerifiedFullPush| {
+        if let Some(runtime) = context.runtime_id.as_deref() {
+            bridge
+                .verified_full_pushes
+                .lock_recover()
+                .insert(runtime.to_string(), cached);
+        }
+    };
+    match check {
+        Ok(true) => {
+            log_global(
+                5,
+                format_args!("[renium] baseline: scoped service push unchanged"),
+            );
+            cached.renew();
+            reinsert_baseline(cached);
+            Ok(Some(Map::from_iter([
+                ("ok".into(), json!(true)),
+                ("unchanged".into(), json!(true)),
+            ])))
+        }
+        Ok(false) => {
+            reinsert_baseline(cached);
+            Ok(None)
+        }
+        Err(error) => {
+            log_global(
+                5,
+                format_args!("[renium] baseline: scoped service pre-check skipped: {error:#}"),
+            );
+            reinsert_baseline(cached);
+            Ok(None)
+        }
+    }
 }
 
 /// A full push whose files match the last verified one answers "unchanged"
@@ -114,7 +224,7 @@ fn reuse_verified_full_push(
             ("unchanged".into(), json!(true)),
         ])));
     }
-    Ok(VerifiedFullPushReuse::Continue(candidate))
+    Ok(VerifiedFullPushReuse::Continue(candidate.map(Box::new)))
 }
 
 /// How a push reads its stores. Where no package is enforced and nothing
@@ -179,6 +289,59 @@ fn leave_unread_documents(prepared: &mut HashMap<PathBuf, PreparedPushVerificati
     }
 }
 
+/// Splits prepared settings changes into documents for the staged push and
+/// entries retained for post-push verification. Large v12 block stores that
+/// are not sparse on both sides are verified row-by-row from raw bytes, so
+/// their `previous` documents are dropped immediately and `desired` is not
+/// pinned across mutation and readback.
+#[allow(clippy::type_complexity)]
+pub(super) fn split_prepared_settings_for_push(
+    prepared_settings: HashMap<PathBuf, PreparedEditorSettingsChange>,
+    project: &ProjectSnapshot,
+) -> Result<(
+    HashMap<String, Arc<SettingsBytecode>>,
+    HashMap<PathBuf, PreparedPushVerification>,
+)> {
+    let mut prepared_documents = HashMap::with_capacity(prepared_settings.len());
+    let mut prepared_verification = HashMap::with_capacity(prepared_settings.len());
+    for (path, change) in prepared_settings {
+        let service = settings_service_name(&path, &change.current, &change.previous)?;
+        let desired = Arc::new(change.current);
+        prepared_documents.insert(service, Arc::clone(&desired));
+        let large_block_store = matches!(
+            project.entries.get(&path),
+            Some(SnapshotEntry::File(bytes))
+                if crate::settings::bytecode::blocks::is_block_store(bytes)
+                    && desired.instances.len() >= super::verify::rows::MIN_ROWS
+        );
+        let both_sparse = crate::settings::equivalence::holds_unread_instances(&desired)
+            && crate::settings::equivalence::holds_unread_instances(&change.previous);
+        let small_previous = change.previous.instances.len() < super::verify::rows::MIN_ROWS;
+        if large_block_store && !both_sparse {
+            if small_previous {
+                prepared_verification.insert(
+                    path,
+                    PreparedPushVerification {
+                        previous: change.previous,
+                        desired: None,
+                    },
+                );
+            } else {
+                drop_settings_document(change.previous);
+            }
+        } else {
+            prepared_verification.insert(
+                path,
+                PreparedPushVerification {
+                    previous: change.previous,
+                    desired: Some(desired),
+                },
+            );
+        }
+    }
+    Ok((prepared_documents, prepared_verification))
+}
+
 /// The plan as it is carried out: one made from the changed instances of
 /// both copies that the instances that differ do not carry out
 /// (`plan_reads_changed_alone`) is made again from the whole copies of its
@@ -191,13 +354,26 @@ pub(super) fn plan_from_whole_stores(
     differences: &HashSet<PathBuf>,
     prepared_settings: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
 ) -> Result<ReconcilePushPlan> {
-    if stores_read != StoresRead::ChangedOfBoth || plan_reads_changed_alone(&plan) {
+    let has_unread_replacement = prepared_settings.iter().any(|(path, change)| {
+        crate::settings::equivalence::holds_unread_instances(&change.current)
+            && !crate::settings::equivalence::holds_unread_instances(&change.previous)
+            && (!service_has_only_native_containers(&change.previous)
+                || !settings_service_name(path, &change.current, &change.previous)
+                    .ok()
+                    .is_some_and(|service| plan.initial_native_services.contains(&service)))
+    });
+    if (stores_read != StoresRead::ChangedOfBoth || plan_reads_changed_alone(&plan))
+        && !has_unread_replacement
+    {
         return Ok(plan);
     }
     let moved = super::replacement::moved_between_stores(&plan);
     let mut read_whole = Vec::new();
     for (path, change) in prepared_settings.iter() {
         let unread = crate::settings::equivalence::holds_unread_instances(&change.current);
+        let in_native = settings_service_name(path, &change.current, &change.previous)
+            .ok()
+            .is_some_and(|service| plan.initial_native_services.contains(&service));
         let whole = match &moved {
             Some(ids) => {
                 unread
@@ -207,7 +383,7 @@ pub(super) fn plan_from_whole_stores(
                         ids,
                     )?
             }
-            None if replace => !service_has_only_native_containers(&change.previous),
+            None if replace || in_native => !service_has_only_native_containers(&change.previous),
             None => unread,
         };
         if whole {
@@ -424,7 +600,12 @@ fn bulk_inline_release_tracking(
     if !plan.changed_paths.is_empty()
         || !plan.target_settings_ids.is_empty()
         || !plan.initial_native_services.is_empty()
+        || !plan.extra_property_changes.is_empty()
         || plan.bulk_property_patches.is_empty()
+        || plan
+            .bulk_property_patches
+            .iter()
+            .any(|patch| !patch.package_targets.is_empty())
         || requires_stage
         || has_link_enforcement
         || tracking_release.guard_id.is_none()
@@ -449,24 +630,126 @@ fn bulk_inline_release_tracking(
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-struct ZeroCaptureContext<'a> {
-    context: &'a BoundContext,
-    bridge: &'a BridgeServer,
-    services: &'a [String],
-    root: &'a Path,
-    src_dir: &'a Path,
-    source_paths: &'a [PathBuf],
-    stage: &'a ExportProjectStage,
-    guard: &'a StudioChangeGuard,
-    push_args: &'a PushEditorChangesArgs,
-    initial_state: &'a Value,
-    cache_input: Option<&'a Value>,
+pub(super) struct ZeroCaptureContext<'a> {
+    pub(super) context: &'a BoundContext,
+    pub(super) bridge: &'a BridgeServer,
+    pub(super) services: &'a [String],
+    pub(super) root: &'a Path,
+    pub(super) src_dir: &'a Path,
+    pub(super) source_paths: &'a [PathBuf],
+    pub(super) stage: &'a ExportProjectStage,
+    pub(super) guard: &'a StudioChangeGuard,
+    pub(super) push_args: &'a PushEditorChangesArgs,
+    pub(super) initial_state: &'a Value,
+    pub(super) cache_input: Option<&'a Value>,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
 struct ExtractedZeroCapture {
     plan: ReconcilePushPlan,
+    prepared_documents: HashMap<String, Arc<SettingsBytecode>>,
     service_rows: HashMap<String, (PathBuf, Vec<usize>)>,
+    extra_before: BTreeMap<PathBuf, SnapshotEntry>,
+    extra_mutation_paths: HashSet<PathBuf>,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn merge_zero_capture_scoped_services(
+    zctx: &ZeroCaptureContext<'_>,
+    held_project: &ProjectSnapshot,
+    capture_services: &[String],
+    plan: &mut ReconcilePushPlan,
+    prepared_documents: &mut HashMap<String, Arc<SettingsBytecode>>,
+    extra_before: &mut BTreeMap<PathBuf, SnapshotEntry>,
+    extra_mutation_paths: &mut HashSet<PathBuf>,
+) -> Result<bool> {
+    let source = Path::new(&zctx.context.source)
+        .strip_prefix(zctx.root)
+        .context("Project source is outside its root")?;
+    let mut scopes = Vec::with_capacity(capture_services.len() * 2);
+    for service in capture_services {
+        scopes.push(source.join(service));
+        scopes.push(
+            service_settings_path(&Path::new(&zctx.context.source).join(service))
+                .strip_prefix(zctx.root)
+                .context("Scoped push capture store is outside its project root")?
+                .to_path_buf(),
+        );
+    }
+    let scope_set = ScopeSet::new(&scopes);
+    let scoped_desired = ProjectSnapshot {
+        entries: held_project
+            .entries
+            .iter()
+            .filter(|(path, _)| scope_set.contains(path))
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect(),
+    };
+    let scoped_studio = capture_studio_services_in_memory_options(
+        zctx.context,
+        zctx.bridge,
+        capture_services,
+        zctx.stage,
+        false,
+        true,
+    )?;
+    let mut prepared_settings = HashMap::new();
+    let (diff_paths, promoted, stores_read) = prepare_replace_push_differences(
+        zctx.context,
+        zctx.root,
+        (&scoped_desired, &scoped_studio),
+        (false, true),
+        &mut prepared_settings,
+        &mut HashMap::new(),
+    )?;
+    if !promoted.is_empty() {
+        return Ok(false);
+    }
+    if diff_paths.is_empty() {
+        return Ok(true);
+    }
+    let mut scoped_plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+        &scoped_studio,
+        &scoped_desired,
+        &diff_paths,
+        &prepared_settings,
+        false,
+        true,
+    )?;
+    scoped_plan = plan_from_whole_stores(
+        (stores_read, true, scoped_plan),
+        (&scoped_desired, &scoped_studio),
+        &diff_paths,
+        &mut prepared_settings,
+    )?;
+    if !scoped_plan.initial_native_services.is_empty() {
+        return Ok(false);
+    }
+    let _ = stage_replace_push_paths(
+        zctx.root,
+        &zctx.stage.project_root,
+        Path::new(&zctx.context.source),
+        &scoped_plan,
+        &prepared_settings,
+        &scoped_desired,
+        &scoped_studio,
+    )?;
+    for (path, change) in prepared_settings {
+        let svc = settings_service_name(&path, &change.current, &change.previous)?;
+        prepared_documents.insert(svc, Arc::new(change.current));
+    }
+    for path in &diff_paths {
+        if let Some(entry) = scoped_studio.entries.get(path) {
+            extra_before.insert(path.clone(), entry.clone());
+        }
+        extra_mutation_paths.insert(path.clone());
+    }
+    let bulk_paths = std::mem::take(&mut plan.bulk_property_paths);
+    let bulk_patches = std::mem::take(&mut plan.bulk_property_patches);
+    *plan = scoped_plan;
+    plan.bulk_property_paths = bulk_paths;
+    plan.bulk_property_patches = bulk_patches;
+    Ok(true)
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -475,136 +758,360 @@ fn plan_zero_capture_bulk_restore(
     held_project: &ProjectSnapshot,
 ) -> Result<Option<ExtractedZeroCapture>> {
     use crate::settings::bytecode::blocks::bulk_diff::{
-        BulkExtractOutcome, extract_v12_bulk_properties,
+        BulkExtractOutcome, extract_v12_bulk_properties_for_classes,
     };
     let Some(scope) = ProofBulkScope::parse(&zctx.initial_state["pushProofScope"]) else {
+        log_global(
+            5,
+            format_args!("[renium] zero-capture skipped: pushProofScope unparseable or unknown"),
+        );
         return Ok(None);
     };
     if scope.services.is_empty() {
         return Ok(None);
     }
     let service_set: HashSet<&str> = zctx.services.iter().map(String::as_str).collect();
-    if scope.services.iter().any(|svc| {
-        !service_set.contains(svc.as_str())
-            || !scope.values_only.contains(svc)
-            || !scope.changed_properties.contains_key(svc)
-    }) {
+    if scope
+        .services
+        .iter()
+        .any(|svc| !service_set.contains(svc.as_str()))
+    {
         return Ok(None);
     }
     if scope.services.contains("Workspace") && scope.expected_terrain_digest.is_none() {
+        log_global(
+            5,
+            format_args!("[renium] zero-capture skipped: missing expectedTerrainDigest"),
+        );
         return Ok(None);
     }
     let stores = crate::project::structural::service_store_paths(Path::new(&zctx.context.source))?;
     let mut plan = ReconcilePushPlan::default();
     let mut service_rows = HashMap::new();
+    let mut capture_services = Vec::new();
+    let mut total_instances = 0_usize;
     for service in &scope.services {
-        let Some(store_abs) = stores.get(service) else {
-            return Ok(None);
-        };
-        let Ok(store_rel) = store_abs.strip_prefix(zctx.root) else {
-            return Ok(None);
-        };
-        let Some(SnapshotEntry::File(desired_bytes)) = held_project.entries.get(store_rel) else {
-            return Ok(None);
-        };
-        let props = &scope.changed_properties[service];
-        let phase = Instant::now();
-        let outcome = extract_v12_bulk_properties(
-            desired_bytes,
-            service,
-            props,
-            super::replacement::BULK_PROPERTY_MIN_INSTANCES,
-        )?;
-        let BulkExtractOutcome::Patch(mut extracted) = outcome else {
-            return Ok(None);
-        };
-        log_reconcile_timing(
-            &format!(
-                "zero-capture bulk extract ({service}, {} instances, {} fields)",
-                extracted.patch.instance_count, extracted.patch.field_count
-            ),
-            phase,
-        );
-        if service == "Workspace" {
-            extracted.patch.expected_terrain_digest = scope.expected_terrain_digest.clone();
+        let can_try_bulk = scope.values_only.contains(service)
+            && scope.changed_class_properties.contains_key(service);
+        let store_entry = stores
+            .get(service)
+            .and_then(|store_abs| store_abs.strip_prefix(zctx.root).ok())
+            .and_then(|store_rel| {
+                if let Some(SnapshotEntry::File(desired_bytes)) =
+                    held_project.entries.get(store_rel)
+                {
+                    Some((store_rel, desired_bytes))
+                } else {
+                    None
+                }
+            });
+        let is_heavy = store_entry.is_some_and(|(_, bytes)| bytes.len() >= 256 * 1024);
+        if can_try_bulk && let Some((store_rel, desired_bytes)) = store_entry {
+            let class_props = &scope.changed_class_properties[service];
+            let phase = Instant::now();
+            let outcome =
+                extract_v12_bulk_properties_for_classes(desired_bytes, service, class_props, 1)?;
+            if let BulkExtractOutcome::Patch(mut extracted) = outcome {
+                log_reconcile_timing(
+                    &format!(
+                        "zero-capture bulk extract ({service}, {} instances, {} fields)",
+                        extracted.patch.instance_count, extracted.patch.field_count
+                    ),
+                    phase,
+                );
+                total_instances += extracted.patch.instance_count;
+                if service == "Workspace" {
+                    extracted.patch.expected_terrain_digest = scope.expected_terrain_digest.clone();
+                }
+                extracted.patch.return_old_values = true;
+                plan.bulk_property_paths.push(store_rel.to_path_buf());
+                plan.bulk_property_patches.push(extracted.patch);
+                service_rows.insert(
+                    service.clone(),
+                    (store_rel.to_path_buf(), extracted.node_to_row),
+                );
+                continue;
+            }
         }
-        extracted.patch.return_old_values = true;
-        plan.bulk_property_paths.push(store_rel.to_path_buf());
-        plan.bulk_property_patches.push(extracted.patch);
-        service_rows.insert(
-            service.clone(),
-            (store_rel.to_path_buf(), extracted.node_to_row),
-        );
+        if is_heavy {
+            log_global(
+                5,
+                format_args!(
+                    "[renium] zero-capture skipped ({service}): values_only={} has_class_props={}",
+                    scope.values_only.contains(service),
+                    scope.changed_class_properties.contains_key(service),
+                ),
+            );
+            return Ok(None);
+        }
+        capture_services.push(service.clone());
     }
-    Ok(Some(ExtractedZeroCapture { plan, service_rows }))
+    if total_instances == 0 {
+        return Ok(None);
+    }
+    let mut prepared_documents = HashMap::new();
+    let mut extra_before = BTreeMap::new();
+    let mut extra_mutation_paths = HashSet::new();
+    if !capture_services.is_empty()
+        && !merge_zero_capture_scoped_services(
+            zctx,
+            held_project,
+            &capture_services,
+            &mut plan,
+            &mut prepared_documents,
+            &mut extra_before,
+            &mut extra_mutation_paths,
+        )?
+    {
+        return Ok(None);
+    }
+    Ok(Some(ExtractedZeroCapture {
+        plan,
+        prepared_documents,
+        service_rows,
+        extra_before,
+        extra_mutation_paths,
+    }))
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-fn record_zero_capture_history(
-    zctx: &ZeroCaptureContext<'_>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BulkSourcemapPolicy {
+    Deny,
+    MetadataOnly,
+    RequireExactRetained,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn bulk_patches_sourcemap_policy(
+    patches: &[crate::editor::types::EditorBulkPropertyPatch],
+) -> BulkSourcemapPolicy {
+    if patches.is_empty() {
+        return BulkSourcemapPolicy::Deny;
+    }
+    let mut has_property = false;
+    for patch in patches {
+        for col in &patch.columns {
+            match col.kind {
+                crate::editor::types::BulkColumnKind::Attribute
+                | crate::editor::types::BulkColumnKind::AttributesReplace
+                | crate::editor::types::BulkColumnKind::Tag
+                | crate::editor::types::BulkColumnKind::AssertModelScale
+                | crate::editor::types::BulkColumnKind::AssertModelPivot => {}
+                crate::editor::types::BulkColumnKind::Property => {
+                    if matches!(
+                        col.property_name.as_str(),
+                        "CFrame" | "Size" | "Position" | "Orientation" | "Rotation"
+                    ) {
+                        return BulkSourcemapPolicy::Deny;
+                    }
+                    has_property = true;
+                }
+            }
+        }
+    }
+    if has_property {
+        BulkSourcemapPolicy::RequireExactRetained
+    } else {
+        BulkSourcemapPolicy::MetadataOnly
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn bulk_patches_allow_preserved_sourcemap(
+    policy: BulkSourcemapPolicy,
+    summary: &Map<String, Value>,
+) -> bool {
+    match policy {
+        BulkSourcemapPolicy::Deny => false,
+        BulkSourcemapPolicy::MetadataOnly => {
+            summary.get("exactRetained") != Some(&Value::Bool(false))
+        }
+        BulkSourcemapPolicy::RequireExactRetained => {
+            summary.get("exactRetained") == Some(&Value::Bool(true))
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn is_bulk_only_values_plan(plan: &ReconcilePushPlan) -> bool {
+    !plan.bulk_property_patches.is_empty()
+        && plan.changed_paths.is_empty()
+        && plan.target_settings_ids.is_empty()
+        && plan.initial_native_services.is_empty()
+        && plan.extra_property_changes.is_empty()
+        && plan.instance_deletes.is_empty()
+        && plan.property_removals.is_empty()
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn summary_has_pending_or_unsupported(summary: &Map<String, Value>) -> bool {
+    summary.contains_key("protectedPending")
+        || summary.contains_key("supplementalImportPendingWrites")
+        || summary.contains_key("unsupportedProperties")
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn reconstruct_zero_capture_before(
     held_project: &ProjectSnapshot,
     service_rows: &HashMap<String, (PathBuf, Vec<usize>)>,
     old_columns_map: &Map<String, Value>,
-) -> Result<String> {
-    use crate::settings::bytecode::blocks::bulk_diff::{
-        decode_bulk_old_value_columns, patch_v12_bulk_old_values,
-    };
+    extra_before: BTreeMap<PathBuf, SnapshotEntry>,
+    extra_mutation_paths: HashSet<PathBuf>,
+) -> Result<(ProjectSnapshot, HashSet<PathBuf>)> {
+    use crate::settings::bytecode::blocks::bulk_diff::patch_v12_bulk_old_value_columns;
     let phase = Instant::now();
-    let mut before_entries = BTreeMap::new();
-    let mut mutation_paths = HashSet::new();
+    let mut before_entries = extra_before;
+    let mut mutation_paths = extra_mutation_paths;
     for (service, (store_rel, node_to_row)) in service_rows {
         let Some(SnapshotEntry::File(desired_bytes)) = held_project.entries.get(store_rel) else {
             continue;
         };
-        let updates = old_columns_map
-            .get(service)
-            .and_then(Value::as_array)
-            .map(|cols| decode_bulk_old_value_columns(cols, node_to_row))
-            .transpose()?
-            .unwrap_or_default();
-        let before_bytes = patch_v12_bulk_old_values(desired_bytes, &updates)?;
+        let before_bytes = match old_columns_map.get(service).and_then(Value::as_array) {
+            Some(cols) if !cols.is_empty() => {
+                patch_v12_bulk_old_value_columns(desired_bytes, cols, node_to_row)?
+            }
+            _ => desired_bytes.clone(),
+        };
         before_entries.insert(store_rel.clone(), SnapshotEntry::File(before_bytes));
         mutation_paths.insert(store_rel.clone());
     }
     log_reconcile_timing("zero-capture history reconstruct", phase);
-    let before = ProjectSnapshot {
-        entries: before_entries,
-    };
-    let mut history =
-        history::SyncHistory::begin(zctx.root, zctx.src_dir, &before, &mutation_paths)?;
-    history.commit(held_project, &ProjectSnapshot::default())
+    Ok((
+        ProjectSnapshot {
+            entries: before_entries,
+        },
+        mutation_paths,
+    ))
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-fn try_zero_capture_bulk_restore(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn zero_capture_verification_paths(
+    context: &BoundContext,
+    summary: &Map<String, Value>,
+    generated_paths: &HashSet<PathBuf>,
+    mutation_paths: &HashSet<PathBuf>,
+    current: Option<&ProjectSnapshot>,
+    expected: Option<&ProjectSnapshot>,
+    has_adapters: bool,
+    replacement: bool,
+) -> HashSet<PathBuf> {
+    let mut verification_paths = mutation_paths.clone();
+    verification_paths.extend(generated_paths.iter().cloned());
+    if verification_paths.is_empty() {
+        return verification_paths;
+    }
+    let has_pending_or_issue = summary.get("ok") == Some(&Value::Bool(false))
+        || summary.get("verified") == Some(&Value::Bool(false))
+        || summary.contains_key("protectedPending")
+        || summary.contains_key("supplementalImportPendingWrites")
+        || summary.contains_key("unsupportedProperties")
+        || summary
+            .get("supplementalImportPendingFields")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| !arr.is_empty())
+        || summary.get("sourceVerifyFailed").and_then(Value::as_u64) != Some(0);
+    if replacement || has_adapters || has_pending_or_issue {
+        return verification_paths;
+    }
+    let verified_services = ["nativeVerifiedServices", "fieldVerifiedServices"]
+        .into_iter()
+        .filter_map(|name| summary.get(name).and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<HashSet<_>>();
+    if !verified_services.is_empty() {
+        verification_paths.retain(|path| {
+            let service = crate::editor::paths::service_from_changed_path(
+                Path::new(&context.source),
+                &Path::new(&context.root).join(path),
+            );
+            let service_verified = service.is_some_and(|service| {
+                verified_services
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&service))
+            });
+            let disk_diverged = match (current, expected) {
+                (Some(cur), Some(exp)) => {
+                    !entries_equivalent(path, exp.entries.get(path), cur.entries.get(path))
+                }
+                _ => false,
+            };
+            !service_verified || generated_paths.contains(path) || disk_diverged
+        });
+    }
+    if !verification_paths.is_empty()
+        && generated_paths.is_empty()
+        && exact_source_push_verified(summary, &verification_paths)
+    {
+        verification_paths.clear();
+    }
+    verification_paths
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn try_zero_capture_if_eligible(
+    flags: [bool; 5],
     zctx: &ZeroCaptureContext<'_>,
-    held_project: &ProjectSnapshot,
+    scoped_baseline: &mut Option<ProjectSnapshot>,
+    held_sourcemap_fallback: &mut Option<Box<SourcemapState>>,
+    tracking_release: &mut StudioTrackingGuardRelease<'_>,
+    #[cfg(windows)] native_relay: &mut Option<NativeRelay>,
+) -> Result<Option<Map<String, Value>>> {
+    if !flags.into_iter().all(|flag| flag) || scoped_baseline.is_none() {
+        return Ok(None);
+    }
+    try_zero_capture_bulk_restore(
+        zctx,
+        scoped_baseline,
+        held_sourcemap_fallback,
+        tracking_release,
+        #[cfg(windows)]
+        native_relay,
+    )
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn try_zero_capture_bulk_restore(
+    zctx: &ZeroCaptureContext<'_>,
+    scoped_baseline: &mut Option<ProjectSnapshot>,
+    held_sourcemap_fallback: &mut Option<Box<SourcemapState>>,
     tracking_release: &mut StudioTrackingGuardRelease<'_>,
     #[cfg(windows)] native_relay: &mut Option<NativeRelay>,
 ) -> Result<Option<Map<String, Value>>> {
     if !(zctx.push_args.no_review || zctx.push_args.yes || crate::app::output::global_yes()) {
         return Ok(None);
     }
+    let Some(held_project) = scoped_baseline.as_ref() else {
+        return Ok(None);
+    };
     let Some(extracted) = plan_zero_capture_bulk_restore(zctx, held_project)? else {
         return Ok(None);
     };
+    let sourcemap_policy = bulk_patches_sourcemap_policy(&extracted.plan.bulk_property_patches);
     let phase = Instant::now();
     let mut args = zctx.push_args.clone();
-    args.inline_release_tracking = bulk_inline_release_tracking(
-        &extracted.plan,
-        zctx.services,
-        zctx.guard,
-        tracking_release,
-        false,
-        false,
-    );
+    args.inline_release_tracking = if extracted.extra_mutation_paths.is_empty() {
+        bulk_inline_release_tracking(
+            &extracted.plan,
+            zctx.services,
+            zctx.guard,
+            tracking_release,
+            false,
+            false,
+        )
+    } else {
+        None
+    };
     let mut pushed = push_staged_project(
         zctx.context,
         zctx.stage,
         zctx.bridge,
         StagedPushRequest {
             plan: extracted.plan,
-            prepared_documents: HashMap::new(),
+            prepared_documents: extracted.prepared_documents,
+            virtual_files: None,
             guard: Some(zctx.guard),
             args,
             expected_project: Some(held_project),
@@ -612,10 +1119,15 @@ fn try_zero_capture_bulk_restore(
         },
     )?;
     if pushed.summary.get("fallbackFullCapture") == Some(&Value::Bool(true)) {
+        let reason = pushed
+            .summary
+            .get("fallbackReason")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         log_global(
             5,
             format_args!(
-                "[renium] zero-capture bulk restore fell back to full capture (Terrain digest mismatch)"
+                "[renium] zero-capture bulk restore fell back to full capture (reason={reason})"
             ),
         );
         return Ok(None);
@@ -633,43 +1145,230 @@ fn try_zero_capture_bulk_restore(
         .get("propertyUpdated")
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
-    let (current, history_id) = std::thread::scope(|scope| {
-        let current = scope.spawn(|| capture_snapshot(zctx.root, zctx.stage.publish_paths()));
-        let history_id = if updated > 0.0 {
-            Some(record_zero_capture_history(
-                zctx,
-                held_project,
-                &extracted.service_rows,
-                &old_columns,
-            ))
-        } else {
-            None
-        };
+    let any_mutated = updated > 0.0 || !extracted.extra_mutation_paths.is_empty();
+    let has_adapters = zctx
+        .stage
+        .loaded
+        .as_ref()
+        .is_some_and(|loaded| !loaded.project.adapters.is_empty());
+    let pending_fields: Vec<crate::editor::types::PendingImportFields> = pushed
+        .summary
+        .get("supplementalImportPendingFields")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    let has_pending_or_unsupported = !pending_fields.is_empty()
+        || pushed.summary.contains_key("protectedPending")
+        || pushed
+            .summary
+            .contains_key("supplementalImportPendingWrites")
+        || pushed.summary.contains_key("unsupportedProperties");
+    let generated_paths: HashSet<PathBuf> = pushed.generated.entries.keys().cloned().collect();
+    let has_extra_mutations = !extracted.extra_mutation_paths.is_empty();
+    let (disk_check, before_and_history) = std::thread::scope(|scope| {
+        let disk_check = scope
+            .spawn(|| snapshot_matches_disk(zctx.root, zctx.stage.publish_paths(), held_project));
+        let before_and_history = reconstruct_zero_capture_before(
+            held_project,
+            &extracted.service_rows,
+            &old_columns,
+            extracted.extra_before,
+            extracted.extra_mutation_paths,
+        )
+        .and_then(|(before, mutation_paths)| {
+            let history_id = if any_mutated {
+                let mut history =
+                    history::SyncHistory::begin(zctx.root, zctx.src_dir, &before, &mutation_paths)?;
+                Some(history.commit(held_project, &pushed.generated)?)
+            } else {
+                None
+            };
+            Ok((before, mutation_paths, history_id))
+        });
         (
-            current.join().expect("Post-push snapshot worker panicked"),
-            history_id,
+            disk_check
+                .join()
+                .expect("Post-push snapshot check worker panicked"),
+            before_and_history,
         )
     });
+    let (before_snapshot, all_mutation_paths, history_id) = before_and_history?;
     if let Some(history_id) = history_id {
         pushed
             .summary
-            .insert("historyId".into(), Value::String(history_id?));
+            .insert("historyId".into(), Value::String(history_id));
     }
     log_reconcile_timing("full push mutation", phase);
-    let current = current?;
-    if *held_project == current {
+    if pushed
+        .summary
+        .get("protectedOfflineApply")
+        .is_some_and(|receipt| receipt["recoveryPending"] == true)
+    {
+        pushed.summary.insert("verified".into(), Value::Bool(false));
+        return Ok(Some(pushed.summary));
+    }
+    let replacement = reopened_push_context(zctx.context, &pushed.summary)?;
+    let _replacement_selection = replacement.as_ref().map(bound_context::select);
+    let active_context = replacement.as_ref().unwrap_or(zctx.context);
+    let mut active_guard = zctx.guard.clone();
+    if replacement.is_some() {
+        tracking_release.guard_id = None;
+        pin_edit_runtime(active_context, zctx.bridge)?;
+        active_guard = current_studio_change_guard(active_context, zctx.bridge)?;
+        tracking_release
+            .runtime_id
+            .clone_from(&active_guard.runtime_id);
+        tracking_release
+            .guard_id
+            .clone_from(&active_guard.tracking_guard_id);
+    }
+    let disk_matches = disk_check?;
+    let initial_verification_paths = zero_capture_verification_paths(
+        active_context,
+        &pushed.summary,
+        &generated_paths,
+        &all_mutation_paths,
+        None,
+        None,
+        has_adapters,
+        replacement.is_some(),
+    );
+    if !initial_verification_paths.is_empty()
+        || !generated_paths.is_empty()
+        || (!disk_matches && (has_extra_mutations || has_pending_or_unsupported))
+    {
+        let current = capture_snapshot(zctx.root, zctx.stage.publish_paths())?;
+        let verification_paths = zero_capture_verification_paths(
+            active_context,
+            &pushed.summary,
+            &generated_paths,
+            &all_mutation_paths,
+            Some(&current),
+            Some(held_project),
+            has_adapters,
+            replacement.is_some(),
+        );
+        if !verification_paths.is_empty() {
+            let verification_services =
+                services_for_snapshot_paths(active_context, &verification_paths);
+            let (_readback_stage, mut readback, _) = capture_push_readback(
+                active_context,
+                zctx.bridge,
+                &verification_services,
+                zctx.src_dir,
+                false,
+                None,
+                true,
+            )?;
+            let mut prepared_verification = HashMap::new();
+            let (mismatches, details) = verify::verify_committed_push_readback(
+                &before_snapshot,
+                &current,
+                &mut readback,
+                &verification_paths,
+                &mut prepared_verification,
+                verify::Verification::of(
+                    false,
+                    &pending_fields,
+                    &verify::NewInstanceValues::of(
+                        zctx.bridge,
+                        active_context.runtime_id.as_deref(),
+                    ),
+                ),
+            )?;
+            if !mismatches.is_empty() {
+                return Err(retention_failure(
+                    "pushed project changes",
+                    &mismatches,
+                    details.as_deref(),
+                ));
+            }
+        }
+        if has_pending_or_unsupported {
+            pushed.summary.insert("verified".into(), Value::Bool(false));
+            pushed.summary.remove("verifiedPushProof");
+            tracking_release.proof = None;
+            if tracking_release.guard_id.is_some() {
+                acknowledge_verified_push(
+                    zctx.bridge,
+                    zctx.services,
+                    &active_guard,
+                    tracking_release,
+                )?;
+            }
+            return Ok(Some(pushed.summary));
+        }
+        let mut expected_after_push = held_project.clone();
+        expected_after_push
+            .entries
+            .extend(pushed.generated.entries.clone());
+        let files_held = expected_after_push == current;
+        if files_held && replacement.is_none() {
+            tracking_release.proof = pushed.summary.remove("verifiedPushProof");
+        } else {
+            tracking_release.retained_proof = None;
+        }
+        if tracking_release.guard_id.is_some() {
+            acknowledge_verified_push(zctx.bridge, zctx.services, &active_guard, tracking_release)?;
+        }
+        retain_verified_full_push(
+            zctx.bridge,
+            zctx.cache_input,
+            zctx.source_paths,
+            current,
+            tracking_release,
+            #[cfg(windows)]
+            native_relay,
+        );
+        return Ok(Some(pushed.summary));
+    }
+    if disk_matches {
         tracking_release.proof = pushed.summary.remove("verifiedPushProof");
     } else {
         tracking_release.retained_proof = None;
     }
     if tracking_release.guard_id.is_some() {
-        acknowledge_verified_push(zctx.bridge, zctx.services, zctx.guard, tracking_release)?;
+        acknowledge_verified_push(zctx.bridge, zctx.services, &active_guard, tracking_release)?;
     }
-    retain_verified_full_push(
+    let retained_project = scoped_baseline.take().expect("scoped baseline held");
+    let can_keep_pull_scope = zero_capture_can_keep_pull_scope(
+        disk_matches,
+        has_extra_mutations,
+        generated_paths.is_empty(),
+        replacement.is_none(),
+        has_pending_or_unsupported,
+        &pushed.summary,
+    );
+    let preserved_sourcemap = preserved_sourcemap_for_bulk_push(
+        can_keep_pull_scope,
+        sourcemap_policy,
+        &pushed.summary,
+        held_sourcemap_fallback,
+    );
+    let pushed_services: BTreeSet<String> = extracted.service_rows.keys().cloned().collect();
+    let retained_pushed_from_pull =
+        if preserved_sourcemap.is_none() && can_keep_pull_scope && !pushed_services.is_empty() {
+            held_sourcemap_fallback.take().map(|sm| {
+                Box::new(PushedFromPull {
+                    sourcemap: *sm,
+                    services: pushed_services,
+                    paths_moved: BTreeSet::new(),
+                    structural: BTreeMap::new(),
+                })
+            })
+        } else {
+            None
+        };
+    retain_full_push_scoped(
         zctx.bridge,
         zctx.cache_input,
         zctx.source_paths,
-        held_project.clone(),
+        RetainedPushScope {
+            project: retained_project,
+            sourcemap: preserved_sourcemap,
+            pushed_from_pull: retained_pushed_from_pull,
+        },
         tracking_release,
         #[cfg(windows)]
         native_relay,
@@ -680,7 +1379,6 @@ fn try_zero_capture_bulk_restore(
 fn prepare_replace_push_differences(
     context: &BoundContext,
     root: &Path,
-    stage: &ExportProjectStage,
     (project, studio): (&ProjectSnapshot, &ProjectSnapshot),
     (bulk_eligible, unenforced): (bool, bool),
     prepared_settings: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
@@ -702,21 +1400,14 @@ fn prepare_replace_push_differences(
             Some(&collected_bulk),
         )?
     } else {
-        let (prepared, staged) = rayon::join(
-            || {
-                prepare_project_replacement_importing(
-                    project,
-                    studio,
-                    &paths,
-                    prepared_settings,
-                    stores_read,
-                    imports_heavy.then_some(&imported),
-                )
-            },
-            || stage_snapshot_paths(&stage.project_root, &paths, project),
-        );
-        staged?;
-        prepared?
+        prepare_project_replacement_importing(
+            project,
+            studio,
+            &paths,
+            prepared_settings,
+            stores_read,
+            imports_heavy.then_some(&imported),
+        )?
     };
     *bulk_patches = collected_bulk
         .into_inner()
@@ -750,16 +1441,168 @@ fn prepare_replace_push_differences(
         })
         .cloned()
         .collect::<HashSet<_>>();
-    if bulk_eligible
-        && diff_paths
-            .iter()
-            .any(|path| !bulk_patches.contains_key(path))
-    {
-        stage_snapshot_paths(&stage.project_root, &paths, project)?;
-    }
     prepared_settings.retain(|path, _| diff_paths.contains(path));
     let promoted_services = imported_services(imported, prepared_settings)?;
     Ok((diff_paths, promoted_services, stores_read))
+}
+
+fn target_subtrees_contain_scripts(
+    document: &SettingsBytecode,
+    target_ids: &HashSet<String>,
+) -> bool {
+    if target_ids.is_empty() {
+        return document
+            .instances
+            .iter()
+            .any(|inst| crate::editor::paths::script_file_names(&inst.class_name).is_some());
+    }
+    let mut children_by_parent: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut roots = Vec::new();
+    for (index, instance) in document.instances.iter().enumerate() {
+        if let Some(parent) = instance.parent_index {
+            children_by_parent.entry(parent).or_default().push(index);
+        }
+        if target_ids.contains(&instance.settings_id) {
+            roots.push(index);
+        }
+    }
+    let mut stack = roots;
+    let mut visited = vec![false; document.instances.len()];
+    while let Some(index) = stack.pop() {
+        if visited[index] {
+            continue;
+        }
+        visited[index] = true;
+        if crate::editor::paths::script_file_names(&document.instances[index].class_name).is_some()
+        {
+            return true;
+        }
+        if let Some(children) = children_by_parent.get(&index) {
+            stack.extend(children.iter().copied());
+        }
+    }
+    false
+}
+
+fn stage_replace_push_paths(
+    root: &Path,
+    stage_root: &Path,
+    src_dir: &Path,
+    plan: &ReconcilePushPlan,
+    prepared_settings: &HashMap<PathBuf, PreparedEditorSettingsChange>,
+    project: &ProjectSnapshot,
+    studio: &ProjectSnapshot,
+) -> Result<Option<Arc<crate::editor::types::VirtualStageFiles>>> {
+    if plan.changed_paths.is_empty() {
+        return Ok(None);
+    }
+    let has_symlinks = project
+        .entries
+        .values()
+        .any(|entry| matches!(entry, SnapshotEntry::Symlink { .. }));
+    if has_symlinks
+        || root.join("renium-link.json").exists()
+        || crate::editor::sync::files_to_studio_filter_rules(root)?.is_some()
+    {
+        let all = project_replacement_paths(project, studio);
+        stage_snapshot_paths(stage_root, &all, project)?;
+        return Ok(None);
+    }
+    let src_rel = project_relative_source_root(root, src_dir)?;
+    let mut needed: HashSet<PathBuf> = HashSet::new();
+    for path in project.entries.keys() {
+        let is_store = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(crate::system::files::is_service_settings_file_name);
+        if is_store || !path.starts_with(&src_rel) {
+            needed.insert(path.clone());
+        }
+    }
+    let mut changed_dirs = Vec::new();
+    for path in &plan.changed_paths {
+        needed.insert(path.clone());
+        if matches!(project.entries.get(path), Some(SnapshotEntry::Directory))
+            || matches!(studio.entries.get(path), Some(SnapshotEntry::Directory))
+        {
+            changed_dirs.push(path.as_path());
+        }
+    }
+    let mut full_script_services: HashSet<String> = plan.initial_native_services.clone();
+    let changed_set: HashSet<&Path> = plan.changed_paths.iter().map(PathBuf::as_path).collect();
+    let target_ids_set: HashSet<String> = plan.target_settings_ids.iter().cloned().collect();
+    for (path, change) in prepared_settings {
+        if !changed_set.contains(path.as_path()) {
+            continue;
+        }
+        let service = settings_service_name(path, &change.current, &change.previous)?;
+        if full_script_services.contains(&service) {
+            continue;
+        }
+        if target_subtrees_contain_scripts(&change.current, &target_ids_set) {
+            full_script_services.insert(service);
+        }
+    }
+    if !changed_dirs.is_empty() || !full_script_services.is_empty() {
+        let service_prefixes: Vec<PathBuf> = full_script_services
+            .iter()
+            .map(|service| src_rel.join(service))
+            .collect();
+        for path in project.entries.keys() {
+            if changed_dirs.iter().any(|dir| path.starts_with(dir))
+                || service_prefixes
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix))
+            {
+                needed.insert(path.clone());
+            }
+        }
+    }
+    if !plan.initial_native_services.is_empty() {
+        let native_prefixes: Vec<PathBuf> = plan
+            .initial_native_services
+            .iter()
+            .map(|service| src_rel.join(service))
+            .collect();
+        let mut disk_needed: HashSet<PathBuf> = HashSet::new();
+        let mut virtual_files = crate::editor::types::VirtualStageFiles::new(stage_root);
+        for path in needed {
+            let is_store = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(crate::system::files::is_service_settings_file_name);
+            let is_virtual_native = !is_store
+                && native_prefixes
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix))
+                && !matches!(
+                    project.entries.get(&path),
+                    Some(SnapshotEntry::Symlink { .. })
+                );
+            if is_virtual_native {
+                match project.entries.get(&path) {
+                    Some(SnapshotEntry::File(bytes)) => {
+                        virtual_files.insert_file(&path, bytes.clone());
+                    }
+                    Some(SnapshotEntry::Directory) => {
+                        virtual_files.insert_dir(&path);
+                    }
+                    _ => {
+                        disk_needed.insert(path);
+                    }
+                }
+            } else {
+                disk_needed.insert(path);
+            }
+        }
+        stage_snapshot_paths(stage_root, &disk_needed, project)?;
+        if !virtual_files.is_empty() {
+            return Ok(Some(Arc::new(virtual_files)));
+        }
+        return Ok(None);
+    }
+    stage_snapshot_paths(stage_root, &needed, project)?;
+    Ok(None)
 }
 
 fn collect_saved_field_differences(
@@ -843,6 +1686,28 @@ fn pre_push_settlement_proof(
 }
 
 #[cfg(any(windows, target_os = "macos"))]
+type HeldPullProof = (Box<SourcemapState>, Value);
+
+#[cfg(any(windows, target_os = "macos"))]
+fn merge_held_pull_touched(
+    context: &BoundContext,
+    held_pull: Option<HeldPullProof>,
+    replace: bool,
+    plan: &ReconcilePushPlan,
+    prior_differing_services: Vec<String>,
+) -> Option<(HeldPullProof, Vec<String>)> {
+    held_pull.filter(|_| replace).map(|held| {
+        let mut touched = written_services(context, plan);
+        for service in prior_differing_services {
+            if !touched.contains(&service) {
+                touched.push(service);
+            }
+        }
+        (held, touched)
+    })
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 fn collect_prior_differing_services(
     context: &BoundContext,
     scoped_moved: Option<Vec<String>>,
@@ -875,6 +1740,304 @@ fn collect_prior_differing_services(
     changed
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+fn all_paths_in_verified_services(
+    context: &BoundContext,
+    differences: &HashSet<PathBuf>,
+    mutation_paths: &HashSet<PathBuf>,
+    verified_services: &HashSet<&str>,
+) -> bool {
+    !verified_services.is_empty()
+        && differences.iter().chain(mutation_paths.iter()).all(|path| {
+            crate::editor::paths::service_from_changed_path(
+                Path::new(&context.source),
+                &Path::new(&context.root).join(path),
+            )
+            .is_some_and(|service| {
+                verified_services
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&service))
+            })
+        })
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn finish_fast_verified_push(
+    bridge: &BridgeServer,
+    services: &[String],
+    guard: &StudioChangeGuard,
+    tracking_release: &mut StudioTrackingGuardRelease<'_>,
+    prepared_verification: HashMap<PathBuf, PreparedPushVerification>,
+    stage: ExportProjectStage,
+) -> Result<()> {
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            prepared_verification
+                .into_par_iter()
+                .for_each(|(_, verified)| {
+                    if let Some(desired) = verified.desired.and_then(Arc::into_inner) {
+                        drop_settings_documents(verified.previous, desired);
+                    } else {
+                        drop_settings_document(verified.previous);
+                    }
+                });
+            drop(stage);
+        });
+        if tracking_release.guard_id.is_some() {
+            acknowledge_verified_push(bridge, services, guard, tracking_release)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) type HeldPullTuple = ((Box<SourcemapState>, Value), Vec<String>);
+
+#[cfg(any(windows, target_os = "macos"))]
+fn take_candidate_pull_scope(
+    candidate: Option<&mut Box<VerifiedFullPushCandidate>>,
+) -> (Option<Box<SourcemapState>>, Option<Box<PushedFromPull>>) {
+    match candidate {
+        Some(candidate) => (
+            candidate.cached.sourcemap.take(),
+            candidate.cached.pushed_from_pull.take(),
+        ),
+        None => (None, None),
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn prior_scope_structural_services(
+    scoped_moved: Option<&Vec<String>>,
+    initial_state: &Value,
+) -> (bool, BTreeSet<String>) {
+    let Some(moved) = scoped_moved else {
+        return (false, BTreeSet::new());
+    };
+    let structural = match ProofScope::parse(&initial_state["pushProofScope"]) {
+        ProofScope::Services {
+            services,
+            touched,
+            values_only,
+        } => paths_moved_in_with(&services, &touched, &values_only),
+        ProofScope::Unknown(_) => moved.iter().cloned().collect(),
+    };
+    (true, structural)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_pushed_from_pull(
+    context: &BoundContext,
+    matched_prior: bool,
+    pushed_services: BTreeSet<String>,
+    prior_structural: BTreeSet<String>,
+    studio: &ProjectSnapshot,
+    project: &ProjectSnapshot,
+    held_pull: Option<HeldPullTuple>,
+    held_pushed_from_pull: Option<Box<PushedFromPull>>,
+) -> Option<Box<PushedFromPull>> {
+    if !matched_prior || pushed_services.is_empty() {
+        return None;
+    }
+    let mut structural =
+        structural_changes_between_snapshots(context, &pushed_services, studio, project, None);
+    for service in prior_structural {
+        structural.insert(service, vec![StructuralPathChange::WholeService]);
+    }
+    let paths_moved: BTreeSet<String> = structural.keys().cloned().collect();
+    if let Some(((sm, _), _)) = held_pull {
+        Some(Box::new(PushedFromPull {
+            sourcemap: *sm,
+            services: pushed_services,
+            paths_moved,
+            structural,
+        }))
+    } else if let Some(mut prior) = held_pushed_from_pull {
+        prior.services.extend(pushed_services);
+        prior.paths_moved.extend(paths_moved);
+        merge_structural_changes(&mut prior.structural, structural);
+        Some(prior)
+    } else {
+        None
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn retain_push_project_scope(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    cache_input: Option<&Value>,
+    source_paths: &[PathBuf],
+    (project, studio): (ProjectSnapshot, &ProjectSnapshot),
+    (kept_sourcemap, matched_prior, pushed_services, prior_structural): (
+        Option<Box<SourcemapState>>,
+        bool,
+        BTreeSet<String>,
+        BTreeSet<String>,
+    ),
+    (held_pull, held_pushed_from_pull): (Option<HeldPullTuple>, Option<Box<PushedFromPull>>),
+    tracking_release: &StudioTrackingGuardRelease<'_>,
+    #[cfg(windows)] native_relay: &mut Option<NativeRelay>,
+) {
+    let kept_pushed = if kept_sourcemap.is_some() {
+        None
+    } else {
+        build_pushed_from_pull(
+            context,
+            matched_prior,
+            pushed_services,
+            prior_structural,
+            studio,
+            &project,
+            held_pull,
+            held_pushed_from_pull,
+        )
+    };
+    retain_full_push_scoped(
+        bridge,
+        cache_input,
+        source_paths,
+        RetainedPushScope {
+            project,
+            sourcemap: kept_sourcemap,
+            pushed_from_pull: kept_pushed,
+        },
+        tracking_release,
+        #[cfg(windows)]
+        native_relay,
+    );
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn restore_held_baseline_on_noop(
+    (bridge, services, guard): (&BridgeServer, &[String], &StudioChangeGuard),
+    tracking_release: &mut StudioTrackingGuardRelease<'_>,
+    (initial_state, prior_proof, cache_input): (&Value, Option<Value>, Option<&Value>),
+    source_paths: &[PathBuf],
+    retained: RetainedPushScope,
+    #[cfg(windows)] native_relay: &mut Option<NativeRelay>,
+) {
+    if initial_state["pushProofMatches"] == true
+        && let Some(prior_proof) = prior_proof
+        && cache_input.is_some()
+    {
+        tracking_release.proof = Some(prior_proof);
+        if tracking_release.guard_id.is_some() {
+            let _ = acknowledge_verified_push(bridge, services, guard, tracking_release);
+        }
+        retain_full_push_scoped(
+            bridge,
+            cache_input,
+            source_paths,
+            retained,
+            tracking_release,
+            #[cfg(windows)]
+            native_relay,
+        );
+    }
+}
+
+struct BulkPushFallback<'a> {
+    context: &'a BoundContext,
+    stage: &'a ExportProjectStage,
+    bridge: &'a BridgeServer,
+    root: &'a Path,
+    src_dir: &'a Path,
+    project: &'a ProjectSnapshot,
+    studio: &'a ProjectSnapshot,
+    differences: &'a HashSet<PathBuf>,
+    mutation_paths: &'a HashSet<PathBuf>,
+    stores_read: StoresRead,
+    replace: bool,
+    guard: &'a StudioChangeGuard,
+}
+
+fn retry_full_push_without_bulk(
+    input: BulkPushFallback<'_>,
+    tracking_release: &mut StudioTrackingGuardRelease<'_>,
+    mut retry_args: PushEditorChangesArgs,
+    reason: &str,
+) -> Result<(
+    history::SyncHistory,
+    HashMap<PathBuf, PreparedPushVerification>,
+    StagedPushResult,
+)> {
+    log_global(
+        4,
+        format_args!("[renium] full push bulk patch fell back to standard push (reason={reason})"),
+    );
+    let mut fallback_prepared = HashMap::new();
+    let _ = prepare_project_replacement_from(
+        input.project,
+        input.studio,
+        input.differences,
+        &mut fallback_prepared,
+        input.stores_read,
+    )?;
+    let fallback_plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+        input.studio,
+        input.project,
+        input.differences,
+        &fallback_prepared,
+        true,
+        false,
+    )?;
+    let fallback_plan = plan_from_whole_stores(
+        (input.stores_read, input.replace, fallback_plan),
+        (input.project, input.studio),
+        input.differences,
+        &mut fallback_prepared,
+    )?;
+    let history = history::SyncHistory::begin_push(
+        input.root,
+        input.src_dir,
+        input.studio,
+        input.mutation_paths,
+        &mut retry_args,
+    )?;
+    let fallback_virtual_files = if input.replace {
+        stage_replace_push_paths(
+            input.root,
+            &input.stage.project_root,
+            input.src_dir,
+            &fallback_plan,
+            &fallback_prepared,
+            input.project,
+            input.studio,
+        )?
+    } else {
+        apply_snapshot_paths(
+            &input.stage.project_root,
+            input.mutation_paths,
+            input.project,
+        )?;
+        None
+    };
+    let (fallback_documents, fallback_verification) =
+        split_prepared_settings_for_push(fallback_prepared, input.project)?;
+    let mut pushed = push_staged_project(
+        input.context,
+        input.stage,
+        input.bridge,
+        StagedPushRequest {
+            plan: fallback_plan,
+            prepared_documents: fallback_documents,
+            virtual_files: fallback_virtual_files,
+            guard: Some(input.guard),
+            args: retry_args,
+            expected_project: Some(input.project),
+            later_edits_follow: false,
+        },
+    )?;
+    if let Some(release_result) = pushed.summary.remove("_inlineReleaseResult") {
+        apply_release_tracking_result(input.guard, tracking_release, &release_result);
+    }
+    Ok((history, fallback_verification, pushed))
+}
+
 pub(crate) fn push_project(
     context: &BoundContext,
     bridge: &BridgeServer,
@@ -884,29 +2047,31 @@ pub(crate) fn push_project(
     replace: bool,
 ) -> Result<Map<String, Value>> {
     #[cfg(any(windows, target_os = "macos"))]
+    let whole_project_push = is_whole_project_push(services, &push_args, guard, replace)?;
+    #[cfg(any(windows, target_os = "macos"))]
+    if !whole_project_push
+        && guard.is_none()
+        && let Some(result) = reuse_verified_subset_push(context, bridge, services, &push_args)?
+    {
+        return Ok(result);
+    }
+    #[cfg(any(windows, target_os = "macos"))]
     let mut verified_candidate = {
-        match reuse_verified_full_push(
-            context,
-            bridge,
-            services,
-            &push_args,
-            replace && guard.is_none(),
-        )? {
+        match reuse_verified_full_push(context, bridge, services, &push_args, whole_project_push)? {
             VerifiedFullPushReuse::Unchanged(result) => return Ok(result),
             VerifiedFullPushReuse::Continue(candidate) => candidate,
         }
     };
     #[cfg(any(windows, target_os = "macos"))]
-    let cache_input = (replace && guard.is_none())
+    let cache_input = whole_project_push
         .then(|| full_push_cache_input(&push_args, services))
         .transpose()?;
     #[cfg(windows)]
     let mut native_relay = None;
     // A baseline over files a pull wrote holds the sourcemap that pull left.
     #[cfg(any(windows, target_os = "macos"))]
-    let held_sourcemap = verified_candidate
-        .as_mut()
-        .and_then(|candidate| candidate.cached.sourcemap.take());
+    let (held_sourcemap, held_pushed_from_pull) =
+        take_candidate_pull_scope(verified_candidate.as_mut());
     let phase = Instant::now();
     // The previous push's native attribute observer must outlive the proof
     // check inside the lease request, yet stop before the new lease arms its
@@ -914,7 +2079,7 @@ pub(crate) fn push_project(
     // disarms the fresh observer.
     #[cfg(any(windows, target_os = "macos"))]
     let (candidate_parts, candidate_files_unchanged, mut previous_attributes) =
-        match verified_candidate {
+        match verified_candidate.map(|c| *c) {
             Some(candidate) => {
                 let VerifiedFullPushCandidate {
                     cached,
@@ -948,13 +2113,15 @@ pub(crate) fn push_project(
         .is_some_and(|relay| relay.ends > Instant::now() + Duration::from_secs(30));
     #[cfg(not(windows))]
     let continue_native_relay = false;
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let whole_project_push = replace;
     let (mut guard, initial_state) = if let Some(guard) = guard {
         (guard.clone(), Value::Null)
     } else {
         current_studio_change_guard_verifying_continuing(
             context,
             bridge,
-            (cfg!(any(windows, target_os = "macos")) && replace).then_some(services),
+            (cfg!(any(windows, target_os = "macos")) && whole_project_push).then_some(services),
             candidate_proof.as_ref(),
             continue_native_relay,
             |state| {
@@ -984,7 +2151,9 @@ pub(crate) fn push_project(
     // The held proof the lease verified as it began, over files a pull wrote:
     // the import settlement may skip services only from such a baseline.
     #[cfg(any(windows, target_os = "macos"))]
-    let (held_pull, held_sourcemap_fallback) = if initial_state["pushProofMatches"] == true {
+    let prior_proof = candidate_proof.clone();
+    #[cfg(any(windows, target_os = "macos"))]
+    let (held_pull, mut held_sourcemap_fallback) = if initial_state["pushProofMatches"] == true {
         (held_sourcemap.zip(candidate_proof), None)
     } else {
         (None, held_sourcemap)
@@ -1053,12 +2222,6 @@ pub(crate) fn push_project(
             .cached_bridge_info_for_target(BridgeTarget::Edit)
             .is_ok_and(|info| info.bulk_property_patch);
     #[cfg(any(windows, target_os = "macos"))]
-    if replace
-        && bulk_eligible
-        && verified_baseline.is_none()
-        && candidate_files_unchanged
-        && can_capture_in_memory
-        && let Some(held_project) = scoped_baseline.as_ref()
     {
         let zctx = ZeroCaptureContext {
             context,
@@ -1073,9 +2236,17 @@ pub(crate) fn push_project(
             initial_state: &initial_state,
             cache_input: cache_input.as_ref(),
         };
-        if let Some(summary) = try_zero_capture_bulk_restore(
+        if let Some(summary) = try_zero_capture_if_eligible(
+            [
+                replace,
+                bulk_eligible,
+                verified_baseline.is_none(),
+                candidate_files_unchanged,
+                can_capture_in_memory,
+            ],
             &zctx,
-            held_project,
+            &mut scoped_baseline,
+            &mut held_sourcemap_fallback,
             &mut tracking_release,
             #[cfg(windows)]
             &mut native_relay,
@@ -1092,6 +2263,9 @@ pub(crate) fn push_project(
     );
     let scoped_moved = scoped_capture_services.clone();
     #[cfg(any(windows, target_os = "macos"))]
+    let (had_scoped_moved, prior_structural_services) =
+        prior_scope_structural_services(scoped_moved.as_ref(), &initial_state);
+    #[cfg(any(windows, target_os = "macos"))]
     let held_pull = pre_push_settlement_proof(
         bridge,
         &guard,
@@ -1101,26 +2275,31 @@ pub(crate) fn push_project(
     );
     // Source capture is read-only and independent of the private Studio stage.
     // Keep Studio calls on this thread, with its selected runtime and lease.
-    let (captured, project) = std::thread::scope(|scope| {
-        let project = scope.spawn(|| capture_snapshot(&root, &source_paths));
-        let captured = if let Some(baseline) = verified_baseline {
-            Ok((stage, baseline))
-        } else if let (Some(moved), Some(baseline)) =
-            (scoped_capture_services, scoped_baseline.take())
-        {
-            capture_scoped_push_baseline(context, bridge, &root, &moved, &stage, baseline)
-                .map(|studio| (stage, studio))
-        } else if can_capture_in_memory {
-            capture_studio_services_in_memory(context, bridge, services, &stage, false)
-                .map(|studio| (stage, studio))
-        } else {
-            capture_studio_services_with_stage(context, bridge, services, false, stage)
-        };
+    let (captured, project) = if let Some(baseline) = verified_baseline {
         (
-            captured,
-            project.join().expect("Source capture worker panicked"),
+            Ok((stage, baseline)),
+            capture_snapshot(&root, &source_paths),
         )
-    });
+    } else {
+        std::thread::scope(|scope| {
+            let project = scope.spawn(|| capture_snapshot(&root, &source_paths));
+            let captured = if let (Some(moved), Some(baseline)) =
+                (scoped_capture_services, scoped_baseline.take())
+            {
+                capture_scoped_push_baseline(context, bridge, &root, &moved, &stage, baseline)
+                    .map(|studio| (stage, studio))
+            } else if can_capture_in_memory {
+                capture_studio_services_in_memory(context, bridge, services, &stage, false)
+                    .map(|studio| (stage, studio))
+            } else {
+                capture_studio_services_with_stage(context, bridge, services, false, stage)
+            };
+            (
+                captured,
+                project.join().expect("Source capture worker panicked"),
+            )
+        })
+    };
     let (stage, mut studio) = captured?;
     let project = project?;
     #[cfg(any(windows, target_os = "macos"))]
@@ -1154,7 +2333,6 @@ pub(crate) fn push_project(
         let (diff_paths, promoted, read_mode) = prepare_replace_push_differences(
             context,
             &root,
-            &stage,
             (&project, &studio),
             (bulk_eligible, link_enforcement.is_none()),
             &mut prepared_settings,
@@ -1277,6 +2455,17 @@ pub(crate) fn push_project(
         );
         return Ok(Map::from_iter([("ok".to_string(), Value::Bool(true))]));
     }
+    #[cfg(any(windows, target_os = "macos"))]
+    let pushed_services_for_scope: BTreeSet<String> =
+        services_for_snapshot_paths(context, &differences)
+            .into_iter()
+            .chain(
+                plan.bulk_property_patches
+                    .iter()
+                    .map(|patch| patch.service.clone()),
+            )
+            .chain(prior_differing_services.iter().cloned())
+            .collect();
     let mutation_paths = differences.clone();
     let phase = Instant::now();
     let mut history = history::SyncHistory::begin_push(
@@ -1288,32 +2477,24 @@ pub(crate) fn push_project(
     )?;
     let settle_native_import = replace && !plan.initial_native_services.is_empty();
     #[cfg(any(windows, target_os = "macos"))]
-    let held_pull = held_pull.filter(|_| replace).map(|held| {
-        let mut touched = written_services(context, &plan);
-        for service in prior_differing_services {
-            if !touched.contains(&service) {
-                touched.push(service);
-            }
-        }
-        (held, touched)
-    });
-    if !replace {
+    let held_pull =
+        merge_held_pull_touched(context, held_pull, replace, &plan, prior_differing_services);
+    let virtual_files = if replace {
+        stage_replace_push_paths(
+            &root,
+            &stage.project_root,
+            &src_dir,
+            &plan,
+            &prepared_settings,
+            &project,
+            &studio,
+        )?
+    } else {
         apply_snapshot_paths(&stage.project_root, &mutation_paths, &project)?;
-    }
-    let mut prepared_documents = HashMap::with_capacity(prepared_settings.len());
-    let mut prepared_verification = HashMap::with_capacity(prepared_settings.len());
-    for (path, change) in prepared_settings {
-        let service = settings_service_name(&path, &change.current, &change.previous)?;
-        let desired = Arc::new(change.current);
-        prepared_documents.insert(service, Arc::clone(&desired));
-        prepared_verification.insert(
-            path,
-            PreparedPushVerification {
-                previous: change.previous,
-                desired: Some(desired),
-            },
-        );
-    }
+        None
+    };
+    let (prepared_documents, mut prepared_verification) =
+        split_prepared_settings_for_push(prepared_settings, &project)?;
     #[cfg(any(windows, target_os = "macos"))]
     let can_settle_in_background =
         replace && import_settle::can_continue(&stage, requires_stage, link_enforcement.is_some());
@@ -1326,6 +2507,16 @@ pub(crate) fn push_project(
         link_enforcement.is_some(),
     );
     let saved_fields = push_args.saved_fields.clone();
+    let had_bulk_patches = !plan.bulk_property_patches.is_empty();
+    let mut fallback_push_args = had_bulk_patches.then(|| {
+        let mut fallback = push_args.clone();
+        fallback.inline_release_tracking = None;
+        fallback
+    });
+    #[cfg(any(windows, target_os = "macos"))]
+    let mut is_bulk_only_values_push = is_bulk_only_values_plan(&plan);
+    #[cfg(any(windows, target_os = "macos"))]
+    let sourcemap_policy = bulk_patches_sourcemap_policy(&plan.bulk_property_patches);
     let mut pushed = push_staged_project(
         context,
         &stage,
@@ -1333,6 +2524,7 @@ pub(crate) fn push_project(
         StagedPushRequest {
             plan,
             prepared_documents,
+            virtual_files,
             guard: Some(&guard),
             args: push_args,
             expected_project: Some(&project),
@@ -1342,9 +2534,56 @@ pub(crate) fn push_project(
     if let Some(release_result) = pushed.summary.remove("_inlineReleaseResult") {
         apply_release_tracking_result(&guard, &mut tracking_release, &release_result);
     }
+    if should_retry_full_push_without_bulk(&pushed.summary, had_bulk_patches)
+        && let Some(retry_args) = fallback_push_args.take()
+    {
+        let reason = pushed
+            .summary
+            .get("fallbackReason")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            is_bulk_only_values_push = false;
+        }
+        drop(history);
+        (history, prepared_verification, pushed) = retry_full_push_without_bulk(
+            BulkPushFallback {
+                context,
+                stage: &stage,
+                bridge,
+                root: &root,
+                src_dir: &src_dir,
+                project: &project,
+                studio: &studio,
+                differences: &differences,
+                mutation_paths: &mutation_paths,
+                stores_read,
+                replace,
+                guard: &guard,
+            },
+            &mut tracking_release,
+            retry_args,
+            reason,
+        )?;
+    }
     if push_applied_nothing(&pushed.summary) {
         // Studio holds or skipped the whole push, so there is nothing to
         // record or read back; the summary carries the hold and its next step.
+        #[cfg(any(windows, target_os = "macos"))]
+        restore_held_baseline_on_noop(
+            (bridge, services, &guard),
+            &mut tracking_release,
+            (&initial_state, prior_proof, cache_input.as_ref()),
+            &source_paths,
+            RetainedPushScope {
+                project: studio,
+                sourcemap: held_pull.map(|((sm, _), _)| sm),
+                pushed_from_pull: held_pushed_from_pull,
+            },
+            #[cfg(windows)]
+            &mut native_relay,
+        );
         return Ok(pushed.summary);
     }
     leave_unread_documents(&mut prepared_verification);
@@ -1461,7 +2700,10 @@ pub(crate) fn push_project(
         .filter(|(_, settled)| settle_native_import || settled.len() < services.len())
         // A Studio that changed since the commit gets the full readback below
         // before the push answers.
-        .filter(|(proof, _)| verified_full_push_proof_matches(context, bridge, proof).unwrap_or(false))
+        .filter(|(proof, _)| {
+            verified_full_push_proof_matches_with_options(context, bridge, proof, true)
+                .unwrap_or(false)
+        })
         // A journal records only a verified Studio commit whose caller can
         // leave before publication. Failed/review-held pushes and synchronous
         // readback never create recovery obligations.
@@ -1513,7 +2755,6 @@ pub(crate) fn push_project(
             import_settle::Settlement::Published(published) => published,
             // Files a settlement of added roots left as the push wrote them
             // stand for the Studio that holds its commit, as after a push
-            // that reads nothing back, but for files it wrote itself.
             import_settle::Settlement::Unwritten if added_roots && !generated_files => {
                 (work.expected, None)
             }
@@ -1531,31 +2772,90 @@ pub(crate) fn push_project(
         return Ok(work.summary);
     }
 
-    let mut current = capture_snapshot(&root, stage.publish_paths())?;
-    let mut verification_paths = differences;
-    verification_paths.extend(mutation_paths);
-    verification_paths.extend(pushed.generated.entries.keys().cloned());
     let verified_services = ["nativeVerifiedServices", "fieldVerifiedServices"]
         .into_iter()
         .filter_map(|name| pushed.summary.get(name).and_then(Value::as_array))
         .flatten()
         .filter_map(Value::as_str)
         .collect::<HashSet<_>>();
+    let allow_fast_verify_skip = !settle_native_import
+        && pushed
+            .summary
+            .get("sourceVerifyFailed")
+            .and_then(Value::as_u64)
+            == Some(0);
+    #[cfg(any(windows, target_os = "macos"))]
+    let fast_verified_paths = allow_fast_verify_skip
+        && !requires_stage
+        && replacement.is_none()
+        && pushed.generated.entries.is_empty()
+        && pending_fields.is_empty()
+        && !summary_has_pending_or_unsupported(&pushed.summary)
+        && stage
+            .loaded
+            .as_ref()
+            .is_none_or(|loaded| loaded.project.adapters.is_empty())
+        && all_paths_in_verified_services(
+            context,
+            &differences,
+            &mutation_paths,
+            &verified_services,
+        );
+    #[cfg(any(windows, target_os = "macos"))]
+    if fast_verified_paths && snapshot_matches_disk(&root, stage.publish_paths(), &project)? {
+        tracking_release.proof = pushed.summary.remove("verifiedPushProof");
+        finish_fast_verified_push(
+            bridge,
+            services,
+            &guard,
+            &mut tracking_release,
+            prepared_verification,
+            stage,
+        )?;
+        let mut candidate_sourcemap = held_pull
+            .as_ref()
+            .map(|((sourcemap, _), _)| sourcemap.clone());
+        let preserved_sourcemap = preserved_sourcemap_for_bulk_push(
+            is_bulk_only_values_push,
+            sourcemap_policy,
+            &pushed.summary,
+            &mut candidate_sourcemap,
+        );
+        let matched_prior = (initial_state["pushProofMatches"] == true || had_scoped_moved)
+            && pushed.generated.entries.is_empty();
+        retain_push_project_scope(
+            context,
+            bridge,
+            cache_input.as_ref(),
+            &source_paths,
+            (project, &studio),
+            (
+                preserved_sourcemap,
+                matched_prior,
+                pushed_services_for_scope,
+                prior_structural_services,
+            ),
+            (held_pull, held_pushed_from_pull),
+            &tracking_release,
+            #[cfg(windows)]
+            &mut native_relay,
+        );
+        return Ok(pushed.summary);
+    }
+    let mut current = capture_snapshot(&root, stage.publish_paths())?;
+    let mut verification_paths = differences;
+    verification_paths.extend(mutation_paths);
+    verification_paths.extend(pushed.generated.entries.keys().cloned());
     // Native replacement validates the loader receipt, retained settings,
     // supplemental writes and script buffers before committing. Re-export only
     // services outside that contract, transformed outputs or newer file edits.
-    if !settle_native_import
+    if allow_fast_verify_skip
         && !requires_stage
         && replacement.is_none()
         && stage
             .loaded
             .as_ref()
             .is_none_or(|loaded| loaded.project.adapters.is_empty())
-        && pushed
-            .summary
-            .get("sourceVerifyFailed")
-            .and_then(Value::as_u64)
-            == Some(0)
         && !verified_services.is_empty()
     {
         verification_paths.retain(|path| {
@@ -1603,15 +2903,27 @@ pub(crate) fn push_project(
             }
         })?;
         #[cfg(any(windows, target_os = "macos"))]
-        retain_verified_full_push(
-            bridge,
-            cache_input.as_ref(),
-            &source_paths,
-            project,
-            &tracking_release,
-            #[cfg(windows)]
-            &mut native_relay,
-        );
+        {
+            let matched_prior = (initial_state["pushProofMatches"] == true || had_scoped_moved)
+                && pushed.generated.entries.is_empty();
+            retain_push_project_scope(
+                context,
+                bridge,
+                cache_input.as_ref(),
+                &source_paths,
+                (project, &studio),
+                (
+                    None,
+                    matched_prior,
+                    pushed_services_for_scope,
+                    prior_structural_services,
+                ),
+                (held_pull, held_pushed_from_pull),
+                &tracking_release,
+                #[cfg(windows)]
+                &mut native_relay,
+            );
+        }
         return Ok(pushed.summary);
     }
     let verification_services = if settle_native_import {
@@ -1626,10 +2938,12 @@ pub(crate) fn push_project(
     let import_readback = settle_native_import
         .then(|| -> Result<_> {
             let covered = ScopeSet::new(&source_paths);
-            let mut stage =
-                ExportProjectStage::create_with_baseline(&root, &src_dir, services, &|paths| {
-                    publish_baseline(&root, &current, &covered, paths)
-                })?;
+            let mut stage = ExportProjectStage::create_with_baseline_background(
+                &root,
+                &src_dir,
+                services,
+                &|paths| publish_baseline(&root, &current, &covered, paths),
+            )?;
             stage.prepare_read_only_links(&root, &src_dir, services)?;
             Ok(stage)
         })
@@ -1703,6 +3017,8 @@ pub(crate) fn push_project(
         stage_verified_import_readback(&mut readback_stage, &readback, current.entries.keys())?;
         log_reconcile_timing("full push stage verified readback", phase);
     }
+    #[cfg(any(windows, target_os = "macos"))]
+    let no_generated = pushed.generated.entries.is_empty();
     let mut expected_after_push = project;
     expected_after_push.entries.extend(pushed.generated.entries);
     let files_held = expected_after_push == current;
@@ -1729,24 +3045,138 @@ pub(crate) fn push_project(
     }
     acknowledge_verified_push(bridge, services, &guard, &mut tracking_release)?;
     #[cfg(any(windows, target_os = "macos"))]
-    retain_full_push(
-        bridge,
-        cache_input.as_ref(),
-        &source_paths,
-        (
-            current,
-            published.as_ref().and_then(import_settle::pulled_sourcemap),
-        ),
-        &tracking_release,
-        #[cfg(windows)]
-        &mut native_relay,
-    );
+    {
+        let kept_sourcemap = published.as_ref().and_then(import_settle::pulled_sourcemap);
+        let matched_prior =
+            (initial_state["pushProofMatches"] == true || had_scoped_moved) && no_generated;
+        retain_push_project_scope(
+            context,
+            bridge,
+            cache_input.as_ref(),
+            &source_paths,
+            (current, &studio),
+            (
+                kept_sourcemap,
+                matched_prior,
+                pushed_services_for_scope,
+                prior_structural_services,
+            ),
+            (held_pull, held_pushed_from_pull),
+            &tracking_release,
+            #[cfg(windows)]
+            &mut native_relay,
+        );
+    }
     Ok(pushed.summary)
 }
 
 /// A push of chosen paths or instances. With a held baseline it runs under a
 /// lease that continues the baseline's observation, and keeps a baseline of
 /// the files where it can say Studio holds them after the push.
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn retain_targeted_baseline_scope(
+    context: &BoundContext,
+    held: &mut VerifiedFullPush,
+    project: &ProjectSnapshot,
+    summary: &Map<String, Value>,
+) -> (Option<Box<SourcemapState>>, Option<Box<PushedFromPull>>) {
+    let kept_sm = sourcemap_after_push(held, project, summary);
+    let kept_pushed = if kept_sm.is_some() {
+        None
+    } else {
+        let changed_paths: HashSet<PathBuf> = held
+            .project
+            .entries
+            .keys()
+            .chain(project.entries.keys())
+            .filter(|path| held.project.entries.get(*path) != project.entries.get(*path))
+            .cloned()
+            .collect();
+        let pushed_services: BTreeSet<String> =
+            services_for_snapshot_paths(context, &changed_paths)
+                .into_iter()
+                .collect();
+        if pushed_services.is_empty() {
+            held.pushed_from_pull.take()
+        } else {
+            let structural = structural_changes_between_snapshots(
+                context,
+                &pushed_services,
+                &held.project,
+                project,
+                None,
+            );
+            let paths_moved: BTreeSet<String> = structural.keys().cloned().collect();
+            if let Some(sm) = held.sourcemap.take() {
+                Some(Box::new(PushedFromPull {
+                    sourcemap: *sm,
+                    services: pushed_services,
+                    paths_moved,
+                    structural,
+                }))
+            } else if let Some(mut prior) = held.pushed_from_pull.take() {
+                prior.services.extend(pushed_services);
+                prior.paths_moved.extend(paths_moved);
+                merge_structural_changes(&mut prior.structural, structural);
+                Some(prior)
+            } else {
+                None
+            }
+        }
+    };
+    (kept_sm, kept_pushed)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn preserved_sourcemap_for_bulk_push(
+    allow: bool,
+    policy: BulkSourcemapPolicy,
+    summary: &Map<String, Value>,
+    held: &mut Option<Box<SourcemapState>>,
+) -> Option<Box<SourcemapState>> {
+    if allow && bulk_patches_allow_preserved_sourcemap(policy, summary) {
+        held.take()
+    } else {
+        None
+    }
+}
+
+pub(super) fn should_retry_full_push_without_bulk(
+    summary: &Map<String, Value>,
+    had_bulk_patches: bool,
+) -> bool {
+    had_bulk_patches && summary.get("fallbackFullCapture") == Some(&Value::Bool(true))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn zero_capture_can_keep_pull_scope(
+    disk_matches: bool,
+    has_extra_mutations: bool,
+    generated_empty: bool,
+    replacement_none: bool,
+    has_pending_or_unsupported: bool,
+    summary: &Map<String, Value>,
+) -> bool {
+    disk_matches
+        && !has_extra_mutations
+        && generated_empty
+        && replacement_none
+        && !has_pending_or_unsupported
+        && summary.get("exactRetained") != Some(&Value::Bool(false))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn targeted_push_keeps_baseline_on_structure_change(
+    summary: &Map<String, Value>,
+    pushed: &TargetedPush,
+    held: &VerifiedFullPush,
+) -> bool {
+    !push_changed_structure(summary)
+        || (push_only_created_instances(summary)
+            && !pushed.ids.is_empty()
+            && (held.sourcemap.is_some() || held.pushed_from_pull.is_some()))
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn push_targeted(
     context: &BoundContext,
@@ -1785,7 +3215,7 @@ pub(crate) fn push_targeted(
         let _span = crate::app::profile::span("push of the chosen paths");
         push_editor_changes_with_warm_bridge(args, bridge)?
     };
-    if push_changed_structure(&summary) {
+    if !targeted_push_keeps_baseline_on_structure_change(&summary, &pushed, &held) {
         // No comparison of the stores can keep these files: skip it.
         not_kept("the push added, replaced or removed instances");
         return Ok(summary);
@@ -1845,10 +3275,13 @@ pub(crate) fn push_targeted(
     // differs from the baseline, so Studio holds these files.
     #[cfg(windows)]
     let relay = held.relay.take();
+    let (kept_sm, kept_pushed) =
+        retain_targeted_baseline_scope(context, &mut held, &project, &summary);
     let entry = VerifiedFullPush {
         connections: bridge.runtime_connection_signature(&release.runtime_id),
         input: std::mem::take(&mut held.input),
-        sourcemap: sourcemap_after_push(&held, &project, &summary),
+        sourcemap: kept_sm,
+        pushed_from_pull: kept_pushed,
         project,
         paths: std::mem::take(&mut held.paths),
         proof,
@@ -1889,6 +3322,7 @@ fn baseline_lease<'a>(
             "trackingGuardId": guard_id,
             "includeGenerations": true,
             "services": sync_services(),
+            "lazyTracking": cfg!(windows),
             "captureLocalPushProof": true,
             "verifyPushProof": held.proof,
             "requirePushProof": true,
@@ -2063,6 +3497,25 @@ pub(crate) fn targeted_baseline(
 }
 
 #[cfg(any(windows, target_os = "macos"))]
+pub(super) fn push_only_created_instances(summary: &Map<String, Value>) -> bool {
+    let count = |top: &str, nested: &str| {
+        summary
+            .get(top)
+            .and_then(Value::as_f64)
+            .or_else(|| {
+                summary
+                    .get("instances")
+                    .and_then(|v| v.get(nested))
+                    .and_then(Value::as_f64)
+            })
+            .unwrap_or(0.0)
+    };
+    count("instanceCreated", "created") > 0.0
+        && count("instanceDeleted", "deleted") == 0.0
+        && count("instanceReplaced", "replaced") == 0.0
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 /// Whether a verified write of the whole instances `ids` of a store (with
 /// what stands under them unless `exact`) leaves the store `held` held as
 /// `files` holds it. Every other instance must be the same, every instance
@@ -2082,6 +3535,52 @@ pub(crate) fn store_rows_differ_only_at(
         return Ok(false);
     };
     let count = was.instances.len();
+    if now.instances.len() > count
+        && was.digests.len() == count
+        && now.digests.len() == now.instances.len()
+        && was.unique_ids.len() == count
+        && now.unique_ids.len() == now.instances.len()
+        && was.unique_ids[..] == now.unique_ids[..count]
+        && was.digests[..] == now.digests[..count]
+        && was
+            .instances
+            .iter()
+            .zip(&now.instances[..count])
+            .all(|(w, n)| {
+                w.settings_id == n.settings_id
+                    && w.name == n.name
+                    && w.class_name == n.class_name
+                    && w.parent_index == n.parent_index
+            })
+    {
+        let total = now.instances.len();
+        let mut chosen = now
+            .instances
+            .iter()
+            .map(|instance| ids.contains(&instance.settings_id))
+            .collect::<Vec<_>>();
+        let mut joined = !exact;
+        while joined {
+            joined = false;
+            for index in 0..total {
+                if !chosen[index]
+                    && now.instances[index]
+                        .parent_index
+                        .is_some_and(|parent| parent < total && chosen[parent])
+                {
+                    chosen[index] = true;
+                    joined = true;
+                }
+            }
+        }
+        let added_ok = (count..total).all(|index| {
+            let inst = &now.instances[index];
+            chosen[index]
+                && !matches!(inst.class_name.as_str(), "PackageLink" | "Camera")
+                && crate::editor::paths::script_file_names(&inst.class_name).is_none()
+        });
+        return Ok(added_ok);
+    }
     let same_places = now.instances.len() == count
         && was.digests.len() == count
         && now.digests.len() == count
@@ -2278,6 +3777,7 @@ pub(super) fn stage_verified_import_readback<'a>(
     readback: &ProjectSnapshot,
     files: impl IntoIterator<Item = &'a PathBuf>,
 ) -> Result<()> {
+    stage.wait_for_copy()?;
     let scopes = ScopeSet::new(stage.publish_paths());
     let mut paths = project_replacement_paths(readback, &ProjectSnapshot::default());
     paths.extend(
@@ -2286,7 +3786,87 @@ pub(super) fn stage_verified_import_readback<'a>(
             .filter(|path| scopes.contains(path) && !derived_project_path(path))
             .cloned(),
     );
-    apply_snapshot_paths(&stage.project_root, &paths, readback)?;
+    if let Some(vs) = stage.virtual_scripts().cloned() {
+        let src_prefix = stage.import_src_dir.clone();
+        let mut non_virtual_paths = HashSet::new();
+        let mut virtual_dirs = BTreeSet::new();
+        let mut virtual_files = Vec::new();
+        for path in &paths {
+            let is_store = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_service_settings_file_name);
+            if !is_store
+                && scopes.contains(path)
+                && path != &src_prefix
+                && path.starts_with(&src_prefix)
+            {
+                if let Ok(after_src) = path.strip_prefix(&src_prefix)
+                    && let Some(first) = after_src.components().next()
+                {
+                    let service_root = src_prefix.join(first.as_os_str());
+                    virtual_dirs.insert(service_root);
+                }
+                match readback.entries.get(path) {
+                    Some(SnapshotEntry::Directory) => {
+                        virtual_dirs.insert(path.clone());
+                    }
+                    Some(SnapshotEntry::File(bytes)) => {
+                        virtual_files.push((path.clone(), bytes.as_slice()));
+                    }
+                    Some(SnapshotEntry::Symlink { .. }) => {
+                        non_virtual_paths.insert(path.clone());
+                    }
+                    None => {}
+                }
+            } else {
+                non_virtual_paths.insert(path.clone());
+            }
+        }
+        {
+            let mut roots = vs.virtual_roots.lock_recover();
+            let mut staged_entries = vs.staged_entries.lock_recover();
+            for dir in &virtual_dirs {
+                if dir.parent() == Some(src_prefix.as_path()) {
+                    roots.insert(dir.clone());
+                }
+                if vs.baseline.get(dir) != Some(&PublishEntryState::Directory) {
+                    fs::create_dir_all(stage.project_root.join(dir))?;
+                }
+                staged_entries.insert(dir.clone(), PublishEntryState::Directory);
+            }
+        }
+        let processed: Vec<(PathBuf, PublishEntryState, bool)> = virtual_files
+            .par_iter()
+            .map(
+                |(rel, bytes)| -> Result<(PathBuf, PublishEntryState, bool)> {
+                    let state = crate::snapshot::export::file_publish_state(bytes);
+                    if vs.baseline.get(rel) == Some(&state) {
+                        return Ok((rel.clone(), state, true));
+                    }
+                    let full = stage.project_root.join(rel);
+                    if let Some(parent) = full.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&full, bytes)?;
+                    Ok((rel.clone(), state, false))
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+        {
+            let mut staged_entries = vs.staged_entries.lock_recover();
+            let mut skipped = vs.skipped_paths.lock_recover();
+            for (rel, state, is_skipped) in processed {
+                if is_skipped {
+                    skipped.insert(rel.clone());
+                }
+                staged_entries.insert(rel, state);
+            }
+        }
+        apply_snapshot_paths(&stage.project_root, &non_virtual_paths, readback)?;
+    } else {
+        apply_snapshot_paths(&stage.project_root, &paths, readback)?;
+    }
     // Capture already built the map from its hierarchy. Rebuilding it from
     // stores here would decode the whole place again.
     stage.finish_projection(false)?;
@@ -2737,22 +4317,25 @@ fn stage_captured_service_map(
     projection: &BTreeMap<PathBuf, Option<Vec<u8>>>,
     writer: &crate::snapshot::import::SourcemapWriter,
 ) -> Result<()> {
-    // The existing map builder resolves script paths against files. Stage only
-    // the captured sources here; verified stores are published after checking.
-    for (path, bytes) in projection {
-        if let Some(bytes) = bytes.as_ref().filter(|_| is_source_path(path)) {
-            fs::create_dir_all(path.parent().context("Captured source has no parent")?)?;
-            fs::write(path, bytes)?;
-        }
-    }
+    let existing_files: HashSet<PathBuf> = projection
+        .iter()
+        .filter_map(|(path, bytes)| {
+            bytes
+                .as_ref()
+                .filter(|_| is_source_path(path))
+                .and_then(|_| path.strip_prefix(&stage.project_root).ok())
+                .map(Path::to_path_buf)
+        })
+        .collect();
     let service_dir = stage
         .import_project_root
         .join(&stage.import_src_dir)
         .join(service);
-    let node = crate::project::sourcemap::build_service_sourcemap_from_state(
+    let node = crate::project::sourcemap::build_service_sourcemap_from_state_with_files(
         state,
         &stage.project_root,
         &service_dir,
+        &existing_files,
     );
     writer
         .sender()
@@ -2993,5 +4576,457 @@ mod stores_read_tests {
             .entries
             .insert(source, SnapshotEntry::File(b"print(3)".to_vec()));
         assert!(stores_read_of(true, &paths, &project, &studio) == StoresRead::ChangedOfBoth);
+    }
+
+    #[test]
+    fn target_subtrees_contain_scripts_uses_zero_based_parent_index_and_stages_scripts() {
+        use crate::settings::bytecode::{SettingsBytecode, SettingsBytecodeInstance};
+        let doc = SettingsBytecode {
+            version: 12,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "root-0".into(),
+                    "ReplicatedStorage".into(),
+                    "ReplicatedStorage".into(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new(
+                    "folder-1".into(),
+                    "Sub".into(),
+                    "Folder".into(),
+                    Some(0),
+                ),
+                SettingsBytecodeInstance::new(
+                    "script-2".into(),
+                    "Mod".into(),
+                    "ModuleScript".into(),
+                    Some(1),
+                ),
+            ],
+        };
+        assert!(
+            target_subtrees_contain_scripts(&doc, &HashSet::from(["folder-1".to_string()])),
+            "R2: 0-based parent_index=Some(1) script under folder-1 must be detected"
+        );
+        assert!(
+            !target_subtrees_contain_scripts(&doc, &HashSet::from(["nonexistent".to_string()])),
+            "unrelated target id should not match"
+        );
+
+        let root = crate::tests::support::temp_dir("r2-stage-replace-scripts");
+        let stage_root = crate::tests::support::temp_dir("r2-stage-replace-out");
+        let store_rel = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
+        let script_rel = PathBuf::from("src/ReplicatedStorage/Sub/Mod.luau");
+        let bytes = crate::settings::bytecode::encode_settings_bytecode(&doc).unwrap();
+        let project = ProjectSnapshot {
+            entries: BTreeMap::from([
+                (store_rel.clone(), SnapshotEntry::File(bytes)),
+                (
+                    script_rel.clone(),
+                    SnapshotEntry::File(b"return 1\n".to_vec()),
+                ),
+            ]),
+        };
+        let studio = ProjectSnapshot::default();
+        let mut plan = ReconcilePushPlan::default();
+        plan.changed_paths.push(store_rel.clone());
+        plan.target_settings_ids.push("folder-1".into());
+        let mut prepared = HashMap::new();
+        prepared.insert(
+            store_rel,
+            PreparedEditorSettingsChange {
+                previous: SettingsBytecode {
+                    version: 12,
+                    instances: vec![doc.instances[0].clone()],
+                },
+                current: doc,
+            },
+        );
+        stage_replace_push_paths(
+            &root,
+            &stage_root,
+            &root.join("src"),
+            &plan,
+            &prepared,
+            &project,
+            &studio,
+        )
+        .unwrap();
+        assert!(
+            stage_root.join(&script_rel).is_file(),
+            "R2: stage_replace_push_paths must stage unchanged script under targeted subtree"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&stage_root);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn same_size_and_mtime_replacement_is_detected_by_snapshot_checks() {
+        let root = crate::tests::support::temp_dir("reconcile1-same-mtime-size");
+        let script_rel = PathBuf::from("src/ServerScriptService/Main.server.luau");
+        let script_abs = root.join(&script_rel);
+        fs::create_dir_all(script_abs.parent().unwrap()).unwrap();
+        fs::write(&script_abs, "return 1\n").unwrap();
+        let fixed_time = std::time::SystemTime::now() - Duration::from_secs(10);
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(&script_abs)
+            .unwrap();
+        f.set_modified(fixed_time).unwrap();
+        drop(f);
+
+        let publish_paths = vec![PathBuf::from("src")];
+        let held = capture_snapshot(&root, &publish_paths).unwrap();
+        assert!(snapshot_matches_disk(&root, &publish_paths, &held).unwrap());
+        assert!(
+            snapshot_matches_disk_subset(&root, std::slice::from_ref(&script_rel), &held).unwrap()
+        );
+        assert!(
+            snapshot_paths_match_disk(&root, std::slice::from_ref(&script_rel), &held)
+                .unwrap()
+                .is_none()
+        );
+
+        fs::write(&script_abs, "return 2\n").unwrap();
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(&script_abs)
+            .unwrap();
+        f.set_modified(fixed_time).unwrap();
+        drop(f);
+
+        assert!(
+            !snapshot_matches_disk(&root, &publish_paths, &held).unwrap(),
+            "same-size same-mtime replacement must not match disk"
+        );
+        assert!(
+            !snapshot_matches_disk_subset(&root, std::slice::from_ref(&script_rel), &held).unwrap(),
+            "subset check must detect same-size same-mtime replacement"
+        );
+        assert_eq!(
+            snapshot_paths_match_disk(&root, std::slice::from_ref(&script_rel), &held).unwrap(),
+            Some(script_rel.clone()),
+            "path check must report same-size same-mtime replacement"
+        );
+        let recaptured = capture_snapshot(&root, &publish_paths).unwrap();
+        assert!(
+            matches!(
+                recaptured.entries.get(&script_rel),
+                Some(SnapshotEntry::File(bytes)) if bytes == b"return 2\n"
+            ),
+            "capture_snapshot must read replaced bytes"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn bulk_patches_allow_preserved_sourcemap_fails_closed_on_spatial_or_unproved_properties() {
+        use crate::editor::types::{
+            BulkColumnKind, BulkPropertyColumn, BulkPropertyValues, EditorBulkPropertyPatch,
+        };
+        let make_patch = |kind: BulkColumnKind, prop: &str| EditorBulkPropertyPatch {
+            service: "Workspace".into(),
+            strings: Vec::new(),
+            nodes: Vec::new(),
+            columns: vec![BulkPropertyColumn {
+                kind,
+                property_name: prop.into(),
+                rows: vec![1],
+                values: BulkPropertyValues::F32Const(0.5),
+            }],
+            field_count: 1,
+            instance_count: 1,
+            expected_terrain_digest: None,
+            return_old_values: false,
+            package_targets: Vec::new(),
+        };
+        let mut proved = Map::new();
+        proved.insert("exactRetained".into(), Value::Bool(true));
+        let mut failed = Map::new();
+        failed.insert("exactRetained".into(), Value::Bool(false));
+        let empty = Map::new();
+
+        for prop in ["CFrame", "Position", "Size", "Orientation", "Rotation"] {
+            let policy =
+                bulk_patches_sourcemap_policy(&[make_patch(BulkColumnKind::Property, prop)]);
+            assert_eq!(policy, BulkSourcemapPolicy::Deny);
+            assert!(
+                !bulk_patches_allow_preserved_sourcemap(policy, &proved),
+                "R8/Reconcile-6: spatial property {prop} must never preserve prior pull sourcemap"
+            );
+        }
+        for prop in [
+            "MaxValue",
+            "MinValue",
+            "MaxHealth",
+            "CanvasSize",
+            "Transparency",
+            "Color",
+        ] {
+            let policy =
+                bulk_patches_sourcemap_policy(&[make_patch(BulkColumnKind::Property, prop)]);
+            assert_eq!(policy, BulkSourcemapPolicy::RequireExactRetained);
+            assert!(
+                !bulk_patches_allow_preserved_sourcemap(policy, &empty),
+                "R8/Reconcile-6: {prop} must fail closed when exactRetained is absent"
+            );
+            assert!(
+                !bulk_patches_allow_preserved_sourcemap(policy, &failed),
+                "R8/Reconcile-6: {prop} must fail closed when Studio observed a side effect"
+            );
+            assert!(
+                bulk_patches_allow_preserved_sourcemap(policy, &proved),
+                "R8/Reconcile-6: {prop} may preserve sourcemap when Studio proved exactRetained=true"
+            );
+        }
+        let attr_policy =
+            bulk_patches_sourcemap_policy(&[make_patch(BulkColumnKind::Attribute, "@attributes")]);
+        assert_eq!(attr_policy, BulkSourcemapPolicy::MetadataOnly);
+        assert!(bulk_patches_allow_preserved_sourcemap(attr_policy, &empty));
+        assert!(!bulk_patches_allow_preserved_sourcemap(
+            attr_policy,
+            &failed
+        ));
+        let tag_policy = bulk_patches_sourcemap_policy(&[make_patch(BulkColumnKind::Tag, "Tags")]);
+        assert_eq!(tag_policy, BulkSourcemapPolicy::MetadataOnly);
+        assert!(bulk_patches_allow_preserved_sourcemap(tag_policy, &empty));
+        let mut with_assertions = make_patch(BulkColumnKind::Attribute, "@attributes");
+        with_assertions.columns.insert(
+            0,
+            BulkPropertyColumn {
+                kind: BulkColumnKind::AssertModelScale,
+                property_name: "Scale".into(),
+                rows: vec![1],
+                values: BulkPropertyValues::F32Const(1.0),
+            },
+        );
+        with_assertions.columns.insert(
+            1,
+            BulkPropertyColumn {
+                kind: BulkColumnKind::AssertModelPivot,
+                property_name: "WorldPivot".into(),
+                rows: vec![1],
+                values: BulkPropertyValues::CFrame(vec![[
+                    0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0,
+                ]]),
+            },
+        );
+        assert!(
+            bulk_patches_allow_preserved_sourcemap(
+                bulk_patches_sourcemap_policy(&[with_assertions]),
+                &empty
+            ),
+            "metadata and read-only model assertion columns may preserve sourcemap"
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn store_rows_differ_only_at_pure_creation_branch_checks_targets_and_classes() {
+        use crate::settings::bytecode::{
+            SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode,
+        };
+        let base_doc = SettingsBytecode {
+            version: 12,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "ws-0".into(),
+                    "Workspace".into(),
+                    "Workspace".into(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new(
+                    "folder-1".into(),
+                    "Holder".into(),
+                    "Folder".into(),
+                    Some(0),
+                ),
+            ],
+        };
+        let mut added_part_doc = base_doc.clone();
+        added_part_doc.instances.push(SettingsBytecodeInstance::new(
+            "part-2".into(),
+            "NewPart".into(),
+            "Part".into(),
+            Some(1),
+        ));
+        let held = encode_settings_bytecode(&base_doc).unwrap();
+        let files_part = encode_settings_bytecode(&added_part_doc).unwrap();
+        assert!(
+            store_rows_differ_only_at(
+                &held,
+                &files_part,
+                &HashSet::from(["folder-1".to_string()]),
+                false
+            )
+            .unwrap()
+        );
+        assert!(
+            !store_rows_differ_only_at(
+                &held,
+                &files_part,
+                &HashSet::from(["folder-1".to_string()]),
+                true
+            )
+            .unwrap()
+        );
+        let mut added_script_doc = base_doc;
+        added_script_doc
+            .instances
+            .push(SettingsBytecodeInstance::new(
+                "script-2".into(),
+                "NewScript".into(),
+                "Script".into(),
+                Some(1),
+            ));
+        let files_script = encode_settings_bytecode(&added_script_doc).unwrap();
+        assert!(
+            !store_rows_differ_only_at(
+                &held,
+                &files_script,
+                &HashSet::from(["folder-1".to_string()]),
+                false
+            )
+            .unwrap()
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn zero_capture_plan_and_before_reconstruction_roundtrip_without_terrain_retry() {
+        use crate::cli::{BridgeConnectionArgs, ProjectSourceArgs};
+        use crate::settings::bytecode::{
+            SettingsBytecode, SettingsBytecodeInstance, decode_settings_bytecode,
+            encode_settings_bytecode,
+        };
+        let root = crate::tests::support::temp_dir("e2-zero-capture-roundtrip");
+        let src_dir = root.join("src");
+        let store_rel = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        fs::create_dir_all(root.join("src/Workspace")).unwrap();
+        let mut part =
+            SettingsBytecodeInstance::new("part-1".into(), "Block".into(), "Part".into(), Some(0));
+        part.properties.insert("Transparency".into(), json!(0.25));
+        let doc = SettingsBytecode {
+            version: 12,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "ws-0".into(),
+                    "Workspace".into(),
+                    "Workspace".into(),
+                    None,
+                ),
+                part,
+            ],
+        };
+        let desired_bytes = encode_settings_bytecode(&doc).unwrap();
+        fs::write(root.join(&store_rel), &desired_bytes).unwrap();
+        let held_project = ProjectSnapshot {
+            entries: BTreeMap::from([(store_rel.clone(), SnapshotEntry::File(desired_bytes))]),
+        };
+        let context = BoundContext {
+            id: 1,
+            initialized: true,
+            root: root.display().to_string(),
+            project: root.join("renium.project.json").display().to_string(),
+            experience: "test".into(),
+            source: src_dir.display().to_string(),
+            resource_lease: None,
+            place_id: None,
+            game_id: None,
+            selector: String::new(),
+            runtime_id: Some("rt-test".into()),
+            plugin_build: None,
+            fingerprint: String::new(),
+        };
+        let stage =
+            ExportProjectStage::create(&root, Path::new("src"), &["Workspace".into()]).unwrap();
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        let guard = StudioChangeGuard {
+            runtime_id: "rt-test".into(),
+            change_seq: 0,
+            tracking_guard_id: None,
+            runtime_bootstrap_safe: true,
+            service_generations: BTreeMap::new(),
+        };
+        let initial_state = json!({
+            "pushProofScope": {
+                "services": ["Workspace"],
+                "valuesOnly": { "Workspace": true },
+                "changedClassProps": {
+                    "Workspace": { "Part": ["Transparency"] }
+                },
+                "expectedTerrainDigest": "digest-1"
+            }
+        });
+        let push_args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            BridgeConnectionArgs::default_connection(),
+        );
+        let services = vec!["Workspace".to_string()];
+        let source_paths = vec![PathBuf::from("src")];
+        let zctx = ZeroCaptureContext {
+            context: &context,
+            bridge: &bridge,
+            root: &root,
+            src_dir: &src_dir,
+            services: &services,
+            stage: &stage,
+            guard: &guard,
+            initial_state: &initial_state,
+            push_args: &push_args,
+            cache_input: None,
+            source_paths: &source_paths,
+        };
+        let extracted = plan_zero_capture_bulk_restore(&zctx, &held_project)
+            .unwrap()
+            .expect("zero-capture bulk restore plan must build for Workspace Part.Transparency");
+        assert_eq!(extracted.plan.bulk_property_patches.len(), 1);
+        assert_eq!(
+            extracted.plan.bulk_property_patches[0]
+                .expected_terrain_digest
+                .as_deref(),
+            Some("digest-1")
+        );
+        let rows_b64 = "AQAAAA==";
+        let vals_b64 = "AABAPw==";
+        let mut old_cols = Map::new();
+        old_cols.insert(
+            "Workspace".into(),
+            json!([{
+                "propertyName": "Transparency",
+                "encoding": "f32",
+                "count": 1,
+                "rows": rows_b64,
+                "values": vals_b64
+            }]),
+        );
+        let (before, mutation_paths) = reconstruct_zero_capture_before(
+            &held_project,
+            &extracted.service_rows,
+            &old_cols,
+            BTreeMap::new(),
+            HashSet::new(),
+        )
+        .unwrap();
+        assert!(mutation_paths.contains(&store_rel));
+        let SnapshotEntry::File(before_bytes) = before.entries.get(&store_rel).unwrap() else {
+            panic!("before store must be a file");
+        };
+        let before_doc = decode_settings_bytecode(before_bytes).unwrap();
+        let before_t = before_doc.instances[1]
+            .properties
+            .get("Transparency")
+            .and_then(Value::as_f64)
+            .unwrap();
+        assert!(
+            (before_t - 0.75).abs() < 1e-5,
+            "before state must hold Studio's 0.75, got {before_t}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

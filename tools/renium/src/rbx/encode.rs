@@ -48,7 +48,8 @@ use crate::roblox::schema::{
 };
 use crate::settings::EXTERNAL_SOURCE_MARKER;
 use crate::settings::bytecode::{
-    SettingsBytecode, SettingsBytecodeInstance, settings_reference_index, strict_reference_path,
+    RawBlockValue, SettingsBytecode, SettingsBytecodeInstance, settings_reference_index,
+    strict_reference_path,
 };
 
 #[cfg(test)]
@@ -59,6 +60,7 @@ pub(super) mod geometry_tests;
 pub(crate) struct BytecodeRbxBuildOptions<'a> {
     pub omitted_properties: Option<&'a mut HashSet<String>>,
     pub source_path: Option<&'a Path>,
+    pub virtual_files: Option<&'a crate::editor::types::VirtualStageFiles>,
     pub omitted_properties_by_class: Option<&'a mut HashMap<String, HashSet<String>>>,
     pub logical_omitted_properties: Option<&'a mut HashMap<rbx_dom_weak::Ustr, RbxVariant>>,
     pub unresolved_reference_properties: Option<&'a mut HashSet<rbx_dom_weak::Ustr>>,
@@ -151,6 +153,8 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
             |values| values.initial_size,
         );
         let decal = class_metadata.decal;
+        let content_alias_pair = modern_content_uri_alias(&instance.class_name);
+        let mut content_alias = ContentAliasState::default();
 
         for (name, value) in properties {
             if name == "Enabled"
@@ -230,6 +234,10 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                 })?;
             if let Some(reference) = unresolved_reference {
                 if let Some(properties) = options.unresolved_reference_properties.as_deref_mut() {
+                    content_alias.note_present(
+                        content_alias_pair,
+                        property_metadata.serialized_name.as_str(),
+                    );
                     properties.insert(rbx_dom_weak::Ustr::from(name.as_str()));
                     continue;
                 }
@@ -254,7 +262,7 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                 || unknown_number;
             let compatibility_type = property
                 .is_none()
-                .then(|| flattened_decal_property_type(decal, name))
+                .then(|| compatibility_property_type(&instance.class_name, decal, name))
                 .flatten();
             let variant = if let Some(target_type) = compatibility_type {
                 json_to_rbx_variant_for_type(value, target_type, self.database, self.refs)
@@ -304,8 +312,10 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                 }
                 continue;
             };
+            content_alias.record(content_alias_pair, serialized_name.as_str(), &variant);
             builder.add_property(serialized_name, variant);
         }
+        content_alias.apply(&instance.name, &mut builder, content_alias_pair)?;
 
         // Studio treats an omitted Workspace flag as a legacy place and
         // migrates pivots throughout the DataModel, including ServerStorage.
@@ -333,6 +343,7 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
                     instance,
                     properties,
                     options.source_path,
+                    options.virtual_files,
                 )?),
             );
         }
@@ -367,18 +378,736 @@ impl<'a, 'db> BytecodeRbxEncoder<'a, 'db> {
 
         Ok(builder)
     }
+
+    pub(crate) fn build_with_raw(
+        &mut self,
+        index: usize,
+        raw_props: &[(&str, RawBlockValue<'_>)],
+        raw_attrs: Option<&Map<String, Value>>,
+        initial_size: Option<RbxVector3>,
+        shared_cache: &mut AHashMap<usize, Option<RbxSharedString>>,
+        mut options: BytecodeRbxBuildOptions<'_>,
+    ) -> Result<RbxInstanceBuilder> {
+        let instance: &'a SettingsBytecodeInstance = &self.document.instances[index];
+        let referent = *self
+            .refs
+            .by_index
+            .get(&index)
+            .ok_or_else(|| anyhow::anyhow!("Missing export referent"))?;
+        let class_metadata = self
+            .metadata
+            .entry(instance.class_name.as_str())
+            .or_insert_with(|| BytecodeExportClassMetadata {
+                name: rbx_dom_weak::Ustr::from(instance.class_name.as_str()),
+                triangle_mesh_part: rbx_reflection_class_is_a(
+                    self.database,
+                    &instance.class_name,
+                    "TriangleMeshPart",
+                ),
+                model: rbx_reflection_class_is_a(self.database, &instance.class_name, "Model"),
+                decal: rbx_reflection_class_is_a(self.database, &instance.class_name, "Decal"),
+                properties: AHashMap::new(),
+            });
+        let has_attrs = raw_attrs.is_some_and(|attrs| !attrs.is_empty());
+        let mut builder = RbxInstanceBuilder::with_referent_and_property_capacity(
+            class_metadata.name,
+            referent,
+            raw_props.len() + usize::from(has_attrs),
+        )
+        .with_name(instance.name.clone());
+        let decal = class_metadata.decal;
+        let content_alias_pair = modern_content_uri_alias(&instance.class_name);
+        let mut content_alias = ContentAliasState::default();
+
+        for (name, raw) in raw_props {
+            let name = *name;
+            if name == "Enabled"
+                && rbx_reflection_class_is_a(self.database, &instance.class_name, "BaseScript")
+            {
+                if let RawBlockValue::Bool(enabled) = raw {
+                    builder.add_property("Disabled", RbxVariant::Bool(!enabled));
+                }
+                continue;
+            }
+            let property_metadata =
+                class_metadata
+                    .properties
+                    .get(name)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        let serialized_name =
+                            if class_metadata.triangle_mesh_part && name == "FluidFidelity" {
+                                Some("FluidFidelityInternal")
+                            } else if class_metadata.model && name == "WorldPivot" {
+                                Some("WorldPivotData")
+                            } else if class_metadata.decal && name == "ColorMapContent" {
+                                Some("TextureContent")
+                            } else {
+                                None
+                            };
+                        let property =
+                            rbx_property_descriptor(self.database, &instance.class_name, name);
+                        let descriptor = if matches!(
+                            property.map(|property| &property.data_type),
+                            Some(RbxDataType::Value(RbxVariantType::Attributes))
+                        ) {
+                            property
+                        } else {
+                            rbx_model_property_descriptor(
+                                self.database,
+                                &instance.class_name,
+                                serialized_name.unwrap_or(name),
+                            )
+                        };
+                        let metadata = BytecodeExportPropertyMetadata {
+                            property,
+                            descriptor,
+                            serialized_name: rbx_dom_weak::Ustr::from(
+                                serialized_name.unwrap_or(name),
+                            ),
+                            native_setter_property: class_metadata.triangle_mesh_part
+                                && name == "CollisionFidelity",
+                            skipped: model_property_value_is_skipped(name),
+                        };
+                        class_metadata.properties.insert(name.to_string(), metadata);
+                        metadata
+                    });
+            if property_metadata.skipped {
+                continue;
+            }
+            if initial_size.is_some() && name.eq_ignore_ascii_case(MESH_INITIAL_SIZE_PROPERTY) {
+                if let Some(logical) = options.logical_omitted_properties.as_deref_mut()
+                    && let Some(variant) = raw_to_rbx_property_variant(
+                        raw,
+                        rbx_property_descriptor(self.database, &instance.class_name, name),
+                        self.database,
+                        self.refs,
+                        shared_cache,
+                    )
+                {
+                    logical.insert(rbx_dom_weak::Ustr::from(name), variant);
+                }
+                continue;
+            }
+            let unresolved_reference = match raw {
+                RawBlockValue::RefIndex(target) => {
+                    if self.refs.by_index.contains_key(target) {
+                        None
+                    } else {
+                        let json_val = raw.to_json();
+                        unresolved_model_export_reference(&json_val, self.refs)
+                            .with_context(|| {
+                                format!(
+                                    "{} ({}) property {name} contains an invalid reference",
+                                    instance.name, instance.class_name
+                                )
+                            })?
+                            .cloned()
+                    }
+                }
+                RawBlockValue::Json(value) => unresolved_model_export_reference(value, self.refs)
+                    .with_context(|| {
+                        format!(
+                            "{} ({}) property {name} contains an invalid reference",
+                            instance.name, instance.class_name
+                        )
+                    })?
+                    .cloned(),
+                _ => None,
+            };
+            if let Some(reference) = unresolved_reference {
+                if let Some(properties) = options.unresolved_reference_properties.as_deref_mut() {
+                    content_alias.note_present(
+                        content_alias_pair,
+                        property_metadata.serialized_name.as_str(),
+                    );
+                    properties.insert(rbx_dom_weak::Ustr::from(name));
+                    continue;
+                }
+                bail!(
+                    "{} ({}) property {name} refers to {}, which is not among the exported instances",
+                    document_instance_path(self.document, index),
+                    instance.class_name,
+                    reference_target_label(self.document, &reference)
+                );
+            }
+            let property = property_metadata.property;
+            let serialized_name = property_metadata.serialized_name;
+            let descriptor = property_metadata.descriptor;
+            let unknown_number =
+                property.is_none() && descriptor.is_none() && raw_value_is_json_number(raw);
+            let unsupported = property.is_some()
+                && descriptor.is_none()
+                && !property_metadata.native_setter_property
+                || unknown_number;
+            let compatibility_type = property
+                .is_none()
+                .then(|| compatibility_property_type(&instance.class_name, decal, name))
+                .flatten();
+            let variant = if let Some(target_type) = compatibility_type {
+                raw_to_rbx_variant_for_type(
+                    raw,
+                    target_type,
+                    self.database,
+                    self.refs,
+                    shared_cache,
+                )
+            } else if unsupported {
+                None
+            } else {
+                raw_to_rbx_property_variant(
+                    raw,
+                    descriptor.or(property),
+                    self.database,
+                    self.refs,
+                    shared_cache,
+                )
+            };
+            let Some(variant) = variant else {
+                if unknown_number {
+                    report_unknown_numeric_member(&instance.class_name, name);
+                }
+                if !unsupported && options.omitted_properties_by_class.is_none() {
+                    bail!(
+                        "{} ({}) property {name} cannot be represented in a Roblox model",
+                        instance.name,
+                        instance.class_name
+                    );
+                }
+                let class_omission = options.omitted_properties_by_class.is_some()
+                    && (unsupported && !unknown_number || options.omitted_properties.is_none());
+                if !class_omission && let Some(omitted) = options.omitted_properties.as_deref_mut()
+                {
+                    omitted.insert(name.to_string());
+                }
+                if let Some(omitted) = options.omitted_properties_by_class.as_deref_mut()
+                    && class_omission
+                {
+                    omitted
+                        .entry(instance.class_name.clone())
+                        .or_default()
+                        .insert(name.to_string());
+                }
+                if let Some(logical) = options.logical_omitted_properties.as_deref_mut()
+                    && let Some(variant) = raw_to_rbx_property_variant(
+                        raw,
+                        property,
+                        self.database,
+                        self.refs,
+                        shared_cache,
+                    )
+                {
+                    logical.insert(rbx_dom_weak::Ustr::from(name), variant);
+                }
+                continue;
+            };
+            content_alias.record(content_alias_pair, serialized_name.as_str(), &variant);
+            builder.add_property(serialized_name, variant);
+        }
+        content_alias.apply(&instance.name, &mut builder, content_alias_pair)?;
+
+        if (instance.class_name == "Workspace"
+            || class_metadata.model && builder.has_property("WorldPivotData"))
+            && !builder.has_property("NeedsPivotMigration")
+        {
+            builder.add_property("NeedsPivotMigration", RbxVariant::Bool(false));
+        }
+
+        if let Some(initial_size) = initial_size
+            && !builder.has_property(MESH_INITIAL_SIZE_PROPERTY)
+        {
+            builder.add_property(
+                MESH_INITIAL_SIZE_PROPERTY,
+                RbxVariant::Vector3(initial_size),
+            );
+        }
+
+        if is_lua_source_class(&instance.class_name) {
+            builder.add_property(
+                "Source",
+                RbxVariant::String(bytecode_export_script_source_raw(
+                    instance,
+                    raw_props,
+                    options.source_path,
+                    options.virtual_files,
+                )?),
+            );
+        }
+
+        let mut attributes = if let Some(raw_attrs) = raw_attrs.filter(|a| !a.is_empty()) {
+            json_attributes_to_rbx(raw_attrs, self.database, self.refs).with_context(|| {
+                format!(
+                    "{} ({}) attributes cannot be represented in a Roblox model",
+                    instance.name, instance.class_name
+                )
+            })?
+        } else {
+            RbxAttributes::new()
+        };
+        if instance.class_name == "Lighting"
+            && (builder.has_property("LightingStyle")
+                || builder.has_property("PrioritizeLightingQuality"))
+        {
+            if !builder.has_property("Technology") {
+                builder.add_property("Technology", RbxVariant::Enum(RbxEnum::from_u32(5)));
+            }
+            let marker = "RBX_LightingTechnologyUnifiedMigration";
+            if attributes.get(marker).is_none() {
+                attributes.insert(marker.to_string(), RbxVariant::Bool(true));
+            }
+        }
+        if !attributes.is_empty() {
+            builder.add_property("Attributes", RbxVariant::Attributes(attributes));
+        }
+
+        Ok(builder)
+    }
 }
 
-fn flattened_decal_property_type(is_decal: bool, property_name: &str) -> Option<RbxVariantType> {
-    if !is_decal {
+fn raw_value_is_json_number(raw: &RawBlockValue<'_>) -> bool {
+    match raw {
+        RawBlockValue::I64(_) | RawBlockValue::U64(_) => true,
+        RawBlockValue::F64(v) => v.is_finite(),
+        RawBlockValue::F32(v) => v.is_finite(),
+        RawBlockValue::Json(v) => v.is_number(),
+        _ => false,
+    }
+}
+
+fn raw_f64_to_i64(value: f64) -> Option<i64> {
+    if !value.is_finite() {
         return None;
     }
-    match property_name {
-        "EmissiveMaskContent" | "TexturePackContent" => Some(RbxVariantType::Content),
-        "EmissiveStrength" => Some(RbxVariantType::Float32),
-        "EmissiveTint" => Some(RbxVariantType::Color3),
+    let truncated = value.trunc();
+    ((truncated - value).abs() < f64::EPSILON).then_some(truncated as i64)
+}
+
+fn raw_f64_to_i32(value: f64) -> Option<i32> {
+    raw_f64_to_i64(value).and_then(|v| i32::try_from(v).ok())
+}
+
+fn raw_cframe(c: [f32; 12]) -> RbxCFrame {
+    RbxCFrame::new(
+        RbxVector3::new(c[0], c[1], c[2]),
+        RbxMatrix3::new(
+            RbxVector3::new(c[3], c[4], c[5]),
+            RbxVector3::new(c[6], c[7], c[8]),
+            RbxVector3::new(c[9], c[10], c[11]),
+        ),
+    )
+}
+
+fn raw_shared_string(
+    str_id: usize,
+    b64: &str,
+    shared_cache: &mut AHashMap<usize, Option<RbxSharedString>>,
+) -> Option<RbxVariant> {
+    let cached = shared_cache
+        .entry(str_id)
+        .or_insert_with(|| base64::decode(b64).ok().map(RbxSharedString::new));
+    cached.clone().map(RbxVariant::SharedString)
+}
+
+fn raw_enum_variant(
+    enum_name: Option<&str>,
+    item_name: &str,
+    database: &ReflectionDatabase<'_>,
+) -> Option<RbxVariant> {
+    let enum_name = enum_name.map(strip_enum_prefix);
+    let tail = enum_tail(item_name);
+    let numeric = tail
+        .parse::<i64>()
+        .ok()
+        .and_then(|value| u32::try_from(value).ok());
+    let value = numeric.or_else(|| enum_item_value_by_name(database, enum_name?, tail))?;
+    if let Some(enum_name) = enum_name {
+        Some(RbxVariant::EnumItem(RbxEnumItem {
+            ty: enum_name.to_string(),
+            value,
+        }))
+    } else {
+        Some(RbxVariant::Enum(RbxEnum::from_u32(value)))
+    }
+}
+
+fn raw_to_rbx_property_variant(
+    raw: &RawBlockValue<'_>,
+    descriptor: Option<&RbxPropertyDescriptor<'_>>,
+    database: &ReflectionDatabase<'_>,
+    refs: &BytecodeModelExportRefs,
+    shared_cache: &mut AHashMap<usize, Option<RbxSharedString>>,
+) -> Option<RbxVariant> {
+    if matches!(raw, RawBlockValue::Null) {
+        return matches!(
+            descriptor.map(|descriptor| &descriptor.data_type),
+            Some(RbxDataType::Value(RbxVariantType::OptionalCFrame))
+        )
+        .then_some(RbxVariant::OptionalCFrame(None));
+    }
+    match descriptor.map(|descriptor| &descriptor.data_type) {
+        Some(RbxDataType::Enum(enum_name)) => match raw {
+            RawBlockValue::EnumName(name) | RawBlockValue::Str(name) => {
+                raw_enum_variant(Some(*enum_name), name, database)
+            }
+            RawBlockValue::NestedEnum(ty, name) => raw_enum_variant(Some(ty), name, database),
+            RawBlockValue::I64(n) => u32::try_from(*n).ok().map(|value| {
+                RbxVariant::EnumItem(RbxEnumItem {
+                    ty: strip_enum_prefix(enum_name).to_string(),
+                    value,
+                })
+            }),
+            RawBlockValue::U64(n) => u32::try_from(*n).ok().map(|value| {
+                RbxVariant::EnumItem(RbxEnumItem {
+                    ty: strip_enum_prefix(enum_name).to_string(),
+                    value,
+                })
+            }),
+            _ => json_to_rbx_enum_variant(&raw.to_json(), Some(*enum_name), database),
+        },
+        Some(RbxDataType::Value(target_type)) => {
+            raw_to_rbx_variant_for_type(raw, *target_type, database, refs, shared_cache)
+        }
+        Some(_) | None => match raw {
+            RawBlockValue::I64(n) => Some(match i32::try_from(*n) {
+                Ok(v) => RbxVariant::Int32(v),
+                Err(_) => RbxVariant::Int64(*n),
+            }),
+            RawBlockValue::U64(n) => {
+                let v = i64::try_from(*n).ok()?;
+                Some(match i32::try_from(v) {
+                    Ok(v) => RbxVariant::Int32(v),
+                    Err(_) => RbxVariant::Int64(v),
+                })
+            }
+            RawBlockValue::Bool(b) => Some(RbxVariant::Bool(*b)),
+            RawBlockValue::F64(v) => Some(RbxVariant::Float64(*v)),
+            RawBlockValue::F32(v) => Some(RbxVariant::Float64(f64::from(*v))),
+            RawBlockValue::Str(s) => Some(RbxVariant::String((*s).to_string())),
+            RawBlockValue::UniqueId(s) => s.parse().ok().map(RbxVariant::UniqueId),
+            RawBlockValue::SharedString(id, b64) => raw_shared_string(*id, b64, shared_cache),
+            _ => json_to_rbx_property_variant(&raw.to_json(), descriptor, database, refs),
+        },
+    }
+}
+
+fn raw_to_rbx_variant_for_type(
+    raw: &RawBlockValue<'_>,
+    target_type: RbxVariantType,
+    database: &ReflectionDatabase<'_>,
+    refs: &BytecodeModelExportRefs,
+    shared_cache: &mut AHashMap<usize, Option<RbxSharedString>>,
+) -> Option<RbxVariant> {
+    match (target_type, raw) {
+        (RbxVariantType::Bool, RawBlockValue::Bool(b)) => Some(RbxVariant::Bool(*b)),
+        (RbxVariantType::Int32, RawBlockValue::I64(n)) => {
+            i32::try_from(*n).ok().map(RbxVariant::Int32)
+        }
+        (RbxVariantType::Int32, RawBlockValue::U64(n)) => {
+            i32::try_from(*n).ok().map(RbxVariant::Int32)
+        }
+        (RbxVariantType::Int32, RawBlockValue::F64(v)) => raw_f64_to_i32(*v).map(RbxVariant::Int32),
+        (RbxVariantType::Int32, RawBlockValue::F32(v)) => {
+            raw_f64_to_i32(f64::from(*v)).map(RbxVariant::Int32)
+        }
+        (RbxVariantType::Int64, RawBlockValue::I64(n)) => Some(RbxVariant::Int64(*n)),
+        (RbxVariantType::Int64, RawBlockValue::U64(n)) => {
+            i64::try_from(*n).ok().map(RbxVariant::Int64)
+        }
+        (RbxVariantType::Int64, RawBlockValue::F64(v)) => raw_f64_to_i64(*v).map(RbxVariant::Int64),
+        (RbxVariantType::Int64, RawBlockValue::F32(v)) => {
+            raw_f64_to_i64(f64::from(*v)).map(RbxVariant::Int64)
+        }
+        (RbxVariantType::Float32, RawBlockValue::F32(v)) => Some(RbxVariant::Float32(*v)),
+        (RbxVariantType::Float32, RawBlockValue::F64(v)) => Some(RbxVariant::Float32(*v as f32)),
+        (RbxVariantType::Float32, RawBlockValue::I64(n)) => Some(RbxVariant::Float32(*n as f32)),
+        (RbxVariantType::Float32, RawBlockValue::U64(n)) => Some(RbxVariant::Float32(*n as f32)),
+        (RbxVariantType::Float64, RawBlockValue::F64(v)) => Some(RbxVariant::Float64(*v)),
+        (RbxVariantType::Float64, RawBlockValue::F32(v)) => {
+            Some(RbxVariant::Float64(f64::from(*v)))
+        }
+        (RbxVariantType::Float64, RawBlockValue::I64(n)) => Some(RbxVariant::Float64(*n as f64)),
+        (RbxVariantType::Float64, RawBlockValue::U64(n)) => Some(RbxVariant::Float64(*n as f64)),
+        (RbxVariantType::String, RawBlockValue::Str(s)) => {
+            Some(RbxVariant::String((*s).to_string()))
+        }
+        (RbxVariantType::BinaryString, RawBlockValue::Str(s)) => Some(RbxVariant::BinaryString(
+            RbxBinaryString::from(s.as_bytes().to_vec()),
+        )),
+        (RbxVariantType::ContentId, RawBlockValue::Str(s)) => {
+            Some(RbxVariant::ContentId(RbxContentId::from(*s)))
+        }
+        (RbxVariantType::Content, RawBlockValue::Str(s)) => {
+            if s.is_empty() || s.eq_ignore_ascii_case("None") {
+                Some(RbxVariant::Content(RbxContent::none()))
+            } else {
+                Some(RbxVariant::Content(RbxContent::from_uri(*s)))
+            }
+        }
+        (RbxVariantType::Content, RawBlockValue::RefIndex(idx)) => Some(RbxVariant::Content(
+            RbxContent::from_referent(refs.by_index.get(idx).copied().unwrap_or_else(RbxRef::none)),
+        )),
+        (RbxVariantType::Tags, RawBlockValue::Str(s)) => Some(RbxVariant::Tags(RbxTags::from(
+            s.split('\0')
+                .filter(|item| !item.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        ))),
+        (RbxVariantType::Ref, RawBlockValue::RefIndex(idx)) => Some(RbxVariant::Ref(
+            refs.by_index.get(idx).copied().unwrap_or_else(RbxRef::none),
+        )),
+        (RbxVariantType::Vector2, RawBlockValue::Vector2(x, y)) => {
+            Some(RbxVariant::Vector2(RbxVector2::new(*x, *y)))
+        }
+        (RbxVariantType::Vector3, RawBlockValue::Vector3(x, y, z)) => {
+            Some(RbxVariant::Vector3(RbxVector3::new(*x, *y, *z)))
+        }
+        (RbxVariantType::UDim, RawBlockValue::UDim(s, o)) => {
+            raw_f64_to_i32(f64::from(*o)).map(|o| RbxVariant::UDim(RbxUDim::new(*s, o)))
+        }
+        (RbxVariantType::UDim2, RawBlockValue::UDim2(xs, xo, ys, yo)) => {
+            Some(RbxVariant::UDim2(RbxUDim2::new(
+                RbxUDim::new(*xs, raw_f64_to_i32(f64::from(*xo))?),
+                RbxUDim::new(*ys, raw_f64_to_i32(f64::from(*yo))?),
+            )))
+        }
+        (RbxVariantType::Color3, RawBlockValue::Color3(r, g, b)) => {
+            Some(RbxVariant::Color3(RbxColor3::new(*r, *g, *b)))
+        }
+        (RbxVariantType::Color3uint8, RawBlockValue::Color3(r, g, b)) => Some(
+            RbxVariant::Color3uint8(RbxColor3uint8::from(RbxColor3::new(*r, *g, *b))),
+        ),
+        (RbxVariantType::BrickColor, RawBlockValue::I64(n)) => u16::try_from(*n)
+            .ok()
+            .and_then(RbxBrickColor::from_number)
+            .map(RbxVariant::BrickColor),
+        (RbxVariantType::BrickColor, RawBlockValue::U64(n)) => u16::try_from(*n)
+            .ok()
+            .and_then(RbxBrickColor::from_number)
+            .map(RbxVariant::BrickColor),
+        (RbxVariantType::BrickColor, RawBlockValue::Str(s)) => {
+            RbxBrickColor::from_name(s).map(RbxVariant::BrickColor)
+        }
+        (RbxVariantType::CFrame, RawBlockValue::CFrame(c)) => {
+            Some(RbxVariant::CFrame(raw_cframe(*c)))
+        }
+        (RbxVariantType::OptionalCFrame, RawBlockValue::Null) => {
+            Some(RbxVariant::OptionalCFrame(None))
+        }
+        (RbxVariantType::OptionalCFrame, RawBlockValue::CFrame(c)) => {
+            Some(RbxVariant::OptionalCFrame(Some(raw_cframe(*c))))
+        }
+        (RbxVariantType::Rect, RawBlockValue::Rect(a, b, c, d)) => Some(RbxVariant::Rect(
+            RbxRect::new(RbxVector2::new(*a, *b), RbxVector2::new(*c, *d)),
+        )),
+        (RbxVariantType::Enum | RbxVariantType::EnumItem, RawBlockValue::NestedEnum(ty, name)) => {
+            raw_enum_variant(Some(ty), name, database)
+        }
+        (RbxVariantType::UniqueId, RawBlockValue::UniqueId(s)) => {
+            s.parse().ok().map(RbxVariant::UniqueId)
+        }
+        (RbxVariantType::SharedString, RawBlockValue::SharedString(id, b64)) => {
+            raw_shared_string(*id, b64, shared_cache)
+        }
+        _ => json_to_rbx_variant_for_type(&raw.to_json(), target_type, database, refs),
+    }
+}
+
+fn raw_vector3(raw: &RawBlockValue<'_>) -> Option<RbxVector3> {
+    match raw {
+        RawBlockValue::Vector3(x, y, z) => Some(RbxVector3::new(*x, *y, *z)),
+        RawBlockValue::Json(v) => json_to_rbx_vector3(v),
         _ => None,
     }
+}
+
+pub(crate) fn synthesized_mesh_initial_size_from_raw(
+    properties: &[(&str, RawBlockValue<'_>)],
+    triangle_mesh_part: bool,
+    ancestor_scale: impl FnOnce() -> Option<f32>,
+) -> Option<RbxVector3> {
+    if !triangle_mesh_part {
+        return None;
+    }
+    let find = |a: &str, b: &str| {
+        properties
+            .iter()
+            .find(|(k, _)| *k == a)
+            .or_else(|| properties.iter().find(|(k, _)| *k == b))
+            .map(|(_, v)| v)
+    };
+    if find(MESH_INITIAL_SIZE_PROPERTY, "initialSize")
+        .and_then(raw_vector3)
+        .is_some_and(|value| rbx_vector3_is_non_zero(&value))
+    {
+        return None;
+    }
+    if let Some(mesh_size) = find(MESH_SIZE_TRANSPORT_PROPERTY, "meshSize")
+        .and_then(raw_vector3)
+        .filter(rbx_vector3_is_non_zero)
+    {
+        return Some(mesh_size);
+    }
+    let size = find("Size", "size")
+        .and_then(raw_vector3)
+        .filter(rbx_vector3_is_non_zero)?;
+    let scale = ancestor_scale().unwrap_or(1.0);
+    if scale.is_finite() && scale.abs() > f32::EPSILON && (scale - 1.0).abs() > 1.0e-6 {
+        return Some(RbxVector3::new(
+            size.x / scale,
+            size.y / scale,
+            size.z / scale,
+        ));
+    }
+    Some(size)
+}
+
+fn bytecode_export_script_source_raw(
+    instance: &SettingsBytecodeInstance,
+    properties: &[(&str, RawBlockValue<'_>)],
+    source_path: Option<&Path>,
+    virtual_files: Option<&crate::editor::types::VirtualStageFiles>,
+) -> Result<String> {
+    let stored_source = properties
+        .iter()
+        .find_map(|(k, v)| {
+            (*k == "Source").then_some(match v {
+                RawBlockValue::Str(s) => Some(*s),
+                RawBlockValue::Json(val) => val.as_str(),
+                _ => None,
+            })
+        })
+        .flatten();
+    if stored_source == Some(EXTERNAL_SOURCE_MARKER) {
+        let path = source_path.with_context(|| {
+            format!(
+                "{} ({}) has external source but no source path",
+                instance.name, instance.class_name
+            )
+        })?;
+        if let Some(result) = virtual_files.and_then(|vf| vf.read_to_string(path)) {
+            return result;
+        }
+        return fs::read_to_string(path)
+            .with_context(|| format!("Failed to read external source {}", path.display()));
+    }
+    if let Some(path) = source_path {
+        if let Some(result) = virtual_files.and_then(|vf| vf.read_to_string(path)) {
+            return result;
+        }
+        if path.is_file() {
+            return fs::read_to_string(path)
+                .with_context(|| format!("Failed to read source {}", path.display()));
+        }
+    }
+    Ok(stored_source.unwrap_or("").to_string())
+}
+
+fn modern_content_uri_alias(class_name: &str) -> Option<(&'static str, &'static str)> {
+    match class_name {
+        "PartOperation" | "UnionOperation" | "NegateOperation" | "IntersectOperation" => {
+            Some(("Content", "AssetId"))
+        }
+        class if crate::roblox::schema::has_protected_texture_pack(class) => {
+            Some(("TexturePackContent", "TexturePack"))
+        }
+        "Shirt" => Some(("ShirtTemplateContent", "ShirtTemplate")),
+        "Pants" => Some(("PantsTemplateContent", "PantsTemplate")),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct ContentAliasState {
+    modern_present: bool,
+    modern_uri: Option<String>,
+    legacy_uri: Option<String>,
+}
+
+impl ContentAliasState {
+    fn note_present(&mut self, pair: Option<(&str, &str)>, serialized_name: &str) {
+        if let Some((modern, _)) = pair
+            && serialized_name == modern
+        {
+            self.modern_present = true;
+        }
+    }
+
+    fn record(&mut self, pair: Option<(&str, &str)>, serialized_name: &str, variant: &RbxVariant) {
+        let Some((modern, legacy)) = pair else {
+            return;
+        };
+        if serialized_name == modern {
+            self.modern_present = true;
+            if let RbxVariant::Content(content) = variant
+                && let rbx_dom_weak::types::ContentType::Uri(uri) = content.value()
+                && !uri.is_empty()
+            {
+                self.modern_uri = Some(uri.clone());
+            }
+        } else if serialized_name == legacy {
+            match variant {
+                RbxVariant::ContentId(id) if !id.as_str().is_empty() => {
+                    self.legacy_uri = Some(id.as_str().to_string());
+                }
+                RbxVariant::String(s) if !s.is_empty() => self.legacy_uri = Some(s.clone()),
+                _ => {}
+            }
+        }
+    }
+
+    fn apply(
+        self,
+        instance_name: &str,
+        builder: &mut RbxInstanceBuilder,
+        pair: Option<(&str, &str)>,
+    ) -> Result<()> {
+        let Some((modern, legacy)) = pair else {
+            return Ok(());
+        };
+        if let Some(uri) = self.modern_uri {
+            if let Some(legacy_uri) = self.legacy_uri.as_deref()
+                && legacy_uri != uri.as_str()
+            {
+                bail!(
+                    "{instance_name} contains conflicting values for properties {legacy} and {modern}"
+                );
+            }
+            if self.legacy_uri.as_deref() != Some(uri.as_str()) {
+                builder.add_property(legacy, RbxVariant::ContentId(RbxContentId::from(uri)));
+            }
+        } else if !self.modern_present
+            && modern == "Content"
+            && let Some(uri) = self.legacy_uri
+            && !builder.has_property(modern)
+        {
+            builder.add_property(modern, RbxVariant::Content(RbxContent::from_uri(uri)));
+        }
+        Ok(())
+    }
+}
+
+fn compatibility_property_type(
+    class_name: &str,
+    is_decal: bool,
+    property_name: &str,
+) -> Option<RbxVariantType> {
+    if is_decal {
+        match property_name {
+            "EmissiveMaskContent" | "TexturePackContent" => return Some(RbxVariantType::Content),
+            "EmissiveStrength" => return Some(RbxVariantType::Float32),
+            "EmissiveTint" => return Some(RbxVariantType::Color3),
+            _ => {}
+        }
+    }
+    if property_name == "Content"
+        && matches!(
+            class_name,
+            "PartOperation" | "UnionOperation" | "NegateOperation" | "IntersectOperation"
+        )
+    {
+        return Some(RbxVariantType::Content);
+    }
+    None
 }
 
 pub(crate) fn synthesized_mesh_initial_size_for_rbx_export_class(
@@ -493,13 +1222,14 @@ pub(crate) fn bytecode_export_script_source(
     instance: &SettingsBytecodeInstance,
     source_path: Option<&Path>,
 ) -> Result<String> {
-    bytecode_export_script_source_values(instance, &instance.properties, source_path)
+    bytecode_export_script_source_values(instance, &instance.properties, source_path, None)
 }
 
 fn bytecode_export_script_source_values(
     instance: &SettingsBytecodeInstance,
     properties: &Map<String, Value>,
     source_path: Option<&Path>,
+    virtual_files: Option<&crate::editor::types::VirtualStageFiles>,
 ) -> Result<String> {
     let stored_source = properties.get("Source").and_then(Value::as_str);
     if stored_source == Some(EXTERNAL_SOURCE_MARKER) {
@@ -509,14 +1239,20 @@ fn bytecode_export_script_source_values(
                 instance.name, instance.class_name
             )
         })?;
+        if let Some(result) = virtual_files.and_then(|vf| vf.read_to_string(path)) {
+            return result;
+        }
         return fs::read_to_string(path)
             .with_context(|| format!("Failed to read external source {}", path.display()));
     }
-    if let Some(path) = source_path
-        && path.is_file()
-    {
-        return fs::read_to_string(path)
-            .with_context(|| format!("Failed to read source {}", path.display()));
+    if let Some(path) = source_path {
+        if let Some(result) = virtual_files.and_then(|vf| vf.read_to_string(path)) {
+            return result;
+        }
+        if path.is_file() {
+            return fs::read_to_string(path)
+                .with_context(|| format!("Failed to read source {}", path.display()));
+        }
     }
     Ok(stored_source.unwrap_or("").to_string())
 }
@@ -3869,6 +4605,412 @@ mod tests {
         assert_eq!(
             camera.properties.get(&"FutureTypedFloat".into()),
             Some(&RbxVariant::Float32(4.0)),
+        );
+    }
+
+    #[test]
+    fn part_operation_content_encodes_as_content_variant_from_json_and_raw_blocks() {
+        use crate::tests::support::{settings_document, settings_instance};
+        use rbx_dom_weak::types::Content as RbxContent;
+
+        let uri = "https://www.roblox.com//asset/?id=123456789";
+        let mut union = settings_instance("union", "Union", "UnionOperation", None);
+        union.properties.insert("AssetId".into(), json!(""));
+        union.properties.insert("Content".into(), json!(uri));
+        let document = settings_document(vec![union]);
+        let wire_database = ReflectionDatabase::new();
+
+        let bytes = crate::rbx::model::encode_settings_model(&document, true).unwrap();
+        let decoded = rbx_binary::Deserializer::new()
+            .reflection_database(&wire_database)
+            .deserialize(bytes.as_slice())
+            .unwrap();
+        let node = decoded.get_by_ref(decoded.root().children()[0]).unwrap();
+        assert_eq!(
+            node.properties.get(&"Content".into()),
+            Some(&RbxVariant::Content(RbxContent::from_uri(uri))),
+        );
+        let typed = rbx_binary::from_reader(bytes.as_slice()).unwrap();
+        let typed_node = typed.get_by_ref(typed.root().children()[0]).unwrap();
+        assert_eq!(
+            typed_node.properties.get(&"AssetId".into()),
+            Some(&RbxVariant::ContentId(RbxContentId::from(uri))),
+        );
+
+        let dir = crate::system::files::create_unique_directory(
+            &std::env::temp_dir(),
+            "renium-union-content-test",
+        )
+        .unwrap();
+        let service_dir = dir.join("ReplicatedStorage");
+        std::fs::create_dir_all(&service_dir).unwrap();
+        let mut root_inst =
+            settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None);
+        root_inst.parent_index = None;
+        let mut child_union = settings_instance("union", "Union", "UnionOperation", Some(0));
+        child_union.properties.insert("AssetId".into(), json!(""));
+        child_union.properties.insert("Content".into(), json!(uri));
+        let service_doc = settings_document(vec![root_inst, child_union]);
+        let service_store =
+            crate::settings::bytecode::encode_settings_bytecode(&service_doc).unwrap();
+        let store_path = crate::system::files::service_settings_path(&service_dir);
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        std::fs::write(&store_path, &service_store).unwrap();
+        let prepared = crate::rbx::model::prepare_rbx_place(
+            &dir,
+            vec!["ReplicatedStorage".to_string()],
+            std::collections::HashMap::new(),
+            true,
+            false,
+            crate::rbx::model::PlaceBuildTuning::default(),
+        )
+        .unwrap();
+        let build = prepared(crate::rbx::model::PlaceImportProperties::default()).unwrap();
+        let svc_ref = build.service_roots[0].1;
+        let child_ref = build.dom.get_by_ref(svc_ref).unwrap().children()[0];
+        let child_node = build.dom.get_by_ref(child_ref).unwrap();
+        assert_eq!(
+            child_node.properties.get(&"Content".into()),
+            Some(&RbxVariant::Content(RbxContent::from_uri(uri))),
+        );
+        assert_eq!(
+            child_node.properties.get(&"AssetId".into()),
+            Some(&RbxVariant::ContentId(RbxContentId::from(uri))),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn part_operation_asset_id_encodes_as_content_variant_from_json_and_raw_blocks() {
+        use crate::tests::support::{settings_document, settings_instance};
+        use rbx_dom_weak::types::Content as RbxContent;
+
+        let uri = "https://www.roblox.com//asset/?id=123456789";
+        let mut union = settings_instance("union", "Union", "UnionOperation", None);
+        union.properties.insert("AssetId".into(), json!(uri));
+        let document = settings_document(vec![union]);
+        let wire_database = ReflectionDatabase::new();
+
+        let bytes = crate::rbx::model::encode_settings_model(&document, true).unwrap();
+        let decoded = rbx_binary::Deserializer::new()
+            .reflection_database(&wire_database)
+            .deserialize(bytes.as_slice())
+            .unwrap();
+        let node = decoded.get_by_ref(decoded.root().children()[0]).unwrap();
+        assert_eq!(
+            node.properties.get(&"Content".into()),
+            Some(&RbxVariant::Content(RbxContent::from_uri(uri))),
+        );
+        let typed = rbx_binary::from_reader(bytes.as_slice()).unwrap();
+        let typed_node = typed.get_by_ref(typed.root().children()[0]).unwrap();
+        assert_eq!(
+            typed_node.properties.get(&"AssetId".into()),
+            Some(&RbxVariant::ContentId(RbxContentId::from(uri))),
+        );
+
+        let dir = crate::system::files::create_unique_directory(
+            &std::env::temp_dir(),
+            "renium-union-assetid-test",
+        )
+        .unwrap();
+        let service_dir = dir.join("ReplicatedStorage");
+        std::fs::create_dir_all(&service_dir).unwrap();
+        let mut root_inst =
+            settings_instance("root", "ReplicatedStorage", "ReplicatedStorage", None);
+        root_inst.parent_index = None;
+        let mut child_union = settings_instance("union", "Union", "UnionOperation", Some(0));
+        child_union.properties.insert("AssetId".into(), json!(uri));
+        let service_doc = settings_document(vec![root_inst, child_union]);
+        let service_store =
+            crate::settings::bytecode::encode_settings_bytecode(&service_doc).unwrap();
+        let store_path = crate::system::files::service_settings_path(&service_dir);
+        std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        std::fs::write(&store_path, &service_store).unwrap();
+        let prepared = crate::rbx::model::prepare_rbx_place(
+            &dir,
+            vec!["ReplicatedStorage".to_string()],
+            std::collections::HashMap::new(),
+            true,
+            false,
+            crate::rbx::model::PlaceBuildTuning::default(),
+        )
+        .unwrap();
+        let build = prepared(crate::rbx::model::PlaceImportProperties::default()).unwrap();
+        let svc_ref = build.service_roots[0].1;
+        let child_ref = build.dom.get_by_ref(svc_ref).unwrap().children()[0];
+        let child_node = build.dom.get_by_ref(child_ref).unwrap();
+        assert_eq!(
+            child_node.properties.get(&"Content".into()),
+            Some(&RbxVariant::Content(RbxContent::from_uri(uri))),
+        );
+        assert_eq!(
+            child_node.properties.get(&"AssetId".into()),
+            Some(&RbxVariant::ContentId(RbxContentId::from(uri))),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn part_operation_content_alias_reconciles_conflicts_and_preserves_explicit_or_deferred_content()
+     {
+        use crate::tests::support::{settings_document, settings_instance};
+        use rbx_dom_weak::types::Content as RbxContent;
+
+        let database = rbx_reflection_database::get().unwrap();
+        let uri_modern = "rbxassetid://111111";
+        let uri_legacy = "rbxassetid://222222";
+
+        let make_refs = || {
+            let mut refs = BytecodeModelExportRefs::default();
+            refs.by_index.insert(0, RbxRef::new());
+            refs
+        };
+
+        for class in [
+            "PartOperation",
+            "UnionOperation",
+            "NegateOperation",
+            "IntersectOperation",
+        ] {
+            let mut inst = settings_instance("solid", "Solid", class, None);
+            inst.properties.insert("AssetId".into(), json!(uri_legacy));
+            let doc = settings_document(vec![inst]);
+            let refs = make_refs();
+            let mut metadata = AHashMap::new();
+            let mut encoder = BytecodeRbxEncoder::new(&doc, database, &mut metadata, &refs);
+            let builder = encoder
+                .build(0, BytecodeRbxBuildOptions::default())
+                .unwrap();
+            let mut dom = rbx_dom_weak::WeakDom::new(RbxInstanceBuilder::new("DataModel"));
+            let root = dom.root_ref();
+            let r = dom.insert(root, builder);
+            let node = dom.get_by_ref(r).unwrap();
+            assert_eq!(
+                node.properties.get(&"Content".into()),
+                Some(&RbxVariant::Content(RbxContent::from_uri(uri_legacy))),
+                "Settings 4: {class} must synthesize Content from AssetId when Content is absent"
+            );
+        }
+
+        let mut conflict = settings_instance("u1", "U1", "UnionOperation", None);
+        conflict
+            .properties
+            .insert("Content".into(), json!(uri_modern));
+        conflict
+            .properties
+            .insert("AssetId".into(), json!(uri_legacy));
+        let doc = settings_document(vec![conflict]);
+        let refs = make_refs();
+        let mut metadata = AHashMap::new();
+        let mut encoder = BytecodeRbxEncoder::new(&doc, database, &mut metadata, &refs);
+        let err_build = encoder
+            .build(0, BytecodeRbxBuildOptions::default())
+            .expect_err("build must refuse conflicting AssetId and Content");
+        assert!(
+            format!("{err_build:#}").contains("conflicting values for properties"),
+            "unexpected build conflict error: {err_build:#}"
+        );
+        let raw_props = [
+            ("AssetId", RawBlockValue::Str(uri_legacy)),
+            ("Content", RawBlockValue::Str(uri_modern)),
+        ];
+        let mut shared_cache = AHashMap::new();
+        let err_raw = encoder
+            .build_with_raw(
+                0,
+                &raw_props,
+                None,
+                None,
+                &mut shared_cache,
+                BytecodeRbxBuildOptions::default(),
+            )
+            .expect_err("build_with_raw must refuse conflicting AssetId and Content");
+        assert!(
+            format!("{err_raw:#}").contains("conflicting values for properties"),
+            "unexpected build_with_raw conflict error: {err_raw:#}"
+        );
+
+        let mut raw_legacy = settings_instance("u1b", "U1b", "UnionOperation", None);
+        raw_legacy
+            .properties
+            .insert("AssetId".into(), json!(uri_legacy));
+        let doc_legacy = settings_document(vec![raw_legacy]);
+        let refs_legacy = make_refs();
+        let mut metadata_legacy = AHashMap::new();
+        let mut encoder =
+            BytecodeRbxEncoder::new(&doc_legacy, database, &mut metadata_legacy, &refs_legacy);
+        let builder_raw = encoder
+            .build_with_raw(
+                0,
+                &[("AssetId", RawBlockValue::Str(uri_legacy))],
+                None,
+                None,
+                &mut AHashMap::new(),
+                BytecodeRbxBuildOptions::default(),
+            )
+            .unwrap();
+        let mut dom = rbx_dom_weak::WeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        let r = dom.insert(root, builder_raw);
+        let node = dom.get_by_ref(r).unwrap();
+        assert_eq!(
+            node.properties.get(&"Content".into()),
+            Some(&RbxVariant::Content(RbxContent::from_uri(uri_legacy))),
+            "Settings 4: build_with_raw must synthesize Content from legacy AssetId"
+        );
+
+        let mut empty_modern = settings_instance("u2", "U2", "UnionOperation", None);
+        empty_modern
+            .properties
+            .insert("Content".into(), json!({"_type": "Content", "value": null}));
+        empty_modern
+            .properties
+            .insert("AssetId".into(), json!(uri_legacy));
+        let doc = settings_document(vec![empty_modern]);
+        let refs = make_refs();
+        let mut metadata = AHashMap::new();
+        let mut encoder = BytecodeRbxEncoder::new(&doc, database, &mut metadata, &refs);
+        let builder = encoder
+            .build(0, BytecodeRbxBuildOptions::default())
+            .unwrap();
+        let mut dom = rbx_dom_weak::WeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        let r = dom.insert(root, builder);
+        let node = dom.get_by_ref(r).unwrap();
+        assert_eq!(
+            node.properties.get(&"Content".into()),
+            Some(&RbxVariant::Content(RbxContent::none())),
+            "Settings 4: explicit empty Content must not be overwritten with URI from AssetId"
+        );
+
+        let mut deferred = settings_instance("u3", "U3", "UnionOperation", None);
+        deferred.properties.insert(
+            "Content".into(),
+            json!({"_type": "Content", "object": {"_type": "Ref", "settingsId": "missing-obj"}}),
+        );
+        deferred
+            .properties
+            .insert("AssetId".into(), json!(uri_legacy));
+        let doc = settings_document(vec![deferred]);
+        let refs = make_refs();
+        let mut metadata = AHashMap::new();
+        let mut encoder = BytecodeRbxEncoder::new(&doc, database, &mut metadata, &refs);
+        let mut unresolved = std::collections::HashSet::new();
+        let builder = encoder
+            .build(
+                0,
+                BytecodeRbxBuildOptions {
+                    unresolved_reference_properties: Some(&mut unresolved),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(unresolved.contains(&rbx_dom_weak::Ustr::from("Content")));
+        let mut dom = rbx_dom_weak::WeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        let r = dom.insert(root, builder);
+        let node = dom.get_by_ref(r).unwrap();
+        assert!(
+            !node.properties.contains_key(&"Content".into()),
+            "Settings 4: deferred object-backed Content must not be replaced by a URI Content from AssetId"
+        );
+
+        let deferred_content_val =
+            json!({"_type": "Content", "object": {"_type": "Ref", "settingsId": "missing-obj"}});
+        let mut unresolved_raw = std::collections::HashSet::new();
+        let builder_raw = encoder
+            .build_with_raw(
+                0,
+                &[
+                    ("Content", RawBlockValue::Json(deferred_content_val)),
+                    ("AssetId", RawBlockValue::Str(uri_legacy)),
+                ],
+                None,
+                None,
+                &mut AHashMap::new(),
+                BytecodeRbxBuildOptions {
+                    unresolved_reference_properties: Some(&mut unresolved_raw),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(unresolved_raw.contains(&rbx_dom_weak::Ustr::from("Content")));
+        let mut dom_raw = rbx_dom_weak::WeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let root_raw = dom_raw.root_ref();
+        let r_raw = dom_raw.insert(root_raw, builder_raw);
+        let node_raw = dom_raw.get_by_ref(r_raw).unwrap();
+        assert!(
+            !node_raw.properties.contains_key(&"Content".into()),
+            "Settings 4: build_with_raw must not replace deferred object-backed Content with URI from AssetId"
+        );
+    }
+
+    #[test]
+    fn rbx_binary_deserializer_elides_only_unmigrated_defaults_and_rejects_truncated_strings() {
+        let mut dom = rbx_dom_weak::WeakDom::new(RbxInstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        let val_default = dom.insert(
+            root,
+            RbxInstanceBuilder::new("StringValue")
+                .with_name("DefaultVal")
+                .with_property("Value", RbxVariant::String(String::new()))
+                .with_property("Tags", RbxVariant::Tags(rbx_dom_weak::types::Tags::new()))
+                .with_property(
+                    "Attributes",
+                    RbxVariant::Attributes(rbx_dom_weak::types::Attributes::new()),
+                ),
+        );
+        let mut non_empty_tags = rbx_dom_weak::types::Tags::new();
+        non_empty_tags.push("Tagged");
+        let mut non_empty_attrs = rbx_dom_weak::types::Attributes::new();
+        non_empty_attrs.insert("Key".into(), RbxVariant::String("Val".into()));
+        let val_custom = dom.insert(
+            root,
+            RbxInstanceBuilder::new("StringValue")
+                .with_name("CustomVal")
+                .with_property("Value", RbxVariant::String("hello".into()))
+                .with_property("Tags", RbxVariant::Tags(non_empty_tags))
+                .with_property("Attributes", RbxVariant::Attributes(non_empty_attrs)),
+        );
+        let mut bytes = Vec::new();
+        rbx_binary::to_writer(&mut bytes, &dom, &[val_default, val_custom]).unwrap();
+
+        let elided = rbx_binary::Deserializer::new()
+            .elide_defaults(true)
+            .deserialize(bytes.as_slice())
+            .unwrap();
+        let children = elided.root().children();
+        assert_eq!(children.len(), 2);
+        let d0 = elided.get_by_ref(children[0]).unwrap();
+        let d1 = elided.get_by_ref(children[1]).unwrap();
+        assert!(!d0.properties.contains_key(&"Value".into()));
+        assert!(!d0.properties.contains_key(&"Tags".into()));
+        assert!(!d0.properties.contains_key(&"Attributes".into()));
+        assert_eq!(
+            d1.properties.get(&"Value".into()),
+            Some(&RbxVariant::String("hello".into()))
+        );
+        assert!(d1.properties.contains_key(&"Tags".into()));
+        assert!(d1.properties.contains_key(&"Attributes".into()));
+
+        let sparse = rbx_binary::Deserializer::new()
+            .deserialize_sparse(bytes.as_slice())
+            .unwrap();
+        let sparse_children = sparse.dom.root().children();
+        let recorded = sparse
+            .elided_defaults
+            .get(&sparse_children[0])
+            .expect("deserialize_sparse must record elided default fields");
+        assert!(recorded.iter().any(|name| name == "Value"));
+        assert!(recorded.iter().any(|name| name == "Tags"));
+        assert!(recorded.iter().any(|name| name == "Attributes"));
+
+        let truncated = &bytes[..bytes.len().saturating_sub(12)];
+        assert!(
+            rbx_binary::Deserializer::new()
+                .elide_defaults(true)
+                .deserialize(truncated)
+                .is_err()
         );
     }
 }

@@ -169,6 +169,7 @@ fn tracker_reply(tracker: &Tracker, params: &Value, runtime: &str) -> Value {
     let mut reply = json!({
         "pushProofMatches": matches, "pushProofScope": scope,
         "retainedPushProof": retained, "retainedPushProofLocal": true,
+        "pushProofContinues": !params["continuesPushProof"].is_null() && retained.is_some(),
         "verifiedPushProof": {"test": true}, "runtimeId": runtime,
         "seq": 0, "tracking": true, "serviceGenerations": tracker.edits
     });
@@ -1242,6 +1243,7 @@ fn live_start(
                 },
                 expires: Instant::now() + Duration::from_secs(600),
                 sourcemap: (held != "pushed").then(Box::default),
+                pushed_from_pull: None,
                 #[cfg(windows)]
                 relay: None,
             },
@@ -1751,6 +1753,7 @@ fn a_live_start_after_a_pull_pushes_an_edit_of_what_it_pulled() -> Result<()> {
             proof: json!({"id": 1}),
             expires: Instant::now() + Duration::from_secs(600),
             sourcemap: Some(Box::default()),
+            pushed_from_pull: None,
             #[cfg(windows)]
             relay: None,
         },
@@ -1842,6 +1845,7 @@ fn a_live_start_merges_from_a_last_sync_newer_than_the_held_pull() -> Result<()>
                 proof: json!({"expired": true}),
                 expires: Instant::now() + Duration::from_secs(600),
                 sourcemap: Some(Box::default()),
+                pushed_from_pull: None,
                 #[cfg(windows)]
                 relay: None,
             },
@@ -2220,6 +2224,7 @@ fn start_over_seeded_edits(seed: u64, hold: bool) -> Result<(Started, Sent, Vec<
                 proof: json!({"id": 1}),
                 expires: Instant::now() + Duration::from_secs(600),
                 sourcemap: Some(Box::default()),
+                pushed_from_pull: None,
                 #[cfg(windows)]
                 relay: None,
             },
@@ -2539,6 +2544,7 @@ fn drawn_live_start(kind: Drawn, drawn: &super::sim::DrawnStart, hold: bool) -> 
                 },
                 expires: Instant::now() + Duration::from_secs(600),
                 sourcemap: Some(Box::default()),
+                pushed_from_pull: None,
                 #[cfg(windows)]
                 relay: None,
             },
@@ -3540,6 +3546,7 @@ fn settle_import(
             proof: json!({"held": true}),
             expires: Instant::now() + Duration::from_secs(60),
             sourcemap: (elsewhere != Elsewhere::Respelled).then(|| Box::new(held_sourcemap)),
+            pushed_from_pull: None,
             #[cfg(windows)]
             relay: None,
         };
@@ -4112,4 +4119,1089 @@ fn seeded_import_settlement_reads_back_only_what_can_differ() {
         }
         Ok(())
     });
+}
+
+#[test]
+fn zero_capture_verification_paths_checks_all_normal_route_guards() {
+    use super::push_flow::zero_capture_verification_paths;
+    let root = crate::tests::support::temp_dir("zc-verify-guards");
+    let ctx = BoundContext {
+        id: 1,
+        initialized: true,
+        project: root.join("renium.project.jsonc").display().to_string(),
+        root: root.display().to_string(),
+        source: root.join("src").display().to_string(),
+        experience: String::new(),
+        resource_lease: None,
+        place_id: None,
+        game_id: None,
+        selector: String::new(),
+        runtime_id: Some("rt-1".into()),
+        plugin_build: None,
+        fingerprint: String::new(),
+    };
+    let ws_store = PathBuf::from("src/Workspace/.renium.settings.bin");
+    let lit_store = PathBuf::from("src/Lighting/.renium.settings.bin");
+    let script_path = PathBuf::from("src/ServerScriptService/Main.server.luau");
+    let mut mutation_paths = HashSet::new();
+    mutation_paths.insert(ws_store.clone());
+    mutation_paths.insert(lit_store.clone());
+
+    let mut summary = Map::new();
+    summary.insert(
+        "fieldVerifiedServices".into(),
+        json!(["Workspace", "Lighting"]),
+    );
+    summary.insert("sourceVerifyFailed".into(), json!(0));
+    let empty_gen = HashSet::new();
+
+    assert!(
+        zero_capture_verification_paths(
+            &ctx,
+            &summary,
+            &empty_gen,
+            &mutation_paths,
+            None,
+            None,
+            false,
+            false,
+        )
+        .is_empty()
+    );
+
+    let mut partial_verified = summary.clone();
+    partial_verified.insert("fieldVerifiedServices".into(), json!(["Workspace"]));
+    let paths = zero_capture_verification_paths(
+        &ctx,
+        &partial_verified,
+        &empty_gen,
+        &mutation_paths,
+        None,
+        None,
+        false,
+        false,
+    );
+    assert!(paths.contains(&lit_store));
+    assert!(!paths.contains(&ws_store));
+
+    partial_verified.insert("nativeVerifiedServices".into(), json!(["Lighting"]));
+    assert!(
+        zero_capture_verification_paths(
+            &ctx,
+            &partial_verified,
+            &empty_gen,
+            &mutation_paths,
+            None,
+            None,
+            false,
+            false,
+        )
+        .is_empty()
+    );
+
+    let mut src_failed = summary.clone();
+    src_failed.insert("sourceVerifyFailed".into(), json!(1));
+    assert_eq!(
+        zero_capture_verification_paths(
+            &ctx,
+            &src_failed,
+            &empty_gen,
+            &mutation_paths,
+            None,
+            None,
+            false,
+            false,
+        )
+        .len(),
+        2
+    );
+
+    for (key, val) in [
+        (
+            "supplementalImportPendingFields",
+            json!([{"service": "Lighting"}]),
+        ),
+        ("supplementalImportPendingWrites", json!(1)),
+        ("protectedPending", json!(1)),
+        ("unsupportedProperties", json!(["Foo"])),
+    ] {
+        let mut s = summary.clone();
+        s.insert(key.into(), val);
+        assert_eq!(
+            zero_capture_verification_paths(
+                &ctx,
+                &s,
+                &empty_gen,
+                &mutation_paths,
+                None,
+                None,
+                false,
+                false,
+            )
+            .len(),
+            2,
+            "expected {key} to force readback"
+        );
+    }
+
+    let mut gen_paths = HashSet::new();
+    gen_paths.insert(script_path.clone());
+    let paths = zero_capture_verification_paths(
+        &ctx,
+        &summary,
+        &gen_paths,
+        &mutation_paths,
+        None,
+        None,
+        false,
+        false,
+    );
+    assert!(paths.contains(&script_path));
+
+    assert_eq!(
+        zero_capture_verification_paths(
+            &ctx,
+            &summary,
+            &empty_gen,
+            &mutation_paths,
+            None,
+            None,
+            true,
+            false,
+        )
+        .len(),
+        2
+    );
+    assert_eq!(
+        zero_capture_verification_paths(
+            &ctx,
+            &summary,
+            &empty_gen,
+            &mutation_paths,
+            None,
+            None,
+            false,
+            true,
+        )
+        .len(),
+        2
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn is_whole_project_push_and_build_pushed_from_pull_cover_guards() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let all = sync_services();
+    let plain = fixture.push_args();
+    assert!(is_whole_project_push(&all, &plain, None, true)?);
+    assert!(is_whole_project_push(&all, &plain, None, false)?);
+    assert!(!is_whole_project_push(
+        &["ReplicatedStorage".into()],
+        &plain,
+        None,
+        false,
+    )?);
+    let dummy_guard = StudioChangeGuard {
+        runtime_id: "rt".into(),
+        change_seq: 0,
+        tracking_guard_id: None,
+        runtime_bootstrap_safe: true,
+        service_generations: BTreeMap::new(),
+    };
+    assert!(!is_whole_project_push(
+        &all,
+        &plain,
+        Some(&dummy_guard),
+        true,
+    )?);
+    let mut with_id = fixture.push_args();
+    with_id.target_settings_ids.push("folder".into());
+    assert!(!is_whole_project_push(&all, &with_id, None, false)?);
+    let mut with_prop = fixture.push_args();
+    with_prop.target_properties.push("Transparency".into());
+    assert!(!is_whole_project_push(&all, &with_prop, None, false)?);
+    let mut with_upsert = fixture.push_args();
+    with_upsert.upsert_instances_only = true;
+    assert!(!is_whole_project_push(&all, &with_upsert, None, false)?);
+
+    let mut after_snap = fixture.desired.clone();
+    let store_rel = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
+    let new_doc = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![
+            SettingsBytecodeInstance::new(
+                "root".into(),
+                "ReplicatedStorage".into(),
+                "ReplicatedStorage".into(),
+                None,
+            ),
+            SettingsBytecodeInstance::new(
+                "folder".into(),
+                "Imported".into(),
+                "Folder".into(),
+                Some(0),
+            ),
+            SettingsBytecodeInstance::new("added".into(), "Added".into(), "Folder".into(), Some(0)),
+        ],
+    };
+    after_snap.entries.insert(
+        store_rel,
+        SnapshotEntry::File(encode_settings_bytecode(&new_doc)?),
+    );
+    let held_pull: HeldPullTuple = (
+        (Box::new(BTreeMap::new()), json!({"held": true})),
+        vec!["ReplicatedStorage".into()],
+    );
+    let built = build_pushed_from_pull(
+        &fixture.context,
+        true,
+        BTreeSet::from(["ReplicatedStorage".into()]),
+        BTreeSet::from(["Workspace".into()]),
+        &fixture.desired,
+        &after_snap,
+        Some(held_pull),
+        None,
+    )
+    .expect("build_pushed_from_pull must build PushedFromPull when matched_prior is true");
+    assert!(built.services.contains("ReplicatedStorage"));
+    assert!(built.paths_moved.contains("ReplicatedStorage"));
+    assert!(built.structural.contains_key("Workspace"));
+    assert!(
+        build_pushed_from_pull(
+            &fixture.context,
+            false,
+            BTreeSet::from(["ReplicatedStorage".into()]),
+            BTreeSet::new(),
+            &fixture.desired,
+            &after_snap,
+            None,
+            None,
+        )
+        .is_none(),
+        "matched_prior=false must return None"
+    );
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn reuse_verified_subset_push_hits_and_preserves_baseline_on_miss_and_error() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let bridge = fixture.bridge.as_ref().unwrap();
+    let runtime = fixture.context.runtime_id.as_deref().unwrap();
+    let args = fixture.push_args();
+    let input = plain_push_input(&args)?;
+    let insert_baseline = || {
+        let entry = VerifiedFullPush {
+            connections: bridge.runtime_connection_signature(runtime),
+            input: input.clone(),
+            project: fixture.desired.clone(),
+            paths: vec![PathBuf::from("src"), PathBuf::from("instances")],
+            proof: json!({"held": true}),
+            expires: Instant::now() + Duration::from_secs(60),
+            sourcemap: None,
+            pushed_from_pull: None,
+            #[cfg(windows)]
+            relay: None,
+        };
+        bridge
+            .verified_full_pushes
+            .lock_recover()
+            .insert(runtime.to_string(), entry);
+    };
+
+    insert_baseline();
+    let hit = reuse_verified_subset_push(
+        &fixture.context,
+        bridge,
+        &["ReplicatedStorage".into()],
+        &args,
+    )?;
+    assert_eq!(
+        hit.as_ref().and_then(|m| m.get("unchanged")),
+        Some(&json!(true)),
+        "subset push with matching files and proof must return unchanged"
+    );
+    assert!(
+        bridge
+            .verified_full_pushes
+            .lock_recover()
+            .contains_key(runtime),
+        "subset push hit must keep baseline"
+    );
+
+    fixture.tracker.lock().unwrap().committed = true;
+    let miss_proof = reuse_verified_subset_push(
+        &fixture.context,
+        bridge,
+        &["ReplicatedStorage".into()],
+        &args,
+    )?;
+    assert!(miss_proof.is_none());
+    assert!(
+        bridge
+            .verified_full_pushes
+            .lock_recover()
+            .contains_key(runtime),
+        "Reconcile 3: proof-mismatch miss must NOT drop the held baseline"
+    );
+    fixture.tracker.lock().unwrap().committed = false;
+
+    let extra_script = Path::new(&fixture.context.source).join("ReplicatedStorage/Edited.luau");
+    fs::write(&extra_script, "return 1\n")?;
+    let miss_disk = reuse_verified_subset_push(
+        &fixture.context,
+        bridge,
+        &["ReplicatedStorage".into()],
+        &args,
+    )?;
+    assert!(miss_disk.is_none());
+    assert!(
+        bridge
+            .verified_full_pushes
+            .lock_recover()
+            .contains_key(runtime),
+        "Reconcile 3: disk-mismatch miss must NOT drop the held baseline"
+    );
+    fs::remove_file(&extra_script)?;
+
+    let mut bad_ctx = fixture.context.clone();
+    bad_ctx.runtime_id = Some("missing-runtime".into());
+    bridge.verified_full_pushes.lock_recover().insert(
+        "missing-runtime".into(),
+        VerifiedFullPush {
+            connections: bridge.runtime_connection_signature("missing-runtime"),
+            input: input.clone(),
+            project: fixture.desired.clone(),
+            paths: vec![PathBuf::from("src"), PathBuf::from("instances")],
+            proof: json!({"held": true}),
+            expires: Instant::now() + Duration::from_secs(60),
+            sourcemap: None,
+            pushed_from_pull: None,
+            #[cfg(windows)]
+            relay: None,
+        },
+    );
+    let err_res =
+        reuse_verified_subset_push(&bad_ctx, bridge, &["ReplicatedStorage".into()], &args)?;
+    assert!(
+        err_res.is_none(),
+        "Reconcile 3: pre-check bridge error must return Ok(None), not fail the push"
+    );
+    assert!(
+        bridge
+            .verified_full_pushes
+            .lock_recover()
+            .contains_key("missing-runtime"),
+        "Reconcile 3: pre-check error must preserve the held baseline"
+    );
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn try_zero_capture_bulk_restore_handles_terrain_fallback_without_retry_and_commits_history()
+-> Result<()> {
+    let fixture = Fixture::for_service("Workspace")?;
+    let root = PathBuf::from(&fixture.context.root);
+    let src_dir = PathBuf::from(&fixture.context.source);
+    let store_rel = PathBuf::from("instances/Workspace.renium");
+    let mut part =
+        SettingsBytecodeInstance::new("part-1".into(), "Block".into(), "Part".into(), Some(0));
+    part.properties.insert("Transparency".into(), json!(0.25));
+    let doc = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![
+            SettingsBytecodeInstance::new(
+                "ws-0".into(),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            ),
+            part,
+        ],
+    };
+    let desired_bytes = encode_settings_bytecode(&doc)?;
+    fs::write(root.join(&store_rel), &desired_bytes)?;
+    let held_project = capture_snapshot(&root, &["src".into(), "instances".into()])?;
+    let bridge = fixture.bridge.as_ref().unwrap();
+    let runtime = fixture.context.runtime_id.clone().unwrap();
+    let stage =
+        ExportProjectStage::create_for_comparison(&root, Path::new("src"), &["Workspace".into()])?;
+    let source_paths = stage.publish_paths().to_vec();
+    let guard = StudioChangeGuard {
+        runtime_id: runtime.clone(),
+        change_seq: 0,
+        tracking_guard_id: None,
+        runtime_bootstrap_safe: true,
+        service_generations: BTreeMap::new(),
+    };
+    let mut push_args = fixture.push_args();
+    push_args.yes = true;
+    let services = vec!["Workspace".to_string()];
+    let initial_state = json!({
+        "pushProofScope": {
+            "services": ["Workspace"],
+            "valuesOnly": { "Workspace": true },
+            "changedClassProps": {
+                "Workspace": { "Part": ["Transparency"] }
+            },
+            "expectedTerrainDigest": "digest-1"
+        }
+    });
+    let zctx = ZeroCaptureContext {
+        context: &fixture.context,
+        bridge,
+        services: &services,
+        root: &root,
+        src_dir: &src_dir,
+        source_paths: &source_paths,
+        stage: &stage,
+        guard: &guard,
+        push_args: &push_args,
+        initial_state: &initial_state,
+        cache_input: None,
+    };
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls_ref = Arc::clone(&calls);
+    MUTATION.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_ctx, _input| {
+            calls_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(StagedPushResult {
+                generated: ProjectSnapshot::default(),
+                summary: Map::from_iter([
+                    ("ok".into(), json!(true)),
+                    ("fallbackFullCapture".into(), json!(true)),
+                    ("fallbackReason".into(), json!("terrain_voxels")),
+                ]),
+            })
+        }));
+    });
+    let mut scoped_a = Some(held_project.clone());
+    let mut sm_a = None;
+    let mut release_a = StudioTrackingGuardRelease::new(bridge, &runtime, None);
+    #[cfg(windows)]
+    let mut relay_a = None;
+    let res_a = try_zero_capture_bulk_restore(
+        &zctx,
+        &mut scoped_a,
+        &mut sm_a,
+        &mut release_a,
+        #[cfg(windows)]
+        &mut relay_a,
+    )?;
+    assert!(
+        res_a.is_none(),
+        "R5: terrain_voxels fallback must return Ok(None) to run full capture"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "R5: try_zero_capture_bulk_restore must never retry terrain_voxels in place"
+    );
+    assert!(
+        scoped_a.is_some(),
+        "R5: fallback must leave scoped_baseline intact for full capture"
+    );
+
+    MUTATION.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_ctx, input| {
+            assert_eq!(input.plan.bulk_property_patches.len(), 1);
+            assert_eq!(
+                input.plan.bulk_property_patches[0]
+                    .expected_terrain_digest
+                    .as_deref(),
+                Some("digest-1")
+            );
+            Ok(StagedPushResult {
+                generated: ProjectSnapshot::default(),
+                summary: Map::from_iter([
+                    ("ok".into(), json!(true)),
+                    ("propertyUpdated".into(), json!(1)),
+                    ("sourceVerifyFailed".into(), json!(0)),
+                    ("fieldVerifiedServices".into(), json!(["Workspace"])),
+                    ("verifiedPushProof".into(), json!({"test": true})),
+                    (
+                        "_bulkOldValueColumns".into(),
+                        json!({
+                            "Workspace": [{
+                                "propertyName": "Transparency",
+                                "encoding": "f32",
+                                "count": 1,
+                                "rows": "AQAAAA==",
+                                "values": "AABAPw=="
+                            }]
+                        }),
+                    ),
+                ]),
+            })
+        }));
+    });
+    let mut scoped_b = Some(held_project);
+    let mut sm_b = None;
+    let mut release_b = StudioTrackingGuardRelease::new(bridge, &runtime, None);
+    #[cfg(windows)]
+    let mut relay_b = None;
+    let summary_b = try_zero_capture_bulk_restore(
+        &zctx,
+        &mut scoped_b,
+        &mut sm_b,
+        &mut release_b,
+        #[cfg(windows)]
+        &mut relay_b,
+    )?
+    .expect("Earlier 2: zero-capture bulk restore must succeed and return summary");
+    let history_id = summary_b
+        .get("historyId")
+        .and_then(Value::as_str)
+        .expect("Earlier 2: zero-capture restore must commit a SyncHistory entry");
+    assert!(!history_id.is_empty());
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn targeted_baseline_held_keeps_old_baseline_and_pure_creation_tracks_pushed_from_pull()
+-> Result<()> {
+    let fixture = Fixture::new()?;
+    let root = PathBuf::from(&fixture.context.root);
+    let script_rel = PathBuf::from("src/ReplicatedStorage/Main.luau");
+    fs::write(root.join(&script_rel), "return 1\n")?;
+    let initial_snap = capture_snapshot(&root, &["src".into(), "instances".into()])?;
+
+    fs::write(root.join(&script_rel), "return 2\n")?;
+    let edited_snap = capture_snapshot(&root, &["src".into(), "instances".into()])?;
+    let mut held_args = fixture.push_args();
+    held_args.changed_paths.push(root.join(&script_rel));
+    let held_summary = Map::from_iter([
+        ("ok".into(), json!(true)),
+        ("heldForReview".into(), json!(true)),
+    ]);
+    let service_of = |path: &Path| {
+        crate::editor::paths::service_from_changed_path(
+            Path::new(&fixture.context.source),
+            &root.join(path),
+        )
+    };
+    let kept = targeted_baseline(
+        &initial_snap,
+        (&edited_snap, &edited_snap),
+        &held_summary,
+        &TargetedPush::of(&held_args),
+        service_of,
+    )
+    .expect("R1: held targeted push must retain the pre-edit baseline");
+    assert!(
+        matches!(
+            kept.entries.get(&script_rel),
+            Some(SnapshotEntry::File(bytes)) if bytes == b"return 1\n"
+        ),
+        "R1: held targeted push must keep pre-edit baseline bytes"
+    );
+    assert!(
+        !snapshot_matches_disk(&root, &["src".into(), "instances".into()], &kept)?,
+        "R1: same-length edit on disk must still be detected after held targeted push"
+    );
+
+    fs::write(root.join(&script_rel), "return 1\n")?;
+    let store_rel = PathBuf::from("instances/ReplicatedStorage.renium");
+    let created_doc = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![
+            SettingsBytecodeInstance::new(
+                "root".into(),
+                "ReplicatedStorage".into(),
+                "ReplicatedStorage".into(),
+                None,
+            ),
+            SettingsBytecodeInstance::new(
+                "folder".into(),
+                "Imported".into(),
+                "Folder".into(),
+                Some(0),
+            ),
+            SettingsBytecodeInstance::new(
+                "new-part".into(),
+                "Created".into(),
+                "Part".into(),
+                Some(1),
+            ),
+        ],
+    };
+    fs::write(
+        root.join(&store_rel),
+        encode_settings_bytecode(&created_doc)?,
+    )?;
+    let created_snap = capture_snapshot(&root, &["src".into(), "instances".into()])?;
+    let mut create_args = fixture.push_args();
+    create_args.changed_paths.push(root.join(&store_rel));
+    create_args.target_settings_ids.push("folder".into());
+    let create_summary = Map::from_iter([
+        ("ok".into(), json!(true)),
+        ("instanceCreated".into(), json!(1)),
+        ("propertyUpdated".into(), json!(0)),
+        ("fieldVerifiedServices".into(), json!(["ReplicatedStorage"])),
+        ("verifiedPushProof".into(), json!({"test": true})),
+    ]);
+    assert!(push_changed_structure(&create_summary));
+    assert!(push_only_created_instances(&create_summary));
+    let mut deleted_summary = create_summary.clone();
+    deleted_summary.insert("instanceDeleted".into(), json!(1));
+    assert!(!push_only_created_instances(&deleted_summary));
+    let pushed_create = TargetedPush::of(&create_args);
+    let next_project = targeted_baseline(
+        &initial_snap,
+        (&created_snap, &created_snap),
+        &create_summary,
+        &pushed_create,
+        service_of,
+    )
+    .expect("R10: pure_creation targeted push must accept store change at targeted folder");
+    let mut held_entry = VerifiedFullPush {
+        connections: Vec::new(),
+        input: Value::Null,
+        project: initial_snap.clone(),
+        paths: vec!["src".into(), "instances".into()],
+        proof: json!({"prior": true}),
+        expires: Instant::now() + Duration::from_secs(60),
+        sourcemap: Some(Box::new(SourcemapState::new())),
+        pushed_from_pull: None,
+        #[cfg(windows)]
+        relay: None,
+    };
+    assert!(
+        targeted_push_keeps_baseline_on_structure_change(
+            &create_summary,
+            &pushed_create,
+            &held_entry
+        ),
+        "R10: pure-creation targeted push with target ids and held sourcemap must keep baseline"
+    );
+    assert!(
+        !targeted_push_keeps_baseline_on_structure_change(
+            &deleted_summary,
+            &pushed_create,
+            &held_entry
+        ),
+        "R10: targeted push that deleted instances must drop held baseline"
+    );
+    let empty_pushed = TargetedPush::of(&fixture.push_args());
+    assert!(
+        !targeted_push_keeps_baseline_on_structure_change(
+            &create_summary,
+            &empty_pushed,
+            &held_entry
+        ),
+        "R10: pure-creation targeted push without target ids must drop held baseline"
+    );
+    let no_scope_entry = VerifiedFullPush {
+        connections: Vec::new(),
+        input: Value::Null,
+        project: initial_snap.clone(),
+        paths: vec!["src".into(), "instances".into()],
+        proof: json!({"prior": true}),
+        expires: Instant::now() + Duration::from_secs(60),
+        sourcemap: None,
+        pushed_from_pull: None,
+        #[cfg(windows)]
+        relay: None,
+    };
+    assert!(
+        !targeted_push_keeps_baseline_on_structure_change(
+            &create_summary,
+            &pushed_create,
+            &no_scope_entry
+        ),
+        "R10: pure-creation targeted push without held sourcemap or pushed_from_pull must drop held baseline"
+    );
+    let (kept_sm, kept_pushed) = retain_targeted_baseline_scope(
+        &fixture.context,
+        &mut held_entry,
+        &next_project,
+        &create_summary,
+    );
+    assert!(
+        kept_sm.is_none(),
+        "R10: pure_creation targeted push must clear preserved sourcemap"
+    );
+    let kept_pushed = kept_pushed
+        .expect("R10: pure_creation targeted push must carry PushedFromPull from held sourcemap");
+    assert!(
+        kept_pushed.services.contains("ReplicatedStorage"),
+        "R10: PushedFromPull must record ReplicatedStorage as pushed"
+    );
+    Ok(())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn restore_held_baseline_on_noop_re_retains_baseline_in_bridge() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let bridge = fixture.bridge.as_ref().unwrap();
+    let runtime = fixture.context.runtime_id.as_deref().unwrap();
+    let cache_input = plain_push_input(&fixture.push_args())?;
+    let services = vec!["ReplicatedStorage".to_string()];
+    let guard = StudioChangeGuard {
+        runtime_id: runtime.to_string(),
+        change_seq: 0,
+        tracking_guard_id: None,
+        runtime_bootstrap_safe: true,
+        service_generations: BTreeMap::new(),
+    };
+    let mut tracking_release = StudioTrackingGuardRelease::new(bridge, runtime, None);
+    tracking_release.retained_proof = Some(json!({"held": true}));
+    tracking_release.studio_unchanged = true;
+    #[cfg(windows)]
+    {
+        tracking_release.retained_proof_local = true;
+    }
+    #[cfg(windows)]
+    let mut native_relay = None;
+    restore_held_baseline_on_noop(
+        (bridge, &services, &guard),
+        &mut tracking_release,
+        (
+            &json!({"pushProofMatches": false}),
+            Some(json!({"held": true})),
+            Some(&cache_input),
+        ),
+        &[PathBuf::from("src"), PathBuf::from("instances")],
+        RetainedPushScope {
+            project: fixture.desired.clone(),
+            sourcemap: None,
+            pushed_from_pull: None,
+        },
+        #[cfg(windows)]
+        &mut native_relay,
+    );
+    assert!(
+        !bridge
+            .verified_full_pushes
+            .lock_recover()
+            .contains_key(runtime),
+        "restore_held_baseline_on_noop must NOT retain baseline when pushProofMatches is false"
+    );
+    restore_held_baseline_on_noop(
+        (bridge, &services, &guard),
+        &mut tracking_release,
+        (
+            &json!({"pushProofMatches": true}),
+            Some(json!({"held": true})),
+            Some(&cache_input),
+        ),
+        &[PathBuf::from("src"), PathBuf::from("instances")],
+        RetainedPushScope {
+            project: fixture.desired.clone(),
+            sourcemap: None,
+            pushed_from_pull: None,
+        },
+        #[cfg(windows)]
+        &mut native_relay,
+    );
+    assert!(
+        bridge
+            .verified_full_pushes
+            .lock_recover()
+            .contains_key(runtime),
+        "restore_held_baseline_on_noop must restore held baseline when pushProofMatches is true"
+    );
+    Ok(())
+}
+
+#[test]
+fn replaced_fast_prepares_large_store_replacement_without_diffing_outgoing_descendants()
+-> Result<()> {
+    let mut desired_instances = vec![SettingsBytecodeInstance::new(
+        "ws".into(),
+        "Workspace".into(),
+        "Workspace".into(),
+        None,
+    )];
+    let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+    for i in 0..4_500 {
+        let mut inst = SettingsBytecodeInstance::new(
+            format!("part-{i}"),
+            format!("Part_{i:04}"),
+            "Part".into(),
+            Some(0),
+        );
+        let mut pad = String::with_capacity(96);
+        for _ in 0..6 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            use std::fmt::Write;
+            let _ = write!(&mut pad, "{rng:016x}");
+        }
+        inst.attributes.insert("Pad".into(), json!(pad));
+        inst.properties
+            .insert("Transparency".into(), json!((i % 10) as f64 / 10.0));
+        desired_instances.push(inst);
+    }
+    let desired_doc = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: desired_instances,
+    };
+    let observed_doc = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![SettingsBytecodeInstance::new(
+            "ws".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        )],
+    };
+    let desired_bytes = encode_settings_bytecode(&desired_doc)?;
+    let observed_bytes = encode_settings_bytecode(&observed_doc)?;
+    assert!(
+        desired_bytes.len() >= 256 * 1024,
+        "test store must exceed CHANGED_INSTANCES_MIN_BYTES (got {})",
+        desired_bytes.len()
+    );
+    let path = PathBuf::from("instances/Workspace.renium");
+    let desired_snap = ProjectSnapshot {
+        entries: BTreeMap::from([(path.clone(), SnapshotEntry::File(desired_bytes))]),
+    };
+    let observed_snap = ProjectSnapshot {
+        entries: BTreeMap::from([(path.clone(), SnapshotEntry::File(observed_bytes))]),
+    };
+    let paths = HashSet::from([path.clone()]);
+    let mut prepared = HashMap::new();
+    let unchanged = prepare_project_replacement_with_bulk(
+        &desired_snap,
+        &observed_snap,
+        &paths,
+        &mut prepared,
+        StoresRead::Changed,
+        None,
+        None,
+    )?;
+    assert!(unchanged.is_empty());
+    let change = prepared
+        .get(&path)
+        .expect("replaced_fast must prepare the large store replacement");
+    assert_eq!(change.current.instances.len(), 4_501);
+    assert_eq!(change.previous.instances.len(), 1);
+    assert!(
+        crate::settings::equivalence::holds_unread_instances(&change.current),
+        "replaced_fast must leave large store instances unread in compact form"
+    );
+    Ok(())
+}
+
+#[test]
+fn bulk_sourcemap_preservation_and_fallback_retry_cover_guards() {
+    let mut ok_summary = Map::from_iter([
+        ("ok".into(), json!(true)),
+        ("exactRetained".into(), json!(true)),
+        ("sourceVerifyFailed".into(), json!(0)),
+    ]);
+    assert!(bulk_patches_allow_preserved_sourcemap(
+        BulkSourcemapPolicy::RequireExactRetained,
+        &ok_summary
+    ));
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let mut held = Some(Box::new(SourcemapState::new()));
+        assert!(
+            preserved_sourcemap_for_bulk_push(
+                true,
+                BulkSourcemapPolicy::RequireExactRetained,
+                &ok_summary,
+                &mut held,
+            )
+            .is_some(),
+            "R8: exactRetained=true with RequireExactRetained must preserve held sourcemap"
+        );
+        assert!(held.is_none());
+        assert!(zero_capture_can_keep_pull_scope(
+            true,
+            false,
+            true,
+            true,
+            false,
+            &ok_summary
+        ));
+    }
+
+    ok_summary.insert("exactRetained".into(), json!(false));
+    assert!(!bulk_patches_allow_preserved_sourcemap(
+        BulkSourcemapPolicy::RequireExactRetained,
+        &ok_summary
+    ));
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let mut held = Some(Box::new(SourcemapState::new()));
+        assert!(
+            preserved_sourcemap_for_bulk_push(
+                true,
+                BulkSourcemapPolicy::RequireExactRetained,
+                &ok_summary,
+                &mut held,
+            )
+            .is_none(),
+            "R8: exactRetained=false must prevent sourcemap preservation"
+        );
+        assert!(
+            held.is_some(),
+            "R8: rejected preservation must leave held sourcemap untaken for fallback"
+        );
+        assert!(!zero_capture_can_keep_pull_scope(
+            true,
+            false,
+            true,
+            true,
+            false,
+            &ok_summary
+        ));
+        let mut deny_held = Some(Box::new(SourcemapState::new()));
+        assert!(
+            preserved_sourcemap_for_bulk_push(
+                true,
+                BulkSourcemapPolicy::Deny,
+                &Map::from_iter([("exactRetained".into(), json!(true))]),
+                &mut deny_held,
+            )
+            .is_none()
+        );
+    }
+
+    let fallback_summary = Map::from_iter([
+        ("ok".into(), json!(false)),
+        ("fallbackFullCapture".into(), json!(true)),
+    ]);
+    assert!(should_retry_full_push_without_bulk(&fallback_summary, true));
+    assert!(!should_retry_full_push_without_bulk(
+        &fallback_summary,
+        false
+    ));
+    assert!(!should_retry_full_push_without_bulk(&ok_summary, true));
+}
+
+#[test]
+fn imported_large_store_keeps_retained_previous_and_catches_unchanged_missing_field() -> Result<()>
+{
+    let make_part = |id: &str, name: &str, uid: &str, props: Vec<(&str, Value)>| {
+        let mut inst =
+            SettingsBytecodeInstance::new(id.into(), name.into(), "Part".into(), Some(0));
+        inst.properties.insert("UniqueId".into(), json!(uid));
+        for (k, v) in props {
+            inst.properties.insert(k.into(), v);
+        }
+        inst
+    };
+    let root =
+        || SettingsBytecodeInstance::new("ws".into(), "Workspace".into(), "Workspace".into(), None);
+
+    let mut before_instances = vec![
+        root(),
+        make_part(
+            "part-a",
+            "PartA",
+            "uid-part-a",
+            vec![("Reflectance", json!(0.5))],
+        ),
+    ];
+    let mut desired_instances = vec![
+        root(),
+        make_part(
+            "part-a",
+            "PartA",
+            "uid-part-a",
+            vec![("Reflectance", json!(0.5))],
+        ),
+    ];
+    let mut observed_instances = vec![root(), make_part("part-a", "PartA", "uid-part-a", vec![])];
+    for i in 1..16 {
+        let id = format!("part-{i}");
+        let name = format!("Part_{i}");
+        let uid = format!("uid-{i}");
+        before_instances.push(make_part(
+            &id,
+            &name,
+            &uid,
+            vec![("Transparency", json!(0.1))],
+        ));
+        desired_instances.push(make_part(
+            &id,
+            &name,
+            &uid,
+            vec![("Transparency", json!(0.9))],
+        ));
+        observed_instances.push(make_part(
+            &id,
+            &name,
+            &uid,
+            vec![("Transparency", json!(0.9))],
+        ));
+    }
+
+    let before_doc = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: before_instances,
+    };
+    let desired_doc = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: desired_instances,
+    };
+    let observed_doc = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: observed_instances,
+    };
+    let retained_previous = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![root()],
+    };
+
+    let before_bytes = encode_settings_bytecode(&before_doc)?;
+    let desired_bytes = encode_settings_bytecode(&desired_doc)?;
+    let observed_bytes = encode_settings_bytecode(&observed_doc)?;
+    assert!(crate::settings::bytecode::blocks::is_block_store(
+        &desired_bytes
+    ));
+    assert!(desired_doc.instances.len() >= super::verify::rows::MIN_ROWS);
+
+    let path = PathBuf::from("src/Workspace/Workspace.renium");
+    let desired_snap = ProjectSnapshot {
+        entries: BTreeMap::from([(path.clone(), SnapshotEntry::File(desired_bytes.clone()))]),
+    };
+    let prepared_settings = HashMap::from([(
+        path.clone(),
+        PreparedEditorSettingsChange {
+            previous: retained_previous,
+            current: desired_doc,
+        },
+    )]);
+    let (_docs, mut prepared_verification) =
+        split_prepared_settings_for_push(prepared_settings, &desired_snap)?;
+    let kept = prepared_verification
+        .remove(&path)
+        .expect("C1: small retained-only previous must be kept for large imported store");
+    assert_eq!(kept.previous.instances.len(), 1);
+    assert!(
+        kept.desired.is_none(),
+        "C1: large imported store must not pin whole desired document in prepared_verification"
+    );
+
+    let before_entry = SnapshotEntry::File(before_bytes);
+    let desired_entry = SnapshotEntry::File(desired_bytes);
+    let observed_entry = SnapshotEntry::File(observed_bytes);
+
+    let (mismatch_with_retained, _) = verify::settings_delta_outcome(
+        &path,
+        (&before_entry, &desired_entry, &observed_entry),
+        (Some(kept), true),
+        (&[], None),
+        (false, false),
+    )?;
+    let detail = mismatch_with_retained
+        .expect("C1: row verification with retained-only previous must catch PartA.Reflectance missing in Studio");
+    assert!(
+        detail.contains("PartA") && detail.contains("Reflectance"),
+        "expected mismatch on PartA.Reflectance, got: {detail}"
+    );
+    Ok(())
 }

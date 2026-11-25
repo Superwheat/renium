@@ -1467,6 +1467,7 @@ impl Coordinator {
                 StagedPushRequest {
                     plan: push_plan,
                     prepared_documents: HashMap::new(),
+                    virtual_files: None,
                     guard: Some(&studio_guard),
                     args,
                     expected_project: Some(&editor),
@@ -2032,6 +2033,7 @@ impl Coordinator {
             StagedPushRequest {
                 plan,
                 prepared_documents,
+                virtual_files: None,
                 guard,
                 args,
                 expected_project: None,

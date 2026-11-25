@@ -2574,6 +2574,7 @@ pub(crate) fn build_editor_binary_import_with_documents(
     let mut properties =
         crate::rbx::model::PlaceImportProperties::retaining(unread_rows.keys().cloned().collect());
     properties.unread_rows = unread_rows;
+    properties.virtual_files = changes.virtual_files.clone();
     build_editor_binary_import_for_services(
         args,
         selection,
@@ -3754,17 +3755,21 @@ fn native_reader_carries_texture_packs_but_keeps_genuine_encoder_omissions() {
     let encoded = HashMap::from([("Part".into(), HashSet::from(["UnsupportedField".into()]))]);
     let native = import_property_omissions(encoded.clone(), true);
     assert!(!native.contains_key("SurfaceAppearance"));
-    assert!(native["Model"].contains("WorldPivot"));
+    assert!(!native.contains_key("Model"));
     assert!(native["Part"].contains("UnsupportedField"));
     let plugin = import_property_omissions(encoded, false);
     assert!(plugin["SurfaceAppearance"].contains("TexturePack"));
-    let unencoded = HashMap::from([(
-        "SurfaceAppearance".into(),
-        HashSet::from(["TexturePack".into()]),
-    )]);
-    assert!(
-        import_property_omissions(unencoded, true)["SurfaceAppearance"].contains("TexturePack")
-    );
+    assert!(plugin["Model"].contains("WorldPivot"));
+    let unencoded = HashMap::from([
+        (
+            "SurfaceAppearance".into(),
+            HashSet::from(["TexturePack".into()]),
+        ),
+        ("Model".into(), HashSet::from(["WorldPivot".into()])),
+    ]);
+    let kept = import_property_omissions(unencoded, true);
+    assert!(kept["SurfaceAppearance"].contains("TexturePack"));
+    assert!(kept["Model"].contains("WorldPivot"));
 }
 
 #[test]

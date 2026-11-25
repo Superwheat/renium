@@ -346,6 +346,7 @@ pub(crate) fn current_studio_change_guard_verifying_continuing(
             "scopePushProof": verify_push_proof.is_some(),
             "continueNativeRelay": cfg!(windows) && continue_native_relay,
             "skipTerrainIfWorkspaceOverflow": cfg!(windows) && continue_native_relay && verify_push_proof.is_some(),
+            "lazyTracking": cfg!(windows) && native_attribute_services.is_some(),
         }),
         BridgeTarget::Edit,
         runtime_id,
@@ -374,7 +375,12 @@ pub(crate) fn current_studio_change_guard_verifying_continuing(
         // In either case this is the initial, fully observed generation fence.
         state = bridge.call_for_runtime_with_timeout(
             "getStudioChangeState",
-            json!({"start": true, "trackingGuardId": guard_id, "includeGenerations": true}),
+            json!({
+                "start": true,
+                "trackingGuardId": guard_id,
+                "includeGenerations": true,
+                "lazyTracking": cfg!(windows) && native_attribute_services.is_some(),
+            }),
             BridgeTarget::Edit,
             runtime_id,
             Some(Duration::from_secs(10)),

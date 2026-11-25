@@ -1424,9 +1424,6 @@ fn decode_property_group_body_filtered(
         .property_group(value_count, property_name, kind)?;
     let mut reader = BytecodeReader::new(body);
     let cframe_group_decoder = decode_cframe_group_header(kind, &mut reader)?;
-    // Large numeric columns otherwise occupy one Rayon worker while the other
-    // property groups finish. Locate values without allocating their JSON trees,
-    // then construct those independent values in bounded parallel chunks.
     let numeric_bytes = match kind {
         11 | 13 => Some(8),
         12 | 15 => Some(12),
@@ -1441,7 +1438,7 @@ fn decode_property_group_body_filtered(
         && value_count >= SETTINGS_BINARY_PARALLEL_CHUNK_SIZE
         && rayon::current_num_threads() > 1
     {
-        let mut values = Vec::with_capacity(reader.capacity(value_count, numeric_bytes + 1));
+        let mut values = Vec::new();
         let mut instance_index = 0_usize;
         for position in 0..value_count {
             instance_index = next_group_instance(
@@ -1608,6 +1605,350 @@ fn skip_property_group_entry(
         }
         _ => Ok(false),
     }
+}
+
+pub(crate) enum RawBlockValue<'s> {
+    Null,
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    F32(f32),
+    Str(&'s str),
+    Vector2(f32, f32),
+    Vector3(f32, f32, f32),
+    UDim(f32, f32),
+    UDim2(f32, f32, f32, f32),
+    Color3(f32, f32, f32),
+    CFrame([f32; 12]),
+    RefIndex(usize),
+    Rect(f32, f32, f32, f32),
+    EnumName(&'s str),
+    NestedEnum(&'s str, &'s str),
+    UniqueId(&'s str),
+    SharedString(usize, &'s str),
+    Json(Value),
+}
+
+impl RawBlockValue<'_> {
+    pub(crate) fn to_json(&self) -> Value {
+        match self {
+            Self::Null => Value::Null,
+            Self::Bool(b) => Value::Bool(*b),
+            Self::I64(n) => json!(*n),
+            Self::U64(n) => json!(*n),
+            Self::F64(n) => json_number_f64(*n),
+            Self::F32(n) => json_number_f64(f64::from(*n)),
+            Self::Str(s) => Value::String((*s).to_string()),
+            Self::Vector2(x, y) => typed_object(
+                "Vector2",
+                [
+                    ("x", json_number_f64(f64::from(*x))),
+                    ("y", json_number_f64(f64::from(*y))),
+                ],
+            ),
+            Self::Vector3(x, y, z) => typed_object(
+                "Vector3",
+                [
+                    ("x", json_number_f64(f64::from(*x))),
+                    ("y", json_number_f64(f64::from(*y))),
+                    ("z", json_number_f64(f64::from(*z))),
+                ],
+            ),
+            Self::UDim(s, o) => typed_object(
+                "UDim",
+                [
+                    ("scale", json_number_f64(f64::from(*s))),
+                    ("offset", json_number_f64(f64::from(*o))),
+                ],
+            ),
+            Self::UDim2(xs, xo, ys, yo) => typed_object(
+                "UDim2",
+                [
+                    ("xScale", json_number_f64(f64::from(*xs))),
+                    ("xOffset", json_number_f64(f64::from(*xo))),
+                    ("yScale", json_number_f64(f64::from(*ys))),
+                    ("yOffset", json_number_f64(f64::from(*yo))),
+                ],
+            ),
+            Self::Color3(r, g, b) => typed_object(
+                "Color3",
+                [
+                    ("r", json_number_f64(f64::from(*r))),
+                    ("g", json_number_f64(f64::from(*g))),
+                    ("b", json_number_f64(f64::from(*b))),
+                ],
+            ),
+            Self::CFrame(c) => typed_object(
+                "CFrame",
+                [(
+                    "components",
+                    Value::Array(c.iter().map(|&v| json_number_f64(f64::from(v))).collect()),
+                )],
+            ),
+            Self::RefIndex(index) => typed_object("Ref", [("instanceIndex", json!(index + 1))]),
+            Self::Rect(a, b, c, d) => typed_object(
+                "Rect",
+                [
+                    ("minX", json_number_f64(f64::from(*a))),
+                    ("minY", json_number_f64(f64::from(*b))),
+                    ("maxX", json_number_f64(f64::from(*c))),
+                    ("maxY", json_number_f64(f64::from(*d))),
+                ],
+            ),
+            Self::EnumName(name) => {
+                typed_object("EnumItem", [("name", Value::String((*name).to_string()))])
+            }
+            Self::NestedEnum(enum_type, name) => typed_object(
+                "EnumItem",
+                [
+                    ("enumType", Value::String((*enum_type).to_string())),
+                    ("name", Value::String((*name).to_string())),
+                ],
+            ),
+            Self::UniqueId(id) => {
+                typed_object("UniqueId", [("value", Value::String((*id).to_string()))])
+            }
+            Self::SharedString(_, b64) => typed_object(
+                "SharedString",
+                [("base64", Value::String((*b64).to_string()))],
+            ),
+            Self::Json(value) => value.clone(),
+        }
+    }
+}
+
+pub(crate) enum DecodedRawGroup<'s> {
+    Properties(&'s str, Vec<(usize, RawBlockValue<'s>)>),
+    Attributes(Vec<(usize, Map<String, Value>)>),
+}
+
+fn decode_property_group_raw<'s>(
+    body: &[u8],
+    property_name: &'s str,
+    kind: u8,
+    value_count: usize,
+    max_row: usize,
+    scope: ValueScope<'s>,
+) -> Result<DecodedRawGroup<'s>> {
+    scope
+        .budget
+        .property_group(value_count, property_name, kind)?;
+    let mut reader = BytecodeReader::new(body);
+    let cframe_group_decoder = decode_cframe_group_header(kind, &mut reader)?;
+    let mut previous_instance_index = 0_usize;
+    let mut previous_ref_target_index = 0_usize;
+    if property_name == "Attributes" && kind == 8 {
+        let mut entries = Vec::with_capacity(reader.capacity(value_count, 1));
+        for position in 0..value_count {
+            let instance_index = next_group_instance(
+                previous_instance_index,
+                reader.read_len("property instance index")?,
+                position,
+            )?;
+            previous_instance_index = instance_index;
+            if instance_index >= scope.instance_count {
+                bail!("Invalid property instance index {instance_index}");
+            }
+            if instance_index >= max_row {
+                bail!("A value block gives a value to a row it does not hold");
+            }
+            entries.push((
+                instance_index,
+                decode_attributes_payload(&mut reader, scope)?,
+            ));
+        }
+        reader.finish()?;
+        return Ok(DecodedRawGroup::Attributes(entries));
+    }
+    let mut entries = Vec::with_capacity(reader.capacity(value_count, 1));
+    for position in 0..value_count {
+        let instance_index = next_group_instance(
+            previous_instance_index,
+            reader.read_len("property instance index")?,
+            position,
+        )?;
+        previous_instance_index = instance_index;
+        if instance_index >= scope.instance_count {
+            bail!("Invalid property instance index {instance_index}");
+        }
+        if instance_index >= max_row {
+            bail!("A value block gives a value to a row it does not hold");
+        }
+        let value = if kind == 17 {
+            let target = decode_resolved_ref_target(
+                &mut reader,
+                scope.instance_count,
+                &mut previous_ref_target_index,
+            )?;
+            RawBlockValue::RefIndex(target)
+        } else {
+            match &cframe_group_decoder {
+                CFrameGroupDecoder::Inline => decode_raw_block_value(&mut reader, kind, scope)?,
+                CFrameGroupDecoder::RotationTable(rotations) => {
+                    let x = read_f32(&mut reader)?;
+                    let y = read_f32(&mut reader)?;
+                    let z = read_f32(&mut reader)?;
+                    let rotation_index = reader.read_len("CFrame rotation index")?;
+                    let r = rotations.get(rotation_index).with_context(|| {
+                        format!("Invalid CFrame rotation index {rotation_index}")
+                    })?;
+                    RawBlockValue::CFrame([
+                        x,
+                        y,
+                        z,
+                        r[0] as f32,
+                        r[1] as f32,
+                        r[2] as f32,
+                        r[3] as f32,
+                        r[4] as f32,
+                        r[5] as f32,
+                        r[6] as f32,
+                        r[7] as f32,
+                        r[8] as f32,
+                    ])
+                }
+            }
+        };
+        entries.push((instance_index, value));
+    }
+    reader.finish()?;
+    Ok(DecodedRawGroup::Properties(property_name, entries))
+}
+
+fn decode_raw_block_value<'s>(
+    reader: &mut BytecodeReader<'_>,
+    kind: u8,
+    scope: ValueScope<'s>,
+) -> Result<RawBlockValue<'s>> {
+    match kind {
+        0 => Ok(RawBlockValue::Null),
+        1 => Ok(RawBlockValue::Bool(false)),
+        2 => Ok(RawBlockValue::Bool(true)),
+        3 => Ok(RawBlockValue::I64(unzigzag_i64(reader.read_var_u64()?))),
+        4 => Ok(RawBlockValue::U64(reader.read_var_u64()?)),
+        5 => Ok(RawBlockValue::F64(read_f64(reader)?)),
+        6 => {
+            let (_, text) = scope.read_str_with_id(reader, "value string id")?;
+            scope.budget.take(text.len())?;
+            Ok(RawBlockValue::Str(text))
+        }
+        8 => decode_raw_block_object(reader, scope),
+        11 => Ok(RawBlockValue::Vector2(read_f32(reader)?, read_f32(reader)?)),
+        12 => Ok(RawBlockValue::Vector3(
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+        )),
+        13 => Ok(RawBlockValue::UDim(read_f32(reader)?, read_f32(reader)?)),
+        14 => Ok(RawBlockValue::UDim2(
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+        )),
+        15 => Ok(RawBlockValue::Color3(
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+        )),
+        16 => {
+            let mut c = [0.0_f32; 12];
+            for slot in &mut c {
+                *slot = read_f32(reader)?;
+            }
+            Ok(RawBlockValue::CFrame(c))
+        }
+        17 => {
+            let index = reader.read_len("resolved ref index")?;
+            check_resolved_ref_index(index, scope.instance_count)?;
+            Ok(RawBlockValue::RefIndex(index))
+        }
+        18 => Ok(RawBlockValue::Rect(
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+            read_f32(reader)?,
+        )),
+        19 => {
+            let (_, text) = scope.read_str_with_id(reader, "enum item string id")?;
+            scope.budget.take(text.len())?;
+            Ok(RawBlockValue::EnumName(text))
+        }
+        20 => Ok(RawBlockValue::F32(read_f32(reader)?)),
+        NESTED_ENUM_ITEM_KIND => {
+            let (_, enum_type) = scope.read_str_with_id(reader, "nested enum type string id")?;
+            let (_, name) = scope.read_str_with_id(reader, "nested enum item string id")?;
+            scope
+                .budget
+                .take(enum_type.len().saturating_add(name.len()))?;
+            Ok(RawBlockValue::NestedEnum(enum_type, name))
+        }
+        _ => Ok(RawBlockValue::Json(decode_raw_value_payload(
+            reader, kind, scope, 0,
+        )?)),
+    }
+}
+
+fn decode_raw_block_object<'s>(
+    reader: &mut BytecodeReader<'_>,
+    scope: ValueScope<'s>,
+) -> Result<RawBlockValue<'s>> {
+    let start = reader.position();
+    let field_count = reader.read_collection_len("object field count")?;
+    if field_count == 2
+        && let Some(fast) = try_decode_raw_two_field_object(reader, scope)?
+    {
+        scope.budget.take(2 * VALUE_SLOT_BYTES)?;
+        return Ok(fast);
+    }
+    reader.pos = start;
+    Ok(RawBlockValue::Json(decode_object_payload(
+        reader, scope, 0,
+    )?))
+}
+
+fn try_decode_raw_two_field_object<'s>(
+    reader: &mut BytecodeReader<'_>,
+    scope: ValueScope<'s>,
+) -> Result<Option<RawBlockValue<'s>>> {
+    let Ok((_, k1)) = scope.read_str_with_id(reader, "object key string id") else {
+        return Ok(None);
+    };
+    if reader.read_u8().ok() != Some(6) {
+        return Ok(None);
+    }
+    let Ok((v1_id, v1)) = scope.read_str_with_id(reader, "value string id") else {
+        return Ok(None);
+    };
+    let Ok((_, k2)) = scope.read_str_with_id(reader, "object key string id") else {
+        return Ok(None);
+    };
+    if reader.read_u8().ok() != Some(6) {
+        return Ok(None);
+    }
+    let Ok((v2_id, v2)) = scope.read_str_with_id(reader, "value string id") else {
+        return Ok(None);
+    };
+    let (type_name, field_name, field_id, field_val) = if k1 == "_type" {
+        (v1, k2, v2_id, v2)
+    } else if k2 == "_type" {
+        (v2, k1, v1_id, v1)
+    } else {
+        return Ok(None);
+    };
+    let result = match (type_name, field_name) {
+        ("UniqueId", "value") => RawBlockValue::UniqueId(field_val),
+        ("SharedString", "base64") => RawBlockValue::SharedString(field_id, field_val),
+        _ => return Ok(None),
+    };
+    scope.budget.take(
+        k1.len()
+            .saturating_add(v1.len())
+            .saturating_add(k2.len())
+            .saturating_add(v2.len()),
+    )?;
+    Ok(Some(result))
 }
 
 // The shared value decoder for eager columns and bounded row materialization.

@@ -6,10 +6,10 @@ use crate::editor::types::EditorNativeReplacement;
 use serde::Deserialize;
 use serde_json::Value;
 
-const HEADER: usize = 1480;
+const HEADER: usize = 1488;
 const CLASS: usize = 264;
 const TARGET: usize = 80;
-const RESPONSE: usize = 312;
+const RESPONSE: usize = 320;
 const READER_TIMING: usize = 136;
 const NATIVE_BATCH_PAUSE_MS: u32 = 1;
 pub(crate) const CREATED_ROW: usize = 56;
@@ -19,6 +19,8 @@ pub(crate) struct NativeReadReceipt {
     pub state: u32,
     pub error: String,
     pub created: Vec<u8>,
+    pub engine_removed: Vec<u32>,
+    pub engine_created: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -290,6 +292,8 @@ pub(crate) fn read_service_payload(
     );
     put_u32(&mut parameters, 1472, u32::try_from(plan.aliases.len())?);
     put_u32(&mut parameters, 1476, NATIVE_BATCH_PAUSE_MS);
+    let parent_offset = properties::parent_offset(&memory, &model)?;
+    put_u32(&mut parameters, 1480, u32::try_from(parent_offset)?);
     for batch in &replacement.batches {
         parameters.extend_from_slice(&(batch.bytes.len() as u64).to_le_bytes());
     }
@@ -392,7 +396,7 @@ pub(crate) fn read_service_payload(
         .read_exact(&mut response)
         .context("Native import outcome is unavailable; do not retry the mutation")?;
     anyhow::ensure!(
-        read_u32(&response, 0)? == 0x52494E52 && read_u32(&response, 4)? == 7,
+        read_u32(&response, 0)? == 0x52494E52 && read_u32(&response, 4)? == 8,
         "Native import receipt header is invalid"
     );
     let status = read_u32(&response, 8)?;
@@ -405,14 +409,20 @@ pub(crate) fn read_service_payload(
     );
     let count = read_u32(&response, 12)? as usize;
     let history_skipped = usize::try_from(read_u64(&response, 40)?)?;
+    let engine_removed_count = read_u32(&response, 312)? as usize;
+    let engine_created_count = read_u32(&response, 316)? as usize;
     anyhow::ensure!(
         count <= expected_created
             && (status != 4 || count == expected_created)
             && history_skipped <= count
+            && engine_removed_count <= count
+            && engine_created_count <= CAPTURE_MAX_ROWS
             && transport.metadata()?.len()
                 >= (RESPONSE
                     + count * CREATED_ROW
                     + replacement.batches.len() * 8
+                    + engine_removed_count * 4
+                    + engine_created_count * 48
                     + READER_TIMING
                     + 8) as u64,
         "Native import creation receipt is incomplete"
@@ -429,6 +439,42 @@ pub(crate) fn read_service_payload(
     transport
         .read_exact(&mut batch_timings)
         .context("Native import batch timings are truncated")?;
+    let mut engine_removed_bytes = vec![0; engine_removed_count * 4];
+    transport
+        .read_exact(&mut engine_removed_bytes)
+        .context("Native import engine-removed indices are truncated")?;
+    let mut engine_removed = Vec::with_capacity(engine_removed_count);
+    for chunk in engine_removed_bytes.chunks_exact(4) {
+        let index = u32::from_le_bytes(chunk.try_into()?);
+        anyhow::ensure!(
+            (index as usize) < count,
+            "Native import engine-removed index is out of range"
+        );
+        engine_removed.push(index);
+    }
+    let mut engine_created_bytes = vec![0; engine_created_count * 48];
+    transport
+        .read_exact(&mut engine_created_bytes)
+        .context("Native import engine-created identities are truncated")?;
+    let mut engine_created = Vec::with_capacity(engine_created_count);
+    for chunk in engine_created_bytes.chunks_exact(48) {
+        let end = chunk
+            .iter()
+            .position(|byte| *byte == 0)
+            .context("Native import engine-created identity is unterminated")?;
+        anyhow::ensure!(end > 0, "Native import engine-created identity is empty");
+        engine_created.push(String::from_utf8_lossy(&chunk[..end]).into_owned());
+    }
+    if !engine_removed.is_empty() || !engine_created.is_empty() {
+        crate::app::output::log_global(
+            5,
+            format_args!(
+                "[renium] native import engine mutations: removed={} created={}",
+                engine_removed.len(),
+                engine_created.len()
+            ),
+        );
+    }
     let mut accounting = [0; READER_TIMING];
     transport
         .read_exact(&mut accounting)
@@ -478,6 +524,8 @@ pub(crate) fn read_service_payload(
             == (RESPONSE
                 + count * CREATED_ROW
                 + replacement.batches.len() * 8
+                + engine_removed_count * 4
+                + engine_created_count * 48
                 + READER_TIMING
                 + 8
                 + intervals.len()) as u64,
@@ -548,5 +596,7 @@ pub(crate) fn read_service_payload(
         state,
         error: error.into_owned(),
         created,
+        engine_removed,
+        engine_created,
     })
 }

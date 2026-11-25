@@ -838,8 +838,12 @@ fn pull_publication(
         // The held baseline is gone: this one captures the whole place.
         baseline = baseline_of(&args);
     }
-    let published =
-        export_snapshots_with_warm_bridge(args, bridge, info, 0.0, false, ExportPurpose::Pull)?;
+    let purpose = if matches!(baseline, Some(PullBaseline::Capture(_))) {
+        ExportPurpose::PullKeepingSnapshot
+    } else {
+        ExportPurpose::Pull
+    };
+    let published = export_snapshots_with_warm_bridge(args, bridge, info, 0.0, false, purpose)?;
     if let Some(PullBaseline::Capture(lease)) = baseline
         && let Err(error) = lease.keep(&published)
     {
@@ -870,11 +874,11 @@ fn automation_pull_operation(
 ) -> Result<(Value, PublishedProjectChanges)> {
     let target = BridgeTarget::Main;
     bridge.wait_for_all_target(bridge_wait_seconds, target)?;
-    let info = bridge.cached_bridge_info_for_target(target)?;
     let mut args = automation_pull_args(context, parameters)?;
     args.preserve_paths = preserve_paths;
     let services = args.services.clone();
     let parsed_services = parse_services(&services)?;
+    let info = bridge.cached_bridge_info_for_target(target)?;
     let pending_ack = pending_change_ack(bridge, &parsed_services)?;
     let acknowledged_pending = pending_ack.is_some();
     let published = pull_publication(context, bridge, &info, args)?;
@@ -2280,7 +2284,7 @@ fn automation_retry_is_safe(
     failure.0.rt == 1
         && (operation != op::CONSOLE
             || parameters.get("clear").and_then(Value::as_bool) != Some(true))
-        && matches!(
+        && (matches!(
             operation,
             op::FIND
                 | op::TREE
@@ -2293,7 +2297,8 @@ fn automation_retry_is_safe(
                 | op::CONSOLE
                 | op::UI
                 | op::JOB_STATUS
-        )
+        ) || (operation == op::PUSH
+            && parameters.get("verify").and_then(Value::as_bool) == Some(true)))
 }
 
 fn operation_failure(operation: u16, error: anyhow::Error) -> automation::Failure {
@@ -2439,18 +2444,6 @@ fn automation_dispatch_managed(
             bridge_wait_seconds,
         )
         .map_err(automation_failure);
-    }
-    // Source verification is observational. Do not capture/acknowledge a sync
-    // checkpoint or run a replacement transaction before reaching its bridge read.
-    if operation == op::PUSH && parameters.get("verify").and_then(Value::as_bool) == Some(true) {
-        return automation_dispatch_with_retry(
-            operation,
-            context,
-            parameters,
-            bridge,
-            bridge_wait_seconds,
-            reviewed,
-        );
     }
     // A push that defers to Live Sync leaves the files to a session that is
     // writing: it sends them itself, and a push beside it would pause it.
@@ -7631,5 +7624,21 @@ mod tests {
         let waited = started.elapsed();
         assert!(cancelled, "a hung settlement was never cancelled");
         assert!(waited + Duration::from_millis(500) >= grace, "{waited:?}");
+    }
+
+    #[test]
+    fn verify_only_push_is_safe_to_retry_on_transient_failure() {
+        let transient = automation::Failure::new("bridge", "lease cancelled", true, "push");
+        assert!(automation_retry_is_safe(
+            op::PUSH,
+            &json!({"verify": true}),
+            &transient
+        ));
+        assert!(!automation_retry_is_safe(
+            op::PUSH,
+            &json!({"verify": false}),
+            &transient
+        ));
+        assert!(!automation_retry_is_safe(op::PUSH, &json!({}), &transient));
     }
 }

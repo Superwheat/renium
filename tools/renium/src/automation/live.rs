@@ -255,7 +255,7 @@ struct ResetState {
 
 enum Rebase {
     Captured(CapturedState),
-    Published(PublishedProjectChanges),
+    Published(Box<PublishedProjectChanges>),
 }
 
 struct RebaseRequest {
@@ -1527,7 +1527,9 @@ impl Manager {
         if let Some(control) = self.control(context.id) {
             control.status.lock_recover().read_only_links_restored =
                 published.read_only_links_restored.clone();
-            if let Err(error) = control.rebase_without_resume(Rebase::Published(published)) {
+            if let Err(error) =
+                control.rebase_without_resume(Rebase::Published(Box::new(published)))
+            {
                 control.set_mode(PairMode::Verify);
                 control.fail(format!(
                     "Live sync could not rebase its file watcher: {error:#}"

@@ -616,11 +616,14 @@ fn append_editor_property_changes_with_paths(
             if !filter.includes_property(logical_name) {
                 continue;
             }
+            let post_apply_class = class_names.is_some_and(|names| names.contains(logical_name));
+            let post_apply_pivot = (instance.class_name.as_str(), logical_name)
+                == crate::editor::types::IMPORT_MODEL_PIVOT
+                && post_apply_class;
             if import.is_some()
-                && (instance.class_name.as_str(), logical_name)
-                    != crate::editor::types::IMPORT_MODEL_PIVOT
+                && !post_apply_pivot
                 && (retained_payload
-                    || !(class_names.is_some_and(|names| names.contains(logical_name))
+                    || !(post_apply_class
                         || path_names.is_some_and(|names| names.contains(logical_name))))
             {
                 continue;
@@ -774,11 +777,7 @@ fn native_target_path_indices(
                 .post_apply_properties_by_class
                 .get(&instance.class_name)
         });
-        if !retained
-            && instance.class_name != crate::editor::types::IMPORT_MODEL_PIVOT.0
-            && path_names.is_empty()
-            && class_names.is_none_or(HashSet::is_empty)
-        {
+        if !retained && path_names.is_empty() && class_names.is_none_or(HashSet::is_empty) {
             continue;
         }
         // Resolve each raw/serialized/alias name once per class, rather than
@@ -792,8 +791,6 @@ fn native_target_path_indices(
                 !name.eq_ignore_ascii_case("Source")
                     && filter.includes_property(logical)
                     && (retained
-                        || (instance.class_name.as_str(), logical)
-                            == crate::editor::types::IMPORT_MODEL_PIVOT
                         || class_names.is_some_and(|names| names.contains(logical))
                         || path_names.contains(logical))
             });
@@ -1549,6 +1546,21 @@ mod native_property_tests {
                 HashSet::from(["Reflectance".into()]),
             )]),
         };
+        let native_supplemental = run(
+            &document,
+            EditorPropertyScope::Imported(Some(&import)),
+            false,
+        );
+        assert_eq!(native_supplemental.property_changes.len(), 2);
+        assert!(
+            native_supplemental
+                .property_changes
+                .iter()
+                .all(|change| !change.properties.contains_key("WorldPivot"))
+        );
+        import
+            .post_apply_properties_by_class
+            .insert("Model".into(), HashSet::from(["WorldPivot".into()]));
         let supplemental = run(
             &document,
             EditorPropertyScope::Imported(Some(&import)),
