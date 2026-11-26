@@ -42,6 +42,9 @@ struct Snapshot {
     processes: Vec<Process>,
 }
 
+const ASKED: &str = "asked";
+const OLDER_COMMANDS_WAIT_MILLIS: u128 = 5_000;
+
 fn directory() -> Result<PathBuf> {
     Ok(update::user_data_dir()?.join("studio-audio").join("global"))
 }
@@ -114,6 +117,7 @@ pub(crate) fn command(action: Action) -> Result<Value> {
     }
     let setting = read_setting()?;
     let started = current_millis();
+    fs::write(dir.join(ASKED), started.to_string())?;
     start_worker(&dir)?;
     let deadline = Instant::now() + Duration::from_secs(12);
     loop {
@@ -173,6 +177,17 @@ fn needs_apply(process: &Process, setting: &Setting, running: bool) -> bool {
     process.revision != setting.revision || !running
 }
 
+fn state_without_counters(snapshot: &Snapshot) -> Result<Vec<u8>> {
+    let mut value = serde_json::to_value(snapshot)?;
+    for process in value["processes"].as_array_mut().into_iter().flatten() {
+        if let Some(process) = process.as_object_mut() {
+            process.remove("outputBuffers");
+            process.remove("suppressedBuffers");
+        }
+    }
+    Ok(serde_json::to_vec(&value)?)
+}
+
 pub(crate) fn run_worker() -> Result<()> {
     let dir = directory()?;
     fs::create_dir_all(&dir)?;
@@ -190,6 +205,7 @@ pub(crate) fn run_worker() -> Result<()> {
         .map(|process| (process.pid, process))
         .collect();
     let mut attempted = HashMap::new();
+    let mut written = (Vec::new(), 0);
     loop {
         let setting = read_setting()?;
         let live: BTreeMap<_, _> = crate::studio::diagnosis::studio_process_ids()
@@ -245,13 +261,24 @@ pub(crate) fn run_worker() -> Result<()> {
                     && process.status.mode == "off"
                     && process.status.pending_restores == 0
             });
-        let snapshot = Snapshot {
+        let mut snapshot = Snapshot {
             revision: setting.revision,
             mode: setting.mode,
-            updated: current_millis(),
+            updated: 0,
             processes: processes.values().cloned().collect(),
         };
-        atomic_write_file(&dir.join("status.json"), &serde_json::to_vec(&snapshot)?)?;
+        let state = state_without_counters(&snapshot)?;
+        let asked = fs::read_to_string(dir.join(ASKED))
+            .ok()
+            .and_then(|text| text.parse::<u128>().ok())
+            .unwrap_or(0);
+        let now = current_millis();
+        if state != written.0 || asked >= written.1 || now >= written.1 + OLDER_COMMANDS_WAIT_MILLIS
+        {
+            snapshot.updated = now;
+            atomic_write_file(&dir.join("status.json"), &serde_json::to_vec(&snapshot)?)?;
+            written = (state, snapshot.updated);
+        }
         if idle {
             let command_lock = open_lock(&dir.join("command.lock"))?;
             if command_lock.try_lock().is_ok() && read_setting()?.revision == snapshot.revision {
@@ -290,6 +317,29 @@ mod tests {
         assert!(!setting.enabled());
         setting.mode = Action::Mute;
         assert!(setting.enabled());
+    }
+
+    #[test]
+    fn buffer_counters_alone_are_not_a_new_state_to_write() {
+        let snapshot = |buffers, muted_sessions| Snapshot {
+            revision: "auto".into(),
+            mode: Action::Auto,
+            updated: 0,
+            processes: vec![Process {
+                pid: 1,
+                identity: "first".into(),
+                revision: "auto".into(),
+                status: Status {
+                    output_buffers: buffers,
+                    suppressed_buffers: buffers,
+                    muted_sessions,
+                    ..Status::default()
+                },
+            }],
+        };
+        let state = |buffers, muted| state_without_counters(&snapshot(buffers, muted)).unwrap();
+        assert_eq!(state(1, 0), state(9, 0));
+        assert_ne!(state(1, 0), state(1, 1));
     }
 
     #[test]
