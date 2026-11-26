@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use ahash::AHashMap;
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use serde_json::{Map, Value, json};
@@ -23,8 +24,7 @@ use crate::bytecode::{
 };
 use crate::editor::document::is_protected_engine_container;
 use crate::editor::paths::{
-    build_editor_instance_paths, build_editor_instance_paths_for_indices,
-    build_editor_source_paths_by_index, script_file_names,
+    build_editor_instance_paths_for_indices, build_editor_source_paths_by_index, script_file_names,
 };
 use crate::rbx::model::canonicalize_settings_references_for_move;
 use crate::settings::bytecode::property_edit::RetainedPropertyColumns;
@@ -145,34 +145,106 @@ pub(crate) fn rewrite_moved_references(
     changed
 }
 
-struct ReferenceLocation {
-    path_key: String,
-    class_name: String,
-    target: MovedReference,
+enum IndexedLocations {
+    One(usize, usize, u32),
+    Many(Vec<(usize, usize, u32)>),
 }
 
-fn reference_locations_by_id(
-    documents: &BTreeMap<String, SettingsBytecode>,
-) -> HashMap<String, Vec<ReferenceLocation>> {
-    let mut locations = HashMap::<String, Vec<ReferenceLocation>>::new();
-    for (service, document) in documents {
-        let paths = build_editor_instance_paths(document, service);
-        for (instance, path) in document.instances.iter().zip(paths) {
-            let Some(path) = path else {
-                continue;
-            };
+impl IndexedLocations {
+    fn push(&mut self, item: (usize, usize, u32)) {
+        match self {
+            Self::One(s, i, p) => {
+                *self = Self::Many(vec![(*s, *i, *p), item]);
+            }
+            Self::Many(list) => list.push(item),
+        }
+    }
+
+    fn as_slice<'a>(
+        &'a self,
+        single: &'a mut [(usize, usize, u32); 1],
+    ) -> &'a [(usize, usize, u32)] {
+        match self {
+            Self::One(s, i, p) => {
+                single[0] = (*s, *i, *p);
+                &single[..]
+            }
+            Self::Many(list) => list.as_slice(),
+        }
+    }
+}
+
+fn index_document_locations<'a>(
+    docs: &[(&'a str, &'a SettingsBytecode)],
+    intern: &mut AHashMap<(u32, &'a str, usize), u32>,
+    next_id: &mut u32,
+) -> AHashMap<&'a str, IndexedLocations> {
+    let total: usize = docs.iter().map(|(_, doc)| doc.instances.len()).sum();
+    let mut locations = AHashMap::<&'a str, IndexedLocations>::with_capacity(total);
+    let mut name_counts = AHashMap::<&'a str, usize>::new();
+    let mut stack = Vec::<(usize, u32)>::new();
+    for (doc_index, &(service, document)) in docs.iter().enumerate() {
+        let count = document.instances.len();
+        let Some(root_index) = editor_service_root_index(document, service) else {
+            continue;
+        };
+        let mut head = vec![usize::MAX; count];
+        let mut next = vec![usize::MAX; count];
+        for index in (0..count).rev() {
+            if let Some(parent) = document.instances[index].parent_index
+                && parent < count
+            {
+                next[index] = head[parent];
+                head[parent] = index;
+            }
+        }
+        let mut visited = vec![false; count];
+        let root_name = document.instances[root_index].name.as_str();
+        let root_path_id = *intern.entry((0, root_name, 1)).or_insert_with(|| {
+            let id = *next_id;
+            *next_id += 1;
+            id
+        });
+        visited[root_index] = true;
+        stack.clear();
+        stack.push((root_index, root_path_id));
+        while let Some((index, path_id)) = stack.pop() {
+            let id = document.instances[index].settings_id.as_str();
+            let entry = (doc_index, index, path_id);
             locations
-                .entry(instance.settings_id.clone())
-                .or_default()
-                .push(ReferenceLocation {
-                    path_key: instance_path_parts_key(&path.path_segments, &path.path_ordinals),
-                    class_name: instance.class_name.clone(),
-                    target: MovedReference {
-                        settings_id: instance.settings_id.clone(),
-                        path_segments: path.path_segments,
-                        path_ordinals: path.path_ordinals,
-                    },
-                });
+                .entry(id)
+                .and_modify(|existing| existing.push(entry))
+                .or_insert(IndexedLocations::One(doc_index, index, path_id));
+            let first_child = head[index];
+            if first_child == usize::MAX {
+                continue;
+            }
+            let single_child = next[first_child] == usize::MAX;
+            if !single_child {
+                name_counts.clear();
+            }
+            let mut child = first_child;
+            while child != usize::MAX {
+                if !visited[child] {
+                    visited[child] = true;
+                    let name = document.instances[child].name.as_str();
+                    let ordinal = if single_child {
+                        1
+                    } else {
+                        let count = name_counts.entry(name).or_insert(0);
+                        *count += 1;
+                        *count
+                    };
+                    let child_path_id =
+                        *intern.entry((path_id, name, ordinal)).or_insert_with(|| {
+                            let id = *next_id;
+                            *next_id += 1;
+                            id
+                        });
+                    stack.push((child, child_path_id));
+                }
+                child = next[child];
+            }
         }
     }
     locations
@@ -182,33 +254,112 @@ pub(crate) fn moved_references_between_documents(
     before: &BTreeMap<String, SettingsBytecode>,
     after: &BTreeMap<String, SettingsBytecode>,
 ) -> HashMap<String, MovedReference> {
-    let before = reference_locations_by_id(before);
-    let after = reference_locations_by_id(after);
-    let mut moved = HashMap::new();
-    for (settings_id, old_locations) in before {
-        let Some(new_locations) = after.get(&settings_id) else {
+    let _span = crate::app::profile::span("moved references between documents");
+    let before_docs: Vec<(&str, &SettingsBytecode)> = before
+        .iter()
+        .map(|(service, doc)| (service.as_str(), doc))
+        .collect();
+    let after_docs: Vec<(&str, &SettingsBytecode)> = after
+        .iter()
+        .map(|(service, doc)| (service.as_str(), doc))
+        .collect();
+    let total_nodes: usize = before_docs
+        .iter()
+        .map(|(_, doc)| doc.instances.len())
+        .sum::<usize>()
+        .max(after_docs.iter().map(|(_, doc)| doc.instances.len()).sum());
+    let mut intern = AHashMap::<(u32, &str, usize), u32>::with_capacity(total_nodes);
+    let mut next_id = 1_u32;
+    let before_locs = index_document_locations(&before_docs, &mut intern, &mut next_id);
+    let after_locs = index_document_locations(&after_docs, &mut intern, &mut next_id);
+    drop(intern);
+
+    let mut moved_pairs = Vec::<(usize, usize, usize, usize)>::new();
+    let mut old_single = [(0, 0, 0)];
+    let mut new_single = [(0, 0, 0)];
+    for (settings_id, old_entry) in &before_locs {
+        let Some(new_entry) = after_locs.get(settings_id) else {
             continue;
         };
-        let removed = old_locations
-            .iter()
-            .filter(|old| !new_locations.iter().any(|new| new.path_key == old.path_key))
-            .collect::<Vec<_>>();
-        let added = new_locations
-            .iter()
-            .filter(|new| !old_locations.iter().any(|old| old.path_key == new.path_key))
-            .collect::<Vec<_>>();
-        if let ([old], [new]) = (removed.as_slice(), added.as_slice())
-            && old.class_name == new.class_name
+        if let (IndexedLocations::One(bs, bi, bp), IndexedLocations::One(as_, ai, ap)) =
+            (old_entry, new_entry)
         {
-            moved.insert(
-                old.path_key.clone(),
-                MovedReference {
-                    settings_id: new.target.settings_id.clone(),
-                    path_segments: new.target.path_segments.clone(),
-                    path_ordinals: new.target.path_ordinals.clone(),
-                },
-            );
+            if bp != ap
+                && before_docs[*bs].1.instances[*bi].class_name
+                    == after_docs[*as_].1.instances[*ai].class_name
+            {
+                moved_pairs.push((*bs, *bi, *as_, *ai));
+            }
+            continue;
         }
+        let old_slice = old_entry.as_slice(&mut old_single);
+        let new_slice = new_entry.as_slice(&mut new_single);
+        let removed: Vec<_> = old_slice
+            .iter()
+            .copied()
+            .filter(|(_, _, bp)| !new_slice.iter().any(|(_, _, ap)| ap == bp))
+            .collect();
+        let added: Vec<_> = new_slice
+            .iter()
+            .copied()
+            .filter(|(_, _, ap)| !old_slice.iter().any(|(_, _, bp)| bp == ap))
+            .collect();
+        if let ([(bs, bi, _)], [(as_, ai, _)]) = (removed.as_slice(), added.as_slice())
+            && before_docs[*bs].1.instances[*bi].class_name
+                == after_docs[*as_].1.instances[*ai].class_name
+        {
+            moved_pairs.push((*bs, *bi, *as_, *ai));
+        }
+    }
+    if moved_pairs.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut before_indices: Vec<Vec<usize>> = vec![Vec::new(); before_docs.len()];
+    let mut after_indices: Vec<Vec<usize>> = vec![Vec::new(); after_docs.len()];
+    for &(bs, bi, as_, ai) in &moved_pairs {
+        before_indices[bs].push(bi);
+        after_indices[as_].push(ai);
+    }
+    let before_paths: Vec<HashMap<usize, crate::editor::types::EditorInstancePath>> = before_docs
+        .iter()
+        .zip(before_indices)
+        .map(|((service, doc), indices)| {
+            if indices.is_empty() {
+                HashMap::new()
+            } else {
+                build_editor_instance_paths_for_indices(doc, service, &indices)
+            }
+        })
+        .collect();
+    let after_paths: Vec<HashMap<usize, crate::editor::types::EditorInstancePath>> = after_docs
+        .iter()
+        .zip(after_indices)
+        .map(|((service, doc), indices)| {
+            if indices.is_empty() {
+                HashMap::new()
+            } else {
+                build_editor_instance_paths_for_indices(doc, service, &indices)
+            }
+        })
+        .collect();
+
+    let mut moved = HashMap::with_capacity(moved_pairs.len());
+    for (bs, bi, as_, ai) in moved_pairs {
+        let (Some(old_path), Some(new_path)) =
+            (before_paths[bs].get(&bi), after_paths[as_].get(&ai))
+        else {
+            continue;
+        };
+        let old_key = instance_path_parts_key(&old_path.path_segments, &old_path.path_ordinals);
+        moved.insert(
+            old_key,
+            MovedReference {
+                settings_id: after_docs[as_].1.instances[ai].settings_id.clone(),
+                path_segments: new_path.path_segments.clone(),
+                path_ordinals: new_path.path_ordinals.clone(),
+            },
+        );
     }
     moved
 }
@@ -580,4 +731,98 @@ pub(crate) fn move_instance_between_service_stores(
     rayon::spawn(move || drop((read, documents, source_paths_before)));
     log_timing("cross-service move total", move_started);
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::bytecode::{SETTINGS_BINARY_VERSION, SettingsBytecodeInstance};
+
+    fn make_doc(instances: Vec<SettingsBytecodeInstance>) -> SettingsBytecode {
+        SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances,
+        }
+    }
+
+    fn inst(id: &str, name: &str, class: &str, parent: Option<usize>) -> SettingsBytecodeInstance {
+        SettingsBytecodeInstance::new(id.into(), name.into(), class.into(), parent)
+    }
+
+    #[test]
+    fn moved_references_detects_rename_reparent_ordinal_shift_and_cross_service_move() {
+        let mut before = BTreeMap::new();
+        before.insert(
+            "Workspace".to_string(),
+            make_doc(vec![
+                inst("ws", "Workspace", "Workspace", None),
+                inst("a", "FolderA", "Folder", Some(0)),
+                inst("b", "FolderB", "Folder", Some(0)),
+                inst("same1", "Dup", "Part", Some(1)),
+                inst("same2", "Dup", "Part", Some(1)),
+                inst("xmove", "Cross", "Part", Some(1)),
+                inst("cls", "Morph", "Part", Some(1)),
+                inst("dup_id", "Clone", "Part", Some(1)),
+                inst("dup_id", "Clone", "Part", Some(2)),
+            ]),
+        );
+        before.insert(
+            "ServerStorage".to_string(),
+            make_doc(vec![inst("ss", "ServerStorage", "ServerStorage", None)]),
+        );
+
+        let mut after = BTreeMap::new();
+        after.insert(
+            "Workspace".to_string(),
+            make_doc(vec![
+                inst("ws", "Workspace", "Workspace", None),
+                inst("a", "FolderA", "Folder", Some(0)),
+                inst("b", "FolderB", "Folder", Some(0)),
+                // same1 removed so same2 shifts from ordinal 2 to ordinal 1
+                inst("same2", "Dup", "Part", Some(1)),
+                // cls changed class, must not be reported as moved
+                inst("cls", "MorphRenamed", "Model", Some(1)),
+                // one of two duplicate settings_ids moved
+                inst("dup_id", "Clone", "Part", Some(1)),
+                inst("dup_id", "CloneMoved", "Part", Some(2)),
+            ]),
+        );
+        after.insert(
+            "ServerStorage".to_string(),
+            make_doc(vec![
+                inst("ss", "ServerStorage", "ServerStorage", None),
+                inst("xmove", "Cross", "Part", Some(0)),
+            ]),
+        );
+
+        let moved = moved_references_between_documents(&before, &after);
+        assert_eq!(moved.len(), 3);
+
+        let ord_key = instance_path_parts_key(
+            &["Workspace".into(), "FolderA".into(), "Dup".into()],
+            &[1, 1, 2],
+        );
+        assert_eq!(moved[&ord_key].settings_id, "same2");
+        assert_eq!(moved[&ord_key].path_ordinals, vec![1, 1, 1]);
+
+        let cross_key = instance_path_parts_key(
+            &["Workspace".into(), "FolderA".into(), "Cross".into()],
+            &[1, 1, 1],
+        );
+        assert_eq!(moved[&cross_key].settings_id, "xmove");
+        assert_eq!(
+            moved[&cross_key].path_segments,
+            vec!["ServerStorage", "Cross"]
+        );
+
+        let dup_key = instance_path_parts_key(
+            &["Workspace".into(), "FolderB".into(), "Clone".into()],
+            &[1, 1, 1],
+        );
+        assert_eq!(moved[&dup_key].settings_id, "dup_id");
+        assert_eq!(
+            moved[&dup_key].path_segments,
+            vec!["Workspace", "FolderB", "CloneMoved"]
+        );
+    }
 }
