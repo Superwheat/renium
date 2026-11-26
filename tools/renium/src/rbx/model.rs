@@ -2319,10 +2319,10 @@ pub(crate) fn prepare_rbx_place<'a>(
                     .par_iter()
                     .map(|&block_index| {
                         let _span = crate::app::profile::span("place raw block conversion");
-                        let build_result: Result<ServiceBuild> = store
+                        let build_result: Result<Vec<ServiceBuild>> = store
                             .visit_block_raw(block_index, |first, row_props, row_attrs| {
-                                Ok((|| -> Result<ServiceBuild> {
-                                    let mut instances = Vec::with_capacity(row_props.len());
+                                let convert_slice = |range: std::ops::Range<usize>| -> Result<ServiceBuild> {
+                                    let mut instances = Vec::with_capacity(range.len());
                                     let mut kept_rows = Vec::new();
                                     let mut omitted_properties_by_ref = HashMap::new();
                                     let mut omitted_properties_by_class = HashMap::new();
@@ -2337,7 +2337,7 @@ pub(crate) fn prepare_rbx_place<'a>(
                                         &mut metadata,
                                         &refs,
                                     );
-                                    for local in 0..row_props.len() {
+                                    for local in range {
                                         let index = first + local;
                                         let Some(&referent) = refs.by_index.get(&index) else {
                                             continue;
@@ -2479,7 +2479,20 @@ pub(crate) fn prepare_rbx_place<'a>(
                                         logical_properties_by_ref,
                                         unresolved_reference_properties_by_ref,
                                     })
-                                })())
+                                };
+                                const RAW_SUB_CHUNK: usize = 1024;
+                                if row_props.len() <= RAW_SUB_CHUNK {
+                                    Ok(convert_slice(0..row_props.len()).map(|b| vec![b]))
+                                } else {
+                                    let ranges: Vec<_> = (0..row_props.len())
+                                        .step_by(RAW_SUB_CHUNK)
+                                        .map(|s| s..(s + RAW_SUB_CHUNK).min(row_props.len()))
+                                        .collect();
+                                    Ok(ranges
+                                        .into_par_iter()
+                                        .map(convert_slice)
+                                        .collect::<Result<Vec<_>>>())
+                                }
                             })
                             .with_context(|| {
                                 format!(
@@ -2489,7 +2502,9 @@ pub(crate) fn prepare_rbx_place<'a>(
                         build_result
                     })
                     .collect::<Result<Vec<_>>>()?;
-                service_chunks.extend(batch_results);
+                for chunks in batch_results {
+                    service_chunks.extend(chunks);
+                }
             }
         } else if let Some(columns) = columns.as_mut() {
             let read = |columns: &mut crate::settings::bytecode::property_edit::RetainedRowColumns, start: usize| {

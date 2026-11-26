@@ -942,12 +942,61 @@ pub(crate) fn import_property_omissions(
     omitted
 }
 
+type NativeImportEncodeOutput = anyhow::Result<(Vec<u8>, EditorNativeReplacement, usize)>;
+
+pub(crate) struct PendingNativeImportEncode {
+    handle: std::sync::Mutex<Option<std::thread::JoinHandle<NativeImportEncodeOutput>>>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PendingNativeImportEncode {
+    pub(crate) fn new(
+        handle: std::thread::JoinHandle<NativeImportEncodeOutput>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            handle: std::sync::Mutex::new(Some(handle)),
+            cancelled,
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> NativeImportEncodeOutput {
+        let Some(handle) = self
+            .handle
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            anyhow::bail!("Native import payload encoder already finished");
+        };
+        handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("Native import payload encoder panicked"))?
+    }
+}
+
+impl Drop for PendingNativeImportEncode {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self
+            .handle
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
 pub(crate) struct EditorBinaryImport {
     /// Host-only decoded rows. The explicit wire payload never includes them.
     pub(crate) kept_rows: HashMap<String, crate::rbx::import_rows::KeptImportRows>,
     pub(crate) bytes: Vec<u8>,
     pub(crate) groups: Vec<EditorBinaryImportGroup>,
     pub(crate) native_replacement: Option<EditorNativeReplacement>,
+    pub(crate) pending_encode: Option<PendingNativeImportEncode>,
     /// Why this plan uses Studio's plugin deserializer instead of the service reader.
     pub(crate) fallback_reason: Option<ServiceReaderFallback>,
     pub(crate) instance_count: usize,
@@ -1008,8 +1057,23 @@ pub(crate) struct EditorNativeBinding {
 }
 
 impl EditorBinaryImport {
+    pub(crate) fn is_native_replacement(&self) -> bool {
+        self.native_replacement.is_some() || self.pending_encode.is_some()
+    }
+
+    pub(crate) fn finish_encode(&mut self) -> anyhow::Result<()> {
+        let Some(pending) = self.pending_encode.take() else {
+            return Ok(());
+        };
+        let (bytes, replacement, instance_count) = pending.finish()?;
+        self.bytes = bytes;
+        self.native_replacement = Some(replacement);
+        self.instance_count = instance_count;
+        Ok(())
+    }
+
     pub(crate) fn carries_container_settings(&self, service: &str, segments: &[String]) -> bool {
-        self.native_replacement.is_some()
+        self.is_native_replacement()
             && self.groups.iter().any(|group| {
                 !group.additive && group.service == service && group.target_path == segments
             })

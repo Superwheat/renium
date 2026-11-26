@@ -89,18 +89,37 @@ pub(crate) fn register_history(pid: u32, title: &str, token: &str) -> Result<()>
         "Name",
         Duration::from_secs(3),
     )?;
-    prepared.memory.authorize(NativeOperation::History, title)?;
+    register_history_prepared(&mut prepared, pid, title, token)
+}
+
+pub(super) fn register_history_prepared(
+    prepared: &mut NativeProperty,
+    pid: u32,
+    title: &str,
+    token: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        !token.is_empty() && token.len() <= 256,
+        "Invalid Studio recording token"
+    );
+    prepared
+        .memory
+        .authorize(NativeOperation::History, title)
+        .map_err(|error| {
+            crate::studio::native::serializer::HistoryHookUnavailable(format!("{error:#}"))
+        })?;
     prepared.invoke(6)?;
     let mut binding = prepared.parameters[96..176].to_vec();
     if binding.iter().all(|byte| *byte == 0) {
-        binding = history::binding(&prepared, pid, title).map_err(|error| {
+        binding = history::binding(prepared, pid, title).map_err(|error| {
             crate::studio::native::serializer::HistoryHookUnavailable(format!("{error:#}"))
         })?;
     }
     binding.extend_from_slice(token.as_bytes());
     put_u32(&mut prepared.parameters, 65916, binding.len() as u32);
     prepared.parameters[INPUT..INPUT + binding.len()].copy_from_slice(&binding);
-    prepared.invoke(6)
+    prepared.invoke(6)?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1373,14 +1392,14 @@ pub(super) fn reflection_functions(
     let mut candidates = Vec::new();
     let methods = vtable_methods(memory, studio, layout, vtable)?;
     for slot in 0..methods.len().saturating_sub(2) {
-        let capability = memory.read_u64(vtable + slot * 8)? as usize;
+        let capability = methods[slot];
         let Ok(code) = verified_code(memory, studio, layout, capability, 8) else {
             continue;
         };
         if !true_return(&code) {
             continue;
         }
-        let getter = memory.read_u64(vtable + (slot + 1) * 8)? as usize;
+        let getter = methods[slot + 1];
         let code = verified_code(memory, studio, layout, getter, 256)?;
         let Some((binding_offset, getter_slot)) = getter_call(&code, &offsets, GetterAbi::Text)
         else {
@@ -1394,7 +1413,7 @@ pub(super) fn reflection_functions(
         let binding_vtable = memory.read_u64(binding)? as usize;
         let bound_getter = memory.read_u64(binding_vtable + getter_slot)? as usize;
         verified_code(memory, studio, layout, bound_getter, 64)?;
-        let setter = memory.read_u64(vtable + (slot + 2) * 8)? as usize;
+        let setter = methods[slot + 2];
         let setter_code = verified_code(memory, studio, layout, setter, 512)?;
         let setter_supported = setter_call(&setter_code, &offsets)
             .is_some_and(|(field, slot)| field == binding_offset && slot.is_multiple_of(8));

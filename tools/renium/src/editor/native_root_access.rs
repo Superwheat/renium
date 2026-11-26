@@ -59,16 +59,16 @@ impl Property {
             Self::Test { state, .. } => Ok(state.borrow().value.clone()),
         }
     }
-    pub(super) fn write(&mut self, value: &str) -> Result<()> {
+    pub(super) fn write(&mut self, value: &str) -> Result<String> {
         match self {
             #[cfg(any(windows, target_os = "macos"))]
-            Self::Engine(property) => property.write(value).map(|_| ()),
+            Self::Engine(property) => property.write(value),
             #[cfg(test)]
             Self::Test { state, .. } => {
                 let mut state = state.borrow_mut();
                 state.writes += 1;
                 state.value = value.into();
-                Ok(())
+                Ok(state.value.clone())
             }
         }
     }

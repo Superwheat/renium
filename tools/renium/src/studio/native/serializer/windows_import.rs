@@ -297,7 +297,6 @@ pub(crate) fn read_service_payload(
     for batch in &replacement.batches {
         parameters.extend_from_slice(&(batch.bytes.len() as u64).to_le_bytes());
     }
-    parameters.extend_from_slice(bytes);
     for (offset, value) in [
         (0, instance),
         (8, model.owner),
@@ -379,8 +378,9 @@ pub(crate) fn read_service_payload(
         1436,
         u32::from(crate::app::profile::enabled()),
     );
-    let remote = memory.allocate(parameters.len())?;
+    let remote = memory.allocate(parameters.len() + bytes.len())?;
     memory.write(remote.address, &parameters)?;
+    memory.write(remote.address + parameters.len(), bytes)?;
     let helper_started = Instant::now();
     drop(prepare_profile);
     let helper_profile = crate::app::profile::span("native import helper round trip");

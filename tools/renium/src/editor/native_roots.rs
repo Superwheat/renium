@@ -894,13 +894,33 @@ fn apply_write(
         "Terrain transfer has no grids"
     );
     let mut terrain = if is_terrain {
-        Some(access::prepare_terrain(
+        #[cfg(windows)]
+        let terrain = if let Some(properties) = &mut prepared.properties {
+            properties
+                .prepare_terrain(
+                    position.context("Native target is missing from its batch; retry the push")?,
+                    title,
+                    std::time::Duration::from_secs(3),
+                )
+                .map(access::Terrain::Engine)?
+        } else {
+            access::prepare_terrain(
+                pid,
+                title,
+                &path_segments,
+                &path_ordinals,
+                std::time::Duration::from_secs(3),
+            )?
+        };
+        #[cfg(not(windows))]
+        let terrain = access::prepare_terrain(
             pid,
             title,
             &path_segments,
             &path_ordinals,
             std::time::Duration::from_secs(3),
-        )?)
+        )?;
+        Some(terrain)
     } else {
         None
     };
@@ -988,6 +1008,13 @@ fn apply_write(
             .as_str()
             .context("Studio omitted the native write recording")?;
         // A native import can start a new recording after its insertion phase.
+        #[cfg(windows)]
+        if let Some(properties) = &mut prepared.properties {
+            properties.register_history_token(pid, title, token, is_terrain)?;
+        } else {
+            access::register_history(pid, title, token, is_terrain)?;
+        }
+        #[cfg(not(windows))]
         access::register_history(pid, title, token, is_terrain)?;
         if let Some(terrain) = &mut terrain {
             terrain.expect(
@@ -1128,9 +1155,9 @@ fn write_native_property(
         return Ok(());
     }
     *changed = true;
-    property.write(text)?;
+    let actual = property.write(text)?;
     ensure!(
-        property_text_matches(&write.class_name, property_name, text, &property.read()?),
+        property_text_matches(&write.class_name, property_name, text, &actual),
         "Studio did not retain {}.{} before commit",
         write.path_segments.join("."),
         write.name,

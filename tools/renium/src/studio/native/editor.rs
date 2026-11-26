@@ -3070,7 +3070,7 @@ fn convert_native_service_output(
     let (instances, native_properties_by_instance): (
         Vec<SnapshotInstance>,
         Vec<Vec<NativeSettingsProperty>>,
-    ) = if native_instances.len() < 1024 {
+    ) = if native_instances.len() < 4096 {
         let mut local = shared_values.local();
         let mut instances = Vec::with_capacity(native_instances.len());
         let mut native_properties_by_instance = Vec::with_capacity(native_instances.len());
@@ -5386,7 +5386,7 @@ pub(crate) struct EditorBatchResult {
 pub(crate) fn send_editor_change_batches(
     bridge: &BridgeServer,
     changes: &EditorChangeSet,
-    binary_import: Option<&EditorBinaryImport>,
+    binary_import: Option<&mut EditorBinaryImport>,
     transaction_id: Option<&str>,
 ) -> Result<EditorBatchResult> {
     send_editor_change_batches_with_options(
@@ -5402,7 +5402,7 @@ pub(crate) fn send_editor_change_batches(
 pub(crate) fn send_editor_change_batches_with_options(
     bridge: &BridgeServer,
     changes: &EditorChangeSet,
-    binary_import: Option<&EditorBinaryImport>,
+    mut binary_import: Option<&mut EditorBinaryImport>,
     transaction_id: Option<&str>,
     inline_commit: bool,
     inline_release: Option<&Value>,
@@ -5447,7 +5447,9 @@ pub(crate) fn send_editor_change_batches_with_options(
     // Material mode changes Terrain's default colors. Lighting changes rebuild
     // the rendered scene: set them before populating it. These retained fields
     // are excluded from the binary payload and use the ordinary undo fences.
-    let native_import = binary_import.is_some_and(|import| import.native_replacement.is_some());
+    let native_import = binary_import
+        .as_deref()
+        .is_some_and(EditorBinaryImport::is_native_replacement);
     let pre_import_changes = changes
         .property_changes
         .iter()
@@ -5483,7 +5485,7 @@ pub(crate) fn send_editor_change_batches_with_options(
     }
 
     let property_changes =
-        collect_post_import_property_changes(changes, binary_import, native_import);
+        collect_post_import_property_changes(changes, binary_import.as_deref(), native_import);
     let mut payload_verified_services = std::collections::BTreeSet::new();
     let mut inline_property_summary = None;
     let mut inline_verify_summary = None;
@@ -5491,7 +5493,8 @@ pub(crate) fn send_editor_change_batches_with_options(
     let mut inline_post_import_sources = None;
     let mut inline_verify_rows_kept = None;
     let mut inline_verify_rows_sent = false;
-    if let Some(binary_import) = binary_import {
+    if let Some(binary_import) = binary_import.as_deref_mut() {
+        binary_import.finish_encode()?;
         let transaction_id =
             transaction_id.context("Native editor import requires an active transaction")?;
         let container_settings = container_setting_rows(changes, binary_import);
@@ -5583,7 +5586,7 @@ pub(crate) fn send_editor_change_batches_with_options(
         verify_in_place_editor_fields(
             bridge,
             changes,
-            binary_import,
+            binary_import.as_deref(),
             transaction_id,
             &native_root_verification,
             &std::collections::BTreeSet::new(),
@@ -5599,7 +5602,7 @@ pub(crate) fn send_editor_change_batches_with_options(
     }
 
     for instance_change in changes.instance_changes.iter().filter_map(|change| {
-        let Some(import) = binary_import else {
+        let Some(import) = binary_import.as_deref() else {
             return Some(std::borrow::Cow::Borrowed(change));
         };
         if import.imports_service(&change.service) {
@@ -5741,7 +5744,7 @@ pub(crate) fn send_editor_change_batches_with_options(
         .source_changes
         .iter()
         .filter(|change| {
-            !binary_import.is_some_and(|import| {
+            !binary_import.as_deref().is_some_and(|import| {
                 import.imports_path(
                     &change.service,
                     &change.path_segments,
@@ -5790,7 +5793,9 @@ pub(crate) fn send_editor_change_batches_with_options(
     let reusable_inline_verify = post_writes.select_inline_verify_summary(
         inline_verify_summary.as_ref(),
         inline_verify_rows_sent,
-        binary_import.is_some_and(|import| import.native_replacement.is_some()),
+        binary_import
+            .as_deref()
+            .is_some_and(|import| import.native_replacement.is_some()),
     );
     #[cfg(any(windows, target_os = "macos"))]
     let pre_verified_unreadable = if let (Some(verify_rows), Some(verify_summary)) =
@@ -5852,7 +5857,7 @@ pub(crate) fn send_editor_change_batches_with_options(
         send_property_batches(bridge, &ordinary_rows, transaction_id, &mut summary)?;
         log_timing("native editor property batches after mesh writes", started);
     }
-    if let Some(import) = binary_import.filter(|import| {
+    if let Some(import) = binary_import.as_deref().filter(|import| {
         import.native_replacement.is_some() || !payload_verified_services.is_empty()
     }) {
         let started = Instant::now();
@@ -5933,7 +5938,7 @@ pub(crate) fn send_editor_change_batches_with_options(
     verify_in_place_editor_fields(
         bridge,
         changes,
-        binary_import,
+        binary_import.as_deref(),
         transaction_id,
         &native_root_verification,
         &bulk_verified_services,
@@ -7257,6 +7262,7 @@ mod source_change_tests {
                 },
                 batches: vec![],
             }),
+            pending_encode: None,
             instance_count: 0,
             post_apply_properties_by_class: Default::default(),
             post_apply_properties_by_path: Default::default(),

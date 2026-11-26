@@ -1215,14 +1215,15 @@ fn check_additive_source_layout(
             })
             .collect();
         clear_import_engine_identities(&mut build.dom);
-        let (bytes, groups, _) = payload::encode_services(
-            &mut build.dom,
-            &build.service_roots,
+        let (groups, pending) = payload::encode_services(
+            build.dom,
+            build.service_roots,
             &build.settings_ids_by_ref,
             groups,
             plans,
             &mut HashMap::new(),
         )?;
+        let (bytes, _, _) = pending.finish()?;
         let actual = (bytes, serde_json::to_value(groups)?);
         assert_eq!(&actual, expected.get_or_insert_with(|| actual.clone()));
     }

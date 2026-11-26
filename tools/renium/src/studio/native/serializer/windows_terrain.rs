@@ -95,6 +95,27 @@ pub(crate) struct NativeTerrain {
     bindings: Vec<u8>,
 }
 
+pub(super) fn from_prepared(
+    property: NativeProperty,
+    studio: &ModuleEntry,
+    layout: &PackageLayout,
+    model: &ActiveDataModel,
+    title: &str,
+) -> Result<NativeTerrain> {
+    anyhow::ensure!(
+        property.class_name == "Terrain",
+        "Native voxel target is not Terrain"
+    );
+    property.memory.authorize(NativeOperation::Terrain, title)?;
+    let instance = read_u64(&property.parameters, 16)? as usize;
+    let output = terrain_bindings(&property.memory, studio, layout, model, instance)?;
+    Ok(NativeTerrain {
+        fingerprint: [0; 64],
+        property,
+        bindings: output,
+    })
+}
+
 pub(crate) fn prepare_terrain(
     pid: u32,
     title: &str,
@@ -102,26 +123,17 @@ pub(crate) fn prepare_terrain(
     ordinals: &[usize],
     timeout: Duration,
 ) -> Result<NativeTerrain> {
-    let property = prepare_property(pid, title, path, ordinals, "Name", timeout)?;
-    anyhow::ensure!(
-        property.class_name == "Terrain",
-        "Native voxel target is not Terrain"
-    );
-    let current_modules = modules(pid)?;
-    let studio = current_modules
-        .iter()
-        .find(|m| m.name.eq_ignore_ascii_case("RobloxStudioBeta.exe"))
-        .context("Missing Studio")?;
-    let layout = package_layout(&studio.path)?;
-    let model = active_data_model(pid, &property.memory, studio, layout.data, title)?;
-    property.memory.authorize(NativeOperation::Terrain, title)?;
-    let instance = read_u64(&property.parameters, 16)? as usize;
-    let output = terrain_bindings(&property.memory, studio, &layout, &model, instance)?;
-    Ok(NativeTerrain {
-        fingerprint: [0; 64],
-        property,
-        bindings: output,
-    })
+    let mut batch = NativePropertyBatch::new(
+        pid,
+        title,
+        &[NativePropertyPath {
+            segments: path,
+            ordinals,
+        }],
+        timeout,
+        None,
+    )?;
+    batch.prepare_terrain(0, title, timeout)
 }
 
 fn terrain_bindings(

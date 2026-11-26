@@ -4506,9 +4506,9 @@ fn native_import_settlement_keeps_checked_values_and_rejects_failed_captures() -
         },
     )]);
     let (failures, _) = verify_and_settle_native_import(
-        &before_snapshot,
-        &desired_snapshot,
+        (&before_snapshot, &desired_snapshot),
         &mut readback,
+        &mut PredecodedStores::default(),
         &paths,
         &mut prepared,
         None,
@@ -4537,9 +4537,9 @@ fn native_import_settlement_keeps_checked_values_and_rejects_failed_captures() -
     let mut rejected = snapshot(&observed)?;
     let original = rejected.clone();
     let (failures, _) = verify_and_settle_native_import(
-        &before_snapshot,
-        &desired_snapshot,
+        (&before_snapshot, &desired_snapshot),
         &mut rejected,
+        &mut PredecodedStores::default(),
         &paths,
         &mut HashMap::new(),
         None,

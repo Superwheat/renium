@@ -2021,6 +2021,101 @@ pub(crate) fn encode_settings_bytecode_over(
     blocks::encode_document(document, !dense, previous)
 }
 
+const MAX_DEFERRED_SETTINGS_INSTANCES: usize = 32_768;
+static ACTIVE_DEFERRED_SETTINGS_DROPS: AtomicUsize = AtomicUsize::new(0);
+static DEFERRED_SETTINGS_INSTANCES: AtomicUsize = AtomicUsize::new(0);
+static DEFERRED_SETTINGS_DROPS: OnceLock<Mutex<Vec<SettingsBytecode>>> = OnceLock::new();
+
+pub(crate) struct DeferredSettingsDropGuard;
+
+impl DeferredSettingsDropGuard {
+    pub(crate) fn enter() -> Self {
+        ACTIVE_DEFERRED_SETTINGS_DROPS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for DeferredSettingsDropGuard {
+    fn drop(&mut self) {
+        if ACTIVE_DEFERRED_SETTINGS_DROPS.fetch_sub(1, Ordering::AcqRel) == 1 {
+            DEFERRED_SETTINGS_INSTANCES.store(0, Ordering::Release);
+            let docs = std::mem::take(
+                &mut *DEFERRED_SETTINGS_DROPS
+                    .get_or_init(|| Mutex::new(Vec::new()))
+                    .lock_recover(),
+            );
+            if !docs.is_empty() {
+                let _ = std::thread::Builder::new()
+                    .name("renium-drop-settings".into())
+                    .spawn(move || {
+                        for doc in docs {
+                            crate::settings::equivalence::drop_settings_document(doc);
+                        }
+                    });
+            }
+        }
+    }
+}
+
+pub(crate) fn defer_drop_settings_document(document: SettingsBytecode) {
+    let len = document.instances.len();
+    if len == 0 {
+        return;
+    }
+    if ACTIVE_DEFERRED_SETTINGS_DROPS.load(Ordering::Acquire) > 0 {
+        let mut queue = DEFERRED_SETTINGS_DROPS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock_recover();
+        let current = DEFERRED_SETTINGS_INSTANCES.load(Ordering::Acquire);
+        if current.saturating_add(len) <= MAX_DEFERRED_SETTINGS_INSTANCES {
+            DEFERRED_SETTINGS_INSTANCES.store(current + len, Ordering::Release);
+            queue.push(document);
+            return;
+        }
+    }
+    crate::settings::equivalence::drop_settings_document(document);
+}
+
+pub(crate) fn encode_settings_bytecode_owned_over(
+    mut document: SettingsBytecode,
+    dense: bool,
+    previous: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let _span = crate::app::profile::span("store encode");
+    settle_settings_document_in_place(&mut document)?;
+    let bytes = blocks::encode_settled_document(&document, !dense, previous)?;
+    defer_drop_settings_document(document);
+    Ok(bytes)
+}
+
+fn settle_settings_document_in_place(document: &mut SettingsBytecode) -> Result<()> {
+    validate_settings_hierarchy(&document.instances)?;
+    validate_settings_record_properties(&document.instances)?;
+    if document
+        .instances
+        .iter()
+        .any(|instance| crate::settings::held::stands_unchanged(&instance.properties))
+    {
+        bail!("A document whose instances stand for unchanged counterparts is not written");
+    }
+    let settle_one = |instance: &mut SettingsBytecodeInstance| {
+        for value in instance.attributes.values_mut() {
+            if let Some(canonical) = canonical_attribute_value(value) {
+                *value = canonical;
+            }
+        }
+        if crate::settings::equivalence::forced_property_differs(&instance.properties) {
+            crate::settings::equivalence::settle_forced_properties(&mut instance.properties);
+        }
+    };
+    if document.instances.len() >= 1024 {
+        document.instances.par_iter_mut().for_each(settle_one);
+    } else {
+        document.instances.iter_mut().for_each(settle_one);
+    }
+    Ok(())
+}
+
 /// The v11 encoder, which the tests keep to write the stores every reader
 /// still reads.
 #[cfg(test)]
@@ -2050,36 +2145,43 @@ fn settled_settings_document(document: &SettingsBytecode) -> Result<Cow<'_, Sett
 /// instance record, which a store keeps only in the record, and an object
 /// named Attributes, which a store reads back as the instance's attributes.
 fn validate_settings_record_properties(instances: &[SettingsBytecodeInstance]) -> Result<()> {
-    let lookup = SettingsBinaryInstanceLookup::default();
-    for instance in instances {
-        let held = |name: &str| {
-            instance
-                .properties
-                .get(name)
-                .filter(|value| !value.is_null())
-        };
-        if let Some(field) = SETTINGS_RECORD_FIELDS
-            .into_iter()
-            .find(|field| held(field).is_some())
-        {
-            bail!(
-                "Instance {} ({}) holds a {field} property; a store keeps the instance's {field} in its record",
-                instance.settings_id,
-                instance.name
-            );
+    let check_chunk = |chunk: &[SettingsBytecodeInstance]| -> Result<()> {
+        let lookup = SettingsBinaryInstanceLookup::default();
+        for instance in chunk {
+            let held = |name: &str| {
+                instance
+                    .properties
+                    .get(name)
+                    .filter(|value| !value.is_null())
+            };
+            if let Some(field) = SETTINGS_RECORD_FIELDS
+                .into_iter()
+                .find(|field| held(field).is_some())
+            {
+                bail!(
+                    "Instance {} ({}) holds a {field} property; a store keeps the instance's {field} in its record",
+                    instance.settings_id,
+                    instance.name
+                );
+            }
+            if held("Attributes").is_some_and(|value| {
+                ref_payload_object(value).is_none()
+                    && matches!(binary_raw_value_kind(value, &lookup), Ok(8))
+            }) {
+                bail!(
+                    "Instance {} ({}) holds an object property named Attributes, which a store reads back as its attributes; set them as attributes",
+                    instance.settings_id,
+                    instance.name
+                );
+            }
         }
-        if held("Attributes").is_some_and(|value| {
-            ref_payload_object(value).is_none()
-                && matches!(binary_raw_value_kind(value, &lookup), Ok(8))
-        }) {
-            bail!(
-                "Instance {} ({}) holds an object property named Attributes, which a store reads back as its attributes; set them as attributes",
-                instance.settings_id,
-                instance.name
-            );
-        }
+        Ok(())
+    };
+    if instances.len() >= 1024 {
+        instances.par_chunks(1024).try_for_each(check_chunk)
+    } else {
+        check_chunk(instances)
     }
-    Ok(())
 }
 
 fn validate_settings_hierarchy(instances: &[SettingsBytecodeInstance]) -> Result<()> {
@@ -2383,7 +2485,6 @@ fn compress_store_payload(payload: &[u8], workers: u32) -> Result<Vec<u8>> {
 /// Initialized once per Rayon worker via `map_init` and dropped when encoding finishes.
 pub(super) struct FrameCodec {
     small_cctx: Option<zstd::bulk::Compressor<'static>>,
-    large_cctx: Option<zstd::zstd_safe::CCtx<'static>>,
     dctx: Option<zstd::bulk::Decompressor<'static>>,
     piece: Vec<u8>,
     pub(super) body_scratch: Vec<u8>,
@@ -2393,7 +2494,6 @@ impl FrameCodec {
     pub(super) fn new() -> Self {
         Self {
             small_cctx: None,
-            large_cctx: None,
             dctx: None,
             piece: Vec::new(),
             body_scratch: Vec::new(),
@@ -2401,63 +2501,24 @@ impl FrameCodec {
     }
 
     pub(super) fn compress_frame(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
-        use zstd::zstd_safe::{
-            CCtx, CParameter, InBuffer, OutBuffer, ResetDirective, zstd_sys::ZSTD_EndDirective,
-        };
-        if payload.len() < LARGE_STORE_PAYLOAD_BYTES {
-            let compressor = match self.small_cctx.as_mut() {
-                Some(compressor) => compressor,
-                None => {
-                    let mut compressor = zstd::bulk::Compressor::new(STORE_COMPRESSION_LEVEL)?;
-                    compressor.set_parameter(CParameter::ChecksumFlag(true))?;
-                    self.small_cctx.insert(compressor)
-                }
-            };
-            let bound = zstd::zstd_safe::compress_bound(payload.len());
-            if self.piece.len() < bound {
-                self.piece.resize(bound, 0);
-            }
-            let written = compressor.compress_to_buffer(payload, &mut self.piece[..bound])?;
-            return Ok(self.piece[..written].to_vec());
+        use zstd::zstd_safe::CParameter;
+        if payload.len() >= LARGE_STORE_PAYLOAD_BYTES {
+            return compress_store_frame(payload, 1, true);
         }
-        let failed = |code| anyhow::anyhow!("{}", zstd::zstd_safe::get_error_name(code));
-        let context = match self.large_cctx.as_mut() {
-            Some(context) => {
-                context.reset(ResetDirective::SessionOnly).map_err(failed)?;
-                context
-            }
+        let compressor = match self.small_cctx.as_mut() {
+            Some(compressor) => compressor,
             None => {
-                let mut context = CCtx::create();
-                for parameter in [
-                    CParameter::CompressionLevel(STORE_COMPRESSION_LEVEL),
-                    CParameter::EnableLongDistanceMatching(true),
-                    CParameter::WindowLog(STORE_WINDOW_LOG),
-                    CParameter::NbWorkers(1),
-                    CParameter::ChecksumFlag(true),
-                ] {
-                    context.set_parameter(parameter).map_err(failed)?;
-                }
-                self.large_cctx.insert(context)
+                let mut compressor = zstd::bulk::Compressor::new(STORE_COMPRESSION_LEVEL)?;
+                compressor.set_parameter(CParameter::ChecksumFlag(true))?;
+                self.small_cctx.insert(compressor)
             }
         };
-        context
-            .set_pledged_src_size(Some(payload.len() as u64))
-            .map_err(failed)?;
-        let mut input = InBuffer::around(payload);
-        if self.piece.len() < (1 << 20) {
-            self.piece.resize(1 << 20, 0);
+        let bound = zstd::zstd_safe::compress_bound(payload.len());
+        if self.piece.len() < bound {
+            self.piece.resize(bound, 0);
         }
-        let mut compressed = Vec::with_capacity(payload.len() / 4);
-        loop {
-            let mut output = OutBuffer::around(&mut self.piece[..1 << 20]);
-            let left = context
-                .compress_stream2(&mut output, &mut input, ZSTD_EndDirective::ZSTD_e_end)
-                .map_err(failed)?;
-            compressed.extend_from_slice(output.as_slice());
-            if left == 0 {
-                return Ok(compressed);
-            }
-        }
+        let written = compressor.compress_to_buffer(payload, &mut self.piece[..bound])?;
+        Ok(self.piece[..written].to_vec())
     }
 
     pub(super) fn decompress_exact(&mut self, bytes: &[u8], decoded: usize) -> Result<Vec<u8>> {
@@ -7772,6 +7833,67 @@ mod tests {
             let actual = codec.compress_frame(payload).unwrap();
             assert_eq!(actual, expected, "payload len {}", payload.len());
         }
+    }
+
+    #[test]
+    fn encode_settings_bytecode_owned_over_and_reused_frame_codec_match_fresh_encode() {
+        let long_kept = "k".repeat(blocks::POOL_MIN_BYTES + 64);
+        let long_changed_a = "a".repeat(blocks::POOL_MIN_BYTES + 128);
+        let long_changed_b = "b".repeat(blocks::POOL_MIN_BYTES + 128);
+        let make_doc = |changed_long: &str, changed_transparency: f64| {
+            let total = blocks::BLOCK_ROWS * 2 + 25;
+            let mut instances = Vec::with_capacity(total);
+            instances.push(SettingsBytecodeInstance::new(
+                "ws".into(),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            ));
+            for i in 1..total {
+                let mut inst = SettingsBytecodeInstance::new(
+                    format!("id-{i:05}"),
+                    format!("Part{i:05}"),
+                    "Part".into(),
+                    Some(0),
+                );
+                inst.properties.insert(
+                    "Transparency".into(),
+                    json!(if i == blocks::BLOCK_ROWS + 3 {
+                        changed_transparency
+                    } else {
+                        0.0
+                    }),
+                );
+                if i == 5 || i == blocks::BLOCK_ROWS * 2 + 5 {
+                    inst.attributes.insert("Kept".into(), json!(long_kept));
+                }
+                if i == blocks::BLOCK_ROWS + 3 {
+                    inst.attributes
+                        .insert("Changed".into(), json!(changed_long));
+                    inst.properties.insert(
+                        "PrimaryPart".into(),
+                        json!({"_type": "Ref", "instanceIndex": 2}),
+                    );
+                }
+                instances.push(inst);
+            }
+            SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances,
+            }
+        };
+        let prev_doc = make_doc(&long_changed_a, 0.25);
+        let next_doc = make_doc(&long_changed_b, 0.75);
+        let prev_bytes = encode_settings_bytecode(&prev_doc).unwrap();
+        let fresh = encode_settings_bytecode(&next_doc).unwrap();
+        let over = encode_settings_bytecode_over(&next_doc, false, Some(&prev_bytes)).unwrap();
+        let owned_over =
+            encode_settings_bytecode_owned_over(next_doc.clone(), false, Some(&prev_bytes))
+                .unwrap();
+        let owned_fresh = encode_settings_bytecode_owned_over(next_doc, false, None).unwrap();
+        assert_eq!(over, fresh);
+        assert_eq!(owned_over, fresh);
+        assert_eq!(owned_fresh, fresh);
     }
 }
 

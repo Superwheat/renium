@@ -3593,26 +3593,14 @@ fn build_editor_binary_import_for_services(
     drop(identities);
     let fallback_reason = service_import_fallback(&package_plans, fallback_reason);
     if fallback_reason.is_none() {
-        let (bytes, groups, native_replacement) = payload::encode_services(
-            &mut build.dom,
-            &build.service_roots,
+        let (groups, pending_encode) = payload::encode_services(
+            build.dom,
+            build.service_roots,
             &build.settings_ids_by_ref,
             pending_groups,
             package_plans,
             &mut post_apply_properties_by_path,
         )?;
-        let instance_count = native_replacement
-            .batches
-            .iter()
-            .map(|batch| {
-                u32::from_le_bytes(
-                    bytes[batch.bytes.start + 20..batch.bytes.start + 24]
-                        .try_into()
-                        .unwrap(),
-                ) as usize
-            })
-            .sum();
-        log_timing("native editor import service encode", phase_started);
         let post_apply_properties_by_class =
             import_property_omissions(build.omitted_properties_by_class, true);
         let kept_rows = build.import_rows.finish(
@@ -3622,11 +3610,12 @@ fn build_editor_binary_import_for_services(
         )?;
         return Ok(Some(EditorBinaryImport {
             kept_rows,
-            bytes,
+            bytes: Vec::new(),
             groups,
-            native_replacement: Some(native_replacement),
+            native_replacement: None,
+            pending_encode: Some(pending_encode),
             fallback_reason: None,
-            instance_count,
+            instance_count: 0,
             post_apply_properties_by_class,
             post_apply_properties_by_path,
             external_references_post_applied: true,
@@ -3741,6 +3730,7 @@ fn build_editor_binary_import_for_services(
         bytes,
         groups,
         native_replacement: None,
+        pending_encode: None,
         fallback_reason,
         instance_count,
         post_apply_properties_by_class,

@@ -151,14 +151,15 @@ fn fixture_payload_and_rows(
         })
         .collect();
     clear_import_engine_identities(&mut build.dom);
-    let (bytes, _, _) = encode_services(
-        &mut build.dom,
-        &build.service_roots,
+    let (_, pending) = encode_services(
+        build.dom,
+        build.service_roots,
         &build.settings_ids_by_ref,
         groups,
         plans,
         &mut omitted_paths,
     )?;
+    let (bytes, _, _) = pending.finish()?;
     let rows = build
         .import_rows
         .finish(

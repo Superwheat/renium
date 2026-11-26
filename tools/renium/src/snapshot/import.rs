@@ -2845,6 +2845,11 @@ fn captured_store_bytes(
     encode_service_settings_binary_over(state, previous.as_deref())
 }
 
+pub(crate) enum CapturedStore {
+    Bytes(Vec<u8>),
+    Document(SettingsBytecode),
+}
+
 /// Project the same settings, script names and directories as a fresh import,
 /// without touching disk or constructing the full editor sourcemap. Existing
 /// script files are looked for under `layout_src_root` (or `src_root`).
@@ -2855,16 +2860,32 @@ pub(crate) fn service_projection_in_memory(
     layout_src_root: Option<&Path>,
     service: &str,
 ) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>> {
-    service_projection_in_memory_options(state, src_root, layout_src_root, service, false)
+    let (mut entries, settings_path, store) = service_projection_in_memory_options(
+        state,
+        src_root,
+        layout_src_root,
+        service,
+        false,
+        None,
+    )?;
+    let CapturedStore::Bytes(bytes) = store else {
+        unreachable!()
+    };
+    entries.insert(settings_path, Some(bytes));
+    Ok(entries)
 }
 
+/// Project the same settings, script names and directories as a fresh import,
+/// without touching disk or constructing the full editor sourcemap. Existing
+/// script files are looked for under `layout_src_root` (or `src_root`).
 pub(crate) fn service_projection_in_memory_options(
     state: &ServiceState,
     src_root: &Path,
     layout_src_root: Option<&Path>,
     service: &str,
     known_changed: bool,
-) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>> {
+    document_below_rows: Option<usize>,
+) -> Result<(BTreeMap<PathBuf, Option<Vec<u8>>>, PathBuf, CapturedStore)> {
     let service_dir = src_root.join(sanitize_name(service));
     let layout_dir = layout_src_root.map_or_else(
         || service_dir.clone(),
@@ -2873,8 +2894,22 @@ pub(crate) fn service_projection_in_memory_options(
     let settings_path = service_settings_path(&service_dir);
     let output = SourceOutput::Memory(Mutex::new(BTreeMap::new()));
     output.directory(&service_dir, &mut ExpectedPathBatch::default())?;
+    let keep_document =
+        document_below_rows.is_some_and(|min_rows| state.instances.len() < min_rows);
     let (settings, sources) = rayon::join(
-        || captured_store_bytes(state, &service_settings_path(&layout_dir), known_changed),
+        || -> Result<CapturedStore> {
+            if keep_document {
+                Ok(CapturedStore::Document(
+                    crate::settings::bytecode::settings_bytecode_from_service_state(state)?,
+                ))
+            } else {
+                Ok(CapturedStore::Bytes(captured_store_bytes(
+                    state,
+                    &service_settings_path(&layout_dir),
+                    known_changed,
+                )?))
+            }
+        },
         || {
             if !state
                 .source_in_subtree
@@ -2902,9 +2937,8 @@ pub(crate) fn service_projection_in_memory_options(
     let SourceOutput::Memory(entries) = output else {
         unreachable!()
     };
-    let mut entries = entries.into_inner().unwrap_or_else(PoisonError::into_inner);
-    entries.insert(settings_path, Some(settings?));
-    Ok(entries)
+    let entries = entries.into_inner().unwrap_or_else(PoisonError::into_inner);
+    Ok((entries, settings_path, settings?))
 }
 
 fn emit_node_index(
@@ -4116,5 +4150,81 @@ mod projection_tests {
             assert_eq!(resolved.0, rel.as_path());
             let _ = fs::remove_dir_all(&root);
         }
+    }
+
+    #[test]
+    fn captured_convert_matches_decode_encode_for_preserved_material_service() -> Result<()> {
+        use crate::settings::bytecode::{
+            SETTINGS_BINARY_VERSION, SettingsBytecodeInstance, encode_settings_bytecode,
+        };
+        let root = crate::tests::support::temp_dir("preserved-material-convert");
+        let _cleanup = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let settings_path = root.join("MaterialService.renium");
+        let mut stored_root = SettingsBytecodeInstance::new(
+            "mat-root".into(),
+            "MaterialService".into(),
+            "MaterialService".into(),
+            None,
+        );
+        stored_root
+            .properties
+            .insert(USE_2022_MATERIALS_PROPERTY.into(), json!(true));
+        let stored = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![stored_root],
+        };
+        fs::write(&settings_path, encode_settings_bytecode(&stored)?)?;
+
+        let state = build_service_state_from_instances(
+            MATERIAL_SERVICE_CLASS,
+            None,
+            vec![
+                SnapshotInstance {
+                    name: MATERIAL_SERVICE_CLASS.into(),
+                    class_name: MATERIAL_SERVICE_CLASS.into(),
+                    instance_index: Some(1),
+                    properties: Map::from_iter([("AsphaltName".into(), json!("CustomAsphalt"))]),
+                    ..Default::default()
+                },
+                SnapshotInstance {
+                    name: "CustomAsphalt".into(),
+                    class_name: "MaterialVariant".into(),
+                    instance_index: Some(2),
+                    parent_index: Some(1),
+                    properties: Map::from_iter([
+                        (
+                            "BaseMaterial".into(),
+                            json!({"_type": "EnumItem", "enumType": "Material", "name": "Asphalt", "value": 1296}),
+                        ),
+                        ("StudsPerTile".into(), json!(8.0)),
+                    ]),
+                    attributes: Map::from_iter([("Tag".into(), json!("road"))]),
+                    ..Default::default()
+                },
+            ],
+            HashMap::new(),
+            true,
+        )?;
+
+        let preserved = state_with_preserved_material_service_settings(
+            MATERIAL_SERVICE_CLASS,
+            &state,
+            &settings_path,
+        )?
+        .expect("expected preserved MaterialService state");
+        let converted =
+            crate::settings::bytecode::settings_bytecode_from_service_state(&preserved)?;
+        let encoded = encode_service_settings_binary(&preserved)?;
+        let decoded = crate::settings::bytecode::decode_settings_bytecode(&encoded)?;
+        assert_eq!(converted, decoded);
+        assert_eq!(
+            converted.instances[0]
+                .properties
+                .get(USE_2022_MATERIALS_PROPERTY),
+            Some(&json!(true))
+        );
+        Ok(())
     }
 }

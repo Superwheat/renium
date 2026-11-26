@@ -999,10 +999,78 @@ impl<'a> EditorTransaction<'a> {
         if let Some(started) = mutation_started {
             started.store(true, std::sync::atomic::Ordering::Release);
         }
+        #[cfg(windows)]
+        let terrain_prewarm = {
+            #[cfg(test)]
+            let mocked = crate::editor::native_roots::RECORDED_WRITES.with_borrow(Option::is_some);
+            #[cfg(not(test))]
+            let mocked = false;
+            let terrain_change = (!mocked && native_properties_available)
+                .then(|| {
+                    changes.property_changes.iter().find(|change| {
+                        change.class_name == "Terrain"
+                            && change
+                                .properties
+                                .keys()
+                                .chain(change.reset_properties.iter())
+                                .any(|name| matches!(name.as_str(), "SmoothGrid" | "PhysicsGrid"))
+                    })
+                })
+                .flatten();
+            terrain_change.and_then(|change| {
+                let info = bridge
+                    .cached_bridge_info_for_target(BridgeTarget::Edit)
+                    .ok()?;
+                let pid = bridge
+                    .studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)
+                    .ok()?;
+                let title =
+                    crate::studio::native::serializer::target_name(pid, &info.place_name).ok()?;
+                Some((
+                    pid,
+                    title,
+                    change.path_segments.clone(),
+                    change.path_ordinals.clone(),
+                ))
+            })
+        };
+        #[cfg(windows)]
+        let (result, mut prewarmed_terrain) = std::thread::scope(|scope| {
+            let begin_params = parameters(services);
+            let upload_params = parameters(upload_services);
+            let id_ref = &id;
+            let begin_handle = scope.spawn(move || {
+                editor_transaction_begin_result(
+                    bridge.call("beginEditorTransaction", begin_params),
+                    || Self::upload(bridge, id_ref, upload_params),
+                )
+            });
+            let prewarmed = terrain_prewarm.map(|(pid, title, segments, ordinals)| -> Result<_> {
+                let paths = [crate::studio::native::serializer::NativePropertyPath {
+                    segments: &segments,
+                    ordinals: &ordinals,
+                }];
+                let mut batch = crate::studio::native::serializer::NativePropertyBatch::new(
+                    pid,
+                    &title,
+                    &paths,
+                    Duration::from_secs(3),
+                    None,
+                )?;
+                let terrain = batch.prepare_terrain(0, &title, Duration::from_secs(3))?;
+                Ok((batch, terrain))
+            });
+            let result = begin_handle
+                .join()
+                .expect("beginEditorTransaction thread panicked");
+            (result, prewarmed)
+        });
+        #[cfg(not(windows))]
         let result = editor_transaction_begin_result(
             bridge.call("beginEditorTransaction", parameters(services)),
             || Self::upload(bridge, &id, parameters(upload_services)),
-        )?;
+        );
+        let result = result?;
         if result.get("studioChanged").and_then(Value::as_bool) == Some(true) {
             if let Some(started) = mutation_started {
                 started.store(false, std::sync::atomic::Ordering::Release);
@@ -1106,34 +1174,78 @@ impl<'a> EditorTransaction<'a> {
                             .chain(change.reset_properties.iter())
                             .any(|name| matches!(name.as_str(), "SmoothGrid" | "PhysicsGrid"))
                 });
-                crate::studio::native::serializer::register_history_if_available(
-                    pid,
-                    &title,
-                    token,
-                    terrain_write && native_properties_available,
-                )?;
-                for change in changes
-                    .property_changes
-                    .iter()
-                    .filter(|_| native_properties_available)
-                {
-                    if change.class_name == "Terrain"
-                        && change
-                            .properties
-                            .keys()
-                            .chain(change.reset_properties.iter())
-                            .any(|name| matches!(name.as_str(), "SmoothGrid" | "PhysicsGrid"))
-                    {
-                        let mut terrain = crate::studio::native::serializer::prepare_terrain(
-                            pid,
-                            &title,
-                            &change.path_segments,
-                            &change.path_ordinals,
-                            Duration::from_secs(3),
-                        )?;
+                #[cfg(windows)]
+                let mut registered_terrain = false;
+                #[cfg(windows)]
+                if terrain_write && native_properties_available {
+                    if let Some(change) = changes.property_changes.iter().find(|change| {
+                        change.class_name == "Terrain"
+                            && change
+                                .properties
+                                .keys()
+                                .chain(change.reset_properties.iter())
+                                .any(|name| matches!(name.as_str(), "SmoothGrid" | "PhysicsGrid"))
+                    }) {
+                        let (mut batch, mut terrain) = match prewarmed_terrain.take() {
+                            Some(Ok(prepared)) => prepared,
+                            Some(Err(error)) => return Err(error),
+                            None => {
+                                let paths =
+                                    [crate::studio::native::serializer::NativePropertyPath {
+                                        segments: &change.path_segments,
+                                        ordinals: &change.path_ordinals,
+                                    }];
+                                let mut batch =
+                                    crate::studio::native::serializer::NativePropertyBatch::new(
+                                        pid,
+                                        &title,
+                                        &paths,
+                                        Duration::from_secs(3),
+                                        None,
+                                    )?;
+                                let terrain =
+                                    batch.prepare_terrain(0, &title, Duration::from_secs(3))?;
+                                (batch, terrain)
+                            }
+                        };
+                        batch.register_history_token(pid, &title, token, true)?;
                         terrain.write(token, None, None)?;
                         bridge.call_for_runtime_with_timeout("getEditorTransactionState", json!({"transactionId":transaction.id,"nativeTerrainBaseline":terrain.fingerprint()}), BridgeTarget::Edit, &info.runtime_id, Some(Duration::from_secs(2)))?;
-                        break;
+                        registered_terrain = true;
+                    }
+                }
+                #[cfg(not(windows))]
+                let registered_terrain = false;
+                if !registered_terrain {
+                    crate::studio::native::serializer::register_history_if_available(
+                        pid,
+                        &title,
+                        token,
+                        terrain_write && native_properties_available,
+                    )?;
+                    for change in changes
+                        .property_changes
+                        .iter()
+                        .filter(|_| native_properties_available)
+                    {
+                        if change.class_name == "Terrain"
+                            && change
+                                .properties
+                                .keys()
+                                .chain(change.reset_properties.iter())
+                                .any(|name| matches!(name.as_str(), "SmoothGrid" | "PhysicsGrid"))
+                        {
+                            let mut terrain = crate::studio::native::serializer::prepare_terrain(
+                                pid,
+                                &title,
+                                &change.path_segments,
+                                &change.path_ordinals,
+                                Duration::from_secs(3),
+                            )?;
+                            terrain.write(token, None, None)?;
+                            bridge.call_for_runtime_with_timeout("getEditorTransactionState", json!({"transactionId":transaction.id,"nativeTerrainBaseline":terrain.fingerprint()}), BridgeTarget::Edit, &info.runtime_id, Some(Duration::from_secs(2)))?;
+                            break;
+                        }
                     }
                 }
             }
@@ -4421,7 +4533,7 @@ fn push_with_reader_platform(
             let result = crate::studio::native::editor::send_editor_change_batches_with_options(
                 bridge,
                 &changes,
-                binary_import.as_ref(),
+                binary_import.as_mut(),
                 transaction_id,
                 can_inline_commit,
                 can_inline_commit
@@ -4555,7 +4667,7 @@ fn push_with_reader_platform(
             } else {
                 let defer_terrain_proof = binary_import
                     .as_ref()
-                    .is_some_and(|import| import.native_replacement.is_some());
+                    .is_some_and(EditorBinaryImport::is_native_replacement);
                 transaction.commit_with_options(defer_terrain_proof)
             };
             match commit_outcome {
@@ -7150,6 +7262,74 @@ enum ChangedPathKind {
     Other,
 }
 
+/// Pre-resolves canonical paths for unique parent directories of virtual paths
+/// top-down from `project_root`, so missing virtual directory subtrees are
+/// resolved without per-file filesystem syscalls.
+fn build_virtual_canonical_dirs(
+    project_root: &Path,
+    changed_paths: &[PathBuf],
+    virtual_files: &crate::editor::types::VirtualStageFiles,
+) -> HashMap<PathBuf, (PathBuf, bool)> {
+    let mut dirs: HashMap<PathBuf, (PathBuf, bool)> = HashMap::new();
+    let root_canonical = canonical_path(project_root)
+        .map(strip_extended_prefix)
+        .unwrap_or_else(|_| strip_extended_prefix(project_root.to_path_buf()));
+    dirs.insert(project_root.to_path_buf(), (root_canonical, true));
+    let mut stack = Vec::new();
+    for changed_path in changed_paths {
+        let absolute = absolutize_under(project_root, changed_path);
+        if virtual_files.relative_key(&absolute).is_none() {
+            continue;
+        }
+        let Some(parent) = absolute.parent() else {
+            continue;
+        };
+        if dirs.contains_key(parent) {
+            continue;
+        }
+        stack.clear();
+        let mut cursor = parent;
+        while !dirs.contains_key(cursor) {
+            stack.push(cursor.to_path_buf());
+            match cursor.parent() {
+                Some(next) if next != cursor => cursor = next,
+                _ => break,
+            }
+        }
+        let (mut base_canon, mut base_exists) =
+            dirs.get(cursor)
+                .cloned()
+                .unwrap_or_else(|| match canonical_path(cursor) {
+                    Ok(c) => (strip_extended_prefix(c), true),
+                    Err(_) => (strip_extended_prefix(cursor.to_path_buf()), false),
+                });
+        for dir in stack.iter().rev() {
+            let entry = if base_exists {
+                match canonical_path(dir) {
+                    Ok(c) => (strip_extended_prefix(c), true),
+                    Err(_) => {
+                        let joined = match dir.file_name() {
+                            Some(name) => base_canon.join(name),
+                            None => strip_extended_prefix(dir.clone()),
+                        };
+                        (joined, false)
+                    }
+                }
+            } else {
+                let joined = match dir.file_name() {
+                    Some(name) => base_canon.join(name),
+                    None => strip_extended_prefix(dir.clone()),
+                };
+                (joined, false)
+            };
+            base_canon = entry.0.clone();
+            base_exists = entry.1;
+            dirs.insert(dir.clone(), entry);
+        }
+    }
+    dirs
+}
+
 /// A changed path as the collection reads it: its canonical form, what
 /// stands there, and a script's text. A file or folder the stage holds only
 /// in memory is read from there, at the place it would have on disk.
@@ -7157,6 +7337,7 @@ fn inspect_editor_changed_path(
     project_root: &Path,
     changed_path: &Path,
     virtual_files: Option<&crate::editor::types::VirtualStageFiles>,
+    virtual_dirs: Option<&HashMap<PathBuf, (PathBuf, bool)>>,
 ) -> (
     PathBuf,
     Option<ChangedPathKind>,
@@ -7179,6 +7360,26 @@ fn inspect_editor_changed_path(
         Some((absolute, ChangedPathKind::File, Some(source)))
     });
     if let Some((absolute, kind, source)) = held {
+        if let Some(dirs) = virtual_dirs
+            && let Some(parent) = absolute.parent()
+            && let Some((parent_canon, parent_exists)) = dirs.get(parent)
+        {
+            if !*parent_exists {
+                let path = match absolute.file_name() {
+                    Some(name) => parent_canon.join(name),
+                    None => parent_canon.clone(),
+                };
+                return (path, Some(kind), source);
+            }
+            if let Ok(canonical) = canonical_path(&absolute) {
+                return (strip_extended_prefix(canonical), Some(kind), source);
+            }
+            let path = match absolute.file_name() {
+                Some(name) => parent_canon.join(name),
+                None => parent_canon.clone(),
+            };
+            return (path, Some(kind), source);
+        }
         let mut existing = absolute.as_path();
         let mut below = Vec::new();
         let canonical = loop {
@@ -7275,9 +7476,18 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
     // contents. Those file system calls dominate a large push, so they run in
     // parallel before the ordered pass below.
     let held_files = prepared_documents.virtual_files.as_deref();
+    let virtual_dirs = held_files
+        .map(|files| build_virtual_canonical_dirs(project_root, &enforced_changed_paths, files));
     let mut inspected_paths = enforced_changed_paths
         .par_iter()
-        .map(|changed_path| inspect_editor_changed_path(project_root, changed_path, held_files))
+        .map(|changed_path| {
+            inspect_editor_changed_path(
+                project_root,
+                changed_path,
+                held_files,
+                virtual_dirs.as_ref(),
+            )
+        })
         .collect::<Vec<_>>();
     log_editor_collection_timing("path inspection", phase_started);
     let phase_started = Instant::now();
@@ -7802,11 +8012,20 @@ fn log_change_set_composition(
         .map(|(class, (rows, fields))| format!("{class}:{rows}/{fields}"))
         .collect::<Vec<_>>();
     let import = binary_import.map(|import| {
+        let pending = import.pending_encode.is_some() && import.native_replacement.is_none();
+        let bytes = if pending {
+            "pending".to_string()
+        } else {
+            import.bytes.len().to_string()
+        };
+        let instances = if pending {
+            "pending".to_string()
+        } else {
+            import.instance_count.to_string()
+        };
         format!(
-            "bytes={}, instances={}, replacement={}, post_apply_paths={}, groups=[{}]",
-            import.bytes.len(),
-            import.instance_count,
-            import.native_replacement.is_some(),
+            "bytes={bytes}, instances={instances}, replacement={}, post_apply_paths={}, groups=[{}]",
+            import.is_native_replacement(),
             import.post_apply_properties_by_path.len(),
             import
                 .groups
@@ -8300,6 +8519,7 @@ mod sync_tests {
             kept_rows: HashMap::new(),
             bytes: Vec::new(),
             native_replacement: None,
+            pending_encode: None,
             fallback_reason: None,
             groups: vec![EditorBinaryImportGroup {
                 additive: false,

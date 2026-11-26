@@ -143,6 +143,19 @@ pub(crate) fn record(pid: u32, operation: NativeOperation, result: &Result<Value
         .insert(operation, ProbeVerdict::from_result(operation, result));
 }
 
+#[cfg(windows)]
+pub(crate) fn has_passed(pid: u32, operation: NativeOperation) -> bool {
+    let Some(identity) = crate::app::update::process_start_identity(pid) else {
+        return false;
+    };
+    let sessions = EVIDENCE.get_or_init(Default::default).lock_recover();
+    sessions
+        .get(&pid)
+        .filter(|session| session.identity == identity)
+        .and_then(|session| session.verdicts.get(&operation))
+        .is_some_and(|verdict| verdict.verdict == "native")
+}
+
 pub(crate) fn cached(pid: u32) -> Value {
     let identity = crate::app::update::process_start_identity(pid);
     let sessions = EVIDENCE.get_or_init(Default::default).lock_recover();

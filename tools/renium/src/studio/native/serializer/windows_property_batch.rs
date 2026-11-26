@@ -154,6 +154,50 @@ impl NativePropertyBatch {
             .map(|(property, _)| property)
     }
 
+    pub(crate) fn prepare_terrain(
+        &mut self,
+        index: usize,
+        title: &str,
+        timeout: Duration,
+    ) -> Result<NativeTerrain> {
+        let property = self.prepare(index, "Name", timeout)?;
+        terrain::from_prepared(property, &self.studio, &self.layout, &self.model, title)
+    }
+
+    pub(crate) fn register_history_token(
+        &mut self,
+        pid: u32,
+        title: &str,
+        token: &str,
+        terrain: bool,
+    ) -> Result<bool> {
+        let _profile = crate::app::profile::span("native transaction history registration");
+        if crate::studio::native::serializer::history_token_registered(pid, token) {
+            return Ok(true);
+        }
+        let change_history = self
+            .model
+            .roots
+            .iter()
+            .copied()
+            .filter(|entry| {
+                read_instance_class(&self.memory, entry.instance, self.model.layout).as_deref()
+                    == Some("ChangeHistoryService")
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            change_history.len() == 1,
+            "ChangeHistoryService could not be resolved uniquely"
+        );
+        self.targets.push(vec![change_history[0]]);
+        let index = self.targets.len() - 1;
+        let prepared = self.prepare(index, "Name", Duration::from_secs(3));
+        self.targets.pop();
+        let mut prepared = prepared?;
+        let result = register_history_prepared(&mut prepared, pid, title, token);
+        crate::studio::native::serializer::finish_register_history(pid, token, terrain, result)
+    }
+
     pub(super) fn prepare_read(
         &mut self,
         index: usize,

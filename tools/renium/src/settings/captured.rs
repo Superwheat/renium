@@ -3871,17 +3871,15 @@ fn convert_prepared_each<T: Send>(
         wire_bytes: Some(&wire_bytes),
     };
     let kept_chunk = |records: &[SettingsBinaryInstance<'_>]| -> Result<Vec<T>> {
-        Ok(convert_chunk(state, records, scope)?
-            .into_iter()
-            .map(&keep)
-            .collect())
+        let rows = convert_chunk_budgeted(state, records, scope)?;
+        Ok(rows.into_iter().map(&keep).collect())
     };
-    // Each chunk is counted as the value block of its rows.
-    let instances = if records.len() <= blocks::BLOCK_ROWS {
+    const CONVERT_CHUNK_ROWS: usize = 1024;
+    let instances = if records.len() <= CONVERT_CHUNK_ROWS {
         kept_chunk(records)?
     } else {
         records
-            .par_chunks(blocks::BLOCK_ROWS)
+            .par_chunks(CONVERT_CHUNK_ROWS)
             .map(kept_chunk)
             .collect::<Result<Vec<_>>>()?
             .into_iter()
@@ -4060,6 +4058,42 @@ fn convert_selected_rows<'a>(
         instances.push(instance);
     }
     Ok(instances)
+}
+
+fn convert_chunk_budgeted<'a>(
+    state: &'a ServiceState,
+    records: &[SettingsBinaryInstance<'a>],
+    scope: ConversionScope<'_, '_>,
+) -> Result<Vec<SettingsBytecodeInstance>> {
+    let available = scope.budget.remaining.load(Ordering::Relaxed);
+    let slab = (available / 32).min(16 * 1024 * 1024);
+    let local_budget =
+        (slab >= 256 * 1024 && scope.budget.take(slab).is_ok()).then(|| DecodeBudget::new(slab));
+    let active_scope = match &local_budget {
+        Some(local) => ConversionScope {
+            budget: local,
+            ..scope
+        },
+        None => scope,
+    };
+    let converted = convert_chunk(state, records, active_scope);
+    match (converted, local_budget) {
+        (Ok(rows), Some(local)) => {
+            let unused = local.remaining.load(Ordering::Relaxed);
+            if unused > 0 {
+                scope.budget.remaining.fetch_add(unused, Ordering::Relaxed);
+            }
+            Ok(rows)
+        }
+        (Err(_), Some(local)) => {
+            let unused = local.remaining.load(Ordering::Relaxed);
+            if unused > 0 {
+                scope.budget.remaining.fetch_add(unused, Ordering::Relaxed);
+            }
+            convert_chunk(state, records, scope)
+        }
+        (result, None) => result,
+    }
 }
 
 fn convert_chunk<'a>(

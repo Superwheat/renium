@@ -634,6 +634,15 @@ pub(super) fn encode_document(
     encode_document_in_blocks(document, by_selectors, previous, BLOCK_ROWS)
 }
 
+pub(super) fn encode_settled_document(
+    document: &SettingsBytecode,
+    by_selectors: bool,
+    previous: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let lookup = document_reference_lookup(document, by_selectors);
+    encode_with_lookup(document, &lookup, previous, BLOCK_ROWS)
+}
+
 fn encode_document_in_blocks(
     document: &SettingsBytecode,
     by_selectors: bool,
@@ -1067,15 +1076,22 @@ fn written(
 ) -> Result<Vec<u8>> {
     let listed = listed(entries, previous)?;
     let (structure, (blocks, pool)) = rayon::join(
-        || framed(structure, previous.map(|store| (store, store.structure))),
+        || {
+            let mut codec = FrameCodec::new();
+            framed_with(
+                structure,
+                previous.map(|store| (store, store.structure)),
+                &mut codec,
+            )
+        },
         || {
             rayon::join(
                 || {
                     (contents.par_iter().enumerate())
-                        .map(|(at, (rows, content))| {
+                        .map_init(FrameCodec::new, |codec, (at, (rows, content))| {
                             let held = previous
                                 .and_then(|store| Some((store, store.blocks.get(at)?.frame)));
-                            Ok((*rows, framed(content, held)?))
+                            Ok((*rows, framed_with(content, held, codec)?))
                         })
                         .collect::<Result<Vec<_>>>()
                 },

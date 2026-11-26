@@ -195,6 +195,11 @@ impl<'a> NewInstanceValues<'a> {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct PredecodedStores {
+    pub(crate) observed: HashMap<PathBuf, SettingsBytecode>,
+}
+
 /// What the verification of one store says, and the store it settles:
 /// from a range of rows at a time where it can, or from the whole documents.
 #[cfg(test)]
@@ -207,10 +212,9 @@ pub(crate) fn settings_delta_outcome(
 ) -> Result<(Option<String>, Option<Vec<u8>>)> {
     let verified = settings_delta_verification(
         path,
-        Some(before),
-        Some(desired),
-        Some(observed),
+        (Some(before), Some(desired), Some(observed)),
         (prepared, asked),
+        None,
         Verification {
             settle,
             pending,
@@ -229,11 +233,12 @@ pub(crate) fn verify_committed_push_readback(
     prepared: &mut HashMap<PathBuf, PreparedPushVerification>,
     policy: Verification<'_>,
 ) -> Result<(Vec<PathBuf>, Option<String>)> {
+    let mut stores = PredecodedStores::default();
     if policy.pending.is_empty() && policy.settle {
         return verify_and_settle_native_import(
-            before,
-            desired,
+            (before, desired),
             observed,
+            &mut stores,
             paths,
             prepared,
             policy.new_instance_values,
@@ -243,7 +248,13 @@ pub(crate) fn verify_committed_push_readback(
         settle: false,
         ..policy
     };
-    let result = verify_snapshot_delta(before, desired, observed, paths, prepared, policy)?;
+    let result = verify_snapshot_delta(
+        (before, desired, observed),
+        &mut stores,
+        paths,
+        prepared,
+        policy,
+    )?;
     Ok((result.mismatches, result.detail))
 }
 
@@ -321,10 +332,10 @@ pub(crate) fn snapshot_intended_delta_mismatches(
     paths: &HashSet<PathBuf>,
     prepared: &mut HashMap<PathBuf, PreparedPushVerification>,
 ) -> Result<(Vec<PathBuf>, Option<String>)> {
+    let mut stores = PredecodedStores::default();
     let result = verify_snapshot_delta(
-        before,
-        desired,
-        observed,
+        (before, desired, observed),
+        &mut stores,
         paths,
         prepared,
         Verification::default(),
@@ -336,17 +347,16 @@ pub(crate) fn snapshot_intended_delta_mismatches(
 /// supply store identities, but do not contain regenerated saved values; those
 /// still come from Studio's export. Publication must use this checked capture.
 pub(crate) fn verify_and_settle_native_import(
-    before: &ProjectSnapshot,
-    desired: &ProjectSnapshot,
+    (before, desired): (&ProjectSnapshot, &ProjectSnapshot),
     observed: &mut ProjectSnapshot,
+    stores: &mut PredecodedStores,
     paths: &HashSet<PathBuf>,
     prepared: &mut HashMap<PathBuf, PreparedPushVerification>,
     new_instance_values: Option<&NewInstanceValues<'_>>,
 ) -> Result<(Vec<PathBuf>, Option<String>)> {
     let result = verify_snapshot_delta(
-        before,
-        desired,
-        observed,
+        (before, desired, observed),
+        stores,
         paths,
         prepared,
         Verification {
@@ -577,9 +587,8 @@ struct SettingsVerification {
 }
 
 fn verify_snapshot_delta(
-    before: &ProjectSnapshot,
-    desired: &ProjectSnapshot,
-    observed: &ProjectSnapshot,
+    (before, desired, observed): (&ProjectSnapshot, &ProjectSnapshot, &ProjectSnapshot),
+    stores: &mut PredecodedStores,
     paths: &HashSet<PathBuf>,
     prepared: &mut HashMap<PathBuf, PreparedPushVerification>,
     policy: Verification<'_>,
@@ -596,13 +605,34 @@ fn verify_snapshot_delta(
             !entries_equivalent(path, before.entries.get(*path), desired.entries.get(*path))
         })
         .collect::<HashSet<_>>();
-    let mut jobs = asked.clone();
+    let mut job_paths = asked
+        .iter()
+        .map(|path| (*path).clone())
+        .collect::<HashSet<_>>();
     if policy.settle {
-        jobs.extend(observed.entries.keys().filter(|path| settings_path(path)));
+        job_paths.extend(
+            observed
+                .entries
+                .keys()
+                .filter(|path| settings_path(path))
+                .cloned(),
+        );
+        job_paths.extend(
+            stores
+                .observed
+                .keys()
+                .filter(|path| settings_path(path))
+                .cloned(),
+        );
     }
-    let jobs = jobs
+    let jobs = job_paths
         .into_iter()
-        .map(|path| (path, (prepared.remove(path), asked.contains(path))))
+        .map(|path| {
+            let was_asked = asked.contains(&path);
+            let prep = prepared.remove(&path);
+            let obs_doc = stores.observed.remove(&path);
+            (path, (prep, was_asked), obs_doc)
+        })
         .collect::<Vec<_>>();
     let is_large_store = |path: &Path| {
         const LARGE_STORE_BYTES: usize = 4 * 1024 * 1024;
@@ -612,17 +642,23 @@ fn verify_snapshot_delta(
                 .flatten()
                 .any(|entry| matches!(entry, SnapshotEntry::File(bytes) if bytes.len() >= LARGE_STORE_BYTES))
     };
-    let (large_jobs, small_jobs): (Vec<_>, Vec<_>) =
-        jobs.into_iter().partition(|(path, _)| is_large_store(path));
-    let verify_job = |path: &Path, prepared: (Option<PreparedPushVerification>, bool)| {
+    let (large_jobs, small_jobs): (Vec<_>, Vec<_>) = jobs
+        .into_iter()
+        .partition(|(path, _, _)| is_large_store(path));
+    let verify_job = |path: &Path,
+                      prepared: (Option<PreparedPushVerification>, bool),
+                      observed_doc: Option<SettingsBytecode>| {
         let desired_entry = desired.entries.get(path);
         let result = if settings_path(path) {
             settings_delta_verification(
                 path,
-                before.entries.get(path),
-                desired_entry,
-                observed.entries.get(path),
+                (
+                    before.entries.get(path),
+                    desired_entry,
+                    observed.entries.get(path),
+                ),
                 prepared,
+                observed_doc,
                 policy,
             )?
         } else if entries_equivalent(path, observed.entries.get(path), desired_entry) {
@@ -640,10 +676,17 @@ fn verify_snapshot_delta(
     };
     let mut results = small_jobs
         .into_par_iter()
-        .map(|(path, prepared)| Ok((path, verify_job(path, prepared)?)))
+        .map(|(path, prepared, observed_doc)| {
+            let outcome = verify_job(&path, prepared, observed_doc)?;
+            Ok((path, outcome))
+        })
         .collect::<Result<Vec<_>>>()?;
-    for (path, prepared) in large_jobs {
-        results.push((path, verify_job(path, prepared)?));
+    if !large_jobs.is_empty() {
+        crate::daemon::memory::release_between_phases();
+    }
+    for (path, prepared, observed_doc) in large_jobs {
+        let outcome = verify_job(&path, prepared, observed_doc)?;
+        results.push((path, outcome));
     }
     let mut differences = Vec::new();
     let mut accepted = ProjectSnapshot::default();
@@ -652,9 +695,7 @@ fn verify_snapshot_delta(
             differences.push((path.clone(), detail));
         }
         if let Some(bytes) = result.accepted {
-            accepted
-                .entries
-                .insert(path.clone(), SnapshotEntry::File(bytes));
+            accepted.entries.insert(path, SnapshotEntry::File(bytes));
         }
     }
     differences.sort_by(|left, right| left.0.cmp(&right.0));
@@ -676,25 +717,37 @@ pub(crate) fn settings_delta_mismatch(
 ) -> Result<Option<String>> {
     Ok(settings_delta_verification(
         path,
-        before,
-        desired,
-        observed,
+        (before, desired, observed),
         (prepared, true),
+        None,
         Verification::default(),
     )?
     .mismatch)
 }
 
 fn decode_verification_documents(
-    before: Option<&SnapshotEntry>,
-    desired: Option<&SnapshotEntry>,
-    observed: Option<&SnapshotEntry>,
+    (before, desired, observed): (
+        Option<&SnapshotEntry>,
+        Option<&SnapshotEntry>,
+        Option<&SnapshotEntry>,
+    ),
     prepared: Option<PreparedPushVerification>,
+    observed_doc: Option<SettingsBytecode>,
 ) -> Result<(SettingsBytecode, Arc<SettingsBytecode>, SettingsBytecode)> {
     const LARGE_STORE_BYTES: usize = 4 * 1024 * 1024;
     let large_store = [before, desired, observed].into_iter().flatten().any(
         |entry| matches!(entry, SnapshotEntry::File(bytes) if bytes.len() >= LARGE_STORE_BYTES),
     );
+    let observed_from = |doc: Option<SettingsBytecode>| -> Result<SettingsBytecode> {
+        match doc {
+            Some(mut doc) => {
+                stabilize_settings_reference_ids(&mut doc);
+                canonicalize_settings_property_names(&mut doc)?;
+                Ok(doc)
+            }
+            None => settings_document(observed),
+        }
+    };
     if large_store {
         let (before, desired) = match prepared {
             Some(prepared) => (
@@ -709,7 +762,7 @@ fn decode_verification_documents(
                 Arc::new(settings_document(desired)?),
             ),
         };
-        let observed = settings_document(observed)?;
+        let observed = observed_from(observed_doc)?;
         return Ok((before, desired, observed));
     }
     let (requested, observed) = rayon::join(
@@ -729,7 +782,7 @@ fn decode_verification_documents(
                 }
             })
         },
-        || settings_document(observed),
+        || observed_from(observed_doc),
     );
     let (before, desired) = requested?;
     Ok((before, desired, observed?))
@@ -737,13 +790,16 @@ fn decode_verification_documents(
 
 fn settings_delta_verification(
     path: &Path,
-    before: Option<&SnapshotEntry>,
-    desired: Option<&SnapshotEntry>,
-    observed: Option<&SnapshotEntry>,
+    entries: (
+        Option<&SnapshotEntry>,
+        Option<&SnapshotEntry>,
+        Option<&SnapshotEntry>,
+    ),
     (prepared, asked): (Option<PreparedPushVerification>, bool),
+    observed_doc: Option<SettingsBytecode>,
     policy: Verification<'_>,
 ) -> Result<SettingsVerification> {
-    let entries = (before, desired, observed);
+    let (before, desired, observed) = entries;
     let before_aligned = prepared.is_some();
     use crate::settings::equivalence::{holds_unread_instances, read_unread_instances};
     let before_bytes = match before {
@@ -798,7 +854,7 @@ fn settings_delta_verification(
         return Ok(verified);
     }
     let (mut before, desired, mut observed) =
-        decode_verification_documents(before, desired, observed, prepared)?;
+        decode_verification_documents(entries, prepared, observed_doc)?;
     // Documents read by their changed instances verify a push that left
     // every instance at its place. Where Studio's instances have to be
     // matched with the files' by what tells them apart, the whole documents
@@ -810,11 +866,9 @@ fn settings_delta_verification(
         && !observed.instances.is_empty()
         && !crate::settings::equivalence::align_settings_ids_by_place(&desired, &mut observed)
     {
-        drop((before, desired, observed));
+        drop((before, desired));
         let unprepared = (None, asked);
-        return settings_delta_verification(
-            path, entries.0, entries.1, entries.2, unprepared, policy,
-        );
+        return settings_delta_verification(path, entries, unprepared, Some(observed), policy);
     }
     let viewport = policy
         .settle
@@ -984,23 +1038,27 @@ fn settings_delta_verification(
                 .map(|detail| format!("{name}.{detail}"))
         });
     }
-    rayon::join(
-        || drop_settings_document(before),
-        || {
-            if let Some(desired) = Arc::into_inner(desired) {
-                drop_settings_document(desired);
-            }
-        },
-    );
+    crate::settings::bytecode::defer_drop_settings_document(before);
+    if let Some(desired) = Arc::into_inner(desired) {
+        crate::settings::bytecode::defer_drop_settings_document(desired);
+    }
     let accepted = if policy.settle && mismatch.is_none() {
         if let Some(camera) = viewport {
             crate::settings::equivalence::keep_reference_viewport_camera(&camera, &mut observed);
         }
-        Some(encode_settings_bytecode(&observed)?)
+        let previous = match entries.1 {
+            Some(SnapshotEntry::File(bytes)) => Some(bytes.as_slice()),
+            _ => None,
+        };
+        Some(
+            crate::settings::bytecode::encode_settings_bytecode_owned_over(
+                observed, false, previous,
+            )?,
+        )
     } else {
+        crate::settings::bytecode::defer_drop_settings_document(observed);
         None
     };
-    drop_settings_document(observed);
     Ok(SettingsVerification { mismatch, accepted })
 }
 
@@ -2472,5 +2530,144 @@ mod row_verify_tests {
             "A2: swapped namesakes with one-sided UniqueIds must align by value, got {:?}",
             res.mismatch
         );
+    }
+
+    #[test]
+    fn settings_delta_verification_chained_recursion_is_safe_on_already_stabilized_observed_doc() {
+        let path = Path::new("instances/Workspace.renium");
+        let make_part = |id: &str, name: &str, parent: usize, transparency: f64| {
+            let mut inst =
+                SettingsBytecodeInstance::new(id.into(), name.into(), "Part".into(), Some(parent));
+            inst.properties
+                .insert("Transparency".into(), json!(transparency));
+            inst
+        };
+        let make_model = |id: &str, primary_index: usize| {
+            let mut inst =
+                SettingsBytecodeInstance::new(id.into(), "Rig".into(), "Model".into(), Some(0));
+            inst.properties.insert(
+                "PrimaryPart".into(),
+                json!({"_type": "Ref", "instanceIndex": primary_index}),
+            );
+            inst
+        };
+
+        let before = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "ws".into(),
+                    "Workspace".into(),
+                    "Workspace".into(),
+                    None,
+                ),
+                make_model("m1", 3),
+                make_part("p1", "Alpha", 1, 0.25),
+                make_part("p2", "Beta", 1, 0.75),
+            ],
+        };
+        let desired = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "ws".into(),
+                    "Workspace".into(),
+                    "Workspace".into(),
+                    None,
+                ),
+                make_model("m1", 3),
+                make_part("p1", "Alpha", 1, 0.5),
+                make_part("p2", "Beta", 1, 0.75),
+            ],
+        };
+        // Swap Alpha and Beta in observed so align_settings_ids_by_place returns false
+        // and triggers the recursive fallback with an already-stabilized observed doc.
+        let observed = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "obs-ws".into(),
+                    "Workspace".into(),
+                    "Workspace".into(),
+                    None,
+                ),
+                make_model("obs-m1", 4),
+                make_part("obs-p2", "Beta", 1, 0.75),
+                make_part("obs-p1", "Alpha", 1, 0.5),
+            ],
+        };
+
+        let before_entry = SnapshotEntry::File(encode_settings_bytecode(&before).unwrap());
+        let desired_entry = SnapshotEntry::File(encode_settings_bytecode(&desired).unwrap());
+        let observed_entry = SnapshotEntry::File(encode_settings_bytecode(&observed).unwrap());
+
+        let mut desired_with_unchanged = desired.clone();
+        desired_with_unchanged.instances[3].properties.clear();
+        crate::settings::held::stand_unchanged(&mut desired_with_unchanged.instances[3].properties);
+
+        let pending: Vec<PendingImportFields> = Vec::new();
+        let no_values = NewInstanceValues::default();
+        let mut policy = Verification::of(true, &pending, &no_values);
+        policy.whole_documents = true;
+
+        let prepared_doc = PreparedPushVerification {
+            previous: before.clone(),
+            desired: Some(Arc::new(desired_with_unchanged.clone())),
+        };
+        let prepared_bytes = PreparedPushVerification {
+            previous: before,
+            desired: Some(Arc::new(desired_with_unchanged)),
+        };
+
+        let via_observed_doc = settings_delta_verification(
+            path,
+            (
+                Some(&before_entry),
+                Some(&desired_entry),
+                Some(&observed_entry),
+            ),
+            (Some(prepared_doc), true),
+            Some(observed),
+            policy,
+        )
+        .unwrap();
+        let via_observed_bytes = settings_delta_verification(
+            path,
+            (
+                Some(&before_entry),
+                Some(&desired_entry),
+                Some(&observed_entry),
+            ),
+            (Some(prepared_bytes), true),
+            None,
+            policy,
+        )
+        .unwrap();
+        let direct = settings_delta_verification(
+            path,
+            (
+                Some(&before_entry),
+                Some(&desired_entry),
+                Some(&observed_entry),
+            ),
+            (None, true),
+            None,
+            policy,
+        )
+        .unwrap();
+
+        assert!(
+            via_observed_doc.mismatch.is_none(),
+            "{:?}",
+            via_observed_doc.mismatch
+        );
+        assert!(
+            via_observed_bytes.mismatch.is_none(),
+            "{:?}",
+            via_observed_bytes.mismatch
+        );
+        assert!(direct.mismatch.is_none(), "{:?}", direct.mismatch);
+        assert_eq!(via_observed_doc.accepted, via_observed_bytes.accepted);
+        assert_eq!(via_observed_doc.accepted, direct.accepted);
     }
 }

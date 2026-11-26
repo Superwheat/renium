@@ -511,8 +511,9 @@ fn capture_scoped_push_baseline(
             moved.join(", ")
         ),
     );
-    let captured_moved =
-        capture_studio_services_in_memory_options(context, bridge, moved, stage, false, true)?;
+    let (captured_moved, _) = capture_studio_services_in_memory_options(
+        context, bridge, moved, stage, false, true, None,
+    )?;
     let source = Path::new(&context.source)
         .strip_prefix(root)
         .context("Project source is outside its root")?;
@@ -685,13 +686,14 @@ fn merge_zero_capture_scoped_services(
             .map(|(path, entry)| (path.clone(), entry.clone()))
             .collect(),
     };
-    let scoped_studio = capture_studio_services_in_memory_options(
+    let (scoped_studio, _) = capture_studio_services_in_memory_options(
         zctx.context,
         zctx.bridge,
         capture_services,
         zctx.stage,
         false,
         true,
+        None,
     )?;
     let mut prepared_settings = HashMap::new();
     let (diff_paths, promoted, stores_read) = prepare_replace_push_differences(
@@ -4242,7 +4244,9 @@ pub(crate) fn capture_studio_services_in_memory(
         stage,
         preserve_saved_settings,
         false,
+        None,
     )
+    .map(|(snapshot, _)| snapshot)
 }
 
 pub(crate) fn capture_studio_services_in_memory_options(
@@ -4252,10 +4256,11 @@ pub(crate) fn capture_studio_services_in_memory_options(
     stage: &ExportProjectStage,
     preserve_saved_settings: bool,
     known_changed: bool,
-) -> Result<ProjectSnapshot> {
+    document_below_rows: Option<usize>,
+) -> Result<(ProjectSnapshot, HashMap<PathBuf, SettingsBytecode>)> {
     #[cfg(all(test, any(windows, target_os = "macos")))]
     if let Some(result) = super::push_flow_tests::capture(context, services, &stage.project_root) {
-        return result;
+        return result.map(|snapshot| (snapshot, HashMap::new()));
     }
     pin_edit_runtime(context, bridge)?;
     let mut args = automation_pull_args(context, &json!({"services": services}))?;
@@ -4278,24 +4283,27 @@ pub(crate) fn capture_studio_services_in_memory_options(
             None
         };
         let state = preserved.as_ref().unwrap_or(&state);
-        let projection = crate::snapshot::import::service_projection_in_memory_options(
-            state,
-            &src_root,
-            layout_src_root.as_deref(),
-            service,
-            known_changed,
-        )?;
+        let (projection, settings_path, store) =
+            crate::snapshot::import::service_projection_in_memory_options(
+                state,
+                &src_root,
+                layout_src_root.as_deref(),
+                service,
+                known_changed,
+                document_below_rows,
+            )?;
         if let Some(writer) = &sourcemap {
             stage_captured_service_map(stage, service, state, &projection, writer)?;
         }
-        Ok(projection)
+        Ok((projection, settings_path, store))
     })?;
     if let Some(writer) = sourcemap {
         writer.request_finish();
         writer.join()?;
     }
     let mut entries = BTreeMap::new();
-    for projection in projections {
+    let mut documents = HashMap::new();
+    for (projection, settings_path, store) in projections {
         for (path, bytes) in projection {
             let relative = path.strip_prefix(&stage.project_root)?.to_path_buf();
             if !derived_project_path(&relative) {
@@ -4306,8 +4314,30 @@ pub(crate) fn capture_studio_services_in_memory_options(
                 );
             }
         }
+        let relative = settings_path
+            .strip_prefix(&stage.project_root)?
+            .to_path_buf();
+        if !derived_project_path(&relative) {
+            match store {
+                crate::snapshot::import::CapturedStore::Bytes(bytes) => {
+                    anyhow::ensure!(
+                        entries
+                            .insert(relative, SnapshotEntry::File(bytes))
+                            .is_none(),
+                        "Native verification projected overlapping paths"
+                    );
+                }
+                crate::snapshot::import::CapturedStore::Document(document) => {
+                    anyhow::ensure!(
+                        !entries.contains_key(&relative)
+                            && documents.insert(relative, document).is_none(),
+                        "Native verification projected overlapping paths"
+                    );
+                }
+            }
+        }
     }
-    Ok(ProjectSnapshot { entries })
+    Ok((ProjectSnapshot { entries }, documents))
 }
 
 fn stage_captured_service_map(

@@ -567,21 +567,44 @@ pub(super) fn settle(
         .filter(|path| scopes.contains(path))
         .collect::<Vec<_>>();
     crate::daemon::memory::release_between_phases();
-    let mut readback = capture_studio_services_in_memory(context, bridge, services, &stage, true)?;
+    const LARGE_STORE_BYTES: usize = 4 * 1024 * 1024;
+    let has_large_store = work.expected.entries.iter().any(|(path, entry)| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_service_settings_file_name)
+            && matches!(entry, SnapshotEntry::File(bytes) if bytes.len() >= LARGE_STORE_BYTES)
+    });
+    let document_below_rows = (!has_large_store).then_some(super::verify::rows::MIN_ROWS);
+    let (mut readback, observed_documents) = capture_studio_services_in_memory_options(
+        context,
+        bridge,
+        services,
+        &stage,
+        true,
+        true,
+        document_below_rows,
+    )?;
     log_reconcile_timing("full push readback", phase);
     crate::daemon::memory::release_between_phases();
     let phase = Instant::now();
-    let (mismatches, details) = verify_and_settle_native_import(
-        &work.before,
-        &work.expected,
-        &mut readback,
-        &work.verification_paths,
-        &mut work.prepared,
-        Some(&NewInstanceValues::of(
-            bridge,
-            context.runtime_id.as_deref(),
-        )),
-    )?;
+    let mut stores = PredecodedStores {
+        observed: observed_documents,
+    };
+    let (mismatches, details) = {
+        let _defer_drop =
+            (!has_large_store).then(crate::settings::bytecode::DeferredSettingsDropGuard::enter);
+        verify_and_settle_native_import(
+            (&work.before, &work.expected),
+            &mut readback,
+            &mut stores,
+            &work.verification_paths,
+            &mut work.prepared,
+            Some(&NewInstanceValues::of(
+                bridge,
+                context.runtime_id.as_deref(),
+            )),
+        )?
+    };
     log_reconcile_timing("full push verification", phase);
     if !mismatches.is_empty() {
         // Studio does not hold what the push sent: the next command says so.
@@ -1327,9 +1350,9 @@ mod tests {
                 SnapshotEntry::File(b"return 999".to_vec()),
             );
             let (mismatches, detail) = verify_and_settle_native_import(
-                &ProjectSnapshot::default(),
-                &expected,
+                (&ProjectSnapshot::default(), &expected),
                 &mut observed,
+                &mut PredecodedStores::default(),
                 &HashSet::from(["src/A.luau".into()]),
                 &mut HashMap::new(),
                 None,

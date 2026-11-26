@@ -6,7 +6,7 @@ use crate::editor::review::{
 };
 use crate::editor::types::{
     EditorNativeAlias, EditorNativeBatch, EditorNativeBinding, EditorNativeClass, EditorNativePlan,
-    EditorNativeReplacement,
+    EditorNativeReplacement, PendingNativeImportEncode,
 };
 use crate::rbx::encode::rbx_logical_property_name;
 use ahash::{AHashMap, AHashSet};
@@ -168,6 +168,28 @@ fn import_identity_metadata_is_linear_for_deep_place_sized_trees() -> Result<()>
 }
 
 #[test]
+fn pending_native_import_encode_drop_joins_thread() {
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let worker_cancelled = std::sync::Arc::clone(&cancelled);
+    let worker_finished = std::sync::Arc::clone(&finished);
+    let worker_ready = std::sync::Arc::clone(&ready);
+    let handle = std::thread::spawn(move || {
+        worker_ready.wait();
+        while !worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        worker_finished.store(true, std::sync::atomic::Ordering::Release);
+        anyhow::bail!("cancelled")
+    });
+    let pending = PendingNativeImportEncode::new(handle, cancelled);
+    ready.wait();
+    drop(pending);
+    assert!(finished.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[test]
 fn native_import_paths_preserve_ordinals_in_wide_mixed_class_siblings() -> Result<()> {
     let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
     let service = dom.insert(
@@ -190,14 +212,15 @@ fn native_import_paths_preserve_ordinals_in_wide_mixed_class_siblings() -> Resul
         mutation_package_roots: Vec::new(),
         change_generation: None,
     };
-    let (_, groups, _) = encode_services(
-        &mut dom,
-        &services,
+    let (groups, pending) = encode_services(
+        dom,
+        services,
         &HashMap::new(),
         groups,
         vec![plan],
         &mut HashMap::new(),
     )?;
+    let _ = pending.finish()?;
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].root_paths.len(), count);
     let mut duplicate = 0;
@@ -240,14 +263,9 @@ fn native_import_parallel_metadata_preserves_service_order_and_identity_scopes()
             change_generation: None,
         })
         .collect();
-    let (_, groups, _) = encode_services(
-        &mut dom,
-        &services,
-        &ids,
-        groups,
-        plans,
-        &mut HashMap::new(),
-    )?;
+    let (groups, pending) =
+        encode_services(dom, services, &ids, groups, plans, &mut HashMap::new())?;
+    let _ = pending.finish()?;
     assert_eq!(
         groups
             .iter()
@@ -295,14 +313,9 @@ fn import_identity_tree_covers_a_subtree_across_native_batches() -> Result<()> {
         mutation_package_roots: Vec::new(),
         change_generation: None,
     }];
-    let (bytes, groups, replacement) = encode_services(
-        &mut dom,
-        &services,
-        &ids,
-        groups,
-        plans,
-        &mut HashMap::new(),
-    )?;
+    let (groups, pending) =
+        encode_services(dom, services, &ids, groups, plans, &mut HashMap::new())?;
+    let (bytes, replacement, _) = pending.finish()?;
     assert!(replacement.batches.len() > 1);
     assert_eq!(
         replacement.plan.aliases.len(),
@@ -514,58 +527,96 @@ fn collect_requested_bindings(
 }
 
 pub(super) fn encode_services(
-    dom: &mut RbxWeakDom,
-    service_roots: &[(String, RbxRef)],
+    mut dom: RbxWeakDom,
+    service_roots: Vec<(String, RbxRef)>,
     settings_ids: &HashMap<RbxRef, String>,
     groups: Vec<PendingEditorBinaryGroup>,
     package_plans: Vec<EditorPackageGroupPlan>,
     post_apply: &mut HashMap<String, HashSet<String>>,
-) -> Result<(
-    Vec<u8>,
-    Vec<EditorBinaryImportGroup>,
-    EditorNativeReplacement,
-)> {
+) -> Result<(Vec<EditorBinaryImportGroup>, PendingNativeImportEncode)> {
     let trim_profile =
         crate::app::profile::span("native encode retained bindings and excluded children");
     anyhow::ensure!(
         groups.len() == package_plans.len(),
         "Native import plans differ"
     );
-    let (requested, included) = collect_requested_bindings(dom, service_roots, &groups)?;
-    remove_excluded_children(dom, &requested, &included)?;
+    let (requested, included) = collect_requested_bindings(&dom, &service_roots, &groups)?;
+    remove_excluded_children(&mut dom, &requested, &included)?;
     let database = rbx_reflection_database::get()?;
-    filter_retained_properties(dom, &requested, post_apply, database)?;
+    filter_retained_properties(&mut dom, &requested, post_apply, database)?;
     drop(trim_profile);
+    let groups_profile = crate::app::profile::span("native encode group paths and identity rows");
+    let built_groups = groups
+        .into_par_iter()
+        .zip(package_plans)
+        .map(|(group, plan)| {
+            let mut paths = crate::rbx::model::RbxDomPaths::new(&dom);
+            let _service = crate::app::profile::span(&format!(
+                "{}: native import paths and identities ({} roots)",
+                group.service,
+                group.roots.len()
+            ));
+            anyhow::ensure!(
+                plan.retained_roots.is_empty()
+                    && plan.package_roots.is_empty()
+                    && plan.mutation_package_roots.is_empty(),
+                "Linked-package replacement requires its existing retention pipeline"
+            );
+            let root_paths = group
+                .roots
+                .iter()
+                .map(|root| {
+                    let (path_segments, path_ordinals) = paths.parts(*root);
+                    EditorBinaryRootPath {
+                        path_segments,
+                        path_ordinals,
+                    }
+                })
+                .collect();
+            Ok(EditorBinaryImportGroup {
+                instance_identities: instance_identities(
+                    &dom,
+                    &group.roots,
+                    settings_ids,
+                    &HashSet::new(),
+                )?,
+                service: group.service,
+                additive: group.additive,
+                target_path: group.target_path,
+                count: group.roots.len(),
+                payload_root_name: String::new(),
+                expected_structure: None,
+                root_paths,
+                root_settings_ids: group.root_settings_ids,
+                viewport_camera: group.viewport_camera,
+                retained_roots: plan.retained_roots,
+                package_roots: plan.package_roots,
+                mutation_package_roots: plan.mutation_package_roots,
+                change_generation: plan.change_generation,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    drop(groups_profile);
     let tree_profile = crate::app::profile::span("native encode subtree sizes and traversal order");
-    let mut preorder = Vec::new();
+    let limit = NATIVE_IMPORT_BATCH_INSTANCES;
     let mut postorder_nodes = Vec::new();
-    let mut subtree_sizes = AHashMap::<RbxRef, usize>::new();
-    let mut postorder = AHashMap::<RbxRef, usize>::new();
-    for (_, root) in service_roots {
+    for (_, root) in &service_roots {
         let mut stack = vec![(*root, false)];
         while let Some((referent, exiting)) = stack.pop() {
-            let node = dom
-                .get_by_ref(referent)
-                .context("Native subtree disappeared")?;
             if exiting {
-                let size = 1 + node
-                    .children()
-                    .iter()
-                    .map(|child| subtree_sizes[child])
-                    .sum::<usize>();
-                subtree_sizes.insert(referent, size);
                 postorder_nodes.push(referent);
             } else {
-                preorder.push(referent);
+                let node = dom
+                    .get_by_ref(referent)
+                    .context("Native subtree disappeared")?;
                 stack.push((referent, true));
                 stack.extend(node.children().iter().rev().map(|child| (*child, false)));
             }
         }
     }
+    let single_batch = postorder_nodes.len() <= limit;
     drop(tree_profile);
-    let limit = NATIVE_IMPORT_BATCH_INSTANCES;
-    let single_batch = preorder.len() <= limit;
-    let (partitions, primary, repeated, schema) = if single_batch {
+    let (partitions, primary, repeated, preorder) = if single_batch {
         let partitions = if postorder_nodes.is_empty() {
             Vec::new()
         } else {
@@ -575,9 +626,32 @@ pub(super) fn encode_services(
             partitions,
             AHashMap::<RbxRef, usize>::new(),
             HashSet::<RbxRef>::new(),
-            HashMap::<rbx_dom_weak::Ustr, HashMap<rbx_dom_weak::Ustr, &RbxVariant>>::new(),
+            Vec::<RbxRef>::new(),
         )
     } else {
+        let mut preorder = Vec::with_capacity(postorder_nodes.len());
+        let mut subtree_sizes = AHashMap::<RbxRef, usize>::with_capacity(postorder_nodes.len());
+        for (_, root) in &service_roots {
+            let mut stack = vec![(*root, false)];
+            while let Some((referent, exiting)) = stack.pop() {
+                let node = dom
+                    .get_by_ref(referent)
+                    .context("Native subtree disappeared")?;
+                if exiting {
+                    let size = 1 + node
+                        .children()
+                        .iter()
+                        .map(|child| subtree_sizes[child])
+                        .sum::<usize>();
+                    subtree_sizes.insert(referent, size);
+                } else {
+                    preorder.push(referent);
+                    stack.push((referent, true));
+                    stack.extend(node.children().iter().rev().map(|child| (*child, false)));
+                }
+            }
+        }
+        let mut postorder = AHashMap::<RbxRef, usize>::with_capacity(postorder_nodes.len());
         for (rank, referent) in postorder_nodes.into_iter().enumerate() {
             postorder.insert(referent, rank);
         }
@@ -673,7 +747,7 @@ pub(super) fn encode_services(
             })
             .collect::<Result<Vec<_>>>()?;
         record_cross_batch_properties(
-            dom,
+            &dom,
             batch_references
                 .iter()
                 .flat_map(|(_, crossing)| crossing.iter().copied()),
@@ -691,6 +765,64 @@ pub(super) fn encode_services(
             }
         }
         drop(reference_profile);
+        (partitions, primary, repeated, preorder)
+    };
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let state = PayloadEncodeState {
+        dom,
+        requested,
+        single_batch,
+        partitions,
+        primary,
+        repeated,
+        preorder,
+        cancelled: std::sync::Arc::clone(&cancelled),
+    };
+    let handle = std::thread::Builder::new()
+        .name("renium-import-encode".to_string())
+        .spawn(move || encode_services_payload(state))
+        .context("Failed to start native import payload encoder")?;
+    Ok((
+        built_groups,
+        PendingNativeImportEncode::new(handle, cancelled),
+    ))
+}
+
+struct PayloadEncodeState {
+    dom: RbxWeakDom,
+    requested: HashMap<RbxRef, InstanceBindingMode>,
+    single_batch: bool,
+    partitions: Vec<Vec<RbxRef>>,
+    primary: AHashMap<RbxRef, usize>,
+    repeated: HashSet<RbxRef>,
+    preorder: Vec<RbxRef>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn encode_services_payload(
+    state: PayloadEncodeState,
+) -> Result<(Vec<u8>, EditorNativeReplacement, usize)> {
+    let started = Instant::now();
+    let _span = crate::app::profile::span("native editor import service encode");
+    let database = rbx_reflection_database::get()?;
+    let PayloadEncodeState {
+        dom,
+        requested,
+        single_batch,
+        partitions,
+        primary,
+        repeated,
+        preorder,
+        cancelled,
+    } = state;
+    anyhow::ensure!(
+        !cancelled.load(std::sync::atomic::Ordering::Relaxed),
+        "Native import payload encode cancelled"
+    );
+    let dom = &dom;
+    let schema = if single_batch {
+        HashMap::<rbx_dom_weak::Ustr, HashMap<rbx_dom_weak::Ustr, &RbxVariant>>::new()
+    } else {
         let schema_profile = crate::app::profile::span("native encode shared class schema");
         let schemas = preorder
             .par_chunks(4096)
@@ -721,13 +853,17 @@ pub(super) fn encode_services(
             }
         }
         drop(schema_profile);
-        (partitions, primary, repeated, schema)
+        schema
     };
     let workers_profile = crate::app::profile::span("native encode parallel batches");
     let encoded = partitions
         .par_iter()
         .enumerate()
         .map(|(index, members)| {
+            anyhow::ensure!(
+                !cancelled.load(std::sync::atomic::Ordering::Relaxed),
+                "Native import payload encode cancelled"
+            );
             let _batch = crate::app::profile::span(&format!(
                 "native encode batch {index}: {} instances",
                 members.len()
@@ -807,6 +943,10 @@ pub(super) fn encode_services(
         })
         .collect::<Result<Vec<_>>>()?;
     drop(workers_profile);
+    anyhow::ensure!(
+        !cancelled.load(std::sync::atomic::Ordering::Relaxed),
+        "Native import payload encode cancelled"
+    );
     let _combine =
         crate::app::profile::span("native encode join payloads, identities and receipt plans");
     let combine_classes = crate::app::profile::span("native encode merge class counts");
@@ -843,7 +983,11 @@ pub(super) fn encode_services(
         .map(|(index, class)| (class.name.as_str(), index))
         .collect::<HashMap<_, _>>();
     let mut offsets = vec![0u32; classes.len()];
-    let mut bytes = Vec::with_capacity(encoded.iter().map(|(bytes, _, _)| bytes.len()).sum());
+    let mut bytes = if encoded.len() == 1 {
+        Vec::new()
+    } else {
+        Vec::with_capacity(encoded.iter().map(|(bytes, _, _)| bytes.len()).sum())
+    };
     let mut batches = Vec::with_capacity(encoded.len());
     let mut bindings = Vec::new();
     let mut aliases = Vec::new();
@@ -855,9 +999,15 @@ pub(super) fn encode_services(
     drop(combine_classes);
     let combine_payloads =
         crate::app::profile::span("native encode concatenate payloads and bind receipts");
+    let reuse_single = encoded.len() == 1;
     for (payload, receipts, batch_classes) in encoded {
         let start = bytes.len();
-        bytes.extend_from_slice(&payload);
+        let instance_count = i32::try_from(u32::from_le_bytes(payload[20..24].try_into()?))?;
+        if reuse_single {
+            bytes = payload;
+        } else {
+            bytes.extend_from_slice(&payload);
+        }
         for receipt in receipts {
             let index = class_indices[receipt.class_name.as_str()];
             let ordinal = receipt.ordinal + offsets[index];
@@ -890,67 +1040,25 @@ pub(super) fn encode_services(
         for class in &batch_classes {
             offsets[class_indices[class.name.as_str()]] += class.count;
         }
-        let instance_count = i32::try_from(u32::from_le_bytes(payload[20..24].try_into()?))?;
         batches.push(EditorNativeBatch {
             bytes: start..bytes.len(),
         });
         referent_offset += instance_count;
     }
     drop(combine_payloads);
-    let _groups = crate::app::profile::span("native encode group paths and identity rows");
-    let groups = groups
-        .into_par_iter()
-        .zip(package_plans)
-        .map(|(group, plan)| {
-            let mut paths = crate::rbx::model::RbxDomPaths::new(dom);
-            let _service = crate::app::profile::span(&format!(
-                "{}: native import paths and identities ({} roots)",
-                group.service,
-                group.roots.len()
-            ));
-            anyhow::ensure!(
-                plan.retained_roots.is_empty()
-                    && plan.package_roots.is_empty()
-                    && plan.mutation_package_roots.is_empty(),
-                "Linked-package replacement requires its existing retention pipeline"
-            );
-            let root_paths = group
-                .roots
-                .iter()
-                .map(|root| {
-                    let (path_segments, path_ordinals) = paths.parts(*root);
-                    EditorBinaryRootPath {
-                        path_segments,
-                        path_ordinals,
-                    }
-                })
-                .collect();
-            Ok(EditorBinaryImportGroup {
-                instance_identities: instance_identities(
-                    dom,
-                    &group.roots,
-                    settings_ids,
-                    &HashSet::new(),
-                )?,
-                service: group.service,
-                additive: group.additive,
-                target_path: group.target_path,
-                count: group.roots.len(),
-                payload_root_name: String::new(),
-                expected_structure: None,
-                root_paths,
-                root_settings_ids: group.root_settings_ids,
-                viewport_camera: group.viewport_camera,
-                retained_roots: plan.retained_roots,
-                package_roots: plan.package_roots,
-                mutation_package_roots: plan.mutation_package_roots,
-                change_generation: plan.change_generation,
-            })
+    let instance_count = batches
+        .iter()
+        .map(|batch| {
+            u32::from_le_bytes(
+                bytes[batch.bytes.start + 20..batch.bytes.start + 24]
+                    .try_into()
+                    .unwrap(),
+            ) as usize
         })
-        .collect::<Result<Vec<_>>>()?;
+        .sum();
+    crate::app::timing::log_timing("native editor import service encode", started);
     Ok((
         bytes,
-        groups,
         EditorNativeReplacement {
             plan: EditorNativePlan {
                 bindings,
@@ -959,6 +1067,7 @@ pub(super) fn encode_services(
             },
             batches,
         },
+        instance_count,
     ))
 }
 

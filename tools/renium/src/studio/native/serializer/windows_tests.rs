@@ -235,6 +235,7 @@ fn native_gate_rejects_writes_allocations_and_both_thread_ownership_modes() {
     let memory = std::mem::ManuallyDrop::new(ProcessMemory {
         handle: null_mut(),
         pid: 0,
+        start_identity: None,
         verified: Cell::new(false),
         task_abi: Cell::new(None),
     });
@@ -270,6 +271,7 @@ fn native_gate_rejects_new_and_resident_helpers() {
     let memory = std::mem::ManuallyDrop::new(ProcessMemory {
         handle: null_mut(),
         pid: 0,
+        start_identity: None,
         verified: Cell::new(false),
         task_abi: Cell::new(None),
     });
@@ -297,6 +299,7 @@ fn native_gate_rejects_new_and_resident_helpers() {
     let verified = std::mem::ManuallyDrop::new(ProcessMemory {
         handle: null_mut(),
         pid: 0,
+        start_identity: None,
         verified: Cell::new(true),
         task_abi: Cell::new(None),
     });

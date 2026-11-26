@@ -207,6 +207,7 @@ struct ActiveDataModel {
 struct ProcessMemory {
     handle: HANDLE,
     pid: u32,
+    start_identity: Option<String>,
     verified: Cell<bool>,
     task_abi: Cell<Option<u32>>,
 }
@@ -241,6 +242,7 @@ impl ProcessMemory {
         Ok(Self {
             handle,
             pid,
+            start_identity: crate::app::update::process_start_identity(pid),
             verified: Cell::new(false),
             task_abi: Cell::new(None),
         })
@@ -288,6 +290,7 @@ impl ProcessMemory {
         Ok(Self {
             handle,
             pid,
+            start_identity: crate::app::update::process_start_identity(pid),
             verified: Cell::new(false),
             task_abi: Cell::new(None),
         })
@@ -1674,13 +1677,20 @@ fn find_active_data_model(
     Ok(candidates.remove(0).2)
 }
 
+fn studio_title_base(title: &str) -> &str {
+    title
+        .strip_suffix(" - Roblox Studio")
+        .unwrap_or(title)
+        .trim_end_matches('*')
+}
+
 fn refresh_active_data_model(
     memory: &ProcessMemory,
     module: &ModuleEntry,
     title: &str,
     cached: &CachedDataModel,
 ) -> Option<ActiveDataModel> {
-    if cached.title != title
+    if studio_title_base(&cached.title) != studio_title_base(title)
         || read_rtti_type(memory, cached.outer, module.base, module.size).as_deref()
             != Some(".?AVDataModel@RBX@@")
     {
@@ -2005,6 +2015,15 @@ fn put_u64(bytes: &mut [u8], offset: usize, value: usize) {
     bytes[offset..offset + 8].copy_from_slice(&(value as u64).to_le_bytes());
 }
 
+#[derive(Clone)]
+struct CachedClassMembers {
+    header: Vec<u8>,
+    members: HashMap<String, Vec<usize>>,
+}
+
+static CLASS_MEMBERS: OnceLock<Mutex<HashMap<(u32, String, usize), CachedClassMembers>>> =
+    OnceLock::new();
+
 fn find_class_member_descriptor(
     memory: &ProcessMemory,
     instance: usize,
@@ -2012,8 +2031,33 @@ fn find_class_member_descriptor(
     member_name: &str,
 ) -> Result<usize> {
     let class_descriptor = memory.read_u64(instance + layout.class_descriptor)? as usize;
+    let header = memory.read_vec(class_descriptor, 16)?;
+    let key = memory
+        .start_identity
+        .as_ref()
+        .map(|identity| (memory.pid, identity.clone(), class_descriptor));
+    let cached = key.as_ref().and_then(|key| {
+        CLASS_MEMBERS
+            .get_or_init(Default::default)
+            .lock_recover()
+            .get(key)
+            .filter(|entry| entry.header == header)
+            .and_then(|entry| entry.members.get(member_name))
+            .filter(|matches| matches.len() == 1)
+            .map(|matches| matches[0])
+    });
+    if let Some(member) = cached
+        && memory
+            .read_u64(member + 8)
+            .ok()
+            .and_then(|name_object| read_msvc_string(memory, name_object as usize))
+            .as_deref()
+            == Some(member_name)
+    {
+        return Ok(member);
+    }
     let class_bytes = memory.read_vec(class_descriptor, 0x218)?;
-    let mut matches = HashSet::new();
+    let mut by_name: HashMap<String, HashSet<usize>> = HashMap::new();
     for offset in (0..=0x200usize).step_by(8) {
         let entries = read_u64(&class_bytes, offset)? as usize;
         let count = read_u64(&class_bytes, offset + 8)? as usize;
@@ -2037,21 +2081,28 @@ fn find_class_member_descriptor(
             let Ok(name_object) = memory.read_u64(member + 8).map(|value| value as usize) else {
                 continue;
             };
-            if read_msvc_string(memory, name_object).as_deref() == Some(member_name) {
-                matches.insert(member);
+            if let Some(name) = read_msvc_string(memory, name_object) {
+                by_name.entry(name).or_default().insert(member);
             }
         }
     }
-    if matches.len() != 1 {
-        bail!(
-            "Class member '{member_name}' resolved to {} descriptors",
-            matches.len()
-        );
-    }
-    matches
+    let members: HashMap<String, Vec<usize>> = by_name
         .into_iter()
-        .next()
-        .context("Class member descriptor was not found")
+        .map(|(name, set)| (name, set.into_iter().collect()))
+        .collect();
+    let count = members.get(member_name).map_or(0, Vec::len);
+    let found = (count == 1).then(|| members[member_name][0]);
+    if let Some(key) = key {
+        let mut cache = CLASS_MEMBERS.get_or_init(Default::default).lock_recover();
+        if cache.len() >= 512 {
+            cache.clear();
+        }
+        cache.insert(key, CachedClassMembers { header, members });
+    }
+    if count != 1 {
+        bail!("Class member '{member_name}' resolved to {count} descriptors");
+    }
+    found.context("Class member descriptor was not found")
 }
 
 /// The descriptor slot that holds a property's GetSetImpl binding moved
