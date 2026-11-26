@@ -653,10 +653,7 @@ pub(crate) fn upload(
             format!("user {user_id}"),
         )
     };
-    let route = UploadRoute::choose(&request, bridge)?;
-    let refused = |refusal| route.refusal(refusal, &creator_name);
-    let mut results = Vec::with_capacity(request.images.len());
-    for (index, source) in request.images.iter().enumerate() {
+    let typed = |source: &str| -> Result<(Vec<u8>, &'static str, &'static str), Failure> {
         let (bytes, label) = load_image(root, source)?;
         let (mime, extension) = image_type(&bytes, &label).ok_or_else(|| {
             failure(
@@ -666,29 +663,47 @@ pub(crate) fn upload(
                 "image-upload",
             )
         })?;
-        let display_name = request
-            .name
-            .as_deref()
-            .map(|name| {
-                if request.images.len() == 1 {
-                    name.to_string()
-                } else {
-                    format!("{name} {}", index + 1)
+        Ok((bytes, mime, extension))
+    };
+    for source in request.images.iter().filter(|source| !is_web(source)) {
+        typed(source)?;
+    }
+    let route = UploadRoute::choose(&request, bridge)?;
+    let refused = |refusal| route.refusal(refusal, &creator_name);
+    let mut results = Vec::with_capacity(request.images.len());
+    for (index, source) in request.images.iter().enumerate() {
+        let sent: Result<Value, Failure> = (|| {
+            let (bytes, mime, extension) = typed(source)?;
+            let display_name = request
+                .name
+                .as_deref()
+                .map(|name| {
+                    if request.images.len() == 1 {
+                        name.to_string()
+                    } else {
+                        format!("{name} {}", index + 1)
+                    }
+                })
+                .unwrap_or_else(|| format!("Renium image {}", index + 1));
+            let metadata = json!({
+                "assetType": "Image",
+                "displayName": display_name,
+                "description": request.description,
+                "creationContext": { "creator": creator },
+            });
+            let filename = format!("image-{}.{}", index + 1, extension);
+            let (boundary, body) = multipart_body(&metadata, &filename, mime, &bytes);
+            let created = route.create(&boundary, &body).map_err(refused)?;
+            Ok(match operation_path(&created) {
+                Some(path) => {
+                    wait_for_upload(path, &route, request.wait_seconds).map_err(refused)?
                 }
+                None => created,
             })
-            .unwrap_or_else(|| format!("Renium image {}", index + 1));
-        let metadata = json!({
-            "assetType": "Image",
-            "displayName": display_name,
-            "description": request.description,
-            "creationContext": { "creator": creator },
-        });
-        let filename = format!("image-{}.{}", index + 1, extension);
-        let (boundary, body) = multipart_body(&metadata, &filename, mime, &bytes);
-        let created = route.create(&boundary, &body).map_err(refused)?;
-        let operation = match operation_path(&created) {
-            Some(path) => wait_for_upload(path, &route, request.wait_seconds).map_err(refused)?,
-            None => created,
+        })();
+        let operation = match sent {
+            Ok(operation) => operation,
+            Err(refusal) => return Err(one_of_several(refusal, source, index, &results, &request)),
         };
         let asset_id = operation
             .pointer("/response/assetId")
@@ -709,6 +724,36 @@ pub(crate) fn upload(
     Ok(json!({ "images": results }))
 }
 
+fn is_web(source: &str) -> bool {
+    source.starts_with("https://") || source.starts_with("http://")
+}
+
+/// The refusal of one image of a request for several: it names the image
+/// and carries what the request uploaded before it.
+fn one_of_several(
+    mut refusal: Failure,
+    source: &str,
+    index: usize,
+    uploaded: &[Value],
+    request: &ImageUpload,
+) -> Failure {
+    let total = request.images.len();
+    if total == 1 {
+        return refusal;
+    }
+    refusal.0.m = format!(
+        "Image {} of {total} ({source}): {}; {} uploaded before it, none after",
+        index + 1,
+        refusal.0.m,
+        uploaded.len()
+    );
+    if uploaded.is_empty() {
+        refusal
+    } else {
+        refusal.detail(json!({ "images": uploaded }))
+    }
+}
+
 pub(crate) fn studio_upload(parameters: &Value) -> bool {
     let Some(images) = parameters
         .get("images")
@@ -722,11 +767,50 @@ pub(crate) fn studio_upload(parameters: &Value) -> bool {
     parameters.get("via").and_then(Value::as_str) != Some("open-cloud")
         && unset("userId")
         && unset("groupId")
-        && images.iter().all(|source| {
-            source.as_str().is_some_and(|source| {
-                source.starts_with("https://") || source.starts_with("http://")
-            })
-        })
+        && images
+            .iter()
+            .all(|source| source.as_str().is_some_and(is_web))
+}
+
+#[cfg(test)]
+#[test]
+fn a_refused_image_of_several_is_named_with_what_was_uploaded_before_it() {
+    let request =
+        |images: Value| serde_json::from_value::<ImageUpload>(json!({ "images": images })).unwrap();
+    let refusal = || {
+        failure(
+            "cloud_http",
+            "Roblox answered HTTP 400",
+            false,
+            "image-upload",
+        )
+    };
+    let alone = one_of_several(refusal(), "a.png", 0, &[], &request(json!(["a.png"])));
+    assert_eq!(alone.0.m, "Roblox answered HTTP 400");
+    let several = request(json!(["a.png", "b.png", "c.png"]));
+    let uploaded = [json!({ "source": "a.png", "assetId": "7" })];
+    let second = one_of_several(refusal(), "b.png", 1, &uploaded, &several);
+    assert_eq!(
+        second.0.m,
+        "Image 2 of 3 (b.png): Roblox answered HTTP 400; 1 uploaded before it, none after"
+    );
+    assert_eq!(second.0.d, Some(json!({ "images": uploaded })));
+    let first = one_of_several(refusal(), "a.png", 0, &[], &several);
+    assert!(first.0.m.starts_with("Image 1 of 3 (a.png)") && first.0.d.is_none());
+
+    let folder = crate::tests::support::temp_dir("upload-files");
+    fs::write(folder.join("good.png"), b"\x89PNG\r\n\x1a\nrest").unwrap();
+    fs::write(folder.join("notes.txt"), b"not an image").unwrap();
+    let asked = json!({ "images": ["good.png", "notes.txt"], "userId": 7, "keyEnv": "RENIUM_TEST_NO_SUCH_KEY" });
+    let refused = upload(&folder, &asked, None)
+        .err()
+        .map(|refusal| refusal.0.m);
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|text| text.contains("notes.txt") && text.contains("not a supported")),
+        "{refused:?}"
+    );
 }
 
 #[cfg(test)]
