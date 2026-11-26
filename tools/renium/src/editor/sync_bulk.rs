@@ -207,7 +207,7 @@ pub(super) fn read_whole_once(
 
 pub(super) type InspectedPath = (
     PathBuf,
-    Option<fs::Metadata>,
+    Option<super::ChangedPathKind>,
     Option<std::io::Result<String>>,
 );
 
@@ -644,8 +644,8 @@ impl DeletedScriptRun<'_> {
         };
         let mut run = vec![first];
         let mut keys = HashSet::from([path_key(path)]);
-        for (path, metadata, _) in following {
-            match self.follower(path, metadata.as_ref(), &keys) {
+        for (path, kind, _) in following {
+            match self.follower(path, kind.is_some(), &keys) {
                 Some(deleted) if self.removable(&deleted, &mut check) => {
                     keys.insert(path_key(path));
                     run.push(deleted);
@@ -665,11 +665,11 @@ impl DeletedScriptRun<'_> {
     fn follower(
         &mut self,
         path: &Path,
-        metadata: Option<&fs::Metadata>,
+        exists: bool,
         keys: &HashSet<String>,
     ) -> Option<DeletedScript> {
         let key = path_key(path);
-        if metadata.is_some()
+        if exists
             || self.seen_paths.contains(&key)
             || keys.contains(&key)
             || self.instance_paths.contains(&key)

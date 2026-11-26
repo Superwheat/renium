@@ -7130,35 +7130,89 @@ fn filter_virtual_native_script_paths(
         HashSet::new()
     };
     let mut kept = Vec::with_capacity(enforced_changed_paths.len());
-    let mut to_materialize: Vec<(PathBuf, &[u8])> = Vec::new();
-    let mut dirs_to_materialize: Vec<PathBuf> = Vec::new();
     for changed_path in enforced_changed_paths {
         let abs = absolutize_under(project_root, &changed_path);
-        if let Some(rel_key) = virtual_files.relative_key(&abs) {
-            if virtual_files.is_dir_key(&rel_key) {
-                if can_skip_mapped {
-                    continue;
-                }
-                dirs_to_materialize.push(abs);
-            } else if let Some(bytes) = virtual_files.file_bytes_by_key(&rel_key) {
-                if can_skip_mapped && mapped_native_scripts.contains(&rel_key) {
-                    continue;
-                }
-                to_materialize.push((abs, bytes));
-            }
+        if can_skip_mapped
+            && let Some(rel_key) = virtual_files.relative_key(&abs)
+            && (virtual_files.is_dir_key(&rel_key) || mapped_native_scripts.contains(&rel_key))
+        {
+            continue;
         }
         kept.push(changed_path);
     }
-    for dir in dirs_to_materialize {
-        fs::create_dir_all(&dir)?;
-    }
-    for (abs, bytes) in to_materialize {
-        if let Some(parent) = abs.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&abs, bytes)?;
-    }
     Ok(kept)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ChangedPathKind {
+    File,
+    Directory,
+    Other,
+}
+
+/// A changed path as the collection reads it: its canonical form, what
+/// stands there, and a script's text. A file or folder the stage holds only
+/// in memory is read from there, at the place it would have on disk.
+fn inspect_editor_changed_path(
+    project_root: &Path,
+    changed_path: &Path,
+    virtual_files: Option<&crate::editor::types::VirtualStageFiles>,
+) -> (
+    PathBuf,
+    Option<ChangedPathKind>,
+    Option<std::io::Result<String>>,
+) {
+    let is_script = |path: &Path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| matches!(extension, "lua" | "luau"))
+    };
+    let held = virtual_files.and_then(|files| {
+        let absolute = absolutize_under(project_root, changed_path);
+        let key = files.relative_key(&absolute)?;
+        if files.is_dir_key(&key) {
+            return Some((absolute, ChangedPathKind::Directory, None));
+        }
+        let bytes = files.file_bytes_by_key(&key)?;
+        let source = String::from_utf8(bytes.to_vec())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        Some((absolute, ChangedPathKind::File, Some(source)))
+    });
+    if let Some((absolute, kind, source)) = held {
+        let mut existing = absolute.as_path();
+        let mut below = Vec::new();
+        let canonical = loop {
+            if let Ok(canonical) = canonical_path(existing) {
+                break strip_extended_prefix(canonical);
+            }
+            match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    below.push(name);
+                    existing = parent;
+                }
+                _ => break strip_extended_prefix(existing.to_path_buf()),
+            }
+        };
+        let path = below
+            .iter()
+            .rev()
+            .fold(canonical, |path, name| path.join(name));
+        return (path, Some(kind), source);
+    }
+    let absolute_path = canonical_editor_changed_path(project_root, changed_path);
+    let metadata = fs::metadata(&absolute_path).ok();
+    let kind = metadata.map(|metadata| {
+        if metadata.is_dir() {
+            ChangedPathKind::Directory
+        } else if metadata.is_file() {
+            ChangedPathKind::File
+        } else {
+            ChangedPathKind::Other
+        }
+    });
+    let source = (kind == Some(ChangedPathKind::File) && is_script(&absolute_path))
+        .then(|| fs::read_to_string(&absolute_path));
+    (absolute_path, kind, source)
 }
 
 fn collect_editor_changes_with_link_enforcement_and_documents(
@@ -7196,6 +7250,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
     let mut store_references = HashMap::new();
     let mut store_referrers = HashMap::new();
 
+    let phase_started = Instant::now();
     let mut changed_paths = expand_editor_changed_paths(args)?;
     let full_reconcile = changed_paths.is_empty();
     if full_reconcile {
@@ -7203,6 +7258,8 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
     }
     let enforced_changed_paths =
         apply_link_enforcement_to_changed_paths(project_root, link_enforcement, changed_paths)?;
+    log_editor_collection_timing("changed paths", phase_started);
+    let phase_started = Instant::now();
     let mut enforced_changed_paths = filter_virtual_native_script_paths(
         project_root,
         src_root,
@@ -7212,34 +7269,23 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
         enforced_changed_paths,
     )?;
     order_init_files_before_their_siblings(&mut enforced_changed_paths);
+    log_editor_collection_timing("script paths held in stores", phase_started);
+    let phase_started = Instant::now();
     // Each path needs a canonical form, its metadata and, for scripts, its
     // contents. Those file system calls dominate a large push, so they run in
     // parallel before the ordered pass below.
+    let held_files = prepared_documents.virtual_files.as_deref();
     let mut inspected_paths = enforced_changed_paths
         .par_iter()
-        .map(|changed_path| {
-            let absolute_path = canonical_editor_changed_path(project_root, changed_path);
-            let metadata = fs::metadata(&absolute_path).ok();
-            let source = metadata
-                .as_ref()
-                .is_some_and(std::fs::Metadata::is_file)
-                .then(|| {
-                    absolute_path
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| matches!(extension, "lua" | "luau"))
-                        .then(|| fs::read_to_string(&absolute_path))
-                })
-                .flatten();
-            (absolute_path, metadata, source)
-        })
+        .map(|changed_path| inspect_editor_changed_path(project_root, changed_path, held_files))
         .collect::<Vec<_>>();
+    log_editor_collection_timing("path inspection", phase_started);
+    let phase_started = Instant::now();
     let mut next = 0;
     while next < inspected_paths.len() {
         let at = next;
         next += 1;
-        let (absolute_path, metadata, mut prefetched_source) =
-            std::mem::take(&mut inspected_paths[at]);
+        let (absolute_path, kind, mut prefetched_source) = std::mem::take(&mut inspected_paths[at]);
         let Some((absolute_path, service)) =
             unique_editor_canonical_path(src_root, absolute_path, &mut seen_paths)
         else {
@@ -7279,7 +7325,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                 })
         });
 
-        if (metadata.as_ref().is_some_and(std::fs::Metadata::is_dir)
+        if (kind == Some(ChangedPathKind::Directory)
             || prepared_documents
                 .instance_paths
                 .contains(&path_key(&absolute_path)))
@@ -7339,7 +7385,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
                 )
             });
 
-        let exists_as_file = metadata.as_ref().is_some_and(std::fs::Metadata::is_file);
+        let exists_as_file = kind == Some(ChangedPathKind::File);
         let inferred_spec = infer_editor_source_path_spec(src_root, &service, &absolute_path);
         let protected_path = mapped_target
             .as_ref()
@@ -7654,7 +7700,10 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
         });
     }
 
+    log_editor_collection_timing("path pass", phase_started);
+    let phase_started = Instant::now();
     widen_target_ids_to_subtrees(&mut property_filter, &documents, args.exact_target_ids);
+    log_editor_collection_timing("target subtrees", phase_started);
     let changes = finish_editor_change_collection(
         changes,
         &documents,
@@ -7664,11 +7713,13 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
         src_root,
         link_enforcement,
     )?;
+    let phase_started = Instant::now();
     for document in documents.into_values().flatten() {
         if let Ok(document) = Arc::try_unwrap(document) {
             drop_settings_document(document);
         }
     }
+    log_editor_collection_timing("documents released", phase_started);
     Ok(changes)
 }
 
