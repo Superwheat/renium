@@ -32,7 +32,6 @@ pub(crate) struct GamepadInitialState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GamepadSessionReady {
-    Reused(String),
     Connected(String),
     NeedsSlotDetection,
 }
@@ -89,7 +88,6 @@ struct PlayClientLookup<'a> {
 
 struct GamepadSession {
     pid: u32,
-    device_id: i32,
     outer: usize,
     owner: usize,
     layout: InstanceLayout,
@@ -180,7 +178,7 @@ pub(crate) fn has_live_gamepad_session(pid: u32, runtime_id: &str) -> Option<Str
         return None;
     };
     let slot_name = session.slot.as_ref()?;
-    if session.pid != pid || !session.connected || session.device_id != VIRTUAL_DEVICE_ID {
+    if session.pid != pid || !session.connected {
         return None;
     }
     let memory = ProcessMemory::open_read_only(pid).ok()?;
@@ -198,24 +196,22 @@ pub(crate) fn connect_gamepad_session(
         bail!("Play client session is closing");
     }
 
-    let device_id = VIRTUAL_DEVICE_ID;
     let memory = ProcessMemory::open(pid)?;
     if let SessionSlot::Active(session) = &*guard
         && session.pid == pid
-        && session.device_id == device_id
         && session.connected
         && session_is_live(&memory, session)
         && let Some(slot_name) = session.slot.clone()
     {
         memory.authorize(NativeOperation::Gamepad, &session.auth_key())?;
-        return Ok(GamepadSessionReady::Reused(slot_name));
+        return Ok(GamepadSessionReady::Connected(slot_name));
     }
 
     let auth_key = format!("player:{}:{}", init.player_name, init.nonce);
     memory.authorize(NativeOperation::Gamepad, &auth_key)?;
-    let mut session = discover_session(&memory, pid, device_id, init)?;
+    let mut session = discover_session(&memory, pid, init)?;
     let connect_binding = session.bindings.connect;
-    let input = native_functions::gamepad_connection_input(true, device_id);
+    let input = native_functions::gamepad_connection_input(true, VIRTUAL_DEVICE_ID);
     invoke_reflected(
         &memory,
         &mut session,
@@ -271,7 +267,7 @@ pub(crate) fn set_gamepad_connected(pid: u32, runtime_id: &str, connected: bool)
     } else {
         session.bindings.disconnect
     };
-    let input = native_functions::gamepad_connection_input(connected, session.device_id);
+    let input = native_functions::gamepad_connection_input(connected, VIRTUAL_DEVICE_ID);
     invoke_reflected(&memory, session, binding, input, HELPER_TIMEOUT_MS)?;
     session.connected = connected;
     if !connected {
@@ -328,14 +324,14 @@ fn apply_gamepad_action(
     action: GamepadAction,
 ) -> Result<()> {
     let bindings = session.bindings;
-    let device_id = session.device_id;
     match action {
         GamepadAction::Button {
             name,
             key_code,
             pressed,
         } => {
-            let input = native_functions::gamepad_button_input(device_id, key_code, pressed);
+            let input =
+                native_functions::gamepad_button_input(VIRTUAL_DEVICE_ID, key_code, pressed);
             invoke_reflected(memory, session, bindings.button, input, HELPER_TIMEOUT_MS)?;
             if pressed {
                 session.held_buttons.insert(name, key_code);
@@ -349,7 +345,8 @@ fn apply_gamepad_action(
             x,
             y,
         } => {
-            let input = native_functions::gamepad_axis_input(device_id, key_code, x, y, 0.0);
+            let input =
+                native_functions::gamepad_axis_input(VIRTUAL_DEVICE_ID, key_code, x, y, 0.0);
             invoke_reflected(memory, session, bindings.axis, input, HELPER_TIMEOUT_MS)?;
             if x == 0.0 && y == 0.0 {
                 session.sticks.remove(name);
@@ -362,7 +359,8 @@ fn apply_gamepad_action(
             key_code,
             value,
         } => {
-            let input = native_functions::gamepad_axis_input(device_id, key_code, 0.0, 0.0, value);
+            let input =
+                native_functions::gamepad_axis_input(VIRTUAL_DEVICE_ID, key_code, 0.0, 0.0, value);
             invoke_reflected(memory, session, bindings.axis, input, HELPER_TIMEOUT_MS)?;
             if value == 0.0 {
                 session.triggers.remove(name);
@@ -374,49 +372,49 @@ fn apply_gamepad_action(
     Ok(())
 }
 
-pub(crate) fn release_gamepad_inputs(pid: u32, runtime_id: &str) {
+pub(crate) fn release_gamepad_inputs(pid: u32, runtime_id: &str) -> bool {
     let slot = {
         let map = sessions().lock_recover();
         map.get(runtime_id).cloned()
     };
     let Some(slot) = slot else {
-        return;
+        return false;
     };
     let mut guard = slot.lock_recover();
     let SessionSlot::Active(session) = &mut *guard else {
-        return;
+        return false;
     };
-    if session.pid != pid
-        || !session.connected
-        || (session.held_buttons.is_empty()
-            && session.sticks.is_empty()
-            && session.triggers.is_empty())
-    {
-        return;
+    if session.pid != pid || !session.connected {
+        return false;
+    }
+    if session.held_buttons.is_empty() && session.sticks.is_empty() && session.triggers.is_empty() {
+        return true;
     }
     let Ok(memory) = ProcessMemory::open(pid) else {
-        return;
+        return true;
     };
-    if !session_is_live(&memory, session)
-        || memory
-            .authorize(NativeOperation::Gamepad, &session.auth_key())
-            .is_err()
+    if !session_is_live(&memory, session) {
+        return false;
+    }
+    if memory
+        .authorize(NativeOperation::Gamepad, &session.auth_key())
+        .is_err()
     {
-        return;
+        return true;
     }
     release_tracked_inputs(&memory, session);
+    true
 }
 
 fn release_tracked_inputs(memory: &ProcessMemory, session: &mut GamepadSession) {
     let bindings = session.bindings;
-    let device_id = session.device_id;
     let buttons: Vec<(&'static str, i32)> = session
         .held_buttons
         .iter()
         .map(|(&name, &code)| (name, code))
         .collect();
     for (name, key_code) in buttons {
-        let input = native_functions::gamepad_button_input(device_id, key_code, false);
+        let input = native_functions::gamepad_button_input(VIRTUAL_DEVICE_ID, key_code, false);
         if invoke_reflected(memory, session, bindings.button, input, RELEASE_TIMEOUT_MS).is_err() {
             return;
         }
@@ -428,7 +426,8 @@ fn release_tracked_inputs(memory: &ProcessMemory, session: &mut GamepadSession) 
         .map(|(&name, &(code, _, _))| (name, code))
         .collect();
     for (name, key_code) in sticks {
-        let input = native_functions::gamepad_axis_input(device_id, key_code, 0.0, 0.0, 0.0);
+        let input =
+            native_functions::gamepad_axis_input(VIRTUAL_DEVICE_ID, key_code, 0.0, 0.0, 0.0);
         if invoke_reflected(memory, session, bindings.axis, input, RELEASE_TIMEOUT_MS).is_err() {
             return;
         }
@@ -440,7 +439,8 @@ fn release_tracked_inputs(memory: &ProcessMemory, session: &mut GamepadSession) 
         .map(|(&name, &(code, _))| (name, code))
         .collect();
     for (name, key_code) in triggers {
-        let input = native_functions::gamepad_axis_input(device_id, key_code, 0.0, 0.0, 0.0);
+        let input =
+            native_functions::gamepad_axis_input(VIRTUAL_DEVICE_ID, key_code, 0.0, 0.0, 0.0);
         if invoke_reflected(memory, session, bindings.axis, input, RELEASE_TIMEOUT_MS).is_err() {
             return;
         }
@@ -480,7 +480,7 @@ fn cleanup_session(session: &mut GamepadSession) {
         return;
     }
     let disconnect_binding = session.bindings.disconnect;
-    let input = native_functions::gamepad_connection_input(false, session.device_id);
+    let input = native_functions::gamepad_connection_input(false, VIRTUAL_DEVICE_ID);
     let _ = invoke_reflected(
         &memory,
         session,
@@ -652,7 +652,6 @@ fn cached_probe_data_model(pid: u32) -> Option<usize> {
 fn discover_session(
     memory: &ProcessMemory,
     pid: u32,
-    device_id: i32,
     init: &GamepadInitialState,
 ) -> Result<GamepadSession> {
     let loaded = modules(pid)?;
@@ -703,7 +702,6 @@ fn discover_session(
 
     Ok(GamepadSession {
         pid,
-        device_id,
         outer: model.outer,
         owner: model.owner,
         layout: model.layout,
@@ -800,7 +798,7 @@ fn find_class_member_descriptors(
     memory: &ProcessMemory,
     instance: usize,
     layout: InstanceLayout,
-    wanted: &[&str],
+    wanted: &[&'static str],
 ) -> Result<HashMap<&'static str, usize>> {
     let class_descriptor = memory.read_u64(instance + layout.class_descriptor)? as usize;
     let class_bytes = memory.read_vec(class_descriptor, 0x218)?;
@@ -833,14 +831,7 @@ fn find_class_member_descriptors(
             };
             for &target in wanted {
                 if name == target {
-                    let static_key: &'static str = match target {
-                        "HandleGamepadConnect" => "HandleGamepadConnect",
-                        "HandleGamepadDisconnect" => "HandleGamepadDisconnect",
-                        "HandleGamepadButtonInput" => "HandleGamepadButtonInput",
-                        "HandleGamepadAxisInput" => "HandleGamepadAxisInput",
-                        _ => continue,
-                    };
-                    matches.entry(static_key).or_default().insert(member);
+                    matches.entry(target).or_default().insert(member);
                 }
             }
         }
@@ -853,14 +844,7 @@ fn find_class_member_descriptors(
             "Virtual gamepad is not supported on this Studio version: VirtualInputManager.{target} resolved to {} descriptors",
             set.len()
         );
-        let static_key: &'static str = match target {
-            "HandleGamepadConnect" => "HandleGamepadConnect",
-            "HandleGamepadDisconnect" => "HandleGamepadDisconnect",
-            "HandleGamepadButtonInput" => "HandleGamepadButtonInput",
-            "HandleGamepadAxisInput" => "HandleGamepadAxisInput",
-            _ => bail!("Unexpected VirtualInputManager member '{target}'"),
-        };
-        resolved.insert(static_key, set.into_iter().next().unwrap());
+        resolved.insert(target, set.into_iter().next().unwrap());
     }
     Ok(resolved)
 }
@@ -1040,10 +1024,18 @@ fn find_play_client_data_model(
     if let Some(outer) = lookup.hint_outer
         && likely_pointer(outer)
         && is_data_model_pointer(memory, module, expected_vtable, outer)
-        && let Some((model, _)) =
-            inspect_data_model(memory, module, outer, None, &player_path, nonce_slice)
     {
-        return Ok(model);
+        let mut hint_layout = None;
+        if let Some(model) = inspect_data_model(
+            memory,
+            module,
+            outer,
+            &mut hint_layout,
+            &player_path,
+            nonce_slice,
+        ) {
+            return Ok(model);
+        }
     }
 
     let data_base = module
@@ -1126,21 +1118,15 @@ fn scan_data_candidates_with(
         if !is_data_model_pointer(scan.memory, scan.module, scan.expected_vtable, outer) {
             continue;
         }
-        if let Some((model, discovered_layout)) = inspect_data_model(
+        if let Some(model) = inspect_data_model(
             scan.memory,
             scan.module,
             outer,
-            *known_layout,
+            known_layout,
             scan.player_path,
             scan.nonce_path,
         ) {
-            *known_layout = Some(discovered_layout);
             matches.push(model);
-        } else if known_layout.is_none()
-            && let Some((discovered, _, _)) =
-                discover_instance_layout(scan.memory, scan.module, outer).first()
-        {
-            *known_layout = Some(*discovered);
         }
     }
 }
@@ -1149,11 +1135,11 @@ fn inspect_data_model(
     memory: &ProcessMemory,
     module: &ModuleEntry,
     outer: usize,
-    known_layout: Option<InstanceLayout>,
+    known_layout: &mut Option<InstanceLayout>,
     player_path: &[String],
     nonce_path: Option<&[String]>,
-) -> Option<(ActiveDataModel, InstanceLayout)> {
-    let layouts: Vec<(InstanceLayout, Vec<SharedEntry>)> = if let Some(layout) = known_layout {
+) -> Option<ActiveDataModel> {
+    let layouts: Vec<(InstanceLayout, Vec<SharedEntry>)> = if let Some(layout) = *known_layout {
         let instance = outer.checked_add(layout.data_model_instance)?;
         if memory
             .read_u64(instance + layout.self_pointer)
@@ -1167,10 +1153,15 @@ fn inspect_data_model(
         let roots = read_children(memory, instance, layout)?;
         vec![(layout, roots)]
     } else {
-        discover_instance_layout(memory, module, outer)
-            .into_iter()
-            .map(|(layout, _, roots)| (layout, roots))
-            .collect()
+        let discovered: Vec<(InstanceLayout, Vec<SharedEntry>)> =
+            discover_instance_layout(memory, module, outer)
+                .into_iter()
+                .map(|(layout, _, roots)| (layout, roots))
+                .collect();
+        if let Some((layout, _)) = discovered.first() {
+            *known_layout = Some(*layout);
+        }
+        discovered
     };
 
     for (layout, roots) in layouts {
@@ -1188,13 +1179,6 @@ fn inspect_data_model(
         if !valid_owner(memory, owner, module.base, module.size) {
             continue;
         }
-        let has_vim = roots.iter().any(|root| {
-            read_instance_class(memory, root.instance, layout).as_deref()
-                == Some("VirtualInputManager")
-        });
-        if !has_vim {
-            continue;
-        }
         let model = ActiveDataModel {
             outer,
             owner,
@@ -1209,7 +1193,7 @@ fn inspect_data_model(
         {
             continue;
         }
-        return Some((model, layout));
+        return Some(model);
     }
     None
 }

@@ -517,21 +517,6 @@ pub fn resolve_gamepad_trigger(name: &str) -> Result<GamepadButtonSpec> {
     }
 }
 
-pub fn validate_gamepad_stick_axes(x: f32, y: f32) -> Result<()> {
-    if !x.is_finite() || !y.is_finite() || !(-1.0..=1.0).contains(&x) || !(-1.0..=1.0).contains(&y)
-    {
-        bail!("stick coordinates must be finite numbers in -1..=1");
-    }
-    Ok(())
-}
-
-pub fn validate_gamepad_trigger_value(value: f32) -> Result<()> {
-    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-        bail!("trigger value must be a finite number in 0..=1");
-    }
-    Ok(())
-}
-
 fn letter_name(ch: u8) -> &'static str {
     const NAMES: [&str; 26] = [
         "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",

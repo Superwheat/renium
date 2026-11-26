@@ -551,6 +551,48 @@ fn is_gamepad_action(action: &InputAction) -> bool {
     }
 }
 
+fn resolve_gamepad_action(action: &InputAction) -> Result<input_inject::GamepadButtonSpec> {
+    match action.action {
+        InputActionKind::KeyDown | InputActionKind::KeyUp | InputActionKind::KeyPress => action
+            .key
+            .as_deref()
+            .and_then(input_inject::resolve_gamepad_button)
+            .context("Gamepad action requires a gamepad button key"),
+        InputActionKind::Stick => {
+            let stick = input_inject::resolve_gamepad_stick(
+                action
+                    .stick
+                    .as_deref()
+                    .context("stick action requires stick (L or R)")?,
+            )?;
+            let x = action.axis_x.context("stick action requires axisX")?;
+            let y = action.axis_y.context("stick action requires axisY")?;
+            if !x.is_finite()
+                || !y.is_finite()
+                || !(-1.0..=1.0).contains(&x)
+                || !(-1.0..=1.0).contains(&y)
+            {
+                bail!("stick coordinates must be finite numbers in -1..=1");
+            }
+            Ok(stick)
+        }
+        InputActionKind::Trigger => {
+            let trigger = input_inject::resolve_gamepad_trigger(
+                action
+                    .trigger
+                    .as_deref()
+                    .context("trigger action requires trigger (L2 or R2)")?,
+            )?;
+            let value = action.value.context("trigger action requires value")?;
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                bail!("trigger value must be a finite number in 0..=1");
+            }
+            Ok(trigger)
+        }
+        _ => bail!("Not a gamepad action"),
+    }
+}
+
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ParsedGamepadStep {
@@ -563,62 +605,26 @@ enum ParsedGamepadStep {
 
 #[cfg(windows)]
 fn parse_gamepad_step(action: &InputAction) -> Result<ParsedGamepadStep> {
+    let spec = resolve_gamepad_action(action)?;
     match action.action {
-        InputActionKind::KeyDown => {
-            let spec = action
-                .key
-                .as_deref()
-                .and_then(input_inject::resolve_gamepad_button)
-                .context("Gamepad action requires a gamepad button key")?;
-            Ok(ParsedGamepadStep::ButtonDown(spec.name, spec.key_code))
-        }
-        InputActionKind::KeyUp => {
-            let spec = action
-                .key
-                .as_deref()
-                .and_then(input_inject::resolve_gamepad_button)
-                .context("Gamepad action requires a gamepad button key")?;
-            Ok(ParsedGamepadStep::ButtonUp(spec.name, spec.key_code))
-        }
-        InputActionKind::KeyPress => {
-            let spec = action
-                .key
-                .as_deref()
-                .and_then(input_inject::resolve_gamepad_button)
-                .context("Gamepad action requires a gamepad button key")?;
-            Ok(ParsedGamepadStep::ButtonPress(
-                spec.name,
-                spec.key_code,
-                action.ms.unwrap_or(60).min(MAX_KEY_HOLD_MS),
-            ))
-        }
-        InputActionKind::Stick => {
-            let stick = input_inject::resolve_gamepad_stick(
-                action
-                    .stick
-                    .as_deref()
-                    .context("stick action requires stick (L or R)")?,
-            )?;
-            let x = action.axis_x.context("stick action requires axisX")?;
-            let y = action.axis_y.context("stick action requires axisY")?;
-            input_inject::validate_gamepad_stick_axes(x, y)?;
-            Ok(ParsedGamepadStep::Stick(stick.name, stick.key_code, x, y))
-        }
-        InputActionKind::Trigger => {
-            let trigger = input_inject::resolve_gamepad_trigger(
-                action
-                    .trigger
-                    .as_deref()
-                    .context("trigger action requires trigger (L2 or R2)")?,
-            )?;
-            let value = action.value.context("trigger action requires value")?;
-            input_inject::validate_gamepad_trigger_value(value)?;
-            Ok(ParsedGamepadStep::Trigger(
-                trigger.name,
-                trigger.key_code,
-                value,
-            ))
-        }
+        InputActionKind::KeyDown => Ok(ParsedGamepadStep::ButtonDown(spec.name, spec.key_code)),
+        InputActionKind::KeyUp => Ok(ParsedGamepadStep::ButtonUp(spec.name, spec.key_code)),
+        InputActionKind::KeyPress => Ok(ParsedGamepadStep::ButtonPress(
+            spec.name,
+            spec.key_code,
+            action.ms.unwrap_or(60).min(MAX_KEY_HOLD_MS),
+        )),
+        InputActionKind::Stick => Ok(ParsedGamepadStep::Stick(
+            spec.name,
+            spec.key_code,
+            action.axis_x.context("stick action requires axisX")?,
+            action.axis_y.context("stick action requires axisY")?,
+        )),
+        InputActionKind::Trigger => Ok(ParsedGamepadStep::Trigger(
+            spec.name,
+            spec.key_code,
+            action.value.context("trigger action requires value")?,
+        )),
         _ => bail!("Not a gamepad action"),
     }
 }
@@ -805,6 +811,9 @@ fn remove_gamepad_nonce(bridge: &BridgeServer, player: Option<&str>, nonce: &str
 }
 
 #[cfg(windows)]
+const GAMEPAD_SLOT_WAIT_SECONDS: f64 = 1.0;
+
+#[cfg(windows)]
 fn detect_connected_gamepad_slot(
     bridge: &BridgeServer,
     player: Option<&str>,
@@ -824,7 +833,7 @@ fn detect_connected_gamepad_slot(
          local uis = game:GetService('UserInputService') \
          local rs = game:GetService('RunService') \
          local before = {{ {before_entries} }} \
-         local deadline = os.clock() + 0.5 \
+         local deadline = os.clock() + {GAMEPAD_SLOT_WAIT_SECONDS} \
          local found = nil \
          repeat \
            for _, pad in ipairs(uis:GetConnectedGamepads()) do \
@@ -865,7 +874,7 @@ fn wait_connected_gamepads_after_disconnect(
     let code = format!(
         "local uis = game:GetService('UserInputService') \
          local rs = game:GetService('RunService') \
-         local deadline = os.clock() + 0.5 \
+         local deadline = os.clock() + {GAMEPAD_SLOT_WAIT_SECONDS} \
          local list = {{}} \
          repeat \
            list = {{}} \
@@ -918,7 +927,7 @@ fn ensure_gamepad_ready(
     let slot_attr = gamepad_slot_attribute();
     let snapshot = fetch_gamepad_init(bridge, player, &nonce, &slot_attr)?;
     match connect_gamepad_session(pid, runtime_id, &snapshot.initial) {
-        Ok(GamepadSessionReady::Reused(slot) | GamepadSessionReady::Connected(slot)) => {
+        Ok(GamepadSessionReady::Connected(slot)) => {
             remove_gamepad_nonce(bridge, player, &nonce);
             Ok(slot)
         }
@@ -1147,17 +1156,65 @@ fn reported_axis(value: f32) -> f64 {
 }
 
 #[cfg(windows)]
-fn release_held_virtual_inputs(bridge: &BridgeServer, player: Option<&str>, prior: &Value) {
-    let has_keys = prior
-        .get("heldKeys")
+fn client_has_held_virtual_gamepad(bridge: &BridgeServer, player: Option<&str>) -> bool {
+    let slot_attr = gamepad_slot_attribute();
+    let code = format!(
+        "local vim = game:GetService('VirtualInputManager') \
+         local slot = vim:GetAttribute('{slot_attr}') \
+         if type(slot) ~= 'string' then return false end \
+         local pad = Enum.UserInputType[slot] \
+         if not pad then return false end \
+         local uis = game:GetService('UserInputService') \
+         if not uis:GetGamepadConnected(pad) then return false end \
+         for _, obj in ipairs(uis:GetGamepadState(pad)) do \
+           local n = obj.KeyCode.Name \
+           if n == 'Thumbstick1' or n == 'Thumbstick2' then \
+             if obj.Position.X ~= 0 or obj.Position.Y ~= 0 then return true end \
+           elseif (n == 'ButtonL2' or n == 'ButtonR2') and obj.Position.Z ~= 0 then \
+             return true \
+           elseif uis:IsGamepadButtonDown(pad, obj.KeyCode) then \
+             return true \
+           end \
+         end \
+         return false"
+    );
+    let Ok(response) = call_execute_luau(
+        bridge,
+        BridgeTarget::Client,
+        player,
+        &code,
+        "ReniumGamepadHeldCheck",
+        5.0,
+        2.0,
+    ) else {
+        return false;
+    };
+    response
+        .get("results")
         .and_then(Value::as_array)
-        .is_some_and(|items| !items.is_empty());
-    let has_buttons = prior
-        .get("heldButtons")
-        .and_then(Value::as_array)
-        .is_some_and(|items| !items.is_empty());
-    if has_keys || has_buttons {
+        .and_then(|values| values.first())
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+#[cfg(windows)]
+fn release_all_held_on_failure(bridge: &BridgeServer, player: Option<&str>, release_virtual: bool) {
+    if release_virtual {
         let _ = send_virtual_input(bridge, player, vec![json!({ "type": "release" })], None);
+    }
+    let Ok(pin) = bridge.runtime_pin_for_selector(BridgeTarget::Client, player) else {
+        return;
+    };
+    let Ok(pid) = bridge.studio_pid_for_selector(BridgeTarget::Client, player) else {
+        return;
+    };
+    if release_gamepad_inputs(pid, &pin.runtime_id) {
+        return;
+    }
+    if client_has_held_virtual_gamepad(bridge, player)
+        && ensure_gamepad_ready(bridge, player, pid, &pin.runtime_id).is_ok()
+    {
+        release_gamepad_inputs(pid, &pin.runtime_id);
     }
 }
 
@@ -1167,6 +1224,7 @@ fn flush_non_gamepad_actions(
     step_offset: usize,
     player: Option<&str>,
     bridge: &BridgeServer,
+    sent: &mut bool,
 ) -> Result<Value> {
     let sub = InputRequest {
         player: player.map(str::to_string),
@@ -1175,9 +1233,9 @@ fn flush_non_gamepad_actions(
         _bridge_wait_seconds: None,
     };
     if os_input_preferred() && sub.actions.iter().any(needs_window) {
-        os_input_result_at(&sub, bridge, step_offset)
+        os_input_result_at(&sub, bridge, step_offset, sent)
     } else {
-        virtual_input_result_at(&sub, bridge, step_offset, false)
+        virtual_input_result_at(&sub, bridge, step_offset, false, sent)
     }
 }
 
@@ -1215,7 +1273,6 @@ fn record_other_method(result: &Value, used_virtual: &mut bool, used_os: &mut bo
 struct GamepadRunContext<'a> {
     pid: u32,
     runtime_id: &'a str,
-    slot: &'a str,
     player: Option<&'a str>,
     bridge: &'a BridgeServer,
 }
@@ -1223,6 +1280,7 @@ struct GamepadRunContext<'a> {
 #[cfg(windows)]
 #[derive(Default)]
 struct GamepadSequenceState {
+    slot: Option<String>,
     pending_other: Vec<InputAction>,
     other_start: Option<usize>,
     pending_gamepad: Vec<(usize, GamepadAction)>,
@@ -1234,14 +1292,23 @@ struct GamepadSequenceState {
 
 #[cfg(windows)]
 impl GamepadSequenceState {
-    fn flush_gamepad(&mut self, ctx: &GamepadRunContext<'_>) -> Result<()> {
+    fn flush_gamepad(&mut self, ctx: &GamepadRunContext<'_>, sent: &mut bool) -> Result<()> {
         if self.pending_gamepad.is_empty() {
             return Ok(());
         }
+        let slot = match &self.slot {
+            Some(slot) => slot.clone(),
+            None => {
+                let slot = ensure_gamepad_ready(ctx.bridge, ctx.player, ctx.pid, ctx.runtime_id)?;
+                self.slot = Some(slot.clone());
+                slot
+            }
+        };
         let batch = std::mem::take(&mut self.pending_gamepad);
+        *sent = true;
         let state = execute_gamepad_actions(ctx.pid, ctx.runtime_id, &batch)
             .map_err(|(step_index, error)| gamepad_step_error(error, step_index))?;
-        observe_gamepad_batch(ctx.bridge, ctx.player, ctx.slot, &batch, &mut self.observed)?;
+        observe_gamepad_batch(ctx.bridge, ctx.player, &slot, &batch, &mut self.observed)?;
         self.last_gamepad_state = Some(state);
         Ok(())
     }
@@ -1250,6 +1317,7 @@ impl GamepadSequenceState {
         &mut self,
         ctx: &GamepadRunContext<'_>,
         merged_other: &mut Option<Value>,
+        sent: &mut bool,
     ) -> Result<()> {
         if self.pending_other.is_empty() {
             return Ok(());
@@ -1260,6 +1328,7 @@ impl GamepadSequenceState {
             offset,
             ctx.player,
             ctx.bridge,
+            sent,
         )?;
         record_other_method(&result, &mut self.used_virtual, &mut self.used_os);
         *merged_other = Some(merge_segment_result(merged_other.take(), result));
@@ -1293,22 +1362,26 @@ fn gamepad_input_result(request: &InputRequest, bridge: &BridgeServer) -> Result
     let player = request.player.as_deref();
     let pin = bridge.runtime_pin_for_selector(BridgeTarget::Client, player)?;
     let pid = bridge.studio_pid_for_selector(BridgeTarget::Client, player)?;
-    let slot = ensure_gamepad_ready(bridge, player, pid, &pin.runtime_id)?;
 
     let ctx = GamepadRunContext {
         pid,
         runtime_id: &pin.runtime_id,
-        slot: &slot,
         player,
         bridge,
     };
     let mut merged_other: Option<Value> = None;
-    match run_gamepad_sequence(&request.actions, &parsed, &ctx, &mut merged_other) {
+    let mut sent = false;
+    match run_gamepad_sequence(
+        &request.actions,
+        &parsed,
+        &ctx,
+        &mut merged_other,
+        &mut sent,
+    ) {
         Ok(result) => Ok(result),
         Err(error) => {
-            release_gamepad_inputs(pid, &pin.runtime_id);
-            if let Some(prior) = merged_other.as_ref() {
-                release_held_virtual_inputs(bridge, player, prior);
+            if sent {
+                release_all_held_on_failure(bridge, player, true);
             }
             Err(error)
         }
@@ -1321,30 +1394,31 @@ fn run_gamepad_sequence(
     parsed: &[Option<ParsedGamepadStep>],
     ctx: &GamepadRunContext<'_>,
     merged_other: &mut Option<Value>,
+    sent: &mut bool,
 ) -> Result<Value> {
     let mut state = GamepadSequenceState::default();
 
     for (index, (action, step)) in actions.iter().zip(parsed.iter().copied()).enumerate() {
         if let Some(step) = step {
-            state.flush_other(ctx, merged_other)?;
-            queue_gamepad_step(&mut state, ctx, index, step)?;
+            state.flush_other(ctx, merged_other, sent)?;
+            queue_gamepad_step(&mut state, ctx, index, step, sent)?;
             continue;
         }
         if matches!(action.action, InputActionKind::Wait) && state.pending_other.is_empty() {
-            state.flush_gamepad(ctx)?;
+            state.flush_gamepad(ctx, sent)?;
             let ms = action.ms.unwrap_or(0).min(MAX_KEY_HOLD_MS);
             if ms > 0 {
                 thread::sleep(Duration::from_millis(ms));
             }
             continue;
         }
-        state.flush_gamepad(ctx)?;
+        state.flush_gamepad(ctx, sent)?;
         state.other_start.get_or_insert(index);
         state.pending_other.push(action.clone());
     }
 
-    state.flush_gamepad(ctx)?;
-    state.flush_other(ctx, merged_other)?;
+    state.flush_gamepad(ctx, sent)?;
+    state.flush_other(ctx, merged_other, sent)?;
 
     let mut result = merged_other
         .take()
@@ -1354,7 +1428,12 @@ fn run_gamepad_sequence(
     result["actions"] = json!(actions.len());
     result["inputMethod"] = json!(combined_input_method(state.used_virtual, state.used_os));
     if let Some(report) = state.last_gamepad_state.as_ref() {
-        apply_gamepad_state(&mut result, ctx.slot, report, &state.observed);
+        apply_gamepad_state(
+            &mut result,
+            state.slot.as_deref().unwrap_or(""),
+            report,
+            &state.observed,
+        );
     }
     Ok(result)
 }
@@ -1365,6 +1444,7 @@ fn queue_gamepad_step(
     ctx: &GamepadRunContext<'_>,
     index: usize,
     step: ParsedGamepadStep,
+    sent: &mut bool,
 ) -> Result<()> {
     match step {
         ParsedGamepadStep::ButtonDown(name, key_code) => {
@@ -1396,7 +1476,7 @@ fn queue_gamepad_step(
                     pressed: true,
                 },
             ));
-            state.flush_gamepad(ctx)?;
+            state.flush_gamepad(ctx, sent)?;
             if hold_ms > 0 {
                 thread::sleep(Duration::from_millis(hold_ms));
             }
@@ -1435,49 +1515,11 @@ fn queue_gamepad_step(
 }
 
 #[cfg(not(windows))]
-fn validate_gamepad_action_name(action: &InputAction) -> Result<&'static str> {
-    match action.action {
-        InputActionKind::KeyDown | InputActionKind::KeyUp | InputActionKind::KeyPress => {
-            let spec = action
-                .key
-                .as_deref()
-                .and_then(input_inject::resolve_gamepad_button)
-                .context("Gamepad action requires a gamepad button key")?;
-            Ok(spec.name)
-        }
-        InputActionKind::Stick => {
-            let stick = input_inject::resolve_gamepad_stick(
-                action
-                    .stick
-                    .as_deref()
-                    .context("stick action requires stick (L or R)")?,
-            )?;
-            let x = action.axis_x.context("stick action requires axisX")?;
-            let y = action.axis_y.context("stick action requires axisY")?;
-            input_inject::validate_gamepad_stick_axes(x, y)?;
-            Ok(stick.name)
-        }
-        InputActionKind::Trigger => {
-            let trigger = input_inject::resolve_gamepad_trigger(
-                action
-                    .trigger
-                    .as_deref()
-                    .context("trigger action requires trigger (L2 or R2)")?,
-            )?;
-            let value = action.value.context("trigger action requires value")?;
-            input_inject::validate_gamepad_trigger_value(value)?;
-            Ok(trigger.name)
-        }
-        _ => bail!("Not a gamepad action"),
-    }
-}
-
-#[cfg(not(windows))]
 fn gamepad_input_result(request: &InputRequest, _bridge: &BridgeServer) -> Result<Value> {
     let mut first = None;
     for action in &request.actions {
         if is_gamepad_action(action) {
-            let name = validate_gamepad_action_name(action)?;
+            let name = resolve_gamepad_action(action)?.name;
             first.get_or_insert(name);
         }
     }
@@ -1485,19 +1527,6 @@ fn gamepad_input_result(request: &InputRequest, _bridge: &BridgeServer) -> Resul
         "Virtual gamepad input ({}) is only supported on Windows",
         first.unwrap_or("gamepad")
     )
-}
-
-#[cfg(windows)]
-fn release_live_gamepad_on_failure(bridge: &BridgeServer, player: Option<&str>) {
-    let Ok(pin) = bridge.runtime_pin_for_selector(BridgeTarget::Client, player) else {
-        return;
-    };
-    let Ok(pid) = bridge.studio_pid_for_selector(BridgeTarget::Client, player) else {
-        return;
-    };
-    if has_live_gamepad_session(pid, &pin.runtime_id).is_some() {
-        release_gamepad_inputs(pid, &pin.runtime_id);
-    }
 }
 
 pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<Value> {
@@ -1513,18 +1542,22 @@ pub(crate) fn input_result(parameters: &Value, bridge: &BridgeServer) -> Result<
             .map_err(|error| stopped_chain_error(error, &request.actions));
     }
     #[cfg(windows)]
-    let outcome = if os_input_preferred() && request.actions.iter().any(needs_window) {
-        os_input_result(&request, bridge)
-    } else {
-        virtual_input_result(&request, bridge)
-    };
-    #[cfg(not(windows))]
-    let outcome = virtual_input_result(&request, bridge);
-    #[cfg(windows)]
-    if outcome.is_err() {
-        release_live_gamepad_on_failure(bridge, request.player.as_deref());
+    {
+        let mut sent = false;
+        let use_os = os_input_preferred() && request.actions.iter().any(needs_window);
+        let outcome = if use_os {
+            os_input_result_at(&request, bridge, 0, &mut sent)
+        } else {
+            virtual_input_result_at(&request, bridge, 0, true, &mut sent)
+        };
+        if outcome.is_err() && sent {
+            release_all_held_on_failure(bridge, request.player.as_deref(), use_os);
+        }
+        return outcome.map_err(|error| stopped_chain_error(error, &request.actions));
     }
-    outcome.map_err(|error| stopped_chain_error(error, &request.actions))
+    #[cfg(not(windows))]
+    virtual_input_result(&request, bridge)
+        .map_err(|error| stopped_chain_error(error, &request.actions))
 }
 
 /// Verified GUI clicks and waits run in the client and need no Studio window.
@@ -1534,15 +1567,11 @@ fn needs_window(action: &InputAction) -> bool {
 }
 
 #[cfg(windows)]
-fn os_input_result(request: &InputRequest, bridge: &BridgeServer) -> Result<Value> {
-    os_input_result_at(request, bridge, 0)
-}
-
-#[cfg(windows)]
 fn os_input_result_at(
     request: &InputRequest,
     bridge: &BridgeServer,
     step_offset: usize,
+    sent: &mut bool,
 ) -> Result<Value> {
     let player = request.player.as_deref();
     let (window, offset_x, offset_y) =
@@ -1562,6 +1591,7 @@ fn os_input_result_at(
                     let (x, y) = action_position(action, bridge, player, position)?;
                     let (dx, dy) = *calibration
                         .get_or_insert_with(|| input_delta(bridge, player, &window, x, y));
+                    *sent = true;
                     input_inject::post_mouse_click(
                         &window,
                         x + offset_x + dx,
@@ -1577,6 +1607,7 @@ fn os_input_result_at(
                         .as_deref()
                         .context("Keyboard actions require key")?,
                 )?;
+                *sent = true;
                 match action.action {
                     InputActionKind::KeyDown => input_inject::post_key_state(&window, &key, true)?,
                     InputActionKind::KeyUp => input_inject::post_key_state(&window, &key, false)?,
@@ -1592,6 +1623,7 @@ fn os_input_result_at(
                     let (x, y) = action_position(action, bridge, player, position)?;
                     let (dx, dy) = *calibration
                         .get_or_insert_with(|| input_delta(bridge, player, &window, x, y));
+                    *sent = true;
                     input_inject::post_mouse_click(
                         &window,
                         x + offset_x + dx,
@@ -1601,13 +1633,12 @@ fn os_input_result_at(
                     )?;
                     position = Some((x, y));
                 }
-                input_inject::post_text(
-                    &window,
-                    action
-                        .text
-                        .as_deref()
-                        .context("text action requires text")?,
-                )?;
+                let text = action
+                    .text
+                    .as_deref()
+                    .context("text action requires text")?;
+                *sent = true;
+                input_inject::post_text(&window, text)?;
             }
             InputActionKind::Move
             | InputActionKind::MouseDown
@@ -1617,6 +1648,7 @@ fn os_input_result_at(
             | InputActionKind::ScrollDown => {
                 if let Some(click) = verified_click_command(action, step_offset + index + 1) {
                     let (x, y) = action_position(action, bridge, player, position)?;
+                    *sent = true;
                     send_virtual_input(bridge, player, vec![click], None)?;
                     used_virtual = true;
                     position = Some((x, y));
@@ -1629,6 +1661,7 @@ fn os_input_result_at(
                 let window_x = x + offset_x + dx;
                 let window_y = y + offset_y + dy;
                 let right = matches!(action.button, Some(MouseButton::Right));
+                *sent = true;
                 match action.action {
                     InputActionKind::Move => {
                         input_inject::post_mouse_move(&window, window_x, window_y)?
@@ -1665,6 +1698,7 @@ fn os_input_result_at(
                 let right = matches!(action.button, Some(MouseButton::Right));
                 let at = |x: i32, y: i32| (x + offset_x + dx, y + offset_y + dy);
                 let (x, y) = at(from_x, from_y);
+                *sent = true;
                 input_inject::post_mouse_move(&window, x, y)?;
                 input_inject::post_mouse_button(&window, x, y, right, true)?;
                 let ms = action.ms.unwrap_or(DEFAULT_DRAG_MS).min(MAX_DRAG_MS);
@@ -1687,8 +1721,9 @@ fn os_input_result_at(
                 thread::sleep(Duration::from_millis(action.ms.unwrap_or(0).min(10_000)));
             }
             InputActionKind::Dismiss | InputActionKind::Press => {
-                let response =
-                    send_virtual_input(bridge, player, vec![core_gui_command(action)?], None)?;
+                let command = core_gui_command(action)?;
+                *sent = true;
+                let response = send_virtual_input(bridge, player, vec![command], None)?;
                 core_gui = response.get("coreGui").cloned();
                 used_virtual = true;
             }
@@ -1753,8 +1788,10 @@ fn predates_gui_path_input(clients: &[Value]) -> bool {
     predates(clients, GUI_PATH_INPUT_BUILD_UNIX)
 }
 
+#[cfg(not(windows))]
 fn virtual_input_result(request: &InputRequest, bridge: &BridgeServer) -> Result<Value> {
-    virtual_input_result_at(request, bridge, 0, true)
+    let mut sent = false;
+    virtual_input_result_at(request, bridge, 0, true, &mut sent)
 }
 
 fn virtual_input_result_at(
@@ -1762,6 +1799,7 @@ fn virtual_input_result_at(
     bridge: &BridgeServer,
     step_offset: usize,
     allow_strict: bool,
+    sent: &mut bool,
 ) -> Result<Value> {
     if names_gui_path(&request.actions) && predates_gui_path_input(&bridge.list_bridge_clients()) {
         bail!(
@@ -1782,6 +1820,7 @@ fn virtual_input_result_at(
         allow_strict,
         &mut |action, previous| action_position(action, bridge, player, previous),
     )?;
+    *sent = true;
     let response = send_virtual_input(bridge, player, commands, None)?;
     let mut result = json!({
         "ok": true,
@@ -2284,5 +2323,70 @@ mod tests {
         assert_eq!(combined_input_method(true, false), "gamepad+virtual");
         assert_eq!(combined_input_method(false, true), "gamepad+os");
         assert_eq!(combined_input_method(true, true), "gamepad+mixed");
+    }
+
+    #[test]
+    fn resolve_gamepad_action_validates_axis_ranges() {
+        let stick = |x: f32, y: f32| InputAction {
+            action: InputActionKind::Stick,
+            key: None,
+            text: None,
+            path: None,
+            x: None,
+            y: None,
+            to_path: None,
+            to_x: None,
+            to_y: None,
+            button: None,
+            ms: None,
+            stick: Some("L".to_string()),
+            trigger: None,
+            axis_x: Some(x),
+            axis_y: Some(y),
+            value: None,
+        };
+        let trigger = |value: f32| InputAction {
+            action: InputActionKind::Trigger,
+            key: None,
+            text: None,
+            path: None,
+            x: None,
+            y: None,
+            to_path: None,
+            to_x: None,
+            to_y: None,
+            button: None,
+            ms: None,
+            stick: None,
+            trigger: Some("R2".to_string()),
+            axis_x: None,
+            axis_y: None,
+            value: Some(value),
+        };
+
+        assert_eq!(
+            resolve_gamepad_action(&stick(-1.0, 1.0)).unwrap().name,
+            "Thumbstick1"
+        );
+        assert_eq!(
+            resolve_gamepad_action(&trigger(0.0)).unwrap().name,
+            "ButtonR2"
+        );
+        assert_eq!(
+            resolve_gamepad_action(&trigger(1.0)).unwrap().name,
+            "ButtonR2"
+        );
+
+        for bad in [
+            stick(1.5, 0.0),
+            stick(0.0, -1.1),
+            stick(f32::NAN, 0.0),
+            stick(0.0, f32::INFINITY),
+            trigger(-0.1),
+            trigger(1.1),
+            trigger(f32::NAN),
+        ] {
+            assert!(resolve_gamepad_action(&bad).is_err());
+        }
     }
 }

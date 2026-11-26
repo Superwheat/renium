@@ -706,19 +706,14 @@ fn axis_pair(value: &str) -> Result<(f32, f32)> {
         .trim()
         .parse()
         .with_context(|| format!("stick Y coordinate must be a number, not '{value}'"))?;
-    crate::studio::input::validate_gamepad_stick_axes(x, y)
-        .with_context(|| format!("invalid stick coordinates '{value}'"))?;
     Ok((x, y))
 }
 
 fn trigger_value(value: &str) -> Result<f32> {
-    let parsed: f32 = value
+    value
         .trim()
         .parse()
-        .with_context(|| format!("trigger takes a value between 0 and 1, not '{value}'"))?;
-    crate::studio::input::validate_gamepad_trigger_value(parsed)
-        .with_context(|| format!("invalid trigger value '{value}'"))?;
-    Ok(parsed)
+        .with_context(|| format!("trigger takes a value between 0 and 1, not '{value}'"))
 }
 
 fn point(value: &str) -> Option<Map<String, Value>> {
@@ -1097,7 +1092,7 @@ mod input_action_tests {
     }
 
     #[test]
-    fn stick_and_trigger_parse_and_validate_ranges() {
+    fn stick_and_trigger_parse_syntax() {
         let actions = input_actions(&[
             "stick".into(),
             "L".into(),
@@ -1132,12 +1127,10 @@ mod input_action_tests {
         );
         for bad in [
             vec!["stick", "X", "0,0"],
-            vec!["stick", "L", "1.5,0"],
-            vec!["stick", "L", "0,-1.1"],
             vec!["stick", "L", "0"],
+            vec!["stick", "L", "a,0"],
             vec!["trigger", "L1", "0.5"],
-            vec!["trigger", "L2", "-0.1"],
-            vec!["trigger", "R2", "1.1"],
+            vec!["trigger", "L2", "abc"],
         ] {
             let tokens: Vec<String> = bad.into_iter().map(String::from).collect();
             assert!(input_actions(&tokens).is_err(), "{tokens:?}");
