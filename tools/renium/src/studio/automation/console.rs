@@ -516,6 +516,8 @@ impl ConsoleMatcher {
             // `output` is the level word the help lists for ordinary prints.
             let wanted = if level.eq_ignore_ascii_case("output") {
                 "print"
+            } else if level.eq_ignore_ascii_case("warning") {
+                "warn"
             } else {
                 level
             };
@@ -558,6 +560,20 @@ fn print_followed_console_entries(args: &PluginConsoleOutputArgs, result: &Value
 mod filter_tests {
     use super::*;
     use crate::cli::BridgeConnectionArgs;
+
+    #[test]
+    fn a_warning_is_matched_under_either_word_for_its_level() {
+        use clap::Parser;
+        let warning = json!({"type": "MessageWarning", "message": "low fuel"});
+        let failure = json!({"type": "MessageError", "message": "no fuel"});
+        for word in ["warn", "warning", "WARNING"] {
+            let matcher = ConsoleMatcher::new(&args(None, false, Some(word), 5)).unwrap();
+            assert!(matcher.matches(&warning), "{word}");
+            assert!(!matcher.matches(&failure), "{word}");
+        }
+        assert!(crate::cli::Cli::try_parse_from(["rbx", "co", "--level", "warning"]).is_ok());
+        assert!(crate::cli::Cli::try_parse_from(["rbx", "co", "--level", "warnings"]).is_err());
+    }
 
     fn args(
         grep: Option<&str>,

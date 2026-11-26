@@ -1431,7 +1431,10 @@ pub(super) struct PluginConsoleOutputArgs {
     #[arg(
         help = "Only entries of this level: error, warn, info, output",
         long,
-        value_name = "LEVEL"
+        value_name = "LEVEL",
+        value_parser = ["error", "warn", "warning", "info", "output", "print"],
+        hide_possible_values = true,
+        ignore_case = true
     )]
     pub(super) level: Option<String>,
     #[arg(help = "Poll interval while following", long, default_value_t = 200)]
