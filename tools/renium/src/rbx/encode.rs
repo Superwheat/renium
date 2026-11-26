@@ -1076,7 +1076,7 @@ impl ContentAliasState {
                 builder.add_property(legacy, RbxVariant::ContentId(RbxContentId::from(uri)));
             }
         } else if !self.modern_present
-            && modern == "Content"
+            && modern != "TexturePackContent"
             && let Some(uri) = self.legacy_uri
             && !builder.has_property(modern)
         {
@@ -4748,6 +4748,47 @@ mod tests {
             Some(&RbxVariant::ContentId(RbxContentId::from(uri))),
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_template_under_its_older_name_is_written_under_both() {
+        use crate::tests::support::{settings_document, settings_instance};
+        use rbx_dom_weak::types::Content as RbxContent;
+
+        let database = rbx_reflection_database::get().unwrap();
+        let uri = "rbxassetid://111111";
+        for (class, modern, legacy) in [
+            ("Pants", "PantsTemplateContent", "PantsTemplate"),
+            ("Shirt", "ShirtTemplateContent", "ShirtTemplate"),
+        ] {
+            for stored in [legacy, modern] {
+                let mut instance = settings_instance("row", "Row", class, None);
+                instance.properties.insert(stored.into(), json!(uri));
+                let document = settings_document(vec![instance]);
+                let mut refs = BytecodeModelExportRefs::default();
+                refs.by_index.insert(0, RbxRef::new());
+                let mut metadata = AHashMap::new();
+                let mut encoder =
+                    BytecodeRbxEncoder::new(&document, database, &mut metadata, &refs);
+                let builder = encoder
+                    .build(0, BytecodeRbxBuildOptions::default())
+                    .unwrap();
+                let mut dom = rbx_dom_weak::WeakDom::new(RbxInstanceBuilder::new("DataModel"));
+                let root = dom.root_ref();
+                let row = dom.insert(root, builder);
+                let node = dom.get_by_ref(row).unwrap();
+                assert_eq!(
+                    node.properties.get(&modern.into()),
+                    Some(&RbxVariant::Content(RbxContent::from_uri(uri))),
+                    "{class} stored as {stored}"
+                );
+                assert_eq!(
+                    node.properties.get(&legacy.into()),
+                    Some(&RbxVariant::ContentId(RbxContentId::from(uri))),
+                    "{class} stored as {stored}"
+                );
+            }
+        }
     }
 
     #[test]
