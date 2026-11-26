@@ -66,6 +66,7 @@ struct Write {
     void* terrain;
     std::shared_ptr<void> owner;
     std::string beforeSmooth, beforePhysics, writtenSmooth, writtenPhysics;
+    bool restorePhysicsOnCommit = false;
     void RestoreAcquisition(const std::string& value) const {
         if (Get(acquisition, terrain) != value &&
             !reinterpret_cast<bool (*)(void*, void*, const std::string*)>(acquisition.setter)(
@@ -91,6 +92,13 @@ struct Write {
     void Check() const {
         if (Get(smooth, terrain) != writtenSmooth)
             throw std::runtime_error("Terrain SmoothGrid changed outside this sync transaction");
+        if (restorePhysicsOnCommit) {
+            renium_terrain_observation::OwnWrite own(terrain);
+            Set(physics, terrain, writtenPhysics);
+            if (Get(physics, terrain) != writtenPhysics)
+                throw std::runtime_error("Studio did not restore the Terrain PhysicsGrid");
+            return;
+        }
         // Replacing voxels schedules a physics rebuild after the setter returns.
         // Its derived cache is not an outside edit; a physics-only write still
         // requires exact readback through commit.
@@ -146,6 +154,17 @@ static Result Apply(void* terrain, std::shared_ptr<void> owner, std::uintptr_t m
         !read((dispatcher ? write->clear.table : write->clear.descriptor) + offset, &member, sizeof(member)) || member != write->clear.function)
         throw std::runtime_error("Terrain Clear binding changed before execution");
     if (lengths[3] & 1) Index(smooth); // Reject malformed or unsupported formats before mutation.
+    if (lengths[3] != 4) {
+        std::function<void()> check;
+        {
+            std::lock_guard lock(renium_history::registrationsMutex);
+            const auto found = renium_history::registrations.find(token);
+            if (found == renium_history::registrations.end() || found->second.model != model)
+                throw std::runtime_error("Terrain write has no registered history transaction");
+            check = found->second.checkTerrain;
+        }
+        if (check) check();
+    }
     write->terrain = terrain; write->owner = std::move(owner);
     write->beforeSmooth = Get(write->smooth, terrain); write->beforePhysics = Get(write->physics, terrain);
     Index(write->beforeSmooth);
@@ -153,15 +172,6 @@ static Result Apply(void* terrain, std::shared_ptr<void> owner, std::uintptr_t m
     if (lengths[3] == 4) return {false, fingerprint};
     if (std::memcmp(fingerprint.data(), input.data() + bindingsSize, fingerprint.size()) != 0)
         throw std::runtime_error("Terrain changed outside this sync transaction");
-    std::function<void()> check;
-    {
-        std::lock_guard lock(renium_history::registrationsMutex);
-        const auto found = renium_history::registrations.find(token);
-        if (found == renium_history::registrations.end() || found->second.model != model)
-            throw std::runtime_error("Terrain write has no registered history transaction");
-        check = found->second.checkTerrain;
-    }
-    if (check) check();
     const bool changeSmooth = (lengths[3] & 1) && write->beforeSmooth != smooth;
     const bool changePhysics = (lengths[3] & 2) && write->beforePhysics != physics;
     if (!changeSmooth && !changePhysics) return {false, fingerprint};
@@ -191,6 +201,7 @@ static Result Apply(void* terrain, std::shared_ptr<void> owner, std::uintptr_t m
     }
     if (((lengths[3] & 1) && write->writtenSmooth != smooth) || ((lengths[3] & 2) && write->writtenPhysics != physics))
         throw std::runtime_error("Studio did not accept the complete Terrain voxel grid");
+    write->restorePhysicsOnCommit = changeSmooth && (lengths[3] & 2) != 0;
     {
         std::lock_guard lock(renium_history::registrationsMutex);
         auto& registration = renium_history::registrations.at(token);
