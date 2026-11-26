@@ -1,6 +1,6 @@
 # Screenshots, recordings, and devices
 
-Capture only when the task needs visual evidence. Use a screenshot for one state and a recording for motion or a transition. Record short-lived effects; don't time screenshots with sleeps. Save captures outside the project or delete them when done. Capturing does not require starting Play; use `--studio` for Edit. Read the Play guide only for runtime work.
+Capture only when the task needs visual evidence. Use a screenshot for one state and a recording for motion or a transition. Record short-lived effects; don't time screenshots with sleeps. Save captures outside the project or delete them when done. Capturing does not require starting Play; use `--studio` for Edit.
 
 ## Check what the player sees
 
@@ -29,9 +29,9 @@ Render quality decides what a capture shows. `rbx gfx` reports Studio's edit and
 `sc --camera-position -10,5,0 --look-at -20,0,0` accepts negative coordinates. `moved: false` means the view was not held (`--output-mode json` adds the requested and actual camera). Inspect the image itself. `--studio` captures the Studio window, including its play view during ordinary Play.
 
 Captures target one window, not the desktop.
-When the viewport is resized during a recording, later frames are fitted into the original canvas and `resizedFrames` reports it.
-Recordings default to 60 FPS (`--fps 1..60`), 60 seconds (`--max-seconds 1..300`), quality 80 (`--quality 0..100`). Keep 60 FPS for clips a person will watch; size is irrelevant.
-Never minimize a window whose behavior matters: the one you record, test or read from. Windows and Roblox throttle a minimized or fully covered window, so it stutters; only filler clients that merely need to exist may be minimized. Leave the windows that matter behind your other windows (`rbx so` opens it that way; `rs` restores a minimized one without focus). `re` reports `achievedFps`; `throttled: true` means the window was starved: fix it and record again.
+A viewport resized mid-recording is fitted into the original canvas; `resizedFrames` reports it.
+Recordings default to 60 FPS (`--fps 1..60`), 60 seconds (`--max-seconds 1..300`), quality 80 (`--quality 0..100`). A clip a person will watch is 60 FPS: on Windows run `rbx fps unlock` first (an unfocused Studio renders one frame in four) and read `achievedFps` from `re`. With `throttled: true`, `note` says what was slow: fix it and record again. Never hand over a choppy clip or lower `--fps` to hide it.
+Never minimize a window whose behavior matters: the one you record, test or read from. Windows and Roblox throttle a minimized or fully covered window; only filler clients may be minimized. Leave the windows that matter behind your other windows (`rbx so` opens it that way; `rs` restores a minimized one without focus).
 
 For an already running client:
 
