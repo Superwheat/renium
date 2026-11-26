@@ -2496,8 +2496,9 @@ updateMouse()
 		end
 		-- Virtual input never reaches Roblox UI, so the prompt's ScreenGui moves
 		-- into PlayerGui for the click and the prompt handles it as a player's;
-		-- it goes back if it is still open afterwards.
-		local function pressCoreGuiButton(button, layer): (boolean, string?)
+		-- it goes back if it is still open afterwards. A prompt that works on
+		-- its answer (a purchase) keeps the button for `answerSeconds` more.
+		local function pressCoreGuiButton(button, layer, answerSeconds: number): (boolean, string?)
 			local localPlayer = game:GetService("Players").LocalPlayer
 			local playerGui = if localPlayer then localPlayer:FindFirstChildOfClass("PlayerGui") else nil
 			if playerGui == nil then
@@ -2535,6 +2536,13 @@ updateMouse()
 			pcall(function()
 				layer.DisplayOrder = displayOrder
 			end)
+			if okClick and not closed then
+				local deadline = os.clock() + answerSeconds
+				while isEffectivelyVisible(button) and os.clock() < deadline do
+					RunService.Heartbeat:Wait()
+				end
+				closed = not isEffectivelyVisible(button)
+			end
 			assertOperationOwnership(operationGeneration)
 			if closed then
 				return true, nil
@@ -2595,7 +2603,7 @@ updateMouse()
 				if button ~= nil then
 					local path = button:GetFullName()
 					local pressError
-					pressed, pressError = pressCoreGuiButton(button, layer)
+					pressed, pressError = pressCoreGuiButton(button, layer, 0)
 					if pressed then
 						appendReport(report, "pressed", { button = path, label = label })
 					else
@@ -2664,12 +2672,18 @@ updateMouse()
 			if refusal ~= nil then
 				error(`{path} is not pressed: {refusal}. \`inp dismiss\` declines or hides the prompt`, 0)
 			end
-			local pressed, pressError = pressCoreGuiButton(button, layer)
+			local answerSeconds = if sells(normalizedLabel(buttonText)) then 15 else 0
+			local pressed, pressError = pressCoreGuiButton(button, layer, answerSeconds)
 			if not pressed then
 				error(`Could not press {path}: {pressError}`, 0)
 			end
 			local report = coreGuiResult()
 			appendReport(report, "pressed", { button = path, label = buttonText })
+			for _, open in openPrompts() do
+				for _, entry in promptButtons(open) do
+					appendReport(report, "buttonsNow", if entry.label ~= "" then entry.label else entry.button.Name)
+				end
+			end
 			finishCoreGui(report)
 		end
 		local ok, result = xpcall(function()
