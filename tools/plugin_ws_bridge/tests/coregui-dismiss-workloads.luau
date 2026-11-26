@@ -26,7 +26,7 @@ local SUPERCLASS = {
 -- selected. That a hidden selection stops counting, that a left click on a
 -- game TextBox focuses it and that a press elsewhere releases that focus are
 -- assumptions the maintainer verifies live.
-local engine = { frame = 0 }
+local engine = { frame = 0, skippedSeconds = 0, secondsPerFrame = 0 }
 local coreGui
 local playerGui
 
@@ -397,6 +397,10 @@ local services = {
 		IsStudio = function() return not engine.published end,
 		Heartbeat = { Wait = function()
 			engine.frame += 1
+			engine.skippedSeconds += engine.secondsPerFrame
+			if engine.onFrame ~= nil then
+				engine.onFrame()
+			end
 			scheduler.wait()
 		end },
 	},
@@ -425,6 +429,11 @@ local RuntimeApi = luau.load(fs.readFile("tools/plugin_ws_bridge/BridgeRuntimeAp
 		Enum = Enum,
 		Vector2 = Vector2,
 		task = scheduler,
+		os = setmetatable({
+			clock = function()
+				return os.clock() + engine.skippedSeconds
+			end,
+		}, { __index = os }),
 		script = { Parent = { BridgeValueCodec = codec } },
 		require = function(module)
 			assert(module == codec)
@@ -711,7 +720,7 @@ local function shop()
 	local hud = new("Frame", main, { Name = "HUD", AbsolutePosition = hudPosition, AbsoluteSize = hudSize })
 	local cashPosition, cashSize = at(120, 530, 100, 40)
 	new("TextButton", hud, { Name = "Cash", AbsolutePosition = cashPosition, AbsoluteSize = cashSize })
-	local fixture = { main = main, panel = panel, codes = codes, hud = hud, redeemed = {} }
+	local fixture = { main = main, panel = panel, codes = codes, redeem = redeem, hud = hud, redeemed = {} }
 	redeem.Activated:Connect(function()
 		table.insert(fixture.redeemed, codes.Text)
 		codes.Text = ""
@@ -830,6 +839,29 @@ assert(message == "Expected one Activated and MouseButton1Click event, got 0 and
 store = shop()
 result = send({ { type = "click", path = "Main.Shop.Redeem", lenient = true } })
 assert(result.ok and result.verifiedClicks == 1 and result.unconfirmedClicks == nil, "a button that fires is verified either way")
+
+-- A button that is not enabled yet (a purchase sheet fills its Buy button
+-- before it takes a press) is pressed once it is, and refused by name when
+-- it stays disabled.
+store = shop()
+store.redeem.Interactable = false
+local enabledAt = engine.frame + 3
+engine.onFrame = function()
+	if engine.frame >= enabledAt then
+		store.redeem.Interactable = true
+	end
+end
+result = send({ { type = "click", path = "Main.Shop.Redeem" } })
+engine.onFrame = nil
+assert(result.ok and result.verifiedClicks == 1, "the press waits for the button to be enabled")
+assert(engine.frame >= enabledAt and delivered() == CLICK, "nothing is pressed before then: " .. delivered())
+store = shop()
+store.redeem.Interactable = false
+engine.secondsPerFrame = 1
+message = failure({ { type = "click", path = "Main.Shop.Redeem" } })
+engine.secondsPerFrame = 0
+assert(message == "GUI element Main.Shop.Redeem is not enabled: its Interactable stayed false for 5 seconds", message)
+assert(delivered() == "", "a disabled button is not pressed: " .. delivered())
 
 -- Studio's purchase dialog stands in an overlay of its own beside a style
 -- link: a close button with an icon, Buy, an upsell banner, and the line

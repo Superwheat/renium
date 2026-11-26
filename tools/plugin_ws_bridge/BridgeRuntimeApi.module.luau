@@ -10,6 +10,7 @@ local CLIENT_RUNNER_NAME = "__ReniumClientRunner"
 local SERVER_RUNNER_NAME = "__ReniumServerRunner"
 local MOUSE_PROBE_NAME = "__ReniumMouseProbe"
 local KEY_OBSERVE_SECONDS = 0.5
+local BUTTON_ENABLE_SECONDS = 5
 local DRAG_MIN_MOVES = 4
 local RELEASE_OBSERVE_FRAMES = 6
 local MOUSE_BUTTON_NAMES = { MouseButton1 = "left", MouseButton2 = "right", MouseButton3 = "middle" }
@@ -2193,6 +2194,17 @@ updateMouse()
 			end
 			local position = Vector2.new(tonumber(bounds.x) or 0, tonumber(bounds.y) or 0)
 			if target:IsA("GuiButton") then
+				local enableBy = os.clock() + BUTTON_ENABLE_SECONDS
+				while target.Interactable == false do
+					if os.clock() >= enableBy then
+						error(
+							`GUI element {bounds.ordinalPath} is not enabled: its Interactable stayed false for {BUTTON_ENABLE_SECONDS} seconds`,
+							0
+						)
+					end
+					RunService.Heartbeat:Wait()
+					assertOperationOwnership(operationGeneration)
+				end
 				if not clickButton(target, position, action.holdMs, action.lenient == true) then
 					unconfirmedClicks += 1
 					return
