@@ -44,10 +44,10 @@ On that 202,000-instance place, with the most memory Renium used at each step:
 |---|---|---|
 | Check Studio and the files when nothing changed | 0.2 s | 0.4 GB |
 | Send one changed script to Studio | 0.3 s | 0.5 GB |
-| Send one changed property to Studio | 1.1 s | 0.9 GB |
+| Send one changed property to Studio | 1.0 s | 0.9 GB |
 | Bring one property changed in Studio into the files | 0.5 s | 0.5 GB |
 | Bring the whole place from Studio into an empty project | 3.2 s | 0.8 GB |
-| Send the whole project to an empty Studio place | 9 s | 1.6 GB |
+| Send the whole project to an empty Studio place | 7 s | 1.3 GB |
 
 No step needs 2 GB.
 
@@ -56,9 +56,9 @@ The same two directions with Argon 2.0.29:
 | | Renium | Argon |
 |---|---|---|
 | Studio to files, 202,000 instances | 3.2 s | stopped with an error after 55 s |
-| Files to Studio, 202,000 instances | 9 s | stopped out of memory at 6.9 GB |
+| Files to Studio, 202,000 instances | 7 s | stopped out of memory at 6.9 GB |
 | Studio to files, 20,000 instances of that place | 0.9 s | 31 s |
-| Files to Studio, the same 20,000 instances | 3.3 s | 27 s |
+| Files to Studio, the same 20,000 instances | 2.4 s | 27 s |
 
 Measured with version 0.6.5 on a Windows desktop.
 
