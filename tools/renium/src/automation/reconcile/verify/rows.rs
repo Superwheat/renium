@@ -295,6 +295,48 @@ fn build_uid_skeleton(document: &SettingsBytecode, uids: &[Option<Value>]) -> Se
     }
 }
 
+fn by_order_row_matches_in_full(
+    desired: &SettingsBytecode,
+    observed: &mut SettingsBytecode,
+    index: usize,
+    place: usize,
+    protected: Option<usize>,
+    before_bytes: Option<&[u8]>,
+    policy: Verification<'_>,
+) -> bool {
+    if protected == Some(place) {
+        return true;
+    }
+    let wanted = &desired.instances[index];
+    let held = &observed.instances[place];
+    if before_bytes.is_some()
+        && wanted.class_name == "Terrain"
+        && wanted.properties.get("PhysicsGrid") != held.properties.get("PhysicsGrid")
+    {
+        return false;
+    }
+    let holds_more = held
+        .properties
+        .keys()
+        .any(|name| !wanted.properties.contains_key(name))
+        || held
+            .attributes
+            .keys()
+            .any(|name| !wanted.attributes.contains_key(name));
+    if holds_more {
+        return false;
+    }
+    if added_instance_mismatch(desired, index, observed, place).is_none() {
+        return true;
+    }
+    match policy.new_instance_values {
+        Some(values) => values
+            .mismatch(None, (desired, index), (observed, place))
+            .is_none(),
+        None => false,
+    }
+}
+
 /// Evaluates a materialized slice of `desired` rows against `observed` (and
 /// lazily-materialized `before_bytes` when `before` is `None`), returning the
 /// earliest mismatch in `settings_ids` order without decoding whole documents.
@@ -811,6 +853,22 @@ fn materialize_and_check_columnar_rows(
         {
             settled.insert(camera, observed.instances[camera].clone());
         }
+        let unchecked: Vec<usize> = chunk
+            .iter()
+            .copied()
+            .filter(|&row| {
+                !by_order[row]
+                    || !by_order_row_matches_in_full(
+                        desired,
+                        observed,
+                        row,
+                        places[row],
+                        protected,
+                        before_bytes,
+                        policy,
+                    )
+            })
+            .collect();
         let result = check_materialized_rows_with_lazy_before(
             path,
             before,
@@ -819,7 +877,7 @@ fn materialize_and_check_columnar_rows(
             (desired, observed),
             desired_rows,
             desired_uids,
-            (chunk, places, desired_ids, service),
+            (&unchecked, places, desired_ids, service),
             (protected, policy, by_order),
         )?;
         let obs_chunk: Vec<usize> = chunk.iter().map(|&r| places[r]).collect();
@@ -2093,5 +2151,72 @@ mod tests {
         );
         assert_eq!(told(&[1, 3]), (1, ordered.clone()));
         assert_eq!(told(&[4, 5]), (1, ordered.clone()));
+    }
+
+    #[test]
+    fn by_order_namesake_rows_matching_after_canonicalization_verify_in_columnar_path() {
+        use crate::settings::bytecode::encode_settings_bytecode;
+        let mut desired_instances = vec![SettingsBytecodeInstance::new(
+            "root".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        )];
+        let mut observed_instances = vec![SettingsBytecodeInstance::new(
+            "s-root".into(),
+            "Workspace".into(),
+            "Workspace".into(),
+            None,
+        )];
+        for idx in 0..4 {
+            let mut d = SettingsBytecodeInstance::new(
+                format!("d-{idx}"),
+                "Twin".into(),
+                "Part".into(),
+                Some(0),
+            );
+            // Distinct float spellings (-0.0 vs 0.0) make raw column hashes miss
+            // while canonicalized rows are identical.
+            d.properties.insert("Transparency".into(), json!(-0.0_f64));
+            desired_instances.push(d);
+
+            let mut o = SettingsBytecodeInstance::new(
+                format!("o-{idx}"),
+                "Twin".into(),
+                "Part".into(),
+                Some(0),
+            );
+            o.properties.insert("Transparency".into(), json!(0.0_f64));
+            observed_instances.push(o);
+        }
+        let desired_bytes = encode_settings_bytecode(&SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: desired_instances,
+        })
+        .expect("encode desired");
+        let observed_bytes = encode_settings_bytecode(&SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: observed_instances,
+        })
+        .expect("encode observed");
+        let policy = Verification {
+            pending: &[],
+            new_instance_values: None,
+            settle: true,
+            whole_documents: false,
+        };
+        let verified = verified_by_rows(
+            Path::new("instances/Workspace.renium"),
+            None,
+            None,
+            &desired_bytes,
+            &observed_bytes,
+            policy,
+            false,
+        )
+        .expect("verify by rows")
+        .expect("handled by rows");
+        assert_eq!(verified.mismatch, None);
+        assert!(verified.accepted.is_some());
     }
 }
