@@ -14,11 +14,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GA_ROOT,
     GW_HWNDNEXT, GW_HWNDPREV, GetAncestor, GetClientRect, GetForegroundWindow, GetSystemMetrics,
     GetWindow, IsIconic, IsWindow, IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, LLKHF_INJECTED,
-    LLMHF_INJECTED, LWA_ALPHA, LWA_COLORKEY, MSG, MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW,
-    RegisterClassW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW,
-    ShowWindow, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_ERASEBKGND,
+    LLMHF_INJECTED, LWA_ALPHA, LWA_COLORKEY, MSG, MSLLHOOKSTRUCT, MWMO_INPUTAVAILABLE,
+    MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW, ShowWindow,
+    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_ERASEBKGND,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
@@ -27,6 +28,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const OUTLINE_KEY: COLORREF = 0x00ff00ff;
 const OUTLINE_COLOR: COLORREF = 0x000b9ef5;
 const OUTLINE_WIDTH: usize = 3;
+const PLACEMENT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 const BADGE_TEXT: &str = concat!("Renium ", env!("CARGO_PKG_VERSION"));
 
 static KEYBOARD_TARGET: AtomicIsize = AtomicIsize::new(0);
@@ -469,14 +471,30 @@ fn run(
                 previous = None;
             }
         }
-        let mut message: MSG = unsafe { std::mem::zeroed() };
-        while unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+        let placed = std::time::Instant::now();
+        loop {
+            let mut message: MSG = unsafe { std::mem::zeroed() };
+            while unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0
+            {
+                unsafe {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+            let left = PLACEMENT_INTERVAL.saturating_sub(placed.elapsed());
+            if left.is_zero() {
+                break;
+            }
             unsafe {
-                TranslateMessage(&message);
-                DispatchMessageW(&message);
+                MsgWaitForMultipleObjectsEx(
+                    0,
+                    std::ptr::null(),
+                    (left.as_millis() as u32).max(1),
+                    QS_ALLINPUT,
+                    MWMO_INPUTAVAILABLE,
+                );
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     unsafe {
         UnhookWindowsHookEx(mouse);
