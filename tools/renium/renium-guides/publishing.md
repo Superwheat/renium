@@ -58,7 +58,7 @@ rbx inp -p 1 click "Shop.BuyButton" wait 100 key E
 `me FILE OLD NEW [OLD NEW ...]` applies exact replacements.
 `--all` replaces every match; `--class` sets a new script's class.
 
-`inp` accepts action/value pairs: `click`, `right`, `move`, `down`, `up`, `right-down`, `right-up`, `scroll-up`, `scroll-down`, `key`, `kd`, `ku`, `text`, `wait`.
+`inp` accepts action/value pairs: `click`, `right`, `move`, `down`, `up`, `right-down`, `right-up`, `scroll-up`, `scroll-down`, `key`, `kd`, `ku`, `stick`, `trigger`, `text`, `wait`.
 Mouse targets are UI paths or `x,y`; waits are milliseconds. Put `-p` first.
 
 ## Report a Renium bug
