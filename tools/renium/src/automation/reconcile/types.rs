@@ -1092,16 +1092,76 @@ fn project_store_paths(root: &Path, src_dir: &Path) -> Result<BTreeMap<String, P
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-pub(crate) fn referring_services(
-    project: &ProjectSnapshot,
-    stores: &BTreeMap<String, PathBuf>,
-    moved: &BTreeSet<String>,
-) -> Result<BTreeSet<String>> {
-    let changes = moved
-        .iter()
-        .map(|service| (service.clone(), vec![StructuralPathChange::WholeService]))
-        .collect();
-    referring_services_for_changes(project, stores, &changes)
+pub(crate) fn structural_changes_from_touched(
+    paths_moved: &BTreeSet<String>,
+    touched: &BTreeMap<String, Option<Vec<TouchedInstance>>>,
+) -> StructuralChanges {
+    let mut out = StructuralChanges::new();
+    for service in paths_moved {
+        let Some(Some(entries)) = touched.get(service) else {
+            out.insert(service.clone(), vec![StructuralPathChange::WholeService]);
+            continue;
+        };
+        if entries.is_empty() {
+            out.insert(service.clone(), vec![StructuralPathChange::WholeService]);
+            continue;
+        }
+        let mut service_changes = Vec::new();
+        let mut whole = false;
+        for entry in entries {
+            if entry.path_segments.first().map(String::as_str) != Some(service.as_str()) {
+                whole = true;
+                break;
+            }
+            match entry.kind.as_str() {
+                "values" => {
+                    if let Some(pos) = entry
+                        .path_segments
+                        .iter()
+                        .position(|segment| segment == "__Renium_SessionLock")
+                    {
+                        if pos == 0 {
+                            whole = true;
+                            break;
+                        }
+                        service_changes.push(StructuralPathChange::Children {
+                            parent: entry.path_segments[..pos].to_vec(),
+                            child_names: Some(BTreeSet::from(["__Renium_SessionLock".to_string()])),
+                        });
+                    }
+                }
+                "subtree" => {
+                    if let Some((last, parent)) = entry.path_segments.split_last()
+                        && !parent.is_empty()
+                    {
+                        service_changes.push(StructuralPathChange::Children {
+                            parent: parent.to_vec(),
+                            child_names: Some(BTreeSet::from([last.clone()])),
+                        });
+                    } else {
+                        whole = true;
+                        break;
+                    }
+                }
+                "children" => {
+                    service_changes.push(StructuralPathChange::Children {
+                        parent: entry.path_segments.clone(),
+                        child_names: None,
+                    });
+                }
+                _ => {
+                    whole = true;
+                    break;
+                }
+            }
+        }
+        if whole || service_changes.is_empty() {
+            out.insert(service.clone(), vec![StructuralPathChange::WholeService]);
+        } else {
+            out.insert(service.clone(), service_changes);
+        }
+    }
+    out
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -1144,49 +1204,18 @@ pub(crate) fn referring_services_for_changes(
             let Some(SnapshotEntry::File(bytes)) = project.entries.get(path) else {
                 return Ok(Some(service.clone()));
             };
-            let Some(document) =
-                SettingsBytecode::decode_if_contains_any_string_set(bytes, &needles)?
-            else {
-                return Ok(None);
-            };
-            let mut refers = false;
-            for value in document.instances.iter().flat_map(|instance| {
-                instance
-                    .properties
-                    .values()
-                    .chain(instance.attributes.values())
-            }) {
-                crate::settings::bytecode::for_each_reference(value, &mut |reference| {
-                    if refers {
-                        return;
-                    }
-                    let Some(segments) = reference
-                        .get("pathSegments")
-                        .and_then(Value::as_array)
-                        .and_then(|segs| {
-                            segs.iter()
-                                .map(|s| s.as_str().map(str::to_string))
-                                .collect::<Option<Vec<_>>>()
-                        })
-                    else {
-                        return;
-                    };
+            let refers =
+                SettingsBytecode::has_reference_path_matching(bytes, &needles, |segments| {
                     let Some(target_service) = segments.first() else {
-                        return;
+                        return false;
                     };
-                    if let Some(service_changes) = changes.get(target_service)
-                        && service_changes
+                    changes.get(target_service).is_some_and(|service_changes| {
+                        service_changes
                             .iter()
-                            .any(|change| change.matches_ref_path(target_service, &segments))
-                    {
-                        refers = true;
-                    }
-                });
-                if refers {
-                    return Ok(Some(service.clone()));
-                }
-            }
-            Ok(None)
+                            .any(|change| change.matches_ref_path(target_service, segments))
+                    })
+                })?;
+            Ok(refers.then(|| service.clone()))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(referring.into_iter().flatten().collect())
@@ -1563,10 +1592,13 @@ pub(crate) fn scoped_premise(
     };
     Ok(
         if services.is_subset(scope)
-            && referring_services(
+            && referring_services_for_changes(
                 project,
                 stores,
-                &paths_moved_in_with(services, touched, values_only),
+                &structural_changes_from_touched(
+                    &paths_moved_in_with(services, touched, values_only),
+                    touched,
+                ),
             )?
             .is_subset(scope)
         {
@@ -1721,10 +1753,7 @@ pub(crate) fn plan_scoped_pull(
                 (services, paths_moved, touched)
             }
         };
-    let mut structural_changes: StructuralChanges = paths_moved
-        .iter()
-        .map(|s| (s.clone(), vec![StructuralPathChange::WholeService]))
-        .collect();
+    let mut structural_changes = structural_changes_from_touched(&paths_moved, &touched);
     if let Some(pushed) = entry.pushed_from_pull.as_ref() {
         moved.extend(pushed.services.iter().cloned());
         paths_moved.extend(pushed.paths_moved.iter().cloned());

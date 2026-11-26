@@ -4028,6 +4028,115 @@ pub(crate) fn decode_if_contains(
     store.decode_opened(structure, opened).map(Some)
 }
 
+/// Whether any reference in a v12 block store has `pathSegments` matching
+/// `matches`, scanning only blocks whose string table contains every exact
+/// string of at least one set in `required` and decoding only property groups
+/// that can hold a path reference.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn has_reference_path_matching(
+    bytes: &[u8],
+    required: &[Vec<String>],
+    matches: impl Fn(&[String]) -> bool + Sync,
+) -> Result<bool> {
+    let _span = crate::app::profile::span("store reference path scan");
+    let store = BlockStore::open(bytes)?;
+    let long_hashes: AHashMap<&str, [u8; 16]> = required
+        .iter()
+        .flatten()
+        .filter(|needle| needle.len() >= POOL_MIN_BYTES)
+        .map(|needle| (needle.as_str(), digest(&[needle.as_bytes()])))
+        .collect();
+    let found = std::sync::atomic::AtomicBool::new(false);
+    let indices = (0..store.blocks.len()).collect::<Vec<_>>();
+    for batch in indices.chunks(STANDING_BATCH) {
+        if found.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
+        store.budget.renew(store.bytes.len());
+        batch.par_iter().try_for_each(|&index| -> Result<()> {
+            if found.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let open = store.open_block(index)?;
+            if !required.is_empty() {
+                let mut own = AHashSet::with_capacity(open.strings.len());
+                let mut pooled = AHashSet::new();
+                for string in &open.strings {
+                    match string {
+                        BlockString::Own(text) => {
+                            own.insert(text.as_str());
+                        }
+                        BlockString::Pool(entry) => {
+                            pooled.insert(store.hashes[*entry]);
+                        }
+                    }
+                }
+                let block_matches = required.iter().any(|set| {
+                    set.iter()
+                        .all(|needle| match long_hashes.get(needle.as_str()) {
+                            Some(hash) => pooled.contains(hash),
+                            None => own.contains(needle.as_str()),
+                        })
+                });
+                if !block_matches {
+                    return Ok(());
+                }
+            }
+            let block = &store.blocks[index];
+            let mut values = (0..block.count)
+                .map(|_| DecodedRowValues::default())
+                .collect::<Vec<_>>();
+            let ref_groups =
+                |name: &str, kind: u8| matches!(kind, 7 | 8 | 10) && name != "UniqueId";
+            store.values(&open, &mut values, |_| true, ref_groups, Texts::Marked)?;
+            let mut scan_error: Option<anyhow::Error> = None;
+            for value in values
+                .iter()
+                .flat_map(|row| row.properties.values().chain(row.attributes.values()))
+            {
+                if found.load(Ordering::Relaxed) || scan_error.is_some() {
+                    break;
+                }
+                for_each_reference(value, &mut |reference| {
+                    if found.load(Ordering::Relaxed) || scan_error.is_some() {
+                        return;
+                    }
+                    let Some(raw_segments) =
+                        reference.get("pathSegments").and_then(Value::as_array)
+                    else {
+                        return;
+                    };
+                    let mut segments = Vec::with_capacity(raw_segments.len());
+                    for seg in raw_segments {
+                        let Some(text) = seg.as_str() else {
+                            return;
+                        };
+                        if let Some(hash) = marked(text) {
+                            match store.pool_text(&hash) {
+                                Ok(resolved) => segments.push(resolved),
+                                Err(error) => {
+                                    scan_error = Some(error);
+                                    return;
+                                }
+                            }
+                        } else {
+                            segments.push(text.to_string());
+                        }
+                    }
+                    if matches(&segments) {
+                        found.store(true, Ordering::Relaxed);
+                    }
+                });
+            }
+            if let Some(error) = scan_error {
+                return Err(error);
+            }
+            Ok(())
+        })?;
+    }
+    Ok(found.load(Ordering::Relaxed))
+}
+
 /// Whether a whole decode refuses the file at `path` where a read of some
 /// of its rows may not: a store in blocks with a frame that is not as its
 /// head says, or a file that cannot be read. A command that read its store

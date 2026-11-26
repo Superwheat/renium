@@ -552,10 +552,13 @@ pub(super) fn moved_services(
             values_only,
         } => (services, touched, values_only),
     };
-    let referring = referring_services(
+    let referring = referring_services_for_changes(
         held,
         stores,
-        &paths_moved_in_with(moved, touched, values_only),
+        &structural_changes_from_touched(
+            &paths_moved_in_with(moved, touched, values_only),
+            touched,
+        ),
     )?;
     let services = moved.union(&referring).cloned().collect::<BTreeSet<_>>();
     if services.is_empty() {

@@ -444,6 +444,53 @@ impl SettingsBytecode {
         decode_settings_bytecode_if_contains_any_string_set(bytes, required)
     }
 
+    /// Whether any reference in the store has `pathSegments` matching `matches`.
+    #[cfg(any(windows, target_os = "macos"))]
+    pub(crate) fn has_reference_path_matching(
+        bytes: &[u8],
+        required: &[Vec<String>],
+        matches: impl Fn(&[String]) -> bool + Sync,
+    ) -> Result<bool> {
+        if blocks::is_block_store(bytes) {
+            return blocks::has_reference_path_matching(bytes, required, matches);
+        }
+        let Some(document) = decode_settings_bytecode_if_contains_any_string_set(bytes, required)?
+        else {
+            return Ok(false);
+        };
+        let mut found = false;
+        for value in document.instances.iter().flat_map(|instance| {
+            instance
+                .properties
+                .values()
+                .chain(instance.attributes.values())
+        }) {
+            for_each_reference(value, &mut |reference| {
+                if found {
+                    return;
+                }
+                let Some(segments) = reference
+                    .get("pathSegments")
+                    .and_then(Value::as_array)
+                    .and_then(|segs| {
+                        segs.iter()
+                            .map(|s| s.as_str().map(str::to_string))
+                            .collect::<Option<Vec<_>>>()
+                    })
+                else {
+                    return;
+                };
+                if matches(&segments) {
+                    found = true;
+                }
+            });
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn read_file_if_contains_any_string_set(
         path: &Path,
         required: &[Vec<String>],

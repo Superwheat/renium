@@ -9692,9 +9692,14 @@ fn no_store_is_read_for_what_refers_to_no_service() -> Result<()> {
         entries: BTreeMap::from([(store.clone(), SnapshotEntry::File(b"no store".to_vec()))]),
     };
     let stores = BTreeMap::from([("Workspace".to_string(), store)]);
-    assert!(referring_services(&project, &stores, &BTreeSet::new())?.is_empty());
-    let lighting = BTreeSet::from(["Lighting".to_string()]);
-    assert!(referring_services(&project, &stores, &lighting).is_err());
+    assert!(
+        referring_services_for_changes(&project, &stores, &StructuralChanges::new())?.is_empty()
+    );
+    let lighting = BTreeMap::from([(
+        "Lighting".to_string(),
+        vec![StructuralPathChange::WholeService],
+    )]);
+    assert!(referring_services_for_changes(&project, &stores, &lighting).is_err());
     Ok(())
 }
 

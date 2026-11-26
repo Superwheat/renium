@@ -2300,13 +2300,21 @@ fn scoped_pull_step(
             (services, paths_moved, touched)
         }
     };
-    let referring = referring_services(&held.project, &stores, &paths_moved)
-        .map_err(|error| format!("{error:#}"))?;
+    let referring = referring_services_for_changes(
+        &held.project,
+        &stores,
+        &structural_changes_from_touched(&paths_moved, &touched),
+    )
+    .map_err(|error| format!("{error:#}"))?;
     if !referring.is_empty() {
         scoped_outcome(4);
     }
     let scope = moved.union(&referring).cloned().collect::<BTreeSet<_>>();
-    if !referring_services(&held.project, &stores, &moved)
+    let whole_moved: StructuralChanges = moved
+        .iter()
+        .map(|service| (service.clone(), vec![StructuralPathChange::WholeService]))
+        .collect();
+    if !referring_services_for_changes(&held.project, &stores, &whole_moved)
         .map_err(|error| format!("{error:#}"))?
         .is_subset(&scope)
     {
@@ -2924,7 +2932,7 @@ fn seeded_live_starts_compare_what_a_capture_compares() {
 /// A store outside a pull's scope that refers into a service the pull
 /// captures is written from the capture's paths: a change there during the
 /// pull is outside the scope, one in a service it does not refer to is not,
-/// and one of values alone moves none of those paths.
+/// and one that leaves the paths it refers to in place moves none of them.
 #[cfg(any(windows, target_os = "macos"))]
 #[test]
 fn a_change_a_store_outside_the_scope_refers_to_falsifies_the_premise() {
@@ -2965,14 +2973,18 @@ fn a_change_a_store_outside_the_scope_refers_to_falsifies_the_premise() {
     assert_eq!(premise("ReplicatedStorage"), ScopedPremise::Inside);
     assert_eq!(premise("Workspace"), ScopedPremise::False);
     // Studio moved only values in a service another store refers into:
-    // that store writes its references as before. A touch of structure, the
-    // whole service, or the session lock's marker moves them.
+    // that store writes its references as before. So it does where the
+    // children of the instance it names changed, or a session lock's marker
+    // beside it: neither moves that instance's path. The instance's own
+    // subtree, its parent's children and the whole service do.
     let scope = BTreeSet::from(["ServerStorage".to_string()]);
-    let premise = |touched: Option<(&str, &str)>| {
-        let touched = touched.map(|(name, kind)| {
+    let premise = |touched: Option<(&[&str], &str)>| {
+        let touched = touched.map(|(below, kind)| {
+            let mut path_segments = vec!["ServerStorage".to_string()];
+            path_segments.extend(below.iter().map(|name| name.to_string()));
             vec![TouchedInstance {
-                path_segments: vec!["ServerStorage".into(), name.into()],
-                path_ordinals: vec![1, 1],
+                path_ordinals: vec![1; path_segments.len()],
+                path_segments,
                 kind: kind.into(),
                 fields: None,
             }]
@@ -2984,15 +2996,15 @@ fn a_change_a_store_outside_the_scope_refers_to_falsifies_the_premise() {
         };
         scoped_premise(&now, &scope, &tree.snapshot(None), &stores).unwrap()
     };
-    assert_eq!(premise(Some(("N1", "values"))), ScopedPremise::Inside);
-    for kind in ["children", "subtree"] {
-        assert_eq!(premise(Some(("N1", kind))), ScopedPremise::False);
-    }
-    assert_eq!(premise(None), ScopedPremise::False);
+    assert_eq!(premise(Some((&["N1"], "values"))), ScopedPremise::Inside);
+    assert_eq!(premise(Some((&["N1"], "children"))), ScopedPremise::Inside);
     assert_eq!(
-        premise(Some(("__Renium_SessionLock", "values"))),
-        ScopedPremise::False
+        premise(Some((&["__Renium_SessionLock"], "values"))),
+        ScopedPremise::Inside
     );
+    assert_eq!(premise(Some((&["N1"], "subtree"))), ScopedPremise::False);
+    assert_eq!(premise(Some((&[], "children"))), ScopedPremise::False);
+    assert_eq!(premise(None), ScopedPremise::False);
     let unnamed = BTreeMap::from([("ServerStorage".to_string(), Some(Vec::new()))]);
     assert_eq!(
         paths_moved_in(&scope, &unnamed),
