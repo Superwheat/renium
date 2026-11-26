@@ -107,6 +107,7 @@ fn finish_settled_rows(
     settle: bool,
 ) -> Result<Option<SettingsVerification>> {
     drop((desired_rows, lazy_before));
+    let _step = crate::app::profile::span("row verification: settled store written");
     let accepted = settled_bytes_from_observed(
         &observed,
         observed_rows,
@@ -833,6 +834,54 @@ fn materialize_and_check_columnar_rows(
     Ok(Some(None))
 }
 
+/// Takes the differing instances that only their order among namesakes
+/// tells for the ones at their places where, of each group of namesakes one
+/// of them or an instance above it stands in, no other member holds a
+/// differing instance: every other member is Studio's in full, which leaves
+/// one counterpart. The answer counts the groups that hold more.
+fn told_by_the_rest(
+    desired: &SettingsBytecode,
+    differing: &[bool],
+    by_order: &mut [bool],
+) -> usize {
+    let rows = || (0..differing.len()).filter(|&index| differing[index]);
+    if !rows().any(|index| by_order[index]) {
+        return 0;
+    }
+    let group = |index: usize| {
+        let instance = &desired.instances[index];
+        (
+            instance.parent_index,
+            instance.name.as_str(),
+            instance.class_name.as_str(),
+        )
+    };
+    let mut members = AHashMap::<_, usize>::with_capacity(desired.instances.len());
+    for index in 0..desired.instances.len() {
+        *members.entry(group(index)).or_default() += 1;
+    }
+    let mut holders = AHashMap::new();
+    let mut shared = ahash::AHashSet::new();
+    for row in rows() {
+        let mut at = Some(row);
+        let mut steps = 0;
+        while let Some(index) = at.filter(|_| steps <= desired.instances.len()) {
+            let key = group(index);
+            if members[&key] > 1 && *holders.entry(key).or_insert(index) != index {
+                shared.insert(key);
+            }
+            at = desired.instances[index].parent_index;
+            steps += 1;
+        }
+    }
+    if shared.is_empty() {
+        for row in rows() {
+            by_order[row] = false;
+        }
+    }
+    shared.len()
+}
+
 struct PlacedRowIds {
     origins: Vec<usize>,
     desired_uids: Vec<Option<Value>>,
@@ -955,10 +1004,12 @@ pub(super) fn verified_by_rows(
     policy: Verification<'_>,
     check_no_extra: bool,
 ) -> Result<Option<SettingsVerification>> {
+    let step = crate::app::profile::span("row verification: stores opened");
     let (desired, observed) = rayon::join(
         || decode_for_row_chunks(desired_bytes),
         || decode_for_row_chunks(observed_bytes),
     );
+    drop(step);
     let (Ok((mut desired, mut desired_rows)), Ok((mut observed, mut observed_rows))) =
         (desired, observed)
     else {
@@ -977,20 +1028,25 @@ pub(super) fn verified_by_rows(
         );
         Ok(None)
     };
-    let Some((desired_ids, studio_ids, studio_roots)) = project_and_stabilize_rows(
+    let step = crate::app::profile::span("row verification: ids and roots read");
+    let stabilized = project_and_stabilize_rows(
         &mut desired,
         &mut desired_rows,
         &mut observed,
         &mut observed_rows,
-    ) else {
+    );
+    drop(step);
+    let Some((desired_ids, studio_ids, studio_roots)) = stabilized else {
         return Ok(None);
     };
+    let step = crate::app::profile::span("row verification: instance places");
     let places_and_order = if observed.instances.len() == count {
         instance_places(&desired, &observed)
     } else {
         None
     };
-    let Some((places, by_order)) = places_and_order else {
+    drop(step);
+    let Some((places, mut by_order)) = places_and_order else {
         let why = if observed.instances.len() != count {
             "Studio holds another count of instances"
         } else {
@@ -1009,6 +1065,7 @@ pub(super) fn verified_by_rows(
         }
         return whole(why);
     };
+    let step = crate::app::profile::span("row verification: placed ids");
     let PlacedRowIds {
         origins,
         desired_uids,
@@ -1024,6 +1081,16 @@ pub(super) fn verified_by_rows(
         &studio_roots,
         &places,
     )?;
+    drop(step);
+    let ordered = by_order.iter().filter(|by_order| **by_order).count();
+    if ordered > 0 {
+        log_global(
+            5,
+            format_args!(
+                "[renium] row verification ({service}): {ordered} of {count} instances told by their order among namesakes"
+            ),
+        );
+    }
     let pending = pending_fields(&service, &desired, policy.pending);
     let reference_ids =
         EditorReferenceIds::new(desired_ids.iter().map(String::as_str)).in_service(&service);
@@ -1369,29 +1436,44 @@ pub(super) fn verified_by_rows(
     if let (Some(d_store), Some(o_store)) =
         (desired_rows.block_store(), observed_rows.block_store())
     {
-        let need_desired =
-            match crate::settings::bytecode::blocks::bulk_diff::matching_rows_by_column_hash_stores(
+        let step = crate::app::profile::span("row verification: column hashes");
+        let matching =
+            crate::settings::bytecode::blocks::bulk_diff::matching_rows_by_column_hash_stores(
                 (d_store, o_store),
                 (&desired.instances, &observed.instances),
                 (&places, &origins, &by_order),
                 protected,
                 &pending_indices,
-            )? {
-                Some(matched) => {
-                    let need = matched.iter().map(|&ok| !ok).collect::<Vec<_>>();
-                    let needed_count = need.iter().filter(|&&n| n).count();
-                    log_global(
-                        5,
-                        format_args!(
-                            "[renium] columnar row verification ({service}): {needed_count} of {count} rows materialized"
-                        ),
-                    );
-                    need
-                }
-                None => vec![true; count],
-            };
+            )?;
+        drop(step);
+        let need_desired = match matching {
+            Some(matched) => {
+                let need = matched.iter().map(|&ok| !ok).collect::<Vec<_>>();
+                let needed_count = need.iter().filter(|&&n| n).count();
+                log_global(
+                    5,
+                    format_args!(
+                        "[renium] columnar row verification ({service}): {needed_count} of {count} rows materialized"
+                    ),
+                );
+                need
+            }
+            None => vec![true; count],
+        };
+        let ordered = (0..count).any(|index| need_desired[index] && by_order[index]);
+        let shared = told_by_the_rest(&desired, &need_desired, &mut by_order);
+        let told = ordered && shared == 0;
+        if shared > 0 {
+            log_global(
+                5,
+                format_args!(
+                    "[renium] row verification ({service}): {shared} groups of namesakes hold more than one differing instance"
+                ),
+            );
+        }
         let before_ref = before.as_ref().map(|(doc, by_id)| (*doc, by_id));
-        match materialize_and_check_columnar_rows(
+        let step = crate::app::profile::span("row verification: differing rows compared");
+        let checked = materialize_and_check_columnar_rows(
             path,
             (&mut desired, &mut observed),
             (&mut desired_rows, &mut observed_rows),
@@ -1411,7 +1493,9 @@ pub(super) fn verified_by_rows(
             before_bytes,
             &desired_uids,
             (policy, &by_order),
-        )? {
+        )?;
+        drop(step);
+        match checked.filter(|checked| !told || checked.is_none()) {
             None => {
                 let before_doc = before.map(|(doc, _)| doc);
                 drop((desired, observed, desired_rows, observed_rows, lazy_before));
@@ -1960,4 +2044,54 @@ fn best_mismatch_in_rows(
         return Some((rank, format!("{name}.{final_detail}")));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_differing_namesake_is_told_by_the_others_matching() {
+        let instances = [
+            ("Model", None),
+            ("Wall", Some(0)),
+            ("Wall", Some(0)),
+            ("Wall", Some(0)),
+            ("Door", Some(2)),
+            ("Door", Some(3)),
+        ];
+        let desired = SettingsBytecode {
+            version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+            instances: instances
+                .iter()
+                .enumerate()
+                .map(|(index, (name, parent))| SettingsBytecodeInstance {
+                    settings_id: index.to_string(),
+                    name: (*name).into(),
+                    class_name: "Part".into(),
+                    parent_index: *parent,
+                    properties: Default::default(),
+                    attributes: Default::default(),
+                })
+                .collect(),
+        };
+        let ordered = vec![false, true, true, true, true, true];
+        let told = |differing: &[usize]| {
+            let mut mask = vec![false; instances.len()];
+            for &index in differing {
+                mask[index] = true;
+            }
+            let mut by_order = ordered.clone();
+            let shared = told_by_the_rest(&desired, &mask, &mut by_order);
+            (shared, by_order)
+        };
+        assert_eq!(told(&[]), (0, ordered.clone()));
+        assert_eq!(told(&[2]), (0, vec![false, true, false, true, true, true]));
+        assert_eq!(
+            told(&[2, 4]),
+            (0, vec![false, true, false, true, false, true])
+        );
+        assert_eq!(told(&[1, 3]), (1, ordered.clone()));
+        assert_eq!(told(&[4, 5]), (1, ordered.clone()));
+    }
 }
