@@ -3731,11 +3731,13 @@ fn send_virtual_input(
         // written before it. The first action has nothing to wait for, and
         // a refusal lets go of every held key, so nothing may be held: not by
         // this request, nor by an earlier one, which the answers so far name.
-        let keys_held = merged
-            .as_ref()
-            .and_then(|answer: &Value| answer.get("heldKeys"))
-            .and_then(Value::as_array)
-            .is_some_and(|keys| !keys.is_empty());
+        let keys_held = ["heldKeys", "heldButtons"].iter().any(|key| {
+            merged
+                .as_ref()
+                .and_then(|answer: &Value| answer.get(key))
+                .and_then(Value::as_array)
+                .is_some_and(|held| !held.is_empty())
+        });
         let awaited = (expect_activated_id.is_none() && held.is_empty() && !keys_held)
             .then(|| batch.first().filter(|action| action["type"] == "click"))
             .flatten()
@@ -3885,7 +3887,7 @@ fn split_virtual_input(actions: Vec<Value>) -> Vec<Vec<Value>> {
     let mut waited = 0;
     let mut held = HashSet::new();
     for action in actions {
-        let wait = if action["type"] == "wait" {
+        let wait = if action["type"] == "wait" || action["type"] == "drag" {
             action["ms"].as_u64().unwrap_or(0)
         } else {
             action["holdMs"].as_u64().unwrap_or(0)

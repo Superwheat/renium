@@ -10,6 +10,9 @@ local CLIENT_RUNNER_NAME = "__ReniumClientRunner"
 local SERVER_RUNNER_NAME = "__ReniumServerRunner"
 local MOUSE_PROBE_NAME = "__ReniumMouseProbe"
 local KEY_OBSERVE_SECONDS = 0.5
+local DRAG_MIN_MOVES = 4
+local RELEASE_OBSERVE_FRAMES = 6
+local MOUSE_BUTTON_NAMES = { MouseButton1 = "left", MouseButton2 = "right", MouseButton3 = "middle" }
 -- The dismissing labels that acknowledge instead of declining.
 local CORE_GUI_ACKNOWLEDGE_LABELS = { "ok", "okay", "got it", "done" }
 -- Labels of the buttons that close a Roblox prompt without accepting it,
@@ -536,14 +539,21 @@ function BridgeRuntimeApi.create(plugin, runtimeContext)
 	local detachedRunners = {}
 	local sharedVirtualInput = nil
 	local sharedHeldKeys = {}
+	local sharedHeldButtons = {}
+	local sharedPointerPosition = nil
 
-	local function releaseSharedKeys()
+	local function releaseSharedInput()
 		if sharedVirtualInput ~= nil then
 			for keyCode in pairs(sharedHeldKeys) do
 				pcall(sharedVirtualInput.SendKey, sharedVirtualInput, false, keyCode, false)
 			end
+			for _, held in pairs(sharedHeldButtons) do
+				local position = sharedPointerPosition or held.position
+				pcall(sharedVirtualInput.SendMouseButton, sharedVirtualInput, position, held.button, false, 0)
+			end
 		end
 		table.clear(sharedHeldKeys)
+		table.clear(sharedHeldButtons)
 	end
 
 	local function assertOperationOwnership(operationGeneration, sessionGeneration, requestThread)
@@ -1807,7 +1817,15 @@ updateMouse()
 		local unconfirmedClicks = 0
 		local heldKeys = sharedHeldKeys
 		local keysObserved = {}
-		local heldButtons = {}
+		local heldButtons = sharedHeldButtons
+		local pointerSentThisFrame = false
+		local function awaitPointerFrame()
+			if pointerSentThisFrame then
+				RunService.Heartbeat:Wait()
+				assertOperationOwnership(operationGeneration)
+			end
+			pointerSentThisFrame = true
+		end
 		local focusedTextBox = nil
 		local focusedTextBefore = nil
 		local textObserved = nil
@@ -1968,9 +1986,11 @@ updateMouse()
 			throughSystemUi[#throughSystemUi + 1] = { x = position.X, y = position.Y, hid = element }
 		end
 		local function sendMousePosition(position)
+			awaitPointerFrame()
 			sendPointer(position, function()
 				virtualInput:SendMousePosition(position)
 			end)
+			sharedPointerPosition = position
 		end
 		local function gameHoldsKey(keyCode)
 			local snapshot = api.getMouseLocation({})
@@ -2012,16 +2032,78 @@ updateMouse()
 			end
 		end
 		local function sendMouseButton(position, button, down, repeatCount)
-			sendPointer(position, function()
+			local held = heldButtons[button.Name] ~= nil
+			if not down and not held then
+				return
+			end
+			if down and held then
+				sendMouseButton(position, button, false, 0)
+			end
+			local name = MOUSE_BUTTON_NAMES[button.Name] or button.Name
+			local heldOutside = `The {name} mouse button is already down in this window and Renium does not hold it (a person's mouse?); release it and send the action again.`
+			awaitPointerFrame()
+			if down then
+				local function pressed()
+					local okRead, state = pcall(UserInputService.IsMouseButtonPressed, UserInputService, button)
+					return okRead and state == true
+				end
+				local deadline = os.clock() + KEY_OBSERVE_SECONDS
+				local frames = 0
+				while pressed() and (os.clock() < deadline or frames < RELEASE_OBSERVE_FRAMES) do
+					RunService.Heartbeat:Wait()
+					assertOperationOwnership(operationGeneration)
+					frames += 1
+				end
+				if pressed() then
+					error(heldOutside, 0)
+				end
+			end
+			local okSend, sendError = pcall(sendPointer, position, function()
 				virtualInput:SendMouseButton(position, button, down, repeatCount)
 			end, down)
-			heldButtons[button] = if down then position else nil
+			if not okSend then
+				if string.find(tostring(sendError), "duplicate button state", 1, true) then
+					error(heldOutside, 0)
+				end
+				error(sendError, 0)
+			end
+			heldButtons[button.Name] = if down then { button = button, position = position } else nil
+			sharedPointerPosition = position
 		end
 		local function releaseHeldInput()
-			releaseSharedKeys()
-			for button, position in heldButtons do
-				pcall(virtualInput.SendMouseButton, virtualInput, position, button, false, 0)
+			for _, held in table.clone(heldButtons) do
+				pcall(sendMouseButton, sharedPointerPosition or held.position, held.button, false, 0)
 			end
+			releaseSharedInput()
+		end
+		local function mouseButtonOf(name)
+			if name == "right" then
+				return Enum.UserInputType.MouseButton2
+			elseif name == "middle" then
+				return Enum.UserInputType.MouseButton3
+			end
+			return Enum.UserInputType.MouseButton1
+		end
+		local function pointerTarget(path, x, y, step)
+			if path == nil then
+				return Vector2.new(tonumber(x) or 0, tonumber(y) or 0), nil
+			end
+			local bounds = api.getGuiBounds({ path = path })
+			local refusal = nil
+			if bounds.ok ~= true then
+				refusal = tostring(bounds.error or "GUI target could not be resolved")
+			elseif bounds.notVisible ~= nil then
+				refusal = `GUI element {bounds.ordinalPath} is not visible: {bounds.notVisible}`
+			end
+			if refusal ~= nil then
+				return nil, {
+					ok = false,
+					error = refusal,
+					failedStep = tonumber(step),
+					clickable = bounds.clickable,
+				}
+			end
+			return Vector2.new(tonumber(bounds.x) or 0, tonumber(bounds.y) or 0), nil
 		end
 		local function clickAt(position, holdMs)
 			sendMouseButton(position, Enum.UserInputType.MouseButton1, true, 0)
@@ -2594,6 +2676,7 @@ updateMouse()
 				if actionType == "wait" then
 					task.wait(math.clamp((tonumber(action.ms) or 0) / 1000, 0, 10))
 					assertOperationOwnership(operationGeneration)
+					pointerSentThisFrame = false
 				elseif actionType == "key" then
 					local keyCode = Enum.KeyCode[tostring(action.key or "")]
 					if keyCode == nil then
@@ -2685,41 +2768,47 @@ updateMouse()
 							clickable = refusedClickable,
 						}
 					end
+				elseif actionType == "drag" then
+					local from, refused = pointerTarget(action.path, action.x, action.y, action.step)
+					local to = nil
+					if refused == nil then
+						to, refused = pointerTarget(action.toPath, action.toX, action.toY, action.step)
+					end
+					if refused ~= nil then
+						assertOperationOwnership(operationGeneration)
+						return refused
+					end
+					local button = mouseButtonOf(action.button)
+					local seconds = math.clamp((tonumber(action.ms) or 300) / 1000, 0, 10)
+					sendMousePosition(from)
+					sendMouseButton(from, button, true, 0)
+					local okDrag, dragError = pcall(function()
+						local started = os.clock()
+						local moves = 0
+						local alpha
+						repeat
+							moves += 1
+							alpha = if seconds > 0 then math.min((os.clock() - started) / seconds, 1) else 1
+							alpha = math.min(alpha, moves / DRAG_MIN_MOVES)
+							sendMousePosition(from + (to - from) * alpha)
+						until alpha >= 1
+					end)
+					sendMouseButton(to, button, false, 0)
+					if not okDrag then
+						error(dragError, 0)
+					end
 				else
-					local position = Vector2.new(tonumber(action.x) or 0, tonumber(action.y) or 0)
-					-- A GUI path is read when its turn comes, so a target an
-					-- earlier action of the batch opened is found.
-					if action.path ~= nil then
-						local bounds = api.getGuiBounds({ path = action.path })
-						local refusal = nil
-						if bounds.ok ~= true then
-							refusal = tostring(bounds.error or "GUI target could not be resolved")
-						elseif bounds.notVisible ~= nil then
-							refusal = `GUI element {bounds.ordinalPath} is not visible: {bounds.notVisible}`
-						end
-						if refusal ~= nil then
-							assertOperationOwnership(operationGeneration)
-							return {
-								ok = false,
-								error = refusal,
-								failedStep = tonumber(action.step),
-								clickable = bounds.clickable,
-							}
-						end
-						position = Vector2.new(tonumber(bounds.x) or 0, tonumber(bounds.y) or 0)
+					local position, refused = pointerTarget(action.path, action.x, action.y, action.step)
+					if refused ~= nil then
+						assertOperationOwnership(operationGeneration)
+						return refused
 					end
 					if actionType == "move" then
 						sendMousePosition(position)
 					elseif actionType == "button" then
-						local button = Enum.UserInputType.MouseButton1
-						if action.button == "right" then
-							button = Enum.UserInputType.MouseButton2
-						elseif action.button == "middle" then
-							button = Enum.UserInputType.MouseButton3
-						end
 						sendMouseButton(
 							position,
-							button,
+							mouseButtonOf(action.button),
 							action.down == true,
 							tonumber(action.repeatCount) or 0
 						)
@@ -2762,11 +2851,11 @@ updateMouse()
 		end, function(message)
 			return message
 		end)
-		restoreCoreGui()
-		restoreSystemUi()
 		if not ok or result.ok ~= true then
 			releaseHeldInput()
 		end
+		restoreCoreGui()
+		restoreSystemUi()
 		if not ok then
 			error(result, 0)
 		end
@@ -2778,6 +2867,14 @@ updateMouse()
 			table.sort(held)
 			if #held > 0 then
 				result.heldKeys = held
+			end
+			local buttons = {}
+			for name in pairs(heldButtons) do
+				buttons[#buttons + 1] = MOUSE_BUTTON_NAMES[name] or name
+			end
+			table.sort(buttons)
+			if #buttons > 0 then
+				result.heldButtons = buttons
 			end
 			if next(keysObserved) ~= nil then
 				result.keysObserved = keysObserved
@@ -4125,7 +4222,7 @@ updateMouse()
 				entry.instance:Destroy()
 			end
 		end
-		releaseSharedKeys()
+		releaseSharedInput()
 		sharedVirtualInput = nil
 		playSession.token += 1
 		return cancelledGeneration

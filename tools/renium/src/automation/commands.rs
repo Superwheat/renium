@@ -681,6 +681,7 @@ fn action(name: &str) -> &'static str {
         "right-up" => "mouse-up",
         "click" => "click",
         "right" | "right-click" => "click",
+        "drag" | "right-drag" => "drag",
         "scroll-up" | "su" => "scroll-up",
         "scroll-down" | "sd" => "scroll-down",
         "wait" => "wait",
@@ -756,6 +757,41 @@ fn input_actions(tokens: &[String]) -> Result<Vec<Value>> {
             actions.push(json!({ "action": "wait", "ms": ms }));
             actions.push(json!({ "action": "key-up", "key": value }));
             index += 3;
+            continue;
+        }
+        if kind == "drag" {
+            let end = tokens
+                .get(index + 2)
+                .with_context(|| "drag needs a start and an end, e.g. drag Slider.Knob 315,430")?;
+            if !end.contains(',') && wait_milliseconds(end).is_ok() {
+                bail!(
+                    "drag needs a start and an end before its duration, e.g. drag Slider.Knob 315,430 {end}"
+                );
+            }
+            let mut entry = Map::new();
+            entry.insert("action".to_string(), json!(kind));
+            entry.extend(target(value)?);
+            for (key, end_value) in target(end)? {
+                let name = match key.as_str() {
+                    "path" => "toPath",
+                    "x" => "toX",
+                    _ => "toY",
+                };
+                entry.insert(name.to_string(), end_value);
+            }
+            if command == "right-drag" {
+                entry.insert("button".to_string(), json!("right"));
+            }
+            index += 3;
+            if let Some(ms) = tokens
+                .get(index)
+                .filter(|token| action(token).is_empty())
+                .and_then(|token| wait_milliseconds(token).ok())
+            {
+                entry.insert("ms".to_string(), json!(ms));
+                index += 1;
+            }
+            actions.push(Value::Object(entry));
             continue;
         }
         let mut entry = Map::new();
@@ -1009,6 +1045,44 @@ mod input_action_tests {
         assert_eq!(actions[2], json!({ "action": "key-up", "key": "W" }));
         assert_eq!(actions[3], json!({ "action": "key-up", "key": "D" }));
         assert!(input_actions(&["hold".into(), "W".into()]).is_err());
+    }
+
+    #[test]
+    fn drag_takes_two_targets_and_an_optional_duration() {
+        let tokens = [
+            "drag",
+            "Settings.Volume.Knob",
+            "315,430",
+            "drag",
+            "10,20",
+            "Inventory.Slot",
+            "0.5s",
+            "wait",
+            "100",
+            "right-drag",
+            "1,2",
+            "3,4",
+            "click",
+            "Close",
+        ]
+        .map(String::from);
+        let actions = input_actions(&tokens).unwrap();
+        assert_eq!(
+            actions[0],
+            json!({ "action": "drag", "path": "Settings.Volume.Knob", "toX": 315, "toY": 430 })
+        );
+        assert_eq!(
+            actions[1],
+            json!({ "action": "drag", "x": 10, "y": 20, "toPath": "Inventory.Slot", "ms": 500 })
+        );
+        assert_eq!(actions[2], json!({ "action": "wait", "ms": 100 }));
+        assert_eq!(
+            actions[3],
+            json!({ "action": "drag", "x": 1, "y": 2, "toX": 3, "toY": 4, "button": "right" })
+        );
+        assert_eq!(actions[4], json!({ "action": "click", "path": "Close" }));
+        assert!(input_actions(&["drag".into(), "1,2".into()]).is_err());
+        assert!(input_actions(&["drag".into(), "Knob".into(), "300".into()]).is_err());
     }
 
     #[test]

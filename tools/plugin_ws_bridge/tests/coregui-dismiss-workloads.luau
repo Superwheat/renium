@@ -285,8 +285,11 @@ function virtualInput:SendMouseButton(position, button, down)
 	if (engine.buttons[button.Name] or false) == down then
 		error("VirtualInput::SendMouseButton: duplicate button state.")
 	end
+	engine.buttonChanges[button.Name] = { frame = engine.frame, before = engine.buttons[button.Name] == true }
 	engine.buttons[button.Name] = down
 	table.insert(engine.delivered, `{button.Name} {if down then "down" else "up"}`)
+	table.insert(engine.pointerFrames, engine.frame)
+	engine.lastButton = position
 	if button == Enum.UserInputType.MouseButton1 then
 		local target = nil
 		for _, object in playerGui:GetGuiObjectsAtPosition(position.X - INSET.X, position.Y - INSET.Y) do
@@ -318,6 +321,8 @@ function virtualInput:SendMousePosition(position)
 		error(("VirtualInput::SendMousePosition: position (%.1f, %.1f) hits CoreGUI."):format(position.X, position.Y))
 	end
 	table.insert(engine.delivered, "move")
+	table.insert(engine.pointerFrames, engine.frame)
+	engine.lastMove = position
 end
 function virtualInput:SendKey(down, keyCode, repeated)
 	if coreKeyboardFocus() then
@@ -375,6 +380,13 @@ local services = {
 		end,
 		GetFocusedTextBox = function()
 			return engine.focusedTextBox
+		end,
+		IsMouseButtonPressed = function(_, button)
+			local change = engine.buttonChanges[button.Name]
+			if change ~= nil and engine.frame - change.frame < 2 then
+				return change.before
+			end
+			return engine.buttons[button.Name] == true
 		end,
 	},
 	RunService = {
@@ -446,7 +458,9 @@ local function reset(options)
 	engine.swallowClicks = false
 	engine.refuseCoreMoves = options and options.refuseCoreMoves or false
 	engine.delivered = {}
+	engine.pointerFrames = {}
 	engine.buttons = {}
+	engine.buttonChanges = {}
 	engine.pressTarget = nil
 	engine.published = false
 end
@@ -1048,5 +1062,59 @@ result = send({
 })
 assert(covered.answers[1] == "CloseAffordance", "dismiss closes it")
 assert(result.ok and string.find(delivered(), "MouseButton1", 1, true) ~= nil, "the game takes the click: " .. delivered())
+
+reset()
+result = send({
+	{ type = "move", x = 140, y = 430 },
+	{ type = "button", x = 140, y = 430, down = true },
+	{ type = "move", x = 200, y = 430 },
+	{ type = "move", x = 260, y = 430 },
+})
+assert(delivered() == "move,MouseButton1 down,move,move", "the press and the moves arrive: " .. delivered())
+for index = 2, #engine.pointerFrames do
+	assert(engine.pointerFrames[index] > engine.pointerFrames[index - 1], "each pointer event has a frame of its own")
+end
+assert(result.heldButtons[1] == "left" and engine.buttons.MouseButton1 == true, "the button stays down after the call")
+result = send({ { type = "button", x = 315, y = 430, down = false }, { type = "button", x = 315, y = 430, down = false } })
+assert(result.heldButtons == nil and engine.buttons.MouseButton1 == false, "a later call releases it")
+assert(delivered() == "move,MouseButton1 down,move,move,MouseButton1 up", "a release of a button that is up sends nothing: " .. delivered())
+
+reset()
+result = send({
+	{ type = "button", x = 140, y = 430, down = true },
+	{ type = "button", x = 200, y = 430, down = true },
+	{ type = "button", x = 200, y = 430, down = false },
+})
+assert(delivered() == "MouseButton1 down,MouseButton1 up,MouseButton1 down,MouseButton1 up", "a second press releases the first: " .. delivered())
+
+reset()
+engine.buttons.MouseButton1 = true
+message = failure({ { type = "button", x = 140, y = 430, down = true } })
+assert(string.find(message, "left mouse button is already down", 1, true) ~= nil, "a button held outside Renium is named: " .. message)
+assert(delivered() == "", "nothing is sent over a button held outside Renium")
+
+reset()
+result = send({ { type = "drag", x = 140, y = 430, toX = 340, toY = 430, ms = 0, step = 1 } })
+assert(
+	delivered() == "move,MouseButton1 down,move,move,move,move,MouseButton1 up",
+	"a drag presses, moves and releases: " .. delivered()
+)
+assert(engine.lastMove == Vector2.new(340, 430), "the last move is the drag's end")
+for index = 2, #engine.pointerFrames do
+	assert(engine.pointerFrames[index] > engine.pointerFrames[index - 1], "each event of a drag has a frame of its own")
+end
+assert(result.ok and result.heldButtons == nil, "a drag leaves nothing held")
+result = send({ { type = "button", x = 140, y = 430, down = true }, { type = "move", x = 260, y = 430 } })
+assert(result.heldButtons[1] == "left", "the button is held for the next call")
+result = send({ { type = "move", path = "Missing.Knob", step = 1 } })
+assert(result.ok == false and engine.buttons.MouseButton1 == false, "a refused action lets go of a button an earlier call pressed")
+assert(engine.lastButton == Vector2.new(260, 430), "the button comes up where the pointer was left")
+result = send({ { type = "move", x = 300, y = 430 } })
+assert(result.heldButtons == nil, "nothing is held after the refusal")
+
+reset()
+result = send({ { type = "drag", x = 140, y = 430, toX = 340, toY = 430, ms = 0, step = 1 } })
+result = send({ { type = "drag", path = "Missing.Knob", toX = 340, toY = 430, ms = 0, step = 3 } })
+assert(result.ok == false and result.failedStep == 3 and delivered() == "move,MouseButton1 down,move,move,move,move,MouseButton1 up", "a drag from a missing path is refused before it presses")
 
 print("Renium CoreGui dismiss tests passed")

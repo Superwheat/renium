@@ -39,6 +39,9 @@ struct InputAction {
     path: Option<String>,
     x: Option<i32>,
     y: Option<i32>,
+    to_path: Option<String>,
+    to_x: Option<i32>,
+    to_y: Option<i32>,
     #[serde(alias = "mouse_button")]
     button: Option<MouseButton>,
     #[serde(alias = "wait_time_ms", alias = "hold_ms")]
@@ -64,6 +67,7 @@ enum InputActionKind {
     MouseUp,
     #[serde(alias = "mouseButtonClick")]
     Click,
+    Drag,
     #[serde(alias = "scrollUp")]
     ScrollUp,
     #[serde(alias = "scrollDown")]
@@ -208,6 +212,60 @@ fn path_pointer_commands(action: &InputAction, path: &str, step: usize) -> Vec<V
     }
 }
 
+/// The end of a drag as an action of its own, so both ends are located the
+/// same way.
+fn drag_end(action: &InputAction) -> InputAction {
+    InputAction {
+        action: InputActionKind::Move,
+        key: None,
+        text: None,
+        path: action.to_path.clone(),
+        x: action.to_x,
+        y: action.to_y,
+        to_path: None,
+        to_x: None,
+        to_y: None,
+        button: action.button,
+        ms: None,
+    }
+}
+
+const DEFAULT_DRAG_MS: u64 = 300;
+const MAX_DRAG_MS: u64 = 10_000;
+
+/// The plugin's drag: press at the start, a move every frame for `ms`, and
+/// the release at the end. The client reads a GUI path when the drag's turn
+/// comes; `locate` reads a world part or a point now.
+fn drag_command(action: &InputAction, step: usize, locate: &mut Locate) -> Result<Value> {
+    let right = matches!(action.button, Some(MouseButton::Right));
+    let ms = action.ms.unwrap_or(DEFAULT_DRAG_MS);
+    if ms > MAX_DRAG_MS {
+        bail!("drag takes up to 10 s; hold the button with down, wait and up for longer");
+    }
+    let mut command = json!({
+        "type": "drag",
+        "step": step,
+        "ms": ms,
+        "button": if right { "right" } else { "left" },
+    });
+    let end = drag_end(action);
+    for (target, path_key, x_key, y_key) in
+        [(action, "path", "x", "y"), (&end, "toPath", "toX", "toY")]
+    {
+        match target.path.as_deref() {
+            Some(path) if !is_world_path(path) && target.x.is_none() && target.y.is_none() => {
+                command[path_key] = json!(path);
+            }
+            _ => {
+                let (x, y) = locate(target, None)?;
+                command[x_key] = json!(x);
+                command[y_key] = json!(y);
+            }
+        }
+    }
+    Ok(command)
+}
+
 /// The click that focuses a key or text action's own path before it: the
 /// verified click for a GUI path, a click at its point for a world part.
 fn focus_commands<'a>(
@@ -291,6 +349,14 @@ fn virtual_input_commands(actions: &[InputAction], locate: &mut Locate) -> Resul
                     pointer = Pointer::At(x, y);
                 }
             }
+            InputActionKind::Drag => {
+                let command = drag_command(action, step, locate)?;
+                pointer = match (command["toX"].as_i64(), command["toY"].as_i64()) {
+                    (Some(x), Some(y)) => Pointer::At(x as i32, y as i32),
+                    _ => Pointer::Unset,
+                };
+                commands.push(command);
+            }
             InputActionKind::Wait => match action.ms.unwrap_or(0) {
                 0 => commands.push(json!({ "type": "wait", "ms": 0 })),
                 ms => commands.extend(virtual_wait_actions(ms)),
@@ -322,12 +388,20 @@ fn virtual_input_commands(actions: &[InputAction], locate: &mut Locate) -> Resul
 fn action_label(action: &InputAction) -> String {
     let name = match action.action {
         InputActionKind::Click => "click",
+        InputActionKind::Drag => "drag",
+        InputActionKind::Move => "move",
+        InputActionKind::MouseDown => "down",
+        InputActionKind::MouseUp => "up",
         InputActionKind::Text => "text",
         InputActionKind::KeyDown => "kd",
         InputActionKind::KeyUp => "ku",
         _ => "key",
     };
-    format!("{name} {}", action.path.as_deref().unwrap_or_default())
+    let label = format!("{name} {}", action.path.as_deref().unwrap_or_default());
+    match action.to_path.as_deref() {
+        Some(end) => format!("{} to {end}", label.trim_end()),
+        None => label,
+    }
 }
 
 fn action_range(first: usize, last: usize) -> String {
@@ -550,6 +624,33 @@ fn os_input_result(request: &InputRequest, bridge: &BridgeServer) -> Result<Valu
                 }
                 position = Some((x, y));
             }
+            InputActionKind::Drag => {
+                used_os = true;
+                let (from_x, from_y) = action_position(action, bridge, player, position)?;
+                let (to_x, to_y) = action_position(&drag_end(action), bridge, player, None)?;
+                let (dx, dy) = *calibration
+                    .get_or_insert_with(|| input_delta(bridge, player, &window, from_x, from_y));
+                let right = matches!(action.button, Some(MouseButton::Right));
+                let at = |x: i32, y: i32| (x + offset_x + dx, y + offset_y + dy);
+                let (x, y) = at(from_x, from_y);
+                input_inject::post_mouse_move(&window, x, y)?;
+                input_inject::post_mouse_button(&window, x, y, right, true)?;
+                let ms = action.ms.unwrap_or(DEFAULT_DRAG_MS).min(MAX_DRAG_MS);
+                let moves = (ms / 16).max(4) as i32;
+                let moved = (1..=moves).try_for_each(|index| {
+                    thread::sleep(Duration::from_millis(16));
+                    let (x, y) = at(
+                        from_x + (to_x - from_x) * index / moves,
+                        from_y + (to_y - from_y) * index / moves,
+                    );
+                    input_inject::post_mouse_move(&window, x, y)
+                });
+                thread::sleep(Duration::from_millis(16));
+                let (x, y) = at(to_x, to_y);
+                input_inject::post_mouse_button(&window, x, y, right, false)?;
+                moved?;
+                position = Some((to_x, to_y));
+            }
             InputActionKind::Wait => {
                 thread::sleep(Duration::from_millis(action.ms.unwrap_or(0).min(10_000)));
             }
@@ -586,24 +687,48 @@ const GUI_PATH_INPUT_BUILD_UNIX: i64 = 1_794_366_810;
 
 fn names_gui_path(actions: &[InputAction]) -> bool {
     actions.iter().any(|action| {
-        action
-            .path
-            .as_deref()
-            .is_some_and(|path| !is_world_path(path))
+        [action.path.as_deref(), action.to_path.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|path| !is_world_path(path))
     })
 }
 
-fn predates_gui_path_input(clients: &[Value]) -> bool {
+/// The plugin build from which pointer events are paced a frame apart, so a
+/// pressed button stays down while the pointer moves, and `drag` exists.
+const HELD_POINTER_BUILD_UNIX: i64 = 1_795_662_400;
+
+fn holds_a_button(actions: &[InputAction]) -> bool {
+    actions.iter().any(|action| {
+        matches!(
+            action.action,
+            InputActionKind::MouseDown | InputActionKind::Drag
+        )
+    })
+}
+
+fn predates(clients: &[Value], build: i64) -> bool {
     clients
         .iter()
         .filter_map(|client| client.get("bridgeBuildUnix").and_then(Value::as_i64))
-        .any(|build| build < GUI_PATH_INPUT_BUILD_UNIX)
+        .any(|client| client < build)
+}
+
+fn predates_gui_path_input(clients: &[Value]) -> bool {
+    predates(clients, GUI_PATH_INPUT_BUILD_UNIX)
 }
 
 fn virtual_input_result(request: &InputRequest, bridge: &BridgeServer) -> Result<Value> {
     if names_gui_path(&request.actions) && predates_gui_path_input(&bridge.list_bridge_clients()) {
         bail!(
             "A connected Studio runs an older Renium plugin than input on GUI paths needs; restart Studio to load the installed one"
+        );
+    }
+    if holds_a_button(&request.actions)
+        && predates(&bridge.list_bridge_clients(), HELD_POINTER_BUILD_UNIX)
+    {
+        bail!(
+            "A connected Studio runs an older Renium plugin than a held mouse button needs; restart Studio to load the installed one"
         );
     }
     let player = request.player.as_deref();
@@ -620,6 +745,7 @@ fn virtual_input_result(request: &InputRequest, bridge: &BridgeServer) -> Result
     note_system_ui(&mut result, &response);
     for key in [
         "heldKeys",
+        "heldButtons",
         "keysObserved",
         "verifiedClicks",
         "unconfirmedClicks",
@@ -739,6 +865,47 @@ mod tests {
             current,
             json!({ "role": "edit" })
         ]));
+    }
+
+    #[test]
+    fn a_drag_is_one_plugin_command_with_both_ends() {
+        let (commands, located) = plan(json!([
+            { "action": "drag", "path": "Settings.Volume.Knob", "toX": 315, "toY": 430 },
+            { "action": "mouse-down" },
+            { "action": "drag", "path": "Workspace.Crate", "toPath": "Inventory.Slot", "ms": 10_000, "button": "right" },
+        ]));
+        assert_eq!(types(&commands), ["drag", "move", "button", "drag"]);
+        assert_eq!(
+            commands[0],
+            json!({ "type": "drag", "step": 1, "ms": 300, "button": "left", "path": "Settings.Volume.Knob", "toX": 315, "toY": 430 })
+        );
+        assert_eq!(commands[1], json!({ "type": "move", "x": 315, "y": 430 }));
+        assert_eq!(
+            commands[3],
+            json!({ "type": "drag", "step": 3, "ms": 10_000, "button": "right", "x": 100, "y": 200, "toPath": "Inventory.Slot" })
+        );
+        assert_eq!(located, ["Workspace.Crate"]);
+
+        let request = |actions: Value| request(actions).actions;
+        let drag =
+            request(json!([{ "action": "drag", "x": 1, "y": 2, "toPath": "Inventory.Slot" }]));
+        assert!(names_gui_path(&drag) && holds_a_button(&drag));
+        assert_eq!(action_label(&drag[0]), "drag to Inventory.Slot");
+        let long = request(
+            json!([{ "action": "drag", "x": 1, "y": 2, "toX": 3, "toY": 4, "ms": 10_001 }]),
+        );
+        assert!(virtual_input_commands(&long, &mut |_, _| Ok((0, 0))).is_err());
+        assert!(holds_a_button(&request(
+            json!([{ "action": "mouse-down", "x": 1, "y": 2 }])
+        )));
+        assert!(!holds_a_button(&request(
+            json!([{ "action": "click", "x": 1, "y": 2 }])
+        )));
+        let older =
+            json!({ "role": "play-client", "bridgeBuildUnix": HELD_POINTER_BUILD_UNIX - 1 });
+        let current = json!({ "role": "edit", "bridgeBuildUnix": HELD_POINTER_BUILD_UNIX });
+        assert!(predates(&[current.clone(), older], HELD_POINTER_BUILD_UNIX));
+        assert!(!predates(&[current], HELD_POINTER_BUILD_UNIX));
     }
 
     #[test]
