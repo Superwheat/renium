@@ -38,6 +38,17 @@ pub(crate) struct Capture {
 }
 
 impl Capture {
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub(crate) fn in_background(&self) -> bool {
+        let front = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+        let mut owner = 0;
+        unsafe { GetWindowThreadProcessId(front, &mut owner) };
+        owner != self.pid
+    }
+
     pub(crate) fn new(window: &StudioWindow) -> Result<Self> {
         super::platform::verify_recording_target(&window.handle)?;
         let (pid, identity) = window

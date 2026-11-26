@@ -39,6 +39,8 @@ pub(crate) mod network;
 mod process_exit;
 pub(crate) mod property_access;
 mod recording;
+#[cfg(windows)]
+mod recording_media;
 mod recording_review;
 pub(crate) mod render_quality;
 pub(crate) mod result_text;

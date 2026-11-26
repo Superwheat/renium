@@ -249,3 +249,46 @@ fn recording_review_large_frames_and_cli_arguments() {
         .unwrap();
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn a_system_encoded_recording_is_reviewed_with_its_colors_and_times() {
+    use super::super::recording_media::{MediaFile, Settings};
+    let fixture = Fixture::new();
+    let path = fixture.0.join("system.renium-tmp");
+    let (width, height) = (640, 360);
+    let settings = Settings {
+        width,
+        height,
+        fps: 60.0,
+        quality: 80.0,
+        key_frame_every: 4,
+    };
+    let Ok(mut file) = MediaFile::start(&path, &settings) else {
+        return;
+    };
+    let colors = [[200u8, 80, 20], [20, 80, 200], [30, 200, 60]];
+    let times = [0, 17, 40, 55, 90, 107];
+    for (index, at) in times.into_iter().enumerate() {
+        let [red, green, blue] = colors[index % 3];
+        file.add(&[blue, green, red, 0].repeat(width * height), true, at)
+            .unwrap();
+    }
+    file.end(130).unwrap();
+    let mut video = Video::open(&path).unwrap();
+    assert_eq!(video.times, times);
+    assert_eq!(video.duration_ms, 130);
+    assert_eq!((video.width, video.height), (width, height));
+    for frame in [1, 5, 6] {
+        let mut sheet = Sheet::new((width, height), 1, false);
+        video.render(&[frame], &mut sheet).unwrap();
+        let center = (height / 2 * width + width / 2) * 3;
+        let expected = colors[(frame as usize - 1) % 3];
+        for (shown, expected) in sheet.pixels[center..center + 3].iter().zip(expected) {
+            assert!(
+                shown.abs_diff(expected) <= 6,
+                "frame {frame}: {shown} for {expected}"
+            );
+        }
+    }
+}

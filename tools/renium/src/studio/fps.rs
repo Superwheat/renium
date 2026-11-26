@@ -233,6 +233,23 @@ fn validate_studio(pid: u32) -> Result<String> {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn unlocked(pid: u32) -> bool {
+    let Some(dir) = identity(pid).and_then(|identity| state_dir(pid, &identity).ok()) else {
+        return false;
+    };
+    let working = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join("worker.lock"))
+        .is_ok_and(|lock| lock.try_lock().is_err());
+    working
+        && fs::read(dir.join("status.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Reply>(&bytes).ok())
+            .is_some_and(|reply| reply.status.unlocked)
+}
+
 pub(crate) fn command(pid: u32, action: Action) -> Result<Value> {
     if helpers_disabled() {
         bail!("Studio FPS helpers are disabled by RENIUM_NO_FPS_HELPERS");
