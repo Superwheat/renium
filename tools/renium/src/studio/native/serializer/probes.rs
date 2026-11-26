@@ -28,11 +28,12 @@ pub(crate) enum NativeOperation {
     AudioGate,
     FpsUnlock,
     Input,
+    Gamepad,
     ViewportCapture,
 }
 
 impl NativeOperation {
-    pub(crate) const ALL: [Self; 17] = [
+    pub(crate) const ALL: [Self; 18] = [
         Self::Snapshot,
         Self::Capture,
         Self::ServiceReader,
@@ -49,6 +50,7 @@ impl NativeOperation {
         Self::AudioGate,
         Self::FpsUnlock,
         Self::Input,
+        Self::Gamepad,
         Self::ViewportCapture,
     ];
 
@@ -72,6 +74,7 @@ impl NativeOperation {
             Self::AudioGate => "audible output",
             Self::FpsUnlock => "Studio default frame rate pacing",
             Self::Input => "bridge input",
+            Self::Gamepad => "virtual gamepad unavailable; use keyboard and mouse input",
             Self::ViewportCapture => "bridge capture",
         }
     }

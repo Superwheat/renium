@@ -2643,6 +2643,10 @@ fn leave_test_result(bridge: &BridgeServer, index: u32, wait_seconds: f64) -> Re
     let runtime_id = bridge
         .runtime_pin_for_selector(BridgeTarget::Client, Some(&selector))?
         .runtime_id;
+    #[cfg(windows)]
+    crate::studio::native::serializer::disconnect_gamepad_runtimes(std::slice::from_ref(
+        &runtime_id,
+    ));
     let Some(server) = bridge.play_runtime_for_selector(BridgeTarget::Server, None) else {
         bail!("No play server is connected; --leave needs a running test (rbx play -s -p N)");
     };
@@ -3914,7 +3918,7 @@ fn split_virtual_input(actions: Vec<Value>) -> Vec<Vec<Value>> {
 
 /// The answer for a batch sent as several calls: counts add up, the observed
 /// keys accumulate and the last call reports what is still held.
-fn merge_virtual_input_results(previous: Value, last: Value) -> Value {
+pub(super) fn merge_virtual_input_results(previous: Value, last: Value) -> Value {
     let mut merged = last;
     let count = |value: &Value, key: &str| value.get(key).and_then(Value::as_u64);
     merged["actions"] =
@@ -4287,7 +4291,7 @@ pub(crate) fn press_result(args: &PressArgs, bridge: &BridgeServer) -> Result<Va
 
 /// A key can be held for a minute; the plugin runs each wait for at most
 /// ten seconds, so longer holds are several waits.
-const MAX_KEY_HOLD_MS: u64 = 60_000;
+pub(super) const MAX_KEY_HOLD_MS: u64 = 60_000;
 
 /// The wait actions that pause a client for `ms` (a minute at most), each
 /// within the plugin's ten-second wait.
@@ -5863,6 +5867,18 @@ fn stop_studio_play_with_bridge_result(bridge: &BridgeServer) -> Result<Value> {
             );
         }
         params.insert("waitForStopped".to_string(), Value::Bool(false));
+        #[cfg(windows)]
+        {
+            let client_runtimes = active_clients
+                .iter()
+                .filter(|entry| entry["role"] == BRIDGE_ROLE_PLAY_CLIENT)
+                .filter_map(|entry| entry.get("runtimeId").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if !client_runtimes.is_empty() {
+                crate::studio::native::serializer::disconnect_gamepad_runtimes(&client_runtimes);
+            }
+        }
         request_play_runtimes_to_stop(
             bridge,
             &edit_runtime_id,

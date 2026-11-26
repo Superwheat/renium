@@ -24,8 +24,12 @@ mod windows;
 pub(crate) use windows::drain_ring_bytes;
 #[cfg(windows)]
 pub(crate) use windows::{
-    AudioOutputGate, AudioPacket, AudioSampleFormat, AudioTap, FpsController, fps_helper_loaded,
-    keep_selection_across_undo, suppress_package_notices,
+    AudioOutputGate, AudioPacket, AudioSampleFormat, AudioTap, FpsController, GamepadAction,
+    GamepadInitialState, GamepadSessionReady, GamepadStateReport, VIRTUAL_DEVICE_ID,
+    connect_gamepad_session, disconnect_gamepad_runtimes, execute_gamepad_actions,
+    fps_helper_loaded, has_live_gamepad_session, keep_selection_across_undo,
+    prune_gamepad_sessions, release_gamepad_inputs, set_gamepad_connected, set_gamepad_slot,
+    suppress_package_notices,
 };
 
 use std::time::Duration;

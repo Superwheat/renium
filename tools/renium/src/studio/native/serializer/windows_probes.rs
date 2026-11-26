@@ -28,6 +28,7 @@ pub(super) fn check(
         NativeOperation::AudioGate => return audio_probe(memory, &loaded),
         NativeOperation::FpsUnlock => return fps::probe(memory, studio),
         NativeOperation::StudioActions => return action_probe(memory, pid, title, &loaded),
+        NativeOperation::Gamepad => return gamepad::probe(memory, pid, title, &loaded),
         NativeOperation::Input | NativeOperation::ViewportCapture => {
             let (window, _) = capture_window(pid, title)?;
             return Ok(

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -396,8 +397,27 @@ static int YieldCalls() {
 
 struct Receiver {
     std::array<std::uint64_t, 4> identity{11, 22, 33, 44};
+    int lastDevice = 0;
+    int lastKey = 0;
+    int lastState = 0;
+    float lastAxes[3]{};
     __declspec(noinline) std::string Documentation(std::string name) {
         return "https://developer.roblox.com/" + name;
+    }
+    __declspec(noinline) void GamepadConnect(int deviceId) {
+        lastDevice = deviceId;
+    }
+    __declspec(noinline) void GamepadButton(int deviceId, int keyCode, int buttonState) {
+        lastDevice = deviceId;
+        lastKey = keyCode;
+        lastState = buttonState;
+    }
+    __declspec(noinline) void GamepadAxis(int objectId, int keyCode, float x, float y, float z) {
+        lastDevice = objectId;
+        lastKey = keyCode;
+        lastAxes[0] = x;
+        lastAxes[1] = y;
+        lastAxes[2] = z;
     }
 };
 
@@ -541,5 +561,50 @@ int main(int argc, char** argv) {
         if (!refused || receiver.identity != identity) return 2;
     }
     }
+    auto gamepadCall = [&](std::uint32_t mode, std::uint64_t fn, std::uint32_t a, std::uint32_t b, std::uint32_t c, const void* extra, std::size_t extraSize) {
+        std::array<std::uint64_t, 16> desc{};
+        desc[0] = 456;
+        desc[2] = fn;
+        renium_functions::Input input{};
+        input.descriptor = reinterpret_cast<std::uintptr_t>(desc.data());
+        input.table = desc[0];
+        input.field = 16;
+        input.mode = mode;
+        input.function = fn;
+        input.enums[0] = a;
+        input.enums[1] = b;
+        input.enums[2] = c;
+        input.firstSize = static_cast<std::uint32_t>(extraSize);
+        std::vector<char> bytes(sizeof(input) + extraSize);
+        std::memcpy(bytes.data(), &input, sizeof(input));
+        if (extraSize) std::memcpy(bytes.data() + sizeof(input), extra, extraSize);
+        auto read = [&](std::uint64_t pointer, void* output, std::size_t size) {
+            if (pointer < input.descriptor || pointer + size > input.descriptor + sizeof(desc)) return false;
+            std::memcpy(output, reinterpret_cast<void*>(pointer), size);
+            return true;
+        };
+        return renium_functions::Begin(&receiver, {}, bytes.data(), bytes.size(), read);
+    };
+    auto connectFn = &Receiver::GamepadConnect;
+    auto buttonFn = &Receiver::GamepadButton;
+    auto axisFn = &Receiver::GamepadAxis;
+    std::uint64_t connectAddr = 0, buttonAddr = 0, axisAddr = 0;
+    std::memcpy(&connectAddr, &connectFn, sizeof(connectAddr));
+    std::memcpy(&buttonAddr, &buttonFn, sizeof(buttonAddr));
+    std::memcpy(&axisAddr, &axisFn, sizeof(axisAddr));
+    Check(gamepadCall(6, connectAddr, 12345, 0, 0, nullptr, 0)->Wait(std::chrono::milliseconds(1)) == "ok");
+    Check(receiver.lastDevice == 12345 && receiver.identity == identity);
+    Check(gamepadCall(7, connectAddr, 6789, 0, 0, nullptr, 0)->Wait(std::chrono::milliseconds(1)) == "ok");
+    Check(receiver.lastDevice == 6789 && receiver.identity == identity);
+    Check(gamepadCall(8, buttonAddr, 12345, 1002, 1, nullptr, 0)->Wait(std::chrono::milliseconds(1)) == "ok");
+    Check(receiver.lastDevice == 12345 && receiver.lastKey == 1002 && receiver.lastState == 1 && receiver.identity == identity);
+    const float axes[3]{0.5f, -1.0f, 0.7f};
+    Check(gamepadCall(9, axisAddr, 12345, 1016, 0, axes, sizeof(axes))->Wait(std::chrono::milliseconds(1)) == "ok");
+    Check(receiver.lastDevice == 12345 && receiver.lastKey == 1016 && receiver.lastAxes[0] == 0.5f && receiver.lastAxes[1] == -1.0f && receiver.lastAxes[2] == 0.7f && receiver.identity == identity);
+    const float nanAxes[3]{std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f};
+    bool nanRefused = false;
+    try { gamepadCall(9, axisAddr, 12345, 1016, 0, nanAxes, sizeof(nanAxes)); }
+    catch (const std::runtime_error&) { nanRefused = true; }
+    Check(nanRefused);
     return 0;
 }

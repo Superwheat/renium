@@ -32,6 +32,8 @@ use memchr::memmem;
 mod audio;
 #[path = "windows_fps.rs"]
 mod fps;
+#[path = "windows_gamepad.rs"]
+mod gamepad;
 #[path = "windows_image.rs"]
 mod image;
 #[path = "windows_import.rs"]
@@ -51,6 +53,12 @@ mod undo_selection;
 pub(crate) use audio::drain_ring_bytes;
 pub(crate) use audio::{AudioOutputGate, AudioPacket, AudioSampleFormat, AudioTap};
 pub(crate) use fps::{FpsController, helper_loaded as fps_helper_loaded};
+pub(crate) use gamepad::{
+    GamepadAction, GamepadInitialState, GamepadSessionReady, GamepadStateReport, VIRTUAL_DEVICE_ID,
+    connect_gamepad_session, disconnect_gamepad_runtimes, execute_gamepad_actions,
+    has_live_gamepad_session, prune_gamepad_sessions, release_gamepad_inputs,
+    set_gamepad_connected, set_gamepad_slot,
+};
 pub(crate) use import::{CREATED_ROW, read_service_payload};
 pub(crate) use observation::{AttributeGuard, begin_attribute_guard, begin_attribute_relay};
 pub(crate) use package_notice::suppress_package_notices;
@@ -169,6 +177,7 @@ struct PackageLayout {
     rdata: Option<PeSection>,
     text: PeSection,
     submit_task: usize,
+    data_model_vtable: Option<usize>,
     image_stamp: [u32; 3],
     function_ranges: std::sync::Arc<[(usize, usize)]>,
 }
@@ -1166,6 +1175,7 @@ fn package_layout(path: &Path) -> Result<PackageLayout> {
         rdata: image.section(b".rdata").ok(),
         text: image.section(b".text")?,
         submit_task: renderer_submit_task_rva(bytes, &image)?,
+        data_model_vtable: undo_selection::descriptor_vtable(&image, b".?AVDataModel@RBX@@\0").ok(),
         image_stamp: image.image_stamp,
         function_ranges: {
             let table = image.section(b".pdata")?;
@@ -1712,7 +1722,10 @@ fn refresh_active_data_model(
 pub(crate) fn prepare_context(pid: u32, title: &str) -> Result<()> {
     // Existing background connection preparation records each independent result.
     for operation in NativeOperation::ALL {
-        if operation == NativeOperation::FpsUnlock {
+        if matches!(
+            operation,
+            NativeOperation::FpsUnlock | NativeOperation::Gamepad
+        ) {
             continue;
         }
         let _ = super::probes::run(pid, title, operation);

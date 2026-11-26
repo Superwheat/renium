@@ -2742,6 +2742,8 @@ updateMouse()
 					if textConnection ~= nil then
 						textConnection:Disconnect()
 					end
+				elseif actionType == "release" then
+					releaseHeldInput()
 				elseif actionType == "dismiss" or actionType == "press" then
 					local position = if action.x ~= nil and action.y ~= nil
 						then Vector2.new(tonumber(action.x) or 0, tonumber(action.y) or 0)

@@ -444,9 +444,92 @@ pub fn resolve_key(name: &str) -> Result<KeySpec> {
             name: canonical,
         }),
         None => bail!(
-            "Unsupported keyboard key '{trimmed}'; keys are Enum.KeyCode names (W, Space, LeftShift, Return); gamepad buttons are not supported"
+            "Unsupported keyboard key '{trimmed}'; keys are Enum.KeyCode names (W, Space, LeftShift, Return)"
         ),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GamepadButtonSpec {
+    pub name: &'static str,
+    #[cfg(any(windows, test))]
+    pub key_code: i32,
+}
+
+pub fn resolve_gamepad_button(name: &str) -> Option<GamepadButtonSpec> {
+    let spec = |canonical: &'static str, _code: i32| GamepadButtonSpec {
+        name: canonical,
+        #[cfg(any(windows, test))]
+        key_code: _code,
+    };
+    match name.trim().to_ascii_uppercase().as_str() {
+        "BUTTONX" => Some(spec("ButtonX", 1000)),
+        "BUTTONY" => Some(spec("ButtonY", 1001)),
+        "BUTTONA" => Some(spec("ButtonA", 1002)),
+        "BUTTONB" => Some(spec("ButtonB", 1003)),
+        "BUTTONR1" => Some(spec("ButtonR1", 1004)),
+        "BUTTONL1" => Some(spec("ButtonL1", 1005)),
+        "BUTTONR2" => Some(spec("ButtonR2", 1006)),
+        "BUTTONL2" => Some(spec("ButtonL2", 1007)),
+        "BUTTONR3" => Some(spec("ButtonR3", 1008)),
+        "BUTTONL3" => Some(spec("ButtonL3", 1009)),
+        "BUTTONSTART" => Some(spec("ButtonStart", 1010)),
+        "BUTTONSELECT" => Some(spec("ButtonSelect", 1011)),
+        "DPADLEFT" => Some(spec("DPadLeft", 1012)),
+        "DPADRIGHT" => Some(spec("DPadRight", 1013)),
+        "DPADUP" => Some(spec("DPadUp", 1014)),
+        "DPADDOWN" => Some(spec("DPadDown", 1015)),
+        _ => None,
+    }
+}
+
+pub fn resolve_gamepad_stick(name: &str) -> Result<GamepadButtonSpec> {
+    let trimmed = name.trim();
+    match trimmed.to_ascii_uppercase().as_str() {
+        "L" | "LEFT" | "THUMBSTICK1" => Ok(GamepadButtonSpec {
+            name: "Thumbstick1",
+            #[cfg(any(windows, test))]
+            key_code: 1016,
+        }),
+        "R" | "RIGHT" | "THUMBSTICK2" => Ok(GamepadButtonSpec {
+            name: "Thumbstick2",
+            #[cfg(any(windows, test))]
+            key_code: 1017,
+        }),
+        _ => bail!("Unsupported gamepad stick '{trimmed}'; use L or R"),
+    }
+}
+
+pub fn resolve_gamepad_trigger(name: &str) -> Result<GamepadButtonSpec> {
+    let trimmed = name.trim();
+    match trimmed.to_ascii_uppercase().as_str() {
+        "L2" | "BUTTONL2" => Ok(GamepadButtonSpec {
+            name: "ButtonL2",
+            #[cfg(any(windows, test))]
+            key_code: 1007,
+        }),
+        "R2" | "BUTTONR2" => Ok(GamepadButtonSpec {
+            name: "ButtonR2",
+            #[cfg(any(windows, test))]
+            key_code: 1006,
+        }),
+        _ => bail!("Unsupported gamepad trigger '{trimmed}'; use L2 or R2"),
+    }
+}
+
+pub fn validate_gamepad_stick_axes(x: f32, y: f32) -> Result<()> {
+    if !x.is_finite() || !y.is_finite() || !(-1.0..=1.0).contains(&x) || !(-1.0..=1.0).contains(&y)
+    {
+        bail!("stick coordinates must be finite numbers in -1..=1");
+    }
+    Ok(())
+}
+
+pub fn validate_gamepad_trigger_value(value: f32) -> Result<()> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        bail!("trigger value must be a finite number in 0..=1");
+    }
+    Ok(())
 }
 
 fn letter_name(ch: u8) -> &'static str {
@@ -498,6 +581,48 @@ fn keys_resolve_to_enum_key_code_names() {
     for written in letters.chain(digits).chain(words.split(' ')) {
         let name = resolve_key(written).unwrap().name;
         assert!(key_codes.contains_key(name), "{written} resolves to {name}");
+    }
+    for button in [
+        "ButtonA",
+        "ButtonB",
+        "ButtonX",
+        "ButtonY",
+        "ButtonL1",
+        "ButtonR1",
+        "ButtonL2",
+        "ButtonR2",
+        "ButtonL3",
+        "ButtonR3",
+        "ButtonStart",
+        "ButtonSelect",
+        "DPadUp",
+        "DPadDown",
+        "DPadLeft",
+        "DPadRight",
+    ] {
+        let spec = resolve_gamepad_button(button).unwrap();
+        assert_eq!(spec.name, button);
+        assert_eq!(
+            key_codes.get(spec.name).copied(),
+            Some(spec.key_code as u32),
+            "{button}"
+        );
+    }
+    for (written, expected) in [("L", "Thumbstick1"), ("R", "Thumbstick2")] {
+        let spec = resolve_gamepad_stick(written).unwrap();
+        assert_eq!(spec.name, expected);
+        assert_eq!(
+            key_codes.get(spec.name).copied(),
+            Some(spec.key_code as u32)
+        );
+    }
+    for (written, expected) in [("L2", "ButtonL2"), ("R2", "ButtonR2")] {
+        let spec = resolve_gamepad_trigger(written).unwrap();
+        assert_eq!(spec.name, expected);
+        assert_eq!(
+            key_codes.get(spec.name).copied(),
+            Some(spec.key_code as u32)
+        );
     }
 }
 

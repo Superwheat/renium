@@ -686,10 +686,39 @@ fn action(name: &str) -> &'static str {
         "scroll-down" | "sd" => "scroll-down",
         "wait" => "wait",
         "hold" => "hold",
+        "stick" => "stick",
+        "trigger" => "trigger",
         "dismiss" => "dismiss",
         "press" => "press",
         _ => "",
     }
+}
+
+fn axis_pair(value: &str) -> Result<(f32, f32)> {
+    let (x, y) = value
+        .split_once(',')
+        .with_context(|| format!("stick takes an X,Y pair such as 0.5,-1, not '{value}'"))?;
+    let x: f32 = x
+        .trim()
+        .parse()
+        .with_context(|| format!("stick X coordinate must be a number, not '{value}'"))?;
+    let y: f32 = y
+        .trim()
+        .parse()
+        .with_context(|| format!("stick Y coordinate must be a number, not '{value}'"))?;
+    crate::studio::input::validate_gamepad_stick_axes(x, y)
+        .with_context(|| format!("invalid stick coordinates '{value}'"))?;
+    Ok((x, y))
+}
+
+fn trigger_value(value: &str) -> Result<f32> {
+    let parsed: f32 = value
+        .trim()
+        .parse()
+        .with_context(|| format!("trigger takes a value between 0 and 1, not '{value}'"))?;
+    crate::studio::input::validate_gamepad_trigger_value(parsed)
+        .with_context(|| format!("invalid trigger value '{value}'"))?;
+    Ok(parsed)
 }
 
 fn point(value: &str) -> Option<Map<String, Value>> {
@@ -756,6 +785,26 @@ fn input_actions(tokens: &[String]) -> Result<Vec<Value>> {
             actions.push(json!({ "action": "key-down", "key": value }));
             actions.push(json!({ "action": "wait", "ms": ms }));
             actions.push(json!({ "action": "key-up", "key": value }));
+            index += 3;
+            continue;
+        }
+        if kind == "stick" {
+            let coords = tokens
+                .get(index + 2)
+                .with_context(|| "stick needs L|R and X,Y, e.g. stick L 0.5,-1")?;
+            crate::studio::input::resolve_gamepad_stick(value)?;
+            let (x, y) = axis_pair(coords)?;
+            actions.push(json!({ "action": "stick", "stick": value, "axisX": x, "axisY": y }));
+            index += 3;
+            continue;
+        }
+        if kind == "trigger" {
+            let amount = tokens
+                .get(index + 2)
+                .with_context(|| "trigger needs L2|R2 and a value in 0..1, e.g. trigger R2 0.7")?;
+            crate::studio::input::resolve_gamepad_trigger(value)?;
+            let parsed = trigger_value(amount)?;
+            actions.push(json!({ "action": "trigger", "trigger": value, "value": parsed }));
             index += 3;
             continue;
         }
@@ -1045,6 +1094,54 @@ mod input_action_tests {
         assert_eq!(actions[2], json!({ "action": "key-up", "key": "W" }));
         assert_eq!(actions[3], json!({ "action": "key-up", "key": "D" }));
         assert!(input_actions(&["hold".into(), "W".into()]).is_err());
+    }
+
+    #[test]
+    fn stick_and_trigger_parse_and_validate_ranges() {
+        let actions = input_actions(&[
+            "stick".into(),
+            "L".into(),
+            "0.5,-1".into(),
+            "stick".into(),
+            "R".into(),
+            "-0.25,0.75".into(),
+            "trigger".into(),
+            "R2".into(),
+            "0.7".into(),
+            "trigger".into(),
+            "L2".into(),
+            "0".into(),
+        ])
+        .unwrap();
+        assert_eq!(actions.len(), 4);
+        assert_eq!(
+            actions[0],
+            json!({ "action": "stick", "stick": "L", "axisX": 0.5_f32, "axisY": -1.0_f32 })
+        );
+        assert_eq!(
+            actions[1],
+            json!({ "action": "stick", "stick": "R", "axisX": -0.25_f32, "axisY": 0.75_f32 })
+        );
+        assert_eq!(
+            actions[2],
+            json!({ "action": "trigger", "trigger": "R2", "value": 0.7_f32 })
+        );
+        assert_eq!(
+            actions[3],
+            json!({ "action": "trigger", "trigger": "L2", "value": 0.0_f32 })
+        );
+        for bad in [
+            vec!["stick", "X", "0,0"],
+            vec!["stick", "L", "1.5,0"],
+            vec!["stick", "L", "0,-1.1"],
+            vec!["stick", "L", "0"],
+            vec!["trigger", "L1", "0.5"],
+            vec!["trigger", "L2", "-0.1"],
+            vec!["trigger", "R2", "1.1"],
+        ] {
+            let tokens: Vec<String> = bad.into_iter().map(String::from).collect();
+            assert!(input_actions(&tokens).is_err(), "{tokens:?}");
+        }
     }
 
     #[test]

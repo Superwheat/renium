@@ -218,6 +218,46 @@ pub(super) fn post_input(url: &str, content_type: &str) -> Result<FunctionInput>
     Ok(FunctionInput { mode, bytes })
 }
 
+#[cfg(windows)]
+pub(super) fn gamepad_connection_input(connect: bool, device_id: i32) -> FunctionInput {
+    let mode = if connect { 6u32 } else { 7u32 };
+    let mut bytes = vec![0; 56];
+    bytes[20..24].copy_from_slice(&mode.to_le_bytes());
+    bytes[32..36].copy_from_slice(&(device_id as u32).to_le_bytes());
+    FunctionInput { mode, bytes }
+}
+
+#[cfg(windows)]
+pub(super) fn gamepad_button_input(device_id: i32, key_code: i32, pressed: bool) -> FunctionInput {
+    let mode = 8u32;
+    let mut bytes = vec![0; 56];
+    bytes[20..24].copy_from_slice(&mode.to_le_bytes());
+    bytes[32..36].copy_from_slice(&(device_id as u32).to_le_bytes());
+    bytes[36..40].copy_from_slice(&(key_code as u32).to_le_bytes());
+    bytes[40..44].copy_from_slice(&u32::from(pressed).to_le_bytes());
+    FunctionInput { mode, bytes }
+}
+
+#[cfg(windows)]
+pub(super) fn gamepad_axis_input(
+    device_id: i32,
+    key_code: i32,
+    x: f32,
+    y: f32,
+    z: f32,
+) -> FunctionInput {
+    let mode = 9u32;
+    let mut bytes = vec![0; 56];
+    bytes[20..24].copy_from_slice(&mode.to_le_bytes());
+    bytes[32..36].copy_from_slice(&(device_id as u32).to_le_bytes());
+    bytes[36..40].copy_from_slice(&(key_code as u32).to_le_bytes());
+    bytes[44..48].copy_from_slice(&12u32.to_le_bytes());
+    bytes.extend_from_slice(&x.to_le_bytes());
+    bytes.extend_from_slice(&y.to_le_bytes());
+    bytes.extend_from_slice(&z.to_le_bytes());
+    FunctionInput { mode, bytes }
+}
+
 #[derive(Debug)]
 pub(crate) struct FunctionFailure {
     pub code: u32,

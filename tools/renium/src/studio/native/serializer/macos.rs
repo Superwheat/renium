@@ -69,6 +69,9 @@ pub(super) fn probe_operation(
         NativeOperation::Input => {
             bail!("Native PID-scoped input is not implemented on macOS; use Studio bridge input")
         }
+        NativeOperation::Gamepad => {
+            bail!("Virtual gamepad input is only supported on Windows")
+        }
         NativeOperation::ViewportCapture => {
             let executable = process_executable_path(pid)?;
             anyhow::ensure!(

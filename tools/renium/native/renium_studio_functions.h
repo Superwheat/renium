@@ -1,4 +1,5 @@
 #include <array>
+#include <cmath>
 #include <condition_variable>
 #include <mutex>
 #include <unordered_map>
@@ -23,10 +24,14 @@ inline std::string TooLargeText(std::size_t size) {
     return "http-response-size: response too large (" + std::to_string(size) + " bytes; limit " + std::to_string(MaxResponse) + " bytes)";
 }
 // Modes: 1 and 2 are the HTTP service's yielding get and post, 3 a string
-// getter, 4 the package flag, 5 DataModel.HttpPostAsync. Mode 5 names the
-// address and the content type as its two strings and takes the body beside
-// the request; `enums` then holds the live DataModel reference (8 bytes) and
-// the receiver offset, and the request type is the engine's default.
+// getter, 4 the package flag, 5 DataModel.HttpPostAsync, 6 VirtualInputManager
+// HandleGamepadConnect(int), 7 HandleGamepadDisconnect(int), 8
+// HandleGamepadButtonInput(int, KeyCode, int), and 9
+// HandleGamepadAxisInput(int, KeyCode, float, float, float) with 3 floats in
+// the trailing payload. Mode 5 names the address and the content type as its
+// two strings and takes the body beside the request; `enums` then holds the
+// live DataModel reference (8 bytes) and the receiver offset, and the request
+// type is the engine's default.
 struct Input {
     std::uint64_t descriptor, table;
     std::uint32_t field, mode;
@@ -342,7 +347,7 @@ std::shared_ptr<Completion> Begin(void* target, std::shared_ptr<void> hold,
     std::memcpy(&input, bytes, sizeof(input));
     Sites sites;
     const bool yields = Yields(input.mode);
-    if (input.mode < 1 || input.mode > 5 || (input.reserved && input.mode == 3) || input.field < 8 || input.field > 65520
+    if (input.mode < 1 || input.mode > 9 || (input.reserved && (input.mode == 3 || input.mode >= 6)) || input.field < 8 || input.field > 65520
         || input.field % 8 || (yields ? !ReadYieldSites(input, bytes, size, sites)
             : size != sizeof(input) + static_cast<std::uint64_t>(input.firstSize) + input.secondSize))
         throw std::runtime_error("Invalid function request");
@@ -424,6 +429,51 @@ std::shared_ptr<Completion> Begin(void* target, std::shared_ptr<void> hold,
 
     }
 #endif
+    else if (input.mode >= 6 && input.mode <= 9) {
+#ifdef _WIN32
+        struct Receiver {};
+        if (input.mode == 6 || input.mode == 7) {
+            if (input.firstSize != 0 || input.secondSize != 0)
+                throw std::runtime_error("Invalid gamepad connection request");
+            using Function = void(Receiver::*)(int);
+            Function member;
+            static_assert(sizeof(member) == sizeof(input.function));
+            std::memcpy(&member, &input.function, sizeof(member));
+            (reinterpret_cast<Receiver*>(target)->*member)(static_cast<int>(input.enums[0]));
+        } else if (input.mode == 8) {
+            if (input.firstSize != 0 || input.secondSize != 0)
+                throw std::runtime_error("Invalid gamepad button request");
+            using Function = void(Receiver::*)(int, int, int);
+            Function member;
+            static_assert(sizeof(member) == sizeof(input.function));
+            std::memcpy(&member, &input.function, sizeof(member));
+            (reinterpret_cast<Receiver*>(target)->*member)(
+                static_cast<int>(input.enums[0]),
+                static_cast<int>(input.enums[1]),
+                static_cast<int>(input.enums[2]));
+        } else {
+            if (input.firstSize != 12 || input.secondSize != 0)
+                throw std::runtime_error("Invalid gamepad axis request");
+            float axes[3]{};
+            std::memcpy(axes, bytes + sizeof(input), sizeof(axes));
+            if (!std::isfinite(axes[0]) || !std::isfinite(axes[1]) || !std::isfinite(axes[2]))
+                throw std::runtime_error("Gamepad axis values must be finite");
+            using Function = void(Receiver::*)(int, int, float, float, float);
+            Function member;
+            static_assert(sizeof(member) == sizeof(input.function));
+            std::memcpy(&member, &input.function, sizeof(member));
+            (reinterpret_cast<Receiver*>(target)->*member)(
+                static_cast<int>(input.enums[0]),
+                static_cast<int>(input.enums[1]),
+                axes[0],
+                axes[1],
+                axes[2]);
+        }
+        result->Finish("ok", true);
+#else
+        throw std::runtime_error("Native gamepad functions are unavailable on this platform");
+#endif
+    }
     else {
 #ifdef _WIN32
         struct Receiver {};

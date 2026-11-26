@@ -401,13 +401,13 @@ fn getter_call(code: &[u8], bindings: &[usize], abi: GetterAbi) -> Option<(usize
     None
 }
 
-const SIZE: usize = 132048;
-const IDENTITY: usize = 65920;
-const EXPECTED_IDENTITY: usize = 65936;
-const INPUT: usize = 65952;
+pub(super) const SIZE: usize = 132048;
+pub(super) const IDENTITY: usize = 65920;
+pub(super) const EXPECTED_IDENTITY: usize = 65936;
+pub(super) const INPUT: usize = 65952;
 const LIMIT: usize = 65536;
 const STATUS: usize = 84;
-const EXCEPTION_CODE: usize = 92;
+pub(super) const EXCEPTION_CODE: usize = 92;
 const ERROR_TEXT: usize = 65632;
 const ERROR_END: usize = ERROR_TEXT + 256;
 
@@ -1333,7 +1333,7 @@ pub(super) fn complete_reflection_type(
     .then_some(kind)
 }
 
-fn reflection_functions(
+pub(super) fn reflection_functions(
     memory: &ProcessMemory,
     studio: &ModuleEntry,
     layout: &PackageLayout,
