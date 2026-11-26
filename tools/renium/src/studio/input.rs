@@ -803,25 +803,27 @@ mod platform {
 
     pub fn watch_auto_recovery_dialogs() {
         std::thread::spawn(|| {
-            let hook = unsafe {
+            let hooks = [EVENT_OBJECT_SHOW, EVENT_OBJECT_NAMECHANGE].map(|event| unsafe {
                 SetWinEventHook(
-                    EVENT_OBJECT_SHOW,
-                    EVENT_OBJECT_NAMECHANGE,
+                    event,
+                    event,
                     std::ptr::null_mut(),
                     Some(recovery_event_proc),
                     0,
                     0,
                     WINEVENT_OUTOFCONTEXT,
                 )
-            };
-            if hook.is_null() {
+            });
+            if hooks.iter().all(|hook| hook.is_null()) {
                 return;
             }
             dismiss_auto_recovery_dialogs();
             let mut message = unsafe { std::mem::zeroed::<MSG>() };
             while unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) } > 0 {}
-            unsafe {
-                UnhookWinEvent(hook);
+            for hook in hooks.into_iter().filter(|hook| !hook.is_null()) {
+                unsafe {
+                    UnhookWinEvent(hook);
+                }
             }
         });
     }
