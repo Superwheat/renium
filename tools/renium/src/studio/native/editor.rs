@@ -4315,7 +4315,7 @@ pub(crate) fn write_connected_editor_place_snapshot(
         output_path,
         Some(existing_place),
         Some(runtime_id),
-        false,
+        true,
     )
 }
 
@@ -4328,34 +4328,56 @@ fn write_editor_place_snapshot(
     runtime_id: Option<&str>,
     try_native: bool,
 ) -> Result<usize> {
-    if try_native && path_extension_is(output_path, &["rbxl"]) {
-        let pid = studio_pid_for_bridge(bridge)?;
-        let title = studio_title_for_bridge(bridge, pid)?;
-        let build = serializer::studio_build_number(pid)
-            .map(|build| format!("0.{build}"))
-            .unwrap_or_else(|_| "unknown".into());
-        match serializer::write_live_place(pid, &title, output_path) {
-            Ok(snapshot) => {
-                eprintln!(
-                    "[renium] native snapshot: pid={pid} build={build} title={title:?} total={:.1}ms trace={:.1}ms discover={:.1}ms helper={:.1}ms invoke={:.1}ms validate={:.1}ms context={:.1}ms roots={:.1}ms serialize={:.1}ms write={:.1}ms bytes={}",
-                    snapshot.elapsed_ms,
-                    snapshot.trace_ms,
-                    snapshot.discover_ms,
-                    snapshot.helper_ms,
-                    snapshot.invoke_ms,
-                    snapshot.validate_ms,
-                    snapshot.context_ms,
-                    snapshot.collect_ms,
-                    snapshot.serialize_ms,
-                    snapshot.write_ms,
-                    snapshot.output_size
-                );
-                return Ok(snapshot.instance_count);
+    let format_path = existing_place.unwrap_or(output_path);
+    let existing_is_xml = existing_place
+        .and_then(|path| fs::File::open(path).ok())
+        .and_then(|file| {
+            let mut reader = std::io::BufReader::new(file);
+            std::io::BufRead::fill_buf(&mut reader)
+                .ok()
+                .and_then(RbxPlaceFormat::sniff)
+        })
+        == Some(RbxPlaceFormat::Xml);
+    if try_native && !existing_is_xml && path_extension_is(format_path, &["rbxl"]) {
+        let pid = match runtime_id {
+            Some(runtime_id) => {
+                bridge.studio_pid_for_runtime(crate::studio::bridge::BridgeTarget::Edit, runtime_id)
             }
-            Err(error) => {
-                eprintln!(
-                    "[renium] native snapshot unavailable for pid={pid} build={build} title={title:?}; using Studio export fallback: {error:#}"
-                );
+            None => studio_pid_for_bridge(bridge),
+        };
+        match pid.and_then(|pid| Ok((pid, studio_title_for_bridge(bridge, pid)?))) {
+            Err(error) => eprintln!(
+                "[renium] native snapshot unavailable; using Studio export fallback: {error:#}"
+            ),
+            Ok((pid, title)) => {
+                let build = serializer::studio_build_number(pid)
+                    .map(|build| format!("0.{build}"))
+                    .unwrap_or_else(|_| "unknown".into());
+                let _native = crate::app::profile::span("save native live place");
+                match serializer::write_live_place(pid, &title, output_path) {
+                    Ok(snapshot) => {
+                        eprintln!(
+                            "[renium] native snapshot: pid={pid} build={build} title={title:?} total={:.1}ms trace={:.1}ms discover={:.1}ms helper={:.1}ms invoke={:.1}ms validate={:.1}ms context={:.1}ms roots={:.1}ms serialize={:.1}ms write={:.1}ms bytes={}",
+                            snapshot.elapsed_ms,
+                            snapshot.trace_ms,
+                            snapshot.discover_ms,
+                            snapshot.helper_ms,
+                            snapshot.invoke_ms,
+                            snapshot.validate_ms,
+                            snapshot.context_ms,
+                            snapshot.collect_ms,
+                            snapshot.serialize_ms,
+                            snapshot.write_ms,
+                            snapshot.output_size
+                        );
+                        return Ok(snapshot.instance_count);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[renium] native snapshot unavailable for pid={pid} build={build} title={title:?}; using Studio export fallback: {error:#}"
+                        );
+                    }
+                }
             }
         }
     }
