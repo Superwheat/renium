@@ -8656,7 +8656,7 @@ pub(crate) fn canonicalize_settings_property_names(document: &mut SettingsByteco
 /// Canonicalizes property names in place and returns `(index, original_properties)`
 /// only for instances whose properties actually changed, so callers can restore
 /// `document` to its pre-canonicalized form before encoding.
-fn canonicalize_settings_property_names_recording(
+pub(crate) fn canonicalize_settings_property_names_recording(
     document: &mut SettingsBytecode,
 ) -> Result<Vec<(usize, Map<String, Value>)>> {
     let chunks = document

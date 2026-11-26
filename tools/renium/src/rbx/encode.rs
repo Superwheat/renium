@@ -1076,7 +1076,6 @@ impl ContentAliasState {
                 builder.add_property(legacy, RbxVariant::ContentId(RbxContentId::from(uri)));
             }
         } else if !self.modern_present
-            && modern != "TexturePackContent"
             && let Some(uri) = self.legacy_uri
             && !builder.has_property(modern)
         {
@@ -4760,6 +4759,7 @@ mod tests {
         for (class, modern, legacy) in [
             ("Pants", "PantsTemplateContent", "PantsTemplate"),
             ("Shirt", "ShirtTemplateContent", "ShirtTemplate"),
+            ("SurfaceAppearance", "TexturePackContent", "TexturePack"),
         ] {
             for stored in [legacy, modern] {
                 let mut instance = settings_instance("row", "Row", class, None);

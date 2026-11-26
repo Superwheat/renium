@@ -733,21 +733,31 @@ fn decode_verification_documents(
     ),
     prepared: Option<PreparedPushVerification>,
     observed_doc: Option<SettingsBytecode>,
-) -> Result<(SettingsBytecode, Arc<SettingsBytecode>, SettingsBytecode)> {
+) -> Result<(
+    SettingsBytecode,
+    Arc<SettingsBytecode>,
+    SettingsBytecode,
+    Vec<(usize, Map<String, Value>)>,
+)> {
     const LARGE_STORE_BYTES: usize = 4 * 1024 * 1024;
     let large_store = [before, desired, observed].into_iter().flatten().any(
         |entry| matches!(entry, SnapshotEntry::File(bytes) if bytes.len() >= LARGE_STORE_BYTES),
     );
-    let observed_from = |doc: Option<SettingsBytecode>| -> Result<SettingsBytecode> {
-        match doc {
-            Some(mut doc) => {
-                stabilize_settings_reference_ids(&mut doc);
-                canonicalize_settings_property_names(&mut doc)?;
-                Ok(doc)
-            }
-            None => settings_document(observed),
-        }
-    };
+    let observed_from =
+        |doc: Option<SettingsBytecode>| -> Result<(SettingsBytecode, Vec<(usize, Map<String, Value>)>)> {
+            let mut doc = match doc {
+                Some(mut doc) => {
+                    stabilize_settings_reference_ids(&mut doc);
+                    doc
+                }
+                None => decoded_settings_document(observed)?,
+            };
+            let restored =
+                crate::settings::equivalence::canonicalize_settings_property_names_recording(
+                    &mut doc,
+                )?;
+            Ok((doc, restored))
+        };
     if large_store {
         let (before, desired) = match prepared {
             Some(prepared) => (
@@ -762,8 +772,8 @@ fn decode_verification_documents(
                 Arc::new(settings_document(desired)?),
             ),
         };
-        let observed = observed_from(observed_doc)?;
-        return Ok((before, desired, observed));
+        let (observed, restored) = observed_from(observed_doc)?;
+        return Ok((before, desired, observed, restored));
     }
     let (requested, observed) = rayon::join(
         || -> Result<_> {
@@ -785,7 +795,8 @@ fn decode_verification_documents(
         || observed_from(observed_doc),
     );
     let (before, desired) = requested?;
-    Ok((before, desired, observed?))
+    let (observed, restored) = observed?;
+    Ok((before, desired, observed, restored))
 }
 
 fn settings_delta_verification(
@@ -853,7 +864,7 @@ fn settings_delta_verification(
     {
         return Ok(verified);
     }
-    let (mut before, desired, mut observed) =
+    let (mut before, desired, mut observed, observed_restored) =
         decode_verification_documents(entries, prepared, observed_doc)?;
     // Documents read by their changed instances verify a push that left
     // every instance at its place. Where Studio's instances have to be
@@ -866,6 +877,9 @@ fn settings_delta_verification(
         && !observed.instances.is_empty()
         && !crate::settings::equivalence::align_settings_ids_by_place(&desired, &mut observed)
     {
+        for (index, original) in observed_restored {
+            observed.instances[index].properties = original;
+        }
         drop((before, desired));
         let unprepared = (None, asked);
         return settings_delta_verification(path, entries, unprepared, Some(observed), policy);
@@ -874,6 +888,10 @@ fn settings_delta_verification(
         .settle
         .then(|| crate::settings::equivalence::reference_viewport_camera(&desired))
         .flatten();
+    let externally_managed = policy
+        .settle
+        .then(|| reference_externally_managed_properties(&desired))
+        .unwrap_or_default();
     if desired.instances.is_empty()
         && !before.instances.is_empty()
         && !observed.instances.is_empty()
@@ -1039,13 +1057,18 @@ fn settings_delta_verification(
         });
     }
     crate::settings::bytecode::defer_drop_settings_document(before);
-    if let Some(desired) = Arc::into_inner(desired) {
-        crate::settings::bytecode::defer_drop_settings_document(desired);
-    }
     let accepted = if policy.settle && mismatch.is_none() {
+        for (index, original) in observed_restored {
+            observed.instances[index].properties = original;
+        }
+        mask_reported_pending_fields(path, &desired, &mut observed, policy.pending)?;
+        if let Some(desired) = Arc::into_inner(desired) {
+            crate::settings::bytecode::defer_drop_settings_document(desired);
+        }
         if let Some(camera) = viewport {
             crate::settings::equivalence::keep_reference_viewport_camera(&camera, &mut observed);
         }
+        keep_reference_externally_managed_properties(&externally_managed, &mut observed);
         let previous = match entries.1 {
             Some(SnapshotEntry::File(bytes)) => Some(bytes.as_slice()),
             _ => None,
@@ -1056,10 +1079,79 @@ fn settings_delta_verification(
             )?,
         )
     } else {
+        if let Some(desired) = Arc::into_inner(desired) {
+            crate::settings::bytecode::defer_drop_settings_document(desired);
+        }
         crate::settings::bytecode::defer_drop_settings_document(observed);
         None
     };
     Ok(SettingsVerification { mismatch, accepted })
+}
+
+fn externally_managed_property_group(name: &str) -> Option<&'static str> {
+    if name.eq_ignore_ascii_case("maxplayers") || name.eq_ignore_ascii_case("maxplayersinternal") {
+        Some("MaxPlayers")
+    } else if name.eq_ignore_ascii_case("preferredplayers")
+        || name.eq_ignore_ascii_case("preferredplayersinternal")
+    {
+        Some("PreferredPlayers")
+    } else {
+        None
+    }
+}
+
+fn reference_externally_managed_properties(
+    desired: &SettingsBytecode,
+) -> Vec<(String, Vec<(String, Value)>)> {
+    desired
+        .instances
+        .iter()
+        .filter(|instance| instance.parent_index.is_none())
+        .filter_map(|instance| {
+            let kept = instance
+                .properties
+                .iter()
+                .filter(|(property, _)| {
+                    is_externally_managed_editor_property(
+                        &instance.name,
+                        &instance.class_name,
+                        std::slice::from_ref(&instance.name),
+                        property,
+                    )
+                })
+                .map(|(property, value)| (property.clone(), value.clone()))
+                .collect::<Vec<_>>();
+            (!kept.is_empty()).then(|| (instance.settings_id.clone(), kept))
+        })
+        .collect()
+}
+
+fn keep_reference_externally_managed_properties(
+    kept: &[(String, Vec<(String, Value)>)],
+    observed: &mut SettingsBytecode,
+) {
+    for (settings_id, properties) in kept {
+        let Some(instance) = observed.instances.iter_mut().find(|instance| {
+            instance.parent_index.is_none() && instance.settings_id == *settings_id
+        }) else {
+            continue;
+        };
+        let root_name = instance.name.clone();
+        let class_name = instance.class_name.clone();
+        for (property, value) in properties {
+            let group = externally_managed_property_group(property);
+            instance.properties.retain(|existing, _| {
+                !(is_externally_managed_editor_property(
+                    &root_name,
+                    &class_name,
+                    std::slice::from_ref(&root_name),
+                    existing,
+                ) && group.is_some()
+                    && externally_managed_property_group(existing) == group)
+            });
+            instance.properties.insert(property.clone(), value.clone());
+        }
+    }
 }
 
 fn mask_reported_pending_fields(
@@ -2669,5 +2761,182 @@ mod row_verify_tests {
         assert!(direct.mismatch.is_none(), "{:?}", direct.mismatch);
         assert_eq!(via_observed_doc.accepted, via_observed_bytes.accepted);
         assert_eq!(via_observed_doc.accepted, direct.accepted);
+    }
+
+    #[test]
+    fn small_store_settle_preserves_observed_texture_pack_content() {
+        let path = Path::new("instances/ReplicatedStorage.renium");
+        let pack_uri = "rbxassetid://12345678";
+        let make_root = |id: &str| {
+            SettingsBytecodeInstance::new(
+                id.into(),
+                "ReplicatedStorage".into(),
+                "ReplicatedStorage".into(),
+                None,
+            )
+        };
+        let make_surface = |id: &str, with_content: bool| {
+            let mut inst = SettingsBytecodeInstance::new(
+                id.into(),
+                "SurfaceAppearance".into(),
+                "SurfaceAppearance".into(),
+                Some(0),
+            );
+            inst.properties
+                .insert("TexturePack".into(), json!(pack_uri));
+            if with_content {
+                inst.properties.insert(
+                    "TexturePackContent".into(),
+                    json!({"_type": "Content", "value": pack_uri}),
+                );
+            }
+            inst
+        };
+        let make_decal = |id: &str, with_content: bool| {
+            let mut inst =
+                SettingsBytecodeInstance::new(id.into(), "Decal".into(), "Decal".into(), Some(0));
+            if with_content {
+                inst.properties.insert(
+                    "TexturePackContent".into(),
+                    json!({"_type": "Content", "value": null}),
+                );
+            }
+            inst
+        };
+
+        let before = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![make_root("rs")],
+        };
+        let desired = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                make_root("rs"),
+                make_surface("sa1", true),
+                make_decal("d1", true),
+            ],
+        };
+        let observed = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                make_root("obs-rs"),
+                make_surface("obs-sa1", true),
+                make_decal("obs-d1", true),
+            ],
+        };
+
+        let before_entry = SnapshotEntry::File(encode_settings_bytecode(&before).unwrap());
+        let desired_entry = SnapshotEntry::File(encode_settings_bytecode(&desired).unwrap());
+        let observed_entry = SnapshotEntry::File(encode_settings_bytecode(&observed).unwrap());
+
+        let pending: Vec<PendingImportFields> = Vec::new();
+        let no_values = NewInstanceValues::default();
+        let mut policy = Verification::of(true, &pending, &no_values);
+        policy.whole_documents = true;
+
+        for obs_doc in [None, Some(observed.clone())] {
+            let verified = settings_delta_verification(
+                path,
+                (
+                    Some(&before_entry),
+                    Some(&desired_entry),
+                    Some(&observed_entry),
+                ),
+                (None, true),
+                obs_doc,
+                policy,
+            )
+            .unwrap();
+            assert!(verified.mismatch.is_none(), "{:?}", verified.mismatch);
+            let accepted = decode_settings_bytecode(verified.accepted.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                accepted.instances[1].properties.get("TexturePackContent"),
+                Some(&json!({"_type": "Content", "value": pack_uri}))
+            );
+            assert_eq!(
+                accepted.instances[2].properties.get("TexturePackContent"),
+                Some(&json!({"_type": "Content", "value": null}))
+            );
+        }
+    }
+
+    #[test]
+    fn settle_preserves_externally_managed_players_properties() {
+        let path = Path::new("instances/Players.renium");
+        let mut desired_root =
+            SettingsBytecodeInstance::new("pl".into(), "Players".into(), "Players".into(), None);
+        desired_root
+            .properties
+            .insert("MaxPlayers".into(), json!(50));
+        desired_root
+            .properties
+            .insert("PreferredPlayers".into(), json!(40));
+        desired_root
+            .properties
+            .insert("CharacterAutoLoads".into(), json!(false));
+
+        let mut observed_root = SettingsBytecodeInstance::new(
+            "obs-pl".into(),
+            "Players".into(),
+            "Players".into(),
+            None,
+        );
+        observed_root
+            .properties
+            .insert("CharacterAutoLoads".into(), json!(false));
+
+        let before = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance::new(
+                "pl".into(),
+                "Players".into(),
+                "Players".into(),
+                None,
+            )],
+        };
+        let desired = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![desired_root],
+        };
+        let observed = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![observed_root],
+        };
+
+        let before_entry = SnapshotEntry::File(encode_settings_bytecode(&before).unwrap());
+        let desired_entry = SnapshotEntry::File(encode_settings_bytecode(&desired).unwrap());
+        let observed_entry = SnapshotEntry::File(encode_settings_bytecode(&observed).unwrap());
+
+        let pending: Vec<PendingImportFields> = Vec::new();
+        let no_values = NewInstanceValues::default();
+        let mut policy = Verification::of(true, &pending, &no_values);
+        policy.whole_documents = true;
+
+        let verified = settings_delta_verification(
+            path,
+            (
+                Some(&before_entry),
+                Some(&desired_entry),
+                Some(&observed_entry),
+            ),
+            (None, true),
+            None,
+            policy,
+        )
+        .unwrap();
+        assert!(verified.mismatch.is_none(), "{:?}", verified.mismatch);
+        let accepted = decode_settings_bytecode(verified.accepted.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            accepted.instances[0].properties.get("MaxPlayers"),
+            Some(&json!(50))
+        );
+        assert_eq!(
+            accepted.instances[0].properties.get("PreferredPlayers"),
+            Some(&json!(40))
+        );
+        assert_eq!(
+            accepted.instances[0].properties.get("CharacterAutoLoads"),
+            Some(&json!(false))
+        );
     }
 }
