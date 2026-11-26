@@ -70,6 +70,14 @@
 - A store keeps its bytes when nothing in it changed. A font, a color sequence or a number sequence was written in one layout by a pull or an import and in another by an edit of the same store, so a store flipped between the two; both now write the one an edit wrote. A store an older version wrote reads as before and takes the new layout the next time it is written.
 - A reference written with `referent` or `ref` in place of an id no longer makes every command that writes its store fail with "Missing binary string id".
 - `rbx ba` with an add that carries `Name` or `Parent` among its `props` fails with an error that names the instance and the field. The value was stored and then dropped by the next read without a word; the name and the parent of an added instance are its own fields.
+- While a Studio is open on Windows, the background process no longer receives every window move and cursor move on the desktop. Its watcher for Studio's auto-recovery dialog listened to a range of window events that included them; it now listens for shown and renamed windows only.
+- The shield that keeps the real mouse and keyboard out of Studio during `rbx inp` handles each input event when it arrives. Its thread slept 10 ms between rounds, which delayed every mouse and keyboard event on the PC by up to that long while a shield was up.
+- With `rbx audio --global` on, the background worker writes its status file when something changes, when a command asks, and every five seconds. It rewrote the file twice a second for as long as it ran.
+- `rbx co --level warning` lists warnings. The level was compared with `warn` exactly, so `warning` matched nothing and the answer was an empty console. A level that does not exist is refused.
+- A push of the whole project no longer fails its check on a Shirt or Pants whose template is stored under the older property name alone; the template is written under both names.
+- `rbx iu` with several local images checks every file before the first upload, and when one is refused it names that image together with the ones uploaded before it.
+- A push of the whole project no longer writes each script it holds in memory to disk and reads it straight back.
+- `rbx inp` refuses a click or press on a disabled button (`Interactable` false) at once and says the button is disabled, as a purchase sheet's Buy button is while it fills. Such a press failed after a second with "Expected one Activated and MouseButton1Click event, got 0 and 0".
 
 ## 0.6.4 - 2026-11-15
 
