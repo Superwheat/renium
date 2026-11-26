@@ -96,6 +96,13 @@ pub struct StudioWindow {
     handle: platform::WindowHandle,
 }
 
+#[cfg(windows)]
+impl StudioWindow {
+    pub(crate) fn recording_pid(&self) -> Option<u32> {
+        self.handle.recording_owner.as_ref().map(|(pid, _)| *pid)
+    }
+}
+
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub struct InputShield {
     _guard: platform::InputShield,

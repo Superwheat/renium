@@ -2518,6 +2518,8 @@ pub(super) struct RecordStartArgs {
     pub(super) max_seconds: f64,
     #[arg(help = "Video quality (0-100)", long, default_value_t = 80.0)]
     pub(super) quality: f32,
+    #[arg(help = "Record video without audio", long)]
+    pub(super) no_audio: bool,
 }
 
 #[derive(Parser)]

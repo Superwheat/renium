@@ -20,10 +20,12 @@ mod macos_write;
 pub(crate) mod probes;
 #[cfg(windows)]
 mod windows;
+#[cfg(all(windows, test))]
+pub(crate) use windows::drain_ring_bytes;
 #[cfg(windows)]
 pub(crate) use windows::{
-    AudioOutputGate, FpsController, fps_helper_loaded, keep_selection_across_undo,
-    suppress_package_notices,
+    AudioOutputGate, AudioPacket, AudioSampleFormat, AudioTap, FpsController, fps_helper_loaded,
+    keep_selection_across_undo, suppress_package_notices,
 };
 
 use std::time::Duration;

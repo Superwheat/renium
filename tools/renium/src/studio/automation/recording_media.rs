@@ -8,14 +8,18 @@ use rayon::prelude::*;
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonQuality, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize, IMFAttributes, IMFMediaBuffer,
-    IMFMediaType, IMFSample, IMFSinkWriter, MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
+    IMFMediaType, IMFSample, IMFSinkWriter, MF_LOW_LATENCY,
+    MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, MF_MT_AAC_PAYLOAD_TYPE,
+    MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT,
+    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
     MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE,
     MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE,
     MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
-    MF_TRANSCODE_CONTAINERTYPE, MF_VERSION, MFMediaType_Video, MFNominalRange_16_235,
-    MFTranscodeContainerType_MPEG4, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, MFVideoPrimaries_SMPTE170M, MFVideoTransFunc_709,
-    MFVideoTransferMatrix_BT601, eAVEncCommonRateControlMode_Quality, eAVEncH264VProfile_Main,
+    MF_TRANSCODE_CONTAINERTYPE, MF_VERSION, MFAudioFormat_AAC, MFAudioFormat_PCM,
+    MFMediaType_Audio, MFMediaType_Video, MFNominalRange_16_235, MFTranscodeContainerType_MPEG4,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    MFVideoPrimaries_SMPTE170M, MFVideoTransFunc_709, MFVideoTransferMatrix_BT601,
+    eAVEncCommonRateControlMode_Quality, eAVEncH264VProfile_Main,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::core::{HRESULT, HSTRING, Interface, PCWSTR};
@@ -25,7 +29,13 @@ use windows_sys::Win32::System::LibraryLoader::{
 };
 
 const TICKS_PER_MILLISECOND: i64 = 10_000;
-static PROVEN: Mutex<Vec<(usize, usize, u32, bool)>> = Mutex::new(Vec::new());
+const TICKS_PER_SECOND: u64 = 10_000_000;
+const AUDIO_SAMPLE_RATE: u32 = 48_000;
+const AUDIO_CHANNELS: u32 = 2;
+const AUDIO_BITS_PER_SAMPLE: u32 = 16;
+const AUDIO_BITRATE_BYTES_PER_SEC: u32 = 24_000;
+type ProvenProfile = (usize, usize, u32, bool, bool);
+static PROVEN: Mutex<Vec<ProvenProfile>> = Mutex::new(Vec::new());
 const BITS_PER_PIXEL: f64 = 0.4;
 
 struct Api {
@@ -137,12 +147,16 @@ pub(super) struct Settings {
     pub(super) fps: f64,
     pub(super) quality: f32,
     pub(super) key_frame_every: u32,
+    pub(super) audio: bool,
 }
 
 pub(super) struct MediaFile {
     api: &'static Api,
     writer: Option<IMFSinkWriter>,
     stream: u32,
+    audio_stream: Option<u32>,
+    audio_frames_written: u64,
+    audio_failed: bool,
     width: usize,
     height: usize,
     pending: Option<(IMFSample, u64)>,
@@ -158,6 +172,9 @@ impl MediaFile {
             api,
             writer: None,
             stream: 0,
+            audio_stream: None,
+            audio_frames_written: 0,
+            audio_failed: false,
             width: settings.width,
             height: settings.height,
             pending: None,
@@ -168,7 +185,13 @@ impl MediaFile {
         file.started = true;
         for hardware in [true, false] {
             let rate = (settings.fps * 1000.0).round() as u32;
-            let size = (settings.width, settings.height, rate, hardware);
+            let size = (
+                settings.width,
+                settings.height,
+                rate,
+                hardware,
+                settings.audio,
+            );
             let known = PROVEN.lock_recover().contains(&size);
             let opened = if known {
                 file.open(path, settings, hardware)
@@ -181,7 +204,11 @@ impl MediaFile {
                     PROVEN.lock_recover().push(size);
                     return Ok(file);
                 }
-                Err(_) => file.writer = None,
+                Err(_) => {
+                    file.writer = None;
+                    file.audio_stream = None;
+                    file.audio_frames_written = 0;
+                }
             }
         }
         bail!("No system encoder takes this video")
@@ -190,11 +217,18 @@ impl MediaFile {
     fn prove(&mut self, path: &Path, settings: &Settings, hardware: bool) -> Result<()> {
         self.pending = None;
         self.writer = None;
+        self.audio_stream = None;
+        self.audio_frames_written = 0;
         self.open(path, settings, hardware)?;
         self.add(&vec![0; self.width * self.height * 4], true, 0)?;
         self.write(1)?;
+        if settings.audio {
+            self.add_audio(&[0i16; 2048])?;
+        }
         unsafe { self.writer()?.Finalize()? };
         self.writer = None;
+        self.audio_stream = None;
+        self.audio_frames_written = 0;
         self.open(path, settings, hardware)
     }
 
@@ -259,9 +293,93 @@ impl MediaFile {
             encoder.SetUINT32(&CODECAPI_AVEncMPVGOPSize, settings.key_frame_every)?;
             encoder.SetUINT32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0)?;
             writer.SetInputMediaType(self.stream, &input, &encoder)?;
+
+            self.audio_stream = if settings.audio {
+                let audio_out = api.new_media_type()?;
+                audio_out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+                audio_out.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
+                audio_out.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, AUDIO_BITS_PER_SAMPLE)?;
+                audio_out.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_SAMPLE_RATE)?;
+                audio_out.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, AUDIO_CHANNELS)?;
+                audio_out.SetUINT32(
+                    &MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+                    AUDIO_BITRATE_BYTES_PER_SEC,
+                )?;
+                audio_out.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)?;
+                audio_out.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29)?;
+                let audio_stream = writer.AddStream(&audio_out)?;
+
+                let block_align = AUDIO_CHANNELS * (AUDIO_BITS_PER_SAMPLE / 8);
+                let audio_in = api.new_media_type()?;
+                audio_in.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+                audio_in.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
+                audio_in.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, AUDIO_BITS_PER_SAMPLE)?;
+                audio_in.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_SAMPLE_RATE)?;
+                audio_in.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, AUDIO_CHANNELS)?;
+                audio_in.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, block_align)?;
+                audio_in.SetUINT32(
+                    &MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+                    AUDIO_SAMPLE_RATE * block_align,
+                )?;
+                writer.SetInputMediaType(audio_stream, &audio_in, None)?;
+                Some(audio_stream)
+            } else {
+                None
+            };
+            self.audio_frames_written = 0;
+
             writer.BeginWriting()?;
             self.writer = Some(writer);
         }
+        Ok(())
+    }
+
+    pub(super) fn has_audio(&self) -> bool {
+        self.audio_stream.is_some() && !self.audio_failed
+    }
+
+    pub(super) fn add_audio(&mut self, pcm_i16: &[i16]) -> Result<()> {
+        if self.audio_failed {
+            return Ok(());
+        }
+        let Some(audio_stream) = self.audio_stream else {
+            return Ok(());
+        };
+        if pcm_i16.is_empty() {
+            return Ok(());
+        }
+        let frames = (pcm_i16.len() / AUDIO_CHANNELS as usize) as u64;
+        if frames == 0 {
+            return Ok(());
+        }
+        let byte_len = std::mem::size_of_val(pcm_i16);
+        let size = u32::try_from(byte_len).context("Recording audio chunk is too large")?;
+        let start_ticks =
+            self.audio_frames_written * TICKS_PER_SECOND / u64::from(AUDIO_SAMPLE_RATE);
+        let next_frames = self.audio_frames_written + frames;
+        let end_ticks = next_frames * TICKS_PER_SECOND / u64::from(AUDIO_SAMPLE_RATE);
+        let duration_ticks = end_ticks.saturating_sub(start_ticks).max(1);
+        let write = (|| -> Result<()> {
+            unsafe {
+                let buffer = made(|value| (self.api.memory_buffer)(size, value))?;
+                let mut bytes = std::ptr::null_mut();
+                buffer.Lock(&mut bytes, None, None)?;
+                std::ptr::copy_nonoverlapping(pcm_i16.as_ptr().cast::<u8>(), bytes, byte_len);
+                buffer.Unlock()?;
+                buffer.SetCurrentLength(size)?;
+                let sample = made(|value| (self.api.sample)(value))?;
+                sample.AddBuffer(&buffer)?;
+                sample.SetSampleTime(i64::try_from(start_ticks)?)?;
+                sample.SetSampleDuration(i64::try_from(duration_ticks)?)?;
+                self.writer()?.WriteSample(audio_stream, &sample)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = write {
+            self.audio_failed = true;
+            return Err(error);
+        }
+        self.audio_frames_written = next_frames;
         Ok(())
     }
 

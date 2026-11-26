@@ -47,7 +47,9 @@ mod package_notice;
 mod properties;
 #[path = "windows_undo_selection.rs"]
 mod undo_selection;
-pub(crate) use audio::AudioOutputGate;
+#[cfg(test)]
+pub(crate) use audio::drain_ring_bytes;
+pub(crate) use audio::{AudioOutputGate, AudioPacket, AudioSampleFormat, AudioTap};
 pub(crate) use fps::{FpsController, helper_loaded as fps_helper_loaded};
 pub(crate) use import::{CREATED_ROW, read_service_payload};
 pub(crate) use observation::{AttributeGuard, begin_attribute_guard, begin_attribute_relay};

@@ -230,6 +230,11 @@ fn recording_review_large_frames_and_cli_arguments() {
     }
     assert!(
         crate::cli::command()
+            .try_get_matches_from(["rbx", "rs", "--no-audio"])
+            .is_ok()
+    );
+    assert!(
+        crate::cli::command()
             .try_get_matches_from(["rbx", "re", "--no-review"])
             .is_ok()
     );
@@ -263,6 +268,7 @@ fn a_system_encoded_recording_is_reviewed_with_its_colors_and_times() {
         fps: 60.0,
         quality: 80.0,
         key_frame_every: 4,
+        audio: false,
     };
     let Ok(mut file) = MediaFile::start(&path, &settings) else {
         return;

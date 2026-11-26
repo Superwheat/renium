@@ -49,6 +49,8 @@ struct StartRequest {
     max_seconds: f64,
     #[serde(default = "default_quality")]
     quality: f32,
+    #[serde(default = "default_audio")]
+    audio: bool,
 }
 
 #[derive(Deserialize)]
@@ -94,6 +96,8 @@ struct FinishedRecording {
     encoder: &'static str,
     serial: bool,
     held_back: bool,
+    audio: bool,
+    audio_error: Option<String>,
 }
 
 /// A picture as a capture hands it over: width, height and four bytes a pixel.
@@ -186,6 +190,11 @@ struct RecordingOptions {
     fps: f64,
     max_seconds: f64,
     quality: f32,
+    audio: bool,
+    #[cfg(windows)]
+    audio_pid: Option<u32>,
+    #[cfg(windows)]
+    audio_tap: Cell<Option<AudioSourceRx>>,
 }
 
 struct EncodedFrame {
@@ -205,6 +214,10 @@ fn default_max_seconds() -> f64 {
 
 fn default_quality() -> f32 {
     80.0
+}
+
+fn default_audio() -> bool {
+    true
 }
 
 #[cfg(windows)]
@@ -377,6 +390,13 @@ fn write_sample(
 
 trait Video {
     fn name(&self) -> &'static str;
+    fn has_audio(&self) -> bool {
+        false
+    }
+    #[cfg(windows)]
+    fn add_audio(&mut self, _pcm: &[i16]) -> Result<()> {
+        Ok(())
+    }
     fn add(&mut self, pixels: &[u8], bgra: bool, at: u64) -> Result<()>;
     fn end(self: Box<Self>, duration_ms: u64) -> Result<()>;
 }
@@ -508,6 +528,14 @@ impl Video for super::recording_media::MediaFile {
         "system"
     }
 
+    fn has_audio(&self) -> bool {
+        Self::has_audio(self)
+    }
+
+    fn add_audio(&mut self, pcm: &[i16]) -> Result<()> {
+        Self::add_audio(self, pcm)
+    }
+
     fn add(&mut self, pixels: &[u8], bgra: bool, at: u64) -> Result<()> {
         Self::add(self, pixels, bgra, at)
     }
@@ -526,39 +554,211 @@ fn open_video(
     height: usize,
     options: &RecordingOptions,
     temp_path: &Path,
-) -> Result<Box<dyn Video>> {
+    want_audio: bool,
+) -> Result<(Box<dyn Video>, Option<String>)> {
     #[cfg(windows)]
-    if options.system_encoder {
-        use super::recording_media::{MediaFile, Settings};
-        let settings = Settings {
-            width,
-            height,
-            fps: options.fps,
-            quality: options.quality,
-            key_frame_every: key_frame_every(options),
-        };
-        if let Ok(video) = MediaFile::start(temp_path, &settings) {
-            return Ok(Box::new(video));
+    {
+        if options.system_encoder {
+            use super::recording_media::{MediaFile, Settings};
+            let settings = Settings {
+                width,
+                height,
+                fps: options.fps,
+                quality: options.quality,
+                key_frame_every: key_frame_every(options),
+                audio: want_audio,
+            };
+            match MediaFile::start(temp_path, &settings) {
+                Ok(video) => return Ok((Box::new(video), None)),
+                Err(audio_error) if want_audio => {
+                    let video_only = Settings {
+                        audio: false,
+                        ..settings
+                    };
+                    if let Ok(video) = MediaFile::start(temp_path, &video_only) {
+                        return Ok((
+                            Box::new(video),
+                            Some(format!("System audio encoder failed: {audio_error:#}")),
+                        ));
+                    }
+                    return Ok((
+                        Box::new(Software::start(width, height, options, temp_path)?),
+                        Some(format!(
+                            "System encoder unavailable for audio: {audio_error:#}"
+                        )),
+                    ));
+                }
+                Err(_) => {}
+            }
         }
+        let reason =
+            want_audio.then(|| "Software video encoder does not support audio tracks".to_string());
+        Ok((
+            Box::new(Software::start(width, height, options, temp_path)?),
+            reason,
+        ))
     }
-    Ok(Box::new(Software::start(
-        width, height, options, temp_path,
-    )?))
+    #[cfg(not(windows))]
+    {
+        let _ = want_audio;
+        Ok((
+            Box::new(Software::start(width, height, options, temp_path)?),
+            None,
+        ))
+    }
 }
 
-fn record_file(
-    mut capture: impl FnMut(Take) -> Result<Option<Timed>>,
-    first: Timed,
-    options: &RecordingOptions,
+#[cfg(windows)]
+type AudioSourceRx = mpsc::Receiver<Result<Box<dyn super::recording_audio::AudioSource>>>;
+
+#[cfg(windows)]
+fn spawn_audio_tap(pid: u32) -> AudioSourceRx {
+    let (tx, rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let res = crate::studio::native::serializer::AudioTap::start(pid)
+            .map(|tap| Box::new(tap) as Box<dyn super::recording_audio::AudioSource>);
+        let _ = tx.send(res);
+    });
+    rx
+}
+
+#[cfg(windows)]
+fn start_audio_tap(options: &RecordingOptions) -> (Option<AudioSourceRx>, Option<String>) {
+    if !options.audio {
+        return (None, None);
+    }
+    if let Some(rx) = options.audio_tap.take() {
+        return (Some(rx), None);
+    }
+    match options.audio_pid {
+        Some(pid) => (Some(spawn_audio_tap(pid)), None),
+        None => (
+            None,
+            Some("No target process is available for audio capture".into()),
+        ),
+    }
+}
+
+#[cfg(windows)]
+struct AudioTrack {
+    recorder: Option<super::recording_audio::AudioRecorder>,
+    retired: Vec<super::recording_audio::AudioRecorder>,
+    error: Option<String>,
+    write_failed: bool,
+    had_tap: bool,
+}
+
+#[cfg(windows)]
+impl AudioTrack {
+    fn start(
+        audio_rx: Option<AudioSourceRx>,
+        video_has_audio: bool,
+        audio_error: Option<String>,
+        encoder_audio_error: Option<String>,
+        started: Instant,
+    ) -> Self {
+        let mut error = audio_error;
+        let recorder = if !video_has_audio {
+            drop(audio_rx);
+            if error.is_none() {
+                error = encoder_audio_error;
+            }
+            None
+        } else {
+            audio_rx.map(|rx| super::recording_audio::AudioRecorder::new(rx, started))
+        };
+        Self {
+            recorder,
+            retired: Vec::new(),
+            error,
+            write_failed: false,
+            had_tap: false,
+        }
+    }
+
+    fn poll(&mut self, elapsed_ms: u64, video: &mut dyn Video) {
+        let Some(recorder) = self.recorder.as_mut() else {
+            return;
+        };
+        if let Err(error) = recorder.poll(elapsed_ms, |chunk| video.add_audio(chunk)) {
+            self.error = Some(format!("Audio encoding failed; kept video only: {error:#}"));
+            self.write_failed = true;
+            if let Some(failed) = self.recorder.take() {
+                failed.deactivate();
+                self.retired.push(failed);
+            }
+        }
+    }
+
+    fn finish(mut self, duration_ms: u64, video: &mut dyn Video) -> (bool, Option<String>) {
+        let mut usable = false;
+        if let Some(recorder) = self.recorder.take() {
+            match recorder.finish(duration_ms, |chunk| video.add_audio(chunk)) {
+                Ok(report) => {
+                    self.had_tap = report.had_tap;
+                    if !report.had_tap {
+                        self.error = report.tap_error.or_else(|| {
+                            Some(
+                                "Process audio capture did not become ready before the recording ended"
+                                    .into(),
+                            )
+                        });
+                    } else if report.read_faults > 0 {
+                        usable = report.got_audio;
+                        self.error.get_or_insert_with(|| {
+                            "Audio capture stopped after a read fault in the audio engine".into()
+                        });
+                    } else if report.tap_lost && !report.got_audio {
+                        self.error.get_or_insert_with(|| {
+                            "Audio capture stopped before receiving any audio".into()
+                        });
+                    } else if report.skipped_unknown > 0 {
+                        usable = report.got_audio;
+                        self.error.get_or_insert_with(|| {
+                            format!(
+                                "Skipped {} audio buffer(s) from a stream with an unverified format",
+                                report.skipped_unknown
+                            )
+                        });
+                    } else if report.tap_lost {
+                        usable = true;
+                        self.error.get_or_insert_with(|| {
+                            "Audio capture stopped before the recording ended".into()
+                        });
+                    } else {
+                        usable = true;
+                        if let Some(ms) = report.late_start_ms {
+                            self.error.get_or_insert_with(|| {
+                                format!("Audio capture started {ms} ms into the recording")
+                            });
+                        } else if report.dropped > 0 {
+                            self.error.get_or_insert_with(|| {
+                                format!("Audio capture dropped {} packet(s)", report.dropped)
+                            });
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.error = Some(format!("Audio encoding failed; kept video only: {error:#}"));
+                    self.write_failed = true;
+                }
+            }
+        }
+        drop(self.retired);
+        let audio = video.has_audio() && self.had_tap && usable && !self.write_failed;
+        (audio, self.error)
+    }
+}
+
+fn acquire_first_frame(
+    capture: &mut impl FnMut(Take) -> Result<Option<Timed>>,
+    mut first: Timed,
+    width: usize,
+    height: usize,
+    opened: Instant,
     stop: &AtomicBool,
-    ready: mpsc::SyncSender<Result<()>>,
-    temp_path: &Path,
-) -> Result<FinishedRecording> {
-    let (_, width, height) = even_rgba(&first.0.2, first.0.0, first.0.1)?;
-    let mut video = open_video(width, height, options, temp_path)?;
-    let opened = Instant::now();
+) -> Result<Timed> {
     let fits = |frame: &Timed| (frame.0.0 & !1, frame.0.1 & !1) == (width as u32, height as u32);
-    let mut first = first;
     while let Some(newer) = capture(Take::Held).ok().flatten() {
         let fresh = newer.1 >= opened;
         if fits(&newer) {
@@ -578,8 +778,113 @@ fn record_file(
             first = newer;
         }
     }
-    let ((source_width, source_height, source_pixels), captured) = first;
+    Ok(first)
+}
+
+// A document replacement can change the viewport without changing the client
+// window. Keep capturing live frames letterboxed on the original canvas.
+fn fit_frame_to_canvas<'a>(
+    pixels: Cow<'a, [u8]>,
+    frame_size: (usize, usize),
+    canvas_size: (usize, usize),
+    resized_frames: &mut usize,
+) -> Cow<'a, [u8]> {
+    let (frame_width, frame_height) = frame_size;
+    let (canvas_width, canvas_height) = canvas_size;
+    if frame_size == canvas_size {
+        return pixels;
+    }
+    *resized_frames += 1;
+    let scale =
+        (canvas_width as f64 / frame_width as f64).min(canvas_height as f64 / frame_height as f64);
+    let fitted_width = ((frame_width as f64 * scale) as usize).max(1);
+    let fitted_height = ((frame_height as f64 * scale) as usize).max(1);
+    let x = (canvas_width - fitted_width) / 2;
+    let y = (canvas_height - fitted_height) / 2;
+    let mut canvas = [0, 0, 0, 255].repeat(canvas_width * canvas_height);
+    for row in 0..fitted_height {
+        let source_row = row * frame_height / fitted_height;
+        for column in 0..fitted_width {
+            let source = (source_row * frame_width + column * frame_width / fitted_width) * 4;
+            let target = ((y + row) * canvas_width + x + column) * 4;
+            canvas[target..target + 4].copy_from_slice(&pixels[source..source + 4]);
+        }
+    }
+    Cow::Owned(canvas)
+}
+
+fn millis_u64(length: Duration) -> u64 {
+    length.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn record_file(
+    capture: impl FnMut(Take) -> Result<Option<Timed>>,
+    first: Timed,
+    options: &RecordingOptions,
+    stop: &AtomicBool,
+    ready: mpsc::SyncSender<Result<()>>,
+    temp_path: &Path,
+) -> Result<FinishedRecording> {
+    let (_, width, height) = even_rgba(&first.0.2, first.0.0, first.0.1)?;
+    #[cfg(windows)]
+    let (audio_rx, audio_error) = start_audio_tap(options);
+    #[cfg(not(windows))]
+    let audio_error = options
+        .audio
+        .then(|| "Recording audio is currently only supported on Windows".to_string());
+    #[cfg(windows)]
+    let want_audio = audio_rx.is_some();
+    #[cfg(not(windows))]
+    let want_audio = false;
+    let (video, encoder_audio_error) = open_video(width, height, options, temp_path, want_audio)?;
+    #[cfg(windows)]
+    let audio_setup = (audio_rx, audio_error, encoder_audio_error);
+    #[cfg(not(windows))]
+    let audio_setup = {
+        let _ = encoder_audio_error;
+        audio_error
+    };
+    drive_recording(
+        video,
+        audio_setup,
+        capture,
+        first,
+        options,
+        (stop, ready, temp_path),
+    )
+}
+
+#[cfg(windows)]
+type AudioSetup = (Option<AudioSourceRx>, Option<String>, Option<String>);
+#[cfg(not(windows))]
+type AudioSetup = Option<String>;
+
+fn drive_recording(
+    mut video: Box<dyn Video>,
+    audio_setup: AudioSetup,
+    mut capture: impl FnMut(Take) -> Result<Option<Timed>>,
+    first: Timed,
+    options: &RecordingOptions,
+    control: (&AtomicBool, mpsc::SyncSender<Result<()>>, &Path),
+) -> Result<FinishedRecording> {
+    let (stop, ready, temp_path) = control;
+    let (_, width, height) = even_rgba(&first.0.2, first.0.0, first.0.1)?;
+    #[cfg(windows)]
+    let (audio_rx, audio_error, encoder_audio_error) = audio_setup;
+    #[cfg(not(windows))]
+    let audio_error = audio_setup;
+    let opened = Instant::now();
+    let ((source_width, source_height, source_pixels), captured) =
+        acquire_first_frame(&mut capture, first, width, height, opened, stop)?;
     let started = captured.max(opened);
+    #[cfg(windows)]
+    let mut audio_track = AudioTrack::start(
+        audio_rx,
+        video.has_audio(),
+        audio_error,
+        encoder_audio_error,
+        started,
+    );
     let (first_pixels, ..) = even_rgba(&source_pixels, source_width, source_height)?;
     video.add(&first_pixels, options.bgra, 0)?;
     let mut encoding = Duration::ZERO;
@@ -588,7 +893,6 @@ fn record_file(
     let _ = ready.send(Ok(()));
     let interval = Duration::from_secs_f64(1.0 / options.fps);
     let limit = Duration::from_secs_f64(options.max_seconds);
-    let millis = |length: Duration| length.as_millis().min(u128::from(u64::MAX)) as u64;
     let mut next_frame = started + interval;
     let mut pending_at = 0u64;
     let mut frames = 1usize;
@@ -603,6 +907,8 @@ fn record_file(
         } else {
             let now = Instant::now();
             if now < next_frame {
+                #[cfg(windows)]
+                audio_track.poll(millis_u64(started.elapsed()), video.as_mut());
                 thread::sleep((next_frame - now).min(Duration::from_millis(10)));
                 continue;
             }
@@ -623,35 +929,18 @@ fn record_file(
             break;
         }
         let (pixels, frame_width, frame_height) = even_rgba(&pixels, frame_width, frame_height)?;
-        // A document replacement can change the viewport without changing the
-        // client window. Keep capturing live frames on the original canvas.
-        let pixels = if (frame_width, frame_height) == (width, height) {
-            pixels
-        } else {
-            resized_frames += 1;
-            let (canvas_width, canvas_height) = (width, height);
-            let scale = (canvas_width as f64 / frame_width as f64)
-                .min(canvas_height as f64 / frame_height as f64);
-            let fitted_width = ((frame_width as f64 * scale) as usize).max(1);
-            let fitted_height = ((frame_height as f64 * scale) as usize).max(1);
-            let x = (canvas_width - fitted_width) / 2;
-            let y = (canvas_height - fitted_height) / 2;
-            let mut canvas = [0, 0, 0, 255].repeat(canvas_width * canvas_height);
-            for row in 0..fitted_height {
-                let source_row = row * frame_height / fitted_height;
-                for column in 0..fitted_width {
-                    let source =
-                        (source_row * frame_width + column * frame_width / fitted_width) * 4;
-                    let target = ((y + row) * canvas_width + x + column) * 4;
-                    canvas[target..target + 4].copy_from_slice(&pixels[source..source + 4]);
-                }
-            }
-            Cow::Owned(canvas)
-        };
-        let timestamp = millis(at).max(pending_at + 1);
+        let pixels = fit_frame_to_canvas(
+            pixels,
+            (frame_width, frame_height),
+            (width, height),
+            &mut resized_frames,
+        );
+        let timestamp = millis_u64(at).max(pending_at + 1);
         let encode_started = Instant::now();
         video.add(&pixels, options.bgra, timestamp)?;
         encoding += encode_started.elapsed();
+        #[cfg(windows)]
+        audio_track.poll(timestamp, video.as_mut());
         pending_at = timestamp;
         frames += 1;
         next_frame += interval;
@@ -661,7 +950,11 @@ fn record_file(
             }
         }
     }
-    let duration_ms = millis(ended.unwrap_or_else(|| started.elapsed())).max(pending_at + 1);
+    let duration_ms = millis_u64(ended.unwrap_or_else(|| started.elapsed())).max(pending_at + 1);
+    #[cfg(windows)]
+    let (audio, audio_error) = audio_track.finish(duration_ms, video.as_mut());
+    #[cfg(not(windows))]
+    let audio = video.has_audio();
     let encoder = video.name();
     video.end(duration_ms)?;
     fs::OpenOptions::new()
@@ -682,6 +975,8 @@ fn record_file(
         encoder,
         serial: !options.paced_by_capture.get(),
         held_back: options.cost.held_back(),
+        audio,
+        audio_error,
     })
 }
 
@@ -1113,6 +1408,14 @@ pub(crate) fn start(
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
+    #[cfg(windows)]
+    let audio_pid = window.recording_pid();
+    #[cfg(windows)]
+    let audio_tap = if request.audio {
+        audio_pid.map(spawn_audio_tap)
+    } else {
+        None
+    };
     let first = input_inject::capture_window_rgba(&window)?;
     let window_label = window.label.clone();
     let stop = Arc::new(AtomicBool::new(false));
@@ -1126,6 +1429,11 @@ pub(crate) fn start(
         fps: request.fps,
         max_seconds: request.max_seconds,
         quality: request.quality,
+        audio: request.audio,
+        #[cfg(windows)]
+        audio_pid,
+        #[cfg(windows)]
+        audio_tap: Cell::new(audio_tap),
     };
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let worker =
@@ -1210,9 +1518,12 @@ pub(crate) fn end(parameters: &Value) -> Result<Value> {
         "requestedFps": active.fps,
         "achievedFps": achieved_fps,
         "mimeType": "video/mp4",
-        "audio": false,
+        "audio": finished.audio,
     });
     result["encoder"] = json!(finished.encoder);
+    if let Some(reason) = finished.audio_error {
+        result["audioError"] = json!(reason);
+    }
     if finished.held_back && active.fps > BACKGROUND_FPS {
         result["throttled"] = json!(true);
         result["note"] = json!(
@@ -1419,6 +1730,11 @@ mod tests {
                 fps: 60.0,
                 max_seconds: 5.0,
                 quality: 80.0,
+                audio: false,
+                #[cfg(windows)]
+                audio_pid: None,
+                #[cfg(windows)]
+                audio_tap: Cell::new(None),
             };
             let (ready, _ready) = mpsc::sync_channel(1);
             let temp = sibling_temp_path(&options.output);
@@ -1531,6 +1847,11 @@ mod tests {
                 fps: 30.0,
                 max_seconds: 5.0,
                 quality: 80.0,
+                audio: false,
+                #[cfg(windows)]
+                audio_pid: None,
+                #[cfg(windows)]
+                audio_tap: Cell::new(None),
             };
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let (done_tx, done_rx) = mpsc::sync_channel(1);
@@ -1590,5 +1911,519 @@ mod tests {
             assert!(end(&json!({})).is_err());
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    struct SyntheticToneSource {
+        active: bool,
+        phase: f64,
+        last_qpc: i64,
+        qpc_freq: u64,
+    }
+
+    #[cfg(windows)]
+    impl SyntheticToneSource {
+        fn new() -> Self {
+            Self {
+                active: true,
+                phase: 0.0,
+                last_qpc: super::super::recording_audio::qpc_now(),
+                qpc_freq: super::super::recording_audio::qpc_frequency(),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl super::super::recording_audio::AudioSource for SyntheticToneSource {
+        fn is_active(&self) -> bool {
+            self.active
+        }
+        fn drain(&mut self, out: &mut Vec<crate::studio::native::serializer::AudioPacket>) {
+            if !self.active {
+                return;
+            }
+            let now = super::super::recording_audio::qpc_now();
+            let step_ticks = (self.qpc_freq / 100).max(1) as i64;
+            let phase_step = 2.0 * std::f64::consts::PI * 440.0 / 48_000.0;
+            while now.saturating_sub(self.last_qpc) >= step_ticks {
+                let mut payload = Vec::with_capacity(480 * 8);
+                for _ in 0..480 {
+                    let s = (0.5 * self.phase.sin()) as f32;
+                    self.phase = (self.phase + phase_step) % (2.0 * std::f64::consts::PI);
+                    payload.extend_from_slice(&s.to_le_bytes());
+                    payload.extend_from_slice(&s.to_le_bytes());
+                }
+                out.push(crate::studio::native::serializer::AudioPacket {
+                    qpc_ticks: self.last_qpc,
+                    stream_id: 1,
+                    sample_rate: 48_000,
+                    frames: 480,
+                    channels: 2,
+                    format: crate::studio::native::serializer::AudioSampleFormat::F32,
+                    silent: false,
+                    payload,
+                });
+                self.last_qpc += step_ticks;
+            }
+        }
+        fn deactivate(&self) {}
+        fn stop(&mut self) {
+            self.active = false;
+        }
+        fn dropped(&self) -> u64 {
+            0
+        }
+        fn skipped_unknown(&self) -> u64 {
+            0
+        }
+        fn read_faults(&self) -> u64 {
+            0
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn audio_write_failure_preserves_video_mp4_and_reports_reason() -> Result<()> {
+        struct FailingAudioVideo {
+            inner: Software,
+        }
+        impl Video for FailingAudioVideo {
+            fn name(&self) -> &'static str {
+                self.inner.name()
+            }
+            fn has_audio(&self) -> bool {
+                true
+            }
+            fn add_audio(&mut self, _pcm: &[i16]) -> Result<()> {
+                bail!("simulated AAC encoder failure")
+            }
+            fn add(&mut self, pixels: &[u8], bgra: bool, at: u64) -> Result<()> {
+                self.inner.add(pixels, bgra, at)
+            }
+            fn end(self: Box<Self>, duration_ms: u64) -> Result<()> {
+                Box::new(self.inner).end(duration_ms)
+            }
+        }
+
+        let root = std::env::temp_dir().join(automation_token("recording-audio-fail"));
+        fs::create_dir_all(&root)?;
+        let output = root.join("video-preserved.mp4");
+        let temp = sibling_temp_path(&output);
+        let options = RecordingOptions {
+            bgra: false,
+            system_encoder: false,
+            cost: Arc::default(),
+            paced_by_capture: Cell::new(false),
+            output: output.clone(),
+            fps: 30.0,
+            max_seconds: 0.4,
+            quality: 80.0,
+            audio: true,
+            audio_pid: None,
+            audio_tap: Cell::new(None),
+        };
+        let (tap_tx, tap_rx) = mpsc::sync_channel(1);
+        let _ = tap_tx.send(Ok(Box::new(SyntheticToneSource::new())
+            as Box<dyn super::super::recording_audio::AudioSource>));
+        let video = Box::new(FailingAudioVideo {
+            inner: Software::start(64, 32, &options, &temp)?,
+        });
+        let (ready_tx, _ready_rx) = mpsc::sync_channel(1);
+        let frame = |k: u32| picture(64, 32, |x, _| [((k * 17) % 255) as u8, x as u8, 200, 255]);
+        let mut n = 0u32;
+        let res = drive_recording(
+            video,
+            (Some(tap_rx), None, None),
+            |t| {
+                if t == Take::Held {
+                    Ok(None)
+                } else {
+                    n += 1;
+                    Ok(Some((frame(n), Instant::now())))
+                }
+            },
+            (frame(0), Instant::now()),
+            &options,
+            (&AtomicBool::new(false), ready_tx, &temp),
+        )?;
+        assert!(output.is_file());
+        assert!(res.frames >= 4);
+        assert!(!res.audio);
+        let err = res
+            .audio_error
+            .as_deref()
+            .context("expected audio_error on write failure")?;
+        assert!(
+            err.starts_with("Audio encoding failed; kept video only"),
+            "unexpected audio_error: {err}"
+        );
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn late_tap_produces_full_length_audio_and_reports_start_ms() -> Result<()> {
+        let captured = Arc::new(Mutex::new(Vec::<i16>::new()));
+        struct CapturingAudioVideo {
+            inner: Software,
+            pcm: Arc<Mutex<Vec<i16>>>,
+        }
+        impl Video for CapturingAudioVideo {
+            fn name(&self) -> &'static str {
+                self.inner.name()
+            }
+            fn has_audio(&self) -> bool {
+                true
+            }
+            fn add_audio(&mut self, pcm: &[i16]) -> Result<()> {
+                self.pcm.lock_recover().extend_from_slice(pcm);
+                Ok(())
+            }
+            fn add(&mut self, pixels: &[u8], bgra: bool, at: u64) -> Result<()> {
+                self.inner.add(pixels, bgra, at)
+            }
+            fn end(self: Box<Self>, duration_ms: u64) -> Result<()> {
+                Box::new(self.inner).end(duration_ms)
+            }
+        }
+
+        let root = std::env::temp_dir().join(automation_token("recording-late-tap"));
+        fs::create_dir_all(&root)?;
+        let output = root.join("late-tap.mp4");
+        let temp = sibling_temp_path(&output);
+        let options = RecordingOptions {
+            bgra: false,
+            system_encoder: false,
+            cost: Arc::default(),
+            paced_by_capture: Cell::new(false),
+            output: output.clone(),
+            fps: 30.0,
+            max_seconds: 1.0,
+            quality: 80.0,
+            audio: true,
+            audio_pid: None,
+            audio_tap: Cell::new(None),
+        };
+        let (delay_tx, delay_rx) = mpsc::sync_channel::<()>(1);
+        let (tap_tx, tap_rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = delay_rx.recv();
+            thread::sleep(Duration::from_millis(300));
+            let _ = tap_tx.send(Ok(Box::new(SyntheticToneSource::new())
+                as Box<dyn super::super::recording_audio::AudioSource>));
+        });
+        let video = Box::new(CapturingAudioVideo {
+            inner: Software::start(64, 32, &options, &temp)?,
+            pcm: Arc::clone(&captured),
+        });
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let frame = |k: u32| picture(64, 32, |x, _| [((k * 11) % 255) as u8, x as u8, 120, 255]);
+        let mut n = 0u32;
+        let worker = thread::spawn(move || {
+            drive_recording(
+                video,
+                (Some(tap_rx), None, None),
+                |t| {
+                    if t == Take::Held {
+                        Ok(None)
+                    } else {
+                        n += 1;
+                        Ok(Some((frame(n), Instant::now())))
+                    }
+                },
+                (frame(0), Instant::now()),
+                &options,
+                (&AtomicBool::new(false), ready_tx, &temp),
+            )
+        });
+        ready_rx.recv()??;
+        let _ = delay_tx.send(());
+        let res = worker.join().unwrap()?;
+        assert!(output.is_file());
+        assert!(res.audio, "expected audio=true: {:?}", res.audio_error);
+        let err = res
+            .audio_error
+            .as_deref()
+            .context("expected late-start audio_error")?;
+        assert!(
+            err.starts_with("Audio capture started ") && err.ends_with(" ms into the recording"),
+            "unexpected audio_error: {err}"
+        );
+        let pcm = captured.lock_recover();
+        let audio_ms = pcm.len() as f64 / (2.0 * 48.0);
+        assert!(
+            (audio_ms - res.duration_ms as f64).abs() < 20.0,
+            "audio_ms={audio_ms} duration_ms={}",
+            res.duration_ms
+        );
+        let head = &pcm[..200 * 48 * 2];
+        assert!(head.iter().all(|&s| s == 0), "expected silence before tap");
+        let tail = &pcm[500 * 48 * 2..];
+        let peak = tail.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        assert!(peak > 10_000, "expected tone after tap, peak={peak}");
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "plays a muted 440 Hz WASAPI tone in-process and writes TONE_CLIP.mp4 via the recorder"]
+    fn tone_clip_done_check() -> Result<()> {
+        use crate::studio::automation::recording_audio::AudioSource;
+        use crate::studio::native::serializer::{AudioPacket, drain_ring_bytes};
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        use windows::Win32::Media::Audio::{
+            AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_NOPERSIST, IAudioClient,
+            IAudioRenderClient, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
+            eConsole, eRender,
+        };
+        use windows::Win32::System::Com::{
+            CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+            CoUninitialize,
+        };
+        use windows::core::{GUID, Interface};
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+
+        struct LocalRingSource {
+            mapping: HANDLE,
+            view: *mut u8,
+            len: usize,
+        }
+        unsafe impl Send for LocalRingSource {}
+        impl AudioSource for LocalRingSource {
+            fn is_active(&self) -> bool {
+                unsafe { (&*self.view.add(12).cast::<AtomicU32>()).load(Ordering::Acquire) != 0 }
+            }
+            fn drain(&mut self, out: &mut Vec<AudioPacket>) {
+                let slice = unsafe { std::slice::from_raw_parts_mut(self.view, self.len) };
+                drain_ring_bytes(slice, out);
+            }
+            fn deactivate(&self) {
+                unsafe { (&*self.view.add(12).cast::<AtomicU32>()).store(0, Ordering::Release) };
+            }
+            fn stop(&mut self) {
+                self.deactivate();
+            }
+            fn dropped(&self) -> u64 {
+                unsafe { (&*self.view.add(32).cast::<AtomicU64>()).load(Ordering::Acquire) }
+            }
+            fn skipped_unknown(&self) -> u64 {
+                unsafe { (&*self.view.add(40).cast::<AtomicU64>()).load(Ordering::Acquire) }
+            }
+            fn read_faults(&self) -> u64 {
+                unsafe { (&*self.view.add(48).cast::<AtomicU64>()).load(Ordering::Acquire) }
+            }
+        }
+        impl Drop for LocalRingSource {
+            fn drop(&mut self) {
+                unsafe {
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: self.view.cast(),
+                    });
+                    CloseHandle(self.mapping);
+                }
+            }
+        }
+
+        let out_dir = std::env::var("RENIUM_TONE_PROOF_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join(automation_token("tone-done-check")));
+        fs::create_dir_all(&out_dir)?;
+
+        let dll_path = Path::new(env!("OUT_DIR")).join("renium-audio.dll");
+        let wide_dll: Vec<u16> = dll_path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let module = unsafe { LoadLibraryW(wide_dll.as_ptr()) };
+        anyhow::ensure!(!module.is_null(), "Could not load renium-audio.dll");
+        let step_fn: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe {
+            std::mem::transmute(GetProcAddress(module, c"ReniumAudioStep".as_ptr().cast()).unwrap())
+        };
+        let tap_fn: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe {
+            std::mem::transmute(GetProcAddress(module, c"ReniumAudioTap".as_ptr().cast()).unwrap())
+        };
+
+        for (idx, (file, vol)) in [("TONE_CLIP.mp4", 1.0f32), ("TONE_LOW_CLIP.mp4", 0.05f32)]
+            .into_iter()
+            .enumerate()
+        {
+            let stop_tone = Arc::new(AtomicBool::new(false));
+            let stop_bg = Arc::clone(&stop_tone);
+            let (tx, rx) = mpsc::sync_channel::<Result<(u64, u64, u64)>>(1);
+            let tone = thread::spawn(move || -> Result<()> {
+                unsafe {
+                    CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+                    let dev = CoCreateInstance::<_, IMMDeviceEnumerator>(
+                        &MMDeviceEnumerator,
+                        None,
+                        CLSCTX_ALL,
+                    )?
+                    .GetDefaultAudioEndpoint(eRender, eConsole)?;
+                    let ac: IAudioClient = dev.Activate(CLSCTX_ALL, None)?;
+                    let mix = ac.GetMixFormat()?;
+                    let (rate, ch) = ((*mix).nSamplesPerSec, usize::from((*mix).nChannels));
+                    let sid =
+                        GUID::from_u128(0x714b_8e52_39a1_4c60_92ab_0000_0000_0001 + idx as u128);
+                    let init = ac.Initialize(
+                        AUDCLNT_SHAREMODE_SHARED,
+                        AUDCLNT_STREAMFLAGS_NOPERSIST,
+                        1_000_000,
+                        0,
+                        mix,
+                        Some(&sid),
+                    );
+                    CoTaskMemFree(Some(mix.cast()));
+                    init?;
+                    let sv: ISimpleAudioVolume = ac.GetService()?;
+                    sv.SetMute(true, &GUID::zeroed())?;
+                    sv.SetMasterVolume(vol, &GUID::zeroed())?;
+                    anyhow::ensure!(sv.GetMute()?.as_bool());
+                    let rc: IAudioRenderClient = ac.GetService()?;
+                    let vtbl = *(Interface::as_raw(&rc) as *const *const usize);
+                    let orig = (vtbl as u64, *vtbl.add(3) as u64, *vtbl.add(4) as u64);
+                    let buf = ac.GetBufferSize()?;
+                    ac.Start()?;
+                    let _ = tx.send(Ok(orig));
+                    let (mut phase, step) =
+                        (0.0f64, 2.0 * std::f64::consts::PI * 440.0 / f64::from(rate));
+                    while !stop_bg.load(Ordering::Relaxed) {
+                        anyhow::ensure!(sv.GetMute()?.as_bool());
+                        let avail = buf.saturating_sub(ac.GetCurrentPadding()?);
+                        if avail > 0 {
+                            let slice = std::slice::from_raw_parts_mut(
+                                rc.GetBuffer(avail)?.cast::<f32>(),
+                                avail as usize * ch,
+                            );
+                            for frame in slice.chunks_exact_mut(ch) {
+                                frame.fill((0.5 * phase.sin()) as f32);
+                                phase = (phase + step) % (2.0 * std::f64::consts::PI);
+                            }
+                            rc.ReleaseBuffer(avail, 0)?;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    ac.Stop()?;
+                    drop((rc, sv, ac));
+                    CoUninitialize();
+                }
+                Ok(())
+            });
+            let (vtbl, orig_get, orig_rel) = rx.recv()??;
+
+            let call_step = |action: u32, refresh: u32| -> u64 {
+                let mut p = [0u8; 320];
+                for (o, v) in [(0, 320u32), (4, 2), (8, action), (12, refresh)] {
+                    p[o..o + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                p[304..312].copy_from_slice(&vtbl.to_le_bytes());
+                p[312..320].copy_from_slice(&orig_rel.to_le_bytes());
+                assert_eq!(unsafe { step_fn(p.as_mut_ptr().cast()) }, 0);
+                assert_eq!(u32::from_le_bytes(p[28..32].try_into().unwrap()), 1);
+                u64::from_le_bytes(p[40..48].try_into().unwrap())
+            };
+            let silenced_before = call_step(2, 1);
+
+            let (cap, tap_id) = (4 * 1024 * 1024u32, idx as u64 + 1);
+            let wide: Vec<u16> = format!("Local\\renium-tone-local-{}-{idx}", std::process::id())
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            let mapping = unsafe {
+                CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    PAGE_READWRITE,
+                    0,
+                    64 + cap,
+                    wide.as_ptr(),
+                )
+            };
+            let raw =
+                unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, (64 + cap) as usize) };
+            unsafe {
+                let hdr = raw.Value.cast::<u8>();
+                std::ptr::write_bytes(hdr, 0, 64);
+                for (o, v) in [(0, 0x5241_5544u32), (4, 4), (8, cap), (12, 1)] {
+                    hdr.add(o).cast::<u32>().write(v);
+                }
+            }
+            let call_tap = |action: u32| {
+                let mut tp = [0u8; 568];
+                for (o, v) in [(0, 568u32), (4, 4), (8, action), (16, std::process::id())] {
+                    tp[o..o + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                for (o, v) in [(24, tap_id), (32, vtbl), (40, orig_get), (48, orig_rel)] {
+                    tp[o..o + 8].copy_from_slice(&v.to_le_bytes());
+                }
+                if action == 1 {
+                    for (i, &u) in wide.iter().take(127).enumerate() {
+                        tp[56 + i * 2..56 + i * 2 + 2].copy_from_slice(&u.to_le_bytes());
+                    }
+                }
+                assert_eq!(unsafe { tap_fn(tp.as_mut_ptr().cast()) }, 0);
+                assert_eq!(u32::from_le_bytes(tp[12..16].try_into().unwrap()), 1);
+            };
+            call_tap(1);
+            let (ttx, trx) = mpsc::sync_channel(1);
+            let _ = ttx.send(Ok(Box::new(LocalRingSource {
+                mapping,
+                view: raw.Value.cast(),
+                len: (64 + cap) as usize,
+            }) as Box<dyn AudioSource>));
+
+            let path = out_dir.join(file);
+            let options = RecordingOptions {
+                bgra: true,
+                system_encoder: true,
+                cost: Arc::default(),
+                paced_by_capture: Cell::new(false),
+                output: path.clone(),
+                fps: 30.0,
+                max_seconds: 3.5,
+                quality: 80.0,
+                audio: true,
+                audio_pid: None,
+                audio_tap: Cell::new(Some(trx)),
+            };
+            let (rtx, _rrx) = mpsc::sync_channel(1);
+            let mut n = 0u32;
+            let frame =
+                |k: u32| picture(128, 72, |x, _| [((k * 7) % 255) as u8, x as u8, 120, 255]);
+            let res = record_file(
+                |t| {
+                    if t == Take::Held {
+                        Ok(None)
+                    } else {
+                        n += 1;
+                        Ok(Some((frame(n), Instant::now())))
+                    }
+                },
+                (frame(0), Instant::now()),
+                &options,
+                &AtomicBool::new(false),
+                rtx,
+                &sibling_temp_path(&path),
+            )?;
+            call_tap(2);
+            let silenced_after = call_step(1, 0);
+            stop_tone.store(true, Ordering::Relaxed);
+            tone.join().unwrap()?;
+            assert!(
+                res.audio && res.audio_error.is_none(),
+                "{file}: {:?}",
+                res.audio_error
+            );
+            assert!(silenced_after > silenced_before);
+        }
+        Ok(())
     }
 }

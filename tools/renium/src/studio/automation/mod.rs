@@ -40,6 +40,8 @@ mod process_exit;
 pub(crate) mod property_access;
 mod recording;
 #[cfg(windows)]
+mod recording_audio;
+#[cfg(windows)]
 mod recording_media;
 mod recording_review;
 pub(crate) mod render_quality;
@@ -5325,6 +5327,7 @@ pub(crate) fn record_start_command(args: RecordStartArgs) -> Result<()> {
             "fps": args.fps,
             "maxSeconds": args.max_seconds,
             "quality": args.quality,
+            "audio": !args.no_audio,
         }),
         false,
         None,
