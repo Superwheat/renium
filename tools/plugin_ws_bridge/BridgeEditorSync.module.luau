@@ -10120,7 +10120,8 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			transaction.transactionId,
 			native.createdById,
 			engineRemovedById,
-			engineCreatedById
+			engineCreatedById,
+			budget
 		)
 		finishPhase("observations")
 		transaction.assertOwnership()

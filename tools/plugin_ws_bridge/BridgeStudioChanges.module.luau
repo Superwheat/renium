@@ -12,6 +12,7 @@ local MAX_CHANGE_LOGS_PER_SERVICE = 1024
 local MAX_DIRECT_PROPERTY_CHANGES = 2048
 local MAX_DIRECT_PROPERTY_BYTES = 8 * 1024 * 1024
 local TRACKING_GUARD_TTL_SECONDS = 300
+local NATIVE_SCAN_SLICE_SECONDS = 0.25
 -- Past this many touched instances a service's answer is the whole service.
 local PROOF_TOUCHED_LIMIT = 256
 -- Past this many names one instance's entry names none.
@@ -1781,7 +1782,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		{ [Instance]: boolean },
 		(Instance, string) -> boolean,
 		Instance?,
-		boolean
+		boolean,
+		(() -> boolean)?
 	) -> (number, Instance?, { [Instance]: { [string]: any } }, { [Instance]: string })
 
 	local function restoreSuspendedNativeSignals(journal: any)
@@ -2530,7 +2532,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		transactionId: string,
 		createdById: { [string]: string }?,
 		engineRemovedById: { [string]: boolean }?,
-		engineCreatedById: { [string]: boolean }?
+		engineCreatedById: { [string]: boolean }?,
+		yieldForBudget: (() -> boolean)?
 	): ({ [string]: { [Instance]: Instance } }, { [string]: { [Instance]: { [string]: any } } }?, { [string]: { [Instance]: string } }?)
 		local journal = state.changeJournal
 		if journal == nil then
@@ -2627,7 +2630,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 						taggedInstances,
 						fastInclusion[serviceName],
 						currentCamera,
-						hasAdded
+						hasAdded,
+						yieldForBudget
 					)
 					addedCount += count
 					if sample ~= nil then
@@ -4494,7 +4498,8 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		taggedInstances: { [Instance]: boolean },
 		fastInclude: (Instance, string) -> boolean,
 		currentCamera: Instance?,
-		hasAdded: boolean
+		hasAdded: boolean,
+		yieldForBudget: (() -> boolean)?
 	): (number, Instance?, { [Instance]: { [string]: any } }, { [Instance]: string })
 		local startEpoch = exportCacheEpochByService[serviceName] or 0
 		local descendants = service:GetDescendants()
@@ -4524,11 +4529,21 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		local fingerprintMap = state.propertyFingerprintByInstance
 		local unowned = false
 		local cacheValid = true
-		local nextYieldAt = os.clock() + 0.015
-		for i = 1, count do
-			if i % 2048 == 0 and os.clock() >= nextYieldAt then
+		local yield = yieldForBudget
+		if yield == nil then
+			local nextYieldAt = os.clock() + NATIVE_SCAN_SLICE_SECONDS
+			yield = function()
+				if os.clock() < nextYieldAt then
+					return false
+				end
 				task.wait()
-				nextYieldAt = os.clock() + 0.015
+				nextYieldAt = os.clock() + NATIVE_SCAN_SLICE_SECONDS
+				return true
+			end
+		end
+		for i = 1, count do
+			if i % 2048 == 0 then
+				yield()
 			end
 			local instance = descendants[i]
 			local parent = instance.Parent

@@ -2865,7 +2865,7 @@ do
 			script = { Parent = setmetatable({}, { __index = function(_, name) return name end }) },
 			os = {
 				clock = function()
-					fakeClock += 0.02
+					fakeClock += opts.clockStep or 0.02
 					return fakeClock
 				end,
 				time = os.time,
@@ -2941,6 +2941,7 @@ do
 	local yieldFired = false
 	local hN1: any
 	hN1 = makeTrackerHarness({
+		clockStep = 0.5,
 		onWait = function()
 			if yieldFired then return end
 			yieldFired = true
@@ -4033,7 +4034,7 @@ do
 	end
 	local origClock = d2Env.os.clock
 	d2Env.os.clock = function()
-		fakeClock += 0.05
+		fakeClock += 0.5
 		return fakeClock
 	end
 	d2Tracker.finishNativeImportObservations("tx-d2-b", scanCreated)
