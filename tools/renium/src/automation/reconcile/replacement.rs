@@ -118,6 +118,10 @@ pub(crate) fn prepare_project_replacement_with_bulk(
         Prepared(PreparedEditorSettingsChange),
     }
 
+    let has_changed_sources = paths.iter().any(|path| {
+        super::merge::is_source_path(path)
+            && desired.entries.get(path) != observed.entries.get(path)
+    });
     let documents = paths
         .par_iter()
         .filter(|path| {
@@ -163,6 +167,38 @@ pub(crate) fn prepare_project_replacement_with_bulk(
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .insert(path.clone(), patch);
                         return Ok((path.clone(), PreparedSlot::Bulk));
+                    }
+                    crate::settings::bytecode::blocks::bulk_diff::BulkDiffOutcome::Hybrid(
+                        hybrid,
+                    ) => {
+                        let patch_instances = hybrid.patch.instance_count;
+                        let patch_fields = hybrid.patch.field_count;
+                        let patch_nodes = hybrid.patch.nodes.len();
+                        let extra_count =
+                            hybrid.extra_desired_rows.len() + hybrid.extra_observed_rows.len();
+                        let patch = hybrid.patch.clone();
+                        if let Some(prepared) = prepare_hybrid_bulk_delta(
+                            desired_bytes,
+                            observed_bytes,
+                            *hybrid,
+                            has_changed_sources,
+                        )? {
+                            crate::app::timing::log_timing(
+                                &format!(
+                                    "columnar hybrid bulk+delta diff ({patch_instances} bulk instances, {patch_fields} bulk fields, {patch_nodes} tree nodes, {extra_count} delta rows)"
+                                ),
+                                bulk_started,
+                            );
+                            bulk_patches
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(path.clone(), patch);
+                            if settings_documents_equivalent(&prepared.current, &prepared.previous)
+                            {
+                                return Ok((path.clone(), PreparedSlot::Bulk));
+                            }
+                            return Ok((path.clone(), PreparedSlot::Prepared(prepared)));
+                        }
                     }
                     crate::settings::bytecode::blocks::bulk_diff::BulkDiffOutcome::Fallback => {}
                 }
@@ -482,6 +518,235 @@ const MAX_CHANGED_INSTANCES: usize = 16_384;
 /// hold a mesh's cooked data.
 const COMPARED_AT_ONCE: usize = if cfg!(test) { 64 } else { 1_024 };
 
+fn is_native_side_effect_property(class_name: &str, name: &str) -> bool {
+    crate::editor::native_roots::is_property(class_name, name)
+        || crate::editor::native_geometry::is_mesh_geometry_property(class_name, name)
+}
+
+pub(super) fn prepare_hybrid_bulk_delta(
+    desired_bytes: &[u8],
+    observed_bytes: &[u8],
+    hybrid: crate::settings::bytecode::blocks::bulk_diff::BulkHybridDelta,
+    has_changed_sources: bool,
+) -> Result<Option<PreparedEditorSettingsChange>> {
+    use crate::settings::bytecode::property_edit::decode_rows;
+    use crate::settings::equivalence::inherit_workspace_viewport_reference;
+
+    let service = hybrid.patch.service.clone();
+    let des_count = hybrid.desired_skeleton.len();
+    let obs_count = hybrid.observed_skeleton.len();
+    if des_count == 0 || obs_count == 0 || hybrid.obs_to_des.len() != obs_count {
+        crate::app::output::log_global(
+            4,
+            format_args!("[renium] hybrid prepare fallback ({service}): invalid skeleton shape"),
+        );
+        return Ok(None);
+    }
+    let mut des_to_obs = vec![None; des_count];
+    for (o_idx, &d_opt) in hybrid.obs_to_des.iter().enumerate() {
+        if let Some(d_idx) = d_opt {
+            if d_idx >= des_count || des_to_obs[d_idx].is_some() {
+                crate::app::output::log_global(
+                    4,
+                    format_args!(
+                        "[renium] hybrid prepare fallback ({service}): non-bijective mapping"
+                    ),
+                );
+                return Ok(None);
+            }
+            des_to_obs[d_idx] = Some(o_idx);
+        }
+    }
+    let has_structural_changes = des_count != obs_count
+        || hybrid.obs_to_des.iter().enumerate().any(|(o_idx, d_opt)| {
+            let Some(d_idx) = *d_opt else {
+                return true;
+            };
+            let o_row = &hybrid.observed_skeleton[o_idx];
+            let d_row = &hybrid.desired_skeleton[d_idx];
+            o_row.name != d_row.name
+                || o_row.class_name != d_row.class_name
+                || o_row.parent_index.and_then(|p| hybrid.obs_to_des[p]) != d_row.parent_index
+        });
+
+    let mut diff_des = vec![false; des_count];
+    let mut diff_obs = vec![false; obs_count];
+    let no_named_des = vec![false; des_count];
+    let no_named_obs = vec![false; obs_count];
+    for &d in &hybrid.extra_desired_rows {
+        if d < des_count {
+            diff_des[d] = true;
+            if let Some(o) = des_to_obs[d] {
+                diff_obs[o] = true;
+            }
+        }
+    }
+    for &o in &hybrid.extra_observed_rows {
+        if o < obs_count {
+            diff_obs[o] = true;
+            if let Some(d) = hybrid.obs_to_des[o] {
+                diff_des[d] = true;
+            }
+        }
+    }
+
+    let (read_des_indices, read_obs_indices) = loop {
+        let des_indices = instances_read(
+            &hybrid.desired_skeleton,
+            (&diff_des, &no_named_des),
+            (true, has_changed_sources),
+        );
+        let obs_indices = instances_read(
+            &hybrid.observed_skeleton,
+            (&diff_obs, &no_named_obs),
+            (true, has_changed_sources),
+        );
+        let mut grew = false;
+        for &d in &des_indices {
+            if !diff_des[d] {
+                diff_des[d] = true;
+            }
+            if let Some(o) = des_to_obs[d]
+                && !diff_obs[o]
+            {
+                diff_obs[o] = true;
+                grew = true;
+            }
+        }
+        for &o in &obs_indices {
+            if !diff_obs[o] {
+                diff_obs[o] = true;
+            }
+            if let Some(d) = hybrid.obs_to_des[o]
+                && !diff_des[d]
+            {
+                diff_des[d] = true;
+                grew = true;
+            }
+        }
+        if !grew {
+            break (des_indices, obs_indices);
+        }
+    };
+    if read_des_indices.len() > MAX_CHANGED_INSTANCES
+        || read_obs_indices.len() > MAX_CHANGED_INSTANCES
+    {
+        crate::app::output::log_global(
+            4,
+            format_args!(
+                "[renium] hybrid prepare fallback ({service}): materialized rows des={} obs={} exceed limit",
+                read_des_indices.len(),
+                read_obs_indices.len()
+            ),
+        );
+        return Ok(None);
+    }
+
+    let (des_decoded, obs_decoded) = rayon::join(
+        || decode_rows(desired_bytes, &read_des_indices),
+        || decode_rows(observed_bytes, &read_obs_indices),
+    );
+    let (Ok((des_rows, _)), Ok((obs_rows, _))) = (des_decoded, obs_decoded) else {
+        crate::app::output::log_global(
+            4,
+            format_args!("[renium] hybrid prepare fallback ({service}): row decode failed"),
+        );
+        return Ok(None);
+    };
+
+    let mut current = sparse_document(
+        hybrid.desired_skeleton,
+        &read_des_indices,
+        des_rows,
+        SETTINGS_BINARY_VERSION,
+        false,
+    )?;
+    let mut previous = sparse_document(
+        hybrid.observed_skeleton,
+        &read_obs_indices,
+        obs_rows,
+        current.version,
+        false,
+    )?;
+
+    let mut used_ids: HashSet<String> = current
+        .instances
+        .iter()
+        .map(|inst| inst.settings_id.clone())
+        .collect();
+    let mut id_remap: HashMap<String, String> = HashMap::with_capacity(obs_count);
+    for (o_idx, inst) in previous.instances.iter_mut().enumerate() {
+        let old_id = inst.settings_id.clone();
+        if let Some(d_idx) = hybrid.obs_to_des[o_idx] {
+            inst.settings_id
+                .clone_from(&current.instances[d_idx].settings_id);
+        } else {
+            if used_ids.contains(&inst.settings_id) {
+                let mut suffix = o_idx;
+                let fresh = loop {
+                    let candidate = format!("hybrid-obs-{suffix}");
+                    if !used_ids.contains(&candidate) {
+                        break candidate;
+                    }
+                    suffix += 1;
+                };
+                inst.settings_id = fresh;
+            }
+            used_ids.insert(inst.settings_id.clone());
+        }
+        id_remap.insert(old_id, inst.settings_id.clone());
+    }
+    let root_service = previous.instances[0].class_name.clone();
+    crate::settings::equivalence::remap_rows(&mut previous, 0..obs_count, &id_remap, &root_service);
+    for (o_idx, prop_name) in &hybrid.bulk_handled_on_extra {
+        if let Some(d_idx) = hybrid.obs_to_des[*o_idx] {
+            match current.instances[d_idx].properties.get(prop_name).cloned() {
+                Some(val) => {
+                    previous.instances[*o_idx]
+                        .properties
+                        .insert(prop_name.clone(), val);
+                }
+                None => {
+                    previous.instances[*o_idx].properties.remove(prop_name);
+                }
+            }
+        }
+    }
+    if has_structural_changes {
+        let has_post_delta_native_write = read_des_indices.iter().any(|&d_idx| {
+            let d_inst = &current.instances[d_idx];
+            let o_inst = des_to_obs[d_idx].map(|o_idx| &previous.instances[o_idx]);
+            d_inst.properties.iter().any(|(name, val)| {
+                is_native_side_effect_property(&d_inst.class_name, name)
+                    && o_inst.and_then(|o| o.properties.get(name)) != Some(val)
+            }) || o_inst.is_some_and(|o| {
+                o.properties.keys().any(|name| {
+                    is_native_side_effect_property(&o.class_name, name)
+                        && !d_inst.properties.contains_key(name)
+                })
+            })
+        });
+        if has_post_delta_native_write {
+            crate::app::output::log_global(
+                4,
+                format_args!(
+                    "[renium] hybrid prepare fallback ({service}): structural edit alongside native root/geometry write"
+                ),
+            );
+            return Ok(None);
+        }
+    }
+    inherit_workspace_viewport_reference(&mut current, &previous);
+    if delta_weight(&current, &previous).heavy() {
+        crate::app::output::log_global(
+            4,
+            format_args!("[renium] hybrid prepare fallback ({service}): delta weight heavy"),
+        );
+        return Ok(None);
+    }
+    Ok(Some(PreparedEditorSettingsChange { previous, current }))
+}
+
 /// A copy of a store read by some of its instances: every other one bare
 /// and standing for its counterpart of the other copy. With `as_stored` each
 /// property keeps the name its file states, as `editor_settings_document`
@@ -644,15 +909,15 @@ fn told_apart(
     Ok(unlike + differing.len() - compared)
 }
 
-/// The instances of a store a push reads whole, of `instances` at the same
-/// places in both copies: the ones that differ or name another by its id,
-/// and what a comparison reads of an instance whatever it holds, the roots
-/// and the cameras. With `paths_too` the scripts as well: where a script
-/// runs is part of the name of its file.
+/// The instances of a store a push reads whole: the ones that differ or name
+/// another by its id, and what a comparison reads of an instance whatever it
+/// holds, the roots and the cameras. `walk_ancestors` walks each read row to
+/// its root; `scripts_too` also reads every `Script` row because its
+/// `RunContext` is part of its file name.
 fn instances_read(
     instances: &[SettingsBytecodeInstance],
     (differs, named): (&[bool], &[bool]),
-    paths_too: bool,
+    (walk_ancestors, scripts_too): (bool, bool),
 ) -> Vec<usize> {
     let count = instances.len();
     let mut read = (0..count)
@@ -661,10 +926,10 @@ fn instances_read(
                 || named[index]
                 || instances[index].parent_index.is_none()
                 || instances[index].class_name == "Camera"
-                || paths_too && instances[index].class_name == "Script"
+                || scripts_too && instances[index].class_name == "Script"
         })
         .collect::<Vec<_>>();
-    if paths_too {
+    if walk_ancestors {
         // A request names an instance by its path, and each instance on that
         // path by what tells it from its namesakes. A store can hold a
         // parent after its child, so each path is walked to its root.
@@ -1522,7 +1787,7 @@ fn changed_instances_placed(
         }
     }
     let beside_run = told.is_none() && moved.and_then(Moved::run).is_some();
-    let mut read = instances_read(&skeleton, (&differs, &kept), files_too);
+    let mut read = instances_read(&skeleton, (&differs, &kept), (files_too, files_too));
     if read.len() > MAX_CHANGED_INSTANCES {
         // The rows that only write the same values another way are not read.
         let mut names = kept.clone();
@@ -1557,7 +1822,7 @@ fn changed_instances_placed(
             let why = "most of its instances differ";
             return imported_anew(copies, (skeleton, files), why);
         }
-        read = instances_read(&skeleton, (&differs, &kept), files_too);
+        read = instances_read(&skeleton, (&differs, &kept), (files_too, files_too));
     }
     // Of the files' copy read by its instances: the counterparts of those,
     // and the instances of a run it alone holds with what is read beside
@@ -1571,7 +1836,11 @@ fn changed_instances_placed(
             let wanted = (0..count)
                 .map(|index| studio_of(index).is_none_or(|studio| of_studio[studio]))
                 .collect::<Vec<_>>();
-            let of_files = instances_read(&files.instances, (&wanted, &vec![false; count]), true);
+            let of_files = instances_read(
+                &files.instances,
+                (&wanted, &vec![false; count]),
+                (true, true),
+            );
             let known = read.len();
             for studio in of_files.iter().filter_map(|index| studio_of(*index)) {
                 if !std::mem::replace(&mut of_studio[studio], true) {
@@ -2747,5 +3016,96 @@ mod heavy_delta_tests {
             "R10: prepare_project_replacement_with_bulk must populate bulk_patches for Workspace"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hybrid_delta_reads_all_40_same_named_siblings_and_remaps_references() {
+        use crate::settings::bytecode::blocks::bulk_diff::{
+            BulkDiffOutcome, diff_v12_bulk_plain_properties,
+        };
+        let mut desired = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "ws".into(),
+                    "Workspace".into(),
+                    "Workspace".into(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new(
+                    "cam".into(),
+                    "Camera".into(),
+                    "Camera".into(),
+                    Some(0),
+                ),
+                SettingsBytecodeInstance::new(
+                    "holder".into(),
+                    "Folder".into(),
+                    "Folder".into(),
+                    Some(0),
+                ),
+            ],
+        };
+        desired.instances[0].properties.insert(
+            "CurrentCamera".into(),
+            serde_json::json!({"_type": "Ref", "settingsId": "cam", "instanceIndex": 2}),
+        );
+        for i in 0..40 {
+            let mut p = SettingsBytecodeInstance::new(
+                format!("sib-{i}"),
+                "Same".into(),
+                "Part".into(),
+                Some(2),
+            );
+            p.properties.insert(
+                "UniqueId".into(),
+                serde_json::json!({"_type": "UniqueId", "value": format!("{:032x}", i + 100)}),
+            );
+            p.properties
+                .insert("Transparency".into(), serde_json::json!(0.0));
+            desired.instances.push(p);
+        }
+        let mut observed = desired.clone();
+        for (idx, inst) in observed.instances.iter_mut().enumerate() {
+            inst.settings_id = format!("obs-{idx}");
+        }
+        observed.instances[0].properties.insert(
+            "CurrentCamera".into(),
+            serde_json::json!({"_type": "Ref", "settingsId": "obs-1", "instanceIndex": 2}),
+        );
+        for inst in observed.instances.iter_mut().skip(3) {
+            inst.properties
+                .insert("Transparency".into(), serde_json::json!(0.5));
+        }
+        observed.instances[3 + 24].name = "SameRenamed".into();
+        let des_bytes = crate::settings::bytecode::encode_settings_bytecode(&desired).unwrap();
+        let obs_bytes = crate::settings::bytecode::encode_settings_bytecode(&observed).unwrap();
+        let BulkDiffOutcome::Hybrid(hybrid) =
+            diff_v12_bulk_plain_properties(&des_bytes, &obs_bytes, "Workspace", 8).unwrap()
+        else {
+            panic!("expected Hybrid outcome for 40-sibling rename + mass Transparency edit");
+        };
+        let prepared = prepare_hybrid_bulk_delta(&des_bytes, &obs_bytes, *hybrid, false)
+            .unwrap()
+            .expect("expected prepared hybrid delta");
+        for idx in 3..43 {
+            assert!(
+                !crate::settings::held::stands_unchanged(
+                    &prepared.current.instances[idx].properties
+                ),
+                "sibling {idx} in desired must be materialized"
+            );
+            assert!(
+                !crate::settings::held::stands_unchanged(
+                    &prepared.previous.instances[idx].properties
+                ),
+                "sibling {idx} in observed must be materialized"
+            );
+        }
+        let prev_cam = prepared.previous.instances[0]
+            .properties
+            .get("CurrentCamera")
+            .unwrap();
+        assert_eq!(prev_cam["settingsId"], "cam");
     }
 }

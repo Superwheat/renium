@@ -362,7 +362,11 @@ pub(super) fn plan_from_whole_stores(
                     .ok()
                     .is_some_and(|service| plan.initial_native_services.contains(&service)))
     });
-    if (stores_read != StoresRead::ChangedOfBoth || plan_reads_changed_alone(&plan))
+    let has_sparse_current = prepared_settings
+        .values()
+        .any(|change| crate::settings::equivalence::holds_unread_instances(&change.current));
+    if ((stores_read != StoresRead::ChangedOfBoth && !has_sparse_current)
+        || plan_reads_changed_alone(&plan))
         && !has_unread_replacement
     {
         return Ok(plan);
@@ -544,6 +548,9 @@ fn collect_delta_bulk_differences(
         BulkDiffOutcome, diff_v12_bulk_plain_properties,
     };
     let paths = project_replacement_paths(project, studio);
+    let has_changed_sources = paths.iter().any(|path| {
+        super::merge::is_source_path(path) && project.entries.get(path) != studio.entries.get(path)
+    });
     let mut non_bulk_project = project.clone();
     let mut non_bulk_studio = studio.clone();
     for path in &paths {
@@ -569,15 +576,68 @@ fn collect_delta_bulk_differences(
             super::replacement::BULK_PROPERTY_MIN_INSTANCES,
         )? {
             BulkDiffOutcome::Unchanged => {
+                crate::app::output::log_global(
+                    4,
+                    format_args!(
+                        "[renium] delta bulk route ({service_name}): unchanged ({})",
+                        path.display()
+                    ),
+                );
                 non_bulk_project.entries.remove(path);
                 non_bulk_studio.entries.remove(path);
             }
             BulkDiffOutcome::Patch(patch) => {
+                crate::app::output::log_global(
+                    4,
+                    format_args!(
+                        "[renium] delta bulk route ({service_name}): bulk patch instances={} fields={}",
+                        patch.instance_count, patch.field_count
+                    ),
+                );
                 bulk_patches.insert(path.clone(), patch);
                 non_bulk_project.entries.remove(path);
                 non_bulk_studio.entries.remove(path);
             }
-            BulkDiffOutcome::Fallback => {}
+            BulkDiffOutcome::Hybrid(hybrid) => {
+                let patch = hybrid.patch.clone();
+                if let Some(prepared) = super::replacement::prepare_hybrid_bulk_delta(
+                    desired_bytes,
+                    observed_bytes,
+                    *hybrid,
+                    has_changed_sources,
+                )? {
+                    let has_delta =
+                        !settings_documents_equivalent(&prepared.current, &prepared.previous);
+                    crate::app::output::log_global(
+                        4,
+                        format_args!(
+                            "[renium] delta bulk route ({service_name}): hybrid bulk_instances={} delta={has_delta}",
+                            patch.instance_count
+                        ),
+                    );
+                    bulk_patches.insert(path.clone(), patch);
+                    if has_delta {
+                        prepared_settings.insert(path.clone(), prepared);
+                    }
+                    non_bulk_project.entries.remove(path);
+                    non_bulk_studio.entries.remove(path);
+                } else {
+                    crate::app::output::log_global(
+                        4,
+                        format_args!(
+                            "[renium] delta bulk route ({service_name}): hybrid rejected, falling back to full diff"
+                        ),
+                    );
+                }
+            }
+            BulkDiffOutcome::Fallback => {
+                crate::app::output::log_global(
+                    4,
+                    format_args!(
+                        "[renium] delta bulk route ({service_name}): fallback to full diff"
+                    ),
+                );
+            }
         }
     }
     let mut diffs = snapshot_differences_prepared(
@@ -588,6 +648,30 @@ fn collect_delta_bulk_differences(
     )?;
     diffs.extend(bulk_patches.keys().cloned());
     Ok(diffs)
+}
+
+fn drop_promoted_bulk_patches(
+    bulk_patches: &mut HashMap<PathBuf, crate::editor::types::EditorBulkPropertyPatch>,
+    hybrid_sparse_paths: &HashSet<PathBuf>,
+    prepared_settings: &HashMap<PathBuf, PreparedEditorSettingsChange>,
+) {
+    bulk_patches.retain(|path, patch| {
+        if hybrid_sparse_paths.contains(path)
+            && prepared_settings.get(path).is_some_and(|change| {
+                !crate::settings::equivalence::holds_unread_instances(&change.current)
+            })
+        {
+            crate::app::output::log_global(
+                4,
+                format_args!(
+                    "[renium] delta bulk route ({}): dropped bulk patch after whole-store re-plan",
+                    patch.service
+                ),
+            );
+            return false;
+        }
+        true
+    });
 }
 
 fn bulk_inline_release_tracking(
@@ -2371,16 +2455,20 @@ pub(crate) fn push_project(
         )?;
         differences
     };
+    let externally_managed_only = prepared_settings
+        .iter()
+        .filter_map(|(path, change)| {
+            super::verify::differs_only_in_externally_managed_fields(
+                &change.current,
+                &change.previous,
+            )
+            .then_some(path.clone())
+        })
+        .collect::<HashSet<_>>();
+    prepared_settings.retain(|path, _| !externally_managed_only.contains(path));
     let differences = differences
         .into_iter()
-        .filter(|path| {
-            prepared_settings.get(path).is_none_or(|change| {
-                !super::verify::differs_only_in_externally_managed_fields(
-                    &change.current,
-                    &change.previous,
-                )
-            })
-        })
+        .filter(|path| bulk_patches.contains_key(path) || !externally_managed_only.contains(path))
         .collect::<HashSet<_>>();
     prepared_settings.retain(|path, _| differences.contains(path));
     log_reconcile_timing(
@@ -2411,7 +2499,7 @@ pub(crate) fn push_project(
     let phase = Instant::now();
     let non_bulk_differences = differences
         .iter()
-        .filter(|path| !bulk_patches.contains_key(*path))
+        .filter(|path| !bulk_patches.contains_key(*path) || prepared_settings.contains_key(*path))
         .cloned()
         .collect::<HashSet<_>>();
     let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
@@ -2422,12 +2510,22 @@ pub(crate) fn push_project(
         true,
         false,
     )?;
+    let hybrid_sparse_paths = bulk_patches
+        .keys()
+        .filter(|path| {
+            prepared_settings.get(*path).is_some_and(|change| {
+                crate::settings::equivalence::holds_unread_instances(&change.current)
+            })
+        })
+        .cloned()
+        .collect::<HashSet<_>>();
     let mut plan = plan_from_whole_stores(
         (stores_read, replace, plan),
         (&project, &studio),
         &non_bulk_differences,
         &mut prepared_settings,
     )?;
+    drop_promoted_bulk_patches(&mut bulk_patches, &hybrid_sparse_paths, &prepared_settings);
     let mut bulk_entries = bulk_patches.into_iter().collect::<Vec<_>>();
     bulk_entries.sort_by(|left, right| left.0.cmp(&right.0));
     for (path, patch) in bulk_entries {
@@ -2497,6 +2595,10 @@ pub(crate) fn push_project(
     };
     let (prepared_documents, mut prepared_verification) =
         split_prepared_settings_for_push(prepared_settings, &project)?;
+    if !plan.bulk_property_paths.is_empty() {
+        let bulk_paths = plan.bulk_property_paths.iter().collect::<HashSet<_>>();
+        prepared_verification.retain(|path, _| !bulk_paths.contains(path));
+    }
     #[cfg(any(windows, target_os = "macos"))]
     let can_settle_in_background =
         replace && import_settle::can_continue(&stage, requires_stage, link_enforcement.is_some());
@@ -5058,5 +5160,555 @@ mod stores_read_tests {
             "before state must hold Studio's 0.75, got {before_t}"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hybrid_route_plans_delta_beside_bulk_and_drops_bulk_on_whole_replan() {
+        use crate::settings::bytecode::{
+            SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
+            encode_settings_bytecode,
+        };
+
+        let store_rel = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        let part_count = super::super::replacement::BULK_PROPERTY_MIN_INSTANCES + 8;
+        let mut desired = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance::new(
+                "ws".into(),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            )],
+        };
+        for i in 0..part_count {
+            let mut p = SettingsBytecodeInstance::new(
+                format!("p-{i}"),
+                format!("Part{i}"),
+                "Part".into(),
+                Some(0),
+            );
+            p.properties.insert(
+                "UniqueId".into(),
+                json!({"_type": "UniqueId", "value": format!("{:032x}", i + 10)}),
+            );
+            p.properties.insert("Transparency".into(), json!(0.0));
+            desired.instances.push(p);
+        }
+        let mut observed = desired.clone();
+        for inst in observed.instances.iter_mut().skip(1) {
+            inst.properties.insert("Transparency".into(), json!(0.5));
+        }
+        observed.instances[1].name = "Part0Renamed".into();
+        let project = ProjectSnapshot {
+            entries: BTreeMap::from([(
+                store_rel.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(&desired).unwrap()),
+            )]),
+        };
+        let studio = ProjectSnapshot {
+            entries: BTreeMap::from([(
+                store_rel.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(&observed).unwrap()),
+            )]),
+        };
+
+        let mut prepared_settings = HashMap::new();
+        let mut bulk_patches = HashMap::new();
+        let differences = collect_delta_bulk_differences(
+            &project,
+            &studio,
+            StoresRead::ChangedOfBoth,
+            &mut prepared_settings,
+            &mut bulk_patches,
+        )
+        .unwrap();
+        assert!(differences.contains(&store_rel));
+        assert!(bulk_patches.contains_key(&store_rel));
+        assert!(prepared_settings.contains_key(&store_rel));
+        assert!(crate::settings::equivalence::holds_unread_instances(
+            &prepared_settings[&store_rel].current
+        ));
+
+        let non_bulk_differences: HashSet<PathBuf> = differences
+            .iter()
+            .filter(|path| {
+                !bulk_patches.contains_key(*path) || prepared_settings.contains_key(*path)
+            })
+            .cloned()
+            .collect();
+        let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+            &studio,
+            &project,
+            &non_bulk_differences,
+            &prepared_settings,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(plan.target_settings_ids.contains(&"p-0".to_string()));
+        assert!(
+            plan.target_settings_ids.len() < part_count / 2,
+            "hybrid plan should target only delta rows, got {}",
+            plan.target_settings_ids.len()
+        );
+
+        let hybrid_sparse: HashSet<PathBuf> = bulk_patches
+            .keys()
+            .filter(|path| {
+                prepared_settings.get(*path).is_some_and(|change| {
+                    crate::settings::equivalence::holds_unread_instances(&change.current)
+                })
+            })
+            .cloned()
+            .collect();
+        let mut bulk_kept = bulk_patches.clone();
+        let kept_plan = plan_from_whole_stores(
+            (StoresRead::ChangedOfBoth, false, plan),
+            (&project, &studio),
+            &non_bulk_differences,
+            &mut prepared_settings,
+        )
+        .unwrap();
+        drop_promoted_bulk_patches(&mut bulk_kept, &hybrid_sparse, &prepared_settings);
+        assert!(bulk_kept.contains_key(&store_rel));
+
+        let mut forced_plan = kept_plan;
+        forced_plan
+            .initial_native_services
+            .insert("ReplicatedStorage".into());
+        let mut bulk_dropped = bulk_patches;
+        let _replanned = plan_from_whole_stores(
+            (StoresRead::ChangedOfBoth, false, forced_plan),
+            (&project, &studio),
+            &non_bulk_differences,
+            &mut prepared_settings,
+        )
+        .unwrap();
+        drop_promoted_bulk_patches(&mut bulk_dropped, &hybrid_sparse, &prepared_settings);
+        assert!(!crate::settings::equivalence::holds_unread_instances(
+            &prepared_settings[&store_rel].current
+        ));
+        assert!(
+            !bulk_dropped.contains_key(&store_rel),
+            "bulk patch must be dropped when hybrid store is swapped for whole documents"
+        );
+    }
+
+    #[test]
+    fn changed_mode_hybrid_replans_whole_store_for_cross_service_class_change_referrer() {
+        use crate::settings::bytecode::{
+            SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
+            encode_settings_bytecode,
+        };
+
+        let ws_rel = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        let rs_rel = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
+        let extra_rel = PathBuf::from("renium.project.jsonc");
+        let part_count = super::super::replacement::BULK_PROPERTY_MIN_INSTANCES + 8;
+
+        let mut ws_desired = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance::new(
+                "ws".into(),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            )],
+        };
+        for i in 0..part_count {
+            let mut p = SettingsBytecodeInstance::new(
+                format!("p-{i}"),
+                format!("Part{i}"),
+                "Part".into(),
+                Some(0),
+            );
+            p.properties.insert(
+                "UniqueId".into(),
+                json!({"_type": "UniqueId", "value": format!("{:032x}", i + 10)}),
+            );
+            p.properties.insert("Transparency".into(), json!(0.0));
+            ws_desired.instances.push(p);
+        }
+        let mut referrer = SettingsBytecodeInstance::new(
+            "ws-ref".into(),
+            "RefHolder".into(),
+            "ObjectValue".into(),
+            Some(0),
+        );
+        referrer.properties.insert(
+            "UniqueId".into(),
+            json!({"_type": "UniqueId", "value": format!("{:032x}", 9999)}),
+        );
+        referrer.properties.insert(
+            "Value".into(),
+            json!({"_type": "Ref", "settingsId": "rs-target", "service": "ReplicatedStorage"}),
+        );
+        ws_desired.instances.push(referrer);
+
+        let mut ws_observed = ws_desired.clone();
+        for inst in ws_observed.instances.iter_mut().skip(1).take(part_count) {
+            inst.properties.insert("Transparency".into(), json!(0.5));
+        }
+        ws_observed.instances[1].name = "Part0Renamed".into();
+
+        let rs_desired = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "rs".into(),
+                    "ReplicatedStorage".into(),
+                    "ReplicatedStorage".into(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new(
+                    "rs-target".into(),
+                    "Target".into(),
+                    "Model".into(),
+                    Some(0),
+                ),
+            ],
+        };
+        let rs_observed = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "rs".into(),
+                    "ReplicatedStorage".into(),
+                    "ReplicatedStorage".into(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new(
+                    "rs-target".into(),
+                    "Target".into(),
+                    "Folder".into(),
+                    Some(0),
+                ),
+            ],
+        };
+
+        let project = ProjectSnapshot {
+            entries: BTreeMap::from([
+                (
+                    ws_rel.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(&ws_desired).unwrap()),
+                ),
+                (
+                    rs_rel.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(&rs_desired).unwrap()),
+                ),
+                (extra_rel.clone(), SnapshotEntry::File(b"{}\n".to_vec())),
+            ]),
+        };
+        let studio = ProjectSnapshot {
+            entries: BTreeMap::from([
+                (
+                    ws_rel.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(&ws_observed).unwrap()),
+                ),
+                (
+                    rs_rel.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(&rs_observed).unwrap()),
+                ),
+            ]),
+        };
+
+        let all_paths = project_replacement_paths(&project, &studio);
+        let stores_read = stores_read_of(true, &all_paths, &project, &studio);
+        assert!(stores_read == StoresRead::Changed);
+
+        let mut prepared_settings = HashMap::new();
+        let mut bulk_patches = HashMap::new();
+        let differences = collect_delta_bulk_differences(
+            &project,
+            &studio,
+            stores_read,
+            &mut prepared_settings,
+            &mut bulk_patches,
+        )
+        .unwrap();
+        assert!(bulk_patches.contains_key(&ws_rel));
+        assert!(crate::settings::equivalence::holds_unread_instances(
+            &prepared_settings[&ws_rel].current
+        ));
+
+        let non_bulk_differences: HashSet<PathBuf> = differences
+            .iter()
+            .filter(|path| {
+                !bulk_patches.contains_key(*path) || prepared_settings.contains_key(*path)
+            })
+            .cloned()
+            .collect();
+        let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+            &studio,
+            &project,
+            &non_bulk_differences,
+            &prepared_settings,
+            true,
+            false,
+        )
+        .unwrap();
+        let hybrid_sparse: HashSet<PathBuf> = bulk_patches
+            .keys()
+            .filter(|path| {
+                prepared_settings.get(*path).is_some_and(|change| {
+                    crate::settings::equivalence::holds_unread_instances(&change.current)
+                })
+            })
+            .cloned()
+            .collect();
+        let replanned = plan_from_whole_stores(
+            (stores_read, false, plan),
+            (&project, &studio),
+            &non_bulk_differences,
+            &mut prepared_settings,
+        )
+        .unwrap();
+        drop_promoted_bulk_patches(&mut bulk_patches, &hybrid_sparse, &prepared_settings);
+
+        assert!(!crate::settings::equivalence::holds_unread_instances(
+            &prepared_settings[&ws_rel].current
+        ));
+        assert!(!bulk_patches.contains_key(&ws_rel));
+        assert!(
+            replanned
+                .target_settings_ids
+                .iter()
+                .any(|id| id == "ws-ref")
+                || replanned
+                    .extra_property_changes
+                    .iter()
+                    .any(|row| row.settings_id.as_deref() == Some("ws-ref")),
+            "unchanged Workspace ObjectValue referring to class-changed ReplicatedStorage target must be resent"
+        );
+    }
+
+    #[test]
+    fn hybrid_store_reads_run_context_for_script_whose_source_this_push_carries() {
+        use crate::settings::bytecode::{
+            SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
+            encode_settings_bytecode,
+        };
+
+        let ws_rel = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        let edited_src = PathBuf::from("src/Workspace/ClientRunner.run-client.luau");
+        let part_count = super::super::replacement::BULK_PROPERTY_MIN_INSTANCES + 8;
+
+        let mut ws_desired = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance::new(
+                "ws".into(),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            )],
+        };
+        for i in 0..part_count {
+            let mut p = SettingsBytecodeInstance::new(
+                format!("p-{i}"),
+                format!("Part{i}"),
+                "Part".into(),
+                Some(0),
+            );
+            p.properties.insert(
+                "UniqueId".into(),
+                json!({"_type": "UniqueId", "value": format!("{:032x}", i + 10)}),
+            );
+            p.properties.insert("Transparency".into(), json!(0.0));
+            ws_desired.instances.push(p);
+        }
+        let mut client_script = SettingsBytecodeInstance::new(
+            "client-script".into(),
+            "ClientRunner".into(),
+            "Script".into(),
+            Some(0),
+        );
+        client_script.properties.insert(
+            "UniqueId".into(),
+            json!({"_type": "UniqueId", "value": format!("{:032x}", 8001)}),
+        );
+        client_script.properties.insert(
+            "RunContext".into(),
+            crate::editor::paths::editor_run_context_value("Client"),
+        );
+        let client_script_index = ws_desired.instances.len();
+        ws_desired.instances.push(client_script);
+
+        let mut untouched_script = SettingsBytecodeInstance::new(
+            "other-script".into(),
+            "UntouchedRunner".into(),
+            "Script".into(),
+            Some(0),
+        );
+        untouched_script.properties.insert(
+            "UniqueId".into(),
+            json!({"_type": "UniqueId", "value": format!("{:032x}", 8002)}),
+        );
+        untouched_script.properties.insert(
+            "RunContext".into(),
+            crate::editor::paths::editor_run_context_value("Client"),
+        );
+        let untouched_script_index = ws_desired.instances.len();
+        ws_desired.instances.push(untouched_script);
+
+        let mut ws_observed = ws_desired.clone();
+        for inst in ws_observed.instances.iter_mut().skip(1).take(part_count) {
+            inst.properties.insert("Transparency".into(), json!(0.5));
+        }
+        ws_observed.instances[1].name = "Part0Renamed".into();
+
+        let project = ProjectSnapshot {
+            entries: BTreeMap::from([
+                (
+                    ws_rel.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(&ws_desired).unwrap()),
+                ),
+                (
+                    edited_src.clone(),
+                    SnapshotEntry::File(b"print('after')\n".to_vec()),
+                ),
+            ]),
+        };
+        let studio = ProjectSnapshot {
+            entries: BTreeMap::from([
+                (
+                    ws_rel.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(&ws_observed).unwrap()),
+                ),
+                (
+                    edited_src.clone(),
+                    SnapshotEntry::File(b"print('before')\n".to_vec()),
+                ),
+            ]),
+        };
+
+        let mut prepared_settings = HashMap::new();
+        let mut bulk_patches = HashMap::new();
+        let _differences = collect_delta_bulk_differences(
+            &project,
+            &studio,
+            StoresRead::ChangedOfBoth,
+            &mut prepared_settings,
+            &mut bulk_patches,
+        )
+        .unwrap();
+        assert!(bulk_patches.contains_key(&ws_rel));
+        let prepared = &prepared_settings[&ws_rel];
+        assert!(!crate::settings::held::stands_unchanged(
+            &prepared.current.instances[client_script_index].properties
+        ));
+        assert!(!crate::settings::held::stands_unchanged(
+            &prepared.current.instances[untouched_script_index].properties
+        ));
+
+        let children = crate::settings::tree::settings_children_by_parent(&prepared.current);
+        let resolved = crate::editor::paths::editor_source_target_with_children(
+            &prepared.current,
+            "Workspace",
+            Path::new("src/Workspace"),
+            &edited_src,
+            &children,
+        )
+        .expect("edited Client RunContext Script source must resolve in hybrid store");
+        assert_eq!(resolved.class_name, "Script");
+        assert_eq!(resolved.settings_id.as_deref(), Some("client-script"));
+    }
+
+    #[test]
+    fn hybrid_store_leaves_script_rows_unread_when_push_carries_no_changed_sources() {
+        use crate::settings::bytecode::{
+            SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
+            encode_settings_bytecode,
+        };
+
+        let ws_rel = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        let unchanged_src = PathBuf::from("src/Workspace/ClientRunner.run-client.luau");
+        let part_count = super::super::replacement::BULK_PROPERTY_MIN_INSTANCES + 8;
+
+        let mut ws_desired = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance::new(
+                "ws".into(),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            )],
+        };
+        for i in 0..part_count {
+            let mut p = SettingsBytecodeInstance::new(
+                format!("p-{i}"),
+                format!("Part{i}"),
+                "Part".into(),
+                Some(0),
+            );
+            p.properties.insert(
+                "UniqueId".into(),
+                json!({"_type": "UniqueId", "value": format!("{:032x}", i + 10)}),
+            );
+            p.properties.insert("Transparency".into(), json!(0.0));
+            ws_desired.instances.push(p);
+        }
+        let mut client_script = SettingsBytecodeInstance::new(
+            "client-script".into(),
+            "ClientRunner".into(),
+            "Script".into(),
+            Some(0),
+        );
+        client_script.properties.insert(
+            "UniqueId".into(),
+            json!({"_type": "UniqueId", "value": format!("{:032x}", 8001)}),
+        );
+        client_script.properties.insert(
+            "RunContext".into(),
+            crate::editor::paths::editor_run_context_value("Client"),
+        );
+        let client_script_index = ws_desired.instances.len();
+        ws_desired.instances.push(client_script);
+
+        let mut ws_observed = ws_desired.clone();
+        for inst in ws_observed.instances.iter_mut().skip(1).take(part_count) {
+            inst.properties.insert("Transparency".into(), json!(0.5));
+        }
+        ws_observed.instances[1].name = "Part0Renamed".into();
+
+        let project = ProjectSnapshot {
+            entries: BTreeMap::from([
+                (
+                    ws_rel.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(&ws_desired).unwrap()),
+                ),
+                (
+                    unchanged_src.clone(),
+                    SnapshotEntry::File(b"print('same')\n".to_vec()),
+                ),
+            ]),
+        };
+        let studio = ProjectSnapshot {
+            entries: BTreeMap::from([
+                (
+                    ws_rel.clone(),
+                    SnapshotEntry::File(encode_settings_bytecode(&ws_observed).unwrap()),
+                ),
+                (
+                    unchanged_src,
+                    SnapshotEntry::File(b"print('same')\n".to_vec()),
+                ),
+            ]),
+        };
+
+        let mut prepared_settings = HashMap::new();
+        let mut bulk_patches = HashMap::new();
+        let _differences = collect_delta_bulk_differences(
+            &project,
+            &studio,
+            StoresRead::ChangedOfBoth,
+            &mut prepared_settings,
+            &mut bulk_patches,
+        )
+        .unwrap();
+        assert!(bulk_patches.contains_key(&ws_rel));
+        let prepared = &prepared_settings[&ws_rel];
+        assert!(crate::settings::held::stands_unchanged(
+            &prepared.current.instances[client_script_index].properties
+        ));
     }
 }

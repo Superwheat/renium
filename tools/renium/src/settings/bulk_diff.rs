@@ -57,16 +57,17 @@ impl BulkEdit {
     }
 }
 
+const MAX_HYBRID_EXTRA_ROWS: usize = 256;
+
 enum BlockResult {
     Fallback,
-    Edits(Vec<BulkEdit>),
+    Edits(Vec<BulkEdit>, Vec<(usize, usize)>),
 }
 
 struct BulkDiffContext<'a> {
     desired: &'a BlockStore<'a>,
     observed: &'a BlockStore<'a>,
     desired_rows: &'a [SettingsBytecodeInstance],
-    obs_to_des: &'a [usize],
     obs_to_des_opt: Vec<Option<usize>>,
     is_identity_perm: bool,
     is_twin: &'a [bool],
@@ -74,10 +75,42 @@ struct BulkDiffContext<'a> {
     service: &'a str,
 }
 
+pub(crate) struct BulkHybridDelta {
+    pub(crate) patch: EditorBulkPropertyPatch,
+    pub(crate) extra_desired_rows: Vec<usize>,
+    pub(crate) extra_observed_rows: Vec<usize>,
+    /// `(observed_row, property_name)` entries on rows materialized by the hybrid
+    /// delta (both `extra_observed_rows` and their namesake siblings) whose plain
+    /// property values `patch` already writes, so `prepare_hybrid_bulk_delta`
+    /// syncs `previous` and omits duplicate delta writes or resets.
+    pub(crate) bulk_handled_on_extra: Vec<(usize, String)>,
+    pub(crate) obs_to_des: Vec<Option<usize>>,
+    pub(crate) desired_skeleton: Vec<SettingsBytecodeInstance>,
+    pub(crate) observed_skeleton: Vec<SettingsBytecodeInstance>,
+}
+
 pub(crate) enum BulkDiffOutcome {
     Unchanged,
     Patch(EditorBulkPropertyPatch),
+    Hybrid(Box<BulkHybridDelta>),
     Fallback,
+}
+
+fn log_fallback(service: &str, detail: std::fmt::Arguments<'_>) {
+    crate::app::output::log_global(
+        4,
+        format_args!("[renium] bulk diff fallback ({service}): {detail}"),
+    );
+}
+
+fn push_hybrid_extra(extra: &mut Vec<(usize, usize)>, pair: (usize, usize)) -> bool {
+    if !extra.contains(&pair) {
+        if extra.len() >= MAX_HYBRID_EXTRA_ROWS {
+            return false;
+        }
+        extra.push(pair);
+    }
+    true
 }
 
 struct CachedStoreTopology {
@@ -207,7 +240,22 @@ pub(crate) fn diff_v12_bulk_plain_properties(
     ) else {
         return Ok(BulkDiffOutcome::Fallback);
     };
-    if desired.rows == 0 || desired.rows != observed.rows {
+    if desired.rows == 0 || observed.rows == 0 {
+        return Ok(BulkDiffOutcome::Fallback);
+    }
+    if desired.rows != observed.rows {
+        if desired.rows >= min_instances
+            && observed.rows >= min_instances
+            && desired.rows.abs_diff(observed.rows) <= MAX_HYBRID_EXTRA_ROWS
+        {
+            return diff_v12_bulk_hybrid_structural(
+                &desired,
+                &observed,
+                None,
+                service,
+                min_instances,
+            );
+        }
         return Ok(BulkDiffOutcome::Fallback);
     }
     let same_structure_frame = desired.structure.decoded == observed.structure.decoded
@@ -234,6 +282,7 @@ pub(crate) fn diff_v12_bulk_plain_properties(
             &desired,
             &observed,
             &topo.rows,
+            None,
             &topo.sibling_ordinals,
             &identity_map,
             true,
@@ -252,12 +301,22 @@ pub(crate) fn diff_v12_bulk_plain_properties(
     }
 
     let Some(topology) = build_bulk_topology(&desired_rows, &observed_rows, service) else {
+        if desired.rows >= min_instances {
+            return diff_v12_bulk_hybrid_structural(
+                &desired,
+                &observed,
+                Some((desired_rows, observed_rows)),
+                service,
+                min_instances,
+            );
+        }
         return Ok(BulkDiffOutcome::Fallback);
     };
     diff_v12_bulk_with_topology(
         &desired,
         &observed,
         &desired_rows,
+        Some(&observed_rows),
         &topology.sibling_ordinals,
         &topology.obs_to_des,
         topology.is_identity_perm,
@@ -273,6 +332,7 @@ fn diff_v12_bulk_with_topology(
     desired: &BlockStore<'_>,
     observed: &BlockStore<'_>,
     desired_rows: &[SettingsBytecodeInstance],
+    observed_rows: Option<&[SettingsBytecodeInstance]>,
     sibling_ordinals: &[u32],
     obs_to_des: &[usize],
     is_identity_perm: bool,
@@ -294,7 +354,6 @@ fn diff_v12_bulk_with_topology(
         desired,
         observed,
         desired_rows,
-        obs_to_des,
         obs_to_des_opt,
         is_identity_perm,
         is_twin,
@@ -309,22 +368,64 @@ fn diff_v12_bulk_with_topology(
         .collect::<Result<Vec<_>>>()?;
 
     let mut all_edits = Vec::new();
+    let mut extra_pairs = Vec::new();
     for result in block_results {
         match result {
             BlockResult::Fallback => return Ok(BulkDiffOutcome::Fallback),
-            BlockResult::Edits(mut block_edits) => all_edits.append(&mut block_edits),
+            BlockResult::Edits(mut block_edits, mut block_extra) => {
+                all_edits.append(&mut block_edits);
+                extra_pairs.append(&mut block_extra);
+            }
         }
     }
     if !permuted_pairs.is_empty() {
-        let Some(mut permuted_edits) = diff_permuted_pairs(&ctx, &permuted_pairs)? else {
+        let Some((mut permuted_edits, mut permuted_extra)) =
+            diff_permuted_pairs(&ctx, &permuted_pairs, false)?
+        else {
             return Ok(BulkDiffOutcome::Fallback);
         };
         all_edits.append(&mut permuted_edits);
+        extra_pairs.append(&mut permuted_extra);
     }
-    if all_edits.is_empty() {
-        return Ok(BulkDiffOutcome::Unchanged);
+    if extra_pairs.is_empty() {
+        if all_edits.is_empty() {
+            return Ok(BulkDiffOutcome::Unchanged);
+        }
+        return Ok(build_bulk_property_patch(
+            desired_rows,
+            sibling_ordinals,
+            package_root_of,
+            all_edits,
+            database,
+            service,
+            min_instances,
+        ));
     }
-    Ok(build_bulk_property_patch(
+    extra_pairs.sort_unstable();
+    extra_pairs.dedup();
+    if extra_pairs.len() > MAX_HYBRID_EXTRA_ROWS {
+        crate::app::output::log_global(
+            4,
+            format_args!(
+                "[renium] bulk diff fallback ({service}): hybrid extra rows {} exceeds limit",
+                extra_pairs.len()
+            ),
+        );
+        return Ok(BulkDiffOutcome::Fallback);
+    }
+    let extra_des_to_obs: AHashMap<usize, usize> = extra_pairs.iter().copied().collect();
+    let mut bulk_handled_on_extra = Vec::new();
+    for edit in &all_edits {
+        if let BulkEdit::Property(row, prop_name, _) = edit
+            && let Some(&o_row) = extra_des_to_obs.get(row)
+        {
+            bulk_handled_on_extra.push((o_row, prop_name.clone()));
+        }
+    }
+    all_edits.retain(|edit| {
+        !extra_des_to_obs.contains_key(&edit.row()) || matches!(edit, BulkEdit::Property(..))
+    });
+    let Some((patch, _)) = build_bulk_property_patch_with_rows(
         desired_rows,
         sibling_ordinals,
         package_root_of,
@@ -332,7 +433,38 @@ fn diff_v12_bulk_with_topology(
         database,
         service,
         min_instances,
-    ))
+    ) else {
+        crate::app::output::log_global(
+            4,
+            format_args!("[renium] bulk diff fallback ({service}): hybrid patch below threshold"),
+        );
+        return Ok(BulkDiffOutcome::Fallback);
+    };
+    crate::app::output::log_global(
+        4,
+        format_args!(
+            "[renium] bulk diff hybrid ({service}): aligned bulk_instances={} extra_rows={}",
+            patch.instance_count,
+            extra_pairs.len()
+        ),
+    );
+    let extra_desired_rows: Vec<usize> = extra_pairs.iter().map(|&(d, _)| d).collect();
+    let extra_observed_rows: Vec<usize> = extra_pairs.iter().map(|&(_, o)| o).collect();
+    let full_obs_to_des = if is_identity_perm {
+        (0..desired_rows.len()).map(Some).collect()
+    } else {
+        obs_to_des.iter().copied().map(Some).collect()
+    };
+    let observed_skeleton = observed_rows.map_or_else(|| desired_rows.to_vec(), ToOwned::to_owned);
+    Ok(BulkDiffOutcome::Hybrid(Box::new(BulkHybridDelta {
+        patch,
+        extra_desired_rows,
+        extra_observed_rows,
+        bulk_handled_on_extra,
+        obs_to_des: full_obs_to_des,
+        desired_skeleton: desired_rows.to_vec(),
+        observed_skeleton,
+    })))
 }
 
 struct RowColumnHashes {
@@ -959,7 +1091,7 @@ fn diff_aligned_block(
         && ctx.desired.bytes[d_block.frame.at..d_block.frame.at + d_block.frame.len]
             == ctx.observed.bytes[o_block.frame.at..o_block.frame.at + o_block.frame.len]
     {
-        return Ok(BlockResult::Edits(Vec::new()));
+        return Ok(BlockResult::Edits(Vec::new(), Vec::new()));
     }
     let open_d = ctx.desired.open_block(d_block_index)?;
     let open_o = ctx.observed.open_block(o_block_index)?;
@@ -988,6 +1120,7 @@ fn diff_aligned_block(
     let block_first = d_block.first;
     let block_count = d_block.count;
     let mut edits = Vec::new();
+    let mut extra = Vec::new();
     let mut eligible_cache: AHashMap<(&str, &str), bool> = AHashMap::new();
     let mut d_strings_cache: Option<Vec<String>> = None;
     let mut o_strings_cache: Option<Vec<String>> = None;
@@ -1046,6 +1179,7 @@ fn diff_aligned_block(
             if d_vals.get(&0) != o_vals.get(&0)
                 && d_vals.contains_key(&0)
                 && o_vals.contains_key(&0)
+                && !push_hybrid_extra(&mut extra, (0, 0))
             {
                 return Ok(BlockResult::Fallback);
             }
@@ -1066,7 +1200,14 @@ fn diff_aligned_block(
                 o_groups,
                 block_count,
             )?;
-            if !diff_aligned_attributes_column(ctx, &d_attrs, &o_attrs, block_first, &mut edits) {
+            if !diff_aligned_attributes_column(
+                ctx,
+                &d_attrs,
+                &o_attrs,
+                block_first,
+                &mut edits,
+                &mut extra,
+            ) {
                 return Ok(BlockResult::Fallback);
             }
             continue;
@@ -1088,19 +1229,16 @@ fn diff_aligned_block(
                 o_groups,
                 block_count,
             )?;
-            if !diff_aligned_tags_column(ctx, &d_vals, &o_vals, block_first, &mut edits) {
+            if !diff_aligned_tags_column(ctx, &d_vals, &o_vals, block_first, &mut edits, &mut extra)
+            {
                 return Ok(BlockResult::Fallback);
             }
             continue;
         }
-        if matches!(
+        if !matches!(
             prop_name,
             "Source" | "LinkedSource" | "Name" | "Parent" | "ClassName" | "Archivable"
-        ) {
-            return Ok(BlockResult::Fallback);
-        }
-
-        if !reconciliation_property_is_derived(prop_name)
+        ) && !reconciliation_property_is_derived(prop_name)
             && let (Some(d_raw), Some(o_raw)) = (
                 decode_block_raw_extracted_opt(d_groups, &open_d, block_count)?,
                 decode_block_raw_extracted_opt(o_groups, &open_o, block_count)?,
@@ -1114,12 +1252,23 @@ fn diff_aligned_block(
                 block_first,
                 &mut eligible_cache,
                 &mut edits,
+                &mut extra,
             ) {
                 return Ok(BlockResult::Fallback);
             }
             continue;
         }
 
+        if matches!(prop_name, "Name" | "Parent" | "ClassName") {
+            crate::app::output::log_global(
+                4,
+                format_args!(
+                    "[renium] bulk diff fallback ({}): structural property column {prop_name}",
+                    ctx.service
+                ),
+            );
+            return Ok(BlockResult::Fallback);
+        }
         let d_vals = decode_block_property(
             ctx.desired,
             &open_d,
@@ -1149,12 +1298,13 @@ fn diff_aligned_block(
             block_first,
             &mut eligible_cache,
             &mut edits,
+            &mut extra,
         ) {
             return Ok(BlockResult::Fallback);
         }
     }
 
-    Ok(BlockResult::Edits(edits))
+    Ok(BlockResult::Edits(edits, extra))
 }
 
 fn groups_equal_unpooled(
@@ -1167,7 +1317,7 @@ fn groups_equal_unpooled(
     if d_groups.is_empty() || d_groups.len() != o_groups.len() {
         return Ok(false);
     }
-    let remap = (!ctx.is_identity_perm).then_some(ctx.obs_to_des);
+    let remap = (!ctx.is_identity_perm).then_some(ctx.obs_to_des_opt.as_slice());
     for (&(dk, dc, db), &(ok, oc, ob)) in d_groups.iter().zip(o_groups.iter()) {
         if dk != ok
             || dc != oc
@@ -1284,6 +1434,7 @@ fn diff_aligned_raw_column<'a>(
     block_first: usize,
     eligible_cache: &mut AHashMap<(&'a str, &'a str), bool>,
     edits: &mut Vec<BulkEdit>,
+    extra: &mut Vec<(usize, usize)>,
 ) -> bool {
     let mut default_cache: AHashMap<&str, Option<Option<ExtractedValue>>> = AHashMap::new();
     let mut vtype_cache: AHashMap<&str, (Option<RbxVariantType>, bool)> = AHashMap::new();
@@ -1368,7 +1519,18 @@ fn diff_aligned_raw_column<'a>(
                     cached_default_extracted(ctx.database, class_name, prop_name)
                 });
                 match def_opt {
-                    None => return false,
+                    None => {
+                        if !push_hybrid_extra(extra, (global_row, global_row)) {
+                            log_fallback(
+                                ctx.service,
+                                format_args!(
+                                    "raw unresolved-default extra limit prop={prop_name} class={class_name}"
+                                ),
+                            );
+                            return false;
+                        }
+                        continue;
+                    }
                     Some(None) => continue,
                     Some(Some(def)) => {
                         if let Some(ov) = o_val
@@ -1386,14 +1548,14 @@ fn diff_aligned_raw_column<'a>(
             continue;
         }
         if class_name == "Camera" {
-            crate::app::output::log_global(
-                4,
-                format_args!(
-                    "[renium] bulk diff fallback ({}): raw protected class={class_name} prop={prop_name}",
-                    ctx.service
-                ),
-            );
-            return false;
+            if !push_hybrid_extra(extra, (global_row, global_row)) {
+                log_fallback(
+                    ctx.service,
+                    format_args!("raw camera extra limit prop={prop_name}"),
+                );
+                return false;
+            }
+            continue;
         }
         let class_prop_eligible = *eligible_cache
             .entry((class_name, prop_name))
@@ -1406,14 +1568,14 @@ fn diff_aligned_raw_column<'a>(
                 )
             });
         if !class_prop_eligible {
-            crate::app::output::log_global(
-                4,
-                format_args!(
-                    "[renium] bulk diff fallback ({}): raw ineligible class={class_name} prop={prop_name}",
-                    ctx.service
-                ),
-            );
-            return false;
+            if !push_hybrid_extra(extra, (global_row, global_row)) {
+                log_fallback(
+                    ctx.service,
+                    format_args!("raw ineligible extra limit prop={prop_name} class={class_name}"),
+                );
+                return false;
+            }
+            continue;
         }
         edits.push(BulkEdit::Property(
             global_row,
@@ -1434,6 +1596,7 @@ fn diff_aligned_attributes_column(
     o_attrs: &AHashMap<usize, serde_json::Map<String, Value>>,
     block_first: usize,
     edits: &mut Vec<BulkEdit>,
+    extra: &mut Vec<(usize, usize)>,
 ) -> bool {
     let mut touched_local: Vec<usize> = Vec::with_capacity(d_attrs.len().max(o_attrs.len()));
     touched_local.extend(d_attrs.keys().copied());
@@ -1454,25 +1617,30 @@ fn diff_aligned_attributes_column(
         if row.class_name == "PackageLink" {
             continue;
         }
-        if row.class_name == "Camera" || row.name == "__Renium_SessionLock" {
+        if row.name == "__Renium_SessionLock" {
             crate::app::output::log_global(
                 4,
                 format_args!(
-                    "[renium] bulk diff fallback ({}): attr protected class={} name={}",
-                    ctx.service, row.class_name, row.name
+                    "[renium] bulk diff fallback ({}): session lock attribute on row={global_row}",
+                    ctx.service
                 ),
             );
             return false;
         }
-        if !append_attribute_map_diffs(global_row, d_map, o_map, edits) {
-            crate::app::output::log_global(
-                4,
-                format_args!(
-                    "[renium] bulk diff fallback ({}): attr value ineligible class={}",
-                    ctx.service, row.class_name
-                ),
-            );
-            return false;
+        if row.class_name == "Camera"
+            || !append_attribute_map_diffs(global_row, d_map, o_map, edits)
+        {
+            if !push_hybrid_extra(extra, (global_row, global_row)) {
+                crate::app::output::log_global(
+                    4,
+                    format_args!(
+                        "[renium] bulk diff fallback ({}): attr ineligible/limit class={} name={}",
+                        ctx.service, row.class_name, row.name
+                    ),
+                );
+                return false;
+            }
+            continue;
         }
     }
     true
@@ -1571,6 +1739,7 @@ fn diff_aligned_tags_column(
     o_vals: &AHashMap<usize, Value>,
     block_first: usize,
     edits: &mut Vec<BulkEdit>,
+    extra: &mut Vec<(usize, usize)>,
 ) -> bool {
     let mut touched_local: Vec<usize> = Vec::with_capacity(d_vals.len().max(o_vals.len()));
     touched_local.extend(d_vals.keys().copied());
@@ -1591,25 +1760,15 @@ fn diff_aligned_tags_column(
         if class_name == "PackageLink" {
             continue;
         }
-        if class_name == "Camera" {
-            crate::app::output::log_global(
-                4,
-                format_args!(
-                    "[renium] bulk diff fallback ({}): tag protected class={class_name}",
-                    ctx.service
-                ),
-            );
-            return false;
-        }
-        if !append_tag_diffs(global_row, d_val, o_val, edits) {
-            crate::app::output::log_global(
-                4,
-                format_args!(
-                    "[renium] bulk diff fallback ({}): tag value ineligible class={class_name}",
-                    ctx.service
-                ),
-            );
-            return false;
+        if class_name == "Camera" || !append_tag_diffs(global_row, d_val, o_val, edits) {
+            if !push_hybrid_extra(extra, (global_row, global_row)) {
+                log_fallback(
+                    ctx.service,
+                    format_args!("tags extra limit class={class_name}"),
+                );
+                return false;
+            }
+            continue;
         }
     }
     true
@@ -1623,6 +1782,7 @@ fn diff_aligned_decoded_column<'a>(
     block_first: usize,
     eligible_cache: &mut AHashMap<(&'a str, &'a str), bool>,
     edits: &mut Vec<BulkEdit>,
+    extra: &mut Vec<(usize, usize)>,
 ) -> bool {
     let mut touched_local: Vec<usize> = Vec::with_capacity(d_vals.len().max(o_vals.len()));
     touched_local.extend(d_vals.keys().copied());
@@ -1639,7 +1799,17 @@ fn diff_aligned_decoded_column<'a>(
         let d_val = d_vals.get(&local_row);
         let o_val = o_vals.get(&local_row);
         if d_val.is_some_and(holds_marker) || o_val.is_some_and(holds_marker) {
-            return false;
+            if d_val == o_val {
+                continue;
+            }
+            if !push_hybrid_extra(extra, (global_row, global_row)) {
+                log_fallback(
+                    ctx.service,
+                    format_args!("decoded marker extra limit prop={prop_name} class={class_name}"),
+                );
+                return false;
+            }
+            continue;
         }
         if reconciliation_property_values_equal(class_name, prop_name, d_val, o_val)
             || reconciliation_property_is_derived(prop_name)
@@ -1650,14 +1820,14 @@ fn diff_aligned_decoded_column<'a>(
             continue;
         }
         if class_name == "Camera" {
-            crate::app::output::log_global(
-                4,
-                format_args!(
-                    "[renium] bulk diff fallback ({}): row={} class={class_name} prop={prop_name}",
-                    ctx.service, global_row
-                ),
-            );
-            return false;
+            if !push_hybrid_extra(extra, (global_row, global_row)) {
+                log_fallback(
+                    ctx.service,
+                    format_args!("decoded camera extra limit prop={prop_name}"),
+                );
+                return false;
+            }
+            continue;
         }
         let target_value = match resolve_target_property_value(
             ctx.database,
@@ -1668,14 +1838,16 @@ fn diff_aligned_decoded_column<'a>(
         ) {
             TargetProperty::Skip => continue,
             TargetProperty::Fallback => {
-                crate::app::output::log_global(
-                    4,
-                    format_args!(
-                        "[renium] bulk diff fallback ({}): unresolved default class={class_name} prop={prop_name}",
-                        ctx.service
-                    ),
-                );
-                return false;
+                if !push_hybrid_extra(extra, (global_row, global_row)) {
+                    log_fallback(
+                        ctx.service,
+                        format_args!(
+                            "decoded unresolved-default extra limit prop={prop_name} class={class_name}"
+                        ),
+                    );
+                    return false;
+                }
+                continue;
             }
             TargetProperty::Write(val) => val,
         };
@@ -1690,14 +1862,16 @@ fn diff_aligned_decoded_column<'a>(
                 )
             });
         if !class_prop_eligible || !is_bulk_plain_value_eligible(&target_value) {
-            crate::app::output::log_global(
-                4,
-                format_args!(
-                    "[renium] bulk diff fallback ({}): ineligible class={class_name} prop={prop_name} class_ok={class_prop_eligible}",
-                    ctx.service
-                ),
-            );
-            return false;
+            if !push_hybrid_extra(extra, (global_row, global_row)) {
+                log_fallback(
+                    ctx.service,
+                    format_args!(
+                        "decoded ineligible extra limit prop={prop_name} class={class_name}"
+                    ),
+                );
+                return false;
+            }
+            continue;
         }
         edits.push(BulkEdit::Property(
             global_row,
@@ -2070,7 +2244,7 @@ fn group_bodies_equal_unpooled(
     open_a: &OpenBlock,
     store_b: &BlockStore<'_>,
     open_b: &OpenBlock,
-    obs_to_des: Option<&[usize]>,
+    obs_to_des: Option<&[Option<usize>]>,
 ) -> Result<bool> {
     match kind {
         0..=5 | 9 | 11..=16 | 18 | 20 | 21 => {
@@ -2108,7 +2282,7 @@ fn group_bodies_equal_unpooled(
             prev_ref_a = ref_a;
             prev_ref_b = ref_b;
             let mapped_b = match obs_to_des {
-                Some(map) => match map.get(ref_b).copied() {
+                Some(map) => match map.get(ref_b).copied().flatten() {
                     Some(mapped) => mapped,
                     None => return Ok(false),
                 },
@@ -2139,7 +2313,7 @@ fn raw_values_equal_unpooled(
     open_a: &OpenBlock,
     store_b: &BlockStore<'_>,
     open_b: &OpenBlock,
-    obs_to_des: Option<&[usize]>,
+    obs_to_des: Option<&[Option<usize>]>,
     depth: usize,
 ) -> Result<bool> {
     if depth > 64 {
@@ -2262,7 +2436,7 @@ fn raw_values_equal_unpooled(
             let ref_a = ra.read_len("resolved ref index")?;
             let ref_b = rb.read_len("resolved ref index")?;
             let mapped_b = match obs_to_des {
-                Some(map) => match map.get(ref_b).copied() {
+                Some(map) => match map.get(ref_b).copied().flatten() {
                     Some(mapped) => mapped,
                     None => return Ok(false),
                 },
@@ -2354,29 +2528,26 @@ fn match_permuted_tree(
     (matched == n).then_some(obs_to_des)
 }
 
+type PermutedDiffResult = (Vec<BulkEdit>, Vec<(usize, usize)>);
+
 fn diff_permuted_pairs(
     ctx: &BulkDiffContext<'_>,
     pairs: &[(usize, usize)],
-) -> Result<Option<Vec<BulkEdit>>> {
+    target_observed: bool,
+) -> Result<Option<PermutedDiffResult>> {
+    // Bound decoded permuted rows in memory to four v12 storage blocks per pass.
+    const PERMUTED_WINDOW_ROWS: usize = super::BLOCK_ROWS * 4;
     let desired = ctx.desired;
     let observed = ctx.observed;
     let desired_rows = ctx.desired_rows;
-    let obs_to_des = ctx.obs_to_des;
     let is_twin = ctx.is_twin;
     let database = ctx.database;
     let service = ctx.service;
-    let row_count = desired_rows.len();
-    let mut des_needed: Vec<usize> = pairs.iter().map(|&(d, _)| d).collect();
-    let mut obs_needed: Vec<usize> = pairs.iter().map(|&(_, o)| o).collect();
-    des_needed.sort_unstable();
-    des_needed.dedup();
-    obs_needed.sort_unstable();
-    obs_needed.dedup();
 
     let read_marked = |store: &BlockStore<'_>,
                        rows: &[usize],
                        remap: Option<&[Option<usize>]>|
-     -> Result<Vec<Option<DecodedRowValues>>> {
+     -> Result<AHashMap<usize, DecodedRowValues>> {
         let mut by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for &row in rows {
             by_block.entry(store.block_of(row)).or_default().push(row);
@@ -2414,196 +2585,658 @@ fn diff_permuted_pairs(
                 },
             )
             .collect::<Result<Vec<_>>>()?;
-        let mut table: Vec<Option<DecodedRowValues>> = (0..row_count).map(|_| None).collect();
+        let mut table = AHashMap::with_capacity(rows.len());
         for part in parts {
             for (row, vals) in part {
-                table[row] = Some(vals);
+                table.insert(row, vals);
             }
         }
         Ok(table)
     };
 
-    let remap: Vec<Option<usize>> = obs_to_des.iter().copied().map(Some).collect();
-    let (des_table, obs_table) = rayon::join(
-        || read_marked(desired, &des_needed, None),
-        || read_marked(observed, &obs_needed, Some(&remap)),
-    );
-    let des_table = des_table?;
-    let obs_table = obs_table?;
-
     enum ChunkResult {
         Fallback,
-        Edits(Vec<BulkEdit>),
+        Edits(Vec<BulkEdit>, Vec<(usize, usize)>),
     }
 
-    let chunk_results = pairs
-        .par_chunks(2048)
-        .map(|chunk| -> Result<ChunkResult> {
-            let mut edits = Vec::new();
-            let mut eligible_cache: AHashMap<(&str, &str), bool> = AHashMap::new();
-            for &(d_row, o_row) in chunk {
-                let Some(d_vals) = des_table[d_row].as_ref() else {
-                    return Ok(ChunkResult::Fallback);
-                };
-                let Some(o_vals) = obs_table[o_row].as_ref() else {
-                    return Ok(ChunkResult::Fallback);
-                };
-                let row_inst = &desired_rows[d_row];
-                let class_name = row_inst.class_name.as_str();
-                if class_name == "PackageLink" {
-                    continue;
-                }
-                if d_vals.attributes != o_vals.attributes
-                    && (class_name == "Camera"
-                        || row_inst.name == "__Renium_SessionLock"
-                        || !append_attribute_map_diffs(
-                            d_row,
-                            (!d_vals.attributes.is_empty()).then_some(&d_vals.attributes),
-                            (!o_vals.attributes.is_empty()).then_some(&o_vals.attributes),
-                            &mut edits,
-                        ))
-                {
-                    return Ok(ChunkResult::Fallback);
-                }
-                if is_twin[d_row]
-                    && d_vals.properties.get(UNIQUE_ID) != o_vals.properties.get(UNIQUE_ID)
-                {
-                    return Ok(ChunkResult::Fallback);
-                }
-                let mut d_iter = d_vals.properties.iter().peekable();
-                let mut o_iter = o_vals.properties.iter().peekable();
-                loop {
-                    let (prop_name, d_val, o_val) = match (d_iter.peek(), o_iter.peek()) {
-                        (None, None) => break,
-                        (Some(&(dk, _)), None) => {
-                            let (_, dv) = d_iter.next().unwrap();
-                            (dk.as_str(), Some(dv), None)
+    let remap = (!ctx.obs_to_des_opt.is_empty()).then_some(ctx.obs_to_des_opt.as_slice());
+    let mut edits = Vec::new();
+    let mut extra = Vec::new();
+    for window in pairs.chunks(PERMUTED_WINDOW_ROWS) {
+        let mut des_needed: Vec<usize> = window.iter().map(|&(d, _)| d).collect();
+        let mut obs_needed: Vec<usize> = window.iter().map(|&(_, o)| o).collect();
+        des_needed.sort_unstable();
+        des_needed.dedup();
+        obs_needed.sort_unstable();
+        obs_needed.dedup();
+
+        let (des_table, obs_table) = rayon::join(
+            || read_marked(desired, &des_needed, None),
+            || read_marked(observed, &obs_needed, remap),
+        );
+        let des_table = des_table?;
+        let obs_table = obs_table?;
+
+        let chunk_results = window
+            .par_chunks(2048)
+            .map(|chunk| -> Result<ChunkResult> {
+                let mut chunk_edits = Vec::new();
+                let mut chunk_extra = Vec::new();
+                let mut eligible_cache: AHashMap<(&str, &str), bool> = AHashMap::new();
+                for &(d_row, o_row) in chunk {
+                    let Some(d_vals) = des_table.get(&d_row) else {
+                        return Ok(ChunkResult::Fallback);
+                    };
+                    let Some(o_vals) = obs_table.get(&o_row) else {
+                        return Ok(ChunkResult::Fallback);
+                    };
+                    let edit_row = if target_observed { o_row } else { d_row };
+                    let row_inst = &desired_rows[d_row];
+                    let class_name = row_inst.class_name.as_str();
+                    if class_name == "PackageLink" {
+                        continue;
+                    }
+                    let mut row_extra = false;
+                    if d_vals.attributes != o_vals.attributes {
+                        if row_inst.name == "__Renium_SessionLock" {
+                            log_fallback(service, format_args!("permuted session lock attribute row={d_row}"));
+                            return Ok(ChunkResult::Fallback);
                         }
-                        (None, Some(&(ok, _))) => {
-                            let (_, ov) = o_iter.next().unwrap();
-                            (ok.as_str(), None, Some(ov))
+                        if class_name == "Camera"
+                            || !append_attribute_map_diffs(
+                                edit_row,
+                                (!d_vals.attributes.is_empty()).then_some(&d_vals.attributes),
+                                (!o_vals.attributes.is_empty()).then_some(&o_vals.attributes),
+                                &mut chunk_edits,
+                            )
+                        {
+                            row_extra = true;
                         }
-                        (Some(&(dk, _)), Some(&(ok, _))) => match dk.cmp(ok) {
-                            std::cmp::Ordering::Less => {
+                    }
+                    if !target_observed
+                        && is_twin[d_row]
+                        && d_vals.properties.get(UNIQUE_ID) != o_vals.properties.get(UNIQUE_ID)
+                    {
+                        log_fallback(service, format_args!("permuted twin UniqueId mismatch row={d_row}"));
+                        return Ok(ChunkResult::Fallback);
+                    }
+                    let mut d_iter = d_vals.properties.iter().peekable();
+                    let mut o_iter = o_vals.properties.iter().peekable();
+                    loop {
+                        let (prop_name, d_val, o_val) = match (d_iter.peek(), o_iter.peek()) {
+                            (None, None) => break,
+                            (Some(&(dk, _)), None) => {
                                 let (_, dv) = d_iter.next().unwrap();
                                 (dk.as_str(), Some(dv), None)
                             }
-                            std::cmp::Ordering::Greater => {
+                            (None, Some(&(ok, _))) => {
                                 let (_, ov) = o_iter.next().unwrap();
                                 (ok.as_str(), None, Some(ov))
                             }
-                            std::cmp::Ordering::Equal => {
-                                let (_, dv) = d_iter.next().unwrap();
-                                let (_, ov) = o_iter.next().unwrap();
-                                (dk.as_str(), Some(dv), Some(ov))
-                            }
-                        },
-                    };
-                    if prop_name == UNIQUE_ID {
-                        continue;
-                    }
-                    if prop_name == "CurrentCamera" && service == "Workspace" && d_row == 0 {
-                        if d_val != o_val && d_val.is_some() && o_val.is_some() {
-                            return Ok(ChunkResult::Fallback);
+                            (Some(&(dk, _)), Some(&(ok, _))) => match dk.cmp(ok) {
+                                std::cmp::Ordering::Less => {
+                                    let (_, dv) = d_iter.next().unwrap();
+                                    (dk.as_str(), Some(dv), None)
+                                }
+                                std::cmp::Ordering::Greater => {
+                                    let (_, ov) = o_iter.next().unwrap();
+                                    (ok.as_str(), None, Some(ov))
+                                }
+                                std::cmp::Ordering::Equal => {
+                                    let (_, dv) = d_iter.next().unwrap();
+                                    let (_, ov) = o_iter.next().unwrap();
+                                    (dk.as_str(), Some(dv), Some(ov))
+                                }
+                            },
+                        };
+                        if prop_name == UNIQUE_ID {
+                            continue;
                         }
-                        continue;
-                    }
-                    if d_val == o_val {
-                        continue;
-                    }
-                    if prop_name == "Tags" {
-                        if class_name == "Camera"
-                            || class_name == "PackageLink"
-                            || !append_tag_diffs(d_row, d_val, o_val, &mut edits)
+                        if prop_name == "CurrentCamera" && service == "Workspace" && d_row == 0 {
+                            if d_val != o_val && d_val.is_some() && o_val.is_some() {
+                                row_extra = true;
+                            }
+                            continue;
+                        }
+                        if d_val == o_val {
+                            continue;
+                        }
+                        if prop_name == "Tags" {
+                            if class_name == "Camera"
+                                || class_name == "PackageLink"
+                                || !append_tag_diffs(edit_row, d_val, o_val, &mut chunk_edits)
+                            {
+                                row_extra = true;
+                            }
+                            continue;
+                        }
+                        if d_val.is_some_and(holds_marker) || o_val.is_some_and(holds_marker) {
+                            row_extra = true;
+                            continue;
+                        }
+                        if reconciliation_property_values_equal(class_name, prop_name, d_val, o_val)
                         {
-                            return Ok(ChunkResult::Fallback);
+                            continue;
                         }
-                        continue;
-                    }
-                    if d_val.is_some_and(holds_marker) || o_val.is_some_and(holds_marker) {
-                        return Ok(ChunkResult::Fallback);
-                    }
-                    if reconciliation_property_values_equal(class_name, prop_name, d_val, o_val) {
-                        continue;
-                    }
-                    if reconciliation_property_is_derived(prop_name) {
-                        continue;
-                    }
-                    if class_name == "Camera" || class_name == "PackageLink" {
-                        return Ok(ChunkResult::Fallback);
-                    }
-                    let target_value = match d_val {
-                        Some(val) => val.clone(),
-                        None => {
-                            if crate::settings::equivalence::reconciliation_property_is_unknown_when_absent(
-                                Some(database),
-                                class_name,
-                                prop_name,
-                            ) {
-                                continue;
-                            }
-                            let Some(default_val) =
-                                reflection_default_json(database, class_name, prop_name)
-                            else {
-                                return Ok(ChunkResult::Fallback);
-                            };
-                            if !reconciliation_property_values_equal(
-                                class_name,
-                                prop_name,
-                                None,
-                                Some(&default_val),
-                            ) {
-                                return Ok(ChunkResult::Fallback);
-                            }
-                            if reconciliation_property_values_equal(
-                                class_name,
-                                prop_name,
-                                Some(&default_val),
-                                o_val,
-                            ) {
-                                continue;
-                            }
-                            default_val
+                        if reconciliation_property_is_derived(prop_name) {
+                            continue;
                         }
-                    };
-                    let class_prop_eligible = *eligible_cache
-                        .entry((class_name, prop_name))
-                        .or_insert_with(|| {
-                            is_bulk_plain_property_class_eligible(
-                                database,
-                                service,
-                                class_name,
-                                prop_name,
-                            )
-                        });
-                    if !class_prop_eligible || !is_bulk_plain_value_eligible(&target_value) {
+                        if class_name == "Camera" || class_name == "PackageLink" {
+                            row_extra = true;
+                            continue;
+                        }
+                        let target_value = match d_val {
+                            Some(val) => val.clone(),
+                            None => {
+                                if crate::settings::equivalence::reconciliation_property_is_unknown_when_absent(
+                                    Some(database),
+                                    class_name,
+                                    prop_name,
+                                ) {
+                                    continue;
+                                }
+                                let Some(default_val) =
+                                    reflection_default_json(database, class_name, prop_name)
+                                else {
+                                    row_extra = true;
+                                    continue;
+                                };
+                                if !reconciliation_property_values_equal(
+                                    class_name,
+                                    prop_name,
+                                    None,
+                                    Some(&default_val),
+                                ) {
+                                    row_extra = true;
+                                    continue;
+                                }
+                                if reconciliation_property_values_equal(
+                                    class_name,
+                                    prop_name,
+                                    Some(&default_val),
+                                    o_val,
+                                ) {
+                                    continue;
+                                }
+                                default_val
+                            }
+                        };
+                        let class_prop_eligible = *eligible_cache
+                            .entry((class_name, prop_name))
+                            .or_insert_with(|| {
+                                is_bulk_plain_property_class_eligible(
+                                    database,
+                                    service,
+                                    class_name,
+                                    prop_name,
+                                )
+                            });
+                        if !class_prop_eligible || !is_bulk_plain_value_eligible(&target_value) {
+                            row_extra = true;
+                            continue;
+                        }
+                        chunk_edits.push(BulkEdit::Property(
+                            edit_row,
+                            prop_name.to_string(),
+                            ExtractedValue::from_json(target_value),
+                        ));
+                    }
+                    if row_extra && !push_hybrid_extra(&mut chunk_extra, (d_row, o_row)) {
                         crate::app::output::log_global(
                             4,
                             format_args!(
-                                "[renium] bulk diff fallback ({service}): permuted ineligible {class_name}.{prop_name}"
+                                "[renium] bulk diff fallback ({service}): permuted extra limit exceeded"
                             ),
                         );
                         return Ok(ChunkResult::Fallback);
                     }
-                    edits.push(BulkEdit::Property(
-                        d_row,
-                        prop_name.to_string(),
-                        ExtractedValue::from_json(target_value),
-                    ));
+                }
+                Ok(ChunkResult::Edits(chunk_edits, chunk_extra))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for part in chunk_results {
+            match part {
+                ChunkResult::Fallback => return Ok(None),
+                ChunkResult::Edits(mut chunk_edits, mut chunk_extra) => {
+                    edits.append(&mut chunk_edits);
+                    for pair in chunk_extra.drain(..) {
+                        if !push_hybrid_extra(&mut extra, pair) {
+                            crate::app::output::log_global(
+                                4,
+                                format_args!(
+                                    "[renium] bulk diff fallback ({service}): permuted combined extra limit exceeded"
+                                ),
+                            );
+                            return Ok(None);
+                        }
+                    }
                 }
             }
-            Ok(ChunkResult::Edits(edits))
+        }
+    }
+    Ok(Some((edits, extra)))
+}
+
+fn match_hybrid_by_unique_id(
+    desired_rows: &[SettingsBytecodeInstance],
+    observed_rows: &[SettingsBytecodeInstance],
+    des_uids: &[Option<Box<str>>],
+    obs_uids: &[Option<Box<str>>],
+    service: &str,
+) -> Option<(Vec<Option<usize>>, Vec<Option<usize>>)> {
+    let des_count = desired_rows.len();
+    let obs_count = observed_rows.len();
+    let mut des_by_uid: AHashMap<&str, usize> = AHashMap::with_capacity(des_count);
+    for (d_idx, uid_opt) in des_uids.iter().enumerate().skip(1) {
+        if let Some(uid) = uid_opt.as_deref()
+            && des_by_uid.insert(uid, d_idx).is_some()
+        {
+            crate::app::output::log_global(
+                4,
+                format_args!("[renium] bulk diff fallback ({service}): duplicate desired UniqueId"),
+            );
+            return None;
+        }
+    }
+    let mut obs_to_des = vec![None; obs_count];
+    let mut des_to_obs = vec![None; des_count];
+    obs_to_des[0] = Some(0);
+    des_to_obs[0] = Some(0);
+
+    let mut seen_obs_uid: AHashSet<&str> = AHashSet::with_capacity(obs_count);
+    for (o_idx, uid_opt) in obs_uids.iter().enumerate().skip(1) {
+        let Some(uid) = uid_opt.as_deref() else {
+            continue;
+        };
+        if !seen_obs_uid.insert(uid) {
+            crate::app::output::log_global(
+                4,
+                format_args!(
+                    "[renium] bulk diff fallback ({service}): duplicate observed UniqueId"
+                ),
+            );
+            return None;
+        }
+        if let Some(&d_idx) = des_by_uid.get(uid) {
+            if desired_rows[d_idx].class_name != observed_rows[o_idx].class_name {
+                crate::app::output::log_global(
+                    4,
+                    format_args!(
+                        "[renium] bulk diff fallback ({service}): class change on matched UniqueId ({} -> {})",
+                        observed_rows[o_idx].class_name, desired_rows[d_idx].class_name
+                    ),
+                );
+                return None;
+            }
+            if des_to_obs[d_idx].is_none() {
+                obs_to_des[o_idx] = Some(d_idx);
+                des_to_obs[d_idx] = Some(o_idx);
+            }
+        }
+    }
+
+    let mut des_unmatched_by_key: AHashMap<(usize, &str, &str), Option<usize>> = AHashMap::new();
+    for (d_idx, row) in desired_rows.iter().enumerate().skip(1) {
+        if des_to_obs[d_idx].is_none()
+            && des_uids[d_idx].is_none()
+            && let Some(parent) = row.parent_index
+        {
+            let key = (parent, row.name.as_str(), row.class_name.as_str());
+            des_unmatched_by_key
+                .entry(key)
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(d_idx));
+        }
+    }
+    if !des_unmatched_by_key.is_empty() {
+        let mut obs_unmatched_by_key: AHashMap<(usize, &str, &str), Option<usize>> =
+            AHashMap::new();
+        for (o_idx, row) in observed_rows.iter().enumerate().skip(1) {
+            if obs_to_des[o_idx].is_none()
+                && obs_uids[o_idx].is_none()
+                && let Some(d_parent) = row.parent_index.and_then(|p| obs_to_des[p])
+            {
+                let key = (d_parent, row.name.as_str(), row.class_name.as_str());
+                obs_unmatched_by_key
+                    .entry(key)
+                    .and_modify(|slot| *slot = None)
+                    .or_insert(Some(o_idx));
+            }
+        }
+        for (key, o_opt) in obs_unmatched_by_key {
+            if let Some(o_idx) = o_opt
+                && let Some(Some(d_idx)) = des_unmatched_by_key.get(&key).copied()
+                && des_to_obs[d_idx].is_none()
+                && obs_to_des[o_idx].is_none()
+            {
+                obs_to_des[o_idx] = Some(d_idx);
+                des_to_obs[d_idx] = Some(o_idx);
+            }
+        }
+    }
+
+    // Class changes without UniqueIds and deleted parents with surviving children
+    // require full planner class-change/recreation handling.
+    let mut unmatched_des_by_parent_name: AHashSet<(usize, &str)> = AHashSet::new();
+    for (d_idx, row) in desired_rows.iter().enumerate().skip(1) {
+        if des_to_obs[d_idx].is_none()
+            && let Some(parent) = row.parent_index
+        {
+            unmatched_des_by_parent_name.insert((parent, row.name.as_str()));
+        }
+    }
+    for (o_idx, row) in observed_rows.iter().enumerate().skip(1) {
+        if obs_to_des[o_idx].is_none() {
+            if let Some(d_parent) = row.parent_index.and_then(|p| obs_to_des[p])
+                && unmatched_des_by_parent_name.contains(&(d_parent, row.name.as_str()))
+            {
+                crate::app::output::log_global(
+                    4,
+                    format_args!(
+                        "[renium] bulk diff fallback ({service}): unmatched same-parent/name class change ({})",
+                        row.class_name
+                    ),
+                );
+                return None;
+            }
+        } else if let Some(parent) = row.parent_index
+            && obs_to_des[parent].is_none()
+        {
+            crate::app::output::log_global(
+                4,
+                format_args!(
+                    "[renium] bulk diff fallback ({service}): surviving child under unmatched parent ({})",
+                    observed_rows[parent].class_name
+                ),
+            );
+            return None;
+        }
+    }
+
+    Some((obs_to_des, des_to_obs))
+}
+
+fn diff_v12_bulk_hybrid_structural(
+    desired: &BlockStore<'_>,
+    observed: &BlockStore<'_>,
+    predecoded_rows: Option<(Vec<SettingsBytecodeInstance>, Vec<SettingsBytecodeInstance>)>,
+    service: &str,
+    min_instances: usize,
+) -> Result<BulkDiffOutcome> {
+    let (mut desired_rows, mut observed_rows) = match predecoded_rows {
+        Some(rows) => rows,
+        None => {
+            let (desired_struct, observed_struct) =
+                rayon::join(|| desired.structure(), || observed.structure());
+            (desired_struct?.instances, observed_struct?.instances)
+        }
+    };
+    if desired_rows.len() != desired.rows
+        || observed_rows.len() != observed.rows
+        || desired_rows.is_empty()
+        || observed_rows.is_empty()
+        || desired_rows[0].parent_index.is_some()
+        || observed_rows[0].parent_index.is_some()
+        || desired_rows[0].class_name != service
+        || observed_rows[0].class_name != service
+        || desired_rows[0].name != observed_rows[0].name
+    {
+        crate::app::output::log_global(
+            4,
+            format_args!("[renium] bulk diff fallback ({service}): structural root mismatch"),
+        );
+        return Ok(BulkDiffOutcome::Fallback);
+    }
+
+    let (des_uids, obs_uids) = rayon::join(
+        || desired.extract_unique_ids_and_root_camera(&mut desired_rows),
+        || observed.extract_unique_ids_and_root_camera(&mut observed_rows),
+    );
+    let des_uids = des_uids?;
+    let obs_uids = obs_uids?;
+    desired_rows[0].properties.clear();
+    observed_rows[0].properties.clear();
+
+    let Some((obs_to_des, des_to_obs)) =
+        match_hybrid_by_unique_id(&desired_rows, &observed_rows, &des_uids, &obs_uids, service)
+    else {
+        return Ok(BulkDiffOutcome::Fallback);
+    };
+
+    let mut extra_des = Vec::new();
+    let mut extra_obs = Vec::new();
+    let mut extra_obs_mask = vec![false; observed_rows.len()];
+    for (o_idx, &d_opt) in obs_to_des.iter().enumerate() {
+        match d_opt {
+            None => {
+                extra_obs.push(o_idx);
+                extra_obs_mask[o_idx] = true;
+            }
+            Some(d_idx) if o_idx > 0 => {
+                let d_row = &desired_rows[d_idx];
+                let o_row = &observed_rows[o_idx];
+                let mapped_o_parent = o_row.parent_index.and_then(|p| obs_to_des[p]);
+                if d_row.name != o_row.name || d_row.parent_index != mapped_o_parent {
+                    extra_des.push(d_idx);
+                    extra_obs.push(o_idx);
+                    extra_obs_mask[o_idx] = true;
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    for (d_idx, &o_opt) in des_to_obs.iter().enumerate() {
+        if o_opt.is_none() {
+            extra_des.push(d_idx);
+        }
+    }
+    if extra_des.is_empty() && extra_obs.is_empty() {
+        crate::app::output::log_global(
+            4,
+            format_args!(
+                "[renium] bulk diff fallback ({service}): structural diff found no structural rows"
+            ),
+        );
+        return Ok(BulkDiffOutcome::Fallback);
+    }
+    if extra_des.len().max(extra_obs.len()) > MAX_HYBRID_EXTRA_ROWS {
+        crate::app::output::log_global(
+            4,
+            format_args!(
+                "[renium] bulk diff fallback ({service}): structural extra rows des={} obs={} exceeds limit",
+                extra_des.len(),
+                extra_obs.len()
+            ),
+        );
+        return Ok(BulkDiffOutcome::Fallback);
+    }
+
+    let (Some((obs_ordinals, obs_pkg_root, _)), Some((_, des_pkg_root, des_is_twin))) = (
+        compute_single_store_topology(&observed_rows),
+        compute_single_store_topology(&desired_rows),
+    ) else {
+        crate::app::output::log_global(
+            4,
+            format_args!("[renium] bulk diff fallback ({service}): structural topology invalid"),
+        );
+        return Ok(BulkDiffOutcome::Fallback);
+    };
+
+    let des_blocks_by_span: AHashMap<(usize, usize), usize> = desired
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(idx, b)| ((b.first, b.count), idx))
+        .collect();
+    let mut aligned_blocks = Vec::new();
+    let mut permuted_pairs = Vec::new();
+    for (o_block_index, block) in observed.blocks.iter().enumerate() {
+        let d_block_index = des_blocks_by_span.get(&(block.first, block.count)).copied();
+        let aligned = d_block_index.is_some()
+            && (block.first..block.first + block.count)
+                .all(|o| obs_to_des[o] == Some(o) && !extra_obs_mask[o]);
+        if let (Some(d_idx), true) = (d_block_index, aligned) {
+            aligned_blocks.push((d_idx, o_block_index));
+        } else {
+            for o in block.first..block.first + block.count {
+                if let Some(d) = obs_to_des[o] {
+                    permuted_pairs.push((d, o));
+                }
+            }
+        }
+    }
+
+    let database = rbx_reflection_database::get()?;
+    let ctx = BulkDiffContext {
+        desired,
+        observed,
+        desired_rows: &desired_rows,
+        obs_to_des_opt: obs_to_des,
+        is_identity_perm: false,
+        is_twin: &des_is_twin,
+        database,
+        service,
+    };
+
+    let block_results = aligned_blocks
+        .par_iter()
+        .map(|&(d_block_index, o_block_index)| {
+            diff_aligned_block(&ctx, d_block_index, o_block_index)
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let mut edits = Vec::new();
-    for part in chunk_results {
-        match part {
-            ChunkResult::Fallback => return Ok(None),
-            ChunkResult::Edits(mut chunk_edits) => edits.append(&mut chunk_edits),
+    let mut all_edits = Vec::new();
+    let mut non_bulk_extra = Vec::new();
+    for result in block_results {
+        match result {
+            BlockResult::Fallback => return Ok(BulkDiffOutcome::Fallback),
+            BlockResult::Edits(mut block_edits, mut block_extra) => {
+                all_edits.append(&mut block_edits);
+                non_bulk_extra.append(&mut block_extra);
+            }
         }
     }
-    Ok(Some(edits))
+    if !permuted_pairs.is_empty() {
+        let Some((mut permuted_edits, mut permuted_extra)) =
+            diff_permuted_pairs(&ctx, &permuted_pairs, true)?
+        else {
+            return Ok(BulkDiffOutcome::Fallback);
+        };
+        all_edits.append(&mut permuted_edits);
+        non_bulk_extra.append(&mut permuted_extra);
+    }
+
+    for (d_row, o_row) in non_bulk_extra {
+        extra_des.push(d_row);
+        extra_obs.push(o_row);
+        extra_obs_mask[o_row] = true;
+    }
+    extra_des.sort_unstable();
+    extra_des.dedup();
+    extra_obs.sort_unstable();
+    extra_obs.dedup();
+    if extra_des.len().max(extra_obs.len()) > MAX_HYBRID_EXTRA_ROWS {
+        crate::app::output::log_global(
+            4,
+            format_args!(
+                "[renium] bulk diff fallback ({service}): structural combined extra rows des={} obs={} exceeds limit",
+                extra_des.len(),
+                extra_obs.len()
+            ),
+        );
+        return Ok(BulkDiffOutcome::Fallback);
+    }
+    // Include namesake siblings materialized by prepare_hybrid_bulk_delta so
+    // the delta does not emit duplicate resets for properties patch writes.
+    let mut handled_obs_mask = extra_obs_mask.clone();
+    let mut namesake_obs_keys: AHashSet<(Option<usize>, &str)> = AHashSet::new();
+    let mut namesake_des_keys: AHashSet<(Option<usize>, &str)> = AHashSet::new();
+    for &o_idx in &extra_obs {
+        if let Some(p) = observed_rows[o_idx].parent_index {
+            namesake_obs_keys.insert((Some(p), observed_rows[o_idx].name.as_str()));
+        }
+    }
+    for &d_idx in &extra_des {
+        if let Some(p) = desired_rows[d_idx].parent_index {
+            namesake_des_keys.insert((Some(p), desired_rows[d_idx].name.as_str()));
+        }
+    }
+    if !namesake_obs_keys.is_empty() {
+        for (o_idx, inst) in observed_rows.iter().enumerate() {
+            if namesake_obs_keys.contains(&(inst.parent_index, inst.name.as_str())) {
+                handled_obs_mask[o_idx] = true;
+            }
+        }
+    }
+    if !namesake_des_keys.is_empty() {
+        for (d_idx, inst) in desired_rows.iter().enumerate() {
+            if namesake_des_keys.contains(&(inst.parent_index, inst.name.as_str()))
+                && let Some(o_idx) = des_to_obs[d_idx]
+            {
+                handled_obs_mask[o_idx] = true;
+            }
+        }
+    }
+    let mut bulk_handled_on_extra = Vec::new();
+    for edit in &all_edits {
+        if let BulkEdit::Property(o_row, prop_name, _) = edit
+            && handled_obs_mask[*o_row]
+        {
+            bulk_handled_on_extra.push((*o_row, prop_name.clone()));
+        }
+    }
+    all_edits.retain(|edit| !extra_obs_mask[edit.row()] || matches!(edit, BulkEdit::Property(..)));
+    if all_edits.iter().any(|edit| {
+        let o_row = edit.row();
+        obs_pkg_root[o_row].is_some()
+            || ctx.obs_to_des_opt[o_row].is_some_and(|d_row| des_pkg_root[d_row].is_some())
+    }) {
+        crate::app::output::log_global(
+            4,
+            format_args!(
+                "[renium] bulk diff fallback ({service}): structural edit inside linked package"
+            ),
+        );
+        return Ok(BulkDiffOutcome::Fallback);
+    }
+    let Some((patch, _)) = build_bulk_property_patch_with_rows(
+        &observed_rows,
+        &obs_ordinals,
+        &obs_pkg_root,
+        all_edits,
+        database,
+        service,
+        min_instances,
+    ) else {
+        crate::app::output::log_global(
+            4,
+            format_args!(
+                "[renium] bulk diff fallback ({service}): structural hybrid patch below threshold"
+            ),
+        );
+        return Ok(BulkDiffOutcome::Fallback);
+    };
+
+    crate::app::output::log_global(
+        4,
+        format_args!(
+            "[renium] bulk diff hybrid ({service}): structural bulk_instances={} extra_des={} extra_obs={}",
+            patch.instance_count,
+            extra_des.len(),
+            extra_obs.len(),
+        ),
+    );
+    let obs_to_des = ctx.obs_to_des_opt;
+    Ok(BulkDiffOutcome::Hybrid(Box::new(BulkHybridDelta {
+        patch,
+        extra_desired_rows: extra_des,
+        extra_observed_rows: extra_obs,
+        bulk_handled_on_extra,
+        obs_to_des,
+        desired_skeleton: desired_rows,
+        observed_skeleton: observed_rows,
+    })))
 }
 
 fn decode_block_attributes(
@@ -6649,7 +7282,7 @@ mod tests {
             &open_d,
             &store_o,
             &open_o,
-            Some(&[0, 2, 1]),
+            Some(&[Some(0), Some(2), Some(1)]),
         )
         .unwrap();
         assert!(!eq, "out-of-bounds ref_b under permutation must not match");
@@ -6684,7 +7317,7 @@ mod tests {
             &open_d,
             &store_o,
             &open_o,
-            Some(&[0, 2, 1]),
+            Some(&[Some(0), Some(2), Some(1)]),
         )
         .unwrap();
         assert!(
@@ -7420,5 +8053,154 @@ mod tests {
             ),
             "Earlier 4: Float64 NumberValue.Value 1e-8 delta must produce a patch in bulk diff"
         );
+    }
+
+    #[test]
+    fn hybrid_diff_routes_session_lock_to_fallback_and_camera_source_unresolved_to_extra() {
+        let mut d_doc = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![SettingsBytecodeInstance::new(
+                "ws".into(),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            )],
+        };
+        for i in 1..=4 {
+            let mut p = SettingsBytecodeInstance::new(
+                format!("p{i}"),
+                format!("P{i}"),
+                "Part".into(),
+                Some(0),
+            );
+            p.properties.insert("Transparency".into(), json!(0.0));
+            d_doc.instances.push(p);
+        }
+        d_doc.instances.push(SettingsBytecodeInstance::new(
+            "cam".into(),
+            "Camera".into(),
+            "Camera".into(),
+            Some(0),
+        ));
+        d_doc.instances.push(SettingsBytecodeInstance::new(
+            "lock".into(),
+            "__Renium_SessionLock".into(),
+            "Folder".into(),
+            Some(0),
+        ));
+        d_doc.instances.push(SettingsBytecodeInstance::new(
+            "scr".into(),
+            "S".into(),
+            "Script".into(),
+            Some(0),
+        ));
+        let mut o_doc = d_doc.clone();
+        for i in 1..=4 {
+            o_doc.instances[i]
+                .properties
+                .insert("Transparency".into(), json!(0.5));
+        }
+        // SessionLock attribute diff must always force full Fallback.
+        o_doc.instances[6]
+            .attributes
+            .insert("Holder".into(), json!("other"));
+        let d_bytes = encode_settings_bytecode(&d_doc).unwrap();
+        let o_bytes = encode_settings_bytecode(&o_doc).unwrap();
+        assert!(matches!(
+            diff_v12_bulk_plain_properties(&d_bytes, &o_bytes, "Workspace", 2).unwrap(),
+            BulkDiffOutcome::Fallback
+        ));
+
+        // Camera, Script.Source, and Archivable route to Hybrid extra.
+        o_doc.instances[6].attributes.clear();
+        o_doc.instances[5]
+            .properties
+            .insert("FieldOfView".into(), json!(90.0));
+        o_doc.instances[7]
+            .properties
+            .insert("Source".into(), json!("print(1)"));
+        o_doc.instances[1]
+            .properties
+            .insert("Archivable".into(), json!(false));
+        let o_bytes = encode_settings_bytecode(&o_doc).unwrap();
+        let BulkDiffOutcome::Hybrid(hybrid) =
+            diff_v12_bulk_plain_properties(&d_bytes, &o_bytes, "Workspace", 2).unwrap()
+        else {
+            panic!("expected Hybrid outcome for Camera, Source, and Archivable");
+        };
+        assert!(hybrid.extra_desired_rows.contains(&1));
+        assert!(hybrid.extra_desired_rows.contains(&5));
+        assert!(hybrid.extra_desired_rows.contains(&7));
+
+        // Differing pooled markers and unresolved defaults route to Hybrid extra.
+        let mut marker_d = d_doc.clone();
+        let big_a = "A".repeat(4096);
+        let big_b = "B".repeat(4096);
+        marker_d.instances[7]
+            .properties
+            .insert("Source".into(), json!(big_a));
+        marker_d.instances.push(SettingsBytecodeInstance::new(
+            "mdl".into(),
+            "M".into(),
+            "Model".into(),
+            Some(0),
+        ));
+        let mut marker_o = marker_d.clone();
+        for i in 1..=4 {
+            marker_o.instances[i]
+                .properties
+                .insert("Transparency".into(), json!(0.5));
+        }
+        marker_o.instances[7]
+            .properties
+            .insert("Source".into(), json!(big_b));
+        marker_o.instances[8]
+            .properties
+            .insert("Scale".into(), json!(1.5));
+        let md_bytes = encode_settings_bytecode(&marker_d).unwrap();
+        let mo_bytes = encode_settings_bytecode(&marker_o).unwrap();
+        let BulkDiffOutcome::Hybrid(marker_hybrid) =
+            diff_v12_bulk_plain_properties(&md_bytes, &mo_bytes, "Workspace", 2).unwrap()
+        else {
+            panic!("expected Hybrid outcome for pooled marker and unresolved default");
+        };
+        assert!(marker_hybrid.extra_desired_rows.contains(&7));
+        assert!(marker_hybrid.extra_desired_rows.contains(&8));
+
+        // Class change on a matched UniqueId must fall back to full reconciliation.
+        let mut class_d = d_doc.clone();
+        for i in 1..=4 {
+            class_d.instances[i].properties.insert(
+                "UniqueId".into(),
+                json!({"_type": "UniqueId", "value": format!("{:032x}", i + 500)}),
+            );
+        }
+        let mut class_o = class_d.clone();
+        for i in 1..=4 {
+            class_o.instances[i]
+                .properties
+                .insert("Transparency".into(), json!(0.5));
+        }
+        class_o.instances[1].class_name = "WedgePart".into();
+        let cd_bytes = encode_settings_bytecode(&class_d).unwrap();
+        let co_bytes = encode_settings_bytecode(&class_o).unwrap();
+        assert!(matches!(
+            diff_v12_bulk_plain_properties(&cd_bytes, &co_bytes, "Workspace", 2).unwrap(),
+            BulkDiffOutcome::Fallback
+        ));
+
+        // Class change without UniqueId at the same parent and name must also fall back.
+        let mut no_uid_o = d_doc.clone();
+        for i in 1..=4 {
+            no_uid_o.instances[i]
+                .properties
+                .insert("Transparency".into(), json!(0.5));
+        }
+        no_uid_o.instances[1].class_name = "WedgePart".into();
+        let nu_bytes = encode_settings_bytecode(&no_uid_o).unwrap();
+        assert!(matches!(
+            diff_v12_bulk_plain_properties(&d_bytes, &nu_bytes, "Workspace", 2).unwrap(),
+            BulkDiffOutcome::Fallback
+        ));
     }
 }

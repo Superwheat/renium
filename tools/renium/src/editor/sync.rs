@@ -2225,7 +2225,7 @@ where
 /// that hold them. The values they held are then read by path before the
 /// anchors are resolved, which finds the same instances only where each
 /// anchor stands in Studio at the place the files give it.
-fn changes_instances(changes: &[super::types::EditorInstanceChange]) -> bool {
+pub(crate) fn changes_instances(changes: &[super::types::EditorInstanceChange]) -> bool {
     let in_place = |instance: &super::types::EditorInstanceDescriptor| {
         let ordinal = |ordinals: &[usize], at: usize| ordinals.get(at).copied().unwrap_or(1);
         // An identity of Studio's capture names its instance whatever the

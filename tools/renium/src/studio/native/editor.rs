@@ -5194,25 +5194,41 @@ fn combined_editor_change_batch(
 }
 
 fn pre_import_property(change: &EditorPropertyChange, name: &str, native_import: bool) -> bool {
-    change.service == change.class_name
-        && change.path_segments == [change.class_name.as_str()]
-        && (matches!(
+    let service_root =
+        change.service == change.class_name && change.path_segments == [change.class_name.as_str()];
+    if service_root
+        && matches!(
             (change.class_name.as_str(), name),
             ("MaterialService", "Use2022Materials")
-        ) || native_import
-            && matches!(
-                (change.class_name.as_str(), name),
-                ("Lighting", "LightingStyle" | "PrioritizeLightingQuality")
-                    | (
-                        "Workspace",
-                        "StreamingEnabled"
-                            | "StreamingIntegrityMode"
-                            | "StreamOutBehavior"
-                            | "ModelStreamingBehavior"
-                            | "StreamingTargetRadius"
-                            | "StreamingMinRadius"
-                    )
-            ))
+        )
+    {
+        return true;
+    }
+    if !native_import {
+        return false;
+    }
+    if service_root
+        && (matches!(
+            (change.class_name.as_str(), name),
+            ("Lighting", "LightingStyle" | "PrioritizeLightingQuality")
+                | (
+                    "Workspace",
+                    "StreamingEnabled"
+                        | "StreamingIntegrityMode"
+                        | "StreamOutBehavior"
+                        | "ModelStreamingBehavior"
+                        | "StreamingTargetRadius"
+                        | "StreamingMinRadius"
+                )
+        ) || crate::editor::native_roots::is_property(&change.class_name, name))
+    {
+        return true;
+    }
+    change.path_segments.len() == 2
+        && change.path_segments[0] == change.service
+        && change.path_segments[1] == change.class_name
+        && crate::roblox::services::is_engine_managed_container(&change.service, &change.class_name)
+        && crate::editor::native_roots::is_property(&change.class_name, name)
 }
 
 fn collect_post_import_property_changes(
@@ -5354,6 +5370,7 @@ fn build_inline_verify_rows(
     container_settings: &[EditorPropertyChange],
     property_changes: &[EditorPropertyChange],
     pre_import_verification: &crate::editor::native_roots::NativeRootVerification,
+    strip_terrain_grids: bool,
 ) -> Option<Vec<EditorPropertyChange>> {
     let total = container_settings.len() + property_changes.len();
     if total == 0 || total > PROPERTY_BATCH_MAX_ITEMS {
@@ -5363,6 +5380,10 @@ fn build_inline_verify_rows(
     for row in container_settings.iter().chain(property_changes.iter()) {
         let mut row = row.clone();
         pre_import_verification.remove_verified_properties(&mut row);
+        if strip_terrain_grids && row.class_name == "Terrain" {
+            row.properties
+                .retain(|name, _| !matches!(name.as_str(), "SmoothGrid" | "PhysicsGrid"));
+        }
         rows.push(row);
     }
     Some(rows)
@@ -5503,6 +5524,13 @@ pub(crate) fn send_editor_change_batches_with_options(
         merge_editor_summary_checked(&mut summary, &result)?;
         pre_import_verification =
             crate::editor::native_roots::apply(bridge, &mut summary, transaction_id)?;
+        if native_import {
+            // Do not credit pre-import writes before the native loader runs;
+            // non-grid fields stay in post-import verification and Terrain grids
+            // are re-read after the loader finishes.
+            pre_import_verification =
+                crate::editor::native_roots::NativeRootVerification::default();
+        }
         log_timing("native editor pre-import root apply", started);
     }
 
@@ -5531,6 +5559,7 @@ pub(crate) fn send_editor_change_batches_with_options(
                 &container_settings,
                 &property_changes,
                 &pre_import_verification,
+                native_import,
             )
         } else {
             None
@@ -5578,6 +5607,40 @@ pub(crate) fn send_editor_change_batches_with_options(
             "binaryInstances".to_string(),
             json!(binary_import.instance_count as u64),
         );
+    }
+
+    let has_other_changes = binary_import.is_some()
+        || !changes.instance_changes.is_empty()
+        || !changes.source_changes.is_empty()
+        || !changes.property_changes.is_empty();
+    let (before_delta_patches, after_delta_patches) = partition_bulk_patches_by_service(
+        &changes.bulk_property_patches,
+        &changes.instance_changes,
+    );
+    let mut bulk_verified_services = std::collections::BTreeSet::new();
+    let mut commit_result = None;
+    let mut release_result = None;
+    if !before_delta_patches.is_empty() {
+        let started = Instant::now();
+        let (verified, _, _) = send_bulk_property_patches(
+            bridge,
+            &before_delta_patches,
+            transaction_id,
+            false,
+            None,
+            &mut summary,
+        )?;
+        log_timing("native editor bulk property patches", started);
+        bulk_verified_services.extend(verified);
+        if summary.get("fallbackFullCapture").and_then(Value::as_bool) == Some(true) {
+            return Ok(EditorBatchResult {
+                summary,
+                individual_dispatches: 0,
+                commit_result: None,
+                release_result: None,
+                post_import_sources: None,
+            });
+        }
     }
 
     if binary_import.is_none()
@@ -5805,7 +5868,6 @@ pub(crate) fn send_editor_change_batches_with_options(
     }
     log_timing("native editor property batches", started);
 
-    let started = Instant::now();
     // Native mesh writes rebuild geometry, which moves welded neighbours and
     // resizes the part, so the rows written before them are applied again.
     let post_writes = NativePostWriteCounts::from_summary(&summary);
@@ -5842,6 +5904,18 @@ pub(crate) fn send_editor_change_batches_with_options(
         let _ = &inline_verify_rows_kept;
         None
     };
+    if native_import && !pre_import_changes.is_empty() {
+        let terrain_started = Instant::now();
+        pre_import_verification = crate::editor::native_roots::verify_terrain_grids_after_import(
+            bridge,
+            &pre_import_changes,
+        );
+        log_timing(
+            "native editor post-import terrain verification",
+            terrain_started,
+        );
+    }
+    let started = Instant::now();
     let mut native_root_verification =
         crate::editor::native_roots::apply(bridge, &mut summary, transaction_id)?;
     native_root_verification.extend(pre_import_verification);
@@ -5941,22 +6015,34 @@ pub(crate) fn send_editor_change_batches_with_options(
         summary.insert("nativeVerifiedServices".into(), json!(services));
         log_timing("native editor supplemental verification", started);
     }
-    let (bulk_verified_services, commit_result, release_result) =
-        if !changes.bulk_property_patches.is_empty() {
-            let started = Instant::now();
-            let (verified, commit_result, release_result) = send_bulk_property_patches(
-                bridge,
-                &changes.bulk_property_patches,
-                transaction_id,
-                inline_commit,
-                inline_release,
-                &mut summary,
-            )?;
-            log_timing("native editor bulk property patches", started);
-            (verified, commit_result, release_result)
-        } else {
-            (std::collections::BTreeSet::new(), None, None)
-        };
+    let has_scale_root_write = changes.property_changes.iter().any(|row| {
+        matches!(row.class_name.as_str(), "Model" | "WorldModel")
+            && (row.properties.contains_key("Scale")
+                || row.reset_properties.iter().any(|name| name == "Scale"))
+    });
+    if !before_delta_patches.is_empty()
+        && (mesh_writes || geometry_writes > 0 || has_scale_root_write)
+    {
+        for patch in &before_delta_patches {
+            bulk_verified_services.remove(&patch.service);
+        }
+    }
+    if !after_delta_patches.is_empty() {
+        let started = Instant::now();
+        let can_inline = inline_commit && !has_other_changes && before_delta_patches.is_empty();
+        let (verified, committed, released) = send_bulk_property_patches(
+            bridge,
+            &after_delta_patches,
+            transaction_id,
+            can_inline,
+            if can_inline { inline_release } else { None },
+            &mut summary,
+        )?;
+        log_timing("native editor bulk property patches", started);
+        bulk_verified_services.extend(verified);
+        commit_result = committed;
+        release_result = released;
+    }
     verify_in_place_editor_fields(
         bridge,
         changes,
@@ -6482,6 +6568,11 @@ fn verify_in_place_editor_fields(
                     .source_changes
                     .iter()
                     .any(|change| change.service == *service && change.deleted)
+                && (!changes
+                    .bulk_property_patches
+                    .iter()
+                    .any(|patch| patch.service == *service)
+                    || bulk_verified_services.contains(*service))
                 && binary_import.is_none_or(|import| {
                     !import.groups.iter().any(|group| group.service == *service)
                         || (import.native_replacement.is_some()
@@ -6810,6 +6901,27 @@ fn unreadable_property_rows(
     Ok(selected)
 }
 
+fn partition_bulk_patches_by_service(
+    patches: &[crate::editor::types::EditorBulkPropertyPatch],
+    instance_changes: &[crate::editor::types::EditorInstanceChange],
+) -> (
+    Vec<crate::editor::types::EditorBulkPropertyPatch>,
+    Vec<crate::editor::types::EditorBulkPropertyPatch>,
+) {
+    let structural_services: std::collections::HashSet<&str> = instance_changes
+        .iter()
+        .filter(|change| crate::editor::sync::changes_instances(std::slice::from_ref(*change)))
+        .map(|change| change.service.as_str())
+        .collect();
+    patches
+        .iter()
+        .cloned()
+        .partition(|patch| structural_services.contains(patch.service.as_str()))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+const UNREADABLE_PROPERTY_BATCH_LIMIT: usize = 32;
+
 #[cfg(any(windows, target_os = "macos"))]
 fn unreadable_property_batch(
     pid: u32,
@@ -6819,7 +6931,10 @@ fn unreadable_property_batch(
 ) -> Result<Vec<bool>> {
     #[cfg(windows)]
     {
-        anyhow::ensure!(fields.len() <= 32, "Supplemental read exceeds batch bound");
+        anyhow::ensure!(
+            fields.len() <= UNREADABLE_PROPERTY_BATCH_LIMIT,
+            "Supplemental read exceeds batch bound"
+        );
         let paths = fields
             .iter()
             .map(|(index, _)| serializer::NativePropertyPath {
@@ -6866,17 +6981,32 @@ fn verify_unreadable_properties(
     let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
     let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
     let title = serializer::target_name(pid, &info.place_name)?;
-    let mut batched = unreadable_property_batch(pid, &title, rows, &fields)
-        .unwrap_or_else(|error| {
-            crate::app::output::log_global(
-                5,
-                format_args!(
-                    "[renium] native supplemental batch unavailable; using single reads: {error:#}"
-                ),
-            );
-            Vec::new()
-        })
-        .into_iter();
+    let mut batched_values = Vec::with_capacity(fields.len());
+    let mut batch_ok = true;
+    for chunk in fields.chunks(UNREADABLE_PROPERTY_BATCH_LIMIT) {
+        match unreadable_property_batch(pid, &title, rows, chunk) {
+            Ok(values) if values.len() == chunk.len() => batched_values.extend(values),
+            Ok(_) => {
+                batch_ok = false;
+                break;
+            }
+            Err(error) => {
+                crate::app::output::log_global(
+                    5,
+                    format_args!(
+                        "[renium] native supplemental batch unavailable; using single reads: {error:#}"
+                    ),
+                );
+                batch_ok = false;
+                break;
+            }
+        }
+    }
+    let mut batched = if batch_ok {
+        batched_values.into_iter()
+    } else {
+        Vec::new().into_iter()
+    };
     let mut verified = 0;
     for (index, name) in fields {
         let row = &rows[index];
@@ -7233,7 +7363,106 @@ mod source_change_tests {
             path_segments: vec!["Workspace".into(), "Terrain".into()],
             ..Default::default()
         };
-        assert!(!pre_import_property(&terrain, "SmoothGrid", true));
+        assert!(pre_import_property(&terrain, "SmoothGrid", true));
+        assert!(!pre_import_property(&terrain, "SmoothGrid", false));
+        assert!(!pre_import_property(&terrain, "WaterColor", true));
+
+        let ws = EditorPropertyChange {
+            service: "Workspace".into(),
+            class_name: "Workspace".into(),
+            path_segments: vec!["Workspace".into()],
+            properties: serde_json::from_value(json!({"UseNewLuauTypeSolver": "Enabled"})).unwrap(),
+            ..Default::default()
+        };
+        let mut terrain_row = terrain.clone();
+        terrain_row.properties = serde_json::from_value(json!({
+            "SmoothGrid": {"_type": "BinaryString", "base64": "AQ=="},
+            "Decoration": true,
+        }))
+        .unwrap();
+        let rows = build_inline_verify_rows(
+            &[ws, terrain_row],
+            &[],
+            &crate::editor::native_roots::NativeRootVerification::default(),
+            true,
+        )
+        .unwrap();
+        assert!(rows[0].properties.contains_key("UseNewLuauTypeSolver"));
+        assert!(!rows[1].properties.contains_key("SmoothGrid"));
+        assert!(rows[1].properties.contains_key("Decoration"));
+    }
+
+    #[test]
+    fn bulk_patch_order_is_decided_per_patch_service() {
+        use crate::editor::types::{
+            EditorBulkPropertyPatch, EditorInstanceChange, EditorInstanceDescriptor,
+        };
+        let ws_patch = EditorBulkPropertyPatch {
+            service: "Workspace".into(),
+            strings: Vec::new(),
+            nodes: Vec::new(),
+            columns: Vec::new(),
+            field_count: 1,
+            instance_count: 1,
+            expected_terrain_digest: None,
+            return_old_values: false,
+            package_targets: Vec::new(),
+        };
+        let rs_new_folder = EditorInstanceChange {
+            service: "ReplicatedStorage".into(),
+            mode: "upsertInstances".into(),
+            allow_deletes: false,
+            instances: vec![EditorInstanceDescriptor {
+                settings_id: "f1".into(),
+                class_name: "Folder".into(),
+                path_segments: vec!["ReplicatedStorage".into(), "NewFolder".into()],
+                path_ordinals: vec![1, 1],
+                ..Default::default()
+            }],
+            preserve_instances: Vec::new(),
+        };
+        let ws_anchor_only = EditorInstanceChange {
+            service: "Workspace".into(),
+            mode: "upsertInstances".into(),
+            allow_deletes: false,
+            instances: vec![EditorInstanceDescriptor {
+                settings_id: "m1".into(),
+                class_name: "MeshPart".into(),
+                path_segments: vec!["Workspace".into(), "MeshA".into()],
+                path_ordinals: vec![1, 1],
+                anchor_only: true,
+                ..Default::default()
+            }],
+            preserve_instances: Vec::new(),
+        };
+        let (before, after) = partition_bulk_patches_by_service(
+            std::slice::from_ref(&ws_patch),
+            &[rs_new_folder.clone(), ws_anchor_only],
+        );
+        assert!(before.is_empty());
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].service, "Workspace");
+
+        let ws_structural = EditorInstanceChange {
+            service: "Workspace".into(),
+            mode: "upsertInstances".into(),
+            allow_deletes: false,
+            instances: vec![EditorInstanceDescriptor {
+                settings_id: "p1".into(),
+                class_name: "Part".into(),
+                path_segments: vec!["Workspace".into(), "MovedPart".into()],
+                path_ordinals: vec![1, 1],
+                ..Default::default()
+            }],
+            preserve_instances: Vec::new(),
+        };
+        let (before, after) = partition_bulk_patches_by_service(
+            std::slice::from_ref(&ws_patch),
+            &[rs_new_folder, ws_structural],
+        );
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].service, "Workspace");
+        assert!(after.is_empty());
     }
 
     #[test]
