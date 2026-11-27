@@ -6783,6 +6783,7 @@ struct VerifyObsAttrBlocks<'a> {
 
 #[derive(Clone, Copy)]
 enum FastVerifyVal<'a> {
+    Null,
     Bool(bool),
     I64(i64),
     U64(u64),
@@ -6804,6 +6805,11 @@ enum FastVerifyVal<'a> {
         pool: Option<usize>,
     },
     Tags(usize, usize),
+    RawComplex {
+        kind: u8,
+        bytes: &'a [u8],
+        block: usize,
+    },
     Unsupported,
 }
 
@@ -6904,6 +6910,7 @@ struct VerifyGroupSource<'a> {
     str_opts: &'a [Option<&'a str>],
     str_pool: &'a [Option<usize>],
     row_map: Option<&'a [u32]>,
+    block: usize,
 }
 
 struct VerifyGroupBuffers<'a, 'b> {
@@ -6949,6 +6956,7 @@ fn decode_verify_group_into<'a>(
         };
         let val = decode_verify_wire_val(
             &mut reader,
+            body,
             (name, kind, &cframe, &mut prev_ref),
             src,
             buf.cframes,
@@ -6966,13 +6974,14 @@ fn decode_verify_group_into<'a>(
 
 fn decode_verify_wire_val<'a>(
     reader: &mut BytecodeReader<'_>,
+    body: &'a [u8],
     (name, kind, cframe, prev_ref): (&str, u8, &CFrameGroupDecoder, &mut usize),
     src: &VerifyGroupSource<'a>,
     cframes: &mut Vec<[f64; 12]>,
     tags: &mut Vec<&'a str>,
 ) -> Result<FastVerifyVal<'a>> {
     let val = match kind {
-        0 => FastVerifyVal::Unsupported,
+        0 => FastVerifyVal::Null,
         1 => FastVerifyVal::Bool(false),
         2 => FastVerifyVal::Bool(true),
         3 => FastVerifyVal::I64(unzigzag_i64(reader.read_var_u64()?)),
@@ -7042,7 +7051,20 @@ fn decode_verify_wire_val<'a>(
                 tags.truncate(start);
                 reader.set_position(save);
                 skip_raw_value_payload_fast(reader, 7, 0)?;
-                FastVerifyVal::Unsupported
+                FastVerifyVal::RawComplex {
+                    kind: 7,
+                    bytes: &body[save..reader.position()],
+                    block: src.block,
+                }
+            }
+        }
+        7 | 9 | 21 => {
+            let save = reader.position();
+            skip_raw_value_payload_fast(reader, kind, 0)?;
+            FastVerifyVal::RawComplex {
+                kind,
+                bytes: &body[save..reader.position()],
+                block: src.block,
             }
         }
         8 => {
@@ -7065,7 +7087,11 @@ fn decode_verify_wire_val<'a>(
                 None => {
                     reader.set_position(save);
                     skip_raw_value_payload_fast(reader, 8, 0)?;
-                    FastVerifyVal::Unsupported
+                    FastVerifyVal::RawComplex {
+                        kind: 8,
+                        bytes: &body[save..reader.position()],
+                        block: src.block,
+                    }
                 }
             }
         }
@@ -7096,31 +7122,66 @@ struct FastVerifyStores<'a> {
     des_hulls: ShardedMap<usize, Option<u8>>,
     obs_hulls: ShardedMap<usize, Option<u8>>,
     obs_opened: Vec<Mutex<Option<Arc<OpenBlock>>>>,
+    obs_remaining: Vec<AtomicUsize>,
 }
 
+const MAX_FAST_VERIFY_OBS_BYTES: usize = 32 * 1024 * 1024;
+
 impl<'s> FastVerifyStores<'s> {
+    fn obs_blocks_within_budget(&self, obs_blocks_used: &[usize]) -> bool {
+        !obs_blocks_used.is_empty()
+            && obs_blocks_used
+                .iter()
+                .try_fold(0_usize, |total, &ob| {
+                    total
+                        .checked_add(self.obs.blocks[ob].frame.decoded)
+                        .filter(|&sum| sum <= MAX_FAST_VERIFY_OBS_BYTES)
+                })
+                .is_some()
+    }
+
     fn open_obs_block(&self, idx: usize) -> Result<Arc<OpenBlock>> {
-        let mut slot = self.obs_opened[idx].lock_recover();
-        if let Some(open) = slot.as_ref() {
-            return Ok(Arc::clone(open));
-        }
+        let should_cache = {
+            let slot = self.obs_opened[idx].lock_recover();
+            if let Some(open) = slot.as_ref() {
+                return Ok(Arc::clone(open));
+            }
+            self.obs_remaining[idx].load(Ordering::Acquire) > 1
+        };
         let opened = Arc::new(self.obs.open_block(idx)?);
-        *slot = Some(Arc::clone(&opened));
+        if should_cache {
+            let mut slot = self.obs_opened[idx].lock_recover();
+            if let Some(existing) = slot.as_ref() {
+                return Ok(Arc::clone(existing));
+            }
+            *slot = Some(Arc::clone(&opened));
+        }
         Ok(opened)
+    }
+
+    fn release_obs_blocks(&self, obs_blocks_used: &[usize]) {
+        for &ob in obs_blocks_used {
+            if self.obs_remaining[ob].fetch_sub(1, Ordering::AcqRel) == 1 {
+                *self.obs_opened[ob].lock_recover() = None;
+            }
+        }
     }
 
     fn verify_block(
         &self,
         cache: &mut crate::settings::equivalence::CanonicalizeCache,
         block_idx: usize,
+        mut ok: Vec<bool>,
+        obs_blocks_used: &[usize],
     ) -> Result<Vec<bool>> {
         let block = &self.des.blocks[block_idx];
         let first = block.first;
         let count = block.count;
-        let (mut ok, obs_blocks_used) = self.eligible_rows_and_obs_blocks(first, count);
-        if obs_blocks_used.is_empty() || obs_blocks_used.len() > 4 {
+        if !self.obs_blocks_within_budget(obs_blocks_used) {
             return Ok(vec![false; count]);
         }
+        let _release =
+            crate::system::files::OnDrop::new(|| self.release_obs_blocks(obs_blocks_used));
 
         let des_open = self.des.open_block(block_idx)?;
         let Some((des_str_opts, des_str_pool, des_prop_names)) = build_block_string_meta(&des_open)
@@ -7128,7 +7189,7 @@ impl<'s> FastVerifyStores<'s> {
             return Ok(vec![false; count]);
         };
         let mut obs_opens: Vec<Arc<OpenBlock>> = Vec::with_capacity(obs_blocks_used.len());
-        for &ob in &obs_blocks_used {
+        for &ob in obs_blocks_used {
             obs_opens.push(self.open_obs_block(ob)?);
         }
         let mut obs_metas = Vec::with_capacity(obs_opens.len());
@@ -7139,7 +7200,7 @@ impl<'s> FastVerifyStores<'s> {
             obs_metas.push(meta);
         }
 
-        let obs_maps = self.build_obs_row_maps(first, &ok, &obs_blocks_used);
+        let obs_maps = self.build_obs_row_maps(first, &ok, obs_blocks_used);
         let (des_specs, des_attr_groups, des_prop_order) =
             parse_block_group_specs(&des_open, &des_prop_names)?;
         let mut obs_specs_all: Vec<Vec<BlockGroupSpec<'_>>> = Vec::with_capacity(obs_opens.len());
@@ -7159,7 +7220,7 @@ impl<'s> FastVerifyStores<'s> {
                 first,
                 (&des_open, &des_specs, &des_attr_groups),
                 &VerifyObsAttrBlocks {
-                    blocks_used: &obs_blocks_used,
+                    blocks_used: obs_blocks_used,
                     opens: &obs_opens,
                     maps: &obs_maps,
                     specs: &obs_specs_all,
@@ -7182,6 +7243,8 @@ impl<'s> FastVerifyStores<'s> {
         all_names.dedup();
 
         let mut scratch = VerifyBlockScratch::new(count);
+        let mut used_exact_special = vec![false; count];
+        let mut had_one_sided = vec![false; count];
         let mut di = 0_usize;
         let mut ois: Vec<usize> = vec![0; obs_opens.len()];
         let des_src = VerifyGroupSource {
@@ -7190,6 +7253,7 @@ impl<'s> FastVerifyStores<'s> {
             str_opts: &des_str_opts,
             str_pool: &des_str_pool,
             row_map: None,
+            block: 0,
         };
 
         for name in all_names {
@@ -7225,6 +7289,7 @@ impl<'s> FastVerifyStores<'s> {
                     str_opts: &obs_metas[k].0,
                     str_pool: &obs_metas[k].1,
                     row_map: Some(&obs_maps[k]),
+                    block: k,
                 };
                 for &gidx in &order[start..ois[k]] {
                     let mut buf = VerifyGroupBuffers {
@@ -7238,7 +7303,20 @@ impl<'s> FastVerifyStores<'s> {
                     decode_verify_group_into(specs[gidx], &obs_src, &ok, &mut buf)?;
                 }
             }
-            self.verify_property_rows(cache, first, name, &mut scratch, &mut ok)?;
+            self.verify_property_rows(
+                cache,
+                first,
+                name,
+                &mut scratch,
+                (&des_open, &obs_opens),
+                (&mut used_exact_special, &mut had_one_sided),
+                &mut ok,
+            )?;
+        }
+        for row in 0..count {
+            if used_exact_special[row] && had_one_sided[row] {
+                ok[row] = false;
+            }
         }
         Ok(ok)
     }
@@ -7379,6 +7457,8 @@ impl<'s> FastVerifyStores<'s> {
         first: usize,
         name: &str,
         scratch: &mut VerifyBlockScratch<'a>,
+        blocks: (&OpenBlock, &[Arc<OpenBlock>]),
+        (used_exact_special, had_one_sided): (&mut [bool], &mut [bool]),
         ok: &mut [bool],
     ) -> Result<()>
     where
@@ -7389,10 +7469,8 @@ impl<'s> FastVerifyStores<'s> {
             reconciliation_property_is_derived,
         };
 
-        let is_unsupported_prop = matches!(
-            name,
-            "Attributes" | "TextScaled" | "TextWrapped" | "CurrentCamera" | "PhysicsGrid"
-        );
+        let is_unsupported_prop = matches!(name, "Attributes" | "CurrentCamera" | "PhysicsGrid");
+        let is_exact_only_prop = matches!(name, "TextScaled" | "TextWrapped");
         let is_skipped_meta = matches!(name, "UniqueId" | "HistoryId" | "ScriptGuid")
             || reconciliation_property_is_derived(name);
         scratch.class_engine.clear();
@@ -7411,11 +7489,22 @@ impl<'s> FastVerifyStores<'s> {
             }
             let global = first + row;
             let class_name = self.input.desired_instances[global].class_name.as_str();
-            if !matches!(
-                cache.property_canonical(class_name, name),
-                PropertyCanonical::Unchanged
-            ) {
-                ok[row] = false;
+            if is_exact_only_prop
+                || !matches!(
+                    cache.property_canonical(class_name, name),
+                    PropertyCanonical::Unchanged
+                )
+            {
+                let matched = match (dv, ov) {
+                    (Some(d), Some(o)) => {
+                        used_exact_special[row] = true;
+                        self.verify_values_exact_match((d, o), scratch, blocks)?
+                    }
+                    _ => false,
+                };
+                if !matched {
+                    ok[row] = false;
+                }
                 continue;
             }
             let skip_prop = is_skipped_meta
@@ -7431,16 +7520,22 @@ impl<'s> FastVerifyStores<'s> {
             }
             let matched = match (dv, ov) {
                 (Some(d), Some(o)) => {
-                    self.verify_values_pair_match(cache, class_name, name, (d, o), scratch)?
+                    self.verify_values_pair_match(cache, class_name, name, (d, o), scratch, blocks)?
                 }
-                (Some(d), None) => match cache.verify_one_sided_rule(class_name, name) {
-                    OneSidedRule::Ignored => true,
-                    OneSidedRule::Default(ref def) => {
-                        verify_val_matches_default(d, def, &scratch.des_cframes)
+                (Some(d), None) => {
+                    had_one_sided[row] = true;
+                    match cache.verify_one_sided_rule(class_name, name) {
+                        OneSidedRule::Ignored => true,
+                        OneSidedRule::Default(ref def) => {
+                            verify_val_matches_default(d, def, &scratch.des_cframes)
+                        }
+                        OneSidedRule::NoDefault => false,
                     }
-                    OneSidedRule::NoDefault => false,
-                },
-                (None, Some(_)) => !self.input.by_order[global] && !self.input.has_before,
+                }
+                (None, Some(_)) => {
+                    had_one_sided[row] = true;
+                    !self.input.by_order[global] && !self.input.has_before
+                }
                 (None, None) => true,
             };
             if !matched {
@@ -7450,6 +7545,74 @@ impl<'s> FastVerifyStores<'s> {
         Ok(())
     }
 
+    fn verify_values_exact_match<'a>(
+        &self,
+        (d, o): (FastVerifyVal<'a>, FastVerifyVal<'a>),
+        scratch: &VerifyBlockScratch<'a>,
+        (des_open, obs_opens): (&OpenBlock, &[Arc<OpenBlock>]),
+    ) -> Result<bool> {
+        let f32s = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(&x, &y)| f32_finite_bits_eq(x, y));
+        let matched = match (d, o) {
+            (FastVerifyVal::Null, FastVerifyVal::Null) => true,
+            (FastVerifyVal::Bool(a), FastVerifyVal::Bool(b)) => a == b,
+            (FastVerifyVal::I64(a), FastVerifyVal::I64(b)) => a == b,
+            (FastVerifyVal::U64(a), FastVerifyVal::U64(b)) => a == b,
+            (FastVerifyVal::F64(a), FastVerifyVal::F64(b)) => f64_finite_bits_eq(a, b),
+            (FastVerifyVal::Str(a), FastVerifyVal::Str(b)) => a == b,
+            (FastVerifyVal::PoolStr(e1), FastVerifyVal::PoolStr(e2)) => {
+                self.des.hashes[e1] == self.obs.hashes[e2]
+            }
+            (FastVerifyVal::Enum(a), FastVerifyVal::Enum(b)) => a == b,
+            (FastVerifyVal::Vec2(a), FastVerifyVal::Vec2(b)) => f32s(&a, &b),
+            (FastVerifyVal::Vec3(a), FastVerifyVal::Vec3(b)) => f32s(&a, &b),
+            (FastVerifyVal::UDim(a), FastVerifyVal::UDim(b)) => f32s(&a, &b),
+            (FastVerifyVal::UDim2(a), FastVerifyVal::UDim2(b)) => f32s(&a, &b),
+            (FastVerifyVal::Color3(a), FastVerifyVal::Color3(b)) => f32s(&a, &b),
+            (FastVerifyVal::Rect(a), FastVerifyVal::Rect(b)) => f32s(&a, &b),
+            (FastVerifyVal::CFrame(di), FastVerifyVal::CFrame(oi)) => scratch.des_cframes[di]
+                .iter()
+                .zip(&scratch.obs_cframes[oi])
+                .all(|(&x, &y)| f64_finite_bits_eq(x, y)),
+            (FastVerifyVal::Ref(t1), FastVerifyVal::Ref(t2)) => self.input.places[t1] == t2,
+            (
+                FastVerifyVal::Payload {
+                    ty: t1,
+                    own: o1,
+                    pool: p1,
+                },
+                FastVerifyVal::Payload {
+                    ty: t2,
+                    own: o2,
+                    pool: p2,
+                },
+            ) if t1 == t2 => match (o1, p1, o2, p2) {
+                (Some(a), _, Some(b), _) => a == b,
+                (_, Some(e1), _, Some(e2)) => self.des.hashes[e1] == self.obs.hashes[e2],
+                _ => false,
+            },
+            (
+                FastVerifyVal::RawComplex {
+                    kind: dk,
+                    bytes: db,
+                    ..
+                },
+                FastVerifyVal::RawComplex {
+                    kind: ok_kind,
+                    bytes: ob,
+                    block: ok_blk,
+                },
+            ) if dk == ok_kind => raw_complex_bytes_equal_no_refs(
+                dk,
+                db,
+                ob,
+                (&self.des, des_open),
+                (&self.obs, &obs_opens[ok_blk]),
+            )?,
+            _ => false,
+        };
+        Ok(matched)
+    }
+
     fn verify_values_pair_match<'a>(
         &self,
         cache: &mut crate::settings::equivalence::CanonicalizeCache,
@@ -7457,6 +7620,7 @@ impl<'s> FastVerifyStores<'s> {
         name: &str,
         (d, o): (FastVerifyVal<'a>, FastVerifyVal<'a>),
         scratch: &mut VerifyBlockScratch<'a>,
+        (des_open, obs_opens): (&OpenBlock, &[Arc<OpenBlock>]),
     ) -> Result<bool> {
         use crate::settings::equivalence::{
             canonical_asset_text, cframes_match_reconciliation, f32_values_match,
@@ -7508,6 +7672,7 @@ impl<'s> FastVerifyStores<'s> {
         }
 
         let matched = match (d, o) {
+            (FastVerifyVal::Null, FastVerifyVal::Null) => true,
             (FastVerifyVal::Bool(a), FastVerifyVal::Bool(b)) => a == b,
             (
                 FastVerifyVal::I64(_) | FastVerifyVal::U64(_) | FastVerifyVal::F64(_),
@@ -7616,9 +7781,260 @@ impl<'s> FastVerifyStores<'s> {
                 scratch.tag_right_buf.dedup();
                 scratch.tag_left_buf == scratch.tag_right_buf
             }
+            (
+                FastVerifyVal::RawComplex {
+                    kind: dk,
+                    bytes: db,
+                    ..
+                },
+                FastVerifyVal::RawComplex {
+                    kind: ok_kind,
+                    bytes: ob,
+                    block: ok_blk,
+                },
+            ) => self.verify_raw_complex_pair(
+                class_name,
+                name,
+                (dk, db),
+                (ok_kind, ob, &obs_opens[ok_blk]),
+                des_open,
+            )?,
             _ => false,
         };
         Ok(matched)
+    }
+
+    fn verify_raw_complex_pair(
+        &self,
+        class_name: &str,
+        name: &str,
+        (dk, db): (u8, &[u8]),
+        (ok_kind, ob, obs_open): (u8, &[u8], &OpenBlock),
+        des_open: &OpenBlock,
+    ) -> Result<bool> {
+        use crate::settings::equivalence::{
+            reconciliation_property_values_equal,
+            reconciliation_value_contains_reference as holds_reference, value_contains_enum_item,
+        };
+
+        if dk == ok_kind
+            && raw_complex_bytes_equal_no_refs(
+                dk,
+                db,
+                ob,
+                (&self.des, des_open),
+                (&self.obs, obs_open),
+            )?
+        {
+            return Ok(true);
+        }
+        let decode_one = |store: &BlockStore<'_>, open: &OpenBlock, kind: u8, bytes: &[u8]| {
+            let marked: Vec<Cow<'_, str>> = open
+                .strings
+                .iter()
+                .map(|s| match s {
+                    BlockString::Own(t) => Cow::Borrowed(t.as_str()),
+                    BlockString::Pool(e) => Cow::Owned(marker(&store.hashes[*e])),
+                })
+                .collect();
+            let refs: Vec<&str> = marked.iter().map(Cow::as_ref).collect();
+            let budget = store.budget.not_holding();
+            let scope = ValueScope::from_borrowed(&refs, store.rows, &budget, None);
+            let mut reader = BytecodeReader::new(bytes);
+            let value = decode_raw_value_payload(&mut reader, kind, scope, 0)?;
+            reader.finish()?;
+            Ok::<_, anyhow::Error>(value)
+        };
+        let dv = decode_one(&self.des, des_open, dk, db)?;
+        if holds_marker(&dv) || value_contains_enum_item(&dv) || holds_reference(&dv) {
+            return Ok(false);
+        }
+        let ov = decode_one(&self.obs, obs_open, ok_kind, ob)?;
+        if holds_marker(&ov) || value_contains_enum_item(&ov) || holds_reference(&ov) {
+            return Ok(false);
+        }
+        Ok(reconciliation_property_values_equal(
+            class_name,
+            name,
+            Some(&dv),
+            Some(&ov),
+        ))
+    }
+}
+
+#[inline]
+fn f32_finite_bits_eq(a: f32, b: f32) -> bool {
+    a.is_finite() && a.to_bits() == b.to_bits()
+}
+
+#[inline]
+fn f64_finite_bits_eq(a: f64, b: f64) -> bool {
+    a.is_finite() && a.to_bits() == b.to_bits()
+}
+
+fn read_f32_lanes_exact_eq(
+    ra: &mut BytecodeReader<'_>,
+    rb: &mut BytecodeReader<'_>,
+    lanes: usize,
+) -> Result<bool> {
+    for _ in 0..lanes {
+        if !f32_finite_bits_eq(read_f32(ra)?, read_f32(rb)?) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn raw_complex_bytes_equal_no_refs(
+    kind: u8,
+    bytes_a: &[u8],
+    bytes_b: &[u8],
+    (store_a, open_a): (&BlockStore<'_>, &OpenBlock),
+    (store_b, open_b): (&BlockStore<'_>, &OpenBlock),
+) -> Result<bool> {
+    let mut ra = BytecodeReader::new(bytes_a);
+    let mut rb = BytecodeReader::new(bytes_b);
+    if !raw_complex_values_equal_no_refs(
+        kind,
+        (&mut ra, store_a, open_a),
+        (&mut rb, store_b, open_b),
+        0,
+    )? {
+        return Ok(false);
+    }
+    ra.finish()?;
+    rb.finish()?;
+    Ok(true)
+}
+
+fn raw_complex_values_equal_no_refs(
+    kind: u8,
+    (ra, store_a, open_a): (&mut BytecodeReader<'_>, &BlockStore<'_>, &OpenBlock),
+    (rb, store_b, open_b): (&mut BytecodeReader<'_>, &BlockStore<'_>, &OpenBlock),
+    depth: usize,
+) -> Result<bool> {
+    if depth > 64 {
+        return Ok(false);
+    }
+    let str_eq = |a: usize, b: usize| match (open_a.strings.get(a), open_b.strings.get(b)) {
+        (Some(BlockString::Own(a)), Some(BlockString::Own(b))) => a == b,
+        (Some(BlockString::Pool(a)), Some(BlockString::Pool(b))) => {
+            store_a.hashes[*a] == store_b.hashes[*b]
+        }
+        _ => false,
+    };
+    match kind {
+        0..=2 => Ok(true),
+        3 | 4 => Ok(ra.read_var_u64()? == rb.read_var_u64()?),
+        5 => Ok(f64_finite_bits_eq(read_f64(ra)?, read_f64(rb)?)),
+        20 => Ok(f32_finite_bits_eq(read_f32(ra)?, read_f32(rb)?)),
+        6 | 19 => Ok(str_eq(ra.read_len("string id")?, rb.read_len("string id")?)),
+        NESTED_ENUM_ITEM_KIND => Ok(str_eq(
+            ra.read_len("enum type string id")?,
+            rb.read_len("enum type string id")?,
+        ) && str_eq(
+            ra.read_len("enum name string id")?,
+            rb.read_len("enum name string id")?,
+        )),
+        11 | 13 => read_f32_lanes_exact_eq(ra, rb, 2),
+        12 | 15 => read_f32_lanes_exact_eq(ra, rb, 3),
+        14 | 18 => read_f32_lanes_exact_eq(ra, rb, 4),
+        16 => read_f32_lanes_exact_eq(ra, rb, 12),
+        9 | 21 => {
+            let la = ra.read_len("numeric array length")?;
+            if la != rb.read_len("numeric array length")? {
+                return Ok(false);
+            }
+            if kind == 21 {
+                return read_f32_lanes_exact_eq(ra, rb, la);
+            }
+            for _ in 0..la {
+                if !f64_finite_bits_eq(read_f64(ra)?, read_f64(rb)?) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        7 => {
+            let la = ra.read_collection_len("array length")?;
+            if la != rb.read_collection_len("array length")? {
+                return Ok(false);
+            }
+            for _ in 0..la {
+                let ka = ra.read_u8().context("Missing array item kind")?;
+                if ka != rb.read_u8().context("Missing array item kind")?
+                    || !raw_complex_values_equal_no_refs(
+                        ka,
+                        (ra, store_a, open_a),
+                        (rb, store_b, open_b),
+                        depth + 1,
+                    )?
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        8 => {
+            let la = ra.read_collection_len("object length")?;
+            if la != rb.read_collection_len("object length")? {
+                return Ok(false);
+            }
+            for _ in 0..la {
+                let (ka, kb) = (
+                    ra.read_len("object key string id")?,
+                    rb.read_len("object key string id")?,
+                );
+                let Some(BlockString::Own(key)) = open_a.strings.get(ka).filter(|_| str_eq(ka, kb))
+                else {
+                    return Ok(false);
+                };
+                if matches!(
+                    key.as_str(),
+                    "instanceIndex"
+                        | "settingsId"
+                        | "instanceId"
+                        | "debugId"
+                        | "path"
+                        | "pathSegments"
+                        | "pathOrdinals"
+                        | "ref"
+                        | "enumType"
+                        | "enumName"
+                ) {
+                    return Ok(false);
+                }
+                let va = ra.read_u8().context("Missing object value kind")?;
+                if va != rb.read_u8().context("Missing object value kind")? {
+                    return Ok(false);
+                }
+                if matches!(key.as_str(), "_type" | "type") {
+                    if va != 6 {
+                        return Ok(false);
+                    }
+                    let (sa, sb) = (ra.read_len("string id")?, rb.read_len("string id")?);
+                    let Some(BlockString::Own(ty)) =
+                        open_a.strings.get(sa).filter(|_| str_eq(sa, sb))
+                    else {
+                        return Ok(false);
+                    };
+                    if matches!(ty.as_str(), "InstanceRef" | "Ref" | "Instance" | "EnumItem") {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+                if !raw_complex_values_equal_no_refs(
+                    va,
+                    (ra, store_a, open_a),
+                    (rb, store_b, open_b),
+                    depth + 1,
+                )? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
     }
 }
 
@@ -7755,6 +8171,8 @@ pub(crate) fn fast_verify_aligned_v12_rows(
     }
 
     let obs_opened = (0..obs.blocks.len()).map(|_| Mutex::new(None)).collect();
+    let obs_remaining: Vec<AtomicUsize> =
+        (0..obs.blocks.len()).map(|_| AtomicUsize::new(0)).collect();
     let stores = FastVerifyStores {
         input: &input,
         des,
@@ -7763,12 +8181,27 @@ pub(crate) fn fast_verify_aligned_v12_rows(
         des_hulls: ShardedMap::new(),
         obs_hulls: ShardedMap::new(),
         obs_opened,
+        obs_remaining,
     };
+    let plans: Vec<(Vec<bool>, Vec<usize>)> = stores
+        .des
+        .blocks
+        .iter()
+        .map(|block| stores.eligible_rows_and_obs_blocks(block.first, block.count))
+        .collect();
+    for (_, used) in &plans {
+        if stores.obs_blocks_within_budget(used) {
+            for &ob in used {
+                stores.obs_remaining[ob].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 
-    let block_results = (0..stores.des.blocks.len())
+    let block_results = plans
         .into_par_iter()
-        .map_init(CanonicalizeCache::new, |cache, block_idx| {
-            stores.verify_block(cache, block_idx)
+        .enumerate()
+        .map_init(CanonicalizeCache::new, |cache, (block_idx, (ok, used))| {
+            stores.verify_block(cache, block_idx, ok, &used)
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -8266,36 +8699,37 @@ impl RowBlocks {
             document.instances.len() == store.rows,
             "Store structure changed during row decoding; restart the store read"
         );
-        let projected = |index: usize| -> Result<Vec<(usize, String, Value)>> {
-            let open = store.open_block(index)?;
-            let mut values = (0..store.blocks[index].count)
-                .map(|_| DecodedRowValues::default())
-                .collect::<Vec<_>>();
-            store.values(
-                &open,
-                &mut values,
-                |_| true,
-                |name, _| names(name),
-                Texts::Resolved(&|_| true),
-            )?;
-            Ok(store.blocks[index]
-                .rows()
-                .zip(values)
-                .flat_map(|(row, values)| {
-                    let properties = values.properties.into_iter();
-                    properties.map(move |(name, value)| (row, name, value))
+        let indices: Vec<usize> = (0..store.blocks.len()).collect();
+        for batch in indices.chunks(STANDING_BATCH) {
+            let decoded = batch
+                .par_iter()
+                .map(|&index| -> Result<(usize, Vec<DecodedRowValues>)> {
+                    let block = &store.blocks[index];
+                    let open = store.open_block(index)?;
+                    let mut rows: Vec<DecodedRowValues> = (0..block.count)
+                        .map(|_| DecodedRowValues::default())
+                        .collect();
+                    store.values(
+                        &open,
+                        &mut rows,
+                        |_| true,
+                        |name, _| names(name),
+                        Texts::Resolved(&|_| true),
+                    )?;
+                    Ok((block.first, rows))
                 })
-                .collect())
-        };
-        let projected = (0..store.blocks.len())
-            .into_par_iter()
-            .map(projected)
-            .collect::<Result<Vec<_>>>()?;
-        for (row, name, value) in projected.into_iter().flatten() {
-            match project(&document.instances[row], &name, value) {
-                Some(value) => document.instances[row].properties.insert(name, value),
-                None => document.instances[row].properties.remove(&name),
-            };
+                .collect::<Result<Vec<_>>>()?;
+            for (first, rows) in decoded {
+                for (offset, row_values) in rows.into_iter().enumerate() {
+                    let row = first + offset;
+                    for (name, value) in row_values.properties {
+                        match project(&document.instances[row], &name, value) {
+                            Some(value) => document.instances[row].properties.insert(name, value),
+                            None => document.instances[row].properties.remove(&name),
+                        };
+                    }
+                }
+            }
         }
         store.budget.renew(store.bytes.len());
         Ok(())
@@ -8871,6 +9305,229 @@ mod fast_path_regression_tests {
         )?
         .expect("compact matcher must align identical twins via non-twin Part0 ref");
         assert_eq!(aligned_ids, vec!["ws", "t2", "t1", "w"]);
+        Ok(())
+    }
+
+    #[test]
+    fn fast_verify_rejects_mismatched_types_nan_neg_zero_refs_and_one_sided_props() -> Result<()> {
+        let uid = |n: u8| json!({"_type": "UniqueId", "value": format!("{n:032x}")});
+        let doc = |instances| SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances,
+        };
+        let row = |id: &str, class: &str, name: &str, n: u8, extra: Vec<(&str, Value)>| {
+            let mut props = Map::from_iter([("UniqueId".into(), uid(n))]);
+            for (k, v) in extra {
+                props.insert(k.into(), v);
+            }
+            doc_instance(id, class, name, Some(0), props)
+        };
+        let ws = || doc_instance("ws", "Workspace", "Workspace", None, Map::new());
+        let run_verify = |des: &SettingsBytecode, obs: &SettingsBytecode| -> Result<Vec<bool>> {
+            let (des_bytes, obs_bytes) = (
+                encode_document(des, false, None)?,
+                encode_document(obs, false, None)?,
+            );
+            let n = des.instances.len();
+            let places: Vec<usize> = (0..n).collect();
+            let (by_order, skip) = (vec![false; n], vec![false; n]);
+            Ok(fast_verify_aligned_v12_rows(FastVerifyInput {
+                desired_bytes: &des_bytes,
+                observed_bytes: &obs_bytes,
+                desired_instances: &des.instances,
+                observed_instances: &obs.instances,
+                places: &places,
+                by_order: &by_order,
+                skip: &skip,
+                has_before: true,
+            })?
+            .expect("v12 stores must run fast verify"))
+        };
+
+        let res_types = run_verify(
+            &doc(vec![
+                ws(),
+                row(
+                    "p1",
+                    "Part",
+                    "A",
+                    1,
+                    vec![(
+                        "CustomA",
+                        json!({"_type": "Vector3", "x": 1.0, "y": 0.5, "z": 0.25}),
+                    )],
+                ),
+                row(
+                    "p2",
+                    "Part",
+                    "B",
+                    2,
+                    vec![(
+                        "CustomB",
+                        json!({"_type": "UDim", "scale": 1.0, "offset": 2.0}),
+                    )],
+                ),
+                row(
+                    "p3",
+                    "Part",
+                    "C",
+                    3,
+                    vec![("CustomC", json!({"_type": "Font", "family": "Plastic"}))],
+                ),
+            ]),
+            &doc(vec![
+                ws(),
+                row(
+                    "p1",
+                    "Part",
+                    "A",
+                    1,
+                    vec![(
+                        "CustomA",
+                        json!({"_type": "Color3", "r": 1.0, "g": 0.5, "b": 0.25}),
+                    )],
+                ),
+                row(
+                    "p2",
+                    "Part",
+                    "B",
+                    2,
+                    vec![("CustomB", json!({"_type": "Vector2", "x": 1.0, "y": 2.0}))],
+                ),
+                row(
+                    "p3",
+                    "Part",
+                    "C",
+                    3,
+                    vec![(
+                        "CustomC",
+                        json!({"_type": "Font", "family": {"_type": "EnumItem", "enumType": "Material", "name": "Plastic"}}),
+                    )],
+                ),
+            ]),
+        )?;
+        assert_eq!(&res_types[1..], &[false, false, false]);
+
+        assert!(!f64_finite_bits_eq(f64::NAN, f64::NAN) && !f32_finite_bits_eq(f32::NAN, f32::NAN));
+        assert!(!f64_finite_bits_eq(-0.0, 0.0) && !f32_finite_bits_eq(-0.0, 0.0));
+        let empty_bytes = encode_document(&doc(vec![ws()]), false, None)?;
+        let empty_store = BlockStore::open(&empty_bytes)?;
+        let empty_open = empty_store.open_block(0)?;
+        for (kind, left, right) in [
+            (
+                5_u8,
+                f64::NAN.to_le_bytes().as_slice(),
+                f64::NAN.to_le_bytes().as_slice(),
+            ),
+            (
+                5_u8,
+                (-0.0_f64).to_le_bytes().as_slice(),
+                0.0_f64.to_le_bytes().as_slice(),
+            ),
+            (
+                20_u8,
+                f32::NAN.to_le_bytes().as_slice(),
+                f32::NAN.to_le_bytes().as_slice(),
+            ),
+            (
+                20_u8,
+                (-0.0_f32).to_le_bytes().as_slice(),
+                0.0_f32.to_le_bytes().as_slice(),
+            ),
+        ] {
+            assert!(!raw_complex_bytes_equal_no_refs(
+                kind,
+                left,
+                right,
+                (&empty_store, &empty_open),
+                (&empty_store, &empty_open),
+            )?);
+        }
+
+        let path_ref = json!({"_type": "Ref", "path": "Workspace.Twin", "pathSegments": ["Workspace", "Twin"]});
+        let res_ref = run_verify(
+            &doc(vec![
+                ws(),
+                row("a", "Part", "Twin", 10, vec![]),
+                row("b", "Part", "Twin", 11, vec![]),
+                row(
+                    "w1",
+                    "WeldConstraint",
+                    "WeldRef",
+                    12,
+                    vec![("Part0", json!({"_type": "Ref", "settingsId": "a"}))],
+                ),
+                row(
+                    "w2",
+                    "Part",
+                    "PathObj",
+                    13,
+                    vec![("CustomRef", path_ref.clone())],
+                ),
+            ]),
+            &doc(vec![
+                ws(),
+                row("a", "Part", "Twin", 10, vec![]),
+                row("b", "Part", "Twin", 11, vec![]),
+                row(
+                    "w1",
+                    "WeldConstraint",
+                    "WeldRef",
+                    12,
+                    vec![("Part0", json!({"_type": "Ref", "settingsId": "b"}))],
+                ),
+                row("w2", "Part", "PathObj", 13, vec![("CustomRef", path_ref)]),
+            ]),
+        )?;
+        assert_eq!((res_ref[3], res_ref[4]), (false, false));
+
+        let res_one = run_verify(
+            &doc(vec![
+                ws(),
+                row(
+                    "d1",
+                    "Part",
+                    "DesOnly",
+                    20,
+                    vec![("Transparency", json!(0.5))],
+                ),
+                row("d2", "Part", "ObsOnly", 21, vec![]),
+                row(
+                    "d3",
+                    "Script",
+                    "MigratedOneSided",
+                    22,
+                    vec![("Disabled", json!(true))],
+                ),
+                row(
+                    "d4",
+                    "Script",
+                    "MigratedPlusOneSided",
+                    23,
+                    vec![("Disabled", json!(true)), ("Enabled", json!(true))],
+                ),
+            ]),
+            &doc(vec![
+                ws(),
+                row("d1", "Part", "DesOnly", 20, vec![]),
+                row(
+                    "d2",
+                    "Part",
+                    "ObsOnly",
+                    21,
+                    vec![("Transparency", json!(0.5))],
+                ),
+                row("d3", "Script", "MigratedOneSided", 22, vec![]),
+                row(
+                    "d4",
+                    "Script",
+                    "MigratedPlusOneSided",
+                    23,
+                    vec![("Disabled", json!(true))],
+                ),
+            ]),
+        )?;
+        assert_eq!(&res_one[1..], &[false, false, false, false]);
         Ok(())
     }
 }
