@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -51,15 +50,8 @@ pub(crate) fn validate_native_snapshot(
 ) -> Result<(usize, f64)> {
     let started = Instant::now();
     let file = File::open(path).with_context(|| format!("Could not read {}", path.display()))?;
-    let database = rbx_reflection_database::get().context("Failed to load Roblox reflection DB")?;
-    let filter = database
-        .classes
-        .keys()
-        .map(|class| (class.to_string(), std::collections::HashSet::new()))
-        .collect::<HashMap<_, _>>();
     let flat = rbx_binary::Deserializer::new()
-        .flat_property_filter(std::sync::Arc::new(filter))
-        .deserialize_flat(BufReader::new(file))
+        .deserialize_flat_structure(BufReader::new(file))
         .context("Studio native serializer returned an invalid RBXL")?;
     if expected_roots.exact_service.is_none()
         && flat

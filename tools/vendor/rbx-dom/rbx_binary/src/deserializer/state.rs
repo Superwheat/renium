@@ -21,7 +21,7 @@ use rbx_dom_weak::{
 use rbx_reflection::{ClassDescriptor, PropertyKind, PropertySerialization, ReflectionDatabase};
 
 use crate::{
-    chunk::{Chunk, RawChunk},
+    chunk::{Chunk, RawChunk, StructureChunk},
     core::{find_property_descriptors, RbxReadExt},
     types::Type,
 };
@@ -471,6 +471,17 @@ impl<'db, R: Read> DeserializerState<'db, R> {
         Ok(Chunk::read_raw(&mut self.input)?)
     }
 
+    pub(super) fn next_structure_raw_chunk(
+        &mut self,
+        scratch_raw: &mut Vec<u8>,
+        scratch_out: &mut Vec<u8>,
+    ) -> Result<StructureChunk, InnerError> {
+        Ok(Chunk::read_structure_raw(
+            &mut self.input,
+            scratch_raw,
+            scratch_out,
+        )?)
+    }
     #[profiling::function]
     pub(super) fn decode_meta_chunk(&mut self, mut chunk: &[u8]) -> Result<(), InnerError> {
         let len = chunk.read_le_u32()?;

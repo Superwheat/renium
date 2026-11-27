@@ -62,6 +62,65 @@ impl RawChunk {
     }
 }
 
+/// One chunk consumed by `Chunk::read_structure_raw`.
+#[derive(Debug)]
+pub(crate) enum StructureChunk {
+    Structural(RawChunk),
+    Prop,
+    SharedStrings,
+}
+
+fn read_chunk_payload<R: Read>(
+    reader: R,
+    header: &ChunkHeader,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    let to_read = if header.compressed_len == 0 {
+        header.len as usize
+    } else {
+        header.compressed_len as usize
+    };
+    out.clear();
+    reader.take(to_read as u64).read_to_end(out)?;
+    if out.len() != to_read {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            if header.compressed_len == 0 {
+                "Truncated chunk"
+            } else {
+                "Truncated compressed chunk"
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn decompress_into_scratch(
+    header: &ChunkHeader,
+    scratch_raw: &[u8],
+    scratch_out: &mut Vec<u8>,
+) -> io::Result<()> {
+    let expected = header.len as usize;
+    scratch_out.resize(expected, 0);
+    let written = if scratch_raw.starts_with(ZSTD_MAGIC_NUMBER) {
+        zstd::bulk::Decompressor::new()?
+            .decompress_to_buffer(scratch_raw, scratch_out.as_mut_slice())?
+    } else {
+        lz4_flex::block::decompress_into(scratch_raw, scratch_out.as_mut_slice())
+            .map_err(io::Error::other)?
+    };
+    if written != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Chunk length mismatch: expected {} bytes, got {}",
+                header.len, written
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl Chunk {
     /// Reads one chunk's header and raw (possibly compressed) payload.
     pub(crate) fn read_raw<R: Read>(mut reader: R) -> io::Result<RawChunk> {
@@ -69,23 +128,8 @@ impl Chunk {
 
         log::trace!("{header}");
 
-        let to_read = if header.compressed_len == 0 {
-            header.len as usize
-        } else {
-            header.compressed_len as usize
-        };
         let mut raw_data = Vec::new();
-        reader.take(to_read as u64).read_to_end(&mut raw_data)?;
-        if raw_data.len() != to_read {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                if header.compressed_len == 0 {
-                    "Truncated chunk"
-                } else {
-                    "Truncated compressed chunk"
-                },
-            ));
-        }
+        read_chunk_payload(&mut reader, &header, &mut raw_data)?;
 
         Ok(RawChunk {
             name: header.name,
@@ -93,6 +137,46 @@ impl Chunk {
             len: header.len,
             raw_data,
         })
+    }
+
+    /// Reads one structural chunk's header and raw payload, decompressing `PROP`
+    /// and `SSTR` chunks into `scratch_out` to verify their integrity and
+    /// declared length without retaining any property data. For `PROP` chunks,
+    /// `scratch_out` holds the uncompressed chunk payload on return.
+    pub(crate) fn read_structure_raw<R: Read>(
+        mut reader: R,
+        scratch_raw: &mut Vec<u8>,
+        scratch_out: &mut Vec<u8>,
+    ) -> io::Result<StructureChunk> {
+        let header = decode_chunk_header(&mut reader)?;
+
+        log::trace!("{header}");
+
+        if &header.name == b"PROP" {
+            if header.compressed_len == 0 {
+                read_chunk_payload(&mut reader, &header, scratch_out)?;
+            } else {
+                read_chunk_payload(&mut reader, &header, scratch_raw)?;
+                decompress_into_scratch(&header, scratch_raw, scratch_out)?;
+            }
+            return Ok(StructureChunk::Prop);
+        }
+        if &header.name == b"SSTR" {
+            read_chunk_payload(&mut reader, &header, scratch_raw)?;
+            if header.compressed_len != 0 {
+                decompress_into_scratch(&header, scratch_raw, scratch_out)?;
+            }
+            return Ok(StructureChunk::SharedStrings);
+        }
+        let mut raw_data = Vec::new();
+        read_chunk_payload(&mut reader, &header, &mut raw_data)?;
+
+        Ok(StructureChunk::Structural(RawChunk {
+            name: header.name,
+            compressed_len: header.compressed_len,
+            len: header.len,
+            raw_data,
+        }))
     }
 
     /// Reads and decodes a `Chunk` from the given reader.
@@ -128,6 +212,62 @@ mod tests {
         short_compressed.extend_from_slice(&0u32.to_le_bytes());
         short_compressed.push(0);
         assert!(Chunk::decode(short_compressed.as_slice()).is_err());
+    }
+
+    #[test]
+    fn structure_read_rejects_corrupt_or_mismatched_prop_and_sstr_chunks() {
+        let mut scratch_raw = Vec::new();
+        let mut scratch_out = Vec::new();
+        for name in [b"PROP", b"SSTR"] {
+            for compression in [
+                CompressionType::None,
+                CompressionType::Lz4,
+                CompressionType::Zstd,
+            ] {
+                let mut chunk = ChunkBuilder::new(name, compression);
+                chunk
+                    .write_all(b"repeated property payload bytes repeated property payload bytes")
+                    .unwrap();
+                let mut bytes = Vec::new();
+                chunk.dump(&mut bytes).unwrap();
+                let kind = Chunk::read_structure_raw(
+                    bytes.as_slice(),
+                    &mut scratch_raw,
+                    &mut scratch_out,
+                )
+                .unwrap();
+                assert!(matches!(
+                    (name, kind),
+                    (b"PROP", StructureChunk::Prop) | (b"SSTR", StructureChunk::SharedStrings)
+                ));
+                assert!(Chunk::read_structure_raw(
+                    &bytes[..bytes.len() - 1],
+                    &mut scratch_raw,
+                    &mut scratch_out,
+                )
+                .is_err());
+                let mut wrong_len = bytes.clone();
+                wrong_len[8..12].copy_from_slice(&999u32.to_le_bytes());
+                assert!(Chunk::read_structure_raw(
+                    wrong_len.as_slice(),
+                    &mut scratch_raw,
+                    &mut scratch_out,
+                )
+                .is_err());
+                if compression != CompressionType::None {
+                    let mut corrupt = bytes.clone();
+                    let last = corrupt.len() - 1;
+                    corrupt[last] ^= 0xff;
+                    corrupt[16] ^= 0xff;
+                    assert!(Chunk::read_structure_raw(
+                        corrupt.as_slice(),
+                        &mut scratch_raw,
+                        &mut scratch_out,
+                    )
+                    .is_err());
+                }
+            }
+        }
     }
 }
 

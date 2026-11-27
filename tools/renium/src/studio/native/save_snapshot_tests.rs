@@ -248,3 +248,79 @@ fn saved_snapshot_checks_contract_references_and_order() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn validate_native_snapshot_rejects_corrupt_prop_chunk() -> Result<()> {
+    use crate::studio::native::snapshot::{NativeSnapshotRoots, validate_native_snapshot};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "../../.save-snapshot-prop-test/{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root)?;
+    let _cleanup = OnDrop::new(|| {
+        let _ = fs::remove_dir_all(&root);
+    });
+    let (base, _) = fixture()?;
+    let prop_pos = base
+        .windows(4)
+        .position(|window| window == b"PROP")
+        .context("fixture must contain a PROP chunk")?;
+    let comp_len = u32::from_le_bytes(base[prop_pos + 4..prop_pos + 8].try_into()?) as usize;
+    let payload_start = prop_pos + 16;
+    let roots = NativeSnapshotRoots {
+        exact_service: None,
+        containing_service: None,
+    };
+
+    let mut wrong_len = base.clone();
+    let declared = u32::from_le_bytes(wrong_len[prop_pos + 8..prop_pos + 12].try_into()?);
+    wrong_len[prop_pos + 8..prop_pos + 12].copy_from_slice(&(declared + 17).to_le_bytes());
+    let wrong_len_path = root.join("wrong-len.rbxl");
+    fs::write(&wrong_len_path, &wrong_len)?;
+    assert!(
+        validate_native_snapshot(&wrong_len_path, roots).is_err(),
+        "mismatched PROP declared length must fail validation"
+    );
+
+    if comp_len > 0 {
+        let mut corrupt = base.clone();
+        corrupt[payload_start] ^= 0xff;
+        corrupt[payload_start + comp_len - 1] ^= 0xff;
+        let corrupt_path = root.join("corrupt-prop.rbxl");
+        fs::write(&corrupt_path, &corrupt)?;
+        assert!(
+            validate_native_snapshot(&corrupt_path, roots).is_err(),
+            "corrupt compressed PROP payload must fail validation"
+        );
+    }
+
+    let mut invalid_type_payload = Vec::new();
+    invalid_type_payload.extend_from_slice(&999_u32.to_le_bytes());
+    invalid_type_payload.extend_from_slice(&4_u32.to_le_bytes());
+    invalid_type_payload.extend_from_slice(b"Name");
+    invalid_type_payload.push(0x01);
+    let mut bad_prop_chunk = Vec::new();
+    bad_prop_chunk.extend_from_slice(b"PROP");
+    bad_prop_chunk.extend_from_slice(&0_u32.to_le_bytes());
+    bad_prop_chunk.extend_from_slice(&(invalid_type_payload.len() as u32).to_le_bytes());
+    bad_prop_chunk.extend_from_slice(&0_u32.to_le_bytes());
+    bad_prop_chunk.extend_from_slice(&invalid_type_payload);
+    let end_pos = base
+        .windows(4)
+        .rposition(|window| window == b"END\0")
+        .context("fixture must contain an END chunk")?;
+    let mut bad_type = Vec::with_capacity(base.len() + bad_prop_chunk.len());
+    bad_type.extend_from_slice(&base[..end_pos]);
+    bad_type.extend_from_slice(&bad_prop_chunk);
+    bad_type.extend_from_slice(&base[end_pos..]);
+    let bad_type_path = root.join("bad-prop-type.rbxl");
+    fs::write(&bad_type_path, &bad_type)?;
+    let err = validate_native_snapshot(&bad_type_path, roots)
+        .err()
+        .context("PROP chunk with unknown type id must fail validation")?;
+    assert!(
+        format!("{err:#}").contains("invalid type ID") || format!("{err:#}").contains("999"),
+        "unexpected error for unknown PROP type id: {err:#}"
+    );
+    Ok(())
+}

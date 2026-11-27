@@ -282,10 +282,104 @@ impl<'db> Deserializer<'db> {
 
         Ok(deserializer.finish_flat())
     }
+
+    /// Deserializes only metadata, instance types, and parent hierarchy into a
+    /// `FlatDom`, decompressing and length-checking `PROP` and `SSTR` chunks
+    /// into a reusable scratch buffer without decoding or retaining their values.
+    pub fn deserialize_flat_structure<R: Read>(&self, reader: R) -> Result<FlatDom, Error> {
+        profiling::scope!("rbx_binary::deserialize_flat_structure");
+
+        let mut deserializer = DeserializerState::new(self, reader, true)?;
+        let mut scratch_raw = Vec::new();
+        let mut scratch_out = Vec::new();
+
+        loop {
+            let raw_chunk = match deserializer
+                .next_structure_raw_chunk(&mut scratch_raw, &mut scratch_out)?
+            {
+                crate::chunk::StructureChunk::Prop => {
+                    deserializer.check_prop_chunk_type(&scratch_out)?;
+                    continue;
+                }
+                crate::chunk::StructureChunk::SharedStrings => continue,
+                crate::chunk::StructureChunk::Structural(raw_chunk) => raw_chunk,
+            };
+            let chunk = raw_chunk
+                .decompress()
+                .map_err(crate::deserializer::error::InnerError::from)?;
+            match &chunk.name {
+                b"META" => deserializer.decode_meta_chunk(&chunk.data)?,
+                b"INST" => deserializer.decode_inst_chunk(&chunk.data)?,
+                b"PRNT" => deserializer.decode_prnt_chunk(&chunk.data)?,
+                b"END\0" => {
+                    deserializer.decode_end_chunk(&chunk.data)?;
+                    break;
+                }
+                _ => match str::from_utf8(&chunk.name) {
+                    Ok(name) => log::info!("Unknown binary chunk name {name}"),
+                    Err(_) => log::info!("Unknown binary chunk name {:?}", chunk.name),
+                },
+            }
+        }
+
+        Ok(deserializer.finish_flat())
+    }
 }
 
 impl Default for Deserializer<'_> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod structure_tests {
+    use super::*;
+    use crate::chunk::ChunkBuilder;
+    use crate::serializer::CompressionType;
+    use rbx_dom_weak::{InstanceBuilder, WeakDom};
+    use std::io::Write;
+
+    #[test]
+    fn deserialize_flat_structure_rejects_unknown_prop_type_id() {
+        let mut dom = WeakDom::new(InstanceBuilder::new("DataModel"));
+        let root = dom.root_ref();
+        dom.insert(root, InstanceBuilder::new("Folder").with_name("Root"));
+        let mut base = Vec::new();
+        crate::to_writer(&mut base, &dom, dom.root().children()).unwrap();
+        let end_pos = base
+            .windows(4)
+            .rposition(|window| window == b"END\0")
+            .unwrap();
+
+        for compression in [
+            CompressionType::None,
+            CompressionType::Lz4,
+            CompressionType::Zstd,
+        ] {
+            let mut chunk = ChunkBuilder::new(b"PROP", compression);
+            chunk.write_all(&999_u32.to_le_bytes()).unwrap();
+            chunk.write_all(&4_u32.to_le_bytes()).unwrap();
+            chunk.write_all(b"Name").unwrap();
+            chunk.write_all(&[0x01]).unwrap();
+            let mut bad_chunk = Vec::new();
+            chunk.dump(&mut bad_chunk).unwrap();
+
+            let mut bytes = Vec::with_capacity(base.len() + bad_chunk.len());
+            bytes.extend_from_slice(&base[..end_pos]);
+            bytes.extend_from_slice(&bad_chunk);
+            bytes.extend_from_slice(&base[end_pos..]);
+
+            let err = Deserializer::new()
+                .deserialize_flat_structure(bytes.as_slice())
+                .err()
+                .expect("expected InvalidTypeId error");
+            assert!(
+                err.to_string().contains("999"),
+                "expected InvalidTypeId(999) for {:?}, got: {}",
+                compression,
+                err
+            );
+        }
     }
 }
