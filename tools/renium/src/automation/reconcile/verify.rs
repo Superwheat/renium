@@ -273,8 +273,21 @@ pub(crate) fn snapshot_path_differences(
 ) -> Result<Vec<PathBuf>> {
     let mut differences = Vec::new();
     for path in paths {
-        if !snapshot_entry_equivalent(path, left.entries.get(path), right.entries.get(path), None)?
+        let (ours, theirs) = (left.entries.get(path), right.entries.get(path));
+        let is_store = ours != theirs
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_service_settings_file_name);
+        let equivalent = match is_store
+            .then(|| super::replacement::store_copies_by_changed((path, ours, theirs), None))
+            .transpose()?
+            .flatten()
         {
+            Some(equivalent) => equivalent,
+            None => snapshot_entry_equivalent(path, ours, theirs, None)?,
+        };
+        if !equivalent {
             differences.push(path.clone());
         }
     }
@@ -292,7 +305,7 @@ pub(crate) fn reconciled_path_differences(
     pending: &[PendingImportFields],
 ) -> Result<Vec<PathBuf>> {
     if pending.is_empty() {
-        return snapshot_path_differences(observed, desired, paths);
+        return snapshot_path_differences(desired, observed, paths);
     }
     let mut differences = Vec::new();
     for path in paths {
@@ -409,12 +422,26 @@ pub(crate) fn settled_services(
 ) -> Vec<String> {
     let phase = Instant::now();
     let root = Path::new(&context.root);
-    let settled = if root.join("renium-link.json").exists() {
-        Err("the project links packages")
-    } else {
+    let ro_package_services =
+        match super::staging::packing_link_enforcement(root, Path::new(&context.source)) {
+            Ok(Some(enforcement)) => Ok(enforcement
+                .read_only_packages
+                .into_iter()
+                .map(|target| target.service)
+                .collect::<Vec<_>>()),
+            Ok(None) => Ok(Vec::new()),
+            Err(_) => Err("the project link manifest could not be read"),
+        };
+    let settled = ro_package_services.and_then(|ro_services| {
         moved_since_proof(context, bridge, held)
             .ok_or("Studio cannot say where it differs from the held proof")
-            .map(|moved| written.into_iter().chain(moved).collect::<HashSet<_>>())
+            .map(|moved| {
+                written
+                    .into_iter()
+                    .chain(moved)
+                    .chain(ro_services)
+                    .collect::<HashSet<_>>()
+            })
             .and_then(|touched| {
                 if services.iter().all(|service| touched.contains(service)) {
                     return Err("the push and Studio's changes reached each of them");
@@ -423,7 +450,7 @@ pub(crate) fn settled_services(
                     services_settled_with(context, services, touched, (before, project, generated));
                 skips_pulled(context, &settled, before).map(|()| settled)
             })
-    };
+    });
     log_reconcile_timing("import settlement services", phase);
     match settled {
         Ok(settled) => {
@@ -2213,6 +2240,7 @@ pub(crate) fn reconcile_value_label(value: &Value) -> String {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn snapshot_differences(
     left: &ProjectSnapshot,
     right: &ProjectSnapshot,

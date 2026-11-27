@@ -192,12 +192,19 @@ pub(crate) fn full_push_cache_input(
     services: &[String],
 ) -> Result<Value> {
     let loaded = config::try_load_project(None, Some(&args.project.project_root))?;
+    let links = crate::project::package_links::link_cache_fingerprint(
+        &args.project.project_root,
+        &args.project.src_root,
+        args.link_cache_dir.as_deref(),
+        args.override_packages,
+    )?;
     Ok(json!({
         "root": args.project.project_root, "source": args.project.src_root, "services": services,
         "paths": args.paths, "changedPaths": args.changed_paths, "changedPathFiles": args.changed_paths_files,
         "ids": args.target_settings_ids, "idFiles": args.target_settings_id_files, "properties": args.target_properties,
         "upsert": args.upsert_instances_only,
         "linkCache": args.link_cache_dir, "overridePackages": args.override_packages,
+        "links": links,
         "configuration": loaded.as_ref().map(|loaded| &loaded.project),
     }))
 }
@@ -627,7 +634,6 @@ pub(crate) fn pull_is_whole(args: &crate::cli::PullArgs) -> Result<bool> {
         || args.export_all_properties
         || args.keep_local_only_scripts
         || args.layout_src_root.is_some()
-        || args.project_root.join("renium-link.json").exists()
     {
         return Ok(false);
     }

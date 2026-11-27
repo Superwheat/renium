@@ -4137,6 +4137,151 @@ pub(crate) fn has_reference_path_matching(
     Ok(found.load(Ordering::Relaxed))
 }
 
+pub(crate) struct ExternalRefTarget {
+    pub(crate) ids: Vec<String>,
+    pub(crate) path_segments: Option<Vec<String>>,
+    pub(crate) path_ordinals: Option<Vec<usize>>,
+}
+
+/// References in a v12 block store that leave its service and may point into
+/// `excluded_service`, streamed a batch of blocks at a time without decoding
+/// the whole document.
+pub(crate) fn external_reference_targets(
+    bytes: &[u8],
+    excluded_service: Option<&str>,
+) -> Result<(Option<String>, Vec<ExternalRefTarget>)> {
+    let store = BlockStore::open(bytes)?;
+    let structure = store.structure()?;
+    let service = structure
+        .instances
+        .iter()
+        .find(|inst| inst.parent_index.is_none())
+        .map(|inst| inst.name.clone());
+    let local: AHashSet<&str> = structure
+        .instances
+        .iter()
+        .map(|inst| inst.settings_id.as_str())
+        .collect();
+    let resolve_text = |text: &str| -> Result<String> {
+        match marked(text) {
+            Some(hash) => store.pool_text(&hash),
+            None => Ok(text.to_string()),
+        }
+    };
+    let mut results = Vec::new();
+    let indices = (0..store.blocks.len()).collect::<Vec<_>>();
+    for batch in indices.chunks(STANDING_BATCH) {
+        store.budget.renew(store.bytes.len());
+        let batch_refs = batch
+            .par_iter()
+            .map(|&index| -> Result<Vec<ExternalRefTarget>> {
+                let open = store.open_block(index)?;
+                let block = &store.blocks[index];
+                let mut values = (0..block.count)
+                    .map(|_| DecodedRowValues::default())
+                    .collect::<Vec<_>>();
+                let ref_groups =
+                    |name: &str, kind: u8| matches!(kind, 7 | 8 | 10) && name != "UniqueId";
+                store.values(&open, &mut values, |_| true, ref_groups, Texts::Marked)?;
+                let mut found = Vec::new();
+                let mut scan_error: Option<anyhow::Error> = None;
+                for value in values
+                    .iter()
+                    .flat_map(|row| row.properties.values().chain(row.attributes.values()))
+                {
+                    if scan_error.is_some() {
+                        break;
+                    }
+                    for_each_reference(value, &mut |reference| {
+                        if scan_error.is_some() {
+                            return;
+                        }
+                        let mut segments = None;
+                        if let Some(raw_segments) =
+                            reference.get("pathSegments").and_then(Value::as_array)
+                        {
+                            let mut parsed = Vec::with_capacity(raw_segments.len());
+                            for seg in raw_segments {
+                                let Some(text) = seg.as_str() else {
+                                    parsed.clear();
+                                    break;
+                                };
+                                match resolve_text(text) {
+                                    Ok(resolved) => parsed.push(resolved),
+                                    Err(error) => {
+                                        scan_error = Some(error);
+                                        return;
+                                    }
+                                }
+                            }
+                            if !parsed.is_empty() {
+                                segments = Some(parsed);
+                            }
+                        }
+                        let target_service = segments
+                            .as_ref()
+                            .and_then(|segs| segs.first())
+                            .map(String::as_str);
+                        if let (Some(target), Some(excluded)) = (target_service, excluded_service)
+                            && target != excluded
+                        {
+                            return;
+                        }
+                        let mut ids = Vec::new();
+                        for selector in ["settingsId", "instanceId"] {
+                            if let Some(raw) = reference.get(selector).and_then(Value::as_str) {
+                                match resolve_text(raw) {
+                                    Ok(resolved) => {
+                                        let defined_locally = local.contains(resolved.as_str());
+                                        let leaves = !defined_locally
+                                            || target_service.is_some_and(|target| {
+                                                service.as_deref() != Some(target)
+                                            });
+                                        if leaves {
+                                            ids.push(resolved);
+                                        }
+                                    }
+                                    Err(error) => {
+                                        scan_error = Some(error);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        let leaves_by_path =
+                            target_service.is_some_and(|target| service.as_deref() != Some(target));
+                        if ids.is_empty() && !leaves_by_path {
+                            return;
+                        }
+                        let path_ordinals = reference
+                            .get("pathOrdinals")
+                            .and_then(Value::as_array)
+                            .and_then(|items| {
+                                items
+                                    .iter()
+                                    .map(|item| item.as_u64().map(|value| value as usize))
+                                    .collect::<Option<Vec<_>>>()
+                            });
+                        found.push(ExternalRefTarget {
+                            ids,
+                            path_segments: segments,
+                            path_ordinals,
+                        });
+                    });
+                }
+                if let Some(error) = scan_error {
+                    return Err(error);
+                }
+                Ok(found)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for group in batch_refs {
+            results.extend(group);
+        }
+    }
+    Ok((service, results))
+}
+
 /// Whether a whole decode refuses the file at `path` where a read of some
 /// of its rows may not: a store in blocks with a frame that is not as its
 /// head says, or a file that cannot be read. A command that read its store

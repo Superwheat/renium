@@ -31,7 +31,15 @@ pub(crate) fn packing_link_enforcement(
             root.display()
         )
     })?;
-    Ok(enforcement.is_active().then_some(enforcement))
+    Ok(enforcement.has_read_only_packages().then_some(enforcement))
+}
+
+fn read_store_structure(bytes: &[u8]) -> Result<SettingsBytecode> {
+    if crate::settings::bytecode::blocks::is_block_store(bytes) {
+        crate::settings::bytecode::blocks::BlockStore::open(bytes)?.structure()
+    } else {
+        decode_settings_bytecode(bytes)
+    }
 }
 
 /// `rbx lkp` leaves a packed script's text in its store and removes its file,
@@ -46,6 +54,14 @@ pub(crate) fn pack_read_only_link_scripts_with(
     editor: &ProjectSnapshot,
     studio: &mut ProjectSnapshot,
 ) -> Result<()> {
+    let ro_services: HashSet<&str> = enforcement
+        .read_only_packages
+        .iter()
+        .map(|target| target.service.as_str())
+        .collect();
+    if ro_services.is_empty() {
+        return Ok(());
+    }
     let stores = editor
         .entries
         .keys()
@@ -63,40 +79,56 @@ pub(crate) fn pack_read_only_link_scripts_with(
         else {
             continue;
         };
-        let packed = {
-            let editor_doc = decode_settings_bytecode(editor_bytes)
-                .with_context(|| format!("Could not read the store {}", path.display()))?;
-            let service = settings_service_name(&path, &editor_doc, &editor_doc)?;
-            let editor_paths =
-                crate::editor::paths::build_editor_instance_paths(&editor_doc, &service);
-            let packed = editor_doc
-                .instances
-                .iter()
-                .zip(&editor_paths)
-                .filter(|(instance, _)| is_lua_source_class(&instance.class_name))
-                .filter_map(|(instance, instance_path)| {
-                    let text = instance.properties.get("Source")?.as_str()?;
-                    if text == crate::settings::EXTERNAL_SOURCE_MARKER {
-                        return None;
-                    }
-                    let instance_path = instance_path.as_ref()?;
-                    enforcement.read_only_package_for_path(
-                        &service,
-                        &instance_path.path_segments,
-                        &instance_path.path_ordinals,
-                    )?;
-                    Some((
-                        (
-                            instance_path.path_segments.clone(),
-                            instance_path.path_ordinals.clone(),
-                        ),
-                        text.to_string(),
-                    ))
-                })
-                .collect::<HashMap<_, _>>();
-            (service, packed)
+        let is_block = crate::settings::bytecode::blocks::is_block_store(editor_bytes);
+        let editor_doc = read_store_structure(editor_bytes)
+            .with_context(|| format!("Could not read the store {}", path.display()))?;
+        let service = settings_service_name(&path, &editor_doc, &editor_doc)?;
+        if !ro_services.contains(service.as_str()) {
+            continue;
+        }
+        let editor_paths = crate::editor::paths::build_editor_instance_paths(&editor_doc, &service);
+        let candidates: Vec<(usize, (Vec<String>, Vec<usize>))> = editor_doc
+            .instances
+            .iter()
+            .enumerate()
+            .zip(&editor_paths)
+            .filter(|((_, instance), _)| is_lua_source_class(&instance.class_name))
+            .filter_map(|((index, _), instance_path)| {
+                let p = instance_path.as_ref()?;
+                enforcement.read_only_package_for_path(
+                    &service,
+                    &p.path_segments,
+                    &p.path_ordinals,
+                )?;
+                Some((index, (p.path_segments.clone(), p.path_ordinals.clone())))
+            })
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        let block_rows = if is_block {
+            let row_indices: Vec<usize> = candidates.iter().map(|(i, _)| *i).collect();
+            Some(
+                crate::settings::bytecode::blocks::BlockStore::open(editor_bytes)
+                    .and_then(|store| store.rows(&row_indices))
+                    .with_context(|| format!("Could not read the store {}", path.display()))?
+                    .into_iter()
+                    .collect::<HashMap<_, _>>(),
+            )
+        } else {
+            None
         };
-        let (service, packed) = packed;
+        let packed: HashMap<_, _> = candidates
+            .into_iter()
+            .filter_map(|(index, key)| {
+                let props = match &block_rows {
+                    Some(rows) => &rows.get(&index)?.properties,
+                    None => &editor_doc.instances[index].properties,
+                };
+                let text = props.get("Source")?.as_str()?;
+                (text != crate::settings::EXTERNAL_SOURCE_MARKER).then(|| (key, text.to_string()))
+            })
+            .collect();
         if packed.is_empty() {
             continue;
         }
@@ -162,6 +194,14 @@ fn drop_stripped_package_links(
     editor: &ProjectSnapshot,
     studio: &mut ProjectSnapshot,
 ) -> Result<()> {
+    let ro_services: HashSet<&str> = enforcement
+        .read_only_packages
+        .iter()
+        .map(|target| target.service.as_str())
+        .collect();
+    if ro_services.is_empty() {
+        return Ok(());
+    }
     let stores = studio
         .entries
         .keys()
@@ -176,10 +216,29 @@ fn drop_stripped_package_links(
         let Some(SnapshotEntry::File(studio_bytes)) = studio.entries.get(&path) else {
             continue;
         };
+        if crate::settings::bytecode::blocks::is_block_store(studio_bytes) {
+            let structure = crate::settings::bytecode::blocks::BlockStore::open(studio_bytes)
+                .and_then(|store| store.structure())
+                .with_context(|| format!("Could not read Studio's copy of {}", path.display()))?;
+            let service = settings_service_name(&path, &structure, &structure)?;
+            if !ro_services.contains(service.as_str())
+                || !structure
+                    .instances
+                    .iter()
+                    .any(|instance| instance.class_name == "PackageLink")
+            {
+                continue;
+            }
+        }
         let editor_link_parents = match editor.entries.get(&path) {
             Some(SnapshotEntry::File(bytes)) => {
-                let editor_doc = decode_settings_bytecode(bytes)
-                    .with_context(|| format!("Could not read the store {}", path.display()))?;
+                let editor_doc = if crate::settings::bytecode::blocks::is_block_store(bytes) {
+                    crate::settings::bytecode::blocks::BlockStore::open(bytes)
+                        .and_then(|store| store.structure())
+                } else {
+                    decode_settings_bytecode(bytes)
+                }
+                .with_context(|| format!("Could not read the store {}", path.display()))?;
                 let service = settings_service_name(&path, &editor_doc, &editor_doc)?;
                 let paths =
                     crate::editor::paths::build_editor_instance_paths(&editor_doc, &service);
@@ -196,6 +255,9 @@ fn drop_stripped_package_links(
         let mut studio_doc = decode_settings_bytecode(studio_bytes)
             .with_context(|| format!("Could not read Studio's copy of {}", path.display()))?;
         let service = settings_service_name(&path, &studio_doc, &studio_doc)?;
+        if !ro_services.contains(service.as_str()) {
+            continue;
+        }
         let studio_paths = crate::editor::paths::build_editor_instance_paths(&studio_doc, &service);
         let stripped = studio_doc
             .instances

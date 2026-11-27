@@ -9783,3 +9783,108 @@ fn a_baseline_answers_a_pull_only_while_the_sourcemap_is_as_its_pull_left_it() -
     assert!(!sourcemap_as_left(&root, &held)?);
     Ok(())
 }
+
+#[test]
+fn repro_legacy_store_pack_and_pull_baseline_invalidation() -> Result<()> {
+    let root = crate::tests::support::temp_dir("repro-legacy-pack-and-baseline");
+    let _cleanup = crate::system::files::OnDrop::new(|| {
+        let _ = fs::remove_dir_all(&root);
+    });
+    let inst = |id: &str, name: &str, class: &str, parent: Option<usize>| {
+        SettingsBytecodeInstance::new(id.into(), name.into(), class.into(), parent)
+    };
+    fs::create_dir_all(root.join("src/ReplicatedStorage"))?;
+    let pkg = root.join("links/pkg.renium");
+    fs::create_dir_all(pkg.parent().unwrap())?;
+    let mut pkg_script = inst("pkg-script", "Mod", "ModuleScript", Some(0));
+    pkg_script
+        .properties
+        .insert("Source".into(), json!("return 'packed'\n"));
+    SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![inst("pkg-root", "Pkg", "Folder", None), pkg_script],
+    }
+    .write_file(&pkg)?;
+    fs::write(
+        root.join("renium-link.json"),
+        serde_json::to_vec(
+            &json!({"version": 1, "broken": [], "links": [{"id": "pkg", "readOnly": true, "source": {"type": "local", "path": "links/pkg.renium"}, "targets": [{"service": "ReplicatedStorage", "path": ["ReplicatedStorage", "Pkg"], "ords": []}]}]}),
+        )?,
+    )?;
+    let legacy_store = PathBuf::from("src/ReplicatedStorage/__roblox_sync_settings.renium");
+    let script_path = PathBuf::from("src/ReplicatedStorage/Pkg/Mod.luau");
+    let mut ed_script = inst("ed-script", "Mod", "ModuleScript", Some(1));
+    ed_script
+        .properties
+        .insert("Source".into(), json!("return 'packed'\n"));
+    let ed_doc = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![
+            inst("rs", "ReplicatedStorage", "ReplicatedStorage", None),
+            inst("ed-pkg", "Pkg", "Folder", Some(0)),
+            ed_script,
+        ],
+    };
+    ed_doc.write_file(&root.join(&legacy_store))?;
+    let mut st_script = inst("st-script", "Mod", "ModuleScript", Some(1));
+    st_script.properties.insert(
+        "Source".into(),
+        json!(crate::settings::EXTERNAL_SOURCE_MARKER),
+    );
+    let st_doc = SettingsBytecode {
+        version: SETTINGS_BINARY_VERSION,
+        instances: vec![
+            inst("rs", "ReplicatedStorage", "ReplicatedStorage", None),
+            inst("st-pkg", "Pkg", "Folder", Some(0)),
+            st_script,
+        ],
+    };
+    let editor = ProjectSnapshot {
+        entries: BTreeMap::from([(
+            legacy_store.clone(),
+            SnapshotEntry::File(encode_settings_bytecode(&ed_doc)?),
+        )]),
+    };
+    let mut studio = ProjectSnapshot {
+        entries: BTreeMap::from([
+            (
+                legacy_store.clone(),
+                SnapshotEntry::File(encode_settings_bytecode(&st_doc)?),
+            ),
+            (
+                script_path.clone(),
+                SnapshotEntry::File(b"return 'packed'\n".to_vec()),
+            ),
+        ]),
+    };
+    pack_read_only_link_scripts(&root, &root.join("src"), &editor, &mut studio)?;
+    assert!(
+        !studio.entries.contains_key(&script_path),
+        "legacy store path must fold packed script"
+    );
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let args = PushEditorChangesArgs::new(
+            crate::cli::ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            crate::cli::BridgeConnectionArgs::local(0.1),
+        );
+        let v1 = plain_push_input(&args)?;
+        SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                inst("pkg-root", "Pkg", "Folder", None),
+                inst("pkg-b", "PartB", "Part", Some(0)),
+            ],
+        }
+        .write_file(&pkg)?;
+        assert_ne!(
+            v1,
+            plain_push_input(&args)?,
+            "pull baseline key must invalidate when read-only package changes"
+        );
+    }
+    Ok(())
+}

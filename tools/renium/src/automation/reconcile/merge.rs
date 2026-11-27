@@ -213,7 +213,13 @@ fn merge_sides(
             .is_some_and(is_service_settings_file_name)
         {
             pass("store merge", || {
-                merge_settings_entry(&path, sides, base.is_none(), conflicts)
+                merge_settings_entry(
+                    &path,
+                    sides,
+                    base.is_none(),
+                    known_differences.is_some(),
+                    conflicts,
+                )
             })?
         } else {
             merge_entry(
@@ -345,7 +351,6 @@ fn scripts_document(entry: Option<&SnapshotEntry>) -> Result<SettingsBytecode> {
 /// Whether a store holds a PackageLink. A store in blocks answers from its
 /// structure, read in place: no instance is built where it does not hold
 /// the class's name.
-#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn holds_package_link(entry: Option<&SnapshotEntry>) -> Result<bool> {
     use crate::settings::bytecode::blocks::{BlockStore, is_block_store};
     const CLASS: &str = "PackageLink";
@@ -1107,6 +1112,7 @@ pub(crate) fn merge_settings_entry(
     path: &Path,
     sides: &SnapshotSides<'_>,
     first_pairing: bool,
+    sides_known_different: bool,
     conflicts: &mut ConflictLog,
 ) -> Result<MergedEntry> {
     let base = sides
@@ -1137,6 +1143,11 @@ pub(crate) fn merge_settings_entry(
             aligned_studio: None,
             editor_script_paths: None,
         });
+    }
+    if !first_pairing
+        && let Some(entry) = try_one_sided_settings_merge(path, sides, sides_known_different)?
+    {
+        return Ok(entry);
     }
     let _whole = crate::app::profile::span("store merge: whole documents");
     let mut editor_doc = pass("store merge: files decoded", || settings_document(editor))
@@ -1357,6 +1368,128 @@ pub(crate) fn merge_settings_entry(
         aligned_studio: aligned_studio.filter(|_| studio.is_some()),
         editor_script_paths: Some(editor_script_paths),
     })
+}
+
+fn side_scripts_unchanged(
+    path: &Path,
+    base: Option<&SnapshotEntry>,
+    side: Option<&SnapshotEntry>,
+    base_entries: &BTreeMap<PathBuf, SnapshotEntry>,
+    side_entries: &BTreeMap<PathBuf, SnapshotEntry>,
+) -> Result<bool> {
+    if base == side {
+        let doc = scripts_document(base)?;
+        let paths = source_paths_by_settings_index(&doc, path)?;
+        return Ok(paths.into_iter().flatten().all(|source| {
+            entries_equivalent(
+                &source,
+                base_entries.get(&source),
+                side_entries.get(&source),
+            )
+        }));
+    }
+    let base_doc = scripts_document(base)?;
+    let mut side_doc = scripts_document(side)?;
+    align_observation_ids_to_baseline(&base_doc, &mut side_doc);
+    Ok(
+        changed_script_source_ids(path, &base_doc, base_entries, &side_doc, side_entries)?
+            .is_empty(),
+    )
+}
+
+fn side_ids_need_no_alignment(base_bytes: &[u8], changed_bytes: &[u8]) -> Result<bool> {
+    if base_bytes == changed_bytes {
+        return Ok(true);
+    }
+    let base = SettingsBytecode::decode_structure(base_bytes)?;
+    let changed = SettingsBytecode::decode_structure(changed_bytes)?;
+    let base_classes = base
+        .instances
+        .iter()
+        .map(|instance| (instance.settings_id.as_str(), instance.class_name.as_str()))
+        .collect::<HashMap<_, _>>();
+    if base_classes.len() != base.instances.len() {
+        return Ok(false);
+    }
+    let mut changed_ids = HashSet::with_capacity(changed.instances.len());
+    let mut has_new = false;
+    for instance in &changed.instances {
+        let id = instance.settings_id.as_str();
+        if !changed_ids.insert(id) {
+            return Ok(false);
+        }
+        match base_classes.get(id) {
+            Some(class_name) if *class_name != instance.class_name => return Ok(false),
+            Some(_) => {}
+            None => has_new = true,
+        }
+    }
+    if !has_new {
+        return Ok(true);
+    }
+    Ok(base_classes.keys().all(|id| changed_ids.contains(id)))
+}
+
+fn try_one_sided_settings_merge(
+    path: &Path,
+    sides: &SnapshotSides<'_>,
+    sides_known_different: bool,
+) -> Result<Option<MergedEntry>> {
+    use crate::settings::bytecode::blocks::is_block_store;
+    let Some(baseline) = sides.baseline else {
+        return Ok(None);
+    };
+    let base = baseline.entries.get(path);
+    let editor = sides.editor.entries.get(path);
+    let studio = sides.studio.entries.get(path);
+    let (
+        Some(SnapshotEntry::File(base_bytes)),
+        Some(SnapshotEntry::File(editor_bytes)),
+        Some(SnapshotEntry::File(studio_bytes)),
+    ) = (base, editor, studio)
+    else {
+        return Ok(None);
+    };
+    if !is_block_store(base_bytes)
+        || !is_block_store(editor_bytes)
+        || !is_block_store(studio_bytes)
+        || editor_bytes == base_bytes
+    {
+        return Ok(None);
+    }
+    if holds_package_link(base)? || holds_package_link(editor)? || holds_package_link(studio)? {
+        return Ok(None);
+    }
+    if !sides_known_different {
+        match super::replacement::store_copies_by_changed((path, editor, studio), None)? {
+            Some(true) => {
+                return Ok(Some(MergedEntry {
+                    value: editor.cloned(),
+                    editor_changed: false,
+                    studio_changed: false,
+                    aligned_studio: None,
+                    editor_script_paths: None,
+                }));
+            }
+            Some(false) => {}
+            None => return Ok(None),
+        }
+    }
+    let studio_same_as_base = studio == base
+        || super::replacement::store_copies_by_changed((path, base, studio), None)? == Some(true);
+    if studio_same_as_base
+        && side_scripts_unchanged(path, base, studio, &baseline.entries, &sides.studio.entries)?
+        && side_ids_need_no_alignment(base_bytes, editor_bytes)?
+    {
+        return Ok(Some(MergedEntry {
+            value: editor.cloned(),
+            editor_changed: false,
+            studio_changed: true,
+            aligned_studio: None,
+            editor_script_paths: None,
+        }));
+    }
+    Ok(None)
 }
 
 /// The identities this store reuses for another class that some other store

@@ -2615,3 +2615,401 @@ fn link_break_remove_forgets_the_target_in_the_lock() {
     assert!(entry.files.keys().any(|key| key.contains("Pkg")));
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn link_apply_mirror_leaves_untouched_v12_stores_and_reapply_leaves_target_store_untouched() {
+    let dir = temp_dir("link-apply-dirty-only");
+    let ws_dir = dir.join("src").join("Workspace");
+    let rs_dir = dir.join("src").join("ReplicatedStorage");
+    fs::create_dir_all(&ws_dir).unwrap();
+    fs::create_dir_all(&rs_dir).unwrap();
+    let ws_store = service_settings_path(&ws_dir);
+    let rs_store = service_settings_path(&rs_dir);
+    let mut ws_part = settings_instance("debug:0_1", "KeepPart", "Part", Some(0));
+    ws_part
+        .properties
+        .insert("Transparency".into(), json!(0.25));
+    settings_document(vec![
+        settings_instance("debug:0_0", "Workspace", "Workspace", None),
+        ws_part,
+    ])
+    .write_file(&ws_store)
+    .unwrap();
+    settings_document(vec![settings_instance(
+        "debug:0_2",
+        "ReplicatedStorage",
+        "ReplicatedStorage",
+        None,
+    )])
+    .write_file(&rs_store)
+    .unwrap();
+    let ws_before = fs::read(&ws_store).unwrap();
+
+    let linked_file = dir.join("linked").join("Mod.luau");
+    fs::create_dir_all(linked_file.parent().unwrap()).unwrap();
+    fs::write(&linked_file, "return 'v1'\n").unwrap();
+    fs::write(
+        dir.join("renium-link.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "links": [{
+                "id": "mod",
+                "readOnly": false,
+                "source": { "type": "local", "path": "linked/Mod.luau" },
+                "targets": [{ "service": "ReplicatedStorage", "path": ["ReplicatedStorage", "Mod"], "ords": [] }],
+            }],
+            "broken": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    assert_eq!(fs::read(&ws_store).unwrap(), ws_before);
+    assert_eq!(
+        fs::read_to_string(rs_dir.join("Mod.luau")).unwrap(),
+        "return 'v1'\n"
+    );
+    let rs_after_first = fs::read(&rs_store).unwrap();
+
+    fs::write(&linked_file, "return 'v2'\n").unwrap();
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    assert_eq!(fs::read(&ws_store).unwrap(), ws_before);
+    assert_eq!(fs::read(&rs_store).unwrap(), rs_after_first);
+    assert_eq!(
+        fs::read_to_string(rs_dir.join("Mod.luau")).unwrap(),
+        "return 'v2'\n"
+    );
+
+    let fp_writable = link_cache_fingerprint(&dir, &dir.join("src"), None, false).unwrap();
+    fs::write(
+        dir.join("renium-link.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "links": [{
+                "id": "mod",
+                "readOnly": true,
+                "source": { "type": "local", "path": "linked/Mod.luau" },
+                "targets": [{ "service": "ReplicatedStorage", "path": ["ReplicatedStorage", "Mod"], "ords": [] }],
+            }],
+            "broken": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let fp_ro_v2 = link_cache_fingerprint(&dir, &dir.join("src"), None, false).unwrap();
+    assert_ne!(fp_writable, fp_ro_v2);
+    fs::write(&linked_file, "return 'v3'\n").unwrap();
+    let fp_ro_v3 = link_cache_fingerprint(&dir, &dir.join("src"), None, false).unwrap();
+    assert_ne!(fp_ro_v2, fp_ro_v3);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn link_apply_package_refuses_removing_instance_referenced_by_unloaded_v12_store() {
+    let dir = temp_dir("link-apply-unloaded-ref");
+    let ws_dir = dir.join("src").join("Workspace");
+    let rs_dir = dir.join("src").join("ReplicatedStorage");
+    fs::create_dir_all(&ws_dir).unwrap();
+    fs::create_dir_all(&rs_dir).unwrap();
+    let ws_store = service_settings_path(&ws_dir);
+    let rs_store = service_settings_path(&rs_dir);
+    settings_document(vec![settings_instance(
+        "rs-root",
+        "ReplicatedStorage",
+        "ReplicatedStorage",
+        None,
+    )])
+    .write_file(&rs_store)
+    .unwrap();
+    let package_path = dir.join("links").join("pkg.renium");
+    fs::create_dir_all(package_path.parent().unwrap()).unwrap();
+    settings_document(vec![
+        settings_instance("pkg-root", "Pkg", "Folder", None),
+        settings_instance("pkg-child", "Target", "Part", Some(0)),
+    ])
+    .write_file(&package_path)
+    .unwrap();
+    write_package_link_manifest(&dir, "ReplicatedStorage", true, &["Pkg"]);
+    link_apply(test_link_apply_args(&dir)).unwrap();
+
+    let rs_doc = SettingsBytecode::read_file(&rs_store).unwrap();
+    let target_id = rs_doc
+        .instances
+        .iter()
+        .find(|inst| inst.name == "Target")
+        .unwrap()
+        .settings_id
+        .clone();
+    let mut ref_holder = settings_instance("ws-ref", "Holder", "ObjectValue", Some(0));
+    ref_holder.properties.insert(
+        "Value".into(),
+        json!({
+            "_type": "Ref",
+            "settingsId": target_id,
+            "pathSegments": ["ReplicatedStorage", "Pkg", "Target"],
+            "pathOrdinals": [1, 1, 1],
+        }),
+    );
+    settings_document(vec![
+        settings_instance("ws-root", "Workspace", "Workspace", None),
+        ref_holder,
+    ])
+    .write_file(&ws_store)
+    .unwrap();
+
+    settings_document(vec![settings_instance("pkg-root", "Pkg", "Folder", None)])
+        .write_file(&package_path)
+        .unwrap();
+    let err = link_apply(test_link_apply_args(&dir)).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("Workspace") && msg.contains("Holder"), "{msg}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+fn repro_init_store(dir: &Path, service: &str) -> PathBuf {
+    let svc_dir = dir.join("src").join(service);
+    fs::create_dir_all(&svc_dir).unwrap();
+    let store = service_settings_path(&svc_dir);
+    settings_document(vec![settings_instance("root", service, service, None)])
+        .write_file(&store)
+        .unwrap();
+    store
+}
+
+fn repro_write_ref(
+    path: &Path,
+    service: &str,
+    ref_id: &str,
+    segs: &[&str],
+    ords: &[usize],
+    legacy: bool,
+) {
+    let mut h = settings_instance("ref-holder", "Holder", "ObjectValue", Some(0));
+    h.properties.insert(
+        "Value".into(),
+        json!({"_type": "Ref", "settingsId": ref_id, "pathSegments": segs, "pathOrdinals": ords}),
+    );
+    let doc = settings_document(vec![
+        settings_instance("svc-root", service, service, None),
+        h,
+    ]);
+    if legacy {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            crate::settings::bytecode::encode_settings_bytecode_v11(&doc).unwrap(),
+        )
+        .unwrap();
+    } else {
+        doc.write_file(path).unwrap();
+    }
+}
+
+#[test]
+fn repro_lk_path_refs_unloaded_v12_and_v11() {
+    for legacy in [false, true] {
+        let dir = temp_dir(if legacy {
+            "repro-path-v11"
+        } else {
+            "repro-path-v12"
+        });
+        let ws = repro_init_store(&dir, "Workspace");
+        repro_init_store(&dir, "ReplicatedStorage");
+        let pkg = dir.join("links/pkg.renium");
+        fs::create_dir_all(pkg.parent().unwrap()).unwrap();
+        settings_document(vec![
+            settings_instance("p0", "Pkg", "Folder", None),
+            settings_instance("p1", "Target", "Part", Some(0)),
+        ])
+        .write_file(&pkg)
+        .unwrap();
+        write_package_link_manifest(&dir, "ReplicatedStorage", true, &["Pkg"]);
+        link_apply(test_link_apply_args(&dir)).unwrap();
+        repro_write_ref(
+            &ws,
+            "Workspace",
+            "obs:stale-id",
+            &["ReplicatedStorage", "Pkg", "Target"],
+            &[1, 1, 1],
+            legacy,
+        );
+        settings_document(vec![settings_instance("p0", "Pkg", "Folder", None)])
+            .write_file(&pkg)
+            .unwrap();
+        let msg = format!("{:#}", link_apply(test_link_apply_args(&dir)).unwrap_err());
+        assert!(
+            msg.contains("Workspace") && msg.contains("Holder"),
+            "legacy={legacy}: {msg}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn repro_b1_third_service_same_id() {
+    let dir = temp_dir("repro-b1-third-svc");
+    let rs = repro_init_store(&dir, "ReplicatedStorage");
+    let ss = repro_init_store(&dir, "ServerStorage");
+    fs::create_dir_all(dir.join("links")).unwrap();
+    settings_document(vec![settings_instance("p0", "Pkg", "Folder", None)])
+        .write_file(&dir.join("links/rs.renium"))
+        .unwrap();
+    settings_document(vec![settings_instance("p1", "Other", "Folder", None)])
+        .write_file(&dir.join("links/ss.renium"))
+        .unwrap();
+    repro_write_ref(
+        &ss,
+        "ServerStorage",
+        "reconcile:24",
+        &["Workspace", "Door"],
+        &[1, 1],
+        false,
+    );
+    settings_document(vec![
+        settings_instance("rs", "ReplicatedStorage", "ReplicatedStorage", None),
+        settings_instance("pkg", "Pkg", "Folder", Some(0)),
+        settings_instance("reconcile:24", "Removed", "Part", Some(1)),
+    ])
+    .write_file(&rs)
+    .unwrap();
+    fs::write(
+        dir.join("renium-link.json"),
+        serde_json::to_vec(&json!({"version": 1, "broken": [], "links": [
+            {"id": "rs-pkg", "readOnly": true, "source": {"type": "local", "path": "links/rs.renium"}, "targets": [{"service": "ReplicatedStorage", "path": ["ReplicatedStorage", "Pkg"], "ords": []}]},
+            {"id": "ss-pkg", "readOnly": true, "source": {"type": "local", "path": "links/ss.renium"}, "targets": [{"service": "ServerStorage", "path": ["ServerStorage", "Other"], "ords": []}]},
+        ]}))
+        .unwrap(),
+    )
+    .unwrap();
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    assert!(
+        !SettingsBytecode::read_file(&rs)
+            .unwrap()
+            .instances
+            .iter()
+            .any(|i| i.name == "Removed")
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn repro_b2_c3_stale_ref_rewrite_loaded_and_unloaded() {
+    let dir = temp_dir("repro-b2-c3-stale-rewrite");
+    let ws = repro_init_store(&dir, "Workspace");
+    let rs = repro_init_store(&dir, "ReplicatedStorage");
+    let ss = repro_init_store(&dir, "ServerStorage");
+    fs::create_dir_all(dir.join("links")).unwrap();
+    let mut tgt = settings_instance("p1", "Target", "Part", Some(0));
+    tgt.properties.insert("Transparency".into(), json!(0.25));
+    settings_document(vec![
+        settings_instance("p0", "Pkg", "Folder", None),
+        tgt.clone(),
+    ])
+    .write_file(&dir.join("links/pkg.renium"))
+    .unwrap();
+    settings_document(vec![settings_instance("s0", "Other", "Folder", None)])
+        .write_file(&dir.join("links/ss.renium"))
+        .unwrap();
+    fs::write(
+        dir.join("renium-link.json"),
+        serde_json::to_vec(&json!({"version": 1, "broken": [], "links": [
+            {"id": "rs-pkg", "readOnly": true, "source": {"type": "local", "path": "links/pkg.renium"}, "targets": [{"service": "ReplicatedStorage", "path": ["ReplicatedStorage", "Pkg"], "ords": []}]},
+            {"id": "ss-pkg", "readOnly": true, "source": {"type": "local", "path": "links/ss.renium"}, "targets": [{"service": "ServerStorage", "path": ["ServerStorage", "Other"], "ords": []}]},
+        ]}))
+        .unwrap(),
+    )
+    .unwrap();
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    let tid = SettingsBytecode::read_file(&rs)
+        .unwrap()
+        .instances
+        .into_iter()
+        .find(|i| i.name == "Target")
+        .unwrap()
+        .settings_id;
+    repro_write_ref(
+        &ws,
+        "Workspace",
+        "obs:stale-unloaded",
+        &["ReplicatedStorage", "Pkg", "Target"],
+        &[1, 1, 1],
+        false,
+    );
+    let mut ss_doc = SettingsBytecode::read_file(&ss).unwrap();
+    let mut h = settings_instance("ss-h", "Holder", "ObjectValue", Some(0));
+    h.properties.insert(
+        "Value".into(),
+        json!({"_type": "Ref", "settingsId": "obs:stale-loaded", "pathSegments": ["ReplicatedStorage", "Pkg", "Target"], "pathOrdinals": [1, 1, 1]}),
+    );
+    ss_doc.instances.push(h);
+    ss_doc.write_file(&ss).unwrap();
+    tgt.properties.insert("Transparency".into(), json!(0.75));
+    settings_document(vec![
+        settings_instance("p0", "Pkg", "Folder", None),
+        settings_instance("pb", "Before", "Folder", Some(0)),
+        tgt,
+    ])
+    .write_file(&dir.join("links/pkg.renium"))
+    .unwrap();
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    for store in [&ws, &ss] {
+        let doc = SettingsBytecode::read_file(store).unwrap();
+        assert_eq!(
+            doc.instances
+                .iter()
+                .find(|i| i.name == "Holder")
+                .unwrap()
+                .properties["Value"]["settingsId"],
+            json!(tid),
+            "{}",
+            store.display()
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn repro_b3_b9_mirror_order_and_namesakes() {
+    let dir = temp_dir("repro-b3-b9-mirror-namesake");
+    let ws = repro_init_store(&dir, "Workspace");
+    repro_init_store(&dir, "ReplicatedStorage");
+    fs::create_dir_all(dir.join("linked")).unwrap();
+    fs::create_dir_all(dir.join("links")).unwrap();
+    fs::write(dir.join("linked/Tool.luau"), "return 1\n").unwrap();
+    settings_document(vec![
+        settings_instance("p0", "Pkg", "Folder", None),
+        settings_instance("p1", "Dup", "Part", Some(0)),
+        settings_instance("p2", "Dup", "Part", Some(0)),
+    ])
+    .write_file(&dir.join("links/pkg.renium"))
+    .unwrap();
+    repro_write_ref(
+        &ws,
+        "Workspace",
+        "obs:stale-id",
+        &["ReplicatedStorage", "Pkg", "Dup"],
+        &[1, 1, 9],
+        false,
+    );
+    fs::write(
+        dir.join("renium-link.json"),
+        serde_json::to_vec(&json!({"version": 1, "broken": [], "links": [
+            {"id": "ws-mirror", "readOnly": false, "source": {"type": "local", "path": "linked/Tool.luau"}, "targets": [{"service": "Workspace", "path": ["Workspace", "Tool"], "ords": []}]},
+            {"id": "rs-pkg", "readOnly": true, "source": {"type": "local", "path": "links/pkg.renium"}, "targets": [{"service": "ReplicatedStorage", "path": ["ReplicatedStorage", "Pkg"], "ords": []}]},
+        ]}))
+        .unwrap(),
+    )
+    .unwrap();
+    link_apply(test_link_apply_args(&dir)).unwrap();
+    fs::write(dir.join("linked/Tool.luau"), "return 2\n").unwrap();
+    let mut ws_doc = SettingsBytecode::read_file(&ws).unwrap();
+    ws_doc.instances.retain(|i| i.name != "Tool");
+    ws_doc.write_file(&ws).unwrap();
+    settings_document(vec![settings_instance("p0", "Pkg", "Folder", None)])
+        .write_file(&dir.join("links/pkg.renium"))
+        .unwrap();
+    let msg = format!("{:#}", link_apply(test_link_apply_args(&dir)).unwrap_err());
+    assert!(msg.contains("Workspace") && msg.contains("Holder"), "{msg}");
+    fs::remove_dir_all(dir).unwrap();
+}

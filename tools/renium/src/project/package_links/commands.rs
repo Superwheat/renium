@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -44,15 +44,15 @@ use super::{
     GLOBAL_LINK_PREFIX, LinkEntry, LinkLockEntry, LinkManifest, LinkResolveOptions, LinkSource,
     LinkSourceMeta, LinkTargetRef, LinkTargetStorage, PackageMaterialization, RENIUM_DIR_GITIGNORE,
     RENIUM_STORE_EXTENSION, ResolvedLinkTarget, collect_project_settings_files,
-    describe_external_reference_refusal, ensure_settings_document, inline_target_sources,
-    is_global_link_path, is_package_path, link_lock_path, link_manifest_path, link_mirror_lock_key,
-    link_slug, link_target_document_selector, link_target_document_selector_parts,
-    link_target_from_settings_id, link_target_key, link_target_ordinals, link_target_ref_key,
-    link_target_segments, load_settings_documents, mark_manifest_target_broken,
+    describe_external_reference_refusal_in_project, ensure_settings_document,
+    inline_target_sources, is_global_link_path, is_package_path, link_lock_path,
+    link_manifest_path, link_mirror_lock_key, link_slug, link_target_document_selector,
+    link_target_document_selector_parts, link_target_from_settings_id, link_target_key,
+    link_target_ordinals, link_target_ref_key, link_target_segments, mark_manifest_target_broken,
     materialize_package_target, package_document_fingerprint, package_lock_key,
     package_target_difference, package_target_fingerprint, package_target_matches,
     package_target_settings_ids, read_link_lock, read_link_manifest, read_link_source_meta,
-    referenced_settings_ids_outside, renium_global_packages_dir, resolve_link_cache_dir,
+    referenced_settings_ids_outside_files, renium_global_packages_dir, resolve_link_cache_dir,
     resolve_link_target_storage, resolve_link_targets, resolve_local_link_path,
     selector_starts_with, serialize_link_lock, serialize_link_manifest,
     stage_settings_document_writes, stray_target_files, subtree_relative_indices,
@@ -625,7 +625,15 @@ pub(super) fn externalize_target_scripts(
     Ok(externalized)
 }
 
-struct PackageLinkApply<'a> {
+struct LinkApplyState<'a> {
+    src_root: &'a Path,
+    other_documents: &'a mut HashMap<PathBuf, SettingsBytecode>,
+    mirror_structures: &'a mut HashMap<PathBuf, (Vec<u8>, SettingsBytecode)>,
+    settings_outputs: &'a mut HashMap<PathBuf, PathBuf>,
+    dirty_settings: &'a mut HashSet<String>,
+}
+
+struct PackageLinkApply<'a, 'b> {
     args: &'a LinkApplyArgs,
     restoring: Option<&'a pull::PullRestorePolicy>,
     project_root: &'a Path,
@@ -634,15 +642,61 @@ struct PackageLinkApply<'a> {
     storage: &'a LinkTargetStorage,
     settings_file: &'a Path,
     document_selector: &'a (String, Vec<String>, Vec<usize>),
-    external_references: &'a HashSet<String>,
+    state: &'a mut LinkApplyState<'b>,
     document: &'a mut SettingsBytecode,
     lock_entry: &'a mut LinkLockEntry,
     manifest: &'a mut LinkManifest,
     changes: &'a mut LinkApplyChanges,
 }
 
-impl PackageLinkApply<'_> {
-    fn apply(self) -> Result<()> {
+fn canonicalize_stale_ref_stores(
+    settings_file: &Path,
+    document: &mut SettingsBytecode,
+    stale_ref_stores: &BTreeSet<PathBuf>,
+    state: &mut LinkApplyState<'_>,
+    changes: &mut LinkApplyChanges,
+) -> Result<()> {
+    let empty = SettingsBytecode {
+        version: document.version,
+        instances: Vec::new(),
+    };
+    let mut subset = HashMap::with_capacity(stale_ref_stores.len() + 1);
+    subset.insert(
+        settings_file.to_path_buf(),
+        std::mem::replace(document, empty),
+    );
+    for path in stale_ref_stores {
+        let loaded = if let Some(doc) = state.other_documents.remove(path) {
+            doc
+        } else if let Some((raw, _)) = state.mirror_structures.remove(path) {
+            crate::settings::bytecode::decode_settings_bytecode(&raw)
+                .with_context(|| format!("Failed to read {}", path.display()))?
+        } else {
+            SettingsBytecode::read_file(path)
+                .with_context(|| format!("Failed to read {}", path.display()))?
+        };
+        state
+            .settings_outputs
+            .entry(path.clone())
+            .or_insert_with(|| path.clone());
+        subset.insert(path.clone(), loaded);
+    }
+    let changed = super::canonicalize_loaded_settings_documents(&mut subset)?;
+    if let Some(updated_target) = subset.remove(settings_file) {
+        *document = updated_target;
+    }
+    for (path, updated) in subset {
+        if super::document_service_name(&updated).is_some_and(|svc| changed.contains(svc)) {
+            state.dirty_settings.insert(exact_path_key(&path));
+            changes.mark_path(&path);
+        }
+        state.other_documents.insert(path, updated);
+    }
+    Ok(())
+}
+
+impl PackageLinkApply<'_, '_> {
+    fn apply(self) -> Result<bool> {
         let Self {
             args,
             restoring,
@@ -652,12 +706,13 @@ impl PackageLinkApply<'_> {
             storage,
             settings_file,
             document_selector,
-            external_references,
+            state,
             document,
             lock_entry,
             manifest,
             changes,
         } = self;
+        let mut document_changed = false;
         let package_path = target
             .package_source
             .as_ref()
@@ -720,7 +775,7 @@ impl PackageLinkApply<'_> {
             {
                 locked.settings_id = None;
             }
-            return Ok(());
+            return Ok(false);
         }
         let previous_package_hash = lock_entry.files.get(&lock_key).cloned();
         let previous_target_fingerprint = lock_entry.files.get(&target_fingerprint_key).cloned();
@@ -763,14 +818,25 @@ impl PackageLinkApply<'_> {
             }
         } else if !unchanged && (!preserved_target_edits || target_forced) {
             if !target_matches_package {
-                let mut protected_references;
-                let external_references = if let Some(policy) = restoring {
-                    protected_references = external_references.clone();
-                    protected_references.extend(policy.outside_references()?.iter().cloned());
-                    &protected_references
-                } else {
-                    external_references
-                };
+                let (mut external_references, stale_ref_stores) =
+                    referenced_settings_ids_outside_files(
+                        state.src_root,
+                        state.other_documents,
+                        settings_file,
+                        document,
+                    )?;
+                if let Some(policy) = restoring {
+                    external_references.extend(policy.outside_references()?.iter().cloned());
+                }
+                if restoring.is_none() && !stale_ref_stores.is_empty() {
+                    canonicalize_stale_ref_stores(
+                        settings_file,
+                        document,
+                        &stale_ref_stores,
+                        state,
+                        changes,
+                    )?;
+                }
                 let materialized = materialize_package_target(
                     document,
                     PackageMaterialization {
@@ -780,10 +846,11 @@ impl PackageLinkApply<'_> {
                         target_ordinals: document_ordinals,
                         package_path,
                         filesystem_target: storage.filesystem_target,
-                        external_references,
+                        external_references: &external_references,
                         displace_into: shared_replaced_dir.as_deref(),
                     },
                 )?;
+                document_changed = true;
                 for path in materialized.removals {
                     changes.remove_package_path(&storage.source_root, path);
                 }
@@ -840,6 +907,7 @@ impl PackageLinkApply<'_> {
                 changes,
             )?
         {
+            document_changed = true;
             changes.mark_path(settings_file);
         }
         changes.processed_targets += 1;
@@ -891,7 +959,7 @@ impl PackageLinkApply<'_> {
             });
         }
         changes.link_results.push(result);
-        Ok(())
+        Ok(document_changed)
     }
 }
 
@@ -904,9 +972,43 @@ struct MirrorLinkApply<'a> {
     document_selector: Option<&'a (String, Vec<String>, Vec<usize>)>,
     settings_file: Option<&'a Path>,
     documents: &'a mut HashMap<PathBuf, SettingsBytecode>,
+    mirror_structures: &'a mut HashMap<PathBuf, (Vec<u8>, SettingsBytecode)>,
+    dirty_settings: &'a mut HashSet<String>,
     lock_entry: &'a mut LinkLockEntry,
     manifest: &'a mut LinkManifest,
     changes: &'a mut LinkApplyChanges,
+}
+
+fn mirror_structure_matches_spec(
+    raw_bytes: &[u8],
+    structure: &SettingsBytecode,
+    spec: &crate::editor::types::EditorSourcePathSpec,
+) -> Result<Option<String>> {
+    let index = crate::editor::document::EditorDocumentIndex::new(structure);
+    let Some(target_index) = index.source_target(structure, spec) else {
+        return Ok(None);
+    };
+    let instance = &structure.instances[target_index];
+    if instance.class_name != spec.class_name {
+        return Ok(None);
+    }
+    let rows =
+        crate::settings::bytecode::blocks::BlockStore::open(raw_bytes)?.rows(&[target_index])?;
+    let rc_val = rows
+        .first()
+        .and_then(|(_, v)| v.properties.get("RunContext"));
+    let rc_name = rc_val.and_then(|v| {
+        v.as_str()
+            .or_else(|| v.as_object()?.get("name").and_then(Value::as_str))
+    });
+    let ok = if instance.class_name == "Script" {
+        spec.run_context
+            .as_deref()
+            .is_none_or(|exp| rc_name.is_some_and(|act| act.eq_ignore_ascii_case(exp)))
+    } else {
+        rc_val.is_none()
+    };
+    Ok(ok.then(|| instance.settings_id.clone()))
 }
 
 impl MirrorLinkApply<'_> {
@@ -920,6 +1022,8 @@ impl MirrorLinkApply<'_> {
             document_selector,
             settings_file,
             documents,
+            mirror_structures,
+            dirty_settings,
             lock_entry,
             manifest,
             changes,
@@ -943,7 +1047,9 @@ impl MirrorLinkApply<'_> {
             .any(|key| target_lock.files.contains_key(key));
         let target_exists = if let Some((service, segments, ordinals)) = document_selector
             && let Some(settings_file) = settings_file
-            && let Some(document) = documents.get(settings_file)
+            && let Some(document) = documents
+                .get(settings_file)
+                .or_else(|| mirror_structures.get(settings_file).map(|(_, doc)| doc))
         {
             resolve_editor_instance_by_path_ordinals(document, service, segments, ordinals)
                 .is_some()
@@ -991,21 +1097,46 @@ impl MirrorLinkApply<'_> {
             let mut target_settings_id = None;
             if let Some((service, _, _)) = document_selector
                 && let Some(settings_file) = settings_file
-                && let Some(document) = documents.get_mut(settings_file)
                 && let Some(spec) = infer_editor_source_path_spec_in_service(
                     &storage.source_root,
                     service,
                     &pair.mirror,
                 )
             {
-                let ensured = ensure_editor_source_target_in_bytecode(document, &spec)?;
-                structure_changed = ensured.changed;
-                if let Some(id) = ensured.target.settings_id {
+                let matched_in_structure = if !documents.contains_key(settings_file)
+                    && let Some((raw_bytes, structure)) = mirror_structures.get(settings_file)
+                {
+                    mirror_structure_matches_spec(raw_bytes, structure, &spec)?
+                } else {
+                    None
+                };
+                if let Some(id) = matched_in_structure {
                     settings_ids.push(id.clone());
                     target_settings_id = Some(id);
-                }
-                if structure_changed {
-                    changes.mark_path(settings_file);
+                } else {
+                    if !documents.contains_key(settings_file)
+                        && let Some((raw_bytes, _)) = mirror_structures.remove(settings_file)
+                    {
+                        documents.insert(
+                            settings_file.to_path_buf(),
+                            crate::settings::bytecode::decode_settings_bytecode(&raw_bytes)
+                                .with_context(|| {
+                                    format!("Failed to read {}", settings_file.display())
+                                })?,
+                        );
+                    }
+                    if let Some(document) = documents.get_mut(settings_file) {
+                        let ensured = ensure_editor_source_target_in_bytecode(document, &spec)?;
+                        structure_changed = ensured.changed;
+                        if let Some(id) = ensured.target.settings_id {
+                            settings_ids.push(id.clone());
+                            target_settings_id = Some(id);
+                        }
+                        if structure_changed {
+                            dirty_settings.insert(exact_path_key(settings_file));
+                            changes.mark_path(settings_file);
+                        }
+                    }
                 }
             }
             let target_changed = structure_changed || mirror_changed && !locally_edited;
@@ -1064,7 +1195,9 @@ impl MirrorLinkApply<'_> {
         changes.processed_targets += 1;
         let root_settings_id = document_selector.zip(settings_file).and_then(
             |((service, segments, ordinals), settings_file)| {
-                let document = documents.get(settings_file)?;
+                let document = documents
+                    .get(settings_file)
+                    .or_else(|| mirror_structures.get(settings_file).map(|(_, doc)| doc))?;
                 let index = resolve_editor_instance_by_path_ordinals(
                     document, service, segments, ordinals,
                 )?;
@@ -1162,26 +1295,64 @@ pub(super) fn apply_project_links_inner(
         cache_dir: resolve_link_cache_dir(&project_root, &manifest, args.cache_dir.as_deref()),
     };
     let mut targets = resolve_link_targets(&project_root, &src_root, &manifest, &options);
-    let settings_files = collect_project_settings_files(
-        &src_root,
-        targets
-            .iter()
-            .filter(|target| target.resolved && !target.broken)
-            .filter_map(|target| target.storage.as_ref()?.settings_file.clone()),
-    )?;
+    let mut target_settings_files: Vec<PathBuf> = targets
+        .iter()
+        .filter(|target| target.resolved && !target.broken)
+        .filter_map(|target| target.storage.as_ref()?.settings_file.clone())
+        .collect();
+    target_settings_files.sort_by_key(|path| exact_path_key(path));
+    target_settings_files.dedup_by(|left, right| exact_path_key(left) == exact_path_key(right));
     let settings_guards = acquire_settings_file_locks(
-        settings_files
+        target_settings_files
             .iter()
             .filter(|path| path.is_file() || !args.check)
             .map(PathBuf::as_path),
     )?;
-
-    let existing_settings_files = settings_files
+    let package_settings_keys: HashSet<String> = targets
         .iter()
-        .filter(|path| path.is_file())
-        .cloned()
-        .collect::<Vec<_>>();
-    let (mut documents, mut settings_outputs) = load_settings_documents(&existing_settings_files)?;
+        .filter(|target| target.resolved && !target.broken && target.package_source.is_some())
+        .filter_map(|target| target.storage.as_ref()?.settings_file.as_ref())
+        .map(|path| exact_path_key(path))
+        .collect();
+    let mut documents = HashMap::<PathBuf, SettingsBytecode>::new();
+    let mut mirror_structures = HashMap::<PathBuf, (Vec<u8>, SettingsBytecode)>::new();
+    let mut settings_outputs = HashMap::<PathBuf, PathBuf>::new();
+    let mut dirty_settings = HashSet::<String>::new();
+    for path in &target_settings_files {
+        if !path.is_file() {
+            continue;
+        }
+        settings_outputs.insert(path.clone(), path.clone());
+        let read_err = || format!("Failed to read {}", path.display());
+        if package_settings_keys.contains(&exact_path_key(path)) {
+            documents.insert(
+                path.clone(),
+                SettingsBytecode::read_file(path).with_context(read_err)?,
+            );
+        } else {
+            let bytes = fs::read(path).with_context(read_err)?;
+            if crate::settings::bytecode::blocks::is_block_store(&bytes) {
+                let structure = crate::settings::bytecode::blocks::BlockStore::open(&bytes)
+                    .and_then(|store| store.structure())
+                    .with_context(read_err)?;
+                mirror_structures.insert(path.clone(), (bytes, structure));
+            } else {
+                let doc = crate::settings::bytecode::decode_settings_bytecode(&bytes)
+                    .with_context(read_err)?;
+                documents.insert(path.clone(), doc);
+            }
+        }
+    }
+    let mut canonicalized_paths = Vec::new();
+    if !package_settings_keys.is_empty() && !documents.is_empty() {
+        let changed_services = super::canonicalize_loaded_settings_documents(&mut documents)?;
+        for (path, doc) in &documents {
+            if super::document_service_name(doc).is_some_and(|svc| changed_services.contains(svc)) {
+                dirty_settings.insert(exact_path_key(path));
+                canonicalized_paths.push(path.clone());
+            }
+        }
+    }
     for target in targets
         .iter()
         .filter(|target| target.resolved && !target.broken)
@@ -1189,12 +1360,26 @@ pub(super) fn apply_project_links_inner(
         let Some(storage) = target.storage.as_ref() else {
             continue;
         };
-        ensure_settings_document(
-            &mut documents,
-            &mut settings_outputs,
-            storage,
-            &target.service,
-        );
+        if let Some(settings_file) = storage.settings_file.as_ref()
+            && !documents.contains_key(settings_file)
+            && !mirror_structures.contains_key(settings_file)
+        {
+            dirty_settings.insert(exact_path_key(settings_file));
+            ensure_settings_document(
+                &mut documents,
+                &mut settings_outputs,
+                storage,
+                &target.service,
+            );
+        } else if let Some(settings_file) = storage.settings_file.as_ref() {
+            settings_outputs.insert(
+                settings_file.clone(),
+                storage
+                    .settings_output_file
+                    .clone()
+                    .unwrap_or_else(|| settings_file.clone()),
+            );
+        }
     }
     let forced_targets: Vec<LinkTargetRef> = args
         .force_target
@@ -1228,6 +1413,9 @@ pub(super) fn apply_project_links_inner(
         manifest_changed,
         ..Default::default()
     };
+    for path in canonicalized_paths {
+        changes.mark_path(&path);
+    }
 
     for target in &targets {
         if target.broken {
@@ -1255,6 +1443,7 @@ pub(super) fn apply_project_links_inner(
             .context("Resolved link target has no ownership information")?;
         if let Some(settings_file) = storage.settings_file.as_ref()
             && !documents.contains_key(settings_file)
+            && !mirror_structures.contains_key(settings_file)
         {
             documents.insert(
                 settings_file.clone(),
@@ -1278,7 +1467,9 @@ pub(super) fn apply_project_links_inner(
         }
         let document_key = storage.settings_file.as_ref();
         let document_selector = if let Some(settings_file) = document_key
-            && let Some(document) = documents.get(settings_file)
+            && let Some(document) = documents
+                .get(settings_file)
+                .or_else(|| mirror_structures.get(settings_file).map(|(_, doc)| doc))
         {
             Some(link_target_document_selector(target, document)?)
         } else {
@@ -1295,10 +1486,16 @@ pub(super) fn apply_project_links_inner(
             let document_selector = document_selector
                 .as_ref()
                 .context("Package link target has no bytecode selector")?;
-            let external_references = referenced_settings_ids_outside(&documents, settings_file);
-            let document = documents
-                .get_mut(settings_file)
+            let mut document = documents
+                .remove(settings_file)
                 .context("Package link target settings were not loaded")?;
+            let mut state = LinkApplyState {
+                src_root: &src_root,
+                other_documents: &mut documents,
+                mirror_structures: &mut mirror_structures,
+                settings_outputs: &mut settings_outputs,
+                dirty_settings: &mut dirty_settings,
+            };
             let applied = PackageLinkApply {
                 args,
                 restoring,
@@ -1308,20 +1505,29 @@ pub(super) fn apply_project_links_inner(
                 storage,
                 settings_file,
                 document_selector,
-                external_references: &external_references,
-                document,
+                state: &mut state,
+                document: &mut document,
                 lock_entry,
                 manifest: &mut manifest,
                 changes: &mut changes,
             }
             .apply();
-            if let Err(error) = applied {
-                return Err(describe_external_reference_refusal(
-                    error,
-                    &documents,
-                    settings_file,
-                    &target.link_id,
-                ));
+            documents.insert(settings_file.clone(), document);
+            match applied {
+                Ok(changed) => {
+                    if changed {
+                        dirty_settings.insert(exact_path_key(settings_file));
+                    }
+                }
+                Err(error) => {
+                    return Err(describe_external_reference_refusal_in_project(
+                        error,
+                        &src_root,
+                        &documents,
+                        settings_file,
+                        &target.link_id,
+                    ));
+                }
             }
             continue;
         }
@@ -1335,6 +1541,8 @@ pub(super) fn apply_project_links_inner(
             document_selector: document_selector.as_ref(),
             settings_file: document_key.map(PathBuf::as_path),
             documents: &mut documents,
+            mirror_structures: &mut mirror_structures,
+            dirty_settings: &mut dirty_settings,
             lock_entry,
             manifest: &mut manifest,
             changes: &mut changes,
@@ -1344,6 +1552,10 @@ pub(super) fn apply_project_links_inner(
 
     let mut studio_overrides = BTreeMap::new();
     if !args.check {
+        documents.retain(|path, _| {
+            exact_path_key(&settings_outputs[path]) != exact_path_key(path)
+                || dirty_settings.contains(&exact_path_key(path))
+        });
         stage_settings_document_writes(
             &documents,
             &settings_outputs,
@@ -1821,17 +2033,21 @@ fn project_link_status(
     let mut packages = HashMap::<PathBuf, Option<(SettingsBytecode, String)>>::new();
     let mut settings_documents = HashMap::new();
     for target in &resolved {
-        if let Some(path) = target
-            .storage
-            .as_ref()
-            .and_then(|storage| storage.settings_file.as_ref())
+        if target.package_source.is_some()
+            && target.resolved
+            && let Some(path) = target
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.settings_file.as_ref())
             && !settings_documents.contains_key(path)
             && let Ok(document) = SettingsBytecode::read_file(path)
         {
             settings_documents.insert(path.clone(), document);
         }
     }
-    if let Err(error) = super::canonicalize_loaded_settings_documents(&mut settings_documents) {
+    if !settings_documents.is_empty()
+        && let Err(error) = super::canonicalize_loaded_settings_documents(&mut settings_documents)
+    {
         return json!({"ok": false, "error": error.to_string()});
     }
     let mut file_contents = HashMap::<PathBuf, Option<String>>::new();

@@ -210,30 +210,30 @@ impl PullLinkRestore {
 /// Read and guard the same bytes. Unpulled stores are not published, but their
 /// references still protect identities that a package replacement would delete.
 fn capture_outside_references(src_root: &Path, services: &[String]) -> Result<OutsideReferences> {
-    let mut documents = HashMap::new();
-    let mut outside = Vec::new();
+    let mut ids = HashSet::new();
     let mut inputs = Vec::new();
     for path in collect_project_settings_files(src_root, std::iter::empty())? {
         let bytes = fs::read(&path)?;
-        let document = decode_settings_bytecode(&bytes)?;
-        if document
-            .instances
-            .first()
-            .is_some_and(|root| !services.contains(&root.name))
+        let (service, file_ids) = if crate::settings::bytecode::blocks::is_block_store(&bytes) {
+            let (service, refs) =
+                crate::settings::bytecode::blocks::external_reference_targets(&bytes, None)?;
+            let ids = refs.into_iter().flat_map(|item| item.ids).collect();
+            (service, ids)
+        } else {
+            let document = decode_settings_bytecode(&bytes)?;
+            let service = document.instances.first().map(|root| root.name.clone());
+            let ids = referenced_settings_ids(&document);
+            (service, ids)
+        };
+        if service
+            .as_ref()
+            .is_some_and(|name| !services.contains(name))
         {
-            inputs.push((path.clone(), Some(sha256_hex(&bytes))));
-            outside.push(path.clone());
+            inputs.push((path, Some(sha256_hex(&bytes))));
+            ids.extend(file_ids);
         }
-        documents.insert(path, document);
     }
-    canonicalize_loaded_settings_documents(&mut documents)?;
-    Ok(OutsideReferences {
-        ids: outside
-            .into_iter()
-            .flat_map(|path| referenced_settings_ids(&documents[&path]))
-            .collect(),
-        inputs,
-    })
+    Ok(OutsideReferences { ids, inputs })
 }
 
 fn ensure_inputs_unchanged(inputs: &[(PathBuf, Option<String>)]) -> Result<()> {

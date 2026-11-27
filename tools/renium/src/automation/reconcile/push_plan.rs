@@ -1127,8 +1127,23 @@ pub(crate) fn attach_capture_identities(
         let Some(entry) = studio.entries.get(path) else {
             continue;
         };
-        let capture = settings_document(Some(entry))?;
         let aligned = &change.previous;
+        let service = settings_service_name(path, &change.current, aligned)?;
+        let needs_identities = plan
+            .previous_paths
+            .keys()
+            .any(|(path_service, _)| *path_service == service)
+            || plan
+                .instance_deletes
+                .iter()
+                .any(|delete| delete.service == service && !delete.instances.is_empty());
+        if !needs_identities {
+            continue;
+        }
+        let capture = match entry {
+            SnapshotEntry::File(bytes) => SettingsBytecode::decode_structure(bytes)?,
+            _ => settings_document(Some(entry))?,
+        };
         let same_shape = capture.instances.len() == aligned.instances.len()
             && capture
                 .instances
@@ -1149,7 +1164,6 @@ pub(crate) fn attach_capture_identities(
             );
             continue;
         }
-        let service = settings_service_name(path, &change.current, aligned)?;
         let index_by_id = aligned
             .instances
             .iter()

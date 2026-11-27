@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -1782,10 +1782,23 @@ pub(crate) fn external_reference_sources(
     sources
 }
 
-/// Adds the link target and the referring instances to a refusal raised by
-/// `prepare_package_replacement`; other errors pass through unchanged.
-pub(crate) fn describe_external_reference_refusal(
+fn parse_ref_path(reference: &Map<String, Value>) -> Option<(Vec<String>, Option<Vec<usize>>)> {
+    let segs = reference
+        .get("pathSegments")?
+        .as_array()?
+        .iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    let ords = reference
+        .get("pathOrdinals")
+        .and_then(Value::as_array)
+        .and_then(|a| a.iter().map(|v| v.as_u64().map(|n| n as usize)).collect());
+    Some((segs, ords))
+}
+
+pub(crate) fn describe_external_reference_refusal_in_project(
     error: anyhow::Error,
+    src_root: &Path,
     documents: &HashMap<PathBuf, SettingsBytecode>,
     settings_file: &Path,
     link_target: &str,
@@ -1793,7 +1806,61 @@ pub(crate) fn describe_external_reference_refusal(
     let Some(removal) = error.downcast_ref::<ExternallyReferencedRemoval>() else {
         return error;
     };
-    let referrers = external_reference_sources(documents, settings_file, &removal.id);
+    let mut referrers = external_reference_sources(documents, settings_file, &removal.id);
+    if referrers.is_empty()
+        && let Some(target_doc) = documents.get(settings_file)
+        && let Some(svc) = document_service_name(target_doc)
+    {
+        let excluded_key = exact_path_key(settings_file);
+        let scan_doc = |path: &Path, doc: &SettingsBytecode, out: &mut Vec<String>| {
+            let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+            for (index, inst) in doc.instances.iter().enumerate() {
+                let mut hit = false;
+                for val in inst.properties.values().chain(inst.attributes.values()) {
+                    crate::settings::bytecode::for_each_reference(val, &mut |r| {
+                        hit |= parse_ref_path(r).is_some_and(|(s, o)| {
+                            resolve_external_ref_indices(target_doc, svc, &s, o.as_deref())
+                                .iter()
+                                .any(|&i| target_doc.instances[i].settings_id == removal.id)
+                        });
+                    });
+                }
+                if hit {
+                    out.push(format!("{name}: {}", settings_instance_path(doc, index)));
+                }
+            }
+        };
+        for (path, doc) in documents {
+            if exact_path_key(path) != excluded_key {
+                scan_doc(path, doc, &mut referrers);
+            }
+        }
+        if referrers.is_empty()
+            && let Ok(all_files) = collect_project_settings_files(src_root, std::iter::empty())
+        {
+            for path in all_files {
+                let key = exact_path_key(&path);
+                if key == excluded_key || documents.keys().any(|p| exact_path_key(p) == key) {
+                    continue;
+                }
+                if let Ok(doc) = SettingsBytecode::read_file(&path) {
+                    let mut pair = HashMap::from([
+                        (path.clone(), doc),
+                        (settings_file.to_path_buf(), target_doc.clone()),
+                    ]);
+                    let _ = canonicalize_loaded_settings_documents(&mut pair);
+                    let found = external_reference_sources(&pair, settings_file, &removal.id);
+                    if !found.is_empty() {
+                        referrers.extend(found);
+                    } else if let Some(d) = pair.get(&path) {
+                        scan_doc(&path, d, &mut referrers);
+                    }
+                }
+            }
+        }
+        referrers.sort();
+        referrers.dedup();
+    }
     let listed = if referrers.is_empty() {
         "a store that is not loaded".to_string()
     } else {
@@ -1982,6 +2049,128 @@ fn referenced_settings_ids_outside(
         .collect()
 }
 
+fn resolve_external_ref_indices(
+    target_doc: &SettingsBytecode,
+    service: &str,
+    segments: &[String],
+    ordinals: Option<&[usize]>,
+) -> Vec<usize> {
+    if segments.first().map(String::as_str) != Some(service) {
+        return Vec::new();
+    }
+    if let Some(ords) = ordinals.filter(|ords| !ords.is_empty()) {
+        let exact =
+            crate::editor::paths::document_instance_path_matches(target_doc, segments, ords);
+        if !exact.is_empty() {
+            return exact.into_iter().map(|(index, _)| index).collect();
+        }
+    }
+    crate::editor::paths::document_instance_path_matches(target_doc, segments, &[])
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn referenced_settings_ids_outside_files(
+    src_root: &Path,
+    documents: &HashMap<PathBuf, SettingsBytecode>,
+    excluded: &Path,
+    excluded_doc: &SettingsBytecode,
+) -> Result<(HashSet<String>, BTreeSet<PathBuf>)> {
+    let excluded_key = exact_path_key(excluded);
+    let excluded_service = document_service_name(excluded_doc);
+    let (mut output, mut stale_ref_stores) = (HashSet::new(), BTreeSet::new());
+    let record_item = |path: &Path,
+                       ids: &[String],
+                       segs: Option<&[String]>,
+                       ords: Option<&[usize]>,
+                       out: &mut HashSet<String>,
+                       stale: &mut BTreeSet<PathBuf>| {
+        out.extend(ids.iter().cloned());
+        if let (Some(svc), Some(segs)) = (excluded_service, segs) {
+            let indices = resolve_external_ref_indices(excluded_doc, svc, segs, ords);
+            let mut matched_id = false;
+            for &i in &indices {
+                let tid = &excluded_doc.instances[i].settings_id;
+                out.insert(tid.clone());
+                matched_id |= ids.iter().any(|id| id == tid);
+            }
+            if !indices.is_empty() && !matched_id {
+                stale.insert(path.to_path_buf());
+            }
+        }
+    };
+    let record_doc = |path: &Path,
+                      doc: &SettingsBytecode,
+                      out: &mut HashSet<String>,
+                      stale: &mut BTreeSet<PathBuf>| {
+        let local: HashSet<&str> = doc
+            .instances
+            .iter()
+            .map(|i| i.settings_id.as_str())
+            .collect();
+        let service = document_service_name(doc);
+        for inst in &doc.instances {
+            for val in inst.properties.values().chain(inst.attributes.values()) {
+                crate::settings::bytecode::for_each_reference(val, &mut |r| {
+                    let parsed = parse_ref_path(r);
+                    let target_svc = parsed.as_ref().and_then(|(s, _)| s.first()).cloned();
+                    if !reference_may_enter(&target_svc, excluded_service) {
+                        return;
+                    }
+                    let ids: Vec<String> = ["settingsId", "instanceId"]
+                        .into_iter()
+                        .filter_map(|sel| r.get(sel).and_then(Value::as_str))
+                        .filter(|id| {
+                            reference_leaves_store(local.contains(id), service, &target_svc)
+                        })
+                        .map(str::to_string)
+                        .collect();
+                    let (s, o) = parsed
+                        .as_ref()
+                        .map_or((None, None), |(s, o)| (Some(s.as_slice()), o.as_deref()));
+                    record_item(path, &ids, s, o, out, stale);
+                });
+            }
+        }
+    };
+    for (path, doc) in documents {
+        if exact_path_key(path) != excluded_key {
+            record_doc(path, doc, &mut output, &mut stale_ref_stores);
+        }
+    }
+    let loaded: HashSet<String> = documents.keys().map(|p| exact_path_key(p)).collect();
+    for path in collect_project_settings_files(src_root, std::iter::empty())? {
+        let key = exact_path_key(&path);
+        if key == excluded_key || loaded.contains(&key) || !path.is_file() {
+            continue;
+        }
+        let bytes =
+            fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+        if crate::settings::bytecode::blocks::is_block_store(&bytes) {
+            let (_, refs) = crate::settings::bytecode::blocks::external_reference_targets(
+                &bytes,
+                excluded_service,
+            )?;
+            for item in refs {
+                record_item(
+                    &path,
+                    &item.ids,
+                    item.path_segments.as_deref(),
+                    item.path_ordinals.as_deref(),
+                    &mut output,
+                    &mut stale_ref_stores,
+                );
+            }
+        } else {
+            let doc = crate::settings::bytecode::decode_settings_bytecode(&bytes)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            record_doc(&path, &doc, &mut output, &mut stale_ref_stores);
+        }
+    }
+    Ok((output, stale_ref_stores))
+}
+
 fn collect_project_settings_files(
     src_root: &Path,
     extras: impl IntoIterator<Item = PathBuf>,
@@ -2008,7 +2197,7 @@ fn collect_project_settings_files(
 
 pub(crate) fn canonicalize_loaded_settings_documents(
     documents: &mut HashMap<PathBuf, SettingsBytecode>,
-) -> Result<()> {
+) -> Result<BTreeSet<String>> {
     let mut paths_by_service = BTreeMap::new();
     let mut by_service = BTreeMap::new();
     for (path, document) in documents.drain() {
@@ -2027,14 +2216,14 @@ pub(crate) fn canonicalize_loaded_settings_documents(
         }
         by_service.insert(service, document);
     }
-    canonicalize_settings_reference_documents(&mut by_service);
+    let changed = canonicalize_settings_reference_documents(&mut by_service);
     for (service, document) in by_service {
         let path = paths_by_service
             .get(&service)
             .context("Canonical settings store path disappeared")?;
         documents.insert(path.clone(), document);
     }
-    Ok(())
+    Ok(changed)
 }
 
 fn load_settings_documents(
@@ -3900,6 +4089,22 @@ impl LinkEnforcement {
         self.active
     }
 
+    pub(crate) fn has_read_only_packages(&self) -> bool {
+        !self.read_only_packages.is_empty()
+    }
+
+    pub(crate) fn touches_services(&self, services: &[String]) -> bool {
+        self.read_only_packages
+            .iter()
+            .any(|target| services.iter().any(|service| service == &target.service))
+    }
+
+    pub(crate) fn has_read_only_mirrors(&self) -> bool {
+        self.mirror_to_canonical
+            .values()
+            .any(|(_, read_only)| *read_only)
+    }
+
     pub(crate) fn read_only_package_for_path(
         &self,
         service: &str,
@@ -3982,6 +4187,60 @@ impl LinkEnforcement {
     }
 }
 
+pub(crate) fn link_cache_fingerprint(
+    project_root: &Path,
+    src_root: &Path,
+    cache_override: Option<&Path>,
+    override_packages: bool,
+) -> Result<Value> {
+    let manifest_path = link_manifest_path(project_root, Path::new("renium-link.json"));
+    let Ok(manifest_bytes) = fs::read(&manifest_path) else {
+        return Ok(Value::Null);
+    };
+    let manifest_hash = crate::system::files::sha256_hex(&manifest_bytes);
+    if override_packages {
+        return Ok(json!({ "manifest": manifest_hash }));
+    }
+    let manifest = read_link_manifest(&manifest_path)?;
+    let broken: HashSet<String> = manifest.broken.iter().map(link_target_ref_key).collect();
+    let has_read_only = manifest.links.iter().any(|link| {
+        link.read_only
+            && link
+                .targets
+                .iter()
+                .any(|target| !broken.contains(&link_target_ref_key(target)))
+    });
+    if !has_read_only {
+        return Ok(Value::Null);
+    }
+    let src_root = absolutize_under(project_root, src_root);
+    let options = LinkResolveOptions {
+        cache_dir: resolve_link_cache_dir(project_root, &manifest, cache_override),
+        ..LinkResolveOptions::default()
+    };
+    let mut inputs = BTreeMap::<String, Option<String>>::new();
+    for target in resolve_link_targets(project_root, &src_root, &manifest, &options) {
+        if target.broken || !target.read_only {
+            continue;
+        }
+        if !target.resolved {
+            return Ok(json!({ "manifest": manifest_hash, "unresolved": target.link_id }));
+        }
+        for path in target
+            .package_source
+            .iter()
+            .chain(target.files.iter().map(|pair| &pair.canonical))
+        {
+            inputs.entry(link_path_key(path)).or_insert_with(|| {
+                fs::read(path)
+                    .ok()
+                    .map(|bytes| crate::system::files::sha256_hex(&bytes))
+            });
+        }
+    }
+    Ok(json!({ "manifest": manifest_hash, "readOnlyInputs": inputs }))
+}
+
 pub(crate) fn build_loaded_project_link_enforcement(
     loaded: &config::LoadedProject,
     override_packages: bool,
@@ -4013,11 +4272,12 @@ pub(crate) fn build_link_enforcement(
     if manifest.links.is_empty() {
         return Ok(LinkEnforcement::default());
     }
+    let src_root = absolutize_under(project_root, src_root);
     let options = LinkResolveOptions {
         cache_dir: resolve_link_cache_dir(project_root, &manifest, cache_override),
         ..LinkResolveOptions::default()
     };
-    let targets = resolve_link_targets(project_root, src_root, &manifest, &options);
+    let targets = resolve_link_targets(project_root, &src_root, &manifest, &options);
     let mut enforcement = LinkEnforcement {
         active: true,
         ..LinkEnforcement::default()

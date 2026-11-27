@@ -949,7 +949,7 @@ pub(crate) fn build_editor_instance_paths_with_children(
     out
 }
 
-fn document_instance_path_matches(
+pub(crate) fn document_instance_path_matches(
     document: &SettingsBytecode,
     path_segments: &[String],
     path_ordinals: &[usize],

@@ -350,6 +350,25 @@ pub(super) fn split_prepared_settings_for_push(
 /// prepared them.
 pub(super) fn plan_from_whole_stores(
     (stores_read, replace, plan): (StoresRead, bool, ReconcilePushPlan),
+    snapshots: (&ProjectSnapshot, &ProjectSnapshot),
+    differences: &HashSet<PathBuf>,
+    prepared_settings: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
+) -> Result<ReconcilePushPlan> {
+    plan_from_whole_stores_with(
+        (stores_read, replace, true, plan),
+        snapshots,
+        differences,
+        prepared_settings,
+    )
+}
+
+pub(super) fn plan_from_whole_stores_with(
+    (stores_read, replace, include_reconciled_services, plan): (
+        StoresRead,
+        bool,
+        bool,
+        ReconcilePushPlan,
+    ),
     (project, studio): (&ProjectSnapshot, &ProjectSnapshot),
     differences: &HashSet<PathBuf>,
     prepared_settings: &mut HashMap<PathBuf, PreparedEditorSettingsChange>,
@@ -416,7 +435,7 @@ pub(super) fn plan_from_whole_stores(
             project,
             differences,
             prepared_settings,
-            true,
+            include_reconciled_services,
             false,
         );
     }
@@ -434,7 +453,7 @@ pub(super) fn plan_from_whole_stores(
         project,
         differences,
         prepared_settings,
-        true,
+        include_reconciled_services,
         false,
     )
 }
@@ -1164,6 +1183,28 @@ fn reconstruct_zero_capture_before(
     ))
 }
 
+pub(super) fn verified_push_services(summary: &Map<String, Value>) -> Option<HashSet<&str>> {
+    if summary.get("ok") == Some(&Value::Bool(false))
+        || summary.get("verified") == Some(&Value::Bool(false))
+        || summary.get("sourceVerifyFailed").and_then(Value::as_u64) != Some(0)
+        || summary_has_pending_or_unsupported(summary)
+        || summary
+            .get("supplementalImportPendingFields")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| !arr.is_empty())
+    {
+        return None;
+    }
+    Some(
+        ["nativeVerifiedServices", "fieldVerifiedServices"]
+            .into_iter()
+            .filter_map(|name| summary.get(name).and_then(Value::as_array))
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect(),
+    )
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn zero_capture_verification_paths(
@@ -1178,28 +1219,12 @@ pub(super) fn zero_capture_verification_paths(
 ) -> HashSet<PathBuf> {
     let mut verification_paths = mutation_paths.clone();
     verification_paths.extend(generated_paths.iter().cloned());
-    if verification_paths.is_empty() {
+    if verification_paths.is_empty() || replacement || has_adapters {
         return verification_paths;
     }
-    let has_pending_or_issue = summary.get("ok") == Some(&Value::Bool(false))
-        || summary.get("verified") == Some(&Value::Bool(false))
-        || summary.contains_key("protectedPending")
-        || summary.contains_key("supplementalImportPendingWrites")
-        || summary.contains_key("unsupportedProperties")
-        || summary
-            .get("supplementalImportPendingFields")
-            .and_then(Value::as_array)
-            .is_some_and(|arr| !arr.is_empty())
-        || summary.get("sourceVerifyFailed").and_then(Value::as_u64) != Some(0);
-    if replacement || has_adapters || has_pending_or_issue {
+    let Some(verified_services) = verified_push_services(summary) else {
         return verification_paths;
-    }
-    let verified_services = ["nativeVerifiedServices", "fieldVerifiedServices"]
-        .into_iter()
-        .filter_map(|name| summary.get(name).and_then(Value::as_array))
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect::<HashSet<_>>();
+    };
     if !verified_services.is_empty() {
         verification_paths.retain(|path| {
             let service = crate::editor::paths::service_from_changed_path(
@@ -1580,7 +1605,8 @@ fn prepare_replace_push_differences(
     let stores_read = stores_read_of(unenforced, &paths, project, studio);
     let imported = ImportedStores::default();
     let collected_bulk = BulkPropertyPatches::default();
-    let imports_heavy = !root.join("renium-link.json").exists();
+    let imports_heavy =
+        super::staging::packing_link_enforcement(root, Path::new(&context.source))?.is_none();
     let unchanged_settings = if bulk_eligible {
         prepare_project_replacement_with_bulk(
             project,
@@ -1692,9 +1718,18 @@ fn stage_replace_push_paths(
         .entries
         .values()
         .any(|entry| matches!(entry, SnapshotEntry::Symlink { .. }));
+    let link_enforcement = if root.join("renium-link.json").exists() {
+        Some(crate::project::package_links::build_link_enforcement(
+            root, src_dir, None,
+        )?)
+    } else {
+        None
+    };
     if has_symlinks
-        || root.join("renium-link.json").exists()
         || crate::editor::sync::files_to_studio_filter_rules(root)?.is_some()
+        || link_enforcement
+            .as_ref()
+            .is_some_and(|e| e.has_read_only_packages() || e.has_read_only_mirrors())
     {
         let all = project_replacement_paths(project, studio);
         stage_snapshot_paths(stage_root, &all, project)?;
@@ -2848,8 +2883,7 @@ pub(crate) fn push_project(
     // is restored.
     #[cfg(any(windows, target_os = "macos"))]
     let narrowable = held_pull.as_ref().filter(|(_, written)| {
-        services.iter().any(|service| !written.contains(service))
-            && !Path::new(&context.root).join("renium-link.json").exists()
+        services.iter().any(|service| !written.contains(service)) && link_enforcement.is_none()
     });
     // Roots imported beside a service's other instances take values Studio
     // generates for them, which only a pull writes to the files. A service

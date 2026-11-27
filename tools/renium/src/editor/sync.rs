@@ -2277,9 +2277,6 @@ pub(crate) fn project_pushes_stores_as_held(args: &PushEditorChangesArgs) -> Res
     {
         return Ok(false);
     }
-    if !args.override_packages && args.project.project_root.join("renium-link.json").exists() {
-        return Ok(false);
-    }
     if files_to_studio_filter_rules(&args.project.project_root)?.is_some() {
         return Ok(false);
     }
@@ -2315,7 +2312,6 @@ fn documents_of_targets(args: &PushEditorChangesArgs) -> Result<PreparedEditorDo
         || args.targets_extend_paths
         || args.changed_paths.is_empty()
         || !args.changed_paths_files.is_empty()
-        || (!args.override_packages && args.project.project_root.join("renium-link.json").exists())
         || files_to_studio_filter_rules(&args.project.project_root)?.is_some()
     {
         return Ok(whole());
@@ -2359,9 +2355,7 @@ fn documents_of_targets(args: &PushEditorChangesArgs) -> Result<PreparedEditorDo
 /// read past its scripts.
 fn documents_of_scripts(args: &PushEditorChangesArgs) -> Result<PreparedEditorDocuments> {
     let mut prepared = PreparedEditorDocuments::default();
-    if (!args.override_packages && args.project.project_root.join("renium-link.json").exists())
-        || files_to_studio_filter_rules(&args.project.project_root)?.is_some()
-    {
+    if files_to_studio_filter_rules(&args.project.project_root)?.is_some() {
         return Ok(prepared);
     }
     let (project_root, src_root) = editor_project_roots(args)?;
@@ -6756,9 +6750,20 @@ fn validate_read_only_service_changes(
     let mut canonical = HashMap::new();
     for target in &targets {
         if let Some(document) = documents.get(&target.service).and_then(Option::as_ref) {
-            canonical
-                .entry(PathBuf::from(&target.service))
-                .or_insert_with(|| (**document).clone());
+            let key = PathBuf::from(&target.service);
+            if !canonical.contains_key(&key) {
+                let full = if crate::settings::equivalence::holds_unread_instances(document) {
+                    let store_path = service_settings_path(&src_root.join(&target.service));
+                    if store_path.is_file() {
+                        SettingsBytecode::read_file(&store_path)?
+                    } else {
+                        (**document).clone()
+                    }
+                } else {
+                    (**document).clone()
+                };
+                canonical.insert(key, full);
+            }
         }
     }
     crate::project::package_links::canonicalize_loaded_settings_documents(&mut canonical)?;

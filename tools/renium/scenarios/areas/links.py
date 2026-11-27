@@ -1019,6 +1019,43 @@ def foreign_package_store_edits_refused(ctx: Context):
     ctx.expect_in("Models containing PackageLink instances cannot be imported", imported.error, "mip refusal")
 
 
+def linked_file_line_endings_and_lon_both_moved(ctx: Context):
+    """LINK-074: a writable linked script with CRLF and LF line endings pushes cleanly with a steady pull,
+    and starting Live Sync with both sides moved reconciles the linked file, a store edit and a Studio edit."""
+    src = ctx.root / "links" / "SuiteMod.luau"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b"return 'crlf'\r\n-- line 2\r\n")
+    ctx.rbx("lka", "--id", "suite-mod", "--source", "links/SuiteMod.luau",
+            "--service", RS, "--path", '["ReplicatedStorage","SuiteMod"]', "--writable", timeout=60)
+    ctx.rbx("lk", timeout=60)
+    ctx.open_studio()
+    ctx.rbx("ps", "--yes", timeout=120)
+    ctx.luau("return 1")
+    mirror = ctx.root / "src" / RS / "SuiteMod.luau"
+    before = (_digest(ctx.root / RS_STORE), _digest(mirror))
+    ctx.rbx("pl", timeout=120)
+    ctx.expect((_digest(ctx.root / RS_STORE), _digest(mirror)) == before, "pull after CRLF push wrote nothing")
+    src.write_bytes(b"return 'lf'\n-- line 2\n")
+    ctx.rbx("lk", "--force-targets", timeout=60)
+    ctx.rbx("ps", "--yes", timeout=120)
+    before = (_digest(ctx.root / RS_STORE), _digest(mirror))
+    ctx.rbx("pl", timeout=120)
+    ctx.expect((_digest(ctx.root / RS_STORE), _digest(mirror)) == before, "pull after LF push wrote nothing")
+    ctx.rbx("lon", "--wait", "60", timeout=120)
+    ctx.rbx("lof", timeout=60)
+    src.write_bytes(b"return 'both'\n")
+    ctx.rbx("lk", "--force-targets", timeout=60)
+    ctx.luau("game.Lighting.Brightness = 1.75 return 1")
+    ctx.rbx("lon", "--wait", "60", timeout=120)
+    ctx.rbx("lst", "--wait", "30", timeout=60)
+    ctx.rbx("lof", timeout=60)
+    ctx.expect("both" in ctx.luau("return game.ReplicatedStorage.SuiteMod.Source"), "linked file edit reached Studio")
+    ctx.expect("1.75" in str(ctx.luau("return game.Lighting.Brightness")), "Studio edit kept")
+    before = (_digest(ctx.root / RS_STORE), _digest(mirror))
+    ctx.rbx("pl", timeout=120)
+    ctx.expect((_digest(ctx.root / RS_STORE), _digest(mirror)) == before, "pull after lon both moved wrote nothing")
+
+
 SCENARIOS = [
     Scenario("LINK-001", "pack a subtree into the project", "small", pack_a_subtree_into_the_project, needs_studio=False),
     Scenario("LINK-002", "pack into the global library", "small", global_library_pack, needs_studio=False),
@@ -1066,6 +1103,7 @@ SCENARIOS = [
     Scenario("LINK-071", "Live Sync PackageLink guard", "heavy", live_sync_package_link_guard),
     Scenario("LINK-072", "link commands from a subfolder", "small", link_commands_from_a_subfolder, needs_studio=False),
     Scenario("LINK-073", "missing link package stops the comparison", "small", missing_link_package_stops_the_comparison),
+    Scenario("LINK-074", "linked file CRLF/LF and lon with both sides moved", "small", linked_file_line_endings_and_lon_both_moved),
 ]
 
 

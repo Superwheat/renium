@@ -462,7 +462,11 @@ fn compared_capture(
     (setup, record): (&PairSetup, &PairRecord),
     studio_state: &Value,
     start: HeldStart,
-) -> Result<(ReconcileCapture, HashSet<PathBuf>)> {
+) -> Result<(
+    ReconcileCapture,
+    HashSet<PathBuf>,
+    HashMap<PathBuf, PreparedEditorSettingsChange>,
+)> {
     let capture = match start {
         #[cfg(any(windows, target_os = "macos"))]
         HeldStart::Unchanged(held) => {
@@ -476,7 +480,7 @@ fn compared_capture(
                 link_enforcement: None,
                 publish_paths,
             };
-            return Ok((capture, HashSet::new()));
+            return Ok((capture, HashSet::new(), HashMap::new()));
         }
         #[cfg(any(windows, target_os = "macos"))]
         HeldStart::Moved { editor, .. } => {
@@ -531,14 +535,15 @@ fn compared_capture(
     let phase = Instant::now();
     // The files against Studio's capture, as a push compares them: a
     // store by the instances that differ where that says as much.
+    let mut side_prepared = HashMap::new();
     let side_differences = super::replacement::snapshot_differences_prepared(
         &capture.editor,
         &capture.studio,
-        None,
+        Some(&mut side_prepared),
         true,
     )?;
     log_reconcile_timing("side comparison", phase);
-    Ok((capture, side_differences))
+    Ok((capture, side_differences, side_prepared))
 }
 
 /// The services a start captures where Studio moved since `held`'s proof
@@ -1121,7 +1126,7 @@ impl Coordinator {
                 HashSet::new()
             } else {
                 let previous = baseline.load(Path::new(&context.root), &setup.key)?;
-                snapshot_differences(&previous, editor)?
+                super::replacement::snapshot_differences_prepared(&previous, editor, None, true)?
             };
             let confirmed = read_studio_change_state(context, bridge)?;
             if checkpoint.matches_state(context, &confirmed) && differences.is_empty() {
@@ -1342,6 +1347,7 @@ impl Coordinator {
                 publish_paths,
             },
             side_differences,
+            mut side_prepared,
         ) = compared_capture(context, bridge, (&*setup, &record), &studio_state, start)?;
         let phase = Instant::now();
         let comparison = compare_sides(
@@ -1446,11 +1452,65 @@ impl Coordinator {
 
         let mut sync_history = None;
         let phase = Instant::now();
-        let push_plan = if changes.studio.is_empty() {
-            ReconcilePushPlan::default()
+        let (push_plan, prepared_documents, push_args) = if changes.studio.is_empty() {
+            (ReconcilePushPlan::default(), HashMap::new(), None)
         } else {
-            let prepared = prepared_studio_settings_changes(&merged, &mut changes)?;
-            let mut plan = reconciliation_push_plan_for_paths_with_prepared_settings(
+            let args = automation_push_args(context, &json!({ "yes": true }), false)?;
+            let mut prepared = prepared_studio_settings_changes(&merged, &mut changes)?;
+            let mut unprepared = changes
+                .studio
+                .iter()
+                .filter(|path| {
+                    !prepared.contains_key(*path)
+                        && path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(is_service_settings_file_name)
+                })
+                .cloned()
+                .collect::<HashSet<_>>();
+            let mut stores_read = StoresRead::Changed;
+            if !unprepared.is_empty() {
+                let unprepared_services = services_for_snapshot_paths(context, &unprepared);
+                let ro_untouched = !link_enforcement
+                    .as_ref()
+                    .is_some_and(|e| e.touches_services(&unprepared_services));
+                stores_read = match super::push_flow::stores_read_of(
+                    ro_untouched,
+                    &changes.studio,
+                    &merged,
+                    &studio,
+                ) {
+                    StoresRead::ChangedOfBoth
+                        if crate::editor::sync::project_pushes_stores_as_held(&args)? =>
+                    {
+                        StoresRead::ChangedOfBoth
+                    }
+                    _ => StoresRead::Changed,
+                };
+                if stores_read == StoresRead::ChangedOfBoth && !side_prepared.is_empty() {
+                    unprepared.retain(|path| {
+                        if merged.entries.get(path) == editor.entries.get(path)
+                            && let Some(change) = side_prepared.remove(path)
+                        {
+                            prepared.insert(path.clone(), change);
+                            return false;
+                        }
+                        true
+                    });
+                }
+                if !unprepared.is_empty() {
+                    let unchanged = prepare_project_replacement_from(
+                        &merged,
+                        &studio,
+                        &unprepared,
+                        &mut prepared,
+                        stores_read,
+                    )?;
+                    changes.studio.retain(|path| !unchanged.contains(path));
+                }
+            }
+            let plan = reconciliation_push_plan_for_paths_with_prepared_settings(
                 &studio,
                 &merged,
                 &changes.studio,
@@ -1458,11 +1518,25 @@ impl Coordinator {
                 false,
                 false,
             )?;
+            let mut plan = super::push_flow::plan_from_whole_stores_with(
+                (stores_read, false, false, plan),
+                (&merged, &studio),
+                &changes.studio,
+                &mut prepared,
+            )?;
             attach_capture_identities(&mut plan, &studio, &prepared)?;
-            plan
+            let mut prepared_documents = HashMap::with_capacity(prepared.len());
+            for (path, change) in prepared {
+                let service = settings_service_name(&path, &change.current, &change.previous)?;
+                drop_settings_document(change.previous);
+                prepared_documents.insert(service, Arc::new(change.current));
+            }
+            (plan, prepared_documents, Some(args))
         };
+        drop(side_prepared);
         log_reconcile_timing("push plan", phase);
         let readback = if push_plan.is_empty() {
+            drop(prepared_documents);
             if changes.editor.is_empty() {
                 studio
             } else {
@@ -1478,7 +1552,7 @@ impl Coordinator {
             }
         } else {
             let phase = Instant::now();
-            let mut args = automation_push_args(context, &json!({ "yes": true }), false)?;
+            let mut args = push_args.expect("push args");
             sync_history = Some(history::SyncHistory::begin_push(
                 Path::new(&context.root),
                 &bound_context::source_dir(context)?,
@@ -1495,7 +1569,7 @@ impl Coordinator {
                 bridge,
                 StagedPushRequest {
                     plan: push_plan,
-                    prepared_documents: HashMap::new(),
+                    prepared_documents,
                     virtual_files: None,
                     guard: Some(&studio_guard),
                     args,
@@ -1522,6 +1596,11 @@ impl Coordinator {
                     changes.studio.insert(path);
                 }
             }
+            let has_adapters = stage
+                .loaded
+                .as_ref()
+                .is_some_and(|loaded| !loaded.project.adapters.is_empty());
+            drop(stage);
             log_reconcile_timing("Studio push", phase);
             let phase = Instant::now();
             let (readback_stage, readback) = if changes.editor.is_empty() {
@@ -1559,14 +1638,65 @@ impl Coordinator {
                 }
                 (readback_stage, readback)
             } else {
-                let (readback_stage, mut readback) = capture_studio_project(context, bridge)?;
+                let readback_paths = changes
+                    .studio
+                    .union(&changes.editor)
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                let mut services = services_for_snapshot_paths(context, &readback_paths);
+                let editor_services = services_for_snapshot_paths(context, &changes.editor)
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                let mut skipped_verified = false;
+                if !has_adapters
+                    && pending.is_empty()
+                    && generated_paths.is_empty()
+                    && !editor_services.is_empty()
+                    && let Some(verified) =
+                        super::push_flow::verified_push_services(&pushed.summary)
+                    && !verified.is_empty()
+                {
+                    let before_len = services.len();
+                    services.retain(|service| {
+                        editor_services.contains(service)
+                            || link_enforcement
+                                .as_ref()
+                                .is_some_and(|e| e.touches_services(std::slice::from_ref(service)))
+                            || !verified.iter().any(|n| n.eq_ignore_ascii_case(service))
+                    });
+                    skipped_verified = services.len() < before_len;
+                }
+                let (readback_stage, mut captured) =
+                    capture_studio_services(context, bridge, &services, false)?;
                 if let Some(enforcement) = &link_enforcement {
                     pack_read_only_link_scripts_with(
                         enforcement,
                         Path::new(&context.root),
                         &merged,
-                        &mut readback,
+                        &mut captured,
                     )?;
+                }
+                let captured_scopes = ScopeSet::new(readback_stage.publish_paths());
+                let mut readback = studio;
+                readback
+                    .entries
+                    .retain(|path, _| !captured_scopes.contains(path));
+                readback.entries.extend(captured.entries);
+                if skipped_verified {
+                    for path in changes
+                        .studio
+                        .iter()
+                        .filter(|p| !captured_scopes.contains(p))
+                    {
+                        match merged.entries.get(path) {
+                            Some(entry) => {
+                                readback.entries.insert(path.clone(), entry.clone());
+                            }
+                            None => {
+                                readback.entries.remove(path);
+                            }
+                        }
+                    }
                 }
                 (readback_stage, readback)
             };
@@ -1574,9 +1704,11 @@ impl Coordinator {
             let phase = Instant::now();
             if !changes.editor.is_empty() {
                 let mismatches = if pending.is_empty() {
-                    snapshot_differences(&readback, &merged)?
-                        .into_iter()
-                        .collect()
+                    super::replacement::snapshot_differences_prepared(
+                        &merged, &readback, None, true,
+                    )?
+                    .into_iter()
+                    .collect()
                 } else {
                     let compared = readback
                         .entries
@@ -2205,9 +2337,10 @@ fn unsynced_project_paths(
     synchronized: &ProjectSnapshot,
 ) -> Result<(Vec<PathBuf>, ProjectSnapshot)> {
     let current = capture_snapshot(Path::new(&context.root), publish_paths)?;
-    let mut paths = snapshot_differences(synchronized, &current)?
-        .into_iter()
-        .collect::<Vec<_>>();
+    let mut paths =
+        super::replacement::snapshot_differences_prepared(synchronized, &current, None, true)?
+            .into_iter()
+            .collect::<Vec<_>>();
     paths.sort();
     if !paths.is_empty() {
         log_global(
@@ -3539,6 +3672,110 @@ mod pushed_alone_tests {
 
         drop(bridge);
         let _ = plugin.join();
+        Ok(())
+    }
+
+    #[test]
+    fn one_sided_v12_store_merge_skips_aligned_studio_and_protects_package_links() -> Result<()> {
+        let store_path = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        let make_store = |transparency: f64, with_package_link: bool| -> Result<Vec<u8>> {
+            let mut instances = vec![
+                crate::settings::bytecode::SettingsBytecodeInstance {
+                    name: "Workspace".into(),
+                    class_name: "Workspace".into(),
+                    settings_id: "ws-root".into(),
+                    parent_index: None,
+                    properties: Map::new(),
+                    attributes: Map::new(),
+                },
+                crate::settings::bytecode::SettingsBytecodeInstance {
+                    name: "Probe".into(),
+                    class_name: "Part".into(),
+                    settings_id: "part-probe".into(),
+                    parent_index: Some(0),
+                    properties: Map::from_iter([("Transparency".into(), json!(transparency))]),
+                    attributes: Map::new(),
+                },
+                crate::settings::bytecode::SettingsBytecodeInstance {
+                    name: "Sibling".into(),
+                    class_name: "Part".into(),
+                    settings_id: "part-sibling".into(),
+                    parent_index: Some(0),
+                    properties: Map::from_iter([("Transparency".into(), json!(0.5))]),
+                    attributes: Map::new(),
+                },
+            ];
+            if with_package_link {
+                instances.push(crate::settings::bytecode::SettingsBytecodeInstance {
+                    name: "PackageLink".into(),
+                    class_name: "PackageLink".into(),
+                    settings_id: "pkg-link".into(),
+                    parent_index: Some(1),
+                    properties: Map::from_iter([("PackageId".into(), json!("rbxassetid://123"))]),
+                    attributes: Map::new(),
+                });
+            }
+            let doc = crate::settings::bytecode::SettingsBytecode {
+                version: crate::settings::bytecode::SETTINGS_BINARY_VERSION,
+                instances,
+            };
+            let temp = crate::tests::support::temp_dir("one-sided-v12");
+            let file = temp.join("Workspace.renium");
+            doc.write_file(&file)?;
+            let bytes = fs::read(&file)?;
+            let _ = fs::remove_dir_all(&temp);
+            Ok(bytes)
+        };
+        let snap = |bytes: Vec<u8>| ProjectSnapshot {
+            entries: BTreeMap::from([(store_path.clone(), SnapshotEntry::File(bytes))]),
+        };
+
+        let base_bytes = make_store(0.25, false)?;
+        let edited_bytes = make_store(0.75, false)?;
+        let (merged, conflicts, changes) = merge_snapshots_with_changes(
+            Some(&snap(base_bytes.clone())),
+            &snap(edited_bytes.clone()),
+            &snap(base_bytes.clone()),
+            ConflictPreference::None,
+            None,
+        )?;
+        assert!(conflicts.is_empty(), "{conflicts:?}");
+        assert!(changes.editor.is_empty());
+        assert!(changes.studio.contains(&store_path));
+        assert!(
+            changes.aligned_studio.is_empty(),
+            "one-sided v12 store merge must not hold a full aligned_studio document"
+        );
+        assert!(
+            merged.entries.get(&store_path) == Some(&SnapshotEntry::File(edited_bytes.clone()))
+        );
+
+        let (merged_studio, conflicts_studio, changes_studio) = merge_snapshots_with_changes(
+            Some(&snap(base_bytes.clone())),
+            &snap(base_bytes),
+            &snap(edited_bytes.clone()),
+            ConflictPreference::None,
+            None,
+        )?;
+        assert!(conflicts_studio.is_empty(), "{conflicts_studio:?}");
+        assert!(changes_studio.editor.contains(&store_path));
+        assert!(changes_studio.studio.is_empty());
+        assert!(changes_studio.aligned_studio.is_empty());
+        assert!(merged_studio.entries.get(&store_path) == Some(&SnapshotEntry::File(edited_bytes)));
+
+        let pkg_base = make_store(0.25, true)?;
+        let pkg_removed = make_store(0.25, false)?;
+        let (_, pkg_conflicts, _) = merge_snapshots_with_changes(
+            Some(&snap(pkg_base.clone())),
+            &snap(pkg_removed),
+            &snap(pkg_base),
+            ConflictPreference::None,
+            None,
+        )?;
+        assert!(
+            !pkg_conflicts.is_empty(),
+            "PackageLink removal must still fall back to whole-document protection"
+        );
         Ok(())
     }
 }

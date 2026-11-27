@@ -4,6 +4,7 @@
 
 ### Improvements
 
+- Projects with linked files stay under 2 GB and answer faster on a large place. On the 202,000-instance place `rbx lk` answers in 0.1 to 0.2 s where it took 2.7 to 2.9 s and 3.7 GB, a push of an edited linked file takes 0.3 s at 0.5 GB where it took 6.1 s at 2.7 GB, and `rbx lon` with a link starts in 2.9 s at 1.1 GB where it took 7.5 s at 2.7 GB. When the file and Studio both changed while Live Sync was off it starts in 4.5 to 4.7 s at 1.2 GB where it took 19 s at 3.4 GB.
 - A push of a terrain edit writes only the voxel chunks that changed and no longer clears and rewrites the whole terrain. On the 202,000-instance place a painted, filled or cleared region pushes in 0.7 to 0.8 s where it took 3.3 to 3.7 s, a terrain edit beside a mass edit in 1.6 to 1.7 s where it took 3.9 to 4.2 s, and the pull right after takes 0.1 s where it took 1.2 to 1.9 s.
 - On a large place Renium's background process stays under 2 GB of memory in every pull and push. Measured on a place of 202,000 instances: a push of the whole project used 2.7 GB and the check that follows it 3.8 GB, and they now use 1.7 GB and 1.8 GB; a pull of one changed property used 1.7 GB and now uses 1.5 GB; the first pull of the place used 1.5 GB and now uses 1.3 GB. A pull or a push reads the instances that differ instead of every instance of a store, and a store pushed whole goes to Studio from its file and is checked a few thousand instances at a time.
 - `rbx fps unlock` keeps a Studio window at its focused frame rate while it is unfocused or covered (Windows). Studio renders one frame in four in a window that is not the active one. With that hold removed, a Studio that never had focus went from 60 FPS to 202 in Edit, 237 in Play solo and 190 in the player window of a local server test, which is what its frame times of 4.2 to 5.3 ms allow under Studio's cap of 240. `rbx fps default` puts the hold back, `--global` keeps the mode for every Studio window and Play process as the user setting `studioFpsMode` (**Renium: Studio FPS Mode** in the editor), and no Studio file is changed.
@@ -46,6 +47,7 @@
 
 ### Bug fixes
 
+- A push of a linked file that was edited, renamed, moved or removed reaches Studio, and the pull after it changes nothing. The push of an edited linked file ended with an error, a renamed or removed linked file was not renamed or removed in Studio, and the next pull rewrote the store of the service.
 - A push that puts painted or filled terrain back to what it was restores it in Studio, and a push after an undo in Studio leaves the terrain exactly as the files have it. Both left the terrain differing from the files.
 - A pull no longer rewrites a script only to change its line endings. A linked script kept with CRLF line endings was written back with LF by the pull after a Live Sync start, which showed as a changed file.
 - On Windows a file can be saved while Renium copies the project in the background during a pull or after a push. The save failed with "The process cannot access the file because it is being used by another process" when it landed on the file being copied.

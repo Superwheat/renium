@@ -1177,21 +1177,13 @@ fn changed_instances_compared(
         && apart.lock_recover().contains(path)
     {
         match told_alone(files, studio, None) {
-            Some((told, as_many_apart)) => {
-                if !as_many_apart {
-                    apart.lock_recover().remove(path);
-                }
+            Some((told, true)) => {
                 #[cfg(test)]
-                if as_many_apart {
-                    PAIRED_FIRST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+                PAIRED_FIRST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return paired(told);
             }
-            None => {
+            Some(_) | None => {
                 apart.lock_recover().remove(path);
-                if let Some(told) = told_compact(files, studio)? {
-                    return paired(told);
-                }
             }
         }
     }
@@ -2232,7 +2224,7 @@ fn replaced_store_for_diff(
 /// differ (`changed_instances_alone`), with the change where they are not
 /// and `prepared` takes one. `None` where the whole documents have to say
 /// (`snapshot_entry_equivalent`).
-fn store_copies_by_changed(
+pub(super) fn store_copies_by_changed(
     (path, left, right): (&Path, Option<&SnapshotEntry>, Option<&SnapshotEntry>),
     prepared: Option<&mut Option<PreparedEditorSettingsChange>>,
 ) -> Result<Option<bool>> {
