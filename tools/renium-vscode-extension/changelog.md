@@ -45,6 +45,7 @@
 
 ### Bug fixes
 
+- A pull no longer rewrites a script only to change its line endings. A linked script kept with CRLF line endings was written back with LF by the pull after a Live Sync start, which showed as a changed file.
 - On Windows a file can be saved while Renium copies the project in the background during a pull or after a push. The save failed with "The process cannot access the file because it is being used by another process" when it landed on the file being copied.
 - A push of a whole project into an empty place leaves the files as a pull of that place writes them. The settle after the push added `TexturePackContent` to every SurfaceAppearance and Decal in the files (9,926 instances of a 202,000-instance place) and dropped the `MaxPlayers` and `PreferredPlayers` the files stated; in about four of ten such pushes it failed instead, and the next push and pull took 2 s each to repair it.
 - The `.renium/.gitignore` that Renium writes also lists `reconcile/`, `import-settlement/`, `store-migration/`, `reports/`, `import-base.json`, `map-cache.json` and `studio-target.json`. They are one machine's own sync state, and `git add -A` in a project committed them. An existing project gets the lines the next time `rbx so`, `ro` or `sx` opens or closes its place, or Live Sync starts; files Git already tracks stay tracked until `git rm --cached` removes them.

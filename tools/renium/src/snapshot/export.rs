@@ -1065,6 +1065,25 @@ impl ExportProjectStage {
         };
         refreshed.extend(repaired);
         refresh_publish_hashes(&self.project_root, &mut staged, &refreshed)?;
+        let same_text: Vec<PathBuf> = current
+            .iter()
+            .filter(|(path, state)| {
+                matches!(state, PublishEntryState::File { .. })
+                    && staged.get(*path).is_some_and(|other| {
+                        other != *state && matches!(other, PublishEntryState::File { .. })
+                    })
+                    && crate::automation::reconcile::is_source_path(path)
+                    && same_source_text(&project_root.join(path), &self.project_root.join(path))
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        for relative in same_text {
+            copy_isolated_file(
+                &project_root.join(&relative),
+                &self.project_root.join(&relative),
+            )?;
+            staged.insert(relative.clone(), current[&relative].clone());
+        }
         if self.keep_local_only_scripts {
             let naming = self
                 .loaded
@@ -2198,6 +2217,17 @@ fn copy_isolated_path(source: &Path, destination: &Path) -> Result<()> {
     files
         .par_iter()
         .try_for_each(|(source, target)| copy_isolated_file(source, target))
+}
+
+/// Whether two script files hold the same text under either line ending. A
+/// publication keeps the project's file then: a pull never rewrites a script
+/// only to change its line endings.
+fn same_source_text(left: &Path, right: &Path) -> bool {
+    let (Ok(left), Ok(right)) = (fs::read(left), fs::read(right)) else {
+        return false;
+    };
+    crate::system::text::normalized_source_bytes(&left)
+        .eq(crate::system::text::normalized_source_bytes(&right))
 }
 
 fn copy_isolated_file(source: &Path, destination: &Path) -> Result<()> {
@@ -5120,5 +5150,24 @@ mod publication_tests {
             fs::metadata(&staged).unwrap().modified().unwrap(),
             fs::metadata(&store_path).unwrap().modified().unwrap()
         );
+    }
+
+    #[test]
+    fn a_publication_keeps_a_script_that_differs_only_in_line_endings() -> Result<()> {
+        let root = create_unique_directory(&std::env::temp_dir(), "publish-crlf-")?;
+        let _clean = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let script_rel = PathBuf::from("src/ReplicatedStorage/Mod.luau");
+        fs::create_dir_all(root.join("src/ReplicatedStorage"))?;
+        fs::write(root.join(&script_rel), b"return 'v2'\r\n")?;
+        let services = vec!["ReplicatedStorage".to_string()];
+        let stage = ExportProjectStage::create(&root, Path::new("src"), &services)?;
+        fs::create_dir_all(stage.project_root.join("src/ReplicatedStorage"))?;
+        fs::write(stage.project_root.join(&script_rel), b"return 'v2'\n")?;
+        let published = stage.publish(&root, false)?;
+        assert!(published.changed_roots.is_empty());
+        assert_eq!(fs::read(root.join(&script_rel))?, b"return 'v2'\r\n");
+        Ok(())
     }
 }
