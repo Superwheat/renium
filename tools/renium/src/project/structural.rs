@@ -263,6 +263,21 @@ pub(crate) fn moved_references_between_documents(
         .iter()
         .map(|(service, doc)| (service.as_str(), doc))
         .collect();
+    let prefix_preserved = before_docs.iter().all(|&(service, bdoc)| {
+        let Some(adoc) = after.get(service) else {
+            return false;
+        };
+        bdoc.instances.len() <= adoc.instances.len()
+            && editor_service_root_index(bdoc, service) == editor_service_root_index(adoc, service)
+            && bdoc.instances.iter().zip(&adoc.instances).all(|(b, a)| {
+                b.settings_id == a.settings_id
+                    && b.name == a.name
+                    && b.parent_index == a.parent_index
+            })
+    });
+    if prefix_preserved {
+        return HashMap::new();
+    }
     let total_nodes: usize = before_docs
         .iter()
         .map(|(_, doc)| doc.instances.len())
