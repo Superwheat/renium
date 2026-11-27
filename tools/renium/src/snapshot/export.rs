@@ -285,7 +285,7 @@ impl ExportProjectStage {
     }
 
     pub(crate) fn create(project_root: &Path, src_dir: &Path, services: &[String]) -> Result<Self> {
-        Self::create_inner(project_root, src_dir, services, true, false, None)
+        Self::create_inner(project_root, src_dir, services, true, false, None, None)
     }
 
     /// Like `create`, with the publication baseline of the stage's publish
@@ -299,7 +299,15 @@ impl ExportProjectStage {
         services: &[String],
         baseline: PublishBaseline<'_>,
     ) -> Result<Self> {
-        Self::create_inner(project_root, src_dir, services, true, false, Some(baseline))
+        Self::create_inner(
+            project_root,
+            src_dir,
+            services,
+            true,
+            false,
+            Some(baseline),
+            None,
+        )
     }
 
     pub(crate) fn create_with_baseline_background(
@@ -308,7 +316,33 @@ impl ExportProjectStage {
         services: &[String],
         baseline: PublishBaseline<'_>,
     ) -> Result<Self> {
-        Self::create_inner(project_root, src_dir, services, true, true, Some(baseline))
+        Self::create_inner(
+            project_root,
+            src_dir,
+            services,
+            true,
+            true,
+            Some(baseline),
+            None,
+        )
+    }
+
+    pub(crate) fn create_selective_background(
+        project_root: &Path,
+        src_dir: &Path,
+        services: &[String],
+        captured_services: &[String],
+        baseline: Option<PublishBaseline<'_>>,
+    ) -> Result<Self> {
+        Self::create_inner(
+            project_root,
+            src_dir,
+            services,
+            true,
+            true,
+            baseline,
+            Some(captured_services),
+        )
     }
 
     /// Like `create`, but copies existing files in the background. Only callers
@@ -318,7 +352,7 @@ impl ExportProjectStage {
         src_dir: &Path,
         services: &[String],
     ) -> Result<Self> {
-        Self::create_inner(project_root, src_dir, services, true, true, None)
+        Self::create_inner(project_root, src_dir, services, true, true, None, None)
     }
 
     pub(crate) fn copy_gate(&self) -> Option<crate::snapshot::import::ImportReadyGate> {
@@ -329,6 +363,11 @@ impl ExportProjectStage {
 
     pub(crate) fn wait_for_copy(&self) -> Result<()> {
         self.copy.as_ref().map_or(Ok(()), StageCopy::wait)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn holds_project_files(&self) -> bool {
+        self.holds_project_files
     }
 
     pub(crate) fn virtual_scripts(
@@ -348,7 +387,7 @@ impl ExportProjectStage {
         {
             bail!("Project requires a staged comparison");
         }
-        Self::create_inner(project_root, src_dir, services, false, false, None)
+        Self::create_inner(project_root, src_dir, services, false, false, None, None)
     }
 
     fn create_inner(
@@ -358,6 +397,7 @@ impl ExportProjectStage {
         clone_project_data: bool,
         background_copy: bool,
         baseline: Option<PublishBaseline<'_>>,
+        captured_services: Option<&[String]>,
     ) -> Result<Self> {
         let started = Instant::now();
         let parent = project_root
@@ -434,10 +474,8 @@ impl ExportProjectStage {
                 .iter()
                 .any(|vdir| vdir != rel && vdir.starts_with(rel))
         });
-        let use_virtual_scripts = background_copy
+        let plain_service_stage = background_copy
             && clone_project_data
-            && !virtual_service_dir_set.is_empty()
-            && !has_covering_parent_clone
             && !project_root.join("renium-link.json").exists()
             && loaded
                 .as_ref()
@@ -445,6 +483,41 @@ impl ExportProjectStage {
             && !publish_baseline
                 .values()
                 .any(|state| matches!(state, PublishEntryState::Symlink(_)));
+        let use_virtual_scripts = plain_service_stage
+            && captured_services.is_none()
+            && !virtual_service_dir_set.is_empty()
+            && !has_covering_parent_clone;
+        let (captured_dir_set, captured_store_set) = match captured_services {
+            Some(captured) if plain_service_stage => {
+                let mut dirs = captured
+                    .iter()
+                    .map(|service| src_dir.join(sanitize_name(service)))
+                    .collect::<Vec<_>>();
+                normalize_owned_paths(&mut dirs);
+                let dir_set: HashSet<PathBuf> = dirs.into_iter().collect();
+                let captured_has_covering_parent_clone = clone_paths.iter().any(|rel| {
+                    dir_set
+                        .iter()
+                        .any(|cdir| cdir != rel && cdir.starts_with(rel))
+                });
+                if captured_has_covering_parent_clone {
+                    (HashSet::new(), HashSet::new())
+                } else {
+                    let stores = captured
+                        .iter()
+                        .filter_map(|service| {
+                            let store = crate::system::files::service_settings_path(
+                                &project_root.join(src_dir).join(sanitize_name(service)),
+                            );
+                            store.strip_prefix(project_root).ok().map(Path::to_path_buf)
+                        })
+                        .collect::<HashSet<_>>();
+                    (dir_set, stores)
+                }
+            }
+            _ => (HashSet::new(), HashSet::new()),
+        };
+        let use_selective_store_only = !captured_dir_set.is_empty();
         let mut deferred = Vec::new();
         for relative in &clone_paths {
             let source = project_root.join(relative);
@@ -454,6 +527,24 @@ impl ExportProjectStage {
                 .and_then(|name| name.to_str())
                 .is_some_and(is_service_settings_file_name);
             match fs::symlink_metadata(&source) {
+                Ok(metadata)
+                    if background_copy
+                        && metadata.is_dir()
+                        && captured_dir_set.contains(relative) =>
+                {
+                    fs::create_dir_all(&destination)
+                        .with_context(|| format!("Failed to create {}", destination.display()))?;
+                    let store = source.join(crate::system::files::SERVICE_SETTINGS_FILE_NAME);
+                    if store.is_file() {
+                        copy_isolated_path(
+                            &store,
+                            &destination.join(crate::system::files::SERVICE_SETTINGS_FILE_NAME),
+                        )?;
+                    }
+                }
+                Ok(_) if background_copy && captured_store_set.contains(relative) => {
+                    copy_isolated_path(&source, &destination)?;
+                }
                 Ok(metadata)
                     if use_virtual_scripts
                         && metadata.is_dir()
@@ -547,7 +638,7 @@ impl ExportProjectStage {
             studio_overrides: BTreeMap::new(),
             preserve_paths: Vec::new(),
             keep_local_only_scripts: false,
-            holds_project_files: clone_project_data,
+            holds_project_files: clone_project_data && !use_selective_store_only,
             active: true,
         };
         log_global(
@@ -769,10 +860,18 @@ impl ExportProjectStage {
             .iter()
             .map(|relative| exact_path_key(relative))
             .collect::<HashSet<_>>();
+        let mut seen_store_sets = HashSet::new();
         for current_source_root in self.source_roots(project_root)? {
             // The stores of a source root are where its layout keeps them,
             // which need not be under the root itself.
             let stores = service_store_paths(&current_source_root)?;
+            let store_key = stores
+                .values()
+                .map(|path| exact_path_key(path))
+                .collect::<Vec<_>>();
+            if !seen_store_sets.insert(store_key) {
+                continue;
+            }
             let mut before = BTreeMap::new();
             let mut after = BTreeMap::new();
             let document_pairs = stores
@@ -4826,5 +4925,132 @@ mod publication_tests {
             keep.after_snapshot.is_some(),
             "R11: PullKeepingSnapshot must keep after_snapshot"
         );
+    }
+
+    #[test]
+    fn selective_background_stage_guards_links_adapters_and_covering_parent_clones() -> Result<()> {
+        let services = vec!["Workspace".to_string(), "ReplicatedStorage".to_string()];
+        let captured = vec!["Workspace".to_string()];
+
+        let make_project = |name: &str| -> Result<PathBuf> {
+            use crate::tests::support::{settings_document, settings_instance};
+            let root = crate::tests::support::temp_dir(name);
+            let ws = root.join("src/Workspace");
+            let rs = root.join("src/ReplicatedStorage");
+            fs::create_dir_all(&ws)?;
+            fs::create_dir_all(&rs)?;
+            fs::write(ws.join("Keep.luau"), "return 'ws'\n")?;
+            settings_document(vec![settings_instance(
+                "ws",
+                "Workspace",
+                "Workspace",
+                None,
+            )])
+            .write_file(&ws.join(crate::system::files::SERVICE_SETTINGS_FILE_NAME))?;
+            fs::write(rs.join("Other.luau"), "return 'rs'\n")?;
+            Ok(root)
+        };
+
+        let plain = make_project("selective-stage-plain")?;
+        let _clean_plain = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&plain);
+        });
+        let stage = ExportProjectStage::create_selective_background(
+            &plain,
+            Path::new("src"),
+            &services,
+            &captured,
+            None,
+        )?;
+        stage.wait_for_copy()?;
+        assert!(!stage.holds_project_files);
+        assert!(
+            !stage.project_root.join("src/Workspace/Keep.luau").exists(),
+            "plain layout skips copying scripts into captured service dirs"
+        );
+        assert!(
+            stage
+                .project_root
+                .join("src/ReplicatedStorage/Other.luau")
+                .exists()
+        );
+
+        let linked = make_project("selective-stage-link")?;
+        let _clean_linked = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&linked);
+        });
+        fs::write(linked.join("renium-link.json"), b"{}")?;
+        let stage = ExportProjectStage::create_selective_background(
+            &linked,
+            Path::new("src"),
+            &services,
+            &captured,
+            None,
+        )?;
+        stage.wait_for_copy()?;
+        assert!(stage.holds_project_files);
+        assert_eq!(
+            fs::read_to_string(stage.project_root.join("src/Workspace/Keep.luau"))?,
+            "return 'ws'\n"
+        );
+
+        let adapted = make_project("selective-stage-adapter")?;
+        let _clean_adapted = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&adapted);
+        });
+        fs::write(adapted.join("table.csv"), "Key,en\nHello,World\n")?;
+        let mut adapted_project = serde_json::to_value(config::ReniumProject::default())?;
+        adapted_project["sourceRoot"] = json!("src");
+        adapted_project["adapters"] = json!([{
+            "source": "table.csv",
+            "target": "Workspace.Table",
+        }]);
+        fs::write(
+            adapted.join("renium.project.jsonc"),
+            serde_json::to_vec(&adapted_project)?,
+        )?;
+        let stage = ExportProjectStage::create_selective_background(
+            &adapted,
+            Path::new("src"),
+            &services,
+            &captured,
+            None,
+        )?;
+        stage.wait_for_copy()?;
+        assert!(stage.holds_project_files);
+        assert_eq!(
+            fs::read_to_string(stage.project_root.join("src/Workspace/Keep.luau"))?,
+            "return 'ws'\n"
+        );
+
+        let covering = make_project("selective-stage-covering")?;
+        let _clean_covering = OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&covering);
+        });
+        let mut covering_project = serde_json::to_value(config::ReniumProject::default())?;
+        covering_project["sourceRoot"] = json!("implicit-src");
+        covering_project["tree"] = json!({
+            "Workspace": { "$path": "src/Workspace" },
+            "ReplicatedStorage": { "$path": "src/ReplicatedStorage" },
+        });
+        fs::write(
+            covering.join("renium.project.jsonc"),
+            serde_json::to_vec(&covering_project)?,
+        )?;
+        let stage = ExportProjectStage::create_selective_background(
+            &covering,
+            Path::new("src"),
+            &services,
+            &captured,
+            None,
+        )?;
+        stage.wait_for_copy()?;
+        assert!(stage.holds_project_files);
+        assert_eq!(
+            fs::read_to_string(stage.project_root.join("src/Workspace/Keep.luau"))?,
+            "return 'ws'\n"
+        );
+
+        Ok(())
     }
 }

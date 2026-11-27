@@ -646,6 +646,7 @@ pub(crate) fn capture_changed_studio_services(
     services: &[String],
     baseline: &ProjectSnapshot,
     initial_state: &Value,
+    known_editor: Option<(ProjectSnapshot, Vec<PathBuf>)>,
 ) -> Result<Option<(ExportProjectStage, ProjectSnapshot, ProjectSnapshot)>> {
     let root = Path::new(&context.root);
     let source = Path::new(&context.source)
@@ -663,9 +664,31 @@ pub(crate) fn capture_changed_studio_services(
     }
     let all_services = sync_services();
     let src_dir = bound_context::source_dir(context)?;
-    let stage = ExportProjectStage::create(root, &src_dir, &all_services)?;
-    let editor = capture_snapshot(&stage.project_root, stage.publish_paths())?;
-    let stage = import_studio_services_into_stage(context, bridge, services, true, stage)?;
+    let (stage, editor) = match known_editor {
+        Some((editor, covered_paths)) => {
+            let covered = ScopeSet::new(&covered_paths);
+            let stage = ExportProjectStage::create_selective_background(
+                root,
+                &src_dir,
+                &all_services,
+                services,
+                Some(&|paths| super::push_flow::publish_baseline(root, &editor, &covered, paths)),
+            )?;
+            (stage, editor)
+        }
+        None => {
+            let stage = ExportProjectStage::create_selective_background(
+                root,
+                &src_dir,
+                &all_services,
+                services,
+                None,
+            )?;
+            let editor = capture_snapshot(root, stage.publish_paths())?;
+            (stage, editor)
+        }
+    };
+    let mut stage = import_studio_services_into_stage(context, bridge, services, true, stage)?;
     let captured = capture_snapshot(&stage.project_root, &scopes)?;
     let scope_set = ScopeSet::new(&scopes);
     let mut studio = baseline.clone();
@@ -675,20 +698,32 @@ pub(crate) fn capture_changed_studio_services(
     if !studio_states_share_epoch(context, initial_state, &confirmed) {
         return Ok(None);
     }
-    // Files edited while Studio was captured are compared at their latest
-    // content. The stage keeps Studio's captured scopes and takes the rest
-    // from the project, so a busy project does not keep failing this capture.
     let current_editor = capture_snapshot(root, stage.publish_paths())?;
+    let uncaptured_stage_diffs = studio
+        .entries
+        .keys()
+        .chain(editor.entries.keys())
+        .chain(current_editor.entries.keys())
+        .filter(|path| !scope_set.contains(path))
+        .filter(|path| {
+            editor.entries.get(*path) != studio.entries.get(*path)
+                || current_editor.entries.get(*path) != studio.entries.get(*path)
+        })
+        .cloned()
+        .collect::<HashSet<_>>();
+    if !uncaptured_stage_diffs.is_empty() {
+        stage.wait_for_copy()?;
+        apply_snapshot_paths(&stage.project_root, &uncaptured_stage_diffs, &studio)?;
+    }
     if editor != current_editor {
-        let refreshed = current_editor
+        let changed = current_editor
             .entries
             .keys()
             .chain(editor.entries.keys())
             .filter(|path| editor.entries.get(*path) != current_editor.entries.get(*path))
-            .filter(|path| !scope_set.contains(path))
             .cloned()
-            .collect::<HashSet<_>>();
-        apply_snapshot_paths(&stage.project_root, &refreshed, &current_editor)?;
+            .collect::<Vec<_>>();
+        stage.accept_project_changes(root, &changed)?;
     }
     log_global(
         5,

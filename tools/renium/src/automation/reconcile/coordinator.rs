@@ -92,8 +92,14 @@ fn capture_for_reconcile(
             .as_ref()
             .context("Reconciliation baseline disappeared")?
             .load(Path::new(&context.root), &setup.key)?;
-        let captured =
-            capture_changed_studio_services(context, bridge, &services, &baseline, studio_state)?;
+        let captured = capture_changed_studio_services(
+            context,
+            bridge,
+            &services,
+            &baseline,
+            studio_state,
+            None,
+        )?;
         loaded_baseline = Some(baseline);
         captured
     } else {
@@ -142,7 +148,10 @@ enum HeldStart {
     /// from the last sync either way: nothing tells whether one that holds
     /// other files is older than the baseline's pull.
     #[cfg(any(windows, target_os = "macos"))]
-    Moved { synced: bool },
+    Moved {
+        synced: bool,
+        editor: Box<(ProjectSnapshot, Vec<PathBuf>)>,
+    },
     /// Studio still holds the baseline's proof, so it holds the baseline's
     /// files, and the files moved since.
     #[cfg(any(windows, target_os = "macos"))]
@@ -301,17 +310,13 @@ impl HeldFiles {
                 ),
             );
             let synced = !files_moved && synced(&entry.project);
+            let publish_paths = stage.publish_paths().to_vec();
+            drop(stage);
             hold_again(bridge, runtime, entry);
-            if files_moved {
-                log_global(
-                    5,
-                    format_args!(
-                        "[renium] baseline: live start captures every service: the files changed since"
-                    ),
-                );
-                return HeldStart::NotHeld;
-            }
-            return HeldStart::Moved { synced };
+            return HeldStart::Moved {
+                synced,
+                editor: Box::new((editor, publish_paths)),
+            };
         }
         log_global(
             5,
@@ -474,10 +479,12 @@ fn compared_capture(
             return Ok((capture, HashSet::new()));
         }
         #[cfg(any(windows, target_os = "macos"))]
-        HeldStart::Moved { .. } => match capture_moved_services(context, bridge, studio_state)? {
-            Some(capture) => capture,
-            None => capture_for_reconcile(context, bridge, setup, record, studio_state)?,
-        },
+        HeldStart::Moved { editor, .. } => {
+            match capture_moved_services(context, bridge, studio_state, *editor)? {
+                Some(capture) => capture,
+                None => capture_for_reconcile(context, bridge, setup, record, studio_state)?,
+            }
+        }
         #[cfg(any(windows, target_os = "macos"))]
         HeldStart::FilesMoved(held) => {
             let HeldFiles {
@@ -588,6 +595,7 @@ fn capture_moved_services(
     context: &BoundContext,
     bridge: &BridgeServer,
     studio_state: &Value,
+    known_editor: (ProjectSnapshot, Vec<PathBuf>),
 ) -> Result<Option<ReconcileCapture>> {
     let runtime = context
         .runtime_id
@@ -596,7 +604,13 @@ fn capture_moved_services(
     let Some(held) = bridge.verified_full_pushes.lock_recover().remove(runtime) else {
         return Ok(None);
     };
-    let captured = capture_moved_services_of(context, (bridge, runtime), &held, studio_state);
+    let captured = capture_moved_services_of(
+        context,
+        (bridge, runtime),
+        &held,
+        studio_state,
+        known_editor,
+    );
     hold_again(bridge, runtime, held);
     captured
 }
@@ -779,6 +793,7 @@ fn capture_moved_services_of(
     (bridge, runtime): (&BridgeServer, &str),
     held: &VerifiedFullPush,
     studio_state: &Value,
+    known_editor: (ProjectSnapshot, Vec<PathBuf>),
 ) -> Result<Option<ReconcileCapture>> {
     let phase = Instant::now();
     let scoped = bridge
@@ -792,12 +807,17 @@ fn capture_moved_services_of(
         .and_then(|state| {
             ensure_plugin_api_ok(&state)?;
             let source = Path::new(&context.source);
-            let stores = crate::project::structural::service_store_paths(source)?
+            let mut stores = crate::project::structural::service_store_paths(source)?
                 .into_iter()
                 .map(|(service, path)| {
                     Ok((service, path.strip_prefix(&context.root)?.to_path_buf()))
                 })
                 .collect::<Result<BTreeMap<_, _>>>()?;
+            for path in held.project.entries.keys() {
+                if let Some(service) = crate::project::storage::store_service_name(path) {
+                    stores.entry(service).or_insert_with(|| path.clone());
+                }
+            }
             moved_services(
                 &ProofScope::parse(&state["pushProofScope"]),
                 &held.project,
@@ -821,8 +841,14 @@ fn capture_moved_services_of(
             return Ok(None);
         }
     };
-    let captured =
-        capture_changed_studio_services(context, bridge, &services, &held.project, studio_state);
+    let captured = capture_changed_studio_services(
+        context,
+        bridge,
+        &services,
+        &held.project,
+        studio_state,
+        Some(known_editor),
+    );
     let (stage, studio, editor) = match captured {
         Ok(Some(captured)) => captured,
         outcome => {
@@ -3146,6 +3172,373 @@ mod pushed_alone_tests {
             pushed(&files(true, "Imported")?, &files(true, "Renamed")?)?,
             None
         );
+        Ok(())
+    }
+
+    #[test]
+    fn files_moved_and_studio_moved_preserves_script_store_and_linked_file_edits() -> Result<()> {
+        let root = crate::tests::support::temp_dir("reconcile-moved-with-edits");
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let ws_dir = root.join("src/Workspace");
+        let rs_dir = root.join("src/ReplicatedStorage");
+        fs::create_dir_all(&ws_dir)?;
+        fs::create_dir_all(&rs_dir)?;
+        fs::write(
+            root.join("renium-link.json"),
+            br#"{"version":1,"links":[],"broken":[]}"#,
+        )?;
+
+        let make_store = |service: &str, prop_val: f64| -> Result<Vec<u8>> {
+            let mut part = SettingsBytecodeInstance::new(
+                format!("{service}-part"),
+                "Probe".into(),
+                "Part".into(),
+                Some(0),
+            );
+            part.properties
+                .insert("Transparency".into(), json!(prop_val));
+            let doc = SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances: vec![
+                    SettingsBytecodeInstance::new(
+                        format!("{service}-root"),
+                        service.into(),
+                        service.into(),
+                        None,
+                    ),
+                    part,
+                ],
+            };
+            encode_settings_bytecode(&doc)
+        };
+
+        let ws_store_rel =
+            PathBuf::from("src/Workspace").join(crate::system::files::SERVICE_SETTINGS_FILE_NAME);
+        let rs_store_rel = PathBuf::from("src/ReplicatedStorage")
+            .join(crate::system::files::SERVICE_SETTINGS_FILE_NAME);
+        let ws_script_rel = PathBuf::from("src/Workspace/Script.luau");
+        let rs_linked_rel = PathBuf::from("src/ReplicatedStorage/Linked.luau");
+
+        fs::write(root.join(&ws_store_rel), make_store("Workspace", 0.25)?)?;
+        fs::write(
+            root.join(&rs_store_rel),
+            make_store("ReplicatedStorage", 0.1)?,
+        )?;
+        fs::write(root.join(&ws_script_rel), "return 'v1'\n")?;
+        fs::write(root.join(&rs_linked_rel), "return 'linked-v1'\n")?;
+
+        let services = vec!["Workspace".to_string(), "ReplicatedStorage".to_string()];
+        let stage = ExportProjectStage::create_selective_background(
+            &root,
+            Path::new("src"),
+            &services,
+            &["ReplicatedStorage".to_string()],
+            None,
+        )?;
+        stage.wait_for_copy()?;
+        let baseline = capture_snapshot(&root, stage.publish_paths())?;
+        let stored_baseline = StoredSnapshot::write(&root, "pair", &baseline)?;
+
+        fs::write(root.join(&ws_script_rel), "return 'v2'\n")?;
+        fs::write(root.join(&ws_store_rel), make_store("Workspace", 0.75)?)?;
+        fs::write(root.join(&rs_linked_rel), "return 'linked-v2'\n")?;
+        let editor = capture_snapshot(&root, stage.publish_paths())?;
+
+        let (bridge, _) = BridgeServer::listen_with_initial_wait("127.0.0.1", &[0], 0.0, false)?;
+        let entry = VerifiedFullPush {
+            connections: Vec::new(),
+            input: json!({}),
+            project: baseline.clone(),
+            paths: stage.publish_paths().to_vec(),
+            proof: json!(1),
+            expires: Instant::now() + BASELINE_IDLE,
+            sourcemap: Some(Box::default()),
+            pushed_from_pull: None,
+            #[cfg(windows)]
+            relay: None,
+        };
+        let held = HeldFiles {
+            entry,
+            stage,
+            editor: editor.clone(),
+            synced: false,
+        };
+        let settled = held.settle(
+            &bridge,
+            ("rt-1", &json!({"pushProofMatches": false, "pushProofMismatch": "ReplicatedStorage changed"})),
+            Some(Some(&stored_baseline)),
+        );
+        let HeldStart::Moved {
+            synced,
+            editor: settled_editor,
+        } = settled
+        else {
+            panic!("both sides moving must yield HeldStart::Moved");
+        };
+        assert!(
+            !synced,
+            "files moved must not mark HeldStart::Moved as synced"
+        );
+        assert!(settled_editor.0 == editor);
+
+        let selective_stage = ExportProjectStage::create_selective_background(
+            &root,
+            Path::new("src"),
+            &services,
+            &["ReplicatedStorage".to_string()],
+            None,
+        )?;
+        selective_stage.wait_for_copy()?;
+        assert!(
+            selective_stage.project_root.join(&rs_linked_rel).exists(),
+            "selective stage with renium-link.json must retain linked files in captured services"
+        );
+        let studio_rs_store = make_store("ReplicatedStorage", 0.9)?;
+        fs::write(
+            selective_stage.project_root.join(&rs_store_rel),
+            &studio_rs_store,
+        )?;
+        let mut studio = baseline.clone();
+        studio.entries.insert(
+            rs_store_rel.clone(),
+            SnapshotEntry::File(studio_rs_store.clone()),
+        );
+
+        let (merged, conflicts, _) = merge_snapshots_with_changes(
+            Some(&baseline),
+            &editor,
+            &studio,
+            ConflictPreference::None,
+            None,
+        )?;
+        assert!(
+            conflicts.is_empty(),
+            "disjoint file and Studio edits must not conflict"
+        );
+        assert!(
+            merged.entries.get(&ws_script_rel)
+                == Some(&SnapshotEntry::File(b"return 'v2'\n".to_vec()))
+        );
+        assert!(
+            merged.entries.get(&rs_linked_rel)
+                == Some(&SnapshotEntry::File(b"return 'linked-v2'\n".to_vec()))
+        );
+        assert!(merged.entries.get(&ws_store_rel) == editor.entries.get(&ws_store_rel));
+        assert!(merged.entries.get(&rs_store_rel) == Some(&SnapshotEntry::File(studio_rs_store)));
+        Ok(())
+    }
+
+    #[test]
+    fn capture_changed_studio_services_with_store_only_stage_preserves_offline_edits() -> Result<()>
+    {
+        use crate::studio::bridge::routing_tests::{connect, edit_info, fixture};
+        use tungstenite::{Message, WebSocket, protocol::Role};
+
+        let root = crate::tests::support::temp_dir("reconcile-selective-store-only");
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let ws_dir = root.join("src/Workspace");
+        let rs_dir = root.join("src/ReplicatedStorage");
+        fs::create_dir_all(&ws_dir)?;
+        fs::create_dir_all(&rs_dir)?;
+
+        let make_store = |service: &str, prop_val: f64| -> Result<Vec<u8>> {
+            let mut part = SettingsBytecodeInstance::new(
+                format!("{service}-part"),
+                "Probe".into(),
+                "Part".into(),
+                Some(0),
+            );
+            part.properties
+                .insert("Transparency".into(), json!(prop_val));
+            let doc = SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances: vec![
+                    SettingsBytecodeInstance::new(
+                        format!("{service}-root"),
+                        service.into(),
+                        service.into(),
+                        None,
+                    ),
+                    part,
+                ],
+            };
+            encode_settings_bytecode(&doc)
+        };
+
+        let ws_store_rel =
+            PathBuf::from("src/Workspace").join(crate::system::files::SERVICE_SETTINGS_FILE_NAME);
+        let rs_store_rel = PathBuf::from("src/ReplicatedStorage")
+            .join(crate::system::files::SERVICE_SETTINGS_FILE_NAME);
+        let ws_script_rel = PathBuf::from("src/Workspace/Offline.luau");
+        let rs_script_rel = PathBuf::from("src/ReplicatedStorage/StudioScript.luau");
+
+        fs::write(root.join(&ws_store_rel), make_store("Workspace", 0.25)?)?;
+        fs::write(
+            root.join(&rs_store_rel),
+            make_store("ReplicatedStorage", 0.1)?,
+        )?;
+        fs::write(root.join(&ws_script_rel), "return 'v1'\n")?;
+        fs::write(root.join(&rs_script_rel), "return 'rs-v1'\n")?;
+
+        let all_services = sync_services();
+        let baseline_stage = ExportProjectStage::create(&root, Path::new("src"), &all_services)?;
+        let publish_paths = baseline_stage.publish_paths().to_vec();
+        let baseline = capture_snapshot(&root, &publish_paths)?;
+        drop(baseline_stage);
+
+        fs::write(root.join(&ws_script_rel), "return 'v2'\n")?;
+        fs::write(root.join(&ws_store_rel), make_store("Workspace", 0.75)?)?;
+        let offline_editor = capture_snapshot(&root, &publish_paths)?;
+
+        let generations: Map<String, Value> = all_services
+            .iter()
+            .map(|service| (service.clone(), json!(0)))
+            .collect();
+        let epoch_state = json!({
+            "runtimeId": "rt-selective",
+            "tracking": true,
+            "trackedServices": all_services.len(),
+            "changeTrackerVersion": 1,
+            "seq": 3,
+            "serviceGenerations": generations,
+            "checkpointGenerations": generations,
+            "dirtyServices": ["ReplicatedStorage"],
+            "fullSyncServices": [],
+        });
+
+        let bridge = fixture();
+        let stream = connect(&bridge, 0, edit_info("rt-selective", 20));
+        let reply_state = epoch_state.clone();
+        let plugin = std::thread::spawn(move || {
+            let mut socket = WebSocket::from_raw_socket(stream, Role::Client, None);
+            while let Ok(message) = socket.read() {
+                let Message::Text(text) = message else {
+                    if let Message::Ping(bytes) = message {
+                        let _ = socket.send(Message::Pong(bytes));
+                    }
+                    continue;
+                };
+                let request: Value = serde_json::from_str(&text).unwrap();
+                let result = match request["method"].as_str() {
+                    Some("getStudioChangeState") => reply_state.clone(),
+                    _ => json!({}),
+                };
+                let reply = json!({ "id": request["id"], "ok": true, "result": result });
+                if socket
+                    .send(Message::Text(reply.to_string().into()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let context = BoundContext {
+            id: 1,
+            initialized: true,
+            project: "selective-test".into(),
+            root: root.to_string_lossy().into_owned(),
+            experience: String::new(),
+            source: root.join("src").to_string_lossy().into_owned(),
+            resource_lease: None,
+            place_id: None,
+            game_id: None,
+            selector: String::new(),
+            runtime_id: Some("rt-selective".into()),
+            plugin_build: None,
+            fingerprint: "fp-selective".into(),
+        };
+        let studio_rs_store = make_store("ReplicatedStorage", 0.9)?;
+        let captured_services = vec!["ReplicatedStorage".to_string()];
+
+        for known_editor in [None, Some((offline_editor.clone(), publish_paths.clone()))] {
+            let store_bytes = studio_rs_store.clone();
+            let rs_store_inner = rs_store_rel.clone();
+            let rs_script_inner = rs_script_rel.clone();
+            let saw_export = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let saw_flag = Arc::clone(&saw_export);
+            crate::snapshot::export::STUDIO_EXPORT.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |services, stage| {
+                    assert_eq!(services, ["ReplicatedStorage"]);
+                    assert!(
+                        !stage.project_root.join(&rs_script_inner).exists(),
+                        "store-only selective stage must not copy scripts into captured service dirs"
+                    );
+                    saw_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    fs::write(stage.project_root.join(&rs_store_inner), &store_bytes)?;
+                    fs::write(
+                        stage.project_root.join(&rs_script_inner),
+                        "return 'rs-studio'\n",
+                    )?;
+                    Ok(())
+                }));
+            });
+            let _reset_hook = crate::system::files::OnDrop::new(|| {
+                crate::snapshot::export::STUDIO_EXPORT.with(|slot| {
+                    *slot.borrow_mut() = None;
+                });
+            });
+
+            let (stage, studio, editor) = capture_changed_studio_services(
+                &context,
+                &bridge,
+                &captured_services,
+                &baseline,
+                &epoch_state,
+                known_editor,
+            )?
+            .context("selective capture must succeed on matching epoch")?;
+            assert!(
+                saw_export.load(std::sync::atomic::Ordering::SeqCst),
+                "selective capture must invoke Studio export"
+            );
+            assert!(!stage.holds_project_files());
+            assert_eq!(
+                fs::read(stage.project_root.join(&ws_script_rel))?,
+                b"return 'v1'\n"
+            );
+            assert!(
+                editor.entries.get(&ws_script_rel)
+                    == Some(&SnapshotEntry::File(b"return 'v2'\n".to_vec()))
+            );
+            assert!(
+                studio.entries.get(&rs_script_rel)
+                    == Some(&SnapshotEntry::File(b"return 'rs-studio'\n".to_vec()))
+            );
+            assert!(
+                studio.entries.get(&rs_store_rel)
+                    == Some(&SnapshotEntry::File(studio_rs_store.clone()))
+            );
+
+            let (merged, conflicts, _) = merge_snapshots_with_changes(
+                Some(&baseline),
+                &editor,
+                &studio,
+                ConflictPreference::None,
+                None,
+            )?;
+            assert!(conflicts.is_empty(), "{conflicts:?}");
+            assert!(
+                merged.entries.get(&ws_script_rel)
+                    == Some(&SnapshotEntry::File(b"return 'v2'\n".to_vec()))
+            );
+            assert!(merged.entries.get(&ws_store_rel) == offline_editor.entries.get(&ws_store_rel));
+            assert!(
+                merged.entries.get(&rs_script_rel)
+                    == Some(&SnapshotEntry::File(b"return 'rs-studio'\n".to_vec()))
+            );
+            assert!(
+                merged.entries.get(&rs_store_rel)
+                    == Some(&SnapshotEntry::File(studio_rs_store.clone()))
+            );
+        }
+
+        drop(bridge);
+        let _ = plugin.join();
         Ok(())
     }
 }
