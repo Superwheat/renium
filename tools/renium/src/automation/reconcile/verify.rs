@@ -866,6 +866,13 @@ fn settings_delta_verification(
     }
     let (mut before, desired, mut observed, observed_restored) =
         decode_verification_documents(entries, prepared, observed_doc)?;
+    let observed_old_ids = (policy.settle && !observed_restored.is_empty()).then(|| {
+        observed
+            .instances
+            .iter()
+            .map(|instance| instance.settings_id.clone())
+            .collect::<Vec<_>>()
+    });
     // Documents read by their changed instances verify a push that left
     // every instance at its place. Where Studio's instances have to be
     // matched with the files' by what tells them apart, the whole documents
@@ -1058,8 +1065,38 @@ fn settings_delta_verification(
     }
     crate::settings::bytecode::defer_drop_settings_document(before);
     let accepted = if policy.settle && mismatch.is_none() {
-        for (index, original) in observed_restored {
-            observed.instances[index].properties = original;
+        if !observed_restored.is_empty() {
+            let remap = observed_old_ids
+                .filter(|old_ids| {
+                    old_ids
+                        .iter()
+                        .zip(&observed.instances)
+                        .any(|(old, instance)| old != &instance.settings_id)
+                })
+                .map(|old_ids| {
+                    old_ids
+                        .into_iter()
+                        .zip(
+                            observed
+                                .instances
+                                .iter()
+                                .map(|instance| instance.settings_id.clone()),
+                        )
+                        .collect::<HashMap<_, _>>()
+                });
+            let service = remap
+                .as_ref()
+                .and_then(|_| crate::snapshot::refs::store_service(&observed).map(str::to_string));
+            for (index, mut original) in observed_restored {
+                if let Some(remap) = &remap {
+                    crate::snapshot::refs::remap_record_reference_ids(
+                        &mut original,
+                        remap,
+                        service.as_deref(),
+                    );
+                }
+                observed.instances[index].properties = original;
+            }
         }
         mask_reported_pending_fields(path, &desired, &mut observed, policy.pending)?;
         if let Some(desired) = Arc::into_inner(desired) {
@@ -2937,6 +2974,99 @@ mod row_verify_tests {
         assert_eq!(
             accepted.instances[0].properties.get("CharacterAutoLoads"),
             Some(&json!(false))
+        );
+    }
+
+    #[test]
+    fn whole_store_settle_remaps_refs_on_restored_observed_properties() {
+        let path = Path::new("instances/Workspace.renium");
+        let make_root = |id: &str| {
+            SettingsBytecodeInstance::new(id.into(), "Workspace".into(), "Workspace".into(), None)
+        };
+        let make_target = |id: &str| {
+            SettingsBytecodeInstance::new(id.into(), "Anchor".into(), "Part".into(), Some(0))
+        };
+        let make_mesh = |id: &str, target_id: &str| {
+            let mut inst =
+                SettingsBytecodeInstance::new(id.into(), "Mesh".into(), "MeshPart".into(), Some(0));
+            inst.properties
+                .insert("MeshId".into(), json!("rbxassetid://987654"));
+            inst.properties.insert(
+                "Target".into(),
+                json!({"_type": "Ref", "settingsId": target_id}),
+            );
+            inst.properties.insert(
+                "Pointer".into(),
+                json!({
+                    "_type": "Ref",
+                    "settingsId": target_id,
+                    "pathSegments": ["Workspace", "Anchor"],
+                    "pathOrdinals": [1, 1],
+                }),
+            );
+            inst
+        };
+
+        let before = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![make_root("ws")],
+        };
+        let desired = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                make_root("ws"),
+                make_target("debug:0_9"),
+                make_mesh("debug:0_10", "debug:0_9"),
+            ],
+        };
+        let observed = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                make_root("obs-ws"),
+                make_target("debug:9_301"),
+                make_mesh("debug:9_302", "debug:9_301"),
+            ],
+        };
+
+        let before_entry = SnapshotEntry::File(encode_settings_bytecode(&before).unwrap());
+        let desired_entry = SnapshotEntry::File(encode_settings_bytecode(&desired).unwrap());
+        let observed_entry = SnapshotEntry::File(encode_settings_bytecode(&observed).unwrap());
+
+        let pending: Vec<PendingImportFields> = Vec::new();
+        let no_values = NewInstanceValues::default();
+        let mut policy = Verification::of(true, &pending, &no_values);
+        policy.whole_documents = true;
+
+        let verified = settings_delta_verification(
+            path,
+            (
+                Some(&before_entry),
+                Some(&desired_entry),
+                Some(&observed_entry),
+            ),
+            (None, true),
+            None,
+            policy,
+        )
+        .unwrap();
+        assert!(verified.mismatch.is_none(), "{:?}", verified.mismatch);
+        let accepted_bytes = verified.accepted.unwrap();
+        let raw = decode_settings_bytecode(&accepted_bytes).unwrap();
+        assert_eq!(
+            raw.instances[2].properties.get("Target"),
+            Some(&json!({"_type": "Ref", "instanceIndex": 2}))
+        );
+        let accepted = settings_document(Some(&SnapshotEntry::File(accepted_bytes))).unwrap();
+        assert_eq!(
+            accepted.instances[2].properties.get("Target"),
+            Some(&json!({"_type": "Ref", "settingsId": "debug:0_9"}))
+        );
+        assert_eq!(
+            accepted.instances[2]
+                .properties
+                .get("Pointer")
+                .and_then(|value| value.get("settingsId")),
+            Some(&json!("debug:0_9"))
         );
     }
 }
