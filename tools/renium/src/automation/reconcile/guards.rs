@@ -345,7 +345,7 @@ pub(crate) fn current_studio_change_guard_verifying_continuing(
             "verifyPushProof": verify_push_proof,
             "scopePushProof": verify_push_proof.is_some(),
             "continueNativeRelay": cfg!(windows) && continue_native_relay,
-            "skipTerrainIfWorkspaceOverflow": cfg!(windows) && continue_native_relay && verify_push_proof.is_some(),
+            "skipTerrainIfWorkspaceOverflow": false,
             "lazyTracking": cfg!(windows) && native_attribute_services.is_some(),
         }),
         BridgeTarget::Edit,

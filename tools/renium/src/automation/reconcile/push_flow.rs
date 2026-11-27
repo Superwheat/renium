@@ -734,6 +734,7 @@ struct ExtractedZeroCapture {
     plan: ReconcilePushPlan,
     prepared_documents: HashMap<String, Arc<SettingsBytecode>>,
     service_rows: HashMap<String, (PathBuf, Vec<usize>)>,
+    terrain_restore: Option<(PathBuf, usize)>,
     extra_before: BTreeMap<PathBuf, SnapshotEntry>,
     extra_mutation_paths: HashSet<PathBuf>,
 }
@@ -832,9 +833,11 @@ fn merge_zero_capture_scoped_services(
     }
     let bulk_paths = std::mem::take(&mut plan.bulk_property_paths);
     let bulk_patches = std::mem::take(&mut plan.bulk_property_patches);
+    let extra_props = std::mem::take(&mut plan.extra_property_changes);
     *plan = scoped_plan;
     plan.bulk_property_paths = bulk_paths;
     plan.bulk_property_patches = bulk_patches;
+    plan.extra_property_changes.extend(extra_props);
     Ok(true)
 }
 
@@ -845,6 +848,7 @@ fn plan_zero_capture_bulk_restore(
 ) -> Result<Option<ExtractedZeroCapture>> {
     use crate::settings::bytecode::blocks::bulk_diff::{
         BulkExtractOutcome, extract_v12_bulk_properties_for_classes,
+        extract_v12_workspace_terrain_voxels,
     };
     let Some(scope) = ProofBulkScope::parse(&zctx.initial_state["pushProofScope"]) else {
         log_global(
@@ -864,7 +868,10 @@ fn plan_zero_capture_bulk_restore(
     {
         return Ok(None);
     }
-    if scope.services.contains("Workspace") && scope.expected_terrain_digest.is_none() {
+    if scope.services.contains("Workspace")
+        && !scope.terrain_differs
+        && scope.expected_terrain_digest.is_none()
+    {
         log_global(
             5,
             format_args!("[renium] zero-capture skipped: missing expectedTerrainDigest"),
@@ -874,11 +881,22 @@ fn plan_zero_capture_bulk_restore(
     let stores = crate::project::structural::service_store_paths(Path::new(&zctx.context.source))?;
     let mut plan = ReconcilePushPlan::default();
     let mut service_rows = HashMap::new();
+    let mut terrain_restore = None;
     let mut capture_services = Vec::new();
     let mut total_instances = 0_usize;
     for service in &scope.services {
         let can_try_bulk = scope.values_only.contains(service)
             && scope.changed_class_properties.contains_key(service);
+        let has_terrain_class_prop = service == "Workspace"
+            && scope
+                .changed_class_properties
+                .get(service)
+                .is_some_and(|pairs| pairs.iter().any(|(cls, _)| cls == "Terrain"));
+        let restore_terrain = service == "Workspace"
+            && scope.terrain_differs
+            && scope.values_only.contains(service)
+            && !has_terrain_class_prop
+            && (can_try_bulk || scope.terrain_only_workspace);
         let store_entry = stores
             .get(service)
             .and_then(|store_abs| store_abs.strip_prefix(zctx.root).ok())
@@ -892,30 +910,78 @@ fn plan_zero_capture_bulk_restore(
                 }
             });
         let is_heavy = store_entry.is_some_and(|(_, bytes)| bytes.len() >= 256 * 1024);
-        if can_try_bulk && let Some((store_rel, desired_bytes)) = store_entry {
-            let class_props = &scope.changed_class_properties[service];
-            let phase = Instant::now();
-            let outcome =
-                extract_v12_bulk_properties_for_classes(desired_bytes, service, class_props, 1)?;
-            if let BulkExtractOutcome::Patch(mut extracted) = outcome {
-                log_reconcile_timing(
-                    &format!(
-                        "zero-capture bulk extract ({service}, {} instances, {} fields)",
-                        extracted.patch.instance_count, extracted.patch.field_count
-                    ),
-                    phase,
-                );
-                total_instances += extracted.patch.instance_count;
-                if service == "Workspace" {
-                    extracted.patch.expected_terrain_digest = scope.expected_terrain_digest.clone();
+        if (can_try_bulk || restore_terrain)
+            && let Some((store_rel, desired_bytes)) = store_entry
+        {
+            let extracted_terrain = if restore_terrain {
+                match extract_v12_workspace_terrain_voxels(desired_bytes)? {
+                    Some(terrain) => Some(terrain),
+                    None => {
+                        log_global(
+                            5,
+                            format_args!(
+                                "[renium] zero-capture skipped (Workspace): terrain row unavailable"
+                            ),
+                        );
+                        return Ok(None);
+                    }
                 }
-                extracted.patch.return_old_values = true;
-                plan.bulk_property_paths.push(store_rel.to_path_buf());
-                plan.bulk_property_patches.push(extracted.patch);
-                service_rows.insert(
-                    service.clone(),
-                    (store_rel.to_path_buf(), extracted.node_to_row),
-                );
+            } else {
+                None
+            };
+            let mut handled = false;
+            if can_try_bulk {
+                let class_props = &scope.changed_class_properties[service];
+                let phase = Instant::now();
+                let outcome = extract_v12_bulk_properties_for_classes(
+                    desired_bytes,
+                    service,
+                    class_props,
+                    1,
+                )?;
+                if let BulkExtractOutcome::Patch(mut extracted) = outcome {
+                    log_reconcile_timing(
+                        &format!(
+                            "zero-capture bulk extract ({service}, {} instances, {} fields)",
+                            extracted.patch.instance_count, extracted.patch.field_count
+                        ),
+                        phase,
+                    );
+                    total_instances += extracted.patch.instance_count;
+                    if service == "Workspace" && extracted_terrain.is_none() {
+                        extracted.patch.expected_terrain_digest =
+                            scope.expected_terrain_digest.clone();
+                    }
+                    extracted.patch.return_old_values = true;
+                    plan.bulk_property_paths.push(store_rel.to_path_buf());
+                    plan.bulk_property_patches.push(extracted.patch);
+                    service_rows.insert(
+                        service.clone(),
+                        (store_rel.to_path_buf(), extracted.node_to_row),
+                    );
+                    handled = true;
+                }
+            } else if extracted_terrain.is_some() {
+                handled = true;
+            }
+            if handled {
+                if let Some(terrain) = extracted_terrain {
+                    let mut properties = Map::new();
+                    properties.insert("SmoothGrid".to_string(), terrain.smooth_grid);
+                    properties.insert("PhysicsGrid".to_string(), terrain.physics_grid);
+                    plan.extra_property_changes.push(EditorPropertyChange {
+                        service: "Workspace".to_string(),
+                        settings_id: terrain.settings_id,
+                        path_segments: terrain.path_segments,
+                        path_ordinals: terrain.path_ordinals,
+                        class_name: "Terrain".to_string(),
+                        properties,
+                        ..EditorPropertyChange::default()
+                    });
+                    plan.capture_before_terrain = true;
+                    terrain_restore = Some((store_rel.to_path_buf(), terrain.row_index));
+                    total_instances += 1;
+                }
                 continue;
             }
         }
@@ -923,9 +989,11 @@ fn plan_zero_capture_bulk_restore(
             log_global(
                 5,
                 format_args!(
-                    "[renium] zero-capture skipped ({service}): values_only={} has_class_props={}",
+                    "[renium] zero-capture skipped ({service}): values_only={} has_class_props={} terrain_differs={} terrain_only={}",
                     scope.values_only.contains(service),
                     scope.changed_class_properties.contains_key(service),
+                    scope.terrain_differs,
+                    scope.terrain_only_workspace,
                 ),
             );
             return Ok(None);
@@ -955,6 +1023,7 @@ fn plan_zero_capture_bulk_restore(
         plan,
         prepared_documents,
         service_rows,
+        terrain_restore,
         extra_before,
         extra_mutation_paths,
     }))
@@ -1042,10 +1111,14 @@ fn reconstruct_zero_capture_before(
     held_project: &ProjectSnapshot,
     service_rows: &HashMap<String, (PathBuf, Vec<usize>)>,
     old_columns_map: &Map<String, Value>,
+    terrain_restore: Option<&(PathBuf, usize)>,
+    before_terrain_grids: Option<&Value>,
     extra_before: BTreeMap<PathBuf, SnapshotEntry>,
     extra_mutation_paths: HashSet<PathBuf>,
 ) -> Result<(ProjectSnapshot, HashSet<PathBuf>)> {
-    use crate::settings::bytecode::blocks::bulk_diff::patch_v12_bulk_old_value_columns;
+    use crate::settings::bytecode::blocks::bulk_diff::{
+        patch_v12_bulk_old_value_columns, patch_v12_terrain_voxels,
+    };
     let phase = Instant::now();
     let mut before_entries = extra_before;
     let mut mutation_paths = extra_mutation_paths;
@@ -1061,6 +1134,26 @@ fn reconstruct_zero_capture_before(
         };
         before_entries.insert(store_rel.clone(), SnapshotEntry::File(before_bytes));
         mutation_paths.insert(store_rel.clone());
+    }
+    if let Some((store_rel, terrain_row)) = terrain_restore {
+        let base_bytes = match before_entries.get(store_rel) {
+            Some(SnapshotEntry::File(bytes)) => Some(bytes.as_slice()),
+            _ => match held_project.entries.get(store_rel) {
+                Some(SnapshotEntry::File(bytes)) => Some(bytes.as_slice()),
+                _ => None,
+            },
+        };
+        if let Some(base_bytes) = base_bytes {
+            let smooth = before_terrain_grids
+                .and_then(|grids| grids.get("SmoothGrid"))
+                .cloned();
+            let physics = before_terrain_grids
+                .and_then(|grids| grids.get("PhysicsGrid"))
+                .cloned();
+            let patched = patch_v12_terrain_voxels(base_bytes, *terrain_row, smooth, physics)?;
+            before_entries.insert(store_rel.clone(), SnapshotEntry::File(patched));
+            mutation_paths.insert(store_rel.clone());
+        }
     }
     log_reconcile_timing("zero-capture history reconstruct", phase);
     Ok((
@@ -1175,7 +1268,12 @@ pub(super) fn try_zero_capture_bulk_restore(
     let Some(extracted) = plan_zero_capture_bulk_restore(zctx, held_project)? else {
         return Ok(None);
     };
-    let sourcemap_policy = bulk_patches_sourcemap_policy(&extracted.plan.bulk_property_patches);
+    let sourcemap_policy =
+        if extracted.plan.bulk_property_patches.is_empty() && extracted.terrain_restore.is_some() {
+            BulkSourcemapPolicy::MetadataOnly
+        } else {
+            bulk_patches_sourcemap_policy(&extracted.plan.bulk_property_patches)
+        };
     let phase = Instant::now();
     let mut args = zctx.push_args.clone();
     args.inline_release_tracking = if extracted.extra_mutation_paths.is_empty() {
@@ -1226,12 +1324,15 @@ pub(super) fn try_zero_capture_bulk_restore(
         .remove("_bulkOldValueColumns")
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
+    let before_terrain_grids = pushed.summary.remove("_beforeTerrainGrids");
     let updated = pushed
         .summary
         .get("propertyUpdated")
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
-    let any_mutated = updated > 0.0 || !extracted.extra_mutation_paths.is_empty();
+    let any_mutated = updated > 0.0
+        || !extracted.extra_mutation_paths.is_empty()
+        || extracted.terrain_restore.is_some();
     let has_adapters = zctx
         .stage
         .loaded
@@ -1259,6 +1360,8 @@ pub(super) fn try_zero_capture_bulk_restore(
             held_project,
             &extracted.service_rows,
             &old_columns,
+            extracted.terrain_restore.as_ref(),
+            before_terrain_grids.as_ref(),
             extracted.extra_before,
             extracted.extra_mutation_paths,
         )
@@ -1432,7 +1535,10 @@ pub(super) fn try_zero_capture_bulk_restore(
         &pushed.summary,
         held_sourcemap_fallback,
     );
-    let pushed_services: BTreeSet<String> = extracted.service_rows.keys().cloned().collect();
+    let mut pushed_services: BTreeSet<String> = extracted.service_rows.keys().cloned().collect();
+    if extracted.terrain_restore.is_some() {
+        pushed_services.insert("Workspace".to_string());
+    }
     let retained_pushed_from_pull =
         if preserved_sourcemap.is_none() && can_keep_pull_scope && !pushed_services.is_empty() {
             held_sourcemap_fallback.take().map(|sm| {
@@ -5141,6 +5247,8 @@ mod stores_read_tests {
             &held_project,
             &extracted.service_rows,
             &old_cols,
+            None,
+            None,
             BTreeMap::new(),
             HashSet::new(),
         )
@@ -5159,6 +5267,183 @@ mod stores_read_tests {
             (before_t - 0.75).abs() < 1e-5,
             "before state must hold Studio's 0.75, got {before_t}"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn zero_capture_plans_terrain_voxels_alone_and_beside_bulk_and_reconstructs_history() {
+        use crate::cli::{BridgeConnectionArgs, ProjectSourceArgs};
+        use crate::settings::bytecode::{
+            SETTINGS_BINARY_VERSION, SettingsBytecode, SettingsBytecodeInstance,
+            decode_settings_bytecode, encode_settings_bytecode,
+        };
+        let root = crate::tests::support::temp_dir("zero-capture-terrain");
+        let src_dir = root.join("src");
+        let store_rel = PathBuf::from("src/Workspace/__roblox_sync_settings.renium");
+        fs::create_dir_all(root.join("src/Workspace")).unwrap();
+        let mut terrain = SettingsBytecodeInstance::new(
+            "terrain-1".into(),
+            "Terrain".into(),
+            "Terrain".into(),
+            Some(0),
+        );
+        let desired_smooth = json!({ "_type": "BinaryString", "base64": "AQU=" });
+        let desired_physics = json!({ "_type": "BinaryString", "base64": "AQ==" });
+        terrain
+            .properties
+            .insert("SmoothGrid".into(), desired_smooth.clone());
+        terrain
+            .properties
+            .insert("PhysicsGrid".into(), desired_physics.clone());
+        let mut part =
+            SettingsBytecodeInstance::new("part-1".into(), "Block".into(), "Part".into(), Some(0));
+        part.properties.insert("Transparency".into(), json!(0.25));
+        let doc = SettingsBytecode {
+            version: SETTINGS_BINARY_VERSION,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "ws-0".into(),
+                    "Workspace".into(),
+                    "Workspace".into(),
+                    None,
+                ),
+                terrain,
+                part,
+            ],
+        };
+        let desired_bytes = encode_settings_bytecode(&doc).unwrap();
+        fs::write(root.join(&store_rel), &desired_bytes).unwrap();
+        let held_project = ProjectSnapshot {
+            entries: BTreeMap::from([(store_rel.clone(), SnapshotEntry::File(desired_bytes))]),
+        };
+        let context = BoundContext {
+            id: 1,
+            initialized: true,
+            root: root.display().to_string(),
+            project: root.join("renium.project.json").display().to_string(),
+            experience: "test".into(),
+            source: src_dir.display().to_string(),
+            resource_lease: None,
+            place_id: None,
+            game_id: None,
+            selector: String::new(),
+            runtime_id: Some("rt-terrain".into()),
+            plugin_build: None,
+            fingerprint: String::new(),
+        };
+        let stage =
+            ExportProjectStage::create(&root, Path::new("src"), &["Workspace".into()]).unwrap();
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+        let guard = StudioChangeGuard {
+            runtime_id: "rt-terrain".into(),
+            change_seq: 0,
+            tracking_guard_id: None,
+            runtime_bootstrap_safe: true,
+            service_generations: BTreeMap::new(),
+        };
+        let push_args = PushEditorChangesArgs::new(
+            ProjectSourceArgs {
+                project_root: root.clone(),
+                src_root: PathBuf::from("src"),
+            },
+            BridgeConnectionArgs::default_connection(),
+        );
+        let services = vec!["Workspace".to_string()];
+        let source_paths = vec![PathBuf::from("src")];
+        let plan_with = |initial_state: &Value| {
+            let zctx = ZeroCaptureContext {
+                context: &context,
+                bridge: &bridge,
+                root: &root,
+                src_dir: &src_dir,
+                services: &services,
+                stage: &stage,
+                guard: &guard,
+                initial_state,
+                push_args: &push_args,
+                cache_input: None,
+                source_paths: &source_paths,
+            };
+            plan_zero_capture_bulk_restore(&zctx, &held_project)
+        };
+
+        let alone_state = json!({
+            "pushProofScope": {
+                "services": ["Workspace"],
+                "valuesOnly": { "Workspace": true },
+                "terrainDiffers": true,
+                "terrainOnlyWorkspace": true,
+                "expectedTerrainDigest": "digest-1"
+            }
+        });
+        let alone = plan_with(&alone_state)
+            .unwrap()
+            .expect("terrain-only Workspace scope must plan zero-capture restore");
+        assert!(alone.plan.bulk_property_patches.is_empty());
+        assert_eq!(alone.plan.extra_property_changes.len(), 1);
+        assert_eq!(alone.plan.extra_property_changes[0].class_name, "Terrain");
+        assert!(alone.plan.capture_before_terrain);
+        assert_eq!(alone.terrain_restore, Some((store_rel.clone(), 1)));
+
+        let studio_smooth = json!({ "_type": "BinaryString", "base64": "AQV4" });
+        let before_grids = json!({
+            "SmoothGrid": studio_smooth,
+            "PhysicsGrid": desired_physics,
+        });
+        let (before, mutation_paths) = reconstruct_zero_capture_before(
+            &held_project,
+            &alone.service_rows,
+            &Map::new(),
+            alone.terrain_restore.as_ref(),
+            Some(&before_grids),
+            BTreeMap::new(),
+            HashSet::new(),
+        )
+        .unwrap();
+        assert!(mutation_paths.contains(&store_rel));
+        let SnapshotEntry::File(before_bytes) = before.entries.get(&store_rel).unwrap() else {
+            panic!("before store must be a file");
+        };
+        let before_doc = decode_settings_bytecode(before_bytes).unwrap();
+        assert_eq!(
+            before_doc.instances[1].properties.get("SmoothGrid"),
+            Some(&studio_smooth)
+        );
+
+        let mixed_state = json!({
+            "pushProofScope": {
+                "services": ["Workspace"],
+                "valuesOnly": { "Workspace": true },
+                "changedClassProps": {
+                    "Workspace": { "Part": ["Transparency"] }
+                },
+                "terrainDiffers": true,
+                "terrainOnlyWorkspace": false,
+                "expectedTerrainDigest": "digest-1"
+            }
+        });
+        let mixed = plan_with(&mixed_state)
+            .unwrap()
+            .expect("mass edit + terrain voxels must plan combined zero-capture restore");
+        assert_eq!(mixed.plan.bulk_property_patches.len(), 1);
+        assert!(
+            mixed.plan.bulk_property_patches[0]
+                .expected_terrain_digest
+                .is_none()
+        );
+        assert_eq!(mixed.plan.extra_property_changes.len(), 1);
+
+        let unsafe_state = json!({
+            "pushProofScope": {
+                "services": ["Workspace"],
+                "valuesOnly": { "Workspace": true },
+                "terrainDiffers": true,
+                "terrainOnlyWorkspace": false,
+                "expectedTerrainDigest": "digest-1"
+            }
+        });
+        assert!(plan_with(&unsafe_state).unwrap().is_none());
         let _ = fs::remove_dir_all(&root);
     }
 

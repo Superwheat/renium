@@ -161,6 +161,10 @@ pub(crate) fn normalize_resets(changes: &mut super::types::EditorChangeSet) -> R
     Ok(())
 }
 
+pub(crate) fn terrain_default_grid(name: &str) -> Result<Value> {
+    default_value("Terrain", name)
+}
+
 fn default_value(class: &str, name: &str) -> Result<Value> {
     // Scale is a virtual plugin property; reflection does not carry its default.
     if matches!(class, "Model" | "WorldModel") && name == "Scale" {
@@ -402,6 +406,7 @@ impl RootWrite {
 pub(crate) struct NativeRootVerification {
     pub(crate) completed_dispatches: usize,
     fields: HashMap<(String, String), Map<String, Value>>,
+    pub(crate) before_terrain_grids: Option<Value>,
 }
 
 impl NativeRootVerification {
@@ -409,6 +414,9 @@ impl NativeRootVerification {
         self.completed_dispatches += other.completed_dispatches;
         for (key, fields) in other.fields {
             self.fields.entry(key).or_default().extend(fields);
+        }
+        if self.before_terrain_grids.is_none() {
+            self.before_terrain_grids = other.before_terrain_grids;
         }
     }
 
@@ -969,7 +977,7 @@ pub(crate) fn apply(
             continue;
         }
         #[cfg(any(windows, target_os = "macos"))]
-        apply_write(
+        if let Some(before) = apply_write(
             bridge,
             transaction_id,
             &write,
@@ -977,7 +985,9 @@ pub(crate) fn apply(
             prepared
                 .as_mut()
                 .context("Native target batch is unavailable; retry the push")?,
-        )?;
+        )? {
+            verified.before_terrain_grids = Some(before);
+        }
         #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = (bridge, transaction_id, text);
@@ -996,13 +1006,116 @@ fn unavailable_root_write() -> Result<()> {
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
+fn smooth_grid_chunk_coords(bytes: &[u8]) -> Result<std::collections::BTreeSet<[i32; 3]>> {
+    let mut coords = std::collections::BTreeSet::new();
+    if bytes.is_empty() {
+        return Ok(coords);
+    }
+    ensure!(
+        bytes.len() >= 2 && bytes[0] == 1 && bytes[1] == 5,
+        "Unsupported Terrain SmoothGrid version or chunk size"
+    );
+    let mut offset = 2usize;
+    let mut prev = [0i64; 3];
+    while offset < bytes.len() {
+        ensure!(offset + 12 <= bytes.len(), "Truncated Terrain SmoothGrid");
+        let mut delta = [0u32; 3];
+        for _ in 0..4 {
+            for axis in 0..3 {
+                delta[axis] = (delta[axis] << 8) | u32::from(bytes[offset]);
+                offset += 1;
+            }
+        }
+        let mut coord = [0i32; 3];
+        for axis in 0..3 {
+            let signed = i64::from(delta[axis] as i32);
+            let next = prev[axis] + signed;
+            ensure!(
+                next >= i64::from(i32::MIN) && next <= i64::from(i32::MAX),
+                "Terrain chunk coordinate overflow"
+            );
+            coord[axis] = next as i32;
+            prev[axis] = next;
+        }
+        let mut cell = 0usize;
+        while cell < 32768 {
+            ensure!(offset < bytes.len(), "Truncated Terrain SmoothGrid");
+            let tag = bytes[offset];
+            offset += 1;
+            if (tag & 64) != 0 {
+                ensure!(offset < bytes.len(), "Truncated Terrain SmoothGrid");
+                offset += 1;
+            }
+            let mut count = 1usize;
+            if (tag & 128) != 0 {
+                ensure!(offset < bytes.len(), "Truncated Terrain SmoothGrid");
+                let repeat = bytes[offset];
+                offset += 1;
+                if repeat != 0 {
+                    count += usize::from(repeat);
+                } else {
+                    ensure!(offset < bytes.len(), "Truncated Terrain SmoothGrid");
+                    offset += 1;
+                }
+            }
+            ensure!(count <= 32768 - cell, "Terrain run exceeds its chunk");
+            cell += count;
+        }
+        coords.insert(coord);
+    }
+    Ok(coords)
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn removed_smooth_grid_chunks(before: &[u8], target: &[u8]) -> Result<Vec<[i32; 3]>> {
+    let old = smooth_grid_chunk_coords(before)?;
+    let desired = smooth_grid_chunk_coords(target)?;
+    Ok(old.difference(&desired).copied().collect())
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn decode_before_terrain_grids(payload_b64: &str) -> Result<(Value, Option<Vec<u8>>)> {
+    use rbx_dom_weak::types::Variant;
+    let bytes = base64::decode(payload_b64).context("Invalid before-Terrain payload base64")?;
+    let dom = rbx_binary::from_reader(std::io::Cursor::new(&bytes))
+        .context("Invalid before-Terrain RBXM payload")?;
+    let terrain = dom
+        .root()
+        .children()
+        .iter()
+        .filter_map(|id| dom.get_by_ref(*id))
+        .find(|inst| inst.class == "Terrain")
+        .context("Before-Terrain payload omitted Terrain")?;
+    let mut map = Map::new();
+    let mut smooth_raw = None;
+    for name in ["SmoothGrid", "PhysicsGrid"] {
+        if let Some(Variant::BinaryString(grid)) =
+            terrain.properties.get(&rbx_dom_weak::Ustr::from(name))
+        {
+            let slice: &[u8] = grid.as_ref();
+            if name == "SmoothGrid" {
+                smooth_raw = Some(slice.to_vec());
+            }
+            map.insert(
+                name.to_string(),
+                serde_json::json!({
+                    "_type": "BinaryString",
+                    "base64": base64::encode(slice),
+                }),
+            );
+        }
+    }
+    Ok((Value::Object(map), smooth_raw))
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
 fn apply_write(
     bridge: &BridgeServer,
     transaction_id: &str,
     write: &RootWrite,
     text: &str,
     prepared: &mut PreparedRootWrites,
-) -> Result<()> {
+) -> Result<Option<Value>> {
     use crate::studio::bridge::BridgeTarget;
     let started = std::time::Instant::now();
     let pid = prepared.pid;
@@ -1155,13 +1268,28 @@ fn apply_write(
         property.ensure_writable()?;
     }
     let state = |finish: bool, changed: bool, terrain_baseline: Option<String>| {
+        let mut params = serde_json::json!({"transactionId":transaction_id, "nativeRootWrite":write.index, "finishNativeRootWrite":finish, "nativeRootChanged":changed, "nativeTerrainBaseline":terrain_baseline});
+        if !finish && is_terrain {
+            params["captureTerrainPayload"] = Value::Bool(true);
+        }
         bridge.call_for_runtime_with_timeout(
-        "getEditorTransactionState",
-        serde_json::json!({"transactionId":transaction_id, "nativeRootWrite":write.index, "finishNativeRootWrite":finish, "nativeRootChanged":changed, "nativeTerrainBaseline":terrain_baseline}),
-        BridgeTarget::Edit, runtime_id, Some(std::time::Duration::from_secs(2)),
-    )
+            "getEditorTransactionState",
+            params,
+            BridgeTarget::Edit,
+            runtime_id,
+            Some(std::time::Duration::from_secs(2)),
+        )
     };
     let begin = state(false, false, None)?;
+    let decoded_before = begin
+        .get("terrainPayload")
+        .and_then(Value::as_str)
+        .map(decode_before_terrain_grids)
+        .transpose()?;
+    let (before_terrain, before_smooth_raw) = match decoded_before {
+        Some((json_val, raw)) => (Some(json_val), raw),
+        None => (None, None),
+    };
     let fenced = std::time::Instant::now();
     ensure!(
         begin["nativeRootWrite"] == write.index,
@@ -1187,6 +1315,31 @@ fn apply_write(
                     .as_str()
                     .context("Studio omitted the Terrain baseline")?,
             )?;
+            let removed = match (before_smooth_raw.as_deref(), smooth.as_deref()) {
+                (Some(before_bytes), Some(target_bytes)) => {
+                    removed_smooth_grid_chunks(before_bytes, target_bytes)
+                        .ok()
+                        .filter(|chunks| !chunks.is_empty() && chunks.len() <= 64)
+                }
+                _ => None,
+            };
+            if let Some(chunks) = removed {
+                terrain.lock_baseline(token)?;
+                let _ = bridge.call_for_runtime_with_timeout(
+                    "getEditorTransactionState",
+                    serde_json::json!({
+                        "transactionId": transaction_id,
+                        "nativeRootWrite": write.index,
+                        "clearTerrainChunks": chunks,
+                    }),
+                    BridgeTarget::Edit,
+                    runtime_id,
+                    Some(std::time::Duration::from_secs(2)),
+                );
+                changed =
+                    terrain.write_after_clear(token, smooth.as_deref(), physics.as_deref())?;
+                return Ok(());
+            }
             changed = terrain.write(token, smooth.as_deref(), physics.as_deref())?;
             return Ok(());
         }
@@ -1295,7 +1448,7 @@ fn apply_write(
             cooked["cookError"].as_str().unwrap_or("unknown error")
         );
     }
-    Ok(())
+    Ok(before_terrain)
 }
 
 #[cfg(any(windows, target_os = "macos", test))]

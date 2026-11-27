@@ -174,4 +174,39 @@ inline std::string Rollback(std::string_view before, std::string_view written, s
     for (const auto& [coordinate, raw] : result) Append(output, coordinate, previous, raw);
     return output;
 }
+
+inline std::string BuildWriteDelta(std::string_view before, std::string_view target, bool* hasRemoved) {
+    const auto old = Index(before), desired = Index(target);
+    bool removed = false;
+    for (const auto& [coordinate, raw] : old) {
+        (void)raw;
+        if (desired.find(coordinate) == desired.end()) {
+            removed = true;
+            break;
+        }
+    }
+    if (hasRemoved) *hasRemoved = removed;
+    if (removed) return {};
+    std::string output;
+    Coordinate previous{};
+    for (const auto& [coordinate, raw] : desired) {
+        if (Find(old, coordinate) == raw) continue;
+        if (output.empty()) output.assign("\1\5", 2);
+        Append(output, coordinate, previous, raw);
+    }
+    return output;
+}
+
+inline bool CheckPostClear(std::string_view original, std::string_view current, std::string_view target) {
+    const auto orig = Index(original), now = Index(current), desired = Index(target);
+    for (const auto& [coordinate, raw] : now) {
+        if (Find(orig, coordinate) != raw) return false;
+    }
+    for (const auto& [coordinate, raw] : orig) {
+        (void)raw;
+        if (now.find(coordinate) == now.end() && desired.find(coordinate) != desired.end())
+            return false;
+    }
+    return true;
+}
 }

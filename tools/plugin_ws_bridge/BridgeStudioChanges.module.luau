@@ -469,7 +469,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		then
 			proof.pathsMoved[serviceName] = true
 		end
-		if proof.changedPropsOverflow ~= nil and proof.changedPropsOverflow[serviceName] ~= true then
+		if field ~= "@terrain" and proof.changedPropsOverflow ~= nil and proof.changedPropsOverflow[serviceName] ~= true then
 			local isAttrField = field == "@attributes"
 				and instance ~= nil
 				and instance.Name ~= "__Renium_SessionLock"
@@ -541,7 +541,10 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			proof.touched[serviceName] = touched
 		end
 		if kind == "values" then
-			local touchedField = if type(field) == "string" and string.sub(field, 1, 5) == "@tag:" then "@tags" else field
+			local touchedField = if field == "@terrain"
+				then nil
+				elseif type(field) == "string" and string.sub(field, 1, 5) == "@tag:" then "@tags"
+				else field
 			local fields = touched.fields[instance]
 			if touchedField == nil or fields == false or fields ~= nil and fields.count >= PROOF_FIELD_LIMIT and not fields.names[touchedField] then
 				touched.fields[instance] = false
@@ -749,6 +752,19 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		end
 		return true
 	end
+	function api.finishPushProofTerrain(id: any): boolean
+		local proof = verifiedPushProof
+		if proof == nil or proof.id ~= id or proof.terrainPending ~= true then
+			return false
+		end
+		local terrain = proofTerrain(proof.terrainRequired)
+		if terrain == nil then return false end
+		local matches = matchesPushState(proof)
+		if not matches then return false end
+		proof.terrain = terrain
+		proof.terrainPending = false
+		return true
+	end
 	function api.verifyPushProof(id: any, deferTerrainProof: boolean?): (boolean, string?)
 		local proof = verifiedPushProof
 		if proof == nil or proof.id ~= id then
@@ -871,42 +887,46 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 	local function proofScopeAnswer(proof, differs, laid, nonProp, terrainDiffers): { [string]: any }
 		local changedProperties = {}
 		local changedClassProps = {}
+		local terrainOnlyWorkspace = false
 		for service in pairs(differs) do
 			if
 				proof.pathsMoved[service] ~= true
 				and (proof.changedPropsOverflow == nil or proof.changedPropsOverflow[service] ~= true)
 				and (nonProp == nil or nonProp[service] ~= true)
-				and proof.changedProps ~= nil
-				and proof.changedProps[service] ~= nil
 			then
-				local names = {}
-				for name in pairs(proof.changedProps[service].names) do
-					names[#names + 1] = name
-				end
-				table.sort(names)
-				if #names > 0 then
-					changedProperties[service] = names
-				end
-				local classMap = {}
 				local hasClass = false
-				for className, fieldMap in pairs(proof.changedProps[service].byClass) do
-					local fields = {}
-					for fieldName in pairs(fieldMap) do
-						fields[#fields + 1] = fieldName
+				if proof.changedProps ~= nil and proof.changedProps[service] ~= nil then
+					local names = {}
+					for name in pairs(proof.changedProps[service].names) do
+						names[#names + 1] = name
 					end
-					table.sort(fields)
-					if #fields > 0 then
-						classMap[className] = fields
-						hasClass = true
+					table.sort(names)
+					if #names > 0 then
+						changedProperties[service] = names
+					end
+					local classMap = {}
+					for className, fieldMap in pairs(proof.changedProps[service].byClass) do
+						local fields = {}
+						for fieldName in pairs(fieldMap) do
+							fields[#fields + 1] = fieldName
+						end
+						table.sort(fields)
+						if #fields > 0 then
+							classMap[className] = fields
+							hasClass = true
+						end
+					end
+					if hasClass then
+						changedClassProps[service] = classMap
 					end
 				end
-				if hasClass then
-					changedClassProps[service] = classMap
+				if service == "Workspace" and terrainDiffers == true and not hasClass then
+					terrainOnlyWorkspace = true
 				end
 			end
 		end
 		for instance, service in pairs(laid) do
-			noteTouched(proof, service, instance, "values")
+			noteTouched(proof, service, instance, "values", if instance == Workspace.Terrain then "@terrain" else nil)
 		end
 		-- Studio moves what a joint holds, a model's pivot with its primary
 		-- part, and a package's link, with no event on what it changes: an
@@ -1000,6 +1020,7 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 			changedProperties = changedProperties,
 			changedClassProps = changedClassProps,
 			terrainDiffers = terrainDiffers == true,
+			terrainOnlyWorkspace = terrainOnlyWorkspace,
 			expectedTerrainDigest = if proof.terrainRequired
 					and type(proof.terrain) == "string"
 					and proof.terrain ~= ""
@@ -2484,6 +2505,14 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		relay.notify:Destroy()
 	end
 
+	local suppressingTerrainRelay = false
+	function api.beginOwnTerrainClear()
+		suppressingTerrainRelay = true
+	end
+	function api.endOwnTerrainClear()
+		suppressingTerrainRelay = false
+	end
+
 	local function prepareNativeTerrainRelay(): ({ string }, boolean)
 		local coreGui = game:GetService("CoreGui")
 		if nativeTerrainRelay then
@@ -2497,6 +2526,10 @@ function BridgeStudioChanges.create(config: { [string]: any }, allowedServices: 
 		nativeTerrainRelay = relay
 		relay.connection = notify:GetPropertyChangedSignal("Value"):Connect(function()
 			if nativeTerrainRelay ~= relay or not notify.Value then return end
+			if suppressingTerrainRelay then
+				notify.Value = false
+				return
+			end
 			config.invalidateTerrainExport()
 			if state.watchedServices.Workspace and state.syncbackProperties and not state.onlyCodeMode then
 				markDirty("Workspace", changeDetailsForInstance(Workspace.Terrain, "property", "SmoothGrid", nil, "terrain changed"))

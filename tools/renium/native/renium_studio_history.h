@@ -76,6 +76,7 @@ struct Registration {
     std::function<void()> rollbackTerrain;
     std::function<void()> checkTerrain;
     bool terrainWritten = false;
+    std::shared_ptr<void> preparedTerrain;
 };
 static std::mutex registrationsMutex;
 static std::mutex installationMutex;

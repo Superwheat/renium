@@ -4183,6 +4183,100 @@ fn extract_block_properties(
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
+pub(crate) struct ExtractedTerrainVoxels {
+    pub(crate) row_index: usize,
+    pub(crate) settings_id: Option<String>,
+    pub(crate) path_segments: Vec<String>,
+    pub(crate) path_ordinals: Vec<usize>,
+    pub(crate) smooth_grid: Value,
+    pub(crate) physics_grid: Value,
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+pub(crate) fn extract_v12_workspace_terrain_voxels(
+    desired_bytes: &[u8],
+) -> Result<Option<ExtractedTerrainVoxels>> {
+    if !is_block_store(desired_bytes) {
+        return Ok(None);
+    }
+    let Ok(store) = BlockStore::open(desired_bytes) else {
+        return Ok(None);
+    };
+    if store.rows == 0 {
+        return Ok(None);
+    }
+    let Some(topo) = cached_store_topology(&store)? else {
+        return Ok(None);
+    };
+    let rows = &topo.rows;
+    if rows.len() != store.rows
+        || rows[0].parent_index.is_some()
+        || rows[0].class_name != "Workspace"
+    {
+        return Ok(None);
+    }
+    let mut terrain_row = None;
+    for (idx, row) in rows.iter().enumerate() {
+        if row.parent_index == Some(0) && row.class_name == "Terrain" {
+            if terrain_row.is_some() {
+                return Ok(None);
+            }
+            terrain_row = Some(idx);
+        }
+    }
+    let Some(row_index) = terrain_row else {
+        return Ok(None);
+    };
+    let decoded = store.rows(&[row_index])?;
+    let Some((_, values)) = decoded.into_iter().next() else {
+        return Ok(None);
+    };
+    let smooth_grid = match values.properties.get("SmoothGrid") {
+        Some(value) => value.clone(),
+        None => crate::editor::native_roots::terrain_default_grid("SmoothGrid")?,
+    };
+    let physics_grid = match values.properties.get("PhysicsGrid") {
+        Some(value) => value.clone(),
+        None => crate::editor::native_roots::terrain_default_grid("PhysicsGrid")?,
+    };
+    let row = &rows[row_index];
+    Ok(Some(ExtractedTerrainVoxels {
+        row_index,
+        settings_id: (!row.settings_id.is_empty()).then(|| row.settings_id.clone()),
+        path_segments: vec!["Workspace".to_string(), row.name.clone()],
+        path_ordinals: vec![1, topo.sibling_ordinals[row_index] as usize],
+        smooth_grid,
+        physics_grid,
+    }))
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+pub(crate) fn patch_v12_terrain_voxels(
+    base_bytes: &[u8],
+    terrain_row: usize,
+    smooth_grid: Option<Value>,
+    physics_grid: Option<Value>,
+) -> Result<Vec<u8>> {
+    if smooth_grid.is_none() && physics_grid.is_none() {
+        return Ok(base_bytes.to_vec());
+    }
+    let (mut document, mut edited) = EditedStore::decode(base_bytes)?;
+    anyhow::ensure!(
+        terrain_row < document.instances.len(),
+        "Terrain row out of range"
+    );
+    edited.materialize(&mut document, &[terrain_row])?;
+    let props = &mut document.instances[terrain_row].properties;
+    if let Some(smooth) = smooth_grid {
+        props.insert("SmoothGrid".to_string(), smooth);
+    }
+    if let Some(physics) = physics_grid {
+        props.insert("PhysicsGrid".to_string(), physics);
+    }
+    edited.encode(&document)
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) fn extract_v12_bulk_properties_for_classes(
     desired_bytes: &[u8],

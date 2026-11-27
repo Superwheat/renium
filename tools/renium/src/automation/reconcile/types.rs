@@ -928,6 +928,8 @@ pub(crate) struct ProofBulkScope {
     pub(crate) values_only: BTreeSet<String>,
     pub(crate) changed_class_properties: BTreeMap<String, Vec<(String, String)>>,
     pub(crate) expected_terrain_digest: Option<String>,
+    pub(crate) terrain_differs: bool,
+    pub(crate) terrain_only_workspace: bool,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -974,11 +976,15 @@ impl ProofBulkScope {
             .as_str()
             .filter(|digest| !digest.is_empty())
             .map(str::to_string);
+        let terrain_differs = answer["terrainDiffers"].as_bool().unwrap_or(false);
+        let terrain_only_workspace = answer["terrainOnlyWorkspace"].as_bool().unwrap_or(false);
         Some(Self {
             services,
             values_only,
             changed_class_properties,
             expected_terrain_digest,
+            terrain_differs,
+            terrain_only_workspace,
         })
     }
 }
@@ -2043,6 +2049,7 @@ pub(crate) struct ReconcilePushPlan {
     pub(crate) bulk_property_patches: Vec<crate::editor::types::EditorBulkPropertyPatch>,
     pub(crate) bulk_property_paths: Vec<PathBuf>,
     pub(crate) extra_property_changes: Vec<EditorPropertyChange>,
+    pub(crate) capture_before_terrain: bool,
 }
 
 pub(crate) struct PreparedEditorSettingsChange {

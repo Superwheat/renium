@@ -5667,6 +5667,11 @@ pub(crate) fn send_editor_change_batches_with_options(
         );
         let native_root_verification =
             crate::editor::native_roots::apply(bridge, &mut summary, transaction_id)?;
+        if changes.capture_before_terrain
+            && let Some(grids) = native_root_verification.before_terrain_grids.clone()
+        {
+            summary.insert("_beforeTerrainGrids".to_string(), grids);
+        }
         crate::editor::native_geometry::apply(bridge, &mut summary, transaction_id)?;
         verify_in_place_editor_fields(
             bridge,
@@ -5919,6 +5924,11 @@ pub(crate) fn send_editor_change_batches_with_options(
     let mut native_root_verification =
         crate::editor::native_roots::apply(bridge, &mut summary, transaction_id)?;
     native_root_verification.extend(pre_import_verification);
+    if changes.capture_before_terrain
+        && let Some(grids) = native_root_verification.before_terrain_grids.clone()
+    {
+        summary.insert("_beforeTerrainGrids".to_string(), grids);
+    }
     log_timing(
         &format!("native editor root apply ({root_writes} writes)"),
         started,
@@ -6821,6 +6831,11 @@ fn verify_native_property_rows(
         .map(|mut row| {
             native_roots.remove_verified_properties(&mut row);
             row
+        })
+        .filter(|row| {
+            !row.properties.is_empty()
+                || !row.attributes.is_empty()
+                || !row.deleted_attributes.is_empty()
         })
         .collect::<Vec<_>>();
     for batch in rows.chunks(PROPERTY_BATCH_MAX_ITEMS) {

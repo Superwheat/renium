@@ -7014,6 +7014,43 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 						cookError = if cooked then nil else tostring(cookError),
 					}
 				end
+				if params.clearTerrainChunks ~= nil then
+					if session.pendingNativeRootWrite ~= write or write.instance ~= Workspace.Terrain or write.name ~= "SmoothGrid" then
+						error("Terrain chunk clear requires an in-flight Terrain write")
+					end
+					if type(params.clearTerrainChunks) ~= "table" or #params.clearTerrainChunks > 64 then
+						error("Invalid Terrain chunk clear list")
+					end
+					local terrain = write.instance :: Terrain
+					if ctx.beginOwnTerrainClear then
+						ctx.beginOwnTerrainClear()
+					end
+					local okClear, clearErr = pcall(function()
+						for _, chunk in ipairs(params.clearTerrainChunks) do
+							local cx, cy, cz = chunk[1], chunk[2], chunk[3]
+							if type(cx) ~= "number" or type(cy) ~= "number" or type(cz) ~= "number" then
+								error("Invalid Terrain chunk coordinate")
+							end
+							local minV = Vector3.new(cx * 128, cy * 128, cz * 128)
+							local maxV = Vector3.new((cx + 1) * 128, (cy + 1) * 128, (cz + 1) * 128)
+							terrain:FillRegion(Region3.new(minV, maxV), 4, Enum.Material.Air)
+						end
+					end)
+					if ctx.endOwnTerrainClear then
+						ctx.endOwnTerrainClear()
+					end
+					if not okClear then
+						error(clearErr, 0)
+					end
+					assertTransactionLease(session)
+					return {
+						ok = true,
+						transactionId = transactionId,
+						state = state,
+						nativeRootWrite = params.nativeRootWrite,
+						clearedTerrainChunks = #params.clearTerrainChunks,
+					}
+				end
 				if params.finishNativeRootWrite == true then
 					if session.pendingNativeRootWrite ~= write then
 						error("Native root write is no longer in flight")
@@ -7081,6 +7118,19 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				geometry = buffer.tostring(EncodingService:Base64Encode(TransactionState.captureMeshGeometry(instance :: MeshPart)))
 				assertTransactionLease(session)
 			end
+			local terrainPayload = nil
+			if params.captureTerrainPayload == true then
+				assertTransactionLease(session)
+				if state ~= "open" and state ~= "prepared" then
+					error("Terrain readback requires an active transaction")
+				end
+				local terrain = Workspace:FindFirstChildOfClass("Terrain")
+				if terrain ~= nil then
+					local payload = SerializationService:SerializeInstancesAsync({ terrain })
+					terrainPayload = buffer.tostring(EncodingService:Base64Encode(payload))
+				end
+				assertTransactionLease(session)
+			end
 			return {
 				ok = true,
 				found = true,
@@ -7099,6 +7149,7 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 				pendingTerminal = if session.pendingTerminal then session.pendingTerminal.state else nil,
 				pluginSessionId = ctx.runtimeId,
 				meshGeometry = geometry,
+				terrainPayload = terrainPayload,
 				nativeRootWrite = params.nativeRootWrite,
 				needsMeshCook = needsMeshCook,
 				historyRecording = session.historyRecording,
@@ -8371,9 +8422,13 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 		-- during FinishRecording can edit Studio after commit; capturing afterward
 		-- would mistake those newer values for the files that were just pushed.
 		local verifiedPushProof, pushProofUnavailable = nil, nil
+		local deferTerrainForHistory = session.terrainBaseline ~= nil
+			and params.deferTerrainProof ~= true
+			and ctx.finishPushProofTerrain ~= nil
 		setTrackedOperationPhase(operation, "verifiedPushProof")
 		if ctx.capturePushProof then
-			verifiedPushProof, pushProofUnavailable = ctx.capturePushProof(params.deferTerrainProof == true)
+			verifiedPushProof, pushProofUnavailable =
+				ctx.capturePushProof(params.deferTerrainProof == true or deferTerrainForHistory)
 		end
 		setTrackedOperationPhase(operation, "commitFenceValidation")
 		assertCommitActive()
@@ -8400,6 +8455,12 @@ function BridgeEditorSync.create(ctx: { [string]: any })
 			cancelExpectedEvent(ctx, write.token)
 		end
 		finishHistoryRecording(session.historyRecording)
+		if deferTerrainForHistory and verifiedPushProof ~= nil then
+			if not ctx.finishPushProofTerrain(verifiedPushProof) then
+				verifiedPushProof = nil
+				pushProofUnavailable = "Terrain proof unavailable after history finish"
+			end
+		end
 		session.commitFence = true
 		session.historyRecording = nil
 		if session.nativeStats ~= nil then

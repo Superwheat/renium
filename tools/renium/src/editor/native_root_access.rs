@@ -107,6 +107,39 @@ impl Terrain {
             }
         }
     }
+    pub(super) fn lock_baseline(&mut self, token: &str) -> Result<()> {
+        match self {
+            #[cfg(any(windows, target_os = "macos"))]
+            Self::Engine(terrain) => terrain.lock_baseline(token),
+            #[cfg(test)]
+            Self::Test { .. } => {
+                let _ = token;
+                Ok(())
+            }
+        }
+    }
+    pub(super) fn write_after_clear(
+        &mut self,
+        token: &str,
+        smooth: Option<&[u8]>,
+        physics: Option<&[u8]>,
+    ) -> Result<bool> {
+        match self {
+            #[cfg(any(windows, target_os = "macos"))]
+            Self::Engine(terrain) => terrain.write_after_clear(token, smooth, physics),
+            #[cfg(test)]
+            Self::Test { state, queried, .. } => {
+                let _ = token;
+                *queried = true;
+                if smooth.is_some() || physics.is_some() {
+                    state.borrow_mut().writes += 1;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
     pub(super) fn write(
         &mut self,
         token: &str,

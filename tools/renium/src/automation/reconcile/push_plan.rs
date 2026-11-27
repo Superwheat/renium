@@ -446,6 +446,7 @@ pub(crate) fn amend_reconciled_changes(
     changes
         .bulk_property_patches
         .append(&mut plan.bulk_property_patches);
+    changes.capture_before_terrain |= plan.capture_before_terrain;
     Ok(())
 }
 

@@ -301,15 +301,20 @@ fn terrain_payload(
     fingerprint: &[u8; 64],
     smooth: Option<&[u8]>,
     physics: Option<&[u8]>,
+    extra_flags: u32,
 ) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(
         bindings.len() == 176 && !token.is_empty() && token.len() <= 256,
         "Invalid Terrain transaction binding"
     );
-    let flags = if smooth.is_none() && physics.is_none() {
-        4
+    let flags = if extra_flags == 8 {
+        8usize
+    } else if smooth.is_none() && physics.is_none() {
+        4usize
     } else {
-        usize::from(smooth.is_some()) | (usize::from(physics.is_some()) << 1)
+        usize::from(smooth.is_some())
+            | (usize::from(physics.is_some()) << 1)
+            | (extra_flags as usize)
     };
     let smooth = smooth.unwrap_or_default();
     let physics = physics.unwrap_or_default();

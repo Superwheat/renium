@@ -650,6 +650,7 @@ pub(crate) struct EditorChangeSet {
     /// below such an instance beyond that is found and removed before it runs.
     pub(crate) whole_instances: Vec<(String, EditorInstancePath)>,
     pub(crate) virtual_files: Option<Arc<VirtualStageFiles>>,
+    pub(crate) capture_before_terrain: bool,
 }
 
 impl EditorChangeSet {

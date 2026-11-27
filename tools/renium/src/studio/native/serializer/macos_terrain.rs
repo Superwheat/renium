@@ -170,12 +170,34 @@ impl NativeTerrain {
         smooth: Option<&[u8]>,
         physics: Option<&[u8]>,
     ) -> Result<bool> {
+        self.write_with_flags(token, smooth, physics, 0)
+    }
+    pub(crate) fn lock_baseline(&mut self, token: &str) -> Result<()> {
+        let _ = self.write_with_flags(token, None, None, 8)?;
+        Ok(())
+    }
+    pub(crate) fn write_after_clear(
+        &mut self,
+        token: &str,
+        smooth: Option<&[u8]>,
+        physics: Option<&[u8]>,
+    ) -> Result<bool> {
+        self.write_with_flags(token, smooth, physics, 16)
+    }
+    fn write_with_flags(
+        &mut self,
+        token: &str,
+        smooth: Option<&[u8]>,
+        physics: Option<&[u8]>,
+        extra_flags: u32,
+    ) -> Result<bool> {
         let payload = crate::studio::native::serializer::terrain_payload(
             &self.bindings,
             token,
             &self.fingerprint,
             smooth,
             physics,
+            extra_flags,
         )?;
         self.property.parameters.truncate(66216);
         self.property.parameters.extend_from_slice(&payload);

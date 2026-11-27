@@ -4733,6 +4733,7 @@ fn push_with_reader_platform(
         if crate::app::output::global_log_enabled(5) {
             let mut logged_summary = summary.clone();
             logged_summary.remove("_bulkOldValueColumns");
+            logged_summary.remove("_beforeTerrainGrids");
             log_global(
                 5,
                 format_args!(

@@ -73,11 +73,23 @@ struct Write {
                 reinterpret_cast<void*>(acquisition.object), terrain, &value))
             throw std::runtime_error("Studio did not restore Terrain acquisition metadata");
     }
-    void ReplaceSmooth(const std::string& value) const {
+    void ReplaceSmooth(const std::string& current, const std::string& value) const {
+        if (current == value) return;
         // Loading SmoothGrid stamps AcquisitionMethod=Legacy. Grid transfer
         // must preserve that separate saved field, including during rollback.
         const auto method = Get(acquisition, terrain);
         try {
+            if (!current.empty() && !value.empty()) {
+                bool hasRemoved = false;
+                const auto delta = BuildWriteDelta(current, value, &hasRemoved);
+                if (!hasRemoved && !delta.empty()) {
+                    Set(smooth, terrain, delta);
+                    if (Get(smooth, terrain) == value) {
+                        RestoreAcquisition(method);
+                        return;
+                    }
+                }
+            }
             if (clear.memberOffset & 1)
                 reinterpret_cast<void (*)(void*, void*)>(clear.function)(reinterpret_cast<void*>(clear.descriptor), terrain);
             else
@@ -110,7 +122,7 @@ struct Write {
         const auto currentSmooth = Get(smooth, terrain), currentPhysics = Get(physics, terrain);
         const auto restored = renium_terrain::Rollback(beforeSmooth, writtenSmooth, currentSmooth);
         if (restored != currentSmooth) {
-            ReplaceSmooth(restored);
+            ReplaceSmooth(currentSmooth, restored);
         }
         // Exact cancellation preserves the engine's original empty-chunk layout
         // too. With outside painting, the SmoothGrid setter updates its geometry.
@@ -137,8 +149,13 @@ static Result Apply(void* terrain, std::shared_ptr<void> owner, std::uintptr_t m
     std::memcpy(&write->acquisition, input.data() + sizeof(Binding) * 2 + sizeof(ClearBinding), sizeof(Binding));
     std::uint32_t lengths[4]{};
     std::memcpy(lengths, input.data() + bindingsSize + sizeof(Fingerprint), sizeof(lengths));
-    if (!lengths[0] || lengths[0] > 256 || !lengths[3] || lengths[3] > 4 ||
-        (!(lengths[3] & 1) && lengths[1]) || (!(lengths[3] & 2) && lengths[2]) ||
+    const std::uint32_t flags = lengths[3];
+    const bool probeOnly = flags == 4;
+    const bool lockBaseline = flags == 8;
+    const bool postClear = (flags & 16) != 0;
+    const bool validFlags = probeOnly || lockBaseline || (flags >= 1 && flags <= 3) || (postClear && (flags & ~16u) >= 1 && (flags & ~16u) <= 3);
+    if (!lengths[0] || lengths[0] > 256 || !validFlags ||
+        (!(flags & 1) && lengths[1]) || (!(flags & 2) && lengths[2]) ||
         static_cast<std::uint64_t>(header) + lengths[0] + lengths[1] + lengths[2] != input.size())
         throw std::runtime_error("Invalid native Terrain field lengths");
     const std::string token(input.substr(header, lengths[0]));
@@ -153,8 +170,8 @@ static Result Apply(void* terrain, std::shared_ptr<void> owner, std::uintptr_t m
         !read(write->clear.descriptor, &member, sizeof(member)) || member != write->clear.table ||
         !read((dispatcher ? write->clear.table : write->clear.descriptor) + offset, &member, sizeof(member)) || member != write->clear.function)
         throw std::runtime_error("Terrain Clear binding changed before execution");
-    if (lengths[3] & 1) Index(smooth); // Reject malformed or unsupported formats before mutation.
-    if (lengths[3] != 4) {
+    if (flags & 1) Index(smooth); // Reject malformed or unsupported formats before mutation.
+    if (!probeOnly) {
         std::function<void()> check;
         {
             std::lock_guard lock(renium_history::registrationsMutex);
@@ -166,14 +183,65 @@ static Result Apply(void* terrain, std::shared_ptr<void> owner, std::uintptr_t m
         if (check) check();
     }
     write->terrain = terrain; write->owner = std::move(owner);
+    if (postClear) {
+        std::shared_ptr<Write> prepared;
+        {
+            std::lock_guard lock(renium_history::registrationsMutex);
+            const auto found = renium_history::registrations.find(token);
+            if (found == renium_history::registrations.end() || found->second.model != model)
+                throw std::runtime_error("Terrain write has no registered history transaction");
+            prepared = std::static_pointer_cast<Write>(found->second.preparedTerrain);
+            found->second.preparedTerrain.reset();
+        }
+        if (!prepared || prepared->terrain != terrain)
+            throw std::runtime_error("Terrain post-clear write has no locked baseline");
+        const auto currentSmooth = Get(prepared->smooth, terrain);
+        Index(currentSmooth);
+        if ((flags & 1) && !CheckPostClear(prepared->beforeSmooth, currentSmooth, smooth))
+            throw std::runtime_error("Terrain changed outside this sync transaction");
+        try {
+            renium_terrain_observation::OwnWrite own(terrain);
+            if ((flags & 1) && currentSmooth != smooth) {
+                prepared->ReplaceSmooth(currentSmooth, smooth);
+            }
+            prepared->writtenSmooth = Get(prepared->smooth, terrain);
+            if ((flags & 2) && Get(prepared->physics, terrain) != physics) Set(prepared->physics, terrain, physics);
+            prepared->writtenPhysics = Get(prepared->physics, terrain);
+        } catch (...) {
+            prepared->writtenSmooth = Get(prepared->smooth, terrain);
+            prepared->writtenPhysics = Get(prepared->physics, terrain);
+            throw;
+        }
+        if (((flags & 1) && prepared->writtenSmooth != smooth) || ((flags & 2) && prepared->writtenPhysics != physics))
+            throw std::runtime_error("Studio did not accept the complete Terrain voxel grid");
+        prepared->restorePhysicsOnCommit = (prepared->beforeSmooth != prepared->writtenSmooth) && (flags & 2) != 0;
+        {
+            std::lock_guard lock(renium_history::registrationsMutex);
+            auto& registration = renium_history::registrations.at(token);
+            registration.checkTerrain = [prepared] { prepared->Check(); };
+            registration.terrainWritten = true;
+        }
+        return {true, Hash(prepared->writtenSmooth, prepared->writtenPhysics)};
+    }
     write->beforeSmooth = Get(write->smooth, terrain); write->beforePhysics = Get(write->physics, terrain);
-    Index(write->beforeSmooth);
     const auto fingerprint = Hash(write->beforeSmooth, write->beforePhysics);
-    if (lengths[3] == 4) return {false, fingerprint};
+    if (probeOnly) return {false, fingerprint};
+    Index(write->beforeSmooth);
     if (std::memcmp(fingerprint.data(), input.data() + bindingsSize, fingerprint.size()) != 0)
         throw std::runtime_error("Terrain changed outside this sync transaction");
-    const bool changeSmooth = (lengths[3] & 1) && write->beforeSmooth != smooth;
-    const bool changePhysics = (lengths[3] & 2) && write->beforePhysics != physics;
+    if (lockBaseline) {
+        write->writtenSmooth = write->beforeSmooth; write->writtenPhysics = write->beforePhysics;
+        std::lock_guard lock(renium_history::registrationsMutex);
+        const auto found = renium_history::registrations.find(token);
+        if (found == renium_history::registrations.end() || found->second.model != model)
+            throw std::runtime_error("Terrain write has no registered history transaction");
+        const auto previous = found->second.rollbackTerrain;
+        found->second.rollbackTerrain = [write, previous] { write->Rollback(); if (previous) previous(); };
+        found->second.preparedTerrain = write;
+        return {false, fingerprint};
+    }
+    const bool changeSmooth = (flags & 1) && write->beforeSmooth != smooth;
+    const bool changePhysics = (flags & 2) && write->beforePhysics != physics;
     if (!changeSmooth && !changePhysics) return {false, fingerprint};
     write->writtenSmooth = write->beforeSmooth; write->writtenPhysics = write->beforePhysics;
     {
@@ -189,19 +257,18 @@ static Result Apply(void* terrain, std::shared_ptr<void> owner, std::uintptr_t m
     try {
         renium_terrain_observation::OwnWrite own(terrain);
         if (changeSmooth) {
-            // SmoothGrid loads only listed chunks; it never removes stale ones.
-            write->ReplaceSmooth(smooth);
+            write->ReplaceSmooth(write->beforeSmooth, smooth);
         }
         write->writtenSmooth = Get(write->smooth, terrain);
-        if ((lengths[3] & 2) && Get(write->physics, terrain) != physics) Set(write->physics, terrain, physics);
+        if ((flags & 2) && Get(write->physics, terrain) != physics) Set(write->physics, terrain, physics);
         write->writtenPhysics = Get(write->physics, terrain);
     } catch (...) {
         write->writtenSmooth = Get(write->smooth, terrain); write->writtenPhysics = Get(write->physics, terrain);
         throw;
     }
-    if (((lengths[3] & 1) && write->writtenSmooth != smooth) || ((lengths[3] & 2) && write->writtenPhysics != physics))
+    if (((flags & 1) && write->writtenSmooth != smooth) || ((flags & 2) && write->writtenPhysics != physics))
         throw std::runtime_error("Studio did not accept the complete Terrain voxel grid");
-    write->restorePhysicsOnCommit = changeSmooth && (lengths[3] & 2) != 0;
+    write->restorePhysicsOnCommit = changeSmooth && (flags & 2) != 0;
     {
         std::lock_guard lock(renium_history::registrationsMutex);
         auto& registration = renium_history::registrations.at(token);

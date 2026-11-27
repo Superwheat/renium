@@ -1029,6 +1029,9 @@ function BridgePluginRuntime.start(context)
 		includeExportInstance = includeExportInstance,
 		nativeExportGeneration = nativeExportGeneration,
 		capturePushProof = Config.studioChanges.capturePushProof,
+		finishPushProofTerrain = Config.studioChanges.finishPushProofTerrain,
+		beginOwnTerrainClear = Config.studioChanges.beginOwnTerrainClear,
+		endOwnTerrainClear = Config.studioChanges.endOwnTerrainClear,
 		getPropertySchema = function(className: string)
 			return getClassPropertySchema(className) or {}
 		end,

@@ -253,4 +253,54 @@ int main() {
     assert(w2.changed);
     renium_history::ReniumHistoryFinish(&history, &token, 0, &options);
     assert(terrain.smooth == Grid(2) && terrain.physics == "first physics");
+
+    // Lock-baseline + external chunk clear + post-clear write: no Clear/Set
+    // when cleared grid already matches target, outside edits are rejected,
+    // and rollback restores the pre-clear original smooth grid.
+    auto makeMulti = [](std::initializer_list<std::pair<renium_terrain::Coordinate, unsigned char>> items) {
+        std::string out("\1\5", 2);
+        renium_terrain::Coordinate prev{};
+        for (const auto& [coord, mat] : items) {
+            auto c = std::make_unique<renium_terrain::Cells>();
+            (*c)[0] = mat; (*c)[1] = 255;
+            renium_terrain::Append(out, coord, prev, renium_terrain::Encode(*c));
+        }
+        return out;
+    };
+    const auto gOne = makeMulti({{{0, 0, 0}, 1}});
+    const auto gTwo = makeMulti({{{0, 0, 0}, 1}, {{1, 0, 0}, 2}});
+    const auto gOutside = makeMulti({{{0, 0, 0}, 3}});
+    bool hasRemoved = false;
+    assert(renium_terrain::BuildWriteDelta(gTwo, gOne, &hasRemoved).empty() && hasRemoved);
+    assert(!renium_terrain::BuildWriteDelta(gOne, gTwo, &hasRemoved).empty() && !hasRemoved);
+    assert(renium_terrain::CheckPostClear(gTwo, gOne, gOne));
+    assert(!renium_terrain::CheckPostClear(gTwo, gOutside, gOne));
+
+    terrain.smooth = gTwo;
+    terrain.physics = "two physics";
+    terrain.acquisition = "Custom";
+    renium_history::registrations.emplace(token, renium_history::Registration{
+        &history, modelAddr, weak, {}, {}, false});
+    const auto p3 = renium_terrain::Apply(&terrain, model, modelAddr, makePayload({}, 4, "", ""), readMem);
+    renium_terrain::Apply(&terrain, model, modelAddr, makePayload(p3.fingerprint, 8, "", ""), readMem);
+    // Simulate Luau FillRegion removing chunk (1,0,0).
+    terrain.smooth = gOne;
+    const auto post = renium_terrain::Apply(&terrain, model, modelAddr, makePayload({}, 16 | 3, gOne, "one physics"), readMem);
+    assert(post.changed && terrain.smooth == gOne && terrain.physics == "one physics" && terrain.acquisition == "Custom");
+    // Rollback must restore gTwo (original before lock_baseline), not gOne.
+    renium_history::ReniumHistoryFinish(&history, &token, 0, &options);
+    assert(terrain.smooth == gTwo && terrain.physics == "two physics");
+
+    // Outside edit between lock_baseline and post_clear must be rejected.
+    terrain.smooth = gTwo;
+    terrain.physics = "two physics";
+    renium_history::registrations.emplace(token, renium_history::Registration{
+        &history, modelAddr, weak, {}, {}, false});
+    const auto p4 = renium_terrain::Apply(&terrain, model, modelAddr, makePayload({}, 4, "", ""), readMem);
+    renium_terrain::Apply(&terrain, model, modelAddr, makePayload(p4.fingerprint, 8, "", ""), readMem);
+    terrain.smooth = gOutside;
+    assert(Rejected([&] {
+        renium_terrain::Apply(&terrain, model, modelAddr, makePayload({}, 16 | 3, gOne, "one physics"), readMem);
+    }));
+    renium_history::ReniumHistoryFinish(&history, &token, 0, &options);
 }
