@@ -78,7 +78,11 @@ pub(super) enum Terrain {
     #[cfg(any(windows, target_os = "macos"))]
     Engine(serializer::NativeTerrain),
     #[cfg(test)]
-    Test { identity: String, state: TestState },
+    Test {
+        identity: String,
+        state: TestState,
+        queried: bool,
+    },
 }
 
 impl Terrain {
@@ -113,10 +117,15 @@ impl Terrain {
             #[cfg(any(windows, target_os = "macos"))]
             Self::Engine(terrain) => terrain.write(token, smooth, physics),
             #[cfg(test)]
-            Self::Test { state, .. } => {
-                let _ = (token, smooth, physics);
-                state.borrow_mut().writes += 1;
-                Ok(true)
+            Self::Test { state, queried, .. } => {
+                let _ = token;
+                *queried = true;
+                if smooth.is_some() || physics.is_some() {
+                    state.borrow_mut().writes += 1;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             }
         }
     }
@@ -125,7 +134,17 @@ impl Terrain {
             #[cfg(any(windows, target_os = "macos"))]
             Self::Engine(terrain) => terrain.fingerprint(),
             #[cfg(test)]
-            Self::Test { .. } => "test-baseline".into(),
+            Self::Test { state, queried, .. } => {
+                if !*queried {
+                    return base64::encode([0u8; 64]);
+                }
+                let fp = &state.borrow().fingerprint;
+                if fp.is_empty() {
+                    "test-baseline".into()
+                } else {
+                    fp.clone()
+                }
+            }
         }
     }
 }
@@ -170,7 +189,11 @@ pub(super) fn prepare_terrain(
     #[cfg(test)]
     if let Some(state) = mock_target(segments, ordinals) {
         let identity = state.borrow().identity.clone();
-        return Ok(Terrain::Test { identity, state });
+        return Ok(Terrain::Test {
+            identity,
+            state,
+            queried: false,
+        });
     }
     #[cfg(any(windows, target_os = "macos"))]
     {
@@ -207,6 +230,7 @@ pub(super) struct TestAccess {
     pub class: String,
     pub identity: String,
     pub value: String,
+    pub fingerprint: String,
     pub paths: Vec<(Vec<String>, Vec<usize>)>,
     pub writes: usize,
 }

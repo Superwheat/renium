@@ -412,6 +412,22 @@ impl NativeRootVerification {
         }
     }
 
+    #[cfg(any(windows, target_os = "macos", test))]
+    fn record_verified_field(
+        &mut self,
+        class_name: &str,
+        path_segments: &[String],
+        path_ordinals: &[usize],
+        name: &str,
+        value: Value,
+    ) {
+        let key = Self::target_key(class_name, path_segments, path_ordinals);
+        self.fields
+            .entry(key)
+            .or_default()
+            .insert(name.to_string(), value);
+    }
+
     fn target_key(class: &str, path: &[String], ordinals: &[usize]) -> (String, String) {
         let mut ordinals = ordinals.to_vec();
         ordinals.resize(path.len(), 1);
@@ -462,6 +478,155 @@ impl NativeRootVerification {
                 .retain(|name, value| fields.get(name) != Some(value));
         }
     }
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn decode_terrain_grid_value(value: &Value) -> Result<Vec<u8>> {
+    let value = crate::settings::held::resolve(value);
+    ensure!(
+        value["_type"] == "BinaryString",
+        "Terrain grid requires a BinaryString"
+    );
+    base64::decode(
+        value["base64"]
+            .as_str()
+            .context("Terrain grid omitted its bytes")?,
+    )
+    .context("Invalid Terrain grid encoding")
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn terrain_fingerprint_matches(
+    fingerprint_base64: &str,
+    expected_smooth: Option<&[u8]>,
+    expected_physics: Option<&[u8]>,
+) -> Result<(bool, bool)> {
+    use sha2::{Digest, Sha256};
+    let bytes = base64::decode(fingerprint_base64).context("Invalid Terrain fingerprint")?;
+    ensure!(bytes.len() == 64, "Invalid Terrain fingerprint length");
+    let smooth_ok =
+        expected_smooth.is_some_and(|grid| Sha256::digest(grid).as_slice() == &bytes[..32]);
+    let physics_ok =
+        expected_physics.is_some_and(|grid| Sha256::digest(grid).as_slice() == &bytes[32..64]);
+    Ok((smooth_ok, physics_ok))
+}
+
+/// `Terrain.SmoothGrid` and `PhysicsGrid` are applied before the native loader
+/// runs, so pre-import writes cannot be credited before import completes. This
+/// re-reads their live SHA-256 fingerprint after the loader finishes; any
+/// mismatch or query error leaves them uncredited so full readback decides.
+#[cfg(any(windows, target_os = "macos", test))]
+pub(crate) fn verify_terrain_grids_after_import(
+    bridge: &BridgeServer,
+    pre_import_changes: &[crate::editor::types::EditorPropertyChange],
+) -> NativeRootVerification {
+    match try_verify_terrain_grids_after_import(bridge, pre_import_changes) {
+        Ok(verified) => verified,
+        Err(error) => {
+            crate::app::output::log_global(
+                4,
+                format_args!(
+                    "[renium] post-import terrain verification unavailable; leaving to readback: {error:#}"
+                ),
+            );
+            NativeRootVerification::default()
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn try_verify_terrain_grids_after_import(
+    bridge: &BridgeServer,
+    pre_import_changes: &[crate::editor::types::EditorPropertyChange],
+) -> Result<NativeRootVerification> {
+    use crate::studio::bridge::BridgeTarget;
+    let mut verified = NativeRootVerification::default();
+    let terrain_rows = pre_import_changes
+        .iter()
+        .filter(|row| {
+            row.class_name == "Terrain"
+                && (row.properties.contains_key("SmoothGrid")
+                    || row.properties.contains_key("PhysicsGrid"))
+        })
+        .collect::<Vec<_>>();
+    if terrain_rows.is_empty() {
+        return Ok(verified);
+    }
+    #[cfg(test)]
+    let mocked = access::TEST_ACCESS.with_borrow(Option::is_some);
+    #[cfg(not(test))]
+    let mocked = false;
+    let (pid, title) = if mocked {
+        (0, String::new())
+    } else {
+        let info = bridge.cached_bridge_info_for_target(BridgeTarget::Edit)?;
+        let pid = bridge.studio_pid_for_runtime(BridgeTarget::Edit, &info.runtime_id)?;
+        let title = crate::studio::native::serializer::target_name(pid, &info.place_name)?;
+        (pid, title)
+    };
+    for row in terrain_rows {
+        let mut ordinals = row.path_ordinals.clone();
+        ordinals.resize(row.path_segments.len(), 1);
+        let expected_smooth = row
+            .properties
+            .get("SmoothGrid")
+            .map(decode_terrain_grid_value)
+            .transpose()?;
+        let expected_physics = row
+            .properties
+            .get("PhysicsGrid")
+            .map(decode_terrain_grid_value)
+            .transpose()?;
+        let mut terrain = access::prepare_terrain(
+            pid,
+            &title,
+            &row.path_segments,
+            &ordinals,
+            std::time::Duration::from_secs(3),
+        )?;
+        let _ = terrain.write("renium-verify-terrain", None, None)?;
+        let (smooth_ok, physics_ok) = terrain_fingerprint_matches(
+            &terrain.fingerprint(),
+            expected_smooth.as_deref(),
+            expected_physics.as_deref(),
+        )?;
+        if (expected_smooth.is_some() && !smooth_ok) || (expected_physics.is_some() && !physics_ok)
+        {
+            crate::app::output::log_global(
+                4,
+                format_args!(
+                    "[renium] post-import terrain verification mismatch: smooth_ok={smooth_ok} physics_ok={physics_ok}"
+                ),
+            );
+        }
+        if smooth_ok && let Some(val) = row.properties.get("SmoothGrid") {
+            verified.record_verified_field(
+                &row.class_name,
+                &row.path_segments,
+                &ordinals,
+                "SmoothGrid",
+                val.clone(),
+            );
+        }
+        if physics_ok && let Some(val) = row.properties.get("PhysicsGrid") {
+            verified.record_verified_field(
+                &row.class_name,
+                &row.path_segments,
+                &ordinals,
+                "PhysicsGrid",
+                val.clone(),
+            );
+        }
+    }
+    Ok(verified)
+}
+
+#[cfg(not(any(windows, target_os = "macos", test)))]
+pub(crate) fn verify_terrain_grids_after_import(
+    _bridge: &BridgeServer,
+    _pre_import_changes: &[crate::editor::types::EditorPropertyChange],
+) -> NativeRootVerification {
+    NativeRootVerification::default()
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -1623,6 +1788,78 @@ mod tests {
             changes.property_changes[2].reset_properties,
             vec!["Transparency"]
         );
+    }
+
+    #[test]
+    fn post_import_terrain_verification_checks_live_fingerprint_and_rejects_mismatch() {
+        use sha2::{Digest, Sha256};
+
+        let smooth_bytes = b"\x01\x05smooth-grid-bytes";
+        let physics_bytes = b"physics-grid-bytes";
+        let mut matching_fp = Vec::with_capacity(64);
+        matching_fp.extend_from_slice(&Sha256::digest(smooth_bytes));
+        matching_fp.extend_from_slice(&Sha256::digest(physics_bytes));
+
+        let terrain_row = crate::editor::types::EditorPropertyChange {
+            service: "Workspace".into(),
+            class_name: "Terrain".into(),
+            path_segments: vec!["Workspace".into(), "Terrain".into()],
+            path_ordinals: vec![1, 1],
+            properties: serde_json::from_value(json!({
+                "SmoothGrid": {"_type": "BinaryString", "base64": base64::encode(smooth_bytes)},
+                "PhysicsGrid": {"_type": "BinaryString", "base64": base64::encode(physics_bytes)},
+                "Decoration": true,
+            }))
+            .unwrap(),
+            ..Default::default()
+        };
+        let bridge = crate::studio::bridge::routing_tests::fixture();
+
+        let state = std::rc::Rc::new(std::cell::RefCell::new(access::TestAccess {
+            class: "Terrain".into(),
+            identity: "terrain-1".into(),
+            fingerprint: base64::encode(&matching_fp),
+            ..Default::default()
+        }));
+        access::TEST_ACCESS.with(|slot| *slot.borrow_mut() = Some(std::rc::Rc::clone(&state)));
+        let verified =
+            verify_terrain_grids_after_import(&bridge, std::slice::from_ref(&terrain_row));
+        access::TEST_ACCESS.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(state.borrow().writes, 0);
+        assert_eq!(verified.verified_fields(&terrain_row), 2);
+        let mut remaining = terrain_row.clone();
+        verified.remove_verified_properties(&mut remaining);
+        assert!(!remaining.properties.contains_key("SmoothGrid"));
+        assert!(!remaining.properties.contains_key("PhysicsGrid"));
+        assert!(remaining.properties.contains_key("Decoration"));
+
+        let mut mismatched_fp = Vec::with_capacity(64);
+        mismatched_fp.extend_from_slice(&Sha256::digest(b"different-smooth"));
+        mismatched_fp.extend_from_slice(&Sha256::digest(b"different-physics"));
+        let bad_state = std::rc::Rc::new(std::cell::RefCell::new(access::TestAccess {
+            class: "Terrain".into(),
+            identity: "terrain-1".into(),
+            fingerprint: base64::encode(&mismatched_fp),
+            ..Default::default()
+        }));
+        access::TEST_ACCESS.with(|slot| *slot.borrow_mut() = Some(std::rc::Rc::clone(&bad_state)));
+        let rejected =
+            verify_terrain_grids_after_import(&bridge, std::slice::from_ref(&terrain_row));
+        access::TEST_ACCESS.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(bad_state.borrow().writes, 0);
+        assert_eq!(rejected.verified_fields(&terrain_row), 0);
+
+        let failed_state = std::rc::Rc::new(std::cell::RefCell::new(access::TestAccess {
+            class: "Terrain".into(),
+            identity: "terrain-1".into(),
+            fingerprint: "not-valid-base64!!!".into(),
+            ..Default::default()
+        }));
+        access::TEST_ACCESS
+            .with(|slot| *slot.borrow_mut() = Some(std::rc::Rc::clone(&failed_state)));
+        let failed = verify_terrain_grids_after_import(&bridge, std::slice::from_ref(&terrain_row));
+        access::TEST_ACCESS.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(failed.verified_fields(&terrain_row), 0);
     }
 
     #[test]
