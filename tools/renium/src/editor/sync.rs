@@ -10527,11 +10527,12 @@ mod saved_field_review_tests {
             ]
         );
         assert!(
-            calls
+            !calls
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|r| r["params"]["verifyOnly"] == true)
+                .any(|r| r["params"]["verifyOnly"] == true),
+            "rows the native roots verified in full need no verify call"
         );
         drop(bridge);
         plugin.join().unwrap();
