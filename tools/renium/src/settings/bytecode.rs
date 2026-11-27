@@ -203,7 +203,7 @@ pub(crate) fn whole_instance_digests(document: &SettingsBytecode) -> Vec<([u8; 1
 
 /// The `PulledDigest` of this state, without holding its document.
 pub(crate) fn pulled_digest_from_service_state(state: &ServiceState) -> Result<PulledDigest> {
-    captured::pulled_digest(state)
+    captured::pulled_digest(state, None)
 }
 
 /// Streamed whole-document alignment over a v12 block store and a captured
@@ -4198,33 +4198,23 @@ fn collect_settings_binary_data<'a>(
     Ok(out)
 }
 
-#[cfg(test)]
-pub(crate) fn write_service_settings_binary_file(path: &Path, state: &ServiceState) -> Result<()> {
-    let _ = write_service_settings_binary_file_inner(path, state, false)?;
-    Ok(())
-}
-
 pub(crate) fn write_fresh_service_settings_binary_file(
     path: &Path,
     state: &ServiceState,
-) -> Result<[u8; 32]> {
-    write_service_settings_binary_file_inner(path, state, true)
-}
-
-fn write_service_settings_binary_file_inner(
-    path: &Path,
-    state: &ServiceState,
-    fresh: bool,
-) -> Result<[u8; 32]> {
+) -> Result<([u8; 32], Option<PulledDigest>)> {
     use sha2::{Digest, Sha256};
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
-
-    let writer = encode_service_settings_binary(state)?;
-    let digest: [u8; 32] = Sha256::digest(&writer).into();
-    if fresh {
+    let instances = collect_service_settings_binary_instances(state);
+    let lookup = build_settings_binary_instance_lookup(state, &instances);
+    let write_file = || -> Result<[u8; 32]> {
+        let writer = {
+            let _span = crate::app::profile::span("captured store encode");
+            blocks::encode_state(state, (&instances, &lookup), None, None)?
+        };
+        let digest: [u8; 32] = Sha256::digest(&writer).into();
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -4232,10 +4222,15 @@ fn write_service_settings_binary_file_inner(
             .with_context(|| format!("Failed to create {}", path.display()))?;
         file.write_all(&writer)
             .with_context(|| format!("Failed to write {}", path.display()))?;
+        Ok(digest)
+    };
+    let compute = || captured::pulled_digest(state, Some((&instances, &lookup))).ok();
+    let (written, observed) = if instances.len() >= 4_096 {
+        rayon::join(write_file, compute)
     } else {
-        write_bytes_if_changed(path, &writer)?;
-    }
-    Ok(digest)
+        (write_file(), compute())
+    };
+    Ok((written?, observed))
 }
 
 pub(crate) fn encode_service_settings_binary(state: &ServiceState) -> Result<Vec<u8>> {

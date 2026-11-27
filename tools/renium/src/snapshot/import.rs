@@ -1503,6 +1503,7 @@ fn import_service_tree_owned_with_store_gate(
 ) -> Result<SourcemapNode> {
     let service_dir = src_root.join(sanitize_name(service));
     if state.instances.len() >= 4_096
+        && service_settings_path(&service_dir).exists()
         && (pull_aligns_whole_documents() || !existing_settings_is_block_store(&service_dir))
     {
         let layout_dir = layout_src_root.map_or_else(
@@ -1596,7 +1597,7 @@ fn import_service_tree_owned_with_store_gate(
         return Ok(node);
     }
 
-    let node = import_service_tree_with_store_gate(
+    let result = import_service_tree_with_store_gate(
         &state,
         project_root,
         src_root,
@@ -1606,7 +1607,7 @@ fn import_service_tree_owned_with_store_gate(
         virtual_scripts,
     );
     finish_service_state_drop(state);
-    node
+    result
 }
 
 fn import_service_tree_with_store_gate(
@@ -1632,9 +1633,10 @@ fn import_service_tree_with_store_gate(
     }
     thread::scope(|scope| -> Result<SourcemapNode> {
         let settings_task = scope.spawn(|| {
-            write_service_settings_file(
+            write_service_settings_file_owned(
                 service,
-                state,
+                None,
+                Some(state),
                 &service_dir,
                 &expected_paths,
                 fresh_service_dir,
@@ -1844,25 +1846,6 @@ fn track_expected_dir(expected_paths: &ImportPathSets, path: &Path) {
     batch.merge_into(expected_paths);
 }
 
-fn write_service_settings_file(
-    service: &str,
-    state: &ServiceState,
-    service_dir: &Path,
-    expected_paths: &ImportPathSets,
-    fresh_stage: bool,
-    store_gate: Option<&Mutex<()>>,
-) -> Result<()> {
-    write_service_settings_file_owned(
-        service,
-        None,
-        Some(state),
-        service_dir,
-        expected_paths,
-        fresh_stage,
-        store_gate,
-    )
-}
-
 fn try_streamed_alignment(
     state_to_write: &ServiceState,
     settings_path: &Path,
@@ -1953,13 +1936,11 @@ fn write_service_settings_file_owned(
         // A fresh capture encodes every store while other services are still
         // converting. Bound those temporary buffers per export; scripts,
         // sourcemaps, comparisons of small stores and other places can proceed.
-        let written_digest = {
+        let (written_digest, observed) = {
             let _store_guard = store_gate.map(LockRecover::lock_recover);
             write_fresh_service_settings_binary_file(&settings_path, state)?
         };
-        // The file holds this state's own bytes, so the next pull that
-        // captures the same state leaves it alone without decoding it.
-        if let Ok(observed) = pulled_digest_from_service_state(state)
+        if let Some(observed) = observed
             && !observed.viewport_camera_lacks_enum_types
         {
             remember_pull(written_digest, observed.digest, Some(observed.rows));

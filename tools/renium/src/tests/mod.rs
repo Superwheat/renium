@@ -55,7 +55,7 @@ use crate::roblox::schema::{
 };
 use crate::settings::bytecode::{
     SettingsBytecode, SettingsBytecodeInstance, is_default_property_value,
-    write_service_settings_binary_file,
+    write_fresh_service_settings_binary_file,
 };
 use crate::snapshot::codec::decode_compact_v5_value;
 use crate::snapshot::export::{
@@ -1242,7 +1242,7 @@ fn service_settings_preserve_package_link_instances_and_package_id() {
         dense_index_topology: true,
     };
 
-    write_service_settings_binary_file(&settings_path, &state).unwrap();
+    write_fresh_service_settings_binary_file(&settings_path, &state).unwrap();
     let decoded = SettingsBytecode::read_file(&settings_path).unwrap();
 
     let package_link = decoded

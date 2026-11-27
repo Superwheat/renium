@@ -118,16 +118,31 @@ pub(super) fn convert_with_budget(
 /// to find that out. No decoder memory limit applies: the digest only says
 /// whether this is a state a pull took before, and that pull decided whether
 /// its store may be written.
-pub(super) fn pulled_digest(state: &ServiceState) -> Result<PulledDigest> {
+pub(super) fn pulled_digest(
+    state: &ServiceState,
+    prebuilt: Option<(
+        &[SettingsBinaryInstance<'_>],
+        &SettingsBinaryInstanceLookup<'_>,
+    )>,
+) -> Result<PulledDigest> {
     use crate::settings::equivalence::{instance_lacks_enum_types, workspace_current_camera_index};
 
     let _span = crate::app::profile::span("captured store digest");
-    let records = collect_service_settings_binary_instances(state);
-    let lookup = build_settings_binary_instance_lookup(state, &records);
+    let owned_records;
+    let owned_lookup;
+    let (records, lookup) = match prebuilt {
+        Some((records, lookup)) => (records, lookup),
+        None => {
+            owned_records = collect_service_settings_binary_instances(state);
+            owned_lookup = build_settings_binary_instance_lookup(state, &owned_records);
+            (owned_records.as_slice(), &owned_lookup)
+        }
+    };
+
     let (viewport_camera, camera_lacks_enum_types) = validate_records_and_camera(
         state,
-        &records,
-        &lookup,
+        records,
+        lookup,
         workspace_current_camera_index,
         instance_lacks_enum_types,
     )?;
