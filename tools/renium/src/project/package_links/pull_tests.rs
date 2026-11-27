@@ -175,6 +175,11 @@ fn pull_recreates_missing_package_target_and_regenerates_sourcemap() {
     fs::write(root.join("sourcemap.json"), r#"{"name":"game","className":"DataModel","children":[{"name":"ServerStorage","className":"ServerStorage","children":[{"name":"Untouched","className":"Folder"}]}]}"#).unwrap();
     let stage = prepare_pull(&root, &[SERVICE]);
     write_link_test_service(&stage.project_root.join("src/ReplicatedStorage"));
+    let staged_pkg = stage.project_root.join("src/ReplicatedStorage/Pkg");
+    if staged_pkg.exists() {
+        set_path_readonly(&staged_pkg.join("Config.luau"), false).unwrap();
+        fs::remove_dir_all(&staged_pkg).unwrap();
+    }
     let result = finish_pull(&root, stage).unwrap();
     assert_eq!(result.read_only_links_restored.len(), 1);
     let map: Value =
@@ -331,6 +336,9 @@ fn pull_restores_into_custom_source_roots_and_projected_owners() {
             root.join("code/ReplicatedStorage"),
         )
         .unwrap();
+        let before_config = root.join("code/ReplicatedStorage/Pkg/Config.luau");
+        set_path_readonly(&before_config, false).unwrap();
+        fs::write(&before_config, "return 'before'").unwrap();
         let configuration = if mapped {
             json!({"schemaVersion":1,"sourceRoot":"src","tree":{"ReplicatedStorage":{"$path":"code/ReplicatedStorage"}}})
         } else {
@@ -408,6 +416,11 @@ fn pull_recreates_a_missing_service_store_from_the_package() {
         &stage.project_root.join("src/ReplicatedStorage"),
     ))
     .unwrap();
+    let staged_pkg = stage.project_root.join("src/ReplicatedStorage/Pkg");
+    if staged_pkg.exists() {
+        set_path_readonly(&staged_pkg.join("Config.luau"), false).unwrap();
+        fs::remove_dir_all(&staged_pkg).unwrap();
+    }
     let result = finish_pull(&root, stage).unwrap();
     assert_eq!(result.read_only_links_restored.len(), 1);
     let store = service_settings_path(&root.join("src/ReplicatedStorage"));

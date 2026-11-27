@@ -47,6 +47,7 @@
 
 ### Bug fixes
 
+- A pull after `rbx lkp` or `rbx lk` on a package changes nothing. The two commands kept the text of a read-only package script inside the store where a pull keeps it in a read-only `.luau` file, and `rbx lk` gave an updated package copy new ids, so the next pull rewrote the store and the script files.
 - A push of a linked file that was edited, renamed, moved or removed reaches Studio, and the pull after it changes nothing. The push of an edited linked file ended with an error, a renamed or removed linked file was not renamed or removed in Studio, and the next pull rewrote the store of the service.
 - A push that puts painted or filled terrain back to what it was restores it in Studio, and a push after an undo in Studio leaves the terrain exactly as the files have it. Both left the terrain differing from the files.
 - A pull no longer rewrites a script only to change its line endings. A linked script kept with CRLF line endings was written back with LF by the pull after a Live Sync start, which showed as a changed file.

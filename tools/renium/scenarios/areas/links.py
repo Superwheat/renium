@@ -99,15 +99,15 @@ def _poll(ctx: Context, check, seconds: float, message: str, interval: float = 1
 
 
 def pack_a_subtree_into_the_project(ctx: Context):
-    """LINK-001/003: lkp writes the package into the link folder, inlines the script source, registers the
-    read-only link and the lock entry; a second lkp resaves the package."""
+    """LINK-001/003: lkp writes the package into the link folder, keeps read-only script files on disk,
+    registers the read-only link and the lock entry; a second lkp resaves the package."""
     packed = _pack_shared(ctx)
     ctx.expect(packed.get("id") == "shared" and packed.get("source") == "links/shared.renium", f"lkp: {packed.json}")
     ctx.expect(packed.get("instances") == 2 and packed.get("path") == ["Shared"], f"lkp counts: {packed.json}")
-    ctx.expect(all(any(p.endswith("Util.luau") for p in packed.get(key) or []) for key in ("embeddedSourceFiles", "deletedSourceFiles")), f"lkp source files: {packed.json}")
+    ctx.expect(any(p.endswith("Util.luau") for p in packed.get("embeddedSourceFiles") or []), f"lkp source files: {packed.json}")
     ctx.expect((ctx.root / "links" / "shared.renium").is_file(), "package file written")
-    ctx.expect(not (ctx.root / UTIL).exists(), "Util.luau inlined into the store")
-    ctx.expect_in("return { version = 1 }", str(ctx.rbx("bg", RS, "Shared.Util", "Source", timeout=60).json), "Util source kept in the store")
+    ctx.expect((ctx.root / UTIL).is_file() and not os.access(ctx.root / UTIL, os.W_OK), "Util.luau kept read-only on disk")
+    ctx.expect_in("return { version = 1 }", (ctx.root / UTIL).read_text(encoding="utf-8"), "Util source kept on disk")
     manifest = _manifest(ctx)
     ctx.expect([(link["id"], link["readOnly"]) for link in manifest["links"]] == [("shared", True)], f"manifest: {manifest}")
     ctx.expect("shared" in json.dumps(_lock(ctx)), "lock entry")
@@ -189,7 +189,7 @@ def missing_link_package_stops_the_comparison(ctx: Context):
     status = ctx.rbx("lst", ok=None, timeout=60)
     text = json.dumps([started.json, started.error, status.json, status.error])
     ctx.expect("shared" in text, f"the missing package is named: {text[:400]}")
-    ctx.expect(not (ctx.root / UTIL).exists(), "the packed script's file is not pulled back")
+    ctx.expect((ctx.root / UTIL).is_file() and not os.access(ctx.root / UTIL, os.W_OK), "the packed script's file stays read-only")
     ctx.rbx("lof", ok=None, timeout=60)
     package.write_bytes(b"not a settings store")
     pushed = ctx.rbx("ps", RS_STORE, "--yes", ok=False, timeout=120)

@@ -185,13 +185,8 @@ pub(super) struct ImportStart<'a> {
     pub optional: bool,
 }
 
-pub(super) fn can_continue(
-    stage: &ExportProjectStage,
-    requires_stage: bool,
-    has_links: bool,
-) -> bool {
+pub(super) fn can_continue(stage: &ExportProjectStage, requires_stage: bool) -> bool {
     !requires_stage
-        && !has_links
         && crate::daemon::can_respond_before_settle()
         && stage
             .loaded
@@ -493,7 +488,7 @@ pub(super) struct ImportWork {
 /// a pull wrote whose sourcemap that pull left as `sourcemap`.
 pub(super) struct Narrowed<'a> {
     pub services: &'a [String],
-    pub sourcemap: &'a SourcemapState,
+    pub sourcemap: Option<&'a SourcemapState>,
 }
 
 /// The files a publication left and the sourcemap a baseline of them keeps.
@@ -531,13 +526,21 @@ pub(super) fn settle(
     let covered = ScopeSet::new(&work.paths);
     let baseline =
         |paths: &[PathBuf]| super::push_flow::publish_baseline(root, &files, &covered, paths);
-    let stage_of = |services| {
-        ExportProjectStage::create_with_baseline_background(root, &source, services, &baseline)
+    let stage_of = |services| -> Result<ExportProjectStage> {
+        let mut stage = ExportProjectStage::create_with_baseline_background(
+            root, &source, services, &baseline,
+        )?;
+        stage.prepare_read_only_links(root, &source, services)?;
+        Ok(stage)
     };
     let mut services = narrowed.as_ref().map_or(full, |narrowed| narrowed.services);
     let mut stage = stage_of(services)?;
     // The services it skips keep their entries of the sourcemap it stages.
-    if narrowed.is_some_and(|narrowed| !holds_sourcemap(&stage.project_root, narrowed.sourcemap)) {
+    if narrowed
+        .as_ref()
+        .and_then(|narrowed| narrowed.sourcemap)
+        .is_some_and(|sourcemap| !holds_sourcemap(&stage.project_root, sourcemap))
+    {
         if CURRENT.with(|slot| {
             slot.borrow()
                 .as_ref()
@@ -647,7 +650,14 @@ pub(super) fn settle(
     };
     let id = work.history.commit(&current, &ProjectSnapshot::default())?;
     work.summary.insert("historyId".into(), json!(id));
-    let sourcemap = pulled_sourcemap(&published);
+    let sourcemap = if narrowed
+        .as_ref()
+        .is_some_and(|narrowed| narrowed.sourcemap.is_none())
+    {
+        None
+    } else {
+        pulled_sourcemap(&published)
+    };
     Ok(Settlement::Published((current, sourcemap)))
 }
 
@@ -2041,7 +2051,7 @@ mod tests {
         super::super::push_flow_tests::replace_capture(ProjectSnapshot::default());
         let narrowed = Narrowed {
             services: &["Workspace".into()],
-            sourcemap: &SourcemapState::new(),
+            sourcemap: Some(&SourcemapState::new()),
         };
         let settlement = settle(
             &context,

@@ -2741,8 +2741,7 @@ pub(crate) fn push_project(
         prepared_verification.retain(|path, _| !bulk_paths.contains(path));
     }
     #[cfg(any(windows, target_os = "macos"))]
-    let can_settle_in_background =
-        replace && import_settle::can_continue(&stage, requires_stage, link_enforcement.is_some());
+    let can_settle_in_background = replace && import_settle::can_continue(&stage, requires_stage);
     push_args.inline_release_tracking = bulk_inline_release_tracking(
         &plan,
         services,
@@ -2878,20 +2877,12 @@ pub(crate) fn push_project(
             .clone_from(&guard.tracking_guard_id);
     }
 
-    // A settlement reads back fewer services than a pull only from a held
-    // pull, where the push wrote some services alone and no linked package
-    // is restored.
     #[cfg(any(windows, target_os = "macos"))]
-    let narrowable = held_pull.as_ref().filter(|(_, written)| {
-        services.iter().any(|service| !written.contains(service)) && link_enforcement.is_none()
-    });
-    // Roots imported beside a service's other instances take values Studio
-    // generates for them, which only a pull writes to the files. A service
-    // the importer replaced whole carries its loader receipt instead. Their
-    // settlement must read back fewer services than a pull, which only a
-    // held pull whose sourcemap the files still hold allows.
+    let narrowable = held_pull
+        .as_ref()
+        .filter(|(_, written)| services.iter().any(|service| !written.contains(service)));
     #[cfg(any(windows, target_os = "macos"))]
-    let added_roots = !settle_native_import
+    let has_added_roots = !settle_native_import
         && pushed
             .summary
             .get("binaryInstances")
@@ -2901,10 +2892,16 @@ pub(crate) fn push_project(
             .summary
             .get("nativeVerifiedServices")
             .and_then(Value::as_array)
-            .is_none_or(Vec::is_empty)
-        && narrowable.is_some_and(|((sourcemap, _), _)| {
-            import_settle::holds_sourcemap(Path::new(&context.root), sourcemap)
-        });
+            .is_none_or(Vec::is_empty);
+    #[cfg(any(windows, target_os = "macos"))]
+    let narrow_from_pull = narrowable.filter(|((sourcemap, _), _)| {
+        import_settle::holds_sourcemap(Path::new(&context.root), sourcemap)
+    });
+    #[cfg(any(windows, target_os = "macos"))]
+    let settle_linked_added_roots =
+        has_added_roots && link_enforcement.is_some() && !pushed_services_for_scope.is_empty();
+    #[cfg(any(windows, target_os = "macos"))]
+    let added_roots = (has_added_roots && narrow_from_pull.is_some()) || settle_linked_added_roots;
     // Files the push wrote itself are read back to be verified.
     #[cfg(any(windows, target_os = "macos"))]
     let generated_files = !pushed.generated.entries.is_empty();
@@ -2925,23 +2922,28 @@ pub(crate) fn push_project(
         .map(|proof| {
             // Only a settlement the commit proof fences until publication
             // skips services: the held proof covers what changed before it.
-            let settled = narrowable.map_or_else(
-                || services.to_vec(),
-                |((_, held), written)| {
-                    settled_services(
-                        context,
-                        bridge,
-                        (services, written.clone()),
-                        held,
-                        (&studio, &project, &pushed.generated),
-                    )
-                },
-            );
+            let settled = if let Some(((_, held), written)) =
+                narrowable.filter(|_| settle_native_import || narrow_from_pull.is_some())
+            {
+                settled_services(
+                    context,
+                    bridge,
+                    (services, written.clone()),
+                    held,
+                    (&studio, &project, &pushed.generated),
+                )
+            } else if settle_linked_added_roots {
+                pushed_services_for_scope.iter().cloned().collect()
+            } else {
+                services.to_vec()
+            };
             (proof, settled)
         })
         // Added roots are settled only where that reads back less than a
         // pull would; their receipt already verified the push.
-        .filter(|(_, settled)| settle_native_import || settled.len() < services.len())
+        .filter(|(_, settled)| {
+            settle_native_import || settle_linked_added_roots || settled.len() < services.len()
+        })
         // A Studio that changed since the commit gets the full readback below
         // before the push answers.
         .filter(|(proof, _)| {
@@ -2967,13 +2969,12 @@ pub(crate) fn push_project(
             &pushed.summary,
         )?
     {
-        let narrowed =
-            narrowable
-                .filter(|_| settled.len() < services.len())
-                .map(|((sourcemap, _), _)| import_settle::Narrowed {
-                    services: &settled,
-                    sourcemap,
-                });
+        let narrowed = (settled.len() < services.len()).then(|| import_settle::Narrowed {
+            services: &settled,
+            sourcemap: narrowable
+                .filter(|_| settle_native_import || narrow_from_pull.is_some())
+                .map(|((sourcemap, _), _)| &**sourcemap),
+        });
         let mut expected = project;
         expected.entries.extend(pushed.generated.entries);
         import_settle::continue_request(context, bridge)?;

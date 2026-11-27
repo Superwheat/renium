@@ -897,7 +897,7 @@ impl PackageLinkApply<'_, '_> {
                 ));
             }
         }
-        if (shared_replaced_dir.is_some() || restoring.is_some())
+        if (shared_replaced_dir.is_some() || restoring.is_some() || target.read_only)
             && !args.check
             && externalize_target_scripts(
                 document,
@@ -2660,39 +2660,6 @@ pub(super) fn pack_subtree_to_bytecode(
     Ok((package, source_by_index))
 }
 
-fn inline_editor_source_files_for_indexes(
-    document: &mut SettingsBytecode,
-    service_dir: &Path,
-    source_paths_by_index: &[Option<PathBuf>],
-    indexes: &[usize],
-    source_by_index: &HashMap<usize, String>,
-) -> Result<Vec<String>> {
-    let mut inlined_paths = Vec::new();
-    for index in indexes {
-        let Some(instance) = document.instances.get_mut(*index) else {
-            continue;
-        };
-        if !is_lua_source_class(&instance.class_name) {
-            continue;
-        }
-        let Some(Some(source_path)) = source_paths_by_index.get(*index) else {
-            continue;
-        };
-        if fs::symlink_metadata(source_path).is_err() || source_path.is_dir() {
-            continue;
-        }
-        ensure_existing_ancestor_inside(service_dir, source_path, "source file to inline")?;
-        let source = source_by_index
-            .get(index)
-            .with_context(|| format!("Source snapshot is missing for {}", source_path.display()))?;
-        instance
-            .properties
-            .insert("Source".to_string(), Value::String(source.clone()));
-        inlined_paths.push(source_path.to_string_lossy().into_owned());
-    }
-    Ok(inlined_paths)
-}
-
 pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
     if args.share {
         return shared::share_link_pack(args);
@@ -2964,27 +2931,56 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
     manifest
         .broken
         .retain(|broken_target| link_target_ref_key(broken_target) != target_key);
-    let inlined_source_paths = inline_editor_source_files_for_indexes(
-        &mut document,
-        &service_dir,
-        &source_paths,
-        &subtree,
-        &source_by_index,
-    )?;
-    let mut source_removals =
-        plan_editor_source_file_removals(&service_dir, &source_paths, &subtree)?;
-    let removed_source_paths = source_removals
+    let read_only = manifest
+        .links
         .iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
+        .find(|link| link.id == id)
+        .map_or(!args.target.writable, |link| link.read_only);
     let mut transaction_writes = BTreeMap::new();
+    let mut mirror_permissions = BTreeMap::new();
+    let mut embedded_source_paths = Vec::new();
+    let mut document_changed = false;
+    for &index in &subtree {
+        let (Some(Some(path)), Some(instance)) =
+            (source_paths.get(index), document.instances.get_mut(index))
+        else {
+            continue;
+        };
+        if !is_lua_source_class(&instance.class_name) {
+            continue;
+        }
+        ensure_existing_ancestor_inside(&service_dir, path, "packed script file")?;
+        if source_by_index.contains_key(&index) {
+            embedded_source_paths.push(path.to_string_lossy().into_owned());
+        }
+        if instance.properties.get("Source").and_then(Value::as_str) != Some(EXTERNAL_SOURCE_MARKER)
+            && let Some(source) = source_by_index.get(&index).cloned().or_else(|| {
+                instance
+                    .properties
+                    .get("Source")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+        {
+            instance.properties.insert(
+                "Source".to_string(),
+                Value::String(EXTERNAL_SOURCE_MARKER.to_string()),
+            );
+            transaction_writes.insert(path.clone(), source.into_bytes());
+            document_changed = true;
+        }
+        if read_only && (path.is_file() || transaction_writes.contains_key(path)) {
+            mirror_permissions.insert(path.clone(), true);
+        }
+    }
+    let mut source_removals = Vec::new();
     transaction_writes.insert(package_file.clone(), package_bytes);
     transaction_writes.insert(link_lock_path(&project_root), serialize_link_lock(&lock)?);
     transaction_writes.insert(
         manifest_path.clone(),
         serialize_link_manifest(&manifest)?.into_bytes(),
     );
-    if !inlined_source_paths.is_empty() {
+    if document_changed || exact_path_key(settings_output_file) != exact_path_key(settings_file) {
         transaction_writes.insert(
             settings_output_file.clone(),
             encode_settings_bytecode(&document)?,
@@ -2997,8 +2993,11 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
     if !gitignore.exists() {
         transaction_writes.insert(gitignore, RENIUM_DIR_GITIGNORE.as_bytes().to_vec());
     }
-    apply_file_mutations(&transaction_writes, &source_removals)?;
-    prune_removed_source_dirs(&service_dir, &source_removals);
+    apply_file_mutations_with_permissions(
+        &transaction_writes,
+        &source_removals,
+        &mirror_permissions,
+    )?;
 
     print_json_output(
         &json!({
@@ -3010,8 +3009,8 @@ pub(crate) fn link_pack(mut args: LinkPackArgs) -> Result<()> {
             "instances": package.instances.len(),
             "service": args.target.service,
             "path": segments_after_service,
-            "embeddedSourceFiles": inlined_source_paths,
-            "deletedSourceFiles": removed_source_paths,
+            "embeddedSourceFiles": embedded_source_paths,
+            "deletedSourceFiles": Vec::<String>::new(),
         }),
         args.pretty,
     )

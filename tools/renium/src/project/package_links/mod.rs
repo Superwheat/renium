@@ -2362,6 +2362,52 @@ fn apply_preserved_subtree_identity(
     Ok(())
 }
 
+const COPY_IDENTITY_PROPERTIES: [&str; 3] = ["UniqueId", "HistoryId", "ScriptGuid"];
+
+fn capture_copy_identity_properties(
+    document: &SettingsBytecode,
+    identity: &PackageIdentityMatches,
+) -> HashMap<String, Vec<(&'static str, Value)>> {
+    let matched_ids: HashSet<&str> = identity
+        .by_package_index
+        .values()
+        .map(String::as_str)
+        .collect();
+    let mut saved = HashMap::new();
+    for instance in &document.instances {
+        if !matched_ids.contains(instance.settings_id.as_str()) {
+            continue;
+        }
+        let entries = COPY_IDENTITY_PROPERTIES
+            .iter()
+            .filter_map(|&key| {
+                instance
+                    .properties
+                    .get(key)
+                    .map(|value| (key, value.clone()))
+            })
+            .collect::<Vec<_>>();
+        if !entries.is_empty() {
+            saved.insert(instance.settings_id.clone(), entries);
+        }
+    }
+    saved
+}
+
+fn apply_copy_identity_properties(
+    properties: &mut Map<String, Value>,
+    saved: Option<&Vec<(&'static str, Value)>>,
+) {
+    for key in COPY_IDENTITY_PROPERTIES {
+        properties.remove(key);
+    }
+    if let Some(entries) = saved {
+        for (key, value) in entries {
+            properties.insert((*key).to_string(), value.clone());
+        }
+    }
+}
+
 fn materialize_package_root(
     document: &mut SettingsBytecode,
     service_dir: &Path,
@@ -2384,6 +2430,7 @@ fn materialize_package_root(
         plan_editor_source_file_removals(service_dir, &source_paths_before, &removed)?;
     let root_name = document.instances[document_root].name.clone();
     let identity = package_identity_matches(document, document_root, package, package_root, true);
+    let copy_identities = capture_copy_identity_properties(document, &identity);
     let package_indices = (0..package.instances.len()).collect::<Vec<_>>();
     let (package_path_segments, package_path_ordinals) =
         build_editor_instance_path_parts(package, "");
@@ -2418,6 +2465,8 @@ fn materialize_package_root(
             next_editor_settings_id_fast(&mut existing_ids, &mut seed)
         };
         let new_index = instances.len();
+        let mut properties = instance.properties.clone();
+        apply_copy_identity_properties(&mut properties, copy_identities.get(&settings_id));
         instances.push(SettingsBytecodeInstance {
             settings_id: settings_id.clone(),
             name: if is_root {
@@ -2427,7 +2476,7 @@ fn materialize_package_root(
             },
             class_name: instance.class_name.clone(),
             parent_index,
-            properties: instance.properties.clone(),
+            properties,
             attributes: instance.attributes.clone(),
         });
         new_index_by_pkg.insert(package_index, new_index);
@@ -2529,6 +2578,7 @@ fn materialize_package_target(
 
     let mut planned_removals = Vec::new();
     let mut identity = PackageIdentityMatches::default();
+    let mut copy_identities = HashMap::new();
     let mut placement = None;
     let same_name_children = document
         .instances
@@ -2561,6 +2611,7 @@ fn materialize_package_target(
         let mut subtree = Vec::new();
         collect_settings_subtree_preorder(&children, existing, &mut subtree);
         identity = package_identity_matches(document, existing, &package, package_root, false);
+        copy_identities = capture_copy_identity_properties(document, &identity);
         prepare_package_replacement(
             document,
             &subtree,
@@ -2654,12 +2705,14 @@ fn materialize_package_target(
             next_editor_settings_id_fast(&mut existing_ids, &mut seed)
         };
         let new_index = document.instances.len();
+        let mut properties = instance.properties.clone();
+        apply_copy_identity_properties(&mut properties, copy_identities.get(&settings_id));
         document.instances.push(SettingsBytecodeInstance {
             settings_id: settings_id.clone(),
             name,
             class_name: instance.class_name.clone(),
             parent_index: parent_in_doc,
-            properties: instance.properties.clone(),
+            properties,
             attributes: instance.attributes.clone(),
         });
         new_index_by_pkg.insert(pkg_index, new_index);

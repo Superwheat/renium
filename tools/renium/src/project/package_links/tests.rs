@@ -194,8 +194,8 @@ fn package_check_status_and_push_agree_on_external_sources_and_references() {
     assert_eq!(test_link_status(&dir)["driftedTargets"], json!(0));
     push().unwrap();
     let source = service_dir.join("First/Code.luau");
-    fs::create_dir_all(source.parent().unwrap()).unwrap();
-    fs::write(&source, "return 1").unwrap();
+    assert_eq!(fs::read_to_string(&source).unwrap(), "return 1");
+    assert!(fs::metadata(&source).unwrap().permissions().readonly());
     document = SettingsBytecode::read_file(&store).unwrap();
     let first = resolve_editor_instance_by_path_ordinals(
         &document,
@@ -206,22 +206,28 @@ fn package_check_status_and_push_agree_on_external_sources_and_references() {
     .unwrap();
     let code = document
         .instances
-        .iter_mut()
+        .iter()
         .find(|instance| instance.parent_index == Some(first) && instance.name == "Code")
         .unwrap();
-    code.properties
-        .insert("Source".into(), json!(EXTERNAL_SOURCE_MARKER));
-    document.write_file(&store).unwrap();
+    assert_eq!(
+        code.properties.get("Source"),
+        Some(&json!(EXTERNAL_SOURCE_MARKER))
+    );
     assert_eq!(check()["differenceCount"], json!(0));
     assert_eq!(test_link_status(&dir)["driftedTargets"], json!(0));
     push().unwrap();
+    set_path_readonly(&source, false).unwrap();
     fs::write(&source, "return 2").unwrap();
     assert_eq!(check()["differenceCount"], json!(1));
     assert_eq!(test_link_status(&dir)["driftedTargets"], json!(1));
     assert!(push().is_err());
     link_apply(test_link_apply_args(&dir)).unwrap();
+    assert_eq!(fs::read_to_string(&source).unwrap(), "return 1");
+    assert!(fs::metadata(&source).unwrap().permissions().readonly());
     assert_eq!(check()["differenceCount"], json!(0));
     push().unwrap();
+    set_path_readonly(&source, false).unwrap();
+    set_path_readonly(&service_dir.join("Second/Code.luau"), false).unwrap();
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -617,7 +623,7 @@ fn link_pack_resaves_existing_package_source_path() {
 }
 
 #[test]
-fn link_pack_inlines_source_and_removes_disk_mirrors() {
+fn link_pack_inlines_package_source_and_keeps_read_only_disk_mirrors() {
     let dir = temp_dir("link-pack-cleanup");
     let src_root = dir.join("src");
     let service_dir = src_root.join("ReplicatedStorage");
@@ -641,8 +647,8 @@ fn link_pack_inlines_source_and_removes_disk_mirrors() {
     })
     .unwrap();
 
-    assert!(!source_path.exists());
-    assert!(!service_dir.join("Pkg").exists());
+    assert_eq!(fs::read_to_string(&source_path).unwrap(), "print('packed')");
+    assert!(fs::metadata(&source_path).unwrap().permissions().readonly());
 
     let updated = SettingsBytecode::read_file(&settings_path).unwrap();
     let script = updated
@@ -652,7 +658,7 @@ fn link_pack_inlines_source_and_removes_disk_mirrors() {
         .unwrap();
     assert_eq!(
         script.properties.get("Source"),
-        Some(&json!("print('packed')"))
+        Some(&json!(EXTERNAL_SOURCE_MARKER))
     );
 
     let package = SettingsBytecode::read_file(&dir.join("links").join("pkg.renium")).unwrap();
@@ -666,6 +672,9 @@ fn link_pack_inlines_source_and_removes_disk_mirrors() {
         Some(&json!("print('packed')"))
     );
 
+    let mut perms = fs::metadata(&source_path).unwrap().permissions();
+    perms.set_readonly(false);
+    fs::set_permissions(&source_path, perms).unwrap();
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -3011,5 +3020,142 @@ fn repro_b3_b9_mirror_order_and_namesakes() {
         .unwrap();
     let msg = format!("{:#}", link_apply(test_link_apply_args(&dir)).unwrap_err());
     assert!(msg.contains("Workspace") && msg.contains("Holder"), "{msg}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn lkp_and_lk_keep_read_only_package_scripts_externalized_like_pull() {
+    let dir = temp_dir("pkg-pull-form");
+    let service_dir = dir.join("src/ReplicatedStorage");
+    write_link_test_service(&service_dir);
+    let store = service_settings_path(&service_dir);
+    let mut doc = SettingsBytecode::read_file(&store).unwrap();
+    let folder_idx = doc.instances.len();
+    doc.instances
+        .push(settings_instance("s0", "SrcPkg", "Folder", Some(0)));
+    let mut script = settings_instance("s1", "Mod", "ModuleScript", Some(folder_idx));
+    script
+        .properties
+        .insert("Source".into(), json!(EXTERNAL_SOURCE_MARKER));
+    script.properties.insert(
+        "UniqueId".into(),
+        json!({"_type": "UniqueId", "value": "src-uid"}),
+    );
+    script
+        .properties
+        .insert("ScriptGuid".into(), json!("{src-guid}"));
+    doc.instances.push(script);
+    doc.write_file(&store).unwrap();
+    let src_mod = service_dir.join("SrcPkg/Mod.luau");
+    fs::create_dir_all(src_mod.parent().unwrap()).unwrap();
+    fs::write(&src_mod, "return 'v1'\n").unwrap();
+
+    commands::link_pack(LinkPackArgs {
+        project: ProjectSourceArgs {
+            project_root: dir.clone(),
+            src_root: "src".into(),
+        },
+        manifest: "renium-link.json".into(),
+        link_folder: Some("links".into()),
+        id: Some("pkg".into()),
+        share: false,
+        all_places: false,
+        target: LinkTargetArgs {
+            service: "ReplicatedStorage".into(),
+            path_segments_json: r#"["ReplicatedStorage","SrcPkg"]"#.into(),
+            path_ordinals_json: "[]".into(),
+            writable: false,
+        },
+        pretty: false,
+    })
+    .unwrap();
+    assert_eq!(fs::read_to_string(&src_mod).unwrap(), "return 'v1'\n");
+    assert!(fs::metadata(&src_mod).unwrap().permissions().readonly());
+
+    let mut manifest = read_link_manifest(&dir.join("renium-link.json")).unwrap();
+    manifest.links[0].targets.push(LinkTargetRef {
+        service: "ReplicatedStorage".into(),
+        path: vec!["CopyPkg".into()],
+        ords: Vec::new(),
+    });
+    write_link_manifest(&dir.join("renium-link.json"), &manifest).unwrap();
+    link_apply(test_link_apply_args(&dir)).unwrap();
+
+    let copy_mod = service_dir.join("CopyPkg/Mod.luau");
+    assert_eq!(fs::read_to_string(&copy_mod).unwrap(), "return 'v1'\n");
+    assert!(fs::metadata(&copy_mod).unwrap().permissions().readonly());
+    let mut updated = SettingsBytecode::read_file(&store).unwrap();
+    for name in ["SrcPkg", "CopyPkg"] {
+        let root = resolve_editor_instance_by_path_ordinals(
+            &updated,
+            "ReplicatedStorage",
+            &[name.into()],
+            &[1],
+        )
+        .unwrap();
+        let mod_inst = updated
+            .instances
+            .iter()
+            .find(|i| i.parent_index == Some(root) && i.name == "Mod")
+            .unwrap();
+        assert_eq!(
+            mod_inst.properties.get("Source"),
+            Some(&json!(EXTERNAL_SOURCE_MARKER))
+        );
+        if name == "CopyPkg" {
+            assert_eq!(mod_inst.properties.get("UniqueId"), None);
+            assert_eq!(mod_inst.properties.get("ScriptGuid"), None);
+        }
+    }
+    let copy_root = resolve_editor_instance_by_path_ordinals(
+        &updated,
+        "ReplicatedStorage",
+        &["CopyPkg".into()],
+        &[1],
+    )
+    .unwrap();
+    let copy_inst = updated
+        .instances
+        .iter_mut()
+        .find(|i| i.parent_index == Some(copy_root) && i.name == "Mod")
+        .unwrap();
+    copy_inst.properties.insert(
+        "UniqueId".into(),
+        json!({"_type": "UniqueId", "value": "copy-uid"}),
+    );
+    copy_inst
+        .properties
+        .insert("ScriptGuid".into(), json!("{copy-guid}"));
+    updated.write_file(&store).unwrap();
+    set_path_readonly(&copy_mod, false).unwrap();
+    fs::write(&copy_mod, "return 'tampered'\n").unwrap();
+    let mut force_args = test_link_apply_args(&dir);
+    force_args.force_targets = true;
+    link_apply(force_args).unwrap();
+    let restored = SettingsBytecode::read_file(&store).unwrap();
+    let copy_root = resolve_editor_instance_by_path_ordinals(
+        &restored,
+        "ReplicatedStorage",
+        &["CopyPkg".into()],
+        &[1],
+    )
+    .unwrap();
+    let copy_inst = restored
+        .instances
+        .iter()
+        .find(|i| i.parent_index == Some(copy_root) && i.name == "Mod")
+        .unwrap();
+    assert_eq!(
+        copy_inst.properties.get("UniqueId"),
+        Some(&json!({"_type": "UniqueId", "value": "copy-uid"}))
+    );
+    assert_eq!(
+        copy_inst.properties.get("ScriptGuid"),
+        Some(&json!("{copy-guid}"))
+    );
+    assert_eq!(fs::read_to_string(&copy_mod).unwrap(), "return 'v1'\n");
+    assert!(fs::metadata(&copy_mod).unwrap().permissions().readonly());
+    set_path_readonly(&src_mod, false).unwrap();
+    set_path_readonly(&copy_mod, false).unwrap();
     fs::remove_dir_all(dir).unwrap();
 }
