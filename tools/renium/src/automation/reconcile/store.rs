@@ -398,12 +398,15 @@ impl StoredEntry {
     }
 }
 
+const LARGE_PACK_FILE_BYTES: usize = 256 * 1024;
+
 fn store_entries<'a>(
     directory: &Path,
     entries: impl Iterator<Item = (&'a PathBuf, &'a SnapshotEntry)>,
 ) -> Result<BTreeMap<PathBuf, StoredEntry>> {
     use rayon::prelude::*;
-    let mut files = Vec::new();
+    let mut small = Vec::new();
+    let mut large = Vec::new();
     let mut stored = BTreeMap::new();
     for (path, entry) in entries {
         match entry {
@@ -419,48 +422,98 @@ fn store_entries<'a>(
                     },
                 );
             }
-            SnapshotEntry::File(bytes) => files.push((path, bytes.as_slice())),
+            SnapshotEntry::File(bytes) => {
+                let slice = bytes.as_slice();
+                if slice.len() >= LARGE_PACK_FILE_BYTES {
+                    large.push((path, slice));
+                } else {
+                    small.push((path, slice));
+                }
+            }
         }
     }
-    if files.is_empty() {
+    if small.is_empty() && large.is_empty() {
         return Ok(stored);
     }
-    // The pack holds the files one after another and is named by its
-    // digest, taken beside the digest of each file.
-    let (name, digests) = rayon::join(
+    let ((small_pack, small_digests), large_digests) = rayon::join(
         || {
-            let mut pack = Sha256::new();
-            for (_, bytes) in &files {
-                pack.update(bytes);
+            if small.is_empty() {
+                return (None, Vec::new());
             }
-            format!("{:x}", pack.finalize())
+            let (name, digests) = rayon::join(
+                || {
+                    let mut pack = Sha256::new();
+                    for (_, bytes) in &small {
+                        pack.update(bytes);
+                    }
+                    format!("{:x}", pack.finalize())
+                },
+                || {
+                    (small.par_iter())
+                        .map(|(_, bytes)| <[u8; 32]>::from(Sha256::digest(bytes)))
+                        .collect::<Vec<_>>()
+                },
+            );
+            (Some(name), digests)
         },
         || {
-            (files.par_iter())
-                .map(|(_, bytes)| <[u8; 32]>::from(Sha256::digest(bytes)))
+            (large.par_iter())
+                .map(|(_, bytes)| {
+                    let hash = Sha256::digest(bytes);
+                    (<[u8; 32]>::from(hash), format!("{hash:x}"))
+                })
                 .collect::<Vec<_>>()
         },
     );
-    let path = directory.join(format!("{name}.bin"));
-    let pack_len = files.iter().map(|(_, bytes)| bytes.len()).sum::<usize>();
-    let pack_len = u64::try_from(pack_len).context("Reconciliation pack is too large")?;
-    if fs::metadata(&path).map_or(true, |metadata| metadata.len() != pack_len) {
-        atomic_write_parts(&path, files.iter().map(|(_, bytes)| *bytes))?;
+    if let Some(name) = small_pack {
+        let path = directory.join(format!("{name}.bin"));
+        let pack_len = small.iter().map(|(_, bytes)| bytes.len()).sum::<usize>();
+        let pack_len = u64::try_from(pack_len).context("Reconciliation pack is too large")?;
+        if fs::metadata(&path).map_or(true, |metadata| metadata.len() != pack_len) {
+            atomic_write_parts(&path, small.iter().map(|(_, bytes)| *bytes))?;
+        }
+        let mut offset = 0;
+        for ((path, bytes), digest) in small.into_iter().zip(small_digests) {
+            let length = u64::try_from(bytes.len()).context("Reconciliation file is too large")?;
+            stored.insert(
+                path.clone(),
+                StoredEntry::File(StoredFile {
+                    pack: name.clone(),
+                    offset,
+                    length,
+                    digest,
+                }),
+            );
+            offset += length;
+        }
     }
-    let mut offset = 0;
-    for ((path, bytes), digest) in files.into_iter().zip(digests) {
+    let mut unique_large: HashMap<[u8; 32], (&str, &[u8], u64)> = HashMap::new();
+    for ((entry_path, bytes), (digest, name)) in large.iter().zip(large_digests.iter()) {
         let length = u64::try_from(bytes.len()).context("Reconciliation file is too large")?;
+        unique_large
+            .entry(*digest)
+            .or_insert((name.as_str(), *bytes, length));
         stored.insert(
-            path.clone(),
+            (*entry_path).clone(),
             StoredEntry::File(StoredFile {
                 pack: name.clone(),
-                offset,
+                offset: 0,
                 length,
-                digest,
+                digest: *digest,
             }),
         );
-        offset += length;
     }
+    unique_large
+        .into_values()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .try_for_each(|(name, bytes, length)| -> Result<()> {
+            let pack_path = directory.join(format!("{name}.bin"));
+            if fs::metadata(&pack_path).map_or(true, |metadata| metadata.len() != length) {
+                atomic_write_parts(&pack_path, std::iter::once(bytes))?;
+            }
+            Ok(())
+        })?;
     Ok(stored)
 }
 
@@ -752,6 +805,127 @@ mod tests {
             assert!(error.contains("conflicting old and new stores"), "{error}");
         }
         assert!(migrate(link("a", false), link("a", false)).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn large_and_legacy_single_pack_layouts_are_mutually_readable() -> Result<()> {
+        let root = temp_dir("reconcile-store-pack-compat");
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let large_a = vec![b'A'; LARGE_PACK_FILE_BYTES + 123];
+        let large_b = vec![b'B'; LARGE_PACK_FILE_BYTES + 456];
+        let small = b"return 'small'".to_vec();
+        let expected = ProjectSnapshot {
+            entries: BTreeMap::from([
+                (PathBuf::from("src"), SnapshotEntry::Directory),
+                (
+                    PathBuf::from("src/Small.luau"),
+                    SnapshotEntry::File(small.clone()),
+                ),
+                (
+                    PathBuf::from("instances/Workspace.renium"),
+                    SnapshotEntry::File(large_a.clone()),
+                ),
+                (
+                    PathBuf::from("instances/ServerStorage.renium"),
+                    SnapshotEntry::File(large_b.clone()),
+                ),
+            ]),
+        };
+
+        let legacy_dir = pack_directory(&root, "legacy");
+        let combined = [large_a.as_slice(), large_b.as_slice(), small.as_slice()].concat();
+        let combined_pack = sha256_hex(&combined);
+        atomic_write_parts(
+            &legacy_dir.join(format!("{combined_pack}.bin")),
+            std::iter::once(combined.as_slice()),
+        )?;
+        let file_entry = |offset: usize, bytes: &[u8]| {
+            serde_json::json!({
+                "File": {
+                    "pack": combined_pack,
+                    "offset": offset,
+                    "length": bytes.len(),
+                    "digest": <[u8; 32]>::from(Sha256::digest(bytes)),
+                }
+            })
+        };
+        let legacy_stored: StoredSnapshot = serde_json::from_value(serde_json::json!({
+            "entries": {
+                "src": "Directory",
+                "instances/Workspace.renium": file_entry(0, &large_a),
+                "instances/ServerStorage.renium": file_entry(large_a.len(), &large_b),
+                "src/Small.luau": file_entry(large_a.len() + large_b.len(), &small),
+            }
+        }))?;
+        assert!(legacy_stored.packs_present(&root, "legacy") && legacy_stored.matches(&expected));
+        assert!(legacy_stored.load(&root, "legacy")? == expected);
+
+        let mut stored = StoredSnapshot::write(&root, "new", &expected)?;
+        let roundtripped: StoredSnapshot = serde_json::from_slice(&serde_json::to_vec(&stored)?)?;
+        let new_dir = pack_directory(&root, "new");
+        let pack_files: HashSet<String> = fs::read_dir(&new_dir)?
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(pack_files.len(), 3);
+        for (rel, bytes) in [
+            ("instances/Workspace.renium", &large_a),
+            ("instances/ServerStorage.renium", &large_b),
+        ] {
+            let StoredEntry::File(f) = &roundtripped.entries[Path::new(rel)] else {
+                panic!("{rel}")
+            };
+            assert_eq!((f.offset, f.pack.as_str()), (0, sha256_hex(bytes).as_str()));
+            assert!(pack_files.contains(&format!("{}.bin", f.pack)));
+        }
+        assert!(roundtripped.packs_present(&root, "new"));
+        assert!(roundtripped.load_at(&new_dir, |_| true)? == expected);
+
+        let updated_a = vec![b'C'; LARGE_PACK_FILE_BYTES + 123];
+        let scope = PathBuf::from("instances/Workspace.renium");
+        let delta = ProjectSnapshot {
+            entries: BTreeMap::from([(scope.clone(), SnapshotEntry::File(updated_a.clone()))]),
+        };
+        stored.replace_scopes(&root, "new", &[scope], &delta)?;
+        stored.prune(&root, "new")?;
+        let mut after = expected;
+        after.entries.insert(
+            PathBuf::from("instances/Workspace.renium"),
+            SnapshotEntry::File(updated_a),
+        );
+        assert!(stored.load(&root, "new")? == after && fs::read_dir(&new_dir)?.count() == 3);
+        Ok(())
+    }
+
+    #[test]
+    fn identical_large_files_dedupe_pack_writes_and_round_trip() -> Result<()> {
+        let root = temp_dir("reconcile-store-large-dedupe");
+        let _cleanup = crate::system::files::OnDrop::new(|| {
+            let _ = fs::remove_dir_all(&root);
+        });
+        let duplicate = vec![b'X'; LARGE_PACK_FILE_BYTES + 257];
+        let expected = ProjectSnapshot {
+            entries: BTreeMap::from([
+                (
+                    PathBuf::from("instances/Workspace.renium"),
+                    SnapshotEntry::File(duplicate.clone()),
+                ),
+                (
+                    PathBuf::from("instances/ServerStorage.renium"),
+                    SnapshotEntry::File(duplicate.clone()),
+                ),
+                (
+                    PathBuf::from("instances/ReplicatedStorage.renium"),
+                    SnapshotEntry::File(duplicate.clone()),
+                ),
+            ]),
+        };
+        let stored = StoredSnapshot::write(&root, "dedupe", &expected)?;
+        assert_eq!(fs::read_dir(pack_directory(&root, "dedupe"))?.count(), 1);
+        assert!(stored.packs_present(&root, "dedupe"));
+        assert!(stored.load(&root, "dedupe")? == expected);
         Ok(())
     }
 }
