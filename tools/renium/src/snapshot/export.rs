@@ -2205,9 +2205,29 @@ fn copy_isolated_file(source: &Path, destination: &Path) -> Result<()> {
     if clone_file(source, destination) {
         return Ok(());
     }
-    fs::copy(source, destination)
-        .with_context(|| format!("Failed to stage {}", source.display()))?;
-    Ok(())
+    copy_file_contents(source, destination)
+        .with_context(|| format!("Failed to stage {}", source.display()))
+}
+
+/// `fs::copy` opens its source without write sharing on Windows, so a save
+/// that lands while a background stage copy reads the file would fail. This
+/// copy lets the writer in: publication compares the project with the
+/// baseline taken before the copy and refuses when the file changed.
+#[cfg(windows)]
+fn copy_file_contents(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let input = fs::File::open(source)?;
+    let modified = input.metadata()?.modified()?;
+    let mut output = fs::File::create(destination)?;
+    std::io::copy(
+        &mut std::io::BufReader::with_capacity(1 << 20, input),
+        &mut output,
+    )?;
+    output.set_modified(modified)
+}
+
+#[cfg(not(windows))]
+fn copy_file_contents(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::copy(source, destination).map(drop)
 }
 
 #[cfg(target_os = "macos")]
@@ -5052,5 +5072,53 @@ mod publication_tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn background_stage_copy_does_not_block_concurrent_writer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut fixture = Fixture::new();
+        drop(fixture.stage.take());
+        let service_dir = fixture.root.join("src/ServerStorage");
+        fs::create_dir_all(&service_dir).unwrap();
+        let store_path = crate::system::files::service_settings_path(&service_dir);
+        fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        let payload = vec![0x5Au8; 8 * 1024 * 1024];
+        fs::write(&store_path, &payload).unwrap();
+        let rel_store = store_path
+            .strip_prefix(&fixture.root)
+            .unwrap()
+            .to_path_buf();
+
+        let stage = ExportProjectStage::create_with_background_copy(
+            &fixture.root,
+            Path::new("src"),
+            &["ServerStorage".to_string()],
+        )
+        .unwrap();
+        let gate = stage
+            .copy_gate()
+            .expect("background stage copy must run asynchronously");
+        let done = Arc::new(AtomicBool::new(false));
+        let done_signal = Arc::clone(&done);
+        let waiter = std::thread::spawn(move || {
+            let outcome = gate();
+            done_signal.store(true, Ordering::Release);
+            outcome
+        });
+        while !done.load(Ordering::Acquire) {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&store_path)
+                .expect("background stage copy must not reject concurrent writers");
+        }
+        waiter.join().unwrap().unwrap();
+        let staged = stage.project_root.join(&rel_store);
+        assert_eq!(fs::read(&staged).unwrap(), payload);
+        assert_eq!(
+            fs::metadata(&staged).unwrap().modified().unwrap(),
+            fs::metadata(&store_path).unwrap().modified().unwrap()
+        );
     }
 }
