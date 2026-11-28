@@ -2058,7 +2058,7 @@ impl ScopedPull {
 
 #[cfg(any(windows, target_os = "macos"))]
 #[path = "instance_pull.rs"]
-mod instance_pull;
+pub(super) mod instance_pull;
 #[cfg(all(test, any(windows, target_os = "macos")))]
 pub(crate) use instance_pull::*;
 

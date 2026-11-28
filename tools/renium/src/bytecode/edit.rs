@@ -297,6 +297,7 @@ pub(crate) fn bytecode_add_instance(args: BytecodeAddInstanceArgs) -> Result<()>
             &attribute_names,
             PushedScope::Subtree,
             false,
+            None,
         )?;
     }
     print_json_output(&result, args.pretty)
@@ -322,23 +323,6 @@ pub(crate) fn push_stored_instance_reading(
     attributes: &[String],
     scope: PushedScope,
     slow_import: bool,
-) -> Result<()> {
-    push_stored_instance_reading_with_previous(
-        result,
-        properties,
-        attributes,
-        scope,
-        slow_import,
-        None,
-    )
-}
-
-pub(crate) fn push_stored_instance_reading_with_previous(
-    result: &mut Value,
-    properties: &[String],
-    attributes: &[String],
-    scope: PushedScope,
-    slow_import: bool,
     previous_path: Option<EditorInstancePath>,
 ) -> Result<()> {
     let settings_file = result
@@ -359,7 +343,7 @@ pub(crate) fn push_stored_instance_reading_with_previous(
             )])
         })
         .unwrap_or_default();
-    result["push"] = push_stored_instances_with_previous(
+    result["push"] = push_stored_instances(
         settings_file.clone(),
         vec![settings_id.clone()],
         scope,
@@ -615,21 +599,6 @@ pub(crate) fn read_back_many_from_studio(
 /// One scoped push of the given instances of one store, without a review;
 /// the summary is the push result.
 pub(crate) fn push_stored_instances(
-    settings_file: PathBuf,
-    settings_ids: Vec<String>,
-    scope: PushedScope,
-    slow_import: bool,
-) -> Result<Value> {
-    push_stored_instances_with_previous(
-        settings_file,
-        settings_ids,
-        scope,
-        slow_import,
-        HashMap::new(),
-    )
-}
-
-pub(crate) fn push_stored_instances_with_previous(
     settings_file: PathBuf,
     settings_ids: Vec<String>,
     scope: PushedScope,

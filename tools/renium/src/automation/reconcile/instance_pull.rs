@@ -800,13 +800,13 @@ fn capture_touched_instances(
 /// The instances of one root's capture, breadth first, each with its parent
 /// among them.
 #[cfg(windows)]
-type CapturedSubtree = Vec<(rbx_binary::FlatInstance, Option<usize>)>;
+pub(crate) type CapturedSubtree = Vec<(rbx_binary::FlatInstance, Option<usize>)>;
 
 /// The subtree each root of a native capture stands at the top of: the bytes
 /// decoded as a capture of a service decodes them, each root told by its
 /// UniqueId.
 #[cfg(windows)]
-fn captured_subtrees(
+pub(crate) fn captured_subtrees(
     capture: crate::studio::native::serializer::NativeCapture,
     roots: usize,
 ) -> Result<Vec<CapturedSubtree>> {
@@ -892,7 +892,7 @@ fn captured_subtrees(
 /// The captured instances of one store as a capture of its service converts
 /// them, each class by its conversion in `conversions`.
 #[cfg(windows)]
-fn captured_instances(
+pub(crate) fn captured_instances(
     service: &str,
     subtree: &[(rbx_binary::FlatInstance, Option<usize>)],
     conversions: &HashMap<String, ClassConversion>,

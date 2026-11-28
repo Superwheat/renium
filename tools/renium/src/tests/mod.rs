@@ -2743,7 +2743,8 @@ fn pushes_of_store_edits_decode_no_store_whole() {
     moved("filler-0", "Workspace", Some("model")).unwrap();
     moved("filler-1", "ReplicatedStorage", None).unwrap();
     let mut edited = json!({"settingsFile": store, "settingsId": "inner"});
-    push_stored_instance_reading(&mut edited, &[], &[], PushedScope::Instance, false).unwrap();
+    push_stored_instance_reading(&mut edited, &[], &[], PushedScope::Instance, false, None)
+        .unwrap();
     let pushed = stored_instances_push(store.clone(), vec!["inner".into()], PushedScope::Instance);
     crate::daemon::TEST_DAEMON.set(None);
 

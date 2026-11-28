@@ -485,6 +485,7 @@ pub(crate) fn clone_instance_command(
             &[],
             crate::bytecode::edit::PushedScope::Subtree,
             false,
+            None,
         )?;
     }
     crate::app::output::print_json_output(&result, false)
@@ -624,6 +625,7 @@ fn move_between_stores(
             &[],
             crate::bytecode::edit::PushedScope::Subtree,
             false,
+            None,
         )?;
     }
     crate::app::output::print_json_output(&result, false)
@@ -645,18 +647,19 @@ fn move_within_store(args: BytecodeSetPropertyArgs, push: bool) -> Result<()> {
         .transpose()?;
     let mut result = crate::bytecode::bytecode_set_property_result(args)?;
     if push {
-        let previous_path =
+        let move_state =
             if let (Some(before), Some(settings_id)) = (&before, settings_id.as_deref()) {
                 let after = SettingsBytecode::read_structure_file(&settings_file)?;
                 moved_previous_path(&settings_file, before, &after, settings_id)
             } else {
                 None
             };
+        let previous_path = move_state.as_ref().and_then(Clone::clone);
         if result.get("settingsId").is_none() {
             result["settingsId"] = json!(settings_id);
         }
         result["settingsFile"] = json!(settings_file);
-        crate::bytecode::edit::push_stored_instance_reading_with_previous(
+        crate::bytecode::edit::push_stored_instance_reading(
             &mut result,
             &[],
             &[],
@@ -664,6 +667,13 @@ fn move_within_store(args: BytecodeSetPropertyArgs, push: bool) -> Result<()> {
             false,
             previous_path,
         )?;
+        if let Some(moved) = move_state {
+            result["reparented"] = json!(if moved.is_some() {
+                "moved"
+            } else {
+                "unchanged"
+            });
+        }
     }
     crate::app::output::print_json_output(&result, false)
 }
@@ -683,7 +693,7 @@ fn moved_previous_path(
     before: &SettingsBytecode,
     after: &SettingsBytecode,
     settings_id: &str,
-) -> Option<EditorInstancePath> {
+) -> Option<Option<EditorInstancePath>> {
     let parent_id = |document: &SettingsBytecode| {
         let instance = document
             .instances
@@ -701,10 +711,10 @@ fn moved_previous_path(
         return None;
     };
     if old_parent == new_parent {
-        return None;
+        return Some(None);
     }
     let service = crate::bytecode::edit::bytecode_service_name(before, settings_file, "");
-    stored_instance_path(before, &service, settings_id)
+    stored_instance_path(before, &service, settings_id).map(Some)
 }
 
 /// Runs the reparent chunk in the open place and returns what it reports.

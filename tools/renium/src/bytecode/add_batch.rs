@@ -285,6 +285,7 @@ pub(crate) fn bytecode_add_batch(
                 store.settings_ids,
                 crate::bytecode::edit::PushedScope::Subtree,
                 false,
+                HashMap::new(),
             )?;
             verified &= ["verified", "unchanged"]
                 .iter()

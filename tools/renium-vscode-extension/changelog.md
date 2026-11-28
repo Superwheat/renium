@@ -46,6 +46,7 @@
 - A `hint:` line now and then tells a caller what costs it tokens: a chunk sent whole for the third time with only its strings and numbers changed (keep it in a file, send the values), and runs whose own text is full of unrounded numbers (return the values). In measured agent sessions half of all Luau tokens were such resent chunks.
 - The update check, the installers, the bug report link, the project schema URLs and the documentation point at `Superwheat/renium`, where the repository is again.
 - Recordings on Windows are encoded by the system's H.264 encoder (the graphics card's when it has one), and hold the frame rate asked for at full window size: a 2560x1350 Studio window recorded at 60 FPS came out at 60.1 FPS with 59 to 61 frames in every second, where the built-in encoder reached 19 to 40. The built-in encoder remains the fallback and the answer names the one used (`encoder`). When the recorded Studio was in the background and not unlocked, the answer says so and names `rbx fps unlock`, because such a window renders one frame in four. A recording's colors are now tagged as BT.601, which is what they are; they were tagged BT.709 full range, so players showed them slightly off.
+- A pull right after a push that added an instance at a service root or moved one to another service takes 1.7 to 1.9 seconds on a 202,000-instance place, where it took 2.6 to 3.0, and peaks at 1.3 to 1.4 GB instead of 1.5: the push now reads back and verifies only what it added.
 
 ### Bug fixes
 

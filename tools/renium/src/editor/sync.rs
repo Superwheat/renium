@@ -4729,6 +4729,7 @@ fn push_with_reader_platform(
             let mut logged_summary = summary.clone();
             logged_summary.remove("_bulkOldValueColumns");
             logged_summary.remove("_beforeTerrainGrids");
+            logged_summary.remove("_additiveNativeRoots");
             log_global(
                 5,
                 format_args!(

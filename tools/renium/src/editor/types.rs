@@ -1014,6 +1014,18 @@ pub(crate) struct EditorNativeReplacement {
     pub(crate) plan: EditorNativePlan,
     #[serde(skip)]
     pub(crate) batches: Vec<EditorNativeBatch>,
+    #[serde(skip)]
+    pub(crate) additive_roots: Vec<EditorAdditiveRootReceipt>,
+}
+
+#[derive(Clone)]
+pub(crate) struct EditorAdditiveRootReceipt {
+    pub(crate) service: String,
+    pub(crate) path_segments: Vec<String>,
+    pub(crate) path_ordinals: Vec<usize>,
+    pub(crate) settings_id: String,
+    pub(crate) class_index: u32,
+    pub(crate) ordinal: u32,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]

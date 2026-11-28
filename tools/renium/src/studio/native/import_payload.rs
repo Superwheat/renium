@@ -5,8 +5,8 @@ use crate::editor::review::{
     is_engine_managed_editor_property, is_externally_managed_editor_property,
 };
 use crate::editor::types::{
-    EditorNativeAlias, EditorNativeBatch, EditorNativeBinding, EditorNativeClass, EditorNativePlan,
-    EditorNativeReplacement, PendingNativeImportEncode,
+    EditorAdditiveRootReceipt, EditorNativeAlias, EditorNativeBatch, EditorNativeBinding,
+    EditorNativeClass, EditorNativePlan, EditorNativeReplacement, PendingNativeImportEncode,
 };
 use crate::rbx::encode::rbx_logical_property_name;
 use ahash::{AHashMap, AHashSet};
@@ -291,6 +291,46 @@ fn native_import_parallel_metadata_preserves_service_order_and_identity_scopes()
 }
 
 #[test]
+fn native_import_records_additive_root_class_and_ordinal_for_non_bound_roots() -> Result<()> {
+    let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
+    let workspace = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
+    let added = dom.insert(
+        workspace,
+        RbxInstanceBuilder::new("Folder").with_name("PullTarget"),
+    );
+    let child = dom.insert(added, RbxInstanceBuilder::new("Folder").with_name("Nested"));
+    let ids = HashMap::from([
+        (added, "editor:pull-target".to_string()),
+        (child, "editor:nested".to_string()),
+    ]);
+    let services = vec![("Workspace".to_string(), workspace)];
+    let mut groups = pending_editor_binary_groups(&dom, &services)?;
+    groups[0].additive = true;
+    groups[0].roots = vec![added];
+    groups[0].root_settings_ids = vec!["editor:pull-target".to_string()];
+    let plans = vec![EditorPackageGroupPlan {
+        retained_roots: Vec::new(),
+        package_roots: Vec::new(),
+        mutation_package_roots: Vec::new(),
+        change_generation: None,
+    }];
+    let (_, pending) = encode_services(dom, services, &ids, groups, plans, &mut HashMap::new())?;
+    let (_, replacement, _) = pending.finish()?;
+    assert_eq!(replacement.additive_roots.len(), 1);
+    let root = &replacement.additive_roots[0];
+    assert_eq!(root.service, "Workspace");
+    assert_eq!(root.settings_id, "editor:pull-target");
+    assert_eq!(root.path_segments, ["Workspace", "PullTarget"]);
+    assert_eq!(root.path_ordinals, [1, 1]);
+    assert_eq!(
+        replacement.plan.classes[root.class_index as usize].name,
+        "Folder"
+    );
+    assert!(root.ordinal < replacement.plan.classes[root.class_index as usize].count);
+    Ok(())
+}
+
+#[test]
 fn import_identity_tree_covers_a_subtree_across_native_batches() -> Result<()> {
     let mut dom = RbxWeakDom::new(RbxInstanceBuilder::new("DataModel"));
     let service = dom.insert(dom.root_ref(), RbxInstanceBuilder::new("Workspace"));
@@ -546,6 +586,14 @@ pub(super) fn encode_services(
     filter_retained_properties(&mut dom, &requested, post_apply, database)?;
     drop(trim_profile);
     let groups_profile = crate::app::profile::span("native encode group paths and identity rows");
+    let mut additive_root_refs = HashMap::new();
+    for group in &groups {
+        if group.additive && group.roots.len() == group.root_settings_ids.len() {
+            for (referent, settings_id) in group.roots.iter().zip(&group.root_settings_ids) {
+                additive_root_refs.insert(*referent, (group.service.clone(), settings_id.clone()));
+            }
+        }
+    }
     let built_groups = groups
         .into_par_iter()
         .zip(package_plans)
@@ -771,6 +819,7 @@ pub(super) fn encode_services(
     let state = PayloadEncodeState {
         dom,
         requested,
+        additive_root_refs,
         single_batch,
         partitions,
         primary,
@@ -791,6 +840,7 @@ pub(super) fn encode_services(
 struct PayloadEncodeState {
     dom: RbxWeakDom,
     requested: HashMap<RbxRef, InstanceBindingMode>,
+    additive_root_refs: HashMap<RbxRef, (String, String)>,
     single_batch: bool,
     partitions: Vec<Vec<RbxRef>>,
     primary: AHashMap<RbxRef, usize>,
@@ -808,6 +858,7 @@ fn encode_services_payload(
     let PayloadEncodeState {
         dom,
         requested,
+        additive_root_refs,
         single_batch,
         partitions,
         primary,
@@ -939,7 +990,40 @@ fn encode_services_payload(
                 }
             }
             classes.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-            Ok((bytes, receipts, classes))
+            let mut batch_additive = Vec::new();
+            if !additive_root_refs.is_empty() {
+                let mut inst_chunks: Vec<((rbx_dom_weak::Ustr, bool), Vec<RbxRef>)> = Vec::new();
+                let mut chunk_pos: AHashMap<(rbx_dom_weak::Ustr, bool), usize> = AHashMap::new();
+                for &referent in members {
+                    let instance = dom.get_by_ref(referent).unwrap();
+                    let is_ref_only =
+                        bindings.get(&referent) == Some(&InstanceBindingMode::ReferenceOnly);
+                    let key = (instance.class, is_ref_only);
+                    let pos = *chunk_pos.entry(key).or_insert_with(|| {
+                        inst_chunks.push((key, Vec::new()));
+                        inst_chunks.len() - 1
+                    });
+                    inst_chunks[pos].1.push(referent);
+                }
+                let mut class_ordinals = AHashMap::<rbx_dom_weak::Ustr, u32>::new();
+                for ((class, is_ref_only), refs) in inst_chunks {
+                    let base = class_ordinals.entry(class).or_default();
+                    let len = refs.len() as u32;
+                    if !is_ref_only {
+                        for (i, referent) in refs.into_iter().enumerate() {
+                            if additive_root_refs.contains_key(&referent) {
+                                batch_additive.push((
+                                    referent,
+                                    class.to_string(),
+                                    *base + i as u32,
+                                ));
+                            }
+                        }
+                    }
+                    *base += len;
+                }
+            }
+            Ok((bytes, receipts, classes, batch_additive))
         })
         .collect::<Result<Vec<_>>>()?;
     drop(workers_profile);
@@ -951,7 +1035,7 @@ fn encode_services_payload(
         crate::app::profile::span("native encode join payloads, identities and receipt plans");
     let combine_classes = crate::app::profile::span("native encode merge class counts");
     let mut counts = std::collections::BTreeMap::<String, (u32, bool)>::new();
-    for (_, _, classes) in &encoded {
+    for (_, _, classes, _) in &encoded {
         for class in classes {
             let entry = counts.entry(class.name.clone()).or_insert((0, true));
             entry.0 += class.count;
@@ -986,10 +1070,11 @@ fn encode_services_payload(
     let mut bytes = if encoded.len() == 1 {
         Vec::new()
     } else {
-        Vec::with_capacity(encoded.iter().map(|(bytes, _, _)| bytes.len()).sum())
+        Vec::with_capacity(encoded.iter().map(|(bytes, _, _, _)| bytes.len()).sum())
     };
     let mut batches = Vec::with_capacity(encoded.len());
     let mut bindings = Vec::new();
+    let mut additive_roots = Vec::with_capacity(additive_root_refs.len());
     let mut aliases = Vec::new();
     let mut first_ordinals = HashMap::new();
     let mut referent_offset = 0;
@@ -1000,7 +1085,7 @@ fn encode_services_payload(
     let combine_payloads =
         crate::app::profile::span("native encode concatenate payloads and bind receipts");
     let reuse_single = encoded.len() == 1;
-    for (payload, receipts, batch_classes) in encoded {
+    for (payload, receipts, batch_classes, batch_additive) in encoded {
         let start = bytes.len();
         let instance_count = i32::try_from(u32::from_le_bytes(payload[20..24].try_into()?))?;
         if reuse_single {
@@ -1037,6 +1122,22 @@ fn encode_services_payload(
                 }
             }
         }
+        for (referent, class_name, batch_ordinal) in batch_additive {
+            if let Some((service, settings_id)) = additive_root_refs.get(&referent)
+                && let Some(&index) = class_indices.get(class_name.as_str())
+            {
+                let ordinal = batch_ordinal + offsets[index];
+                let (path_segments, path_ordinals) = paths.parts(referent);
+                additive_roots.push(EditorAdditiveRootReceipt {
+                    service: service.clone(),
+                    path_segments,
+                    path_ordinals,
+                    settings_id: settings_id.clone(),
+                    class_index: index as u32,
+                    ordinal,
+                });
+            }
+        }
         for class in &batch_classes {
             offsets[class_indices[class.name.as_str()]] += class.count;
         }
@@ -1066,6 +1167,7 @@ fn encode_services_payload(
                 aliases,
             },
             batches,
+            additive_roots,
         },
         instance_count,
     ))

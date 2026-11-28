@@ -435,6 +435,26 @@ pub(crate) fn build_service_sourcemap_from_state_with_files(
     )
 }
 
+pub(crate) fn build_service_sourcemap_from_settings_with_files(
+    document: &SettingsBytecode,
+    service: &str,
+    project_root: &Path,
+    service_dir: &Path,
+    known_files: &std::collections::HashSet<PathBuf>,
+) -> Result<SourcemapNode> {
+    let root_index = editor_service_root_index(document, service)
+        .with_context(|| format!("{service} settings have no service root"))?;
+    let children_by_parent = settings_children_by_parent(document);
+    Ok(build_full_service_sourcemap(
+        &document.instances,
+        &children_by_parent,
+        root_index,
+        project_root,
+        service_dir,
+        Some(known_files),
+    ))
+}
+
 fn build_service_sourcemap_from_settings(
     document: &SettingsBytecode,
     service: &str,

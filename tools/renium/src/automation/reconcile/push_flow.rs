@@ -2812,6 +2812,11 @@ pub(crate) fn push_project(
             reason,
         )?;
     }
+    let additive_native_roots: Vec<import_settle::AdditiveSettleRoot> = pushed
+        .summary
+        .remove("_additiveNativeRoots")
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
     if push_applied_nothing(&pushed.summary) {
         // Studio holds or skipped the whole push, so there is nothing to
         // record or read back; the summary carries the hold and its next step.
@@ -2970,11 +2975,38 @@ pub(crate) fn push_project(
             &pushed.summary,
         )?
     {
+        let field_verified_services: HashSet<String> = pushed
+            .summary
+            .get("fieldVerifiedServices")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect();
+        let additive_scope = (added_roots
+            && !settle_native_import
+            && !generated_files
+            && link_enforcement.is_none()
+            && narrow_from_pull.is_some()
+            && pending_fields.is_empty()
+            && !summary_has_pending_or_unsupported(&pushed.summary)
+            && pushed
+                .summary
+                .get("sourceVerifyFailed")
+                .and_then(Value::as_u64)
+                == Some(0)
+            && !additive_native_roots.is_empty())
+        .then_some(import_settle::AdditiveSettleScope {
+            roots: &additive_native_roots,
+            field_verified: &field_verified_services,
+        });
         let narrowed = (settled.len() < services.len()).then(|| import_settle::Narrowed {
             services: &settled,
             sourcemap: narrowable
                 .filter(|_| settle_native_import || narrow_from_pull.is_some())
                 .map(|((sourcemap, _), _)| &**sourcemap),
+            additive: additive_scope,
         });
         let mut expected = project;
         expected.entries.extend(pushed.generated.entries);

@@ -5032,10 +5032,23 @@ fn send_editor_service_replacement(
         // The helper's fixed-width ABI is not the bridge's wire format. Keep
         // exact identities/ordinals, without transporting 48-byte padded strings.
         let mut chunks = vec![Vec::new()];
+        let track_additive = !plan.additive_roots.is_empty()
+            && engine_removed.is_empty()
+            && engine_created.is_empty()
+            && import.groups.iter().all(|group| group.additive);
+        let mut additive_debug_ids: HashMap<(u32, u32), String> = if track_additive {
+            plan.additive_roots
+                .iter()
+                .map(|root| ((root.class_index, root.ordinal), String::new()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         for row in created.chunks_exact(serializer::CREATED_ROW) {
-            let class = u32::from_le_bytes(row[..4].try_into()?);
+            let class_u32 = u32::from_le_bytes(row[..4].try_into()?);
+            let ordinal_u32 = u32::from_le_bytes(row[4..8].try_into()?);
             let class =
-                u16::try_from(class).context("Native receipt class exceeds its wire limit")?;
+                u16::try_from(class_u32).context("Native receipt class exceeds its wire limit")?;
             let length = row[8..]
                 .iter()
                 .position(|byte| *byte == 0)
@@ -5044,6 +5057,12 @@ fn send_editor_service_replacement(
                 length > 0 && length < 48,
                 "Native receipt identity is empty or oversized"
             );
+            if track_additive
+                && let Some(slot) = additive_debug_ids.get_mut(&(class_u32, ordinal_u32))
+                && let Ok(text) = std::str::from_utf8(&row[8..8 + length])
+            {
+                *slot = text.to_string();
+            }
             if chunks.last().unwrap().len() + 7 + length > 2 * 1024 * 1024 {
                 chunks.push(Vec::new());
             }
@@ -5129,7 +5148,7 @@ fn send_editor_service_replacement(
         }
         let response = bridge.call("finishEditorBinaryImport", finish_params);
         log_timing("native import complete", import_step_started);
-        let response = response?;
+        let mut response = response?;
         if let Some(timings) = response.get("nativeCompleteTimings") {
             crate::app::output::log_global(
                 5,
@@ -5143,6 +5162,29 @@ fn send_editor_service_replacement(
                     == Some((created.len() / serializer::CREATED_ROW) as u64),
             "Studio did not confirm the native replacement: {response}"
         );
+        if track_additive
+            && plan.additive_roots.iter().all(|root| {
+                additive_debug_ids
+                    .get(&(root.class_index, root.ordinal))
+                    .is_some_and(|id| !id.is_empty())
+            })
+            && let Some(object) = response.as_object_mut()
+        {
+            let roots = plan
+                .additive_roots
+                .iter()
+                .map(|root| {
+                    json!({
+                        "service": root.service,
+                        "pathSegments": root.path_segments,
+                        "pathOrdinals": root.path_ordinals,
+                        "settingsId": root.settings_id,
+                        "debugId": additive_debug_ids[&(root.class_index, root.ordinal)],
+                    })
+                })
+                .collect::<Vec<_>>();
+            object.insert("_additiveNativeRoots".to_string(), Value::Array(roots));
+        }
         Ok(response)
     })();
     if result.is_err() && !invoked {
@@ -5583,6 +5625,7 @@ pub(crate) fn send_editor_change_batches_with_options(
             },
         )?;
         inline_verify_rows_kept = inline_verify_rows;
+        let mut additive_native_roots = None;
         if let Some(object) = response.as_object_mut() {
             inline_property_summary = object
                 .remove("postImportPropertySummary")
@@ -5596,9 +5639,15 @@ pub(crate) fn send_editor_change_batches_with_options(
             inline_post_import_sources = object
                 .remove("postImportSources")
                 .filter(|value| !value.is_null());
+            additive_native_roots = object
+                .remove("_additiveNativeRoots")
+                .filter(|value| !value.is_null());
         }
         payload_verified_services = verified_payload_services(binary_import, &response);
         merge_editor_summary_checked(&mut summary, &response)?;
+        if let Some(roots) = additive_native_roots {
+            summary.insert("_additiveNativeRoots".to_string(), roots);
+        }
         summary.insert(
             "binaryBytes".to_string(),
             json!(binary_import.bytes.len() as u64),
@@ -7547,6 +7596,7 @@ mod source_change_tests {
                     aliases: vec![],
                 },
                 batches: vec![],
+                additive_roots: vec![],
             }),
             pending_encode: None,
             instance_count: 0,

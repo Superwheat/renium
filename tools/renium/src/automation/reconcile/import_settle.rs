@@ -484,11 +484,29 @@ pub(super) struct ImportWork {
     pub summary: Map<String, Value>,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) struct AdditiveSettleRoot {
+    pub(super) service: String,
+    pub(super) path_segments: Vec<String>,
+    pub(super) path_ordinals: Vec<usize>,
+    pub(super) settings_id: String,
+    pub(super) debug_id: String,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) struct AdditiveSettleScope<'a> {
+    pub(super) roots: &'a [AdditiveSettleRoot],
+    pub(super) field_verified: &'a HashSet<String>,
+}
+
 /// A settlement that reads back only `services`, from a baseline over files
 /// a pull wrote whose sourcemap that pull left as `sourcemap`.
 pub(super) struct Narrowed<'a> {
     pub services: &'a [String],
     pub sourcemap: Option<&'a SourcemapState>,
+    pub additive: Option<AdditiveSettleScope<'a>>,
 }
 
 /// The files a publication left and the sourcemap a baseline of them keeps.
@@ -534,6 +552,9 @@ pub(super) fn settle(
         Ok(stage)
     };
     let mut services = narrowed.as_ref().map_or(full, |narrowed| narrowed.services);
+    let mut additive = narrowed
+        .as_ref()
+        .and_then(|narrowed| narrowed.additive.as_ref());
     let mut stage = stage_of(services)?;
     // The services it skips keep their entries of the sourcemap it stages.
     if narrowed
@@ -561,6 +582,7 @@ pub(super) fn settle(
             ),
         );
         services = full;
+        additive = None;
         stage = stage_of(services)?;
     }
     let scopes = ScopeSet::new(stage.publish_paths());
@@ -570,54 +592,72 @@ pub(super) fn settle(
         .filter(|path| scopes.contains(path))
         .collect::<Vec<_>>();
     crate::daemon::memory::release_between_phases();
-    const LARGE_STORE_BYTES: usize = 4 * 1024 * 1024;
-    let has_large_store = work.expected.entries.iter().any(|(path, entry)| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(is_service_settings_file_name)
-            && matches!(entry, SnapshotEntry::File(bytes) if bytes.len() >= LARGE_STORE_BYTES)
-    });
-    let document_below_rows = (!has_large_store).then_some(super::verify::rows::MIN_ROWS);
-    let (mut readback, observed_documents) = capture_studio_services_in_memory_options(
-        context,
-        bridge,
-        services,
-        &stage,
-        true,
-        true,
-        document_below_rows,
-    )?;
-    log_reconcile_timing("full push readback", phase);
-    crate::daemon::memory::release_between_phases();
-    let phase = Instant::now();
-    let mut stores = PredecodedStores {
-        observed: observed_documents,
+    #[cfg(windows)]
+    let subtree_readback = match additive {
+        Some(scope) => {
+            try_settle_additive_subtrees(context, bridge, services, scope, &mut stage, work, proof)?
+        }
+        None => None,
     };
-    let (mismatches, details) = {
-        let _defer_drop =
-            (!has_large_store).then(crate::settings::bytecode::DeferredSettingsDropGuard::enter);
-        verify_and_settle_native_import(
-            (&work.before, &work.expected),
-            &mut readback,
-            &mut stores,
-            &work.verification_paths,
-            &mut work.prepared,
-            Some(&NewInstanceValues::of(
-                bridge,
-                context.runtime_id.as_deref(),
-            )),
-        )?
+    #[cfg(not(windows))]
+    let subtree_readback: Option<ProjectSnapshot> = {
+        let _ = additive;
+        None
     };
-    log_reconcile_timing("full push verification", phase);
-    if !mismatches.is_empty() {
-        // Studio does not hold what the push sent: the next command says so.
-        amend(|journal| journal.recoverable(&work.before, &work.expected))?;
-        return Err(retention_failure(
-            "pushed project changes",
-            &mismatches,
-            details.as_deref(),
-        ));
-    }
+    let readback = if let Some(readback) = subtree_readback {
+        stage.mark_settings_aligned();
+        readback
+    } else {
+        const LARGE_STORE_BYTES: usize = 4 * 1024 * 1024;
+        let has_large_store = work.expected.entries.iter().any(|(path, entry)| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_service_settings_file_name)
+                && matches!(entry, SnapshotEntry::File(bytes) if bytes.len() >= LARGE_STORE_BYTES)
+        });
+        let document_below_rows = (!has_large_store).then_some(super::verify::rows::MIN_ROWS);
+        let (mut readback, observed_documents) = capture_studio_services_in_memory_options(
+            context,
+            bridge,
+            services,
+            &stage,
+            true,
+            true,
+            document_below_rows,
+        )?;
+        log_reconcile_timing("full push readback", phase);
+        crate::daemon::memory::release_between_phases();
+        let phase = Instant::now();
+        let mut stores = PredecodedStores {
+            observed: observed_documents,
+        };
+        let (mismatches, details) = {
+            let _defer_drop = (!has_large_store)
+                .then(crate::settings::bytecode::DeferredSettingsDropGuard::enter);
+            verify_and_settle_native_import(
+                (&work.before, &work.expected),
+                &mut readback,
+                &mut stores,
+                &work.verification_paths,
+                &mut work.prepared,
+                Some(&NewInstanceValues::of(
+                    bridge,
+                    context.runtime_id.as_deref(),
+                )),
+            )?
+        };
+        log_reconcile_timing("full push verification", phase);
+        if !mismatches.is_empty() {
+            // Studio does not hold what the push sent: the next command says so.
+            amend(|journal| journal.recoverable(&work.before, &work.expected))?;
+            return Err(retention_failure(
+                "pushed project changes",
+                &mismatches,
+                details.as_deref(),
+            ));
+        }
+        readback
+    };
     let phase = Instant::now();
     super::push_flow::stage_verified_import_readback(&mut stage, &readback, &staged)?;
     log_reconcile_timing("full push stage verified readback", phase);
@@ -685,6 +725,594 @@ pub(super) fn pulled_sourcemap(
 pub(super) fn holds_sourcemap(root: &Path, sourcemap: &SourcemapState) -> bool {
     crate::snapshot::export::collect_publish_hashes(root, &[PathBuf::from("sourcemap.json")])
         .is_ok_and(|held| held == *sourcemap)
+}
+
+#[cfg(windows)]
+const ADDITIVE_SETTLE_MAX_ROWS: usize = 4_096;
+#[cfg(windows)]
+const ADDITIVE_SETTLE_MAX_ROOTS: usize = 256;
+
+#[cfg(windows)]
+struct AdditiveServicePlan {
+    service: String,
+    store_rel: PathBuf,
+    document: SettingsBytecode,
+    retained: crate::settings::bytecode::property_edit::RetainedPropertyColumns,
+    children: Vec<Vec<usize>>,
+    roots: Vec<(AdditiveSettleRoot, usize)>,
+}
+
+#[cfg(windows)]
+fn plan_additive_service_settle(
+    service: &str,
+    store_rel: PathBuf,
+    before_bytes: &[u8],
+    expected_bytes: &[u8],
+    roots_for_service: &[AdditiveSettleRoot],
+) -> Result<Option<AdditiveServicePlan>> {
+    use crate::settings::bytecode::property_edit::decode_for_property_edit;
+    use crate::settings::equivalence::reconciliation_value_contains_reference as refers;
+
+    if service == crate::roblox::schema::MATERIAL_SERVICE_CLASS
+        || roots_for_service.len() > ADDITIVE_SETTLE_MAX_ROOTS
+    {
+        return Ok(None);
+    }
+    let Ok((mut document, mut retained)) = decode_for_property_edit(expected_bytes) else {
+        return Ok(None);
+    };
+    let count = document.instances.len();
+    let Some(service_root) = crate::settings::tree::editor_service_root_index(&document, service)
+    else {
+        return Ok(None);
+    };
+    let mut children = vec![Vec::new(); count];
+    for (row, instance) in document.instances.iter().enumerate() {
+        match instance.parent_index {
+            Some(parent) if parent < count => children[parent].push(row),
+            Some(_) => return Ok(None),
+            None => {}
+        }
+    }
+    let mut planned_roots = Vec::with_capacity(roots_for_service.len());
+    let mut added_rows = Vec::new();
+    let mut seen = vec![false; count];
+    for root in roots_for_service {
+        let mut matches = document
+            .instances
+            .iter()
+            .enumerate()
+            .filter(|(_, inst)| inst.settings_id == root.settings_id)
+            .map(|(idx, _)| idx);
+        let (Some(row), None) = (matches.next(), matches.next()) else {
+            return Ok(None);
+        };
+        if document.instances[row].parent_index != Some(service_root)
+            || root.path_segments.last().map(String::as_str)
+                != Some(document.instances[row].name.as_str())
+            || children[service_root]
+                .iter()
+                .filter(|&&child| document.instances[child].name == document.instances[row].name)
+                .count()
+                != 1
+        {
+            return Ok(None);
+        }
+        planned_roots.push((root.clone(), row));
+        let mut stack = vec![row];
+        while let Some(idx) = stack.pop() {
+            if std::mem::replace(&mut seen[idx], true) {
+                return Ok(None);
+            }
+            let class = document.instances[idx].class_name.as_str();
+            if matches!(
+                class,
+                "Terrain" | "PackageLink" | "Camera" | "SurfaceAppearance"
+            ) || crate::editor::sync::is_lua_source_class(class)
+            {
+                return Ok(None);
+            }
+            added_rows.push(idx);
+            if added_rows.len() > ADDITIVE_SETTLE_MAX_ROWS {
+                return Ok(None);
+            }
+            stack.extend(&children[idx]);
+        }
+    }
+    let Ok(before_structure) = SettingsBytecode::decode_structure(before_bytes) else {
+        return Ok(None);
+    };
+    let before_by_id: HashMap<&str, &str> = before_structure
+        .instances
+        .iter()
+        .map(|inst| (inst.settings_id.as_str(), inst.class_name.as_str()))
+        .collect();
+    if (0..count).filter(|&idx| !seen[idx]).any(|idx| {
+        let inst = &document.instances[idx];
+        before_by_id.get(inst.settings_id.as_str()) != Some(&inst.class_name.as_str())
+    }) {
+        return Ok(None);
+    }
+    let expected_ids: HashSet<&str> = document
+        .instances
+        .iter()
+        .map(|inst| inst.settings_id.as_str())
+        .collect();
+    let mut deleted_id_sets = Vec::new();
+    for inst in &before_structure.instances {
+        if !expected_ids.contains(inst.settings_id.as_str()) {
+            let class = inst.class_name.as_str();
+            if matches!(class, "Terrain" | "PackageLink" | "Camera")
+                || crate::editor::sync::is_lua_source_class(class)
+            {
+                return Ok(None);
+            }
+            deleted_id_sets.push(vec![inst.settings_id.clone()]);
+        }
+    }
+    if !deleted_id_sets.is_empty()
+        && crate::settings::bytecode::holds_any_string_set(expected_bytes, &deleted_id_sets)
+    {
+        return Ok(None);
+    }
+    let mut to_materialize = added_rows.clone();
+    for (idx, inst) in document.instances.iter().enumerate() {
+        if crate::editor::sync::is_lua_source_class(&inst.class_name) {
+            to_materialize.push(idx);
+        }
+    }
+    to_materialize.sort_unstable();
+    to_materialize.dedup();
+    if retained
+        .materialize(&mut document, &to_materialize)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    for &idx in &added_rows {
+        let inst = &document.instances[idx];
+        if inst.properties.values().any(refers) || inst.attributes.values().any(refers) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(AdditiveServicePlan {
+        service: service.to_string(),
+        store_rel,
+        document,
+        retained,
+        children,
+        roots: planned_roots,
+    }))
+}
+
+#[cfg(windows)]
+fn apply_captured_additive_subtrees(
+    plan: &mut AdditiveServicePlan,
+    captured_roots: &[Vec<super::types::instance_pull::CapturedInstance>],
+    new_instance_values: &NewInstanceValues<'_>,
+) -> Result<Option<Vec<u8>>> {
+    use crate::settings::equivalence::reconciliation_value_contains_reference as refers;
+
+    if plan.roots.is_empty() {
+        return Ok(None);
+    }
+    if captured_roots.len() != plan.roots.len() {
+        return Ok(None);
+    }
+    let mut paired: Vec<(usize, &super::types::instance_pull::CapturedInstance)> = Vec::new();
+    let mut used_rows = HashSet::new();
+    for ((_, root_row), captured) in plan.roots.iter().zip(captured_roots) {
+        if captured.is_empty() || captured[0].parent.is_some() {
+            return Ok(None);
+        }
+        let mut below = vec![Vec::new(); captured.len()];
+        for (at, inst) in captured.iter().enumerate().skip(1) {
+            let Some(parent) = inst.parent.filter(|&p| p < at) else {
+                return Ok(None);
+            };
+            below[parent].push(at);
+        }
+        let mut queue = std::collections::VecDeque::from([(0usize, *root_row)]);
+        while let Some((at, row)) = queue.pop_front() {
+            if !used_rows.insert(row) {
+                return Ok(None);
+            }
+            let expected = &plan.document.instances[row];
+            let cap = &captured[at];
+            if expected.name != cap.name
+                || expected.class_name != cap.class_name
+                || plan.children[row].len() != below[at].len()
+            {
+                return Ok(None);
+            }
+            paired.push((row, cap));
+            let mut remaining = plan.children[row].clone();
+            for &child_at in &below[at] {
+                let child_cap = &captured[child_at];
+                let Some(pos) = remaining.iter().position(|&cand| {
+                    let cand_inst = &plan.document.instances[cand];
+                    cand_inst.name == child_cap.name && cand_inst.class_name == child_cap.class_name
+                }) else {
+                    return Ok(None);
+                };
+                let child_row = remaining.remove(pos);
+                queue.push_back((child_at, child_row));
+            }
+        }
+    }
+    let mut updates = Vec::with_capacity(paired.len());
+    for (row, cap) in paired {
+        let expected = &plan.document.instances[row];
+        if !cap.values.overlaid.is_empty()
+            || cap.values.properties.values().any(refers)
+            || cap.values.attributes.values().any(refers)
+        {
+            return Ok(None);
+        }
+        let parent_stub = expected
+            .parent_index
+            .map(|parent| {
+                let p = &plan.document.instances[parent];
+                SettingsBytecodeInstance::new(
+                    p.settings_id.clone(),
+                    p.name.clone(),
+                    p.class_name.clone(),
+                    None,
+                )
+            })
+            .unwrap_or_else(|| {
+                SettingsBytecodeInstance::new(
+                    plan.service.clone(),
+                    plan.service.clone(),
+                    plan.service.clone(),
+                    None,
+                )
+            });
+        let mut desired_check = expected.clone();
+        desired_check.parent_index = Some(0);
+        let mut observed_row = SettingsBytecodeInstance::new(
+            expected.settings_id.clone(),
+            expected.name.clone(),
+            expected.class_name.clone(),
+            Some(0),
+        );
+        observed_row.properties = cap.values.properties.clone();
+        observed_row.attributes = cap.values.attributes.clone();
+        let desired_doc = SettingsBytecode {
+            version: plan.document.version,
+            instances: vec![parent_stub.clone(), desired_check],
+        };
+        let mut observed_doc = SettingsBytecode {
+            version: plan.document.version,
+            instances: vec![parent_stub, observed_row],
+        };
+        if new_instance_values
+            .mismatch(None, (&desired_doc, 1), (&mut observed_doc, 1))
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let mut settled_row = observed_doc.instances.pop().unwrap();
+        settled_row.parent_index = expected.parent_index;
+        updates.push((row, settled_row));
+    }
+    for (row, settled_row) in updates {
+        plan.document.instances[row] = settled_row;
+    }
+    Ok(plan.retained.encode(&plan.document).ok())
+}
+
+#[cfg(windows)]
+fn try_settle_additive_subtrees(
+    context: &BoundContext,
+    bridge: &BridgeServer,
+    services: &[String],
+    scope: &AdditiveSettleScope<'_>,
+    stage: &mut ExportProjectStage,
+    work: &mut ImportWork,
+    proof: &Value,
+) -> Result<Option<ProjectSnapshot>> {
+    use crate::studio::native::serializer;
+
+    let started = Instant::now();
+    let not_taken = |reason: &str| {
+        log_global(
+            5,
+            format_args!("[renium] import settlement subtree fast path not taken: {reason}"),
+        );
+        Ok(None)
+    };
+    let Some(runtime) = context.runtime_id.as_deref() else {
+        return not_taken("missing runtime id");
+    };
+    let rel_source = bound_context::source_dir(context)?;
+    let service_prefix_of = |service: &str| {
+        if rel_source == Path::new(".") {
+            PathBuf::from(service)
+        } else {
+            rel_source.join(service)
+        }
+    };
+    let mut fast_plans = Vec::new();
+    let mut fallback_services = Vec::new();
+    for service in services {
+        if !scope.field_verified.contains(service.as_str()) {
+            fallback_services.push(service.clone());
+            continue;
+        }
+        let service_prefix = service_prefix_of(service);
+        let Some(store_rel) = work
+            .expected
+            .entries
+            .keys()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_service_settings_file_name)
+                    && services_for_snapshot_paths(context, &HashSet::from([(*path).clone()]))
+                        .iter()
+                        .any(|owner| owner == service)
+            })
+            .cloned()
+        else {
+            fallback_services.push(service.clone());
+            continue;
+        };
+        let scripts_differ = work
+            .before
+            .entries
+            .keys()
+            .chain(work.expected.entries.keys())
+            .filter(|path| path.starts_with(&service_prefix) && **path != store_rel)
+            .any(|path| work.before.entries.get(path) != work.expected.entries.get(path));
+        if scripts_differ {
+            fallback_services.push(service.clone());
+            continue;
+        }
+        let (Some(SnapshotEntry::File(before_bytes)), Some(SnapshotEntry::File(expected_bytes))) = (
+            work.before.entries.get(&store_rel),
+            work.expected.entries.get(&store_rel),
+        ) else {
+            fallback_services.push(service.clone());
+            continue;
+        };
+        let roots_for_service = scope
+            .roots
+            .iter()
+            .filter(|entry| entry.service == *service)
+            .cloned()
+            .collect::<Vec<_>>();
+        match plan_additive_service_settle(
+            service,
+            store_rel,
+            before_bytes,
+            expected_bytes,
+            &roots_for_service,
+        )? {
+            Some(plan) => fast_plans.push(plan),
+            None => fallback_services.push(service.clone()),
+        }
+    }
+    if fast_plans.is_empty() {
+        return not_taken("no eligible service plan");
+    }
+    let total_roots: usize = fast_plans.iter().map(|plan| plan.roots.len()).sum();
+    if total_roots > ADDITIVE_SETTLE_MAX_ROOTS {
+        return not_taken("root count exceeds limit");
+    }
+    let mut settled_bytes_by_service: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+    let mut demoted_services = HashSet::new();
+    if total_roots > 0 {
+        let Ok(info) = bridge.cached_bridge_info_for_runtime(BridgeTarget::Edit, runtime) else {
+            return not_taken("missing cached bridge info");
+        };
+        let Ok(pid) = bridge.studio_pid_for_runtime(BridgeTarget::Edit, runtime) else {
+            return not_taken("missing studio pid");
+        };
+        let Ok(title) = serializer::target_name(pid, &info.place_name) else {
+            return not_taken("missing target name");
+        };
+        let asked = fast_plans
+            .iter()
+            .flat_map(|plan| &plan.roots)
+            .map(|(root, _)| serializer::NativeCaptureRoot {
+                path: serializer::NativePropertyPath {
+                    segments: &root.path_segments,
+                    ordinals: &root.path_ordinals,
+                },
+                descendants: true,
+                expected_debug_id: &root.debug_id,
+            })
+            .collect::<Vec<_>>();
+        let capture =
+            match serializer::capture_live_instances(pid, &title, &asked, Duration::from_secs(5)) {
+                Ok(capture) => capture,
+                Err(error) => {
+                    return not_taken(&format!("capture_live_instances failed: {error:#}"));
+                }
+            };
+        let mut all_subtrees =
+            match super::types::instance_pull::captured_subtrees(capture, asked.len()) {
+                Ok(subtrees) => subtrees.into_iter(),
+                Err(error) => {
+                    return not_taken(&format!("captured_subtrees failed: {error:#}"));
+                }
+            };
+        let per_plan_subtrees: Vec<Vec<super::types::instance_pull::CapturedSubtree>> = fast_plans
+            .iter()
+            .map(|plan| (&mut all_subtrees).take(plan.roots.len()).collect())
+            .collect();
+        let classes = per_plan_subtrees
+            .iter()
+            .flatten()
+            .flatten()
+            .map(|(inst, _)| inst.class.as_str())
+            .collect::<BTreeSet<_>>();
+        let state = bridge
+            .call_for_runtime_with_timeout(
+                "getStudioChangeState",
+                json!({
+                    "start": false,
+                    "verifyPushProof": proof,
+                    "propertySchemaClasses": classes,
+                }),
+                BridgeTarget::Edit,
+                runtime,
+                Some(Duration::from_secs(10)),
+            )
+            .and_then(|state| ensure_plugin_api_ok(&state).map(|()| state))?;
+        anyhow::ensure!(
+            state["pushProofMatches"] == true,
+            "Studio changed during import settlement; the committed import was not repeated"
+        );
+        let Some(Ok(schemas)) = state
+            .get("propertySchemaByClass")
+            .map(|schemas| crate::roblox::schema::parse_property_schema_map(Some(schemas)))
+        else {
+            return not_taken("missing propertySchemaByClass");
+        };
+        let conversions = super::types::instance_pull::class_conversions(
+            rbx_reflection_database::get()?,
+            &schemas,
+            classes,
+        );
+        let new_instance_values = NewInstanceValues::of(bridge, Some(runtime));
+        for (plan, subtrees) in fast_plans.iter_mut().zip(&per_plan_subtrees) {
+            if plan.roots.is_empty() {
+                settled_bytes_by_service.insert(plan.service.clone(), None);
+                continue;
+            }
+            let captured = subtrees
+                .iter()
+                .map(|subtree| {
+                    super::types::instance_pull::captured_instances(
+                        &plan.service,
+                        subtree,
+                        &conversions,
+                    )
+                })
+                .collect::<Result<Vec<_>>>();
+            let Ok(captured) = captured else {
+                demoted_services.insert(plan.service.clone());
+                continue;
+            };
+            match apply_captured_additive_subtrees(plan, &captured, &new_instance_values)? {
+                Some(bytes) => {
+                    settled_bytes_by_service.insert(plan.service.clone(), Some(bytes));
+                }
+                None => {
+                    demoted_services.insert(plan.service.clone());
+                }
+            }
+        }
+    } else {
+        for plan in &fast_plans {
+            settled_bytes_by_service.insert(plan.service.clone(), None);
+        }
+    }
+    for service in &demoted_services {
+        fallback_services.push(service.clone());
+    }
+    fast_plans.retain(|plan| !demoted_services.contains(&plan.service));
+    if fast_plans.is_empty() {
+        return not_taken("all services demoted during subtree apply");
+    }
+    let mut readback = ProjectSnapshot::default();
+    if !fallback_services.is_empty() {
+        let (mut fallback_readback, observed_documents) =
+            capture_studio_services_in_memory_options(
+                context,
+                bridge,
+                &fallback_services,
+                stage,
+                true,
+                true,
+                Some(super::verify::rows::MIN_ROWS),
+            )?;
+        let mut stores = PredecodedStores {
+            observed: observed_documents,
+        };
+        let fallback_set: HashSet<&str> = fallback_services.iter().map(String::as_str).collect();
+        let fallback_verification_paths: HashSet<PathBuf> = work
+            .verification_paths
+            .iter()
+            .filter(|path| {
+                services_for_snapshot_paths(context, &HashSet::from([(*path).clone()]))
+                    .iter()
+                    .any(|svc| fallback_set.contains(svc.as_str()))
+            })
+            .cloned()
+            .collect();
+        let (mismatches, details) = verify_and_settle_native_import(
+            (&work.before, &work.expected),
+            &mut fallback_readback,
+            &mut stores,
+            &fallback_verification_paths,
+            &mut work.prepared,
+            Some(&NewInstanceValues::of(bridge, Some(runtime))),
+        )?;
+        if !mismatches.is_empty() {
+            amend(|journal| journal.recoverable(&work.before, &work.expected))?;
+            return Err(retention_failure(
+                "pushed project changes",
+                &mismatches,
+                details.as_deref(),
+            ));
+        }
+        readback.entries.extend(fallback_readback.entries);
+    }
+    let writer =
+        crate::snapshot::import::SourcemapWriter::start(stage.project_root.clone(), false, None);
+    for plan in &fast_plans {
+        let service_prefix = service_prefix_of(&plan.service);
+        let mut existing_files = HashSet::new();
+        for (path, entry) in &work.expected.entries {
+            if path.starts_with(&service_prefix) && *path != plan.store_rel {
+                if matches!(entry, SnapshotEntry::File(_)) && is_source_path(path) {
+                    existing_files.insert(path.clone());
+                }
+                readback.entries.insert(path.clone(), entry.clone());
+            }
+        }
+        if let Some(Some(bytes)) = settled_bytes_by_service.remove(&plan.service) {
+            readback
+                .entries
+                .insert(plan.store_rel.clone(), SnapshotEntry::File(bytes));
+        } else if let Some(entry) = work.expected.entries.get(&plan.store_rel) {
+            readback
+                .entries
+                .insert(plan.store_rel.clone(), entry.clone());
+        }
+        let service_dir = stage
+            .import_project_root
+            .join(&stage.import_src_dir)
+            .join(&plan.service);
+        let node = crate::project::sourcemap::build_service_sourcemap_from_settings_with_files(
+            &plan.document,
+            &plan.service,
+            &stage.import_project_root,
+            &service_dir,
+            &existing_files,
+        )?;
+        writer
+            .sender()
+            .send(crate::snapshot::import::SourcemapWriterMessage::Service(
+                plan.service.clone(),
+                node,
+            ))?;
+    }
+    writer.request_finish();
+    writer.join()?;
+    log_reconcile_timing("full push additive subtree settlement", started);
+    log_global(
+        4,
+        format_args!(
+            "[renium] import settlement settled {} service(s) by subtree ({total_roots} root(s)), {} fallback service(s)",
+            fast_plans.len(),
+            fallback_services.len()
+        ),
+    );
+    Ok(Some(readback))
 }
 
 /// Files changed since the push, which the settlement leaves as they are:
@@ -2052,6 +2680,7 @@ mod tests {
         let narrowed = Narrowed {
             services: &["Workspace".into()],
             sourcemap: Some(&SourcemapState::new()),
+            additive: None,
         };
         let settlement = settle(
             &context,
@@ -2837,6 +3466,229 @@ mod tests {
         interrupt_test_request();
         let loaded = Journal::load(&context);
         assert!(loaded.is_ok(), "{:#}", loaded.err().unwrap());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn additive_subtree_settle_splices_engine_values_and_rejects_outside_changes() -> Result<()> {
+        use crate::settings::bytecode::encode_settings_bytecode;
+        use crate::settings::equivalence::{SettingsAlignment, align_settings_bytes_to_reference};
+
+        let mut before = SettingsBytecode {
+            version: 12,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "ws-0".into(),
+                    "Workspace".into(),
+                    "Workspace".into(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new(
+                    "kept-1".into(),
+                    "KeptPart".into(),
+                    "Part".into(),
+                    Some(0),
+                ),
+            ],
+        };
+        before.instances[1]
+            .properties
+            .insert("UniqueId".into(), json!("00000000000000000000000000000001"));
+        before.instances[1]
+            .properties
+            .insert("Transparency".into(), json!(0.25));
+        let before_bytes = encode_settings_bytecode(&before)?;
+
+        let mut expected = before.clone();
+        expected.instances.push(SettingsBytecodeInstance::new(
+            "add-root".into(),
+            "PullTarget".into(),
+            "Folder".into(),
+            Some(0),
+        ));
+        let mut child = SettingsBytecodeInstance::new(
+            "add-child".into(),
+            "ChildPart".into(),
+            "Part".into(),
+            Some(2),
+        );
+        child.properties.insert("Transparency".into(), json!(0.5));
+        expected.instances.push(child);
+        let expected_bytes = encode_settings_bytecode(&expected)?;
+
+        let root_desc = AdditiveSettleRoot {
+            service: "Workspace".into(),
+            path_segments: vec!["Workspace".into(), "PullTarget".into()],
+            path_ordinals: vec![1, 1],
+            settings_id: "add-root".into(),
+            debug_id: "dbg-root".into(),
+        };
+        let mut plan = plan_additive_service_settle(
+            "Workspace",
+            PathBuf::from("src/Workspace/Workspace.luau"),
+            &before_bytes,
+            &expected_bytes,
+            std::slice::from_ref(&root_desc),
+        )?
+        .context("additive subtree plan should accept clean added root")?;
+
+        let make_captured = |transparency: f64| {
+            vec![vec![
+                super::types::instance_pull::CapturedInstance {
+                    name: "PullTarget".into(),
+                    class_name: "Folder".into(),
+                    parent: None,
+                    values: super::types::instance_pull::CapturedValues {
+                        properties: Map::from_iter([(
+                            "UniqueId".into(),
+                            json!("000000000000000000000000000000aa"),
+                        )]),
+                        attributes: Map::new(),
+                        overlaid: std::sync::Arc::new(HashSet::new()),
+                    },
+                },
+                super::types::instance_pull::CapturedInstance {
+                    name: "ChildPart".into(),
+                    class_name: "Part".into(),
+                    parent: Some(0),
+                    values: super::types::instance_pull::CapturedValues {
+                        properties: Map::from_iter([
+                            ("UniqueId".into(), json!("000000000000000000000000000000bb")),
+                            ("Transparency".into(), json!(transparency)),
+                        ]),
+                        attributes: Map::new(),
+                        overlaid: std::sync::Arc::new(HashSet::new()),
+                    },
+                },
+            ]]
+        };
+        let captured = make_captured(0.5);
+        let new_vals = NewInstanceValues::default();
+        let settled_bytes = apply_captured_additive_subtrees(&mut plan, &captured, &new_vals)?
+            .context("apply_captured_additive_subtrees should succeed")?;
+
+        let mut full_pull_doc = expected.clone();
+        full_pull_doc.instances[2]
+            .properties
+            .insert("UniqueId".into(), json!("000000000000000000000000000000aa"));
+        full_pull_doc.instances[3]
+            .properties
+            .insert("UniqueId".into(), json!("000000000000000000000000000000bb"));
+        let full_pull_bytes = encode_settings_bytecode(&full_pull_doc)?;
+        assert!(matches!(
+            align_settings_bytes_to_reference(&settled_bytes, &full_pull_bytes)?,
+            SettingsAlignment::Equivalent
+        ));
+
+        let mismatched = make_captured(0.9);
+        let mut plan2 = plan_additive_service_settle(
+            "Workspace",
+            PathBuf::from("src/Workspace/Workspace.luau"),
+            &before_bytes,
+            &expected_bytes,
+            std::slice::from_ref(&root_desc),
+        )?
+        .unwrap();
+        assert!(
+            apply_captured_additive_subtrees(&mut plan2, &mismatched, &new_vals)?.is_none(),
+            "mismatched Studio value must fall back"
+        );
+
+        let mut with_extra_create = expected.clone();
+        with_extra_create
+            .instances
+            .push(SettingsBytecodeInstance::new(
+                "non-additive-extra".into(),
+                "Extra".into(),
+                "Part".into(),
+                Some(1),
+            ));
+        let extra_bytes = encode_settings_bytecode(&with_extra_create)?;
+        assert!(
+            plan_additive_service_settle(
+                "Workspace",
+                PathBuf::from("src/Workspace/Workspace.luau"),
+                &before_bytes,
+                &extra_bytes,
+                std::slice::from_ref(&root_desc),
+            )?
+            .is_none(),
+            "non-additive create outside roots must fall back"
+        );
+
+        // Clean deletion with no surviving reference is accepted with empty roots.
+        let mut deleted_clean = SettingsBytecode {
+            version: 12,
+            instances: vec![before.instances[0].clone()],
+        };
+        let deleted_clean_bytes = encode_settings_bytecode(&deleted_clean)?;
+        assert!(
+            plan_additive_service_settle(
+                "Workspace",
+                PathBuf::from("src/Workspace/Workspace.luau"),
+                &before_bytes,
+                &deleted_clean_bytes,
+                &[],
+            )?
+            .is_some(),
+            "clean deletion without surviving refs should stay on fast path"
+        );
+
+        // Surviving row referencing a deleted id must fall back to full readback.
+        let mut ref_holder = SettingsBytecodeInstance::new(
+            "holder-2".into(),
+            "Holder".into(),
+            "ObjectValue".into(),
+            Some(0),
+        );
+        ref_holder.properties.insert(
+            "Value".into(),
+            json!({ "_type": "Ref", "settingsId": "kept-1" }),
+        );
+        let mut before_with_ref = before.clone();
+        before_with_ref.instances.push(ref_holder.clone());
+        let before_with_ref_bytes = encode_settings_bytecode(&before_with_ref)?;
+        deleted_clean.instances.push(ref_holder);
+        let deleted_dangling_bytes = encode_settings_bytecode(&deleted_clean)?;
+        assert!(
+            plan_additive_service_settle(
+                "Workspace",
+                PathBuf::from("src/Workspace/Workspace.luau"),
+                &before_with_ref_bytes,
+                &deleted_dangling_bytes,
+                &[],
+            )?
+            .is_none(),
+            "deletion referenced by surviving row must fall back"
+        );
+
+        // Duplicate root sibling name under the service must fall back.
+        let mut before_dup = before.clone();
+        before_dup.instances.push(SettingsBytecodeInstance::new(
+            "existing-dup".into(),
+            "PullTarget".into(),
+            "Folder".into(),
+            Some(0),
+        ));
+        let mut expected_dup = expected.clone();
+        expected_dup.instances.push(SettingsBytecodeInstance::new(
+            "existing-dup".into(),
+            "PullTarget".into(),
+            "Folder".into(),
+            Some(0),
+        ));
+        assert!(
+            plan_additive_service_settle(
+                "Workspace",
+                PathBuf::from("src/Workspace/Workspace.luau"),
+                &encode_settings_bytecode(&before_dup)?,
+                &encode_settings_bytecode(&expected_dup)?,
+                std::slice::from_ref(&root_desc),
+            )?
+            .is_none(),
+            "duplicate sibling name under service root must fall back"
+        );
         Ok(())
     }
 }

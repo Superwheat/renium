@@ -2619,7 +2619,7 @@ fn finish_set_property(
         } else {
             (names, Vec::new())
         };
-        crate::bytecode::edit::push_stored_instance_reading_with_previous(
+        crate::bytecode::edit::push_stored_instance_reading(
             &mut result,
             &properties,
             &attributes,
@@ -2730,6 +2730,7 @@ fn bytecode_set_property_where(mut args: BytecodeSetPropertyArgs, query: &str) -
             ids.clone(),
             crate::bytecode::edit::PushedScope::Instance,
             args.slow_import,
+            HashMap::new(),
         )?;
         let (properties, attributes) = if args.scope.eq_ignore_ascii_case("attribute") {
             (Vec::new(), set_names)
@@ -2912,6 +2913,7 @@ pub(crate) fn bytecode_rename_where(
             ids.clone(),
             crate::bytecode::edit::PushedScope::Subtree,
             false,
+            HashMap::new(),
         )?;
         let (mut after, mut after_rows) = SettingsBytecode::read_by_rows(&settings_file)?;
         let after_paths = build_editor_instance_paths(&after, &service);
