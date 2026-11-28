@@ -225,6 +225,38 @@ pub(crate) struct VerifiedFullPushCandidate {
     pub(crate) files_unchanged: bool,
 }
 
+#[cfg(any(windows, target_os = "macos"))]
+static PENDING_TARGETED_BASELINES: std::sync::LazyLock<
+    Mutex<HashMap<(usize, String), std::thread::JoinHandle<Option<VerifiedFullPush>>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn defer_targeted_baseline(
+    bridge: &BridgeServer,
+    runtime_id: String,
+    handle: std::thread::JoinHandle<Option<VerifiedFullPush>>,
+) {
+    let key = (bridge as *const BridgeServer as usize, runtime_id);
+    let previous = PENDING_TARGETED_BASELINES
+        .lock_recover()
+        .insert(key, handle);
+    if let Some(previous) = previous {
+        let _ = previous.join();
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn join_pending_targeted_baseline(bridge: &BridgeServer, runtime: &str) {
+    let key = (bridge as *const BridgeServer as usize, runtime.to_string());
+    let handle = PENDING_TARGETED_BASELINES.lock_recover().remove(&key);
+    if let Some(handle) = handle
+        && let Ok(Some(entry)) = handle.join()
+    {
+        let mut pushes = bridge.verified_full_pushes.lock_recover();
+        pushes.entry(runtime.to_string()).or_insert(entry);
+    }
+}
+
 /// Takes the runtime's baseline when it still applies to a push of `input`.
 #[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn take_baseline(
@@ -233,6 +265,7 @@ pub(crate) fn take_baseline(
     input: &Value,
 ) -> Option<VerifiedFullPush> {
     let runtime = context.runtime_id.as_deref()?;
+    join_pending_targeted_baseline(bridge, runtime);
     // Take ownership before any RPC or native cleanup: another place must not
     // wait behind this place's verification or an expired observer's teardown.
     let cached = bridge.verified_full_pushes.lock_recover().remove(runtime)?;

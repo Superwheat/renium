@@ -106,7 +106,6 @@ fn finish_settled_rows(
     ),
     settle: bool,
 ) -> Result<Option<SettingsVerification>> {
-    drop((desired_rows, lazy_before));
     let _step = crate::app::profile::span("row verification: settled store written");
     let accepted = settled_bytes_from_observed(
         &observed,
@@ -117,7 +116,7 @@ fn finish_settled_rows(
         settled,
         settle,
     )?;
-    rayon::spawn(move || drop((desired, observed)));
+    rayon::spawn(move || drop((desired, observed, desired_rows, lazy_before)));
     Ok(Some(SettingsVerification {
         mismatch: None,
         accepted,
@@ -782,7 +781,7 @@ fn materialize_and_check_columnar_rows(
     ),
     (pending, reference_ids, keeps_camera, protected): (
         Option<&PendingFields<'_>>,
-        &EditorReferenceIds<'_>,
+        Option<&EditorReferenceIds<'_>>,
         bool,
         Option<usize>,
     ),
@@ -830,7 +829,7 @@ fn materialize_and_check_columnar_rows(
             canonicalize_instances(&mut desired.instances[range])?;
             canonicalize_instances(&mut observed.instances[place])?;
         }
-        if let Some(pending) = pending {
+        if let (Some(pending), Some(reference_ids)) = (pending, reference_ids) {
             for (index, row) in &pending.rows {
                 if need_d[*index]
                     && mask_pending_fields(
@@ -956,16 +955,21 @@ fn assign_placed_ids_and_remap(
     studio_ids: &[String],
     studio_roots: &[usize],
     places: &[usize],
+    need_desired_uids: bool,
 ) -> Result<PlacedRowIds> {
     let mut origins = vec![0; desired.instances.len()];
     for (index, place) in places.iter().enumerate() {
         origins[*place] = index;
     }
-    let desired_uids: Vec<Option<Value>> = desired
-        .instances
-        .iter()
-        .map(|inst| inst.properties.get("UniqueId").cloned())
-        .collect();
+    let desired_uids: Vec<Option<Value>> = if need_desired_uids {
+        desired
+            .instances
+            .iter()
+            .map(|inst| inst.properties.get("UniqueId").cloned())
+            .collect()
+    } else {
+        Vec::new()
+    };
     for document in [&mut *desired, &mut *observed] {
         for instance in &mut document.instances {
             if instance.parent_index.is_some() {
@@ -977,11 +981,10 @@ fn assign_placed_ids_and_remap(
         .iter()
         .map(|origin| desired_ids[*origin].clone())
         .collect::<Vec<_>>();
-    let remap = studio_ids
-        .iter()
-        .cloned()
-        .zip(placed_ids.iter().cloned())
-        .collect::<HashMap<_, _>>();
+    let mut remap = HashMap::with_capacity(studio_ids.len());
+    for (studio_id, placed_id) in studio_ids.iter().zip(&placed_ids) {
+        remap.insert(studio_id.clone(), placed_id.clone());
+    }
     for (instance, id) in observed.instances.iter_mut().zip(&placed_ids) {
         instance.settings_id.clone_from(id);
     }
@@ -1124,6 +1127,8 @@ pub(super) fn verified_by_rows(
         return whole(why);
     };
     let step = crate::app::profile::span("row verification: placed ids");
+    let before_holds_unread =
+        before.is_some_and(crate::settings::equivalence::holds_unread_instances);
     let PlacedRowIds {
         origins,
         desired_uids,
@@ -1138,6 +1143,7 @@ pub(super) fn verified_by_rows(
         &studio_ids,
         &studio_roots,
         &places,
+        !before_holds_unread,
     )?;
     drop(step);
     let ordered = by_order.iter().filter(|by_order| **by_order).count();
@@ -1150,13 +1156,14 @@ pub(super) fn verified_by_rows(
         );
     }
     let pending = pending_fields(&service, &desired, policy.pending);
-    let reference_ids =
-        EditorReferenceIds::new(desired_ids.iter().map(String::as_str)).in_service(&service);
+    let reference_ids = pending.is_some().then(|| {
+        EditorReferenceIds::new(desired_ids.iter().map(String::as_str)).in_service(&service)
+    });
     let before = before.map(|before| {
-        let ids = before.instances.iter().enumerate();
-        let by_id = ids
-            .map(|(index, instance)| (instance.settings_id.as_str(), index))
-            .collect::<AHashMap<_, _>>();
+        let mut by_id = AHashMap::with_capacity(before.instances.len());
+        for (index, instance) in before.instances.iter().enumerate() {
+            by_id.insert(instance.settings_id.as_str(), index);
+        }
         (before, by_id)
     });
     let mut lazy_before: Option<LazyBefore> = None;
@@ -1325,7 +1332,7 @@ pub(super) fn verified_by_rows(
             (&mut desired_rows, &mut observed_rows),
             (&rows, &places, &origins),
             (&desired_ids, &studio_ids, &remap, &service),
-            (None, &reference_ids, keeps_camera, protected),
+            (None, reference_ids.as_ref(), keeps_camera, protected),
         )?
         else {
             return Ok(None);
@@ -1396,7 +1403,12 @@ pub(super) fn verified_by_rows(
                 (&mut desired_rows, &mut observed_rows),
                 (&unresolved, &places, &origins),
                 (&desired_ids, &studio_ids, &remap, &service),
-                (pending.as_ref(), &reference_ids, keeps_camera, protected),
+                (
+                    pending.as_ref(),
+                    reference_ids.as_ref(),
+                    keeps_camera,
+                    protected,
+                ),
             )?
             else {
                 return Ok(None);
@@ -1544,7 +1556,12 @@ pub(super) fn verified_by_rows(
                 &remap,
                 &service,
             ),
-            (pending.as_ref(), &reference_ids, keeps_camera, protected),
+            (
+                pending.as_ref(),
+                reference_ids.as_ref(),
+                keeps_camera,
+                protected,
+            ),
             &mut settled,
             before_ref,
             &mut lazy_before,
@@ -1636,11 +1653,11 @@ pub(super) fn verified_by_rows(
         if waiting > ROWS_AT_A_TIME {
             return whole("Studio holds the instances in another order");
         }
-        if let Some(pending) = &pending {
+        if let (Some(pending), Some(reference_ids)) = (&pending, reference_ids.as_ref()) {
             for (index, row) in pending.rows.iter().filter(|(index, _)| read(*index)) {
                 if mask_pending_fields(
                     &pending.paths,
-                    &reference_ids,
+                    reference_ids,
                     row,
                     &desired.instances[*index],
                     &mut observed.instances[places[*index]],
@@ -1824,7 +1841,7 @@ fn materialize_unresolved_rows(
     ),
     (pending, reference_ids, keeps_camera, protected): (
         Option<&PendingFields<'_>>,
-        &EditorReferenceIds<'_>,
+        Option<&EditorReferenceIds<'_>>,
         bool,
         Option<usize>,
     ),
@@ -1853,7 +1870,7 @@ fn materialize_unresolved_rows(
         canonicalize_instances(&mut observed.instances[obs_row])?;
     }
     let mut written = Vec::new();
-    if let Some(pending) = pending {
+    if let (Some(pending), Some(reference_ids)) = (pending, reference_ids) {
         for (index, row) in &pending.rows {
             if mask_pending_fields(
                 &pending.paths,

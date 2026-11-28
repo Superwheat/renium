@@ -645,24 +645,24 @@ fn move_within_store(args: BytecodeSetPropertyArgs, push: bool) -> Result<()> {
         .transpose()?;
     let mut result = crate::bytecode::bytecode_set_property_result(args)?;
     if push {
-        if let (Some(before), Some(settings_id)) = (&before, settings_id.as_deref()) {
-            let after = SettingsBytecode::read_structure_file(&settings_file)?;
-            if let Some(reparented) =
-                reparent_in_studio(&settings_file, before, &after, settings_id)?
-            {
-                result["reparented"] = reparented;
-            }
-        }
+        let previous_path =
+            if let (Some(before), Some(settings_id)) = (&before, settings_id.as_deref()) {
+                let after = SettingsBytecode::read_structure_file(&settings_file)?;
+                moved_previous_path(&settings_file, before, &after, settings_id)
+            } else {
+                None
+            };
         if result.get("settingsId").is_none() {
             result["settingsId"] = json!(settings_id);
         }
         result["settingsFile"] = json!(settings_file);
-        crate::bytecode::edit::push_stored_instance_reading(
+        crate::bytecode::edit::push_stored_instance_reading_with_previous(
             &mut result,
             &[],
             &[],
             crate::bytecode::edit::PushedScope::Subtree,
             false,
+            previous_path,
         )?;
     }
     crate::app::output::print_json_output(&result, false)
@@ -678,18 +678,12 @@ pub(crate) fn reparent_luau(instance: &EditorInstancePath, parent: &EditorInstan
     )
 }
 
-/// Sets the parent of a moved instance in the open place to its new parent,
-/// as one undo step, and returns what happened; `None` when the store does
-/// not place both. `before` and `after` are the store's instances around the
-/// move, without their values, which no path takes. Both instances are found
-/// by their paths before the move, the tree the place still has: the move
-/// itself can shift the ordinals of same-named siblings.
-fn reparent_in_studio(
+fn moved_previous_path(
     settings_file: &Path,
     before: &SettingsBytecode,
     after: &SettingsBytecode,
     settings_id: &str,
-) -> Result<Option<Value>> {
+) -> Option<EditorInstancePath> {
     let parent_id = |document: &SettingsBytecode| {
         let instance = document
             .instances
@@ -704,19 +698,13 @@ fn reparent_in_studio(
         )
     };
     let (Some(old_parent), Some(new_parent)) = (parent_id(before), parent_id(after)) else {
-        return Ok(None);
+        return None;
     };
     if old_parent == new_parent {
-        return Ok(Some(json!("unchanged")));
+        return None;
     }
     let service = crate::bytecode::edit::bytecode_service_name(before, settings_file, "");
-    let (Some(instance), Some(parent)) = (
-        stored_instance_path(before, &service, settings_id),
-        stored_instance_path(before, &service, &new_parent),
-    ) else {
-        return Ok(None);
-    };
-    reparent_live(&instance, &parent).map(Some)
+    stored_instance_path(before, &service, settings_id)
 }
 
 /// Runs the reparent chunk in the open place and returns what it reports.

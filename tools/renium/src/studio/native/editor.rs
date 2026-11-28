@@ -6547,11 +6547,19 @@ fn verify_in_place_editor_fields(
     let Some(transaction_id) = transaction_id else {
         return Ok(());
     };
+    let database = rbx_reflection_database::get().ok();
+    let resolve_reset = |class_name: &str, name: &str| -> Option<Value> {
+        if name == "Tags" || (class_name == "MeshPart" && name == "CollisionFidelity") {
+            return None;
+        }
+        crate::settings::equivalence::reflection_default_settings_value(database?, class_name, name)
+    };
     let field_services = changes
         .property_changes
         .iter()
         .filter(|row| {
             !row.properties.is_empty()
+                || !row.reset_properties.is_empty()
                 || !row.attributes.is_empty()
                 || !row.deleted_attributes.is_empty()
         })
@@ -6569,7 +6577,11 @@ fn verify_in_place_editor_fields(
                 .property_changes
                 .iter()
                 .filter(|row| row.service == *service)
-                .all(|row| row.reset_properties.is_empty())
+                .all(|row| {
+                    row.reset_properties
+                        .iter()
+                        .all(|name| resolve_reset(&row.class_name, name).is_some())
+                })
                 && !changes.instance_changes.iter().any(|change| {
                     change.service == *service
                         && !matches!(change.mode.as_str(), "upsertInstances" | "deleteInstances")
@@ -6652,6 +6664,14 @@ fn verify_in_place_editor_fields(
                 })
             })
             .cloned()
+            .map(|mut row| {
+                for name in std::mem::take(&mut row.reset_properties) {
+                    if let Some(value) = resolve_reset(&row.class_name, &name) {
+                        row.properties.entry(name).or_insert(value);
+                    }
+                }
+                row
+            })
             .collect::<Vec<_>>();
         let expected = rows
             .iter()

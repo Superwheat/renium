@@ -1664,6 +1664,7 @@ fn targeted_step(
     let pushed = TargetedPush {
         paths,
         ids: targets.into_iter().collect(),
+        previous_ids: HashSet::new(),
         exact,
         whole_rows: true,
     };
@@ -3038,12 +3039,14 @@ fn a_targeted_baseline_holds_only_rows_a_push_sends() {
         .unwrap()
     };
     let ids = HashSet::from(["row".to_string()]);
+    let empty = HashSet::new();
     let kept = |class: &str, property: &str, was: Value, now: Value| {
         store_rows_differ_only_at(
             &store(class, property, was),
             &store(class, property, now),
             &ids,
             true,
+            &empty,
         )
         .unwrap()
     };
@@ -3088,7 +3091,7 @@ fn a_targeted_baseline_holds_only_rows_a_push_sends() {
         .unwrap()
     };
     let held = decal("rbxassetid://1", "rbxassetid://1");
-    let kept = |now: &[u8]| store_rows_differ_only_at(&held, now, &ids, true).unwrap();
+    let kept = |now: &[u8]| store_rows_differ_only_at(&held, now, &ids, true, &empty).unwrap();
     assert!(kept(&decal("rbxassetid://2", "rbxassetid://2")));
     assert!(!kept(&decal("rbxassetid://1", "rbxassetid://2")));
     assert!(!kept(&decal("rbxassetid://2", "rbxassetid://1")));

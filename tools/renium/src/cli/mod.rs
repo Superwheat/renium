@@ -2953,6 +2953,9 @@ pub(super) struct PushEditorChangesArgs {
     /// `-i` names an instance whose subtree comes along.
     #[arg(skip)]
     pub(crate) exact_target_ids: bool,
+    #[arg(skip)]
+    pub(crate) previous_instance_paths:
+        std::collections::HashMap<String, (Vec<String>, Vec<usize>)>,
     /// A user's `-i` narrows the named paths to those instances; the delta
     /// planner names changed paths and changed instances side by side, so
     /// every listed script file is pushed as well.
@@ -3045,6 +3048,7 @@ impl PushEditorChangesArgs {
             target_settings_ids: Vec::new(),
             target_settings_id_files: Vec::new(),
             exact_target_ids: false,
+            previous_instance_paths: std::collections::HashMap::new(),
             targets_extend_paths: false,
             link_project_root: None,
             defer_to_live_sync: false,

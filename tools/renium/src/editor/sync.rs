@@ -1940,6 +1940,7 @@ pub(crate) fn push_request_with_reader_setting(
         "changedPathsFiles": args.changed_paths_files,
         "targetSettingsIds": args.target_settings_ids,
         "exactTargetIds": args.exact_target_ids,
+        "previousInstancePaths": args.previous_instance_paths,
         "targetSettingsIdFiles": args.target_settings_id_files,
         "targetProperties": args.target_properties,
         "upsertInstancesOnly": args.upsert_instances_only,
@@ -7920,7 +7921,7 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
     let phase_started = Instant::now();
     widen_target_ids_to_subtrees(&mut property_filter, &documents, args.exact_target_ids);
     log_editor_collection_timing("target subtrees", phase_started);
-    let changes = finish_editor_change_collection(
+    let mut changes = finish_editor_change_collection(
         changes,
         &documents,
         changed_services,
@@ -7929,6 +7930,20 @@ fn collect_editor_changes_with_link_enforcement_and_documents(
         src_root,
         link_enforcement,
     )?;
+    if !args.previous_instance_paths.is_empty() {
+        for change in &mut changes.instance_changes {
+            if change.mode == "upsertInstances" {
+                for descriptor in &mut change.instances {
+                    if let Some((segments, ordinals)) =
+                        args.previous_instance_paths.get(&descriptor.settings_id)
+                    {
+                        descriptor.previous_path_segments.clone_from(segments);
+                        descriptor.previous_path_ordinals.clone_from(ordinals);
+                    }
+                }
+            }
+        }
+    }
     let phase_started = Instant::now();
     for document in documents.into_values().flatten() {
         if let Ok(document) = Arc::try_unwrap(document) {

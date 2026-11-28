@@ -2482,10 +2482,19 @@ pub(super) fn bytecode_set_property(mut args: BytecodeSetPropertyArgs) -> Result
         return bytecode_set_property_where(args, &query);
     }
     let (mut result, studio) = set_property_outcome(args.clone())?;
-    if args.push && !studio.is_empty() {
+    let single_store_only = result
+        .get("changedPaths")
+        .and_then(Value::as_array)
+        .is_some_and(|paths| paths.len() == 1);
+    let previous_path = if args.push && single_store_only {
+        studio.single_rename_path().cloned()
+    } else {
+        None
+    };
+    if args.push && previous_path.is_none() && !studio.is_empty() {
         result["studioApplied"] = studio.apply_in_studio()?;
     }
-    finish_set_property(args, result)
+    finish_set_property(args, result, previous_path)
 }
 
 /// The assignments of a `bs` call, each a property name and its value: one
@@ -2564,7 +2573,11 @@ fn assignments_result(
 }
 
 /// Pushes the edited instance when asked, with its read-back, and prints.
-fn finish_set_property(args: BytecodeSetPropertyArgs, mut result: Value) -> Result<()> {
+fn finish_set_property(
+    args: BytecodeSetPropertyArgs,
+    mut result: Value,
+    previous_path: Option<crate::editor::types::EditorInstancePath>,
+) -> Result<()> {
     if args.push {
         if result.get("settingsId").is_none() {
             let (settings_file, service_hint) = resolve_bytecode_cli_settings_file(
@@ -2606,12 +2619,13 @@ fn finish_set_property(args: BytecodeSetPropertyArgs, mut result: Value) -> Resu
         } else {
             (names, Vec::new())
         };
-        crate::bytecode::edit::push_stored_instance_reading(
+        crate::bytecode::edit::push_stored_instance_reading_with_previous(
             &mut result,
             &properties,
             &attributes,
             crate::bytecode::edit::PushedScope::Instance,
             args.slow_import,
+            previous_path,
         )?;
     }
     print_json_output(&result, args.pretty)

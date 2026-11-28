@@ -323,6 +323,24 @@ pub(crate) fn push_stored_instance_reading(
     scope: PushedScope,
     slow_import: bool,
 ) -> Result<()> {
+    push_stored_instance_reading_with_previous(
+        result,
+        properties,
+        attributes,
+        scope,
+        slow_import,
+        None,
+    )
+}
+
+pub(crate) fn push_stored_instance_reading_with_previous(
+    result: &mut Value,
+    properties: &[String],
+    attributes: &[String],
+    scope: PushedScope,
+    slow_import: bool,
+    previous_path: Option<EditorInstancePath>,
+) -> Result<()> {
     let settings_file = result
         .get("settingsFile")
         .and_then(Value::as_str)
@@ -333,11 +351,20 @@ pub(crate) fn push_stored_instance_reading(
         .and_then(Value::as_str)
         .map(str::to_string)
         .context("The store edit did not name its instance; push the store file with `rbx ps`")?;
-    result["push"] = push_stored_instances(
+    let previous_paths = previous_path
+        .map(|path| {
+            HashMap::from([(
+                settings_id.clone(),
+                (path.path_segments, path.path_ordinals),
+            )])
+        })
+        .unwrap_or_default();
+    result["push"] = push_stored_instances_with_previous(
         settings_file.clone(),
         vec![settings_id.clone()],
         scope,
         slow_import,
+        previous_paths,
     )?;
     let Some((document, index)) = read_store_for_instance(&settings_file, &settings_id)? else {
         return Ok(());
@@ -593,8 +620,25 @@ pub(crate) fn push_stored_instances(
     scope: PushedScope,
     slow_import: bool,
 ) -> Result<Value> {
+    push_stored_instances_with_previous(
+        settings_file,
+        settings_ids,
+        scope,
+        slow_import,
+        HashMap::new(),
+    )
+}
+
+pub(crate) fn push_stored_instances_with_previous(
+    settings_file: PathBuf,
+    settings_ids: Vec<String>,
+    scope: PushedScope,
+    slow_import: bool,
+    previous_instance_paths: HashMap<String, (Vec<String>, Vec<usize>)>,
+) -> Result<Value> {
     let mut args = stored_instances_push(settings_file, settings_ids, scope);
     args.slow_import = slow_import;
+    args.previous_instance_paths = previous_instance_paths;
     crate::editor::sync::push_editor_changes_result(args)
         .context("The store was written but the push failed; push it with `rbx ps`")
 }

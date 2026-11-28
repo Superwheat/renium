@@ -2348,7 +2348,8 @@ pub(crate) fn push_project(
         current_studio_change_guard_verifying_continuing(
             context,
             bridge,
-            (cfg!(any(windows, target_os = "macos")) && whole_project_push).then_some(services),
+            cfg!(any(windows, target_os = "macos")).then_some(services),
+            whole_project_push,
             candidate_proof.as_ref(),
             continue_native_relay,
             |state| {
@@ -3429,7 +3430,7 @@ pub(crate) fn push_targeted(
     args: PushEditorChangesArgs,
 ) -> Result<Map<String, Value>> {
     use crate::editor::sync::push_editor_changes_with_warm_bridge;
-    let Some(mut held) = take_baseline(context, bridge, &plain_push_input(&args)?) else {
+    let Some(held) = take_baseline(context, bridge, &plain_push_input(&args)?) else {
         return push_editor_changes_with_warm_bridge(args, bridge);
     };
     let not_kept = |reason: &str| {
@@ -3449,7 +3450,12 @@ pub(crate) fn push_targeted(
     };
     let (before, (guard, mut release)) = match lease {
         Ok(Some(lease)) => lease,
-        Ok(None) => return push_editor_changes_with_warm_bridge(args, bridge),
+        Ok(None) => {
+            if let Some(runtime_id) = context.runtime_id.as_deref() {
+                keep_baseline(bridge, runtime_id, held, "targeted push prior baseline");
+            }
+            return push_editor_changes_with_warm_bridge(args, bridge);
+        }
         Err(error) => {
             not_kept(&format!("{error:#}"));
             return push_editor_changes_with_warm_bridge(args, bridge);
@@ -3470,25 +3476,6 @@ pub(crate) fn push_targeted(
         Ok(after) => after,
         Err(error) => {
             not_kept(&format!("{error:#}"));
-            return Ok(summary);
-        }
-    };
-    let service_of = |path: &Path| {
-        crate::editor::paths::service_from_changed_path(
-            Path::new(&context.source),
-            &Path::new(&context.root).join(path),
-        )
-    };
-    let project = match targeted_baseline(
-        &held.project,
-        (&before, &after),
-        &summary,
-        &pushed,
-        service_of,
-    ) {
-        Ok(project) => project,
-        Err(reason) => {
-            not_kept(&reason);
             return Ok(summary);
         }
     };
@@ -3513,31 +3500,87 @@ pub(crate) fn push_targeted(
         not_kept("Studio changed during the push");
         return Ok(summary);
     }
-    // Studio held the baseline when the lease began, no tracked change but
-    // the push's own reached a synced service until the release, and the
-    // state no event tracks (Terrain voxels, open script buffers) is what the
-    // baseline's proof saw. The push wrote and verified every file that
-    // differs from the baseline, so Studio holds these files.
-    #[cfg(windows)]
-    let relay = held.relay.take();
-    let (kept_sm, kept_pushed) =
-        retain_targeted_baseline_scope(context, &mut held, &project, &summary);
-    let entry = VerifiedFullPush {
-        connections: bridge.runtime_connection_signature(&release.runtime_id),
-        input: std::mem::take(&mut held.input),
-        sourcemap: kept_sm,
-        pushed_from_pull: kept_pushed,
-        project,
-        paths: std::mem::take(&mut held.paths),
-        proof,
-        expires: baseline_expiry(
-            #[cfg(windows)]
-            relay.as_ref(),
-        ),
+    let connections = bridge.runtime_connection_signature(&release.runtime_id);
+    let runtime_id = release.runtime_id.clone();
+    let has_large_pushed_store = pushed.paths.iter().any(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_service_settings_file_name)
+            && matches!(
+                after.entries.get(path),
+                Some(SnapshotEntry::File(bytes)) if bytes.len() >= 4 * 1024 * 1024
+            )
+    });
+    let build_entry = move |context: &BoundContext,
+                            mut held: VerifiedFullPush,
+                            before: ProjectSnapshot,
+                            after: ProjectSnapshot,
+                            summary: &Map<String, Value>,
+                            pushed: TargetedPush|
+          -> Option<VerifiedFullPush> {
+        let service_of = |path: &Path| {
+            crate::editor::paths::service_from_changed_path(
+                Path::new(&context.source),
+                &Path::new(&context.root).join(path),
+            )
+        };
+        let project = match targeted_baseline(
+            &held.project,
+            (&before, &after),
+            summary,
+            &pushed,
+            service_of,
+        ) {
+            Ok(project) => project,
+            Err(reason) => {
+                log_global(
+                    5,
+                    format_args!("[renium] baseline: not kept after targeted push: {reason}"),
+                );
+                return None;
+            }
+        };
         #[cfg(windows)]
-        relay,
+        let relay = held.relay.take();
+        let (kept_sm, kept_pushed) =
+            retain_targeted_baseline_scope(context, &mut held, &project, summary);
+        Some(VerifiedFullPush {
+            connections,
+            input: std::mem::take(&mut held.input),
+            sourcemap: kept_sm,
+            pushed_from_pull: kept_pushed,
+            project,
+            paths: std::mem::take(&mut held.paths),
+            proof,
+            expires: baseline_expiry(
+                #[cfg(windows)]
+                relay.as_ref(),
+            ),
+            #[cfg(windows)]
+            relay,
+        })
     };
-    keep_baseline(bridge, &release.runtime_id, entry, "targeted push");
+    if has_large_pushed_store {
+        let context_owned = context.clone();
+        let summary_owned = summary.clone();
+        let handle = std::thread::spawn(move || {
+            let entry = build_entry(&context_owned, held, before, after, &summary_owned, pushed);
+            if let Some(ref entry) = entry {
+                let seconds = entry
+                    .expires
+                    .saturating_duration_since(Instant::now())
+                    .as_secs();
+                log_global(
+                    5,
+                    format_args!("[renium] baseline: kept after targeted push for {seconds}s"),
+                );
+            }
+            entry
+        });
+        defer_targeted_baseline(bridge, runtime_id, handle);
+    } else if let Some(entry) = build_entry(context, held, before, after, &summary, pushed) {
+        keep_baseline(bridge, &runtime_id, entry, "targeted push");
+    }
     Ok(summary)
 }
 
@@ -3606,6 +3649,7 @@ fn baseline_lease<'a>(
 pub(crate) struct TargetedPush {
     pub(crate) paths: HashSet<PathBuf>,
     pub(crate) ids: HashSet<String>,
+    pub(crate) previous_ids: HashSet<String>,
     /// Whether what stands under the chosen instances went with them.
     pub(crate) exact: bool,
     /// Whether each instance went whole: no property filter, no instance
@@ -3629,6 +3673,7 @@ impl TargetedPush {
                 })
                 .collect(),
             ids: args.target_settings_ids.iter().cloned().collect(),
+            previous_ids: args.previous_instance_paths.keys().cloned().collect(),
             exact: args.exact_target_ids,
             whole_rows: args.target_properties.is_empty()
                 && args.target_settings_id_files.is_empty()
@@ -3719,8 +3764,14 @@ pub(crate) fn targeted_baseline(
                         .any(|name| name.eq_ignore_ascii_case(&service))
                 }) {
                     Some("the push did not verify its service")
-                } else if !store_rows_differ_only_at(was, now, &pushed.ids, pushed.exact)
-                    .unwrap_or(false)
+                } else if !store_rows_differ_only_at(
+                    was,
+                    now,
+                    &pushed.ids,
+                    pushed.exact,
+                    &pushed.previous_ids,
+                )
+                .unwrap_or(false)
                 {
                     Some("it differs beyond the instances the push wrote")
                 } else {
@@ -3773,6 +3824,7 @@ pub(crate) fn store_rows_differ_only_at(
     files: &[u8],
     ids: &HashSet<String>,
     exact: bool,
+    previous_ids: &HashSet<String>,
 ) -> Result<bool> {
     use crate::settings::bytecode::property_edit::{decode_rows, whole_row_digests_of_both};
     let (was, now) = whole_row_digests_of_both(held, files, None);
@@ -3832,14 +3884,68 @@ pub(crate) fn store_rows_differ_only_at(
         && was.unique_ids == now.unique_ids
         && was.instances.iter().zip(&now.instances).all(|(was, now)| {
             was.settings_id == now.settings_id
-                && was.name == now.name
                 && was.class_name == now.class_name
-                && was.parent_index == now.parent_index
+                && ((was.name == now.name && was.parent_index == now.parent_index)
+                    || (previous_ids.contains(&was.settings_id)
+                        && ids.contains(&was.settings_id)
+                        && !matches!(now.class_name.as_str(), "PackageLink" | "Camera")
+                        && crate::editor::paths::script_file_names(&now.class_name).is_none()))
         });
-    if !same_places {
+    let was_of: Option<Vec<usize>> = if same_places {
+        None
+    } else if !previous_ids.is_empty()
+        && now.instances.len() == count
+        && was.digests.len() == count
+        && now.digests.len() == count
+    {
+        let was_by_id: AHashMap<&str, usize> = was
+            .instances
+            .iter()
+            .enumerate()
+            .map(|(index, inst)| (inst.settings_id.as_str(), index))
+            .collect();
+        let mut mapping = Vec::with_capacity(count);
+        let mut seen = vec![false; count];
+        let mut ok = true;
+        for (now_idx, now_inst) in now.instances.iter().enumerate() {
+            let Some(&was_idx) = was_by_id.get(now_inst.settings_id.as_str()) else {
+                ok = false;
+                break;
+            };
+            if std::mem::replace(&mut seen[was_idx], true) {
+                ok = false;
+                break;
+            }
+            let was_inst = &was.instances[was_idx];
+            let was_parent = was_inst
+                .parent_index
+                .and_then(|p| was.instances.get(p))
+                .map(|i| i.settings_id.as_str());
+            let now_parent = now_inst
+                .parent_index
+                .and_then(|p| now.instances.get(p))
+                .map(|i| i.settings_id.as_str());
+            let moved_ok = previous_ids.contains(&now_inst.settings_id)
+                && ids.contains(&now_inst.settings_id)
+                && !matches!(now_inst.class_name.as_str(), "PackageLink" | "Camera")
+                && crate::editor::paths::script_file_names(&now_inst.class_name).is_none();
+            if was_inst.class_name != now_inst.class_name
+                || was.unique_ids[was_idx] != now.unique_ids[now_idx]
+                || ((was_inst.name != now_inst.name || was_parent != now_parent) && !moved_ok)
+            {
+                ok = false;
+                break;
+            }
+            mapping.push(was_idx);
+        }
+        if !ok {
+            return Ok(false);
+        }
+        Some(mapping)
+    } else {
         return Ok(false);
-    }
-    let mut chosen = was
+    };
+    let mut chosen = now
         .instances
         .iter()
         .map(|instance| ids.contains(&instance.settings_id))
@@ -3851,7 +3957,7 @@ pub(crate) fn store_rows_differ_only_at(
         joined = false;
         for index in 0..count {
             if !chosen[index]
-                && was.instances[index]
+                && now.instances[index]
                     .parent_index
                     .is_some_and(|parent| parent < count && chosen[parent])
             {
@@ -3860,8 +3966,9 @@ pub(crate) fn store_rows_differ_only_at(
             }
         }
     }
+    let was_idx_of = |now_idx: usize| was_of.as_ref().map_or(now_idx, |m| m[now_idx]);
     let differing = (0..count)
-        .filter(|&index| was.digests[index] != now.digests[index])
+        .filter(|&index| was.digests[was_idx_of(index)] != now.digests[index])
         .collect::<Vec<_>>();
     if differing.iter().any(|&index| !chosen[index]) {
         return Ok(false);
@@ -3872,7 +3979,8 @@ pub(crate) fn store_rows_differ_only_at(
     let Ok(database) = rbx_reflection_database::get() else {
         return Ok(false);
     };
-    let (was_rows, _) = decode_rows(held, &differing)?;
+    let was_indices: Vec<usize> = differing.iter().map(|&index| was_idx_of(index)).collect();
+    let (was_rows, _) = decode_rows(held, &was_indices)?;
     let (now_rows, _) = decode_rows(files, &differing)?;
     Ok(was_rows.iter().zip(&now_rows).all(|(was, now)| {
         // Studio holds a Decal's ColorMapContent as its TextureContent.
@@ -5127,12 +5235,14 @@ mod stores_read_tests {
         ));
         let held = encode_settings_bytecode(&base_doc).unwrap();
         let files_part = encode_settings_bytecode(&added_part_doc).unwrap();
+        let empty = HashSet::new();
         assert!(
             store_rows_differ_only_at(
                 &held,
                 &files_part,
                 &HashSet::from(["folder-1".to_string()]),
-                false
+                false,
+                &empty,
             )
             .unwrap()
         );
@@ -5141,7 +5251,8 @@ mod stores_read_tests {
                 &held,
                 &files_part,
                 &HashSet::from(["folder-1".to_string()]),
-                true
+                true,
+                &empty,
             )
             .unwrap()
         );
@@ -5160,7 +5271,76 @@ mod stores_read_tests {
                 &held,
                 &files_script,
                 &HashSet::from(["folder-1".to_string()]),
-                false
+                false,
+                &empty,
+            )
+            .unwrap()
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn store_rows_differ_only_at_with_previous_allows_targeted_rename_and_reordered_move() {
+        use crate::settings::bytecode::{
+            SettingsBytecode, SettingsBytecodeInstance, encode_settings_bytecode,
+        };
+        let base_doc = SettingsBytecode {
+            version: 12,
+            instances: vec![
+                SettingsBytecodeInstance::new(
+                    "ws-0".into(),
+                    "Workspace".into(),
+                    "Workspace".into(),
+                    None,
+                ),
+                SettingsBytecodeInstance::new(
+                    "folder-a".into(),
+                    "FolderA".into(),
+                    "Folder".into(),
+                    Some(0),
+                ),
+                SettingsBytecodeInstance::new(
+                    "folder-b".into(),
+                    "FolderB".into(),
+                    "Folder".into(),
+                    Some(0),
+                ),
+                SettingsBytecodeInstance::new(
+                    "part-1".into(),
+                    "One".into(),
+                    "Part".into(),
+                    Some(1),
+                ),
+                SettingsBytecodeInstance::new(
+                    "part-2".into(),
+                    "Two".into(),
+                    "Part".into(),
+                    Some(2),
+                ),
+            ],
+        };
+        let held = encode_settings_bytecode(&base_doc).unwrap();
+        let mut renamed = base_doc.clone();
+        renamed.instances[3].name = "OneRenamed".into();
+        let renamed_bytes = encode_settings_bytecode(&renamed).unwrap();
+        let empty = HashSet::new();
+        let ids = HashSet::from(["part-1".to_string()]);
+        assert!(!store_rows_differ_only_at(&held, &renamed_bytes, &ids, true, &empty).unwrap());
+        assert!(store_rows_differ_only_at(&held, &renamed_bytes, &ids, true, &ids).unwrap());
+        let mut moved = base_doc;
+        let mut part_1 = moved.instances.remove(3);
+        part_1.parent_index = Some(2);
+        moved.instances.push(part_1);
+        let moved_bytes = encode_settings_bytecode(&moved).unwrap();
+        assert!(!store_rows_differ_only_at(&held, &moved_bytes, &ids, false, &empty).unwrap());
+        assert!(store_rows_differ_only_at(&held, &moved_bytes, &ids, false, &ids).unwrap());
+        assert!(
+            !store_rows_differ_only_at(
+                &held,
+                &moved_bytes,
+                &HashSet::from(["part-2".to_string()]),
+                false,
+                &HashSet::from(["part-2".to_string()]),
             )
             .unwrap()
         );

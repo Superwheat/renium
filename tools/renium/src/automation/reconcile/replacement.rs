@@ -1469,6 +1469,38 @@ fn taken_by_order(
         .then_some(ordered)
 }
 
+fn ordered_differing_pairs(
+    by_order: &[(usize, ByOrder)],
+    studio: &[SettingsBytecodeInstance],
+    differs: &[bool],
+    files_of: Counterpart<'_>,
+) -> Vec<(usize, usize)> {
+    let mut ordered = vec![None; studio.len()];
+    for &(index, how) in by_order {
+        ordered[index] = Some(how);
+    }
+    let mut pairs = Vec::new();
+    for index in 0..studio.len() {
+        let parent = studio[index].parent_index;
+        if parent.is_some_and(|parent| parent >= index) {
+            return Vec::new();
+        }
+        let above = parent.and_then(|parent| ordered[parent]);
+        if above == Some(ByOrder::More) {
+            ordered[index] = above;
+        } else if ordered[index] != Some(ByOrder::More) {
+            ordered[index] = ordered[index].max(above);
+            if ordered[index].is_some()
+                && differs[index]
+                && let Some(files_idx) = files_of(index)
+            {
+                pairs.push((files_idx, index));
+            }
+        }
+    }
+    pairs
+}
+
 /// Whether an instance read of either copy refers to one of `taken`
 /// (`taken_by_order`, of Studio's instances): namesakes that hold the same
 /// are told apart by what names them, and a pairing by their order that took
@@ -1481,6 +1513,21 @@ fn names_one_taken_by_order(
     studio_of: Counterpart<'_>,
 ) -> bool {
     use crate::settings::bytecode::for_each_reference;
+    use crate::settings::bytecode::property_edit::names_an_instance_by_id;
+    let has_ref = |instance: &SettingsBytecodeInstance| {
+        instance
+            .properties
+            .values()
+            .chain(instance.attributes.values())
+            .any(names_an_instance_by_id)
+    };
+    if !read.iter().any(|index| has_ref(&studio.instances[*index]))
+        && !read_of_files
+            .iter()
+            .any(|index| has_ref(&files.instances[*index]))
+    {
+        return false;
+    }
     let by_id = |document: &'_ SettingsBytecode| {
         let ids = document.instances.iter().enumerate();
         ids.map(|(index, instance)| (instance.settings_id.clone(), index))
@@ -1746,8 +1793,6 @@ fn changed_instances_placed(
         }));
     }
     let moved = moved.as_ref();
-    // The files' instance each of Studio's stands for, and Studio's for
-    // each of the files': none for an instance of the run.
     let files_of = |studio: usize| moved.map_or(Some(studio), |moved| moved.in_state(studio));
     let studio_of = |files: usize| moved.map_or(Some(files), |moved| moved.in_store(files));
     let mut differs = (0..studio_count)
@@ -1770,6 +1815,21 @@ fn changed_instances_placed(
             (&files_of, &studio_of),
         );
         if taken.is_none() {
+            let ordered_diff = ordered_differing_pairs(by_order, &skeleton, &differs, &files_of);
+            if !ordered_diff.is_empty() && ordered_diff.len() <= MAX_CHANGED_INSTANCES {
+                let copies = (desired_bytes.as_slice(), observed_bytes.as_slice());
+                let unlike = told_apart(copies, &ordered_diff, (&mut differs, None), moved)?;
+                if unlike == 0 {
+                    taken = taken_by_order(
+                        by_order,
+                        (&skeleton, files_instances),
+                        &differs,
+                        (&files_of, &studio_of),
+                    );
+                }
+            }
+        }
+        if taken.is_none() {
             #[cfg(test)]
             BY_ORDER[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(ChangedInstances::Apart(match files {
@@ -1779,7 +1839,14 @@ fn changed_instances_placed(
         }
     }
     let beside_run = told.is_none() && moved.and_then(Moved::run).is_some();
-    let mut read = instances_read(&skeleton, (&differs, &kept), (files_too, files_too));
+    let no_kept;
+    let kept_for_read = if told.is_some() && !as_stored {
+        no_kept = vec![false; studio_count];
+        &no_kept
+    } else {
+        &kept
+    };
+    let mut read = instances_read(&skeleton, (&differs, kept_for_read), (files_too, files_too));
     if read.len() > MAX_CHANGED_INSTANCES {
         // The rows that only write the same values another way are not read.
         let mut names = kept.clone();
@@ -1874,23 +1941,6 @@ fn changed_instances_placed(
     if settings_documents_positionally_equivalent(&current, &previous) {
         return Ok(ChangedInstances::None);
     }
-    if let Some(taken) = &taken {
-        let of_files = match &read_of_files {
-            Some(read) => read.clone(),
-            None => {
-                let alone = (0..count).filter(|index| studio_of(*index).is_none());
-                let paired = read.iter().filter_map(|index| files_of(*index));
-                paired.chain(alone).collect()
-            }
-        };
-        let named =
-            names_one_taken_by_order(taken, (&previous, &current), (&read, &of_files), &studio_of);
-        #[cfg(test)]
-        BY_ORDER[usize::from(!named)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if named {
-            return Ok(ChangedInstances::Apart((!files_too).then_some(current)));
-        }
-    }
     let stored_ids = as_stored.then(|| {
         let ids = previous.instances.iter();
         ids.map(|instance| instance.settings_id.clone())
@@ -1906,6 +1956,48 @@ fn changed_instances_placed(
             align_settings_ids_beside_run(&current, &mut previous, run, !of_files)
         }
     };
+    if let Some(taken) = &taken {
+        let props_differ_ignoring_uid = |a: &Map<String, Value>, b: &Map<String, Value>| {
+            a.iter()
+                .any(|(k, v)| k != "UniqueId" && b.get(k) != Some(v))
+                || b.iter()
+                    .any(|(k, v)| k != "UniqueId" && a.get(k) != Some(v))
+        };
+        let mut studio_check = Vec::new();
+        let mut files_check = Vec::new();
+        for &studio_idx in &read {
+            match files_of(studio_idx) {
+                Some(files_idx) => {
+                    let p = &previous.instances[studio_idx];
+                    let c = &current.instances[files_idx];
+                    if differs[studio_idx]
+                        || p.attributes != c.attributes
+                        || props_differ_ignoring_uid(&p.properties, &c.properties)
+                    {
+                        studio_check.push(studio_idx);
+                        files_check.push(files_idx);
+                    }
+                }
+                None => studio_check.push(studio_idx),
+            }
+        }
+        for files_idx in 0..count {
+            if studio_of(files_idx).is_none() {
+                files_check.push(files_idx);
+            }
+        }
+        let named = names_one_taken_by_order(
+            taken,
+            (&previous, &current),
+            (&studio_check, &files_check),
+            &studio_of,
+        );
+        #[cfg(test)]
+        BY_ORDER[usize::from(!named)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if named {
+            return Ok(ChangedInstances::Apart((!files_too).then_some(current)));
+        }
+    }
     // Two copies of the files' own share their ids: an alignment that gives
     // an instance another id took it for one the files hold under that id.
     let kept = stored_ids.is_none_or(|ids| {
@@ -3099,5 +3191,281 @@ mod heavy_delta_tests {
             .get("CurrentCamera")
             .unwrap();
         assert_eq!(prev_cam["settingsId"], "cam");
+    }
+
+    #[test]
+    fn by_order_pairing_accepts_unchanged_twin_ref_and_rejects_swapped_twin_ref() {
+        let make_doc = |uid_base: u64, obs_ids: bool, swap_ref: bool, change_target: bool| {
+            let id = |s: &str| {
+                if obs_ids {
+                    format!("obs-{s}")
+                } else {
+                    s.to_string()
+                }
+            };
+            let mut instances = vec![SettingsBytecodeInstance::new(
+                id("ws"),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            )];
+            for t in 0..2 {
+                let mut twin = SettingsBytecodeInstance::new(
+                    id(&format!("twin-{t}")),
+                    "Twin".into(),
+                    "Part".into(),
+                    Some(0),
+                );
+                twin.properties.insert(
+                    "UniqueId".into(),
+                    serde_json::json!({"_type": "UniqueId", "value": format!("{:032x}", uid_base + t)}),
+                );
+                instances.push(twin);
+            }
+            let target_ref = if swap_ref { 2 } else { 1 };
+            let target_id = id(if swap_ref { "twin-1" } else { "twin-0" });
+            let mut weld =
+                SettingsBytecodeInstance::new(id("weld"), "Weld".into(), "Weld".into(), Some(0));
+            weld.properties.insert(
+                "UniqueId".into(),
+                serde_json::json!({"_type": "UniqueId", "value": format!("{:032x}", uid_base + 10)}),
+            );
+            weld.properties.insert(
+                "Part0".into(),
+                serde_json::json!({"_type": "Ref", "settingsId": target_id, "instanceIndex": target_ref + 1}),
+            );
+            instances.push(weld);
+            let mut changed = SettingsBytecodeInstance::new(
+                id("changed"),
+                "Changed".into(),
+                "Part".into(),
+                Some(0),
+            );
+            changed.properties.insert(
+                "UniqueId".into(),
+                serde_json::json!({"_type": "UniqueId", "value": format!("{:032x}", uid_base + 20)}),
+            );
+            changed.properties.insert(
+                "Transparency".into(),
+                serde_json::json!(if change_target { 0.5 } else { 0.0 }),
+            );
+            instances.push(changed);
+            for i in 0..512 {
+                let mut filler = SettingsBytecodeInstance::new(
+                    id(&format!("pad-{i}")),
+                    format!("Pad_{i}"),
+                    "Part".into(),
+                    Some(0),
+                );
+                filler.properties.insert(
+                    "UniqueId".into(),
+                    serde_json::json!({"_type": "UniqueId", "value": format!("{:032x}", uid_base + 100 + i)}),
+                );
+                instances.push(filler);
+            }
+            if obs_ids {
+                instances.swap(5, 6);
+            }
+            SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances,
+            }
+        };
+        let desired_doc = make_doc(1, false, false, false);
+        let obs_unchanged_ref = make_doc(10_000, true, false, true);
+        let obs_swapped_ref = make_doc(20_000, true, true, true);
+        let desired_entry = SnapshotEntry::File(
+            crate::settings::bytecode::encode_settings_bytecode(&desired_doc).unwrap(),
+        );
+        let obs_same_entry = SnapshotEntry::File(
+            crate::settings::bytecode::encode_settings_bytecode(&obs_unchanged_ref).unwrap(),
+        );
+        let obs_swap_entry = SnapshotEntry::File(
+            crate::settings::bytecode::encode_settings_bytecode(&obs_swapped_ref).unwrap(),
+        );
+
+        let before_accepted = BY_ORDER[1].load(std::sync::atomic::Ordering::Relaxed);
+        let path = Path::new("instances/Workspace.renium");
+        let res = changed_instances_alone(
+            path,
+            Some(&desired_entry),
+            Some(&obs_same_entry),
+            true,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(res, ChangedInstances::Prepared(_)));
+        assert!(
+            BY_ORDER[1].load(std::sync::atomic::Ordering::Relaxed) > before_accepted,
+            "unchanged twin reference must accept by-order pairing"
+        );
+
+        let before_refused = BY_ORDER[0].load(std::sync::atomic::Ordering::Relaxed);
+        let res_swap = changed_instances_alone(
+            path,
+            Some(&desired_entry),
+            Some(&obs_swap_entry),
+            true,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            res_swap,
+            ChangedInstances::Prepared(_) | ChangedInstances::Whole(_)
+        ));
+        assert!(
+            BY_ORDER[0].load(std::sync::atomic::Ordering::Relaxed) > before_refused,
+            "swapped twin reference must reject by-order pairing and fall back"
+        );
+    }
+
+    #[test]
+    fn by_order_pairing_accepts_reordered_humanoid_description_lists() {
+        let make_doc = |uid_base: u64, accessories: &str, changed_val: f64, swap_padding: bool| {
+            let id = |s: &str| format!("id-{uid_base}-{s}");
+            let mut instances = vec![SettingsBytecodeInstance::new(
+                id("ws"),
+                "Workspace".into(),
+                "Workspace".into(),
+                None,
+            )];
+            for t in 0..2 {
+                let model_idx = instances.len();
+                let mut model = SettingsBytecodeInstance::new(
+                    id(&format!("npc-{t}")),
+                    "Model".into(),
+                    "Model".into(),
+                    Some(0),
+                );
+                model.properties.insert(
+                    "UniqueId".into(),
+                    serde_json::json!({"_type": "UniqueId", "value": format!("{:032x}", uid_base + t * 10)}),
+                );
+                instances.push(model);
+                let hum_idx = instances.len();
+                let mut hum = SettingsBytecodeInstance::new(
+                    id(&format!("hum-{t}")),
+                    "Humanoid".into(),
+                    "Humanoid".into(),
+                    Some(model_idx),
+                );
+                hum.properties.insert(
+                    "UniqueId".into(),
+                    serde_json::json!({"_type": "UniqueId", "value": format!("{:032x}", uid_base + t * 10 + 1)}),
+                );
+                instances.push(hum);
+                let mut hd = SettingsBytecodeInstance::new(
+                    id(&format!("hd-{t}")),
+                    "HumanoidDescription".into(),
+                    "HumanoidDescription".into(),
+                    Some(hum_idx),
+                );
+                hd.properties.insert(
+                    "UniqueId".into(),
+                    serde_json::json!({"_type": "UniqueId", "value": format!("{:032x}", uid_base + t * 10 + 2)}),
+                );
+                hd.properties.insert(
+                    "HatAccessory".into(),
+                    serde_json::json!(if t == 0 { accessories } else { "100,200" }),
+                );
+                instances.push(hd);
+            }
+            let mut changed = SettingsBytecodeInstance::new(
+                id("changed"),
+                "Changed".into(),
+                "Part".into(),
+                Some(0),
+            );
+            changed.properties.insert(
+                "UniqueId".into(),
+                serde_json::json!({"_type": "UniqueId", "value": format!("{:032x}", uid_base + 50)}),
+            );
+            changed
+                .properties
+                .insert("Transparency".into(), serde_json::json!(changed_val));
+            instances.push(changed);
+            let pad_start = instances.len();
+            for p in 0..320 {
+                let mut part = SettingsBytecodeInstance::new(
+                    id(&format!("pad-{p}")),
+                    format!("Pad{p}"),
+                    "Part".into(),
+                    Some(0),
+                );
+                part.properties.insert(
+                    "UniqueId".into(),
+                    serde_json::json!({"_type": "UniqueId", "value": format!("{:032x}", uid_base + 100 + p as u64)}),
+                );
+                instances.push(part);
+            }
+            if swap_padding {
+                instances.swap(pad_start, pad_start + 1);
+            }
+            SettingsBytecode {
+                version: SETTINGS_BINARY_VERSION,
+                instances,
+            }
+        };
+        let desired_entry = SnapshotEntry::File(
+            crate::settings::bytecode::encode_settings_bytecode(&make_doc(
+                1, "11,22,33", 0.0, false,
+            ))
+            .unwrap(),
+        );
+        let obs_reordered = SnapshotEntry::File(
+            crate::settings::bytecode::encode_settings_bytecode(&make_doc(
+                10_000, "33,11,22", 0.25, true,
+            ))
+            .unwrap(),
+        );
+        let obs_mutated = SnapshotEntry::File(
+            crate::settings::bytecode::encode_settings_bytecode(&make_doc(
+                20_000, "11,22,99", 0.25, true,
+            ))
+            .unwrap(),
+        );
+        let path = Path::new("instances/Workspace.renium");
+
+        let before_accepted = BY_ORDER[1].load(std::sync::atomic::Ordering::Relaxed);
+        let before_refused = BY_ORDER[0].load(std::sync::atomic::Ordering::Relaxed);
+        let res = changed_instances_alone(
+            path,
+            Some(&desired_entry),
+            Some(&obs_reordered),
+            true,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(res, ChangedInstances::Prepared(_)));
+        assert!(
+            BY_ORDER[1].load(std::sync::atomic::Ordering::Relaxed) > before_accepted,
+            "equivalent reordered HumanoidDescription accessory list must stay on by-order fast path"
+        );
+        assert_eq!(
+            BY_ORDER[0].load(std::sync::atomic::Ordering::Relaxed),
+            before_refused,
+            "equivalent reordered HumanoidDescription accessory list must not reject by-order"
+        );
+
+        let res_mutated = changed_instances_alone(
+            path,
+            Some(&desired_entry),
+            Some(&obs_mutated),
+            true,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            res_mutated,
+            ChangedInstances::Prepared(_) | ChangedInstances::Whole(_)
+        ));
+        assert!(
+            BY_ORDER[0].load(std::sync::atomic::Ordering::Relaxed) > before_refused,
+            "genuinely changed HumanoidDescription under a twin must reject by-order"
+        );
     }
 }

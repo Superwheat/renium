@@ -1704,6 +1704,14 @@ impl StudioPrep {
         self.renames.is_empty() && self.moves.is_empty() && self.destroys.is_empty()
     }
 
+    pub(crate) fn single_rename_path(&self) -> Option<&EditorInstancePath> {
+        if self.renames.len() == 1 && self.moves.is_empty() && self.destroys.is_empty() {
+            self.paths.get(self.renames[0].0)
+        } else {
+            None
+        }
+    }
+
     /// Adds the renames, moves and removals that turn one store from `before`
     /// into `after`, as paths of `before` and in the order `before` holds the
     /// instances. A move under a parent `before` does not hold is refused

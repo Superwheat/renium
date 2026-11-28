@@ -318,6 +318,10 @@ pub(super) fn automation_push_args(
         .collect();
     args.target_settings_ids = automation_strings(object, "targetSettingsIds");
     args.exact_target_ids = automation_bool(object, "exactTargetIds", false)?;
+    if let Some(previous) = object.get("previousInstancePaths").filter(|v| !v.is_null()) {
+        args.previous_instance_paths = serde_json::from_value(previous.clone())
+            .context("previousInstancePaths must map settingsId to [segments, ordinals]")?;
+    }
     args.target_settings_id_files = automation_strings(object, "targetSettingsIdFiles")
         .into_iter()
         .map(PathBuf::from)
