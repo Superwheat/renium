@@ -1364,7 +1364,9 @@ fn import_place_into_an_existing_project_keeps_matching_identities() {
     let changed = result["changedPaths"].as_array().unwrap();
     assert!(changed.contains(&json!("instances/Workspace.renium")));
     assert!(changed.contains(&json!("src/Workspace/Lobby")));
-    assert!(changed.contains(&json!("src/ReplicatedStorage/Shared/Config.luau")));
+    // The place holds this script's text with other line endings: the file
+    // stands.
+    assert!(!changed.contains(&json!("src/ReplicatedStorage/Shared/Config.luau")));
     assert_eq!(
         fx.both(&["tr", "Workspace", "--depth", "2", "-r", &root]),
         json!([
@@ -1380,7 +1382,7 @@ fn import_place_into_an_existing_project_keeps_matching_identities() {
     assert!(!fx.exists("src/Workspace/Lobby/Helper.client.luau"));
     assert_eq!(
         fs::read_to_string(fx.root.join("src/ReplicatedStorage/Shared/Config.luau")).unwrap(),
-        "return { rounds = 3 }\r\n"
+        CONFIG_SOURCE
     );
     assert_eq!(
         fx.both(&["bg", "-f", &fx.store_arg("Workspace"), "-p", "Gravity"]),

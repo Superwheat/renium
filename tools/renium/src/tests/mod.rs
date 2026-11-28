@@ -2688,14 +2688,18 @@ fn a_named_copy_writes_what_a_copy_and_its_rename_wrote() {
 /// edit of a script (`cp`, `rn`, `ba`, `bs` and `br` with `--push`), decode
 /// no store whole: the paths the place is sent and the script files a push
 /// carries come from a store's instances and the rows of the scripts and of
-/// the instances above them. The daemon answers as the place would, and the
-/// project the push resolves is the test's.
+/// the instances above them. A move in one store is pushed with the path the
+/// instance had before it; a move into another store sets the parent in the
+/// place. The daemon answers as the place would, and the project the push
+/// resolves is the test's.
 #[test]
 fn pushes_of_store_edits_decode_no_store_whole() {
     use crate::bytecode::edit::{PushedScope, push_stored_instance_reading, stored_instances_push};
     use crate::settings::bytecode::blocks::WHOLE_DECODES;
     thread_local! {
         static REPARENTS: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        static PREVIOUS: std::cell::RefCell<Vec<Value>> =
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
@@ -2711,6 +2715,11 @@ fn pushes_of_store_edits_decode_no_store_whole() {
             && let Some((targets, _)) = moved.split_once(" if not inst")
         {
             REPARENTS.with_borrow_mut(|sent| sent.push(targets.to_string()));
+        }
+        if let Some(previous) = parameters.get("previousInstancePaths")
+            && previous.as_object().is_some_and(|paths| !paths.is_empty())
+        {
+            PREVIOUS.with_borrow_mut(|sent| sent.push(previous.clone()));
         }
         json!({"results": ["moved"]})
     }));
@@ -2746,11 +2755,12 @@ fn pushes_of_store_edits_decode_no_store_whole() {
         .join("Inner.luau");
     assert_eq!(pushed.changed_paths, [store.clone(), inner]);
     assert_eq!(
+        PREVIOUS.take(),
+        [json!({"filler-0": [["Workspace", "Filler0"], [1, 1]]})]
+    );
+    assert_eq!(
         REPARENTS.take(),
-        [
-            r#"at({ {"Workspace", "Filler0"}, {1, 1} }), at({ {"Workspace", "Model"}, {1, 1} })"#,
-            r#"at({ {"Workspace", "Filler1"}, {1, 1} }), at({ {"ReplicatedStorage"}, {1} })"#,
-        ]
+        [r#"at({ {"Workspace", "Filler1"}, {1, 1} }), at({ {"ReplicatedStorage"}, {1} })"#]
     );
     SettingsBytecode::read_file(&store).unwrap();
     assert_eq!(WHOLE_DECODES.get(), 1);

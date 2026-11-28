@@ -312,7 +312,6 @@ fn native_gate_rejects_new_and_resident_helpers() {
 #[test]
 fn read_only_probes_refuse_non_studio_processes_without_loading_a_helper() -> Result<()> {
     let pid = std::process::id();
-    let before = modules(pid)?.len();
     for operation in NativeOperation::ALL {
         let error = probe_operation(pid, "", operation).unwrap_err().to_string();
         assert!(
@@ -320,7 +319,13 @@ fn read_only_probes_refuse_non_studio_processes_without_loading_a_helper() -> Re
             "{operation:?}: {error}"
         );
     }
-    assert_eq!(before, modules(pid)?.len());
+    // Other tests of this process load system libraries meanwhile, so the
+    // helper is looked for by its name.
+    let helpers = modules(pid)?
+        .into_iter()
+        .filter(|module| module.name.starts_with("renium-studio-helper"))
+        .count();
+    assert_eq!(helpers, 0);
     Ok(())
 }
 
